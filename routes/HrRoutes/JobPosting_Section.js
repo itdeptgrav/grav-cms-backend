@@ -4,6 +4,34 @@ const JobPosting = require("../../models/HR_Models/JobPosting");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const HRDepartment = require("../../models/HRDepartment");
 
+// Recruitment history. Job postings and candidates share a section because they
+// share a page - somebody asking "what happened to this vacancy" wants the
+// posting's edits and the candidates' stage moves in one list, not two.
+const { recordChange } = require("../../services/changeLog");
+const auditJob = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:recruitment",
+    entity: "job-posting",
+    ...entry,
+  });
+
+/** The fields on a posting worth diffing - the rest is presentation. */
+const jobSnapshot = (j) => ({
+  title: j?.title,
+  department: j?.department,
+  status: j?.status,
+  positionsOpen: j?.positionsOpen,
+  lastDate: j?.lastDate,
+  location: j?.location,
+  employmentType: j?.employmentType,
+  experienceRequired: j?.experienceRequired,
+  salaryRange: j?.salaryRange,
+  technicalRole: j?.technicalRole,
+  description: j?.description,
+  commonQuestions: (j?.commonQuestions || []).map((q) => q?.question || q),
+});
+
 // ✅ CREATE new job posting
 router.post("/", EmployeeAuthMiddleware, async (req, res) => {
   try {
@@ -53,6 +81,19 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
 
     const newJobPosting = new JobPosting(jobData);
     await newJobPosting.save();
+
+    await auditJob(req, {
+      entityId: String(newJobPosting._id),
+      entityLabel: newJobPosting.title,
+      action: "create",
+      summary:
+        `Created job posting "${newJobPosting.title}"` +
+        `${newJobPosting.department ? ` in ${newJobPosting.department}` : ""} ` +
+        `for ${newJobPosting.positionsOpen} position(s), closing ` +
+        `${String(newJobPosting.lastDate).slice(0, 10)}. ` +
+        `Status ${newJobPosting.status}.`,
+      after: jobSnapshot(newJobPosting),
+    });
 
     res.status(201).json({
       success: true,
@@ -327,6 +368,14 @@ router.put("/:id", EmployeeAuthMiddleware, async (req, res) => {
       runValidators: true,
     });
 
+    await auditJob(req, {
+      entityId: String(id),
+      entityLabel: updatedJob?.title || existingJob.title,
+      action: "update",
+      before: jobSnapshot(existingJob),
+      after: jobSnapshot(updatedJob),
+    });
+
     res.status(200).json({
       success: true,
       message: "Job posting updated successfully",
@@ -372,8 +421,20 @@ router.delete("/:id", EmployeeAuthMiddleware, async (req, res) => {
     }
 
     // Archive instead of hard delete
+    const previousStatus = jobPosting.status;
     jobPosting.status = "archived";
     await jobPosting.save();
+
+    await auditJob(req, {
+      entityId: String(id),
+      entityLabel: jobPosting.title,
+      action: "delete",
+      summary:
+        `Archived job posting "${jobPosting.title}" (was ${previousStatus}). ` +
+        `The posting and its candidates are kept; it stops accepting applications.`,
+      before: { status: previousStatus },
+      after: { status: "archived" },
+    });
 
     res.status(200).json({
       success: true,
@@ -417,6 +478,7 @@ router.patch("/:id/status", EmployeeAuthMiddleware, async (req, res) => {
       });
     }
 
+    const previousStatus = jobPosting.status;
     jobPosting.status = status;
     if (status === "published") {
       jobPosting.publishedAt = new Date();
@@ -425,6 +487,21 @@ router.patch("/:id/status", EmployeeAuthMiddleware, async (req, res) => {
     }
 
     await jobPosting.save();
+
+    await auditJob(req, {
+      entityId: String(id),
+      entityLabel: jobPosting.title,
+      action: "update",
+      summary:
+        `Moved job posting "${jobPosting.title}" from ${previousStatus} to ${status}` +
+        (status === "published"
+          ? " - it is now visible to applicants."
+          : status === "closed"
+            ? " - it no longer accepts applications."
+            : "."),
+      before: { status: previousStatus },
+      after: { status },
+    });
 
     res.status(200).json({
       success: true,

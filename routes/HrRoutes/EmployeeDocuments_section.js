@@ -109,6 +109,25 @@ const {
 } = require("../../utils/letterDownloadToken");
 
 const EmployeeDocument = require("../../models/HR_Models/EmployeeDocument");
+
+// Documents keep their own per-row `history[]` and that stays - it is what the
+// document drawer renders. This is the OTHER half: the same events in the
+// department-wide log, so "who released anything last week" is answerable
+// without opening documents one at a time.
+const { recordChange } = require("../../services/changeLog");
+const auditDoc = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:documents",
+    entity: "employee-document",
+    ...entry,
+  });
+
+/** "Ramesh Kumar - Experience letter" */
+const docLabel = (row) =>
+  [row?.employeeName || row?.biometricId, TYPE_LABEL[row?.type] || row?.type]
+    .filter(Boolean)
+    .join(" - ");
 const DOC_TYPES = EmployeeDocument.DOC_TYPES || [
   "appointment",
   "offer",
@@ -856,6 +875,26 @@ router.post("/", withUpload, async (req, res) => {
     // Fires ONCE, never twice, even though two mutations happened.
     if (released) safeNotify(notifyDocumentReleased, row);
 
+    await auditDoc(req, {
+      entityId: String(row._id),
+      entityLabel: docLabel(row),
+      action: "create",
+      summary:
+        `Generated a ${TYPE_LABEL[row.type] || row.type} for ${row.employeeName || row.biometricId}` +
+        `${requestId ? " against their own request" : ""}. ` +
+        (released
+          ? "Released to the employee immediately - they can see and download it now."
+          : "NOT released - the employee cannot see it until it is released.") +
+        `${replacing ? " An existing stored file was replaced." : ""}`,
+      after: {
+        type: row.type,
+        title: row.title,
+        released,
+        requestStatus: row.requestStatus,
+        fulfilledRequest,
+      },
+    });
+
     return res.status(201).json({
       success: true,
       data: toHrView(row.toObject()),
@@ -949,6 +988,20 @@ router.patch("/:id/release", async (req, res) => {
 
     safeNotify(notifyDocumentReleased, row);
 
+    await auditDoc(req, {
+      entityId: String(row._id),
+      entityLabel: docLabel(row),
+      action: "approve",
+      summary:
+        `Released the ${TYPE_LABEL[row.type] || row.type} for ` +
+        `${row.employeeName || row.biometricId} to the employee` +
+        `${fulfilledRequest ? ", fulfilling their request" : ""}. ` +
+        `They can now see and download it.` +
+        `${note ? ` Note: ${note}` : ""}`,
+      before: { released: false },
+      after: { released: true, requestStatus: row.requestStatus, releaseCount: row.releaseCount },
+    });
+
     return res.json({
       success: true,
       data: toHrView(row.toObject()),
@@ -1003,6 +1056,18 @@ router.patch("/:id/revoke", async (req, res) => {
 
     await row.save();
     safeNotify(notifyDocumentRevoked, row);
+
+    await auditDoc(req, {
+      entityId: String(row._id),
+      entityLabel: docLabel(row),
+      action: "update",
+      summary:
+        `Withdrew the ${TYPE_LABEL[row.type] || row.type} for ` +
+        `${row.employeeName || row.biometricId}. The employee can no longer see it, ` +
+        `though their request still counts as having been answered. Reason: ${reason}`,
+      before: { released: true },
+      after: { released: false, revokeReason: reason },
+    });
 
     return res.json({
       success: true,
@@ -1068,6 +1133,18 @@ router.patch("/:id/decline", async (req, res) => {
     await row.save();
     safeNotify(notifyDocumentDeclined, row, reason);
 
+    await auditDoc(req, {
+      entityId: String(row._id),
+      entityLabel: docLabel(row),
+      action: "reject",
+      summary:
+        `Declined ${row.employeeName || row.biometricId}'s request for a ` +
+        `${TYPE_LABEL[row.type] || row.type}.` +
+        `${reason ? ` Reason: ${reason}` : " No reason was given."}`,
+      before: { requestStatus: "requested" },
+      after: { requestStatus: "declined", declineReason: reason },
+    });
+
     return res.json({
       success: true,
       data: toHrView(row.toObject()),
@@ -1103,8 +1180,25 @@ router.delete("/:id", async (req, res) => {
       );
 
     const stored = hasFile(row.file) ? { ...row.file } : null;
+    const deletedLabel = docLabel(row);
+    const deletedType = row.type;
+    const deletedTitle = row.title;
+
     await EmployeeDocument.deleteOne({ _id: row._id });
     if (stored) destroyStored(stored);
+
+    // A hard delete, and the only one on this page - the row's own history[]
+    // goes with it. This entry is all that survives.
+    await auditDoc(req, {
+      entityId: String(req.params.id),
+      entityLabel: deletedLabel,
+      action: "delete",
+      summary:
+        `Deleted the unreleased ${TYPE_LABEL[deletedType] || deletedType} "${deletedTitle}" ` +
+        `and its stored file. It had never been released, which is the only state in which ` +
+        `a document can be deleted rather than withdrawn.`,
+      before: { type: deletedType, title: deletedTitle, released: false },
+    });
 
     return res.json({ success: true, message: "Document deleted." });
   } catch (err) {

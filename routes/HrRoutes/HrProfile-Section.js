@@ -4,6 +4,11 @@ const bcrypt = require("bcryptjs");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const HRDepartment = require("../../models/HRDepartment");
 
+// An HR user editing their OWN account. Logged like any other change: "who
+// changed this email" has to be answerable even - especially - when the answer
+// is the account holder themselves.
+const { recordChange } = require("../../services/changeLog");
+
 // ✅ GET HR Profile
 router.get("/profile", EmployeeAuthMiddleware, async (req, res) => {
   try {
@@ -55,6 +60,10 @@ router.put("/profile", EmployeeAuthMiddleware, async (req, res) => {
       });
     }
 
+    const previousHR = await HRDepartment.findById(req.user.id)
+      .select("name phone email")
+      .lean();
+
     const updatedHR = await HRDepartment.findByIdAndUpdate(
       req.user.id,
       {
@@ -64,6 +73,17 @@ router.put("/profile", EmployeeAuthMiddleware, async (req, res) => {
       },
       { new: true, runValidators: true },
     ).select("-password");
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:profile",
+      entity: "hr-profile",
+      entityId: String(req.user.id),
+      entityLabel: updatedHR?.name || previousHR?.name || String(req.user.id),
+      action: "update",
+      before: { name: previousHR?.name, phone: previousHR?.phone, email: previousHR?.email },
+      after: { name: updatedHR?.name, phone: updatedHR?.phone, email: updatedHR?.email },
+    });
 
     res.status(200).json({
       success: true,
@@ -122,6 +142,20 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
     // Update password (auto-hashed by pre-save hook)
     hr.password = newPassword;
     await hr.save();
+
+    // The password itself is never written to the log - only the fact of it.
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:profile",
+      entity: "hr-profile",
+      entityId: String(req.user.id),
+      entityLabel: hr.name || String(req.user.id),
+      action: "update",
+      summary:
+        "Changed their own password. The current password was verified first, so this was " +
+        "the account holder and not an administrative reset.",
+      fields: [{ path: "password", label: "Password", to: "[changed]", kind: "changed" }],
+    });
 
     res.status(200).json({
       success: true,

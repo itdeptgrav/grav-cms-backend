@@ -1037,6 +1037,26 @@ app.use(
 );
 
 /* =====================
+    HR CHANGE HISTORY
+  =====================
+
+  Every write under an HR prefix is recorded in change_logs. Routes that log
+  properly (with a real before/after diff) suppress this; it catches the rest,
+  so a handler nobody instrumented — including whichever one gets added next —
+  still leaves a trace. See Middlewear/auditTrail.js.
+
+  Mounted by PREFIX rather than beside each of the twenty HR routers: the point
+  of a floor is that it is under everything, and a per-router list is a list
+  somebody forgets to add to. It runs on response finish, by which time the
+  router's own auth middleware has resolved req.user, so entries carry a name.
+*/
+const auditTrail = require("./Middlewear/auditTrail");
+const hrAuditTrail = auditTrail("hr");
+app.use("/api/hr", hrAuditTrail);
+app.use("/hr", hrAuditTrail);
+app.use("/api/employees", hrAuditTrail);
+
+/* =====================
     Normal Employees ROUTES
   ===================== */
 const authRoutes = require("./routes/login");
@@ -1068,6 +1088,12 @@ app.use("/api/call-events", require("./routes/callEvents"));
 app.use("/api/field-tracking", require("./routes/fieldTracking"));
 
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
+
+// Per-page change history for HR. Mounted ABOVE the catch-all "/api/hr"
+// profile router below: that one is mounted at the bare prefix, so a router
+// added after it only ever sees requests it declined, and one that shares a
+// path segment would be shadowed.
+app.use("/api/hr/change-history", require("./routes/HrRoutes/ChangeHistory"));
 
 app.use("/api/hr", hrProfileRoutes);
 

@@ -55,6 +55,14 @@ const changeRequestSchema = new mongoose.Schema(
     // stays readable after a department is renamed — same reasoning as ChangeLog.
     departmentSlug: { type: String, required: true, index: true, lowercase: true, trim: true },
 
+    // Which page it was submitted from — the same key ChangeLog stores, so a
+    // page's history can show "sent for approval" beside the changes that
+    // actually landed. Resolved from the request path by
+    // services/auditSections, because the guard that holds a change is mounted
+    // above every route and never learns which one it was headed for.
+    section: { type: String, default: "", index: true },
+    sectionLabel: { type: String, default: "" },
+
     entity: { type: String, required: true, index: true },
     entityId: { type: String, default: "", index: true },
     // What a human recognises without opening the record.

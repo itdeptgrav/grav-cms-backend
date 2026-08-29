@@ -69,9 +69,39 @@ router.get("/c4-config", verifyHRToken, async (req, res) => {
   }
 });
 
+// Policy history. Policies drive automatic point deductions, so an edit to one
+// silently changes what happens to everybody it applies to from then on - which
+// is exactly the kind of change that needs a name and a date against it.
+const { recordChange } = require("../../services/changeLog");
+const auditPolicy = (req, entry) =>
+  recordChange(req, { departmentSlug: "hr", section: "hr:policies", ...entry });
+
+/** The fields on a policy that change what it DOES. */
+const policySnapshot = (p) => ({
+  name: p?.name,
+  description: p?.description,
+  points: p?.points,
+  scope: p?.scope,
+  departmentNames: p?.departmentNames,
+  triggerKey: p?.triggerKey,
+  thresholdMins: p?.thresholdMins,
+  isActive: p?.isActive,
+  bleachType: p?.bleachType,
+});
+
 router.put("/c4-config", verifyHRToken, async (req, res) => {
   try {
     const cfg = await C4Config.getSingleton();
+    // Snapshotted before the loop below writes onto the same document.
+    const beforeCfg = {
+      basePointsPerDay: cfg.basePointsPerDay,
+      lateArrivalPoints: cfg.lateArrivalPoints,
+      absencePoints: cfg.absencePoints,
+      earlyDeparturePoints: cfg.earlyDeparturePoints,
+      lateThresholdMins: cfg.lateThresholdMins,
+      earlyThresholdMins: cfg.earlyThresholdMins,
+      nonWorkingStatuses: [...(cfg.nonWorkingStatuses || [])],
+    };
     const NUMS = [
       "basePointsPerDay",
       "lateArrivalPoints",
@@ -96,6 +126,24 @@ router.put("/c4-config", verifyHRToken, async (req, res) => {
       cfg.updatedByRole = String(req.body.updatedByRole);
     cfg.updatedAt = Date.now();
     await cfg.save();
+
+    await auditPolicy(req, {
+      entity: "policy-rule",
+      entityId: "c4-config",
+      entityLabel: "C4 settings",
+      action: "update",
+      before: beforeCfg,
+      after: {
+        basePointsPerDay: cfg.basePointsPerDay,
+        lateArrivalPoints: cfg.lateArrivalPoints,
+        absencePoints: cfg.absencePoints,
+        earlyDeparturePoints: cfg.earlyDeparturePoints,
+        lateThresholdMins: cfg.lateThresholdMins,
+        earlyThresholdMins: cfg.earlyThresholdMins,
+        nonWorkingStatuses: cfg.nonWorkingStatuses,
+      },
+    });
+
     res.json({ success: true, config: cfg, message: "C4 settings saved." });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -931,6 +979,21 @@ router.post("/", verifyHRToken, async (req, res) => {
       createdByRole: createdByRole || "hr_manager",
     });
 
+    await auditPolicy(req, {
+      entity: "policy",
+      entityId: String(policy._id),
+      entityLabel: policy.name,
+      action: "create",
+      summary:
+        `Created ${policy.bleachType === "debit" ? "reward" : "penalty"} policy "${policy.name}" ` +
+        `worth ${policy.points} point(s), scoped to ` +
+        `${policy.scope === "department" ? (policy.departmentNames || []).join(", ") || "a department" : "the whole company"}, ` +
+        `triggered by ${policy.triggerKey}` +
+        `${policy.triggerKey !== "manual" ? ` with a ${policy.thresholdMins} minute threshold` : ""}. ` +
+        `${policy.isActive ? "It is ACTIVE and will start producing suggestions immediately." : "It is inactive."}`,
+      after: policySnapshot(policy),
+    });
+
     res.status(201).json({ success: true, policy });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -945,6 +1008,8 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
   try {
     const policy = await Policy.findById(req.params.id);
     if (!policy) return res.status(404).json({ error: "Policy not found." });
+
+    const beforePolicy = policySnapshot(policy.toObject ? policy.toObject() : policy);
 
     const {
       name,
@@ -1035,6 +1100,16 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
     }
 
     await policy.save();
+
+    await auditPolicy(req, {
+      entity: "policy",
+      entityId: String(policy._id),
+      entityLabel: policy.name,
+      action: "update",
+      before: beforePolicy,
+      after: policySnapshot(policy.toObject ? policy.toObject() : policy),
+    });
+
     res.json({ success: true, policy });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1049,6 +1124,19 @@ router.delete("/:id", verifyHRToken, async (req, res) => {
   try {
     const policy = await Policy.findByIdAndDelete(req.params.id);
     if (!policy) return res.status(404).json({ error: "Policy not found." });
+
+    await auditPolicy(req, {
+      entity: "policy",
+      entityId: String(req.params.id),
+      entityLabel: policy.name,
+      action: "delete",
+      summary:
+        `Deleted policy "${policy.name}" (${policy.points} point(s), trigger ${policy.triggerKey}). ` +
+        `It stops producing suggestions from now on; points already applied under it stay on ` +
+        `employees' records.`,
+      before: policySnapshot(policy),
+    });
+
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1367,6 +1455,36 @@ router.post("/apply", verifyHRToken, async (req, res) => {
 
     await employee.save();
     const who = employee.firstName || targetEmployeeId;
+
+    const yearTotal = employee.sopPoints.find((sp) => sp.year === year)?.totalDeducted;
+    await auditPolicy(req, {
+      entity: "sop-deduction",
+      entityId: `${targetEmployeeId}:${date}:${policyId}`,
+      entityLabel: `${employee.firstName || ""} ${employee.lastName || ""} (${targetEmployeeId})`.trim(),
+      action: "create",
+      summary:
+        `${isReward ? "Awarded" : "Deducted"} ${points} point(s) ` +
+        `${isReward ? "to" : "from"} ${who} (${targetEmployeeId}) for "${policy.name}" on ${date}. ` +
+        `Their ${year} total is now ${yearTotal}.` +
+        `${reason && reason.trim() ? ` Reason: ${reason.trim()}` : ""}`,
+      fields: [
+        {
+          path: "points",
+          label: isReward ? "Points awarded" : "Points deducted",
+          to: points,
+          kind: "added",
+        },
+        { path: "policyName", label: "Policy", to: policy.name, kind: "added" },
+        { path: "date", label: "For the day", to: date, kind: "added" },
+        {
+          path: "totalDeducted",
+          label: `Running total ${year}`,
+          to: yearTotal,
+          kind: "changed",
+        },
+      ],
+    });
+
     res.status(201).json({
       success: true,
       message: isReward

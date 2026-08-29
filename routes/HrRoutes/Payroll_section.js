@@ -22,6 +22,44 @@ const {
   decryptEmployeeDoc,
 } = require("../../utils/salaryEncryption");
 
+// Payroll history. Two sections, because they are two pages and two audiences:
+// a run edit belongs to Payroll, a policy change belongs to Payroll settings.
+//
+// NOTE ON SALARY FIGURES: the change log redacts anything whose field name is
+// on its list (basicSalary, grossSalary, netSalary...). Payroll's own field
+// names -- netPay, grossEarnings, payableDays -- are NOT on it, and that is
+// deliberate: a payroll history that hides the number that changed records
+// nothing worth having. What stays out is the employee's stored salary, which
+// is encrypted at rest and is a different fact from what a given month paid.
+const { recordChange } = require("../../services/changeLog");
+const auditPayroll = (req, entry) =>
+  recordChange(req, { departmentSlug: "hr", section: "hr:payroll", ...entry });
+
+/** "Ramesh Kumar - Aug 2026" - a payroll row somebody recognises. */
+const itemLabel = (item) =>
+  [
+    item?.employeeName || item?.biometricId || item?.employeeId,
+    `${MONTH_NAMES[item?.month] || item?.month} ${item?.year}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+/** The figures worth diffing on a payroll item. */
+const payrollSnapshot = (item) => ({
+  payableDays: item?.payableDays,
+  lopDays: item?.lopDays,
+  presentDays: item?.presentDays,
+  paidLeaveDays: item?.paidLeaveDays,
+  grossEarnings: item?.grossEarnings,
+  totalDeductions: item?.totalDeductions,
+  netPay: item?.netPay,
+  earnings: item?.earnings,
+  deductions: item?.deductions,
+  remarks: item?.remarks,
+  status: item?.status,
+  isManuallyOverridden: item?.isManuallyOverridden,
+});
+
 const MONTH_NAMES = [
   "",
   "January",
@@ -1197,6 +1235,35 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.processedAt = new Date();
     await payrollRun.save();
 
+    // The run, as one entry. Every payslip inside it was computed by the engine
+    // from attendance and the salary on file - none of them is somebody's
+    // decision, so none of them is its own history entry. What IS a decision is
+    // running the month, and the totals are what a reader wants to compare
+    // against the next month's.
+    await auditPayroll(req, {
+      entity: "payroll-run",
+      entityId: `${year}-${String(month).padStart(2, "0")}`,
+      entityLabel: `${MONTH_NAMES[month]} ${year}`,
+      action: "create",
+      summary:
+        `Processed payroll for ${MONTH_NAMES[month]} ${year} across ${employees.length} employee(s). ` +
+        `Gross ${totalGross}, deductions ${totalDed}, net ${totalNet} ` +
+        `(PF ${totalPF}, ESIC ${totalESIC}). ` +
+        `${clBalanceUpdates.length} CL balance adjustment(s) were applied as part of the run.`,
+      after: {
+        month,
+        year,
+        status: "processed",
+        totalEmployees: employees.length,
+        totalGross,
+        totalDeductions: totalDed,
+        totalNetPay: totalNet,
+        totalPF,
+        totalESIC,
+        clAdjustmentsApplied: clBalanceUpdates.length,
+      },
+    });
+
     res.json({
       success: true,
       message: `Payroll processed for ${employees.length} employees`,
@@ -1338,10 +1405,21 @@ router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
     }
 
     const allowed = ["earnings", "deductions", "remarks"];
+    const before = payrollSnapshot(item.toObject());
     allowed.forEach((k) => {
       if (req.body[k] !== undefined) item[k] = req.body[k];
     });
     await item.save();
+
+    await auditPayroll(req, {
+      entity: "payroll-record",
+      entityId: String(item._id),
+      entityLabel: itemLabel(item),
+      action: "update",
+      before,
+      after: payrollSnapshot(item.toObject()),
+    });
+
     res.json({ success: true, data: item.toObject() });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1377,6 +1455,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "Employee not found" });
     const empSalary = decryptSalaryFields(employee.salary || {});
     const salaryCfg = await SalaryConfig.getSingleton();
+    const beforeOverride = payrollSnapshot(item.toObject());
 
     const {
       payableDays,
@@ -1532,6 +1611,27 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     item.markModified("earnings");
     item.markModified("deductions");
     await item.save();
+
+    // A manual payroll override is the change that most needs a name attached:
+    // it moves what somebody is paid, away from what the engine computed. The
+    // remarks are included because they are often the only place the reason was
+    // ever written down.
+    await auditPayroll(req, {
+      entity: "payroll-record",
+      entityId: String(item._id),
+      entityLabel: itemLabel(item),
+      action: "update",
+      before: beforeOverride,
+      after: payrollSnapshot(item.toObject()),
+      summary:
+        `Manually overrode payroll for ${itemLabel(item)}: net pay ` +
+        `${beforeOverride.netPay ?? "-"} to ${item.netPay ?? "-"}` +
+        (dayEdit
+          ? `, payable days ${beforeOverride.payableDays ?? "-"} to ${item.payableDays ?? "-"}`
+          : "") +
+        `. The figures no longer match what the payroll engine computed.` +
+        `${remarks ? ` Remarks: ${remarks}` : ""}`,
+    });
 
     res.json({
       success: true,
@@ -1905,6 +2005,27 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
       );
     }
 
+    // One entry for the month, not one per payslip. Marking paid is a single
+    // act on a whole run; the per-employee figures were logged when they were
+    // computed or overridden, and repeating them here would say nothing new.
+    await auditPayroll(req, {
+      entity: "payroll-run",
+      entityId: `${year}-${String(month).padStart(2, "0")}`,
+      entityLabel: `${MONTH_NAMES[month]} ${year}`,
+      action: "update",
+      summary:
+        `Marked ${MONTH_NAMES[month]} ${year} payroll as PAID - ${result.modifiedCount} payslip(s) ` +
+        `moved from processed to paid and released to employees. ` +
+        `Payslip notifications were sent to ${pushResult.recipients} employee(s). ` +
+        `Paid payroll is locked against further edits while lockAfterPaid is on.`,
+      before: { status: "processed" },
+      after: {
+        status: "paid",
+        itemsMarkedPaid: result.modifiedCount,
+        paymentDate: new Date(),
+      },
+    });
+
     res.json({
       success: true,
       message: `${result.modifiedCount} items marked as paid`,
@@ -1993,6 +2114,20 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (e) {
       console.warn("[PAYROLL-SETTINGS] diff/email step failed:", e.message);
     }
+
+    // `before` was already read above for the CEO email diff - reused rather
+    // than re-fetched, so the entry and the email cannot disagree about what
+    // the previous value was.
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:payroll-settings",
+      entity: "payroll-setting",
+      entityId: "singleton",
+      entityLabel: "Payroll settings",
+      action: "update",
+      before: Object.fromEntries(allowed.map((k) => [k, before?.[k]])),
+      after: Object.fromEntries(allowed.map((k) => [k, cfg?.[k]])),
+    });
 
     res.json({ success: true, data: cfg });
   } catch (err) {
@@ -2664,8 +2799,25 @@ router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
+    // Counted before the delete, because afterwards there is nothing left to
+    // count and "deleted a payroll run" without a size is not a useful record
+    // of the largest destructive action on the page.
+    const itemCount = await PayrollItem.countDocuments({ month, year });
+
     await PayrollItem.deleteMany({ month, year });
     await Payroll.deleteOne({ _id: run._id });
+
+    await auditPayroll(req, {
+      entity: "payroll-run",
+      entityId: `${year}-${String(month).padStart(2, "0")}`,
+      entityLabel: `${MONTH_NAMES[month]} ${year}`,
+      action: "delete",
+      summary:
+        `Deleted the ${MONTH_NAMES[month]} ${year} payroll run and all ${itemCount} payslip(s) in it. ` +
+        `The run was ${run.status} at the time. The figures are gone - the month has to be ` +
+        `re-processed from scratch.`,
+      before: { status: run.status, itemCount },
+    });
 
     res.json({
       success: true,
@@ -2863,6 +3015,26 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.totalBonus = totalBonus;
     await payrollRun.save();
 
+    await auditPayroll(req, {
+      entity: "payroll-run",
+      entityId: `${year}-${String(month).padStart(2, "0")}`,
+      entityLabel: `${MONTH_NAMES[month]} ${year}`,
+      action: "create",
+      summary:
+        `Saved a payroll DRAFT for ${MONTH_NAMES[month]} ${year} across ${employees.length} employee(s). ` +
+        `Gross ${totalGross}, deductions ${totalDed}, net ${totalNet}. ` +
+        `Nothing is payable yet - a draft has to be processed and then marked paid.`,
+      after: {
+        month,
+        year,
+        status: "draft",
+        totalEmployees: employees.length,
+        totalGross,
+        totalDeductions: totalDed,
+        totalNetPay: totalNet,
+      },
+    });
+
     res.json({
       success: true,
       message: `Draft saved for ${employees.length} employees — review and edit before processing`,
@@ -2923,6 +3095,13 @@ router.patch(
 
       const items = await PayrollItem.find({ _id: { $in: itemIds } });
 
+      // Snapshotted before the loop mutates anything. Reading each item's
+      // "before" inside the loop would read a document this loop has already
+      // changed on a retry, and the diff would come out empty.
+      const beforeById = new Map(
+        items.map((i) => [String(i._id), payrollSnapshot(i.toObject())]),
+      );
+
       for (const item of items) {
         try {
           if (item.status === "paid" && settings.lockAfterPaid) {
@@ -2978,6 +3157,23 @@ router.patch(
           item.markModified("earnings");
           item.markModified("deductions");
           await item.save();
+
+          // Per item, not per batch. A bulk override still changes what each
+          // of these people is paid, and each payslip has to carry its own
+          // record of having been touched - an employee querying their net pay
+          // cannot be told to go and read a batch summary.
+          await auditPayroll(req, {
+            entity: "payroll-record",
+            entityId: String(item._id),
+            entityLabel: itemLabel(item),
+            action: "update",
+            before: beforeById.get(String(item._id)),
+            after: payrollSnapshot(item.toObject()),
+            summary:
+              `Bulk-overrode payroll for ${itemLabel(item)} as one of ` +
+              `${items.length} item(s) edited together: net pay ` +
+              `${beforeById.get(String(item._id))?.netPay ?? "-"} to ${item.netPay ?? "-"}.`,
+          });
 
           results.updated.push({
             id: String(item._id),
@@ -3050,8 +3246,21 @@ router.patch(
         { $set: { status: "pending" } },
       );
 
+      const previousStatus = run.status;
       run.status = "draft";
       await run.save();
+
+      await auditPayroll(req, {
+        entity: "payroll-run",
+        entityId: `${year}-${String(month).padStart(2, "0")}`,
+        entityLabel: `${MONTH_NAMES[month]} ${year}`,
+        action: "update",
+        summary:
+          `Reverted the ${MONTH_NAMES[month]} ${year} payroll run from ${previousStatus} back to draft. ` +
+          `Every processed payslip in it was set back to pending and is editable again.`,
+        before: { status: previousStatus },
+        after: { status: "draft" },
+      });
 
       res.json({
         success: true,
@@ -3098,8 +3307,24 @@ router.delete("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     const { month, year, payrollId } = item;
     const employeeName = item.employeeName;
+    const removedSnapshot = payrollSnapshot(item.toObject());
+    const removedLabel = itemLabel(item);
 
     await PayrollItem.deleteOne({ _id: item._id });
+
+    // Snapshotted before the delete: once the row is gone the only remaining
+    // record of what this person was owed for the month is this entry.
+    await auditPayroll(req, {
+      entity: "payroll-record",
+      entityId: String(req.params.id),
+      entityLabel: removedLabel,
+      action: "delete",
+      summary:
+        `Removed ${employeeName} from the ${MONTH_NAMES[month]} ${year} payroll run. ` +
+        `The payslip was ${removedSnapshot.status} with a net pay of ` +
+        `${removedSnapshot.netPay ?? "-"}. Run totals were recomputed without it.`,
+      before: removedSnapshot,
+    });
 
     // Recompute run-level totals from remaining items
     const remaining = await PayrollItem.find({ payrollId }).lean();

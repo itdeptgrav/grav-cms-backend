@@ -29,6 +29,8 @@ const ChangeRequest = require("../models/Access/ChangeRequest");
 const { MAX_BODY_BYTES } = ChangeRequest;
 const { SECRET } = require("../config/jwt");
 const { getRole, listRoles, roleAtLeast } = require("./departmentRoles");
+const { sectionForPath, sectionLabel } = require("./auditSections");
+const { recordChange } = require("./changeLog");
 
 /**
  * The one-shot header that lets a replay past this middleware.
@@ -41,6 +43,33 @@ const { getRole, listRoles, roleAtLeast } = require("./departmentRoles");
  */
 const REPLAY_HEADER = "x-grav-change-request";
 
+/**
+ * The approver, spelled out for the change log on the far side of the replay.
+ *
+ * Sent as headers rather than folded into the replay token because the token is
+ * the REQUESTER's — putting the approver in it would make every downstream
+ * `req.user` read ambiguous about which of the two people it refers to, and the
+ * routes that stamp `updatedBy` from `req.user` would start recording the wrong
+ * name on the record itself.
+ *
+ * Values are stripped of anything that cannot travel in a header. A name with a
+ * newline in it would otherwise be a header-injection bug, and a name is
+ * user-supplied.
+ */
+function headerSafe(v) {
+  return String(v ?? "").replace(/[\r\n]+/g, " ").slice(0, 200);
+}
+
+function APPROVER_HEADERS(cr) {
+  const by = cr.decidedBy || {};
+  return {
+    "x-grav-approver-id": headerSafe(by.id),
+    "x-grav-approver-name": headerSafe(by.name),
+    "x-grav-approver-email": headerSafe(by.email),
+    "x-grav-decision-note": headerSafe(cr.decisionNote),
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* Who is asking                                                       */
 /* ------------------------------------------------------------------ */
@@ -52,6 +81,88 @@ function actorFrom(req) {
     email: String(u.email || "").toLowerCase(),
     name: u.name || [u.firstName, u.lastName].filter(Boolean).join(" ") || "",
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* The submission and the decision, in the history                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The three moments of a held change, as history entries.
+ *
+ * The APPLY is logged by the route itself when the replay reaches it, carrying
+ * the approver from the headers — that entry is the change. These two are the
+ * bracket around it: the ask, and the decision. Both are needed because the
+ * only path that produces no route entry at all is the one that matters most to
+ * an editor — a rejection — and a history that is silent about rejected work
+ * cannot answer "what happened to the change I submitted on Tuesday".
+ *
+ * `changes` on the request is a list of {field,label,from,to} written by an
+ * optional describe() hook, which is close enough to the log's own field shape
+ * to pass straight through when it exists.
+ */
+function fieldsFromRequest(cr) {
+  if (!Array.isArray(cr.changes)) return [];
+  return cr.changes
+    .filter((c) => c && (c.field || c.path))
+    .map((c) => ({
+      path: String(c.path || c.field),
+      label: c.label || "",
+      from: c.from,
+      to: c.to,
+      kind: "changed",
+    }));
+}
+
+async function recordSubmission(req, cr) {
+  return recordChange(req, {
+    departmentSlug: cr.departmentSlug,
+    section: cr.section,
+    entity: cr.entity,
+    entityId: cr.entityId,
+    entityLabel: cr.entityLabel,
+    action: "other",
+    origin: "approval",
+    fields: fieldsFromRequest(cr),
+    summary:
+      `Sent ${cr.action === "create" ? "a new" : "a change to"} ` +
+      `${cr.entity}${cr.entityLabel ? ` “${cr.entityLabel}”` : ""} for approval` +
+      `${cr.summary ? ` — ${cr.summary}` : ""}. Not applied yet.`,
+  });
+}
+
+/**
+ * The decision. Written for approve, reject and a failed apply alike: an
+ * approval whose replay failed is the case where the queue says one thing and
+ * the record says another, and it is exactly the case somebody will need to
+ * look up later.
+ */
+async function recordDecision(req, cr, { applied, error }) {
+  const who = cr.decidedBy?.name || cr.decidedBy?.email || "an approver";
+  const what = `${cr.entity}${cr.entityLabel ? ` “${cr.entityLabel}”` : ""}`;
+  const asked = cr.requestedBy?.name || cr.requestedBy?.email || "an editor";
+
+  let summary;
+  if (cr.status === "rejected") {
+    summary = `Rejected ${asked}’s change to ${what}. Nothing was applied.`;
+  } else if (applied) {
+    summary = `Approved ${asked}’s change to ${what} — applied.`;
+  } else {
+    summary = `Approved ${asked}’s change to ${what}, but it could not be applied: ${error || "unknown error"}.`;
+  }
+  if (cr.decisionNote) summary += ` Note: ${cr.decisionNote}`;
+
+  return recordChange(req, {
+    departmentSlug: cr.departmentSlug,
+    section: cr.section,
+    entity: cr.entity,
+    entityId: cr.entityId,
+    entityLabel: cr.entityLabel,
+    action: cr.status === "rejected" ? "reject" : "approve",
+    origin: "approval",
+    fields: fieldsFromRequest(cr),
+    summary: `${summary} (decided by ${who})`,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -129,9 +240,21 @@ function requireApproval(departmentSlug, opts = {}) {
         }
       }
 
+      const resolved = sectionForPath(req.originalUrl || req.url || "");
+      const section = req.auditSection || described.section || resolved?.section || "";
+
+      // The mount-level guard passes one entity name for a whole department,
+      // which reads as "a change to hr record" in the queue. A name resolved
+      // from the path says "leave" or "payroll-run" instead, which is the
+      // difference between an approver knowing what they are approving and
+      // having to open the request to find out.
+      const entityName = req.auditEntity || resolved?.entity || entity;
+
       const cr = await ChangeRequest.create({
         departmentSlug: slug,
-        entity,
+        section,
+        sectionLabel: section ? sectionLabel(section) : "",
+        entity: entityName,
         entityId: String(described.entityId || req.params?.id || ""),
         entityLabel: described.entityLabel || "",
         action,
@@ -148,6 +271,13 @@ function requireApproval(departmentSlug, opts = {}) {
         requestedBy: actor,
         status: "pending",
       });
+
+      // The page's history has to show the submission, not only the outcome.
+      // A change that is submitted and then rejected never reaches a route and
+      // would otherwise leave no trace at all — the editor would see their work
+      // disappear with nothing anywhere saying it had ever been asked for.
+      // `action: "other"` deliberately: nothing was created, updated or deleted.
+      await recordSubmission(req, cr).catch(() => {});
 
       // 202, not 200: the request was accepted, the change has NOT happened.
       // A UI that treats this as success and closes the form having told the
@@ -247,6 +377,15 @@ async function applyChangeRequest(cr) {
         Authorization: `Bearer ${token}`,
         Cookie: `auth_token=${token}`,
         [REPLAY_HEADER]: String(cr._id),
+        // WHO APPROVED IT, carried to the route so its change-log entry can say
+        // so. The replay runs as the REQUESTER (see replayToken), which is what
+        // keeps authorship honest — but it also means the approver is invisible
+        // to everything downstream unless it is passed explicitly. Without
+        // these, an approved change is indistinguishable in the history from
+        // one the editor was allowed to make alone, which is the single fact
+        // the approval workflow exists to establish. services/changeLog reads
+        // them, so every route that logs gets this without knowing about it.
+        ...APPROVER_HEADERS(cr),
       },
       body: ["GET", "HEAD"].includes(cr.intent.method)
         ? undefined
@@ -273,7 +412,12 @@ async function applyChangeRequest(cr) {
  * whose replay failed is stored as "failed" with the reason, so the queue never
  * shows a green tick for a change that never happened.
  */
-async function decideChangeRequest({ id, decision, note, actor }) {
+async function decideChangeRequest({ id, decision, note, actor, req }) {
+  // The decision is logged as the APPROVER, which is a different person from
+  // the one the applied change is logged as. When the caller has a request it
+  // is used directly; otherwise a stand-in carries the actor so the entry still
+  // has a name on it rather than being filed as anonymous.
+  const decisionReq = req || { user: actor, method: "POST", originalUrl: "" };
   const cr = await ChangeRequest.findById(id);
   if (!cr) return { ok: false, code: 404, message: "That request no longer exists." };
   if (cr.status !== "pending") {
@@ -291,6 +435,7 @@ async function decideChangeRequest({ id, decision, note, actor }) {
   if (decision === "reject") {
     cr.status = "rejected";
     await cr.save();
+    await recordDecision(decisionReq, cr, { applied: false }).catch(() => {});
     return { ok: true, request: cr };
   }
 
@@ -308,6 +453,7 @@ async function decideChangeRequest({ id, decision, note, actor }) {
   }
 
   await cr.save();
+  await recordDecision(decisionReq, cr, { applied: result.ok, error: cr.applyError }).catch(() => {});
 
   return {
     ok: result.ok,

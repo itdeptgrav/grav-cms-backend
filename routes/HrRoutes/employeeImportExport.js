@@ -871,6 +871,12 @@ router.post("/import/preview", EmployeeAuthMiddlewear, upload.single("file"), as
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTE 3: CONFIRM IMPORT
 // ─────────────────────────────────────────────────────────────────────────────
+// A spreadsheet import is a bulk edit to employee records, and the one place
+// where a mistake reaches hundreds of people at once. It gets its own section
+// so it can be read as a list of imports rather than being scattered through
+// the Employees history alongside single edits.
+const { recordChange } = require("../../services/changeLog");
+
 router.post("/import/confirm", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -990,6 +996,31 @@ router.post("/import/confirm", EmployeeAuthMiddlewear, async (req, res) => {
         const parts = [`${results.created} created`, `${results.updated} updated`];
         if (results.unchanged) parts.push(`${results.unchanged} already up to date`);
         if (results.failed) parts.push(`${results.failed} failed`);
+
+        // Named per employee, with the fields the import touched on each. A
+        // count alone cannot answer the question this log exists for: an
+        // employee whose designation changed on the 14th needs to be able to
+        // find that it was an import that did it, and which columns it wrote.
+        await recordChange(req, {
+            departmentSlug: "hr",
+            section: "hr:employee-import",
+            entity: "employee-import",
+            entityId: new Date().toISOString(),
+            entityLabel: `Import of ${rows.length} row(s)`,
+            action: "import",
+            origin: "import",
+            summary:
+                `Imported an employee spreadsheet of ${rows.length} row(s): ${parts.join(", ")}. ` +
+                (results.failed
+                    ? `The ${results.failed} failed row(s) changed nothing.`
+                    : "Every row was processed."),
+            fields: results.updatedDetails.slice(0, 120).map((d) => ({
+                path: d.biometricId || String(d.employeeNum),
+                label: `${d.name || d.biometricId} (matched by ${d.matchedBy})`,
+                to: d.fields.join(", "),
+                kind: "changed",
+            })),
+        });
 
         res.json({
             success: true,
