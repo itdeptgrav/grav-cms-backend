@@ -54,6 +54,7 @@ const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+const vendorResolve = require("../../../services/vendorResolve.service");
 /* The material door's own fulfilment rules — the split between what is issued
    and what is bought, and the tax on top of the quote. Shared rather than
    restated so the two store doors cannot drift apart on the same arithmetic. */
@@ -2209,8 +2210,17 @@ router.patch("/:id/classify", async (req, res) => {
           suggestedVendorName: text(spec.suggestedVendorName, 200),
           vendorNote: text(spec.vendorNote, 300),
           vendorName: text(spec.vendorName, 200),
-          vendorId:
-            spec.vendorId && mongoose.isValidObjectId(spec.vendorId) ? spec.vendorId : null,
+          /* ── THE VENDOR BECOMES A REAL RECORD, NOT JUST A STRING ────────
+             The picker already tells Store "it will be recorded as a new
+             supplier" for a typed name — resolved here, once, so a name typed
+             on one request and picked from the list on the next are provably
+             the same supplier rather than two records that quietly diverge. */
+          vendorId: await vendorResolve.resolveVendor({
+            vendorId: spec.vendorId,
+            vendorName: text(spec.vendorName, 200),
+            gstin: text(spec.gstin, 20),
+            createdBy: emp._id,
+          }),
           gstin: text(spec.gstin, 20),
           quoteRef: text(spec.quoteRef, 60),
           gstPercent:

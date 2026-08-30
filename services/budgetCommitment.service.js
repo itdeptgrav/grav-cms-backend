@@ -29,6 +29,7 @@
 
 const Commitment = require("../models/Accountant_model/Acc_BudgetCommitment");
 const control = require("./budgetControl.service");
+const classification = require("./budgetClassification.service");
 
 const money = (v) => {
   const n = Number(v);
@@ -293,10 +294,18 @@ async function approvedHeadsFor({ companyId, department }) {
   /* Nature from the GROUP, like every other budget figure in this module —
      a revenue target is not an envelope to spend out of. */
   const natures = await actuals.natureByLedger(lines.map((l) => l.item.ledgerId));
+  /* ── ONLY HEADS SOMEBODY CAN ACTUALLY SPEND AGAINST ───────────────────────
+     This filtered `nature !== "revenue"`, which let through every
+     expense-natured head including the ones nobody budgets — Round Off,
+     Suspense, tax control accounts. A requester picking a budget head should
+     never be offered one of those, and a request charged to one is charged to
+     a head no report treats as spend.
+
+     `budgetControl` is the single answer: finance's stored decision where
+     they have made one, derived from nature/group/name otherwise. */
   const expense = lines.filter((l) => {
     const n = natures.get(String(l.item.ledgerId));
-    const kind = typeof n === "string" ? n : n?.nature;
-    return kind !== "revenue";
+    return n?.budgetControl === classification.EXPENSE_BUDGET;
   });
   if (!expense.length) return { heads: [], reason: "no_expense_lines" };
 

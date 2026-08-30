@@ -35,6 +35,7 @@ const escalation = require("../../services/budgetEscalation.service");
 const departments = require("../../services/budgetDepartment.service");
 const roundNames = require("../../services/budgetRoundName.service");
 const subWindow = require("../../services/budgetSubmissionWindow.service");
+const classification = require("../../services/budgetClassification.service");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
 
@@ -457,41 +458,74 @@ router.get("/", async (req, res) => {
   }
 });
 
-/* ── LEDGER PICKER ───────────────────────────────────────────────────────────
- * The heads a budget line may bind to: revenue and expense only. An asset or a
- * liability head is not something you budget against, and offering the whole
- * chart is how people end up budgeting against Sundry Debtors. */
+/* ── LEDGER PICKER ─────────────────────────────────────────────────────────
+ * The heads a budget line may bind to.
+ *
+ * "Revenue and expense only" was the old rule and it was too coarse: Round
+ * Off, Opening Stock and a GST head parked in an expense group are all
+ * expenses, and none of them is something a department can be given money
+ * against. The list now comes from budgetClassification, so a head appears
+ * here for exactly the same reason it is budget-controlled at posting time —
+ * one rule, not two that drift.
+ *
+ * `?type=expense_budget|revenue_target` narrows it, because a revenue picker
+ * offering expense heads is how a sales target ends up bound to Cartage.
+ *
+ * Finance's override is honoured in both directions: a head finance marked
+ * budgetable is offered even if its group would not have qualified, which is
+ * the escape hatch for a chart of accounts that does not fit the rules. */
 router.get("/ledger-options", async (req, res) => {
   try {
     const companyId = actuals.oid(companyOf(req));
+    const want = String(req.query.type || "").trim();
+    const wanted = classification.VALUES.includes(want) && want !== classification.NOT_BUDGETED
+      ? want
+      : null;
+
     const groupFilter = { nature: { $in: ["revenue", "expense"] } };
     if (companyId) groupFilter.companyId = companyId;
-
     const groups = await Acc_Group.find(groupFilter).select("_id name nature").lean();
     const byId = new Map(groups.map((g) => [String(g._id), g]));
 
-    const ledgerFilter = { groupId: { $in: groups.map((g) => g._id) } };
+    // Either the group qualifies it, or finance has said so explicitly. The
+    // second arm is what lets an override reach a head outside these groups.
+    const ledgerFilter = {
+      $or: [
+        { groupId: { $in: groups.map((g) => g._id) } },
+        { budgetControl: { $in: [classification.EXPENSE_BUDGET, classification.REVENUE_TARGET] } },
+      ],
+    };
     if (companyId) ledgerFilter.companyId = companyId;
 
     const ledgers = await Acc_Ledger.find(ledgerFilter)
-      .select("_id name groupId groupName isActive")
+      .select("_id name groupId groupName isActive budgetControl")
       .sort({ name: 1 })
       .lean();
 
-    res.json({
-      success: true,
-      options: ledgers
-        .filter((l) => l.isActive !== false)
-        .map((l) => {
-          const g = byId.get(String(l.groupId));
-          return {
-            ledgerId: l._id,
-            ledgerName: l.name,
-            groupName: l.groupName || (g && g.name) || null,
-            nature: (g && g.nature) || "expense",
-          };
-        }),
-    });
+    const options = [];
+    for (const l of ledgers) {
+      if (l.isActive === false) continue;
+      const g = byId.get(String(l.groupId));
+      const nature = (g && g.nature) || null;
+      const budgetControl = classification.budgetControlOf({
+        budgetControl: l.budgetControl,
+        name: l.name,
+        groupName: l.groupName || (g && g.name) || "",
+        nature,
+      });
+      if (budgetControl === classification.NOT_BUDGETED) continue;
+      if (wanted && budgetControl !== wanted) continue;
+      options.push({
+        ledgerId: l._id,
+        ledgerName: l.name,
+        groupName: l.groupName || (g && g.name) || null,
+        // Follows the classification, not the group — see resolveRequestLedger.
+        nature: budgetControl === classification.REVENUE_TARGET ? "revenue" : "expense",
+        budgetControl,
+      });
+    }
+
+    res.json({ success: true, options });
   } catch (error) {
     console.error("[budgets] ledger-options error:", error);
     res.status(500).json({ success: false, message: error.message });
@@ -2388,10 +2422,13 @@ function actorOf(req) {
  *
  * The GROUP is the authority on nature, not `Acc_Ledger.nature` — the ledger's
  * own field carries no enum and the group's does, and budgetActuals.service
- * already resolves nature this way for exactly that reason. Budgeting against
- * an asset or liability head is meaningless (you do not budget Sundry
- * Debtors), which is the same rule /ledger-options applies when it offers only
- * revenue and expense heads.
+ * already resolves nature this way for exactly that reason.
+ *
+ * The gate is budgetClassification, not nature: budgeting against an asset or
+ * liability head is meaningless (you do not budget Sundry Debtors), and so is
+ * budgeting against Round Off or a GST head that happens to sit in an expense
+ * group. This is the same rule /ledger-options applies when it builds the
+ * picker, so nothing offerable is refused and nothing refused is offerable.
  */
 async function resolveRequestLedger({ ledgerId, companyId }) {
   const lid = actuals.oid(ledgerId);
@@ -2403,7 +2440,9 @@ async function resolveRequestLedger({ ledgerId, companyId }) {
   const cid = actuals.oid(companyId);
   if (cid) filter.companyId = cid;
 
-  const ledger = await Acc_Ledger.findOne(filter).select("_id name groupId groupName").lean();
+  const ledger = await Acc_Ledger.findOne(filter)
+    .select("_id name groupId groupName budgetControl")
+    .lean();
   if (!ledger) {
     // 404-flavoured wording even at 400: a cross-company ledger id must not be
     // distinguishable from one that does not exist.
@@ -2414,11 +2453,19 @@ async function resolveRequestLedger({ ledgerId, companyId }) {
     ? await Acc_Group.findById(ledger.groupId).select("_id name nature").lean()
     : null;
   const nature = group?.nature || null;
-  if (nature !== "revenue" && nature !== "expense") {
+  const budgetControl = classification.budgetControlOf({
+    budgetControl: ledger.budgetControl,
+    name: ledger.name,
+    groupName: ledger.groupName || group?.name || "",
+    nature,
+  });
+  if (budgetControl === classification.NOT_BUDGETED) {
     return {
       ok: false,
       status: 400,
-      message: "A budget request must target a revenue or expense head",
+      // Name the head. "Not a budget head" against a list of 468 ledgers is a
+      // dead end; against "Round Off" it is self-explanatory.
+      message: `${ledger.name} is not a budget head — a budget request must target a spend or revenue head`,
     };
   }
 
@@ -2428,7 +2475,15 @@ async function resolveRequestLedger({ ledgerId, companyId }) {
       ledgerId: ledger._id,
       ledgerName: ledger.name,
       groupName: ledger.groupName || group?.name || null,
-      nature,
+      /* ── NATURE FOLLOWS THE CLASSIFICATION, NOT THE GROUP ─────────────
+         Where finance has overridden, the two disagree, and `nature` is what
+         every downstream revenue/expense split reads — including the enum on
+         budgetRequests, which accepts only those two. Reporting the group's
+         "asset" here made an overridden head a 500 on save. There are exactly
+         two budgetable classes and each maps to exactly one side, so this is
+         a rename, not a second opinion. */
+      nature: budgetControl === classification.REVENUE_TARGET ? "revenue" : "expense",
+      budgetControl,
     },
   };
 }

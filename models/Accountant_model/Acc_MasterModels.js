@@ -447,6 +447,41 @@ const tallyLedgerSchema = new mongoose.Schema(
       required: true,
     },
 
+    /* ── CAN THIS HEAD CARRY A BUDGET? ──────────────────────────────────────
+       A control layer over the chart of accounts. It changes NOTHING about
+       bookkeeping — no posting, no debit, no credit reads this field. It
+       decides only which heads budget screens offer and which the voucher
+       budget check looks at.
+
+       `nature` alone could not answer this. Round Off is an expense and is
+       not a budget head; a tax control account an import parented under an
+       expense group is not either. Three values, no more:
+
+         expense_budget   controllable spend, including raw material, job
+                          work, freight, consumables and services
+         revenue_target   income — a floor to reach, never a spending cap
+         not_budgeted     never offered, never checked, never reported as
+                          missing a budget
+
+       ── ABSENT MEANS "DERIVE IT" ─────────────────────────────────────────
+       Deliberately no default. Every ledger written before this field is
+       classified on read by budgetClassification.budgetControlOf(), from its
+       own nature, group and name — so the whole system behaves correctly
+       before the backfill runs, and the backfill is an optimisation rather
+       than a precondition. A value stored here is finance's decision and is
+       never re-derived: see `budgetControlSetAt`. */
+    budgetControl: {
+      type: String,
+      enum: ["expense_budget", "revenue_target", "not_budgeted"],
+      index: true,
+    },
+    /* Set only when a human chose. Its presence is what makes the backfill
+       skip a row — without it there is no way to tell finance's deliberate
+       "not budgeted" from a value the previous backfill guessed. */
+    budgetControlSetAt: { type: Date },
+    budgetControlSetBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    budgetControlSetByName: { type: String, trim: true },
+
     // Opening balance — Tally stores this signed
     openingBalance: { type: Number, default: 0 }, // signed: positive = Dr, negative = Cr
     openingBalanceType: { type: String, enum: ["Dr", "Cr"], default: "Dr" },

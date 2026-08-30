@@ -52,7 +52,9 @@ async function natureByLedger(ledgerIds = []) {
   if (ids.length === 0) return new Map();
 
   const ledgers = await Acc_Ledger.find({ _id: { $in: ids } })
-    .select("_id name groupId groupName")
+    /* `budgetControl` so every caller can tell a budget head from a posting
+       ledger without a second read — see budgetClassification. */
+    .select("_id name groupId groupName budgetControl")
     .lean();
 
   const groupIds = [...new Set(ledgers.map((l) => String(l.groupId)).filter(Boolean))]
@@ -65,15 +67,29 @@ async function natureByLedger(ledgerIds = []) {
 
   const groupNature = new Map(groups.map((g) => [String(g._id), g.nature]));
 
+  const classification = require("./budgetClassification.service");
+
   return new Map(
-    ledgers.map((l) => [
-      String(l._id),
-      {
-        ledgerName: l.name,
-        groupName: l.groupName || null,
-        nature: groupNature.get(String(l.groupId)) || null,
-      },
-    ]),
+    ledgers.map((l) => {
+      const nature = groupNature.get(String(l.groupId)) || null;
+      return [
+        String(l._id),
+        {
+          ledgerName: l.name,
+          groupName: l.groupName || null,
+          nature,
+          /* Finance's stored decision where there is one, derived from
+             nature/group/name where there is not — so this is correct on
+             ledgers that predate the field entirely. */
+          budgetControl: classification.budgetControlOf({
+            budgetControl: l.budgetControl,
+            name: l.name,
+            groupName: l.groupName,
+            nature,
+          }),
+        },
+      ];
+    }),
   );
 }
 

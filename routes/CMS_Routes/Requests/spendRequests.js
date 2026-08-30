@@ -39,6 +39,7 @@ const budgetMatch = require("../../../services/budgetCommitment.service");
 /* The same Store/board/finance grant the intake door reads. Shared so
    "Store & Purchase" means one thing across both routers. */
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+const vendorResolve = require("../../../services/vendorResolve.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const multer = require("multer");
 const {
@@ -1733,6 +1734,21 @@ router.patch("/:id/requote", async (req, res) => {
       if (spec.newItemName) l.name = text(spec.newItemName, 200);
       if (spec.spec !== undefined) l.spec = text(spec.spec, 300);
       l.vendorName = vendorName;
+      /* ── THE VENDOR BECOMES A REAL RECORD, AND THE STALE-ID BUG STAYS CLOSED
+         Two bugs, one fix. The name used to be overwritten here while the id
+         was not — so requoting from a picked vendor to a freshly typed one
+         left the OLD id attached to the NEW name, and the purchase order's
+         own vendor reference silently pointed at the wrong company. And a
+         typed name with no match on the books was never turned into a real
+         vendor record at all, despite the picker telling Store it would be.
+         `resolveVendor` fixes both: trusts a picked id, matches an existing
+         supplier by name, or creates one — never leaves a stale id behind. */
+      l.vendorId = await vendorResolve.resolveVendor({
+        vendorId: spec.vendorId,
+        vendorName,
+        gstin: text(spec.gstin, 20),
+        createdBy: emp._id,
+      });
       l.gstin = text(spec.gstin, 20);
       l.quoteRef = text(spec.quoteRef, 60);
       l.rate = rate;

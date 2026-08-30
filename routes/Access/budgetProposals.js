@@ -58,6 +58,7 @@ const adjustments = require("../../services/budgetAdjustment.service");
 const actionCentre = require("../../services/budgetActionCentre.service");
 const transfersvc = require("../../services/budgetTransfer.service");
 const duplicates = require("../../services/budgetDuplicates.service");
+const classification = require("../../services/budgetClassification.service");
 
 /** Same self-authentication as changeRequests: this router sits outside every
  *  department's middleware, so it reads and verifies the session itself. */
@@ -454,8 +455,14 @@ router.get("/my-requests", async (req, res) => {
  * way. Offering heads by the row's own copy would let this picker call a head
  * one thing and every figure downstream call it another.
  *
- * Same rule, same query shape as /budgets/ledger-options, so the portal's
- * picker and finance's picker offer the same heads.
+ * ── AND NATURE ALONE IS NOT ENOUGH ─────────────────────────────────────────
+ * Round Off, Opening Stock and a GST head sitting in an expense group are all
+ * expenses by nature and none of them is a head a department may ask money
+ * against. budgetClassification decides, so this picker offers exactly the
+ * heads that are budget-controlled at posting time.
+ *
+ * Same rule, same source as /budgets/ledger-options, so the portal's picker
+ * and finance's picker offer the same heads.
  */
 router.get("/heads", async (req, res) => {
   try {
@@ -473,29 +480,41 @@ router.get("/heads", async (req, res) => {
 
     const natureOf = new Map(groups.map((g) => [String(g._id), g]));
 
-    const heads = await Acc_Ledger.find({
+    const found = await Acc_Ledger.find({
       companyId: s.companyId,
-      groupId: { $in: groups.map((g) => g._id) },
+      $or: [
+        { groupId: { $in: groups.map((g) => g._id) } },
+        { budgetControl: { $in: [classification.EXPENSE_BUDGET, classification.REVENUE_TARGET] } },
+      ],
     })
-      .select("_id name groupId groupName isActive")
+      .select("_id name groupId groupName isActive budgetControl")
       .sort({ name: 1 })
       .limit(500)
       .lean();
 
-    res.json({
-      success: true,
-      heads: heads
-        .filter((l) => l.isActive !== false)
-        .map((l) => {
-          const g = natureOf.get(String(l.groupId));
-          return {
-            ledgerId: l._id,
-            ledgerName: l.name,
-            groupName: l.groupName || (g && g.name) || null,
-            nature: g ? g.nature : "expense",
-          };
-        }),
-    });
+    const heads = [];
+    for (const l of found) {
+      if (l.isActive === false) continue;
+      const g = natureOf.get(String(l.groupId));
+      const budgetControl = classification.budgetControlOf({
+        budgetControl: l.budgetControl,
+        name: l.name,
+        groupName: l.groupName || (g && g.name) || "",
+        nature: g ? g.nature : null,
+      });
+      if (budgetControl === classification.NOT_BUDGETED) continue;
+      heads.push({
+        ledgerId: l._id,
+        ledgerName: l.name,
+        groupName: l.groupName || (g && g.name) || null,
+        // Classification, not group — an overridden head must not report the
+        // nature the override was made to get away from.
+        nature: budgetControl === classification.REVENUE_TARGET ? "revenue" : "expense",
+        budgetControl,
+      });
+    }
+
+    res.json({ success: true, heads });
   } catch (error) {
     console.error("[budget-proposals] heads error:", error);
     res.status(500).json({ success: false, message: error.message });

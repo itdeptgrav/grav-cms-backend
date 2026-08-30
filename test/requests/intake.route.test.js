@@ -2232,7 +2232,13 @@ describe("the supplier on a quote", () => {
     expect(spend.items[0].vendorName).toBe("Sharma Engineering");
   });
 
-  test("a supplier nobody has heard of is accepted, with no id", async () => {
+  test("a supplier nobody has heard of BECOMES a real vendor record", async () => {
+    /* ── THIS ASSERTION INVERTED ─────────────────────────────────────────
+       It used to expect a null id here — a typed name stored as a bare
+       string, nothing added to the vendor register. That was a promise the
+       picker's own copy already made and the backend never kept: "Not on the
+       books — it will be recorded as a new supplier." This is what makes that
+       sentence true rather than decorative. */
     const s = await seed();
     const { id } = await askAndApprove(s, {
       items: [{ name: "Laptop", quantity: 1, unit: "pcs" }],
@@ -2241,17 +2247,46 @@ describe("the supplier on a quote", () => {
     const { status } = await call(s.store, `/${id}/classify`, {
       method: "PATCH",
       body: {
-        lines: { 0: { issueQty: 0, rate: 50000, vendorName: "A brand new shop" } },
+        lines: { 0: { issueQty: 0, rate: 50000, vendorName: "A Brand New Shop", gstin: "22AAAAA0000A1Z5" } },
       },
     });
 
     expect(status).toBe(200);
     const saved = await IntakeRequest.findById(id).lean();
     const spend = await SpendRequest.findById(saved.spendRequestId).lean();
-    expect(spend.items[0].vendorName).toBe("A brand new shop");
-    /* Explicitly null rather than absent: "we looked and there is no supplier
-       record" is a different fact from "nobody filled this in". */
-    expect(spend.items[0].vendorId).toBeNull();
+    expect(spend.items[0].vendorName).toBe("A Brand New Shop");
+    expect(spend.items[0].vendorId).toBeTruthy();
+
+    const created = await Vendor.findById(spend.items[0].vendorId).lean();
+    expect(created).toBeTruthy();
+    expect(created.companyName).toBe("A Brand New Shop");
+    expect(created.gstNumber).toBe("22AAAAA0000A1Z5");
+  });
+
+  test("the same name typed again resolves to the SAME vendor, not a second record", async () => {
+    /* "sharma systems" on one request and "Sharma Systems" on another have to
+       be one supplier — otherwise every typo and every casing difference is a
+       new, disconnected vendor and the register never converges. */
+    const s = await seed();
+    const first = await askAndApprove(s, { items: [{ name: "Laptop", quantity: 1, unit: "pcs" }] });
+    await call(s.store, `/${first.id}/classify`, {
+      method: "PATCH",
+      body: { lines: { 0: { issueQty: 0, rate: 50000, vendorName: "Repeat Traders" } } },
+    });
+    const firstSaved = await IntakeRequest.findById(first.id).lean();
+    const firstSpend = await SpendRequest.findById(firstSaved.spendRequestId).lean();
+
+    const second = await askAndApprove(s, { items: [{ name: "Dock", quantity: 1, unit: "pcs" }] });
+    await call(s.store, `/${second.id}/classify`, {
+      method: "PATCH",
+      /* Different casing, on purpose. */
+      body: { lines: { 0: { issueQty: 0, rate: 4000, vendorName: "repeat traders" } } },
+    });
+    const secondSaved = await IntakeRequest.findById(second.id).lean();
+    const secondSpend = await SpendRequest.findById(secondSaved.spendRequestId).lean();
+
+    expect(String(secondSpend.items[0].vendorId)).toBe(String(firstSpend.items[0].vendorId));
+    expect(await Vendor.countDocuments({ companyName: /^repeat traders$/i })).toBe(1);
   });
 
   test("the lookup is refused to somebody without fulfilment access", async () => {
@@ -3427,5 +3462,94 @@ describe("fetching one spend request directly, and the routes it must not shadow
     const s = await seed();
     const { status } = await call(s.store, `/${new mongoose.Types.ObjectId()}`, { app: "spend" });
     expect(status).toBe(404);
+  });
+});
+
+/* ═══ REQUOTING A LINE MUST NOT LEAVE A STALE VENDOR ID BEHIND ═════════════
+ *
+ * ── THE BUG THIS CLOSES ─────────────────────────────────────────────────────
+ * The requote handler overwrote `vendorName` on the flagged line but never
+ * touched `vendorId`. Requoting FROM a picked supplier (which carries an id)
+ * TO a freshly typed one left the OLD id attached to the NEW name — so
+ * everything downstream that trusts the id, including the purchase order's
+ * own vendor reference, silently pointed at a company nobody quoted.
+ */
+describe("requoting replaces the vendor id along with the vendor name", () => {
+  async function pricedWithVendorId(s, vendorId) {
+    const { id } = await askAndApprove(s, {
+      items: [{ name: "Laptop", quantity: 1, unit: "pcs" }],
+    });
+    await call(s.store, `/${id}/classify`, {
+      method: "PATCH",
+      body: {
+        lines: {
+          0: { issueQty: 0, rate: 12000, vendorName: "Old Supplier Pvt Ltd", vendorId },
+        },
+      },
+    });
+    return (await IntakeRequest.findById(id).lean()).spendRequestId;
+  }
+
+  test("typing a fresh name over a picked vendor replaces the old id, never keeps it", async () => {
+    /* ── THIS ASSERTION CHANGED TWICE OVER ────────────────────────────────
+       First it expected the OLD id to survive under the new name — the
+       original bug this whole chunk started from. Then it expected `null` —
+       correct once the id was properly cleared, but only half the promise:
+       the picker already tells Store a typed name "will be recorded as a new
+       supplier", so the right outcome is a NEW real vendor, not a blank. */
+    const s = await seed();
+    const oldVendor = await Vendor.create({ companyName: "Old Supplier Pvt Ltd", status: "Active" });
+    const spendId = await pricedWithVendorId(s, oldVendor._id);
+
+    await call(s.emp, `/${spendId}/confirm`, {
+      method: "PATCH", app: "spend",
+      body: { lines: { 0: { revise: true, reason: "Wrong supplier." } } },
+    });
+
+    await call(s.store, `/${spendId}/requote`, {
+      method: "PATCH", app: "spend",
+      body: {
+        lines: {
+          /* No vendorId posted — Store typed this one fresh. */
+          0: { rate: 11000, vendorName: "New Supplier Pvt Ltd", expectedDeliveryDate: "2026-09-25" },
+        },
+      },
+    });
+
+    const spend = await SpendRequest.findById(spendId).lean();
+    expect(spend.items[0].vendorName).toBe("New Supplier Pvt Ltd");
+    expect(spend.items[0].vendorId).toBeTruthy();
+    expect(String(spend.items[0].vendorId)).not.toBe(String(oldVendor._id));
+
+    const created = await Vendor.findById(spend.items[0].vendorId).lean();
+    expect(created.companyName).toBe("New Supplier Pvt Ltd");
+  });
+
+  test("picking a different vendor sets the new id, not the old one", async () => {
+    const s = await seed();
+    const oldVendor = await Vendor.create({ companyName: "Old Supplier Pvt Ltd", status: "Active" });
+    const newVendor = await Vendor.create({ companyName: "Picked Supplier Pvt Ltd", status: "Active" });
+    const spendId = await pricedWithVendorId(s, oldVendor._id);
+
+    await call(s.emp, `/${spendId}/confirm`, {
+      method: "PATCH", app: "spend",
+      body: { lines: { 0: { revise: true, reason: "Wrong supplier." } } },
+    });
+
+    await call(s.store, `/${spendId}/requote`, {
+      method: "PATCH", app: "spend",
+      body: {
+        lines: {
+          0: {
+            rate: 11000, vendorName: "Picked Supplier Pvt Ltd",
+            vendorId: String(newVendor._id), expectedDeliveryDate: "2026-09-25",
+          },
+        },
+      },
+    });
+
+    const spend = await SpendRequest.findById(spendId).lean();
+    expect(String(spend.items[0].vendorId)).toBe(String(newVendor._id));
+    expect(String(spend.items[0].vendorId)).not.toBe(String(oldVendor._id));
   });
 });

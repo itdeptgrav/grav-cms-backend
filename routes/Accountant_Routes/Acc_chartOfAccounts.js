@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const classification = require("../../services/budgetClassification.service");
 const {
   Acc_Group,
   Acc_Ledger,
@@ -1310,9 +1311,85 @@ router.get("/ledgers/:id", async (req, res) => {
   }
 });
 
+/* ══ FINANCE DECIDES WHICH HEADS CARRY A BUDGET ═════════════════════════════
+ * The only door that sets `budgetControl`.
+ *
+ * ── WHY IT IS FINANCE-ONLY ──────────────────────────────────────────────────
+ * Whether a ledger is budgetable is an accounting-policy decision with real
+ * consequences: it decides what every budget picker offers, and what the
+ * voucher check will and will not stop. A requester, a Store user or a
+ * department approver picking from a list must never be able to add to that
+ * list — otherwise "is this budgeted?" is answered by whoever needed it to be.
+ *
+ * ── AND WHY THE STAMP MATTERS ───────────────────────────────────────────────
+ * `budgetControlSetAt` is what tells the backfill to leave a row alone. Without
+ * it there is no way to distinguish finance's deliberate "not budgeted" from a
+ * value the previous backfill derived — and the next run would quietly undo
+ * the decision.
+ */
+router.patch("/ledgers/:id/budget-control", async (req, res) => {
+  try {
+    const role = String(req.user?.role || "");
+    const perms = req.user?.permissions || {};
+    /* The same shape the rest of the accounting module uses for a decision
+       rather than a data-entry edit. An editor enters vouchers; classifying
+       the chart is an owner's or an approver's call. */
+    if (!["owner", "approver", "admin", "accountant"].includes(role) && !perms.canApprove) {
+      return res.status(403).json({
+        success: false,
+        message: "Changing what a ledger is budgeted as is an owner's or an approver's call.",
+      });
+    }
+
+    const value = String(req.body?.budgetControl || "");
+    if (!classification.VALUES.includes(value)) {
+      return res.status(400).json({
+        success: false,
+        message: `budgetControl must be one of: ${classification.VALUES.join(", ")}.`,
+      });
+    }
+
+    const ledger = await Acc_Ledger.findById(req.params.id);
+    if (!ledger) {
+      return res.status(404).json({ success: false, message: "Ledger not found." });
+    }
+
+    ledger.budgetControl = value;
+    ledger.budgetControlSetAt = new Date();
+    ledger.budgetControlSetBy = req.user?.id || undefined;
+    ledger.budgetControlSetByName = req.user?.name || "";
+    await ledger.save();
+
+    res.json({
+      success: true,
+      message: `${ledger.name} is now ${classification.LABEL[value]}.`,
+      ledger: {
+        _id: String(ledger._id),
+        name: ledger.name,
+        budgetControl: ledger.budgetControl,
+        budgetControlSetByName: ledger.budgetControlSetByName,
+        budgetControlSetAt: ledger.budgetControlSetAt,
+      },
+    });
+  } catch (e) {
+    console.error("[coa] budget-control:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.put("/ledgers/:id", async (req, res) => {
   try {
     const updates = { ...req.body };
+    /* ── BUDGET CLASSIFICATION IS NOT AN ORDINARY LEDGER EDIT ──────────────
+       This route spreads the whole body onto the document, so leaving these
+       in would let any caller who may edit a ledger silently reclassify what
+       is budget-controlled — and do it without the stamp that tells the
+       backfill a human decided. It has its own route, with its own gate:
+       PATCH /ledgers/:id/budget-control. */
+    delete updates.budgetControl;
+    delete updates.budgetControlSetAt;
+    delete updates.budgetControlSetBy;
+    delete updates.budgetControlSetByName;
     if (updates.groupId) {
       const grp = await Acc_Group.findById(updates.groupId);
       if (grp) {

@@ -233,6 +233,180 @@ const checkBody = ({ company, ledger, amount, type = "Dr", ...rest }) => ({
   ...rest,
 });
 
+/* ══ WHICH LEGS OF A VOUCHER ARE BUDGET-CONTROLLED ═══════════════════════════
+ * A purchase voucher is five or six legs and at most one of them is spend. The
+ * rest are GST, the supplier's payable, the bank and the rounding difference,
+ * and every one of those used to be looked up as if it might have a budget.
+ *
+ * These call checkBudgetAvailability directly rather than over HTTP: the
+ * `releasingCommitment` argument is what carries the source request's budget
+ * line, and the routes resolve it themselves from the voucher. Testing through
+ * a route would prove the route can find a commitment, which is a different
+ * claim from the one being made here.
+ */
+describe("which legs are budget-controlled", () => {
+  const control = require("../../services/budgetControl.service");
+
+  async function chartWithTaxAndParty(company) {
+    const taxGroup = await Acc_Group.create({
+      companyId: company._id, name: "Duties & Taxes", nature: "liability",
+    });
+    const partyGroup = await Acc_Group.create({
+      companyId: company._id, name: "Sundry Creditors", nature: "liability",
+    });
+    const expGroup = await Acc_Group.findOne({ companyId: company._id, name: "Indirect Expenses" });
+    const mk = (name, group, nature) => Acc_Ledger.create({
+      companyId: company._id, name, groupId: group._id, groupName: group.name, nature,
+    });
+    return {
+      cgst: await mk("CGST Input", taxGroup, "liability"),
+      tds: await mk("TDS Payable", taxGroup, "liability"),
+      party: await mk("Khandelwal Steel & Pipes", partyGroup, "liability"),
+      roundOff: await mk("Round Off", expGroup, "expense"),
+    };
+  }
+
+  const rowFor = (res, ledgerId) =>
+    res.results.find((r) => String(r.ledgerId) === String(ledgerId));
+
+  test("GST, TDS, the payable, the bank and rounding are all left alone", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+    const { cgst, tds, party, roundOff } = await chartWithTaxAndParty(company);
+
+    /* A whole realistic purchase voucher, not one leg at a time. */
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: expenseLedger._id, type: "Dr", amount: 100000 },
+        { ledgerId: cgst._id, type: "Dr", amount: 9000 },
+        { ledgerId: tds._id, type: "Cr", amount: 2000 },
+        { ledgerId: roundOff._id, type: "Dr", amount: 0.4 },
+        { ledgerId: party._id, type: "Cr", amount: 107000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 400 },
+      ],
+    });
+
+    for (const l of [cgst, tds, party, roundOff, bankLedger]) {
+      const row = rowFor(res, l._id);
+      expect(row.budgetControl).toBe("not_budgeted");
+      /* "ok" and not a status of its own: a leg nobody budgets is not a
+         warning to clear, it is a leg the control has no opinion about. The
+         reason is in the note, so "why was this not checked?" is answerable
+         without inferring it from a silence. */
+      expect(row.status).toBe("ok");
+      expect(row.note).toMatch(/not budget-controlled/i);
+      expect(row.budgets).toEqual([]);
+      expect(row.allocated).toBeNull();
+    }
+
+    /* …and the one leg that IS spend is still controlled. A check that
+       excludes everything is not a fix, it is a disabled control. */
+    const spend = rowFor(res, expenseLedger._id);
+    expect(spend.budgetControl).toBe("expense_budget");
+    expect(spend.allocated).toBe(500000);
+  });
+
+  test("the voucher's own entries are not touched by the check", async () => {
+    /* This is a classification layer over the chart of accounts. It reads the
+       legs and it never rewrites them: same ledgers, same Dr/Cr, same amounts,
+       same order, before and after. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+    const { cgst, party } = await chartWithTaxAndParty(company);
+
+    const entries = [
+      { ledgerId: expenseLedger._id, type: "Dr", amount: 100000 },
+      { ledgerId: cgst._id, type: "Dr", amount: 18000 },
+      { ledgerId: party._id, type: "Cr", amount: 118000 },
+    ];
+    const before = JSON.parse(JSON.stringify(entries));
+
+    await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: entries,
+    });
+
+    expect(JSON.parse(JSON.stringify(entries))).toEqual(before);
+    /* And the books themselves: Dr still equals Cr. */
+    const dr = entries.filter((e) => e.type === "Dr").reduce((t, e) => t + e.amount, 0);
+    const cr = entries.filter((e) => e.type === "Cr").reduce((t, e) => t + e.amount, 0);
+    expect(dr).toBe(cr);
+  });
+
+  test("a bill raised from an approved request is tracked against the request's head, not Purchase — Local", async () => {
+    /* The failure this exists for: an approved request for IT software, billed
+       through the Purchase — Local posting ledger, came back "Purchase — Local
+       has no approved allocation" — a budget that existed, was approved and had
+       room, reported as missing because the check read the posting ledger. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const budget = await liveBudget({
+      companyId: company._id, ledger: expenseLedger, allocated: 500000, department: "IT",
+    });
+    const lineId = budget.items[0]._id;
+
+    const purchaseGroup = await Acc_Group.create({
+      companyId: company._id, name: "Purchase Accounts", nature: "expense",
+    });
+    const purchaseLocal = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Purchase — Local",
+      groupId: purchaseGroup._id,
+      groupName: purchaseGroup.name,
+      nature: "expense",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: purchaseLocal._id, type: "Dr", amount: 40000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 40000 },
+      ],
+      releasingCommitment: { budgetLineId: lineId, ledgerId: expenseLedger._id },
+    });
+
+    const row = rowFor(res, purchaseLocal._id);
+    expect(row.status).toBe("ok");
+    expect(String(row.trackedAgainstBudgetLineId)).toBe(String(lineId));
+    expect(row.note).toMatch(/approved on/i);
+    /* Specifically NOT the "no approved allocation" answer. */
+    expect(row.status).not.toBe("no_budget");
+  });
+
+  test("with no source request, the posting ledger is still matched on its own", async () => {
+    /* The attribution above must not become a blanket pass. A bill typed
+       straight into the purchase module has no request behind it and is
+       checked exactly as it always was. */
+    const { company, bankLedger } = await seedCompany();
+    const purchaseGroup = await Acc_Group.create({
+      companyId: company._id, name: "Purchase Accounts", nature: "expense",
+    });
+    const purchaseLocal = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Purchase — Local",
+      groupId: purchaseGroup._id,
+      groupName: purchaseGroup.name,
+      nature: "expense",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: purchaseLocal._id, type: "Dr", amount: 40000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 40000 },
+      ],
+    });
+
+    const row = rowFor(res, purchaseLocal._id);
+    expect(row.trackedAgainstBudgetLineId).toBeUndefined();
+    expect(row.budgetControl).toBe("expense_budget");
+  });
+});
+
 /* ── the availability check itself ────────────────────────────────────────── */
 
 describe("check-availability", () => {

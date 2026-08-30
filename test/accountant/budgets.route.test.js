@@ -1329,7 +1329,180 @@ describe("department budget requests", () => {
       body: validRequest(assetLedger),
     });
     expect(status).toBe(400);
-    expect(body.message).toMatch(/revenue or expense/i);
+    expect(body.message).toMatch(/not a budget head/i);
+    // Named, because "not a budget head" against a chart of 468 ledgers is a
+    // dead end and against "A Buyer Pvt Ltd" it explains itself.
+    expect(body.message).toContain("A Buyer Pvt Ltd");
+  });
+
+  /* ── An expense head that is not a SPEND head ──────────────────────────────
+   * Nature is not the gate any more, budgetClassification is, and the two
+   * disagree exactly here: Round Off is an expense and nobody budgets against
+   * it. Under the old rule this was accepted. */
+  test("an expense head that is not spend is refused too — Round Off", async () => {
+    const { company, expGroup } = await seedCompany();
+    const roundOff = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Round Off",
+      groupId: expGroup._id,
+      groupName: expGroup.name,
+      nature: "expense",
+    });
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(roundOff),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/not a budget head/i);
+  });
+
+  /* ── Finance's override is the escape hatch ────────────────────────────────
+   * The rules cannot fit every chart of accounts, so finance can overrule
+   * them — in the permissive direction as well as the restrictive one. */
+  test("a head finance marked budgetable is accepted despite its group", async () => {
+    const { company } = await seedCompany();
+    const assetGroup = await Acc_Group.create({
+      companyId: company._id,
+      name: "Prepayments",
+      nature: "asset",
+    });
+    const oddLedger = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Prepaid Software Licences",
+      groupId: assetGroup._id,
+      groupName: assetGroup.name,
+      nature: "asset",
+      budgetControl: "expense_budget",
+    });
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(oddLedger),
+    });
+    expect(status).toBe(201);
+    // Filed on the spend side, not as an asset — the override renames it.
+    expect(body.request.nature).toBe("expense");
+  });
+
+  /* ══ THE PICKER ═══════════════════════════════════════════════════════════
+   * A refusal the picker could have prevented is a bug in the picker, not a
+   * working control. These assert the two lists agree: nothing offered is
+   * refused, nothing refused is offered.
+   *
+   * The heads seeded here are the real ones that went wrong — an expense-group
+   * Round Off, a GST control account, and a bank ledger — not invented shapes.
+   */
+  describe("ledger picker", () => {
+    async function seedChart() {
+      const { company, expGroup, revGroup } = await seedCompany();
+      const bankGroup = await Acc_Group.create({
+        companyId: company._id,
+        name: "Bank Accounts",
+        nature: "asset",
+      });
+      const taxGroup = await Acc_Group.create({
+        companyId: company._id,
+        name: "Duties & Taxes",
+        nature: "liability",
+      });
+      const mk = (name, group, nature, extra = {}) =>
+        Acc_Ledger.create({
+          companyId: company._id,
+          name,
+          groupId: group._id,
+          groupName: group.name,
+          nature,
+          ...extra,
+        });
+      await mk("Round Off", expGroup, "expense");
+      await mk("HDFC Current A/c", bankGroup, "asset");
+      await mk("CGST Input", taxGroup, "asset");
+      await mk("Printing & Stationery", expGroup, "expense");
+      await mk("Domestic Sales", revGroup, "revenue");
+      return { company };
+    }
+
+    const names = (opts) => opts.map((o) => o.ledgerName);
+
+    test("offers spend and revenue heads, and nothing that is not budgeted", async () => {
+      const { company } = await seedChart();
+      const { status, body } = await call(`/ledger-options?companyId=${company._id}`);
+      expect(status).toBe(200);
+      const got = names(body.options);
+
+      expect(got).toEqual(expect.arrayContaining(["Printing & Stationery", "Domestic Sales"]));
+      /* Each of these is an expense or an asset by nature and none of them is
+         a head anyone can be given money against. */
+      expect(got).not.toContain("Round Off");
+      expect(got).not.toContain("HDFC Current A/c");
+      expect(got).not.toContain("CGST Input");
+      expect(body.options.every((o) => o.budgetControl !== "not_budgeted")).toBe(true);
+    });
+
+    test("the revenue picker offers no expense heads", async () => {
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=revenue_target`);
+      expect(names(body.options)).toContain("Domestic Sales");
+      expect(names(body.options)).not.toContain("Printing & Stationery");
+      expect(body.options.every((o) => o.budgetControl === "revenue_target")).toBe(true);
+    });
+
+    test("the expense picker offers no revenue heads", async () => {
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=expense_budget`);
+      expect(names(body.options)).toContain("Printing & Stationery");
+      expect(names(body.options)).not.toContain("Domestic Sales");
+      expect(body.options.every((o) => o.budgetControl === "expense_budget")).toBe(true);
+    });
+
+    test("a `type` that is not a budgetable class is ignored, not obeyed", async () => {
+      /* `?type=not_budgeted` must not become a way to ask the picker for the
+         heads it exists to withhold. */
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=not_budgeted`);
+      expect(names(body.options)).not.toContain("Round Off");
+      expect(names(body.options)).toEqual(
+        expect.arrayContaining(["Printing & Stationery", "Domestic Sales"]),
+      );
+    });
+
+    test("finance's override moves a head onto the list, and off it", async () => {
+      const { company } = await seedChart();
+
+      await Acc_Ledger.updateOne(
+        { companyId: company._id, name: "Printing & Stationery" },
+        { $set: { budgetControl: "not_budgeted" } },
+      );
+      await Acc_Ledger.updateOne(
+        { companyId: company._id, name: "Round Off" },
+        { $set: { budgetControl: "expense_budget" } },
+      );
+
+      const { body } = await call(`/ledger-options?companyId=${company._id}`);
+      const got = names(body.options);
+      expect(got).not.toContain("Printing & Stationery");
+      expect(got).toContain("Round Off");
+    });
+
+    test("nothing the picker offers is refused when it is requested", async () => {
+      /* The property that matters more than any single row: the picker and
+         the create gate read the same classifier, so the two lists cannot
+         drift apart. */
+      const { company } = await seedChart();
+      const budget = await makeBudget({ companyId: company._id });
+      const { body } = await call(`/ledger-options?companyId=${company._id}`);
+
+      for (const opt of body.options) {
+        const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+          method: "POST",
+          body: validRequest({ _id: opt.ledgerId }),
+        });
+        expect([201, status]).toEqual([201, 201]);
+      }
+    });
   });
 
   /* ── The list is per-budget ────────────────────────────────────────────── */

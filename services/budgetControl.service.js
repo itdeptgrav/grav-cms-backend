@@ -39,6 +39,8 @@ const escalation = require("./budgetEscalation.service");
  *
  * draft/collecting/review are not yet in force, and closed is over.
  */
+const classification = require("./budgetClassification.service");
+
 const CONTROLLING_STATUSES = ["active", "exceeded"];
 
 /* Mirrors `warnAtPct` in budgetVariance.service.js — the point at which a
@@ -249,6 +251,27 @@ async function checkBudgetAvailability({
   const checkedAt = new Date();
   const proposed = proposedByLedger(ledgerEntries);
 
+  /* ── THE SOURCE REQUEST'S OWN BUDGET HEAD ────────────────────────────────
+     A voucher raised from an approved request already knows which budget line
+     the money was approved against — it travels on the commitment. The
+     voucher's ledger entries do NOT say that: they say "Purchase — Local",
+     which is where the bookkeeping posts, not what anybody budgeted.
+
+     Without this, a perfectly ordinary bill against an approved request came
+     back "Purchase — Local has no approved allocation" — a budget that exists,
+     was approved, and has room, reported as missing because the check was
+     reading the posting ledger instead of the plan.
+
+     Where a source line exists, every budget-controlled leg is attributed to
+     it. Where there is none, nothing changes and each head is matched on its
+     own as it always was. */
+  const sourceLineId = releasingCommitment?.budgetLineId
+    ? String(releasingCommitment.budgetLineId)
+    : null;
+  const sourceLedgerId = releasingCommitment?.ledgerId
+    ? String(releasingCommitment.ledgerId)
+    : null;
+
   /* No company context means the actuals cannot be scoped, and an unscoped
    * check would compare this company's spend against every company's postings.
    * Say so rather than returning a confident wrong answer. */
@@ -304,6 +327,9 @@ async function checkBudgetAvailability({
      * not silently treated as spend — see the asset/liability skip below for
      * why that default was actively dangerous. */
     const nature = meta.nature || null;
+    /* Resolved by natureByLedger — finance's stored decision where there
+       is one, derived from nature/group/name where there is not. */
+    const budgetControl = meta.budgetControl || classification.NOT_BUDGETED;
     const signed = p.debit - p.credit;
     const thisVoucher = actuals.actualFrom({ signed }, nature);
     const lineDepartment = p.department || department || null;
@@ -313,6 +339,7 @@ async function checkBudgetAvailability({
       ledgerName: meta.ledgerName || null,
       groupName: meta.groupName || null,
       nature,
+      budgetControl,
       department: lineDepartment,
       /* Which slice of this head's spend the row is about. Null on every
        * voucher that tags nothing, which is how this endpoint has always
@@ -338,13 +365,29 @@ async function checkBudgetAvailability({
      * that is the correct side to fail on: refusing spend because a ledger
      * is mis-parented punishes the wrong person. The budget screens will
      * still show the overspend afterwards. */
-    if (nature !== "expense" && nature !== "revenue") {
+    /* ── CLASSIFICATION, NOT RAW NATURE ─────────────────────────────────
+       This tested `nature` directly — right for the funding legs (bank,
+       vendor and cash are assets and liabilities) and wrong for the
+       expense-natured heads nobody budgets: Round Off, Suspense, and any tax
+       control account an import parented under an expense group. Each of
+       those reported itself "unbudgeted" on ordinary vouchers.
+
+       `budgetControl` folds nature, group and name into one answer and lets
+       finance overrule it per ledger. Anything not a budget head is skipped
+       exactly as an asset leg always was. */
+    if (budgetControl === classification.NOT_BUDGETED) {
       results.push({
         ...base,
         status: "ok",
-        note: nature
-          ? `${nature} head — not budget-controlled.`
-          : "Head has no resolved nature — not budget-controlled.",
+        /* Three different reasons a head is skipped, and they are worth
+           telling apart when somebody asks why a voucher was not checked:
+           an ordinary funding leg, a head finance ruled out, and a
+           mis-parented ledger nobody has fixed. */
+        note: !nature
+          ? "Head has no resolved nature — not budget-controlled."
+          : nature === "expense" || nature === "revenue"
+            ? `${meta.ledgerName || "This head"} is marked not budgeted — not budget-controlled.`
+            : `${nature} head — not budget-controlled.`,
         allocated: null,
         actual: null,
         projectedActual: null,
@@ -357,7 +400,7 @@ async function checkBudgetAvailability({
     /* A revenue head is a target. Reported for context, never a cap — see the
      * file header. It is also why this returns before any allocation lookup:
      * "no revenue budget for this head" is not a finding. */
-    if (nature === "revenue") {
+    if (budgetControl === classification.REVENUE_TARGET) {
       results.push({
         ...base,
         status: "ok",
@@ -367,6 +410,31 @@ async function checkBudgetAvailability({
         projectedActual: null,
         remainingAfter: null,
         budgets: [],
+      });
+      continue;
+    }
+
+    /* ── THE SOURCE REQUEST ALREADY NAMED THE HEAD ──────────────────────
+       This leg posts to an accounting ledger — typically "Purchase — Local" —
+       while the money was approved against a different head entirely, the one
+       the requester chose and finance agreed. Checking this leg against its
+       OWN ledger's allocations asks the wrong question and answers
+       "unbudgeted" about a budget that exists.
+
+       So it is attributed to the source line and reported as tracked there.
+       The spend still counts — against the head that was actually approved,
+       via the commitment this voucher releases. */
+    if (sourceLineId && sourceLedgerId && String(p.ledgerId) !== sourceLedgerId) {
+      results.push({
+        ...base,
+        status: "ok",
+        note: `Tracked against the budget head this request was approved on, not against ${meta.ledgerName || "this posting ledger"}.`,
+        allocated: null,
+        actual: null,
+        projectedActual: null,
+        remainingAfter: null,
+        budgets: [],
+        trackedAgainstBudgetLineId: sourceLineId,
       });
       continue;
     }
