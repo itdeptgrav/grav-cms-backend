@@ -28,7 +28,7 @@ const FACE_PYTHON =
 
 /** Where the engine keeps photos, the mapping and the status file. */
 const FACE_BIOMETRIC_ROOT =
-  process.env.FACE_BIOMETRIC_ROOT || "/Volumes/ESD-USB/PHONE_DETC";
+  process.env.FACE_BIOMETRIC_ROOT || "/Volumes/ESD-USB/GRAV_BIOMETRIC";
 
 const FACE_BIOMETRIC_REGISTERED_DIR =
   process.env.FACE_BIOMETRIC_REGISTERED_DIR ||
