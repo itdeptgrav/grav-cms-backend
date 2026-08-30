@@ -244,6 +244,40 @@ function effectiveEndMs(task) {
   return readMs(task.dueDate);
 }
 
+/**
+ * The last moment this person actually put this task DOWN.
+ *
+ * `effectiveEndMs` above answers the same question for a task handed over
+ * whole, and only for that: it reads `completionSubmission`, which exists only
+ * once every requirement is delivered. A task with OUTPUTS is handed over a
+ * piece at a time, so a person can deliver everything they are currently able
+ * to deliver — the rest waiting on somebody else — while the task itself is
+ * still `confirmed` and carries no completion submission at all.
+ *
+ * That instant is real work leaving their hands, and the queue behind it has
+ * to start from it. Reported: an output submitted at 18:58 left the next task
+ * anchored at the queue's 18:35 start, so it reached the front already
+ * carrying a deadline that had expired.
+ *
+ * **The SUBMISSION, never the approval.** Waiting on a reviewer is not the
+ * assignee's time to lose — they were free the moment they handed it over,
+ * and whether it comes back approved at 19:24 or rejected next morning
+ * changes nothing about when they could start the next thing.
+ */
+function lastHandoverMs(task) {
+  let latest = null;
+  const consider = (value) => {
+    const m = readMs(value);
+    if (Number.isFinite(m) && (latest === null || m > latest)) latest = m;
+  };
+  consider(task.completionSubmission && task.completionSubmission.submittedAt);
+  const subs = task.outputSubmissions || {};
+  for (const key of Object.keys(subs)) {
+    consider(subs[key] && subs[key].submittedAt);
+  }
+  return latest;
+}
+
 /** This person's rank on this task — legacy's own precedence. */
 function rankOf(task, employeeId) {
   const per = task.assigneePriorities || {};
@@ -380,11 +414,37 @@ async function approvedOutputIdsNow() {
 function unblockedAtMs(task, approvedAt, nowMs) {
   const outputs = Array.isArray(task.outputs) ? task.outputs : [];
   if (outputs.length === 0) return null;
-  let earliest = null;
+  let latest = null;
   for (const o of outputs) {
     const needs = Array.isArray(o.needsOutputIds) ? o.needsOutputIds : [];
     /* Nothing to wait for — this task was never held up. */
     if (needs.length === 0) return null;
+    /**
+     * **An output already handed over cannot be what holds the clock still.**
+     * OWNER RULE, 26 Aug 2026.
+     *
+     * The clock freezes on an approval because the approval gave this person
+     * something to do. Once they have DONE it and handed it over, that reason
+     * is spent: they are waiting on somebody else again, and the deadline must
+     * resume moving exactly as it did before the first input landed.
+     *
+     * Reported as four states of one pair of tasks:
+     *   · input not submitted        -> waiting   -> time moves
+     *   · input approved             -> workable  -> time stops
+     *   · that work handed over      -> waiting   -> time moves again
+     *   · next input approved        -> workable  -> time stops
+     *
+     * Only the third was wrong: the first approval kept the clock frozen while
+     * the person sat idle, so the wait for the SECOND input came out of their
+     * budget.
+     *
+     * A RETURNED output is not handed over — the reviewer gave it back, it is
+     * work again, and it holds the clock like any other workable output.
+     */
+    const sub = (task.outputSubmissions || {})[o.id];
+    const handedOver =
+      sub && sub.submittedAt && (!sub.review || sub.review.approved === true);
+    if (handedOver) continue;
     let lastOfThisOutput = 0;
     let allApproved = true;
     for (const n of needs) {
@@ -394,7 +454,24 @@ function unblockedAtMs(task, approvedAt, nowMs) {
     }
     /* Still waiting on something: this output cannot be the one that freed it. */
     if (!allApproved) continue;
-    if (earliest === null || lastOfThisOutput < earliest) earliest = lastOfThisOutput;
+    /**
+     * **The LATEST approval, not the earliest.** OWNER RULE, 26 Aug 2026.
+     *
+     * This took the earliest, which meant one task with two dependent outputs
+     * was anchored by whichever input landed FIRST and never moved again:
+     *
+     *   puri approved 10:00, paradeep approved 13:00  ->  anchored 10:00
+     *   the 13:00 approval changed nothing at all
+     *
+     * So the half of the work that only became possible at 13:00 was scheduled
+     * as though it could have been started at 10:00, and the person lost three
+     * hours of their budget to a wait somebody else owned.
+     *
+     * The latest approval is the moment the task became fully workable, which
+     * is the honest place to count the REMAINING budget from — see where the
+     * seconds are chosen in the walk below.
+     */
+    if (latest === null || lastOfThisOutput > latest) latest = lastOfThisOutput;
   }
 
   /**
@@ -414,8 +491,8 @@ function unblockedAtMs(task, approvedAt, nowMs) {
    * holds still". It is the one case where holding still would be a promise the
    * person was forbidden to keep.
    */
-  if (earliest === null && Number.isFinite(nowMs)) return nowMs;
-  return earliest;
+  if (latest === null && Number.isFinite(nowMs)) return nowMs;
+  return latest;
 }
 
 /**
@@ -702,9 +779,23 @@ async function rechainQueueFor(employeeId, opts = {}) {
      happening — `snap.docs` is not part of the shape the walk is given. Used
      only to clear a position from work that has left the queue. */
   const seen = [];
+  /**
+   * The last time this person handed ANY of their work over — see
+   * `lastHandoverMs`. Collected across every document they hold, including the
+   * terminal ones: a task submitted and since approved still occupied them
+   * right up to the moment they submitted it.
+   */
+  const handovers = [];
   snap.forEach((doc) => {
     const t = doc.data();
     seen.push({ id: doc.id, ref: doc.ref, effectivePriority: t.effectivePriority });
+    const handed = lastHandoverMs(t);
+    /* Kept PER TASK rather than as one figure, so a task can be excluded from
+       its own floor below. Capped at now: a stamp in the future is bad data,
+       and letting it through would push a live queue past the end of the day. */
+    if (Number.isFinite(handed) && handed <= nowMs) {
+      handovers.push({ taskId: doc.id, atMs: handed });
+    }
     const simulated = sim && doc.id === String(sim.taskId);
     if (TERMINAL_STATUSES.includes(t.status)) return;
     if (t.fixedDeadline || t.hasTimer === false) return;
@@ -742,6 +833,29 @@ async function rechainQueueFor(employeeId, opts = {}) {
       /* When this task could first have been started, where it was held up by
          somebody else's output. Null where it never was. */
       unblockedAtMs: simulated ? null : unblockedAtMs(t, approvedAtById, nowMs),
+      /**
+       * The instant a dependency was actually APPROVED, or null while the task
+       * is still waiting on one.
+       *
+       * `unblockedAtMs` above answers a different question and folds two cases
+       * into one number: a real approval, and — where nothing is approved yet
+       * — `nowMs`, so a waiting task's deadline does not burn down. Those two
+       * must not be treated alike. An approval is a FIXED instant and is the
+       * whole anchor; the now-floor is a moving one and may only ever push a
+       * start later.
+       *
+       * Telling them apart costs nothing: passing a non-finite clock makes the
+       * now-fallback unreachable, so what comes back is the approval or null.
+       *
+       * Reported: a task whose inputs were BOTH still unapproved was anchored
+       * at 02:02 — the moment the walk happened to run — while the P1 above it
+       * ran until 02:55. The two overlapped, and a blocked task had overtaken
+       * work that was actually being done.
+       */
+      freedAtMs: simulated ? null : unblockedAtMs(t, approvedAtById, NaN),
+      /* Filled in below, from the timer session. Only a dependency re-anchor
+         reads it — see where the seconds are chosen in the walk. */
+      workedSecs: 0,
       raw: t,
     });
   });
@@ -752,6 +866,45 @@ async function rechainQueueFor(employeeId, opts = {}) {
   live.sort((a, b) => a.rank - b.rank || a.createdMs - b.createdMs);
   /* Then the one adjustment the screen makes, so the dates agree with the
      positions shown beside them. */
+  /**
+   * How long each task has actually been worked, from its timer session.
+   *
+   * Read only for the tasks a dependency re-anchor could touch, and in
+   * parallel: a queue is a handful of documents, and the alternative — folding
+   * it into the walk — would make an awaited read per task inside a loop that
+   * is otherwise pure arithmetic.
+   *
+   * A missing session is zero, not an error: it means nobody has started the
+   * clock, which is the ordinary case for work that has been waiting.
+   */
+  await Promise.all(
+    live
+      .filter((t) => Number.isFinite(t.freedAtMs))
+      .map(async (t) => {
+        try {
+          const s = await db
+            .collection("cowork_task_timers")
+            .doc(String(employeeId))
+            .collection("sessions")
+            .doc(t.id)
+            .get();
+          if (!s.exists) return;
+          const d = s.data();
+          const base = Number(d.totalSeconds) || 0;
+          /* A clock still running counts the part nobody has banked yet. */
+          const elapsed =
+            d.isActive && d.lastStartTime
+              ? Math.floor((nowMs - Number(d.lastStartTime)) / 1000)
+              : 0;
+          t.workedSecs = Math.max(0, base + Math.max(0, elapsed));
+        } catch (e) {
+          /* An unreadable timer costs the remaining-time refinement, never the
+             deadline: the task simply keeps its full budget. */
+          console.warn("[officeDeadline] timer read failed for", t.id, e.message);
+        }
+      }),
+  );
+
   const ordered = workableFirst(live);
   /* 1..N over the work that actually holds a slot, in the order walked below.
      Folded into the deadline update where there is one, so a task is never
@@ -960,13 +1113,143 @@ async function rechainQueueFor(employeeId, opts = {}) {
      * changes nothing, which is the ordinary case; it bites where a blocked
      * task reaches the FRONT and would otherwise take the queue's start.
      */
-    if (Number.isFinite(task.unblockedAtMs) && task.unblockedAtMs > anchorMs) {
+    /**
+     * **The head cannot start before the person put down what they were
+     * holding.** Companion to the rule below, and the same shape: a `max`
+     * applied after the chain, so it can only ever push a start later.
+     *
+     * The queue's start is the moment the person became available to the queue
+     * as a whole. That is the right anchor for the task that leads it at the
+     * beginning of a session — and the wrong one for a task that reaches the
+     * front hours later, because the work above it was handed over. The person
+     * was busy until that handover; the head could not have begun before it.
+     *
+     * Reported: two tasks, both raised 18:35 and 18:40. The dependent one led
+     * until it delivered its first output at 18:58 and its second was still
+     * blocked. The plain task took the front and was anchored at the queue's
+     * 18:35 start — a one-hour budget due at 19:35, already expired by the time
+     * it reached the front, for a person who had been working the whole time.
+     *
+     * Only the HEAD reads it. Everything behind chains from the task above,
+     * which already ends at or after any handover the person made.
+     *
+     * **A task's OWN handovers are excluded, and that is not a detail.**
+     * REPORTED 26 Aug 2026. Umung's task waits on nobody: both its outputs are
+     * his own work. He submitted the first at 03:11 and the second at 03:47,
+     * and each submission pushed the task's own start forward — 03:11, then
+     * 03:47 — so its deadline grew every time he made progress on it. The
+     * floor exists to say "you were busy with something ELSE until you put it
+     * down"; a task cannot have been busy with itself.
+     */
+    const otherHandoverMs = handovers.reduce(
+      (latest, h) =>
+        h.taskId === task.id ? latest : latest === null || h.atMs > latest ? h.atMs : latest,
+      null,
+    );
+
+    if (
+      previousEndMs === null &&
+      Number.isFinite(otherHandoverMs) &&
+      otherHandoverMs > anchorMs
+    ) {
+      anchorMs = otherHandoverMs;
+    }
+
+    /**
+     * **A dependency's approval is the WHOLE anchor, not a floor under one.**
+     * OWNER RULE, 26 Aug 2026.
+     *
+     * This was `if (unblockedAtMs > anchorMs)` — a `max`, so the approval only
+     * counted when it happened to fall later than wherever the queue had
+     * already placed the task. Where the queue placed it later, the approval
+     * was ignored and the task was scheduled from a time it could not have
+     * started, chained behind unrelated work.
+     *
+     * The owner's case, in their numbers. Two of B's tasks, each waiting on a
+     * different one of A's outputs:
+     *
+     *   Puri Dev    (4h)  input approved 10:00  ->  10:00 + 4h = 14:00
+     *   Pardeep Dev (6h)  input approved 13:00  ->  13:00 + 6h = 19:00
+     *
+     * Under the `max` Pardeep Dev chained behind Puri Dev — anchor 14:00, due
+     * 20:00 — because 14:00 was later than its 13:00 approval. The approval is
+     * the instant the work became possible, and it is the one the budget is
+     * counted from: each dependency drives its own task's date and nothing
+     * else's.
+     *
+     * **This may pull a date EARLIER**, which is the one place in this file
+     * that is allowed to. It is the same exception `unblockedAtMs` already
+     * documents for the waiting case: a deadline derived from a queue position
+     * the dependency has overruled was never a promise anybody made.
+     *
+     * The consequence is deliberate and worth stating: two of one person's
+     * tasks freed at different times can now hold overlapping windows. The
+     * dependency decides when each CAN start; fitting them into a day is the
+     * assignee's own scheduling, not something a chain should decide for them.
+     */
+    if (Number.isFinite(task.freedAtMs)) {
+      /**
+       * **At the head, the approval IS the start. Behind live work, it is only
+       * a floor.** OWNER RULE, 26 Aug 2026, third statement of it.
+       *
+       * Two requirements meet here and they contradict each other whenever an
+       * approval lands earlier than the work above finishes:
+       *
+       *  · A dependent task must be counted from its own approval, not from
+       *    wherever the chain happened to place it — Pardeep Dev approved at
+       *    13:00 must read 13:00 + 6h = 19:00.
+       *  · A P2 must not start before the P1 above it ends — a task with one
+       *    input approved at 02:11 and another still waiting must not sit on
+       *    top of the plain task being worked from 02:16 to 03:16.
+       *
+       * The position settles it. A task that LEADS the queue has nothing to
+       * wait for but its input, so the approval is the whole of its start. A
+       * task BEHIND one still has a person doing something else first, and no
+       * approval makes them free earlier — so there it may only ever push the
+       * start later, never pull it back over work in hand.
+       *
+       * Pardeep Dev keeps its 19:00 because by then it leads: the work above
+       * it was handed over, so nothing occupies the person any more.
+       */
+      anchorMs =
+        previousEndMs === null
+          ? task.freedAtMs
+          : Math.max(anchorMs, task.freedAtMs);
+    } else if (
+      Number.isFinite(task.unblockedAtMs) &&
+      task.unblockedAtMs > anchorMs
+    ) {
+      /* Still waiting on somebody: the now-floor may only push a start LATER.
+         Applied as a max, it stops the deadline burning down while the task
+         cannot be touched; applied exactly it would drag a blocked task on top
+         of the work above it, which is the 02:02-against-02:55 overlap. */
       anchorMs = task.unblockedAtMs;
     }
 
+    /**
+     * **A dependency re-anchor schedules what is LEFT, never the whole budget
+     * again.** OWNER RULE, 26 Aug 2026.
+     *
+     * The anchor above moves to the LATEST approval, which is the moment the
+     * task finally became fully workable. Counting the full budget from there
+     * would hand back every hour already spent on the part that WAS unblocked:
+     *
+     *   4h task, puri approved 10:00, one hour worked, paradeep approved 13:00
+     *   full budget    -> 13:00 + 4h = 17:00   (the worked hour handed back)
+     *   what is left   -> 13:00 + 3h = 16:00   (correct)
+     *
+     * Scoped to the dependency case on purpose. Every other task in this walk
+     * keeps being scheduled from its full agreed budget, which is what the
+     * rest of the product measures against — this is not a general switch to
+     * remaining-time scheduling.
+     */
+    const secsToSchedule = Number.isFinite(task.freedAtMs)
+      ? Math.max(0, task.secs - (Number(task.workedSecs) || 0))
+      : task.secs;
+
     let dueIso = addWorkingSecsIST(
       anchorMs,
-      task.secs,
+      secsToSchedule,
       calendar.schedule,
       calendar.breaks,
     );
@@ -1192,6 +1475,7 @@ module.exports = {
   rankOf,
   isAwaitingReview,
   effectiveEndMs,
+  lastHandoverMs,
   reworkLeftoverSecs,
   TERMINAL_STATUSES,
 };

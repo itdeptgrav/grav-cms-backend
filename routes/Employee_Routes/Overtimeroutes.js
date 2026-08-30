@@ -224,6 +224,23 @@ router.get("/my", AllEmployeeAppMiddleware, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 //  POST /overtime/submit — Employee submits OT report
 // ════════════════════════════════════════════════════════════════════════════
+// Overtime history. Filed under HR even though every actor here is an employee
+// or their manager: an approved overtime report grants grace on the next day's
+// attendance, so it changes an HR record, and the person who later asks why a
+// late arrival was not marked late works in HR.
+const { recordChange } = require("../../services/changeLog");
+const auditOvertime = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:overtime",
+    entity: "overtime",
+    ...entry,
+  });
+
+/** "Ramesh Kumar - 2026-08-14" */
+const otLabel = (r) =>
+  [r?.employeeName || r?.biometricId, r?.dateStr].filter(Boolean).join(" - ");
+
 router.post(
   "/submit",
   AllEmployeeAppMiddleware,
@@ -381,6 +398,31 @@ router.post(
       console.log(
         `[OVERTIME] ${report.employeeName} submitted for ${dateStr}: ${stayOver.stayOverMins}min extra, grace=${stayOver.graceMinutes}min`,
       );
+      await auditOvertime(req, {
+        entityId: String(report._id),
+        entityLabel: otLabel(report),
+        action: "create",
+        summary:
+          `${report.employeeName} reported working late on ${dateStr} — left at ` +
+          `${report.actualOutTime} against a scheduled ${report.scheduledOutTime}, ` +
+          `${stayOver.stayOverMins} minute(s) over. ` +
+          (stayOver.graceMinutes > 0
+            ? `If approved they may report by ${stayOver.adjustedReportTime} on ${report.nextDateStr} (${stayOver.graceMinutes}min grace).`
+            : "No grace would follow from it.") +
+          `${report.documentUrl ? " Proof was attached." : ""}`,
+        after: {
+          dateStr,
+          actualOutTime: report.actualOutTime,
+          scheduledOutTime: report.scheduledOutTime,
+          stayOverMins: stayOver.stayOverMins,
+          graceMinutes: stayOver.graceMinutes,
+          nextDateStr: report.nextDateStr,
+          adjustedReportTime: stayOver.adjustedReportTime,
+          description,
+          status: "pending",
+        },
+      });
+
       res.status(201).json({
         success: true,
         data: report,
@@ -434,6 +476,7 @@ router.patch(
         .lean();
       const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "HOD";
 
+      const beforeStatus = report.status;
       report.status = "manager_approved";
       report.approvedBy = req.user.id;
       report.approvedByName = mgrName;
@@ -515,6 +558,34 @@ router.patch(
         }
       } catch (_) {}
 
+      // Whether the grace actually reached the attendance record is the half
+      // that matters and the half that is invisible afterwards: a report can be
+      // approved and apply to nothing (no next-day record yet, the day already
+      // closed), and the employee is then marked late on a morning they were
+      // told they had grace for.
+      await auditOvertime(req, {
+        entityId: String(report._id),
+        entityLabel: otLabel(report),
+        action: "approve",
+        summary:
+          `${mgrName} approved ${report.employeeName}'s overtime for ${report.dateStr} ` +
+          `(${report.stayOverMins} minute(s) over). ` +
+          (report.graceApplied
+            ? `${report.graceMinutes}min grace was applied to ${report.nextDateStr} — they may report by ${report.adjustedReportTime}.`
+            : report.graceMinutes > 0
+              ? `The ${report.graceMinutes}min grace was NOT applied to ${report.nextDateStr}; that day's attendance is unchanged.`
+              : "No grace was due.") +
+          `${report.approvalRemarks ? ` Remarks: ${report.approvalRemarks}` : ""}`,
+        before: { status: beforeStatus, graceApplied: false },
+        after: {
+          status: "manager_approved",
+          approvedByName: mgrName,
+          graceApplied: Boolean(report.graceApplied),
+          graceMinutes: report.graceMinutes,
+          approvalRemarks: report.approvalRemarks || "",
+        },
+      });
+
       // O2 — employee. Fire-and-forget.
       notifyOvertimeApproved(report.employeeId, {
         body: report.graceApplied
@@ -558,11 +629,24 @@ router.patch(
         .lean();
       const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "HOD";
 
+      const beforeStatus = report.status;
       report.status = "manager_rejected";
       report.rejectedBy = req.user.id;
       report.rejectedAt = new Date();
       report.rejectionReason = req.body.remarks || req.body.reason || "";
       await report.save();
+
+      await auditOvertime(req, {
+        entityId: String(report._id),
+        entityLabel: otLabel(report),
+        action: "reject",
+        summary:
+          `${mgrName} rejected ${report.employeeName}'s overtime for ${report.dateStr}. ` +
+          `No grace was applied to ${report.nextDateStr}, so normal reporting time stands.` +
+          `${report.rejectionReason ? ` Reason: ${report.rejectionReason}` : " No reason was given."}`,
+        before: { status: beforeStatus },
+        after: { status: "manager_rejected", rejectionReason: report.rejectionReason },
+      });
 
       try {
         const io = req.app.get("io");

@@ -30,12 +30,34 @@
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
-function sizeOf(wo) {
-  const attrs = wo.variantAttributes || [];
-  const size = attrs.find((a) => /size/i.test(a?.name || ""));
-  if (size?.value) return String(size.value);
-  return attrs.map((a) => a?.value).filter(Boolean).join(" / ") || "—";
-}
+/**
+ * A work order's human label.
+ *
+ * `workOrderNumber` is declared on the model but NOTHING GENERATES IT — as of
+ * 27 Aug 2026 all 138 work orders in the live database have it unset, so every
+ * view that showed it rendered a blank cell and the lists read as broken or
+ * empty. Falling back to the id's last 8 characters matches both the existing
+ * convention in routes/CEO_Routes/commandCenter.js and, more usefully, the
+ * barcode format production actually prints (`WO-<shortId>-<unit>`), so the
+ * label on screen is the one a person can match against a physical ticket.
+ *
+ * A display fallback, not a fix: the real repair is generating the number on
+ * creation. This stops the gap being invisible in the meantime.
+ */
+/**
+ * Product identity for a work order — the SAME resolver productionView uses,
+ * imported rather than duplicated so the two screens can never disagree about
+ * which photo represents a style (27 Aug 2026).
+ */
+const { productIdentity, variantOf, sizeOf } = require("./productionView");
+
+const woLabel = (wo) => wo.workOrderNumber || (wo._id ? `WO-${String(wo._id).slice(-8)}` : "—");
+
+// sizeOf/variantOf come from productionView — a SECOND copy of this lived here
+// and carried the same bug (falling back to "any attribute", so a colour-only
+// product reported its size as "Green" and the by-size grid grew a GREEN
+// column). Importing the one implementation means the two screens cannot drift
+// apart again (27 Aug 2026).
 
 /** How many of this work order's pieces are through the LAST operation. */
 function packedOf(wo) {
@@ -61,9 +83,11 @@ function buildShipmentView(workOrders = [], challans = [], earlyRequests = [], n
     const dispatched = Math.min(packed, num(wo.dispatchedQuantity));
     return {
       workOrderId: String(wo._id || ""),
-      workOrderNumber: wo.workOrderNumber || "",
+      workOrderNumber: woLabel(wo),
       style: wo.stockItemName || wo.stockItemReference || "—",
+      ...productIdentity(wo),
       size: sizeOf(wo),
+      variant: variantOf(wo),
       ordered,
       packed,
       dispatched,
@@ -72,7 +96,7 @@ function buildShipmentView(workOrders = [], challans = [], earlyRequests = [], n
       inProduction: Math.max(0, ordered - packed),
       deadline: wo.assignedDeadline || null,
     };
-  }).sort((a, b) => a.style.localeCompare(b.style) || a.size.localeCompare(b.size));
+  }).sort((a, b) => a.style.localeCompare(b.style) || String(a.size ?? "").localeCompare(String(b.size ?? "")));
 
   const sum = (k) => lines.reduce((s, l) => s + l[k], 0);
   const totals = {
@@ -89,7 +113,10 @@ function buildShipmentView(workOrders = [], challans = [], earlyRequests = [], n
   const byStyle = new Map();
   for (const l of lines) {
     if (!byStyle.has(l.style)) {
-      byStyle.set(l.style, { style: l.style, ordered: 0, packed: 0, dispatched: 0, ready: 0, inProduction: 0, sizes: [], deadline: l.deadline });
+      byStyle.set(l.style, {
+        style: l.style, ordered: 0, packed: 0, dispatched: 0, ready: 0, inProduction: 0, sizes: [], deadline: l.deadline,
+        image: l.image, reference: l.reference, gender: l.gender, category: l.category,
+      });
     }
     const st = byStyle.get(l.style);
     for (const k of ["ordered", "packed", "dispatched", "ready", "inProduction"]) st[k] += l[k];

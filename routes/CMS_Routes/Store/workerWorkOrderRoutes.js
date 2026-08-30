@@ -26,6 +26,25 @@ const WorkOrderSettings = require("../../../models/CMS_Models/Store/WorkOrderSet
 router.use(EmployeeAuthMiddleware);
 
 const ALLOWED_STATUSES = ["Draft", "Issued", "Completed"];
+const ALLOWED_PAYMENT_METHODS = ["", "UPI", "Bank Transfer", "Net Banking", "Cheque", "Cash"];
+
+// Documents are already-uploaded {name, url, mimeType, fileId?/publicId?}
+// objects (the frontend uploads to Drive/Cloudinary first, same as every
+// other document field in this backend) — just pass through what's a plain
+// object with a url, drop anything malformed instead of 500ing on it.
+const sanitizeDocuments = (docs) =>
+  Array.isArray(docs)
+    ? docs
+        .filter((d) => d && typeof d === "object" && d.url)
+        .map((d) => ({
+          name: d.name || "",
+          url: d.url,
+          mimeType: d.mimeType || "",
+          fileId: d.fileId || "",
+          publicId: d.publicId || "",
+          uploadedAt: d.uploadedAt || new Date(),
+        }))
+    : undefined;
 
 // ── helper: consume the next number atomically ────────────────────────────
 async function consumeNextNumber() {
@@ -217,6 +236,17 @@ router.post("/", async (req, res) => {
       customHeaderFields: Array.isArray(body.customHeaderFields)
         ? body.customHeaderFields
         : [],
+      paymentMethod: ALLOWED_PAYMENT_METHODS.includes(body.paymentMethod)
+        ? body.paymentMethod
+        : "",
+      paymentUpiId: body.paymentUpiId || "",
+      paymentBankName: body.paymentBankName || "",
+      paymentAccountHolderName: body.paymentAccountHolderName || "",
+      paymentAccountNumber: body.paymentAccountNumber || "",
+      paymentIfscCode: body.paymentIfscCode || "",
+      paymentChequeNumber: body.paymentChequeNumber || "",
+      paymentNotes: body.paymentNotes || "",
+      documents: sanitizeDocuments(body.documents) || [],
       status: ALLOWED_STATUSES.includes(body.status) ? body.status : "Draft",
       priority: ["Emergency", "Urgent", "Neutral"].includes(body.priority)
         ? body.priority
@@ -284,6 +314,24 @@ router.put("/:id", async (req, res) => {
       wo.customHeaderFields = Array.isArray(body.customHeaderFields)
         ? body.customHeaderFields
         : [];
+    if (body.paymentMethod !== undefined)
+      wo.paymentMethod = ALLOWED_PAYMENT_METHODS.includes(body.paymentMethod)
+        ? body.paymentMethod
+        : "";
+    if (body.paymentUpiId !== undefined) wo.paymentUpiId = body.paymentUpiId;
+    if (body.paymentBankName !== undefined) wo.paymentBankName = body.paymentBankName;
+    if (body.paymentAccountHolderName !== undefined)
+      wo.paymentAccountHolderName = body.paymentAccountHolderName;
+    if (body.paymentAccountNumber !== undefined)
+      wo.paymentAccountNumber = body.paymentAccountNumber;
+    if (body.paymentIfscCode !== undefined) wo.paymentIfscCode = body.paymentIfscCode;
+    if (body.paymentChequeNumber !== undefined)
+      wo.paymentChequeNumber = body.paymentChequeNumber;
+    if (body.paymentNotes !== undefined) wo.paymentNotes = body.paymentNotes;
+    if (body.documents !== undefined) {
+      const docs = sanitizeDocuments(body.documents);
+      if (docs !== undefined) wo.documents = docs;
+    }
     if (body.status && ALLOWED_STATUSES.includes(body.status))
       wo.status = body.status;
     if (

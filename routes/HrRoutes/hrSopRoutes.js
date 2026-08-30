@@ -8,6 +8,12 @@ const verifyHRToken = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const HR_DEPT = "hr";
 
+// SOP history. A point deduction costs somebody real money at year end, so
+// every one of them is recorded with who applied it and what it was for.
+const { recordChange } = require("../../services/changeLog");
+const auditSop = (req, entry) =>
+    recordChange(req, { departmentSlug: "hr", section: "hr:sop", ...entry });
+
 // GET /api/hr/sop/folders
 router.get("/folders", verifyHRToken, async (req, res) => {
     try {
@@ -25,6 +31,14 @@ router.post("/folders", verifyHRToken, async (req, res) => {
             name: name.trim(), department: HR_DEPT,
             createdBy: "", createdByName: createdByName || "HR Manager", createdByRole: createdByRole || "hr_manager",
         });
+        await auditSop(req, {
+            entity: "sop-folder",
+            entityId: String(folder._id),
+            entityLabel: folder.name,
+            action: "create",
+            summary: `Created SOP folder "${folder.name}".`,
+            after: { name: folder.name },
+        });
         res.status(201).json({ success: true, folder });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -34,8 +48,20 @@ router.delete("/folders/:id", verifyHRToken, async (req, res) => {
     try {
         const folder = await SopFolder.findById(req.params.id);
         if (!folder || folder.department !== HR_DEPT) return res.status(404).json({ error: "Folder not found." });
+        const orphaned = await Sop.countDocuments({ folderId: folder._id });
         await Sop.updateMany({ folderId: folder._id }, { $set: { folderId: null, folderName: "Uncategorized" } });
         await folder.deleteOne();
+
+        await auditSop(req, {
+            entity: "sop-folder",
+            entityId: String(req.params.id),
+            entityLabel: folder.name,
+            action: "delete",
+            summary:
+                `Deleted SOP folder "${folder.name}". Its ${orphaned} SOP(s) were kept and moved ` +
+                `to Uncategorized rather than deleted with it.`,
+            before: { name: folder.name, sopCount: orphaned },
+        });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -68,6 +94,22 @@ router.post("/", verifyHRToken, async (req, res) => {
             createdByRole: createdByRole || "hr_manager",
             folderId: resolvedFolderId, folderName, status: "pending",
         });
+        await auditSop(req, {
+            entity: "sop-deduction",
+            entityId: String(sop._id),
+            entityLabel: sop.name,
+            action: "create",
+            summary:
+                `Created SOP "${sop.name}" worth ${sop.points} point(s), filed under ${folderName}. ` +
+                `It is pending approval and cannot be applied to anybody until it is approved.`,
+            after: {
+                name: sop.name,
+                points: sop.points,
+                description: sop.description,
+                folderName,
+                status: "pending",
+            },
+        });
         res.status(201).json({ success: true, sop });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -78,6 +120,14 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
         const sop = await Sop.findById(req.params.id);
         if (!sop || sop.department !== HR_DEPT) return res.status(404).json({ error: "SOP not found." });
         if (sop.status === "approved") return res.status(400).json({ error: "Cannot edit an approved SOP." });
+
+        const before = {
+            name: sop.name,
+            points: sop.points,
+            description: sop.description,
+            folderName: sop.folderName,
+            status: sop.status,
+        };
 
         const { name, points, description, folderId } = req.body;
         if (name) sop.name = name.trim();
@@ -92,6 +142,21 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
         }
         sop.status = "pending";
         await sop.save();
+
+        await auditSop(req, {
+            entity: "sop-deduction",
+            entityId: String(sop._id),
+            entityLabel: sop.name,
+            action: "update",
+            before,
+            after: {
+                name: sop.name,
+                points: sop.points,
+                description: sop.description,
+                folderName: sop.folderName,
+                status: "pending",
+            },
+        });
         res.json({ success: true, sop });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -102,7 +167,19 @@ router.delete("/:id", verifyHRToken, async (req, res) => {
         const sop = await Sop.findById(req.params.id);
         if (!sop || sop.department !== HR_DEPT) return res.status(404).json({ error: "SOP not found." });
         if (sop.status === "approved") return res.status(400).json({ error: "Cannot delete an approved SOP." });
+        const removed = { name: sop.name, points: sop.points, folderName: sop.folderName, status: sop.status };
         await sop.deleteOne();
+
+        await auditSop(req, {
+            entity: "sop-deduction",
+            entityId: String(req.params.id),
+            entityLabel: removed.name,
+            action: "delete",
+            summary:
+                `Deleted the ${removed.status} SOP "${removed.name}" (${removed.points} point(s)). ` +
+                `Deductions already applied to employees under it are unaffected.`,
+            before: removed,
+        });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -196,6 +273,30 @@ router.post("/bleach", verifyHRToken, async (req, res) => {
         }
 
         await employee.save();
+
+        // The one entry on this page that costs somebody money. It names the
+        // rule, the points, the employee's new running total, and whether the
+        // deduction came from an approved SOP or was typed in by hand - the
+        // last of those being the part most worth being able to look up.
+        const yearTotal = employee.sopPoints.find((sp) => sp.year === year)?.totalDeducted;
+        await auditSop(req, {
+            entity: "sop-deduction",
+            entityId: `${targetEmployeeId}:${today}`,
+            entityLabel: `${employee.firstName} ${employee.lastName || ""} (${targetEmployeeId})`.trim(),
+            action: "create",
+            summary:
+                `Deducted ${finalPoints} SOP point(s) from ${employee.firstName} ${employee.lastName || ""} ` +
+                `(${targetEmployeeId}) for "${finalSopName}"` +
+                `${sopId ? " under an approved SOP" : " as a MANUAL deduction, not tied to any approved SOP"}. ` +
+                `Their total deducted for ${year} is now ${yearTotal}.` +
+                `${description ? ` Note: ${description.trim()}` : ""}`,
+            fields: [
+                { path: "points", label: "Points deducted", to: finalPoints, kind: "added" },
+                { path: "sopName", label: "Rule", to: finalSopName, kind: "added" },
+                { path: "totalDeducted", label: `Total deducted ${year}`, to: yearTotal, kind: "changed" },
+            ],
+        });
+
         res.status(201).json({ success: true, message: `${finalPoints} pts deducted from ${employee.firstName} for "${finalSopName}".` });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });

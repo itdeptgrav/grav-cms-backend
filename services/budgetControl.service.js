@@ -47,6 +47,69 @@ const CONTROLLING_STATUSES = ["active", "exceeded"];
  * head has consumed enough of its number to be worth saying so. */
 const WARN_AT_PCT = 90;
 
+/**
+ * ── TEMPORARY: THE ENFORCEMENT SWITCH ───────────────────────────────────────
+ *
+ * The control above is finished; the BUDGETS ARE NOT. Until every department
+ * has its allocations entered, most real vouchers charge a head that no live
+ * budget mentions, and the honest answer — "no approved allocation" — stops
+ * Accounts from posting anything at all. This switch lets that answer be
+ * recorded instead of enforced, for as long as it takes to seed the budgets.
+ *
+ * `ACC_BUDGET_ENFORCEMENT` in the backend `.env`:
+ *
+ *   "on"       (default, and what happens if the variable is absent)
+ *              Nothing changes. Spend that needs an override is refused until
+ *              a human supplies a reason. This is the finished behaviour.
+ *
+ *   "partial"  Only the "there is no budget here yet" complaints are waved
+ *              through — `missing_budget` and `needs_cost_centre`. A head that
+ *              HAS an allocation and would genuinely blow it still blocks,
+ *              because that refusal is about real money, not about rollout.
+ *
+ *   "off"      Every overridable status is waved through, `over_budget` too.
+ *
+ * ── HOW TO UNDO THIS ────────────────────────────────────────────────────────
+ * Delete the line from `.env` (or set it to "on") and the control is back,
+ * with no data to unwind. To remove the escape hatch itself, delete this
+ * block, `autoClearable`, `AUTO_CLEAR_REASON`, and the `autoCleared` branch in
+ * `clearanceFor` — the three of them are the whole of it.
+ *
+ * NOTHING IS SILENT. The check still runs, and a waved-through voucher is
+ * still stamped with a full `budgetOverride` — the heads, the numbers, the
+ * approver — carrying `auto: true` and this reason. When the budgets are live,
+ * those stamps are the list of what got through while this was off.
+ *
+ * Cost-centre allocation errors are NOT covered by any setting. Allocating
+ * more of an entry to a project than the entry holds is arithmetic that cannot
+ * be true, not a policy to relax.
+ */
+const ENFORCEMENT = String(process.env.ACC_BUDGET_ENFORCEMENT || "on")
+  .trim()
+  .toLowerCase();
+
+const AUTO_CLEAR_REASON =
+  "Auto-cleared: budget control not yet in force (ACC_BUDGET_ENFORCEMENT).";
+
+/* Says at boot which way the switch is set. Without this the only way to tell
+ * a relaxed server from a strict one is to try to post a voucher and read the
+ * error — and an `.env` edited without a restart looks identical to one that
+ * was never edited at all. Silent on "on" so normal boots stay quiet. */
+if (ENFORCEMENT !== "on") {
+  console.log(
+    `[budgetControl] ACC_BUDGET_ENFORCEMENT=${ENFORCEMENT} — budget refusals are being auto-cleared. Set it to "on" to enforce.`,
+  );
+}
+
+/** Is this the switch's business, or a refusal that must still stand? */
+function autoClearable(status) {
+  if (ENFORCEMENT === "off") return needsOverride(status);
+  if (ENFORCEMENT === "partial") {
+    return status === "missing_budget" || status === "needs_cost_centre";
+  }
+  return false;
+}
+
 const STATUS_RANK = {
   ok: 0,
   unscoped: 1,

@@ -40,6 +40,10 @@ const canSend = () => Boolean(cfg.accessToken && cfg.phoneNumberId);
 const graphBase = () => `https://graph.facebook.com/${cfg.apiVersion}`;
 const messagesUrl = () => `${graphBase()}/${cfg.phoneNumberId}/messages`;
 const mediaUrl = (mediaId) => `${graphBase()}/${mediaId}`;
+// Upload a file to Meta first, then reference the returned media id in a
+// template's document/image header (26 Aug 2026) — a header component
+// can't carry raw bytes inline, only a media id or a link Meta fetches itself.
+const mediaUploadUrl = () => `${graphBase()}/${cfg.phoneNumberId}/media`;
 
 // Validate Meta's webhook signature. Returns true when no app secret is
 // configured (verification simply skipped) OR the HMAC matches. `rawBody` must
@@ -57,4 +61,4 @@ function verifySignature(rawBody, signatureHeader) {
   }
 }
 
-module.exports = { cfg, canReceive, canSend, graphBase, messagesUrl, mediaUrl, verifySignature };
+module.exports = { cfg, canReceive, canSend, graphBase, messagesUrl, mediaUrl, mediaUploadUrl, verifySignature };

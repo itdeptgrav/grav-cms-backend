@@ -12,6 +12,7 @@ const { getCalendars, getUpcomingEvents, getTodayEvents, createEvent } = require
 const { getRecentFiles, searchFiles } = require("./services/googleDriveService");
 const {
   getEmployeeAuthUrl,
+  parseOAuthState,
   saveEmployeeGmailToken,
   getEmployeeGmailToken,
   disconnectEmployeeGmail,
@@ -283,16 +284,23 @@ router.get("/employee-gmail/auth-url", (req, res) => {
 
 // GET /api/google/employee-gmail/callback?code=xxx&state=E001
 router.get("/employee-gmail/callback", async (req, res) => {
+  // Where to land afterwards. `state` may carry the caller's own return path
+  // (27 Aug 2026) — Sales connects from its own settings page and must come
+  // back to it, not to /coworking/settings, which was the only destination
+  // before. parseOAuthState only accepts a same-site path, so this can never
+  // be redirected off-domain by a crafted state.
+  const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
+  let landing = "/coworking/settings";
   try {
-    const { code, state: employeeId } = req.query;
+    const { code, state } = req.query;
+    const { employeeId, returnTo } = parseOAuthState(state);
+    if (returnTo) landing = returnTo;
     if (!code || !employeeId) return res.status(400).json({ success: false, message: "Missing code or employeeId" });
     const { connectedEmail } = await saveEmployeeGmailToken(employeeId, code);
-    const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
-    res.redirect(`${frontendUrl}/coworking/settings?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
+    res.redirect(`${frontendUrl}${landing}?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
   } catch (err) {
     console.error("[employee-gmail/callback]", err.message);
-    const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
-    res.redirect(`${frontendUrl}/coworking/settings?gmail=error&message=${encodeURIComponent(err.message)}`);
+    res.redirect(`${frontendUrl}${landing}?gmail=error&message=${encodeURIComponent(err.message)}`);
   }
 });
 

@@ -6,6 +6,7 @@ const router = express.Router();
 const ExcelJS = require("exceljs");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
+const { resolveShift } = require("../../services/shiftPolicy");
 const Employee = require("../../models/Employee");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 
@@ -305,12 +306,58 @@ function designationMatches(designation, list) {
     return e && (d === e || d.includes(e));
   });
 }
+/**
+ * How many punches this person's day is expected to have.
+ *
+ * Core is the 2-punch office day and General the 6-punch production one, so
+ * those two answer it by themselves. Custom does not: two people on the same
+ * 06:00-14:00 hours can punch two times or six, and nothing about the hours
+ * says which. So it is asked per person, on their own record.
+ *
+ * Getting it wrong is not cosmetic. `hasMissPunch` is `punches < expected`,
+ * so expecting six from somebody who makes two flags EVERY one of their days
+ * for HR to clear by hand — which is why an unanswered custom shift falls back
+ * to 2 rather than to the higher number.
+ */
+function resolvePunchCount(emp, settings) {
+  const mode = emp?.workShift?.mode;
+  if (mode === "core") return 2;
+  if (mode === "general") return 6;
+  if (mode === "custom") {
+    const n = Number(emp?.workShift?.punches);
+    if (Number.isFinite(n) && n >= 1) return Math.round(n);
+    return 2;
+  }
+  // No shift category yet — pre-backfill. Fall back to the department-derived
+  // classification, which is what these people were being measured by before.
+  return resolveEmployeeType(emp, settings) === "operator" ? 6 : 2;
+}
+
 function resolveEmployeeType(emp, settings) {
   if (!settings) return "executive";
   if (emp?.employeeType) {
     const t = String(emp.employeeType).toLowerCase();
     if (t === "operator" || t === "executive") return t;
   }
+  // The employee's shift category settles the punch pattern too. Core is the
+  // office 2-punch day and General the production 6-punch one; Custom is the
+  // only one that has to be told, and it is told once in attendance settings
+  // rather than read off anybody's department.
+  const mode = emp?.workShift?.mode;
+  if (mode === "core") return "executive";
+  if (mode === "general") return "operator";
+  if (mode === "custom") {
+    // employeeType decides how the day is MEASURED — an operator's day is net
+    // of punched breaks, an executive's is the whole span. The punch count
+    // answers that on its own: somebody who punches out for lunch has a break
+    // to exclude, somebody who touches the reader twice does not.
+    return resolvePunchCount(emp, settings) > 2 ? "operator" : "executive";
+  }
+  // Below here is the pre-categories fallback, and it should never fire:
+  // scripts/backfillWorkShift.js gives every existing employee a mode and the
+  // employee form requires one. It stays for anyone the backfill has not
+  // reached yet, so their day is classified the way it was yesterday instead
+  // of silently becoming an office day.
   const designation = extractDesignation(emp);
   const department = extractDepartment(emp).toUpperCase().trim();
   const opDesigs = settings.operatorDesignations || [],
@@ -332,12 +379,71 @@ function resolveEmployeeType(emp, settings) {
   return "executive";
 }
 
+/**
+ * The shift an employee is judged against.
+ *
+ * Every call site in this file used to do `settings.shifts[empType]`, where
+ * empType came from their department — so a housekeeper on 06:00-14:00 was
+ * still measured against 09:30-18:30 and marked early-out every day. Worse,
+ * setting their shift on the employee form changed nothing, because none of
+ * these paths ever looked at it. That is the "resync did not apply it" report:
+ * the sync writes the right shift now, but the HR routes that recompute and
+ * display the day were still deriving their own.
+ *
+ * One helper, so there is one answer. Returns the same {start, end,
+ * lateGraceMins, halfDayThresholdMins, otGraceMins} shape those call sites
+ * already expect, so nothing downstream changes.
+ */
+function shiftFor(emp, settings) {
+  // expectedPunches rides along on the shift object rather than becoming a
+  // seventh positional argument to computeDay. It belongs to the same answer:
+  // "what is this person's working day", which is hours AND how many times
+  // they touch the reader in it.
+  return {
+    ...resolveShift(emp || {}, settings),
+    expectedPunches: resolvePunchCount(emp || {}, settings),
+  };
+}
+
+/**
+ * Rebuild a full shift from the hours stored on an attendance entry.
+ *
+ * The merge path has the entry but not the employee, and the entry records
+ * only shiftStart and shiftEnd. Those hours can have come from exactly three
+ * places, so matching them back identifies which — and that matters, because
+ * the merge reads lateGraceMins as well as the times. Taking the grace from
+ * whichever profile happened to be handy is how a General employee gets an
+ * office grace period.
+ */
+function shiftFromStoredTimes(entry, settings) {
+  const start = entry?.shiftStart;
+  const end = entry?.shiftEnd;
+  const shifts = settings.shifts || {};
+  if (!start || !end) return resolveShift({}, settings);
+
+  for (const key of ["executive", "operator"]) {
+    const p = shifts[key];
+    if (p && p.start === start && p.end === end) return { ...p };
+  }
+  // Neither preset matches, so these hours are somebody's custom ones and the
+  // custom profile holds their rules.
+  return { ...(shifts.custom || {}), start, end };
+}
+
 function shiftMidpointMins(shift) {
   return Math.round((hhmmMins(shift.start) + hhmmMins(shift.end)) / 2);
 }
 
 function assignPunchTypes(punches, employeeType, shift, settings) {
-  const expected = employeeType === "operator" ? 6 : 2;
+  // Set per person for custom shifts — see resolvePunchCount. The
+  // employeeType fallback is for the merge path, which rebuilds a shift from
+  // stored times and has no employee to ask.
+  const expected =
+    Number(shift?.expectedPunches) > 0
+      ? Math.round(Number(shift.expectedPunches))
+      : employeeType === "operator"
+        ? 6
+        : 2;
   const sorted = [...punches].sort((a, b) => a.time - b.time);
   if (sorted.length === 0)
     return {
@@ -399,7 +505,10 @@ function assignPunchTypes(punches, employeeType, shift, settings) {
     } else if (middle.length === 2) {
       middle[0].punchType = "lunch_out";
       middle[1].punchType = "lunch_in";
-      missingPunchType = "tea_out";
+      // Only a 6-punch day is short a tea pair here. Somebody set to 4
+      // punches has made all of theirs, and naming a missing one would put a
+      // miss-punch flag on a complete day.
+      missingPunchType = expected >= 6 ? "tea_out" : null;
     } else if (middle.length === 1) {
       middle[0].punchType = "lunch_out";
       missingPunchType = "lunch_in";
@@ -821,6 +930,10 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     hrFinalStatus: existing.hrFinalStatus || null,
     hrRemarks: existing.hrRemarks || null,
     hrReviewedAt: existing.hrReviewedAt || null,
+    // Who made the override. Was missing from this list while the other three
+    // hr* fields were carried, so a resync of a manually-corrected day
+    // silently blanked the reviewer's name off the record.
+    hrReviewedBy: existing.hrReviewedBy || null,
   };
 }
 
@@ -857,8 +970,9 @@ async function smartSaveDay(
     );
     const hasHROverride = !!(old.hrFinalStatus || old.hrRemarks);
     if (!hasManualPunches && !hasHROverride) return fresh;
-    const empType = fresh.employeeType || "operator";
-    const shift = settings.shifts[empType] || settings.shifts.executive;
+    // fresh was built moments ago with this employee's own shift and carries
+    // the hours. Re-deriving from their department here would undo that.
+    const shift = shiftFromStoredTimes(fresh, settings);
     return mergeEmployeeEntry(fresh, old, shift, isToday);
   });
   const freshBids = new Set(freshEmployees.map((e) => e.biometricId));
@@ -1004,7 +1118,7 @@ async function syncDay(dateStr, empCode = "ALL") {
       identityId = extractIdentity(g.employee);
       numericId = numericOf(g.biometricId);
     }
-    const shift = settings.shifts[employeeType] || settings.shifts.executive;
+    const shift = shiftFor(g.isGhost ? null : g.employee, settings);
     const extraGrace = graceAppliesTo(employeeType, settings)
       ? yesterdayOt.get(g.biometricId) || 0
       : 0;
@@ -1046,7 +1160,7 @@ async function syncDay(dateStr, empCode = "ALL") {
       const key = String(bid).toUpperCase();
       if (seenBiometricIds.has(key)) continue;
       const empType = resolveEmployeeType(emp, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(emp, settings);
       employees.push({
         employeeDbId: emp._id,
         biometricId: key,
@@ -1320,7 +1434,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       identityId = extractIdentity(g.employee);
       numericId = numericOf(g.biometricId);
     }
-    const shift = settings.shifts[employeeType] || settings.shifts.executive;
+    const shift = shiftFor(g.isGhost ? null : g.employee, settings);
     const extraGrace = graceAppliesTo(employeeType, settings)
       ? yesterdayOt.get(g.biometricId) || 0
       : 0;
@@ -1362,7 +1476,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       const key = String(bid).toUpperCase();
       if (seenBids.has(key)) continue;
       const empType = resolveEmployeeType(emp, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(emp, settings);
       employees.push({
         employeeDbId: emp._id,
         biometricId: key,
@@ -2039,7 +2153,13 @@ async function applyRegularizationToAttendance(r, actor = {}) {
   // nothing new to derive from, and recomputing would churn the day for nothing.
   if (punchChanges.length > 0) {
     const settings = await AttendanceSettings.getConfig();
-    const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
+    // Rebuild from the hours ALREADY STORED on the entry, not from the
+    // employee record. `emp` here is an attendance entry, so shiftFor() finds
+    // no `workShift` on it and silently falls back to department inference —
+    // which loses a custom shift. The stored shiftStart/shiftEnd are what
+    // this day was actually judged against, so they are the right basis for
+    // re-judging it.
+    const shift = shiftFromStoredTimes(emp, settings);
     const shiftStart = hhmmMins(shift.start),
       shiftEnd = hhmmMins(shift.end),
       inMins = minsOf(emp.inTime),
@@ -2409,7 +2529,7 @@ async function getDailyAttendance(date, department) {
         )
           continue;
         const empType = resolveEmployeeType(emp, settings);
-        const shift = settings.shifts[empType] || settings.shifts.executive;
+        const shift = shiftFor(emp, settings);
         absentEntries.push({
           employeeDbId: emp._id,
           biometricId: bid,
@@ -2636,6 +2756,18 @@ function buildSettingsChanges(oldCfg, body) {
     );
     diff("Executive OT grace (mins)", oe.otGraceMins, es.otGraceMins);
   }
+  const cs = body.shifts?.custom;
+  if (cs) {
+    const oc = oldCfg.shifts?.custom || {};
+    diff("Custom late grace (mins)", oc.lateGraceMins, cs.lateGraceMins);
+    diff(
+      "Custom half-day threshold (mins)",
+      oc.halfDayThresholdMins,
+      cs.halfDayThresholdMins,
+    );
+    diff("Custom half-day measured on", oc.halfDayBasis, cs.halfDayBasis);
+    diff("Custom OT grace (mins)", oc.otGraceMins, cs.otGraceMins);
+  }
   const lhp = body.lateHalfDayPolicy;
   if (lhp) {
     const ol = oldCfg.lateHalfDayPolicy || {};
@@ -2741,6 +2873,8 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
       displayLabels,
     } = req.body;
     const update = {};
+    // shifts carries operator, executive AND custom — the custom profile holds
+    // only the rules, since a custom shift's hours live on the employee.
     if (shifts) update.shifts = shifts;
     if (lateHalfDayPolicy) update.lateHalfDayPolicy = lateHalfDayPolicy;
     if (operatorDepartments)
@@ -2778,6 +2912,43 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
         .sendAttendanceSettingsChangeToCEO(changedBy, changes)
         .catch((e) => console.warn("[SETTINGS-EMAIL]", e.message));
     }
+
+    // The CEO email already existed and already says what moved; this puts the
+    // same facts where somebody can look them up later without going through
+    // an inbox. Diffed against the config read at the top of the handler, so
+    // shift timings nested two deep report as "shifts.operator.start", not as
+    // "the shifts object changed".
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "attendance-setting",
+      entityId: "singleton",
+      entityLabel: "Attendance settings",
+      action: "update",
+      before: {
+        shifts: oldCfg.shifts,
+        lateHalfDayPolicy: oldCfg.lateHalfDayPolicy,
+        operatorDepartments: oldCfg.operatorDepartments,
+        departmentCategories: oldCfg.departmentCategories,
+        executiveDesignations: oldCfg.executiveDesignations,
+        operatorDesignations: oldCfg.operatorDesignations,
+        singlePunchHandling: oldCfg.singlePunchHandling,
+        graceCarryForward: oldCfg.graceCarryForward,
+        displayLabels: oldCfg.displayLabels,
+      },
+      after: {
+        shifts: newCfg.shifts,
+        lateHalfDayPolicy: newCfg.lateHalfDayPolicy,
+        operatorDepartments: newCfg.operatorDepartments,
+        departmentCategories: newCfg.departmentCategories,
+        executiveDesignations: newCfg.executiveDesignations,
+        operatorDesignations: newCfg.operatorDesignations,
+        singlePunchHandling: newCfg.singlePunchHandling,
+        graceCarryForward: newCfg.graceCarryForward,
+        displayLabels: newCfg.displayLabels,
+      },
+    });
+
     res.json({ success: true, data: newCfg });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -3426,7 +3597,7 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 
     if (!empMeta && empDoc) {
       const empType = resolveEmployeeType(empDoc, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(empDoc, settings);
       empMeta = {
         employeeName: extractName(empDoc),
         department: extractDepartment(empDoc),
@@ -4024,17 +4195,70 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     // never a good enough answer — this makes it a name and a time. Never
     // awaited into the response path: a failed log entry is a gap in history,
     // a failed save because of it is lost work.
+    // The punch edits go in as named fields rather than being folded into the
+    // status line. An override that moved an in-time by forty minutes and an
+    // override that only relabelled the day are different events, and a summary
+    // that mentions the status alone makes them look identical.
+    const auditFields = (punchChanges || []).map((c) => ({
+      path: `punch.${c.punchType || c.type || "time"}`,
+      label: {
+        in: "In time",
+        lunch_out: "Lunch out",
+        lunch_in: "Lunch in",
+        tea_out: "Tea out",
+        tea_in: "Tea in",
+        final_out: "Out time",
+        out: "Out time",
+      }[c.punchType || c.type] || "Punch",
+      from: c.oldTime,
+      to: c.newTime,
+      kind: c.action === "add" ? "added" : c.action === "remove" ? "removed" : "changed",
+    }));
+
+    const statusChanged = (oldStatus || null) !== (emp.hrFinalStatus || null);
+    if (statusChanged) {
+      auditFields.unshift({
+        path: "hrFinalStatus",
+        label: "Attendance status",
+        from: oldStatus || "(none)",
+        to: emp.hrFinalStatus || "(cleared — back to system prediction)",
+        kind: "changed",
+      });
+    }
+    if ((previousRemarks || "") !== (hrRemarks || "")) {
+      auditFields.push({
+        path: "hrRemarks",
+        label: "HR remarks",
+        from: previousRemarks || "",
+        to: hrRemarks || "",
+        kind: "changed",
+      });
+    }
+
     recordChange(req, {
       departmentSlug: "hr",
-      entity: "attendance",
-      entityId: `${biometricId}:${dateStr}`,
-      entityLabel: `${biometricId} on ${dateStr}`,
+      section: "hr:attendance-daily",
+      entity: "attendance-day",
+      entityId: `${bid}:${dateStr}`,
+      entityLabel: `${emp.employeeName || bid} · ${dateStr}`,
       action: "update",
-      summary: `Attendance for ${biometricId} on ${dateStr} set to ${
-        hrFinalStatus || "(cleared)"
-      }`,
+      fields: auditFields,
+      summary:
+        `Overrode attendance for ${emp.employeeName || bid} (${bid}) on ${dateStr}` +
+        (statusChanged
+          ? `: status ${oldStatus || "(none)"} → ${emp.hrFinalStatus || "cleared, back to the system prediction " + emp.systemPrediction}`
+          : ": status unchanged") +
+        (punchChanges?.length
+          ? `; ${punchChanges.length} punch time${punchChanges.length === 1 ? "" : "s"} edited`
+          : "") +
+        (hrRemarks ? `. Remarks: ${hrRemarks}` : "."),
       before: { status: oldStatus, remarks: previousRemarks },
-      after: { status: hrFinalStatus || null, remarks: hrRemarks || "" },
+      after: {
+        status: emp.hrFinalStatus || null,
+        remarks: hrRemarks || "",
+        systemPrediction: emp.systemPrediction,
+        netWorkMins: emp.netWorkMins,
+      },
     });
 
     res.json({
@@ -4242,6 +4466,53 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
       console.error("[PUNCH-CORRECTION] Log error:", logErr.message);
     }
 
+    // A punch edit moves the worked minutes, which moves overtime and pay.
+    // Both the punch and whatever the status became are recorded, because a
+    // corrected in-time that silently flipped the day from late to present is
+    // two facts and only one of them is visible on the screen afterwards.
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "attendance-punch",
+      entityId: `${bid}:${dateStr}`,
+      entityLabel: `${emp.employeeName || bid} · ${dateStr}`,
+      action: "update",
+      fields: [
+        {
+          path: `punch.${punchType}`,
+          label: {
+            in: "In time",
+            lunch_out: "Lunch out",
+            lunch_in: "Lunch in",
+            tea_out: "Tea out",
+            tea_in: "Tea in",
+            out: "Out time",
+          }[punchType] || "Punch",
+          from: oldTime || "",
+          to: action === "remove" ? "" : punchTime || "",
+          kind: action === "add" ? "added" : action === "remove" ? "removed" : "changed",
+        },
+        ...((oldStatus || null) !== (emp.hrFinalStatus || emp.systemPrediction || null)
+          ? [
+              {
+                path: "effectiveStatus",
+                label: "Attendance status",
+                from: oldStatus || "",
+                to: emp.hrFinalStatus || emp.systemPrediction || "",
+                kind: "changed",
+              },
+            ]
+          : []),
+      ],
+      summary:
+        `${{ add: "Added", remove: "Removed", modify: "Changed" }[action]} the ` +
+        `${punchType.replace(/_/g, " ")} punch for ${emp.employeeName || bid} (${bid}) on ${dateStr}` +
+        (action === "modify" ? `: ${oldTime || "—"} → ${punchTime}` : action === "add" ? `: ${punchTime}` : `: was ${oldTime || "—"}`) +
+        `. Worked time is now ${emp.netWorkMins || 0} minute(s) and the day reads ` +
+        `${emp.hrFinalStatus || emp.systemPrediction}` +
+        (hrRemarks ? `. Remarks: ${hrRemarks}` : "."),
+    });
+
     res.json({
       success: true,
       message: `Punch ${action} applied for ${punchType}`,
@@ -4262,6 +4533,7 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "dateStr and updates[] required" });
     let ok = 0,
       fail = 0;
+    const applied = [];
     const reviewer = req.user?.name || req.user?.email || "HR";
     for (const u of updates) {
       const set = {
@@ -4279,9 +4551,44 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         },
         { $set: set },
       );
-      if (r.matchedCount > 0) ok++;
-      else fail++;
+      if (r.matchedCount > 0) {
+        ok++;
+        applied.push(u);
+      } else fail++;
     }
+
+    // One entry naming every person in the batch, rather than one entry per
+    // person. A bulk override is a single deliberate act — marking a floor
+    // absent for a shutdown day — and splitting it into ninety rows loses the
+    // fact that they were one decision. The names are kept as fields so the
+    // detail is still there for anybody who opens it.
+    if (applied.length) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:attendance-daily",
+        entity: "attendance-day",
+        entityId: dateStr,
+        entityLabel: `Bulk override · ${dateStr}`,
+        action: "update",
+        fields: applied.slice(0, 120).map((u) => ({
+          path: String(u.biometricId).toUpperCase(),
+          label: String(u.biometricId).toUpperCase(),
+          to:
+            [
+              u.hrFinalStatus !== undefined ? (u.hrFinalStatus || "cleared") : null,
+              u.hrRemarks ? `remarks: ${u.hrRemarks}` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ") || "reviewed",
+          kind: "changed",
+        })),
+        summary:
+          `Bulk-overrode attendance on ${dateStr} for ${ok} employee(s)` +
+          (fail ? `; ${fail} could not be matched and were not changed` : "") +
+          `. Reviewed by ${reviewer}.`,
+      });
+    }
+
     res.json({ success: true, updated: ok, failed: fail });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -4308,6 +4615,24 @@ router.delete(
         { yearMonth, "employees.biometricId": bid },
         { $pull: { employees: { biometricId: bid } } },
       );
+      // Removing somebody from a month deletes attendance rows outright. It is
+      // the only destructive action on this page and the one most likely to be
+      // asked about, so it is logged as a delete with the day count named.
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:attendance-daily",
+        entity: "attendance-day",
+        entityId: `${bid}:${yearMonth}`,
+        entityLabel: `${bid} · ${yearMonth}`,
+        action: "delete",
+        summary:
+          `Removed ${bid} from the attendance register for ${yearMonth} — ` +
+          `${result.modifiedCount} day record(s) deleted. This cannot be undone from the UI; ` +
+          `the days must be re-synced from the biometric device to come back.`,
+        before: { biometricId: bid, yearMonth, daysPresent: result.modifiedCount },
+        after: { daysPresent: 0 },
+      });
+
       res.json({
         success: true,
         message: `Removed ${bid} from ${result.modifiedCount} day(s) in ${yearMonth}`,
@@ -6799,7 +7124,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
     }
     if (!empMeta && empDoc) {
       const empType = resolveEmployeeType(empDoc, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(empDoc, settings);
       empMeta = {
         employeeName: extractName(empDoc),
         department: extractDepartment(empDoc),
@@ -7001,6 +7326,21 @@ router.get("/regularizations/:id", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// Regularisations live on their own page, so they get their own section — a
+// regularisation approved on Tuesday should not have to be hunted for among
+// that day's attendance overrides.
+const auditReg = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:attendance-regularizations",
+    entity: "regularization",
+    ...entry,
+  });
+
+/** "Ramesh Kumar · 2026-08-12" — enough to recognise the request. */
+const regLabel = (r) =>
+  [r?.employeeName || r?.biometricId, r?.dateStr].filter(Boolean).join(" · ");
+
 router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const {
@@ -7084,6 +7424,25 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       managersNotified: Array.isArray(managersNotified) ? managersNotified : [],
       status: "pending",
     });
+    await auditReg(req, {
+      entityId: String(doc._id),
+      entityLabel: regLabel(doc),
+      action: "create",
+      summary:
+        `Raised a regularisation request for ${doc.employeeName || doc.biometricId} on ${doc.dateStr}` +
+        `${requestedStatus ? ` asking for status ${requestedStatus}` : ""}` +
+        `${doc.proposedPunches?.length ? ` with ${doc.proposedPunches.length} proposed punch time(s)` : ""}` +
+        `${doc.reason ? `. Reason: ${doc.reason}` : "."}` +
+        `${documentUrl ? " A supporting document was attached." : ""}`,
+      after: {
+        dateStr: doc.dateStr,
+        requestedStatus: doc.requestedStatus || null,
+        reason: doc.reason || "",
+        status: "pending",
+        hasDocument: Boolean(documentUrl),
+      },
+    });
+
     res.status(201).json({
       success: true,
       data: doc,
@@ -7132,6 +7491,28 @@ router.patch(
       });
       await r.save();
 
+      // Whether it actually reached the attendance record is part of the entry.
+      // "Approved" alone is the misleading half: a request can be approved and
+      // apply to nothing, and the employee's day stays exactly as it was.
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "approve",
+        summary:
+          `Approved the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr}` +
+          `${r.requestedStatus ? ` (requested status ${r.requestedStatus})` : ""}. ` +
+          (applyRes.applied
+            ? `Applied to the attendance record${applyRes.punchChanges?.length ? `, changing ${applyRes.punchChanges.length} punch time(s)` : ""}.`
+            : `NOTHING was applied to attendance — ${applyRes.skipped}.`) +
+          `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`,
+        before: { status: "pending", hrRemarks: "" },
+        after: {
+          status: "hr_approved",
+          hrRemarks: r.hrRemarks || "",
+          appliedToAttendance: Boolean(applyRes.applied),
+        },
+      });
+
       notifyRegularizationApproved(r); // R5 — employee
 
       res.json({
@@ -7159,11 +7540,24 @@ router.patch(
       const r = await getRegularizationRequest().findById(req.params.id);
       if (!r)
         return res.status(404).json({ success: false, message: "Not found" });
+      const beforeStatus = r.status;
       r.status = "hr_rejected";
       r.rejectedBy = req.user.id;
       r.rejectedAt = new Date();
       r.rejectionReason = req.body?.rejectionReason || "";
       await r.save();
+
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "reject",
+        summary:
+          `Rejected the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr}. ` +
+          `The attendance record is unchanged.` +
+          `${r.rejectionReason ? ` Reason: ${r.rejectionReason}` : " No reason was given."}`,
+        before: { status: beforeStatus, rejectionReason: "" },
+        after: { status: "hr_rejected", rejectionReason: r.rejectionReason },
+      });
 
       notifyRegularizationRejected(r, r.rejectionReason); // R6 — employee
 
@@ -7187,11 +7581,25 @@ router.patch(
           success: false,
           message: `Cannot cancel from status ${r.status}`,
         });
+      const beforeStatus = r.status;
       r.status = "cancelled";
       r.cancelledBy = req.user.id;
       r.cancelledAt = new Date();
       r.cancelReason = req.body?.cancelReason || "";
       await r.save();
+
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "update",
+        summary:
+          `Cancelled the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr} ` +
+          `while it was ${beforeStatus}.` +
+          `${r.cancelReason ? ` Reason: ${r.cancelReason}` : ""}`,
+        before: { status: beforeStatus },
+        after: { status: "cancelled", cancelReason: r.cancelReason },
+      });
+
       res.json({ success: true, data: r });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
@@ -7242,6 +7650,20 @@ router.post("/holidays", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (e) {
       console.warn("[HOLIDAY] re-sync failed:", e.message);
     }
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "holiday",
+      entityId: String(h._id),
+      entityLabel: `${name} (${date})`,
+      action: "create",
+      summary:
+        `Added company holiday “${name}” on ${date}` +
+        `${type && type !== "company" ? ` as ${type}` : ""}. ` +
+        `Attendance for that date was re-synced, so everybody's status for the day changed with it.`,
+      after: { date, name, description: description || "", type: type || "company" },
+    });
+
     res.status(201).json({ success: true, data: h });
   } catch (err) {
     if (err.code === 11000)
@@ -7262,6 +7684,21 @@ router.delete("/holidays/:id", EmployeeAuthMiddlewear, async (req, res) => {
         console.warn("[HOLIDAY-DEL] re-sync failed:", e.message);
       }
     }
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "holiday",
+      entityId: String(req.params.id),
+      entityLabel: h ? `${h.name} (${h.date})` : String(req.params.id),
+      action: "delete",
+      summary: h
+        ? `Removed company holiday “${h.name}” on ${h.date}. Attendance for that date was ` +
+          `re-synced as a normal working day, which changes everybody's status for it.`
+        : `Removed a holiday that no longer existed (${req.params.id}).`,
+      before: h ? { date: h.date, name: h.name, type: h.type } : undefined,
+    });
+
     res.json({ success: true, message: "Holiday removed" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -8148,10 +8585,30 @@ module.exports.parseTimeOnDateIST = parseTimeOnDateIST;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
+module.exports.syncDay = syncDay;
+module.exports.syncDayForce = syncDayForce;
+// The employee-field extractors. Employee documents are inconsistent — names
+// live at the top level on some records and under basicInfo/personalInfo on
+// others — and these are the versions hardened against every shape in the
+// collection. Anything reading an Employee should use them rather than write
+// a fresh guess.
+module.exports.extractName = extractName;
+module.exports.extractBiometricId = extractBiometricId;
+module.exports.extractDepartment = extractDepartment;
+module.exports.extractDesignation = extractDesignation;
 // Exported so Access Control can filter employees by operator/executive using
-// the SAME policy HR configures here (designation lists, department
-// categories) rather than a second, drifting copy of the rules.
+// the SAME policy attendance does — the employee's own shift category, and for
+// Custom the punch pattern in attendance settings — rather than a second,
+// drifting copy of the rules.
 module.exports.resolveEmployeeType = resolveEmployeeType;
+// Exported for the same reason, and for the tests: how many punches a day is
+// expected to have is now a per-person answer, not one derived from a
+// department or a global setting.
+module.exports.resolvePunchCount = resolvePunchCount;
+// Exported for the tests. It is the function that turns raw punches into a
+// day — resolving the punch count correctly and then failing to thread it in
+// here would pass every resolver test and change nothing.
+module.exports.computeDay = computeDay;
 // Exported so the read-only Daily Attendance AI assistant builds its context
 // from the SAME computation the HR daily page uses, rather than a second copy.
 module.exports.getDailyAttendance = getDailyAttendance;

@@ -37,6 +37,10 @@ const employeeSchema = new mongoose.Schema({
 
   phone: { type: String },
   alternatePhone: { type: String },
+  // The number the company gives them, as opposed to `phone`, which is the
+  // personal one they log into the app with. Deliberately NOT surfaced in any
+  // company-wide list — the same rule that keeps numbers off Who's away.
+  workPhone: { type: String, trim: true },
   extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
@@ -153,8 +157,66 @@ const employeeSchema = new mongoose.Schema({
     enum: ["full_time", "part_time", "contract", "intern", ""],
     default: "",
   },
+
+  // ─── INTERNSHIP ────────────────────────────────────────────────────────────
+  //  An intern is an Employee with employmentType "intern", not a record in
+  //  some other collection. Attendance, leave, documents and the biometric ID
+  //  all key off this collection; a parallel one would mean a second copy of
+  //  every one of them.
+  //
+  //  What actually differs is money and access, and both are handled where
+  //  they belong: services/payroll pays a prorated stipend with no statutory
+  //  components (see Payroll_section.js), and the app login refuses them
+  //  outright (Employee_Routes/login.js).
+  //
+  //  stipendType is the arrangement, and there are three:
+  //    paid       the company pays them a monthly stipend
+  //    unpaid     no money changes hands
+  //    self_paid  the internship is funded by the intern or their institution
+  //  Only "paid" has an amount, and it lives in salary.stipend with every
+  //  other pay figure — encrypted, because it is compensation.
+  internship: {
+    stipendType: {
+      type: String,
+      enum: ["paid", "unpaid", "self_paid"],
+      default: undefined,
+    },
+    startDate: { type: Date },
+    endDate: { type: Date },
+  },
   workLocation: { type: String, default: "GRAV Clothing" },
+  // Legacy free-text shift label. Kept as-is: it is written by the employee
+  // importer, exported again, and shown on the profile screen. Repurposing it
+  // would fail to cast every existing string.
   shift: { type: String, trim: true },
+
+  // The shift attendance is actually JUDGED against.
+  //
+  // "core" and "general" name the two presets in attendance settings — and
+  // mind the inversion documented in services/shiftPolicy.js, where UI "Core"
+  // is stored as shifts.executive. "custom" carries this person's own hours,
+  // with the grace periods coming from the shared custom profile in settings.
+  //
+  // Left unset, attendance falls back to the department/designation mapping
+  // that decided it before, so nobody's status changes until HR sets one.
+  workShift: {
+    mode: { type: String, enum: ["core", "general", "custom"], default: undefined },
+    start: { type: String, trim: true }, // "HH:MM", custom only
+    end: { type: String, trim: true },   // "HH:MM", custom only
+
+    // How many times this person is expected to touch the reader in a day.
+    // Custom only: Core is the 2-punch office day and General the 6-punch
+    // production one, so those two answer it by themselves.
+    //
+    // Per person, and not a setting, because it does not follow from the
+    // hours. Two people can both be on 06:00-14:00 and one of them punches
+    // for lunch while the other does not — a housekeeper and a night guard
+    // are the example that started this. A shared default would be wrong for
+    // whichever of them lost the coin toss, and getting it wrong is not
+    // cosmetic: a day with fewer punches than expected is flagged as a
+    // miss-punch for HR to clear by hand, every day, forever.
+    punches: { type: Number, min: 1, max: 12 },
+  },
 
   status: { type: String, default: "active" },
   isActive: { type: Boolean, default: true },
@@ -170,6 +232,13 @@ const employeeSchema = new mongoose.Schema({
   salary: {
     // ── HR Input ──────────────────────────────────────────────────────────────
     gross: { type: mongoose.Schema.Types.Mixed, default: 0 },
+
+    // An intern's monthly stipend. Kept here, alongside gross, so it rides the
+    // encryption and the decryptEmployeeDoc() path that every existing reader
+    // already goes through rather than needing a second one. Mutually
+    // exclusive with gross in practice: the pre-save hook below computes the
+    // statutory breakdown for one and refuses to for the other.
+    stipend: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Earnings (auto) ───────────────────────────────────────────────────────
     basic: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -193,6 +262,20 @@ const employeeSchema = new mongoose.Schema({
     employerCost: { type: mongoose.Schema.Types.Mixed, default: 0 },
     totalDeduction: { type: mongoose.Schema.Types.Mixed, default: 0 },
     netSalary: { type: mongoose.Schema.Types.Mixed, default: 0 },
+
+    // ── Other deduction ───────────────────────────────────────────────────────
+    // A standing monthly deduction — canteen, transport, whatever the company
+    // recovers from pay. Optional, and zero for most people.
+    //
+    // Charged for the days they were THERE, not as a flat monthly figure:
+    // payroll prorates it by (days in month − approved leave days) ÷ days in
+    // month. Somebody on leave for a week is not consuming the thing being
+    // deducted for, so they are not charged for that week. Sundays, week-offs
+    // and holidays ARE charged — the month is the month.
+    //
+    // Encrypted like every other pay figure. See Payroll_section.js for the
+    // proration, which is where the leave days come from.
+    otherDeduction: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Legacy ────────────────────────────────────────────────────────────────
     allowances: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -402,6 +485,46 @@ employeeSchema.pre("save", async function (next) {
       encryptSalaryFields,
     } = require("../utils/salaryEncryption");
 
+    // ── Interns take the short road ──────────────────────────────────────────
+    // A stipend has no components. Splitting it into basic and HRA, deducting
+    // provident fund from it and enrolling it in ESI would all be inventions —
+    // there is no such arrangement to describe. So an intern's salary object
+    // holds the stipend and nothing else, and every derived figure is written
+    // as zero rather than left at whatever a previous employment type put
+    // there. Somebody converted from employee to intern must not keep a
+    // basic and an EPF from their old contract.
+    if (this.employmentType === "intern") {
+      const prev = decryptSalaryFields(this.salary);
+      const stipend = Number(prev.stipend) || 0;
+      const encrypted = encryptSalaryFields({
+        stipend,
+        gross: 0,
+        basic: 0,
+        hra: 0,
+        specialAllowance: 0,
+        epf: 0,
+        edli: 0,
+        adminCharges: 0,
+        eeesic: 0,
+        erEsic: 0,
+        foodAllowance: 0,
+        employerCost: stipend,
+        totalDeduction: 0,
+        netSalary: stipend,
+        allowances: 0,
+        deductions: 0,
+        // Carried through: it is HR's input, not a derived figure, and this
+        // hook replaces the whole salary object.
+        otherDeduction: Number(prev.otherDeduction) || 0,
+      });
+      encrypted.epfOverride = false;
+      encrypted.edliOverride = false;
+      encrypted.adminOverride = false;
+      this.salary = encrypted;
+      this.updatedAt = Date.now();
+      return next();
+    }
+
     const cfg = await SalaryConfig.getSingleton();
 
     // ── 1. Decrypt first so all arithmetic works on plain numbers ────────────
@@ -462,6 +585,13 @@ employeeSchema.pre("save", async function (next) {
       netSalary,
       allowances: hra,
       deductions: totalDeduction,
+      // Zeroed, not omitted: encryptSalaryFields replaces this.salary
+      // wholesale, so an intern promoted to staff would otherwise keep a
+      // stipend sitting beside their new gross.
+      stipend: 0,
+      // Kept, not zeroed — unlike the stipend, this is HR's input and applies
+      // to staff and interns alike.
+      otherDeduction: Number(s.otherDeduction) || 0,
     };
 
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────

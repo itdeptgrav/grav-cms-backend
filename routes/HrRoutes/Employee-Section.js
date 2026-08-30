@@ -7,6 +7,9 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 const emailService = require("../../services/emailService");
 const { recordChange } = require("../../services/changeLog");
 const {
+  invalidateAppAccess,
+} = require("../../Middlewear/AllEmployeeAppMiddleware");
+const {
   encryptSalaryFields,
   decryptSalaryFields,
   decryptEmployeeDoc,
@@ -18,9 +21,33 @@ require("dotenv").config();
 // ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
 // Always operates on plain numbers. Caller must decrypt before passing in,
 // and encrypt the result before saving to MongoDB.
-function recalculateSalary(salary = {}, cfg = {}) {
+function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
   // Decrypt in case caller passed an encrypted object (belt-and-suspenders)
   const s = decryptSalaryFields(salary);
+
+  // ── Interns ──────────────────────────────────────────────────────────────
+  // A stipend has no basic, no HRA and no statutory deductions, so none are
+  // computed. This has to live here as well as in the model's pre-save hook
+  // because the update below goes through findByIdAndUpdate, which does not
+  // fire that hook — the two paths would otherwise disagree about what an
+  // intern's salary object contains, and HR editing an intern would quietly
+  // give them an EPF deduction.
+  if (employmentType === "intern") {
+    const stipend = Number(s.stipend) || 0;
+    return {
+      stipend,
+      gross: 0, basic: 0, hra: 0, specialAllowance: 0,
+      epf: 0, edli: 0, adminCharges: 0,
+      epfOverride: false, edliOverride: false, adminOverride: false,
+      eeesic: 0, erEsic: 0, foodAllowance: 0,
+      employerCost: stipend,
+      totalDeduction: 0,
+      netSalary: stipend,
+      allowances: 0, deductions: 0,
+      // HR's input, not a derived figure — and it applies to interns too.
+      otherDeduction: Number(s.otherDeduction) || 0,
+    };
+  }
 
   const basicPct = (cfg.basicPct ?? 50) / 100;
   const hraPct = (cfg.hraPct ?? 50) / 100;
@@ -83,6 +110,12 @@ function recalculateSalary(salary = {}, cfg = {}) {
     netSalary,
     allowances: hra,
     deductions: totalDeduction,
+    // Zeroed rather than omitted — the caller replaces the whole salary
+    // object, so an intern promoted to staff would otherwise keep a stipend
+    // sitting beside their new gross.
+    stipend: 0,
+    // Kept, not zeroed: HR's input, and it survives a change of type.
+    otherDeduction: Number(s.otherDeduction) || 0,
   };
 }
 
@@ -126,11 +159,27 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
     updates.updatedBy = user.id;
     updates.updatedAt = new Date();
 
+    // Read before the write. These percentages drive every payslip the company
+    // issues, so "PF changed at some point" is not an answer anybody can act on
+    // — the entry has to carry the old rate.
+    const previousConfig = (await SalaryConfig.findOne({}).lean()) || {};
+
     const config = await SalaryConfig.findOneAndUpdate(
       {},
       { $set: updates },
       { new: true, upsert: true, runValidators: true },
     );
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:salary-config",
+      entity: "salary-config",
+      entityId: "global",
+      entityLabel: "Salary configuration",
+      action: "update",
+      before: Object.fromEntries(allowed.map((k) => [k, previousConfig[k]])),
+      after: Object.fromEntries(allowed.map((k) => [k, config[k]])),
+    });
 
     res.json({ success: true, message: "Salary config updated", data: config });
   } catch (err) {
@@ -264,6 +313,7 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       `${newEmployee.firstName || ""} ${newEmployee.lastName || ""}`.trim();
     recordChange(req, {
       departmentSlug: "hr",
+      section: "hr:employees",
       entity: "employee",
       entityId: newEmployee._id,
       entityLabel: createdName,
@@ -356,6 +406,75 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+/**
+ * An employee record as the history should see it.
+ *
+ * WHY NOT A LIST OF INTERESTING FIELDS
+ * ------------------------------------
+ * The first version of this diffed nine hand-picked fields (department,
+ * designation, status, email, phone, gross pay, the two managers). Editing
+ * anything else — an address, a date of birth, a bank account, a shift, an
+ * emergency contact — produced an entry that said "Updated employee X" and
+ * listed nothing, because the diff of the nine fields was empty. That is worse
+ * than no entry: it records that something happened and refuses to say what.
+ *
+ * So this inverts it. Everything is included, and only what genuinely should
+ * not be in a history is taken out:
+ *
+ *   secrets        password, temporary password, push/FCM tokens
+ *   audit stamps   created/updated by and at — the log already knows all four,
+ *                  and they change on EVERY save, so leaving them in would put
+ *                  two meaningless rows on every entry
+ *   engine state   sopPoints, timer accumulators, welcome-email bookkeeping —
+ *                  written by background jobs, not by the person saving the form
+ *   its own screen profilePhoto, which has its own route and its own entry
+ *
+ * SALARY is deliberately IN, and decrypted, because a hike is the single change
+ * most worth being able to look up — that was the intent of the original
+ * `grossPay` field too. Only the figures a human actually types are kept; EPF,
+ * EDLI and admin charges are recomputed from gross on every save, so including
+ * them would add half a dozen derived rows to every pay change and bury the one
+ * number that was edited.
+ */
+const AUDIT_OMIT = new Set([
+  "_id", "id", "__v",
+  "password", "temporaryPassword", "pushToken", "fcmToken",
+  "createdAt", "updatedAt", "createdBy", "createdByName", "updatedBy", "updatedByName",
+  "profilePhoto", "sopPoints",
+  "timerDeficitAccumHrs", "timerOvertimeAccumHrs", "lastFinalizedDate",
+  "welcomeEmailSent", "emailSentAt", "emailError",
+]);
+
+function employeeAuditSnapshot(doc, decryptedSalary) {
+  if (!doc) return undefined;
+  const raw = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (AUDIT_OMIT.has(k)) continue;
+    out[k] = v;
+  }
+
+  // Managers flattened to the name that is actually shown. Left as objects they
+  // diff on their ObjectId, which reads as a change every time mongoose hands
+  // back a hydrated document instead of a lean one.
+  out.primaryManager = raw.primaryManager?.managerName || "";
+  out.secondaryManager = raw.secondaryManager?.managerName || "";
+
+  // Encrypted at rest, so the raw values are two ciphertexts that differ on
+  // every save whether or not the number moved.
+  const sal = decryptedSalary || {};
+  out.salary = {
+    gross: sal.gross,
+    basic: sal.basic,
+    hra: sal.hra,
+    specialAllowance: sal.specialAllowance,
+    stipend: sal.stipend,
+  };
+
+  return out;
+}
+
 // ─── UPDATE employee ──────────────────────────────────────────────────────────
 router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
@@ -371,17 +490,44 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     }
 
     // Snapshot before the write, so the change log can diff old against new.
-    // Gross pay is included (decrypted, under the non-redacted `grossPay` key)
-    // so the HR history page can show hikes; the raw salary object itself is
-    // never logged.
-    const beforeDoc = await Employee.findById(id)
-      .select(
-        "firstName lastName department designation jobTitle status email phone salary primaryManager secondaryManager",
-      )
-      .lean();
-    const beforeGross = beforeDoc?.salary
-      ? decryptSalaryFields(beforeDoc.salary)?.gross
-      : undefined;
+    //
+    // THE WHOLE DOCUMENT, not a projection. This used to select thirteen
+    // fields, which broke the diff twice over: an edit to anything outside the
+    // list showed as no change at all, and once `after` became the full record
+    // every field missing from `before` would have been reported as newly
+    // added. employeeAuditSnapshot decides what is worth keeping — the query
+    // must not decide it as well, or the two lists drift and the difference
+    // between them is silently logged as edits nobody made.
+    const beforeDoc = await Employee.findById(id).lean();
+
+    // ── The biometric ID is write-once ──────────────────────────────────────
+    // It is the join key across both datastores — Mongo's employee record and
+    // the Firestore cowork document share it, and every attendance row, punch
+    // and payroll item is keyed on it. Changing it does not rename those; it
+    // orphans them, and the employee silently stops having a history.
+    //
+    // So: set it once, on an employee who has none, and never again. Sent
+    // unchanged is fine and common — the form posts the whole record back —
+    // and only an actual attempt to change one is refused, loudly, because
+    // silently ignoring it would leave HR believing it had been renamed.
+    //
+    // identityId is deliberately NOT locked. It is a display/HR number with
+    // nothing keyed on it.
+    if (updateData.biometricId !== undefined && beforeDoc?.biometricId) {
+      const next = String(updateData.biometricId || "").trim().toUpperCase();
+      const current = String(beforeDoc.biometricId).trim().toUpperCase();
+      if (next && next !== current) {
+        return res.status(400).json({
+          success: false,
+          code: "BIOMETRIC_ID_IMMUTABLE",
+          message:
+            `Biometric ID cannot be changed. ${beforeDoc.biometricId} is the ` +
+            `key their attendance, punches and payroll are stored under — ` +
+            `renaming it here would orphan all of it, not move it.`,
+        });
+      }
+      delete updateData.biometricId;
+    }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
     if (
@@ -445,7 +591,16 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // then encrypt the result before it goes into MongoDB
     if (updateData.salary) {
       const cfg = await SalaryConfig.getSingleton();
-      const calculated = recalculateSalary(updateData.salary, cfg.toObject());
+      // The type being saved, or the one already on file when this edit does
+      // not touch it — a partial update must not turn an intern back into a
+      // salaried employee by omission.
+      const effectiveType =
+        updateData.employmentType ?? beforeDoc?.employmentType ?? "";
+      const calculated = recalculateSalary(
+        updateData.salary,
+        cfg.toObject(),
+        effectiveType,
+      );
       updateData.salary = encryptSalaryFields(calculated);
       // Boolean override flags are not encrypted
       updateData.salary.epfOverride = calculated.epfOverride;
@@ -463,44 +618,38 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
+    // App access is cached for five minutes per employee. Moving somebody to
+    // or from intern changes whether they may use the app at all, so the
+    // stale answer is dropped here instead of being served for another five.
+    if (
+      updateData.employmentType !== undefined &&
+      updateData.employmentType !== beforeDoc?.employmentType
+    ) {
+      invalidateAppAccess(id);
+    }
+
     // Decrypt salary before sending to client
     const decryptedDoc = decryptEmployeeDoc(updated);
 
-    // Audit: who last edited, and which display fields moved. Gross pay and
-    // managers are part of the diff so promotions/hikes land in the history.
+    // Audit: the whole record, before and after. No hand-written summary —
+    // services/changeLog writes one from the diff, so the sentence can never
+    // disagree with the fields underneath it. An edit that moved nothing this
+    // snapshot can see is now suppressed entirely rather than filed as a
+    // contentless "Updated employee X".
     const updatedName =
       `${updated.firstName || ""} ${updated.lastName || ""}`.trim();
     recordChange(req, {
       departmentSlug: "hr",
+      section: "hr:employees",
       entity: "employee",
       entityId: id,
       entityLabel: updatedName,
       action: "update",
-      summary: `Updated employee ${updatedName}`,
-      before: beforeDoc
-        ? {
-            department: beforeDoc.department,
-            designation: beforeDoc.designation,
-            jobTitle: beforeDoc.jobTitle,
-            status: beforeDoc.status,
-            email: beforeDoc.email,
-            phone: beforeDoc.phone,
-            grossPay: beforeGross,
-            primaryManager: beforeDoc.primaryManager?.managerName || "",
-            secondaryManager: beforeDoc.secondaryManager?.managerName || "",
-          }
-        : undefined,
-      after: {
-        department: updated.department,
-        designation: updated.designation,
-        jobTitle: updated.jobTitle,
-        status: updated.status,
-        email: updated.email,
-        phone: updated.phone,
-        grossPay: decryptedDoc?.salary?.gross ?? beforeGross,
-        primaryManager: updated.primaryManager?.managerName || "",
-        secondaryManager: updated.secondaryManager?.managerName || "",
-      },
+      before: employeeAuditSnapshot(
+        beforeDoc,
+        beforeDoc?.salary ? decryptSalaryFields(beforeDoc.salary) : {},
+      ),
+      after: employeeAuditSnapshot(updated, decryptedDoc?.salary || {}),
     });
     res.status(200).json({
       success: true,
@@ -556,6 +705,8 @@ router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
       );
     }
 
+    const previous = await Employee.findById(id).select("documents").lean();
+
     const updated = await Employee.findByIdAndUpdate(
       id,
       { $set: { documents: clean } },
@@ -566,6 +717,19 @@ router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
+    // Filed under Employee documents, not Employees: it is the documents page
+    // somebody will be looking at when they ask when an Aadhaar was replaced.
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:documents",
+      entity: "employee-document",
+      entityId: String(id),
+      entityLabel: `${[updated.firstName, updated.lastName].filter(Boolean).join(" ")}${updated.biometricId ? ` (${updated.biometricId})` : ""}`,
+      action: "update",
+      before: previous?.documents || {},
+      after: updated.documents || {},
+    });
 
     res.status(200).json({
       success: true,
@@ -620,6 +784,19 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:employees",
+      entity: "employee",
+      entityId: String(id),
+      entityLabel: `${[updated.firstName, updated.lastName].filter(Boolean).join(" ")}${updated.biometricId ? ` (${updated.biometricId})` : ""}`,
+      action: "update",
+      summary:
+        `Replaced the profile photo` +
+        `${user.id === id ? " (their own)" : ""}.`,
+      after: { "profilePhoto.publicId": profilePhoto.publicId },
+    });
+
     res.status(200).json({
       success: true,
       message: "Profile photo updated successfully",
@@ -636,7 +813,15 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
 // ─── GET ALL employees (paginated, filterable) ─────────────────────────────────
 router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { page = 1, limit = 10, department, status, search, sort } = req.query;
+    const {
+      page = 1,
+      limit = 10,
+      department,
+      status,
+      search,
+      sort,
+      employmentType,
+    } = req.query;
 
     // Optional sort — the list defaults to newest-first; "dob"/"dob_desc"
     // order by date of birth (missing DOBs sink to the end via the fallback).
@@ -662,6 +847,16 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       };
 
     if (status && status !== "all") filter.status = status;
+
+    // "interns" and "staff" rather than a bare employmentType match, because
+    // the useful question on this page is which side of that line somebody
+    // falls — and "staff" has to include the employees who predate the field
+    // and have it empty, which $ne does and an enum match would not.
+    if (employmentType === "interns") filter.employmentType = "intern";
+    else if (employmentType === "staff")
+      filter.employmentType = { $ne: "intern" };
+    else if (employmentType && employmentType !== "all")
+      filter.employmentType = employmentType;
     if (search) {
       filter.$or = [
         { firstName: { $regex: search, $options: "i" } },
@@ -840,15 +1035,21 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
           secondaryManager: doc.secondaryManager?.managerName || "",
         };
 
+        const beforeType = doc.employmentType;
         for (const [path, value] of Object.entries(paths)) doc.set(path, value);
         doc.set("updatedBy", user.id);
         doc.set("updatedByName", user.name || "");
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
+        // Same reason as the single-employee update: a change of employment
+        // type changes whether the app will let them in, and the answer is
+        // cached for five minutes.
+        if (doc.employmentType !== beforeType) invalidateAppAccess(doc._id);
 
         const name = `${doc.firstName || ""} ${doc.lastName || ""}`.trim();
         recordChange(req, {
           departmentSlug: "hr",
+          section: "hr:employees",
           entity: "employee",
           entityId: doc._id,
           entityLabel: name,
@@ -1306,6 +1507,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // Audit: who deactivated this employee.
     recordChange(req, {
       departmentSlug: "hr",
+      section: "hr:employees",
       entity: "employee",
       entityId: req.params.id,
       entityLabel: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),

@@ -17,6 +17,22 @@ const ShiftSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// Custom shifts carry their TIMES on the employee and their RULES here, so HR
+// sets grace periods once for everyone on a bespoke shift rather than five
+// fields per person. No start/end on purpose: a shared start time is exactly
+// what a custom shift is not.
+const CustomShiftRulesSchema = new mongoose.Schema(
+  {
+    lateGraceMins: { type: Number, default: 10 },
+    halfDayThresholdMins: { type: Number, default: 300 },
+    // Custom hours are an arbitrary window, so default to the measure that does
+    // not depend on whether this person punches their breaks.
+    halfDayBasis: { type: String, enum: ["net", "span"], default: "net" },
+    otGraceMins: { type: Number, default: 30 },
+  },
+  { _id: false },
+);
+
 const LateHalfDayPolicySchema = new mongoose.Schema(
   {
     enabled: { type: Boolean, default: true },
@@ -90,6 +106,11 @@ const AttendanceSettingsSchema = new mongoose.Schema(
           otGraceMins: 30,
         }),
       },
+      // NOTE the naming: the UI calls shifts.executive "Core Employees" and
+      // shifts.operator "General Employees", and departmentCategories is
+      // inverted against those labels too. services/shiftPolicy.js has the
+      // full table; read it before touching either.
+      custom: { type: CustomShiftRulesSchema, default: () => ({}) },
     },
 
     lateHalfDayPolicy: { type: LateHalfDayPolicySchema, default: () => ({}) },
@@ -137,6 +158,13 @@ AttendanceSettingsSchema.statics.getConfig = async function () {
   if (doc.lateHalfDayPolicy.autoDeductCL == null)
     doc.lateHalfDayPolicy.autoDeductCL = false;
   // Back-fill half-day thresholds to new defaults if still at old default (240)
+  if (!doc.shifts) doc.shifts = {};
+  if (!doc.shifts.custom) doc.shifts.custom = {};
+  if (doc.shifts.custom.lateGraceMins == null) doc.shifts.custom.lateGraceMins = 10;
+  if (doc.shifts.custom.halfDayThresholdMins == null)
+    doc.shifts.custom.halfDayThresholdMins = 300;
+  if (doc.shifts.custom.halfDayBasis == null) doc.shifts.custom.halfDayBasis = "net";
+  if (doc.shifts.custom.otGraceMins == null) doc.shifts.custom.otGraceMins = 30;
   if (doc.shifts?.operator?.halfDayThresholdMins === 240)
     doc.shifts.operator.halfDayThresholdMins = 390;
   if (doc.shifts?.executive?.halfDayThresholdMins === 240)

@@ -94,6 +94,43 @@ const workerWorkOrderSchema = new mongoose.Schema(
       },
     ],
 
+    // ── Payment (26 Aug 2026, explicit request: "ask it properly like for
+    // Upi or net banking or like bank transfer... ask the input as per the
+    // corresponding payment method"). All optional, same as everything else
+    // on this form — paymentMethod just decides which of the detail fields
+    // below the frontend asks for and shows; every field is stored
+    // regardless of method so switching methods on edit never loses data
+    // that was already typed in.
+    paymentMethod: {
+      type: String,
+      enum: ["", "UPI", "Bank Transfer", "Net Banking", "Cheque", "Cash"],
+      default: "",
+    },
+    paymentUpiId: { type: String, trim: true, default: "" },
+    paymentBankName: { type: String, trim: true, default: "" },
+    paymentAccountHolderName: { type: String, trim: true, default: "" },
+    paymentAccountNumber: { type: String, trim: true, default: "" },
+    paymentIfscCode: { type: String, trim: true, default: "" },
+    paymentChequeNumber: { type: String, trim: true, default: "" },
+    paymentNotes: { type: String, trim: true, default: "" },
+
+    // ── Documents — POs, signed agreements, ID proof, anything attached to
+    // this work order. Uploaded via the same Drive/Cloudinary type-routed
+    // helper (lib/driveImage.js's uploadDocumentToDrive) already used for
+    // Purchase Invoice confirmation POs, so either shape can show up here:
+    // Drive's {fileId} or Cloudinary's {publicId}.
+    documents: [
+      {
+        name: { type: String, trim: true, default: "" },
+        url: { type: String, trim: true, default: "" },
+        mimeType: { type: String, trim: true, default: "" },
+        fileId: { type: String, trim: true, default: "" },
+        publicId: { type: String, trim: true, default: "" },
+        uploadedAt: { type: Date, default: Date.now },
+        _id: false,
+      },
+    ],
+
     // ── Totals (snapshot, computed on save) ──
     subtotalBeforeGST: { type: Number, default: 0 },
     totalGST: { type: Number, default: 0 },

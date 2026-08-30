@@ -376,6 +376,34 @@ const ACTIVITY_PRIORITIES = [
   pair("urgent", "Urgent"),
 ];
 
+// A reminder's WORKING sub-state, while it is still open (status stays
+// "planned" for all four — see the comment on Activity.js's progressStage
+// field for why this is deliberately a separate field from `status` rather
+// than new values added to ACTIVITY_STATUSES). 28 Aug 2026, explicit
+// request: a reminder needed to represent "started, but not done", "on
+// hold", and "pushed to a new date", not just open-vs-closed.
+const ACTIVITY_PROGRESS_STAGES = [
+  pair("planned", "Planned"),
+  pair("in_progress", "In Progress"),
+  pair("paused", "Paused"),
+  pair("rescheduled", "Rescheduled"),
+];
+
+// How an open reminder was RESOLVED — set alongside `status` moving to
+// completed/cancelled. "Done" is the plain case; the other three exist
+// because a reminder that tracked something needing the CUSTOMER's response
+// ("get sign-off on the quotation") ends in one of these instead, and
+// collapsing them all into "done" would lose that (same 28 Aug 2026
+// request). Kept as its own field rather than repurposing the shared
+// `outcome` field, which is a differently-scoped vocabulary already used for
+// call/email/message interaction outcomes.
+const ACTIVITY_RESOLUTIONS = [
+  pair("done", "Done"),
+  pair("approved", "Approved"),
+  pair("accepted", "Accepted"),
+  pair("rejected", "Rejected"),
+];
+
 const ACTIVITY_VISIBILITIES = [
   pair("internal", "Internal"),
   pair("restricted", "Restricted"),
@@ -657,6 +685,13 @@ const SALES_JOURNEY_STAGES = [
   pair("enquiry", "Enquiry/RFQ"),
   pair("styleSample", "Style & Sample"),
   pair("costQuote", "Cost & Invoicing"),
+  // The customer's proforma invoices for this journey's account — raising
+  // one, sending it, and recording the customer's approval against their PO
+  // (25 Aug 2026, explicit request for a fourth Pipeline tab). Added AFTER
+  // costQuote so the stored codes keep lifecycle order; `poContract` stays
+  // where it is because existing journeys carry it and the enum below is
+  // what validates them.
+  pair("purchaseInvoice", "Purchase Invoice"),
   pair("poContract", "PO/Contract"),
   pair("production", "Production"),
   pair("shipment", "Shipment"),
@@ -974,7 +1009,13 @@ const SAMPLE_SAMPLING_TRANSITIONS = {
   in_progress: ["submitted"],
   submitted: ["approved", "rejected"],
   rejected: ["in_progress"],
-  approved: [],
+  // approved -> rejected (26 Aug 2026, bug fix: "Can't move sampling from
+  // 'approved' to 'rejected'"). Sales approving the sample internally is no
+  // longer the end of the road — the customer can still reject it at their
+  // own approval step (StyleSampleStage.js's SampleCustomerApprovalChat),
+  // and "Send to R&D for Rework" reuses this same reject action to route it
+  // back. Was `[]` (terminal) from when Sales' approval was the only gate.
+  approved: ["rejected"],
 };
 // How one round was judged. Deliberately separate from SAMPLE_SAMPLING_STATUSES:
 // that is where the STYLE is, this is what happened to a single sample. Round 2
@@ -1127,6 +1168,10 @@ module.exports = {
   ACTIVITY_TYPE_CODES: codes(ACTIVITY_TYPES),
   ACTIVITY_STATUS_CODES: codes(ACTIVITY_STATUSES),
   ACTIVITY_PRIORITY_CODES: codes(ACTIVITY_PRIORITIES),
+  ACTIVITY_PROGRESS_STAGES,
+  ACTIVITY_PROGRESS_STAGE_CODES: codes(ACTIVITY_PROGRESS_STAGES),
+  ACTIVITY_RESOLUTIONS,
+  ACTIVITY_RESOLUTION_CODES: codes(ACTIVITY_RESOLUTIONS),
   ACTIVITY_VISIBILITY_CODES: codes(ACTIVITY_VISIBILITIES),
   ACTIVITY_OUTCOME_CODES: codes(ACTIVITY_OUTCOMES),
   ACTIVITY_CHANNELS,

@@ -25,6 +25,8 @@ const {
   ACTIVITY_STATUS_CODES,
   ACTIVITY_PRIORITY_CODES,
   ACTIVITY_VISIBILITY_CODES,
+  ACTIVITY_PROGRESS_STAGE_CODES,
+  ACTIVITY_RESOLUTION_CODES,
 } = require("../../../constants/crm");
 
 const actorRef = () => ({
@@ -67,6 +69,22 @@ const activitySchema = new mongoose.Schema(
     dueDate: { type: Date }, // for tasks / follow-ups
     status: { type: String, enum: ACTIVITY_STATUS_CODES, default: "planned" },
     priority: { type: String, enum: ACTIVITY_PRIORITY_CODES, default: "normal" },
+    // A reminder's WORKING sub-state while status stays "planned" — Planned /
+    // In Progress / Paused / Rescheduled (28 Aug 2026, explicit request: a
+    // reminder needed to represent more than open-vs-closed). Deliberately a
+    // SEPARATE field from `status`, not new values added to it: every other
+    // "is this task still open" query across the CRM (leadNextAction.js's
+    // isOpen, the isOverdue virtual below, the Account/Journey dashboards'
+    // overdue counts) keys strictly on `status === "planned"` — folding these
+    // sub-states into `status` would make an "in progress" reminder silently
+    // vanish from all of them. Meaningful only for task/follow_up activities;
+    // left at its default for every other activityType.
+    progressStage: { type: String, enum: ACTIVITY_PROGRESS_STAGE_CODES, default: "planned" },
+    // How an open reminder was RESOLVED, set alongside `status` moving to
+    // completed/cancelled — Done / Approved / Accepted / Rejected. Kept apart
+    // from the free-text `outcome` field below, which is a differently-scoped
+    // vocabulary already used for call/email/message interaction outcomes.
+    resolution: { type: String, enum: ACTIVITY_RESOLUTION_CODES },
 
     ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
     ownerName: { type: String, trim: true },

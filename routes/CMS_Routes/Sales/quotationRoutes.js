@@ -65,13 +65,19 @@ const POST_QUOTATION_STATUSES = [
   "production", "shipping", "delivered", "completed", "cancelled",
 ];
 
-// Project quotation.status onto request.status. `rejected` / `expired` have no
-// forward projection: the request falls back to in_progress so sales can
-// re-issue, unless production already owns the request.
+// Project quotation.status onto request.status. `expired` has no forward
+// projection: the request falls back to in_progress so sales can re-issue.
+// `rejected` gets its OWN status now (26 Aug 2026, explicit request — see
+// the enum's own comment on the model) rather than sharing that same
+// in_progress fallback, which made a rejected PI indistinguishable from one
+// simply being priced normally. Neither happens once production already
+// owns the request.
 function syncRequestStatusFromQuotation(request, quotation) {
   if (POST_QUOTATION_STATUSES.includes(request.status)) return request.status;
 
-  if (quotation.status === "rejected" || quotation.status === "expired") {
+  if (quotation.status === "rejected") {
+    request.status = "rejected";
+  } else if (quotation.status === "expired") {
     request.status = "in_progress";
   } else {
     const mapped = REQUEST_STATUS_FOR_QUOTATION[quotation.status];
@@ -90,6 +96,29 @@ function isQuotationRegression(from, to) {
   const a = QUOTATION_RANK[from], b = QUOTATION_RANK[to];
   if (a == null || b == null) return false;
   return b < a;
+}
+
+// Normalizes a raw poProof payload into the shape stored on quotation.poProof.
+// Shared by approve-on-behalf and sales-approve (26 Aug 2026) — both are
+// places a PO can first get attached, and they must store it identically so
+// every screen that reads quotation.poProof sees one shape regardless of
+// which route wrote it. Returns null when the payload carries no actual file.
+function buildPoProof(raw, uploadedBy) {
+  if (!raw || !(raw.url || raw.fileId || raw.publicId)) return null;
+  return {
+    fileId: raw.fileId || undefined,
+    publicId: raw.publicId || undefined,
+    url: raw.url || undefined,
+    name: raw.name || undefined,
+    mimeType: raw.mimeType || undefined,
+    poNumber: raw.poNumber ? String(raw.poNumber).trim() : undefined,
+    poDate: raw.poDate ? new Date(raw.poDate) : undefined,
+    poValue: Number.isFinite(Number(raw.poValue)) && Number(raw.poValue) >= 0
+      ? Number(raw.poValue)
+      : undefined,
+    uploadedAt: new Date(),
+    uploadedBy: uploadedBy || undefined,
+  };
 }
 
 // The quotation popup posts the whole quotation back on every save, including a
@@ -968,7 +997,16 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const itemsWithCalculations = await Promise.all(quotationData.items.map(async (item) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
-      const unitPrice = parseFloat(item.unitPrice) || 0;
+      // The floor a price can never go below — a sales person can price up
+      // from the target, never down (26 Aug 2026, explicit request). basePrice
+      // is echoed back by the client from what it was first shown; when a
+      // caller sends none (an older client, or a manually-added line with no
+      // prior price), the submitted unitPrice IS the floor, same as if it had
+      // never moved. Enforced here, not just in the popup's UI, since the UI
+      // clamp alone would be trivially bypassable.
+      const submittedPrice = parseFloat(item.unitPrice) || 0;
+      const basePrice = item.basePrice != null ? parseFloat(item.basePrice) || 0 : submittedPrice;
+      const unitPrice = Math.max(submittedPrice, basePrice);
       const gstPercentage = getGSTPercentage(unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
@@ -978,7 +1016,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
       return {
-        ...item, gstPercentage,
+        ...item, unitPrice, basePrice, gstPercentage,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -1049,7 +1087,18 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
     request.quotationValidUntil = new Date(quotationData.validUntil);
     request.updatedAt = new Date();
- 
+    // Every OTHER route that touches a quotation's total (sales-approve,
+    // approve-on-behalf, the customer's own approve) writes this unconditionally
+    // — this one, where the total is actually first computed, never did. So a
+    // quotation created and sent — a real total, "With customer" — showed
+    // "Invoiced ₹0" until it was later approved, on both a bulk PI and a
+    // person-wise one (26 Aug 2026, explicit report: "why it is showing 0
+    // invoiced even though this request is having an genuine price"). This is
+    // the actual source of truth for the total, so it is the actual source for
+    // this field too, not a side effect of approval.
+    request.finalOrderPrice = currentQuotation.grandTotal;
+    request.totalDueAmount = Math.max(0, (currentQuotation.grandTotal || 0) - (request.totalPaidAmount || 0));
+
     // ── Sync request.items + customerInfo when flagged by frontend ───────────
     if (quotationData._syncRequestItems) {
       console.log(`[quotationRoutes] _syncRequestItems triggered — ${itemsWithCalculations.length} item(s) in quotation`);
@@ -1876,6 +1925,7 @@ async function recalcQuotationFromRequestItems(request) {
       description: "",
       quantity: item.totalQuantity || 0,
       unitPrice,
+      basePrice: unitPrice,
       discountPercentage: 0,
       discountAmount: 0,
       gstPercentage: getGSTPercentage(unitPrice),
@@ -2829,7 +2879,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     // "no customer approval, no advance payment" warning and chose to push the
     // order to production anyway. Payment is deliberately NOT a precondition
     // here: recording money is a separate flow (record-payment / verify).
-    const { notes, acknowledgeNoCustomerApproval } = req.body;
+    const { notes, acknowledgeNoCustomerApproval, poProof } = req.body;
 
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
@@ -2846,6 +2896,32 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           ? "Quotation is not approved by the customer yet. Re-send with acknowledgeNoCustomerApproval to approve on their behalf."
           : `Quotation cannot be approved from status '${quotation.status}'`,
       });
+    }
+
+    // ── THE PO-PROOF RULE ALSO APPLIES HERE (26 Aug 2026, explicit request:
+    // "this same PO-proof requirement should also apply on the
+    // customer-requests page"). `customer_approved` can be reached two ways:
+    // approve-on-behalf, which already requires a PO and leaves it on
+    // quotation.poProof — or the customer's OWN portal action
+    // (Customer_Routes/QuotationRoutes.js), which records nothing at all.
+    // Sales countersigning that second case is the same unchecked assertion
+    // the on-behalf rule exists to close, so it is required here too unless
+    // one is already on file. `approvedWithoutCustomer` is exempt on
+    // purpose — that path is an explicit acknowledgement that no customer
+    // approval exists, so there is nothing to attach proof to.
+    if (!approvedWithoutCustomer) {
+      const existingProof = quotation.poProof && (quotation.poProof.url || quotation.poProof.fileId || quotation.poProof.publicId)
+        ? quotation.poProof
+        : null;
+      const newProof = buildPoProof(poProof, req.user?.id);
+      if (!existingProof && !newProof) {
+        return res.status(400).json({
+          success: false,
+          message: "Upload the customer's PO before approving this quotation — it is the proof of what they agreed to.",
+          code: "PO_PROOF_REQUIRED",
+        });
+      }
+      if (!existingProof && newProof) quotation.poProof = newProof;
     }
 
     if (approvedWithoutCustomer) {
@@ -3430,9 +3506,20 @@ router.get('/:measurementId/po-persons-export', async (req, res) => {
 });
 
 
+// A reason is now REQUIRED (26 Aug 2026, explicit request: "there is no
+// proper handler for the rejection of the pi... upon click on the reject
+// button then it is needed to properly ask for the reason"). It used to be
+// entirely optional server-side — a bare window.prompt() on the frontend was
+// the only thing standing between an empty string and a saved rejection with
+// no reason anywhere on it. Matches the validation the customer-portal's own
+// reject route already had (Customer_Routes/QuotationRoutes.js) — sales
+// rejecting should not be held to a lower bar than a customer rejecting.
 router.post("/requests/:requestId/quotation/reject", async (req, res) => {
   try {
-    const { reason } = req.body;
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      return res.status(400).json({ success: false, message: "A reason is required to reject a PI." });
+    }
     const request = await CustomerRequest.findById(req.params.requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found" });
@@ -3441,17 +3528,25 @@ router.post("/requests/:requestId/quotation/reject", async (req, res) => {
       return res.status(400).json({ success: false, message: "A sales-approved quotation cannot be rejected — cancel the order instead" });
     }
     const wasCustomerApproved = quotation.status === 'customer_approved';
-    quotation.status = 'rejected'; quotation.updatedAt = new Date();
-    quotation.salesApproval = { approved: false, approvedAt: new Date(), approvedBy: req.user.id, notes: reason || 'Rejected by sales team' };
-    // A rejected quotation always parks the request back at in_progress so it
-    // reads the same on both portals — previously it claimed 'quotation_sent'
-    // while the quotation itself said 'rejected'.
+    const now = new Date();
+    quotation.status = 'rejected'; quotation.updatedAt = now;
+    quotation.salesApproval = { approved: false, approvedAt: now, approvedBy: req.user.id, notes: reason };
+    // Structured, so the detail view and the list can read a reason directly
+    // instead of parsing it back out of salesApproval.notes or the timeline
+    // (26 Aug 2026 — see the field's own comment on the model).
+    quotation.rejectedAt = now;
+    quotation.rejectedBy = req.user.id;
+    quotation.rejectedByName = req.user?.name || "Sales Team";
+    quotation.rejectedByRole = "sales";
+    quotation.rejectionReason = reason;
+    // request.status now becomes "rejected" itself, not "in_progress" — see
+    // syncRequestStatusFromQuotation's own comment.
     syncRequestStatusFromQuotation(request, quotation);
-    request.updatedAt = new Date();
+    request.updatedAt = now;
     request.notes = request.notes || [];
     request.notes.push({
-      text: `Quotation ${wasCustomerApproved ? "rejected after customer approval" : "rejected"} by ${req.user?.name || "Sales Team"}. Reason: ${reason || "—"}`,
-      addedBy: req.user.id, addedByModel: "SalesDepartment", createdAt: new Date(),
+      text: `Quotation ${wasCustomerApproved ? "rejected after customer approval" : "rejected"} by ${req.user?.name || "Sales Team"}. Reason: ${reason}`,
+      addedBy: req.user.id, addedByModel: "SalesDepartment", createdAt: now,
     });
     request.quotationNotifications.push({ type: 'quotation_expired', message: `Quotation rejected: ${reason}`, actionRequired: false });
     await request.save();
@@ -3528,16 +3623,16 @@ router.delete("/requests/:requestId", async (req, res) => {
 router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res) => {
   try {
     const { requestId } = req.params;
-    const { approvalNotes, customerInfoOverride, payment } = req.body;
- 
+    const { approvalNotes, customerInfoOverride, payment, poProof } = req.body;
+
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
- 
+
     if (request.quotations.length === 0)
       return res.status(400).json({ success: false, message: "No quotation found for this request" });
- 
+
     const quotation = request.quotations[0];
- 
+
     // Allow on-behalf approval only when the quotation is sent_to_customer
     if (!["sent_to_customer", "draft"].includes(quotation.status)) {
       return res.status(400).json({
@@ -3545,7 +3640,29 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
         message: `Cannot approve on behalf — quotation is already '${quotation.status}'`,
       });
     }
- 
+
+    // ── THE CUSTOMER'S PO IS THE EVIDENCE, AND IT IS REQUIRED ───────────────
+    // (25 Aug 2026, explicit request.) This route records that a customer
+    // approved a price, while acting as Sales — an assertion about someone
+    // who is not here, which until now took nothing but a click. The PO is
+    // the document the customer actually sent, so it is what makes the claim
+    // checkable afterwards.
+    //
+    // Enforced HERE and not only by disabling the button: a disabled button
+    // is a courtesy, not a control, and this endpoint is reachable without
+    // the UI. An upload with no usable address is rejected too — a record
+    // pointing at nothing is worse than an honest refusal, because it reads
+    // as evidence on every screen that lists it.
+    const poFile = buildPoProof(poProof, req.user?.id);
+    if (!poFile) {
+      return res.status(400).json({
+        success: false,
+        message: "Upload the customer's PO before recording their approval — it is the proof of what they agreed to.",
+        code: "PO_PROOF_REQUIRED",
+      });
+    }
+    quotation.poProof = poFile;
+
     // 1. Mark customer approval
     quotation.customerApproval = {
       approved:   true,
@@ -3560,7 +3677,22 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
 
     // 2. Update request status (projection of the quotation status)
     syncRequestStatusFromQuotation(request, quotation);
- 
+
+    // Every other route that moves a quotation forward (create/update,
+    // sales-approve, the customer's own approve) sets these two unconditionally
+    // — this route never did, because the only place they were ever written
+    // here was INSIDE the `payment` block below, which only runs when an
+    // advance is recorded in the same call. Once approving on behalf stopped
+    // bundling a mandatory payment (26 Aug 2026, explicit correction: "don't
+    // need to keep this approve & pay on behalf... payment will happen
+    // separately"), that block stopped running at all for the normal case,
+    // so `finalOrderPrice` was left `undefined` forever and every "Invoiced"
+    // column reading it showed ₹0 on an order with a real, approved price
+    // (26 Aug 2026, explicit report: "why it is showing 0 invoiced even
+    // though this request is having an genuine price").
+    request.finalOrderPrice = quotation.grandTotal;
+    request.totalDueAmount = Math.max(0, (quotation.grandTotal || 0) - (request.totalPaidAmount || 0));
+
     // 3. Update customer info if overrides provided
     if (customerInfoOverride) {
       if (customerInfoOverride.address)

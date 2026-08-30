@@ -17,6 +17,108 @@
 
 const mongoose = require("mongoose");
 
+// ── Sampling message defaults (28 Aug 2026) ──────────────────────────────────
+//
+// Declared as a plain object and EXPORTED, not written inline in the schema,
+// because three separate places need the exact same text:
+//   • this schema, as the field defaults for a brand-new settings document;
+//   • services/departmentNotify.service.js, which falls back to them when
+//     sending — schema defaults only materialise on document CREATION, so the
+//     settings singletons that already exist in every environment carry no
+//     samplingTemplates at all and would otherwise send nothing;
+//   • the Sales Settings page's "Reset to defaults", so what a salesperson
+//     resets to is what actually goes out.
+//
+// Formal, industry-standard wording on purpose ("messgae should be in an
+// formal way ok as like idustry standard ok" — 28 Aug 2026). Placeholders are
+// `{curly}`, matching utils/salesEmailService.js's customer templates.
+//   {product} {customer} {salesPerson} {styleCode}   — every message
+//   {approvedBy}                                     — the R&D message only
+//   {decidedBy}                                       — bomApproved / bomRejected
+//   {reason}                                          — bomRejected only
+const SAMPLING_TEMPLATE_DEFAULTS = {
+  // Step 1 — "Send to Merchandiser".
+  merchandiser: {
+    enabled: true,
+    subject: "Sampling request — BOM required for {product} ({customer})",
+    heading: "Sampling request: {product}",
+    bodyText:
+      "Dear Merchandising Team,\n\n" +
+      "The Sales team ({salesPerson}) has raised a sampling request for the product detailed below, on behalf of our customer {customer}.\n\n" +
+      "Kindly prepare and record the Bill of Materials (BOM) / raw material requirement against this product so that development can proceed. The product details and reference images are set out below for your reference.\n\n" +
+      "Please revert once the BOM has been filled in, or write back if any specification requires clarification.\n\n" +
+      "Thank you for your support.\n\n" +
+      "Regards,\n{salesPerson}\nSales Team, GRAV Clothing",
+    ctaLabel: "View Product",
+  },
+  // Step 2 — "Send Request for BOM Approval" (decided from the email itself).
+  bomApproval: {
+    enabled: true,
+    subject: "BOM approval required — {product} ({customer})",
+    heading: "BOM approval required: {product}",
+    bodyText:
+      "Dear Project Manager,\n\n" +
+      "The Sales team ({salesPerson}) requests your approval of the Bill of Materials prepared for the product detailed below, raised for our customer {customer}.\n\n" +
+      "Kindly review the raw material selection, product specification and reference images below, and record your decision using the Approve or Reject option in this email. Should you reject the request, please state the reason so that Merchandising can revise the BOM accordingly.\n\n" +
+      "Development cannot be released to R&D until this approval is received, so your prompt response would be appreciated.\n\n" +
+      "Regards,\n{salesPerson}\nSales Team, GRAV Clothing",
+    ctaLabel: "View Product",
+  },
+  // Step 3 — "Send to R&D", once Production has approved.
+  rnd: {
+    enabled: true,
+    subject: "Sampling & development — {product} ({customer})",
+    heading: "Sample development: {product}",
+    bodyText:
+      "Dear R&D Team,\n\n" +
+      "The Sales team ({salesPerson}) has released the product detailed below for sample development, on behalf of our customer {customer}. The Bill of Materials has been approved by the Project Manager{approvedBy}.\n\n" +
+      "Kindly proceed with the technical pack and the sample as per the specification and reference images below. Please revert with the tech sheet for approval once prepared.\n\n" +
+      "Thank you for your support.\n\n" +
+      "Regards,\n{salesPerson}\nSales Team, GRAV Clothing",
+    ctaLabel: "Open in R&D",
+  },
+  // Sent to BOTH Merchandising and Sales the moment the Project Manager
+  // records their decision on the BOM-approval email (28 Aug 2026, explicit
+  // request — the decision used to reach only Sales, and only as fixed
+  // system wording, not an editable template). Addressed to "Team" rather
+  // than a single role since one message now serves two different readers —
+  // the person who built the BOM, and the person who asked for the sign-off.
+  bomApproved: {
+    enabled: true,
+    subject: "BOM approved — {product} ({customer})",
+    heading: "BOM approved: {product}",
+    bodyText:
+      "Dear Team,\n\n" +
+      "This is to inform you that the Bill of Materials submitted for {product}, raised for our customer {customer}, has been approved by {decidedBy}.\n\n" +
+      "Development may now proceed — Sales will release this style to R&D for sample preparation. Please find the approved product and material details below for your reference.\n\n" +
+      "Thank you for your continued support.\n\n" +
+      "Regards,\n{salesPerson}\nSales Team, GRAV Clothing",
+    ctaLabel: "View Product",
+  },
+  bomRejected: {
+    enabled: true,
+    subject: "BOM rejected — revision required for {product} ({customer})",
+    heading: "BOM rejected: {product}",
+    bodyText:
+      "Dear Team,\n\n" +
+      "This is to inform you that the Bill of Materials submitted for {product}, raised for our customer {customer}, has been rejected by {decidedBy}.\n\n" +
+      "Reason for rejection: {reason}\n\n" +
+      "Kindly revise the raw material selection accordingly. Once updated, Sales will send the request for approval again.\n\n" +
+      "Thank you for your attention to this matter.\n\n" +
+      "Regards,\n{salesPerson}\nSales Team, GRAV Clothing",
+    ctaLabel: "View Product",
+  },
+};
+
+/** One sampling message's fields, defaulted from the object above. */
+const samplingTemplateField = (d) => ({
+  enabled:  { type: Boolean, default: d.enabled },
+  subject:  { type: String, trim: true, default: d.subject },
+  heading:  { type: String, trim: true, default: d.heading },
+  bodyText: { type: String, trim: true, default: d.bodyText },
+  ctaLabel: { type: String, trim: true, default: d.ctaLabel },
+});
+
 // ── Shared sub-schema used for every email type ───────────────────────────────
 const emailConfigSchema = new mongoose.Schema(
   {
@@ -152,6 +254,38 @@ const salesSettingsSchema = new mongoose.Schema(
       disabledEvents: { type: [String], default: [] },
     },
 
+    // ── Sampling messages — the three Style & Sample hand-offs (28 Aug 2026) ──
+    //
+    // The ONE set of department emails whose wording Sales owns, on explicit
+    // request: "in the setting page keep an feature for dynamically defining
+    // the sampling product message & template ok.. so the sales person can
+    // also modify the messgae and all templte ok.. bydefault ut an proepr
+    // template".
+    //
+    // Every OTHER department notification stays fixed system wording (see
+    // departmentNotifications above) because it reports a fact. These three are
+    // different in kind: each is a formal REQUEST addressed to another
+    // department — fill this BOM, approve this BOM, develop this style — and
+    // the phrasing of a request is exactly the sort of thing a sales team
+    // reasonably wants to set in their own house style.
+    //
+    // Prose only. The customer/product detail rows, the reference photos and
+    // the deep-link URLs are built by the route that sends the mail, not stored
+    // here — a template can change how the ask reads, never which record it
+    // points at. Placeholders are `{curly}`, the same convention
+    // utils/salesEmailService.js already uses for the customer templates; the
+    // ones each message supports are listed on its own `bodyText` default below.
+    //
+    // `enabled: false` is a per-message off switch, independent of the
+    // event-level `disabledEvents` opt-out above.
+    samplingTemplates: {
+      merchandiser: samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.merchandiser),
+      bomApproval:  samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.bomApproval),
+      rnd:          samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.rnd),
+      bomApproved:  samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.bomApproved),
+      bomRejected:  samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.bomRejected),
+    },
+
     // ── Audit ─────────────────────────────────────────────────────────────────
     updatedBy:     { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
     updatedByName: { type: String, trim: true },
@@ -159,4 +293,9 @@ const salesSettingsSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-module.exports = mongoose.models.SalesSettings || mongoose.model("SalesSettings", salesSettingsSchema);
+const SalesSettings = mongoose.models.SalesSettings || mongoose.model("SalesSettings", salesSettingsSchema);
+
+module.exports = SalesSettings;
+// Named export alongside the default so the sender and the settings page can
+// fall back to the same copy — see SAMPLING_TEMPLATE_DEFAULTS' own comment.
+module.exports.SAMPLING_TEMPLATE_DEFAULTS = SAMPLING_TEMPLATE_DEFAULTS;

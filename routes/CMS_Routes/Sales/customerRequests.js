@@ -163,7 +163,9 @@ router.get("/requests/export", async (req, res) => {
         if (startDate && endDate) {
             filter.createdAt = { $gte: new Date(startDate), $lte: new Date(endDate) };
         }
-        if (status && status !== 'all') filter.status = status;
+        // Same stage-vs-status handling as the list route below, so an export
+        // taken with a filter on screen contains the rows that were on screen.
+        applyStatusFilter(filter, status);
 
         const requests = await CustomerRequest.find(filter)
             .sort({ createdAt: -1 })
@@ -186,6 +188,48 @@ router.get("/requests/export", async (req, res) => {
     }
 });
 
+/**
+ * Apply the `status` query param to a Mongo filter.
+ *
+ * `customer_approved` is a STAGE, not a status value (24 Aug 2026 bug fix —
+ * "the filter is not working for this customer approved"). The Order Book was
+ * defaulted to `status: "quotation_customer_approved"` and came back empty,
+ * because request.status walks a ONE-WAY ladder:
+ *
+ *   quotation_draft → quotation_sent → quotation_customer_approved
+ *                                    → quotation_sales_approved → production → …
+ *
+ * (see REQUEST_STATUS_FOR_QUOTATION in quotationRoutes.js). The customer's
+ * approval advances it to `quotation_customer_approved`, and Sales'
+ * counter-approval — normally moments later — advances it again, so that
+ * value only exists inside that window. Measured against the live data: of
+ * 30 requests, 16 had a customer-approved quotation and NOT ONE still read
+ * `quotation_customer_approved`; they had all moved on to
+ * `quotation_sales_approved`.
+ *
+ * So the question "has the customer approved this?" is answered by the
+ * QUOTATION's own status, which does not get overwritten when the request
+ * moves to production — not by the request's current status. That is also
+ * what the page is asking for literally: requests "whose quotation is
+ * approved by the customer".
+ *
+ * Every other value stays an exact status match, so existing callers of this
+ * endpoint are untouched.
+ */
+const CUSTOMER_APPROVED_QUOTATION_STATES = ["customer_approved", "sales_approved"];
+function applyStatusFilter(filter, status) {
+    if (!status || status === "all") return filter;
+    if (status === "customer_approved") {
+        filter["quotations.status"] = { $in: CUSTOMER_APPROVED_QUOTATION_STATES };
+        // A cancelled order is not an approved one, whatever its quotation
+        // still says.
+        filter.status = { $ne: "cancelled" };
+        return filter;
+    }
+    filter.status = status;
+    return filter;
+}
+
 // GET all customer requests — NOW with WO completion enrichment + deadline risk
 router.get("/requests", async (req, res) => {
     try {
@@ -200,7 +244,7 @@ router.get("/requests", async (req, res) => {
                 { 'customerInfo.phone': { $regex: search, $options: "i" } }
             ];
         }
-        if (status && status !== 'all') filter.status = status;
+        applyStatusFilter(filter, status);
         if (priority && priority !== 'all') filter.priority = priority;
 
         if (dateRange && dateRange !== 'all') {
@@ -315,13 +359,25 @@ router.get("/requests", async (req, res) => {
             };
         });
 
-        const total = await CustomerRequest.countDocuments(filter);
+        // Six counts that used to be awaited ONE AT A TIME — the page paid every
+        // latency end to end (27 Aug 2026, explicit performance request). The
+        // four status tallies are now a single $group pass instead of four
+        // separate full counts, and it runs alongside the filtered total rather
+        // than after it. Same numbers, one round trip.
+        const [total, grouped] = await Promise.all([
+            CustomerRequest.countDocuments(filter),
+            CustomerRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+        ]);
+        // `stats` is deliberately UNFILTERED — it always described the whole
+        // order book, not the current filter, and the tabs that read it depend
+        // on that. Preserved exactly.
+        const byStatus = Object.fromEntries(grouped.map((g) => [g._id, g.count]));
         const stats = {
-            total: await CustomerRequest.countDocuments(),
-            pending: await CustomerRequest.countDocuments({ status: 'pending' }),
-            inProgress: await CustomerRequest.countDocuments({ status: 'in_progress' }),
-            completed: await CustomerRequest.countDocuments({ status: 'completed' }),
-            cancelled: await CustomerRequest.countDocuments({ status: 'cancelled' })
+            total: grouped.reduce((n, g) => n + g.count, 0),
+            pending: byStatus.pending || 0,
+            inProgress: byStatus.in_progress || 0,
+            completed: byStatus.completed || 0,
+            cancelled: byStatus.cancelled || 0
         };
 
         res.json({
@@ -375,7 +431,17 @@ router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
             .populate('salesPersonAssigned', 'name email phone')
-            .populate('items.stockItemId', 'name reference category images genderCategory')
+            // `variants.images` as well as `images` (27 Aug 2026). A StockItem
+            // carries photos in TWO places — a top-level `images` array and a
+            // per-variant one — and in the live register only 9 of 119 products
+            // use the top-level field while 99 have their photo on a variant
+            // alone. Selecting `images` by itself therefore returned nothing
+            // for 83% of products, which is why the Order Items list appeared
+            // to have no photos. Only the variant IMAGES are pulled, not whole
+            // variant documents, so this stays cheap.
+            // `variants.attributes` too, so the frontend can pick the photo for
+            // the SIZE/COLOUR actually ordered rather than any variant's.
+            .populate('items.stockItemId', 'name reference category images variants.images variants.attributes genderCategory')
             .select('-__v');
 
         if (!request) {
@@ -737,7 +803,13 @@ router.get("/requests/:requestId/production", async (req, res) => {
 
         const workOrders = await WorkOrder.find({ customerRequestId: requestId })
             .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
-                  + "assignedDeadline productionCompletion customerName")
+                  + "assignedDeadline productionCompletion customerName stockItemId variantId")
+            // Product identity for the style rail — a photo, the reference code
+            // and the gender, so a style can be RECOGNISED and not just named
+            // (27 Aug 2026). `variants.images` matters as much as `images`:
+            // most products in the live register carry their photo only on a
+            // variant, so selecting the top-level array alone finds nothing.
+            .populate("stockItemId", "name reference category genderCategory images variants.images")
             .lean();
 
         if (!workOrders.length) {
@@ -763,7 +835,9 @@ router.get("/requests/:requestId/shipment", async (req, res) => {
         const [workOrders, challans, enquiry] = await Promise.all([
             WorkOrder.find({ customerRequestId: requestId })
                 .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
-                      + "assignedDeadline dispatchedQuantity productionCompletion.operationCompletion")
+                      + "assignedDeadline dispatchedQuantity productionCompletion.operationCompletion "
+                      + "stockItemId variantId")
+                .populate("stockItemId", "name reference category genderCategory images variants.images")
                 .lean(),
             DispatchChallan.find({ manufacturingOrderId: requestId })
                 .select("challanNumber dispatchType totalUnits totalPersons persons.employeeName persons.employeeUIN "

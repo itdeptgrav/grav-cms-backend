@@ -154,13 +154,38 @@ test("a task whose date has passed stops delaying the ones below it", () => {
    * is to reach for the timer session, and that would reverse the decision.
    */
   assert.match(src, /ahead\.endMs > personal\.anchorMs/);
+
+  /**
+   * **Scoped to the PUSH rule, where the 17 Aug decision actually lives.**
+   *
+   * This read the whole file until 26 Aug 2026, on the reasoning that any
+   * timer read anywhere near this arithmetic would be the "improvement" that
+   * reverses the decision. That is still true of the rule below — what it must
+   * never do is count a late task's unspent hours in order to delay the work
+   * BENEATH it, which is exactly the case the owner ruled on.
+   *
+   * It is not true of the whole file. `rechainQueueFor` now reads worked time
+   * for a different question, settled separately: when a task's own dependency
+   * is finally approved, it is rescheduled from that approval with the hours
+   * it has LEFT, so the time already spent on the part that was unblocked is
+   * not handed back to it. That touches one task's own budget and pushes
+   * nothing onto anybody else — the 17 Aug decision is untouched by it.
+   *
+   * So the guard now covers `queueAheadEndMs` and `resolveAcceptanceAnchor`,
+   * and stops at the walk.
+   */
+  const anchorRule = src.slice(
+    src.indexOf("function queueAheadEndMs("),
+    src.indexOf("async function rechainQueueFor("),
+  );
+  assert.ok(anchorRule.length > 0, "the anchor rule was renamed — this guard is now blind");
   assert.equal(
-    /cowork_task_timers/.test(src),
+    /cowork_task_timers/.test(anchorRule),
     false,
     "the anchor rule started reading worked time — that reverses the 17 Aug decision that a late task stops pushing",
   );
   assert.equal(
-    /totalSeconds|workedSecs|remainingSecs/.test(src),
+    /totalSeconds|workedSecs|remainingSecs/.test(anchorRule),
     false,
     "leftover-work arithmetic appeared in the anchor rule; see the decision above",
   );

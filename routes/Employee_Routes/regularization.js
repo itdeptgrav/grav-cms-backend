@@ -225,6 +225,23 @@ router.get("/manager/history", AllEmployeeAppMiddleware, async (req, res) => {
  * approval is FINAL: it reaches hr_approved and writes attendance through the
  * one shared applier.
  */
+// Regularisations raised from the app share a history with the ones HR files
+// from the Regularisations page — same section key, so one page shows the whole
+// chain: the employee asked, the primary passed it on, the secondary approved,
+// and whether it actually reached the attendance record.
+const { recordChange } = require("../../services/changeLog");
+const auditReg = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:attendance-regularizations",
+    entity: "regularization",
+    ...entry,
+  });
+
+/** "Ramesh Kumar - 2026-08-14" */
+const regLabel = (r) =>
+  [r?.employeeName || r?.biometricId, r?.dateStr].filter(Boolean).join(" - ");
+
 router.patch(
   "/manager/:id/approve",
   AllEmployeeAppMiddleware,
@@ -293,6 +310,18 @@ router.patch(
           categoryId: "general",
         });
 
+        await auditReg(req, {
+          entityId: String(r._id),
+          entityLabel: regLabel(r),
+          action: "approve",
+          summary:
+            `${mgr?.managerName || "The primary manager"} approved ${r.employeeName}'s ` +
+            `correction for ${r.dateStr} and passed it to the secondary manager. ` +
+            `Nothing has been applied to attendance yet.`,
+          before: { status: "pending" },
+          after: { status: "manager_approved" },
+        });
+
         return res.json({
           success: true,
           data: r,
@@ -303,6 +332,7 @@ router.patch(
       // ── FINAL APPROVAL ───────────────────────────────────────────────
       // hrApprovedBy is a ref to HRDepartment — a manager's Employee _id must
       // never go in it, which is what finalApprovedBy exists for.
+      const beforeStatus = r.status;
       r.status = "hr_approved";
       r.finalApprovedBy = myId;
       r.finalApprovedByName = mgr?.managerName || "";
@@ -323,6 +353,30 @@ router.patch(
         applyRes = { applied: false, skipped: "apply_failed" };
       }
       await r.save();
+
+      // Approved and applied are two different facts. A request can be approved
+      // and reach nothing — and the employee is then told their day was
+      // corrected when it was not.
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "approve",
+        summary:
+          `${mgr?.managerName || "A manager"} gave final approval to ${r.employeeName}'s ` +
+          `correction for ${r.dateStr}` +
+          `${r.requestedStatus ? ` (requested ${r.requestedStatus})` : ""}. ` +
+          (applyRes.applied
+            ? "Applied to the attendance record."
+            : `NOTHING was applied to attendance — ${applyRes.skipped}.`) +
+          `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`,
+        before: { status: beforeStatus },
+        after: {
+          status: "hr_approved",
+          finalApprovedByName: r.finalApprovedByName,
+          appliedToAttendance: Boolean(applyRes.applied),
+          hrRemarks: r.hrRemarks || "",
+        },
+      });
 
       notify(r.employeeId, {
         title: "Request approved",
@@ -388,6 +442,7 @@ router.patch(
           decidedAt: new Date(),
         });
 
+      const beforeRejectStatus = r.status;
       r.status = "manager_rejected";
       r.rejectedBy = myId;
       r.rejectedAt = new Date();
@@ -402,6 +457,18 @@ router.patch(
         data: pushData(r),
         channelId: "general",
         categoryId: "general",
+      });
+
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "reject",
+        summary:
+          `${mgr?.managerName || "A manager"} rejected ${r.employeeName}'s correction ` +
+          `for ${r.dateStr}. The attendance record is unchanged.` +
+          `${rejectionReason ? ` Reason: ${rejectionReason}` : " No reason was given."}`,
+        before: { status: beforeRejectStatus },
+        after: { status: "manager_rejected", rejectionReason: r.rejectionReason },
       });
 
       return res.json({ success: true, data: r, message: "Request rejected" });
@@ -630,6 +697,28 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       categoryId: "general",
     });
 
+    await auditReg(req, {
+      entityId: String(doc._id),
+      entityLabel: regLabel(doc),
+      action: "create",
+      summary:
+        `${doc.employeeName} asked to correct their attendance for ${dateStr} ` +
+        `(${type}${doc.requestedStatus ? `, requesting ${doc.requestedStatus}` : ""}). ` +
+        (inTime || outTime
+          ? `Proposed ${[inTime && `in ${inTime}`, outTime && `out ${outTime}`].filter(Boolean).join(", ")}. `
+          : "") +
+        `Reason: ${String(reason).trim()}. Waiting on ${primary?.managerName || "their manager"}.`,
+      after: {
+        dateStr,
+        type,
+        requestedStatus: doc.requestedStatus || null,
+        proposedInTime: inTime || null,
+        proposedOutTime: outTime || null,
+        reason: String(reason).trim(),
+        status: "pending",
+      },
+    });
+
     return res.status(201).json({ success: true, data: doc });
   } catch (err) {
     console.error("[employee/regularizations POST]", err);
@@ -663,6 +752,18 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     r.cancelledAt = new Date();
     r.cancelReason = req.body?.reason || "";
     await r.save();
+
+    await auditReg(req, {
+      entityId: String(r._id),
+      entityLabel: regLabel(r),
+      action: "update",
+      summary:
+        `${r.employeeName} withdrew their own correction request for ${r.dateStr} ` +
+        `before any manager decided it.` +
+        `${r.cancelReason ? ` Reason: ${r.cancelReason}` : ""}`,
+      before: { status: "pending" },
+      after: { status: "cancelled", cancelReason: r.cancelReason },
+    });
 
     return res.json({ success: true, data: r, message: "Request cancelled" });
   } catch (err) {

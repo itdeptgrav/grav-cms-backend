@@ -273,6 +273,18 @@ const quotationItemSchema = new mongoose.Schema(
 
       min: 0,
     },
+    // The target price this item was raised at — set once, at request
+    // creation or when the item is first added to the PI, and never lowered
+    // after (26 Aug 2026: "they can change the price just by increase the
+    // price ok not decrease... that changed price also need to keep the
+    // record"). unitPrice - basePrice is the increase a sales person sold
+    // above target; preparedBy + updatedAt on the quotation say who and
+    // when. Falls back to unitPrice itself for quotations saved before this
+    // field existed — see quotationRoutes.js.
+    basePrice: {
+      type: Number,
+      min: 0,
+    },
     discountPercentage: {
       type: Number,
       default: 0,
@@ -544,6 +556,46 @@ const quotationSchema = new mongoose.Schema(
       },
       notes: String,
     },
+
+    /**
+     * The customer's own purchase order, as evidence that they approved this
+     * quotation (25 Aug 2026, explicit request: "at the time of asking for
+     * the Customer approve button it is needed to ask for the upload PO
+     * proof, so here the file upload will happen, or else the customer
+     * approve button will not be enabled").
+     *
+     * Sales recording an approval ON BEHALF of a customer is an assertion
+     * about someone who is not in the room. Until now that assertion had
+     * nothing behind it — approve-on-behalf wrote `customerApproval.approved
+     * = true` on a click. The PO is the document the customer actually sent,
+     * so it is the thing that makes the claim checkable later, which is why
+     * the route now refuses without it rather than merely the button being
+     * disabled.
+     *
+     * Either `fileId` (Google Drive, legacy) or `publicId`/`url`
+     * (Cloudinary, current) identifies the file — same dual shape every other
+     * upload in this app stores; see grav-clothing/lib/driveImage.js.
+     *
+     * NOT required for the two deliberate internal overrides — sales-approve
+     * with `acknowledgeNoCustomerApproval`, and mark-internal-order — because
+     * those exist precisely for orders with no customer approval to evidence.
+     */
+    poProof: {
+      fileId: { type: String, trim: true },
+      publicId: { type: String, trim: true },
+      url: { type: String, trim: true },
+      name: { type: String, trim: true },
+      mimeType: { type: String, trim: true },
+      /** What the customer calls this PO on their side, and its own date/value. */
+      poNumber: { type: String, trim: true },
+      poDate: Date,
+      poValue: { type: Number, min: 0 },
+      uploadedAt: Date,
+      uploadedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "SalesDepartment",
+      },
+    },
     salesApproval: {
       approved: {
         type: Boolean,
@@ -556,6 +608,28 @@ const quotationSchema = new mongoose.Schema(
       },
       notes: String,
     },
+
+    /**
+     * A structured rejection record (26 Aug 2026, explicit request: "there
+     * is no proper handler for the rejection of the pi... once rejected it
+     * is needed to show the rejection reason and all"). Before this, a
+     * reject only ever wrote free text into `salesApproval.notes` (a field
+     * meant for approval notes, not a rejection) and into the request's
+     * general timeline — nowhere the detail view or the list could read a
+     * reason from directly. Mirrors the existing `pmRejected*`/
+     * `pmRejectionNote` shape already on this same document (the
+     * Project-Manager-approval layer, below) rather than inventing a new
+     * convention.
+     */
+    rejectedAt: { type: Date, default: null },
+    rejectedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    rejectedByName: { type: String, trim: true, default: "" },
+    // Which side rejected it — Sales, on their own review, or the customer,
+    // via the portal. Both routes write to this same field; only the actor
+    // differs.
+    rejectedByRole: { type: String, trim: true, enum: ["sales", "customer", null], default: null },
+    rejectionReason: { type: String, trim: true, default: "" },
+
     sentToCustomerAt: Date,
     sentBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -829,6 +903,14 @@ const customerRequestSchema = new mongoose.Schema(
         "quotation_sent",
         "quotation_customer_approved",
         "quotation_sales_approved",
+        // A rejected quotation used to fall straight back to "in_progress" —
+        // indistinguishable in the list from a PI simply being priced
+        // normally (26 Aug 2026, explicit request: "in the list it is needed
+        // to show ki this Pi is rejected"). Not a dead end: sending a fresh
+        // quotation moves `status` forward again the same way it always did
+        // (see syncRequestStatusFromQuotation in quotationRoutes.js), so this
+        // clears itself the moment Sales acts on the request again.
+        "rejected",
         "production",
         "shipping",
         "delivered",
@@ -968,5 +1050,23 @@ const customerRequestSchema = new mongoose.Schema(
     toObject: { virtuals: true },
   },
 );
+
+// ── Indexes ──────────────────────────────────────────────────────────────────
+// This model had NONE until 27 Aug 2026 (explicit performance request: the
+// Order Book "takes too much time to load"). Every list query was a full
+// collection scan followed by an in-memory sort, which is invisible at 30 rows
+// and gets linearly worse for the life of the business.
+//
+// Matched to what routes/CMS_Routes/Sales/customerRequests.js actually does:
+//   • The list route filters on `status` and sorts `{ createdAt: -1 }` — a
+//     compound index in that order serves filter-then-sort in one pass, and
+//     also serves the unfiltered sort via its prefix.
+//   • `createdAt` alone covers the no-filter case cleanly.
+//   • `customerId` is the customer-scoped lookup (a customer's own orders).
+//   • `requestId` is the human-facing reference searched by exact match.
+customerRequestSchema.index({ status: 1, createdAt: -1 });
+customerRequestSchema.index({ createdAt: -1 });
+customerRequestSchema.index({ customerId: 1, createdAt: -1 });
+customerRequestSchema.index({ requestId: 1 });
 
 module.exports = mongoose.model("CustomerRequest", customerRequestSchema);

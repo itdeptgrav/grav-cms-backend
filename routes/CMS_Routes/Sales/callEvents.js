@@ -99,6 +99,82 @@ router.get("/", salesAuth, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/cms/crm/call-events/recent?page=&limit=&search=&status=&direction=&days=
+ *
+ * → { success, events[], page, limit, total, totalPages }
+ *
+ * The org-wide call log — every call ANY sales phone has reported, not one
+ * contact's history (26 Aug 2026, explicit request: "keep the log of this
+ * each and every call... properly showcase over here... so that it seems
+ * like proper tracking of the sales person call will gonna happen"). Both
+ * routes above need an accountId/customerId/leadId; this is deliberately the
+ * one that doesn't — "each and every call" means the whole desk, not one
+ * customer's numbers. Same row shape as call-recordings' list (transcript,
+ * both summaries, notes) so a row can be expanded into the same detail a
+ * scoped view would show, without a second round trip per call.
+ *
+ * `status` reads the same three outcomes the stats endpoint below produces —
+ * received / rejected / missed — never inferred from duration, only from the
+ * `received`/`rejected` flags the device itself reported.
+ */
+router.get("/recent", salesAuth, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+    const { search, status, direction } = req.query;
+
+    const filter = { startTime: { $gte: Date.now() - days * 86400000 } };
+    if (direction && ["INCOMING", "OUTGOING"].includes(direction)) filter.direction = direction;
+    if (status === "received") filter.received = true;
+    else if (status === "rejected") filter.rejected = true;
+    else if (status === "missed") { filter.received = false; filter.rejected = false; }
+    if (search && search.trim()) {
+      const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ contactName: re }, { phoneNumber: re }];
+    }
+
+    const [rows, total] = await Promise.all([
+      CallEvent.find(filter).sort({ startTime: -1, createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      CallEvent.countDocuments(filter),
+    ]);
+
+    const events = rows.map((r) => ({
+      _id: r._id,
+      phoneNumber: r.phoneNumber,
+      contactName: r.contactName,
+      direction: r.direction,
+      callType: r.callType,
+      received: r.received,
+      rejected: r.rejected,
+      startTime: r.startTime,
+      durationMillis: Math.round((r.durationSec || 0) * 1000),
+      hasRecording: Boolean(r.driveFileId),
+      audioUrl: r.driveFileId ? `/api/cms/crm/call-recordings/${r._id}/audio` : null,
+      transcription: r.transcription,
+      deviceSummary: r.summary,
+      aiSummary: r.aiSummary,
+      aiSummaryAt: r.aiSummaryAt,
+      notes: r.notes,
+      audioFileName: r.audioFileName,
+      createdAt: r.createdAt,
+    }));
+
+    return res.json({
+      success: true,
+      events,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (error) {
+    console.error("[crm/call-events] recent failed:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /** Every calendar day (IST) in the trailing `days`-day window, oldest first. */
 function trailingDayKeys(days) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;

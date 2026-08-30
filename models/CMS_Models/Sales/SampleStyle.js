@@ -43,6 +43,34 @@ const imageSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// One raw item picked for this style, variant-wise — the Merchandiser's
+// materials pick AND R&D's sample consumption both use this exact shape
+// (24 Aug 2026), so the same sync-onto-the-stock-item logic handles either
+// source without a case-by-case translation.
+const rawItemPickSchema = new mongoose.Schema(
+  {
+    rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
+    rawItemName: { type: String, trim: true },
+    rawItemSku: { type: String, trim: true },
+    // The RAW ITEM's own physical variant (colour/vendor combination) —
+    // distinct from productVariantId below.
+    variantId: { type: mongoose.Schema.Types.ObjectId },
+    variantCombination: [{ type: String, trim: true }],
+    // Which variant of the LINKED STOCK ITEM this row is for — absent means
+    // "every variant" (a trim like a button is usually the same across
+    // sizes; a fabric quantity usually is not, which is exactly why this
+    // exists instead of one flat list for the whole product).
+    productVariantId: { type: mongoose.Schema.Types.ObjectId },
+    productVariantLabel: { type: String, trim: true },
+    // Optional — the Merchandiser is picking WHAT'S needed, not always
+    // measuring HOW MUCH yet; R&D fills the real consumption later. Present
+    // when they do know it.
+    quantity: { type: Number, min: 0 },
+    unit: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
 // A revision bounced back from a Sales gate — the note + who/when.
 //
 // `roundId` says WHICH round was rejected. Without it the revisions and the
@@ -204,6 +232,21 @@ const sampleStyleSchema = new mongoose.Schema(
       // currently wears, which is exactly the kind of context that shapes a
       // tech pack.
       existingUniform: { type: String, trim: true },
+      // The rest of what the enquiry row knows, snapshotted so R&D reads the
+      // WHOLE product rather than the subset this brief used to carry
+      // (24 Aug 2026, explicit request). Mongoose strips anything not
+      // declared here, so briefFromProduct's additions have to be mirrored.
+      logo: { type: Boolean, default: false },
+      embroidery: { type: Boolean, default: false },
+      printing: { type: Boolean, default: false },
+      stockItemReference: { type: String, trim: true },
+      /** Salesperson-defined spec — see Enquiry's products[].customSpecs. */
+      customSpecs: [
+        new mongoose.Schema(
+          { label: { type: String, trim: true }, value: { type: String, trim: true, default: "" } },
+          { _id: false },
+        ),
+      ],
       images: [imageSchema],
     },
 
@@ -211,9 +254,71 @@ const sampleStyleSchema = new mongoose.Schema(
     // tech sheet until these are selected.
     materials: {
       status: { type: String, enum: SAMPLE_MATERIALS_STATUS_CODES, default: "pending" },
+      // Free-text "Item — Vendor" rows — the ORIGINAL shape, kept for the
+      // history already recorded this way and for callers that only need a
+      // name to show, not a real BOM entry.
       items: [{ type: String, trim: true }],
+      // The structured, variant-wise sibling of `items` above (24 Aug 2026,
+      // explicit request — "the raw item are goona fill as per the variant
+      // wise... keep the consumption input... optional"). This is what syncs
+      // onto the linked stock item's BOM once approved, and what R&D's own
+      // sample-submission step reads to auto-suggest what's already known —
+      // `items` alone (a name and a vendor, no real rawItemId/variantId/
+      // quantity) can't drive either.
+      rawItems: [rawItemPickSchema],
       selectedBy: actorRef(),
       selectedAt: { type: Date },
+      // Optional target date Sales sets when routing to the Merchandiser
+      // (28 Aug 2026, explicit request: "an input need to ask for the sales
+      // while click for the sent to merchantiser... do u want to set deadline
+      // ok.. so this is optional"). Attached to the hand-off email when
+      // present; nothing enforces it — a target the Merchandiser is told, not
+      // a gate that blocks anything.
+      deadline: { type: Date },
+    },
+
+    // ── Project Manager's BOM sign-off — the gate between Materials and
+    // R&D (28 Aug 2026, explicit request: "the second step will be Take
+    // Approval From Production manager... and once approved, then only the
+    // next step means the send to R&D button will goona enable").
+    //
+    // NOT A NEW `stage`. The style stays at `materials` throughout; this is a
+    // sub-state of it. Adding a fourth stage code would have rippled into the
+    // R&D app's own queries, the kanban columns, STAGE_ORDER's backward-move
+    // arithmetic and every existing row's meaning — for a gate that only ever
+    // decides whether ONE button is enabled.
+    //
+    // The decision is made from the emailed request itself, not in the CMS
+    // (same request: "on that mail they need to approve/reject the request...
+    // don't keep manual button here for production manager approval"), so
+    // there is no logged-in actor to record — `decidedByEmail` is whichever
+    // recipient opened the link, and `decidedByName` their Access Control
+    // name. See routes/CMS_Routes/Sales/sampleBomApproval.js.
+    bomApproval: {
+      status: { type: String, enum: ["none", "pending", "approved", "rejected"], default: "none", index: true },
+      /**
+       * Rotated on every request, and the ONLY thing the emailed decision link
+       * carries besides the style id. Rotating it is what expires the previous
+       * round's email: a stale "Approve" link from a superseded request
+       * resolves to a token that no longer matches and is refused, so an
+       * approval can never be replayed against a BOM that has since changed.
+       */
+      token: { type: String, trim: true, select: false },
+      round: { type: Number, default: 0 },
+      requestedAt: { type: Date },
+      requestedBy: actorRef(),
+      /** Who the request went to, captured at send time so Sales can see it. */
+      requestedTo: [{ type: String, trim: true }],
+      decidedAt: { type: Date },
+      decidedByName: { type: String, trim: true },
+      decidedByEmail: { type: String, trim: true },
+      /** Required on a rejection — what Merchandising has to fix. */
+      note: { type: String, trim: true },
+      // Optional target date Sales sets when requesting the approval — same
+      // reasoning and same "informational, not enforced" nature as
+      // materials.deadline above. Cleared and re-set on every new request
+      // (including "Send Approval Again"), alongside token/round/requestedAt.
+      deadline: { type: Date },
     },
 
     // Staged Merchandiser/PM submissions awaiting a Sales decision — mirrors
@@ -225,6 +330,13 @@ const sampleStyleSchema = new mongoose.Schema(
       new mongoose.Schema(
         {
           items: [{ type: String, trim: true }],
+          rawItems: [rawItemPickSchema],
+          // Explicit "no materials needed for this style", not just an
+          // empty form nobody filled in yet (26 Aug 2026, "the sales person
+          // can also skip this part") — carried through so approving this
+          // entry later still resolves materials as done, not "still
+          // pending", even though items is empty either way.
+          skip: { type: Boolean, default: false },
           status: { type: String, trim: true, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
           submittedBy: actorRef(),
           submittedAt: { type: Date, default: Date.now },
@@ -279,6 +391,23 @@ const sampleStyleSchema = new mongoose.Schema(
           notes: { type: String, trim: true, default: "" },
         },
       ],
+      // The operations (process steps + time) R&D actually ran making this
+      // sample — raised alongside consumptionRawItems (24 Aug 2026, explicit
+      // request), same shape as StockItem.operations so it can be synced
+      // straight onto the product on approval. Deliberately NOT required —
+      // R&D may not always time every step, and the raw-item evidence above
+      // is what approval actually gates on.
+      operations: [
+        {
+          type: { type: String, trim: true },
+          operationCode: { type: String, trim: true, default: "" },
+          machine: { type: String, trim: true },
+          machineType: { type: String, trim: true },
+          minutes: { type: Number, min: 0, default: 0 },
+          seconds: { type: Number, min: 0, default: 0 },
+          totalSeconds: { type: Number, min: 0, default: 0 },
+        },
+      ],
       photos: [imageSchema],
       // R&D ↔ Sales conversation about THIS sample specifically — not the
       // enquiry-level product chat (that's about the whole product, not
@@ -323,6 +452,43 @@ const sampleStyleSchema = new mongoose.Schema(
       stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
       customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
       workOrderIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder" }],
+      // HOW MANY OF EACH VARIANT TO MAKE — SET BY SALES, READ BY R&D
+      // (26 Aug 2026, explicit request: "Sales person will set the qty of the
+      // corresponding product-variant wise... once after approved the techpack
+      // (send by the r&d team) so that the r&d team can't set the qty as per
+      // there own ok, only they can see the qty").
+      //
+      // This is new state, not a rename. Until now the order quantities were
+      // never persisted anywhere on the style at all: R&D typed them into
+      // local React state in the Quantities step of its production wizard and
+      // POSTed them straight through to the CustomerRequest and the work
+      // orders. Nothing recorded what was ordered, or who decided it — so
+      // there was nothing for R&D to "only see", and no way for Sales to say
+      // it first.
+      //
+      // Order quantity is a COMMERCIAL fact (what the customer is buying),
+      // which is why it belongs to Sales, and why it is gated on the tech
+      // sheet being approved: before that the spec can still change, so a
+      // quantity against a variant list that may not survive is premature.
+      orderVariants: [
+        new mongoose.Schema(
+          {
+            // The StockItem variant this quantity is against. Not a ref: the
+            // variants are subdocuments of StockItem, so this is their _id
+            // within that document, resolved through the parent.
+            variantId: { type: mongoose.Schema.Types.ObjectId, required: true },
+            // Denormalised so the figure stays readable if the variant is
+            // later renamed or removed from the register — same reasoning as
+            // rawItemName on the materials picks above.
+            variantLabel: { type: String, trim: true, default: "" },
+            sku: { type: String, trim: true, default: "" },
+            quantity: { type: Number, required: true, min: 0 },
+          },
+          { _id: false },
+        ),
+      ],
+      orderVariantsSetAt: { type: Date, default: null },
+      orderVariantsSetBy: actorRef(),
       // The audit trail R&D reads back — "customer created", "product
       // registered", "order request raised", "approved, N work orders
       // created" — exactly what the pipeline actually did, in order.
@@ -339,6 +505,57 @@ const sampleStyleSchema = new mongoose.Schema(
 
     // Overall lifecycle of the style within sampling.
     status: { type: String, enum: SAMPLE_STYLE_STATUS_CODES, default: "active", index: true },
+
+    // Set when the CUSTOMER rejects this SAMPLE — denormalized here so R&D's
+    // existing style view/history renderer surfaces it with no new UI code
+    // (26 Aug 2026). Cleared back to false only by a fresh customer-approval
+    // decision recording approved:true for the same product.
+    customerRejected: { type: Boolean, default: false },
+
+    // The customer's verdict on the finished sample, asked as a chat-style
+    // prompt in Style & Sample right after Sales' own internal approval
+    // (26 Aug 2026, explicit request — replacing the earlier Cost &
+    // Invoicing customer-approval step, which "is just handling only one
+    // thing that is the customer approval" and moved here since the
+    // decision belongs with the sample, before any pricing happens). Sales
+    // records the customer's answer on their behalf — there is no customer
+    // login here to do it themselves, same reasoning as costingLifecycle's
+    // customerApprovalLog. Cache fields for quick reads; `log` is
+    // append-only, mirroring that same pattern, so a changed mind never
+    // erases what was said before.
+    customerApproval: {
+      approved: { type: Boolean, default: null },
+      decidedAt: { type: Date, default: null },
+      decidedBy: actorRef(),
+      note: { type: String, trim: true, default: "" },
+      log: [
+        {
+          approved: { type: Boolean, required: true },
+          decidedAt: { type: Date, default: Date.now },
+          decidedBy: actorRef(),
+          note: { type: String, trim: true, default: "" },
+          _id: false,
+        },
+      ],
+      // The WhatsApp side of this same decision (26 Aug 2026, "the approval
+      // request need to auto sent to that customer ok in whatsapp") — a
+      // template message with Approve/Reject quick-reply buttons. messageId
+      // is Meta's own wamid for the sent message; the webhook's incoming
+      // button-tap payload carries that same id back as `context.id`, which
+      // is how a reply gets matched to THIS style with no ambiguity even if
+      // several approval requests are in flight for the same customer at
+      // once. status tracks Meta's own delivery callbacks (sent → delivered
+      // → read), separate from approved/decidedAt above, which only ever
+      // reflects an actual button tap.
+      whatsapp: {
+        sentAt: { type: Date, default: null },
+        phone: { type: String, trim: true, default: "" },
+        messageId: { type: String, trim: true, default: "" },
+        status: { type: String, enum: ["sent", "delivered", "read", "failed", null], default: null },
+        statusUpdatedAt: { type: Date, default: null },
+        error: { type: String, trim: true, default: "" },
+      },
+    },
 
     createdBy: actorRef(),
     updatedBy: actorRef(),

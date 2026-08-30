@@ -17,9 +17,11 @@
 "use strict";
 
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../../models/CMS_Models/Sales/Account");
+const Customer = require("../../../models/Customer_Models/Customer");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Employee = require("../../../models/Employee");
@@ -34,6 +36,8 @@ const { canSeeCost, costingTier, visibleParts, reduceCostLedger } = require("../
 const { costingTotals } = require("../../../services/costingTotals");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+const CustomerEmailService = require("../../../services/CustomerEmailService");
 
 // Same three roles CoWork's own documents used — kept as the vocabulary for
 // "who can see/edit this sheet" now that the sheet itself is native.
@@ -55,6 +59,60 @@ async function customerNameFor(enquiry) {
   if (!enquiry?.accountId) return "—";
   const acc = await Account.findById(enquiry.accountId).select("displayName companyName").lean();
   return acc?.displayName || acc?.companyName || "—";
+}
+
+// The account's own contact email — for the per-product costing approval
+// email (24 Aug 2026). Falls back to nothing rather than guessing; the
+// send-to-customer route refuses to fire without a real address.
+async function customerEmailFor(enquiry) {
+  if (!enquiry?.accountId) return null;
+  const acc = await Account.findById(enquiry.accountId).select("primaryEmail").lean();
+  return acc?.primaryEmail || null;
+}
+
+// ── Per-product customer approval token (24 Aug 2026) ───────────────────────
+// Same shape as Cowork's external-share tokens (services/shareInvite.service
+// .js) — a random value whose SHA-256 hash alone is ever stored, so a
+// database leak yields no usable link — Mongo-backed here since costingLifecycle
+// already lives on this document. 7-day lifetime, single-use: the hash is
+// cleared the moment a decision is recorded through it (see the decide route).
+const COSTING_APPROVAL_TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+function hashApprovalToken(plain) {
+  return crypto.createHash("sha256").update(String(plain)).digest("hex");
+}
+
+// Resolve a plaintext token back to the enquiry + the ONE costingLifecycle
+// entry it belongs to. Returns null on anything not live: unknown, expired,
+// or already redeemed (hash cleared on decide).
+async function resolveCostingApprovalToken(token) {
+  const hash = hashApprovalToken(token);
+  const enquiry = await Enquiry.findOne({ "costingLifecycle.customerApprovalTokenHash": hash, isActive: true });
+  if (!enquiry) return null;
+  const entry = (enquiry.costingLifecycle || []).find((c) => c.customerApprovalTokenHash === hash);
+  if (!entry) return null;
+  if (!entry.customerApprovalTokenExpiresAt || entry.customerApprovalTokenExpiresAt < new Date()) return null;
+  return { enquiry, entry };
+}
+
+// Once the customer approves, the price they just confirmed is what the
+// product actually sells at — written onto EVERY variant of the linked
+// stock item (24 Aug 2026, explicit request: "the corresponding product
+// price will be filled in the corresponding product stock item variant
+// price... for all variant"). Silently a no-op if nothing's registered yet
+// for this product — the approval itself is still real either way.
+async function syncApprovedPriceToStockItem(enquiry, productName, price) {
+  if (!(price > 0)) return;
+  const product = (enquiry.products || []).find((p) => p.product === productName);
+  if (!product?.stockItemId) return;
+  try {
+    const stockItem = await StockItem.findById(product.stockItemId);
+    if (!stockItem) return;
+    for (const v of stockItem.variants || []) v.salesPrice = price;
+    stockItem.baseSalesPrice = price;
+    await stockItem.save();
+  } catch (err) {
+    console.error("[enquiries] price → stock item sync failed:", err.message);
+  }
 }
 
 // The margin policy. Hardcoded for now and deliberately server-side: the floor
@@ -138,19 +196,33 @@ function leadEstimateSnapshot(lead) {
   return snap;
 }
 
-// Seed enquiry products from the lead's structured requirement. `requirementItems`
-// is the [{ product, quantity }] captured at lead stage; `productInterest` is the
-// flat name list — fall back to it when items weren't structured.
-function productsFromLead(lead) {
-  if (!lead) return [];
+// The lead's requirement, as ONE readable line for the enquiry's summary.
+//
+// It used to be seeded straight into `enquiry.products[]` (26 Aug 2026,
+// explicit request to stop: "the product requirement form which is asking in
+// the lead shouldn't be auto create as an enquiry product in the pipeline
+// section... that just need to ask for a record"). What a lead captured is a
+// stated interest — a name and a rough quantity, typed before anyone knew
+// whether it maps to a registered product. A pipeline product row is a
+// different, heavier thing: it carries the full spec, the register link, and
+// the SampleStyle raised from it. Promoting one to the other automatically
+// created half-formed rows the salesperson then had to correct or delete.
+//
+// So the requirement stays on the Lead as the record it always was, and it is
+// carried here only as TEXT the salesperson reads while registering the real
+// products themselves.
+function requirementSummaryFromLead(lead) {
+  if (!lead) return "";
   const items = Array.isArray(lead.requirementItems) ? lead.requirementItems : [];
-  if (items.length) {
-    return items
-      .filter((it) => it && String(it.product || "").trim())
-      .map((it) => ({ product: String(it.product).trim(), quantity: it.quantity != null ? Number(it.quantity) : undefined }));
-  }
+  const fromItems = items
+    .filter((it) => it && String(it.product || "").trim())
+    .map((it) => {
+      const name = String(it.product).trim();
+      return it.quantity != null ? `${name} (${Number(it.quantity)} pcs)` : name;
+    });
+  if (fromItems.length) return fromItems.join(", ");
   const names = Array.isArray(lead.productInterest) ? lead.productInterest : [];
-  return names.filter((n) => String(n || "").trim()).map((n) => ({ product: String(n).trim() }));
+  return names.map((n) => String(n || "").trim()).filter(Boolean).join(", ");
 }
 
 // Free-text spec fields carried through verbatim (trimmed). Kept in one list so
@@ -274,6 +346,68 @@ function summarizeCostingSheetChange(before, after) {
   return parts.join(" · ");
 }
 
+/**
+ * Undo `enquiry.products[]`'s own product→customer auto-link (see the PATCH
+ * handler below) for products that no longer belong on the enquiry — a row
+ * removed outright, or unpicked back to free text (26 Aug 2026, explicit
+ * request: "if the sales person remove the product from here means the
+ * linked product id get removed form that customer ok, means that product
+ * id need to dis link form that customer").
+ *
+ * Two safety checks, both required, so this can never remove a link it
+ * didn't create:
+ *
+ *  1. ONLY entries this auto-link mechanism itself created. A salesperson can
+ *     independently assign a product to a customer from the Customer detail
+ *     page's own Products tab (POST /:id/assign-items) — those entries carry
+ *     no `notes`, only an enquiry-created one does (`"From <ref>'s
+ *     requirement."`, set below). Removing a product from an enquiry must
+ *     never silently undo a link someone set up by hand, somewhere else.
+ *
+ *  2. ONLY when no OTHER active enquiry for the same account still
+ *     references the stock item. The same product can legitimately be asked
+ *     for across more than one enquiry for a repeat customer; the link
+ *     belongs to the RELATIONSHIP; removing it from one enquiry must not
+ *     sever a need a different, still-open enquiry has for it.
+ *
+ * Best-effort and never awaited by its caller for the same reason the
+ * forward link isn't: a product row saving must never fail on this.
+ */
+async function unlinkRemovedEnquiryProducts({ accountId, removedStockItemIds, excludeEnquiryId }) {
+  if (!accountId || !removedStockItemIds?.length) return;
+  try {
+    const account = await Account.findById(accountId).select("linkedCustomer");
+    if (!account?.linkedCustomer) return;
+
+    const stillNeeded = new Set(
+      (
+        await Enquiry.find({
+          accountId,
+          isActive: true,
+          _id: { $ne: excludeEnquiryId },
+          "products.stockItemId": { $in: removedStockItemIds },
+        })
+          .select("products.stockItemId")
+          .lean()
+      ).flatMap((e) => (e.products || []).map((p) => p.stockItemId && String(p.stockItemId))),
+    );
+
+    const toUnlink = removedStockItemIds.filter((id) => !stillNeeded.has(String(id)));
+    if (!toUnlink.length) return;
+
+    const customer = await Customer.findById(account.linkedCustomer).select("assignedStockItems");
+    if (!customer) return;
+    const unlinkSet = new Set(toUnlink.map(String));
+    const before = customer.assignedStockItems.length;
+    customer.assignedStockItems = customer.assignedStockItems.filter(
+      (a) => !(a.stockItemId && unlinkSet.has(String(a.stockItemId)) && /^From .+'s requirement\.$/.test(a.notes || "")),
+    );
+    if (customer.assignedStockItems.length !== before) await customer.save();
+  } catch (e) {
+    console.error("[enquiries] product unlink failed:", e.message);
+  }
+}
+
 // A client-supplied products array, cleaned to what the schema accepts: drop
 // blank rows, coerce quantity to a non-negative number, validate the gender
 // enum, and carry the garment-spec fields through trimmed.
@@ -286,10 +420,16 @@ function sanitizeProducts(input) {
       // A picked row carries its master id; a typed one does not, and both are
       // valid. Validated rather than trusted — this arrives from the client.
       const sid = String(p.stockItemId || "").trim();
+      const validSid = mongoose.Types.ObjectId.isValid(sid) ? sid : undefined;
       const out = {
         product: String(p.product).trim(),
-        stockItemId: mongoose.Types.ObjectId.isValid(sid) ? sid : undefined,
+        stockItemId: validSid,
         stockItemReference: String(p.stockItemReference || "").trim() || undefined,
+        // Only meaningful alongside a real stockItemId (26 Aug 2026, bug fix)
+        // — see the model's own comment on this field. Forced false whenever
+        // there is no id at all, so a stray true can never survive a save
+        // with nothing for it to describe.
+        pickedFromRegister: validSid ? Boolean(p.pickedFromRegister) : false,
         quantity: Number.isFinite(qty) && qty >= 0 ? qty : undefined,
         gender: GARMENT_GENDER_CODES.includes(p.gender) ? p.gender : undefined,
         logo: Boolean(p.logo),
@@ -313,6 +453,21 @@ function sanitizeProducts(input) {
             url: String(im.url || "").trim() || undefined,
           }));
         if (imgs.length) out.images = imgs;
+      }
+      // Salesperson-defined specification (label + answer). A row with no
+      // label is dropped — an answer to an unnamed question tells R&D
+      // nothing, and it is the label that makes this readable downstream.
+      // Capped at 20 so a runaway client cannot grow the subdocument without
+      // bound; labels trimmed to a sane length for the same reason.
+      if (Array.isArray(p.customSpecs)) {
+        const specs = p.customSpecs
+          .filter((s) => s && String(s.label || "").trim())
+          .slice(0, 20)
+          .map((s) => ({
+            label: String(s.label).trim().slice(0, 80),
+            value: String(s.value == null ? "" : s.value).trim().slice(0, 500),
+          }));
+        if (specs.length) out.customSpecs = specs;
       }
       return out;
     });
@@ -405,8 +560,16 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         sourceLeadId: lead?._id || undefined,
         title: journey.name,
         source: enquirySourceFromLead(lead),
-        summary: lead?.requirements || undefined,
-        products: productsFromLead(lead),
+        // The lead's own requirement note, plus what it said it wanted — kept
+        // as readable text so nothing the lead established is lost now that
+        // products are no longer auto-created from it (see
+        // requirementSummaryFromLead).
+        summary: [lead?.requirements, requirementSummaryFromLead(lead) && `Requirement from lead: ${requirementSummaryFromLead(lead)}`]
+          .filter(Boolean).join("\n\n") || undefined,
+        // Deliberately empty — the salesperson registers the real products in
+        // the Enquiry stage, where the register link and full spec are
+        // captured. See requirementSummaryFromLead above.
+        products: [],
         // Seed our indicative estimate from the lead's researched unit price —
         // a starting point the salesperson refines. The customer's target is
         // left blank for them to capture.
@@ -710,6 +873,54 @@ router.patch("/:id", salesAuth, async (req, res) => {
 
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    // A product-wise requirement row picked from the item master carries that
+    // product's stockItemId — so the moment it's saved onto this enquiry, it
+    // is a product the account is asking for, and belongs on that account's
+    // linked (portal) customer the same way Production registration links one
+    // (see routes/CMS_Routes/Sales/sampleStyles.js's POST /:id/production/
+    // stock-item) (24 Aug 2026, explicit request: "we are storing the
+    // product id in the customer schema... here also need to do the same").
+    // Non-blocking — a product row saving must never fail on this.
+    //
+    // The REVERSE also has to happen (26 Aug 2026, explicit request): a row
+    // deleted outright, or unpicked back to free text via the register field's
+    // own ✕ (both arrive here as `products` simply no longer containing that
+    // stockItemId — this route has no separate "delete" signal), removes the
+    // customer link the same way. `before` (captured pre-mutation, above)
+    // is what makes the diff possible.
+    if ("products" in body && enquiry.accountId) {
+      const beforeIds = new Set((before.products || []).filter((p) => p.stockItemId).map((p) => String(p.stockItemId)));
+      const afterIds = new Set((enquiry.products || []).filter((p) => p.stockItemId).map((p) => String(p.stockItemId)));
+      const toAddIds = [...afterIds].filter((id) => !beforeIds.has(id));
+      const removedIds = [...beforeIds].filter((id) => !afterIds.has(id));
+
+      if (toAddIds.length) {
+        (async () => {
+          const account = await Account.findById(enquiry.accountId).select("linkedCustomer");
+          if (!account?.linkedCustomer) return;
+          const customer = await Customer.findById(account.linkedCustomer).select("assignedStockItems");
+          if (!customer) return;
+          const already = new Set((customer.assignedStockItems || []).map((a) => String(a.stockItemId)));
+          const addSet = new Set(toAddIds);
+          const toAdd = enquiry.products.filter((p) => p.stockItemId && addSet.has(String(p.stockItemId)) && !already.has(String(p.stockItemId)));
+          if (!toAdd.length) return;
+          for (const p of toAdd) {
+            customer.assignedStockItems.push({
+              stockItemId: p.stockItemId, stockItemName: p.product, stockItemReference: p.stockItemReference,
+              assignedBy: req.user?.id, assignedByName: req.user?.name,
+              notes: `From ${enquiry.enquiryId}'s requirement.`,
+            });
+          }
+          await customer.save();
+        })().catch((e) => console.error("[enquiries] product→customer link failed:", e.message));
+      }
+
+      if (removedIds.length) {
+        unlinkRemovedEnquiryProducts({ accountId: enquiry.accountId, removedStockItemIds: removedIds, excludeEnquiryId: enquiry._id })
+          .catch((e) => console.error("[enquiries] product unlink (PATCH) failed:", e.message));
+      }
+    }
 
     // Stage-progressive deal value: the enquiry's opportunity size is the
     // INDICATIVE value at this stage, so mirror it onto the journey's
@@ -1015,6 +1226,77 @@ async function seedMaterialsFromApprovedSample(enquiryId, productName) {
       };
     });
 }
+/**
+ * The product's linked StockItem's raw items and operations, read RIGHT NOW
+ * and shaped as costing-sheet rows — the "directly connected" half of the
+ * costing rebuild (24 Aug 2026, explicit request: "wherever the raw items,
+ * operations are defined, so basically as the product is also created in the
+ * stock item and linked to here so if anyone change the raw items or like
+ * operations and all then it will also change over here also... as it is
+ * directly connected"). Deliberately NOT a live join at read-time — a
+ * costing sheet keeps storing its own snapshot rows exactly as it always
+ * has, the same "auto suggest, then fill/adjust, then overwrite" shape
+ * already used for Materials → R&D consumption (sampleStyles.js's
+ * `syncMaterialsRawItems`) — the caller pulls this explicitly (see the
+ * stock-item-sync route below) and merges it into the sheet before saving,
+ * so a sheet raised before a StockItem existed, or for a product with no
+ * link at all, keeps working completely unchanged.
+ *
+ * A StockItem's rawItems are per-VARIANT; a costing sheet is per-PRODUCT, so
+ * rows are deduped across variants by raw item + variant combination — a
+ * lining fabric common to every size contributes one row, not one per size.
+ */
+async function stockItemCostingRows(stockItemId) {
+  const stockItem = await StockItem.findById(stockItemId).select("variants operations").lean();
+  if (!stockItem) return { materials: [], operations: [] };
+
+  const rawIds = new Set();
+  for (const v of stockItem.variants || []) {
+    for (const r of v.rawItems || []) if (r.rawItemId) rawIds.add(String(r.rawItemId));
+  }
+  const catalog = rawIds.size
+    ? await RawItem.find({ _id: { $in: [...rawIds] } }).select("category customCategory").lean()
+    : [];
+  const categoryById = new Map(catalog.map((it) => [String(it._id), it.customCategory || it.category || ""]));
+
+  const seen = new Map();
+  for (const v of stockItem.variants || []) {
+    for (const r of v.rawItems || []) {
+      if (!r.rawItemName) continue;
+      const key = `${r.rawItemId || r.rawItemName}::${(r.variantCombination || []).join("/")}`;
+      if (seen.has(key)) continue;
+      seen.set(key, {
+        category: costingCategoryFor(categoryById.get(String(r.rawItemId)) || ""),
+        item: r.rawItemName,
+        rawItemId: r.rawItemId || null,
+        vendor: (r.variantCombination || []).filter(Boolean).join(" / "),
+        unitCost: "",
+        unit: r.unit || "",
+        consumption: r.quantity != null ? String(r.quantity) : "",
+        allowancePercent: r.allowancePercent != null ? String(r.allowancePercent) : "",
+      });
+    }
+  }
+
+  // sam (minutes) × rate (cost/min) is how the costing model recomputes an
+  // operation's per-piece cost (costingModel.js's `opOf`) — deriving rate as
+  // operatorCost ÷ sam here means that multiplication reproduces the exact
+  // operatorCost the stock item's own operation register already settled on.
+  const operations = (stockItem.operations || [])
+    .filter((o) => o.type)
+    .map((o) => {
+      const sam = Math.round(((Number(o.minutes) || 0) + (Number(o.seconds) || 0) / 60) * 10000) / 10000;
+      const rate = sam > 0 && Number(o.operatorCost) > 0 ? Math.round((Number(o.operatorCost) / sam) * 10000) / 10000 : "";
+      return {
+        detail: [o.operationCode, o.type].filter(Boolean).join(" — "),
+        sam: sam ? String(sam) : "",
+        rate: rate === "" ? "" : String(rate),
+      };
+    });
+
+  return { materials: [...seen.values()], operations };
+}
+
 /** Clean a client-supplied operations array to the shape the schema accepts. */
 function sanitizeOperationRows(input) {
   return (Array.isArray(input) ? input : []).map((o) => ({
@@ -1137,6 +1419,31 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
     return res.status(201).json({ success: true, costingSheets: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/costing-sheet", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/costing-sheet/:productName/stock-item-sync
+// Preview of what the product's linked StockItem's raw items and operations
+// look like RIGHT NOW, shaped as costing rows. The client merges these into
+// its materials/operations state (letting the person filling the sheet
+// adjust vendor/unitCost/rate, and add more) and saves through the normal
+// PATCH — this route only reads, it never writes the sheet itself.
+router.get("/:id/costing-sheet/:productName/stock-item-sync", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("products").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const product = (enquiry.products || []).find((p) => p.product === req.params.productName);
+    if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+    if (!product.stockItemId) {
+      return res.status(404).json({ success: false, message: "This product isn't linked to a stock item yet." });
+    }
+
+    const rows = await stockItemCostingRows(product.stockItemId);
+    return res.json({ success: true, ...rows });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/costing-sheet/:productName/stock-item-sync", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1690,20 +1997,55 @@ router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, re
   }
 });
 
+// Now actually reaches the customer's inbox (24 Aug 2026, explicit request —
+// this used to only flip an internal flag and notify Sales/Access Control
+// staff, with NO email and nothing for the customer to click). Mints a
+// single-use, 7-day review link and emails it directly; the internal
+// notification below is unchanged, so Sales still hears about their own action.
 router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
     const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
-    if (!(enquiry.products || []).some((p) => p.product === productName)) {
+    const product = (enquiry.products || []).find((p) => p.product === productName);
+    if (!product) {
       return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
     }
+
+    const price = (enquiry.costLedger || []).find((l) => l.productName === productName)?.price;
+    if (!(price > 0)) {
+      return res.status(400).json({ success: false, message: "This product has no price yet — set one before sending it to the customer." });
+    }
+    const customerEmail = await customerEmailFor(enquiry);
+    if (!customerEmail) {
+      return res.status(400).json({ success: false, message: "This customer's account has no email on file — add one before sending." });
+    }
+    const customerName = await customerNameFor(enquiry);
+
+    const plainToken = crypto.randomBytes(32).toString("base64url");
     const entry = findOrCreateLifecycle(enquiry, productName);
     entry.sentToCustomerAt = new Date();
     entry.sentToCustomerBy = actor(req);
+    entry.customerApprovalTokenHash = hashApprovalToken(plainToken);
+    entry.customerApprovalTokenExpiresAt = new Date(Date.now() + COSTING_APPROVAL_TOKEN_LIFETIME_MS);
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    const reviewUrl = `${DEPT_NOTIFY_APP_URL}/costing-approval/${encodeURIComponent(plainToken)}`;
+    const emailResult = await CustomerEmailService.sendCostingApprovalEmail({
+      toEmail: customerEmail,
+      toName: customerName !== "—" ? customerName : undefined,
+      productName,
+      price,
+      currency: "INR",
+      quantity: product.quantity,
+      enquiryRef: enquiry.enquiryId,
+      reviewUrl,
+    });
+    if (!emailResult.success) {
+      return res.status(502).json({ success: false, message: emailResult.error || "Could not send the email — try again." });
+    }
 
     recordChange(req, {
       departmentSlug: "sales",
@@ -1711,15 +2053,13 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
       entityId: enquiry._id,
       entityLabel: enquiry.enquiryId,
       action: "sent-to-customer",
-      summary: `${actor(req).name || "Sales"} sent pricing for "${productName}" to the customer`,
+      summary: `${actor(req).name || "Sales"} emailed pricing for "${productName}" to ${customerEmail}`,
     }).catch(() => {});
 
     (async () => {
-      const product = (enquiry.products || []).find((p) => p.product === productName);
-      const customerName = await customerNameFor(enquiry);
       await notifyEvent("costing_sent_to_customer", {
         heading: `Quote sent to customer: ${productName}`,
-        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> sent pricing for this product to the customer.</p>`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> emailed pricing for this product to the customer.</p>`,
         details: [
           ["Customer", customerName],
           ["Enquiry ref", enquiry.enquiryId],
@@ -1727,7 +2067,7 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
           ["Quantity", product?.quantity],
         ],
         image: product?.images?.[0],
-        bodyText: `${actor(req).name || "Sales"} sent pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
+        bodyText: `${actor(req).name || "Sales"} emailed pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
         ctaLabel: "Open Cost & Invoicing",
         ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
       });
@@ -1736,6 +2076,106 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/send-to-customer", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC — the customer's own review link, no login (24 Aug 2026). Deliberately
+// exposes ONLY the total price, never the raw-item/operation cost build-up
+// ("just the direct total price need to showcase to the customer").
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/costing-approval/:token", async (req, res) => {
+  try {
+    const found = await resolveCostingApprovalToken(req.params.token);
+    if (!found) return res.status(404).json({ success: false, message: "This link is invalid, already used, or has expired." });
+    const { enquiry, entry } = found;
+    const product = (enquiry.products || []).find((p) => p.product === entry.productName);
+    const price = (enquiry.costLedger || []).find((l) => l.productName === entry.productName)?.price;
+    const customerName = await customerNameFor(enquiry);
+    const decided = entry.customerApproved != null;
+    return res.json({
+      success: true,
+      review: {
+        productName: entry.productName,
+        quantity: product?.quantity ?? null,
+        price: price ?? null,
+        currency: "INR",
+        enquiryRef: enquiry.enquiryId,
+        customerName: customerName !== "—" ? customerName : null,
+        decided,
+        approved: decided ? entry.customerApproved : null,
+        decidedAt: decided ? entry.customerApprovedAt : null,
+      },
+    });
+  } catch (err) {
+    console.error("[enquiries] GET /costing-approval/:token", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUBLIC — the customer's decision. Body: { approved: boolean, note?: string }.
+// Single-use: the token hash is cleared here regardless of outcome, so this
+// exact link can never record a second, different answer. Approval writes
+// the confirmed price straight onto the linked stock item's variants.
+router.post("/costing-approval/:token/decide", async (req, res) => {
+  try {
+    const found = await resolveCostingApprovalToken(req.params.token);
+    if (!found) return res.status(404).json({ success: false, message: "This link is invalid, already used, or has expired." });
+    if (typeof req.body?.approved !== "boolean") {
+      return res.status(400).json({ success: false, message: "approved (true/false) is required." });
+    }
+    const { enquiry, entry } = found;
+    const note = String(req.body?.note || "").trim();
+    const customerName = await customerNameFor(enquiry);
+
+    const now = new Date();
+    entry.customerApprovalLog = entry.customerApprovalLog || [];
+    entry.customerApprovalLog.push({ approved: req.body.approved, decidedAt: now, decidedBy: { id: null, name: customerName !== "—" ? customerName : "Customer" }, note });
+    entry.customerApproved = req.body.approved;
+    entry.customerApprovedAt = now;
+    entry.customerApprovedBy = { id: null, name: customerName !== "—" ? customerName : "Customer" };
+    entry.customerDecisionNote = note;
+    // Single-use — this link cannot be replayed to record a second answer.
+    entry.customerApprovalTokenHash = undefined;
+    entry.customerApprovalTokenExpiresAt = undefined;
+    await enquiry.save();
+
+    if (req.body.approved) {
+      const price = (enquiry.costLedger || []).find((l) => l.productName === entry.productName)?.price;
+      await syncApprovedPriceToStockItem(enquiry, entry.productName, price);
+    }
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: req.body.approved ? "customer-approved" : "customer-rejected",
+      summary: `The customer ${req.body.approved ? "approved" : "rejected"} "${entry.productName}" directly, by email${note ? ` — ${note}` : ""}`,
+    }).catch(() => {});
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === entry.productName);
+      await notifyEvent("customer_decision_recorded", {
+        heading: `Customer ${req.body.approved ? "approved" : "rejected"}: ${entry.productName}`,
+        bodyHtml: `<p>The customer <strong>${req.body.approved ? "approved" : "rejected"}</strong> this quote directly, by email.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", entry.productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `The customer ${req.body.approved ? "approved" : "rejected"} "${entry.productName}" directly, by email — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
+        ctaLabel: "Open Cost & Invoicing",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("[enquiries] POST /costing-approval/:token/decide", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1788,6 +2228,25 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
       summary: `${who.name || "Sales"} recorded that the customer ${req.body.approved ? "approved" : "rejected"} "${productName}"${note ? ` — ${note}` : ""}`,
     }).catch(() => {});
 
+    // Denormalize onto every matching SampleStyle (26 Aug 2026, explicit
+    // request: "everywhere in both sales, r&d and all other where the tag
+    // need to showcase ki customer rejected this product") so R&D's already
+    // existing history/status rendering shows this with zero new R&D-side
+    // code. A product can have more than one SampleStyle — one per
+    // variantKey — so every match is updated, not just the first.
+    (async () => {
+      const styles = await SampleStyle.find({ journeyId: enquiry.journeyId, productName });
+      for (const style of styles) {
+        style.customerRejected = !req.body.approved;
+        if (!req.body.approved) {
+          style.history = style.history || [];
+          style.history.push({ kind: "customer_rejected_at_costing", note, by: who, at: now });
+        }
+        style.updatedBy = who;
+        await style.save();
+      }
+    })().catch((err) => console.error("[enquiries] customer-approval → SampleStyle sync failed:", err.message));
+
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
       const customerName = await customerNameFor(enquiry);
@@ -1810,6 +2269,78 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/remove
+// "Change Product Design" → "Remove & Create New Version of this product"
+// (26 Aug 2026, explicit request). Removes ONLY this product's row from the
+// enquiry — never the underlying StockItem catalog document, per "unlink
+// that product from the customer" — and keeps the full removed row (spec,
+// photos, everything) recoverable via the shared ChangeLog, same mechanism
+// already used throughout this file (recordChange/historyFor), so a later
+// "why isn't this product here anymore" always has an answer: what it was,
+// who removed it, and why (the customer's own rejection reason, carried
+// over from costingLifecycle).
+router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    const row = (enquiry.products || []).find((p) => p.product === productName);
+    if (!row) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+
+    const snapshot = row.toObject();
+    enquiry.products = (enquiry.products || []).filter((p) => p.product !== productName);
+    const who = actor(req);
+    enquiry.updatedBy = who;
+    await enquiry.save();
+
+    // The comment above this route has claimed "unlink that product from the
+    // customer" since it was written — this call is what actually makes that
+    // true (26 Aug 2026, bug fix: it was never implemented).
+    if (snapshot.stockItemId && enquiry.accountId) {
+      unlinkRemovedEnquiryProducts({ accountId: enquiry.accountId, removedStockItemIds: [snapshot.stockItemId], excludeEnquiryId: enquiry._id })
+        .catch((e) => console.error("[enquiries] product unlink (remove route) failed:", e.message));
+    }
+
+    const lifecycleEntry = (enquiry.costingLifecycle || []).find((c) => c.productName === productName);
+    const rejectionNote = lifecycleEntry?.customerDecisionNote || "";
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry-product",
+      entityId: enquiry._id,
+      entityLabel: productName,
+      action: "delete",
+      summary: `${who.name || "Sales"} removed "${productName}"${rejectionNote ? ` — customer rejected: ${rejectionNote}` : ""}`,
+      before: snapshot,
+      after: {},
+    }).catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/remove", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/products/:productName/removed-snapshot
+// The read side of "Remove & Create New Version" — the last snapshot of a
+// removed product row (name/description/category/photos/specs), read back
+// out of the same ChangeLog entry the remove route above writes, so the new
+// product registration form can be pre-filled from it (26 Aug 2026).
+router.get("/:id/products/:productName/removed-snapshot", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const productName = decodeURIComponent(req.params.productName);
+    const entries = await historyFor("crm-enquiry-product", req.params.id, 50);
+    const match = entries.find((e) => e.action === "delete" && e.before?.product === productName);
+    return res.json({ success: true, snapshot: match?.before || null });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/products/:productName/removed-snapshot", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

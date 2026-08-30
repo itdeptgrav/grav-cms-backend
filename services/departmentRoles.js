@@ -121,6 +121,7 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
       { $set: { isActive: false } },
       { new: true },
     );
+    dropRoleCaches(slug, mail);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -155,6 +156,10 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
     },
     { new: true, upsert: true, setDefaultsOnInsert: true },
   );
+
+  // Whole-department, not just this email: promoting an owner demotes the
+  // incumbent above, so somebody else's cached role is stale too.
+  dropRoleCaches(slug, null);
 
   return { role: row.role, created: !before, previous: before?.role || null };
 }

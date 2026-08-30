@@ -10,7 +10,20 @@ const Operation      = require("../../../../models/CMS_Models/Inventory/Configur
 const OperationCode  = require("../../../../models/CMS_Models/Inventory/Configurations/OperationCode")
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup")
 const MachineType    = require("../../../../models/CMS_Models/Inventory/Configurations/MachineType")
+const StockItem      = require("../../../../models/CMS_Models/Inventory/Products/StockItem")
+const Employee       = require("../../../../models/Employee")
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear")
+const { recordChange } = require("../../../../services/changeLog")
+// Reused rather than duplicated — see stockItems.js's own module.exports for
+// why (26 Aug 2026: "assign the operation group to the product category...
+// overwrite the operations with that operation group" — every product in the
+// category needs the same cost recompute pass a normal Operations-tab save
+// already runs).
+const {
+  updateStockItemAggregates,
+  recomputeVariantCostsFromBom,
+  STOCK_ITEM_CATEGORIES,
+} = require("../Products/stockItems")
 
 router.use(EmployeeAuthMiddleware)
 
@@ -64,7 +77,7 @@ router.get("/operations/:id", async (req, res) => {
 // POST create single operation
 router.post("/operations", async (req, res) => {
   try {
-    const { name, operationCode, totalSam, durationSeconds, machineType } = req.body
+    const { name, operationCode, totalSam, durationSeconds, machineType, salaryDept, salaryDesig } = req.body
     if (!name || totalSam == null || !machineType) {
       return res.status(400).json({ success: false, message: "name, totalSam, and machineType are required" })
     }
@@ -77,6 +90,8 @@ router.post("/operations", async (req, res) => {
       totalSam: parseFloat(totalSam),
       durationSeconds: durationSeconds ?? Math.round(parseFloat(totalSam) * 60),
       machineType: machineType.trim(),
+      salaryDept: (salaryDept || "").trim(),
+      salaryDesig: (salaryDesig || "").trim(),
       createdBy: req.user.id,
     })
     await op.save()
@@ -109,7 +124,7 @@ router.post("/operations", async (req, res) => {
 // PUT update operation
 router.put("/operations/:id", async (req, res) => {
   try {
-    const { name, operationCode, totalSam, durationSeconds, machineType } = req.body
+    const { name, operationCode, totalSam, durationSeconds, machineType, salaryDept, salaryDesig } = req.body
     const op = await Operation.findById(req.params.id)
     if (!op) return res.status(404).json({ success: false, message: "Operation not found" })
 
@@ -127,6 +142,8 @@ router.put("/operations/:id", async (req, res) => {
         { upsert: true }
       )
     }
+    if (salaryDept !== undefined) op.salaryDept = (salaryDept || "").trim()
+    if (salaryDesig !== undefined) op.salaryDesig = (salaryDesig || "").trim()
 
     // Auto-register updated code
     if (op.operationCode) {
@@ -184,6 +201,8 @@ router.post("/operations/import", async (req, res) => {
         totalSam: parseFloat(row.totalSam),
         durationSeconds: row.durationSeconds ?? Math.round(parseFloat(row.totalSam) * 60),
         machineType: (row.machineType || "").trim(),
+        salaryDept: (row.salaryDept || "").trim(),
+        salaryDesig: (row.salaryDesig || "").trim(),
         createdBy: req.user.id,
       })
       await op.save()
@@ -341,7 +360,7 @@ router.post("/operation-codes/import", async (req, res) => {
 router.get("/operation-groups", async (req, res) => {
   try {
     const groups = await OperationGroup.find()
-      .populate("operations", "name operationCode totalSam durationSeconds machineType")
+      .populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig")
       .sort({ createdAt: -1 })
     res.json({ success: true, groups })
   } catch (err) {
@@ -390,7 +409,7 @@ router.post("/operation-groups", async (req, res) => {
     await group.save()
 
     const populated = await OperationGroup.findById(group._id)
-      .populate("operations", "name operationCode totalSam durationSeconds machineType")
+      .populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig")
     res.status(201).json({ success: true, message: "Group created", group: populated })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to create group: " + err.message })
@@ -431,7 +450,7 @@ router.put("/operation-groups/:id", async (req, res) => {
     await group.save()
 
     const populated = await OperationGroup.findById(group._id)
-      .populate("operations", "name operationCode totalSam durationSeconds machineType")
+      .populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig")
     res.json({ success: true, message: "Group updated", group: populated })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to update group: " + err.message })
@@ -447,6 +466,148 @@ router.delete("/operation-groups/:id", async (req, res) => {
     res.json({ success: true, message: "Group deleted" })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to delete group" })
+  }
+})
+
+// GET the product categories a group can be applied to — the same fixed list
+// the stock-item create form offers (26 Aug 2026).
+router.get("/operation-groups/categories", async (req, res) => {
+  res.json({ success: true, categories: STOCK_ITEM_CATEGORIES })
+})
+
+// POST apply a group's operations to every product in a category — the
+// GROUP → CATEGORY assignment feature (26 Aug 2026, explicit request:
+// "the user can assign the operation group to the product category...
+// select the product category... it will inherit all the product(stock
+// item) with that category in order to overwrite the operations with that
+// operation group").
+//
+// This OVERWRITES `operations` on every matching StockItem — not merges —
+// same as picking a group from the Operations tab's own group picker on a
+// single product, just applied to a whole category at once. Each product's
+// costs are recomputed the same way a normal per-product Operations save
+// does (recomputeVariantCostsFromBom + updateStockItemAggregates), and each
+// gets its own change-log entry so the bulk edit is auditable per product,
+// not just as one opaque event.
+router.post("/operation-groups/:id/apply-to-category", async (req, res) => {
+  try {
+    const { category } = req.body || {}
+    if (!category || !STOCK_ITEM_CATEGORIES.includes(category)) {
+      return res.status(400).json({ success: false, message: "A valid product category is required" })
+    }
+
+    const group = await OperationGroup.findById(req.params.id)
+      .populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig")
+    if (!group) return res.status(404).json({ success: false, message: "Operation group not found" })
+    if (!group.operations?.length) {
+      return res.status(400).json({ success: false, message: `Group "${group.name}" has no operations yet` })
+    }
+
+    // Fallback operator-salary estimate for any operation with no salary
+    // basis of its own — averaged over active Operator-department employees,
+    // same as the stock-item create form uses (line ~700 of stockItems.js).
+    const operators = await Employee.find({ department: "Operator", status: "active" }).select("salary")
+    const fallbackSalary = operators.length > 0
+      ? operators.reduce((sum, emp) => sum + (emp.salary?.netSalary || 0), 0) / operators.length
+      : 0
+    const MINUTES_PER_MONTH = 26 * 8 * 60 // 26 work days × 8 hours — matches the frontend's own constant
+
+    // Per-operation salary basis (26 Aug 2026, explicit request: "in the
+    // operation registration time... ask for the department, designation...
+    // so that when in the stock item, the operation will goona fill then it
+    // also auto select the department, designation... no need to do the
+    // department, designation selection for each and every product"). An
+    // operation registered with its own salaryDept/salaryDesig prices itself
+    // against THAT dept/desig average rather than the flat fallback — same
+    // decrypt-and-average logic as GET /data/salary-lookup, just resolved
+    // once per unique dept/desig pair so N operations sharing a basis don't
+    // repeat the query.
+    const { decryptSalaryFields } = require("../../../../utils/salaryEncryption")
+    const salaryCache = new Map()
+    async function salaryForBasis(dept, desig) {
+      const key = `${dept || ""}|${desig || ""}`
+      if (salaryCache.has(key)) return salaryCache.get(key)
+      const filter = { isActive: true }
+      if (dept) filter.department = dept
+      if (desig) filter.designation = desig
+      const employees = await Employee.find(filter).select("salary")
+      let totalNet = 0, count = 0
+      for (const emp of employees) {
+        try {
+          const s = decryptSalaryFields(emp.salary || {})
+          const net = parseFloat(s.netSalary) || 0
+          if (net > 0) { totalNet += net; count++ }
+        } catch { /* skip undecryptable records */ }
+      }
+      const avg = count > 0 ? Math.round(totalNet / count) : 0
+      salaryCache.set(key, avg)
+      return avg
+    }
+    await Promise.all(
+      group.operations
+        .filter(op => op.salaryDept || op.salaryDesig)
+        .map(op => salaryForBasis(op.salaryDept, op.salaryDesig))
+    )
+
+    const templateOperations = group.operations.map(op => {
+      const duration = op.durationSeconds || 0
+      const minutes = Math.floor(duration / 60)
+      const seconds = duration % 60
+      const hasOwnBasis = Boolean(op.salaryDept || op.salaryDesig)
+      const resolvedSalary = hasOwnBasis
+        ? (salaryCache.get(`${op.salaryDept || ""}|${op.salaryDesig || ""}`) || fallbackSalary)
+        : fallbackSalary
+      return {
+        type: op.name || "",
+        operationCode: op.operationCode || "",
+        machine: "",
+        machineType: op.machineType || "",
+        minutes,
+        seconds,
+        totalSeconds: duration,
+        operatorSalary: Math.round(resolvedSalary),
+        operatorCost: Math.round(((resolvedSalary / MINUTES_PER_MONTH) * (minutes + seconds / 60)) * 100) / 100,
+        salaryDept: op.salaryDept || "",
+        salaryDesig: op.salaryDesig || "",
+      }
+    })
+
+    const items = await StockItem.find({ category })
+    if (!items.length) {
+      return res.status(404).json({ success: false, message: `No products found in category "${category}"` })
+    }
+
+    let updatedCount = 0
+    for (const item of items) {
+      item.operations = templateOperations.map(op => ({ ...op }))
+      recomputeVariantCostsFromBom(item)
+      updateStockItemAggregates(item)
+      item.updatedBy = req.user.id
+      await item.save()
+      updatedCount++
+
+      await recordChange(req, {
+        departmentSlug: "inventory",
+        entity: "stock-item",
+        entityId: item._id,
+        entityLabel: item.name,
+        action: "update",
+        summary: `Operations replaced from group "${group.name}" (bulk-applied to category "${category}")`,
+        before: {},
+        after: {
+          changes: [`Operations overwritten with ${templateOperations.length} operation(s) from group "${group.name}" — applied to every product in category "${category}"`],
+        },
+      })
+    }
+
+    res.json({
+      success: true,
+      message: `Applied "${group.name}" to ${updatedCount} product(s) in "${category}"`,
+      updatedCount,
+    })
+  } catch (err) {
+    console.error("apply-to-category error:", err)
+    res.status(500).json({ success: false, message: "Failed to apply group to category: " + err.message })
   }
 })
 
