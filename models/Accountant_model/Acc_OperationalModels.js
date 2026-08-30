@@ -535,6 +535,46 @@ const budgetSchema = new mongoose.Schema(
      * validated against it — see budgetSubmissionWindow.service. */
     submissionStartDate: { type: Date },
     submissionEndDate: { type: Date },
+
+    /* ── THE DRAFTS THIS CYCLE WENT THROUGH ─────────────────────────────────
+     * A budget is not set in one pass. Draft 1 opens, departments submit, the
+     * deadline closes it, THE MEETING happens, and Draft 2 opens carrying
+     * whatever was not settled. Two of them; see budgetDraft.service for why
+     * a third is the remainder of a remainder.
+     *
+     * ── WHY THIS IS HISTORY AND NOT ENFORCEMENT ─────────────────────────────
+     * The two dates above remain the ACTIVE draft's window, and every existing
+     * reader of them — the department's submission gate, `windowState`,
+     * `isOpenForSubmissions` — keeps working without knowing drafts exist.
+     * Opening Draft 2 moves those two dates. This array records what happened;
+     * it is deliberately not a second source of truth about whether a
+     * department may submit right now, because two of those eventually
+     * disagree and then no screen knows which to believe.
+     *
+     * Absent on every cycle opened before this existed. Those are read as a
+     * single Draft 1 using the window they already have — which is what they
+     * always were, so nothing is migrated. */
+    drafts: [
+      {
+        _id: false,
+        number: { type: Number, required: true },
+        opensOn: { type: Date },
+        closesOn: { type: Date },
+        openedBy: { type: String, trim: true },
+        openedAt: { type: Date },
+        /* When it actually stopped taking submissions, which is not always the
+           day it was due to: finance may close a draft early once everybody
+           has submitted, and the meeting is then held sooner. */
+        closedAt: { type: Date },
+        /* What the meeting decided, in the words of whoever opened the next
+           draft. The one place the reason for a second round is recorded. */
+        note: { type: String, trim: true },
+        /* How many requests came into this draft from the previous one — the
+           size of the argument still outstanding when it opened. */
+        carriedForward: { type: Number, default: 0 },
+      },
+    ],
+
     items: [budgetItemSchema],
 
     /* Which books this belongs to. The app has a company selector and the
@@ -749,6 +789,59 @@ const budgetSchema = new mongoose.Schema(
               amount: { type: Number, min: 0 },
               manualAmount: { type: Boolean, default: false },
 
+              /* ── WHAT FINANCE SAID ABOUT THIS ROW ────────────────────────
+               * Finance's answer used to be one number for the whole head,
+               * which is too coarse for the argument they actually want to
+               * have: yes to the festival, half the annual day, no to the
+               * monthly lunches. Countering at a single figure says none of
+               * that, and the department's next draft is a guess at which row
+               * was meant.
+               *
+               * These rows do NOT become accounting lines. The allocation is
+               * still one budget line per head, written by
+               * syncAllocationFromRequest from `agreedAmount` — these only
+               * DERIVE that figure, so the ledger never learns rows exist.
+               * See services/budgetLineReview.service.js.
+               *
+               * Every field is additive and optional: a proposal written
+               * before any of this reads correctly with all of them absent,
+               * which is what "pending" means. */
+
+              /* ── A ROW HAD NO WAY TO BE ADDRESSED ────────────────────────
+               * This array is `_id: false`, so a row could only be pointed at
+               * by its POSITION. Position is not identity: a department
+               * revising an ask inserts and reorders rows, and a decision
+               * recorded against index 2 would silently reattach itself to
+               * whatever landed there. Assigned on first write rather than by
+               * a migration over every budget in the system. */
+              rowId: { type: String, trim: true },
+
+              /* Absent IS pending — an unanswered row is not a stored state. */
+              decision: {
+                type: String,
+                enum: ["approved", "countered", "refused"],
+              },
+              /* Stated rather than implied, including the zero on a refusal:
+               * a refused row that kept its asked amount would roll up into
+               * the head total as though it had been funded. */
+              approvedAmount: { type: Number, min: 0 },
+              /* Required by the route for a counter or a refusal. "₹70,000 →
+               * ₹0" with no sentence beside it is not something a department
+               * can revise against. */
+              financeNote: { type: String, trim: true },
+              decidedBy: { type: String, trim: true },
+              decidedAt: { type: Date },
+
+              /* ── WHOSE TURN IT IS ────────────────────────────────────────
+               * A countered row is an open question, and turning one into an
+               * allocation before the department has answered writes
+               * finance's own figure into the budget and calls it agreement.
+               * Cleared whenever the row is decided again, so an acceptance
+               * of the PREVIOUS counter cannot make the new one look
+               * answered. */
+              departmentAccepted: { type: Boolean },
+              departmentRespondedAt: { type: Date },
+
               /* ── A ROW THAT CARRIES ITS OWN MONTHS ───────────────────────
                * A month-wise line describes what each item costs in each
                * month rather than a quantity times a rate. The row's amount
@@ -794,10 +887,41 @@ const budgetSchema = new mongoose.Schema(
          * across one module would be worse than the duplication. */
         state: {
           type: String,
-          enum: ["awaiting", "submitted", "countered", "agreed", "defaulted"],
+          /* ── `rejected` IS NOT "KILLED" ────────────────────────────────
+           * Finance refusing an ask with a reason sends it BACK: the line
+           * carries into the next draft, and the department revises it or
+           * drops it themselves. A budget round has no way to delete somebody
+           * else's priority — it can only decline to fund it and say why.
+           *
+           * It exists so that "answered" and "agreed" stop being the same
+           * word. Draft 2 cannot open with anything unanswered, and before
+           * this there was no way to answer NO. */
+          enum: ["awaiting", "submitted", "countered", "agreed", "defaulted", "rejected"],
           default: "submitted",
           index: true,
         },
+
+        /* Who answered this ask, and when. Written on a refusal; an agreement
+           has `agreedAmount` and its own allocation line to date it. Without
+           these two, the reject route's fields were dropped silently by strict
+           mode and the trail recorded only that the state had changed. */
+        decidedAt: { type: Date },
+        decidedBy: { type: String, trim: true },
+
+        /* ── WHICH DRAFT THIS BELONGS TO ────────────────────────────────
+         * A budget is not set in one pass: Draft 1 is submitted, a meeting
+         * happens, and Draft 2 reopens whatever was not settled. Absent on
+         * every request raised before drafts existed, which is read as 1 —
+         * they were all the first round, so nothing needs migrating.
+         *
+         * `revisionOf` points at the same ask in the previous draft, and
+         * `supersededByDraft` marks the older row as history. Both, rather
+         * than editing the original in place: what a department FIRST asked
+         * for, against what they came back with, is the number the second
+         * meeting is actually about, and an edit would destroy it. */
+        draft: { type: Number, default: 1, index: true },
+        revisionOf: { type: mongoose.Schema.Types.ObjectId },
+        supersededByDraft: { type: Number },
 
         /* Finance's side of the exchange. Written by finance, not the
          * requester — Chunk 2 stores them; the UI that drives them is later. */

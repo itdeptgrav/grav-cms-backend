@@ -166,6 +166,21 @@ const purchase = ({ companyId, head, bank, amount, extra = {} }) => ({
   ...extra,
 });
 
+/**
+ * Settle on a figure other than the one asked for.
+ *
+ * Two calls, because they are two decisions. Approving agrees what is on the
+ * table unedited; naming a different number is a COUNTER, which puts finance's
+ * figure in front of the department before it becomes their budget. Agreeing
+ * at a figure nobody had been shown was one click, and left the record unable
+ * to tell a department that proposed 3L from one that was cut to it.
+ */
+async function counterThenAgree(path, query, amount, body = {}) {
+  const c = await fin(`${path}/counter${query}`, { counterAmount: amount, ...body });
+  expect(c.status).toBe(200);
+  return fin(`${path}/agree${query}`, {});
+}
+
 jest.setTimeout(120000);
 
 test("a budget is opened, funded, spent down, blown, overridden and topped up", async () => {
@@ -244,7 +259,7 @@ test("a budget is opened, funded, spent down, blown, overridden and topped up", 
 
   /* ═══ 3 · FINANCE AGREES A SMALLER NUMBER ═════════════════════════════════ */
   step(3, "finance agrees Rs 4,00,000 of the Rs 5,00,000 asked");
-  const agreed = await fin(`/${budget._id}/requests/${request._id}/agree${q}`, { agreedAmount: 400000 });
+  const agreed = await counterThenAgree(`/${budget._id}/requests/${request._id}`, q, 400000);
   expect(agreed.status).toBe(200);
 
   let doc = await Acc_Budget.findById(budget._id).lean();
@@ -262,7 +277,7 @@ test("a budget is opened, funded, spent down, blown, overridden and topped up", 
       quantity: 20, unit: "orders", rate: 100000 }],
   });
   expect(revReq.status).toBe(201);
-  await fin(`/${budget._id}/requests/${revReq.body.request._id}/agree${q}`, { agreedAmount: 2000000 });
+  await counterThenAgree(`/${budget._id}/requests/${revReq.body.request._id}`, q, 2000000);
 
   /* ═══ 4 · THE ROUND GOES LIVE ═════════════════════════════════════════════ */
   step(4, "finance closes collection and activates the round");

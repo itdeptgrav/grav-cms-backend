@@ -112,6 +112,22 @@ async function call(path, { method = "GET", body, user = OWNER } = {}) {
 }
 
 /**
+ * Settle a request at a figure other than the one asked for.
+ *
+ * Two calls, because they are two decisions. `agree` means "as submitted" and
+ * refuses a different number outright — naming one is a COUNTER, which puts
+ * finance's figure in front of the department before it becomes their budget.
+ */
+async function settleAt(budgetId, requestId, q, amount, body = {}) {
+  const c = await call(`/${budgetId}/requests/${requestId}/counter${q}`, {
+    method: "POST",
+    body: { counterAmount: amount, ...body },
+  });
+  expect(c.status).toBe(200);
+  return call(`/${budgetId}/requests/${requestId}/agree${q}`, { method: "POST", body: {} });
+}
+
+/**
  * Approve an adjustment the way the rule now requires.
  *
  * Raising an allocation takes the same two people as spending past one —
@@ -1570,9 +1586,8 @@ describe("finance review", () => {
 
   test("agreeing creates an approved allocation carrying the request's head", async () => {
     const { budget, q, request, expenseLedger } = await setup();
-    const { status, body } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST",
-      body: { agreedAmount: 275000, financeNote: "Trimmed to last year's actual." },
+    const { status, body } = await settleAt(budget._id, request._id, q, 275000, {
+      financeNote: "Trimmed to last year's actual.",
     });
     expect(status).toBe(200);
     expect(body.created).toBe(true);
@@ -1613,10 +1628,7 @@ describe("finance review", () => {
     const before = await Acc_Budget.findById(budget._id).lean();
     expect(before.totalAllocated).toBe(0);
 
-    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST",
-      body: { agreedAmount: 275000 },
-    });
+    await settleAt(budget._id, request._id, q, 275000);
 
     const after = await Acc_Budget.findById(budget._id).lean();
     expect(after.totalAllocated).toBe(275000);
@@ -1656,11 +1668,9 @@ describe("finance review", () => {
     const { budget, q, request } = await setup();
 
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 300000 },
+      method: "POST", body: {},
     });
-    const second = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 400000 },
-    });
+    const second = await settleAt(budget._id, request._id, q, 400000);
     expect(second.body.created).toBe(false);
 
     const stored = await Acc_Budget.findById(budget._id).lean();
@@ -1756,7 +1766,7 @@ describe("finance review", () => {
       method: "POST", body: { counterAmount: 180000 },
     });
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 180000 },
+      method: "POST", body: {},
     });
 
     const stored = await Acc_Budget.findById(budget._id).lean();
@@ -1769,9 +1779,7 @@ describe("finance review", () => {
 
   test("reopening WITHDRAWS the allocation — money never approved must not linger", async () => {
     const { budget, q, request } = await setup();
-    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 275000 },
-    });
+    await settleAt(budget._id, request._id, q, 275000);
 
     const { status, body } = await call(`/${budget._id}/requests/${request._id}/reopen${q}`, {
       method: "POST", body: {},
@@ -1898,7 +1906,7 @@ describe("finance review", () => {
   test("an approved allocation behaves like any other line for actuals and variance", async () => {
     const { company, budget, q, request, expenseLedger } = await setup();
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 300000 },
+      method: "POST", body: {},
     });
 
     // Real spend against that head, in this company.
@@ -2338,10 +2346,7 @@ describe("dashboard", () => {
     const before = await dash(company._id, "&asOf=2027-03-31");
     expect(before.body.attention.noAllocations).toHaveLength(1);
 
-    const agreed = await call(
-      `/${budget._id}/requests/${created.body.request._id}/agree${q}`,
-      { method: "POST", body: { agreedAmount: 300000 } },
-    );
+    const agreed = await settleAt(budget._id, created.body.request._id, q, 300000);
     expect(agreed.status).toBe(200);
 
     const after = await dash(company._id, "&asOf=2027-03-31");

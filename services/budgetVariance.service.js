@@ -167,6 +167,14 @@ function expectedToDate({
 function evaluateLine({
   allocated,
   actual,
+  /* ── MONEY PROMISED BUT NOT YET PAID ──────────────────────────────────────
+   * Approved spend requests that have no voucher against them yet. Defaults to
+   * zero, so every caller written before commitments existed reads exactly as
+   * it did — this only changes the answer for a caller that passes one.
+   *
+   * It is NOT added to `actual`. An actual is a posting; this is a promise,
+   * and conflating them would report money as spent that no ledger has seen. */
+  committed = 0,
   nature,
   startDate,
   endDate,
@@ -180,6 +188,9 @@ function evaluateLine({
   const kind = natureOf({ nature });
   const alloc = money(allocated) ?? 0;
   const act = money(actual) ?? 0;
+  /* Only an expense head can promise money out. A revenue target is a floor to
+     reach, and there is nothing to reserve against it. */
+  const comm = kind === "expense" ? money(committed) ?? 0 : 0;
 
   const variance = kind === "revenue" ? act - alloc : alloc - act;
   const favourable = variance >= 0;
@@ -208,7 +219,10 @@ function evaluateLine({
        revenue the equivalent question is "how much left to earn", which is the
        same subtraction but must never be read as headroom, so it is named for
        what it is rather than shared. */
-    remaining: kind === "expense" ? alloc - act : null,
+    committed: comm,
+    /* What is left to SPEND — after what has been paid and what has been
+       promised. The figure a new request is measured against. */
+    remaining: kind === "expense" ? alloc - act - comm : null,
     toGo: kind === "revenue" ? Math.max(0, alloc - act) : null,
     variance,
     variancePct: alloc > 0 ? (variance / alloc) * 100 : null,

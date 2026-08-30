@@ -1627,3 +1627,207 @@ describe("budget control after a transfer", () => {
     expect(allowed.body.budgetOverride?.required).toBeUndefined();
   });
 });
+
+/* ═══ COMMITMENTS INFORM, THEY DO NOT BLOCK ════════════════════════════════
+ *
+ * The gate above stops a voucher on ACTUAL posted spend and nothing else, and
+ * this group does not change that — every test in it asserts the block rule is
+ * exactly what it was. What is new is the sentence the posting screen was
+ * missing: the head picker, the submissions desk and the cash-flow forecast all
+ * subtract commitments, and the one place finance actually spends money did not
+ * even mention them.
+ */
+describe("commitment context on the availability check", () => {
+  const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
+  const SpendRequest = require("../../models/CMS_Models/Requests/SpendRequest");
+
+  /** A live promise against a budget line. */
+  const promise = ({ company, budget, ledger, amount, status = "committed", spendRequestId = null }) =>
+    Commitment.create({
+      spendRequestId: spendRequestId || new mongoose.Types.ObjectId(),
+      spendRequestNumber: `SPR-${seq++}`,
+      companyId: company._id,
+      budgetId: budget._id,
+      budgetLineId: budget.items[0]._id,
+      department: "Logistics",
+      ledgerId: ledger._id,
+      ledgerName: ledger.name,
+      amount,
+      status,
+    });
+
+  const availability = ({ company, ledger, amount, extra = {} }) =>
+    call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2026-08-10",
+        ledgerEntries: [{ ledgerId: String(ledger._id), type: "Dr", amount }],
+        ...extra,
+      },
+    });
+
+  test("no commitments means no commitment message at all", async () => {
+    // Not "₹0 committed" — a screen that reports the absence of a thing on
+    // every voucher is a screen people learn to stop reading.
+    const { company, expenseLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(body.results[0].commitment).toBeNull();
+    expect(body.commitmentWarnings).toEqual([]);
+  });
+
+  test("the worked example: allowed on actuals, warned on pressure", async () => {
+    // Budget 1,00,000 · posted 20,000 · committed 40,000 · this voucher 30,000.
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await postedSpend({ companyId: company._id, ledger: expenseLedger, amount: 20000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    const r = body.results[0];
+
+    /* THE BLOCK RULE, UNCHANGED. Actual after the voucher is 50,000 of
+       1,00,000, so this posts. */
+    expect(r.status).toBe("ok");
+    expect(body.requiredOverride).toBe(false);
+    expect(r.projectedActual).toBe(50000);
+    expect(r.remainingAfter).toBe(50000);
+
+    /* And the half the screen was not being told. */
+    expect(r.commitment).toMatchObject({
+      committed: 40000,
+      pressure: 90000,
+      availableExcludingCommitments: 50000,
+      availableIncludingCommitments: 10000,
+      severity: "near",
+      blocking: false,
+    });
+    expect(r.commitment.detail).toMatch(/₹90,000 of ₹1,00,000 will be spoken for/);
+    expect(body.commitmentWarnings).toHaveLength(1);
+    expect(body.commitmentWarnings[0].ledgerName).toBe("Freight & Forwarding");
+  });
+
+  test("pressure past the allocation warns harder and still does not block", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 90000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    const r = body.results[0];
+
+    expect(r.status).toBe("ok");            // actuals are 30,000 of 1,00,000
+    expect(body.requiredOverride).toBe(false);
+    expect(r.commitment.severity).toBe("high");
+    expect(r.commitment.availableIncludingCommitments).toBe(-20000);
+    expect(r.commitment.headline).toMatch(/Posting is still allowed/);
+  });
+
+  test("actual over-budget still blocks exactly as before, commitments or not", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await postedSpend({ companyId: company._id, ledger: expenseLedger, amount: 90000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 5000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    /* The gate's own arithmetic, untouched: 90,000 + 30,000 against 1,00,000. */
+    expect(body.results[0].status).toBe("over_budget");
+    expect(body.requiredOverride).toBe(true);
+    expect(body.results[0].overBy).toBe(20000);
+    /* The commitment is still reported beside it — it does not become the
+       reason, and it does not disappear because a bigger problem exists. */
+    expect(body.results[0].commitment.committed).toBe(5000);
+  });
+
+  test("the commitment this voucher will release is not counted against it", async () => {
+    /* A bill raised against an approved request discharges its own promise the
+       moment it posts. Counting it as still-open pressure would warn finance
+       about money the voucher itself removes — the same ₹40,000 twice. */
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const request = await SpendRequest.create({
+      title: "Compressor AMC", requestType: "SERVICE", purpose: "Annual",
+      requestedBy: new mongoose.Types.ObjectId(), requestedByName: "Rutu",
+      department: "Logistics", companyId: company._id,
+      ledgerId: expenseLedger._id, ledgerName: expenseLedger.name,
+      items: [{ name: "AMC", whyNeeded: "Annual", quantity: 1, unit: "year", rate: 40000, amount: 40000 }],
+      totalAmount: 40000, status: "approved",
+    });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000, spendRequestId: request._id });
+
+    const linked = await availability({
+      company, ledger: expenseLedger, amount: 30000,
+      extra: { spendRequestId: String(request._id) },
+    });
+    // Nothing left open once its own promise is set aside.
+    expect(linked.body.results[0].commitment).toBeNull();
+
+    // The identical voucher WITHOUT the link is warned, which is the control.
+    const unlinked = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(unlinked.body.results[0].commitment.committed).toBe(40000);
+  });
+
+  test("a released commitment is not pressure — it already became a bill", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000, status: "released" });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(body.results[0].commitment).toBeNull();
+  });
+
+  test("each head gets its own message, named", async () => {
+    /* A voucher can touch four heads and a merged sentence would tell finance
+       about none of them. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const second = await Acc_Ledger.create({
+      companyId: company._id, name: "Software Subscription",
+      groupId: expenseLedger.groupId, groupName: "Indirect Expenses", nature: "expense",
+    });
+    const b1 = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const b2 = await liveBudget({ companyId: company._id, ledger: second, allocated: 200000 });
+    await promise({ company, budget: b1, ledger: expenseLedger, amount: 40000 });
+    await promise({ company, budget: b2, ledger: second, amount: 10000 });
+
+    const { body } = await call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2026-08-10",
+        ledgerEntries: [
+          { ledgerId: String(expenseLedger._id), type: "Dr", amount: 30000 },
+          { ledgerId: String(second._id), type: "Dr", amount: 5000 },
+        ],
+      },
+    });
+
+    expect(body.commitmentWarnings).toHaveLength(2);
+    const byName = Object.fromEntries(body.commitmentWarnings.map((w) => [w.ledgerName, w]));
+    expect(byName["Freight & Forwarding"].committed).toBe(40000);
+    expect(byName["Software Subscription"].committed).toBe(10000);
+    // Different heads, different sentences — neither is a merged summary.
+    expect(byName["Freight & Forwarding"].detail).toMatch(/^Freight & Forwarding/);
+    expect(byName["Software Subscription"].detail).toMatch(/^Software Subscription/);
+  });
+
+  test("a head with commitments but no allocation still says something useful", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000 });
+
+    // Checked on a date outside the budget's window: no live allocation.
+    const { body } = await call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2028-08-10",
+        ledgerEntries: [{ ledgerId: String(expenseLedger._id), type: "Dr", amount: 30000 }],
+      },
+    });
+    expect(body.results[0].status).toBe("missing_budget");
+    // No allocation means no lines to read commitments off — reported as
+    // nothing rather than as a confident zero pressure.
+    expect(body.results[0].commitment).toBeNull();
+  });
+});

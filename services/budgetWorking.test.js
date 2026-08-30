@@ -303,3 +303,95 @@ test("monthly amounts must arrive as a list", () => {
     /list/i,
   );
 });
+
+/* ══ WHAT A ROW IS WORTH ═══════════════════════════════════════════════════
+ * `rowAmount` is the one derivation the whole system uses — the stored total,
+ * the review screen's "Requested" column, the row roll-up and the head figure
+ * approval takes. It exists because those four had drifted into three
+ * different answers, and the wrong one reached the screen.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+test("a quantity row is quantity × rate × multiplier", () => {
+  assert.equal(w.rowAmount({ quantity: 5, rate: 6000, multiplier: 12 }), 360000);
+});
+
+test("a missing multiplier is once, not nothing", () => {
+  assert.equal(w.rowAmount({ quantity: 2, rate: 200000 }), 400000);
+  assert.equal(w.rowAmount({ quantity: 2, rate: 200000, multiplier: null }), 400000);
+});
+
+test("A MULTIPLIER OF ZERO IS ALSO ONCE — the bug this helper exists for", () => {
+  /* The screenshot: a row reading "2 events × ₹2,00,000" and, beside it, ₹0.
+     Nothing in a budget is bought "× 0 months"; the field means "and this many
+     times over", so absent and zero are the same statement. */
+  assert.equal(w.rowAmount({ quantity: 2, rate: 200000, multiplier: 0, amount: 0 }), 400000);
+});
+
+test("a quantity of zero IS zero, because that is a thing to mean", () => {
+  // "We are not buying any of these this year." The two fields look alike and
+  // are not: a zero multiplier is a missing answer, a zero quantity is one.
+  assert.equal(w.rowAmount({ quantity: 0, rate: 200000, multiplier: 1 }), 0);
+});
+
+test("a month-wise row is the sum of its own months", () => {
+  assert.equal(
+    w.rowAmount({
+      quantity: 99, rate: 99, // deliberately present and deliberately ignored
+      monthly: [{ month: "2026-09", amount: 60000 }, { month: "2026-10", amount: 40000 }],
+    }),
+    100000,
+  );
+});
+
+test("a manual row is the only one whose stored amount is believed", () => {
+  // A quoted price or a negotiated lump sum — asserted rather than computed,
+  // which is the whole point of the flag.
+  assert.equal(w.rowAmount({ manualAmount: true, amount: 150000, quantity: 0, rate: 0 }), 150000);
+});
+
+test("a stale stored amount never wins over the inputs that contradict it", () => {
+  // The failure mode in one line: the row says 2 × 2,00,000 and the document
+  // says 0. The inputs are the derivation; the stored figure is a cache of it.
+  assert.equal(w.rowAmount({ quantity: 2, rate: 200000, amount: 0 }), 400000);
+  assert.equal(w.rowAmount({ quantity: 2, rate: 200000, amount: 999 }), 400000);
+});
+
+test("an empty row is zero rather than NaN", () => {
+  for (const row of [undefined, null, {}, { label: "x" }]) {
+    assert.equal(w.rowAmount(row), 0, JSON.stringify(row));
+  }
+});
+
+/* ══ AND THE STORED ROW IS FIXED ON THE WAY IN ═════════════════════════════ */
+
+test("normalising rewrites a zero multiplier to one, so the row stops lying", () => {
+  /* The read side is defended by `rowAmount`, but a document that stores a
+     figure disagreeing with its own inputs is a trap for the next reader. */
+  const { lines, total } = w.normaliseWorkingLines([
+    { label: "Festival", quantity: 2, rate: 200000, multiplier: 0, amount: 0 },
+    { label: "Annual day", quantity: 1, rate: 200000, multiplier: 0, amount: 0 },
+  ]);
+  assert.equal(lines[0].amount, 400000);
+  assert.equal(lines[0].multiplier, 1);
+  assert.equal(lines[1].amount, 200000);
+  assert.equal(total, 600000);
+});
+
+test("the screenshot case reconciles to the head's own figure", () => {
+  // Festival 4,00,000 + Annual day 2,00,000 = 6,00,000, which is what the
+  // header said all along while the rows said nothing.
+  const { total } = w.normaliseWorkingLines([
+    { label: "Festival", quantity: 2, rate: 200000, multiplier: 0 },
+    { label: "Annual day", quantity: 1, rate: 200000, multiplier: 0 },
+  ]);
+  assert.equal(total, 600000);
+});
+
+test("a manual row keeps the multiplier it was given", () => {
+  // Its amount does not come from the multiplier, so there is nothing to fix
+  // and nothing to gain from overwriting what the department typed.
+  const { lines } = w.normaliseWorkingLines([
+    { label: "Quoted", manualAmount: true, amount: 50000 },
+  ]);
+  assert.equal(lines[0].amount, 50000);
+});

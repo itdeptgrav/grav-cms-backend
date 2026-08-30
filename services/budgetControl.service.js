@@ -240,6 +240,11 @@ async function checkBudgetAvailability({
   ledgerEntries = [],
   department = null,
   excludeVoucherId = null,
+  /* The commitment this voucher will discharge, when there is one. Excluded
+     from the pressure figure below — see attachCommitmentContext. Passed in
+     rather than resolved here so this stays one query's worth of work for
+     callers that have already looked it up. */
+  releasingCommitment = null,
 } = {}) {
   const checkedAt = new Date();
   const proposed = proposedByLedger(ledgerEntries);
@@ -514,12 +519,28 @@ async function checkBudgetAvailability({
         _id: m.budget._id,
         name: m.budget.name,
         status: m.budget.status,
+        /* Which year's envelope this is. Denormalised onto the match because
+           every consumer that records a match wants to say WHICH cycle it
+           was, and re-reading the budget to find out would be a second query
+           for a string already in hand. `budgetCommitment.matchFor` reads it
+           — it always did, and until now it was always undefined, so every
+           spend request raised through classification recorded a budget line
+           with no year against it. */
+        financialYear: m.budget.financialYear || null,
         itemId: m.item._id,
         department: m.item.department || null,
         allocatedAmount: m.item.allocatedAmount || 0,
       })),
     });
   }
+
+  /* Advisory only, and attached AFTER every status is settled — so the two
+     lines below cannot be influenced by it however this evolves. */
+  await attachCommitmentContext({ results, releasingCommitment }).catch((e) => {
+    /* A commitment read that fails must not cost finance the availability
+       check. The screen shows the gate's answer without the extra context. */
+    console.error("[budget] commitment context failed, omitting it:", e.message);
+  });
 
   const overallStatus = results.reduce((acc, r) => worstStatus(acc, r.status), "ok");
   const requiredOverride = results.some((r) => needsOverride(r.status));
@@ -529,6 +550,15 @@ async function checkBudgetAvailability({
     requiredOverride,
     results,
     message: messageFor(overallStatus, results),
+    /* The heads carrying promises, so a screen can say something without
+       walking the results. Empty when nothing is committed anywhere. */
+    commitmentWarnings: results
+      .filter((r) => r.commitment)
+      .map((r) => ({
+        ledgerId: r.ledgerId ? String(r.ledgerId) : null,
+        ledgerName: r.ledgerName || null,
+        ...r.commitment,
+      })),
     checkedAt,
   };
 }
@@ -613,7 +643,18 @@ async function clearanceFor({
   const reason = String(overrideReason || "").trim();
   const held = signatures || voucher?.budgetOverride?.signatures || [];
   try {
+    /* Whatever this voucher will release, so the warning does not count money
+       the posting itself removes. The same resolver that does the releasing —
+       one rule, so the two cannot disagree. */
+    let releasingCommitment = null;
+    try {
+      releasingCommitment = await require("./budgetCommitment.service").commitmentForVoucher(voucher);
+    } catch (e) {
+      console.error("[budget] could not resolve the voucher's commitment:", e.message);
+    }
+
     const check = await checkBudgetAvailability({
+      releasingCommitment,
       companyId: voucher.companyId,
       voucherDate: voucher.voucherDate,
       ledgerEntries: (voucher.ledgerEntries || []).map((e) => ({
@@ -785,7 +826,145 @@ async function assertClearance(args) {
   return clearance.override;
 }
 
+/* ── COMMITMENTS INFORM; THEY DO NOT BLOCK ───────────────────────────────────
+ * The gate above stops a voucher on ACTUAL posted spend and nothing else. That
+ * policy is unchanged here and deliberately so: a commitment is a promise
+ * finance made, not an obligation the company has incurred, and blocking a real
+ * invoice because of a stale promise is worse than the reverse.
+ *
+ * But finance posting a bill against a head that already carries ₹40,000 of
+ * approved requests is deciding with half the picture. Every other screen in
+ * this module — the head picker, the submissions desk, the cash-flow forecast —
+ * subtracts commitments, and the posting screen was the only one that did not
+ * even mention them.
+ *
+ * So: say it, and let them post. Nothing below can change a status, set
+ * `requiredOverride`, or produce an error.
+ */
+const inr = (n) => `₹${Math.round(Number(n) || 0).toLocaleString("en-IN")}`;
+
+/**
+ * What the commitments on one head amount to, and how loudly to say it.
+ *
+ * Pure, so the wording and the thresholds are testable without a database.
+ * `severity` is advisory throughout — the caller attaches it beside a status it
+ * never touches.
+ *
+ *   null    nothing committed; the screen says nothing rather than "₹0 committed"
+ *   info    committed money exists and there is room for all of it
+ *   near    the head is close to spoken for once promises are counted
+ *   high    promises plus this voucher exceed the allocation
+ */
+function commitmentNote({ ledgerName, allocated, projectedActual, openCommitments }) {
+  const committed = variance.money(openCommitments) ?? 0;
+  if (!(committed > 0)) return null;
+
+  const alloc = variance.money(allocated) ?? 0;
+  const projected = variance.money(projectedActual) ?? 0;
+  /* Everything spoken for: what will have been posted once this voucher lands,
+     plus what has been promised and not yet billed. */
+  const pressure = Math.round((projected + committed) * 100) / 100;
+  const pressurePct = alloc > 0 ? (pressure / alloc) * 100 : null;
+
+  const severity =
+    alloc > 0 && pressure > alloc
+      ? "high"
+      : pressurePct !== null && pressurePct >= WARN_AT_PCT
+        ? "near"
+        : "info";
+
+  const head = ledgerName || "This head";
+  const headline =
+    severity === "high"
+      ? "Including approved requests, this head will be over budget. Posting is still allowed unless actual spend crosses the budget rule."
+      : "Approved requests already use part of this budget head.";
+
+  /* The figures, in one sentence, naming the head — a voucher can touch four
+     heads and a merged message would tell finance about none of them. */
+  const detail =
+    `${head} already has ${inr(committed)} committed through approved requests. ` +
+    (alloc > 0
+      ? `After this voucher, ${inr(pressure)} of ${inr(alloc)} will be spoken for including commitments.`
+      : `After this voucher, ${inr(pressure)} will be spoken for including commitments.`);
+
+  return {
+    committed,
+    pressure,
+    pressurePct: pressurePct === null ? null : Math.round(pressurePct * 10) / 10,
+    /* Both readings, because they answer different questions: the first is what
+       the gate uses, the second is what a person should know. */
+    availableExcludingCommitments: Math.round((alloc - projected) * 100) / 100,
+    availableIncludingCommitments: Math.round((alloc - pressure) * 100) / 100,
+    severity,
+    headline,
+    detail,
+    /* Never a blocker. Stated on the object so no caller has to infer it. */
+    blocking: false,
+  };
+}
+
+/**
+ * Attach commitment context to an availability result set.
+ *
+ * ── WHAT IS DELIBERATELY EXCLUDED ───────────────────────────────────────────
+ * The commitment THIS voucher is about to release. A bill raised against an
+ * approved request discharges its own promise the moment it posts, so counting
+ * it as still-open pressure would warn finance about money the voucher itself
+ * removes — the same ₹40,000 twice.
+ *
+ * Which commitment that is comes from `commitmentForVoucher`, the same function
+ * that decides what actually gets released. Using a second rule here would let
+ * the warning and the release disagree, which is the only way this can be
+ * wrong. It matches on explicit links only — the commitment id, the spend
+ * request id, or the order reference the company itself generated — and never
+ * on amount, vendor or date.
+ */
+async function attachCommitmentContext({ results, releasingCommitment = null }) {
+  /* ── RAW IDS, NOT STRINGS ────────────────────────────────────────────────
+     `committedByLine` matches inside an aggregation pipeline, and an
+     aggregation does not cast against the schema the way a query does — a
+     string never matches a stored ObjectId, and the failure is silent: every
+     head reports zero committed and the warning simply never appears. */
+  /* Every result carries the key, so a screen never has to tell "no
+     commitments" apart from "the field is missing". */
+  for (const r of results || []) r.commitment = null;
+
+  const lineIds = [];
+  for (const r of results || []) {
+    for (const b of r.budgets || []) if (b.itemId) lineIds.push(b.itemId);
+  }
+  if (!lineIds.length) return results;
+
+  const commitments = require("./budgetCommitment.service");
+  const byLine = await commitments.committedByLine(lineIds).catch(() => new Map());
+
+  const releasedLine = releasingCommitment?.budgetLineId
+    ? String(releasingCommitment.budgetLineId)
+    : null;
+  const releasedAmount = variance.money(releasingCommitment?.amount) ?? 0;
+  /* Only a live promise is released by posting. One already released is not
+     being counted anyway. */
+  const releasing = releasingCommitment?.status === "committed" ? releasedAmount : 0;
+
+  for (const r of results || []) {
+    const lines = (r.budgets || []).map((b) => String(b.itemId)).filter(Boolean);
+    let open = lines.reduce((sum, id) => sum + (byLine.get(id) || 0), 0);
+    if (releasedLine && lines.includes(releasedLine)) open -= releasing;
+    open = Math.round(Math.max(0, open) * 100) / 100;
+
+    r.commitment = commitmentNote({
+      ledgerName: r.ledgerName,
+      allocated: r.allocated,
+      projectedActual: r.projectedActual,
+      openCommitments: open,
+    });
+  }
+  return results;
+}
+
 module.exports = {
+  commitmentNote,
+  attachCommitmentContext,
   validateCostCentreAllocations,
   CONTROLLING_STATUSES,
   WARN_AT_PCT,

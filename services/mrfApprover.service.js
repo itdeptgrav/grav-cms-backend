@@ -88,6 +88,53 @@ async function resolveApprover(requester) {
   };
 }
 
+/**
+ * The same resolution, in the shape the REQUEST collections store.
+ *
+ * ── WHY NOT JUST `resolveApprover` ──────────────────────────────────────────
+ * That function answers with MRF's routing vocabulary — `approvalRoute`,
+ * `autoForwarded`, "sent directly to the Store". An intake request that cannot
+ * find a manager does not go to the Store; it goes to whoever classifies it,
+ * and a spend request goes to finance. Both routers were therefore cherry-
+ * picking three fields off it and DROPPING the reason the chain broke, which
+ * is exactly the fact the requester needs to see.
+ *
+ * So: one resolution, two vocabularies. The manager lookup is shared — there
+ * is still only one place that reads `primaryManager.managerId` — and the
+ * caller says where an unresolved request actually goes.
+ *
+ * @param {object} requester  lean Employee doc of the person raising it
+ * @param {string} fallbackTo where an unrouted request goes instead, in words
+ *                            ("Store & Purchase", "finance")
+ */
+async function approverPatchFor(requester, { fallbackTo = "the next desk" } = {}) {
+  const resolved = await resolveApprover(requester);
+
+  if (resolved.approverResolution === "RESOLVED") {
+    return {
+      approverEmployee: resolved.approverEmployee,
+      approverBiometricId: resolved.approverBiometricId,
+      approverAltIds: resolved.approverAltIds,
+      approverName: resolved.approverName,
+      approverResolution: "RESOLVED",
+      approverResolutionNote: "",
+    };
+  }
+
+  /* Named plainly rather than as a status code. "No Primary Manager found in
+     HR" is something the requester can get fixed; "NO_MANAGER" is not. */
+  return {
+    approverEmployee: null,
+    approverBiometricId: "",
+    approverAltIds: [],
+    approverName: "",
+    approverResolution: resolved.approverResolution,
+    approverResolutionNote:
+      `${HUMAN_REASON[resolved.approverResolution] || "No approver could be determined"}` +
+      ` — sent to ${fallbackTo} according to the fallback rule.`,
+  };
+}
+
 /** Every cowork id an employee could be signed in as. */
 function coworkIdsOf(emp) {
   return [...new Set([emp?.biometricId, emp?.identityId].filter(Boolean))];
@@ -111,6 +158,6 @@ async function listManagedEmployeeIds(managerBiometricId) {
 }
 
 module.exports = {
-  resolveApprover, listManagedEmployeeIds, coworkIdsOf,
+  resolveApprover, approverPatchFor, listManagedEmployeeIds, coworkIdsOf,
   buildFullName, isInactive, HUMAN_REASON,
 };

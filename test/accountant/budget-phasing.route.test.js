@@ -379,17 +379,31 @@ test("agreeing a different amount against an unchanged split is refused", async 
   });
   expect(raised.status).toBe(201);
 
-  /* Finance cutting the amount without restating the split would otherwise
-     store a line whose months add up to more than the line itself. */
-  const agreed = await call(
-    `/${budget._id}/requests/${raised.body.request._id}/agree`,
-    { method: "POST", body: { agreedAmount: 400000 } },
+  /* ── THE CUT MOVED TO COUNTER, AND SO DID THIS CHECK ────────────────────
+     Finance cutting the amount can no longer happen at approval at all — that
+     is an edit, and edits are counters. What must not change is the arithmetic
+     the old refusal protected: a line whose months add up to more than the
+     line itself. That hazard now lives on the counter, and is refused there
+     against the COUNTERED figure. */
+  const badCounter = await call(
+    `/${budget._id}/requests/${raised.body.request._id}/counter`,
+    {
+      method: "POST",
+      body: {
+        counterAmount: 400000,
+        phasingMode: "custom_monthly",
+        monthlyPhasing: [
+          { month: "2026-09", amount: 600000 },
+          { month: "2026-10", amount: 300000 },
+        ],
+      },
+    },
   );
-  expect(agreed.status).toBe(400);
-  expect(agreed.body.code).toBe("PHASING_SUM_MISMATCH");
+  expect(badCounter.status).toBe(400);
+  expect(badCounter.body.code).toBe("PHASING_SUM_MISMATCH");
 });
 
-test("finance can agree a different amount by restating the split", async () => {
+test("cutting the amount at approval is refused as an edit, before phasing is even reached", async () => {
   const { expenseLedger, budget } = await budgetForRequests();
   const raised = await call(`/${budget._id}/requests`, {
     method: "POST",
@@ -404,18 +418,76 @@ test("finance can agree a different amount by restating the split", async () => 
   });
   const agreed = await call(
     `/${budget._id}/requests/${raised.body.request._id}/agree`,
+    { method: "POST", body: { agreedAmount: 400000 } },
+  );
+  expect(agreed.status).toBe(400);
+  expect(agreed.body.code).toBe("AGREE_IS_NOT_AN_EDIT");
+});
+
+test("finance cuts an amount and restates the split through a counter", async () => {
+  // The successor to agreeing at a different figure with a new split. Same
+  // outcome on the line, one extra step, and the department sees the number
+  // and the shape before either becomes their budget.
+  const { expenseLedger, budget } = await budgetForRequests();
+  const raised = await call(`/${budget._id}/requests`, {
+    method: "POST",
+    body: {
+      department: "Marketing",
+      ledgerId: expenseLedger._id.toString(),
+      requestedAmount: 900000,
+      purpose: "Festival campaign",
+      phasingMode: "custom_monthly",
+      monthlyPhasing: [{ month: "2026-09", amount: 900000 }],
+    },
+  });
+  const countered = await call(
+    `/${budget._id}/requests/${raised.body.request._id}/counter`,
     {
       method: "POST",
       body: {
-        agreedAmount: 400000,
+        counterAmount: 400000,
         phasingMode: "custom_monthly",
         monthlyPhasing: [{ month: "2026-09", amount: 400000 }],
       },
     },
   );
+  expect(countered.status).toBe(200);
+
+  const agreed = await call(
+    `/${budget._id}/requests/${raised.body.request._id}/agree`,
+    { method: "POST", body: {} },
+  );
   expect(agreed.status).toBe(200);
   expect(agreed.body.item.allocatedAmount).toBe(400000);
   expect(agreed.body.item.monthlyPhasing[0].amount).toBe(400000);
+});
+
+test("a counter that cuts the money but forgets the split is caught on approval", async () => {
+  // Countering 9L down to 4L while leaving a 9L split standing is a line whose
+  // months out-total the line. Nothing allocates it silently: the sum check
+  // still runs at approval, against the countered figure.
+  const { expenseLedger, budget } = await budgetForRequests();
+  const raised = await call(`/${budget._id}/requests`, {
+    method: "POST",
+    body: {
+      department: "Marketing",
+      ledgerId: expenseLedger._id.toString(),
+      requestedAmount: 900000,
+      purpose: "Festival campaign",
+      phasingMode: "custom_monthly",
+      monthlyPhasing: [{ month: "2026-09", amount: 900000 }],
+    },
+  });
+  await call(`/${budget._id}/requests/${raised.body.request._id}/counter`, {
+    method: "POST",
+    body: { counterAmount: 400000 },
+  });
+  const agreed = await call(
+    `/${budget._id}/requests/${raised.body.request._id}/agree`,
+    { method: "POST", body: {} },
+  );
+  expect(agreed.status).toBe(400);
+  expect(agreed.body.code).toBe("PHASING_SUM_MISMATCH");
 });
 
 test("a request with an unsplit ask still agrees to an even line", async () => {

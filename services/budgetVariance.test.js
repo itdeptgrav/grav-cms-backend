@@ -373,3 +373,43 @@ test("an empty round has nothing over", () => {
   assert.deepEqual(rollUp([]).overrun, { heads: 0, amount: 0 });
   assert.deepEqual(rollUp().overrun, { heads: 0, amount: 0 });
 });
+
+/* ── MONEY PROMISED BUT NOT YET PAID ─────────────────────────────────────────
+   A budget head has three figures, not two: what was approved, what has been
+   posted, and what has been promised to approved spend requests with no
+   voucher against them yet. Available is what is left after both. */
+
+test("a head with no commitments reads exactly as it always did", () => {
+  /* Every caller written before commitments existed passes nothing, and must
+     get the same answer it used to. */
+  const before = evaluateLine({ allocated: 100000, actual: 30000, nature: "expense" });
+  assert.equal(before.remaining, 70000);
+  assert.equal(before.committed, 0);
+});
+
+test("committed money is no longer available to spend", () => {
+  const l = evaluateLine({ allocated: 100000, actual: 30000, committed: 25000, nature: "expense" });
+  assert.equal(l.committed, 25000);
+  assert.equal(l.remaining, 45000, "100,000 − 30,000 posted − 25,000 promised");
+});
+
+test("a commitment is never counted as actual spend", () => {
+  /* A promise is not a posting. Adding it to `actual` would report money as
+     spent that no ledger has seen. */
+  const l = evaluateLine({ allocated: 100000, actual: 30000, committed: 25000, nature: "expense" });
+  assert.equal(l.actual, 30000);
+  assert.equal(l.variance, 70000, "variance still measures the plan against real spend");
+});
+
+test("promises can take a head past its number", () => {
+  const l = evaluateLine({ allocated: 50000, actual: 10000, committed: 60000, nature: "expense" });
+  assert.equal(l.remaining, -20000);
+});
+
+test("a revenue target has nothing to promise out of it", () => {
+  /* A target is a floor to reach, not an envelope to reserve against. */
+  const l = evaluateLine({ allocated: 2000000, actual: 500000, committed: 90000, nature: "revenue" });
+  assert.equal(l.committed, 0);
+  assert.equal(l.remaining, null, "revenue reports toGo, never remaining");
+  assert.equal(l.toGo, 1500000);
+});

@@ -16,6 +16,7 @@ const mrfNotify = require("../../../../services/mrfNotify.service");
 const mrfChat = require("../../../../services/mrfChat.service");
 const { buildContext } = require("../../../../services/mrfContext.service");
 const mrfUnits = require("../../../../services/mrfUnits.service");
+const fulfilment = require("../../../../services/storeFulfilment.service");
 
 router.use(EmployeeAuth);
 
@@ -1389,6 +1390,438 @@ router.patch("/:id/cancel", async (req, res) => {
 });
 
 // ── POST /:id/issue ───────────────────────────────────────────────────────────
+// ── GET /:id/budget-head ─────────────────────────────────────────────────────
+//
+// What the head this request is charged to has left on it, right now.
+//
+// ── WHY THIS IS ITS OWN ROUTE ───────────────────────────────────────────────
+// Store is about to decide whether to spend a department's money, and
+// "Consumables" on its own does not tell them whether that is a comfortable
+// decision. The MRF carries WHICH head — the requester's manager chose it —
+// but not what is left on it, and a figure snapshotted at approval time would
+// be weeks stale by the time the store person reads it.
+//
+// Additive: nothing else's response changed, so no existing screen has to know
+// this exists. READ-ONLY, and deliberately so — Store may see the envelope and
+// may not choose it. The head is the manager's decision and stays theirs.
+//
+// Scoped to the REQUESTER's department, never the store person's. A store
+// employee looking at a Tech request is looking at Tech's envelope, and
+// answering with Store's would be the wrong number presented confidently.
+router.get("/:id/budget-head", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id)
+      .select("budgetLedgerId budgetLedgerName budgetFinancialYear budgetDepartment budgetHeadRequested requestedForDept")
+      .lean();
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    if (!mrf.budgetLedgerId) {
+      return res.json({
+        success: true,
+        head: null,
+        /* A head the department ASKED for is a real decision, not a gap — it
+           simply has no envelope behind it yet. Said plainly so the screen can
+           tell the two apart. */
+        requestedHeadName: mrf.budgetHeadRequested ? mrf.budgetLedgerName || null : null,
+        message: mrf.budgetHeadRequested
+          ? "A new head was requested for this — finance decides the envelope."
+          : "No budget head was set on this request.",
+      });
+    }
+
+    const { Acc_Company } = require("../../../../models/Accountant_model/Acc_MasterModels");
+    const companies = await Acc_Company.find({}).select("_id").limit(2).lean();
+    if (companies.length !== 1) {
+      return res.json({ success: true, head: null, message: "The books are not configured for this yet." });
+    }
+
+    const budgetMatch = require("../../../../services/budgetCommitment.service");
+    const { heads } = await budgetMatch.approvedHeadsFor({
+      companyId: companies[0]._id,
+      department: mrf.budgetDepartment || mrf.requestedForDept || "",
+    });
+    const head = heads.find((h) => String(h.ledgerId) === String(mrf.budgetLedgerId)) || null;
+
+    res.json({
+      success: true,
+      head: head
+        ? {
+            ledgerId: head.ledgerId,
+            ledgerName: head.name,
+            financialYear: head.financialYear,
+            department: head.department,
+            approved: head.approved,
+            committed: head.committed,
+            actual: head.actual,
+            available: head.available,
+          }
+        : null,
+      /* The head was chosen and has since been withdrawn from the department's
+         budget. Not a gap and not an envelope — a thing to say out loud. */
+      message: head
+        ? null
+        : `"${mrf.budgetLedgerName || "That head"}" is no longer in this department's approved budget.`,
+    });
+  } catch (e) {
+    console.error("[MRF budget-head]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── POST /:id/fulfilment-decision ────────────────────────────────────────────
+//
+// CAN WE GIVE THEM THIS, OR DO WE HAVE TO BUY IT?
+//
+// The step between the TL agreeing a department needs something and finance
+// agreeing to pay for it. A request does not reach finance because it exists —
+// it reaches finance because money has to be spent, and the only people who
+// can see the shelf are the ones who know whether that is true.
+//
+// Three answers, and only two of them cost anything:
+//
+//   issue_from_stock     stock moves. No spend request, no budget commitment,
+//                        no finance step. Issuing what the company already
+//                        owns spends nothing.
+//   partial_buy_balance  what is on the shelf is issued; ONLY the shortfall is
+//                        priced and sent on.
+//   buy_or_service       priced and sent on whole.
+//
+// ── WHAT THE STORE OWNS, AND WHAT IT DOES NOT ───────────────────────────────
+// Store owns pricing and sourcing: vendor, rate, tax, delivery date. It does
+// NOT own the budget head — that was chosen by the requester's own manager,
+// who holds the department's envelope, and it is carried here read-only. A
+// request that arrived without one cannot become a purchase; it goes back.
+//
+// ── AND WHAT THIS DOES NOT DO ───────────────────────────────────────────────
+// It does not commit budget. The spend request it creates goes to finance at
+// `pending_finance`, and the commitment is made when FINANCE says yes — see
+// budgetCommitment.service. Nothing here reserves money, and the stock half
+// never touches a budget at all.
+router.post("/:id/fulfilment-decision", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const decision = String(b.decision || "").toLowerCase();
+
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({
+        success: false,
+        message: `This request has not been approved yet — it is still with ${mrf.approverName || "the requester's Primary Manager/TL"}.`,
+      });
+    }
+    if (!["APPROVED", "PARTIALLY_ISSUED"].includes(mrf.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot decide fulfilment — this request is ${String(mrf.status).toLowerCase()}.`,
+      });
+    }
+
+    /* Live stock, in the requester's own unit — the same figure the store
+       person was looking at. Read now rather than trusted from the page: the
+       shelf may have moved since it loaded. A line with no catalogue item has
+       no stock figure at all, which is `null` and not zero. */
+    const enriched = await mrfUnits.enrichItemsWithStock(mrf.items.map((i) => i.toObject()));
+    const availableByItem = new Map();
+    mrf.items.forEach((item, i) => {
+      const live = enriched[i];
+      availableByItem.set(
+        String(item._id),
+        live && live.available !== undefined ? live.available : null,
+      );
+    });
+
+    const plan = fulfilment.planFor({
+      decision,
+      items: mrf.items.map((i) => i.toObject()),
+      plan: Array.isArray(b.lines) ? b.lines : [],
+      availableByItem,
+    });
+    if (!plan.ok) return res.status(400).json({ success: false, message: plan.reason });
+
+    const who = actorName(req);
+    const actorId = getActorId(req);
+    const now = new Date();
+
+    /* ── THE HALF THAT COMES OFF THE SHELF ────────────────────────────── */
+    const planned = plan.lines
+      .filter((l) => l.issueQty > 0)
+      .map((l) => ({ mrfItem: mrf.items.id(l.itemId), issueQty: l.issueQty }))
+      .filter((x) => x.mrfItem)
+      .map((x) => ({ mrfItem: x.mrfItem, issuedQty: x.issueQty, notes: "" }));
+
+    /* Every line has to be matched to a catalogue item before its stock can
+       move — the same rule the Issue button enforces, checked before anything
+       is written so a refusal leaves nothing half-done. */
+    const unmatched = planned.filter((x) => !x.mrfItem.rawItem);
+    if (unmatched.length) {
+      return res.status(400).json({
+        success: false,
+        message: `"${unmatched[0].mrfItem.rawItemName}" isn't matched to a catalogue item yet — match or register it before issuing.`,
+      });
+    }
+
+    let issuedLines = [];
+    if (planned.length) {
+      issuedLines = await applyIssue({ mrf, planned, actorId, storeNotes: "" });
+    }
+
+    /* ── THE HALF THAT HAS TO BE BOUGHT ───────────────────────────────── */
+    let spend = null;
+    const buying = plan.lines.filter((l) => l.buyQty > 0);
+
+    if (fulfilment.needsPurchase(decision)) {
+      const missingRate = buying.find((l) => !(l.rate > 0));
+      if (missingRate) {
+        return res.status(400).json({
+          success: false,
+          message: `"${missingRate.name}" is being bought but has no rate. Finance approves a figure, so it needs one.`,
+        });
+      }
+
+      const vendorName = String(b.vendorName || "").trim();
+      const price = fulfilment.priceFor({ lines: buying, gstPercent: b.gstPercent });
+
+      /* The budget head is the requester's manager's decision, carried. Store
+         does not choose it and cannot override it — a head picked by the
+         person who knows the shelf rather than the envelope is exactly the
+         mistake the head moved up a level to prevent. */
+      if (!mrf.budgetLedgerId && !mrf.budgetHeadRequested) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "No budget head was set on this request, so it cannot become a purchase. " +
+            "Send it back to the requester's manager to choose one.",
+        });
+      }
+
+      const { Acc_Company } = require("../../../../models/Accountant_model/Acc_MasterModels");
+      const companies = await Acc_Company.find({}).select("_id companyName").limit(2).lean();
+      if (companies.length !== 1) {
+        return res.status(409).json({
+          success: false,
+          message: companies.length
+            ? "More than one set of books exists, and a request cannot tell which it belongs to. Ask finance to configure this."
+            : "No company is set up in the books yet. Ask finance to create one.",
+        });
+      }
+
+      const { Acc_Ledger } = require("../../../../models/Accountant_model/Acc_MasterModels");
+      const ledger = mrf.budgetLedgerId
+        ? await Acc_Ledger.findOne({ _id: mrf.budgetLedgerId, companyId: companies[0]._id })
+            .select("_id name").lean()
+        : null;
+      if (mrf.budgetLedgerId && !ledger) {
+        return res.status(400).json({ success: false, message: "That budget head is not in the books." });
+      }
+
+      const spendCreate = require("../../../../services/spendRequestCreate.service");
+      const requester = await Employee.findById(mrf.requestedFor)
+        .select("_id biometricId identityId department").lean();
+
+      const lines = buying.map((l) => ({
+        name: l.name,
+        /* Every line says why. The request's own purpose stands in where the
+           line had nothing of its own — the field is required, and an empty
+           one would read as nobody having asked. */
+        whyNeeded: l.note || mrf.reason || "Requested material the store cannot supply from stock",
+        quantity: l.buyQty,
+        unit: l.unit,
+        rate: l.rate,
+        amount: Math.round(l.buyQty * l.rate * 100) / 100,
+      }));
+
+      const created = await spendCreate.createSpendRequest({
+        emp: {
+          _id: mrf.requestedFor,
+          biometricId: requester?.biometricId || mrf.requestedForId,
+          identityId: requester?.identityId,
+          department: mrf.requestedForDept,
+        },
+        actorName: mrf.requestedForName || "",
+        company: companies[0],
+        title: `${mrf.mrfNumber} — balance to buy`,
+        purpose: mrf.reason || "Material the store cannot supply from stock",
+        requestType: String(b.requestType || "PRODUCT").toUpperCase() === "SERVICE" ? "SERVICE" : "PRODUCT",
+        priority: mrf.priority || "NORMAL",
+        neededBy: mrf.neededBy || null,
+        vendorName,
+        gstin: String(b.gstin || "").trim().toUpperCase(),
+        lines,
+        totalAmount: price.subtotal,
+        ledger,
+        asksForNewHead: !mrf.budgetLedgerId && Boolean(mrf.budgetHeadRequested),
+        requestedHeadName: mrf.budgetLedgerName || "",
+        requestedHeadReason: "Carried from the request the store could not fill from stock",
+        /* The manager the MRF was addressed to, carried whole — the approval
+           is a record of who was asked, and this request is the same ask. */
+        approver: {
+          approverEmployee: mrf.approverEmployee || null,
+          approverName: mrf.approverName || "",
+          approverBiometricId: mrf.approverBiometricId || "",
+          approverAltIds: mrf.approverAltIds || [],
+          approverResolution: mrf.approverResolution || "RESOLVED",
+          approverResolutionNote: "",
+        },
+        /* Straight to finance. The TL already agreed the department needs it;
+           sending it back would be the same person answering twice. */
+        startAt: "pending_finance",
+        tlApproval: mrf.tlApprovedAt
+          ? { by: mrf.tlApprovedBy, byName: mrf.tlApprovedByName, at: mrf.tlApprovedAt }
+          : null,
+        /* The store's own words travel with it. Finance is deciding on a
+           vendor and a price they had no part in choosing, and "only vendor
+           who stocks this grade" is most of the case for the figure. */
+        historyNote:
+          `Raised by ${who} from ${mrf.mrfNumber} — the store could not supply this from stock.` +
+          (String(b.note || "").trim() ? ` ${String(b.note).trim().slice(0, 400)}` : ""),
+        now,
+      });
+
+      spend = created.request;
+      /* The commercial detail, stamped after creation so the shared creator
+         stays the one place a spend request is built. `pricedAt` is the gate
+         finance approval sits behind. */
+      spend.gstPercent = price.gstPercent;
+      spend.taxAmount = price.taxAmount;
+      spend.grandTotal = price.grandTotal;
+      spend.expectedDeliveryDate = b.expectedDeliveryDate ? new Date(b.expectedDeliveryDate) : undefined;
+      spend.pricedBy = actorId;
+      spend.pricedByName = who;
+      spend.pricedAt = now;
+      spend.sourceMrfId = mrf._id;
+      spend.sourceMrfNumber = mrf.mrfNumber;
+      await spend.save();
+
+      mrf.spendRequestId = spend._id;
+      mrf.spendRequestNumber = spend.requestNumber;
+      buying.forEach((l) => {
+        const item = mrf.items.id(l.itemId);
+        if (item) item.buyQty = l.buyQty;
+      });
+    }
+
+    /* ── RECORD THE DECISION ──────────────────────────────────────────── */
+    mrf.fulfilmentDecision = decision;
+    mrf.fulfilmentDecidedAt = now;
+    mrf.fulfilmentDecidedBy = actorId;
+    mrf.fulfilmentDecidedByName = who;
+    mrf.fulfilmentNote = String(b.note || "").trim().slice(0, 500);
+    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = now;
+
+    /* Status follows what actually moved, by the same rule the Issue button
+       uses. A request whose whole balance went to finance keeps its status —
+       nothing has been issued and nothing is settled until the goods arrive. */
+    const live = mrf.items.filter((i) => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus));
+    const allIssued = live.length > 0 && live.every((i) => i.itemStatus === "ISSUED");
+    const someIssued = mrf.items.some((i) => (i.issuedQty || 0) > 0);
+    mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
+
+    const detail =
+      fulfilment.DECISION_LABEL[decision] +
+      (issuedLines.length
+        ? ` — issued ${issuedLines.map((l) => `${l.issuedQty} ${l.unit} of ${l.name}`).join("; ")}`
+        : "") +
+      (spend ? ` — ${spend.requestNumber} sent to finance` : "");
+    mrf.logEvent({ action: "STORE_FULFILMENT_DECISION", actorName: who, actorRole: "store", detail });
+
+    await mrf.save();
+
+    mrfChat.systemMessage(mrf, detail, who);
+    if (issuedLines.length) {
+      mrfNotify.issued(mrf, issuedLines).catch((e) => console.error("[fulfilment issue notify]", e.message));
+    }
+
+    const obj = mrf.toObject();
+    res.json({
+      success: true,
+      message: spend
+        ? `${spend.requestNumber} is with finance for ${spend.grandTotal ? `₹${spend.grandTotal}` : "pricing"}.` +
+          (issuedLines.length ? " What was on the shelf has been issued." : "")
+        : "Issued from stock — nothing to buy, so finance is not involved.",
+      mrf: obj,
+      issued: issuedLines,
+      spendRequest: spend
+        ? {
+            _id: String(spend._id),
+            requestNumber: spend.requestNumber,
+            status: spend.status,
+            totalAmount: spend.totalAmount,
+            gstPercent: spend.gstPercent,
+            taxAmount: spend.taxAmount,
+            grandTotal: spend.grandTotal,
+          }
+        : null,
+      context: buildContext(obj, "store"),
+    });
+  } catch (e) {
+    console.error("[MRF fulfilment-decision]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/**
+ * MOVE THE STOCK. The one place a requester-unit quantity becomes a ledger
+ * movement.
+ *
+ * ── WHY THIS IS A FUNCTION AND NOT TWO COPIES ──────────────────────────────
+ * Two things issue material now: the store's Issue button, and the fulfilment
+ * decision, which issues what is on the shelf before sending the shortfall to
+ * be bought. Both have to convert units the same way, write the same ledger
+ * reason, set the same line status and push the same history — and if they
+ * ever stopped agreeing, the disagreement would be between the stock ledger
+ * and the request, which is the one pair nobody can reconcile after the fact.
+ *
+ * The CALLER validates: what is owed, whether the line is matched, and whether
+ * the shelf can still cover it. This function trusts `planned` and does the
+ * moving, because the two callers refuse for different reasons and in
+ * different words.
+ *
+ * Does not save. The caller decides what else changes in the same write.
+ */
+async function applyIssue({ mrf, planned, actorId, storeNotes = "" }) {
+  const issuedLines = [];
+
+  for (const { mrfItem, issuedQty, notes } of planned) {
+    // The only place a requester-unit quantity is converted to the
+    // catalogue's base unit: the stock ledger.
+    const deductQty = await convertQty(issuedQty, mrfItem.unit, mrfItem.baseUnit);
+    await adjustStock(
+      mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, -deductQty,
+      {
+        type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
+        quantity: deductQty,
+        reason: `MRF Issue — ${mrf.mrfNumber}`,
+        notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
+        performedBy: actorId,
+      }
+    );
+    mrfItem.issuedQty += issuedQty;
+    mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
+    mrfItem.itemStatus = mrfItem.issuedQty >= mrfItem.requestedQty - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED";
+    // Issuing settles the availability question for what just went out.
+    if (mrfItem.itemStatus === "ISSUED") mrfItem.availability = "AVAILABLE";
+    if (notes) mrfItem.storeNotes = notes;
+    mrfItem.issueHistory = mrfItem.issueHistory || [];
+    mrfItem.issueHistory.push({
+      issuedQty,
+      notes: notes || storeNotes || "",
+      recordedBy: actorId,
+      recordedAt: new Date(),
+    });
+
+    issuedLines.push({
+      name: mrfItem.rawItemName,
+      unit: mrfItem.unit,
+      issuedQty,
+      remaining: Math.max(0, (mrfItem.requestedQty || 0) - mrfItem.issuedQty),
+    });
+  }
+
+  return issuedLines;
+}
+
 router.post("/:id/issue", async (req, res) => {
   try {
     const { items = [], storeNotes = "" } = req.body;
@@ -1461,43 +1894,9 @@ router.post("/:id/issue", async (req, res) => {
       });
 
     const who = actorName(req);
-    const issuedLines = [];
-
-    for (const { mrfItem, issuedQty, notes } of planned) {
-      // The only place a requester-unit quantity is converted to the
-      // catalogue's base unit: the stock ledger.
-      const deductQty = await convertQty(issuedQty, mrfItem.unit, mrfItem.baseUnit);
-      await adjustStock(
-        mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, -deductQty,
-        {
-          type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
-          quantity: deductQty,
-          reason: `MRF Issue — ${mrf.mrfNumber}`,
-          notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
-          performedBy: getActorId(req),
-        }
-      );
-      mrfItem.issuedQty += issuedQty;
-      mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
-      mrfItem.itemStatus = mrfItem.issuedQty >= mrfItem.requestedQty - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED";
-      // Issuing settles the availability question for what just went out.
-      if (mrfItem.itemStatus === "ISSUED") mrfItem.availability = "AVAILABLE";
-      if (notes) mrfItem.storeNotes = notes;
-      mrfItem.issueHistory = mrfItem.issueHistory || [];
-      mrfItem.issueHistory.push({
-        issuedQty,
-        notes: notes || storeNotes || "",
-        recordedBy: getActorId(req),
-        recordedAt: new Date(),
-      });
-
-      issuedLines.push({
-        name: mrfItem.rawItemName,
-        unit: mrfItem.unit,
-        issuedQty,
-        remaining: Math.max(0, (mrfItem.requestedQty || 0) - mrfItem.issuedQty),
-      });
-    }
+    const issuedLines = await applyIssue({
+      mrf, planned, actorId: getActorId(req), storeNotes,
+    });
 
     if (storeNotes) mrf.storeNotes = storeNotes;
     if (!mrf.storeReviewedAt) mrf.storeReviewedAt = new Date();

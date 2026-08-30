@@ -118,6 +118,71 @@ function normaliseRowMonths(raw, at) {
   return rows.length ? rows : null;
 }
 
+/**
+ * WHAT A WORKING ROW IS WORTH — the one derivation, used everywhere.
+ *
+ * ── THE BUG THIS EXISTS TO END ──────────────────────────────────────────────
+ * A row stored as `{quantity: 2, rate: 200000, multiplier: 0, amount: 0}` read
+ * on screen as "2 events × ₹2,00,000 … ₹0". The head said ₹6,00,000 and its own
+ * derivation said nothing, which is worse than having no derivation at all: a
+ * reviewer cannot tell whether the rows are wrong or the total is.
+ *
+ * A multiplier of ZERO is the culprit, and it is never a real answer. Nothing
+ * in a budget is bought "× 0 months" — the field means "and this many times
+ * over", so absent and zero are the same statement: once. `foldMultiplier` in
+ * the proposal builder already read it that way; this makes the whole system
+ * agree.
+ *
+ * ── WHY QUANTITY IS NOT TREATED THE SAME ────────────────────────────────────
+ * A zero QUANTITY is a real thing a department can mean — "we are not buying
+ * any of these this year" — and `normaliseWorkingLines` says so explicitly: a
+ * line can be zero, but not less. So an absent quantity is one, and a stated
+ * zero is zero. The two fields look alike and are not.
+ *
+ * ── THE ORDER, AND WHY ──────────────────────────────────────────────────────
+ *   1 · a row with its own MONTHS is the sum of them — it never had a quantity
+ *       and a rate to multiply;
+ *   2 · a row marked MANUAL states its own figure — a quoted price or a
+ *       negotiated lump sum, which is the whole point of the flag;
+ *   3 · everything else is quantity × rate × multiplier.
+ *
+ * The stored `amount` is deliberately NOT consulted outside case 2. A stored
+ * total that disagrees with its own inputs is not a derivation, and preferring
+ * it is how a stale zero reached the screen in the first place.
+ */
+function rowAmount(row) {
+  const monthly = Array.isArray(row?.monthly) ? row.monthly : null;
+  if (monthly && monthly.length) {
+    return money(monthly.reduce((sum, m) => sum + (money(m?.amount) ?? 0), 0)) ?? 0;
+  }
+
+  if (row?.manualAmount === true) return money(row?.amount) ?? 0;
+
+  /* ── A ROW WITH NOTHING TO DERIVE FROM KEEPS ITS OWN TOTAL ──────────────
+     Every row this service writes carries a quantity, a rate and a multiplier,
+     so this is a defence rather than a path — but a row that arrived by some
+     other route with only an `amount` on it has no derivation to prefer, and
+     returning zero for it would invent the very bug this helper removes.
+
+     It cannot mask that bug: the stale row HAS a quantity and a rate, so it
+     derives and the stored figure loses. This branch is only for rows that
+     state a total and nothing else. */
+  const hasInputs =
+    row?.quantity !== undefined && row?.quantity !== null
+      ? true
+      : (row?.rate !== undefined && row?.rate !== null) ||
+        (row?.multiplier !== undefined && row?.multiplier !== null);
+  if (!hasInputs) return money(row?.amount) ?? 0;
+
+  const quantity = money(row?.quantity) ?? 1;
+  const rate = money(row?.rate) ?? 0;
+  /* Absent, null and zero all mean "once". See the header. */
+  const raw = money(row?.multiplier);
+  const multiplier = raw === null || raw === 0 ? 1 : raw;
+
+  return money(quantity * rate * multiplier) ?? 0;
+}
+
 function normaliseWorkingLines(workingLines) {
   if (workingLines === undefined || workingLines === null) return { lines: [], total: null };
   if (!Array.isArray(workingLines)) {
@@ -161,7 +226,18 @@ function normaliseWorkingLines(workingLines) {
        rather than collapsing to NaN. */
     const quantity = manual ? money(raw?.quantity) ?? 0 : money(raw?.quantity) ?? 1;
     const rate = manual ? money(raw?.rate) ?? 0 : money(raw?.rate) ?? 0;
-    const multiplier = manual ? money(raw?.multiplier) ?? 0 : money(raw?.multiplier) ?? 1;
+    /* ── A ZERO MULTIPLIER IS NOT AN ANSWER ────────────────────────────────
+       On a computed row it means "once", not "none" — see `rowAmount`. Stored
+       as 1 rather than 0 so the row is self-consistent from here on and the
+       next reader does not have to know the rule. A MANUAL row keeps whatever
+       it was given: its amount does not come from the multiplier, so nothing
+       is corrupted by leaving the number the department typed alone. */
+    const sentMultiplier = money(raw?.multiplier);
+    const multiplier = manual
+      ? sentMultiplier ?? 0
+      : sentMultiplier === null || sentMultiplier === 0
+        ? 1
+        : sentMultiplier;
 
     for (const [name, value] of [
       ["quantity", quantity],
@@ -191,8 +267,10 @@ function normaliseWorkingLines(workingLines) {
         throw new WorkingError("WORKING_NEGATIVE", `${at} has a negative amount.`);
       }
     } else {
-      /* The client's `amount` is deliberately not read here. See the header. */
-      amount = money(quantity * rate * multiplier) ?? 0;
+      /* The client's `amount` is deliberately not read here. See the header.
+         Through `rowAmount`, so the figure this STORES and the figure every
+         screen DERIVES cannot come apart. */
+      amount = rowAmount({ quantity, rate, multiplier });
     }
 
     lines.push({
@@ -302,6 +380,7 @@ module.exports = {
   SUM_TOLERANCE,
   MAX_LINES,
   money,
+  rowAmount,
   normaliseWorkingLines,
   reconcileAmount,
   summarise,

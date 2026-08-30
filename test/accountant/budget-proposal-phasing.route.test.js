@@ -395,6 +395,13 @@ describe("finance approval carries the department's shape", () => {
       body: JSON.stringify(body),
     }).then(async (r) => ({ status: r.status, body: JSON.parse((await r.text()) || "null") }));
 
+  const counter = (budgetId, requestId, body) =>
+    fetch(`${financeBase}/${budgetId}/requests/${requestId}/counter`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-test-user": JSON.stringify(OWNER) },
+      body: JSON.stringify(body),
+    }).then(async (r) => ({ status: r.status, body: JSON.parse((await r.text()) || "null") }));
+
   const proposeSplit = async () => {
     const s = await seed();
     const { body } = await submit(s.budget, s.company, {
@@ -429,13 +436,23 @@ describe("finance approval carries the department's shape", () => {
     ]);
   });
 
-  test("finance may re-phase what it agrees, and the line takes that shape", async () => {
+  test("finance re-phases through a counter, and the line takes that shape", async () => {
+    /* Re-phasing at approval used to be one click. It is now a counter, because
+       a department finding out afterwards that its festival money was moved to
+       January is not something they agreed to. What must survive the change is
+       the record: the ask keeps its own shape, the settlement keeps finance's. */
     const { company, budget, requestId } = await proposeSplit();
-    const { status } = await agree(budget._id, requestId, {
+    const countered = await counter(budget._id, requestId, {
       companyId: company._id.toString(),
-      agreedAmount: 1200000,
+      counterAmount: 1200000,
       phasingMode: "custom_monthly",
       monthlyPhasing: [{ month: "2027-01", amount: 1200000 }],
+      financeNote: "Same money, but after the festival quarter.",
+    });
+    expect(countered.status).toBe(200);
+
+    const { status } = await agree(budget._id, requestId, {
+      companyId: company._id.toString(),
     });
     expect(status).toBe(200);
 
@@ -449,15 +466,30 @@ describe("finance approval carries the department's shape", () => {
     expect(row.agreedMonthlyPhasing.map((m) => m.month)).toEqual(["2027-01"]);
   });
 
-  test("cutting the amount without re-phasing is refused rather than silently straight-lined", async () => {
+  test("cutting the amount at approval is refused as an edit", async () => {
     const { company, budget, requestId } = await proposeSplit();
     const { status, body } = await agree(budget._id, requestId, {
       companyId: company._id.toString(),
       agreedAmount: 800000,
     });
-    /* The department's split still sums to 12,00,000. Finance has to say how
-       the smaller number is spread — the alternative is a line whose months
-       do not add up to its own total. */
+    expect(status).toBe(400);
+    expect(body.code).toBe("AGREE_IS_NOT_AN_EDIT");
+  });
+
+  test("cutting it by counter without re-phasing is still refused rather than straight-lined", async () => {
+    /* The arithmetic this always protected, on its new path. The department's
+       split still sums to 12,00,000; finance has to say how the smaller number
+       is spread, or the line's months do not add up to its own total. */
+    const { company, budget, requestId } = await proposeSplit();
+    const countered = await counter(budget._id, requestId, {
+      companyId: company._id.toString(),
+      counterAmount: 800000,
+    });
+    expect(countered.status).toBe(200);
+
+    const { status, body } = await agree(budget._id, requestId, {
+      companyId: company._id.toString(),
+    });
     expect(status).toBe(400);
     expect(body.code).toBe("PHASING_SUM_MISMATCH");
   });
@@ -490,16 +522,21 @@ describe("finance approval carries the department's shape", () => {
     expect(row.workingLines).toHaveLength(3);
   });
 
-  test("an evenly-phased ask agreed at a lower amount stays even", async () => {
+  test("an evenly-phased ask countered down stays even", async () => {
     const s = await seed();
     const { body } = await submit(s.budget, s.company, {
       ledgerId: s.expense._id.toString(),
       requestedAmount: 1200000,
       phasingMode: "even",
     });
+    const countered = await counter(s.budget._id, body.request._id, {
+      companyId: s.company._id.toString(),
+      counterAmount: 800000,
+    });
+    expect(countered.status).toBe(200);
+
     const { status } = await agree(s.budget._id, body.request._id, {
       companyId: s.company._id.toString(),
-      agreedAmount: 800000,
     });
     expect(status).toBe(200);
     const fresh = await Acc_Budget.findById(s.budget._id).lean();

@@ -16,6 +16,7 @@ const { SECRET } = require("../../config/jwt");
 const { Acc_Company, Acc_Group, Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_BudgetDepartment } = require("../../models/Accountant_model/Acc_BudgetDepartment");
+const Employee = require("../../models/Employee");
 
 let server;
 let base;
@@ -33,6 +34,23 @@ beforeAll(async () => {
 afterAll(async () => {
   await new Promise((r) => server.close(r));
 });
+
+/* ── WHO A TOKEN IS, NOW THAT HR DECIDES ────────────────────────────────────
+ * A department used to be granted in Access Control, so a token plus a linked
+ * portal was the whole story. It comes from the EMPLOYEE RECORD now, so a
+ * token that names nobody HR knows resolves to nothing — which is the point.
+ *
+ * `asDept` creates the employee the token belongs to. Every test that expects
+ * to reach a department's budget calls it; the ones that expect a refusal
+ * deliberately do not. */
+async function asDept(email, department) {
+  await Employee.findOneAndUpdate(
+    { email },
+    { email, firstName: "Dept", lastName: "Head", department, isActive: true, gender: "Other" },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  return tokenFor({ email });
+}
 
 /** A real signed CMS department token, exactly as deptAuth mints one. */
 const tokenFor = ({ deptSlug, email = "head@demo.example", isAdmin = false } = {}) =>

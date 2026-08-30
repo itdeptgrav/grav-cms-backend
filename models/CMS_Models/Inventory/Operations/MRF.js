@@ -134,6 +134,19 @@ const mrfItemSchema = new mongoose.Schema(
     // set by the requisition route once the form is saved. Lets the Store
     // screen show it was already actioned instead of offering the same
     // buttons again with no memory of it.
+    /* ── THE PART OF THIS LINE THAT HAS TO BE BOUGHT ──────────────────────
+     * Set when Store decides the shelf cannot cover this line — wholly, or
+     * only the balance after what they could issue.
+     *
+     * Kept on the LINE and not on the request because a request is routinely
+     * mixed: three items on the shelf and a fourth that has to be ordered is
+     * the ordinary case, and one decision for the whole document would force
+     * the store to send the three away too. `requestedQty − issuedQty` is not
+     * the same number — a line can be short without anybody having decided to
+     * buy the difference, and that difference is exactly what this records.
+     */
+    buyQty: { type: Number, default: 0, min: 0 },
+
     purchaseFormRaised: { type: Boolean, default: false },
     purchaseRequisitionId: { type: mongoose.Schema.Types.ObjectId, ref: "Requisition", default: null },
     purchaseRequisitionNumber: { type: String, trim: true, default: "" },
@@ -275,7 +288,88 @@ const mrfSchema = new mongoose.Schema(
     autoForwarded: { type: Boolean, default: false },
     autoForwardReason: { type: String, trim: true, default: "" },
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // THE STORE'S FULFILMENT DECISION
+    // ═══════════════════════════════════════════════════════════════════════
+    // A department's request does not go to finance because it exists. It goes
+    // to finance because MONEY HAS TO BE SPENT — and the only people who know
+    // whether that is true are the ones who can see the shelf.
+    //
+    // So a TL-approved request stops here first. Store answers one question,
+    // three ways:
+    //
+    //   issue_from_stock     we have it. Stock moves, nothing is bought, no
+    //                        budget is touched and finance never hears about
+    //                        it. Issuing something the company already owns
+    //                        spends nothing.
+    //   partial_buy_balance  we have some. What we have is issued; only the
+    //                        shortfall is priced and sent on.
+    //   buy_or_service       we have none of it, or it was never stock — a
+    //                        repair, an AMC, a vendor purchase. Priced and
+    //                        sent on whole.
+    //
+    // ── WHY THIS IS RECORDED AND NOT INFERRED ──────────────────────────────
+    // "Nothing was issued" and "Store decided to buy it" look identical from
+    // the quantities alone, and they are completely different facts: the first
+    // is a request nobody has looked at, the second is a commitment somebody
+    // made. Only one of them should reach finance.
+    fulfilmentDecision: {
+      type: String,
+      enum: ["issue_from_stock", "partial_buy_balance", "buy_or_service"],
+    },
+    fulfilmentDecidedAt: { type: Date },
+    fulfilmentDecidedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    fulfilmentDecidedByName: { type: String, trim: true, default: "" },
+    fulfilmentNote: { type: String, trim: true, default: "" },
+
+    // What the balance became, when there was one. A reference rather than a
+    // status copy: the spend request's own state is the live one, and keeping
+    // a second copy here is how two screens start disagreeing about whether
+    // finance has answered.
+    spendRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "SpendRequest", default: null },
+    spendRequestNumber: { type: String, trim: true, default: "" },
+
     // ── TL approval layer ──────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    // WHERE THIS CAME FROM, WHEN IT CAME OFF THE UNIFIED REQUESTS DESK
+    // ═══════════════════════════════════════════════════════════════════════
+    // A back-pointer to the IntakeRequest that was classified as store stock,
+    // and the budget head the requester's manager had already chosen on it.
+    //
+    // ── WHY THE HEAD IS CARRIED ONTO SOMETHING THAT SPENDS NOTHING ─────────
+    // Issuing stock the company already owns spends nothing, so this head is
+    // normally never used — it is recorded and ignored, which is exactly what
+    // the manager was told would happen when they were asked for it.
+    //
+    // It matters for the one case where that turns out to be wrong: the store
+    // cannot supply it after all, and the ask has to be bought instead. The
+    // decision the manager already made is then still here, and nobody has to
+    // send the request back up the chain to have the same question answered
+    // twice. Denormalised alongside `intakeRequestId` so the figures read even
+    // if the originating request is later archived.
+    //
+    // Absent on every MRF raised through the material app directly, which is
+    // the truth about those: nobody chose a head, because that flow never
+    // asks for one.
+    intakeRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "IntakeRequest" },
+    intakeRequestNumber: { type: String, trim: true, default: "" },
+    budgetLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+    budgetLedgerName: { type: String, trim: true, default: "" },
+    budgetCycleId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Budget" },
+    budgetLineId: { type: mongoose.Schema.Types.ObjectId },
+    budgetFinancialYear: { type: String, trim: true, default: "" },
+    budgetDepartment: { type: String, trim: true, default: "" },
+    /* ── THE PLANNED ITEM THE REQUEST NAMED ─────────────────────────────────
+       Fulfilment context: the store is issuing against the row of the budget
+       that was agreed, not just against an accounting head. Additive — absent
+       on every MRF raised before planned items existed. */
+    plannedItemKey: { type: String, trim: true, index: true },
+    plannedItemName: { type: String, trim: true },
+    plannedItemAmount: { type: Number, min: 0 },
+    // A head the department ASKED for rather than one finance had approved.
+    // Carried for the same reason, and flagged so nothing reads it as budgeted.
+    budgetHeadRequested: { type: Boolean, default: false },
+
     tlApproved: { type: Boolean, default: false },
     tlApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
     tlApprovedByName: { type: String, trim: true, default: "" },

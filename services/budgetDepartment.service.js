@@ -355,6 +355,114 @@ async function budgetDepartmentsForGrant({ companyId, slugs }) {
   });
 }
 
+/**
+ * THE CALLER'S OWN DEPARTMENT, FROM HR.
+ *
+ * ── WHAT THIS REPLACED, AND WHY ─────────────────────────────────────────────
+ * A person used to reach the Budget app's data through ACCESS CONTROL: either
+ * a grant naming budget departments directly ("can submit budget for HR"), or
+ * an older indirection where finance mapped a login portal to a budget
+ * department through `Acc_BudgetDepartment.accessSlug`.
+ *
+ * Both asked an administrator to state, by hand, a fact HR already holds:
+ * which department this person is in. Two records of one truth, kept in step
+ * by nobody — and when they disagreed the app either showed somebody another
+ * department's budget or told a correctly-employed person their account was
+ * not linked. The second is what happened here: the grant was set, the
+ * registry it resolved against was empty, and the app resolved nothing for
+ * anyone.
+ *
+ * So the department comes from the employee record now. HR sets it when
+ * somebody joins and changes it when they move, which is exactly when the
+ * answer should change, and there is no second place to forget.
+ *
+ * ── departmentId FIRST, THE STRING AS FALLBACK ──────────────────────────────
+ * The same rule the approval chain uses. A reference cannot be spelled two
+ * ways; the free-text field can, so it is slugified — "R&D", "R and D" and
+ * "r-and-d" are one department. Both are read, because most records carry only
+ * the string.
+ *
+ * ── AND WHY IT WORKS WITH AN EMPTY REGISTRY ─────────────────────────────────
+ * `Acc_BudgetDepartment` supplies display names and aliases when finance has
+ * registered a department. It is NOT the gate: with no rows at all — which is
+ * the state of this database — the caller's own HR department still resolves,
+ * against the department names the budget's own lines carry. Requiring a
+ * registry row would mean the app stays dark until somebody seeds eighteen of
+ * them, which is the failure this change exists to end.
+ *
+ * ── FAILS CLOSED ────────────────────────────────────────────────────────────
+ * No employee record, or no department on it, is an empty list — never every
+ * department. A blank department cannot widen into a match because blank slugs
+ * are dropped before anything is compared.
+ */
+async function budgetDepartmentsForEmployee({ companyId, user }) {
+  const Employee = require("../models/Employee");
+
+  const email = String(user?.email || "").trim().toLowerCase();
+  const loginId = user?.employeeId || user?.id;
+  const or = [];
+  if (email) or.push({ email });
+  if (loginId) or.push({ biometricId: String(loginId) }, { identityId: String(loginId) });
+  if (!or.length) return [];
+
+  const emp = await Employee.findOne({ $or: or })
+    .select("department departmentId isActive status")
+    .lean();
+  if (!emp) return [];
+
+  /* Somebody the login would refuse must not carry a budget entitlement. */
+  const inactive =
+    emp.isActive === false ||
+    ["inactive", "suspended"].includes(String(emp.status || "").toLowerCase());
+  if (inactive) return [];
+
+  const names = new Set();
+  if (emp.department) names.add(String(emp.department));
+
+  /* The org-chart reference, when there is one. Read for its NAME — the id
+     itself means nothing to a budget line, which stores a department as text. */
+  if (emp.departmentId) {
+    try {
+      const mongoose = require("mongoose");
+      const row = await mongoose.connection
+        .collection("departments")
+        .findOne({ _id: new mongoose.Types.ObjectId(String(emp.departmentId)) });
+      if (row?.name) names.add(String(row.name));
+    } catch {
+      /* A department row that cannot be read costs the alias, not the access —
+         the free-text field is still there and is what most records use. */
+    }
+  }
+
+  const slugs = [...new Set([...names].map(slugify).filter(Boolean))];
+  if (!slugs.length) return [];
+
+  /* Registered departments answer with their own name and aliases; anything
+     HR knows about and finance has not registered still resolves, under the
+     name HR gave it. */
+  const registered = await Acc_BudgetDepartment.find({
+    companyId: actuals.oid(companyId),
+    slug: { $in: slugs },
+    isActive: { $ne: false },
+  })
+    .select("_id slug name aliases")
+    .lean();
+
+  const bySlug = new Map(registered.map((r) => [r.slug, r]));
+  return slugs.map((slug) => {
+    const hit = bySlug.get(slug);
+    return hit
+      ? { _id: hit._id, slug: hit.slug, name: hit.name, aliases: hit.aliases || [] }
+      : {
+          _id: null,
+          slug,
+          /* Displayed as HR spells it, not as a slug. */
+          name: displayOf([...names].find((n) => slugify(n) === slug) || slug),
+          aliases: [],
+        };
+  });
+}
+
 module.exports = {
   slugify,
   displayOf,
@@ -363,4 +471,5 @@ module.exports = {
   departmentsForAccessSlugs,
   departmentsForSlugs,
   budgetDepartmentsForGrant,
+  budgetDepartmentsForEmployee,
 };

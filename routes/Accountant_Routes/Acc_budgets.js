@@ -20,6 +20,10 @@ const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddlew
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Ledger, Acc_Group, Acc_CostCentre } = require("../../models/Accountant_model/Acc_MasterModels");
 const variance = require("../../services/budgetVariance.service");
+const lineReview = require("../../services/budgetLineReview.service");
+const requestContext = require("../../services/budgetRequestContext.service");
+const commitments = require("../../services/budgetCommitment.service");
+const drafts = require("../../services/budgetDraft.service");
 const phasing = require("../../services/budgetPhasing.service");
 const working = require("../../services/budgetWorking.service");
 const adjustments = require("../../services/budgetAdjustment.service");
@@ -1348,12 +1352,34 @@ router.get("/dashboard", async (req, res) => {
 router.post("/check-availability", async (req, res) => {
   try {
     const body = req.body || {};
+
+    /* ── THE PROMISE THIS VOUCHER WOULD DISCHARGE ─────────────────────────
+       A form checking availability for a bill raised against an approved
+       request must not be warned about that request's own commitment — the
+       posting removes it. Resolved from the SAME explicit links the release
+       uses (commitment id, spend request id, or the order reference the
+       company generated), never from amount, vendor or date. */
+    let releasingCommitment = null;
+    if (body.budgetCommitmentId || body.spendRequestId || body.referenceNumber) {
+      try {
+        releasingCommitment = await commitments.commitmentForVoucher({
+          voucherType: body.voucherType || "purchase",
+          budgetCommitmentId: body.budgetCommitmentId || null,
+          spendRequestId: body.spendRequestId || null,
+          referenceNumber: body.referenceNumber || null,
+        });
+      } catch (e) {
+        console.error("[budgets] could not resolve the commitment being released:", e.message);
+      }
+    }
+
     const result = await control.checkBudgetAvailability({
       companyId: body.companyId || companyOf(req),
       voucherDate: body.voucherDate,
       ledgerEntries: body.ledgerEntries || [],
       department: body.department || body.costCentre || null,
       excludeVoucherId: body.excludeVoucherId || null,
+      releasingCommitment,
     });
     res.json({ success: true, ...result });
   } catch (error) {
@@ -2187,11 +2213,148 @@ router.post("/:id/close-collection", async (req, res) => {
         s.state = "agreed";
       }
     }
+    /* Stamped so "how long has this meeting been pending" has a date to count
+       from — the one deadline in this process that nothing enforces. */
+    const closing = drafts.activeDraft(budget);
+    if (closing && Array.isArray(budget.drafts) && budget.drafts.length) {
+      const row = budget.drafts[budget.drafts.length - 1];
+      if (!row.closedAt) row.closedAt = new Date();
+    }
+
     budget.status = "review";
     await budget.save();
-    res.json({ success: true, defaulted, submissions: budget.submissions, status: budget.status });
+    res.json({
+      success: true,
+      defaulted,
+      submissions: budget.submissions,
+      status: budget.status,
+      draft: drafts.draftNumber(budget),
+      /* Whether there is another draft to open, said here so the screen that
+         just closed one does not have to ask again to find out. */
+      nextDraft: drafts.canOpenNext(budget),
+    });
   } catch (error) {
     console.error("[budgets] close-collection error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── OPEN THE NEXT DRAFT ──────────────────────────────────────────────────────
+ * A budget is not set in one pass. Draft 1 closed, the meeting happened, and
+ * this is somebody acting on it: reopening the cycle for a second round with
+ * whatever was not settled carried forward.
+ *
+ * ── WHAT IT DELIBERATELY DOES NOT DO ────────────────────────────────────────
+ * Decide anything. It does not counter, agree, cut or set a target — the
+ * meeting did that, and the lines finance settled there are already agreed and
+ * do not come back. This reopens the argument that is still open, and nothing
+ * else.
+ *
+ * A copy is made rather than the same request being reused, so Draft 1 stays
+ * exactly as submitted. What a department originally asked for, against what
+ * they came back with, is the number the second meeting is actually about.
+ */
+router.post("/:id/drafts", async (req, res) => {
+  try {
+    if (requireFinance(req, res)) return;
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
+    if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
+
+    const allowed = drafts.canOpenNext(budget);
+    if (!allowed.ok) return res.status(409).json({ success: false, message: allowed.reason });
+
+    const body = req.body || {};
+    const opensOn = body.opensOn ? new Date(body.opensOn) : new Date();
+    const closesOn = body.closesOn ? new Date(body.closesOn) : null;
+    if (Number.isNaN(opensOn.getTime()) || (closesOn && Number.isNaN(closesOn.getTime()))) {
+      return res.status(400).json({ success: false, message: "Those dates cannot be read." });
+    }
+    if (closesOn && closesOn < opensOn) {
+      return res.status(400).json({
+        success: false,
+        message: "A draft cannot close before it opens.",
+      });
+    }
+    /* A deadline is the point of a draft. One without a date is an invitation,
+       and an invitation is what the first round already was. */
+    if (!closesOn) {
+      return res.status(400).json({
+        success: false,
+        message: "Give the draft a deadline — a round with no date is what the last one already was.",
+      });
+    }
+
+    /* ── WHAT COMES BACK, AND WHAT IS FINISHED ────────────────────────────
+       A line finance agreed is done: it becomes an allocation and leaves the
+       process. Carrying it forward would also write a SECOND allocation for
+       the same money, because `syncAllocationFromRequest` keys on
+       `sourceRequestId`. A department whose whole submission was agreed has
+       nothing to do in this draft at all. */
+    const number = allowed.next;
+    const previous = (budget.budgetRequests || []).filter(
+      (r) => drafts.carriesForward(r) && (r.draft || 1) === number - 1,
+    );
+
+    const now = new Date();
+    const actor = actorOf(req);
+    let carried = 0;
+    for (const r of previous) {
+      const copy = r.toObject ? r.toObject() : { ...r };
+      delete copy._id;
+      budget.budgetRequests.push({
+        ...copy,
+        draft: number,
+        revisionOf: r._id,
+        /* Back to the department. Finance's counter travels with it as the
+           number they are being asked to respond to, but the state cannot stay
+           `countered` or the request would read as already answered. */
+        state: "submitted",
+        submittedAt: null,
+        submittedBy: r.submittedBy,
+      });
+      /* The original is history now — readable, and out of every queue. */
+      r.supersededByDraft = number;
+      carried += 1;
+    }
+
+    /* The active draft's window, which is what every existing reader of the
+       submission gate actually consults. `drafts[]` is the record; these two
+       dates are the enforcement. */
+    budget.submissionStartDate = opensOn;
+    budget.submissionEndDate = closesOn;
+
+    if (!Array.isArray(budget.drafts) || !budget.drafts.length) {
+      /* A cycle that predates drafts has its first one written down now, from
+         the window it already had, so the history is not missing a round. */
+      budget.drafts = drafts.draftsOf(budget).map((d) => ({ ...d, closedAt: d.closedAt || now }));
+    }
+    budget.drafts.push({
+      number,
+      opensOn,
+      closesOn,
+      openedBy: actor?.email || actor?.name || null,
+      openedAt: now,
+      note: String(body.note || "").trim().slice(0, 1000),
+      carriedForward: carried,
+    });
+
+    budget.status = "collecting";
+    await budget.save();
+
+    res.status(201).json({
+      success: true,
+      draft: number,
+      carriedForward: carried,
+      submissionStartDate: budget.submissionStartDate,
+      submissionEndDate: budget.submissionEndDate,
+      status: budget.status,
+      drafts: budget.drafts,
+    });
+  } catch (error) {
+    console.error("[budgets] open-draft error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -2368,12 +2531,52 @@ router.get("/:id/requests", async (req, res) => {
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
     let requests = budget.budgetRequests || [];
+
+    /* ── THE PREVIOUS DRAFT'S ROWS ARE HISTORY ──────────────────────────────
+       A request carried into Draft 2 leaves its original behind, superseded.
+       Both are real and both are kept, but showing them side by side would put
+       a department's old number in the same queue as its new one and make the
+       total twice what was asked. `?drafts=all` is how a screen asks for the
+       history deliberately. */
+    if (req.query.drafts !== "all") {
+      requests = requests.filter((r) => !r.supersededByDraft);
+    }
+
     // Cheap, obvious filters. Anything richer belongs in a query layer, not here.
     if (req.query.department) {
       requests = requests.filter((r) => r.department === req.query.department);
     }
     if (req.query.state) {
       requests = requests.filter((r) => r.state === req.query.state);
+    }
+
+    /* ── BUDGET CONTEXT, ON REQUEST ────────────────────────────────────────
+       Opt-in, so every existing caller of this endpoint gets exactly the shape
+       it always got. The submissions desk asks for it because a row showing a
+       department, a head and an amount does not answer the only question
+       finance is being asked — see budgetRequestContext.service for what it
+       composes and what it deliberately refuses to call things.
+
+       A context read that fails must not cost finance the queue: the requests
+       are the endpoint's job and the context is an aid, so a failure here
+       returns the list without it rather than a 500. */
+    if (req.query.context === "1" || req.query.context === "true") {
+      try {
+        const ctx = await requestContext.contextFor({
+          budget,
+          requests,
+          companyId: budget.companyId,
+        });
+        return res.json({
+          success: true,
+          requests,
+          budgetStatus: budget.status,
+          contexts: ctx.contexts,
+          summary: ctx.summary,
+        });
+      } catch (e) {
+        console.error("[budgets] request context failed, returning the list without it:", e.message);
+      }
     }
 
     res.json({ success: true, requests, budgetStatus: budget.status });
@@ -2663,6 +2866,18 @@ async function budgetAndRequestForReview(req) {
   const request = budget.budgetRequests.id(req.params.requestId);
   if (!request) return { error: { status: 404, message: "Request not found" } };
 
+  /* A row the next draft replaced is the record of what was asked the first
+     time. Deciding it now would be deciding a figure the department has since
+     revised — and would leave the live copy still waiting. */
+  if (request.supersededByDraft) {
+    return {
+      error: {
+        status: 409,
+        message: `This is the Draft ${(request.draft || 1)} version. It was carried into Draft ${request.supersededByDraft} — decide that one.`,
+      },
+    };
+  }
+
   return { budget, request };
 }
 
@@ -2774,15 +2989,60 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
       });
     }
 
-    const raw =
+    /* ── AGREEING IS AGREEING, NOT EDITING ─────────────────────────────────
+     * The figure on the table, and only that: the counter if finance has
+     * already offered one, otherwise what the department asked for.
+     *
+     * Finance CAN of course settle on a different number — by countering it.
+     * The two were one action here and that made them indistinguishable on the
+     * record: a request agreed at 3L when 5L was asked looked identical to one
+     * where the department had proposed 3L, and the department was never shown
+     * a figure to accept or argue with. Countering puts the number in front of
+     * them first, which is the whole difference between a decision and an
+     * edit.
+     *
+     * `standing` is what a screen should be offering to confirm, so an amount
+     * that matches it is accepted rather than pedantically refused — a client
+     * echoing back what it displayed is not making a change. */
+    /* ── AND THE ROWS ARE PART OF "THE FIGURE ON THE TABLE" ────────────────
+     * Once finance has decided rows — approved the festival, halved the annual
+     * day, refused the lunches — the standing figure is what those decisions
+     * add up to, not the head's original ask. That is why approving still
+     * never needs to be told a number: whatever route finance took to get
+     * here, the figure is derivable. */
+    const rows = request.workingLines || [];
+    const standing = lineReview.standingAmount({ request, rows });
+
+    /* ── AN OPEN QUESTION IS NOT AN AGREEMENT ──────────────────────────────
+     * A countered row the department has not answered cannot become an
+     * allocation. Doing so would write finance's own figure into the budget
+     * and call it agreement, which is precisely what countering exists to
+     * avoid. */
+    const gate = lineReview.readyToApprove({ request, rows });
+    if (!gate.ok) {
+      return res.status(409).json({ success: false, code: gate.code, message: gate.reason });
+    }
+    const sent =
       req.body?.agreedAmount !== undefined && req.body?.agreedAmount !== null && req.body?.agreedAmount !== ""
-        ? req.body.agreedAmount
-        : request.requestedAmount;
-    const amount = variance.money(raw);
+        ? variance.money(req.body.agreedAmount)
+        : null;
+
+    if (sent !== null && Math.abs(sent - standing) > 0.5) {
+      return res.status(400).json({
+        success: false,
+        code: "AGREE_IS_NOT_AN_EDIT",
+        message:
+          `Approving agrees ${variance.money(standing)} — the figure currently on the table. ` +
+          `To settle on a different number, counter it: that puts your figure in front of the ` +
+          `department instead of changing theirs.`,
+      });
+    }
+
+    const amount = standing;
     if (amount === null || amount < 0) {
       return res
         .status(400)
-        .json({ success: false, message: "agreedAmount must be a number ≥ 0" });
+        .json({ success: false, message: "There is no amount on this request to agree." });
     }
 
     /* The phasing finance is agreeing to. Explicit body wins; otherwise the
@@ -2794,12 +3054,72 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
        line would carry a shape that disagrees with its own total. That is
        also why an amount change without a matching split falls back to even
        rather than keeping a split that no longer sums. */
-    const wantsOwnSplit = req.body?.phasingMode !== undefined || req.body?.monthlyPhasing !== undefined;
-    const proposedMode = wantsOwnSplit ? req.body?.phasingMode : request.phasingMode;
-    const proposedRows = wantsOwnSplit ? req.body?.monthlyPhasing : request.monthlyPhasing;
+    /* ── AND THE SHAPE IS THEIRS TOO ───────────────────────────────────────
+     * Reshaping a department's year is a change to their plan, and a change is
+     * a counter. Approving takes the split they proposed, exactly as it takes
+     * the figure they proposed. A different shape offered through a counter is
+     * one they can see and answer; one applied at approval is one they find
+     * out about later. */
+    if (req.body?.phasingMode !== undefined || req.body?.monthlyPhasing !== undefined) {
+      return res.status(400).json({
+        success: false,
+        code: "AGREE_IS_NOT_AN_EDIT",
+        message:
+          "Approving keeps the monthly shape the department proposed. To change it, counter — that shows them the shape before it becomes their budget.",
+      });
+    }
+
+    /* ── THE STANDING SHAPE, WHICH IS NOT ALWAYS THE SUBMITTED ONE ─────────
+     * A counter can carry a shape as well as a figure, and once it does, that
+     * shape is what is on the table — the department has seen it and can
+     * answer it. Falling back to `request.phasingMode` here would quietly
+     * agree the ORIGINAL split while agreeing the COUNTERED amount, so a
+     * counter that moved a lump sum into an even spread came out lumpy again.
+     * The shape follows the money: countered if countered, submitted if not. */
+    const counteredSplit =
+      request.state === "countered" && request.agreedPhasingMode
+        ? { mode: request.agreedPhasingMode, rows: request.agreedMonthlyPhasing }
+        : null;
+    const proposedMode = counteredSplit ? counteredSplit.mode : request.phasingMode;
+    const proposedRows = counteredSplit ? counteredSplit.rows : request.monthlyPhasing;
+
+    /* ── APPROVING THE HEAD ANSWERS EVERY ROW STILL UNANSWERED ─────────────
+     * "Yes to the rest of it" — rows already argued over keep their answers,
+     * so the head button is never a silent way to discard the row decisions
+     * on the page. A head with no breakdown is unaffected: there is nothing
+     * to push the decision down onto. */
+    let decidedRows = null;
+    if (rows.length) {
+      decidedRows = lineReview.applyHeadDecision({
+        rows: rows.map((r) => (r.toObject ? r.toObject() : r)),
+        decision: "approved",
+        actor: actorOf(req),
+      });
+    }
+
+    /* ── THE SHAPE MUST FOLLOW THE MONEY ───────────────────────────────────
+     * When rows carry the decisions, the head's split is derived from them —
+     * summed from the rows' own months where they have them, and scaled from
+     * the department's shape where they do not. Either way it lands on the
+     * final amount exactly, because a plan whose months disagree with its own
+     * total is the one outcome that must not be reachable.
+     *
+     * A head whose rows were never touched keeps the existing path untouched:
+     * the department's split (or the countered one), validated against the
+     * amount as it always was. */
+    const rowsDecided = decidedRows && lineReview.rollUp(decidedRows).anyDecided;
+    const shapeChanged =
+      rowsDecided && Math.abs(lineReview.rollUp(decidedRows).asked - amount) > 0.5;
 
     let agreedPhasing = { phasingMode: "even", monthlyPhasing: [] };
-    if (proposedMode === "custom_monthly" && Array.isArray(proposedRows) && proposedRows.length) {
+    if (shapeChanged) {
+      agreedPhasing = lineReview.phasingForDecisions({
+        rows: decidedRows,
+        phasingMode: proposedMode,
+        monthlyPhasing: proposedRows,
+        finalAmount: amount,
+      });
+    } else if (proposedMode === "custom_monthly" && Array.isArray(proposedRows) && proposedRows.length) {
       try {
         agreedPhasing = phasing.normalisePhasing({
           phasingMode: proposedMode,
@@ -2816,6 +3136,7 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
       }
     }
 
+    if (decidedRows) request.workingLines = decidedRows;
     request.agreedAmount = amount;
     request.agreedPhasingMode = agreedPhasing.phasingMode;
     request.agreedMonthlyPhasing = agreedPhasing.monthlyPhasing;
@@ -2952,6 +3273,244 @@ router.post("/:id/requests/:requestId/resolve-head", async (req, res) => {
   }
 });
 
+/* ── REFUSE ONE, WITH A REASON ───────────────────────────────────────────────
+ * ── WHAT THIS IS NOT ────────────────────────────────────────────────────────
+ * A delete. A budget round has no way to remove somebody else's priority — it
+ * can only decline to fund it and say why. The line carries into the next draft
+ * and the department revises it, drops it, or argues for it again; what changes
+ * is that they now know finance looked and said no, and on what grounds.
+ *
+ * ── WHY THE REASON IS MANDATORY ─────────────────────────────────────────────
+ * A refusal without one is indistinguishable from being ignored, and a
+ * department that cannot tell which resubmits the same figure. The whole value
+ * of a second draft is that the first was answered — and "no" is only an answer
+ * if it says something.
+ *
+ * Agreeing needs no reason. A forced one produces "ok", which reads like a
+ * reason and is not.
+ */
+router.post("/:id/requests/:requestId/reject", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, request.submittedBy)) return;
+
+    const note = String(req.body?.financeNote || req.body?.note || "").trim();
+    if (note.length < 5) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Say why. A refusal with no reason cannot be told apart from being ignored, and the department will send the same figure back.",
+      });
+    }
+
+    /* An ask that had already become an allocation cannot be refused without
+       that allocation going too, and withdrawing money a department is already
+       spending against is a different decision with its own route. */
+    if (request.state === "agreed") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This was agreed and is already an allocation line. Reopen it first if the decision has changed.",
+      });
+    }
+
+    /* ── AND EVERY ROW UNDER IT ────────────────────────────────────────────
+     * A row still reading "approved" beneath a refused head is a contradiction
+     * the department would reasonably read as a promise. Rows that already
+     * carry their own refusal note keep it — it is more specific than the
+     * head's. */
+    if ((request.workingLines || []).length) {
+      request.workingLines = lineReview.applyHeadDecision({
+        rows: (request.workingLines || []).map((r) => (r.toObject ? r.toObject() : r)),
+        decision: "refused",
+        financeNote: note,
+        actor: actorOf(req),
+      });
+    }
+
+    request.state = "rejected";
+    request.financeNote = note;
+    request.decidedAt = new Date();
+    /* `actorOf` returns a STRING — an email, a name or an id. Reaching for
+       `.email` on it was always undefined, so no refusal ever recorded who
+       made it. */
+    request.decidedBy = actorOf(req) || undefined;
+
+    await budget.save();
+    res.json({
+      success: true,
+      request,
+      /* Said back, because the word does not mean what it usually means here.
+         See the route header. */
+      message: "Refused, with your reason. It goes back to the department in the next draft.",
+    });
+  } catch (error) {
+    console.error("[budgets] reject-request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── DECIDING ONE WORKING ROW ────────────────────────────────────────────────
+ * ── WHY THE HEAD WAS NOT ENOUGH ─────────────────────────────────────────────
+ * A department's ask is one accounting head with a derivation underneath it:
+ *
+ *     Staff Welfare                                    ₹4,20,000
+ *       Festival                                       ₹2,00,000
+ *       Annual day                                     ₹1,50,000
+ *       Team lunch            12 × ₹5,833      =         ₹70,000
+ *
+ * Finance's answer was one number for the whole head, which cannot express the
+ * decision they actually want to make: yes to the festival, half the annual
+ * day, no to the lunches. Countering at ₹3,00,000 says none of it, and the
+ * department's next draft is a guess at which row was meant.
+ *
+ * ── WHAT THIS DOES NOT DO ───────────────────────────────────────────────────
+ * It does not create an accounting line per row. `syncAllocationFromRequest`
+ * remains the only path that writes an allocation, and it still writes exactly
+ * one line per head from `agreedAmount`. Row decisions only DERIVE that figure.
+ * The ledger never learns that rows exist.
+ */
+router.post("/:id/requests/:requestId/lines/:rowId/decide", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, request.submittedBy)) return;
+
+    /* An agreed request is an allocation line somebody is already spending
+       against. Re-deciding a row under it would move the head's total without
+       moving the money that has been drawn on it. */
+    if (request.state === "agreed") {
+      return res.status(409).json({
+        success: false,
+        code: "REQUEST_ALREADY_AGREED",
+        message:
+          "This head is already an allocation line. Reopen it first if the decision has changed.",
+      });
+    }
+
+    const rows = lineReview.ensureRowIds(
+      (request.workingLines || []).map((r) => (r.toObject ? r.toObject() : r)),
+    );
+    if (!rows.length) {
+      return res.status(400).json({
+        success: false,
+        code: "NO_WORKING_ROWS",
+        message: "This ask has no breakdown to decide. Approve, counter or refuse the head itself.",
+      });
+    }
+
+    const row = lineReview.findRow(rows, req.params.rowId);
+    if (!row) {
+      return res.status(404).json({ success: false, code: "ROW_NOT_FOUND", message: "That row is not part of this request." });
+    }
+
+    let decided;
+    try {
+      decided = lineReview.decideRow({
+        row,
+        decision: req.body?.decision,
+        amount: req.body?.amount,
+        financeNote: req.body?.financeNote ?? req.body?.note,
+        actor: actorOf(req),
+      });
+    } catch (e) {
+      if (e instanceof lineReview.LineReviewError) {
+        return res.status(400).json({ success: false, code: e.code, message: e.message });
+      }
+      throw e;
+    }
+
+    request.workingLines = rows.map((r) =>
+      String(r.rowId) === String(row.rowId) ? { ...r, ...decided } : r,
+    );
+
+    /* ── THE HEAD FOLLOWS ITS ROWS ─────────────────────────────────────────
+     * Not an allocation — nothing is allocated until the head is approved —
+     * but the request's own record of where the argument stands. A countered
+     * row makes the whole head countered, because the department has
+     * something to answer. */
+    const up = lineReview.rollUp(request.workingLines);
+    const status = lineReview.headStatus({ request, rows: request.workingLines });
+    if (status === "needs_department_response") {
+      request.state = "countered";
+      request.counterAmount = up.financeAmount;
+    }
+    request.updatedAt = new Date();
+    request.updatedBy = actorOf(req);
+
+    await budget.save();
+
+    res.json({
+      success: true,
+      request,
+      row: request.workingLines.find((r) => String(r.rowId) === String(row.rowId)),
+      rollUp: up,
+      headStatus: status,
+      headStatusLabel: lineReview.HEAD_STATUS_LABEL[status],
+    });
+  } catch (error) {
+    if (handledVersionConflict(error, res)) return;
+    console.error("[budgets] decide row error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── THE DEPARTMENT ANSWERING A COUNTERED ROW ────────────────────────────────
+ * A counter is half a conversation. Until the department accepts it, the head
+ * cannot become an allocation — writing finance's own figure into the budget
+ * and calling it agreement is exactly what countering exists to avoid.
+ *
+ * Accepting is the only thing this route does. REVISING is the existing edit
+ * path (`PUT /:id/requests/:requestId`, which already allows a countered
+ * request to be changed) — a department that disagrees changes its ask and the
+ * argument continues, rather than being forced to accept or be blocked.
+ */
+router.post("/:id/requests/:requestId/lines/:rowId/respond", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const rows = lineReview.ensureRowIds(
+      (request.workingLines || []).map((r) => (r.toObject ? r.toObject() : r)),
+    );
+    const row = lineReview.findRow(rows, req.params.rowId);
+    if (!row) {
+      return res.status(404).json({ success: false, code: "ROW_NOT_FOUND", message: "That row is not part of this request." });
+    }
+    if (String(row.decision || "") !== "countered") {
+      return res.status(400).json({
+        success: false,
+        code: "ROW_NOT_COUNTERED",
+        message: "There is nothing to answer on this row — finance has not countered it.",
+      });
+    }
+
+    const accepted = req.body?.accepted !== false;
+    request.workingLines = rows.map((r) =>
+      String(r.rowId) === String(row.rowId)
+        ? { ...r, departmentAccepted: accepted, departmentRespondedAt: new Date() }
+        : r,
+    );
+    request.updatedAt = new Date();
+    request.updatedBy = actorOf(req);
+    await budget.save();
+
+    const status = lineReview.headStatus({ request, rows: request.workingLines });
+    res.json({
+      success: true,
+      request,
+      row: request.workingLines.find((r) => String(r.rowId) === String(row.rowId)),
+      headStatus: status,
+      headStatusLabel: lineReview.HEAD_STATUS_LABEL[status],
+    });
+  } catch (error) {
+    if (handledVersionConflict(error, res)) return;
+    console.error("[budgets] respond to row error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.post("/:id/requests/:requestId/counter", async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
@@ -2988,6 +3547,19 @@ router.post("/:id/requests/:requestId/counter", async (req, res) => {
       }
     }
 
+    /* ── A HEAD COUNTER RESTARTS THE ROW ARGUMENT ──────────────────────────
+     * Finance approving rows worth 4.2L and then countering the HEAD at 5L
+     * leaves two standing figures, and only one of them can be the one the
+     * department answers. The head is the offer, so the row answers below it
+     * are stale — see clearRowDecisions. */
+    const hadRowDecisions =
+      (request.workingLines || []).some((r) => lineReview.isDecided(r));
+    if (hadRowDecisions) {
+      request.workingLines = lineReview.clearRowDecisions(
+        (request.workingLines || []).map((r) => (r.toObject ? r.toObject() : r)),
+      );
+    }
+
     request.counterAmount = amount;
     request.state = "countered";
     if (req.body?.financeNote !== undefined) request.financeNote = req.body.financeNote;
@@ -2995,7 +3567,7 @@ router.post("/:id/requests/:requestId/counter", async (req, res) => {
     request.updatedBy = actorOf(req);
 
     await budget.save();
-    res.json({ success: true, request });
+    res.json({ success: true, request, rowDecisionsCleared: hadRowDecisions });
   } catch (error) {
     if (handledVersionConflict(error, res)) return;
     console.error("[budgets] counter request error:", error);

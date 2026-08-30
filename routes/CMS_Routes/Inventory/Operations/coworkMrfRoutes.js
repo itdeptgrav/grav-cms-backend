@@ -309,6 +309,10 @@ router.get("/data/raw-items", async (req, res) => {
       ? { $or: [{ name: { $regex: search, $options: "i" } }, { sku: { $regex: search, $options: "i" } }] }
       : {}
     const items = await RawItem.find(filter)
+      // A picker should show what the thing looks like — choosing between six
+      // similarly-named items is guesswork from names alone. There is no
+      // item-level picture in this model; the registered ones hang off the
+      // variants, so `variants` (already selected) is where it comes from.
       .select("name sku unit customUnit quantity variants")
       .sort({ name: 1 }).limit(50).lean()
     const unitMap = await buildUnitConversions()
@@ -318,12 +322,16 @@ router.get("/data/raw-items", async (req, res) => {
         _id: item._id,
         name: item.name,
         sku: item.sku,
+        /* The first variant that was actually photographed. An item nobody
+           photographed has none, which is a real answer and not a gap. */
+        image: (item.variants || []).map((v) => v.image).find(Boolean) || "",
         baseUnit,
         quantity: item.quantity || 0,
         conversions: unitMap[baseUnit] || [],
         variants: (item.variants || []).map(v => ({
           _id: v._id,
           combination: v.combination || [],
+          image: v.image || "",
           quantity: v.quantity || 0,
           sku: v.sku || "",
           status: v.status || "Out of Stock",

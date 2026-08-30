@@ -171,59 +171,7 @@ async function grantedAccessSlugs(user) {
   return [...slugs];
 }
 
-/**
- * The budget departments this person was granted DIRECTLY, on the Budget app
- * grant itself.
- *
- * ── THE POINT OF THIS FUNCTION ──────────────────────────────────────────────
- * Access used to need two setups that nobody could see at once: give somebody
- * the Budget app in Access Control, then separately have finance link their
- * portal to a budget department. Granting the app alone produced "your account
- * is not linked", with neither screen able to say what was missing.
- *
- * Now the grant carries the answer. One record, set in one place, read here.
- *
- * Returns SLUGS OF BUDGET DEPARTMENTS — not portal slugs. They are resolved
- * against `Acc_BudgetDepartment` for one company by the caller, so a grant can
- * never reach another company's books.
- *
- * Fails closed: no email, no grant, or a grant naming nothing ⇒ [].
- */
-async function grantedBudgetDepartmentSlugs(user) {
-  const email = String(user?.email || "").trim().toLowerCase();
-  if (!email) return [];
 
-  const rows = await DepartmentRole.find({
-    departmentSlug: BUDGET_APP_SLUG,
-    email,
-    isActive: { $ne: false },
-  })
-    .select("budgetDepartments")
-    .lean();
-
-  const slugs = new Set();
-  for (const r of rows) {
-    for (const d of r.budgetDepartments || []) {
-      const slug = String(d ?? "").trim().toLowerCase();
-      if (slug) slugs.add(slug);
-    }
-  }
-  return [...slugs];
-}
-
-/**
- * Which access-control slugs to resolve this request against.
- *
- * A real portal still answers for itself — a head working inside Sales gets
- * exactly what they always got, one slug, one query, unchanged. The grant
- * lookup runs only when there is no portal to ask: the standalone Budget app,
- * or a token with no `deptSlug` at all.
- */
-async function accessSlugsFor(req) {
-  const portal = req.user.deptSlug;
-  if (portal && !NOT_A_DEPARTMENT.has(portal)) return [portal];
-  return grantedAccessSlugs(req.user);
-}
 
 /**
  * Is this caller a platform administrator, according to the DATABASE?
@@ -274,60 +222,29 @@ async function allowedFor(req, companyId) {
       companyId: actuals.oid(companyId),
       isActive: { $ne: false },
     })
-      .select("_id slug name aliases accessSlug")
+      .select("_id slug name aliases")
       .lean();
     return rows.map((r) => ({
       _id: r._id,
       slug: r.slug,
       name: r.name,
       aliases: r.aliases || [],
-      accessSlug: r.accessSlug || null,
     }));
   }
 
   req.budgetViewAs = "department";
 
-  /* ── TWO SOURCES, ONE ANSWER ──────────────────────────────────────────────
-     1. The Budget grant itself, naming budget departments directly. This is
-        the normal path: one grant in Access Control and the app works.
-     2. The older indirection — a portal linked to a department by finance.
-        Kept so every mapping made before this still resolves; it is a
-        fallback, not a requirement, and nothing new needs it.
+  /* ── THE DEPARTMENT COMES FROM HR ──────────────────────────────────────────
+     Not from an Access Control grant, and not from a portal finance mapped to
+     a department. Both of those asked an administrator to restate, by hand, a
+     fact the employee record already holds — two records of one truth, kept in
+     step by nobody. See budgetDepartment.budgetDepartmentsForEmployee.
 
-     Unioned rather than preferred, because a person can legitimately hold both
-     (their own portal, plus an explicit grant for a second department) and
-     dropping either would silently narrow access somebody already had.
-     Deduped by department id, so holding both for the same department yields
-     one row rather than two. */
-  const [granted, portalSlugs] = await Promise.all([
-    grantedBudgetDepartmentSlugs(req.user),
-    accessSlugsFor(req),
-  ]);
-
-  return allowedForSlugs(companyId, granted, portalSlugs);
+     Fails closed: no employee record, no department on it, or an inactive one
+     is an empty list, never every department. */
+  return departments.budgetDepartmentsForEmployee({ companyId, user: req.user });
 }
 
-/**
- * The two sources, merged, for one company. Extracted so `/context` and every
- * scoped read answer with exactly the same rule rather than two that drift.
- */
-async function allowedForSlugs(companyId, granted, portalSlugs) {
-  const [direct, viaPortal] = await Promise.all([
-    /* The grant, read against the company's own department list. No finance
-       registry has to exist for this to work — that is the whole point. */
-    departments.budgetDepartmentsForGrant({ companyId, slugs: granted }),
-    portalSlugs.length
-      ? departments.departmentsForAccessSlugs({ companyId, accessSlugs: portalSlugs })
-      : [],
-  ]);
-
-  /* Keyed on SLUG, not id: a granted department may have no registry row and
-     so no id at all, and keying on a null id would collapse every such
-     department into one entry. */
-  const bySlug = new Map();
-  for (const row of [...direct, ...viaPortal]) bySlug.set(row.slug, row);
-  return [...bySlug.values()];
-}
 
 /**
  * One line in the server log when an administrator WRITES through the
@@ -407,62 +324,33 @@ router.get("/context", async (req, res) => {
          reach the mapping they need to fix. Mapped or not — an unmapped
          department is precisely what they came to see. */
       rows = await Acc_BudgetDepartment.find({ isActive: { $ne: false } })
-        .select("_id companyId slug name accessSlug")
+        .select("_id companyId slug name")
         .lean();
     } else {
       /* ── WHICH COMPANIES THIS PERSON HAS A BUDGET LIFE IN ──────────────────
-         The grant names departments, not companies, so the companies are the
-         ones that actually run budget rounds. Listing every company would turn
-         this into a directory of the group's books; listing none would hide a
-         company whose first round has just opened. */
-      const [granted, portalSlugs] = await Promise.all([
-        grantedBudgetDepartmentSlugs(req.user),
-        accessSlugsFor(req),
-      ]);
-      if (!granted.length && !portalSlugs.length) {
-        return res.json({
-          success: true,
-          portal: req.user.deptSlug || null,
-          viewAs: "department",
-          companies: [],
-        });
-      }
-
-      /* ── WHICH COMPANIES, AND WHY NOT "THE ONES WITH ROUNDS" ──────────────
-         A grant names departments, not companies, so the books a granted
-         person belongs to are simply the company's books.
+         Their department comes from HR, and a department is not per company —
+         an employee in IT is in IT whichever set of books is being looked at.
+         So the candidate companies are simply the company's books, and the
+         per-company resolution below drops any where that department has
+         nothing.
 
          This deliberately does NOT filter on "has a budget round". That was
          the first shape and it was wrong in the one case that matters most:
          the day after a clean start there are no rounds, so a correctly
-         granted person was told their account was not linked — the exact
-         message this whole change existed to stop showing to people who ARE
-         linked. "Nothing has been opened yet" and "you have no access" are
-         different sentences and must not share a screen.
-
-         The legacy branch keeps its own narrower rule: a portal mapping is
-         per company, so it lists only the companies it was mapped in. */
-      const [allCompanies, mapped] = await Promise.all([
-        granted.length ? Acc_Company.find({}).select("_id").lean() : [],
-        portalSlugs.length
-          ? Acc_BudgetDepartment.distinct("companyId", {
-              accessSlug: { $in: portalSlugs },
-              isActive: { $ne: false },
-            })
-          : [],
-      ]);
-      const companyIds = [
-        ...new Map(
-          [...allCompanies.map((c) => c._id), ...mapped]
-            .filter(Boolean)
-            .map((id) => [String(id), id]),
-        ).values(),
-      ];
+         employed person was told their account was not linked — the exact
+         message this whole change exists to stop showing to people who ARE
+         employed. "Nothing has been opened yet" and "you have no access" are
+         different sentences and must not share a screen. */
+      const allCompanies = await Acc_Company.find({}).select("_id").lean();
+      const companyIds = allCompanies.map((c) => c._id);
 
       const perCompany = await Promise.all(
         companyIds.map(async (cid) => ({
           companyId: cid,
-          departments: await allowedForSlugs(cid, granted, portalSlugs),
+          departments: await departments.budgetDepartmentsForEmployee({
+            companyId: cid,
+            user: req.user,
+          }),
         })),
       );
 

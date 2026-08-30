@@ -974,6 +974,12 @@ app.use("/api/hr", hrProfileRoutes);
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
 
+// Face recognition for the sign-in page. Mounted AFTER deptAuth so it can
+// never shadow /api/auth/login — password sign-in stays exactly as it was.
+// Recognition only: this issues no session and records no attendance.
+const faceSigninRoutes = require("./routes/auth/faceSignin");
+app.use("/api/auth/face", faceSigninRoutes);
+
 // Self-service "forgot password" for the same login this replaces — request a
 // 4-digit email OTP, verify it, then set a new password. Reuses deptAuth's own
 // identity resolution, so it covers every account /login can authenticate.
@@ -1399,6 +1405,36 @@ app.use("/api/cowork/mrf", mrfRequesterRoutes.firebaseChain, mrfRequesterRoutes)
  */
 app.use("/api/cms/mrf", mrfRequesterRoutes.cmsChain, mrfRequesterRoutes);
 
+/* ── PURCHASE AND SERVICE REQUESTS ───────────────────────────────────────────
+ * The second kind of ask in the Requests app: what the store cannot issue — a
+ * repair, a vendor purchase, a piece of software. Its own model and its own
+ * collection rather than more fields on MRF, which stays exactly what it is:
+ * stock the store holds, issues and takes back.
+ *
+ * Same authentication as the MRF door above, because it is the same app and
+ * the same person. */
+app.use(
+  "/api/requests/spend",
+  require("./Middlewear/EmployeeAuthMiddlewear"),
+  require("./routes/CMS_Routes/Requests/spendRequests"),
+);
+
+/* ── THE UNIFIED REQUESTS DESK ───────────────────────────────────────────────
+ * One door in. The requester says what they need; whether that is stock the
+ * store holds, something to buy, a repair or a subscription is decided AFTER
+ * they have asked, by the people who know — see requestIntake.service.
+ *
+ * Additive. The two doors above still work and every request raised through
+ * them still loads, on this desk, in the same words. Classification does not
+ * reimplement fulfilment: it creates the MRF or the spend request the older
+ * doors would have created, and the store and finance screens carry on
+ * exactly as they do today. */
+app.use(
+  "/api/requests/intake",
+  require("./Middlewear/EmployeeAuthMiddlewear"),
+  require("./routes/CMS_Routes/Requests/intakeRequests"),
+);
+
 // Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
 // actually owns. Deliberately NOT applied to /api/cms/manufacturing/* at large:
 // cutting-master, QC, packaging-dispatch and production-supervisor all write
@@ -1488,6 +1524,11 @@ app.use("/api/hr/payroll", payrollRoutes);
 
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);
+
+// Face-registration status, read-only. Serves a snapshot written by the
+// punch-in machine's Python engine; this process never loads a face model.
+const faceRegistrationRouter = require("./routes/HrRoutes/FaceRegistration_section");
+app.use("/hr/face-registration", faceRegistrationRouter);
 
 const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
 app.use("/api/hr/leaves", hrLeaveRoutes);
@@ -1674,6 +1715,19 @@ app.use(
 app.use(
   "/api/accountant/reports",
   require("./routes/Accountant_Routes/Acc_reports"),
+);
+
+/* ── PAYABLES → SPEND APPROVALS ───────────────────────────────────────────
+ * Operational purchase and service requests that Store has priced, waiting on
+ * finance. Deliberately NOT under /budgets: a budget request is a department
+ * arguing for next year's envelope, this is one vendor invoice about to exist.
+ *
+ * The same decision the Requests app offers, from the accounting side —
+ * services/spendFinanceDecision.service.js is the single rule both call, so
+ * approving here and approving there cannot write different commitments. */
+app.use(
+  "/api/accountant/spend-approvals",
+  require("./routes/Accountant_Routes/Acc_spendApprovals"),
 );
 
 // ── Books / Vouchers / Import ─────────────────────────────────────────
