@@ -1373,6 +1373,15 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+
+// The sales roster — which employees are on sales duty, and the corporate
+// phone number that stands for each of them in the call log and the tracking
+// map (30 Aug 2026). Deliberately NOT behind salesWrites: the roster decides
+// whose calls get attributed to whom, which is an access-control-shaped
+// decision, and parking it in an approval queue would leave the call log
+// unattributed until somebody approved it. RequireRole on the settings screen
+// is what gates it.
+app.use("/api/cms/sales/sales-persons", require("./routes/CMS_Routes/Sales/salesPersons"));
 // Emails exchanged with a customer, read live from the salesperson's own
 // connected Gmail — the email sibling of call-events and crm/whatsapp. Scoped
 // to the caller's own mailbox via the JWT; see that route file's header.

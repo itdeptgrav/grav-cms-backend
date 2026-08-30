@@ -19,6 +19,7 @@ const express = require("express");
 const router = express.Router();
 
 const CallEvent = require("../../../models/CallEvent");
+const { SalesPerson } = require("../../../models/CMS_Models/Sales/SalesPerson");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { buildRecordingFilter, annotateMatches } = require("../../../services/callRecordingMatch.service");
 const { identityFor } = require("../../../services/customerIdentityLookup.service");
@@ -134,32 +135,75 @@ router.get("/recent", salesAuth, async (req, res) => {
       const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       filter.$or = [{ contactName: re }, { phoneNumber: re }];
     }
+    // Narrow to one salesperson's own calls — the roster row's normalised
+    // corporate number is the key, so this works for any device that reports
+    // which handset it is.
+    const salesPersonId = String(req.query.salesPersonId || "").trim();
+    if (salesPersonId && /^[0-9a-fA-F]{24}$/.test(salesPersonId)) {
+      const person = await SalesPerson.findById(salesPersonId).select("normalizedPhone").lean();
+      // A roster row with no usable number matches nothing — an explicit
+      // impossible filter, rather than silently widening to the whole org.
+      filter.normalizedOwnerPhone = person?.normalizedPhone || "__none__";
+    } else if (salesPersonId === "unattributed") {
+      filter.$and = [
+        ...(filter.$and || []),
+        { $or: [{ normalizedOwnerPhone: null }, { normalizedOwnerPhone: "" }, { normalizedOwnerPhone: { $exists: false } }] },
+      ];
+    }
 
-    const [rows, total] = await Promise.all([
+    const [rows, total, roster] = await Promise.all([
       CallEvent.find(filter).sort({ startTime: -1, createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       CallEvent.countDocuments(filter),
+      SalesPerson.find({}).select("name employeeCode workPhone normalizedPhone responsibility active").lean(),
     ]);
 
-    const events = rows.map((r) => ({
-      _id: r._id,
-      phoneNumber: r.phoneNumber,
-      contactName: r.contactName,
-      direction: r.direction,
-      callType: r.callType,
-      received: r.received,
-      rejected: r.rejected,
-      startTime: r.startTime,
-      durationMillis: Math.round((r.durationSec || 0) * 1000),
-      hasRecording: Boolean(r.driveFileId),
-      audioUrl: r.driveFileId ? `/api/cms/crm/call-recordings/${r._id}/audio` : null,
-      transcription: r.transcription,
-      deviceSummary: r.summary,
-      aiSummary: r.aiSummary,
-      aiSummaryAt: r.aiSummaryAt,
-      notes: r.notes,
-      audioFileName: r.audioFileName,
-      createdAt: r.createdAt,
-    }));
+    // One pass over the roster, then an O(1) lookup per row — the alternative
+    // (a query per call) is the N+1 this page would notice first.
+    const byPhone = new Map(roster.filter((p) => p.normalizedPhone).map((p) => [p.normalizedPhone, p]));
+
+    const events = rows.map((r) => {
+      const owner = r.normalizedOwnerPhone ? byPhone.get(r.normalizedOwnerPhone) : null;
+      return {
+        _id: r._id,
+        phoneNumber: r.phoneNumber,
+        contactName: r.contactName,
+        direction: r.direction,
+        callType: r.callType,
+        received: r.received,
+        rejected: r.rejected,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        durationMillis: Math.round((r.durationSec || 0) * 1000),
+        hasRecording: Boolean(r.driveFileId),
+        audioUrl: r.driveFileId ? `/api/cms/crm/call-recordings/${r._id}/audio` : null,
+        transcription: r.transcription,
+        deviceSummary: r.summary,
+        aiSummary: r.aiSummary,
+        aiSummaryAt: r.aiSummaryAt,
+        notes: r.notes,
+        audioFileName: r.audioFileName,
+        recordingMethod: r.recordingMethod,
+        source: r.source,
+        createdAt: r.createdAt,
+        // ── Attribution ──────────────────────────────────────────────────
+        // `ownerPhone` is the handset that reported the call; `salesPerson`
+        // is that number resolved against the roster. Both can be absent:
+        // a call recorded before the owner field existed has neither, and a
+        // call from a number nobody has added to the roster has the first
+        // without the second. The UI distinguishes those two cases — see
+        // its own note on why "unknown number" and "no number reported" are
+        // different problems with different fixes.
+        ownerPhone: r.ownerPhone || null,
+        salesPerson: owner
+          ? {
+              name: owner.name || "",
+              employeeCode: owner.employeeCode || "",
+              responsibility: owner.responsibility || "",
+              active: owner.active !== false,
+            }
+          : null,
+      };
+    });
 
     return res.json({
       success: true,
@@ -168,6 +212,11 @@ router.get("/recent", salesAuth, async (req, res) => {
       limit,
       total,
       totalPages: Math.max(1, Math.ceil(total / limit)),
+      // So the UI can offer a "filter by salesperson" picker without a second
+      // request, and can say how many of the roster are actually reporting.
+      roster: roster
+        .filter((p) => p.active !== false)
+        .map((p) => ({ _id: String(p._id), name: p.name, employeeCode: p.employeeCode, responsibility: p.responsibility })),
     });
   } catch (error) {
     console.error("[crm/call-events] recent failed:", error);

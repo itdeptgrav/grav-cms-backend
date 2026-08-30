@@ -567,6 +567,49 @@ router.post("/lookup-piece", async (req, res) => {
   }
 });
 
+// ─── Shared defect-shape validation ─────────────────────────────────────────
+//
+// Used by both /save-inspection (online, catalogue in hand) and
+// /save-inspection-offline when an offline entry was recorded WITH a cached
+// catalogue (lib/qcCatalogCache.js on the client) rather than the bare
+// OTHER-with-note thin path. One function so the two write paths cannot drift
+// into disagreeing about what a defect or a defect type looks like — see this
+// file's git history for why that drift is exactly how a rework report ends
+// up with a garbled attribution.
+
+/** Defect types are normalised the same way wherever they appear — nested
+ *  under an operation, or standing alone with none. */
+function cleanDefectTypesList(list) {
+  return Array.isArray(list)
+    ? list
+        .filter((t) => t && t.code)
+        .map((t) => ({
+          code: String(t.code).trim().toUpperCase(),
+          name: String(t.name || "").trim(),
+          category: String(t.category || "").trim(),
+          // The note survives only for OTHER. On any other code it would be a
+          // second, unsearchable description of a defect that already has a
+          // name — and the first place somebody would put information that
+          // then never reaches a report.
+          note: String(t.code).trim().toUpperCase() === "OTHER"
+            ? String(t.note || "").trim().slice(0, 300)
+            : "",
+        }))
+    : [];
+}
+
+function cleanDefectsList(defects) {
+  return Array.isArray(defects)
+    ? defects.filter(d => d && d.operationCode).map(d => ({
+        operationCode: d.operationCode, operationName: d.operationName || "",
+        operators: Array.isArray(d.operators)
+          ? d.operators.map(o => ({ operatorId: o.operatorId || "", operatorName: o.operatorName || "" })).filter(o => o.operatorId || o.operatorName)
+          : [],
+        types: cleanDefectTypesList(d.types),
+      }))
+    : [];
+}
+
 // ─── POST /save-inspection ─────────────────────────────────────────────────────
 router.post("/save-inspection", async (req, res) => {
   try {
@@ -581,36 +624,8 @@ router.post("/save-inspection", async (req, res) => {
     // validator's.
     const isFault = status === "defective" || status === "rejected";
 
-    // Defect types are normalised the same way wherever they appear — nested
-    // under an operation, or standing alone with none. One function so the two
-    // paths cannot drift into disagreeing about what a type looks like.
-    const cleanTypes = (list) =>
-      Array.isArray(list)
-        ? list
-            .filter((t) => t && t.code)
-            .map((t) => ({
-              code: String(t.code).trim().toUpperCase(),
-              name: String(t.name || "").trim(),
-              category: String(t.category || "").trim(),
-              // The note survives only for OTHER. On any other code it would be
-              // a second, unsearchable description of a defect that already has
-              // a name — and the first place somebody would put information
-              // that then never reaches a report.
-              note: String(t.code).trim().toUpperCase() === "OTHER"
-                ? String(t.note || "").trim().slice(0, 300)
-                : "",
-            }))
-        : [];
-
-    const cleanDefects = Array.isArray(defects)
-      ? defects.filter(d => d && d.operationCode).map(d => ({
-          operationCode: d.operationCode, operationName: d.operationName || "",
-          operators: Array.isArray(d.operators)
-            ? d.operators.map(o => ({ operatorId: o.operatorId || "", operatorName: o.operatorName || "" })).filter(o => o.operatorId || o.operatorName)
-            : [],
-          types: cleanTypes(d.types),
-        }))
-      : [];
+    const cleanTypes = cleanDefectTypesList;
+    const cleanDefects = cleanDefectsList(defects);
 
     // Defects belonging to no operation — a stain, a shade variation, a
     // missing label. Real faults of the garment that no single operation
@@ -732,10 +747,26 @@ router.post("/save-inspection", async (req, res) => {
  * alone (`parseBarcode` + `findWorkOrderByShortId`) — nothing here is trusted
  * from a stale client-side lookup, because there wasn't one.
  *
- * No `operationCode` — there was no catalogue on screen to pick one from — so a
- * fault is always recorded as a single OTHER defect type carrying the
- * inspector's note. That note is REQUIRED for a defect/reject exactly as the
- * online form requires picking at least one defect type.
+ * TWO SHAPES NOW (29 Aug 2026, explicit request: "keep them in the
+ * localstorage or anywhere so for the network lost situation these
+ * operations or like the defects options are needed to fetch from the
+ * memory... so the flow shouldn't gonna break"). The client now caches each
+ * work order's operations and the defect-type catalogue in localStorage
+ * (lib/qcCatalogCache.js) from its last online lookup, so a later offline
+ * scan of the SAME work order can still show the real picker rather than the
+ * bare form below — and when it does, `defects` / `defectTypes` arrive here
+ * shaped exactly like `/save-inspection`'s, validated with the same function
+ * (`cleanDefectsList` / `cleanDefectTypesList`, defined above), so an offline
+ * record with a catalogue on hand carries real operation attribution, not a
+ * flattened note.
+ *
+ * No `operationCode` is still the fallback: when this barcode's work order was
+ * never looked up on this device — a fresh install, a different line, cache
+ * evicted — there is no catalogue to have cached, and a fault is recorded as a
+ * single OTHER defect type carrying the inspector's note instead. That note is
+ * REQUIRED for a defect/reject exactly as the online form requires picking at
+ * least one defect type; a garment with a fault and no attribution to check it
+ * against still gets ONE.
  *
  * THE SAME GUARD, NOT A WEAKER ONE. `qcStages.evaluateScan` re-reads this
  * piece's live state at write time regardless of how old the offline record
@@ -749,14 +780,33 @@ router.post("/save-inspection", async (req, res) => {
  */
 router.post("/save-inspection-offline", async (req, res) => {
   try {
-    const { barcodeId, status, note, qcSession, stageId } = req.body;
+    const { barcodeId, status, note, qcSession, stageId, defects, defectTypes } = req.body;
 
     if (!barcodeId || !["passed", "defective", "rejected"].includes(status))
       return res.status(400).json({ success: false, message: "barcodeId and a valid verdict are required" });
 
     const isFault = status === "defective" || status === "rejected";
     const trimmedNote = String(note || "").trim().slice(0, 300);
-    if (isFault && !trimmedNote)
+
+    // A cached catalogue was on screen when this was recorded — the real
+    // picker, not the bare fallback form — so validate it exactly like the
+    // online route does, rather than forcing it through the OTHER-with-note
+    // shape it was never in.
+    const cleanDefects = cleanDefectsList(defects);
+    const cleanDefectTypes = cleanDefectTypesList(defectTypes);
+    const hasStructuredDefect = cleanDefects.length > 0 || cleanDefectTypes.length > 0;
+
+    if (isFault && hasStructuredDefect) {
+      const allTypes = [...cleanDefectTypes, ...cleanDefects.flatMap((d) => d.types)];
+      if (allTypes.some((t) => t.code === "OTHER" && !t.note))
+        return res.status(400).json({
+          success: false,
+          code: "OTHER_NEEDS_NOTE",
+          message: "Say what the defect was — \"Other\" needs a short description.",
+        });
+    } else if (isFault && !trimmedNote) {
+      // THE THIN PATH — no catalogue was available offline, exactly as before
+      // this change: the only thing recoverable is what the inspector typed.
       return res.status(400).json({
         success: false,
         code: "OTHER_NEEDS_NOTE",
@@ -764,6 +814,7 @@ router.post("/save-inspection-offline", async (req, res) => {
           ? "Say why this piece is being scrapped — a note is required."
           : "Say what was wrong — a note is required for an offline defect.",
       });
+    }
 
     const parsed = parseBarcode(barcodeId);
     if (!parsed.success)
@@ -814,8 +865,10 @@ router.post("/save-inspection-offline", async (req, res) => {
       date: istDateString(), barcodeId, workOrderShortId: parsed.workOrderShortId,
       workOrderId: workOrder._id, moRequestId, manufacturingOrderId: workOrder.customerRequestId || null,
       status,
-      defects: [],
-      defectTypes: isFault ? [{ code: "OTHER", name: "Other", category: "", note: trimmedNote }] : [],
+      defects: isFault && hasStructuredDefect ? cleanDefects : [],
+      defectTypes: isFault
+        ? (hasStructuredDefect ? cleanDefectTypes : [{ code: "OTHER", name: "Other", category: "", note: trimmedNote }])
+        : [],
       stageId:     stage?._id    || null,
       stageCode:   stage?.code   || "",
       stageName:   stage?.name   || "",
