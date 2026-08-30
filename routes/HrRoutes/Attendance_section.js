@@ -2912,6 +2912,43 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
         .sendAttendanceSettingsChangeToCEO(changedBy, changes)
         .catch((e) => console.warn("[SETTINGS-EMAIL]", e.message));
     }
+
+    // The CEO email already existed and already says what moved; this puts the
+    // same facts where somebody can look them up later without going through
+    // an inbox. Diffed against the config read at the top of the handler, so
+    // shift timings nested two deep report as "shifts.operator.start", not as
+    // "the shifts object changed".
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "attendance-setting",
+      entityId: "singleton",
+      entityLabel: "Attendance settings",
+      action: "update",
+      before: {
+        shifts: oldCfg.shifts,
+        lateHalfDayPolicy: oldCfg.lateHalfDayPolicy,
+        operatorDepartments: oldCfg.operatorDepartments,
+        departmentCategories: oldCfg.departmentCategories,
+        executiveDesignations: oldCfg.executiveDesignations,
+        operatorDesignations: oldCfg.operatorDesignations,
+        singlePunchHandling: oldCfg.singlePunchHandling,
+        graceCarryForward: oldCfg.graceCarryForward,
+        displayLabels: oldCfg.displayLabels,
+      },
+      after: {
+        shifts: newCfg.shifts,
+        lateHalfDayPolicy: newCfg.lateHalfDayPolicy,
+        operatorDepartments: newCfg.operatorDepartments,
+        departmentCategories: newCfg.departmentCategories,
+        executiveDesignations: newCfg.executiveDesignations,
+        operatorDesignations: newCfg.operatorDesignations,
+        singlePunchHandling: newCfg.singlePunchHandling,
+        graceCarryForward: newCfg.graceCarryForward,
+        displayLabels: newCfg.displayLabels,
+      },
+    });
+
     res.json({ success: true, data: newCfg });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -4158,17 +4195,70 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     // never a good enough answer — this makes it a name and a time. Never
     // awaited into the response path: a failed log entry is a gap in history,
     // a failed save because of it is lost work.
+    // The punch edits go in as named fields rather than being folded into the
+    // status line. An override that moved an in-time by forty minutes and an
+    // override that only relabelled the day are different events, and a summary
+    // that mentions the status alone makes them look identical.
+    const auditFields = (punchChanges || []).map((c) => ({
+      path: `punch.${c.punchType || c.type || "time"}`,
+      label: {
+        in: "In time",
+        lunch_out: "Lunch out",
+        lunch_in: "Lunch in",
+        tea_out: "Tea out",
+        tea_in: "Tea in",
+        final_out: "Out time",
+        out: "Out time",
+      }[c.punchType || c.type] || "Punch",
+      from: c.oldTime,
+      to: c.newTime,
+      kind: c.action === "add" ? "added" : c.action === "remove" ? "removed" : "changed",
+    }));
+
+    const statusChanged = (oldStatus || null) !== (emp.hrFinalStatus || null);
+    if (statusChanged) {
+      auditFields.unshift({
+        path: "hrFinalStatus",
+        label: "Attendance status",
+        from: oldStatus || "(none)",
+        to: emp.hrFinalStatus || "(cleared — back to system prediction)",
+        kind: "changed",
+      });
+    }
+    if ((previousRemarks || "") !== (hrRemarks || "")) {
+      auditFields.push({
+        path: "hrRemarks",
+        label: "HR remarks",
+        from: previousRemarks || "",
+        to: hrRemarks || "",
+        kind: "changed",
+      });
+    }
+
     recordChange(req, {
       departmentSlug: "hr",
-      entity: "attendance",
-      entityId: `${biometricId}:${dateStr}`,
-      entityLabel: `${biometricId} on ${dateStr}`,
+      section: "hr:attendance-daily",
+      entity: "attendance-day",
+      entityId: `${bid}:${dateStr}`,
+      entityLabel: `${emp.employeeName || bid} · ${dateStr}`,
       action: "update",
-      summary: `Attendance for ${biometricId} on ${dateStr} set to ${
-        hrFinalStatus || "(cleared)"
-      }`,
+      fields: auditFields,
+      summary:
+        `Overrode attendance for ${emp.employeeName || bid} (${bid}) on ${dateStr}` +
+        (statusChanged
+          ? `: status ${oldStatus || "(none)"} → ${emp.hrFinalStatus || "cleared, back to the system prediction " + emp.systemPrediction}`
+          : ": status unchanged") +
+        (punchChanges?.length
+          ? `; ${punchChanges.length} punch time${punchChanges.length === 1 ? "" : "s"} edited`
+          : "") +
+        (hrRemarks ? `. Remarks: ${hrRemarks}` : "."),
       before: { status: oldStatus, remarks: previousRemarks },
-      after: { status: hrFinalStatus || null, remarks: hrRemarks || "" },
+      after: {
+        status: emp.hrFinalStatus || null,
+        remarks: hrRemarks || "",
+        systemPrediction: emp.systemPrediction,
+        netWorkMins: emp.netWorkMins,
+      },
     });
 
     res.json({
@@ -4376,6 +4466,53 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
       console.error("[PUNCH-CORRECTION] Log error:", logErr.message);
     }
 
+    // A punch edit moves the worked minutes, which moves overtime and pay.
+    // Both the punch and whatever the status became are recorded, because a
+    // corrected in-time that silently flipped the day from late to present is
+    // two facts and only one of them is visible on the screen afterwards.
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "attendance-punch",
+      entityId: `${bid}:${dateStr}`,
+      entityLabel: `${emp.employeeName || bid} · ${dateStr}`,
+      action: "update",
+      fields: [
+        {
+          path: `punch.${punchType}`,
+          label: {
+            in: "In time",
+            lunch_out: "Lunch out",
+            lunch_in: "Lunch in",
+            tea_out: "Tea out",
+            tea_in: "Tea in",
+            out: "Out time",
+          }[punchType] || "Punch",
+          from: oldTime || "",
+          to: action === "remove" ? "" : punchTime || "",
+          kind: action === "add" ? "added" : action === "remove" ? "removed" : "changed",
+        },
+        ...((oldStatus || null) !== (emp.hrFinalStatus || emp.systemPrediction || null)
+          ? [
+              {
+                path: "effectiveStatus",
+                label: "Attendance status",
+                from: oldStatus || "",
+                to: emp.hrFinalStatus || emp.systemPrediction || "",
+                kind: "changed",
+              },
+            ]
+          : []),
+      ],
+      summary:
+        `${{ add: "Added", remove: "Removed", modify: "Changed" }[action]} the ` +
+        `${punchType.replace(/_/g, " ")} punch for ${emp.employeeName || bid} (${bid}) on ${dateStr}` +
+        (action === "modify" ? `: ${oldTime || "—"} → ${punchTime}` : action === "add" ? `: ${punchTime}` : `: was ${oldTime || "—"}`) +
+        `. Worked time is now ${emp.netWorkMins || 0} minute(s) and the day reads ` +
+        `${emp.hrFinalStatus || emp.systemPrediction}` +
+        (hrRemarks ? `. Remarks: ${hrRemarks}` : "."),
+    });
+
     res.json({
       success: true,
       message: `Punch ${action} applied for ${punchType}`,
@@ -4396,6 +4533,7 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "dateStr and updates[] required" });
     let ok = 0,
       fail = 0;
+    const applied = [];
     const reviewer = req.user?.name || req.user?.email || "HR";
     for (const u of updates) {
       const set = {
@@ -4413,9 +4551,44 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         },
         { $set: set },
       );
-      if (r.matchedCount > 0) ok++;
-      else fail++;
+      if (r.matchedCount > 0) {
+        ok++;
+        applied.push(u);
+      } else fail++;
     }
+
+    // One entry naming every person in the batch, rather than one entry per
+    // person. A bulk override is a single deliberate act — marking a floor
+    // absent for a shutdown day — and splitting it into ninety rows loses the
+    // fact that they were one decision. The names are kept as fields so the
+    // detail is still there for anybody who opens it.
+    if (applied.length) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:attendance-daily",
+        entity: "attendance-day",
+        entityId: dateStr,
+        entityLabel: `Bulk override · ${dateStr}`,
+        action: "update",
+        fields: applied.slice(0, 120).map((u) => ({
+          path: String(u.biometricId).toUpperCase(),
+          label: String(u.biometricId).toUpperCase(),
+          to:
+            [
+              u.hrFinalStatus !== undefined ? (u.hrFinalStatus || "cleared") : null,
+              u.hrRemarks ? `remarks: ${u.hrRemarks}` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ") || "reviewed",
+          kind: "changed",
+        })),
+        summary:
+          `Bulk-overrode attendance on ${dateStr} for ${ok} employee(s)` +
+          (fail ? `; ${fail} could not be matched and were not changed` : "") +
+          `. Reviewed by ${reviewer}.`,
+      });
+    }
+
     res.json({ success: true, updated: ok, failed: fail });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -4442,6 +4615,24 @@ router.delete(
         { yearMonth, "employees.biometricId": bid },
         { $pull: { employees: { biometricId: bid } } },
       );
+      // Removing somebody from a month deletes attendance rows outright. It is
+      // the only destructive action on this page and the one most likely to be
+      // asked about, so it is logged as a delete with the day count named.
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:attendance-daily",
+        entity: "attendance-day",
+        entityId: `${bid}:${yearMonth}`,
+        entityLabel: `${bid} · ${yearMonth}`,
+        action: "delete",
+        summary:
+          `Removed ${bid} from the attendance register for ${yearMonth} — ` +
+          `${result.modifiedCount} day record(s) deleted. This cannot be undone from the UI; ` +
+          `the days must be re-synced from the biometric device to come back.`,
+        before: { biometricId: bid, yearMonth, daysPresent: result.modifiedCount },
+        after: { daysPresent: 0 },
+      });
+
       res.json({
         success: true,
         message: `Removed ${bid} from ${result.modifiedCount} day(s) in ${yearMonth}`,
@@ -7135,6 +7326,21 @@ router.get("/regularizations/:id", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// Regularisations live on their own page, so they get their own section — a
+// regularisation approved on Tuesday should not have to be hunted for among
+// that day's attendance overrides.
+const auditReg = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:attendance-regularizations",
+    entity: "regularization",
+    ...entry,
+  });
+
+/** "Ramesh Kumar · 2026-08-12" — enough to recognise the request. */
+const regLabel = (r) =>
+  [r?.employeeName || r?.biometricId, r?.dateStr].filter(Boolean).join(" · ");
+
 router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const {
@@ -7218,6 +7424,25 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       managersNotified: Array.isArray(managersNotified) ? managersNotified : [],
       status: "pending",
     });
+    await auditReg(req, {
+      entityId: String(doc._id),
+      entityLabel: regLabel(doc),
+      action: "create",
+      summary:
+        `Raised a regularisation request for ${doc.employeeName || doc.biometricId} on ${doc.dateStr}` +
+        `${requestedStatus ? ` asking for status ${requestedStatus}` : ""}` +
+        `${doc.proposedPunches?.length ? ` with ${doc.proposedPunches.length} proposed punch time(s)` : ""}` +
+        `${doc.reason ? `. Reason: ${doc.reason}` : "."}` +
+        `${documentUrl ? " A supporting document was attached." : ""}`,
+      after: {
+        dateStr: doc.dateStr,
+        requestedStatus: doc.requestedStatus || null,
+        reason: doc.reason || "",
+        status: "pending",
+        hasDocument: Boolean(documentUrl),
+      },
+    });
+
     res.status(201).json({
       success: true,
       data: doc,
@@ -7266,6 +7491,28 @@ router.patch(
       });
       await r.save();
 
+      // Whether it actually reached the attendance record is part of the entry.
+      // "Approved" alone is the misleading half: a request can be approved and
+      // apply to nothing, and the employee's day stays exactly as it was.
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "approve",
+        summary:
+          `Approved the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr}` +
+          `${r.requestedStatus ? ` (requested status ${r.requestedStatus})` : ""}. ` +
+          (applyRes.applied
+            ? `Applied to the attendance record${applyRes.punchChanges?.length ? `, changing ${applyRes.punchChanges.length} punch time(s)` : ""}.`
+            : `NOTHING was applied to attendance — ${applyRes.skipped}.`) +
+          `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`,
+        before: { status: "pending", hrRemarks: "" },
+        after: {
+          status: "hr_approved",
+          hrRemarks: r.hrRemarks || "",
+          appliedToAttendance: Boolean(applyRes.applied),
+        },
+      });
+
       notifyRegularizationApproved(r); // R5 — employee
 
       res.json({
@@ -7293,11 +7540,24 @@ router.patch(
       const r = await getRegularizationRequest().findById(req.params.id);
       if (!r)
         return res.status(404).json({ success: false, message: "Not found" });
+      const beforeStatus = r.status;
       r.status = "hr_rejected";
       r.rejectedBy = req.user.id;
       r.rejectedAt = new Date();
       r.rejectionReason = req.body?.rejectionReason || "";
       await r.save();
+
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "reject",
+        summary:
+          `Rejected the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr}. ` +
+          `The attendance record is unchanged.` +
+          `${r.rejectionReason ? ` Reason: ${r.rejectionReason}` : " No reason was given."}`,
+        before: { status: beforeStatus, rejectionReason: "" },
+        after: { status: "hr_rejected", rejectionReason: r.rejectionReason },
+      });
 
       notifyRegularizationRejected(r, r.rejectionReason); // R6 — employee
 
@@ -7321,11 +7581,25 @@ router.patch(
           success: false,
           message: `Cannot cancel from status ${r.status}`,
         });
+      const beforeStatus = r.status;
       r.status = "cancelled";
       r.cancelledBy = req.user.id;
       r.cancelledAt = new Date();
       r.cancelReason = req.body?.cancelReason || "";
       await r.save();
+
+      await auditReg(req, {
+        entityId: String(r._id),
+        entityLabel: regLabel(r),
+        action: "update",
+        summary:
+          `Cancelled the regularisation for ${r.employeeName || r.biometricId} on ${r.dateStr} ` +
+          `while it was ${beforeStatus}.` +
+          `${r.cancelReason ? ` Reason: ${r.cancelReason}` : ""}`,
+        before: { status: beforeStatus },
+        after: { status: "cancelled", cancelReason: r.cancelReason },
+      });
+
       res.json({ success: true, data: r });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
@@ -7376,6 +7650,20 @@ router.post("/holidays", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (e) {
       console.warn("[HOLIDAY] re-sync failed:", e.message);
     }
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "holiday",
+      entityId: String(h._id),
+      entityLabel: `${name} (${date})`,
+      action: "create",
+      summary:
+        `Added company holiday “${name}” on ${date}` +
+        `${type && type !== "company" ? ` as ${type}` : ""}. ` +
+        `Attendance for that date was re-synced, so everybody's status for the day changed with it.`,
+      after: { date, name, description: description || "", type: type || "company" },
+    });
+
     res.status(201).json({ success: true, data: h });
   } catch (err) {
     if (err.code === 11000)
@@ -7396,6 +7684,21 @@ router.delete("/holidays/:id", EmployeeAuthMiddlewear, async (req, res) => {
         console.warn("[HOLIDAY-DEL] re-sync failed:", e.message);
       }
     }
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-settings",
+      entity: "holiday",
+      entityId: String(req.params.id),
+      entityLabel: h ? `${h.name} (${h.date})` : String(req.params.id),
+      action: "delete",
+      summary: h
+        ? `Removed company holiday “${h.name}” on ${h.date}. Attendance for that date was ` +
+          `re-synced as a normal working day, which changes everybody's status for it.`
+        : `Removed a holiday that no longer existed (${req.params.id}).`,
+      before: h ? { date: h.date, name: h.name, type: h.type } : undefined,
+    });
+
     res.json({ success: true, message: "Holiday removed" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

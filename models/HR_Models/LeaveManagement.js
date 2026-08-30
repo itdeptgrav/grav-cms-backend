@@ -52,6 +52,11 @@ const leaveBalanceSchema = new mongoose.Schema(
     },
     plEligible: { type: Boolean, default: false },
     plGrantedDate: { type: Date },
+    // When the PL sync took the entitlement back, because the date of joining
+    // no longer supports it. Kept alongside plGrantedDate rather than clearing
+    // it: the pair is the record of an entitlement that was given and then
+    // withdrawn, which is a different thing from one that was never granted.
+    plRevokedDate: { type: Date },
     lastUpdatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",

@@ -6,6 +6,36 @@ const JobPosting = require("../../models/HR_Models/JobPosting");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const HRDepartment = require("../../models/HRDepartment");
 
+// Interview scheduling history. Filed under Recruitment, not its own page: an
+// interview being moved or cancelled is part of that candidate's story and
+// belongs beside their stage changes.
+const { recordChange } = require("../../services/changeLog");
+const auditTask = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:recruitment",
+    entity: "employee-task",
+    ...entry,
+  });
+
+/** "Technical interview - Ramesh Kumar" */
+const taskLabel = (t) =>
+  [t?.title || t?.type, t?.candidateName || t?.employeeName].filter(Boolean).join(" - ") ||
+  String(t?._id || "");
+
+const taskSnapshot = (t) => ({
+  title: t?.title,
+  type: t?.type,
+  status: t?.status,
+  scheduledDate: t?.scheduledDate,
+  scheduledTime: t?.scheduledTime,
+  interviewStage: t?.interviewStage,
+  location: t?.location,
+  interviewers: t?.interviewers,
+  notes: t?.notes,
+  outcome: t?.outcome,
+});
+
 // ✅ CREATE new employee task (for scheduling meetings)
 router.post("/", EmployeeAuthMiddleware, async (req, res) => {
   try {
@@ -120,6 +150,17 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
       });
       console.log(`Updated candidate stage to: ${taskData.interviewStage}`);
     }
+
+    await auditTask(req, {
+      entityId: String(newTask._id),
+      entityLabel: taskLabel(newTask),
+      action: "create",
+      summary:
+        `Scheduled a ${newTask.type || "task"} for ` +
+        `${String(newTask.scheduledDate).slice(0, 10)}${newTask.scheduledTime ? ` at ${newTask.scheduledTime}` : ""}` +
+        `${taskData.interviewStage ? `. The candidate was moved to the ${taskData.interviewStage} stage by this booking` : ""}.`,
+      after: taskSnapshot(newTask),
+    });
 
     res.status(201).json({
       success: true,
@@ -261,6 +302,8 @@ router.patch("/:taskId/status", EmployeeAuthMiddleware, async (req, res) => {
       updateData.rescheduledAt = new Date();
     }
 
+    const previousTask = await EmployeeTask.findById(taskId).lean();
+
     const updatedTask = await EmployeeTask.findByIdAndUpdate(
       taskId,
       updateData,
@@ -273,6 +316,16 @@ router.patch("/:taskId/status", EmployeeAuthMiddleware, async (req, res) => {
         message: "Task not found",
       });
     }
+
+    await auditTask(req, {
+      entityId: String(taskId),
+      entityLabel: taskLabel(updatedTask),
+      action: "update",
+      summary:
+        `Moved ${taskLabel(updatedTask)} from ${previousTask?.status || "unknown"} to ${status}.`,
+      before: { status: previousTask?.status },
+      after: { status },
+    });
 
     res.status(200).json({
       success: true,
@@ -314,6 +367,16 @@ router.put("/:taskId", EmployeeAuthMiddleware, async (req, res) => {
       { new: true, runValidators: true },
     );
 
+    // `task` was read at the top of the handler for the existence check, so it
+    // is a genuine pre-write snapshot.
+    await auditTask(req, {
+      entityId: String(taskId),
+      entityLabel: taskLabel(updatedTask),
+      action: "update",
+      before: taskSnapshot(task),
+      after: taskSnapshot(updatedTask),
+    });
+
     res.status(200).json({
       success: true,
       message: "Task updated successfully",
@@ -352,6 +415,18 @@ router.delete("/:taskId", EmployeeAuthMiddleware, async (req, res) => {
     }
 
     await EmployeeTask.findByIdAndDelete(taskId);
+
+    // A hard delete - nothing survives but this entry.
+    await auditTask(req, {
+      entityId: String(taskId),
+      entityLabel: taskLabel(task),
+      action: "delete",
+      summary:
+        `Deleted the ${task.type || "task"} that was scheduled for ` +
+        `${String(task.scheduledDate).slice(0, 10)}${task.scheduledTime ? ` at ${task.scheduledTime}` : ""} ` +
+        `(status ${task.status}). The record is gone, not archived.`,
+      before: taskSnapshot(task),
+    });
 
     res.status(200).json({
       success: true,
@@ -478,6 +553,25 @@ router.patch("/:taskId/complete", EmployeeAuthMiddleware, async (req, res) => {
     }
 
     await task.save();
+
+    await auditTask(req, {
+      entityId: String(taskId),
+      entityLabel: taskLabel(task),
+      action: "update",
+      summary:
+        `Completed the ${task.interviewStage || task.type || "task"} with an outcome of ` +
+        `"${task.outcome}"` +
+        `${candidateRating != null ? ` and a rating of ${candidateRating}` : ""}` +
+        `${candidate ? `. The candidate is now at the ${candidate.stage} stage.` : "."}` +
+        `${outcomeNotes ? ` Notes: ${outcomeNotes}` : ""}`,
+      before: { status: "scheduled", outcome: "" },
+      after: {
+        status: "completed",
+        outcome: task.outcome,
+        outcomeNotes: task.outcomeNotes,
+        candidateStage: candidate?.stage,
+      },
+    });
 
     res.status(200).json({
       success: true,

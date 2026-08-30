@@ -2,6 +2,241 @@
 
 ---
 
+## PL eligibility reconcile, overtime & regularisation history, record stamps
+
+> Follow-on to the HR change-history work below. Five items the user raised
+> after using it. Nothing committed.
+
+### 1. PL sync now REVOKES as well as grants — the correctness bug
+
+Reported symptom: people holding PL they were never eligible for, and people at
+the threshold who never got it. The cause is not the threshold maths — it is
+that eligibility derives from `dateOfJoining`, a field HR edits, and the sync
+only ever granted. A DOJ typo that made somebody eligible left them holding PL
+permanently once it was corrected.
+
+| File | Change |
+|---|---|
+| `services/plEligibility.js` | **New, pure.** `decidePlEligibility()` returns one of six actions. Extracted from the route specifically because it now takes entitlements *away*: a wrong answer here is invisible afterwards, and the cases where it must refuse to act are the easy ones to get wrong. Takes `workingDays` as a parameter rather than reading the clock, so the table is testable. |
+| `services/plEligibility.test.js` | **New**, 10 node:test cases over the whole decision table, including the two refusals and the inclusive-threshold boundary. |
+| `routes/HrRoutes/Leave_section.js` | The loop is now a `switch` over that decision. Grants, revokes, and reports the two it refuses to touch. Logs grants and revocations as **separate** change-log entries — they are different events, and somebody searching for "when did this person lose their PL" must not have to open a combined one. |
+| `models/HR_Models/LeaveManagement.js` | `plRevokedDate`, kept alongside `plGrantedDate` — given-then-withdrawn is a different fact from never-granted. |
+| `app/hr/dashboard/leaves/PLSyncModal.js` | Preview now shows both directions plus both refusal buckets, each with the people named. The old "Will Grant" tile counted `eligible`, which includes everybody already holding PL correctly — it overstated the change. Now counted from the list. |
+
+**Two things it refuses to do, and this is the substance of the fix:**
+
+- **No date of joining → skip, always.** `workingDaysSince(undefined)` returns 0,
+  which reads as "nowhere near eligible" and would have revoked every employee
+  with a blank field — the same class of mistake this exists to clean up,
+  applied to more people. Reported under `noJoiningDate`.
+- **PL already taken → report, never auto-revoke.** Zeroing the entitlement of
+  somebody who has taken PL days leaves consumed above entitlement: leave that
+  was applied for, approved and usually already paid. Whether those days become
+  LWP, stand as an exception, or are recovered is a payroll decision with money
+  attached. Reported under `needsReview` with the day count.
+
+### 2. Overtime and regularisation history
+
+Both live under `/api/employee/**` and so were outside the HR audit trail —
+which is exactly why they had no history. They are HR facts regardless: an
+approved overtime grants grace on the next day's attendance, and a
+regularisation rewrites a day outright.
+
+- New section `hr:overtime` + path patterns; regularisations file into the
+  existing `hr:attendance-regularizations` so the app-side and HR-side halves of
+  one request share a history.
+- `server.js` mounts the trail on `/api/employee/overtime` and
+  `/api/employee/regularizations` **by name** — not on all of `/api/employee`,
+  which is the whole mobile surface and has no business in the HR log.
+- `Overtimeroutes.js`: submit, manager approve, manager reject (3 entries).
+- `Employee_Routes/regularization.js`: employee applies, primary hands to
+  secondary, final approval, manager rejects, employee withdraws (5 entries).
+
+Both approval entries record **whether it actually reached the attendance
+record**, separately from the decision. A request can be approved and apply to
+nothing, and the employee is then told their day was corrected when it was not.
+
+**Frontend for these two** (asked about after the first pass, and the answer was
+only half yes):
+
+- *Regularisations* needed nothing new. The page already exists and already
+  passes `activeMenu="attendance-regularizations"`, which the layout maps to
+  `hr:attendance-regularizations` — so its top-bar History button was already
+  opening exactly this history, and the new app-side entries land in it because
+  they share the section key.
+- *Overtime* had no way in beyond the section rail on the history page. There is
+  no HR overtime screen to hang a button on — it is raised in the app and
+  decided by a manager. So: `/hr/dashboard/history` now reads `?section=` from
+  the URL (split into `page.js` + `HistoryClient.js` with a Suspense boundary,
+  the same shape as the new-employee page, because `useSearchParams` suspends),
+  the rail writes the section back with `router.replace` so a section view is
+  linkable without stacking history entries, and an **Overtime** item sits under
+  Time in the HR nav pointing at it. `NAV_KEY_FOR_SECTION` keeps that item
+  highlighted while it is open.
+
+### 3. Leave page had no page gutter
+
+`app/hr/dashboard/leaves/page.js` used `mx-auto w-full max-w-[1480px] space-y-5
+pb-10` — no horizontal or top padding, so the content sat flush against the rail
+and the top bar. Every other HR page uses `mx-auto max-w-[1480px] px-4 py-6
+deck:px-8`. Now matches.
+
+### 4. "Added by / last changed by" on records
+
+| File | Change |
+|---|---|
+| `routes/HrRoutes/ChangeHistory.js` | `GET /stamps?entity=&ids=` — created and last-changed for up to 500 records in **one** query. Batched deliberately: per-row it is one request per record, which on a 400-employee list is 400 requests to render one line of small text each. The first *create* wins rather than the first row of any kind — a record whose earliest surviving entry is an edit predates the log, and calling that its creation puts the wrong name on it. |
+| `components/access/RecordStamp.js` | **New.** One line of ink-faint text. Self-fetches on a detail screen; takes a pre-fetched stamp in a list, via the `useRecordStamps` hook. Names the approver too when the change only landed because somebody accepted it — otherwise the line credits the editor and implies they could make it alone. |
+| Employee form, department detail, departments list | Wired in. |
+
+The documents list already showed `generatedByName`, so it was left alone rather
+than given a second, competing attribution line.
+
+### Verification
+
+- `node --test services/plEligibility.test.js` — **10/10**.
+- `npm test` — **936 / 939**. The 3 failures are in `blockedDeadline.test.js`
+  and `salesJourneyOutcome.test.js`; confirmed pre-existing by stashing every
+  change and re-running on a clean tree (926/929, same 3).
+- `node -r dotenv/config verifyHrChangeHistory.js` — **46/46** still green.
+- `node --check` clean across every touched backend file.
+- All 8 changed frontend modules compiled in dev with no errors.
+
+**Not verified:** the PL reconcile against real data — it needs an HR session,
+and a dry run is the safe way to see it (the modal opens on one). The decision
+rule behind it is covered by the unit tests.
+
+---
+
+## HR change history — every change recorded, per page, with approver attribution
+
+> **Scope: HR only, deliberately.** The user asked for the whole CMS eventually
+> but for HR first, "to minimize the load". Everything below is built to extend
+> to another department with a section list and one mount line — see *Extending*
+> at the end. Nothing committed.
+
+### The problem
+
+`change_logs` and `services/changeLog.js` already existed, but only four HR route
+files wrote to them (12 of ~90 write handlers), the collection had no idea which
+SCREEN a change came from, the diff was shallow, and the only way to read it was
+`GET /api/admin/change-log` — platform-admin only, so the department whose work
+it recorded could not see it. An approved change was also indistinguishable from
+one an editor was allowed to make alone.
+
+### Backend (`grav-cms-backend`)
+
+| File | Purpose |
+|---|---|
+| `models/Access/ChangeLog.js` | Extended, additively. New: `section`/`sectionLabel` (which page), `fields[]` (per-field `{path,label,from,to,kind}`), `origin` (`direct`/`approval`/`import`/`system`), `approvedBy*`/`decisionNote`/`changeRequestId`, `requestMethod`/`requestPath`, plus two section indexes. `sanitiseValue(path,value)` redacts by the **leaf** of a dotted path, so a salary nested at `components.2.basicSalary` redacts as reliably as a top-level one. `before`/`after` and the shallow `diff()` are untouched — the CRM writes ~170 entries through them and existing readers index into `after[key]`. |
+| `services/auditSections.js` | **New.** The vocabulary: 28 HR sections (key, label, nav group, href), a field-label registry (`COMMON` + per-section overrides, so `status` is "Employment status" on the employee form and "Approval status" in the leave queue), and `sectionForPath()` for the two places that have only a URL — the mount-level write guard and the approval queue. Labels are resolved **at write time** and stored: renaming a field next year must not rewrite what last year's history says happened. |
+| `services/changeLog.js` | `fieldDiff()` — a deep diff walking objects and arrays to dotted paths (`punches.1.inTime`), depth-capped at 4 and 120 fields, comparing the way the database does (an ObjectId equals its string, a Date equals its ISO string, `5` equals `"5"`) so mongoose's lean-vs-hydrated inconsistency does not fill every entry with changes that never happened. `buildSummary()` writes the sentence from the diff rather than by hand, because a hand-written summary drifts from the fields under it. `approvalFrom(req)` reads the approver off the replay headers, so **every route that logs gets approval attribution without knowing it exists**. Plus `listChanges()` (filters + pagination + escaped search) and `auditFor()`. |
+| `services/changeRequests.js` | The loopback replay now sends `x-grav-approver-{id,name,email}` and `x-grav-decision-note` alongside the existing replay header — header-injection-safe. Headers, not the token: the token is the *requester's*, and folding the approver into it would make every downstream `req.user` ambiguous about which of the two people it means. Also records the **submission**, the **decision**, and a **withdrawal** — a rejected change never reaches a route, so without these an editor's work vanishes with nothing anywhere saying it was asked for. `decideChangeRequest` takes `req` and logs from the *result*, so a failed replay is never recorded as "approved". |
+| `models/Access/ChangeRequest.js` | `section`/`sectionLabel` added, so a held change shows on the page it was submitted from. |
+| `Middlewear/departmentWriteGuard.js` | Resolves `req.auditSection`/`req.auditEntity` from the path before holding, so the queue says "leave" rather than "hr record". |
+| `Middlewear/auditTrail.js` | **New — the floor.** Mounted by prefix, it records any successful write that the route did not log itself. Skips reads, read-shaped POSTs (same list the write guard uses), failures (4xx/5xx changed nothing), and 202s (held, not applied). `recordChange` sets `req.__auditLogged` on the *call*, so a route that looked at a change and decided nothing happened is not second-guessed. Fires on `finish`, by which point the router's auth middleware has resolved `req.user`. Entity id comes from the **path**, not `req.params` — params are reassigned per route layer and mean nothing at app level. |
+| `routes/HrRoutes/ChangeHistory.js` | **New**, mounted `/api/hr/change-history` behind `EmployeeAuthMiddleware`, **above** the bare `/api/hr` profile router. `GET /`, `/sections`, `/actors`, `/record/:entity/:entityId`, `/summary`, `/export` (CSV). `departmentSlug: "hr"` is pinned server-side on every handler — taking it from the caller would make this a way to read another department's payroll changes by editing a query string. An unknown section is dropped rather than passed through: a mistyped section would return an empty list, and an empty history reads exactly like "nobody changed anything". |
+| 17 HR route files | `recordChange` calls with real before/after, filed to a section. Coverage went from 12 to 99 explicit call sites (a few of those are shared per-file helpers rather than one-per-handler): leaves (15), payroll (9), attendance (12), employees (7), documents (6), candidates (6), policies (6), SOP (7), job postings (5), tasks (6), password management (5), departments (5), app versions (4), HR profile (2), shift swaps (1), employee import (1). Bulk actions log **per record** where each record has its own history (bulk leave approval, bulk payroll override) and as **one entry naming everybody** where they do not (year init, PL sync, bulk attendance override) — several hundred identical rows would bury every other change on the page. |
+| `server.js` | Two mounts: the audit trail on `/api/hr`, `/hr`, `/api/employees`; the read API on `/api/hr/change-history`. |
+| `verifyHrChangeHistory.js` | **New**, hand-run like the other `verify*.js` scripts. Writes and then deletes its own `change_logs` rows (entity `verify-harness`), cleaning up on crash too. |
+
+Two bugs found and fixed on the way, both in code being touched:
+
+- `routes/HrRoutes/Candidates_section.js` logged `stage changed from X to Y`
+  **after** assigning the new stage, so both sides always printed the same value.
+- `Middlewear/auditTrail.js`'s first draft copied the write guard's
+  `POST /:id/verb` heuristic, which matches any two trailing word segments — so a
+  plain `POST /api/hr/departments` was classed as an update. It now requires the
+  parent segment to *look* like an id. **The same latent bug is still in
+  `departmentWriteGuard.js`**, where it only mislabels an action in the approval
+  queue; left alone because changing it moves Sales's queue labels and this task
+  is HR-scoped.
+
+### Frontend (`grav-cms`)
+
+| File | Purpose |
+|---|---|
+| `lib/changeHistoryApi.js` | **New.** Thin client over `/api/hr/change-history`, through `lib/api` so it inherits both halves of the auth story (cookie *and* Bearer). Also owns `ACTION_META`/`ORIGIN_META` and the value/date formatters, so the drawer and the full page cannot disagree about what a rejection looks like. |
+| `components/access/ChangeHistory.js` | **New.** One renderer, three placements: `<ChangeHistory>` (full page), `<ChangeHistoryDrawer>`, `<HistoryButton>`. An entry carries when, kind, record, a written sentence, every changed field with old → new, who, and — for a held change — who approved it and their note. Fields collapse by default. Pending approvals render **above** the history, because a record's history that omits them shows a salary of 25,000 without mentioning the 30,000 sitting in a queue. Out-of-order responses are guarded with a request sequence counter. |
+| `components/Hr_DashboardLayout.js` | A `History` nav item, and — the important part — a `HistoryButton` in FrostShell's `extras`, mapped from `activeMenu`. **One edit covers all ~40 HR pages**, and a page added later gets its history by being in the nav. Forty per-page edits would have been forty chances to pass the wrong key and one guaranteed omission on the next new page. |
+| `app/hr/dashboard/history/page.js` | **New.** Department-wide history with a grouped section rail (from the server vocabulary, so a page with no changes still appears and says so), a four-cell stat strip that refetches per section, and the shared list. |
+| `app/hr/dashboard/departments/[id]/page.js`, `.../employees/new-employee/NewEmployeeClient.js` | Record-scoped `HistoryButton` on the two detail screens. On the employee form it only renders once there is a record — an empty drawer reads as a broken one. |
+
+`app/hr/dashboard/employees/history/page.js` was left as it is at the user's
+direction; it still reads `/api/employees/history` and is unaffected, since every
+model change is additive.
+
+### Verification
+
+- `node -r dotenv/config verifyHrChangeHistory.js` — **38/38 pass** against the
+  dev database. Covers the label registry, path→section resolution, the deep
+  diff's four equality cases, redaction in both `before`/`after` *and* `fields[]`
+  *and* the generated summary, the no-op suppression, approval attribution
+  (editor stays the actor, approver recorded separately), and every read filter
+  including department isolation and a regex metacharacter typed into search.
+- `node --check` clean across all 21 HR route files and every touched service.
+- The new route answers **401** exactly like its HR neighbours (mounted, gated).
+- Frontend compiles clean in dev (no errors in the Turbopack log); the component
+  renders, its toolbar sits on one row, and it uses **no hardcoded colours** —
+  every value is a `--g-*`-derived token, so it follows the shell's theme.
+
+**Not verified:** the populated list rendered in a real logged-in HR session —
+that needs credentials. The data shape behind it is covered by the harness.
+
+### Fixed after first review
+
+The user opened the drawer on a real record and got *"Updated employee KRISHNA
+BEHERA"* with nothing under it, and a sheet whose colour did not match the page.
+Both were real:
+
+- **The employee update route diffed a hand-picked list of nine fields** and
+  passed its own `summary`, so an edit to anything else (address, bank details,
+  date of birth, shift) recorded an entry that said something had happened and
+  refused to say what — and the explicit summary defeated the no-op suppression
+  that would otherwise have dropped it. `beforeDoc` was *also* a 13-field
+  projection, so widening one without the other would have reported every
+  unselected field as newly added. Now: `beforeDoc` is the whole document, a new
+  `employeeAuditSnapshot()` decides what a history should see (an exclude list —
+  secrets, audit stamps, engine state, the photo — rather than an include list),
+  salary is decrypted so a hike reads as `Gross salary 25000 → 30000`, and the
+  hand-written summary is gone so `buildSummary` writes one from the actual
+  diff. Labels added for the ~30 fields this newly exposes.
+- **The drawer painted itself with `--body-bg`**, the page *ground* — a flat
+  slab the same colour as the page it floats above. It now uses `frost-panel`,
+  the surface material every other raised thing in the shell uses, correct in
+  both themes and both perf modes without naming a colour.
+- **The drawer is now portalled to `document.body`**, carrying `.grav-ui` plus
+  `data-theme` and `data-perf` (FrostShell's own documented pattern). This was a
+  latent bug, not cosmetics: the button lives in `.frost-bar`, which has
+  `backdrop-filter` when effects are on, and an ancestor with `backdrop-filter`
+  becomes the containing block for `position: fixed` — so the sheet would have
+  been positioned against the top bar rather than the viewport the moment
+  anybody turned effects on. HR defaults to effects off, which is why it looked
+  fine. A `mounted` flag keeps the portal out of the first client render so it
+  hydrates cleanly.
+
+Harness extended to **46 checks**, pinning the whitelist bug specifically: an
+off-list edit is recorded, names the fields that moved, labels nested paths
+(`address.line1` → "Address line 1"), reports neither an unchanged nested value
+nor an unchanged salary, and a pay rise reads as one. Both themes were verified
+in the browser through the portal.
+
+A pre-existing hydration error fires on the landing page too and is unrelated to
+this work.
+
+### Extending to another department
+
+1. Add its sections to `SECTIONS` in `services/auditSections.js` (and any path
+   patterns to `PATH_SECTIONS`).
+2. `app.use("/api/<prefix>", auditTrail("<slug>"))` in `server.js`.
+3. Copy `routes/HrRoutes/ChangeHistory.js`, changing the one `DEPARTMENT`
+   constant and the auth middleware.
+4. Add the `HistoryButton` to that department's `*_DashboardLayout.js` `extras`.
+5. Instrument its write handlers with `recordChange` for real diffs — the floor
+   covers them until then.
+
+---
+
 ## Personal Planner — chunk 1: foundation, Today, Ladder, Review
 
 > **One employee's own Vision → Mission → Project → Task ladder, private to

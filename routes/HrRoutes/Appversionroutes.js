@@ -47,6 +47,17 @@ router.get("/latest", async (req, res) => {
   }
 });
 
+// Publishing a build changes what every employee's phone downloads, so it is
+// recorded like any other HR change rather than living only in a console line.
+const { recordChange } = require("../../services/changeLog");
+const auditVersion = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:app-version",
+    entity: "app-version",
+    ...entry,
+  });
+
 // ── POST /api/hr/app/upload — upload APK (HR only) ──
 router.post(
   "/upload",
@@ -104,6 +115,23 @@ router.post(
       console.log(
         `[APP-UPLOAD] v${version} uploaded by ${req.user?.name || "HR"} → ${driveResult.fileId}`,
       );
+      await auditVersion(req, {
+        entityId: String(appVersion._id),
+        entityLabel: `v${version}`,
+        action: "create",
+        summary:
+          `Uploaded GRAV CRM v${version} (${Math.round((req.file.size || 0) / 1024)} KB) and made it ` +
+          `the LATEST build - every employee's app will now offer this version. ` +
+          `${releaseNotes ? `Release notes: ${releaseNotes}` : "No release notes were given."}`,
+        after: {
+          version,
+          fileName,
+          fileSize: req.file.size,
+          isLatest: true,
+          releaseNotes: releaseNotes || "",
+        },
+      });
+
       res.json({
         success: true,
         data: appVersion,
@@ -135,6 +163,17 @@ router.patch(
         return res
           .status(404)
           .json({ success: false, message: "Version not found" });
+      await auditVersion(req, {
+        entityId: String(ver._id),
+        entityLabel: `v${ver.version}`,
+        action: "update",
+        summary:
+          `Made v${ver.version} the latest build. Whatever was latest before is no longer ` +
+          `offered - this is how a release is rolled back as well as rolled forward.`,
+        before: { isLatest: false },
+        after: { isLatest: true, version: ver.version },
+      });
+
       res.json({
         success: true,
         data: ver,
@@ -152,6 +191,16 @@ router.delete("/versions/:id", EmployeeAuthMiddleware, async (req, res) => {
     const ver = await AppVersion.findByIdAndDelete(req.params.id);
     if (!ver)
       return res.status(404).json({ success: false, message: "Not found" });
+    await auditVersion(req, {
+      entityId: String(req.params.id),
+      entityLabel: `v${ver.version}`,
+      action: "delete",
+      summary:
+        `Deleted the v${ver.version} build record${ver.isLatest ? " — it was the LATEST build, so no version is marked latest until another is set" : ""}. ` +
+        `It had been downloaded ${ver.downloadCount || 0} time(s).`,
+      before: { version: ver.version, isLatest: ver.isLatest, downloadCount: ver.downloadCount },
+    });
+
     res.json({ success: true, message: `v${ver.version} deleted` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

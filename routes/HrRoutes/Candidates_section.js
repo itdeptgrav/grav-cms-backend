@@ -5,6 +5,40 @@ const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear"
 const Candidate = require("../../models/HR_Models/Candidates");
 const EmployeeTask = require("../../models/HR_Models/EmployeeTask");
 
+// Candidates share the Recruitment history with job postings - see the note in
+// JobPosting_Section.js.
+const { recordChange } = require("../../services/changeLog");
+const auditCandidate = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:recruitment",
+    entity: "candidate",
+    ...entry,
+  });
+
+/** Stage keys as the pipeline column headings spell them. */
+const STAGE_LABELS = {
+  screening: "Screening",
+  technical_interview: "Technical interview",
+  hr_interview: "HR interview",
+  training: "Training",
+  hired: "Hired",
+  rejected: "Rejected",
+};
+
+const candidateSnapshot = (c) => ({
+  name: c?.name,
+  email: c?.email,
+  phone: c?.phone,
+  stage: c?.stage,
+  status: c?.status,
+  experience: c?.experience,
+  expectedSalary: c?.expectedSalary,
+  source: c?.source,
+  notes: c?.notes,
+  resumeUrl: c?.resumeUrl,
+});
+
 // ✅ GET candidates for a job posting
 router.get("/:jobId", EmployeeAuthMiddleware, async (req, res) => {
   try {
@@ -115,6 +149,17 @@ router.post("/:jobId/candidates", EmployeeAuthMiddleware, async (req, res) => {
       $inc: { applications: 1 },
     });
 
+    await auditCandidate(req, {
+      entityId: String(newCandidate._id),
+      entityLabel: `${newCandidate.name}${newCandidate.jobTitle ? ` - ${newCandidate.jobTitle}` : ""}`,
+      action: "create",
+      summary:
+        `Added candidate ${newCandidate.name} to "${newCandidate.jobTitle || jobId}" ` +
+        `at the ${STAGE_LABELS[newCandidate.stage] || newCandidate.stage || "screening"} stage` +
+        `${newCandidate.source ? `, sourced from ${newCandidate.source}` : ""}.`,
+      after: candidateSnapshot(newCandidate),
+    });
+
     res.status(201).json({
       success: true,
       message: "Candidate added successfully",
@@ -183,6 +228,12 @@ router.patch(
         });
       }
 
+      // Read before the assignment. The console line below used to be written
+      // after it and so printed the new stage on both sides of its own
+      // "from X to Y".
+      const previousStage = candidate.stage;
+      const previousStatus = candidate.status;
+
       // Update candidate stage
       candidate.stage = stage;
 
@@ -195,8 +246,24 @@ router.patch(
 
       // Log the stage change
       console.log(
-        `Candidate ${candidate.name} stage changed from ${candidate.stage} to ${stage} by ${user.id}`,
+        `Candidate ${candidate.name} stage changed from ${previousStage} to ${stage} by ${user.id}`,
       );
+
+      await auditCandidate(req, {
+        entityId: String(candidateId),
+        entityLabel: `${candidate.name}${candidate.jobTitle ? ` - ${candidate.jobTitle}` : ""}`,
+        action: stage === "hired" ? "approve" : stage === "rejected" ? "reject" : "update",
+        summary:
+          `Moved ${candidate.name} from ${STAGE_LABELS[previousStage] || previousStage} ` +
+          `to ${STAGE_LABELS[stage] || stage}` +
+          (stage === "rejected"
+            ? " and archived the candidate."
+            : stage === "hired"
+              ? " - the candidate is hired."
+              : "."),
+        before: { stage: previousStage, status: previousStatus },
+        after: { stage, status: candidate.status },
+      });
 
       res.status(200).json({
         success: true,
@@ -230,8 +297,21 @@ router.delete(
       }
 
       // Soft delete by setting status to archived
+      const previousStatus = candidate.status;
       candidate.status = "archived";
       await candidate.save();
+
+      await auditCandidate(req, {
+        entityId: String(candidateId),
+        entityLabel: `${candidate.name}${candidate.jobTitle ? ` - ${candidate.jobTitle}` : ""}`,
+        action: "delete",
+        summary:
+          `Removed candidate ${candidate.name} from the pipeline at the ` +
+          `${STAGE_LABELS[candidate.stage] || candidate.stage} stage. ` +
+          `The record was archived rather than deleted, so it can be restored.`,
+        before: { status: previousStatus, stage: candidate.stage },
+        after: { status: "archived" },
+      });
 
       res.status(200).json({
         success: true,
@@ -310,6 +390,8 @@ router.put(
         delete updateData[field];
       });
 
+      const previousCandidate = await Candidate.findById(candidateId).lean();
+
       // Update candidate
       const updatedCandidate = await Candidate.findByIdAndUpdate(
         candidateId,
@@ -319,6 +401,14 @@ router.put(
           runValidators: true,
         },
       );
+
+      await auditCandidate(req, {
+        entityId: String(candidateId),
+        entityLabel: `${updatedCandidate?.name || ""}${updatedCandidate?.jobTitle ? ` - ${updatedCandidate.jobTitle}` : ""}`,
+        action: "update",
+        before: candidateSnapshot(previousCandidate),
+        after: candidateSnapshot(updatedCandidate),
+      });
 
       res.status(200).json({
         success: true,
@@ -498,9 +588,23 @@ router.patch(
       }
 
       // Archive candidate
+      const previousStage = candidate.stage;
+      const previousStatus = candidate.status;
       candidate.status = "archived";
       candidate.stage = "rejected";
       await candidate.save();
+
+      await auditCandidate(req, {
+        entityId: String(candidateId),
+        entityLabel: `${candidate.name}${candidate.jobTitle ? ` - ${candidate.jobTitle}` : ""}`,
+        action: "reject",
+        summary:
+          `Archived candidate ${candidate.name} out of the ` +
+          `${STAGE_LABELS[previousStage] || previousStage} stage and marked them rejected.` +
+          `${reason ? ` Reason: ${reason}` : " No reason was given."}`,
+        before: { stage: previousStage, status: previousStatus },
+        after: { stage: "rejected", status: "archived", reason: reason || "" },
+      });
 
       res.status(200).json({
         success: true,

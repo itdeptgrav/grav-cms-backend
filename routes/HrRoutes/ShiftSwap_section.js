@@ -214,6 +214,7 @@ router.post("/exchange", EmployeeAuthMiddlewear, async (req, res) => {
     try {
       await recordChange(req, {
         departmentSlug: "hr",
+        section: "hr:shift-swaps",
         entity: "shift-swap",
         entityId: String(a._id),
         action: "update",

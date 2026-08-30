@@ -205,28 +205,22 @@ router.post("/:id/decide", async (req, res) => {
       });
     }
 
+    // The decision is logged inside decideChangeRequest, not here. It has to
+    // be: only the service knows whether an APPROVAL actually applied, and an
+    // entry written here would say "approved" for a replay that failed — the
+    // one case where the history most needs to disagree with the intention.
+    // Passing `req` lets that entry carry the approver and the section.
     const result = await decideChangeRequest({
       id: req.params.id,
       decision,
       note,
       actor: actorFrom(req),
+      req,
     });
 
     if (result.code === 404 || result.code === 409) {
       return res.status(result.code).json({ success: false, message: result.message });
     }
-
-    await recordChange(req, {
-      departmentSlug: cr.departmentSlug,
-      entity: cr.entity,
-      entityId: cr.entityId,
-      entityLabel: cr.entityLabel,
-      action: decision === "approve" ? "approve" : "reject",
-      summary:
-        `${decision === "approve" ? "Approved" : "Rejected"} a change requested by ` +
-        `${cr.requestedBy?.name || cr.requestedBy?.email || "someone"}` +
-        (cr.summary ? ` — ${cr.summary}` : ""),
-    });
 
     // An approval whose replay failed is NOT a success, and must not be
     // reported as one: the approver would close the queue believing the change
@@ -266,6 +260,22 @@ router.post("/:id/withdraw", async (req, res) => {
     cr.decidedAt = new Date();
     cr.decisionNote = "Withdrawn by the person who submitted it.";
     await cr.save();
+
+    // Logged for the same reason a rejection is: the request left the queue
+    // without ever reaching a route, so nothing else in the system would show
+    // that it had existed.
+    await recordChange(req, {
+      departmentSlug: cr.departmentSlug,
+      section: cr.section,
+      entity: cr.entity,
+      entityId: cr.entityId,
+      entityLabel: cr.entityLabel,
+      action: "reject",
+      origin: "approval",
+      summary:
+        `Withdrew their own pending change to ${cr.entity}` +
+        `${cr.entityLabel ? ` “${cr.entityLabel}”` : ""}. Nothing was applied.`,
+    });
 
     res.json({ success: true, message: "Withdrawn." });
   } catch (err) {

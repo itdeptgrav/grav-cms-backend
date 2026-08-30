@@ -31,6 +31,7 @@ const jwt = require("jsonwebtoken");
 
 const { requireDepartmentRole } = require("../services/departmentRoles");
 const { requireApproval } = require("../services/changeRequests");
+const { sectionForPath } = require("../services/auditSections");
 const { SECRET, LEGACY_SECRETS, readToken } = require("../config/jwt");
 
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -140,6 +141,18 @@ function departmentWrites(slug, opts = {}) {
 
     const path = req.originalUrl || req.url || "";
     if (isReadShaped(path)) return next();
+
+    // Which page this write belongs to, for a held change's history entry.
+    // Set on the request rather than baked into the guard because one mount
+    // covers a whole department: HR's writes arrive on twenty different paths
+    // and a single section chosen at mount time would file all of them under
+    // one page. A route that names its own section when it logs still wins —
+    // this is only the fallback for a change that never reaches its route.
+    const resolved = sectionForPath(path);
+    if (resolved && !req.auditSection) {
+      req.auditSection = resolved.section;
+      req.auditEntity = resolved.entity;
+    }
 
     // Must happen before either guard reads req.user — see seedIdentity.
     seedIdentity(req);

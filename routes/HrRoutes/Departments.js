@@ -5,6 +5,30 @@ const Employee = require("../../models/Employee");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { recordChange } = require("../../services/changeLog");
 
+// Every department edit, in the Departments page history.
+const auditDept = (req, entry) =>
+  recordChange(req, { departmentSlug: "hr", section: "hr:departments", ...entry });
+
+/**
+ * A department's designations, flattened so a diff can name the one that moved.
+ *
+ * Designations are the part of a department people actually edit, and comparing
+ * the raw arrays reports "designations changed" for a single renamed job title.
+ * Keyed by name so adding one at the top does not read as every row changing.
+ */
+function designationMap(dept) {
+  const out = {};
+  for (const d of dept?.designations || []) {
+    if (!d?.name) continue;
+    out[d.name] = {
+      active: d.isActive !== false,
+      manager: d.managerName || d.manager || "",
+      level: d.level ?? "",
+    };
+  }
+  return out;
+}
+
 // "FIRSTNAME LASTNAME (GR0045)" — the same label format employee docs already
 // store in primaryManager.managerName (see leave approval flow).
 function managerLabel(emp) {
@@ -225,6 +249,25 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
     const newDepartment = new Department(departmentData);
     await newDepartment.save();
 
+    await auditDept(req, {
+      entity: "department",
+      entityId: String(newDepartment._id),
+      entityLabel: newDepartment.name,
+      action: "create",
+      summary:
+        `Created department “${newDepartment.name}”` +
+        `${newDepartment.code ? ` (${newDepartment.code})` : ""} with ` +
+        `${newDepartment.designations?.length || 0} designation(s)` +
+        `${newDepartment.designations?.length ? `: ${newDepartment.designations.map((d) => d.name).join(", ")}` : ""}.`,
+      after: {
+        name: newDepartment.name,
+        code: newDepartment.code || "",
+        description: newDepartment.description || "",
+        status: newDepartment.status,
+        designations: designationMap(newDepartment),
+      },
+    });
+
     res.status(201).json({
       success: true,
       message: "Department created successfully",
@@ -377,6 +420,7 @@ router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
 
     recordChange(req, {
       departmentSlug: "hr",
+      section: "hr:departments",
       entity: "department",
       entityId: id,
       entityLabel: department.name,
@@ -498,6 +542,29 @@ router.put("/:id", EmployeeAuthMiddleware, async (req, res) => {
       updateData,
       { new: true, runValidators: true },
     ).select("-__v");
+
+    // `existingDepartment` was read at the top of the handler, before the
+    // write — which is the only reason this can report a real before/after.
+    await auditDept(req, {
+      entity: "department",
+      entityId: String(id),
+      entityLabel: updatedDepartment?.name || existingDepartment.name,
+      action: "update",
+      before: {
+        name: existingDepartment.name,
+        code: existingDepartment.code || "",
+        description: existingDepartment.description || "",
+        status: existingDepartment.status,
+        designations: designationMap(existingDepartment),
+      },
+      after: {
+        name: updatedDepartment?.name,
+        code: updatedDepartment?.code || "",
+        description: updatedDepartment?.description || "",
+        status: updatedDepartment?.status,
+        designations: designationMap(updatedDepartment),
+      },
+    });
 
     res.status(200).json({
       success: true,
@@ -623,9 +690,26 @@ router.delete("/:id", EmployeeAuthMiddleware, async (req, res) => {
     }
 
     // Soft delete by setting status to inactive
+    const previousStatus = department.status;
     department.status = "inactive";
     department.updatedAt = new Date();
     await department.save();
+
+    // Logged as a delete even though the row survives: "deactivated" is what
+    // the button says and what the reader means, and calling it an update
+    // would file the most consequential change on the page alongside a
+    // description edit.
+    await auditDept(req, {
+      entity: "department",
+      entityId: String(id),
+      entityLabel: department.name,
+      action: "delete",
+      summary:
+        `Deactivated department “${department.name}”. The record was kept and its ` +
+        `${department.designations?.length || 0} designation(s) are unchanged — only its status moved to inactive.`,
+      before: { status: previousStatus },
+      after: { status: "inactive" },
+    });
 
     res.status(200).json({
       success: true,

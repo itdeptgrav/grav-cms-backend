@@ -371,6 +371,18 @@ router.patch(
 
       const userName = getUserName(user, userType);
 
+      await auditCredential(req, {
+        entityId: String(id),
+        entityLabel: `${userName} (${userType})`,
+        action: "update",
+        summary:
+          `Set a new password for ${userName}, a ${userType} account. ` +
+          `The password itself is not recorded anywhere in this history.`,
+        fields: [
+          { path: "password", label: "Password", to: "[changed]", kind: "changed" },
+        ],
+      });
+
       res.status(200).json({
         success: true,
         message: `Password updated successfully for ${userName}`,
@@ -451,6 +463,20 @@ router.post(
       const hashed = await bcrypt.hash(tempPassword, salt);
 
       await Model.findByIdAndUpdate(id, { password: hashed });
+
+      await auditCredential(req, {
+        entityId: String(id),
+        entityLabel: `${userName} (${userType})`,
+        action: "update",
+        summary:
+          `Reset ${userName}'s password. ` +
+          (userType === "employee"
+            ? "It is now the default format built from their mobile number, so anybody who knows that number can sign in as them until they change it."
+            : "A temporary password was generated and shown once to whoever performed the reset."),
+        fields: [
+          { path: "password", label: "Password", to: "[reset]", kind: "changed" },
+        ],
+      });
 
       res.status(200).json({
         success: true,
@@ -598,6 +624,24 @@ router.post("/bulk-reset", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
       }
     }
 
+    // Named individually, because "12 passwords were reset" does not tell the
+    // person whose account it was that theirs was one of them.
+    await auditCredential(req, {
+      entityId: "bulk",
+      entityLabel: `Bulk password reset (${results.length})`,
+      action: "update",
+      summary:
+        `Reset the passwords of ${results.length} employee account(s) in one action` +
+        `${errors.length ? `; ${errors.length} failed` : ""}. ` +
+        `Each was set to the default format built from that person's mobile number.`,
+      fields: results.slice(0, 120).map((r) => ({
+        path: String(r.userId),
+        label: r.name || String(r.userId),
+        to: "[reset to default]",
+        kind: "changed",
+      })),
+    });
+
     res.status(200).json({
       success: true,
       message: `Reset completed: ${results.length} successful, ${errors.length} failed`,
@@ -635,6 +679,22 @@ router.post("/bulk-reset", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
  * and Project Manager accounts are protected, since those are real login
  * accounts that may legitimately have no Employee record.
  */
+// Credential changes, in the Password management history.
+//
+// WHAT IS NEVER WRITTEN: the password. Not the new one, not the temporary one,
+// not a hash. The change log redacts a field NAMED "password", and nothing here
+// passes one anyway - the fact worth recording is that somebody's credentials
+// were changed, by whom, and when. A history that leaks the password it is
+// recording would be a worse problem than the one it solves.
+const { recordChange } = require("../../services/changeLog");
+const auditCredential = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "hr",
+    section: "hr:security",
+    entity: "credential",
+    ...entry,
+  });
+
 const ADMIN_PROTECTED_DEPT_KEYS = new Set([
   "hr",
   "accountant",
@@ -785,6 +845,29 @@ router.post(
         } catch (e) {
           errors.push({ id, error: e.message });
         }
+      }
+
+      // Deleting a login is irreversible and removes somebody's ability to
+      // sign in. Each removed account is named, since after the delete there is
+      // no record left of what was there.
+      if (removed.length) {
+        await auditCredential(req, {
+          entityId: "dept-logins",
+          entityLabel: `Department login cleanup (${removed.length})`,
+          action: "delete",
+          summary:
+            `Deleted ${removed.length} duplicate or orphaned department login(s)` +
+            `${errors.length ? `; ${errors.length} were skipped` : ""}. ` +
+            `Those accounts can no longer sign in. Admin logins (HR, accountant, CEO, ` +
+            `project manager) are never offered for removal and were not touched.`,
+          fields: removed.map((r) => ({
+            path: String(r.id),
+            label: r.name || String(r.id),
+            from: r.deptLabel || "department login",
+            to: "deleted",
+            kind: "removed",
+          })),
+        });
       }
 
       res.status(200).json({
