@@ -57,6 +57,11 @@ const SECTIONS = [
   { key: "hr:attendance-settings", label: "Attendance settings", group: "Time", href: "/hr/dashboard/attendance/settings", entities: ["attendance-setting", "holiday"] },
   { key: "hr:attendance-regularizations", label: "Regularisations", group: "Time", href: "/hr/dashboard/attendance/regularizations", entities: ["regularization"] },
   { key: "hr:shift-swaps", label: "Shift swaps", group: "Time", href: "/hr/dashboard/attendance/shifts", entities: ["shift-swap"] },
+  // Overtime is raised in the app and decided by a manager, so nobody in HR
+  // ever touches it — which is precisely why it needed a history. Filed under
+  // Time with attendance and regularisations, because the three of them are the
+  // same question about the same day.
+  { key: "hr:overtime", label: "Overtime", group: "Time", href: "/hr/dashboard/attendance", entities: ["overtime"] },
   { key: "hr:leaves", label: "Leaves", group: "Time", href: "/hr/dashboard/leaves", entities: ["leave", "leave-policy", "leave-balance"] },
 
   // Pay & policy
@@ -140,6 +145,12 @@ const PATH_SECTIONS = [
   [/^\/hr\/performance/i, "hr:performance", "performance-review"],
   [/^\/api\/hr\/profile/i, "hr:profile", "hr-profile"],
   [/^\/api\/admin\/department-roles/i, "hr:access", "department-role"],
+
+  // Raised from the mobile app rather than from HR, but they are HR facts: an
+  // overtime grace and a regularisation both change what a day's attendance
+  // says, and the person asking "why is this day marked present" is in HR.
+  [/^\/api\/employee\/overtime/i, "hr:overtime", "overtime"],
+  [/^\/api\/employee\/regularizations/i, "hr:attendance-regularizations", "regularization"],
 ];
 
 /**
@@ -335,6 +346,22 @@ const BY_SECTION = {
     endTime: "Shift end",
     breakMinutes: "Break",
     graceMinutes: "Grace period",
+  },
+  "hr:overtime": {
+    dateStr: "Worked late on",
+    nextDateStr: "Grace applies to",
+    scheduledOutTime: "Scheduled out",
+    actualOutTime: "Actually left at",
+    stayOverMins: "Extra minutes worked",
+    graceMinutes: "Grace granted",
+    adjustedReportTime: "May report by",
+    description: "What they did",
+    status: "Request status",
+    approvalRemarks: "Approver's remarks",
+    rejectionReason: "Reason for rejection",
+    graceApplied: "Grace applied to attendance",
+    approvedByName: "Approved by",
+    documentUrl: "Proof",
   },
   "hr:shift-swaps": {
     status: "Request status",

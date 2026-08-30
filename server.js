@@ -1056,6 +1056,15 @@ app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
 app.use("/api/employees", hrAuditTrail);
 
+/* Two employee-app prefixes, named individually rather than mounting the trail
+   on all of /api/employee. Overtime and regularisations are HR facts raised
+   from the phone — both change what a day of attendance says, and the person
+   who later asks why a day reads Present works in HR. The rest of
+   /api/employee is the whole mobile surface (chat, tasks, profile reads) and
+   has no business in the HR change log. */
+app.use("/api/employee/overtime", hrAuditTrail);
+app.use("/api/employee/regularizations", hrAuditTrail);
+
 /* =====================
     Normal Employees ROUTES
   ===================== */

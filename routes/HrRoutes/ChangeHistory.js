@@ -192,6 +192,83 @@ router.get("/actors", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* GET /api/hr/change-history/stamps                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * "Added by X · last edited by Y" for a set of records, in one query.
+ *
+ * WHY THIS IS A BATCH ENDPOINT
+ * ----------------------------
+ * The line it feeds belongs under every row of a list — an employee list, the
+ * document library, a department list. Fetched per row that is one request per
+ * record, which on a 400-employee page is 400 requests to render one line of
+ * small text each. So the caller sends the ids it is already showing and gets
+ * one object back.
+ *
+ * Two facts per record, and they are different questions:
+ *   created      — who put this here. Never changes, so it is the "added by"
+ *                  line on a record that has never been edited.
+ *   lastChanged  — the most recent change of any kind, which is what somebody
+ *                  looking at a stale-looking record actually wants.
+ *
+ * Query: entity=employee&ids=a,b,c   (max 500 ids)
+ */
+router.get("/stamps", async (req, res) => {
+  try {
+    const entity = String(req.query.entity || "").trim();
+    if (!entity) {
+      return res.status(400).json({ success: false, message: "entity is required" });
+    }
+
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+      .slice(0, 500);
+    if (!ids.length) return res.json({ success: true, data: {} });
+
+    // One pass, sorted oldest-first, folded in JS. The alternative — a $group
+    // with $first and $last — needs two sorts on the server for the same two
+    // values, and this collection is already indexed on (entity, entityId,
+    // createdAt) which makes the sort free.
+    const rows = await ChangeLog.find({
+      departmentSlug: DEPARTMENT,
+      entity,
+      entityId: { $in: ids },
+    })
+      .select("entityId action actorName actorEmail approvedByName createdAt summary")
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const out = {};
+    for (const r of rows) {
+      const slot = (out[r.entityId] ||= { created: null, lastChanged: null, changes: 0 });
+      slot.changes += 1;
+
+      // The FIRST create wins, not the first row of any kind: a record whose
+      // earliest surviving entry is an edit was created before the log existed,
+      // and calling that edit its creation would put the wrong name on it.
+      if (!slot.created && r.action === "create") {
+        slot.created = { name: r.actorName || r.actorEmail || "", at: r.createdAt };
+      }
+      slot.lastChanged = {
+        name: r.actorName || r.actorEmail || "",
+        approvedBy: r.approvedByName || "",
+        action: r.action,
+        at: r.createdAt,
+        summary: r.summary,
+      };
+    }
+
+    res.json({ success: true, data: out });
+  } catch (err) {
+    console.error("[hr/change-history] stamps failed:", err.message);
+    res.status(500).json({ success: false, message: "Could not load the record stamps." });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* GET /api/hr/change-history/record/:entity/:entityId                 */
 /* ------------------------------------------------------------------ */
 

@@ -2,6 +2,112 @@
 
 ---
 
+## PL eligibility reconcile, overtime & regularisation history, record stamps
+
+> Follow-on to the HR change-history work below. Five items the user raised
+> after using it. Nothing committed.
+
+### 1. PL sync now REVOKES as well as grants — the correctness bug
+
+Reported symptom: people holding PL they were never eligible for, and people at
+the threshold who never got it. The cause is not the threshold maths — it is
+that eligibility derives from `dateOfJoining`, a field HR edits, and the sync
+only ever granted. A DOJ typo that made somebody eligible left them holding PL
+permanently once it was corrected.
+
+| File | Change |
+|---|---|
+| `services/plEligibility.js` | **New, pure.** `decidePlEligibility()` returns one of six actions. Extracted from the route specifically because it now takes entitlements *away*: a wrong answer here is invisible afterwards, and the cases where it must refuse to act are the easy ones to get wrong. Takes `workingDays` as a parameter rather than reading the clock, so the table is testable. |
+| `services/plEligibility.test.js` | **New**, 10 node:test cases over the whole decision table, including the two refusals and the inclusive-threshold boundary. |
+| `routes/HrRoutes/Leave_section.js` | The loop is now a `switch` over that decision. Grants, revokes, and reports the two it refuses to touch. Logs grants and revocations as **separate** change-log entries — they are different events, and somebody searching for "when did this person lose their PL" must not have to open a combined one. |
+| `models/HR_Models/LeaveManagement.js` | `plRevokedDate`, kept alongside `plGrantedDate` — given-then-withdrawn is a different fact from never-granted. |
+| `app/hr/dashboard/leaves/PLSyncModal.js` | Preview now shows both directions plus both refusal buckets, each with the people named. The old "Will Grant" tile counted `eligible`, which includes everybody already holding PL correctly — it overstated the change. Now counted from the list. |
+
+**Two things it refuses to do, and this is the substance of the fix:**
+
+- **No date of joining → skip, always.** `workingDaysSince(undefined)` returns 0,
+  which reads as "nowhere near eligible" and would have revoked every employee
+  with a blank field — the same class of mistake this exists to clean up,
+  applied to more people. Reported under `noJoiningDate`.
+- **PL already taken → report, never auto-revoke.** Zeroing the entitlement of
+  somebody who has taken PL days leaves consumed above entitlement: leave that
+  was applied for, approved and usually already paid. Whether those days become
+  LWP, stand as an exception, or are recovered is a payroll decision with money
+  attached. Reported under `needsReview` with the day count.
+
+### 2. Overtime and regularisation history
+
+Both live under `/api/employee/**` and so were outside the HR audit trail —
+which is exactly why they had no history. They are HR facts regardless: an
+approved overtime grants grace on the next day's attendance, and a
+regularisation rewrites a day outright.
+
+- New section `hr:overtime` + path patterns; regularisations file into the
+  existing `hr:attendance-regularizations` so the app-side and HR-side halves of
+  one request share a history.
+- `server.js` mounts the trail on `/api/employee/overtime` and
+  `/api/employee/regularizations` **by name** — not on all of `/api/employee`,
+  which is the whole mobile surface and has no business in the HR log.
+- `Overtimeroutes.js`: submit, manager approve, manager reject (3 entries).
+- `Employee_Routes/regularization.js`: employee applies, primary hands to
+  secondary, final approval, manager rejects, employee withdraws (5 entries).
+
+Both approval entries record **whether it actually reached the attendance
+record**, separately from the decision. A request can be approved and apply to
+nothing, and the employee is then told their day was corrected when it was not.
+
+**Frontend for these two** (asked about after the first pass, and the answer was
+only half yes):
+
+- *Regularisations* needed nothing new. The page already exists and already
+  passes `activeMenu="attendance-regularizations"`, which the layout maps to
+  `hr:attendance-regularizations` — so its top-bar History button was already
+  opening exactly this history, and the new app-side entries land in it because
+  they share the section key.
+- *Overtime* had no way in beyond the section rail on the history page. There is
+  no HR overtime screen to hang a button on — it is raised in the app and
+  decided by a manager. So: `/hr/dashboard/history` now reads `?section=` from
+  the URL (split into `page.js` + `HistoryClient.js` with a Suspense boundary,
+  the same shape as the new-employee page, because `useSearchParams` suspends),
+  the rail writes the section back with `router.replace` so a section view is
+  linkable without stacking history entries, and an **Overtime** item sits under
+  Time in the HR nav pointing at it. `NAV_KEY_FOR_SECTION` keeps that item
+  highlighted while it is open.
+
+### 3. Leave page had no page gutter
+
+`app/hr/dashboard/leaves/page.js` used `mx-auto w-full max-w-[1480px] space-y-5
+pb-10` — no horizontal or top padding, so the content sat flush against the rail
+and the top bar. Every other HR page uses `mx-auto max-w-[1480px] px-4 py-6
+deck:px-8`. Now matches.
+
+### 4. "Added by / last changed by" on records
+
+| File | Change |
+|---|---|
+| `routes/HrRoutes/ChangeHistory.js` | `GET /stamps?entity=&ids=` — created and last-changed for up to 500 records in **one** query. Batched deliberately: per-row it is one request per record, which on a 400-employee list is 400 requests to render one line of small text each. The first *create* wins rather than the first row of any kind — a record whose earliest surviving entry is an edit predates the log, and calling that its creation puts the wrong name on it. |
+| `components/access/RecordStamp.js` | **New.** One line of ink-faint text. Self-fetches on a detail screen; takes a pre-fetched stamp in a list, via the `useRecordStamps` hook. Names the approver too when the change only landed because somebody accepted it — otherwise the line credits the editor and implies they could make it alone. |
+| Employee form, department detail, departments list | Wired in. |
+
+The documents list already showed `generatedByName`, so it was left alone rather
+than given a second, competing attribution line.
+
+### Verification
+
+- `node --test services/plEligibility.test.js` — **10/10**.
+- `npm test` — **936 / 939**. The 3 failures are in `blockedDeadline.test.js`
+  and `salesJourneyOutcome.test.js`; confirmed pre-existing by stashing every
+  change and re-running on a clean tree (926/929, same 3).
+- `node -r dotenv/config verifyHrChangeHistory.js` — **46/46** still green.
+- `node --check` clean across every touched backend file.
+- All 8 changed frontend modules compiled in dev with no errors.
+
+**Not verified:** the PL reconcile against real data — it needs an HR session,
+and a dry run is the safe way to see it (the modal opens on one). The decision
+rule behind it is covered by the unit tests.
+
+---
+
 ## HR change history — every change recorded, per page, with approver attribution
 
 > **Scope: HR only, deliberately.** The user asked for the whole CMS eventually

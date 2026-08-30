@@ -27,6 +27,10 @@ const {
 // today. HR sees exactly the number the employee's own app screen sees.
 const { computeReserved } = require("../../utils/leaveReserve");
 
+// The grant/revoke/refuse rule, pulled out so its decision table can be
+// tested without a database — see services/plEligibility.test.js.
+const { decidePlEligibility } = require("../../services/plEligibility");
+
 // Every decision on a leave, in the Leaves page history. Bound here rather than
 // repeated at each of the fifteen write handlers so a new one cannot end up
 // filed under a different section by a typo — see services/auditSections.
@@ -713,26 +717,46 @@ router.post("/balance/grant-pl", EmployeeAuthMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  NEW: POST /sync-pl-eligibility — bulk PL granter
-//  Walks every active employee. For each:
-//    • Compute workingDaysSince(dateOfJoining)
-//    • If >= config.daysRequiredForPL AND plEligible !== true:
-//        → set plEligible = true
-//        → set entitlement.PL = config.plPerYear (default 18)
-//    • Skip if already plEligible — preserves their consumed PL,
-//      no renewal logic touches anyone who already has PL.
+//  POST /sync-pl-eligibility — reconcile PL entitlement against date of joining
 //
-//  Two modes:
-//    body.dryRun=true → no mutations, returns the would-be result so HR can
-//      preview the count before clicking again to apply.
-//    body.dryRun=false / unset → actually applies, returns the same summary.
+//  THIS USED TO ONLY GRANT, AND THAT WAS THE BUG.
+//  ---------------------------------------------
+//  Eligibility is derived from `dateOfJoining`, and a date of joining is a field
+//  HR edits — corrected after a typo, fixed when a paper record turns up, moved
+//  when somebody is re-hired. The old sync granted PL to anyone over the
+//  threshold and never looked back, so a wrong DOJ that made somebody eligible
+//  left them holding PL permanently once it was corrected; and because the grant
+//  was one-directional there was no way to notice. The two symptoms reported
+//  were exactly this: people holding PL they were never entitled to, and the
+//  register disagreeing with the dates on file.
 //
-//  Response: { eligible, granted, alreadyEligible, notYetEligible, list }
-//   • eligible           — total who qualify on workingDays
-//   • granted            — how many had PL granted this run (only if !dryRun)
-//   • alreadyEligible    — skipped (already plEligible)
-//   • notYetEligible     — under the threshold
-//   • list               — array of {name, bid, workingDays, action}
+//  So this now reconciles in BOTH directions:
+//    eligible + not granted   → GRANT   (entitlement.PL = plPerYear)
+//    not eligible + granted   → REVOKE  (entitlement.PL = 0)
+//    already correct          → left completely alone
+//
+//  THREE THINGS IT REFUSES TO DO, all of them about not destroying data on a
+//  button press:
+//
+//  1. NO DATE OF JOINING → SKIP, always. `workingDaysSince(undefined)` returns
+//     0, which reads as "not eligible" and would revoke every employee whose
+//     DOJ has not been filled in yet. Revoking on absent data is the same class
+//     of mistake this route exists to clean up. They are reported under
+//     `noJoiningDate` so somebody can go and fill it in.
+//
+//  2. PL ALREADY CONSUMED → SKIP THE REVOKE, and report it. Zeroing the
+//     entitlement of somebody who has already taken PL days leaves consumed
+//     above entitlement: leave that was taken, approved, and in most cases
+//     already paid. Whether those days become LWP, stay as a goodwill
+//     exception, or are recovered is a payroll decision with money attached,
+//     and a sync button must not make it silently. They surface under
+//     `needsReview` with the day count.
+//
+//  3. NOTHING AT ALL unless `dryRun` is false. The preview reports the same
+//     four buckets, so HR sees every revocation before one happens.
+//
+//  Response data: { eligible, granted, revoked, alreadyEligible, notYetEligible,
+//                   needsReview[], noJoiningDate[], list[] }
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post(
   "/sync-pl-eligibility",
@@ -757,77 +781,130 @@ router.post(
       );
 
       let granted = 0,
+        revoked = 0,
         alreadyEligible = 0,
         notYetEligible = 0,
         eligible = 0;
       const list = [];
+      const needsReview = [];
+      const noJoiningDate = [];
 
       for (const emp of emps) {
-        const wd = workingDaysSince(emp.dateOfJoining);
         const name = `${emp.firstName || ""} ${emp.lastName || ""}`.trim();
         const existing = balByEmpId.get(String(emp._id));
+        const wd = emp.dateOfJoining ? workingDaysSince(emp.dateOfJoining) : 0;
+        const row = {
+          employeeId: String(emp._id),
+          name,
+          biometricId: emp.biometricId || "",
+          department: emp.department || "",
+          workingDays: wd,
+        };
 
-        // Already PL eligible → skip silently, no renewal.
-        if (existing?.plEligible) {
-          alreadyEligible++;
-          continue;
-        }
+        const decision = decidePlEligibility({
+          dateOfJoining: emp.dateOfJoining,
+          workingDays: wd,
+          threshold,
+          plEligible: Boolean(existing?.plEligible),
+          consumedPL: Number(existing?.consumed?.PL ?? existing?.consumed?.EL ?? 0),
+        });
 
-        if (wd >= threshold) {
-          eligible++;
-          if (dryRun) {
-            list.push({
-              employeeId: String(emp._id),
-              name,
-              biometricId: emp.biometricId || "",
-              department: emp.department || "",
-              workingDays: wd,
-              action: "would_grant",
+        if (wd >= threshold && emp.dateOfJoining) eligible += 1;
+
+        switch (decision.action) {
+          case "no-joining-date":
+            noJoiningDate.push({
+              ...row,
+              currentlyEligible: Boolean(existing?.plEligible),
+              reason: decision.reason,
             });
-          } else {
-            // Apply the grant. Upsert in case there's no LeaveBalance row.
-            await LeaveBalance.findOneAndUpdate(
-              { employeeId: emp._id, year },
-              {
-                $set: {
-                  plEligible: true,
-                  plGrantedDate: new Date(),
-                  "entitlement.PL": plPerYear,
-                  biometricId: emp.biometricId || "",
-                },
-                $setOnInsert: {
-                  employeeId: emp._id,
-                  year,
-                  "entitlement.CL": config.clPerYear,
-                  "entitlement.SL": config.slPerYear,
-                  consumed: { CL: 0, SL: 0, PL: 0 },
-                },
-              },
-              { upsert: true, new: true },
-            );
-            granted++;
-            list.push({
-              employeeId: String(emp._id),
-              name,
-              biometricId: emp.biometricId || "",
-              department: emp.department || "",
-              workingDays: wd,
-              action: "granted",
+            break;
+
+          case "already-correct":
+            alreadyEligible += 1;
+            break;
+
+          case "not-yet-eligible":
+            notYetEligible += 1;
+            break;
+
+          case "needs-review":
+            needsReview.push({
+              ...row,
+              shortBy: decision.shortBy,
+              consumedPL: Number(existing?.consumed?.PL ?? existing?.consumed?.EL ?? 0),
+              entitlementPL: Number(existing?.entitlement?.PL || 0),
+              reason: decision.reason,
             });
-            console.log(
-              `[PL-SYNC] Granted ${plPerYear} PL to ${name} (${emp.biometricId}, ${wd} working days)`,
-            );
-          }
-        } else {
-          notYetEligible++;
+            break;
+
+          case "grant":
+            if (dryRun) {
+              list.push({ ...row, action: "would_grant" });
+            } else {
+              await LeaveBalance.findOneAndUpdate(
+                { employeeId: emp._id, year },
+                {
+                  $set: {
+                    plEligible: true,
+                    plGrantedDate: new Date(),
+                    "entitlement.PL": plPerYear,
+                    biometricId: emp.biometricId || "",
+                  },
+                  $setOnInsert: {
+                    employeeId: emp._id,
+                    year,
+                    "entitlement.CL": config.clPerYear,
+                    "entitlement.SL": config.slPerYear,
+                    consumed: { CL: 0, SL: 0, PL: 0 },
+                  },
+                },
+                { upsert: true, new: true },
+              );
+              granted += 1;
+              list.push({ ...row, action: "granted" });
+              console.log(
+                `[PL-SYNC] Granted ${plPerYear} PL to ${name} (${emp.biometricId}, ${wd} working days)`,
+              );
+            }
+            break;
+
+          case "revoke":
+            if (dryRun) {
+              list.push({ ...row, action: "would_revoke" });
+            } else {
+              await LeaveBalance.updateOne(
+                { employeeId: emp._id, year },
+                {
+                  $set: {
+                    plEligible: false,
+                    "entitlement.PL": 0,
+                    plRevokedDate: new Date(),
+                  },
+                },
+              );
+              revoked += 1;
+              list.push({ ...row, action: "revoked" });
+              console.log(
+                `[PL-SYNC] REVOKED PL from ${name} (${emp.biometricId}) — ` +
+                  `${wd}/${threshold} working days, 0 PL consumed`,
+              );
+            }
+            break;
+
+          default:
+            break;
         }
       }
 
       // A dry run changes nothing and is not logged as a change — recording a
       // preview as an edit is how a history starts disagreeing with reality.
-      // The real run is logged as ONE entry naming everybody in it: several
-      // hundred identical per-person rows would bury every other change on the
-      // page, and the names are what somebody actually wants to read back.
+      //
+      // Grants and revocations are logged as TWO entries, not one. They are
+      // different events with different consequences: a grant gives somebody
+      // days, a revocation takes days away, and somebody scanning the history
+      // for "when did this person lose their PL" must not have to open a
+      // combined entry to find out which half they are in.
       if (!dryRun && granted > 0) {
         await auditLeave(req, {
           entity: "leave-balance",
@@ -850,11 +927,70 @@ router.post(
         });
       }
 
+      if (!dryRun && revoked > 0) {
+        await auditLeave(req, {
+          entity: "leave-balance",
+          entityId: String(year),
+          entityLabel: `PL eligibility sync ${year}`,
+          action: "delete",
+          summary:
+            `Removed privilege leave from ${revoked} employee(s) whose date of joining does not ` +
+            `support it — they have fewer than the ${threshold} working days required. ` +
+            `None of them had taken any PL, so no leave already granted was affected. ` +
+            `This normally means a date of joining was corrected after the PL was first granted.`,
+          fields: list
+            .filter((r) => r.action === "revoked")
+            .map((r) => ({
+              path: r.biometricId || r.employeeId,
+              label: `${r.name}${r.biometricId ? ` (${r.biometricId})` : ""}`,
+              from: `${plPerYear} PL days`,
+              to: `not eligible · ${r.workingDays} of ${threshold} working days`,
+              kind: "removed",
+            })),
+        });
+      }
+
+      // Flagged rather than changed, so the fact that somebody looked and found
+      // a discrepancy is on the record even when nothing was done about it.
+      if (!dryRun && needsReview.length > 0) {
+        await auditLeave(req, {
+          entity: "leave-balance",
+          entityId: String(year),
+          entityLabel: `PL eligibility sync ${year}`,
+          action: "other",
+          summary:
+            `${needsReview.length} employee(s) hold PL their date of joining does not support ` +
+            `AND have already taken PL days. Nothing was changed for them — removing the ` +
+            `entitlement would leave leave already taken with nothing to draw on, which is a ` +
+            `payroll decision rather than a sync.`,
+          fields: needsReview.map((r) => ({
+            path: r.biometricId || r.employeeId,
+            label: `${r.name}${r.biometricId ? ` (${r.biometricId})` : ""}`,
+            from: `${r.consumedPL} PL day(s) already taken`,
+            to: `short by ${r.shortBy} working day(s) — needs a decision`,
+            kind: "changed",
+          })),
+        });
+      }
+
+      const parts = [];
+      if (dryRun) {
+        const wouldGrant = list.filter((r) => r.action === "would_grant").length;
+        const wouldRevoke = list.filter((r) => r.action === "would_revoke").length;
+        parts.push(`${wouldGrant} would be granted PL`);
+        if (wouldRevoke) parts.push(`${wouldRevoke} would have PL removed`);
+      } else {
+        parts.push(`${granted} granted PL`);
+        if (revoked) parts.push(`${revoked} had PL removed`);
+      }
+      if (needsReview.length) parts.push(`${needsReview.length} need review`);
+      if (noJoiningDate.length) parts.push(`${noJoiningDate.length} have no date of joining`);
+      parts.push(`${alreadyEligible} already correct`);
+      parts.push(`${notYetEligible} below the threshold`);
+
       res.json({
         success: true,
-        message: dryRun
-          ? `Dry run: ${eligible} employee(s) would be granted PL. ${alreadyEligible} already eligible, ${notYetEligible} below threshold.`
-          : `${granted} employee(s) granted ${plPerYear} PL. ${alreadyEligible} already eligible, ${notYetEligible} below threshold.`,
+        message: `${dryRun ? "Dry run: " : ""}${parts.join(", ")}.`,
         data: {
           dryRun,
           threshold,
@@ -862,8 +998,11 @@ router.post(
           year,
           eligible,
           granted,
+          revoked,
           alreadyEligible,
           notYetEligible,
+          needsReview,
+          noJoiningDate,
           totalActive: emps.length,
           list,
         },
