@@ -56,6 +56,40 @@ const tallyCompanySchema = new mongoose.Schema(
     baseCurrency: { type: String, default: "INR" },
     currencySymbol: { type: String, default: "₹" },
 
+    /* ── STATUTORY DOCUMENTS ────────────────────────────────────────────
+     * The certificates behind the identifiers above: the GST registration,
+     * the PAN card, the certificate of incorporation. A sub-document array
+     * rather than its own collection, and rather than rows in the /files
+     * drive, for the reason models/Files/Doc_File.js states from the other
+     * side — a file that exists only as evidence FOR one record belongs to
+     * that record. Nobody browses to a company's PAN card; they open the
+     * company and find it there.
+     *
+     * The bytes are on Drive and PRIVATE. There is deliberately no `url`
+     * column: a provider URL is a permanent grant to anyone who ever sees
+     * it, so reads go through the download route, which re-checks the
+     * session every time. Same posture as employee letters and the drive. */
+    documents: [
+      {
+        /* What the file IS, not what it is called. Free text would give us
+           "pan", "PAN card", "Pan Card.pdf" and no way to ask whether the
+           GST certificate is on file. */
+        kind: {
+          type: String,
+          enum: ["gst", "pan", "cin", "tan", "incorporation", "address-proof", "bank", "other"],
+          default: "other",
+        },
+        name: { type: String, trim: true, maxlength: 260 },
+        mimeType: { type: String, default: "application/octet-stream" },
+        bytes: { type: Number, default: 0 },
+        driveFileId: { type: String, default: "" },
+        note: { type: String, trim: true, maxlength: 300 },
+        uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+        uploadedByName: { type: String, trim: true, default: "" },
+        uploadedAt: { type: Date, default: Date.now },
+      },
+    ],
+
     // Tally provenance
     isImportedFromTally: { type: Boolean, default: false },
     tallyCompanyGuid: { type: String }, // Tally's internal UUID if available
@@ -413,6 +447,41 @@ const tallyLedgerSchema = new mongoose.Schema(
       required: true,
     },
 
+    /* ── CAN THIS HEAD CARRY A BUDGET? ──────────────────────────────────────
+       A control layer over the chart of accounts. It changes NOTHING about
+       bookkeeping — no posting, no debit, no credit reads this field. It
+       decides only which heads budget screens offer and which the voucher
+       budget check looks at.
+
+       `nature` alone could not answer this. Round Off is an expense and is
+       not a budget head; a tax control account an import parented under an
+       expense group is not either. Three values, no more:
+
+         expense_budget   controllable spend, including raw material, job
+                          work, freight, consumables and services
+         revenue_target   income — a floor to reach, never a spending cap
+         not_budgeted     never offered, never checked, never reported as
+                          missing a budget
+
+       ── ABSENT MEANS "DERIVE IT" ─────────────────────────────────────────
+       Deliberately no default. Every ledger written before this field is
+       classified on read by budgetClassification.budgetControlOf(), from its
+       own nature, group and name — so the whole system behaves correctly
+       before the backfill runs, and the backfill is an optimisation rather
+       than a precondition. A value stored here is finance's decision and is
+       never re-derived: see `budgetControlSetAt`. */
+    budgetControl: {
+      type: String,
+      enum: ["expense_budget", "revenue_target", "not_budgeted"],
+      index: true,
+    },
+    /* Set only when a human chose. Its presence is what makes the backfill
+       skip a row — without it there is no way to tell finance's deliberate
+       "not budgeted" from a value the previous backfill guessed. */
+    budgetControlSetAt: { type: Date },
+    budgetControlSetBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    budgetControlSetByName: { type: String, trim: true },
+
     // Opening balance — Tally stores this signed
     openingBalance: { type: Number, default: 0 }, // signed: positive = Dr, negative = Cr
     openingBalanceType: { type: String, enum: ["Dr", "Cr"], default: "Dr" },
@@ -451,6 +520,39 @@ const tallyLedgerSchema = new mongoose.Schema(
         state: { type: String, trim: true },
       },
     ],
+    /* ── WHAT THE GST NETWORK SAYS ABOUT THIS PARTY ─────────────────────
+     * Stored, not merely displayed, because it is a fact about the books
+     * rather than a state of a screen.
+     *
+     * A supplier whose registration was CANCELLED is not a cosmetic problem:
+     * input tax credit claimed against a cancelled GSTIN is disallowed, and
+     * it is found at assessment, long after the money is spent. A customer
+     * with a dead GSTIN gets the wrong invoice treatment. Neither is visible
+     * anywhere in the ledger today.
+     *
+     * `checkedAt` matters as much as `status`: a registration cancelled last
+     * month makes a check from last year worthless, so every reader can see
+     * how old the answer is and decide for itself.
+     */
+    gstVerification: {
+      /* unchecked | active | cancelled | not-found | mismatch | unavailable
+         `mismatch` = the register knows this GSTIN but under another name.
+         `unavailable` = we could not ask; NOT a verdict on the party. */
+      status: { type: String, default: "unchecked" },
+      /* The name the register holds, kept verbatim so a mismatch can be read
+         rather than just flagged. */
+      legalName: { type: String, trim: true, default: "" },
+      tradeName: { type: String, trim: true, default: "" },
+      registrationDate: { type: String, trim: true, default: "" },
+      taxpayerType: { type: String, trim: true, default: "" },
+      cancelledDate: { type: String, trim: true, default: "" },
+      /* Which provider answered, so a bad batch can be traced to its source. */
+      source: { type: String, trim: true, default: "" },
+      checkedAt: { type: Date, default: null },
+      /* Why it could not be checked, when it could not be. */
+      note: { type: String, trim: true, default: "" },
+    },
+
     hsnCode: { type: String, trim: true },
     taxRate: { type: Number, default: 0 }, // for income/expense ledgers
 

@@ -38,6 +38,15 @@ const EmployeeAuthMiddleware = (req, res, next) => {
       // them meant every change log recorded an id with no name against it.
       name: decoded.name || "",
       email: decoded.email || "",
+      // The department this session was issued for. Same story as the two
+      // above: the token has carried them since v2, this middleware did not
+      // forward them, and a route that needed to know which department a
+      // login belonged to had no way to ask. That is what made the CEO — who
+      // signs in as a department and has no `employees` row — invisible to the
+      // requests desk. Additive: nothing that ignored these reads them now.
+      deptId: decoded.deptId || null,
+      deptSlug: decoded.deptSlug || "",
+      isAdmin: Boolean(decoded.isAdmin),
     };
 
     next();

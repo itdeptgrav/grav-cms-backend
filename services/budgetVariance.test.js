@@ -20,10 +20,23 @@ test("nature comes straight from a ledger group when it has one", () => {
   assert.equal(natureOf({ nature: "expense" }), "expense");
 });
 
-test("an unrecognised nature falls back to expense, not to a crash", () => {
-  assert.equal(natureOf({ nature: "asset" }), "expense");
+test("a head that is not a budget is 'other', never silently expense", () => {
+  /* The chart of accounts has five natures and only two of them are a budget.
+     These used to normalise to "expense", which added a bank account or a loan
+     to the company's spend — a figure that could never be reconciled against
+     the P&L, and nothing on screen said why. */
+  assert.equal(natureOf({ nature: "asset" }), "other");
+  assert.equal(natureOf({ nature: "liability" }), "other");
+  assert.equal(natureOf({ nature: "equity" }), "other");
+});
+
+test("a line that says nothing at all is still expense, not a crash", () => {
+  /* A legacy row with no ledger and no snapshot. Still a guess, but the one
+     the module has always made and the one the row's own default implies —
+     unlike an asset head, which is a positive statement that it is not spend. */
   assert.equal(natureOf({}), "expense");
   assert.equal(natureOf(undefined), "expense");
+  assert.equal(natureOf({ nature: "nonsense" }), "expense");
 });
 
 test("the legacy isRevenue flag is honoured when nature is absent", () => {
@@ -249,4 +262,154 @@ test("expense pace escalation also respects the warm-up floor", () => {
 test("modest overspend pace warns without crying critical", () => {
   const r = evaluateLine({ allocated: 120000, actual: 78000, nature: "expense", ...YEAR, asOf: HALFWAY });
   assert.equal(r.severity, "warning");
+});
+
+/* ── Nature comes from the head, the centre comes from the lines ──────────── */
+
+const { centreOf, rollUp: roll } = require("./budgetVariance.service");
+
+test("an 'other' line is counted but kept out of both totals and out of net", () => {
+  const out = roll([
+    { nature: "expense", allocated: 100, actual: 40, variance: 60 },
+    { nature: "revenue", allocated: 500, actual: 300, variance: -200 },
+    { nature: "asset", allocated: 900, actual: 900, variance: 0 },
+  ]);
+  assert.equal(out.expense.allocated, 100, "the bank line must not be spend");
+  assert.equal(out.revenue.allocated, 500);
+  assert.equal(out.other.allocated, 900);
+  assert.equal(out.other.count, 1);
+  /* Net is revenue minus expense and nothing else. */
+  assert.equal(out.budgetedNet, 400);
+  assert.equal(out.actualNet, 260);
+});
+
+test("hasRevenue tells an absent side apart from a met one", () => {
+  /* Both total zero on revenue. They are not the same thing, and a screen
+     that cannot tell them apart prints "₹0 earned" at a department that was
+     never asked to earn anything. */
+  const none = roll([{ nature: "expense", allocated: 100, actual: 40, variance: 60 }]);
+  const met = roll([{ nature: "revenue", allocated: 0, actual: 0, variance: 0 }]);
+  assert.equal(none.hasRevenue, false);
+  assert.equal(met.hasRevenue, true);
+  assert.equal(none.hasExpense, true);
+});
+
+test("a department's type is read off its lines, never declared", () => {
+  assert.equal(centreOf([{ nature: "expense" }, { nature: "expense" }]), "cost");
+  assert.equal(centreOf([{ nature: "revenue" }]), "revenue");
+  assert.equal(centreOf([{ nature: "revenue" }, { nature: "expense" }]), "contribution");
+  /* No lines is an absence, not a classification — calling it a cost centre
+     would be inventing a fact about a department nobody has budgeted yet. */
+  assert.equal(centreOf([]), "unclassified");
+  assert.equal(centreOf([{ nature: "asset" }]), "unclassified");
+});
+
+/* ── HEADS OVER BUDGET ──────────────────────────────────────────────────────
+   The round's health, derived rather than stored. There is an `exceeded`
+   value in the budget status enum that nothing has ever written; these figures
+   are what the rounds list shows instead. */
+
+test("a round with every head inside its number reports no overrun", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 310000 },
+    { nature: "expense", allocated: 100000, actual: 100000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 0, amount: 0 });
+});
+
+test("a head spent past its allocation is counted, with the overage", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 430000 },
+    { nature: "expense", allocated: 100000, actual: 20000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 1, amount: 30000 });
+});
+
+test("overspends are never netted against underspends", () => {
+  /* The reason this is counted per head. Moving money between heads is a
+     transfer and a transfer needs approving, so a round that overspent one
+     head and underspent another by the same amount has NOT stayed within
+     budget — and must not report that it has. */
+  const { overrun, expense } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 430000 },
+    { nature: "expense", allocated: 100000, actual: 70000 },
+  ]);
+  assert.equal(expense.allocated, expense.actual, "the totals do net out");
+  assert.deepEqual(overrun, { heads: 1, amount: 30000 }, "the heads do not");
+});
+
+test("several heads over are all counted", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 100000, actual: 120000 },
+    { nature: "expense", allocated: 50000, actual: 55000 },
+    { nature: "expense", allocated: 80000, actual: 80000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 2, amount: 25000 });
+});
+
+test("a revenue head short of its target is not an overspend", () => {
+  /* A shortfall and an overspend are opposite kinds of miss. Counting them
+     together would produce a figure that describes nothing. */
+  const { overrun } = rollUp([
+    { nature: "revenue", allocated: 2000000, actual: 500000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 0, amount: 0 });
+});
+
+test("and a revenue head far past its target is not one either", () => {
+  const { overrun } = rollUp([
+    { nature: "revenue", allocated: 2000000, actual: 9000000 },
+    { nature: "expense", allocated: 100000, actual: 100001 },
+  ]);
+  assert.deepEqual(overrun, { heads: 1, amount: 1 });
+});
+
+test("a head with no allocation but real spend is over by all of it", () => {
+  const { overrun } = rollUp([{ nature: "expense", allocated: 0, actual: 5000 }]);
+  assert.deepEqual(overrun, { heads: 1, amount: 5000 });
+});
+
+test("an empty round has nothing over", () => {
+  assert.deepEqual(rollUp([]).overrun, { heads: 0, amount: 0 });
+  assert.deepEqual(rollUp().overrun, { heads: 0, amount: 0 });
+});
+
+/* ── MONEY PROMISED BUT NOT YET PAID ─────────────────────────────────────────
+   A budget head has three figures, not two: what was approved, what has been
+   posted, and what has been promised to approved spend requests with no
+   voucher against them yet. Available is what is left after both. */
+
+test("a head with no commitments reads exactly as it always did", () => {
+  /* Every caller written before commitments existed passes nothing, and must
+     get the same answer it used to. */
+  const before = evaluateLine({ allocated: 100000, actual: 30000, nature: "expense" });
+  assert.equal(before.remaining, 70000);
+  assert.equal(before.committed, 0);
+});
+
+test("committed money is no longer available to spend", () => {
+  const l = evaluateLine({ allocated: 100000, actual: 30000, committed: 25000, nature: "expense" });
+  assert.equal(l.committed, 25000);
+  assert.equal(l.remaining, 45000, "100,000 − 30,000 posted − 25,000 promised");
+});
+
+test("a commitment is never counted as actual spend", () => {
+  /* A promise is not a posting. Adding it to `actual` would report money as
+     spent that no ledger has seen. */
+  const l = evaluateLine({ allocated: 100000, actual: 30000, committed: 25000, nature: "expense" });
+  assert.equal(l.actual, 30000);
+  assert.equal(l.variance, 70000, "variance still measures the plan against real spend");
+});
+
+test("promises can take a head past its number", () => {
+  const l = evaluateLine({ allocated: 50000, actual: 10000, committed: 60000, nature: "expense" });
+  assert.equal(l.remaining, -20000);
+});
+
+test("a revenue target has nothing to promise out of it", () => {
+  /* A target is a floor to reach, not an envelope to reserve against. */
+  const l = evaluateLine({ allocated: 2000000, actual: 500000, committed: 90000, nature: "revenue" });
+  assert.equal(l.committed, 0);
+  assert.equal(l.remaining, null, "revenue reports toGo, never remaining");
+  assert.equal(l.toGo, 1500000);
 });

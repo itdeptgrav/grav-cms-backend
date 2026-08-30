@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const classification = require("../../services/budgetClassification.service");
 const {
   Acc_Group,
   Acc_Ledger,
@@ -1310,9 +1311,85 @@ router.get("/ledgers/:id", async (req, res) => {
   }
 });
 
+/* ══ FINANCE DECIDES WHICH HEADS CARRY A BUDGET ═════════════════════════════
+ * The only door that sets `budgetControl`.
+ *
+ * ── WHY IT IS FINANCE-ONLY ──────────────────────────────────────────────────
+ * Whether a ledger is budgetable is an accounting-policy decision with real
+ * consequences: it decides what every budget picker offers, and what the
+ * voucher check will and will not stop. A requester, a Store user or a
+ * department approver picking from a list must never be able to add to that
+ * list — otherwise "is this budgeted?" is answered by whoever needed it to be.
+ *
+ * ── AND WHY THE STAMP MATTERS ───────────────────────────────────────────────
+ * `budgetControlSetAt` is what tells the backfill to leave a row alone. Without
+ * it there is no way to distinguish finance's deliberate "not budgeted" from a
+ * value the previous backfill derived — and the next run would quietly undo
+ * the decision.
+ */
+router.patch("/ledgers/:id/budget-control", async (req, res) => {
+  try {
+    const role = String(req.user?.role || "");
+    const perms = req.user?.permissions || {};
+    /* The same shape the rest of the accounting module uses for a decision
+       rather than a data-entry edit. An editor enters vouchers; classifying
+       the chart is an owner's or an approver's call. */
+    if (!["owner", "approver", "admin", "accountant"].includes(role) && !perms.canApprove) {
+      return res.status(403).json({
+        success: false,
+        message: "Changing what a ledger is budgeted as is an owner's or an approver's call.",
+      });
+    }
+
+    const value = String(req.body?.budgetControl || "");
+    if (!classification.VALUES.includes(value)) {
+      return res.status(400).json({
+        success: false,
+        message: `budgetControl must be one of: ${classification.VALUES.join(", ")}.`,
+      });
+    }
+
+    const ledger = await Acc_Ledger.findById(req.params.id);
+    if (!ledger) {
+      return res.status(404).json({ success: false, message: "Ledger not found." });
+    }
+
+    ledger.budgetControl = value;
+    ledger.budgetControlSetAt = new Date();
+    ledger.budgetControlSetBy = req.user?.id || undefined;
+    ledger.budgetControlSetByName = req.user?.name || "";
+    await ledger.save();
+
+    res.json({
+      success: true,
+      message: `${ledger.name} is now ${classification.LABEL[value]}.`,
+      ledger: {
+        _id: String(ledger._id),
+        name: ledger.name,
+        budgetControl: ledger.budgetControl,
+        budgetControlSetByName: ledger.budgetControlSetByName,
+        budgetControlSetAt: ledger.budgetControlSetAt,
+      },
+    });
+  } catch (e) {
+    console.error("[coa] budget-control:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.put("/ledgers/:id", async (req, res) => {
   try {
     const updates = { ...req.body };
+    /* ── BUDGET CLASSIFICATION IS NOT AN ORDINARY LEDGER EDIT ──────────────
+       This route spreads the whole body onto the document, so leaving these
+       in would let any caller who may edit a ledger silently reclassify what
+       is budget-controlled — and do it without the stamp that tells the
+       backfill a human decided. It has its own route, with its own gate:
+       PATCH /ledgers/:id/budget-control. */
+    delete updates.budgetControl;
+    delete updates.budgetControlSetAt;
+    delete updates.budgetControlSetBy;
+    delete updates.budgetControlSetByName;
     if (updates.groupId) {
       const grp = await Acc_Group.findById(updates.groupId);
       if (grp) {
@@ -4555,19 +4632,16 @@ async function doPartiesSync(req, res, companyId, dryRun) {
 //     virtually all typos. No external call.
 //
 //   TIER 2 — External provider (optional, only if env-configured)
-//     If GSTIN_LOOKUP_API_URL and GSTIN_LOOKUP_API_KEY are set in your .env,
-//     the endpoint also fetches business name / trade name / address /
-//     registration status from the configured provider. The official GSTN
-//     Public API requires a GSP licence (months of paperwork); paid resellers
-//     like KnowYourGST, ClearTax, Masters India, GSTSearchonline, and Surepass
-//     work out of the box for a few rupees per lookup.
+//     The register itself is asked through services/gstPortal.service.js.
+//     Configure it once in .env and both this endpoint and the company form
+//     use it:
 //
-//     Provider call shape (overridable by env):
-//       GSTIN_LOOKUP_METHOD       = "GET" | "POST"  (default GET)
-//       GSTIN_LOOKUP_API_URL      = full URL with {GSTIN} placeholder
-//                                   e.g. "https://api.example.com/gstin/{GSTIN}"
-//       GSTIN_LOOKUP_API_KEY      = API key
-//       GSTIN_LOOKUP_API_KEY_HDR  = header name (default "X-API-Key")
+//       GST_PORTAL_PROVIDER = masters-india | surepass | appyflow |
+//                             knowyourgst | custom
+//       GST_PORTAL_API_KEY  = the provider's key
+//
+//     The older GSTIN_LOOKUP_* variables still work and select `custom`, so
+//     no existing install needs editing
 //
 //     The endpoint expects JSON back. It tries common field names — adjust
 //     the field-mapping section if your provider uses different keys.
@@ -4618,22 +4692,12 @@ const GST_STATE_CODES = {
   99: "Centre Jurisdiction",
 };
 
-function gstinChecksumValid(gstin) {
-  // Official GSTN algorithm: base-36 over the first 14 chars, weighted alternating
-  // 1, 2, 1, 2, ... Final digit is the mod-36 check digit.
-  if (!/^[0-9A-Z]{15}$/.test(gstin)) return false;
-  const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  let sum = 0;
-  for (let i = 0; i < 14; i++) {
-    let v = charset.indexOf(gstin[i]);
-    if (v < 0) return false;
-    v = v * (i % 2 === 0 ? 1 : 2);
-    v = Math.floor(v / 36) + (v % 36);
-    sum += v;
-  }
-  const expected = charset[(36 - (sum % 36)) % 36];
-  return expected === gstin[14];
-}
+/* Moved to services/taxIdentity.service.js, which is where the company form
+   and every future caller can reach it — this file is four thousand lines
+   long and nothing outside it could import from here. Re-exported under the
+   same name so the callers below read exactly as they did. */
+const { gstinChecksumValid } = require("../../services/taxIdentity.service");
+const gstPortal = require("../../services/gstPortal.service");
 
 function parseGstinOffline(gstin) {
   if (!gstin || typeof gstin !== "string") {
@@ -4696,90 +4760,32 @@ router.get("/gstin-lookup/:gstin", async (req, res) => {
       taxpayerType: null,
     };
 
-    // Tier 2 — external API (optional)
-    const apiUrl = process.env.GSTIN_LOOKUP_API_URL;
-    const apiKey = process.env.GSTIN_LOOKUP_API_KEY;
-    if (apiUrl && apiKey) {
-      try {
-        const url = apiUrl.replace(
-          "{GSTIN}",
-          encodeURIComponent(offline.gstin),
-        );
-        const method = (process.env.GSTIN_LOOKUP_METHOD || "GET").toUpperCase();
-        const keyHeader = process.env.GSTIN_LOOKUP_API_KEY_HDR || "X-API-Key";
-
-        // Use built-in fetch (Node 18+). If your runtime is older, install node-fetch.
-        const fetchFn =
-          typeof fetch !== "undefined" ? fetch : require("node-fetch");
-        const response = await fetchFn(url, {
-          method,
-          headers: {
-            [keyHeader]: apiKey,
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body:
-            method === "POST"
-              ? JSON.stringify({ gstin: offline.gstin })
-              : undefined,
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          // Most providers return either at the top level or nested under .data
-          const d = data.data || data.result || data.response || data;
-
-          // Try multiple common field names in priority order
-          result.legalName =
-            d.lgnm ||
-            d.legalName ||
-            d.legal_name ||
-            d.name ||
-            d.company_name ||
-            null;
-          result.tradeName =
-            d.tradeNam || d.tradeName || d.trade_name || d.tradingName || null;
-          result.registrationStatus =
-            d.sts || d.status || d.registrationStatus || null;
-          result.registrationDate =
-            d.rgdt || d.registrationDate || d.registration_date || null;
-          result.taxpayerType =
-            d.dty || d.taxpayerType || d.taxpayer_type || d.entityType || null;
-
-          // Address can come in many shapes — concatenate whatever's available
-          const addr =
-            d.pradr || d.principalAddress || d.address || d.addr || null;
-          if (addr) {
-            if (typeof addr === "string") {
-              result.address = addr;
-            } else {
-              const a = addr.adr || addr;
-              const parts = [
-                a.bnm,
-                a.bno,
-                a.flno,
-                a.st,
-                a.loc,
-                a.city,
-                a.dst,
-                a.stcd,
-                a.pncd,
-              ].filter(Boolean);
-              result.address = parts.join(", ") || JSON.stringify(addr);
-            }
-          }
-
-          if (result.legalName || result.tradeName)
-            result.source = "offline+api";
-        } else {
-          result.apiError = `Lookup provider returned ${response.status}`;
-        }
-      } catch (e) {
-        result.apiError = `Lookup provider call failed: ${e.message}`;
-      }
+    /* ── TIER 2 — THE REGISTER ──────────────────────────────────────────
+     * Ninety lines of inline provider call used to live here: no timeout, no
+     * cache, and its own opinions about whose JSON field is whose. It now
+     * delegates to services/gstPortal.service.js, which the company form also
+     * uses — so a provider swap is one .env line rather than two edits, and
+     * a slow provider can no longer hold this request open indefinitely.
+     *
+     * The response shape below is unchanged; existing callers do not care
+     * where the values came from. */
+    const lookup = await gstPortal.lookupGstin(offline.gstin);
+    if (lookup.ok && lookup.found) {
+      const d = lookup.data;
+      result.legalName = d.legalName;
+      result.tradeName = d.tradeName;
+      result.address = d.address;
+      result.registrationStatus = d.status;
+      result.registrationDate = d.registrationDate;
+      result.taxpayerType = d.taxpayerType;
+      result.source = "offline+api";
+      result.cached = !!lookup.cached;
+    } else if (lookup.ok && lookup.found === false) {
+      result.apiError = "No registration with this GSTIN in the register.";
+    } else if (lookup.reason === "not-configured") {
+      result.apiHint = lookup.hint;
     } else {
-      result.apiHint =
-        "Set GSTIN_LOOKUP_API_URL + GSTIN_LOOKUP_API_KEY in your .env to enable name/address auto-fill from a provider like KnowYourGST, ClearTax, Masters India, or Surepass.";
+      result.apiError = `Lookup ${lookup.reason}${lookup.status ? ` (${lookup.status})` : ""}`;
     }
 
     res.json(result);

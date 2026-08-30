@@ -1084,27 +1084,11 @@ app.use("/api/hr", hrProfileRoutes);
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
 
-/* ---------------------------------------------------------------------------
- * PUBLIC (UNAUTHENTICATED) ROUTES — everything under /api/public.
- *
- * Mounted HERE, up with the auth routes, and NOT under /api/cms, for a
- * concrete reason: `app.use("/api/cms", productOperations)` further down
- * attaches EmployeeAuthMiddleware to every path beneath /api/cms (that router
- * does `router.use(EmployeeAuthMiddleware)` at its top), so anything mounted
- * below it inherits a login requirement no matter what its own file says. A
- * first pass put bom-approval at /api/cms/crm/bom-approval and every link in
- * every email 401'd.
- *
- * The BOM approval link is opened by the Project Manager from their inbox,
- * without signing in. It is token-gated, single-use, and writes exactly one
- * field on one style — see routes/CMS_Routes/Sales/sampleBomApproval.js's
- * header for what stands in for a login. Anything added under /api/public must
- * clear that same bar.
- * ------------------------------------------------------------------------ */
-app.use(
-  "/api/public/bom-approval",
-  require("./routes/CMS_Routes/Sales/sampleBomApproval"),
-);
+// Face recognition for the sign-in page. Mounted AFTER deptAuth so it can
+// never shadow /api/auth/login — password sign-in stays exactly as it was.
+// Recognition only: this issues no session and records no attendance.
+const faceSigninRoutes = require("./routes/auth/faceSignin");
+app.use("/api/auth/face", faceSigninRoutes);
 
 // Self-service "forgot password" for the same login this replaces — request a
 // 4-digit email OTP, verify it, then set a new password. Reuses deptAuth's own
@@ -1125,6 +1109,15 @@ app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 // them. Mounted outside any one department's middleware because the queue spans
 // departments; it authenticates the session itself.
 app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+/* Department-facing budget proposals. Mounted HERE, beside the other
+ * cross-department surface, and deliberately NOT under /api/accountant — the
+ * frontend's authFetch skips that prefix, so a department session would never
+ * reach it. The router authenticates itself; see its header. */
+app.use("/api/budget-proposals", require("./routes/Access/budgetProposals"));
+/* The company drive's bytes. Self-protecting: every endpoint in it verifies
+   the session itself, and /download additionally requires a short-lived
+   signed token — see routes/Access/files.js. */
+app.use("/api/files", require("./routes/Access/files"));
 
 // Unauthenticated on purpose — backs the public /onboarding tile grid.
 // Returns names and icons only; never emails, counts or user data.
@@ -1532,9 +1525,50 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/storeSettingsRoutes")
 );
 
+const mrfRequesterRoutes = require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes");
+
+/* The Firebase door — the Cowork app, unchanged behaviour. */
+app.use("/api/cowork/mrf", mrfRequesterRoutes.firebaseChain, mrfRequesterRoutes);
+
+/* ── THE CMS DOOR ────────────────────────────────────────────────────────────
+ * The same handlers, behind the CMS's own employee login, for the Material
+ * Requests app in the launcher. One router, two authentications: the approval
+ * flow, the notifications and the chat are literally the same code, so they
+ * cannot drift the way two copies of them would.
+ *
+ * `EmployeeAuth` first — it verifies the CMS session and puts the employee on
+ * `req.user`; the attach step then restates that in the shape the handlers read.
+ */
+app.use("/api/cms/mrf", mrfRequesterRoutes.cmsChain, mrfRequesterRoutes);
+
+/* ── PURCHASE AND SERVICE REQUESTS ───────────────────────────────────────────
+ * The second kind of ask in the Requests app: what the store cannot issue — a
+ * repair, a vendor purchase, a piece of software. Its own model and its own
+ * collection rather than more fields on MRF, which stays exactly what it is:
+ * stock the store holds, issues and takes back.
+ *
+ * Same authentication as the MRF door above, because it is the same app and
+ * the same person. */
 app.use(
-  "/api/cowork/mrf",
-  require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
+  "/api/requests/spend",
+  require("./Middlewear/EmployeeAuthMiddlewear"),
+  require("./routes/CMS_Routes/Requests/spendRequests"),
+);
+
+/* ── THE UNIFIED REQUESTS DESK ───────────────────────────────────────────────
+ * One door in. The requester says what they need; whether that is stock the
+ * store holds, something to buy, a repair or a subscription is decided AFTER
+ * they have asked, by the people who know — see requestIntake.service.
+ *
+ * Additive. The two doors above still work and every request raised through
+ * them still loads, on this desk, in the same words. Classification does not
+ * reimplement fulfilment: it creates the MRF or the spend request the older
+ * doors would have created, and the store and finance screens carry on
+ * exactly as they do today. */
+app.use(
+  "/api/requests/intake",
+  require("./Middlewear/EmployeeAuthMiddlewear"),
+  require("./routes/CMS_Routes/Requests/intakeRequests"),
 );
 
 // Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
@@ -1644,6 +1678,11 @@ app.use("/hr/attendance", attendanceRouter);
 // it for syncDayForce; requiring it first would hand it a half-built module.
 const shiftSwapRouter = require("./routes/HrRoutes/ShiftSwap_section");
 app.use("/hr/shift-swaps", shiftSwapRouter);
+
+// Face-registration status, read-only. Serves a snapshot written by the
+// punch-in machine's Python engine; this process never loads a face model.
+const faceRegistrationRouter = require("./routes/HrRoutes/FaceRegistration_section");
+app.use("/hr/face-registration", faceRegistrationRouter);
 
 const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
 app.use("/api/hr/leaves", hrLeaveRoutes);
@@ -1842,6 +1881,19 @@ app.use(
   require("./routes/Accountant_Routes/Acc_reports"),
 );
 
+/* ── PAYABLES → SPEND APPROVALS ───────────────────────────────────────────
+ * Operational purchase and service requests that Store has priced, waiting on
+ * finance. Deliberately NOT under /budgets: a budget request is a department
+ * arguing for next year's envelope, this is one vendor invoice about to exist.
+ *
+ * The same decision the Requests app offers, from the accounting side —
+ * services/spendFinanceDecision.service.js is the single rule both call, so
+ * approving here and approving there cannot write different commitments. */
+app.use(
+  "/api/accountant/spend-approvals",
+  require("./routes/Accountant_Routes/Acc_spendApprovals"),
+);
+
 // ── Books / Vouchers / Import ─────────────────────────────────────────
 app.use(
   "/api/accountant/chart-of-accounts",
@@ -1850,6 +1902,12 @@ app.use(
 app.use(
   "/api/accountant/tally/companies",
   require("./routes/Accountant_Routes/Acc_companies"),
+);
+/* GSTIN verification for the parties in the books — reads are free, the
+   sweep is the only thing that spends. See the route file's header. */
+app.use(
+  "/api/accountant/gst-verification",
+  require("./routes/Accountant_Routes/Acc_gstVerification"),
 );
 app.use(
   "/api/accountant/tally/import",

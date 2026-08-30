@@ -38,7 +38,7 @@ const SLUG_RE = /^[a-z0-9-]+$/;
 const EDITABLE = [
   "name", "description", "iconUrl", "iconAlt", "accentColor",
   "dashboardPath", "loginRedirect", "showOnOnboarding", "sortOrder",
-  "capabilities", "isActive", "externalBaseUrl",
+  "capabilities", "isActive", "externalBaseUrl", "budgetEnabled",
 ];
 
 /** Additionally editable, but only on departments this system did not seed. */
@@ -1118,6 +1118,44 @@ const {
 const deptRoles = require("../../services/departmentRoles");
 
 /** GET /api/admin/department-roles/vocabulary */
+/**
+ * GET /api/admin/budget-departments — the departments a Budget grant can name.
+ *
+ * Across every company, because this screen grants people access and is not
+ * itself company-scoped; each row says which company it belongs to so the
+ * admin picks the right "Logistics" when two companies both have one. Read
+ * only — departments are created in the books, never here.
+ */
+router.get("/budget-departments", async (req, res) => {
+  try {
+    /* ── WHERE THE CHOICES COME FROM ────────────────────────────────────────
+     * The company's own departments — the same list this screen already
+     * manages — not a separate registry finance has to populate first.
+     *
+     * Two kinds are left out, and neither is a judgement call: the Budget app
+     * itself and platform-admin are apps, not cost centres, so "submit a
+     * budget for Budget" is not a thing anybody means. Everything else that is
+     * active and has budget submissions enabled is offered.
+     */
+    const rows = await AccessDepartment.find({
+      isActive: true,
+      budgetEnabled: { $ne: false },
+      slug: { $nin: ["budget", "platform-admin"] },
+    })
+      .select("_id slug name")
+      .sort({ name: 1 })
+      .lean();
+
+    res.json({
+      success: true,
+      departments: rows.map((r) => ({ slug: r.slug, name: r.name })),
+    });
+  } catch (error) {
+    console.error("[access-admin] budget departments:", error);
+    fail(res, 500, error.message);
+  }
+});
+
 router.get("/department-roles/vocabulary", (req, res) => {
   res.json({ success: true, roles: deptRoles.ROLES });
 });
@@ -1151,12 +1189,15 @@ router.get("/department-roles/:slug", async (req, res) => {
  */
 router.put("/department-roles/:slug", async (req, res) => {
   try {
-    const { email, name, role, password } = req.body || {};
+    const { email, name, role, password, budgetDepartments } = req.body || {};
     if (!email) return fail(res, 400, "An email address is required");
 
     const result = await deptRoles.setRole({
       departmentSlug: req.params.slug,
       email, name, role: role || null, password,
+      /* Which departments a Budget grant covers. Ignored on every other slug,
+         so this stays one route for every department. */
+      budgetDepartments,
       actor: req.admin,
     });
 

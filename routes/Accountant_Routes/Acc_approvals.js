@@ -142,7 +142,7 @@ async function applyLedgerBalances(voucher, direction, session) {
 // ─────────────────────────────────────────────────────────────────────────
 // The executor — turns an approved Acc_ApprovalRequest into a real change
 // ─────────────────────────────────────────────────────────────────────────
-async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason } = {}) {
+async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, budgetSignatures = [] } = {}) {
   const { kind, action, payload, target } = reqDoc;
 
   // VOUCHER  ── post an existing draft
@@ -169,6 +169,8 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason } = 
         voucher,
         overrideReason: budgetOverrideReason,
         user: approver,
+        signatures: budgetSignatures,
+        signing: true,
       });
       if (override) voucher.budgetOverride = override;
 
@@ -218,6 +220,8 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason } = 
         voucher,
         overrideReason: budgetOverrideReason,
         user: approver,
+        signatures: budgetSignatures,
+        signing: true,
       });
       if (override) voucher.budgetOverride = override;
 
@@ -305,6 +309,8 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason } = 
           voucher: budgetControl.proposedVoucher(voucher, payload),
           overrideReason: budgetOverrideReason,
           user: approver,
+          signatures: budgetSignatures,
+          signing: true,
         });
       }
 
@@ -776,12 +782,24 @@ router.post(
       try {
         result = await applyApprovedAction(item, req.user, {
           budgetOverrideReason: req.body?.budgetOverrideReason,
+          budgetSignatures: item.budgetSignatures || [],
         });
       } catch (e) {
         /* A budget refusal is a question for the approver, not a failure.
            Flattening it into "Execution failed: <string>" would tell them
            they are over budget with no idea by how much or on which head. */
         if (e && e.code === "BUDGET_OVERRIDE_REQUIRED") {
+          /* ── ONE APPROVER IS NOT TWO ──────────────────────────────────────
+             Spending past a budget takes finance and the CEO. This approver's
+             signature is KEPT on the request and it stays pending, so the
+             second person finishes what they started rather than the click
+             being thrown away with the refusal. */
+          const collected = e.payload?.escalation?.signatures || [];
+          if (collected.length > (item.budgetSignatures || []).length) {
+            item.budgetSignatures = collected;
+            await item.save();
+            return res.status(202).json({ success: false, item, ...e.payload });
+          }
           return res.status(409).json({ success: false, ...e.payload });
         }
         console.error("[approvals] execution failed:", e);

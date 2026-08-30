@@ -27,6 +27,7 @@ const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels
 const actuals = require("./budgetActuals.service");
 const departments = require("./budgetDepartment.service");
 const variance = require("./budgetVariance.service");
+const escalation = require("./budgetEscalation.service");
 
 /**
  * Which budgets are live enough to control spend.
@@ -38,6 +39,8 @@ const variance = require("./budgetVariance.service");
  *
  * draft/collecting/review are not yet in force, and closed is over.
  */
+const classification = require("./budgetClassification.service");
+
 const CONTROLLING_STATUSES = ["active", "exceeded"];
 
 /* Mirrors `warnAtPct` in budgetVariance.service.js — the point at which a
@@ -302,9 +305,35 @@ async function checkBudgetAvailability({
   ledgerEntries = [],
   department = null,
   excludeVoucherId = null,
+  /* The commitment this voucher will discharge, when there is one. Excluded
+     from the pressure figure below — see attachCommitmentContext. Passed in
+     rather than resolved here so this stays one query's worth of work for
+     callers that have already looked it up. */
+  releasingCommitment = null,
 } = {}) {
   const checkedAt = new Date();
   const proposed = proposedByLedger(ledgerEntries);
+
+  /* ── THE SOURCE REQUEST'S OWN BUDGET HEAD ────────────────────────────────
+     A voucher raised from an approved request already knows which budget line
+     the money was approved against — it travels on the commitment. The
+     voucher's ledger entries do NOT say that: they say "Purchase — Local",
+     which is where the bookkeeping posts, not what anybody budgeted.
+
+     Without this, a perfectly ordinary bill against an approved request came
+     back "Purchase — Local has no approved allocation" — a budget that exists,
+     was approved, and has room, reported as missing because the check was
+     reading the posting ledger instead of the plan.
+
+     Where a source line exists, every budget-controlled leg is attributed to
+     it. Where there is none, nothing changes and each head is matched on its
+     own as it always was. */
+  const sourceLineId = releasingCommitment?.budgetLineId
+    ? String(releasingCommitment.budgetLineId)
+    : null;
+  const sourceLedgerId = releasingCommitment?.ledgerId
+    ? String(releasingCommitment.ledgerId)
+    : null;
 
   /* No company context means the actuals cannot be scoped, and an unscoped
    * check would compare this company's spend against every company's postings.
@@ -361,6 +390,9 @@ async function checkBudgetAvailability({
      * not silently treated as spend — see the asset/liability skip below for
      * why that default was actively dangerous. */
     const nature = meta.nature || null;
+    /* Resolved by natureByLedger — finance's stored decision where there
+       is one, derived from nature/group/name where there is not. */
+    const budgetControl = meta.budgetControl || classification.NOT_BUDGETED;
     const signed = p.debit - p.credit;
     const thisVoucher = actuals.actualFrom({ signed }, nature);
     const lineDepartment = p.department || department || null;
@@ -370,6 +402,7 @@ async function checkBudgetAvailability({
       ledgerName: meta.ledgerName || null,
       groupName: meta.groupName || null,
       nature,
+      budgetControl,
       department: lineDepartment,
       /* Which slice of this head's spend the row is about. Null on every
        * voucher that tags nothing, which is how this endpoint has always
@@ -395,13 +428,29 @@ async function checkBudgetAvailability({
      * that is the correct side to fail on: refusing spend because a ledger
      * is mis-parented punishes the wrong person. The budget screens will
      * still show the overspend afterwards. */
-    if (nature !== "expense" && nature !== "revenue") {
+    /* ── CLASSIFICATION, NOT RAW NATURE ─────────────────────────────────
+       This tested `nature` directly — right for the funding legs (bank,
+       vendor and cash are assets and liabilities) and wrong for the
+       expense-natured heads nobody budgets: Round Off, Suspense, and any tax
+       control account an import parented under an expense group. Each of
+       those reported itself "unbudgeted" on ordinary vouchers.
+
+       `budgetControl` folds nature, group and name into one answer and lets
+       finance overrule it per ledger. Anything not a budget head is skipped
+       exactly as an asset leg always was. */
+    if (budgetControl === classification.NOT_BUDGETED) {
       results.push({
         ...base,
         status: "ok",
-        note: nature
-          ? `${nature} head — not budget-controlled.`
-          : "Head has no resolved nature — not budget-controlled.",
+        /* Three different reasons a head is skipped, and they are worth
+           telling apart when somebody asks why a voucher was not checked:
+           an ordinary funding leg, a head finance ruled out, and a
+           mis-parented ledger nobody has fixed. */
+        note: !nature
+          ? "Head has no resolved nature — not budget-controlled."
+          : nature === "expense" || nature === "revenue"
+            ? `${meta.ledgerName || "This head"} is marked not budgeted — not budget-controlled.`
+            : `${nature} head — not budget-controlled.`,
         allocated: null,
         actual: null,
         projectedActual: null,
@@ -414,7 +463,7 @@ async function checkBudgetAvailability({
     /* A revenue head is a target. Reported for context, never a cap — see the
      * file header. It is also why this returns before any allocation lookup:
      * "no revenue budget for this head" is not a finding. */
-    if (nature === "revenue") {
+    if (budgetControl === classification.REVENUE_TARGET) {
       results.push({
         ...base,
         status: "ok",
@@ -424,6 +473,31 @@ async function checkBudgetAvailability({
         projectedActual: null,
         remainingAfter: null,
         budgets: [],
+      });
+      continue;
+    }
+
+    /* ── THE SOURCE REQUEST ALREADY NAMED THE HEAD ──────────────────────
+       This leg posts to an accounting ledger — typically "Purchase — Local" —
+       while the money was approved against a different head entirely, the one
+       the requester chose and finance agreed. Checking this leg against its
+       OWN ledger's allocations asks the wrong question and answers
+       "unbudgeted" about a budget that exists.
+
+       So it is attributed to the source line and reported as tracked there.
+       The spend still counts — against the head that was actually approved,
+       via the commitment this voucher releases. */
+    if (sourceLineId && sourceLedgerId && String(p.ledgerId) !== sourceLedgerId) {
+      results.push({
+        ...base,
+        status: "ok",
+        note: `Tracked against the budget head this request was approved on, not against ${meta.ledgerName || "this posting ledger"}.`,
+        allocated: null,
+        actual: null,
+        projectedActual: null,
+        remainingAfter: null,
+        budgets: [],
+        trackedAgainstBudgetLineId: sourceLineId,
       });
       continue;
     }
@@ -576,12 +650,28 @@ async function checkBudgetAvailability({
         _id: m.budget._id,
         name: m.budget.name,
         status: m.budget.status,
+        /* Which year's envelope this is. Denormalised onto the match because
+           every consumer that records a match wants to say WHICH cycle it
+           was, and re-reading the budget to find out would be a second query
+           for a string already in hand. `budgetCommitment.matchFor` reads it
+           — it always did, and until now it was always undefined, so every
+           spend request raised through classification recorded a budget line
+           with no year against it. */
+        financialYear: m.budget.financialYear || null,
         itemId: m.item._id,
         department: m.item.department || null,
         allocatedAmount: m.item.allocatedAmount || 0,
       })),
     });
   }
+
+  /* Advisory only, and attached AFTER every status is settled — so the two
+     lines below cannot be influenced by it however this evolves. */
+  await attachCommitmentContext({ results, releasingCommitment }).catch((e) => {
+    /* A commitment read that fails must not cost finance the availability
+       check. The screen shows the gate's answer without the extra context. */
+    console.error("[budget] commitment context failed, omitting it:", e.message);
+  });
 
   const overallStatus = results.reduce((acc, r) => worstStatus(acc, r.status), "ok");
   const requiredOverride = results.some((r) => needsOverride(r.status));
@@ -591,6 +681,15 @@ async function checkBudgetAvailability({
     requiredOverride,
     results,
     message: messageFor(overallStatus, results),
+    /* The heads carrying promises, so a screen can say something without
+       walking the results. Empty when nothing is committed anywhere. */
+    commitmentWarnings: results
+      .filter((r) => r.commitment)
+      .map((r) => ({
+        ledgerId: r.ledgerId ? String(r.ledgerId) : null,
+        ledgerName: r.ledgerName || null,
+        ...r.commitment,
+      })),
     checkedAt,
   };
 }
@@ -644,10 +743,49 @@ function messageFor(status, results) {
  * warning. An unexpected failure logs and lets the voucher through; the
  * budget screens will still show the overspend afterwards.
  */
-async function clearanceFor({ voucher, overrideReason, department = null, user = null } = {}) {
+/**
+ * ── A REASON IS NO LONGER ENOUGH ────────────────────────────────────────────
+ * This used to let anything through the moment somebody typed a sentence. But
+ * posting vouchers is the accounts job and every role that does it may post
+ * directly, so the person spending past the budget was always the person
+ * allowed to wave it through. It read like an approval and was a log.
+ *
+ * Now an overspend needs two signatures, one of them the CEO's — see
+ * budgetEscalation.service. `clearanceFor` blocks until it has both, and
+ * because every gate in the app already refuses on `blocked`, all five of them
+ * inherit the rule without knowing it exists.
+ *
+ * `signatures` are the ones already collected on this voucher. A reason from
+ * somebody who may sign counts as THEIR signature, so finance writing "here is
+ * why" is finance approving it and not a separate click.
+ */
+async function clearanceFor({
+  voucher,
+  overrideReason,
+  department = null,
+  user = null,
+  signatures = null,
+  /* True when this call IS somebody approving, rather than a check on the way
+     past. Approving is signing, so it collects a signature whether or not a
+     sentence came with it — the second signer is allowed to add nothing, and
+     it is the escalation service that decides the FIRST one must speak. */
+  signing = false,
+} = {}) {
   const reason = String(overrideReason || "").trim();
+  const held = signatures || voucher?.budgetOverride?.signatures || [];
   try {
+    /* Whatever this voucher will release, so the warning does not count money
+       the posting itself removes. The same resolver that does the releasing —
+       one rule, so the two cannot disagree. */
+    let releasingCommitment = null;
+    try {
+      releasingCommitment = await require("./budgetCommitment.service").commitmentForVoucher(voucher);
+    } catch (e) {
+      console.error("[budget] could not resolve the voucher's commitment:", e.message);
+    }
+
     const check = await checkBudgetAvailability({
+      releasingCommitment,
       companyId: voucher.companyId,
       voucherDate: voucher.voucherDate,
       ledgerEntries: (voucher.ledgerEntries || []).map((e) => ({
@@ -663,69 +801,90 @@ async function clearanceFor({ voucher, overrideReason, department = null, user =
       excludeVoucherId: voucher.status === "posted" ? voucher._id : null,
     });
 
-    /* TEMPORARY, see ACC_BUDGET_ENFORCEMENT above. A missing override becomes
-     * a stamped auto-override rather than a refusal — but only when EVERY
-     * complaint on this voucher is one the switch covers. One head genuinely
-     * over its allocation still blocks the post, even if the others are only
-     * unbudgeted, because letting it through on the coat-tails of a rollout
-     * gap is exactly the overspend this control exists to catch. */
-    const autoCleared =
-      check.requiredOverride &&
-      !reason &&
-      (check.results || [])
-        .filter((r) => needsOverride(r.status))
-        .every((r) => autoClearable(r.status));
+    if (check.requiredOverride) {
+      /* A reason from somebody who may sign is their signature. From anybody
+         else it is the case they are making, and it travels on the voucher
+         for the two who do have to sign. */
+      let collected = held;
+      let signatureError = null;
+      if ((signing || reason) && escalation.maySign(user)) {
+        const added = escalation.addSignature(held, { user, reason });
+        if (added.signatures) collected = added.signatures;
+        /* Kept rather than swallowed: somebody clicking approve a second time
+           has to be told they are the same person, not handed the same
+           "waiting for the CEO" they saw a moment ago. */
+        else signatureError = added;
+      }
 
-    if (check.requiredOverride && !reason && !autoCleared) {
-      return {
-        blocked: true,
-        check,
-        payload: {
-          error: check.message,
-          code: "BUDGET_OVERRIDE_REQUIRED",
-          budgetCheck: check,
-        },
-      };
+      if (!escalation.isComplete(collected)) {
+        return {
+          blocked: true,
+          check,
+          signatures: collected,
+          signatureError,
+          payload: {
+            error: signatureError?.error || check.message,
+            /* The old code is kept alongside the new one. Clients written
+               before this still recognise the refusal; the new one tells them
+               it is now a queue rather than a prompt for a sentence. */
+            code: "BUDGET_OVERRIDE_REQUIRED",
+            escalation: {
+              required: true,
+              code: signatureError?.code || "BUDGET_ESCALATION_REQUIRED",
+              waitingOn: escalation.waitingOn(collected),
+              message: escalation.describe(collected),
+              signatures: collected,
+            },
+            budgetCheck: check,
+          },
+        };
+      }
+      /* Both signatures are in — fall through and let it post. */
+      return { blocked: false, check, signatures: collected, override: overrideRecord(check, collected) };
     }
 
-    /* Metadata is written whenever an override was NEEDED. A voucher that
-     * says "over budget, and here is who said yes and why" is the entire
-     * point; one that posts silently is what we had before this chunk. */
-    if (!check.requiredOverride) return { blocked: false, check, override: null };
-
-    return {
-      blocked: false,
-      check,
-      override: {
-        required: true,
-        reason: reason || AUTO_CLEAR_REASON,
-        /* Distinguishes "a human answered for this" from "the switch was off
-         * when it was posted" — without it the two are indistinguishable in
-         * the audit trail afterwards. */
-        auto: !reason,
-        status: check.overallStatus,
-        checkedAt: check.checkedAt,
-        overriddenBy: user?.id,
-        overriddenByName: user?.name || "",
-        results: (check.results || [])
-          .filter((r) => r.status !== "ok")
-          .map((r) => ({
-            ledgerId: r.ledgerId,
-            ledgerName: r.ledgerName,
-            department: r.department,
-            status: r.status,
-            allocated: r.allocated,
-            actual: r.actual,
-            thisVoucher: r.thisVoucher,
-            projectedActual: r.projectedActual,
-            remainingAfter: r.remainingAfter,
-          })),
-      },
-    };
+    /* Within budget: nothing to record. */
+    return { blocked: false, check, override: null };
   } catch (e) {
     console.error("[budgetControl] check failed, allowing post:", e.message);
     return { blocked: false, check: null, override: null };
   }
+}
+
+/**
+ * What a posted-over-budget voucher permanently carries.
+ *
+ * The named fields stay as they were — everything written before signatures
+ * existed still reads the same way — and are filled from the completed set:
+ * the CEO is the one recorded as having overridden it, and the case made by
+ * whoever signed first is the reason. The full set travels alongside, so the
+ * record shows both names rather than only the last.
+ */
+function overrideRecord(check, signatures = []) {
+  const ceo = signatures.find((s) => s.slot === escalation.CEO);
+  const stated = signatures.find((s) => s.reason);
+  return {
+    required: true,
+    reason: stated?.reason || "",
+    status: check.overallStatus,
+    checkedAt: check.checkedAt,
+    overriddenBy: ceo?.userId || signatures[signatures.length - 1]?.userId,
+    overriddenByName: ceo?.name || signatures[signatures.length - 1]?.name || "",
+    signatures,
+    results: (check.results || [])
+      .filter((r) => r.status !== "ok")
+      .map((r) => ({
+        ledgerId: r.ledgerId,
+        ledgerName: r.ledgerName,
+        department: r.department,
+        status: r.status,
+        allocated: r.allocated,
+        actual: r.actual,
+        thisVoucher: r.thisVoucher,
+        projectedActual: r.projectedActual,
+        remainingAfter: r.remainingAfter,
+      })),
+  };
 }
 
 /**
@@ -798,7 +957,145 @@ async function assertClearance(args) {
   return clearance.override;
 }
 
+/* ── COMMITMENTS INFORM; THEY DO NOT BLOCK ───────────────────────────────────
+ * The gate above stops a voucher on ACTUAL posted spend and nothing else. That
+ * policy is unchanged here and deliberately so: a commitment is a promise
+ * finance made, not an obligation the company has incurred, and blocking a real
+ * invoice because of a stale promise is worse than the reverse.
+ *
+ * But finance posting a bill against a head that already carries ₹40,000 of
+ * approved requests is deciding with half the picture. Every other screen in
+ * this module — the head picker, the submissions desk, the cash-flow forecast —
+ * subtracts commitments, and the posting screen was the only one that did not
+ * even mention them.
+ *
+ * So: say it, and let them post. Nothing below can change a status, set
+ * `requiredOverride`, or produce an error.
+ */
+const inr = (n) => `₹${Math.round(Number(n) || 0).toLocaleString("en-IN")}`;
+
+/**
+ * What the commitments on one head amount to, and how loudly to say it.
+ *
+ * Pure, so the wording and the thresholds are testable without a database.
+ * `severity` is advisory throughout — the caller attaches it beside a status it
+ * never touches.
+ *
+ *   null    nothing committed; the screen says nothing rather than "₹0 committed"
+ *   info    committed money exists and there is room for all of it
+ *   near    the head is close to spoken for once promises are counted
+ *   high    promises plus this voucher exceed the allocation
+ */
+function commitmentNote({ ledgerName, allocated, projectedActual, openCommitments }) {
+  const committed = variance.money(openCommitments) ?? 0;
+  if (!(committed > 0)) return null;
+
+  const alloc = variance.money(allocated) ?? 0;
+  const projected = variance.money(projectedActual) ?? 0;
+  /* Everything spoken for: what will have been posted once this voucher lands,
+     plus what has been promised and not yet billed. */
+  const pressure = Math.round((projected + committed) * 100) / 100;
+  const pressurePct = alloc > 0 ? (pressure / alloc) * 100 : null;
+
+  const severity =
+    alloc > 0 && pressure > alloc
+      ? "high"
+      : pressurePct !== null && pressurePct >= WARN_AT_PCT
+        ? "near"
+        : "info";
+
+  const head = ledgerName || "This head";
+  const headline =
+    severity === "high"
+      ? "Including approved requests, this head will be over budget. Posting is still allowed unless actual spend crosses the budget rule."
+      : "Approved requests already use part of this budget head.";
+
+  /* The figures, in one sentence, naming the head — a voucher can touch four
+     heads and a merged message would tell finance about none of them. */
+  const detail =
+    `${head} already has ${inr(committed)} committed through approved requests. ` +
+    (alloc > 0
+      ? `After this voucher, ${inr(pressure)} of ${inr(alloc)} will be spoken for including commitments.`
+      : `After this voucher, ${inr(pressure)} will be spoken for including commitments.`);
+
+  return {
+    committed,
+    pressure,
+    pressurePct: pressurePct === null ? null : Math.round(pressurePct * 10) / 10,
+    /* Both readings, because they answer different questions: the first is what
+       the gate uses, the second is what a person should know. */
+    availableExcludingCommitments: Math.round((alloc - projected) * 100) / 100,
+    availableIncludingCommitments: Math.round((alloc - pressure) * 100) / 100,
+    severity,
+    headline,
+    detail,
+    /* Never a blocker. Stated on the object so no caller has to infer it. */
+    blocking: false,
+  };
+}
+
+/**
+ * Attach commitment context to an availability result set.
+ *
+ * ── WHAT IS DELIBERATELY EXCLUDED ───────────────────────────────────────────
+ * The commitment THIS voucher is about to release. A bill raised against an
+ * approved request discharges its own promise the moment it posts, so counting
+ * it as still-open pressure would warn finance about money the voucher itself
+ * removes — the same ₹40,000 twice.
+ *
+ * Which commitment that is comes from `commitmentForVoucher`, the same function
+ * that decides what actually gets released. Using a second rule here would let
+ * the warning and the release disagree, which is the only way this can be
+ * wrong. It matches on explicit links only — the commitment id, the spend
+ * request id, or the order reference the company itself generated — and never
+ * on amount, vendor or date.
+ */
+async function attachCommitmentContext({ results, releasingCommitment = null }) {
+  /* ── RAW IDS, NOT STRINGS ────────────────────────────────────────────────
+     `committedByLine` matches inside an aggregation pipeline, and an
+     aggregation does not cast against the schema the way a query does — a
+     string never matches a stored ObjectId, and the failure is silent: every
+     head reports zero committed and the warning simply never appears. */
+  /* Every result carries the key, so a screen never has to tell "no
+     commitments" apart from "the field is missing". */
+  for (const r of results || []) r.commitment = null;
+
+  const lineIds = [];
+  for (const r of results || []) {
+    for (const b of r.budgets || []) if (b.itemId) lineIds.push(b.itemId);
+  }
+  if (!lineIds.length) return results;
+
+  const commitments = require("./budgetCommitment.service");
+  const byLine = await commitments.committedByLine(lineIds).catch(() => new Map());
+
+  const releasedLine = releasingCommitment?.budgetLineId
+    ? String(releasingCommitment.budgetLineId)
+    : null;
+  const releasedAmount = variance.money(releasingCommitment?.amount) ?? 0;
+  /* Only a live promise is released by posting. One already released is not
+     being counted anyway. */
+  const releasing = releasingCommitment?.status === "committed" ? releasedAmount : 0;
+
+  for (const r of results || []) {
+    const lines = (r.budgets || []).map((b) => String(b.itemId)).filter(Boolean);
+    let open = lines.reduce((sum, id) => sum + (byLine.get(id) || 0), 0);
+    if (releasedLine && lines.includes(releasedLine)) open -= releasing;
+    open = Math.round(Math.max(0, open) * 100) / 100;
+
+    r.commitment = commitmentNote({
+      ledgerName: r.ledgerName,
+      allocated: r.allocated,
+      projectedActual: r.projectedActual,
+      openCommitments: open,
+    });
+  }
+  return results;
+}
+
 module.exports = {
+  commitmentNote,
+  attachCommitmentContext,
   validateCostCentreAllocations,
   CONTROLLING_STATUSES,
   WARN_AT_PCT,
@@ -808,6 +1105,7 @@ module.exports = {
   checkBudgetAvailability,
   clearanceFor,
   assertClearance,
+  overrideRecord,
   proposedVoucher,
   affectsBudget,
   BudgetOverrideRequiredError,

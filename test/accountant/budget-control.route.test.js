@@ -59,6 +59,18 @@ const EDITOR = {
   role: "editor",
   permissions: { canEdit: true },
 };
+/* ── THE SECOND PAIR OF EYES ────────────────────────────────────────────────
+ * Going past a budget now needs finance AND the CEO, two different people. The
+ * owner above is the CEO; this is finance. Before this rule a reason from one
+ * person was enough, which is what most of the rewritten tests below used to
+ * assert — and the reason it was not a control: posting is the accounts job,
+ * so the person spending was always also the person clearing it. */
+const APPROVER = {
+  id: new mongoose.Types.ObjectId().toString(),
+  name: "Anil Approver",
+  role: "approver",
+  permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
+};
 
 let server;
 let base;
@@ -75,7 +87,23 @@ beforeAll(async () => {
    * most needs to prove the gate fires is the one that would otherwise have
    * been quietly skipped. */
   const { MongoMemoryReplSet } = require("mongodb-memory-server");
-  replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  replSet = await MongoMemoryReplSet.create({
+    replSet: {
+      count: 1,
+      /* Mongo gives a transaction 5ms to take a write lock before giving up.
+         The posting paths here transact, and on a loaded single-node in-memory
+         server that limit is occasionally missed — the call comes back
+         "Unable to acquire IX lock ... within 5ms" rather than an answer.
+
+         Contention in the test environment. The routes were already changed to
+         stop holding locks across the budget check, which is several
+         aggregations and had no business being inside the transaction; this is
+         the remainder. Worth knowing that the routes do NOT retry a transient
+         transaction error, so the same contention in production surfaces to
+         the user as a 400. */
+      args: ["--setParameter", "maxTransactionLockRequestTimeoutMillis=5000"],
+    },
+  });
   await mongoose.disconnect();
   await mongoose.connect(replSet.getUri(), { dbName: "budget_control_test" });
 
@@ -108,6 +136,31 @@ async function call(path, { method = "GET", body, user = OWNER } = {}) {
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
+}
+
+/** An over-budget voucher taken all the way through: raised by the accountant,
+ *  signed by finance, then by the CEO. Returns the posted document. */
+async function overBudgetPosted({ company, expenseLedger, bankLedger, amount, reason = "Contracted overrun." }) {
+  const raised = await call("/vouchers", {
+    method: "POST",
+    user: EDITOR,
+    body: voucherBody({
+      companyId: company._id, expenseLedger, bankLedger, amount,
+      extra: { autoPost: true, budgetOverrideReason: reason },
+    }),
+  });
+  const id = raised.body._id || raised.body.voucher?._id;
+  await bothSign(id, reason);
+  return Acc_Voucher.findById(id).lean();
+}
+
+/** Finance signs with the case, then the CEO. The voucher posts on the second. */
+async function bothSign(id, reason = "Contracted rate rise, unavoidable.") {
+  const finance = await call(`/vouchers/${id}/approve`, {
+    method: "POST", user: APPROVER, body: { budgetOverrideReason: reason },
+  });
+  const ceo = await call(`/vouchers/${id}/approve`, { method: "POST", user: OWNER });
+  return { finance, ceo };
 }
 
 let seq = 0;
@@ -178,6 +231,180 @@ const checkBody = ({ company, ledger, amount, type = "Dr", ...rest }) => ({
   voucherDate: "2026-08-10",
   ledgerEntries: [{ ledgerId: String(ledger._id), type, amount }],
   ...rest,
+});
+
+/* ══ WHICH LEGS OF A VOUCHER ARE BUDGET-CONTROLLED ═══════════════════════════
+ * A purchase voucher is five or six legs and at most one of them is spend. The
+ * rest are GST, the supplier's payable, the bank and the rounding difference,
+ * and every one of those used to be looked up as if it might have a budget.
+ *
+ * These call checkBudgetAvailability directly rather than over HTTP: the
+ * `releasingCommitment` argument is what carries the source request's budget
+ * line, and the routes resolve it themselves from the voucher. Testing through
+ * a route would prove the route can find a commitment, which is a different
+ * claim from the one being made here.
+ */
+describe("which legs are budget-controlled", () => {
+  const control = require("../../services/budgetControl.service");
+
+  async function chartWithTaxAndParty(company) {
+    const taxGroup = await Acc_Group.create({
+      companyId: company._id, name: "Duties & Taxes", nature: "liability",
+    });
+    const partyGroup = await Acc_Group.create({
+      companyId: company._id, name: "Sundry Creditors", nature: "liability",
+    });
+    const expGroup = await Acc_Group.findOne({ companyId: company._id, name: "Indirect Expenses" });
+    const mk = (name, group, nature) => Acc_Ledger.create({
+      companyId: company._id, name, groupId: group._id, groupName: group.name, nature,
+    });
+    return {
+      cgst: await mk("CGST Input", taxGroup, "liability"),
+      tds: await mk("TDS Payable", taxGroup, "liability"),
+      party: await mk("Khandelwal Steel & Pipes", partyGroup, "liability"),
+      roundOff: await mk("Round Off", expGroup, "expense"),
+    };
+  }
+
+  const rowFor = (res, ledgerId) =>
+    res.results.find((r) => String(r.ledgerId) === String(ledgerId));
+
+  test("GST, TDS, the payable, the bank and rounding are all left alone", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+    const { cgst, tds, party, roundOff } = await chartWithTaxAndParty(company);
+
+    /* A whole realistic purchase voucher, not one leg at a time. */
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: expenseLedger._id, type: "Dr", amount: 100000 },
+        { ledgerId: cgst._id, type: "Dr", amount: 9000 },
+        { ledgerId: tds._id, type: "Cr", amount: 2000 },
+        { ledgerId: roundOff._id, type: "Dr", amount: 0.4 },
+        { ledgerId: party._id, type: "Cr", amount: 107000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 400 },
+      ],
+    });
+
+    for (const l of [cgst, tds, party, roundOff, bankLedger]) {
+      const row = rowFor(res, l._id);
+      expect(row.budgetControl).toBe("not_budgeted");
+      /* "ok" and not a status of its own: a leg nobody budgets is not a
+         warning to clear, it is a leg the control has no opinion about. The
+         reason is in the note, so "why was this not checked?" is answerable
+         without inferring it from a silence. */
+      expect(row.status).toBe("ok");
+      expect(row.note).toMatch(/not budget-controlled/i);
+      expect(row.budgets).toEqual([]);
+      expect(row.allocated).toBeNull();
+    }
+
+    /* …and the one leg that IS spend is still controlled. A check that
+       excludes everything is not a fix, it is a disabled control. */
+    const spend = rowFor(res, expenseLedger._id);
+    expect(spend.budgetControl).toBe("expense_budget");
+    expect(spend.allocated).toBe(500000);
+  });
+
+  test("the voucher's own entries are not touched by the check", async () => {
+    /* This is a classification layer over the chart of accounts. It reads the
+       legs and it never rewrites them: same ledgers, same Dr/Cr, same amounts,
+       same order, before and after. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+    const { cgst, party } = await chartWithTaxAndParty(company);
+
+    const entries = [
+      { ledgerId: expenseLedger._id, type: "Dr", amount: 100000 },
+      { ledgerId: cgst._id, type: "Dr", amount: 18000 },
+      { ledgerId: party._id, type: "Cr", amount: 118000 },
+    ];
+    const before = JSON.parse(JSON.stringify(entries));
+
+    await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: entries,
+    });
+
+    expect(JSON.parse(JSON.stringify(entries))).toEqual(before);
+    /* And the books themselves: Dr still equals Cr. */
+    const dr = entries.filter((e) => e.type === "Dr").reduce((t, e) => t + e.amount, 0);
+    const cr = entries.filter((e) => e.type === "Cr").reduce((t, e) => t + e.amount, 0);
+    expect(dr).toBe(cr);
+  });
+
+  test("a bill raised from an approved request is tracked against the request's head, not Purchase — Local", async () => {
+    /* The failure this exists for: an approved request for IT software, billed
+       through the Purchase — Local posting ledger, came back "Purchase — Local
+       has no approved allocation" — a budget that existed, was approved and had
+       room, reported as missing because the check read the posting ledger. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const budget = await liveBudget({
+      companyId: company._id, ledger: expenseLedger, allocated: 500000, department: "IT",
+    });
+    const lineId = budget.items[0]._id;
+
+    const purchaseGroup = await Acc_Group.create({
+      companyId: company._id, name: "Purchase Accounts", nature: "expense",
+    });
+    const purchaseLocal = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Purchase — Local",
+      groupId: purchaseGroup._id,
+      groupName: purchaseGroup.name,
+      nature: "expense",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: purchaseLocal._id, type: "Dr", amount: 40000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 40000 },
+      ],
+      releasingCommitment: { budgetLineId: lineId, ledgerId: expenseLedger._id },
+    });
+
+    const row = rowFor(res, purchaseLocal._id);
+    expect(row.status).toBe("ok");
+    expect(String(row.trackedAgainstBudgetLineId)).toBe(String(lineId));
+    expect(row.note).toMatch(/approved on/i);
+    /* Specifically NOT the "no approved allocation" answer. */
+    expect(row.status).not.toBe("no_budget");
+  });
+
+  test("with no source request, the posting ledger is still matched on its own", async () => {
+    /* The attribution above must not become a blanket pass. A bill typed
+       straight into the purchase module has no request behind it and is
+       checked exactly as it always was. */
+    const { company, bankLedger } = await seedCompany();
+    const purchaseGroup = await Acc_Group.create({
+      companyId: company._id, name: "Purchase Accounts", nature: "expense",
+    });
+    const purchaseLocal = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Purchase — Local",
+      groupId: purchaseGroup._id,
+      groupName: purchaseGroup.name,
+      nature: "expense",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: purchaseLocal._id, type: "Dr", amount: 40000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 40000 },
+      ],
+    });
+
+    const row = rowFor(res, purchaseLocal._id);
+    expect(row.trackedAgainstBudgetLineId).toBeUndefined();
+    expect(row.budgetControl).toBe("expense_budget");
+  });
 });
 
 /* ── the availability check itself ────────────────────────────────────────── */
@@ -556,7 +783,7 @@ describe("gate 1 — voucher create with autoPost", () => {
     await expect(Acc_Voucher.countDocuments({ companyId: company._id })).resolves.toBe(0);
   });
 
-  test("with a reason it posts, and the override is stamped on the voucher", async () => {
+  test("with a reason it is RAISED, not posted — a reason is no longer an approval", async () => {
     const { company, expenseLedger, bankLedger } = await seedCompany();
     await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
 
@@ -564,23 +791,120 @@ describe("gate 1 — voucher create with autoPost", () => {
       method: "POST",
       body: voucherBody({
         companyId: company._id, expenseLedger, bankLedger, amount: 150000,
-        extra: { autoPost: true, budgetOverrideReason: "Urgent shipment, CFO approved on call." },
+        extra: { autoPost: true, budgetOverrideReason: "Urgent shipment, need it on the water." },
       }),
     });
 
-    expect(status).toBe(201);
-    expect(body.status).toBe("posted");
+    /* 202, not 201: it exists and it is going nowhere yet. The voucher is kept
+       rather than thrown away, so nobody has to re-key it once it is signed. */
+    expect(status).toBe(202);
+    expect(body.voucher.status).toBe("pending_approval");
+    expect(body.escalation.waitingOn).toBe("finance");
 
+    const saved = await Acc_Voucher.findById(body.voucher._id).lean();
+    expect(saved.status).toBe("pending_approval");
+    expect(saved.budgetOverride.reason).toMatch(/on the water/);
+    /* ── THE RAISER'S OWN CASE IS THEIR SIGNATURE, WHEN THEY MAY SIGN ───────
+       The owner wrote why, and the owner is the CEO — asking them to click
+       approve on their own sentence afterwards is theatre. What it does NOT
+       do is finish the job: a second, different person still has to sign, and
+       the whole rule is that the spender is never the only one who agreed. */
+    expect(saved.budgetOverride.signatures.map((x) => x.slot)).toEqual(["ceo"]);
+  });
+
+  test("an accountant's case is not a signature — they cannot sign at all", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const { status, body } = await call("/vouchers", {
+      method: "POST",
+      user: EDITOR,
+      body: voucherBody({
+        companyId: company._id, expenseLedger, bankLedger, amount: 150000,
+        extra: { autoPost: true, budgetOverrideReason: "Supplier will not ship otherwise." },
+      }),
+    });
+    expect(status).toBe(201);
     const saved = await Acc_Voucher.findById(body._id).lean();
+    /* An editor never auto-posts, so this is the ordinary approval queue —
+       and it carries no signatures, because posting vouchers does not make
+       somebody able to agree a budget may be broken. */
+    expect(saved.status).toBe("pending_approval");
+    expect(saved.budgetOverride?.signatures || []).toHaveLength(0);
+  });
+
+  test("finance and the CEO together post it, and both names are on the record", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    /* Raised by the accountant, which is how this actually happens: they enter
+       the voucher, they cannot sign, and it waits for the two who can. */
+    const raised = await call("/vouchers", {
+      method: "POST",
+      user: EDITOR,
+      body: voucherBody({
+        companyId: company._id, expenseLedger, bankLedger, amount: 150000,
+        extra: { autoPost: true, budgetOverrideReason: "Urgent shipment." },
+      }),
+    });
+    const id = raised.body._id;
+
+    /* One at a time, because the state BETWEEN the two signatures is the
+       thing being asserted. */
+    const finance = await call(`/vouchers/${id}/approve`, {
+      method: "POST", user: APPROVER, body: { budgetOverrideReason: "Freight surcharge, contracted." },
+    });
+    expect(finance.status).toBe(202);
+    expect(finance.body.escalation.waitingOn).toBe("ceo");
+    await expect(Acc_Voucher.findById(id).then((d) => d.status)).resolves.toBe("pending_approval");
+
+    const ceo = await call(`/vouchers/${id}/approve`, { method: "POST", user: OWNER });
+    expect(ceo.status).toBe(200);
+    const saved = await Acc_Voucher.findById(id).lean();
+    expect(saved.status).toBe("posted");
     expect(saved.budgetOverride.required).toBe(true);
-    expect(saved.budgetOverride.reason).toMatch(/CFO approved/);
     expect(saved.budgetOverride.status).toBe("over_budget");
-    expect(saved.budgetOverride.overriddenByName).toBe("Priya Owner");
-    expect(saved.budgetOverride.checkedAt).toBeInstanceOf(Date);
-    // The snapshot keeps pointing at the numbers the approver actually saw.
+    expect(saved.budgetOverride.signatures.map((x) => [x.slot, x.name])).toEqual([
+      ["finance", "Anil Approver"],
+      ["ceo", "Priya Owner"],
+    ]);
+    expect(saved.budgetOverride.reason).toMatch(/Freight surcharge/);
+    /* The snapshot still points at the numbers that were true when it went. */
     expect(saved.budgetOverride.results[0].allocated).toBe(100000);
-    expect(saved.budgetOverride.results[0].projectedActual).toBe(150000);
     expect(saved.budgetOverride.results[0].remainingAfter).toBe(-50000);
+  });
+
+  test("the CEO alone cannot clear their own overspend", async () => {
+    /* The hole this rule closes: the owner may post directly, so before this
+       they signed their own overspend and it went. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const raised = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({
+        companyId: company._id, expenseLedger, bankLedger, amount: 150000,
+        extra: { autoPost: true, budgetOverrideReason: "I want this." },
+      }),
+    });
+    const id = raised.body.voucher._id;
+
+    /* Raising it already used their CEO signature. Clicking approve again is
+       the same person a second time, and is told so. */
+    const again = await call(`/vouchers/${id}/approve`, {
+      method: "POST", user: OWNER, body: { budgetOverrideReason: "Approved." },
+    });
+    expect(again.status).toBe(409);
+    expect(again.body.escalation.code).toBe("BUDGET_ESCALATION_SAME_PERSON");
+    expect(again.body.error).toMatch(/already approved this/);
+    await expect(Acc_Voucher.findById(id).then((d) => d.status)).resolves.toBe("pending_approval");
+
+    /* Finance is what it is actually waiting for, and finance releases it. */
+    const fin = await call(`/vouchers/${id}/approve`, {
+      method: "POST", user: APPROVER, body: { budgetOverrideReason: "Checked the contract." },
+    });
+    expect(fin.status).toBe(200);
+    await expect(Acc_Voucher.findById(id).then((d) => d.status)).resolves.toBe("posted");
   });
 
   test("within budget posts untouched, with no override metadata", async () => {
@@ -653,20 +977,31 @@ describe("gate 2 — voucher /post", () => {
     expect(still.status).toBe("draft");
   });
 
-  test("posting with a reason succeeds and stamps the override", async () => {
+  test("posting an overspend collects a signature — it does not post on one", async () => {
     const { company, expenseLedger, bankLedger } = await seedCompany();
     await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
     const v = await draft({ company, expenseLedger, bankLedger, amount: 150000 });
 
-    const { status } = await call(`/vouchers/${v._id}/post`, {
+    /* Posting IS spending, so posting past a budget is signing for it — and
+       one signature is not two. The owner's reason fills the CEO slot and the
+       voucher stays a draft until finance signs as well. */
+    const first = await call(`/vouchers/${v._id}/post`, {
       method: "POST",
       body: { budgetOverrideReason: "Board-approved capex overrun." },
     });
-    expect(status).toBe(200);
+    expect(first.status).toBe(202);
+    expect(first.body.escalation.waitingOn).toBe("finance");
+    await expect(Acc_Voucher.findById(v._id).then((d) => d.status)).resolves.toBe("draft");
+
+    const second = await call(`/vouchers/${v._id}/post`, {
+      method: "POST", user: APPROVER, body: { budgetOverrideReason: "Checked." },
+    });
+    expect(second.status).toBe(200);
 
     const saved = await Acc_Voucher.findById(v._id).lean();
     expect(saved.status).toBe("posted");
     expect(saved.budgetOverride.reason).toMatch(/Board-approved/);
+    expect(saved.budgetOverride.signatures.map((x) => x.slot).sort()).toEqual(["ceo", "finance"]);
   });
 
   test("posting within budget is unchanged", async () => {
@@ -709,16 +1044,27 @@ describe("gate 3 — voucher /approve", () => {
       Acc_Voucher.findById(v._id).then((d) => d.status),
     ).resolves.toBe("pending_approval");
 
-    const ok = await call(`/vouchers/${v._id}/approve`, {
+    /* And ONE approver is not enough either. Finance signs, and it waits. */
+    const one = await call(`/vouchers/${v._id}/approve`, {
       method: "POST",
+      user: APPROVER,
       body: { budgetOverrideReason: "Approved — freight surcharge outside our control." },
     });
+    expect(one.status).toBe(202);
+    expect(one.body.escalation.waitingOn).toBe("ceo");
+    await expect(Acc_Voucher.findById(v._id).then((d) => d.status)).resolves.toBe("pending_approval");
+
+    const ok = await call(`/vouchers/${v._id}/approve`, { method: "POST", user: OWNER });
     expect(ok.status).toBe(200);
 
     const saved = await Acc_Voucher.findById(v._id).lean();
     expect(saved.status).toBe("posted");
+    /* The CEO is recorded as the one who overrode it; the case is finance's. */
     expect(saved.budgetOverride.overriddenByName).toBe("Priya Owner");
     expect(saved.budgetOverride.reason).toMatch(/freight surcharge/);
+    expect(saved.budgetOverride.signatures.map((x) => x.name)).toEqual([
+      "Anil Approver", "Priya Owner",
+    ]);
   });
 });
 
@@ -749,7 +1095,7 @@ describe("gates 4 and 5 — the expense module", () => {
     await expect(Acc_Voucher.countDocuments({ companyId: company._id })).resolves.toBe(0);
   });
 
-  test("gate 4 — with a reason it posts and carries the override", async () => {
+  test("gate 4 — with a reason it is raised unposted, and two signatures release it", async () => {
     const { company, expenseLedger, bankLedger } = await seedCompany();
     await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 50000 });
 
@@ -761,11 +1107,25 @@ describe("gates 4 and 5 — the expense module", () => {
       }),
     });
 
-    expect(status).toBe(201);
-    const saved = await Acc_Voucher.findById(body.expense._id).lean();
+    /* Saved, not posted. Refusing outright would leave the expense module
+       unusable over budget — there would be no document for the two
+       signatories to sign. */
+    expect(status).toBe(202);
+    expect(body.escalation.waitingOn).toBe("finance");
+    const id = body.expense._id;
+    const raised = await Acc_Voucher.findById(id).lean();
+    expect(raised.status).toBe("draft");
+    expect(raised.budgetOverride.reason).toMatch(/Statutory deadline/);
+
+    /* The owner raised it, so the CEO slot is already theirs. Finance closes it. */
+    const done = await call(`/expenses/${id}/approve`, {
+      method: "POST", user: APPROVER, body: { budgetOverrideReason: "Checked the quote." },
+    });
+    expect(done.status).toBe(200);
+    const saved = await Acc_Voucher.findById(id).lean();
     expect(saved.status).toBe("posted");
-    expect(saved.budgetOverride.reason).toMatch(/Statutory deadline/);
     expect(saved.budgetOverride.status).toBe("over_budget");
+    expect(saved.budgetOverride.signatures.map((x) => x.slot).sort()).toEqual(["ceo", "finance"]);
   });
 
   test("gate 4 — an expense within budget is unaffected", async () => {
@@ -797,14 +1157,20 @@ describe("gates 4 and 5 — the expense module", () => {
     expect(refused.status).toBe(409);
     await expect(Acc_Voucher.findById(id).then((d) => d.status)).resolves.toBe("draft");
 
-    const ok = await call(`/expenses/${id}/approve`, {
-      method: "POST",
+    /* Finance signs and it waits; the CEO releases it. */
+    const one = await call(`/expenses/${id}/approve`, {
+      method: "POST", user: APPROVER,
       body: { budgetOverrideReason: "Reviewed against Q2 accrual." },
     });
+    expect(one.status).toBe(202);
+    await expect(Acc_Voucher.findById(id).then((d) => d.status)).resolves.toBe("draft");
+
+    const ok = await call(`/expenses/${id}/approve`, { method: "POST", user: OWNER });
     expect(ok.status).toBe(200);
     const saved = await Acc_Voucher.findById(id).lean();
     expect(saved.status).toBe("posted");
     expect(saved.budgetOverride.reason).toMatch(/Q2 accrual/);
+    expect(saved.budgetOverride.signatures).toHaveLength(2);
   });
 });
 
@@ -831,21 +1197,17 @@ describe("the control and the budget screens agree", () => {
     const { company, expenseLedger, bankLedger } = await seedCompany();
     const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
 
-    const created = await call("/vouchers", {
-      method: "POST",
-      body: voucherBody({
-        companyId: company._id, expenseLedger, bankLedger, amount: 150000,
-        extra: { autoPost: true, budgetOverrideReason: "Signed off." },
-      }),
+    const created = await overBudgetPosted({
+      company, expenseLedger, bankLedger, amount: 150000, reason: "Signed off.",
     });
-    expect(created.status).toBe(201);
+    expect(created.status).toBe("posted");
 
     const drill = await call(
       `/budgets/${budget._id}/items/${budget.items[0]._id}/vouchers?companyId=${company._id}`,
     );
     expect(drill.body.totals.actual).toBe(150000);
     expect(drill.body.vouchers).toHaveLength(1);
-    expect(String(drill.body.vouchers[0].voucherId)).toBe(String(created.body._id));
+    expect(String(drill.body.vouchers[0].voucherId)).toBe(String(created._id));
   });
 
   /* ── CHUNK B GUARD ────────────────────────────────────────────────────────
@@ -911,14 +1273,18 @@ describe("the control and the budget screens agree", () => {
  * tests exist only to pin that.
  * ────────────────────────────────────────────────────────────────────────── */
 describe("gate 6 — editing a POSTED voucher", () => {
-  /** A posted voucher for `amount`, created through the real gate. */
+  /** A posted voucher for `amount`, created through the real gate. An amount
+   *  that needs a reason is one that is over budget, so it takes the two
+   *  signatures like anything else — the helper walks them. */
   async function posted({ company, expenseLedger, bankLedger, amount, reason }) {
+    if (reason) {
+      const saved = await overBudgetPosted({ company, expenseLedger, bankLedger, amount, reason });
+      expect(saved.status).toBe("posted");
+      return { ...saved, _id: String(saved._id) };
+    }
     const { status, body } = await call("/vouchers", {
       method: "POST",
-      body: voucherBody({
-        companyId: company._id, expenseLedger, bankLedger, amount,
-        extra: { autoPost: true, ...(reason ? { budgetOverrideReason: reason } : {}) },
-      }),
+      body: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount, extra: { autoPost: true } }),
     });
     expect(status).toBe(201);
     expect(body.status).toBe("posted");
@@ -1002,28 +1368,44 @@ describe("gate 6 — editing a POSTED voucher", () => {
     expect(status).toBe(200);
   });
 
-  test("an over-budget edit WITH a reason saves and re-stamps the override with the new figures", async () => {
+  test("an over-budget edit is escalated, not saved on one person's say-so", async () => {
+    /* Editing a POSTED voucher upward past its allocation is spending past
+       it, so it takes the same two signatures. The edit is not applied on the
+       first one — nothing is worse than a control that stops a new voucher
+       and lets the same money through as an edit. */
     const { company, expenseLedger, bankLedger } = await seedCompany();
     await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
     const v = await posted({ company, expenseLedger, bankLedger, amount: 10000 });
 
-    const { status } = await call(
+    const first = await call(
       `/vouchers/${v._id}`,
       editTo(v, {
         expenseLedger, bankLedger, amount: 250000,
         extra: { budgetOverrideReason: "Scope grew — revised PO attached." },
       }),
     );
-    expect(status).toBe(200);
+    expect(first.status).toBe(202);
+    expect(first.body.escalation.waitingOn).toBe("finance");
 
+    const held = await Acc_Voucher.findById(v._id).lean();
+    expect(held.grandTotal).toBe(10000);
+    expect(held.budgetOverride.signatures.map((x) => x.slot)).toEqual(["ceo"]);
+    /* The snapshot is of THIS edit, not the original posting. */
+    expect(first.body.budgetCheck.results[0].thisVoucher).toBe(250000);
+    expect(first.body.budgetCheck.results[0].remainingAfter).toBe(-150000);
+
+    const second = await call(`/vouchers/${v._id}`, {
+      ...editTo(v, {
+        expenseLedger, bankLedger, amount: 250000,
+        extra: { budgetOverrideReason: "Checked the revised PO." },
+      }),
+      user: APPROVER,
+    });
+    expect(second.status).toBe(200);
     const saved = await Acc_Voucher.findById(v._id).lean();
     expect(saved.grandTotal).toBe(250000);
     expect(saved.budgetOverride.required).toBe(true);
-    expect(saved.budgetOverride.reason).toMatch(/Scope grew/);
-    // The snapshot is of THIS edit, not the original posting.
-    expect(saved.budgetOverride.results[0].thisVoucher).toBe(250000);
-    expect(saved.budgetOverride.results[0].actual).toBe(0);
-    expect(saved.budgetOverride.results[0].remainingAfter).toBe(-150000);
+    expect(saved.budgetOverride.signatures).toHaveLength(2);
   });
 
   test("moving a posted voucher's DATE out of the budget period is re-checked", async () => {
@@ -1146,7 +1528,17 @@ describe("gates 7–9 — the approvals executor", () => {
   const ORG = new mongoose.Types.ObjectId().toString();
 
   const orgUser = (u) => ({ ...u, organizationId: ORG });
-  const APPROVER = orgUser({ ...OWNER, role: "approver" });
+  /* Two DIFFERENT people, both inside the org the requests belong to. The
+     approvals router scopes every read by organizationId, and the escalation
+     rule refuses one person signing twice — so a single user wearing two role
+     labels would satisfy neither. */
+  const APPROVER = orgUser({
+    ...OWNER,
+    id: new mongoose.Types.ObjectId().toString(),
+    name: "Anil Approver",
+    role: "approver",
+  });
+  const CEO_USER = orgUser({ ...OWNER, role: "owner" });
 
   function request({ company, action, target, payload }) {
     return Acc_ApprovalRequest.create({
@@ -1163,8 +1555,16 @@ describe("gates 7–9 — the approvals executor", () => {
     });
   }
 
-  const approve = (id, body) =>
-    call(`/approvals/${id}/approve`, { method: "POST", body, user: APPROVER });
+  const approve = (id, body, user = APPROVER) =>
+    call(`/approvals/${id}/approve`, { method: "POST", body, user });
+
+  /** Finance signs the request, then the CEO — the same two signatures the
+   *  voucher gates want, collected on the approval request instead. */
+  const approveBoth = async (id, reason) => {
+    const finance = await approve(id, { budgetOverrideReason: reason });
+    const ceo = await approve(id, undefined, CEO_USER);
+    return { finance, ceo };
+  };
 
   test("gate 7 — approving a POST of an over-budget draft is refused, then allowed with a reason", async () => {
     const { company, expenseLedger, bankLedger } = await seedCompany();
@@ -1183,11 +1583,20 @@ describe("gates 7–9 — the approvals executor", () => {
       Acc_Voucher.findById(draft.body._id).then((d) => d.status),
     ).resolves.toBe("draft");
 
-    const ok = await approve(ar._id, { budgetOverrideReason: "Approved at board level." });
+    /* Finance signs and the request stays pending; the CEO releases it. */
+    const first = await approve(ar._id, { budgetOverrideReason: "Approved at board level." });
+    expect(first.status).toBe(202);
+    expect(first.body.escalation.waitingOn).toBe("ceo");
+    await expect(
+      Acc_Voucher.findById(draft.body._id).then((d) => d.status),
+    ).resolves.toBe("draft");
+
+    const ok = await approve(ar._id, undefined, CEO_USER);
     expect(ok.status).toBe(200);
     const saved = await Acc_Voucher.findById(draft.body._id).lean();
     expect(saved.status).toBe("posted");
     expect(saved.budgetOverride.reason).toMatch(/board level/);
+    expect(saved.budgetOverride.signatures.map((x) => x.slot)).toEqual(["finance", "ceo"]);
   });
 
   test("gate 8 — approving a CREATE that materialises a posted voucher is gated", async () => {
@@ -1204,7 +1613,7 @@ describe("gates 7–9 — the approvals executor", () => {
     expect(refused.status).toBe(409);
     await expect(Acc_Voucher.countDocuments({ companyId: company._id })).resolves.toBe(0);
 
-    const ok = await approve(ar._id, { budgetOverrideReason: "Emergency repair, quoted twice." });
+    const { ceo: ok } = await approveBoth(ar._id, "Emergency repair, quoted twice.");
     expect(ok.status).toBe(200);
     const saved = await Acc_Voucher.findOne({ companyId: company._id }).lean();
     expect(saved.status).toBe("posted");
@@ -1239,7 +1648,8 @@ describe("gates 7–9 — the approvals executor", () => {
     expect(still.status).toBe("posted");
     expect(still.grandTotal).toBe(20000);
 
-    const ok = await approve(ar._id, { budgetOverrideReason: "Variation order signed." });
+    const { finance, ceo: ok } = await approveBoth(ar._id, "Variation order signed.");
+    expect(finance.status).toBe(202);
     expect(ok.status).toBe(200);
     const saved = await Acc_Voucher.findById(v.body._id).lean();
     expect(saved.grandTotal).toBe(900000);
@@ -1389,5 +1799,209 @@ describe("budget control after a transfer", () => {
     expect(allowed.status).toBe(201);
     expect(allowed.body.status).toBe("posted");
     expect(allowed.body.budgetOverride?.required).toBeUndefined();
+  });
+});
+
+/* ═══ COMMITMENTS INFORM, THEY DO NOT BLOCK ════════════════════════════════
+ *
+ * The gate above stops a voucher on ACTUAL posted spend and nothing else, and
+ * this group does not change that — every test in it asserts the block rule is
+ * exactly what it was. What is new is the sentence the posting screen was
+ * missing: the head picker, the submissions desk and the cash-flow forecast all
+ * subtract commitments, and the one place finance actually spends money did not
+ * even mention them.
+ */
+describe("commitment context on the availability check", () => {
+  const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
+  const SpendRequest = require("../../models/CMS_Models/Requests/SpendRequest");
+
+  /** A live promise against a budget line. */
+  const promise = ({ company, budget, ledger, amount, status = "committed", spendRequestId = null }) =>
+    Commitment.create({
+      spendRequestId: spendRequestId || new mongoose.Types.ObjectId(),
+      spendRequestNumber: `SPR-${seq++}`,
+      companyId: company._id,
+      budgetId: budget._id,
+      budgetLineId: budget.items[0]._id,
+      department: "Logistics",
+      ledgerId: ledger._id,
+      ledgerName: ledger.name,
+      amount,
+      status,
+    });
+
+  const availability = ({ company, ledger, amount, extra = {} }) =>
+    call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2026-08-10",
+        ledgerEntries: [{ ledgerId: String(ledger._id), type: "Dr", amount }],
+        ...extra,
+      },
+    });
+
+  test("no commitments means no commitment message at all", async () => {
+    // Not "₹0 committed" — a screen that reports the absence of a thing on
+    // every voucher is a screen people learn to stop reading.
+    const { company, expenseLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(body.results[0].commitment).toBeNull();
+    expect(body.commitmentWarnings).toEqual([]);
+  });
+
+  test("the worked example: allowed on actuals, warned on pressure", async () => {
+    // Budget 1,00,000 · posted 20,000 · committed 40,000 · this voucher 30,000.
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await postedSpend({ companyId: company._id, ledger: expenseLedger, amount: 20000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    const r = body.results[0];
+
+    /* THE BLOCK RULE, UNCHANGED. Actual after the voucher is 50,000 of
+       1,00,000, so this posts. */
+    expect(r.status).toBe("ok");
+    expect(body.requiredOverride).toBe(false);
+    expect(r.projectedActual).toBe(50000);
+    expect(r.remainingAfter).toBe(50000);
+
+    /* And the half the screen was not being told. */
+    expect(r.commitment).toMatchObject({
+      committed: 40000,
+      pressure: 90000,
+      availableExcludingCommitments: 50000,
+      availableIncludingCommitments: 10000,
+      severity: "near",
+      blocking: false,
+    });
+    expect(r.commitment.detail).toMatch(/₹90,000 of ₹1,00,000 will be spoken for/);
+    expect(body.commitmentWarnings).toHaveLength(1);
+    expect(body.commitmentWarnings[0].ledgerName).toBe("Freight & Forwarding");
+  });
+
+  test("pressure past the allocation warns harder and still does not block", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 90000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    const r = body.results[0];
+
+    expect(r.status).toBe("ok");            // actuals are 30,000 of 1,00,000
+    expect(body.requiredOverride).toBe(false);
+    expect(r.commitment.severity).toBe("high");
+    expect(r.commitment.availableIncludingCommitments).toBe(-20000);
+    expect(r.commitment.headline).toMatch(/Posting is still allowed/);
+  });
+
+  test("actual over-budget still blocks exactly as before, commitments or not", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await postedSpend({ companyId: company._id, ledger: expenseLedger, amount: 90000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 5000 });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    /* The gate's own arithmetic, untouched: 90,000 + 30,000 against 1,00,000. */
+    expect(body.results[0].status).toBe("over_budget");
+    expect(body.requiredOverride).toBe(true);
+    expect(body.results[0].overBy).toBe(20000);
+    /* The commitment is still reported beside it — it does not become the
+       reason, and it does not disappear because a bigger problem exists. */
+    expect(body.results[0].commitment.committed).toBe(5000);
+  });
+
+  test("the commitment this voucher will release is not counted against it", async () => {
+    /* A bill raised against an approved request discharges its own promise the
+       moment it posts. Counting it as still-open pressure would warn finance
+       about money the voucher itself removes — the same ₹40,000 twice. */
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const request = await SpendRequest.create({
+      title: "Compressor AMC", requestType: "SERVICE", purpose: "Annual",
+      requestedBy: new mongoose.Types.ObjectId(), requestedByName: "Rutu",
+      department: "Logistics", companyId: company._id,
+      ledgerId: expenseLedger._id, ledgerName: expenseLedger.name,
+      items: [{ name: "AMC", whyNeeded: "Annual", quantity: 1, unit: "year", rate: 40000, amount: 40000 }],
+      totalAmount: 40000, status: "approved",
+    });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000, spendRequestId: request._id });
+
+    const linked = await availability({
+      company, ledger: expenseLedger, amount: 30000,
+      extra: { spendRequestId: String(request._id) },
+    });
+    // Nothing left open once its own promise is set aside.
+    expect(linked.body.results[0].commitment).toBeNull();
+
+    // The identical voucher WITHOUT the link is warned, which is the control.
+    const unlinked = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(unlinked.body.results[0].commitment.committed).toBe(40000);
+  });
+
+  test("a released commitment is not pressure — it already became a bill", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000, status: "released" });
+
+    const { body } = await availability({ company, ledger: expenseLedger, amount: 30000 });
+    expect(body.results[0].commitment).toBeNull();
+  });
+
+  test("each head gets its own message, named", async () => {
+    /* A voucher can touch four heads and a merged sentence would tell finance
+       about none of them. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const second = await Acc_Ledger.create({
+      companyId: company._id, name: "Software Subscription",
+      groupId: expenseLedger.groupId, groupName: "Indirect Expenses", nature: "expense",
+    });
+    const b1 = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const b2 = await liveBudget({ companyId: company._id, ledger: second, allocated: 200000 });
+    await promise({ company, budget: b1, ledger: expenseLedger, amount: 40000 });
+    await promise({ company, budget: b2, ledger: second, amount: 10000 });
+
+    const { body } = await call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2026-08-10",
+        ledgerEntries: [
+          { ledgerId: String(expenseLedger._id), type: "Dr", amount: 30000 },
+          { ledgerId: String(second._id), type: "Dr", amount: 5000 },
+        ],
+      },
+    });
+
+    expect(body.commitmentWarnings).toHaveLength(2);
+    const byName = Object.fromEntries(body.commitmentWarnings.map((w) => [w.ledgerName, w]));
+    expect(byName["Freight & Forwarding"].committed).toBe(40000);
+    expect(byName["Software Subscription"].committed).toBe(10000);
+    // Different heads, different sentences — neither is a merged summary.
+    expect(byName["Freight & Forwarding"].detail).toMatch(/^Freight & Forwarding/);
+    expect(byName["Software Subscription"].detail).toMatch(/^Software Subscription/);
+  });
+
+  test("a head with commitments but no allocation still says something useful", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await promise({ company, budget, ledger: expenseLedger, amount: 40000 });
+
+    // Checked on a date outside the budget's window: no live allocation.
+    const { body } = await call("/budgets/check-availability", {
+      method: "POST",
+      body: {
+        companyId: String(company._id),
+        voucherDate: "2028-08-10",
+        ledgerEntries: [{ ledgerId: String(expenseLedger._id), type: "Dr", amount: 30000 }],
+      },
+    });
+    expect(body.results[0].status).toBe("missing_budget");
+    // No allocation means no lines to read commitments off — reported as
+    // nothing rather than as a confident zero pressure.
+    expect(body.results[0].commitment).toBeNull();
   });
 });

@@ -192,6 +192,9 @@ function buildWeeklyRows(rows = []) {
       openPayables: 0,
       recurringInflows: 0,
       recurringOutflows: 0,
+      commitmentOutflows: 0,
+      plannedInflows: 0,
+      plannedOutflows: 0,
     };
     let items = [];
     let movingDayCount = 0;
@@ -205,6 +208,9 @@ function buildWeeklyRows(rows = []) {
       sources.openPayables += d.sources.openPayables;
       sources.recurringInflows += d.sources.recurringInflows;
       sources.recurringOutflows += d.sources.recurringOutflows;
+      sources.commitmentOutflows += d.sources.commitmentOutflows;
+      sources.plannedInflows += d.sources.plannedInflows;
+      sources.plannedOutflows += d.sources.plannedOutflows;
       if (d.inflows > 0 || d.outflows > 0) movingDayCount += 1;
       if (d.items && d.items.length) items = items.concat(d.items);
       // Lowest daily CLOSING inside the week. Ties keep the earliest date,
@@ -233,6 +239,9 @@ function buildWeeklyRows(rows = []) {
         openPayables: round2(sources.openPayables),
         recurringInflows: round2(sources.recurringInflows),
         recurringOutflows: round2(sources.recurringOutflows),
+        commitmentOutflows: round2(sources.commitmentOutflows),
+        plannedInflows: round2(sources.plannedInflows),
+        plannedOutflows: round2(sources.plannedOutflows),
       },
       items,
       dayCount: days.length,
@@ -382,6 +391,28 @@ function buildForecast({
   openingCash = 0,
   openItems = [],
   recurringItems = [],
+  /* ── THE SECOND LAYER ─────────────────────────────────────────────────────
+   * Finance-approved purchase and service requests that have not yet become a
+   * voucher. They are money the company has agreed to pay and no accounting
+   * document knows about yet, so a forecast built from documents alone reads
+   * better than the position actually is.
+   *
+   * Kept as its own source, never folded into `openPayables`: the confirmed
+   * layer's figures must be the same numbers whether or not this list was
+   * passed, or the two layers are not comparable and nobody can tell which
+   * part of a change came from where.
+   *
+   * Empty for the confirmed layer, which is what makes that layer unchanged
+   * rather than merely similar. */
+  commitmentItems = [],
+  /* ── AND THE THIRD ────────────────────────────────────────────────────────
+   * Budget that has produced neither a document nor a request: money the plan
+   * says will move and nothing else has confirmed. A PLAN, and the reason it
+   * is a separate layer rather than a line in the forecast — a scenario read
+   * as a forecast is a number somebody commits to.
+   *
+   * Empty for both other layers. */
+  plannedItems = [],
   counts = {},
   groupBy = null,
 } = {}) {
@@ -401,6 +432,14 @@ function buildForecast({
       openPayables: 0,
       recurringInflows: 0,
       recurringOutflows: 0,
+      /* ── THE TWO LAYERS ABOVE CONFIRMED ─────────────────────────────────
+         Always present, always zero unless that layer was asked for. A field
+         that appears only sometimes is one every consumer has to guard, and
+         a confirmed layer whose figures are literally unchanged is the only
+         way two layers can be compared at all. */
+      commitmentOutflows: 0,
+      plannedInflows: 0,
+      plannedOutflows: 0,
       items: [], // Chunk 1-B drilldown; contributes to no figure above
     });
   }
@@ -565,6 +604,121 @@ function buildForecast({
     recurringItemsIncluded += 1;
   }
 
+  /* ── COMMITTED: FINANCE SAID YES, NO DOCUMENT YET ─────────────────────────
+   * Money the company has agreed to pay that no invoice knows about. Placed on
+   * the date finance expects to pay, never on the department's `neededBy` —
+   * one is when the thing is wanted, the other is when the cash leaves, and a
+   * compressor needed on the 1st on thirty-day terms is an outflow on the 31st.
+   *
+   * Anything undated was filtered out before it reached here, and counted, so
+   * the screen can say how much is missing rather than quietly omitting it. */
+  let commitmentsIncluded = 0;
+  let commitmentsBeyondHorizon = 0;
+
+  for (const item of commitmentItems || []) {
+    const when = toDate(item.date);
+    if (!when) continue;
+    const day = startOfDayUTC(when);
+    /* A payment date already past is brought to the front of the horizon: the
+       money has not left, and hiding it would flatter the position. */
+    const placed = day < asOf ? asOf : day;
+    if (placed > lastDay) {
+      commitmentsBeyondHorizon += 1;
+      continue;
+    }
+    const bucket = buckets.get(dayKey(placed));
+    if (!bucket) continue;
+
+    const amount = Math.abs(Number(item.amount) || 0);
+    if (amount <= 0) continue;
+
+    bucket.commitmentOutflows += amount;
+    commitmentsIncluded += 1;
+    bucket.items.push({
+      id: item.id,
+      kind: "budget_commitment",
+      direction: "outflow",
+      date: placed,
+      amount: round2(amount),
+      label: item.label || "Committed spend",
+      partyOrLedgerName: item.vendorName || item.ledgerName || null,
+      source: "budget_commitment",
+      sourceLabel: "Approved request",
+      /* How firm this money is. The forecast's own vocabulary, so a reader
+         never has to infer it from which array a row came out of. */
+      confidence: "committed",
+      overdue: day < asOf,
+      requestId: item.requestId || null,
+      requestNumber: item.requestNumber || null,
+      ledgerId: item.ledgerId || null,
+      ledgerName: item.ledgerName || null,
+      department: item.department || null,
+      vendorName: item.vendorName || null,
+    });
+  }
+
+  /* ── PLANNED: THE BUDGET, WHERE NOTHING STRONGER EXISTS ───────────────────
+   * A scenario, and never folded into the layers above. Budget is permission
+   * to spend, not a document and not an agreement — a plan read as a forecast
+   * is a number somebody commits to.
+   *
+   * The remainder is computed before this point, by whoever built the list:
+   * confirmed wins over committed, committed wins over plan, and the plan
+   * fills only what is left of that head's month. */
+  let plannedIncluded = 0;
+  let plannedBeyondHorizon = 0;
+
+  for (const item of plannedItems || []) {
+    const when = toDate(item.date);
+    if (!when) continue;
+    const day = startOfDayUTC(when);
+    /* A plan is about the future. A planned month already underway has had
+       its chance to produce a document, and pulling the remainder forward to
+       today would invent an outflow on a day nothing is expected to move. */
+    if (day < asOf || day > lastDay) {
+      if (day > lastDay) plannedBeyondHorizon += 1;
+      continue;
+    }
+    const bucket = buckets.get(dayKey(day));
+    if (!bucket) continue;
+
+    const amount = Math.abs(Number(item.amount) || 0);
+    if (amount <= 0) continue;
+
+    const outflow = item.direction !== "inflow";
+    if (outflow) bucket.plannedOutflows += amount;
+    else bucket.plannedInflows += amount;
+    plannedIncluded += 1;
+
+    bucket.items.push({
+      id: item.id,
+      kind: "budget_plan",
+      direction: outflow ? "outflow" : "inflow",
+      date: day,
+      amount: round2(amount),
+      label: item.label || (outflow ? "Budget plan" : "Revenue plan"),
+      partyOrLedgerName: item.ledgerName || null,
+      source: "budget_plan",
+      sourceLabel: outflow ? "Budget plan" : "Revenue plan",
+      confidence: "planned",
+      budgetId: item.budgetId || null,
+      budgetLineId: item.budgetLineId || null,
+      ledgerId: item.ledgerId || null,
+      ledgerName: item.ledgerName || null,
+      department: item.department || null,
+      month: item.month || null,
+      /* `custom` — the department's own month-wise split.
+         `even` — a line phased evenly on purpose.
+         `estimated_even` — no phasing at all, spread by us. The screen says so;
+         a spread nobody chose must not read like one somebody did. */
+      phasingSource: item.phasingSource || "estimated_even",
+      estimated: item.phasingSource === "estimated_even",
+      coveredByConfirmed: round2(Number(item.coveredByConfirmed) || 0),
+      coveredByCommitted: round2(Number(item.coveredByCommitted) || 0),
+      plannedForMonth: round2(Number(item.plannedForMonth) || 0),
+    });
+  }
+
   /* ── Roll forward ──────────────────────────────────────────────────────── */
   const rows = [];
   let running = Number(openingCash) || 0;
@@ -572,13 +726,31 @@ function buildForecast({
   let totalOut = 0;
   let minimumCash = null;
   let minimumCashDate = null;
+  /* ── THE SPLIT BY HOW FIRM THE MONEY IS ─────────────────────────────────
+     A net position that mixes an invoice with an intention is a number nobody
+     can act on. The totals therefore carry their own breakdown, and the two
+     upper layers are zero unless they were asked for — so the same forecast
+     can be read as "what is certain" and "what is likely" without running it
+     twice. */
+  const totalSources = {
+    openReceivables: 0,
+    openPayables: 0,
+    recurringInflows: 0,
+    recurringOutflows: 0,
+    commitmentOutflows: 0,
+    plannedInflows: 0,
+    plannedOutflows: 0,
+  };
 
   for (let i = 0; i < days; i += 1) {
     const d = addDaysUTC(asOf, i);
     const b = buckets.get(dayKey(d));
 
-    const inflows = b.openReceivables + b.recurringInflows;
-    const outflows = b.openPayables + b.recurringOutflows;
+    for (const k of Object.keys(totalSources)) totalSources[k] += b[k];
+
+    const inflows = b.openReceivables + b.recurringInflows + b.plannedInflows;
+    const outflows =
+      b.openPayables + b.recurringOutflows + b.commitmentOutflows + b.plannedOutflows;
     const netMovement = inflows - outflows;
 
     const opening = running;
@@ -610,6 +782,9 @@ function buildForecast({
         openPayables: round2(b.openPayables),
         recurringInflows: round2(b.recurringInflows),
         recurringOutflows: round2(b.recurringOutflows),
+        commitmentOutflows: round2(b.commitmentOutflows),
+        plannedInflows: round2(b.plannedInflows),
+        plannedOutflows: round2(b.plannedOutflows),
       },
       // Largest first, so opening a heavy day leads with what made it heavy.
       items: b.items.slice().sort((x, y) => y.amount - x.amount),
@@ -637,6 +812,19 @@ function buildForecast({
     includedOpenItems: openItemsIncluded,
     includedOpenItemAmount: round2(includedOpenItemAmount),
     includedRecurringItems: recurringItemsIncluded,
+    /* ── THE TWO LAYERS ABOVE CONFIRMED ─────────────────────────────────────
+       Zero on the confirmed layer by construction, not by filtering — nothing
+       was passed in to count. `undatedCommitments` is the one that matters on
+       screen: it is money finance has agreed to that the forecast cannot place,
+       and a figure quietly left out is worse than one reported as missing. */
+    includedCommitments: commitmentsIncluded,
+    commitmentsBeyondHorizon,
+    undatedCommitments: Number(counts.undatedCommitments) || 0,
+    undatedCommitmentAmount: round2(Number(counts.undatedCommitmentAmount) || 0),
+    releasedCommitmentsExcluded: Number(counts.releasedCommitmentsExcluded) || 0,
+    includedPlannedItems: plannedIncluded,
+    plannedBeyondHorizon,
+    plannedEstimatedLines: Number(counts.plannedEstimatedLines) || 0,
     excludedUndatedOpenItems: Number(counts.openItemsUndated) || 0,
     excludedUndatedAmount: round2(Number(counts.openItemsUndatedAmount) || 0),
     excludedOverdueOpenItems: openItemsOverdue,
@@ -719,6 +907,25 @@ function buildForecast({
       // the honest answer rather than a fabricated zero.
       minimumCash: minimumCash === null ? round2(openingCash) : minimumCash,
       minimumCashDate,
+      /* Every figure above, split by how firm it is. */
+      sources: {
+        openReceivables: round2(totalSources.openReceivables),
+        openPayables: round2(totalSources.openPayables),
+        recurringInflows: round2(totalSources.recurringInflows),
+        recurringOutflows: round2(totalSources.recurringOutflows),
+        commitmentOutflows: round2(totalSources.commitmentOutflows),
+        plannedInflows: round2(totalSources.plannedInflows),
+        plannedOutflows: round2(totalSources.plannedOutflows),
+      },
+      /* The three the screen shows side by side. Confirmed is what an
+         accounting document says; committed is what finance agreed to; planned
+         is what only the budget says. */
+      confirmed: round2(
+        totalSources.openReceivables + totalSources.recurringInflows -
+          totalSources.openPayables - totalSources.recurringOutflows,
+      ),
+      committed: round2(-totalSources.commitmentOutflows),
+      planned: round2(totalSources.plannedInflows - totalSources.plannedOutflows),
     },
     coverage: {
       openItemsIncluded,

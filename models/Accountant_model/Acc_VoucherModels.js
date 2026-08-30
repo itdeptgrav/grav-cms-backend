@@ -402,6 +402,24 @@ const tallyVoucherSchema = new mongoose.Schema(
      *
      * Optional and unindexed: absent on every voucher that was within budget,
      * which is almost all of them. */
+    /* ── THE SPEND REQUEST THIS VOUCHER IS THE ACTUAL FOR ──────────────────
+     * When a department's approved purchase finally arrives as a bill, this is
+     * how the two are tied together: posting this voucher releases the budget
+     * commitment that request created, because the promise has become real
+     * spend and counting both would block the head twice.
+     *
+     * An EXPLICIT link, and deliberately the only kind. Matching a voucher to
+     * a commitment by amount, vendor and date would eventually release the
+     * wrong one — two ₹12,000 repairs from the same vendor in the same week is
+     * not an unusual month — and a wrongly released commitment is money the
+     * budget thinks it has and does not.
+     *
+     * Absent on almost every voucher, which is why neither is indexed here;
+     * the commitment carries the reverse link and that is the side that is
+     * looked up. */
+    spendRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "SpendRequest" },
+    budgetCommitmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_BudgetCommitment" },
+
     budgetOverride: {
       required: { type: Boolean },
       reason: { type: String, trim: true },
@@ -430,6 +448,26 @@ const tallyVoucherSchema = new mongoose.Schema(
           thisVoucher: { type: Number },
           projectedActual: { type: Number },
           remainingAfter: { type: Number },
+        },
+      ],
+
+      /* ── WHO AGREED THE BUDGET COULD BE BROKEN ────────────────────────────
+       * Going past a budget takes two people and one of them is the CEO — see
+       * budgetEscalation.service. The signatures collect here while the
+       * voucher waits, and the voucher cannot post until both are in.
+       *
+       * The fields above (`reason`, `overriddenBy`, `checkedAt`) are filled
+       * from the completed set at the moment it finally posts, so everything
+       * written before this change still reads the same way. */
+      signatures: [
+        {
+          _id: false,
+          slot: { type: String }, // "finance" | "ceo"
+          userId: { type: String },
+          name: { type: String, trim: true },
+          role: { type: String },
+          reason: { type: String, trim: true },
+          at: { type: Date },
         },
       ],
     },
@@ -741,6 +779,74 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── A BUDGET COMMITMENT FOLLOWS ITS VOUCHER ─────────────────────────────────
+ *
+ * When an approved spend request's bill is finally posted, the promise it made
+ * has become real spend. Both counting would block the head twice:
+ *
+ *     available = approved − committed − actual
+ *
+ * so posting has to release the commitment, and cancelling that posting has to
+ * bring it back.
+ *
+ * ── WHY A HOOK AND NOT SIX CALL SITES ───────────────────────────────────────
+ * A voucher becomes posted in six different places — create-with-autoPost,
+ * /post, /approve, the edit path, the expense module and the approvals
+ * executor — and every one of them ends in `save()`. Wiring the release into
+ * each would be six chances to miss one, and the seventh path somebody adds
+ * next month would silently not release at all. This is the chokepoint they
+ * all pass through.
+ *
+ * ── WHY IT RE-READS BEFORE ACTING ───────────────────────────────────────────
+ * Two of those paths save inside a transaction that can still abort. A hook
+ * that trusted the document in front of it would release a commitment for a
+ * voucher that never posted. So it asks the database what is actually stored
+ * before changing anything, and a rolled-back save finds nothing to act on.
+ *
+ * ── AND WHY IT NEVER THROWS ─────────────────────────────────────────────────
+ * A failure here must not unpost a voucher that is correctly posted. It is
+ * logged and the accounting stands; the commitment is repairable, the books
+ * are not.
+ */
+tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
+  const status = String(doc?.status || "");
+  if (status !== "posted" && status !== "cancelled") return;
+  /* Nothing to do for the overwhelming majority of vouchers, and this check
+     costs nothing — the link is on the document already. */
+  if (status === "posted" && !doc.spendRequestId && !doc.budgetCommitmentId &&
+      !doc.referenceNumber) return;
+
+  try {
+    const commitments = require("../../services/budgetCommitment.service");
+    const Model = doc.constructor;
+
+    /* What is actually stored, not what this document believes. */
+    const fresh = await Model.findById(doc._id)
+      .select("_id status companyId voucherType voucherNumber grandTotal referenceNumber spendRequestId budgetCommitmentId updatedBy")
+      .lean();
+    if (!fresh) return;
+
+    if (fresh.status === "posted") {
+      const commitment = await commitments.commitmentForVoucher(fresh);
+      if (commitment) {
+        await commitments.releaseForVoucher({
+          commitment,
+          voucher: fresh,
+          actor: { id: fresh.updatedBy },
+          reason: "voucher_posted",
+        });
+      }
+      return;
+    }
+
+    if (fresh.status === "cancelled") {
+      await commitments.restoreForVoucher({ voucher: fresh });
+    }
+  } catch (e) {
+    console.error("[budget commitment] voucher hook failed:", e.message);
+  }
+});
+
 const Acc_Voucher = mongoose.model("Acc_Voucher", tallyVoucherSchema);
 const Acc_Godown = mongoose.model("Acc_Godown", tallyGodownSchema);
 

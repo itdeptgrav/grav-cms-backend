@@ -17,23 +17,20 @@ const { ROLES, ROLE_KEYS, roleAtLeast } = DepartmentRole;
 
 const ACCOUNTING = "accountant";
 
-/**
- * Clear any per-department identity cache a role change invalidates.
- *
- * QC caches "which role does this email hold" for a minute to keep its
- * dashboard off nine redundant lookups per page load (see services/qcViewer.js).
- * That is fine for a role that has not changed and visibly wrong for one that
- * just did — granting somebody owner and having them still be refused for the
- * next sixty seconds reads as a broken grant. Required lazily so qcViewer can
- * keep requiring this module without a cycle.
- */
-function dropRoleCaches(slug, email) {
-  if (slug !== "qc") return;
-  try {
-    require("./qcViewer").invalidateViewer(email);
-  } catch (e) {
-    console.warn("[departmentRoles] qc viewer cache invalidation skipped:", e.message);
-  }
+/* The standalone Budget app's own slug. Its grant is the only one that carries
+   which departments it covers — see DepartmentRole.budgetDepartments. */
+const BUDGET = "budget";
+
+/** Slugs, deduped, blanks dropped. An empty list is stored as an empty list:
+ *  "granted the app, no departments yet" is a real state the app explains. */
+function normaliseBudgetDepartments(value) {
+  return [
+    ...new Set(
+      (Array.isArray(value) ? value : [])
+        .map((v) => String(v ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 /* ------------------------------------------------------------------ */
@@ -75,11 +72,14 @@ async function listRoles(departmentSlug) {
   }
 
   const rows = await DepartmentRole.find({ departmentSlug: slug })
-    .select("name email role isActive updatedAt")
+    .select("name email role isActive updatedAt budgetDepartments")
     .sort({ role: 1, name: 1 })
     .lean();
   return rows.map((r) => ({
     email: r.email, name: r.name, role: r.role, isActive: r.isActive !== false, updatedAt: r.updatedAt,
+    /* Only ever populated on the Budget grant; the admin screen reads it to
+       show which departments a person may submit for. */
+    budgetDepartments: r.budgetDepartments || [],
   }));
 }
 
@@ -93,7 +93,7 @@ async function listRoles(departmentSlug) {
  * @param actor  the administrator doing it, recorded on the row so the change
  *               log and the row itself agree about who is responsible
  */
-async function setRole({ departmentSlug, email, name, role, password, actor }) {
+async function setRole({ departmentSlug, email, name, role, password, budgetDepartments, actor }) {
   const slug = String(departmentSlug || "").toLowerCase().trim();
   const mail = String(email || "").toLowerCase().trim();
   if (!slug) throw new Error("A department is required");
@@ -143,6 +143,12 @@ async function setRole({ departmentSlug, email, name, role, password, actor }) {
         role,
         isActive: true,
         ...(name ? { name } : {}),
+        /* Only the Budget grant carries departments. Sending them on any other
+           slug is ignored rather than refused — one admin route serves every
+           department, and a 400 here would make the caller special-case it. */
+        ...(slug === BUDGET && budgetDepartments !== undefined
+          ? { budgetDepartments: normaliseBudgetDepartments(budgetDepartments) }
+          : {}),
         grantedBy: actor?._id,
         grantedByEmail: actor?.email || "",
       },

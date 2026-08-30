@@ -70,6 +70,23 @@ const budgetDepartmentSchema = new mongoose.Schema(
      * Stored slugified, so an alias is matched the same way a name is. */
     aliases: [{ type: String, trim: true, lowercase: true }],
 
+    /* ── WHICH LOGIN PORTAL OWNS THIS DEPARTMENT ────────────────────────────
+     * The slug of the AccessDepartment whose users may propose budget for
+     * this department — "sales", "hr", "store", "production-supervisor".
+     *
+     * A deliberate, explicit link rather than a guess, because the two
+     * vocabularies genuinely differ: AccessDepartment registers LOGIN PORTALS
+     * (accountant, qc, cutting-master) while this table registers COST
+     * DEPARTMENTS (Logistics, Admin, Facilities). Matching them by name would
+     * be right often enough to be dangerous — the failure mode is one
+     * department proposing budget as another, which is exactly what this
+     * field exists to prevent.
+     *
+     * Unset means nobody outside finance can propose for it. That is the safe
+     * default: a department only becomes reachable from a portal when someone
+     * says so, never by inference. */
+    accessSlug: { type: String, trim: true, lowercase: true, index: true },
+
     /* "Stop offering this in pickers", never "stop reading rows that use it".
      * A closed department's budgets must still report — a company that
      * dissolves Logistics in March still has to explain what Logistics spent

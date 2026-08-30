@@ -374,7 +374,18 @@ async function resolveActiveRecurring(companyId) {
  * @param {number} [opts.horizon] — one of ALLOWED_HORIZONS; defaults to 30
  * @param {string|Date} [opts.asOfDate] — day 1; defaults to today (UTC)
  */
-async function buildForecast({ companyId, horizon, asOfDate, groupBy } = {}) {
+
+const layers = require("./cashFlowLayers.service");
+
+/** What each layer is called on screen — composed once, so no view invents
+ *  its own word for the same thing. */
+const LAYER_LABEL = {
+  confirmed: "Confirmed only",
+  with_commitments: "With commitments",
+  budget_scenario: "Budget scenario",
+};
+
+async function buildForecast({ companyId, horizon, asOfDate, groupBy, layer: layerRaw } = {}) {
   const cid = castId(companyId);
   const horizonDays = parseHorizon(horizon);
   const asOf = parseAsOfDate(asOfDate);
@@ -406,6 +417,8 @@ async function buildForecast({ companyId, horizon, asOfDate, groupBy } = {}) {
     return { ok: false, code: "COMPANY_NOT_FOUND", message: "Company not found." };
   }
 
+  const layer = layers.parseLayer(layerRaw);
+
   const [cashLedgers, cashConfig] = await Promise.all([
     resolveCashLedgers(cid),
     fetchCashLedgerConfig(cid),
@@ -417,6 +430,27 @@ async function buildForecast({ companyId, horizon, asOfDate, groupBy } = {}) {
   ]);
   const { openingCash, cashLedgerCount } = cash;
 
+  /* ── THE LAYERS ABOVE CONFIRMED ─────────────────────────────────────────
+     Fetched only when asked for. The confirmed layer does not merely filter
+     them out — it never loads them, which is what makes its figures identical
+     to what they were before any of this existed. */
+  const lastDay = new Date(asOf.getTime() + Math.max(0, horizonDays - 1) * 86400000);
+  let commitments = { items: [], undated: 0, undatedAmount: 0, releasedExcluded: 0, byLineMonth: new Map() };
+  let planned = { items: [], estimatedLines: 0, hasPlan: false };
+
+  if (layer === "with_commitments" || layer === "budget_scenario") {
+    commitments = await layers.resolveCommitments(cid, { asOf, lastDay });
+  }
+  if (layer === "budget_scenario") {
+    /* The plan is what is LEFT after the two firmer layers — see the
+       precedence note in cashFlowLayers.service. */
+    planned = await layers.resolvePlanned(cid, {
+      asOf,
+      lastDay,
+      committedByLineMonth: commitments.byLineMonth,
+    });
+  }
+
   const forecast = engine.buildForecast({
     companyId: String(cid),
     asOfDate: asOf,
@@ -424,18 +458,33 @@ async function buildForecast({ companyId, horizon, asOfDate, groupBy } = {}) {
     openingCash,
     openItems: open.items,
     recurringItems,
+    commitmentItems: commitments.items,
+    plannedItems: planned.items,
     groupBy: grouping,
     counts: {
       openItemsTotal: open.total,
       openItemsUndated: open.undated,
       openItemsUndatedAmount: open.undatedAmount,
       recurringItemsActive: recurringItems.length,
+      undatedCommitments: commitments.undated,
+      undatedCommitmentAmount: commitments.undatedAmount,
+      releasedCommitmentsExcluded: commitments.releasedExcluded,
+      plannedEstimatedLines: planned.estimatedLines,
     },
   });
 
   return {
     ok: true,
     ...forecast,
+    /* ── WHICH LAYER THIS IS ────────────────────────────────────────────────
+       Always stated, never inferred. A scenario read as a forecast is a number
+       somebody commits to, and the only defence against that is the answer
+       saying what it is every single time. */
+    layer,
+    layerLabel: LAYER_LABEL[layer],
+    /* Said out loud so the screen can offer the empty state rather than
+       drawing a scenario view identical to the layer below it. */
+    hasBudgetPlan: layer === "budget_scenario" ? planned.hasPlan : null,
     companyName: company.companyName || null,
     cashLedgerCount,
     // ── Chunk 1-D ──────────────────────────────────────────────────────────
@@ -454,6 +503,7 @@ async function buildForecast({ companyId, horizon, asOfDate, groupBy } = {}) {
 }
 
 module.exports = {
+  LAYER_LABEL,
   ALLOWED_HORIZONS,
   DEFAULT_HORIZON,
   CASH_GROUP_NAMES,

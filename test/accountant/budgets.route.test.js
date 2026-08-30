@@ -45,6 +45,15 @@ const OWNER = {
   role: "owner",
   permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
 };
+/* ── THE SECOND SIGNATURE ────────────────────────────────────────────────────
+ * Raising an allocation now takes the same two people as spending past one:
+ * finance and the CEO, and they must be different people. The owner above is
+ * the CEO; this is finance. */
+const APPROVER_USER = {
+  id: new (require("mongoose").Types.ObjectId)().toString(),
+  name: "Anil Approver", email: "anil.approver@example.com", role: "approver",
+  permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
+};
 
 /* The two roles the guards actually separate. An editor may raise anything and
  * approve nothing; a viewer may not even raise. */
@@ -100,6 +109,37 @@ async function call(path, { method = "GET", body, user = OWNER } = {}) {
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
+}
+
+/**
+ * Settle a request at a figure other than the one asked for.
+ *
+ * Two calls, because they are two decisions. `agree` means "as submitted" and
+ * refuses a different number outright — naming one is a COUNTER, which puts
+ * finance's figure in front of the department before it becomes their budget.
+ */
+async function settleAt(budgetId, requestId, q, amount, body = {}) {
+  const c = await call(`/${budgetId}/requests/${requestId}/counter${q}`, {
+    method: "POST",
+    body: { counterAmount: amount, ...body },
+  });
+  expect(c.status).toBe(200);
+  return call(`/${budgetId}/requests/${requestId}/agree${q}`, { method: "POST", body: {} });
+}
+
+/**
+ * Approve an adjustment the way the rule now requires.
+ *
+ * Raising an allocation takes the same two people as spending past one —
+ * finance and then the CEO — because a CEO gate on overspending that a
+ * supplementary can walk around is not a gate. A refusal on the first call
+ * (404, 403, already applied) is handed straight back, so the tests about
+ * those are unaffected.
+ */
+async function approveAdj(url, opts = {}) {
+  const first = await call(url, { method: "POST", user: APPROVER_USER, ...opts });
+  if (first.status !== 202) return first;
+  return call(url, { method: "POST", ...opts });
 }
 
 /** One company with a revenue head and an expense head to budget against. */
@@ -244,6 +284,194 @@ describe("period and status validation", () => {
 });
 
 /* ── basic read / create / update, and line shape ──────────────────────────── */
+
+/* ── OPENING A ROUND ────────────────────────────────────────────────────────
+ * The form no longer asks finance to type a title for a company round, so the
+ * server has to be able to name one that arrives without a name. `name` is
+ * required on the schema; before this, a client that omitted it got a 500. */
+describe("a company round names itself", () => {
+  const open = async (over = {}) => {
+    const { company } = await seedCompany();
+    const res = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27",
+        period: "yearly",
+        scope: "company",
+        status: "collecting",
+        startDate: "2026-04-01",
+        endDate: "2027-03-31",
+        items: [],
+        ...over,
+      },
+    });
+    return res;
+  };
+
+  test("an annual round with no name is called Budget FY 2026-27", async () => {
+    const { status, body } = await open();
+    expect(status).toBe(201);
+    expect(body.budget.name).toBe("Budget FY 2026-27");
+  });
+
+  test("a quarterly round carries its quarter, counted from April", async () => {
+    const { body } = await open({
+      period: "quarterly", startDate: "2026-07-01", endDate: "2026-09-30",
+    });
+    expect(body.budget.name).toBe("Budget FY 2026-27 Q2");
+  });
+
+  test("a monthly round carries its month", async () => {
+    const { body } = await open({
+      period: "monthly", startDate: "2026-04-01", endDate: "2026-04-30",
+    });
+    expect(body.budget.name).toBe("Budget FY 2026-27 Apr");
+  });
+
+  test("a round opens with no allocations at all", async () => {
+    /* The normal case: lines arrive by approving department asks, so demanding
+       one up front made finance invent a figure nobody agreed to. */
+    const { status, body } = await open();
+    expect(status).toBe(201);
+    expect(body.budget.items).toEqual([]);
+    expect(body.budget.status).toBe("collecting");
+  });
+
+  test("a name that WAS sent is kept exactly", async () => {
+    const { body } = await open({ name: "Diwali contingency round" });
+    expect(body.budget.name).toBe("Diwali contingency round");
+  });
+
+  test("a round sent with only a year and a period gets both its dates and its name", async () => {
+    /* The form derives these and sends them; this is the API caller that does
+       not. Dates are filled first, because the name reads the start date. */
+    const { company } = await seedCompany();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "quarterly", quarter: 1,
+        scope: "company", status: "collecting", items: [],
+      },
+    });
+    expect(status).toBe(201);
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-07-01");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2026-09-30");
+    expect(body.budget.name).toBe("Budget FY 2026-27 Q2");
+  });
+
+  test("an annual round with no dates covers the whole financial year", async () => {
+    const { company } = await seedCompany();
+    const { body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly",
+        scope: "company", status: "collecting", items: [],
+      },
+    });
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-04-01");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2027-03-31");
+    expect(body.budget.name).toBe("Budget FY 2026-27");
+  });
+
+  test("dates that WERE sent are kept exactly", async () => {
+    const { company } = await seedCompany();
+    const { body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly", scope: "company",
+        status: "collecting", startDate: "2026-05-15", endDate: "2027-02-14", items: [],
+      },
+    });
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-05-15");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2027-02-14");
+  });
+
+  test("a second round for the same financial year is refused, and says which", async () => {
+    /* One year, one budget. Quarterly and monthly planning lives in a line's
+       monthly phasing, not in parallel envelopes that split a department's
+       asks and make "the FY 26-27 budget" ambiguous in every roll-up. */
+    const { company } = await seedCompany();
+    const body = {
+      companyId: company._id.toString(),
+      financialYear: "2026-27", scope: "company", status: "collecting", items: [],
+    };
+    const first = await call("/", { method: "POST", body });
+    expect(first.status).toBe(201);
+    expect(first.body.budget.name).toBe("Budget FY 2026-27");
+    /* No period sent — a company round IS the year. */
+    expect(first.body.budget.period).toBe("yearly");
+
+    const second = await call("/", { method: "POST", body });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe("FY_BUDGET_EXISTS");
+    expect(second.body.message).toBe("Budget FY 2026-27 already exists. Open that budget instead.");
+    /* Carries the id, so the screen can offer the round rather than the error. */
+    expect(second.body.budgetId).toBe(String(first.body.budget._id));
+  });
+
+  test("a different year, and a different company, are both fine", async () => {
+    const { company } = await seedCompany();
+    const other = await seedCompany();
+    const mk = (companyId, financialYear) =>
+      call("/", { method: "POST", body: {
+        companyId: companyId.toString(), financialYear, scope: "company",
+        status: "collecting", items: [],
+      }});
+    expect((await mk(company._id, "2026-27")).status).toBe(201);
+    expect((await mk(company._id, "2027-28")).status).toBe(201);
+    expect((await mk(other.company._id, "2026-27")).status).toBe(201);
+  });
+
+  test("a project budget may share the year with the company round", async () => {
+    /* The rule is about COMPANY rounds. A site or a campaign is a different
+       object and several may legitimately run inside one year. */
+    const { company } = await seedCompany();
+    /* `period` is sent explicitly here: the yearly default is a COMPANY-round
+       rule, and a project's period is real information — a site may run for a
+       quarter inside a year the company budgets annually. */
+    const base = { companyId: company._id.toString(), financialYear: "2026-27",
+      period: "yearly", status: "collecting",
+      startDate: "2026-04-01", endDate: "2027-03-31", items: [] };
+    expect((await call("/", { method: "POST", body: { ...base, scope: "company" } })).status).toBe(201);
+    const project = await call("/", { method: "POST", body: {
+      ...base, scope: "project", costCentreName: "Greenfield Park", name: "Greenfield site works",
+    }});
+    expect(project.status).toBe(201);
+  });
+
+  test("a closed round still blocks a second one for its year", async () => {
+    /* A finished FY is still that FY's budget. "Re-open the old one" is the
+       honest answer rather than quietly starting a parallel history. */
+    const { company } = await seedCompany();
+    const body = { companyId: company._id.toString(), financialYear: "2026-27",
+      scope: "company", items: [] };
+    expect((await call("/", { method: "POST", body: { ...body, status: "closed" } })).status).toBe(201);
+    const again = await call("/", { method: "POST", body: { ...body, status: "collecting" } });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe("FY_BUDGET_EXISTS");
+  });
+
+  test("a project budget is never auto-named — its name is real information", async () => {
+    const { company } = await seedCompany();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly", scope: "project",
+        costCentreName: "Greenfield Park",
+        status: "collecting", startDate: "2026-04-01", endDate: "2027-03-31", items: [],
+      },
+    });
+    /* No name, no derivation: the server refuses rather than calling a project
+       "Budget FY 2026-27", which would say nothing about which project. */
+    expect(status).toBe(500);
+    expect(body.success).toBe(false);
+  });
+});
 
 describe("basic budget read, create and update", () => {
   test("a created budget's lines round-trip ledger, nature, department, owner and notes", async () => {
@@ -1101,7 +1329,180 @@ describe("department budget requests", () => {
       body: validRequest(assetLedger),
     });
     expect(status).toBe(400);
-    expect(body.message).toMatch(/revenue or expense/i);
+    expect(body.message).toMatch(/not a budget head/i);
+    // Named, because "not a budget head" against a chart of 468 ledgers is a
+    // dead end and against "A Buyer Pvt Ltd" it explains itself.
+    expect(body.message).toContain("A Buyer Pvt Ltd");
+  });
+
+  /* ── An expense head that is not a SPEND head ──────────────────────────────
+   * Nature is not the gate any more, budgetClassification is, and the two
+   * disagree exactly here: Round Off is an expense and nobody budgets against
+   * it. Under the old rule this was accepted. */
+  test("an expense head that is not spend is refused too — Round Off", async () => {
+    const { company, expGroup } = await seedCompany();
+    const roundOff = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Round Off",
+      groupId: expGroup._id,
+      groupName: expGroup.name,
+      nature: "expense",
+    });
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(roundOff),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/not a budget head/i);
+  });
+
+  /* ── Finance's override is the escape hatch ────────────────────────────────
+   * The rules cannot fit every chart of accounts, so finance can overrule
+   * them — in the permissive direction as well as the restrictive one. */
+  test("a head finance marked budgetable is accepted despite its group", async () => {
+    const { company } = await seedCompany();
+    const assetGroup = await Acc_Group.create({
+      companyId: company._id,
+      name: "Prepayments",
+      nature: "asset",
+    });
+    const oddLedger = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Prepaid Software Licences",
+      groupId: assetGroup._id,
+      groupName: assetGroup.name,
+      nature: "asset",
+      budgetControl: "expense_budget",
+    });
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(oddLedger),
+    });
+    expect(status).toBe(201);
+    // Filed on the spend side, not as an asset — the override renames it.
+    expect(body.request.nature).toBe("expense");
+  });
+
+  /* ══ THE PICKER ═══════════════════════════════════════════════════════════
+   * A refusal the picker could have prevented is a bug in the picker, not a
+   * working control. These assert the two lists agree: nothing offered is
+   * refused, nothing refused is offered.
+   *
+   * The heads seeded here are the real ones that went wrong — an expense-group
+   * Round Off, a GST control account, and a bank ledger — not invented shapes.
+   */
+  describe("ledger picker", () => {
+    async function seedChart() {
+      const { company, expGroup, revGroup } = await seedCompany();
+      const bankGroup = await Acc_Group.create({
+        companyId: company._id,
+        name: "Bank Accounts",
+        nature: "asset",
+      });
+      const taxGroup = await Acc_Group.create({
+        companyId: company._id,
+        name: "Duties & Taxes",
+        nature: "liability",
+      });
+      const mk = (name, group, nature, extra = {}) =>
+        Acc_Ledger.create({
+          companyId: company._id,
+          name,
+          groupId: group._id,
+          groupName: group.name,
+          nature,
+          ...extra,
+        });
+      await mk("Round Off", expGroup, "expense");
+      await mk("HDFC Current A/c", bankGroup, "asset");
+      await mk("CGST Input", taxGroup, "asset");
+      await mk("Printing & Stationery", expGroup, "expense");
+      await mk("Domestic Sales", revGroup, "revenue");
+      return { company };
+    }
+
+    const names = (opts) => opts.map((o) => o.ledgerName);
+
+    test("offers spend and revenue heads, and nothing that is not budgeted", async () => {
+      const { company } = await seedChart();
+      const { status, body } = await call(`/ledger-options?companyId=${company._id}`);
+      expect(status).toBe(200);
+      const got = names(body.options);
+
+      expect(got).toEqual(expect.arrayContaining(["Printing & Stationery", "Domestic Sales"]));
+      /* Each of these is an expense or an asset by nature and none of them is
+         a head anyone can be given money against. */
+      expect(got).not.toContain("Round Off");
+      expect(got).not.toContain("HDFC Current A/c");
+      expect(got).not.toContain("CGST Input");
+      expect(body.options.every((o) => o.budgetControl !== "not_budgeted")).toBe(true);
+    });
+
+    test("the revenue picker offers no expense heads", async () => {
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=revenue_target`);
+      expect(names(body.options)).toContain("Domestic Sales");
+      expect(names(body.options)).not.toContain("Printing & Stationery");
+      expect(body.options.every((o) => o.budgetControl === "revenue_target")).toBe(true);
+    });
+
+    test("the expense picker offers no revenue heads", async () => {
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=expense_budget`);
+      expect(names(body.options)).toContain("Printing & Stationery");
+      expect(names(body.options)).not.toContain("Domestic Sales");
+      expect(body.options.every((o) => o.budgetControl === "expense_budget")).toBe(true);
+    });
+
+    test("a `type` that is not a budgetable class is ignored, not obeyed", async () => {
+      /* `?type=not_budgeted` must not become a way to ask the picker for the
+         heads it exists to withhold. */
+      const { company } = await seedChart();
+      const { body } = await call(`/ledger-options?companyId=${company._id}&type=not_budgeted`);
+      expect(names(body.options)).not.toContain("Round Off");
+      expect(names(body.options)).toEqual(
+        expect.arrayContaining(["Printing & Stationery", "Domestic Sales"]),
+      );
+    });
+
+    test("finance's override moves a head onto the list, and off it", async () => {
+      const { company } = await seedChart();
+
+      await Acc_Ledger.updateOne(
+        { companyId: company._id, name: "Printing & Stationery" },
+        { $set: { budgetControl: "not_budgeted" } },
+      );
+      await Acc_Ledger.updateOne(
+        { companyId: company._id, name: "Round Off" },
+        { $set: { budgetControl: "expense_budget" } },
+      );
+
+      const { body } = await call(`/ledger-options?companyId=${company._id}`);
+      const got = names(body.options);
+      expect(got).not.toContain("Printing & Stationery");
+      expect(got).toContain("Round Off");
+    });
+
+    test("nothing the picker offers is refused when it is requested", async () => {
+      /* The property that matters more than any single row: the picker and
+         the create gate read the same classifier, so the two lists cannot
+         drift apart. */
+      const { company } = await seedChart();
+      const budget = await makeBudget({ companyId: company._id });
+      const { body } = await call(`/ledger-options?companyId=${company._id}`);
+
+      for (const opt of body.options) {
+        const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+          method: "POST",
+          body: validRequest({ _id: opt.ledgerId }),
+        });
+        expect([201, status]).toEqual([201, 201]);
+      }
+    });
   });
 
   /* ── The list is per-budget ────────────────────────────────────────────── */
@@ -1358,9 +1759,8 @@ describe("finance review", () => {
 
   test("agreeing creates an approved allocation carrying the request's head", async () => {
     const { budget, q, request, expenseLedger } = await setup();
-    const { status, body } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST",
-      body: { agreedAmount: 275000, financeNote: "Trimmed to last year's actual." },
+    const { status, body } = await settleAt(budget._id, request._id, q, 275000, {
+      financeNote: "Trimmed to last year's actual.",
     });
     expect(status).toBe(200);
     expect(body.created).toBe(true);
@@ -1401,10 +1801,7 @@ describe("finance review", () => {
     const before = await Acc_Budget.findById(budget._id).lean();
     expect(before.totalAllocated).toBe(0);
 
-    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST",
-      body: { agreedAmount: 275000 },
-    });
+    await settleAt(budget._id, request._id, q, 275000);
 
     const after = await Acc_Budget.findById(budget._id).lean();
     expect(after.totalAllocated).toBe(275000);
@@ -1444,11 +1841,9 @@ describe("finance review", () => {
     const { budget, q, request } = await setup();
 
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 300000 },
+      method: "POST", body: {},
     });
-    const second = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 400000 },
-    });
+    const second = await settleAt(budget._id, request._id, q, 400000);
     expect(second.body.created).toBe(false);
 
     const stored = await Acc_Budget.findById(budget._id).lean();
@@ -1544,7 +1939,7 @@ describe("finance review", () => {
       method: "POST", body: { counterAmount: 180000 },
     });
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 180000 },
+      method: "POST", body: {},
     });
 
     const stored = await Acc_Budget.findById(budget._id).lean();
@@ -1557,9 +1952,7 @@ describe("finance review", () => {
 
   test("reopening WITHDRAWS the allocation — money never approved must not linger", async () => {
     const { budget, q, request } = await setup();
-    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 275000 },
-    });
+    await settleAt(budget._id, request._id, q, 275000);
 
     const { status, body } = await call(`/${budget._id}/requests/${request._id}/reopen${q}`, {
       method: "POST", body: {},
@@ -1686,7 +2079,7 @@ describe("finance review", () => {
   test("an approved allocation behaves like any other line for actuals and variance", async () => {
     const { company, budget, q, request, expenseLedger } = await setup();
     await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
-      method: "POST", body: { agreedAmount: 300000 },
+      method: "POST", body: {},
     });
 
     // Real spend against that head, in this company.
@@ -2126,10 +2519,7 @@ describe("dashboard", () => {
     const before = await dash(company._id, "&asOf=2027-03-31");
     expect(before.body.attention.noAllocations).toHaveLength(1);
 
-    const agreed = await call(
-      `/${budget._id}/requests/${created.body.request._id}/agree${q}`,
-      { method: "POST", body: { agreedAmount: 300000 } },
-    );
+    const agreed = await settleAt(budget._id, created.body.request._id, q, 300000);
     expect(agreed.status).toBe(200);
 
     const after = await dash(company._id, "&asOf=2027-03-31");
@@ -2781,10 +3171,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 2500000 });
     const created = await submit(budget, q, supplementary(item, 500000));
 
-    const { status, body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
-      { method: "POST" },
-    );
+    const { status, body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     expect(status).toBe(200);
     expect(body.adjustment.state).toBe("approved");
@@ -2799,7 +3186,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 500000 });
     const created = await submit(budget, q, revision(item, 700000));
 
-    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
     // 700000, not 1200000.
     expect(await allocationOf(budget._id, item._id)).toBe(700000);
   });
@@ -2809,7 +3196,7 @@ describe("adjustments — supplementary and revision", () => {
     const created = await submit(budget, q, supplementary(item, 500000));
     const url = `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`;
 
-    const first = await call(url, { method: "POST" });
+    const first = await approveAdj(url);
     expect(first.status).toBe(200);
     expect(await allocationOf(budget._id, item._id)).toBe(3000000);
 
@@ -2829,9 +3216,9 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 2500000 });
     const created = await submit(budget, q, supplementary(item, 500000));
 
-    const { body } = await call(
+    const { body } = await approveAdj(
       `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
-      { method: "POST", body: { approvedDeltaAmount: 300000, financeNote: "Half now, revisit in Q3." } },
+      { body: { approvedDeltaAmount: 300000, financeNote: "Half now, revisit in Q3." } },
     );
 
     expect(body.adjustment.approvedDeltaAmount).toBe(300000);
@@ -2851,11 +3238,11 @@ describe("adjustments — supplementary and revision", () => {
     expect(a.body.adjustment.currentAllocatedAmount).toBe(2500000);
     expect(b.body.adjustment.currentAllocatedAmount).toBe(2500000);
 
-    await call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`);
     expect(await allocationOf(budget._id, item._id)).toBe(3000000);
 
     // "₹3L more" must mean more than whatever it is NOW — 33L, not 28L.
-    const second = await call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" });
+    const second = await approveAdj(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`);
     expect(second.body.adjustment.currentAllocatedAmount).toBe(3000000);
     expect(await allocationOf(budget._id, item._id)).toBe(3300000);
   });
@@ -2870,9 +3257,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(before.totalExpenseAllocated || 0).toBe(0);
 
     const created = await submit(budget, q, supplementary(item, 500000));
-    const { body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
-    );
+    const { body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     expect(body.totals.totalExpenseAllocated).toBe(3000000);
     expect(body.totals.totalRevenueAllocated).toBe(4000000);
@@ -2898,7 +3283,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(lineBefore.pace).toBe("over_budget");
 
     const created = await submit(budget, q, revision(item, 200000));
-    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     // Within budget after it — same spend, revised number.
     const after = await call(`/${budget._id}${q}&asOf=2027-03-31`);
@@ -2930,7 +3315,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup();
     const created = await submit(budget, q, supplementary(item, 500000));
     const id = created.body.adjustment._id;
-    await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${id}/approve${q}`);
 
     const rejected = await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
     expect(rejected.status).toBe(409);
@@ -2945,7 +3330,7 @@ describe("adjustments — supplementary and revision", () => {
     const id = created.body.adjustment._id;
 
     await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
-    const { status, body } = await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+    const { status, body } = await approveAdj(`/${budget._id}/adjustments/${id}/approve${q}`);
     expect(status).toBe(409);
     expect(body.message).toMatch(/rejected/);
     expect(await allocationOf(budget._id, item._id)).toBe(2500000);
@@ -2999,7 +3384,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(mine.status).toBe(201);
     const id = mine.body.adjustment._id;
 
-    expect((await call(`/${budget._id}/adjustments/${id}/approve${oq}`, { method: "POST" })).status).toBe(404);
+    expect((await approveAdj(`/${budget._id}/adjustments/${id}/approve${oq}`)).status).toBe(404);
     expect((await call(`/${budget._id}/adjustments/${id}/reject${oq}`, { method: "POST" })).status).toBe(404);
   });
 
@@ -3009,10 +3394,10 @@ describe("adjustments — supplementary and revision", () => {
     expect((await call(`/${new mongoose.Types.ObjectId()}/adjustments${q}`)).status).toBe(404);
     expect((await call(`/not-an-id/adjustments${q}`)).status).toBe(404);
     expect(
-      (await call(`/${budget._id}/adjustments/${new mongoose.Types.ObjectId()}/approve${q}`, { method: "POST" })).status,
+      (await approveAdj(`/${budget._id}/adjustments/${new mongoose.Types.ObjectId()}/approve${q}`)).status,
     ).toBe(404);
     expect(
-      (await call(`/${budget._id}/adjustments/nope/approve${q}`, { method: "POST" })).status,
+      (await approveAdj(`/${budget._id}/adjustments/nope/approve${q}`)).status,
     ).toBe(404);
   });
 
@@ -3024,9 +3409,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(created.status).toBe(201);
     expect(created.body.adjustment.nature).toBe("revenue");
 
-    const { body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
-    );
+    const { body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
     expect(body.totals.totalRevenueAllocated).toBe(5000000);
     expect(await allocationOf(budget._id, revenueItem._id)).toBe(5000000);
   });
@@ -3607,7 +3990,11 @@ describe("authorization", () => {
     const other = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
       method: "POST", user: OWNER,
     });
-    expect(other.status).toBe(200);
+    /* Accepted — 202 rather than 200 because raising an allocation also needs
+       the second signature now. Four eyes and the CEO rule are different
+       rules; what matters here is that this one did not refuse. */
+    expect(other.status).toBe(202);
+    expect(other.body.escalation.waitingOn).toBe("finance");
   });
 
   test("the owner is exempt — one owner per org, so four eyes would deadlock", async () => {
@@ -3619,7 +4006,10 @@ describe("authorization", () => {
     const { status } = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
       method: "POST", user: OWNER,
     });
-    expect(status).toBe(200);
+    /* Not 403 — that is the exemption working. It is 202 because the owner is
+       exempt from four eyes and NOT from the CEO rule: raising an allocation
+       still wants a second, different signature. */
+    expect(status).toBe(202);
   });
 
   test("four eyes applies to requests and transfers too, not just adjustments", async () => {
@@ -3671,8 +4061,15 @@ describe("authorization", () => {
       method: "POST", user: EDITOR,
       body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "x" },
     });
-    const { status } = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
+    const legacy = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
       method: "POST", user: LEGACY,
+    });
+    /* Accepted, not locked out — a legacy admin still signs. They are not the
+       owner, so theirs is the finance signature and the CEO closes it. */
+    expect(legacy.status).toBe(202);
+    expect(legacy.body.escalation.waitingOn).toBe("ceo");
+    const { status } = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: OWNER,
     });
     expect(status).toBe(200);
   });
@@ -3811,8 +4208,8 @@ describe("concurrency", () => {
        and one department's ₹10k vanished while both callers were told it
        worked. Now one of them is refused outright. */
     const [r1, r2] = await Promise.all([
-      call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" }),
-      call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" }),
+      approveAdj(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`),
+      approveAdj(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`),
     ]);
 
     const codes = [r1.status, r2.status].sort();
@@ -3844,7 +4241,7 @@ describe("concurrency", () => {
     const a = await raiseAdjustment(budget, q, budget.items[0], 10000);
     const url = `/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`;
 
-    expect((await call(url, { method: "POST" })).status).toBe(200);
+    expect((await approveAdj(url)).status).toBe(200);
     const second = await call(url, { method: "POST" });
     expect(second.status).toBe(409);
     // The appliedAt guard answers first, with the message that actually
@@ -3942,7 +4339,7 @@ describe("dashboard pending counts", () => {
     expect(before.body.totals.pending.total).toBe(3);
 
     const saved = await Acc_Budget.findById(budget._id).lean();
-    await call(`/${budget._id}/adjustments/${saved.adjustments[0]._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${saved.adjustments[0]._id}/approve${q}`);
     await call(`/${budget._id}/adjustments/${saved.adjustments[1]._id}/reject${q}`, { method: "POST" });
     await call(`/${budget._id}/transfers/${saved.transfers[0]._id}/reject${q}`, { method: "POST" });
 
@@ -5020,5 +5417,176 @@ describe("dashboard overlap deduplication", () => {
     const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
     expect(byName["Company FY"].totals.expense.actual).toBe(100000);
     expect(byName["Company Q2"].totals.expense.actual).toBe(100000);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * NATURE COMES FROM THE ACCOUNT HEAD
+ *
+ * Not from the department, and not from a flag someone set on the row. The
+ * chart of accounts has five natures and only two of them are a budget; the
+ * other three used to be coerced to "expense", which added a bank account to
+ * the company's spend with nothing on screen saying so.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("budget line nature is read off the ledger", () => {
+  let seq2 = 0;
+
+  async function company() {
+    const c = await Acc_Company.create({
+      companyName: `Nature Co ${seq2++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const mk = async (name, nature) => {
+      const g = await Acc_Group.create({ companyId: c._id, name: `${name} group`, nature });
+      return Acc_Ledger.create({
+        companyId: c._id, name, groupId: g._id, groupName: g.name, nature,
+      });
+    };
+    return {
+      company: c,
+      expense: await mk("Freight & Forwarding", "expense"),
+      revenue: await mk("Export Sales", "revenue"),
+      bank: await mk("HDFC Current", "asset"),
+    };
+  }
+
+  const budget = (c, items) =>
+    Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id, items,
+    });
+
+  const line = (ledger, department, allocatedAmount, natureSnapshot) => ({
+    ledgerId: ledger._id, ledgerName: ledger.name, department, allocatedAmount,
+    ...(natureSnapshot ? { nature: natureSnapshot } : {}),
+  });
+
+  test("the LEDGER decides, even when the row's snapshot disagrees", async () => {
+    const { company: c, revenue } = await company();
+    /* The row says expense; the head says revenue. The head wins — a head
+       re-parented in the chart of accounts must move sides everywhere. */
+    const b = await budget(c, [line(revenue, "Sales", 4000000, "expense")]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    expect(body.budget.items[0].nature).toBe("revenue");
+    expect(body.budget.totals.revenue.allocated).toBe(4000000);
+    expect(body.budget.totals.expense.allocated).toBe(0);
+  });
+
+  test("an asset head is 'other' — not spend, and out of both totals", async () => {
+    const { company: c, expense, bank } = await company();
+    const b = await budget(c, [
+      line(expense, "Logistics", 500000),
+      line(bank, "Admin", 900000),
+    ]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    const bankLine = body.budget.items.find((i) => i.ledgerName === "HDFC Current");
+
+    expect(bankLine.nature).toBe("other");
+    /* The whole point: 9,00,000 on a bank account is not 9,00,000 of spend. */
+    expect(body.budget.totals.expense.allocated).toBe(500000);
+    expect(body.budget.totals.other.allocated).toBe(900000);
+    expect(body.budget.totals.budgetedNet).toBe(-500000);
+  });
+
+  test("hasRevenue tells an absent revenue side from a met one", async () => {
+    const { company: c, expense } = await company();
+    const b = await budget(c, [line(expense, "Admin", 500000)]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    /* An expense-only budget has no revenue side. A screen that reads the
+       zero instead prints "₹0 earned" at a department never asked to earn. */
+    expect(body.budget.totals.hasRevenue).toBe(false);
+    expect(body.budget.totals.hasExpense).toBe(true);
+  });
+});
+
+describe("a department's type is derived from its lines", () => {
+  let seq3 = 0;
+
+  async function setup(items) {
+    const c = await Acc_Company.create({
+      companyName: `Centre Co ${seq3++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const mk = async (name, nature) => {
+      const g = await Acc_Group.create({ companyId: c._id, name: `${name} g`, nature });
+      return Acc_Ledger.create({ companyId: c._id, name, groupId: g._id, groupName: g.name, nature });
+    };
+    const expense = await mk("Freight", "expense");
+    const revenue = await mk("Export Sales", "revenue");
+    await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id,
+      items: items({ expense, revenue }),
+    });
+    const { body } = await call(`/dashboard?companyId=${c._id}&asOf=2027-03-31`);
+    return body;
+  }
+
+  const at = (body, name) => body.byDepartment.find((d) => d.department === name);
+
+  test("expense-only is a cost centre; HR is never shown as earning", async () => {
+    const body = await setup(({ expense }) => [
+      { ledgerId: expense._id, department: "HR", allocatedAmount: 500000 },
+    ]);
+    const hr = at(body, "HR");
+    expect(hr.centre).toBe("cost");
+    /* Not "₹0 earned" — HR has no revenue side at all. */
+    expect(hr.hasRevenue).toBe(false);
+  });
+
+  test("revenue-only is a revenue centre", async () => {
+    const body = await setup(({ revenue }) => [
+      { ledgerId: revenue._id, department: "Sales", allocatedAmount: 4000000 },
+    ]);
+    const sales = at(body, "Sales");
+    expect(sales.centre).toBe("revenue");
+    expect(sales.hasExpense).toBe(false);
+  });
+
+  test("both sides make a contribution centre", async () => {
+    const body = await setup(({ expense, revenue }) => [
+      { ledgerId: revenue._id, department: "Sales", allocatedAmount: 4000000 },
+      { ledgerId: expense._id, department: "Sales", allocatedAmount: 600000 },
+    ]);
+    const sales = at(body, "Sales");
+    expect(sales.centre).toBe("contribution");
+    expect(sales.hasRevenue).toBe(true);
+    expect(sales.hasExpense).toBe(true);
+    expect(sales.budgetedNet).toBe(3400000);
+  });
+
+  test("nobody is asked — the department carries no stored type", async () => {
+    const body = await setup(({ expense }) => [
+      { ledgerId: expense._id, department: "Admin", allocatedAmount: 100000 },
+    ]);
+    /* Derived per read. Nothing about a department's nature is persisted, so
+       adding a revenue line reclassifies it with no migration. */
+    const stored = await Acc_Budget.findOne({ "items.department": "Admin" }).lean();
+    expect(stored.items[0].centre).toBeUndefined();
+    expect(at(body, "Admin").centre).toBe("cost");
+  });
+
+  test("an unsupported head is flagged on the head roll-up", async () => {
+    const c = await Acc_Company.create({
+      companyName: `Head Co ${seq3++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const g = await Acc_Group.create({ companyId: c._id, name: "Bank", nature: "asset" });
+    const bank = await Acc_Ledger.create({
+      companyId: c._id, name: "HDFC Current", groupId: g._id, groupName: g.name, nature: "asset",
+    });
+    await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id,
+      items: [{ ledgerId: bank._id, department: "Admin", allocatedAmount: 900000 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${c._id}&asOf=2027-03-31`);
+    const head = body.byHead.find((h) => h.ledgerName === "HDFC Current");
+    expect(head.supported).toBe(false);
+    expect(head.nature).toBe("other");
   });
 });

@@ -147,6 +147,23 @@ const paymentSchema = new mongoose.Schema(
 const purchaseOrderSchema = new mongoose.Schema(
   {
     // Basic Information
+    /* ── THE APPROVED QUOTE THIS ORDER FULFILS ──────────────────────────────
+       A purchase order used to have no link to anything upstream: it was
+       raised by hand, and "was this approved?" could only be answered by
+       somebody remembering. This ties it to the spend request finance agreed —
+       the quote, the vendor, the figure and the budget head it was committed
+       against.
+
+       Optional, because the eighty orders that predate this were raised the
+       old way and are not wrong for having no link. It is what lets an order
+       raised FROM an approval be told apart from one typed in. */
+    spendRequestId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SpendRequest",
+      index: true,
+    },
+    spendRequestNumber: { type: String, trim: true },
+
     poNumber: {
       type: String,
       trim: true,

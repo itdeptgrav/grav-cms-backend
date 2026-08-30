@@ -129,11 +129,18 @@ test("sources break the day's movement down by origin", () => {
   });
 
   const s = rowOn(r, "2026-09-01").sources;
+  /* The two layers above confirmed are present and ZERO — nothing was passed
+     in for them. That is the point of the split: a confirmed forecast reports
+     the same figures whether or not the caller asked for commitments, so the
+     layers can be compared rather than merely looked at side by side. */
   assert.deepEqual(s, {
     openReceivables: 100,
     openPayables: 40,
     recurringInflows: 7,
     recurringOutflows: 3,
+    commitmentOutflows: 0,
+    plannedInflows: 0,
+    plannedOutflows: 0,
   });
   assert.equal(rowOn(r, "2026-09-01").inflows, 107);
   assert.equal(rowOn(r, "2026-09-01").outflows, 43);
@@ -409,17 +416,26 @@ test("the result carries the full documented shape", () => {
   assert.equal(r.companyId, "abc");
   assert.equal(r.horizonDays, 2);
   assert.equal(r.scenario, "base");
+  /* `sources` and the three headline splits are how a reader tells an invoice
+     from an intention in one number. Zero on a confirmed forecast. */
   assert.deepEqual(Object.keys(r.totals).sort(), [
     "closingCash",
+    "committed",
+    "confirmed",
     "inflows",
     "minimumCash",
     "minimumCashDate",
     "netMovement",
     "outflows",
+    "planned",
+    "sources",
   ]);
   assert.deepEqual(Object.keys(r.rows[0].sources).sort(), [
+    "commitmentOutflows",
     "openPayables",
     "openReceivables",
+    "plannedInflows",
+    "plannedOutflows",
     "recurringInflows",
     "recurringOutflows",
   ]);
@@ -773,10 +789,22 @@ test("1-B: the inclusion summary counts included, undated and overdue separately
     counts: { openItemsUndated: 4, openItemsUndatedAmount: 9999, openItemsTotal: 7 },
   });
 
+  /* The commitment and plan counts sit here too, at zero: nothing was passed
+     in for those layers. `undatedCommitments` is the one that earns its place
+     on screen — money finance has agreed to that the forecast cannot place,
+     reported as missing rather than quietly left out. */
   assert.deepEqual(r.inclusion, {
     includedOpenItems: 2,
     includedOpenItemAmount: 1500,
     includedRecurringItems: 1,
+    includedCommitments: 0,
+    commitmentsBeyondHorizon: 0,
+    undatedCommitments: 0,
+    undatedCommitmentAmount: 0,
+    releasedCommitmentsExcluded: 0,
+    includedPlannedItems: 0,
+    plannedBeyondHorizon: 0,
+    plannedEstimatedLines: 0,
     excludedUndatedOpenItems: 4,
     excludedUndatedAmount: 9999,
     excludedOverdueOpenItems: 1,
@@ -928,8 +956,11 @@ test("1-B: diagnostics and drilldown do NOT affect the roll-forward totals", () 
 
   // And the 1-A row shape is intact beneath the new field.
   assert.deepEqual(Object.keys(r.rows[0].sources).sort(), [
+    "commitmentOutflows",
     "openPayables",
     "openReceivables",
+    "plannedInflows",
+    "plannedOutflows",
     "recurringInflows",
     "recurringOutflows",
   ]);
@@ -1561,4 +1592,179 @@ test("1-E scope guard: grouping adds no scenario, band or alert output", () => {
   for (const k of ["severity", "trend", "forecastQuality", "confidence"]) {
     assert.ok(!(k in w), `a weekly row must not carry ${k}`);
   }
+});
+
+/* ══ THE LAYERS ABOVE CONFIRMED ═══════════════════════════════════════════
+   A forecast built only from accounting documents is true and incomplete: it
+   does not know about the money finance approved last week that no invoice has
+   arrived for, nor what the budget says is planned for next quarter.
+
+   Both are real information and neither is a document, so they stack — and the
+   confirmed layer's figures must be IDENTICAL whether or not the layers above
+   it were asked for, or the three cannot be compared. */
+
+const COMMIT = (over = {}) => ({
+  id: "commitment:1", date: "2026-09-02", amount: 40000,
+  label: "Committed spend · Compressor repair", ledgerName: "Repairs", ...over,
+});
+const PLAN = (over = {}) => ({
+  id: "plan:1:2026-09", date: "2026-09-15", amount: 60000, direction: "outflow",
+  label: "Budget plan · Software", ledgerName: "Software",
+  month: "2026-09", phasingSource: "custom", ...over,
+});
+
+test("layers: confirmed reports the same figures whether or not the others were asked for", () => {
+  const base = { asOfDate: AS_OF, horizonDays: 30, openingCash: 1000,
+    openItems: [{ dueDate: "2026-09-03", amount: 500, direction: "outflow" }] };
+
+  const confirmed = fc.buildForecast(base);
+  const withLayers = fc.buildForecast({
+    ...base, commitmentItems: [COMMIT()], plannedItems: [PLAN()],
+  });
+
+  /* The confirmed SOURCE is untouched by what was stacked on top of it. */
+  assert.equal(
+    confirmed.totals.sources.openPayables,
+    withLayers.totals.sources.openPayables,
+  );
+  /* And the layers contributed nothing to it. */
+  assert.equal(confirmed.totals.sources.commitmentOutflows, 0);
+  assert.equal(confirmed.totals.sources.plannedOutflows, 0);
+});
+
+test("layers: a commitment is an outflow of its own kind, not a payable", () => {
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0, commitmentItems: [COMMIT()],
+  });
+  assert.equal(r.totals.sources.commitmentOutflows, 40000);
+  assert.equal(r.totals.sources.openPayables, 0, "never folded into payables");
+  assert.equal(r.totals.outflows, 40000, "but it does move the cash position");
+});
+
+test("layers: a commitment carries its confidence and its request", () => {
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0,
+    commitmentItems: [COMMIT({ requestNumber: "SPR-2608-0004", department: "Tech" })],
+  });
+  const item = rowOn(r, "2026-09-02").items[0];
+  assert.equal(item.kind, "budget_commitment");
+  assert.equal(item.confidence, "committed");
+  assert.equal(item.sourceLabel, "Approved request");
+  assert.equal(item.requestNumber, "SPR-2608-0004");
+  assert.equal(item.department, "Tech");
+});
+
+test("layers: a plan is planned, and revenue plans are inflows", () => {
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 40, openingCash: 0,
+    plannedItems: [
+      PLAN(),
+      PLAN({ id: "plan:2:2026-09", direction: "inflow", amount: 250000,
+             label: "Revenue plan · Export Sales", ledgerName: "Export Sales" }),
+    ],
+  });
+  assert.equal(r.totals.sources.plannedOutflows, 60000);
+  assert.equal(r.totals.sources.plannedInflows, 250000);
+
+  const items = rowOn(r, "2026-09-15").items;
+  for (const it of items) {
+    assert.equal(it.kind, "budget_plan");
+    assert.equal(it.confidence, "planned");
+  }
+  assert.equal(items.find((i) => i.direction === "inflow").sourceLabel, "Revenue plan");
+  assert.equal(items.find((i) => i.direction === "outflow").sourceLabel, "Budget plan");
+});
+
+test("layers: a spread nobody chose is marked estimated", () => {
+  /* An even split the department actually asked for and one we invented
+     because the line had no phasing are different claims, and the screen has
+     to be able to tell them apart. */
+  const chosen = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 40, openingCash: 0,
+    plannedItems: [PLAN({ phasingSource: "even" })],
+  });
+  const guessed = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 40, openingCash: 0,
+    plannedItems: [PLAN({ phasingSource: "estimated_even" })],
+  });
+  assert.equal(rowOn(chosen, "2026-09-15").items[0].estimated, false);
+  assert.equal(rowOn(guessed, "2026-09-15").items[0].estimated, true);
+  assert.equal(rowOn(guessed, "2026-09-15").items[0].phasingSource, "estimated_even");
+});
+
+test("layers: the plan carries what already covered its month", () => {
+  /* The remainder is computed upstream; the item reports the working so a
+     reader can see why ₹1,00,000 of budget contributed ₹60,000. */
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 40, openingCash: 0,
+    plannedItems: [PLAN({ plannedForMonth: 100000, coveredByCommitted: 40000, amount: 60000 })],
+  });
+  const item = rowOn(r, "2026-09-15").items[0];
+  assert.equal(item.plannedForMonth, 100000);
+  assert.equal(item.coveredByCommitted, 40000);
+  assert.equal(item.amount, 60000);
+});
+
+test("layers: a plan dated before today is dropped, not pulled forward", () => {
+  /* A month already underway has had its chance to produce a document.
+     Dragging its remainder to today would invent an outflow on a day nothing
+     is expected to move. A COMMITMENT is different — see the next test. */
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0,
+    plannedItems: [PLAN({ date: "2026-08-15" })],
+  });
+  assert.equal(r.totals.sources.plannedOutflows, 0);
+  assert.equal(r.inclusion.includedPlannedItems, 0);
+});
+
+test("layers: an overdue commitment is brought to the front, not hidden", () => {
+  /* The money has not left. Dropping it would flatter the position. */
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0,
+    commitmentItems: [COMMIT({ date: "2026-08-20" })],
+  });
+  assert.equal(r.totals.sources.commitmentOutflows, 40000);
+  assert.equal(rowOn(r, "2026-09-01").items[0].overdue, true);
+});
+
+test("layers: beyond the horizon is excluded and counted, for both", () => {
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 7, openingCash: 0,
+    commitmentItems: [COMMIT({ date: "2026-12-01" })],
+    plannedItems: [PLAN({ date: "2026-12-15" })],
+  });
+  assert.equal(r.totals.sources.commitmentOutflows, 0);
+  assert.equal(r.totals.sources.plannedOutflows, 0);
+  assert.equal(r.inclusion.commitmentsBeyondHorizon, 1);
+  assert.equal(r.inclusion.plannedBeyondHorizon, 1);
+});
+
+test("layers: diagnostics report what could not be placed", () => {
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0,
+    commitmentItems: [COMMIT()],
+    counts: { undatedCommitments: 3, undatedCommitmentAmount: 90000,
+              releasedCommitmentsExcluded: 2, plannedEstimatedLines: 1 },
+  });
+  assert.equal(r.inclusion.includedCommitments, 1);
+  assert.equal(r.inclusion.undatedCommitments, 3);
+  assert.equal(r.inclusion.undatedCommitmentAmount, 90000);
+  assert.equal(r.inclusion.releasedCommitmentsExcluded, 2);
+  assert.equal(r.inclusion.plannedEstimatedLines, 1);
+});
+
+test("layers: a row's items still sum to that row's own figures", () => {
+  /* The invariant the whole drilldown rests on, now with three kinds of item
+     in one day. */
+  const r = fc.buildForecast({
+    asOfDate: AS_OF, horizonDays: 30, openingCash: 0,
+    openItems: [{ dueDate: "2026-09-15", amount: 500, direction: "outflow" }],
+    commitmentItems: [COMMIT({ date: "2026-09-15" })],
+    plannedItems: [PLAN({ date: "2026-09-15" })],
+  });
+  const row = rowOn(r, "2026-09-15");
+  const out = row.items.filter((i) => i.direction === "outflow")
+    .reduce((s, i) => s + i.amount, 0);
+  assert.equal(out, row.outflows);
+  assert.equal(row.outflows, 500 + 40000 + 60000);
 });

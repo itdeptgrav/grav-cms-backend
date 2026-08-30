@@ -63,6 +63,24 @@ const departmentRoleSchema = new mongoose.Schema(
 
     role: { type: String, enum: ROLE_KEYS, required: true },
 
+    /* ── WHICH BUDGET DEPARTMENTS THIS GRANT COVERS ───────────────────────────
+     * Only meaningful on the `budget` grant, and the whole point of it: giving
+     * somebody the Budget app used to say nothing about WHOSE budget they may
+     * submit. That answer lived in a second place — an `accessSlug` finance had
+     * to set on the budget department — so a person granted the app was told
+     * their account was "not linked" and neither screen said what was missing.
+     *
+     * Slugs of Acc_BudgetDepartment rows, resolved per company at read time so
+     * a slug granted here can never reach another company's books. Empty means
+     * empty: the app opens and shows the setup message, never every department.
+     *
+     * Ignored for every other department slug rather than refused, so the one
+     * shared admin route stays one route. */
+    budgetDepartments: {
+      type: [{ type: String, lowercase: true, trim: true }],
+      default: undefined,
+    },
+
     isActive: { type: Boolean, default: true },
 
     grantedBy: { type: mongoose.Schema.Types.ObjectId },

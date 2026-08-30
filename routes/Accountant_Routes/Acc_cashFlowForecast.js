@@ -35,7 +35,7 @@ router.use(accountantAuth);
 /* ------------------------------------------------------------------ */
 router.get("/", async (req, res) => {
   try {
-    const { companyId, horizon, asOfDate, groupBy } = req.query;
+    const { companyId, horizon, asOfDate, groupBy, layer } = req.query;
 
     // Fail closed BEFORE any query is built. A missing companyId must never
     // fall through to an unscoped read of every company's cash position.
@@ -43,7 +43,13 @@ router.get("/", async (req, res) => {
       return res.status(400).json({ error: "companyId required.", code: "INVALID_COMPANY" });
     }
 
-    const result = await forecast.buildForecast({ companyId, horizon, asOfDate, groupBy });
+    /* `layer` decides how much beyond real accounting documents the forecast
+       reaches: confirmed only, plus finance-approved commitments, or plus the
+       remaining budget plan. An unrecognised value falls back to the default
+       rather than refusing — a forecast that will not draw because of a query
+       string is worse than one that draws the usual view. The answer always
+       says which layer it is. */
+    const result = await forecast.buildForecast({ companyId, horizon, asOfDate, groupBy, layer });
 
     if (!result.ok) {
       const status = result.code === "COMPANY_NOT_FOUND" ? 404 : 400;

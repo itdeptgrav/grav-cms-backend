@@ -29,6 +29,7 @@
 const mongoose = require("mongoose");
 const { Acc_Voucher } = require("../models/Accountant_model/Acc_VoucherModels");
 const { Acc_Ledger, Acc_Group } = require("../models/Accountant_model/Acc_MasterModels");
+const variance = require("./budgetVariance.service");
 
 /** Cast to ObjectId, or null when the value cannot be one. Never throws. */
 function oid(v) {
@@ -51,7 +52,9 @@ async function natureByLedger(ledgerIds = []) {
   if (ids.length === 0) return new Map();
 
   const ledgers = await Acc_Ledger.find({ _id: { $in: ids } })
-    .select("_id name groupId groupName")
+    /* `budgetControl` so every caller can tell a budget head from a posting
+       ledger without a second read — see budgetClassification. */
+    .select("_id name groupId groupName budgetControl")
     .lean();
 
   const groupIds = [...new Set(ledgers.map((l) => String(l.groupId)).filter(Boolean))]
@@ -64,15 +67,29 @@ async function natureByLedger(ledgerIds = []) {
 
   const groupNature = new Map(groups.map((g) => [String(g._id), g.nature]));
 
+  const classification = require("./budgetClassification.service");
+
   return new Map(
-    ledgers.map((l) => [
-      String(l._id),
-      {
-        ledgerName: l.name,
-        groupName: l.groupName || null,
-        nature: groupNature.get(String(l.groupId)) || null,
-      },
-    ]),
+    ledgers.map((l) => {
+      const nature = groupNature.get(String(l.groupId)) || null;
+      return [
+        String(l._id),
+        {
+          ledgerName: l.name,
+          groupName: l.groupName || null,
+          nature,
+          /* Finance's stored decision where there is one, derived from
+             nature/group/name where there is not — so this is correct on
+             ledgers that predate the field entirely. */
+          budgetControl: classification.budgetControlOf({
+            budgetControl: l.budgetControl,
+            name: l.name,
+            groupName: l.groupName,
+            nature,
+          }),
+        },
+      ];
+    }),
   );
 }
 
@@ -665,8 +682,13 @@ async function hydrateLines({ companyId, lines = [], from, to }) {
       return { ...line, actual: 0, unbound: true, voucherCount: 0 };
     }
     const meta = natures.get(key) || {};
-    /* Ledger tree wins over the snapshot on the row — see natureByLedger. */
-    const nature = meta.nature || line.nature || "expense";
+    /* ── NATURE COMES FROM THE HEAD ────────────────────────────────────────
+     * The ledger tree wins over the snapshot on the row — see natureByLedger.
+     * `variance.natureOf` maps the tree's five natures onto the three a budget
+     * can be: an asset, liability or equity head becomes "other" rather than
+     * being coerced to expense, which used to add a bank account or a loan to
+     * the company's spend with nothing on screen saying so. */
+    const nature = variance.natureOf({ nature: meta.nature || line.nature });
 
     const headMovement = movements.get(key) || null;
     const costCentreId = line.costCentreId ? String(line.costCentreId) : null;

@@ -315,8 +315,10 @@ router.post("/", async (req, res) => {
       gstRate = 18,
       isInterstate = false,
       referenceNumber,
-      autoPost = true,
     } = body;
+    /* Reassigned when the spend turns out to be over budget: it is saved
+       unposted so the two signatories have something to sign. */
+    let autoPost = body.autoPost === undefined ? true : body.autoPost;
 
     // ── Validation ──────────────────────────────────────────────────
     if (!companyId)
@@ -479,6 +481,7 @@ router.post("/", async (req, res) => {
      * so a refused expense leaves nothing behind to clean up. A draft
      * (autoPost false) is saved unchecked — drafting is not spending. */
     let budgetOverride;
+    let escalated = null;
     if (autoPost) {
       const clearance = await budgetControl.clearanceFor({
         voucher: { companyId, voucherDate: voucherDate || new Date(), ledgerEntries, status: "draft" },
@@ -486,8 +489,25 @@ router.post("/", async (req, res) => {
         department: body.department || body.costCentre || null,
         user: req.user,
       });
-      if (clearance.blocked) return res.status(409).json(clearance.payload);
-      budgetOverride = clearance.override || undefined;
+      if (clearance.blocked) {
+        /* ── OVER BUDGET IS A QUEUE, NOT A REFUSAL ─────────────────────────
+           An overspend takes finance and the CEO now, so there is nothing a
+           single person can type here that posts it. Refusing outright would
+           leave the expense module unusable over budget — no document, so
+           nothing for the two signatories to sign. It is saved unposted
+           instead, carrying the case and whatever signature came with it. */
+        if (!body.budgetOverrideReason) return res.status(409).json(clearance.payload);
+        escalated = clearance;
+        budgetOverride = {
+          required: true,
+          status: clearance.check?.overallStatus,
+          reason: String(body.budgetOverrideReason).trim(),
+          signatures: clearance.signatures || [],
+        };
+        autoPost = false;
+      } else {
+        budgetOverride = clearance.override || undefined;
+      }
     }
 
     const voucher = await Acc_Voucher.create({
@@ -519,8 +539,19 @@ router.post("/", async (req, res) => {
     // Apply balance updates only when posted
     if (autoPost) await applyLedgerBalances(voucher, +1);
 
-    res.status(201).json({
+    res.status(escalated ? 202 : 201).json({
       success: true,
+      ...(escalated
+        ? {
+            escalation: {
+              required: true,
+              code: "BUDGET_ESCALATION_REQUIRED",
+              waitingOn: "finance",
+              message: "Raised. It needs finance and then the CEO before it can post.",
+            },
+            budgetCheck: escalated.check,
+          }
+        : {}),
       expense: {
         ...voucher.toObject(),
         // Backwards-compat aliases
@@ -561,8 +592,23 @@ router.post("/:id/approve", async (req, res) => {
       overrideReason: req.body?.budgetOverrideReason,
       department: req.body?.department || null,
       user: req.user,
+      signing: true,
     });
-    if (clearance.blocked) return res.status(409).json(clearance.payload);
+    if (clearance.blocked) {
+      /* Approving is signing. One signature is not two — it is kept on the
+         expense and it waits for the other. */
+      if (clearance.signatureError || !clearance.signatures?.length) {
+        return res.status(409).json(clearance.payload);
+      }
+      v.budgetOverride = {
+        ...(v.budgetOverride?.toObject?.() || v.budgetOverride || {}),
+        required: true,
+        status: clearance.check?.overallStatus,
+        signatures: clearance.signatures,
+      };
+      await v.save();
+      return res.status(202).json({ ...clearance.payload, expense: v.toObject() });
+    }
     if (clearance.override) v.budgetOverride = clearance.override;
 
     v.status = "posted";
