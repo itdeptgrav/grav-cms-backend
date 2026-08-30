@@ -1555,8 +1555,22 @@ app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
 app.use("/api/cms/production/dashboard", pmWrites("production dashboard"), productionDashboardRoutes);
 
+// WAS pmWrites("machine layout") — wrong department. The Machine Position
+// Designer lives entirely on the production-supervisor dashboard
+// (app/production-supervisor/dashboard/tracker) and its "Save Layout" button
+// is offered directly to that role with no approval step in the UI. Gating
+// the save behind a "project-manager" editor role meant every supervisor's
+// save 403'd with NO_DEPARTMENT_ROLE — they have no role in that department
+// and were never supposed to need one for their own floor layout. Scoped to
+// "production-supervisor" instead, which (per departmentWrites' own contract)
+// fails OPEN until an administrator actually assigns roles in that
+// department, so this restores today's behaviour rather than swapping one
+// wrong gate for a differently-wrong one.
+const productionSupervisorWrites = (entity, extra = {}) =>
+  departmentWrites("production-supervisor", { entity, ...extra });
+
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
-app.use("/api/cms/production/canvas-layout", pmWrites("machine layout"), productionMachineLayout);
+app.use("/api/cms/production/canvas-layout", productionSupervisorWrites("machine layout"), productionMachineLayout);
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
