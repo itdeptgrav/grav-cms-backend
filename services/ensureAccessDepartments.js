@@ -214,4 +214,8 @@ async function ensureAccessDepartments(connection) {
   }
 }
 
-module.exports = { ensureAccessDepartments };
+/* DEPARTMENTS is the canonical map of department → the collection its logins
+   actually live in. Exported because Access Control needs the same list to show
+   and remove those logins, and a second copy would be a second answer to
+   "where does hr@grav.in live". */
+module.exports = { ensureAccessDepartments, DEPARTMENTS };

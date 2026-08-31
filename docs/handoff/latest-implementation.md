@@ -2,6 +2,94 @@
 
 ---
 
+## Access Control can now see — and remove — the accounts that actually sign in
+
+> Nothing committed.
+
+### Why the seeded defaults were invisible
+
+Access Control listed `dept_users`, the access table.
+`services/ensureAccessDepartments` **mirrors** each legacy department login into
+it, reusing the same `_id` — but the mirror is not the credential.
+`routes/login.js` probes the legacy collections themselves (`hrdepartments`,
+`ceodepartments`, …). So:
+
+- an account could exist in a legacy collection with **no mirror**, be invisible
+  on this screen, and still sign in — which is exactly why `hr@grav.in` could
+  not be found; and
+- deleting the mirror would have tidied the screen and **left the login
+  working**, which is worse than not offering the button at all.
+
+There was also already a `showDepartmentLogins` tab, defaulted **off** in the
+CEO console with a reasoned comment: these are the shared legacy passwords the
+access refactor exists to retire, and showing them invites their continued use.
+That was right while they could not be removed. It inverts once they can.
+
+### What was added
+
+| File | Change |
+|---|---|
+| `services/ensureAccessDepartments.js` | Exports `DEPARTMENTS`, the canonical department → legacy-collection map, so Access Control and the mirror service cannot disagree about where a login lives. |
+| `routes/Admin/accessAdmin.js` | `GET /api/admin/department-logins` reads all 13 legacy collections directly — the raw collection, not the models, because a model applies schema defaults and StoreDepartment defaults `role` to `production_manager` while the stored rows say `store_manager`. `DELETE /department-logins/:collection/:id` removes the credential **and** its mirror. Rows with no mirror are flagged, so the previously-invisible ones are named rather than quietly listed. |
+| `lib/accessApi.js`, `components/access/AccessManager.js`, `app/ceo/dashboard/access/page.js` | **One** tab — Department Logins — reading the merged list, with Remove added alongside the existing controls. Turned on for the CEO console. |
+
+**Corrected on review:** the first pass added a second tab beside the existing
+one, so two screens listed overlapping sets of the same people — which is how an
+administrator removes somebody in one place and finds them still able to sign in
+from the other. Merged on the SERVER instead: `/department-logins` now joins each
+legacy credential to its `dept_users` mirror on the shared `_id` and returns one
+row per person, carrying `isAdmin`, department and `mustChangePassword` from the
+mirror. `UserPanel` reads that single endpoint and keeps every control it had —
+move department, reset password, admin toggle, activate — plus Remove. The
+mirror-dependent controls are hidden on an unmirrored credential (marked NOT
+MANAGED), because those routes address the mirror and would 404; Remove is the
+one action that always applies. The second panel is deleted.
+
+Two refusals, both about not locking everybody out: you cannot remove the
+account you are signed in as, and you cannot remove the last active
+administrator. That check reads `dept_users`, because `isAdmin` lives on the
+mirror and Access Control is reachable only by an admin.
+
+### Every seeder is gone
+
+224 lines removed from `server.js` (3175 → 2936). All eight seeder definitions
+plus the `ensureCeoExists()` boot call: cutting-master, CEO, QC, embroidery,
+production-supervisor, accountant, packaging/dispatch — and one more that an
+earlier cleanup had missed.
+
+**`overwriteExistingMeasurements`** was two unrelated jobs in one function: it
+rewrote stock-item measurements for three categories AND created `hr@grav.in`
+with the literal password `Hr@12345`. The account half was invisible from the
+name, which is how it survived a previous seeder sweep — nobody greps for an
+account seeder inside a measurements helper. Nothing called it.
+
+Removing these had to happen for the delete button to mean anything: an account
+removed in Access Control came back on the next restart.
+
+**What this means for an empty database:** there is no automatic way in. A fresh
+deployment needs one administrator inserted by hand, or via
+`scripts/migrations/001-seed-access-departments.js`. That is the intended trade
+— an empty database is a one-off event, a self-healing admin account is a
+permanent one.
+
+`ensureAccessDepartments` stays, and is not a seeder in this sense: it registers
+department rows and mirrors existing logins, creating no credential and
+inventing no password.
+
+### Verification
+
+- Backend restarts clean after the removal; `GET /api/admin/department-logins`
+  answers **401** exactly like its neighbours — mounted and admin-gated.
+- No reference to any removed seeder remains, and no seeded credential
+  (`hr@grav.in`, `Hr@12345`, `CEO@2026`, …) survives anywhere in `server.js`.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- `verifyAccountantPasswordSync.js` 15/15 still green; Access Control compiles.
+
+**Not verified:** the tab driven from a browser — that needs an admin login. The
+first thing worth checking is that `hr@grav.in` now appears in it.
+
+---
+
 ## One person, one password — and Access Control brought to parity with Team
 
 > Nothing committed.
