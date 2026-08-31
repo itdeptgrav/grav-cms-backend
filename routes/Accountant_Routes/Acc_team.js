@@ -29,6 +29,8 @@ const {
   orgAuth,
   requireRole,
 } = require("../../Middlewear/AccountantOrgAuthMiddleware");
+const { setAccountantPassword } = require("../../services/accountantAccess");
+const { recordChange } = require("../../services/changeLog");
 
 router.use(orgAuth);
 
@@ -339,9 +341,45 @@ router.post(
           message: "Owners must reset their own password",
         });
       }
-      await user.setPassword(newPassword);
-      await user.save();
-      res.json({ success: true });
+
+      /* Through the shared service, not `user.setPassword` directly.
+         ---------------------------------------------------------------
+         Somebody who is both an employee and a team member has TWO doors:
+         the CMS login checks Employee.password, the books login checks
+         Acc_User.password. Writing only the second one here produced a reset
+         that reported success and left the CMS door on the old password.
+         The service writes both and says which it touched. */
+      const { employeeUpdated } = await setAccountantPassword(
+        user.email,
+        newPassword,
+      );
+
+      await recordChange(req, {
+        departmentSlug: "accounting",
+        section: "accounting:team",
+        entity: "acc-user",
+        entityId: String(user._id),
+        entityLabel: `${user.name} (${user.email})`,
+        action: "update",
+        summary:
+          `Reset ${user.name}'s password. ` +
+          (employeeUpdated
+            ? "They are also an employee, so their CMS password was changed to match — " +
+              "both sign-in doors now use the new one."
+            : "They sign in to the books only.") +
+          " Their open sessions were ended. The password itself is not recorded.",
+        fields: [
+          { path: "password", label: "Password", to: "[reset]", kind: "changed" },
+        ],
+      });
+
+      res.json({
+        success: true,
+        employeeUpdated,
+        message: employeeUpdated
+          ? "Password updated for the books and for their CMS sign-in."
+          : "Password updated. Their open sessions were ended.",
+      });
     } catch (e) {
       res.status(500).json({ success: false, message: e.message });
     }
@@ -466,11 +504,12 @@ router.put("/:userId/nav-prefs", requireRole("owner"), async (req, res) => {
           "Owners always see the full sidebar. You can't hide items from another owner.",
       });
     }
-    // Write with updateOne + $set rather than doc.save(). If `hiddenNavItems`
-    // is missing from the Acc_User schema, Mongoose's strict mode silently
-    // DROPS the assignment on save() — no error, no write, and the response
-    // still echoes the in-memory value, so it looks like it worked. The
-    // `strict: false` option forces the field through either way.
+    // `hiddenNavItems` is now declared on the Acc_User schema, so a plain
+    // save() would persist too. This stays as updateOne + `strict: false`
+    // because it is the write that cannot regress: if the field is ever
+    // dropped from the schema again, strict mode would silently discard a
+    // save() — no error, no write, and the response still echoing the
+    // in-memory value, which is how this went unnoticed the first time.
     const upd = await Acc_User.updateOne(
       { _id: target._id, organizationId: req.user.organizationId },
       { $set: { hiddenNavItems: cleaned } },

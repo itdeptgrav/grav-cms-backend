@@ -2,6 +2,549 @@
 
 ---
 
+## One person, one password — and Access Control brought to parity with Team
+
+> Nothing committed.
+
+### The schema was already shared; the credential was not
+
+`services/accountantAccess.js` already states the position, and it holds:
+`Acc_User` is the single source of truth, and Access Control reads and writes
+**that** collection rather than a shadow copy — so "add it on one side and it
+appears on the other" is true by construction. Both surfaces already list the
+same rows. Nothing needed unifying there.
+
+What was not shared was the **password**, and the reason is worth stating
+because the old code documented the opposite:
+
+```
+/api/auth/login             (the CMS)     checks Employee.password
+/api/accountant/auth/login  (the books)   checks Acc_User.password
+```
+
+Somebody who is both an employee and a team member therefore has **two**
+passwords. `resetAccountantPassword` refused employees outright, on the
+reasoning that "their credential lives on the HR record and that is the one
+login checks" — true of the CMS door, false of the books door. And the Team
+page's own reset wrote only `Acc_User`, so it reported success and left the CMS
+door on the old password. Refusing did not fix the split; it moved the surprise.
+
+**Now:** `setAccountantPassword(email, password)` writes both and returns which
+it touched, so the person doing it is told what actually happened instead of
+guessing. Wired into all three entry points:
+
+| Entry point | Behaviour |
+|---|---|
+| Accountant → Team → Reset password | writes both; the response says whether the CMS sign-in changed too |
+| Access Control → accountant users → Set password | no longer refuses employees; same service |
+| HR → Password management → change / reset | now also updates `Acc_User` when the person has an accounting role |
+
+The HR direction is best-effort and never fatal: a password reset that worked
+must not report failure because the person happens to also hold an accounting
+role.
+
+**Worth knowing:** this means an accounting owner resetting a team member's
+password also changes that person's CMS password. That is the point — one
+person, one credential — but it is real authority, which is why those routes are
+owner-only and why every call now writes a change-log entry (naming the person,
+never the password).
+
+### Sidebar access — a real parity gap
+
+Access Control had **no** nav-preference endpoints at all, so the two screens
+managed the same people with different powers. Added
+`GET`/`PUT /api/admin/accountant-users/:email/nav-prefs`, both calling the same
+`getAccountantNavPrefs` / `setAccountantNavPrefs` the Team page now uses — the
+dashboard-can-never-be-hidden rule included, so it cannot drift between them.
+
+### A latent bug found on the way
+
+`hiddenNavItems` **was never declared on the `Acc_User` schema.** The Team route
+worked only because somebody had already hit this and written round it with
+`updateOne(..., { strict: false })` plus a read-back, with a comment explaining
+that a plain `save()` is silently dropped under strict mode — no error, no
+write, and the response still echoing the in-memory value.
+
+My first version of the shared helper used `save()` and would have failed
+exactly that way. The field is now declared, so both paths work; the route keeps
+its `strict: false` write, and its comment now says why that is the write that
+cannot regress rather than describing a bug that has been fixed.
+
+### Designation
+
+Already correct — the Team page has no designation field at all. It offers role,
+password, sidebar access and remove, which is the intended set.
+
+### Verification
+
+- `node -r dotenv/config verifyAccountantPasswordSync.js` — **15/15**, new,
+  against the dev database. Creates a throwaway employee-plus-team-member,
+  proves both doors open on the old password, resets once, and proves both doors
+  now take the new one and neither takes the old. Also checks the employee
+  password is stored hashed, that accounting sessions are ended, that an
+  accounting-only user still works and reports `employeeUpdated: false`, and
+  that the dashboard cannot be hidden. Deletes its own rows, including on crash.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- `verifyAuditFloor.js` 22/22, `verifyCompanyDocuments.js` 17/17.
+
+**Not verified:** the two screens driven from a browser — needs an owner login.
+The service behind both is verified directly.
+
+---
+
+## Phantom history entries, a pre-existing crash, and one permissions source
+
+> Three things, found from one screenshot. Nothing committed.
+
+### 1. `gstState is not defined` — pre-existing, and why the PAN edit failed
+
+`routes/Accountant_Routes/Acc_companies.js` referenced `gstState.resolveState()`
+in the PUT handler's address-merge branch, but **never imported it**. Present at
+HEAD, so it predates this work — it just never fired, because the branch only
+runs when an update carries an `address` or `contact` object. Editing any other
+field worked; editing the address threw a ReferenceError, the handler's catch
+returned 500, and the save was lost.
+
+Fixed by importing `services/gstState.util`. Verified it resolves
+`21AABCU9603R1ZM` → Odisha / 21.
+
+### 2. The change history showed things that never changed
+
+Two separate causes, both in the mount-level floor.
+
+**Read-shaped POSTs were counted as writes.** `POST .../companies/verify` is
+GSTIN/PAN verification, fired **on blur** by the company form — so typing a
+GSTIN wrote "changed" to the history twice before anything was saved. Added to
+`READ_SHAPED`, along with `/probe`, `/suggest`, `/resolve`, `/parse`, `/status`
+and `/ping`. `/verify` had to be added explicitly: the list already had
+`/verify-otp`, which is a prefix of nothing.
+
+**Unattributable writes were logged as "Created record".** The floor fell back
+to the word "record" with no section, which produced entries that were true,
+useless, and impossible to trace to a page — and swept up writes that are not
+business changes at all (sidebar pins, saved filters, nav preferences). It now
+records **only when the path maps to a section**. A section is the definition of
+"something we keep history for"; a path with none is not an unrecorded change,
+it is a request nobody decided to record. `AUDIT_TRAIL_DEBUG=1` logs the skipped
+ones so a missing mapping is discoverable rather than silent.
+
+**Also fixed while in there:** the floor listened on `close` as well as `finish`,
+and `close` fires for an **aborted** connection where `statusCode` is still its
+default 200 and nothing was ever sent. Those became history entries for requests
+the client hung up on. Now requires `res.writableEnded`.
+
+A failed save was never logged — `statusCode >= 400` was already skipped, and
+the 500 from §1 took that path. The entries on screen were the verify POSTs and
+unmapped writes above.
+
+### 3. Editor and viewer — checked properly, and one real bug
+
+The concern was that editor/viewer might be unrecognised the way owner was.
+**The backend is sound.** The capability matrix is correct for all four roles
+(owner: everything; approver: edit/post/approve; editor: edit; viewer: view),
+`extractToken` reads `accountant_token` first so sub-accounts authenticate, and
+`/me` returns those permissions. A scan for the owner-bug pattern — a role check
+mounted above its own auth — produced 11 candidates, **all of which were false
+positives** on inspection: each does `router.use(auth)` first and then defines
+helpers that read `req.user` inside handlers. `Acc_bankRecon` even has an
+explicit `blockViewerWrite`.
+
+**The real bug was on the frontend.** `components/accountant/AuthProvider.js`
+computed permissions twice: the exposed `permissions` value fell back to an
+all-false object, while `can()` read the **raw** state and returned false
+whenever it was null. Two sources of truth for one question, disagreeing in
+exactly the window that matters — between a session resolving and `/me`
+returning permissions, `can()` said no to everything, **including to an owner**.
+Every gate in the module goes through `can()`, so an owner could watch their own
+controls disappear.
+
+Now one `resolvedPermissions`, used by both. Failing closed while genuinely
+unknown is right; failing closed in two different places, one of which the rest
+of the app cannot see, is not.
+
+### Verification
+
+- `node verifyAuditFloor.js` — **22/22**, new. Pins the reported cases with no
+  I/O: verification-on-blur, pins, priorities, searches, exports and PDF renders
+  are not recorded; company/voucher/journal/leave/attendance/employee writes
+  still are; and the floor never claims to know a previous value it cannot see.
+- `node verifyCompanyDocuments.js` — 17/17.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- All touched frontend modules compile.
+
+**Not verified:** the history observed from a viewer and an editor session —
+needs those logins. The capability matrix behind it is verified directly.
+
+---
+
+## Accountant RBAC sweep — viewers no longer see controls they cannot use
+
+> The last open item. Nothing committed.
+
+### The measurement came first, and it changed the work
+
+The earlier estimate — "44 of 79 pages ungated" — came from a crude grep for
+`RoleGate` / `canEdit`. Replacing it with a scanner that resolves **which
+onClick handlers actually reach a mutating API call**, and which recognises
+optional chaining (`auth.can?.("canApprove")`) and per-request flags
+(`state.canApprove`) as real gates, produced a much smaller and more accurate
+list: **45 pages perform mutations, and 15 were genuinely ungated.**
+
+Several pages the first pass flagged were already correct. `approvals` gates on
+`canApprove` throughout; `payables/spend-approvals/[id]` disables on a
+per-request `state.canApprove`. Both were false positives of my own regex, found
+by reading rather than by trusting the tool. The scanner lives in the scratchpad;
+its two corrections are commented in it.
+
+### Two mechanisms, because two different problems
+
+`components/accountant/RequireEdit.js` (**new**) guards a whole page.
+`RoleGate` hides one control, which is right on a list — a viewer should read
+the invoices and simply not see Delete. But a **create or edit form is not a
+page with a control on it, it is a control**: gating only its Save button leaves
+a viewer filling in twenty fields, choosing ledgers, adding line items, and
+finding out at the end. Some of those forms are 2,000–3,700 lines, so hunting
+every mutating button inside one is also how a sweep misses three of them.
+
+Fails closed while the role resolves — showing an editable form and snatching it
+back is worse than a beat of blank.
+
+**Guarded at the door (9 form pages):** purchase-vouchers/new,
+sales-vouchers/new, credit-notes/new, credit-notes/[id]/edit, debit-notes/new,
+debit-notes/[id]/edit, proforma-invoices/new, contra-vouchers/new,
+vouchers/new/[type].
+
+**Gated per control (6 pages):** bank-transactions (header import + new
+transaction, per-row reconcile/undo, the whole Setu connect/sync/import
+cluster), recurring-items (add, edit, pause, resume, end), data-cleanup (merge,
++alias), budgets/departments (name it), proforma-invoices/[id] (edit, every
+status transition, delete), companies (done in the previous pass).
+
+**Deliberately left open:** `accept-invite`. It authenticates with an emailed
+token *before* the person has a role at all; gating it would break onboarding.
+It is the one page the scanner still reports, and it should stay that way.
+
+Refresh, search, filter, pagination and export are untouched throughout —
+reading is not editing, and gating them would make the module unusable for the
+role it is meant to serve.
+
+### A bug I introduced and caught
+
+The form guard worked by renaming each page component to `*Inner` and exporting
+a guarded wrapper. **Six of the nine already had an `*Inner`** behind a Suspense
+boundary for `useSearchParams` — so the rename produced a function that rendered
+itself. Infinite recursion plus a duplicate declaration; the dev server returned
+500 and then died compiling it.
+
+Fixed by renaming the existing Suspense shell to `*Suspended` and having the
+guard wrap that, so the chain is guard → Suspense → form. Verified with a check
+that asserts no duplicate declarations and no self-calls across all nine.
+
+This is the entire argument for compiling every batch rather than trusting a
+string replacement that "looks right".
+
+### Verification
+
+- Scanner: **1 page ungated**, and it is `accept-invite` by design (was 15).
+- No duplicate declarations and no self-referencing components across the nine
+  guarded pages.
+- Every touched page compiles in dev — in three batches, because the dev server
+  OOMs compiling the 3,000-line voucher forms in one go and had to be restarted
+  once.
+
+**Not verified:** the gates observed from an actual viewer session — that needs
+a viewer login. What is verified is that the controls are wired to the same
+`canEdit` capability the server enforces.
+
+---
+
+## Company documents — named, optional, and multi-page
+
+> The remaining item from the accountant list. Nothing committed.
+
+### What was wrong
+
+The model was strictly **one file per document**. An Aadhaar has a front and a
+back; a certificate of incorporation runs to four pages; a lease runs to twenty.
+All of those had to go up as separate documents, so the list showed "Aadhaar"
+twice with no way to tell which side was which, and a two-page certificate was
+indistinguishable from two unrelated files. The kind list was eight entries, so
+most real company proofs had nowhere to go but "Other" — where they all shared
+one name.
+
+### Model — `Acc_MasterModels.js`
+
+| Added | Why |
+|---|---|
+| `ACC_COMPANY_DOC_KINDS` | **31 kinds in 7 groups** (Statutory, Constitution, Premises, Banking, Registrations, People, Other). One list, and it is the only one: the schema enum is derived from it and the API serves it to the form, so a kind cannot exist in the dropdown but be rejected by the schema. Every entry is optional — nothing is required, nothing is chased. |
+| `label` on a document | What *this company* calls it. "Other" covers a hundred real documents (a franchise agreement, a pollution consent, a lease addendum) and filing them all under one word makes the list unreadable. The `kind` stays machine-readable so "is the GST certificate on file" is still answerable; the label is what a person reads. Offered on **every** kind, not just Other — two rent agreements for two premises are both rent agreements. |
+| `files[]` on a document | driveFileId, name, mime, bytes, and a free-text `caption` ("Front", "Back", "Page 2"). Free text because front/back and page numbers do not share a vocabulary and an enum would have to guess which one a document uses. |
+| `multi` on a kind | A **hint**, not a rule — marks the kinds that usually run to more than one image so the form can say so. Every kind accepts several files regardless. |
+
+**No migration.** Rows written before this keep their single file in the legacy
+top-level fields; `filesOfDoc()` returns `files` when it has any and synthesises
+file zero from the legacy fields when it does not, so every reader has one path.
+A migration would have to touch every company on every deployment to fix data
+that already reads correctly. The first time something is *appended* to a legacy
+row, its file is promoted into the array, so the two eras never coexist on one
+document.
+
+### Routes — `Acc_companies.js`
+
+- `GET /document-kinds` — the catalogue. Declared **before** `GET /:id` or
+  Express matches "document-kinds" as a company id.
+- `POST /:id/documents` — accepts `file` (one, the old shape) **and** `files`
+  (several), so the older client keeps working through the same handler rather
+  than a second one that would drift. `docId` in the body appends to an existing
+  document instead of creating one. Missing captions are numbered from what is
+  already there, so appending two pages to a three-page certificate gives
+  "Page 4" and "Page 5".
+- `DELETE /:id/documents/:docId/files/:fileId` — one page or side. Losing the
+  back of an Aadhaar because you meant to replace it is a different mistake from
+  losing the Aadhaar. When the last file goes the document goes with it — an
+  empty document is a row claiming a proof is on file when none is.
+- `DELETE /:id/documents/:docId` — now deletes **every** file's bytes. Reading
+  only `driveFileId` would have dropped the record and left all but one scan
+  orphaned on Drive.
+- Download tokens now carry an optional `f` (file id), so a link to page one
+  cannot open page ten. Tokens minted before this carry no `f` and are accepted
+  for the document's first file — the only file they could ever have meant.
+
+### Form — `app/accountant/companies/page.js`
+
+- The four identifier rows show a chip per page with per-file open and remove,
+  plus "Add page / back".
+- "Other documents" is now: a **grouped picker of all 31 kinds**, a **name
+  field** (required only for "Other"), multi-select attach, and per-document
+  rows showing every file as a chip. A per-row **+** adds pages later.
+- `AddToDocument` is its own component **only** because it needs its own file
+  input ref — one shared ref across a list attaches every file to whichever row
+  rendered last.
+- The local `DOC_LABELS` map is deleted rather than kept: a second list of
+  document names is exactly how the dropdown and the schema drift apart.
+- All of it is behind `documents.canEdit`, threaded through from the page.
+
+### Verification
+
+- `node verifyCompanyDocuments.js` — **17/17**. Catalogue shape, the legacy
+  single-file read path, `files` winning over the legacy field when both exist,
+  empty and missing documents not throwing, and custom labels beating catalogue
+  ones.
+- `GET /document-kinds` live: **31 kinds, 7 groups**.
+- `npm test` — 1462/1465, the same 3 pre-existing failures.
+- The rewritten companies page compiles clean in dev.
+
+**Not verified:** an actual multi-file upload end to end — that needs a session
+and a Drive credential. The shape either side of it is covered.
+
+---
+
+## Accountant change history, role visibility, and the RBAC mechanism
+
+> Second accountant pass. The change history is complete; the RBAC work is the
+> mechanism plus the pages in active use, with the full sweep still to do; the
+> company-documents form is not started. Nothing committed.
+
+### The architecture call
+
+Asked whether accounting should join HR's `change_logs` spine or keep its own
+log. **Joined the spine**, because of the stated intention to eventually merge
+every department's history into one admin view: `change_logs` already carries
+`departmentSlug`, so a merged view is this router with the department filter
+removed rather than a rewrite. Keeping a second, differently-shaped log would
+have made that merge a migration.
+
+The accountant module's existing **activity log and approval queue both stay** —
+they answer different questions:
+
+| | answers |
+|---|---|
+| activity log | a document was posted, by whom, when |
+| approval queue | who let an **editor's** submission through |
+| change history | who changed this figure, from what, to what — for **every** role |
+
+The gap that made this necessary is the **owner**: an owner posts directly and
+never enters the approval queue, so nothing anywhere recorded an owner's edits.
+That is exactly what was noticed.
+
+| File | Change |
+|---|---|
+| `routes/Access/changeHistoryRouter.js` | **New.** The six endpoints, extracted from HR's copy into a factory taking `{department, auth, mount}`. The department, the auth and the mount path are parameters; **the query is not** — a per-department query is how two histories start disagreeing. `departmentSlug` is pinned from the factory argument and never read from the request, so an accounts viewer cannot read HR's salary changes by editing a query string. |
+| `routes/HrRoutes/ChangeHistory.js` | 472 lines → 20. Now just a mount. Behaviour unchanged. |
+| `routes/Accountant_Routes/Acc_changeHistory.js` | **New**, the second mount. `accountantReadOnlyAuth`, not `accountantAuth`: reading history is a read, and a viewer is the person most likely to need it. |
+| `services/auditSections.js` | 29 accounting sections grouped like the accountant sidebar, 27 path patterns, and field labels for the money-carrying ones. |
+| `server.js` | Trail + history mounted. **Order is load-bearing** — first attempt put `auditTrail("accounting")` at the bottom of the accountant block, where Express's registration-order matching meant it wrapped none of the routers above it. Moved above the first one. |
+| `routes/Accountant_Routes/Acc_companies.js` | Real before/after on create, update and deactivate. The update's "before" is a **full document fetch**: the `existing` already in that handler is declared inside the address-merge branch (out of scope) *and* is a three-field projection, so reusing it would have been both a `ReferenceError` and, once fixed, a diff reporting every unselected field as newly added — the same trap as the HR employee route. |
+| `lib/changeHistoryApi.js` | `createChangeHistoryApi(base)` factory; `hrHistory` and `accountingHistory` instances. The original named exports still point at HR so existing pages are untouched. |
+| `components/access/ChangeHistory.js`, `RecordStamp.js` | Take a `client` prop, defaulting to HR. The components know nothing about either department — which is what keeps the two histories reading identically. |
+| `app/accountant/change-history/{page,HistoryClient}.js` | **New.** Section rail, stat strip, `?section=` deep links, Suspense boundary. Built on the accountant module's own Tailwind-slate kit, not the HR frost kit. |
+| `components/accountant/Sidebar.js` | "Change History" under Admin, ungated. |
+
+### Role visibility, and the RBAC position
+
+`components/accountant/ReadOnlyNotice.js` (**new**, mounted in `LayoutShell`)
+tells a view-only user which role they are in and what it can do. Renders
+nothing for anyone who can edit. This is the half that works **everywhere
+immediately**, whatever a given page has or has not been gated yet — a wrong
+button with a clear explanation is much better than a wrong button alone.
+
+`app/accountant/companies/page.js` had a genuine gap: `canAttach` asked only
+"is there a company to attach to", never "may this person change anything", and
+the Remove cross on a certificate was ungated outright. A viewer saw live
+Attach and Remove controls on every certificate. `canEdit` is now threaded
+through `CompanyForm` → `useCompanyDocs` → `IdentifierRow`, carried on the
+shared documents object so the rows and the Other list cannot disagree.
+
+**The measured position** (see the audit in the previous entry): every
+accountant write is authenticated server-side, so this is presentation, not
+exposure. 44 of 79 pages still have mutation controls with little or no gating —
+worst are chart-of-accounts (41 mutation points, 64 buttons), bank-transactions
+(23) and tax-filings (13).
+
+### Verification
+
+- `npm test` (backend) — **1462 / 1465**, the 3 pre-existing
+  `blockedDeadline` / `salesJourneyOutcome` failures, confirmed on a clean tree.
+- `node --test lib/accounting/taxableSplit.test.mjs` — **10/10**.
+- Both history routes answer **401** like their neighbours; HR's still does
+  after the extraction, which is the check that the refactor was behaviour-neutral.
+- Every changed frontend module compiles in dev; both clients resolve to their
+  own base and the accounting export URL is correctly formed.
+- `node --check` clean across every touched backend file.
+
+**Not verified:** the accountant history rendered with real rows in a logged-in
+session — needs credentials.
+
+### Remaining
+
+1. **Company documents form** — not started. Named custom document fields,
+   multiple files per document (front/back, multi-page certificates), and the
+   wider set of optional proofs. The model is currently strictly
+   one-file-per-document (`driveFileId` on the sub-document), so this needs a
+   `files[]` array with the legacy top-level fields read as file zero to avoid a
+   migration, per-file download tokens, and the form work. Deliberately not
+   begun rather than left half-built.
+2. **RBAC sweep** — the remaining 43 pages.
+3. **Deeper accountant instrumentation** — the mount-level trail records every
+   accountant write already (including an owner's, which was the point), but
+   only `Acc_companies` has hand-written before/after. Vouchers and
+   chart-of-accounts are the next most valuable.
+
+---
+
+## Accountant module — owner gate, taxable value, Tally import retired
+
+> First pass on the accountant side. Four of the seven items raised are done;
+> the remaining three are named at the end with why they were not started rather
+> than half-started. Nothing committed.
+
+### 1. "Only the owner can add or manage companies" — refused everybody
+
+Not a role problem. `routes/Accountant_Routes/Acc_companies.js` mounted an
+owner gate with `router.use` that read `req.user?.role`, and **nothing above it
+put a user there**: that router applies `accountantAuth` on exactly one route
+(`/:id/default-credit-days`). On every other write `req.user` was `undefined`,
+`isOwner` was `false`, and the owner was refused along with everyone else.
+
+The same trap `Middlewear/departmentWriteGuard.js` documents: a permission check
+mounted above a router runs *before* that router's own auth.
+
+Fixed by authenticating first, then checking the **`canManageSettings`
+capability** rather than comparing the role name — that is what the role system
+already calls this, it is owner-only by its own definition, and it keeps the
+module's two role vocabularies (legacy names, new capabilities) from having to
+agree in this one spot. The refusal now names the role you are signed in as, so
+the next person to hit it is not left guessing.
+
+### 2. Total taxable value counted 0%-GST lines
+
+Reported on the purchase voucher, and it was in five screens. Every one summed
+*every* line and called it "Total taxable value", so ten pieces at 18% plus ten
+at 0% reported ₹2,000 of taxable value with ₹180 of tax under it — 9% of the
+number printed directly above.
+
+| File | Change |
+|---|---|
+| `lib/accounting/taxableSplit.js` | **New.** One rule, `splitByTaxability` / `splitLineTotals`. Split rather than subtract: dropping the 0% lines would fix the arithmetic and lose the money, leaving a document that no longer foots to its own grand total. GSTR-1 already reports taxable supplies separately from nil-rated ones, so the value goes into two named buckets that still add up. |
+| `lib/accounting/taxableSplit.test.mjs` | **New**, 10 cases including the exact reported figures. |
+| purchase-vouchers/new, sales-vouchers/new, debit-notes/new, debit-notes/[id]/edit, credit-notes/[id]/edit | Show `taxableValue`, plus a "Nil-rated / exempt" row **only when it holds money** — but never hidden then, or the strip stops adding up. `totals.subtotal` is untouched, because that is what the ledger postings use. |
+
+`credit-notes/new` was deliberately left alone: its figure is a **column footer**
+under a "Taxable" column, so it must foot to that column.
+
+The tests caught a real bug on the first run: the option was named `valueOf`, and
+destructuring a default walks the prototype chain — `{ valueOf = fn } = {}` finds
+`Object.prototype.valueOf` and binds that, which throws on first call. Every
+caller would have broken. Renamed `amountOf`.
+
+The untaxed bucket is one bucket, not three. Nil-rated, exempt and non-GST are
+different things in law, and the difference is a property of the *item*, not of a
+rate field holding 0. Splitting them properly needs a supply-type on the line;
+one honest bucket beats three guessed ones.
+
+### 3. Tally import retired
+
+Scoped to what was asked — the ability to import again, not the imported data.
+
+- Deleted `app/accountant/import/` (wizard + history) and
+  `app/accountant/tally/import/`, and the "Import & Sync" sidebar entry.
+- `routes/Accountant_Routes/Acc_import.js` answers **410 Gone** on everything,
+  via one `router.use` at the top. Removing a screen is not removing a
+  capability: the endpoints still accepted a file and still wrote vouchers, and
+  a bookmark or a stale tab could re-run an import over live books. 410 rather
+  than 404 because the route existed and the data it created is still in the
+  books.
+- The handlers below that guard are **left intact**. They are the only written
+  record of how the existing data was mapped and committed. To re-enable: delete
+  the one middleware.
+- `services/tally*.service.js` and `Acc_importMapping` untouched, as asked.
+
+### 4. Security position on roles — audited, and it is sound
+
+Before sweeping 44 pages of UI, the question worth answering was whether a viewer
+clicking a button they should not see actually gets through. Audited all 39
+accountant routers, 200+ write handlers:
+
+- Every write is authenticated. Several routers alias the middleware
+  (`const auth = accountantAuth`) or use `verifyAccountantToken`, which a naive
+  grep reports as unguarded — checked each by hand rather than trusting it.
+- `accountantAuth` refuses a viewer's non-GET with 403 (`canEdit` is false), so
+  the data is safe.
+- **`Acc_companies` was the one real hole**, and it is the bug fixed in §1.
+
+So the viewer problem is a **UI consistency** issue — viewers see controls that
+will fail — not a data-security one. That is worth knowing before spending a day
+on it, and it is why the sweep is listed as remaining rather than rushed.
+
+### Verification
+
+- `node --test lib/accounting/taxableSplit.test.mjs` — **10/10**.
+- `npm test` (backend) — **1462 / 1465**; the 3 failures are the pre-existing
+  `blockedDeadline` / `salesJourneyOutcome` ones, confirmed on a clean tree.
+- Rendered the split against the reported figures: `taxable=1000 nil=1000
+  total=2000`.
+- All changed accountant pages plus the sidebar compile in dev with no errors;
+  no dangling references to the removed import routes.
+
+### Not started, and why
+
+1. **Accountant change history.** The HR spine (`services/auditSections.js`,
+   `Middlewear/auditTrail.js`, `recordChange`) extends to accounting with a
+   section list and a mount line — but the accountant module has its **own**
+   activity log already (`Acc_ActivityLog`, written by
+   `AccountantAuthMiddleware`'s helper). Wiring a second log beside it without
+   deciding which one wins would leave two half-histories, which is the exact
+   failure the HR work set out to fix. Needs a deliberate call first.
+2. **Company documents form** — named custom document fields, multiple images
+   per document (front/back, multi-page certificates), and the wider set of
+   optional proofs. Schema plus upload plumbing plus form; a real piece of work.
+3. **Viewer RBAC sweep** — 44 of 79 pages have mutation controls with no gating
+   (worst: chart-of-accounts 41, bank-transactions 23, tax-filings 13). The
+   `RoleGate` primitive already exists and is correct; this is applying it. Per
+   §4 it is presentation, not exposure.
+
+---
+
 ## PL eligibility reconcile, overtime & regularisation history, record stamps
 
 > Follow-on to the HR change-history work below. Five items the user raised

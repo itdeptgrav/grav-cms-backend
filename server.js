@@ -1820,6 +1820,24 @@ console.log("[accountant] mounting routes…");
 //   • /auth has public endpoints (login, accept-invite, bootstrap) that
 //     must work without prior auth
 //   • /team and /approvals self-protect with orgAuth internally
+/* The accountant module's change history, and the floor that fills it.
+
+   Same spine as HR (change_logs, section-scoped) — see
+   routes/Access/changeHistoryRouter.js for why it is one factory rather than a
+   router per department, and for where a merged admin-wide view would come from.
+
+   ORDER IS LOAD-BEARING. Express matches middleware in registration order, so
+   the trail has to be mounted ABOVE every accountant router or it wraps only
+   the ones declared after it — which, mounted at the bottom of this section,
+   was none of the interesting ones. The read API goes above the trail for the
+   same reason: a GET is skipped anyway, but this way the history can never end
+   up logging requests for the history. */
+app.use(
+  "/api/accountant/change-history",
+  require("./routes/Accountant_Routes/Acc_changeHistory"),
+);
+app.use("/api/accountant", auditTrail("accounting"));
+
 app.use("/api/accountant/auth", require("./routes/Accountant_Routes/Acc_auth"));
 app.use("/api/accountant/team", require("./routes/Accountant_Routes/Acc_team"));
 app.use(

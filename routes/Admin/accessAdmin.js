@@ -1101,6 +1101,9 @@ const {
   findAccountantUser,
   setAccountantRole,
   resetAccountantPassword,
+  setAccountantPassword,
+  getAccountantNavPrefs,
+  setAccountantNavPrefs,
   revokeAccountantRole,
   deleteAccountantUser,
 } = require("../../services/accountantAccess");
@@ -1313,8 +1316,13 @@ router.get("/accountant-role/:email", async (req, res) => {
 /**
  * POST /api/admin/accountant-users/:email/set-password
  *
- * Only for accounting-only users. The service refuses employees, because their
- * password lives on the HR record and that is what login actually checks.
+ * Works for everybody with an accounting role, employee or not.
+ *
+ * It used to refuse employees, on the reasoning that their password lives on
+ * the HR record and that is what login checks. That is only half true: the CMS
+ * login checks Employee.password, the books login checks Acc_User.password, so
+ * such a person has TWO passwords and refusing the reset just moved the
+ * surprise. The service now writes both — see setAccountantPassword.
  */
 router.post("/accountant-users/:email/set-password", async (req, res) => {
   try {
@@ -1323,12 +1331,56 @@ router.post("/accountant-users/:email/set-password", async (req, res) => {
       return fail(res, 400, "The password must be at least 8 characters");
     }
 
-    await resetAccountantPassword(req.params.email, password);
+    const { employeeUpdated } = await setAccountantPassword(
+      req.params.email,
+      password,
+    );
     audit(req, "accountant.set-password", req.params.email);
 
     res.json({
       success: true,
-      message: `Password updated for ${req.params.email}. Their open sessions were ended.`,
+      employeeUpdated,
+      message:
+        `Password updated for ${req.params.email}. Their open sessions were ended.` +
+        (employeeUpdated
+          ? " They are also an employee, so their CMS sign-in now uses the same password."
+          : ""),
+    });
+  } catch (error) {
+    fail(res, 400, error.message);
+  }
+});
+
+/**
+ * GET / PUT /api/admin/accountant-users/:email/nav-prefs
+ *
+ * The same "Sidebar access" the accountant Team page offers. Access Control had
+ * no equivalent, so the two screens managed the same people with different
+ * powers — which is the drift this whole file exists to avoid. Both now call
+ * the same helpers in services/accountantAccess.
+ */
+router.get("/accountant-users/:email/nav-prefs", async (req, res) => {
+  try {
+    res.json({ success: true, ...(await getAccountantNavPrefs(req.params.email)) });
+  } catch (error) {
+    fail(res, 404, error.message);
+  }
+});
+
+router.put("/accountant-users/:email/nav-prefs", async (req, res) => {
+  try {
+    const { hiddenNavItems } = req.body || {};
+    if (!Array.isArray(hiddenNavItems)) {
+      return fail(res, 400, "hiddenNavItems must be an array of paths");
+    }
+
+    const saved = await setAccountantNavPrefs(req.params.email, hiddenNavItems);
+    audit(req, "accountant.nav-prefs", req.params.email);
+
+    res.json({
+      success: true,
+      hiddenNavItems: saved?.hiddenNavItems || [],
+      message: `Sidebar updated for ${req.params.email}. They see it on their next page load.`,
     });
   } catch (error) {
     fail(res, 400, error.message);
