@@ -121,7 +121,6 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
       { $set: { isActive: false } },
       { new: true },
     );
-    dropRoleCaches(slug, mail);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -157,9 +156,20 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
     { new: true, upsert: true, setDefaultsOnInsert: true },
   );
 
-  // Whole-department, not just this email: promoting an owner demotes the
-  // incumbent above, so somebody else's cached role is stale too.
-  dropRoleCaches(slug, null);
+  /* There was a `dropRoleCaches(slug, null)` here, and another on the revoke
+     path above. Neither ever existed: nothing in this file, or anywhere in the
+     role path, defines or imports it — so every call to setRole threw
+     `ReferenceError: dropRoleCaches is not defined`.
+
+     The damage was worse than a failed request. The throw came AFTER the
+     database write, so the role change landed and was then reported as an
+     error: the caller saw a red banner, the role had actually changed, and
+     re-trying looked like it did nothing.
+
+     Removed rather than implemented. `getRole` and `listRoles` read the
+     database on every call — there is no cache in front of them to invalidate,
+     so a cache-drop here would be a no-op at best. If one is ever added, its
+     invalidation belongs next to it, not as an undefined name here. */
 
   return { role: row.role, created: !before, previous: before?.role || null };
 }
@@ -187,6 +197,14 @@ function requireDepartmentRole(departmentSlug, required = "editor") {
       if (!email) {
         return res.status(401).json({ success: false, message: "Not authenticated" });
       }
+
+      /* A platform administrator is not part of any department's chain.
+         `requireApproval` in services/changeRequests.js already lets them
+         through (`req.user?.isAdmin || req.admin`); this guard did not, so the
+         two disagreed about the same person — an admin could be refused here
+         and waved through there depending on which guard a route happened to
+         reach first. They now agree. */
+      if (req.user?.isAdmin || req.admin) return next();
 
       const slug = String(departmentSlug || "").toLowerCase();
       const assigned = await listRoles(slug);

@@ -2,6 +2,136 @@
 
 ---
 
+## HR approvals — the page, and why the queue is not switched on with it
+
+> Nothing committed.
+
+### The page
+
+`app/hr/dashboard/approvals/page.js` — 24 lines, because the queue screen is
+already shared. `components/access/ApprovalQueue` takes a slug and nothing in it
+is department-specific; Sales and Production use the same one. Plus an
+**Approvals** nav entry under System, with its own icon rather than reusing the
+SOP clipboard.
+
+Deliberately **not** role-gated. An editor has to be able to open it: it is
+where they see their change is still waiting and read the reason if it was
+refused. The server already decides what each role sees — an editor's queue
+contains only their own requests, and the decision buttons are absent.
+
+### Why the write guard was NOT mounted for HR
+
+`departmentWrites("hr", …)` is the piece that would actually hold an editor's
+write. It is not mounted, and mounting it today would break HR for most of the
+team. Two measured reasons:
+
+**1. There are no HR editors.** The `DepartmentRole` table holds 27 rows; HR's
+three are **two approvers and one owner**. Approvers and owners commit directly —
+`requireApproval` waves them through — so with the guard mounted the queue would
+still be empty. Nothing to approve until an editor exists.
+
+**2. Anyone without an HR role would be locked out.** `requireDepartmentRole`
+refuses an unknown email with `NO_DEPARTMENT_ROLE`. Only three people have an HR
+role row; every other HR user writes today through `EmployeeAuthMiddlewear` with
+no `DepartmentRole` at all. Mounting the guard would 403 their attendance
+overrides, leave approvals and employee edits immediately.
+
+That is not hypothetical — the comment above the Production mount records
+exactly this happening: *"every supervisor's save 403'd with
+NO_DEPARTMENT_ROLE — they have no role in that department"*.
+
+**To switch it on**, in order:
+1. give every HR user a role in CEO → Access Control (editors for the people
+   whose work should be reviewed, approvers for those it should not);
+2. add one line beside the Sales and Production mounts in `server.js`:
+   `app.use("/api/hr", departmentWrites("hr", { entity: "HR record", exempt: [...] }))`.
+
+The `exempt` list matters and is worth writing carefully: HR self-service
+(`/profile`, `/change-password` — nobody should need approval to change their own
+password), the sync and backfill endpoints, and the bulk import, whose payload
+exceeds the 256 KB the queue can store and would 413 rather than queue.
+
+I have left that line out rather than adding it commented-out — a commented mount
+is a thing somebody uncomments without reading the list above it.
+
+### A guard inconsistency fixed on the way
+
+`requireApproval` exempts platform administrators (`req.user?.isAdmin ||
+req.admin`). `requireDepartmentRole` did not. The same admin was therefore
+refused by one guard and waved through by the other, depending on which a route
+reached first — and the write guard runs both in sequence, so the refusal won.
+They now agree.
+
+### Verification
+
+- `node -r dotenv/config verifyDepartmentRoles.js` — **15/15** still green after
+  the guard change.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- The HR approvals page compiles; `/api/change-requests` answers 401 (mounted).
+
+**Not verified:** the queue with a real held request in it — that needs an HR
+editor and the mount, per above.
+
+---
+
+## `dropRoleCaches is not defined` — every department role change was failing
+
+> A one-line fix with a wide blast radius. Pre-existing, present at HEAD.
+> Nothing committed.
+
+### What it was
+
+`services/departmentRoles.js` called `dropRoleCaches(slug, mail)` on the revoke
+path and `dropRoleCaches(slug, null)` on the grant path. **Nothing anywhere
+defines or imports it.** So every call to `setRole` threw
+`ReferenceError: dropRoleCaches is not defined` — which is every grant, every
+role change and every revoke, in every department that uses this service.
+
+### Why it was worse than a failed request
+
+The throw came **after** the database write. `findOneAndUpdate` had already
+landed, so the sequence was:
+
+1. the role change is written
+2. the cache-drop throws
+3. the route returns 500 and the screen shows a red banner
+
+The change had actually applied. Anybody seeing that banner would reasonably
+conclude it had not, retry, and watch the same error — with the role quietly
+correct underneath the whole time. **Roles you set while seeing this error are
+very likely already in place**, so it is worth reading the current state before
+redoing anything.
+
+### The fix
+
+Both calls removed, not implemented. `getRole` and `listRoles` read the database
+on every call — there is no cache in front of them, so a cache-drop would be a
+no-op at best. Adding a cache to justify the invalidation would have introduced
+staleness nobody asked for. The comment left in its place says so, and says
+where invalidation should live if a cache is ever added.
+
+### Verification
+
+`node -r dotenv/config verifyDepartmentRoles.js` — **15/15**, new, against the
+dev database. Covers the whole path that was broken: grant, read back, change a
+role, the one-owner-per-department demotion, list, revoke, and the two reads that
+must return null rather than throw (unknown department, blank email). It works in
+a throwaway department slug with throwaway addresses and deletes its own rows,
+including on crash.
+
+`npm test` — 1462/1465, the same three pre-existing failures.
+
+### Two of these now
+
+This is the second bug of exactly this shape found from a screenshot —
+`gstState is not defined` in `Acc_companies.js` was the first, also
+used-but-never-imported, also only firing on one branch. Both were invisible to
+`node --check` because a `ReferenceError` is a runtime event, and both sat on
+paths with no test. Worth a grep for other undefined identifiers in the write
+paths if there is ever a quiet moment.
+
+---
+
 ## Access Control can now see — and remove — the accounts that actually sign in
 
 > Nothing committed.
