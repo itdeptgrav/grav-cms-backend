@@ -119,6 +119,16 @@ const accountantUserSchema = new mongoose.Schema(
     // user grants notification permission. Empty until the frontend registers
     // one — email notifications work without it.
     fcmTokens: { type: [String], default: [] },
+
+    /* Which sidebar entries this person has had hidden — the "Sidebar access"
+       control on the Team page and in Access Control.
+
+       DECLARED, at last. It was being written with
+       `updateOne(..., { strict: false })` because it was missing from this
+       schema, and a plain `doc.save()` therefore dropped it silently: no error,
+       no write, and the response still echoed the in-memory value so it looked
+       like it had worked. Anything that writes it can now use either path. */
+    hiddenNavItems: { type: [String], default: [] },
     // Audit
     invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
   },

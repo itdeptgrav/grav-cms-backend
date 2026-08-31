@@ -10,6 +10,11 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const creditTerms = require("../../services/creditTerms.service");
 const taxIdentity = require("../../services/taxIdentity.service");
 const gstPortal = require("../../services/gstPortal.service");
+/* Used by the address merge in PUT /:id to derive a state code from the GSTIN.
+   It was referenced there but never imported — a pre-existing ReferenceError
+   that only fired when an update carried an `address` or `contact` object, so
+   editing any other field worked and editing the address did not. */
+const gstState = require("../../services/gstState.util");
 const multer = require("multer");
 const drive = require("../../services/companyDrive.service");
 const {

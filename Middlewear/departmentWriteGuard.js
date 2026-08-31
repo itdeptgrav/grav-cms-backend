@@ -107,6 +107,26 @@ const READ_SHAPED = [
   "/login",
   "/logout",
   "/refresh",
+
+  /* Added after these turned up in the change history as edits. Each one is a
+     POST only because its input does not fit in a query string:
+
+       /verify    GSTIN and PAN verification — the accountant company form
+                  fires it on blur, so typing a GSTIN wrote "changed" to the
+                  history twice before anything had been saved
+       /probe, /suggest, /resolve, /parse   read-and-return helpers
+       /status, /ping                       liveness and connector checks
+
+     `/verify` deliberately sits alongside the older `/verify-otp`: that one is
+     a prefix of nothing, and leaving only it meant every plain verification
+     endpoint counted as a write. */
+  "/verify",
+  "/probe",
+  "/suggest",
+  "/resolve",
+  "/parse",
+  "/status",
+  "/ping",
 ];
 
 function isReadShaped(path) {

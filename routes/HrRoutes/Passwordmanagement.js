@@ -370,6 +370,7 @@ router.patch(
       await Model.findByIdAndUpdate(id, { password: hashed });
 
       const userName = getUserName(user, userType);
+      const alsoAccountant = await syncAccountantPassword(user.email, newPassword);
 
       await auditCredential(req, {
         entityId: String(id),
@@ -377,6 +378,10 @@ router.patch(
         action: "update",
         summary:
           `Set a new password for ${userName}, a ${userType} account. ` +
+          (alsoAccountant
+            ? "They also hold an accounting role, so the books' sign-in was " +
+              "changed to match and their accounting sessions were ended. "
+            : "") +
           `The password itself is not recorded anywhere in this history.`,
         fields: [
           { path: "password", label: "Password", to: "[changed]", kind: "changed" },
@@ -464,12 +469,17 @@ router.post(
 
       await Model.findByIdAndUpdate(id, { password: hashed });
 
+      const alsoAccountant = await syncAccountantPassword(user.email, tempPassword);
+
       await auditCredential(req, {
         entityId: String(id),
         entityLabel: `${userName} (${userType})`,
         action: "update",
         summary:
           `Reset ${userName}'s password. ` +
+          (alsoAccountant
+            ? "They also hold an accounting role, so the books' sign-in was changed to match. "
+            : "") +
           (userType === "employee"
             ? "It is now the default format built from their mobile number, so anybody who knows that number can sign in as them until they change it."
             : "A temporary password was generated and shown once to whoever performed the reset."),
@@ -687,6 +697,39 @@ router.post("/bulk-reset", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
 // were changed, by whom, and when. A history that leaks the password it is
 // recording would be a worse problem than the one it solves.
 const { recordChange } = require("../../services/changeLog");
+
+/**
+ * Keep the books' door on the same key.
+ *
+ * Somebody who is both an employee and an accounting team member has two
+ * passwords: the CMS login checks Employee.password, the accountant login
+ * checks Acc_User.password. Resetting one and not the other leaves a door open
+ * on the old one — which is the same bug the accountant Team page had in the
+ * other direction, so it is fixed in both places rather than one.
+ *
+ * Best effort and never fatal: an HR password reset that worked must not report
+ * failure because the person happens to also have an accounting role.
+ * Returns true when a second credential was actually updated, so the caller can
+ * say so instead of guessing.
+ */
+async function syncAccountantPassword(email, plain) {
+  const address = String(email || "").toLowerCase().trim();
+  if (!address) return false;
+  try {
+    const {
+      findAccountantUser,
+    } = require("../../services/accountantAccess");
+    const accUser = await findAccountantUser(address);
+    if (!accUser) return false;
+    await accUser.setPassword(plain);
+    accUser.tokenVersion = (accUser.tokenVersion || 0) + 1; // end their sessions
+    await accUser.save();
+    return true;
+  } catch (e) {
+    console.warn("[password-management] accountant sync failed:", e.message);
+    return false;
+  }
+}
 const auditCredential = (req, entry) =>
   recordChange(req, {
     departmentSlug: "hr",

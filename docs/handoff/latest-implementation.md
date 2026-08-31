@@ -2,6 +2,181 @@
 
 ---
 
+## One person, one password — and Access Control brought to parity with Team
+
+> Nothing committed.
+
+### The schema was already shared; the credential was not
+
+`services/accountantAccess.js` already states the position, and it holds:
+`Acc_User` is the single source of truth, and Access Control reads and writes
+**that** collection rather than a shadow copy — so "add it on one side and it
+appears on the other" is true by construction. Both surfaces already list the
+same rows. Nothing needed unifying there.
+
+What was not shared was the **password**, and the reason is worth stating
+because the old code documented the opposite:
+
+```
+/api/auth/login             (the CMS)     checks Employee.password
+/api/accountant/auth/login  (the books)   checks Acc_User.password
+```
+
+Somebody who is both an employee and a team member therefore has **two**
+passwords. `resetAccountantPassword` refused employees outright, on the
+reasoning that "their credential lives on the HR record and that is the one
+login checks" — true of the CMS door, false of the books door. And the Team
+page's own reset wrote only `Acc_User`, so it reported success and left the CMS
+door on the old password. Refusing did not fix the split; it moved the surprise.
+
+**Now:** `setAccountantPassword(email, password)` writes both and returns which
+it touched, so the person doing it is told what actually happened instead of
+guessing. Wired into all three entry points:
+
+| Entry point | Behaviour |
+|---|---|
+| Accountant → Team → Reset password | writes both; the response says whether the CMS sign-in changed too |
+| Access Control → accountant users → Set password | no longer refuses employees; same service |
+| HR → Password management → change / reset | now also updates `Acc_User` when the person has an accounting role |
+
+The HR direction is best-effort and never fatal: a password reset that worked
+must not report failure because the person happens to also hold an accounting
+role.
+
+**Worth knowing:** this means an accounting owner resetting a team member's
+password also changes that person's CMS password. That is the point — one
+person, one credential — but it is real authority, which is why those routes are
+owner-only and why every call now writes a change-log entry (naming the person,
+never the password).
+
+### Sidebar access — a real parity gap
+
+Access Control had **no** nav-preference endpoints at all, so the two screens
+managed the same people with different powers. Added
+`GET`/`PUT /api/admin/accountant-users/:email/nav-prefs`, both calling the same
+`getAccountantNavPrefs` / `setAccountantNavPrefs` the Team page now uses — the
+dashboard-can-never-be-hidden rule included, so it cannot drift between them.
+
+### A latent bug found on the way
+
+`hiddenNavItems` **was never declared on the `Acc_User` schema.** The Team route
+worked only because somebody had already hit this and written round it with
+`updateOne(..., { strict: false })` plus a read-back, with a comment explaining
+that a plain `save()` is silently dropped under strict mode — no error, no
+write, and the response still echoing the in-memory value.
+
+My first version of the shared helper used `save()` and would have failed
+exactly that way. The field is now declared, so both paths work; the route keeps
+its `strict: false` write, and its comment now says why that is the write that
+cannot regress rather than describing a bug that has been fixed.
+
+### Designation
+
+Already correct — the Team page has no designation field at all. It offers role,
+password, sidebar access and remove, which is the intended set.
+
+### Verification
+
+- `node -r dotenv/config verifyAccountantPasswordSync.js` — **15/15**, new,
+  against the dev database. Creates a throwaway employee-plus-team-member,
+  proves both doors open on the old password, resets once, and proves both doors
+  now take the new one and neither takes the old. Also checks the employee
+  password is stored hashed, that accounting sessions are ended, that an
+  accounting-only user still works and reports `employeeUpdated: false`, and
+  that the dashboard cannot be hidden. Deletes its own rows, including on crash.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- `verifyAuditFloor.js` 22/22, `verifyCompanyDocuments.js` 17/17.
+
+**Not verified:** the two screens driven from a browser — needs an owner login.
+The service behind both is verified directly.
+
+---
+
+## Phantom history entries, a pre-existing crash, and one permissions source
+
+> Three things, found from one screenshot. Nothing committed.
+
+### 1. `gstState is not defined` — pre-existing, and why the PAN edit failed
+
+`routes/Accountant_Routes/Acc_companies.js` referenced `gstState.resolveState()`
+in the PUT handler's address-merge branch, but **never imported it**. Present at
+HEAD, so it predates this work — it just never fired, because the branch only
+runs when an update carries an `address` or `contact` object. Editing any other
+field worked; editing the address threw a ReferenceError, the handler's catch
+returned 500, and the save was lost.
+
+Fixed by importing `services/gstState.util`. Verified it resolves
+`21AABCU9603R1ZM` → Odisha / 21.
+
+### 2. The change history showed things that never changed
+
+Two separate causes, both in the mount-level floor.
+
+**Read-shaped POSTs were counted as writes.** `POST .../companies/verify` is
+GSTIN/PAN verification, fired **on blur** by the company form — so typing a
+GSTIN wrote "changed" to the history twice before anything was saved. Added to
+`READ_SHAPED`, along with `/probe`, `/suggest`, `/resolve`, `/parse`, `/status`
+and `/ping`. `/verify` had to be added explicitly: the list already had
+`/verify-otp`, which is a prefix of nothing.
+
+**Unattributable writes were logged as "Created record".** The floor fell back
+to the word "record" with no section, which produced entries that were true,
+useless, and impossible to trace to a page — and swept up writes that are not
+business changes at all (sidebar pins, saved filters, nav preferences). It now
+records **only when the path maps to a section**. A section is the definition of
+"something we keep history for"; a path with none is not an unrecorded change,
+it is a request nobody decided to record. `AUDIT_TRAIL_DEBUG=1` logs the skipped
+ones so a missing mapping is discoverable rather than silent.
+
+**Also fixed while in there:** the floor listened on `close` as well as `finish`,
+and `close` fires for an **aborted** connection where `statusCode` is still its
+default 200 and nothing was ever sent. Those became history entries for requests
+the client hung up on. Now requires `res.writableEnded`.
+
+A failed save was never logged — `statusCode >= 400` was already skipped, and
+the 500 from §1 took that path. The entries on screen were the verify POSTs and
+unmapped writes above.
+
+### 3. Editor and viewer — checked properly, and one real bug
+
+The concern was that editor/viewer might be unrecognised the way owner was.
+**The backend is sound.** The capability matrix is correct for all four roles
+(owner: everything; approver: edit/post/approve; editor: edit; viewer: view),
+`extractToken` reads `accountant_token` first so sub-accounts authenticate, and
+`/me` returns those permissions. A scan for the owner-bug pattern — a role check
+mounted above its own auth — produced 11 candidates, **all of which were false
+positives** on inspection: each does `router.use(auth)` first and then defines
+helpers that read `req.user` inside handlers. `Acc_bankRecon` even has an
+explicit `blockViewerWrite`.
+
+**The real bug was on the frontend.** `components/accountant/AuthProvider.js`
+computed permissions twice: the exposed `permissions` value fell back to an
+all-false object, while `can()` read the **raw** state and returned false
+whenever it was null. Two sources of truth for one question, disagreeing in
+exactly the window that matters — between a session resolving and `/me`
+returning permissions, `can()` said no to everything, **including to an owner**.
+Every gate in the module goes through `can()`, so an owner could watch their own
+controls disappear.
+
+Now one `resolvedPermissions`, used by both. Failing closed while genuinely
+unknown is right; failing closed in two different places, one of which the rest
+of the app cannot see, is not.
+
+### Verification
+
+- `node verifyAuditFloor.js` — **22/22**, new. Pins the reported cases with no
+  I/O: verification-on-blur, pins, priorities, searches, exports and PDF renders
+  are not recorded; company/voucher/journal/leave/attendance/employee writes
+  still are; and the floor never claims to know a previous value it cannot see.
+- `node verifyCompanyDocuments.js` — 17/17.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- All touched frontend modules compile.
+
+**Not verified:** the history observed from a viewer and an editor session —
+needs those logins. The capability matrix behind it is verified directly.
+
+---
+
 ## Accountant RBAC sweep — viewers no longer see controls they cannot use
 
 > The last open item. Nothing committed.
