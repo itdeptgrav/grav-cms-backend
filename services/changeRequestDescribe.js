@@ -104,7 +104,13 @@ function personName(d) {
     [d.firstName, d.lastName].filter(Boolean).join(" ").trim() ||
     d.fullName ||
     "";
-  return d.employeeId ? `${name || d.employeeId} (${d.employeeId})` : name;
+  // biometricId, not employeeId: `employeeId` is a VIRTUAL on the Employee
+  // schema aliasing biometricId, and virtuals do not exist on a .lean()
+  // document or in a .select() projection. Reading it off a lean query is
+  // always undefined — silently, which is why an employee code never
+  // appeared here.
+  const code = d.biometricId || d.employeeId || "";
+  return code ? `${name || code} (${code})` : name;
 }
 
 /**
@@ -142,7 +148,7 @@ async function loadBefore(path) {
     const Model = entry.model();
     let doc = /^[0-9a-f]{24}$/i.test(id)
       ? await Model.findById(id).lean()
-      : await Model.findOne({ employeeId: id }).lean();
+      : await Model.findOne({ biometricId: id }).lean();
     // Bring the stored record into the same terms the form submits in — see
     // the note on the Employee entry above.
     if (doc && entry.normalise) {

@@ -84,7 +84,12 @@ router.get("/:slug", async (req, res) => {
     // email.
     const emails = holders.map((h) => h.email);
     const employees = await Employee.find({ email: { $in: emails } })
-      .select("email firstName lastName name employeeId designation department isActive")
+      /* biometricId, not employeeId: `employeeId` is a VIRTUAL on the Employee
+         schema aliasing biometricId, and virtuals exist on neither a .lean()
+         document nor a .select() projection. Reading it off a lean query is
+         always undefined — silently, which is why no employee code ever
+         appeared on this screen. */
+      .select("email firstName lastName name biometricId designation department isActive")
       .lean();
 
     const byEmail = new Map(
@@ -108,7 +113,7 @@ router.get("/:slug", async (req, res) => {
             emp?.name ||
             [emp?.firstName, emp?.lastName].filter(Boolean).join(" ") ||
             "",
-          employeeId: emp?.employeeId || "",
+          employeeId: emp?.biometricId || "",
           designation: emp?.designation || "",
           department: emp?.department || "",
           isActive: emp ? emp.isActive !== false : null,
@@ -237,9 +242,9 @@ router.get("/:slug/candidates", async (req, res) => {
     const people = await Employee.find({
       isActive: { $ne: false },
       email: { $nin: [null, ""] },
-      $or: [{ email: rx }, { firstName: rx }, { lastName: rx }, { employeeId: rx }],
+      $or: [{ email: rx }, { firstName: rx }, { lastName: rx }, { biometricId: rx }],
     })
-      .select("email firstName lastName name employeeId designation department")
+      .select("email firstName lastName name biometricId designation department")
       .limit(30)
       .lean();
 
@@ -251,7 +256,7 @@ router.get("/:slug/candidates", async (req, res) => {
           email: String(p.email).toLowerCase(),
           name:
             p.name || [p.firstName, p.lastName].filter(Boolean).join(" ") || p.email,
-          employeeId: p.employeeId || "",
+          employeeId: p.biometricId || "",
           designation: p.designation || "",
           department: p.department || "",
         }))

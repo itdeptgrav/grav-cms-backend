@@ -56,7 +56,7 @@ async function cleanup() {
     firstName: "Verify",
     lastName: "Subject",
     email: "verify-subject@grav.invalid",
-    employeeId: `VT${Date.now().toString().slice(-6)}`,
+    biometricId: `VT${Date.now().toString().slice(-6)}`,
     phone: "9000000001",
     designation: "Tailor",
     // Explicit because Employee.gender defaults to "" which its own enum does
@@ -72,9 +72,9 @@ async function cleanup() {
     }),
   });
   await Employee.create([
-    { firstName: "Verify", lastName: "Owner", email: OWNER, employeeId: `VO${Date.now().toString().slice(-6)}`, fcmToken: "tok-owner", gender: "Other" },
-    { firstName: "Verify", lastName: "Approver", email: APPROVER, employeeId: `VA${Date.now().toString().slice(-6)}`, fcmToken: "tok-approver", gender: "Other" },
-    { firstName: "Verify", lastName: "Editor", email: EDITOR, employeeId: `VE${Date.now().toString().slice(-6)}`, fcmToken: "tok-editor", gender: "Other" },
+    { firstName: "Verify", lastName: "Owner", email: OWNER, biometricId: `VO${Date.now().toString().slice(-6)}`, fcmToken: "tok-owner", gender: "Other" },
+    { firstName: "Verify", lastName: "Approver", email: APPROVER, biometricId: `VA${Date.now().toString().slice(-6)}`, fcmToken: "tok-approver", gender: "Other" },
+    { firstName: "Verify", lastName: "Editor", email: EDITOR, biometricId: `VE${Date.now().toString().slice(-6)}`, fcmToken: "tok-editor", gender: "Other" },
   ]);
 
   await setRole({ departmentSlug: SLUG, email: OWNER, name: "Owner", role: "owner" });

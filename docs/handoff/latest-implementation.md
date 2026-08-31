@@ -2,6 +2,167 @@
 
 ---
 
+## HR: one navigation, not two — and sign-out where people look for it
+
+> Nothing committed.
+
+### The rail is gone, the app switcher is in the bar
+
+HR was carrying a 64px department rail down the left AND a full top nav: two
+navigations for one screen, and most of why HR read as a separate module beside
+Accounts. `"/hr"` joins `RAIL_HIDDEN_PATHS` in `components/shell/AppShell.js`,
+alongside `/accountant`, `/store`, `/budget`, `/files` and `/mrf`.
+
+The prerequisite those entries all name is met the same way: the shell now
+carries `appLogoSlug="hr"`, so the department's own mark sits at the bar's left
+edge and swaps to a back-arrow ("Back to apps") on hover. Dropping the rail
+without it would have removed the only way to reach another department.
+
+### Sign out moved to the account menu
+
+It was in the gear, next to light/dark and effects — settings, not identity.
+It is now the last item in the account dropdown, under a rule, because it is
+that menu's most destructive action and should not sit under a thumb travelling
+towards "Your profile".
+
+`FrostShell` gained `showSignOut`, **defaulting to true**, so Accounts, Store,
+Budget and every other consumer are untouched; HR passes `false`. It gates both
+places the shell can draw one — the gear entry and the standalone button on the
+ungrouped path — so the prop means the same thing whether or not a consumer
+groups its controls. The result is exactly one sign-out in the bar; two is how
+somebody hits the wrong one.
+
+### Verification
+
+9/9 against the sources with comments stripped, including the two that matter
+most for a shared component: **`showSignOut` defaults to true**, and
+**`components/accountant/LayoutShell.js` does not opt out**, so nothing outside
+HR changed. Seven files compile under SWC — every consumer of the shell, not
+just the two I edited.
+
+---
+
+## "Failed to load profile data" — and a name dropdown instead of an icon
+
+> Nothing committed.
+
+### The error had TWO causes, and the bigger one was server-side
+
+**1. `HRDepartment` is empty.** `/api/hr/profile` did
+`HRDepartment.findById(req.user.id)` and 404'd otherwise. That collection now
+has **zero** documents — the boot-time seeding of default department accounts
+was removed a few turns ago, and HR is staffed by employees holding an `hr`
+`DepartmentRole`. All three current role holders are Employees. So the endpoint
+answered 404 for **every user, always**, and the page had never worked since the
+seeding went.
+
+All three routes (`GET /profile`, `PUT /profile`, `PUT /change-password`) now
+resolve through `resolveAccount()`: HRDepartment first so a legacy account is
+untouched, Employee as the fallback and today the only match. `shapeAccount()`
+gives one response shape from two schemas — HRDepartment has `name`, Employee
+has firstName/lastName — and `applyName()` writes a display name back into
+whichever shape, keeping "Mary Anne" out of the surname.
+
+Three things fixed on the way: the email-uniqueness check now looks in BOTH
+collections (checking one would let an employee take an address a legacy account
+already signs in with); an email change here calls `followEmailChange`, since a
+profile edit orphans the person's roles exactly like the employee edit did; and
+an account with **no** password set is told so rather than 500ing out of
+`bcrypt.compare(x, null)`.
+
+**2. The page sent no credential.** It used bare
+`fetch(..., { credentials: "include" })` — cookie only — and Chrome refuses to
+store a cross-origin cookie for `localhost:3000 -> localhost:5000`, which
+`lib/api.js` exists to work around. All three calls now go through `api`, which
+sends the cookie AND `Authorization: Bearer`. Their catch blocks surface the
+server's message instead of a generic string, so "Current password is incorrect"
+reaches the person it is about.
+
+### `employeeId` is a virtual, and virtuals do not survive `.lean()`
+
+Found by a failing assertion. `Employee.employeeId` is a **virtual** aliasing
+`biometricId`, so it is `undefined` on any `.lean()` document and cannot be
+named in a `.select()`. Three places I had written this session read it that way
+and silently showed nothing: the approval card's record label, and both queries
+behind the Team screen. All now read `biometricId`.
+
+### The profile control is a name dropdown
+
+`components/access/ProfileMenu.js`. Geometry copied from the accountant company
+switcher — the same `max-w-[200px] px-2.5 py-1.5 rounded-lg` trigger and `w-72
+rounded-lg` menu — so the two bars read as one product. The COLOURS are not
+copied: that component hardcodes `border-slate-200`/`bg-white`, fine in a module
+that never goes dark and wrong here, so this uses the hairline/frost/ink tokens.
+
+A name rather than an avatar glyph because an icon says "profile" to somebody who
+already knows what it is, while the name says WHOSE session this is — worth
+knowing on a shared machine before you change a record under someone else's
+login.
+
+One request per tab: the in-flight promise is shared across mounts and the result
+cached in localStorage so the bar does not flash on every navigation. Saving the
+profile calls `clearProfileMenuCache()`, or a rename would keep showing the old
+name until the tab closed. The menu is portalled to `document.body` carrying
+`.grav-ui` and the theme attributes — `position: fixed` is not viewport-relative
+under a `backdrop-filter` ancestor, and this hangs off `.frost-bar`. No "Sign
+out": FrostShell's gear menu two inches away already has one.
+
+### Verification
+
+`verifyHrProfile.js` — **20/20**, driving the real handlers with throwaway
+employees. It pins the empty-collection premise, that an employee gets a profile
+rather than a 404, the first/last name round-trip, the cross-collection email
+clash, that a role follows an email change, all four password refusals, that the
+new password is stored **hashed**, and that a passwordless account gets a
+message rather than a 500.
+
+Everything else green: `verifyApprovalDetail` 27/27, `verifyDepartmentTeam`
+22/22, `verifyHrApprovalFlow` 16/16, `verifyDepartmentRoles` 15/15,
+`verifyHrChangeHistory` 46/46, `verifyAuditFloor` 22/22, `npm test` 1462/1465.
+Five frontend files compile under SWC; `/api/hr/profile` answers 401 unauthed.
+
+---
+
+## The HR bar's extra is the profile, not history
+
+> Nothing committed.
+
+History has its own entry under **System** since the nav was regrouped, so the
+top-bar button was spending the most valuable space on the screen duplicating a
+link three inches away. The profile, meanwhile, had no way in at all — and it is
+where somebody changes their own password.
+
+`extras` is now a profile link to `/hr/dashboard/profile`, styled as one of
+FrostShell's own round icon controls and marking itself current on that page.
+
+**An icon, not initials.** The layout has the caller's ROLE (`useDeptRole`) but
+not their name, so initials would mean another request and a letter that pops in
+after paint — to say something the page it opens says properly.
+
+**Removed with it:** `HISTORY_SECTION` and `HISTORY_TITLE`, the ~60-line maps
+from each page's `activeMenu` to its history section. Nothing referenced them
+once the button went, and a dead map that looks live is worse than a gap. A note
+in their place records what they were. `HistoryButton` itself is untouched and
+still used by the departments and new-employee pages, so any page that wants a
+scoped history affordance can still place one.
+
+**A pre-existing bug this surfaced:** `HRProfilePageContent` passed
+`activeMenu="profile"` in its loading branch and `activeMenu="dashboard"` in its
+real one — the two halves of the same page claiming to be different pages. It
+did not matter while nothing keyed on "profile"; now the bar's button does, so
+it would have stayed dark while HR dashboard lit up instead. Both branches say
+"profile".
+
+### Verification
+
+8/8 against the source with comments stripped: the button and its maps are gone,
+a profile link took its place with an accessible name and a current-page state,
+both imports are present, and **history is still reachable from the nav** — the
+thing that would make this a regression rather than a cleanup. All four touched
+files compile under SWC.
+
+---
+
 ## The Allow button was checking, not asking
 
 > Nothing committed.
