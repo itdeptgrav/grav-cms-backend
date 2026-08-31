@@ -35,7 +35,22 @@ async function cleanup() {
   const ChangeRequest = require("./models/Access/ChangeRequest");
   const a = await DepartmentRole.deleteMany({ departmentSlug: SLUG });
   const b = await ChangeRequest.deleteMany({ departmentSlug: SLUG });
-  return a.deletedCount + b.deletedCount;
+  /* The change_logs these actions cause are part of the mess to clear up.
+     Without this the harness left rows in the REAL history reading "by
+     Harness" — which is exactly how a verification script turns into a
+     support question. Matched narrowly: the harness actor, and the throwaway
+     names and addresses only these scripts use. */
+  const ChangeLog = require("./models/Access/ChangeLog");
+  const logs = await ChangeLog.deleteMany({
+    $or: [
+      { actorName: "Harness" },
+      { entityLabel: /^Verify / },
+      { summary: /grav\.invalid/ },
+      { entityLabel: /grav\.invalid/ },
+    ],
+  });
+
+  return a.deletedCount + b.deletedCount + logs.deletedCount;
 }
 
 /** A stand-in Express response that records what the middleware answered. */

@@ -854,8 +854,23 @@ app.use("/api/employees", hrAuditTrail);
 const hrWrites = departmentWrites("hr", {
   entity: "HR record",
   exempt: [
-    "/profile",
-    "/change-password",
+    /* FULL paths, not bare words. These are matched with `includes`, and the
+       short forms let two administrative writes through by accident:
+
+         "/profile"          also matched /api/employees/:id/profile-photo —
+                             HR changing somebody else's photo, which is an
+                             edit to another person's record and belongs in
+                             the queue like any other.
+         "/change-password"  also matched
+                             /api/hr/password-management/change-password/:type/:id
+                             — that is HR RESETTING SOMEBODY ELSE'S password,
+                             the opposite of the self-service case the
+                             exemption was written for, and the single most
+                             sensitive write in the department.
+
+       The exemption is "changing your OWN credentials", so it says so. */
+    "/api/hr/profile",
+    "/api/hr/change-password",
     "/change-history",
     "/import-export",
     "/sync-period",

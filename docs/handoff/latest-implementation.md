@@ -2,6 +2,73 @@
 
 ---
 
+## HR write coverage audited — and two exemptions were too broad
+
+> Nothing committed.
+
+### The audit
+
+`verifyHrWriteCoverage.js` (new, **23/23**, read-only — it writes nothing at
+all). It loads all 20 HR routers, walks their route tables, and asks the REAL
+guard logic — the same `READ_SHAPED` list, and an exempt list it asserts against
+`server.js` rather than retyping — what would happen to each path. It answers the
+question a screenshot cannot: not "did this edit get held" but "is there a write
+anywhere in HR that quietly does not".
+
+**85 writes go to the approver · 9 exempt by name · 5 read-shaped.**
+
+Named individually rather than counted, because a count passes while the one
+route that matters is missing: editing, removing and adding an employee, adding a
+department, a leave decision, issuing a document — all held.
+
+**Attendance: 11 held, 5 exempt, and every exemption is a machine operation** —
+`sync-period`, `backfill-hr-leaves`, and the three `notification-*` endpoints.
+The assertion is written as a rule, not a list: *no human-facing attendance edit
+is exempt*. So day-override, bulk-day-override, punch-correction,
+remove-from-month, the three regularisation decisions, holidays and settings all
+go to the approver.
+
+### Two exemptions were letting administrative writes through
+
+The audit's own "nothing is exempt by accident" listing is what surfaced them.
+Both came from matching bare words with `includes`:
+
+| path | matched | what it actually is |
+|---|---|---|
+| `PATCH /api/employees/:id/profile-photo` | `/profile` | HR changing **someone else's** photo |
+| `PATCH /api/hr/password-management/change-password/:userType/:id` | `/change-password` | HR **resetting someone else's password** |
+
+The second is the most sensitive write in the department, and it was skipping the
+queue because "/change-password" is a substring of its path. The exemption was
+written for *changing your own credentials*; it now says so —
+`"/api/hr/profile"` and `"/api/hr/change-password"` — and both routes are held.
+The harness names them individually so shortening the list again fails there
+rather than in production.
+
+**Behaviour change worth knowing:** an editor resetting another person's
+password, or changing their photo, now needs approval. Approvers and owners are
+unaffected.
+
+### The harnesses were writing into the real change log
+
+Fair catch from the screenshot: entries reading **"by Harness"** were mine.
+`verifyHrProfile.js` and friends cleaned up the employees and roles they created
+but not the `change_logs` their actions caused — 7 rows out of 786.
+
+All four harnesses now clear their own log rows, matched narrowly (the `Harness`
+actor, `Verify `-prefixed labels, `@grav.invalid` addresses). Re-running the
+suite removed exactly those 7: **786 → 779, and 0 remaining**, so nothing real
+was caught by the match.
+
+### Verification
+
+`verifyHrWriteCoverage` 23/23 · `verifyHrProfile` 20/20 · `verifyApprovalDetail`
+27/27 · `verifyDepartmentTeam` 22/22 · `verifyHrApprovalFlow` 16/16 ·
+`verifyDepartmentRoles` 15/15 · `verifyHrChangeHistory` 46/46 ·
+`verifyAuditFloor` 22/22 · `npm test` 1462/1465 · server boots clean.
+
+---
+
 ## HR: one navigation, not two — and sign-out where people look for it
 
 > Nothing committed.
