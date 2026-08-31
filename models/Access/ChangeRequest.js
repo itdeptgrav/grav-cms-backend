@@ -82,7 +82,15 @@ const changeRequestSchema = new mongoose.Schema(
     changes: [
       {
         _id: false,
+        // The human label, which is what the approval card prints.
         field: String,
+        // The machine path it came from ("address.city"), kept alongside the
+        // label because this list is replayed into the change log when the
+        // submission and the decision are recorded, and a log keyed on a
+        // display string cannot be searched for a field. Mongoose strict mode
+        // drops anything not declared here, so both have to be named.
+        path: String,
+        label: String,
         from: mongoose.Schema.Types.Mixed,
         to: mongoose.Schema.Types.Mixed,
       },

@@ -108,8 +108,24 @@ const MAX_DEPTH = 4;
 /** Beyond this many changed fields the entry stops being readable anyway. */
 const MAX_FIELDS = 120;
 
+/**
+ * May fieldDiff descend INTO this value, or is it a value in its own right?
+ *
+ * Only genuinely plain objects — the shape `.lean()` gives a subdocument. This
+ * used to be "any object that is not an array or a Date", which walked straight
+ * into every class instance Mongo hands back. An ObjectId is an object with a
+ * twelve-byte `.buffer` on it, so changing an employee's email produced twelve
+ * rows reading "Buffer #1: 105 → —" for an untouched manager reference. A
+ * Buffer, a Decimal128 and a Map all had the same problem.
+ *
+ * Stopping here is not a loss of detail: sameValue() stringifies both sides, so
+ * an ObjectId compares equal to the string form of itself, which is exactly what
+ * a partially-populated document looks like.
+ */
 function isPlainObject(v) {
-  return v && typeof v === "object" && !Array.isArray(v) && !(v instanceof Date);
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
 }
 
 /**

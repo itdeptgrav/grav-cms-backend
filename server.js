@@ -813,10 +813,60 @@ app.use(
   router's own auth middleware has resolved req.user, so entries carry a name.
 */
 const auditTrail = require("./Middlewear/auditTrail");
+/* Required here rather than beside the Sales mount further down: HR now uses it
+   too, and the first mount in the file has to be the one that loads it. */
+const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const hrAuditTrail = auditTrail("hr");
 app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
 app.use("/api/employees", hrAuditTrail);
+
+/* ─── HR: role enforcement + the editor-needs-approval queue ───────────────
+ *
+ * See Middlewear/departmentWriteGuard.js. Reads are untouched; an approver or
+ * owner commits directly; an EDITOR's write is held as a ChangeRequest and
+ * answered with 202, and shows up at /hr/dashboard/approvals.
+ *
+ * TWO THINGS TO KNOW BEFORE CHANGING THIS
+ *
+ * 1. It enforces the moment HR has its first role — which it now does. A
+ *    person with NO HR role gets 403 NO_DEPARTMENT_ROLE on every write, so
+ *    every HR user needs a role in CEO → Access Control. Platform
+ *    administrators are exempt (both guards agree on that now).
+ *
+ * 2. The exemptions below are not decoration:
+ *      /profile, /change-password  nobody should need an approver's permission
+ *                                  to change their own password
+ *      /change-history             a read API; a GET is skipped anyway, but it
+ *                                  must never be able to queue
+ *      /import-export              a spreadsheet import exceeds the 256 KB a
+ *                                  held request can store, so it would answer
+ *                                  413 rather than queue — the guard refuses to
+ *                                  truncate, correctly, and the result would
+ *                                  read as a broken importer
+ *      /sync-period, /backfill,    machine operations, not somebody's edit.
+ *      /day-range, /notification-  Queueing a biometric sync means attendance
+ *                                  silently stops updating until an approver
+ *                                  notices.
+ *
+ * Mounted on the three HR prefixes only. `/api/employee` (singular) is the
+ * mobile app and belongs to no department's queue. */
+const hrWrites = departmentWrites("hr", {
+  entity: "HR record",
+  exempt: [
+    "/profile",
+    "/change-password",
+    "/change-history",
+    "/import-export",
+    "/sync-period",
+    "/backfill",
+    "/day-range",
+    "/notification-",
+  ],
+});
+app.use("/api/hr", hrWrites);
+app.use("/hr", hrWrites);
+app.use("/api/employees", hrWrites);
 
 /* Two employee-app prefixes, named individually rather than mounting the trail
    on all of /api/employee. Overtime and regularisations are HR facts raised
@@ -906,6 +956,11 @@ app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 // them. Mounted outside any one department's middleware because the queue spans
 // departments; it authenticates the session itself.
 app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+
+/* A department's own team screen — the same DepartmentRole rows Access Control
+   manages, reached by that department's OWNER instead of a platform admin. See
+   the header of the router for what it refuses and why. */
+app.use("/api/department-team", require("./routes/Access/departmentTeam"));
 /* Department-facing budget proposals. Mounted HERE, beside the other
  * cross-department surface, and deliberately NOT under /api/accountant — the
  * frontend's authFetch skips that prefix, so a department session would never
@@ -943,7 +998,6 @@ app.use("/api/ceo/sop", ceoSopRoutes);
 // Role enforcement + the editor-needs-approval queue for the whole Sales API.
 // See Middlewear/departmentWriteGuard.js — reads are untouched, and nothing
 // changes at all until an administrator assigns the first Sales role.
-const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const salesWrites = (entity, extra = {}) =>
   departmentWrites("sales", { entity, ...extra });
 
