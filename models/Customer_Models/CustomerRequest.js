@@ -843,6 +843,43 @@ const customerRequestSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+
+    // ── WHAT KIND OF ORDER THIS ACTUALLY IS ──────────────────────────────
+    //
+    // Added 31 Aug 2026, explicit request: the Manufacturing Order screens and
+    // the Project Manager's notification both need to say "which type of order
+    // it is whether it is for sampling order, genuine customer order or like
+    // testing order".
+    //
+    // WHY A FIELD AND NOT AN INFERENCE. Before this, the only way to guess was
+    // `isInternalOrder`, which is overloaded — it is set BOTH by a salesperson
+    // marking a real customer's order as company-funded AND by the sampling
+    // pipeline, so the two were indistinguishable downstream. Every screen that
+    // wanted the distinction would have had to re-derive it from a different
+    // combination of fields, and they would have drifted apart. One stored
+    // value, written once at creation, is what makes the badge, the PM email
+    // and the order PDF agree.
+    //
+    // `customer` is the default so every existing row keeps its current
+    // meaning without a backfill — a real customer's order is what this
+    // collection has always held.
+    orderOrigin: {
+      type: String,
+      enum: ["customer", "sampling", "internal", "testing"],
+      default: "customer",
+      index: true,
+    },
+
+    // The in-house sample this order was raised from, when `orderOrigin` is
+    // "sampling". SampleStyle already points here via
+    // `production.customerRequestId`; this is the other half, so the MO screens
+    // and the PM's email can name the style without a reverse lookup.
+    sampleStyleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SampleStyle",
+      default: null,
+      index: true,
+    },
     measurementId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Measurement",

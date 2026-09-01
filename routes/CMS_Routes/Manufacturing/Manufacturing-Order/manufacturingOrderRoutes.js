@@ -10,6 +10,7 @@ const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufa
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
+const { resolveOrderOrigin } = require("../../../../services/orderOrigin");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -288,6 +289,15 @@ router.get("/", async (req, res) => {
                 createdAt: 1,
                 requestType: 1,
                 measurementName: 1,
+                // What KIND of order this is — sampling / internal / testing /
+                // a real customer's. Projected because anything absent here
+                // never reaches the UI, and the MO list badges on it
+                // (31 Aug 2026). `isInternalOrder` rides along so an older row
+                // written before `orderOrigin` existed can still be read as
+                // internal rather than silently badged as a customer order.
+                orderOrigin: 1,
+                isInternalOrder: 1,
+                sampleStyleId: 1,
                 workOrdersCount: 1,
                 completionPercentage: 1,
                 completedQuantity: "$_totalCompleted",
@@ -326,6 +336,11 @@ router.get("/", async (req, res) => {
       measurementName: r.measurementName || null,
       deliveryDeadline: r.customerInfo?.deliveryDeadline || null,
       estimatedCompletion: r.estimatedCompletion || null,
+      // What kind of order this is, resolved once server-side so the list, the
+      // detail page and the Project Manager's email cannot disagree — see
+      // services/orderOrigin.js for why older rows are inferred rather than
+      // read straight off the field.
+      orderOrigin: resolveOrderOrigin(r),
     }));
 
     res.json({
@@ -843,6 +858,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       .select(
         "requestId customerInfo finalOrderPrice totalPaidAmount totalDueAmount " +
         "priority status measurementId measurementName requestType " +
+        "orderOrigin isInternalOrder sampleStyleId " +
         "salesPersonAssigned quotations actualCompletion " +
         "estimatedCompletion createdAt updatedAt"
       )
@@ -1009,6 +1025,13 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       measurementId: customerRequest.measurementId || null,
       measurementName: customerRequest.measurementName || null,
       isMeasurementConversion,
+      // What kind of order this is — sampling / internal / testing / a real
+      // customer's. Separate from `requestTypeBadge` above, which answers a
+      // different question (how the order was ENTERED: from a measurement
+      // conversion or directly). An order can be both a measurement
+      // conversion and a sampling run, so neither badge can stand in for the
+      // other. See services/orderOrigin.js.
+      orderOrigin: resolveOrderOrigin(customerRequest),
 
       workOrders,
       workOrderStats: {
