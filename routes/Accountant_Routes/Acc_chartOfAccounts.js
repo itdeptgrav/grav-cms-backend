@@ -2699,7 +2699,7 @@ router.get("/payroll/ledger-map", async (req, res) => {
     if (!companyId)
       return res.status(400).json({ success: false, message: "companyId required" });
 
-    const { Acc_PayrollLedgerMap, departmentKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
     const HR = loadPayrollModels();
 
     const [map, ledgers] = await Promise.all([
@@ -2714,11 +2714,13 @@ router.get("/payroll/ledger-map", async (req, res) => {
        "Designing" are one row to map rather than two that silently differ. */
     let departments = [];
     if (HR) {
+      /* Grouped by department AND designation, so the screen can offer a row
+         per designation under each department without a second query. */
       const agg = await HR.PayrollItem.aggregate([
         { $match: { isIntern: { $ne: true } } },
         {
           $group: {
-            _id: "$department",
+            _id: { department: "$department", designation: "$designation" },
             employees: { $addToSet: "$employeeId" },
             gross: { $sum: { $ifNull: ["$earnings.grossEarnings", 0] } },
           },
@@ -2726,17 +2728,51 @@ router.get("/payroll/ledger-map", async (req, res) => {
       ]);
       const folded = new Map();
       for (const row of agg) {
-        const key = departmentKey(row._id);
+        const key = departmentKey(row._id?.department);
         if (!key) continue;
         if (!folded.has(key)) {
-          folded.set(key, { key, label: String(row._id).trim(), spellings: [], employees: 0, gross: 0 });
+          folded.set(key, {
+            key,
+            label: String(row._id.department).trim(),
+            spellings: [],
+            /* Distinct PEOPLE, not a sum of per-designation counts: somebody
+               who was promoted mid-year appears in two groups and adding the
+               counts would report the department as one head larger than it
+               is. */
+            people: new Set(),
+            gross: 0,
+            designations: new Map(),
+          });
         }
         const f = folded.get(key);
-        f.spellings.push(String(row._id).trim());
-        f.employees += (row.employees || []).length;
+        const spelling = String(row._id.department).trim();
+        if (!f.spellings.includes(spelling)) f.spellings.push(spelling);
+        for (const e of row.employees || []) f.people.add(String(e));
         f.gross += row.gross || 0;
+
+        const gName = String(row._id.designation || "").trim();
+        if (gName) {
+          const gKey = mapKey(row._id.department, gName);
+          if (!f.designations.has(gKey)) {
+            f.designations.set(gKey, { key: gKey, label: gName, people: new Set(), gross: 0 });
+          }
+          const g = f.designations.get(gKey);
+          for (const e of row.employees || []) g.people.add(String(e));
+          g.gross += row.gross || 0;
+        }
       }
-      departments = [...folded.values()].sort((a, b) => b.gross - a.gross);
+      departments = [...folded.values()]
+        .map((f) => ({
+          key: f.key,
+          label: f.label,
+          spellings: f.spellings,
+          employees: f.people.size,
+          gross: f.gross,
+          designations: [...f.designations.values()]
+            .map((g) => ({ key: g.key, label: g.label, employees: g.people.size, gross: g.gross }))
+            .sort((a, b) => b.gross - a.gross),
+        }))
+        .sort((a, b) => b.gross - a.gross);
     }
 
     res.json({
@@ -2762,7 +2798,7 @@ router.put("/payroll/ledger-map", async (req, res) => {
     if (!canEditPayroll(req))
       return res.status(403).json({ success: false, message: "This needs an owner or approver." });
 
-    const { Acc_PayrollLedgerMap, departmentKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
 
     /* Every ledger id is checked against THIS company before it is stored. The
        picker only offers this company's ledgers, but a mapping that survives
@@ -2780,9 +2816,19 @@ router.put("/payroll/ledger-map", async (req, res) => {
       .map((d) => {
         const hit = d?.ledgerId ? valid.get(String(d.ledgerId)) : null;
         if (!hit) return null; // a row pointing nowhere is not a mapping
+        /* The key is taken as the client sent it when it already carries a
+           designation ("DEPT::ROLE"); otherwise it is folded from the label.
+           Re-folding a composite key here would flatten it back to a
+           department row and silently lose the designation split. */
+        const raw = String(d.key || d.label || "");
+        const key = raw.includes("::")
+          ? mapKey(raw.split("::")[0], raw.split("::").slice(1).join("::"))
+          : departmentKey(raw);
         return {
-          key: departmentKey(d.key || d.label),
-          label: String(d.label || d.key || "").trim(),
+          key,
+          label: String(d.label || raw).trim(),
+          department: String(d.department || "").trim(),
+          designation: String(d.designation || "").trim(),
           ledgerId: hit._id,
           ledgerName: hit.name,
         };
@@ -3173,7 +3219,7 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   /* The company's configured department → ledger map, if it has one. Absent
      (or absent for a given slot) the bridge resolves exactly as it always did,
      so a company that never opens the configurator posts unchanged. */
-  const { Acc_PayrollLedgerMap, departmentKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+  const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
   const payrollMap = await Acc_PayrollLedgerMap.findOne({ companyId }).lean();
 
   /** A configured ledger for `slot`, or null. Verified live: a ledger deleted
@@ -3468,7 +3514,11 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       if (item.isIntern) continue; // stipends are their own line below
       const gross = item.earnings?.grossEarnings || 0;
       if (!gross) continue;
-      const hit = mappedByKey.get(departmentKey(item.department));
+      /* Most specific first: a row for this exact designation, else the
+         department's row, else the default ledger. */
+      const hit =
+        mappedByKey.get(mapKey(item.department, item.designation)) ||
+        mappedByKey.get(departmentKey(item.department));
       const key = hit ? String(hit.ledgerId) : String(salariesLedger._id);
       if (!deptTotals.has(key)) {
         deptTotals.set(key, {

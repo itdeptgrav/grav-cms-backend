@@ -42,6 +42,23 @@ function departmentKey(name) {
   return String(name || "").trim().toUpperCase().replace(/\s+/g, " ");
 }
 
+/**
+ * The key for a department, or for one designation inside it.
+ *
+ * "DESIGNING" and "DESIGNING::GRAPHIC DESIGNER" are both valid rows, and the
+ * bridge prefers the more specific one — a company that pays its designers out
+ * of one head and its design managers out of another says so with two rows,
+ * and a company that does not simply never adds the second.
+ *
+ * "::" cannot appear in a department name, so a designation row can never
+ * collide with a department one.
+ */
+function mapKey(department, designation) {
+  const d = departmentKey(department);
+  const g = departmentKey(designation);
+  return g ? `${d}::${g}` : d;
+}
+
 const ledgerRefSchema = new mongoose.Schema(
   {
     ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
@@ -60,13 +77,17 @@ const payrollLedgerMapSchema = new mongoose.Schema(
       index: true,
     },
 
-    /* department → salary expense ledger */
+    /* department (or department::designation) → salary expense ledger */
     departments: {
       type: [
         {
           _id: false,
           key: { type: String, required: true },
           label: { type: String, default: "" },
+          /* Kept apart so the UI can group rows under their department without
+             re-splitting the key, and so a designation row reads as one. */
+          department: { type: String, default: "" },
+          designation: { type: String, default: "" },
           ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
           ledgerName: { type: String, default: "" },
         },
@@ -143,4 +164,4 @@ const Acc_PayrollExternalPost =
   mongoose.models.Acc_PayrollExternalPost ||
   mongoose.model("Acc_PayrollExternalPost", payrollExternalPostSchema, "acc_payroll_external_posts");
 
-module.exports = { Acc_PayrollLedgerMap, Acc_PayrollExternalPost, departmentKey };
+module.exports = { Acc_PayrollLedgerMap, Acc_PayrollExternalPost, departmentKey, mapKey };

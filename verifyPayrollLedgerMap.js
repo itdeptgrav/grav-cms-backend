@@ -59,7 +59,7 @@ async function cleanup() {
 
   const Acc_Ledger = require("./models/Accountant_model/Acc_MasterModels").Acc_Ledger;
   const expenses = await Acc_Ledger.find({ companyId: FAKE_COMPANY, isActive: true, nature: "expense" })
-    .select("_id name").limit(3).lean();
+    .select("_id name").limit(4).lean();
   check("the company has expense ledgers to map onto", expenses.length >= 2, `${expenses.length}`);
 
   /* Which departments this run actually contains, and the staff gross the
@@ -73,13 +73,15 @@ async function cleanup() {
 
   const routes = require("./routes/Accountant_Routes/Acc_chartOfAccounts");
   const build = routes.__buildPayrollVouchers;
+  /* The builder returns { vouchers, totals, ledgerIds }; the journal is the
+     voucher whose kind is "processing". */
+  const pick = (out) => out.vouchers.find((v) => v.kind === "processing");
   check("the builder is reachable for testing", typeof build === "function");
 
   if (typeof build === "function" && run && expenses.length >= 2) {
     /* 1. WITHOUT a map — one salary line, the behaviour before this work. */
     /* The builder returns { vouchers, totals, ledgerIds }; the journal is the
        voucher whose kind is "processing". */
-    const pick = (out) => out.vouchers.find((v) => v.kind === "processing");
     const before = pick(await build(FAKE_COMPANY, run, items, {}));
     const beforeDr = before.entries.filter((e) => e.type === "Dr");
     const beforeSalary = beforeDr.filter((e) => !/stipend/i.test(e.ledgerName));
@@ -140,6 +142,87 @@ async function cleanup() {
     );
     check("a mapping to a ledger that no longer exists still balances",
       Math.abs(staleTotal - staffGross) < 0.005, `${staleTotal} vs ${staffGross}`);
+  }
+
+  /* ── a designation overrides its department ───────────────────────────── */
+  console.log("\ndesignation overrides");
+  {
+    const { mapKey } = require("./models/Accountant_model/Acc_PayrollBridge");
+    check("a designation key is distinct from its department key",
+      mapKey("Designing", "Graphic Designer") !== mapKey("Designing", ""));
+    check("a blank designation falls back to the plain department key",
+      mapKey("Designing", "") === departmentKey("Designing"));
+    check("designation keys case-fold like department ones",
+      mapKey("designing", "graphic designer") === mapKey("DESIGNING", "GRAPHIC DESIGNER"));
+
+    if (typeof build === "function" && run && expenses.length >= 3) {
+      /* Pick a department that genuinely holds more than one designation, so
+         the override is testable against real money rather than a contrived
+         row. */
+      const byDept = new Map();
+      for (const i of staff) {
+        const k = departmentKey(i.department);
+        if (!k) continue;
+        if (!byDept.has(k)) byDept.set(k, new Map());
+        const g = String(i.designation || "").trim();
+        if (!g) continue;
+        const m = byDept.get(k);
+        m.set(g, (m.get(g) || 0) + (i.earnings?.grossEarnings || 0));
+      }
+      let dept = null;
+      let desig = null;
+      for (const [k, m] of byDept) {
+        if (m.size >= 2) {
+          dept = k;
+          desig = [...m.entries()].sort((x, y) => y[1] - x[1])[0][0];
+          break;
+        }
+      }
+      check("found a department holding several designations",
+        Boolean(dept), dept ? `${dept} / ${desig}` : "none in this run");
+
+      if (dept) {
+        const desigGross = parseFloat(byDept.get(dept).get(desig).toFixed(2));
+        const deptGross = parseFloat(
+          staff.filter((i) => departmentKey(i.department) === dept)
+            .reduce((a, i) => a + (i.earnings?.grossEarnings || 0), 0).toFixed(2),
+        );
+
+        await Acc_PayrollLedgerMap.findOneAndUpdate(
+          { companyId: FAKE_COMPANY },
+          {
+            $set: {
+              departments: [
+                { key: dept, label: dept, department: dept, designation: "",
+                  ledgerId: expenses[0]._id, ledgerName: expenses[0].name },
+                { key: mapKey(dept, desig), label: desig, department: dept, designation: desig,
+                  ledgerId: expenses[2]._id, ledgerName: expenses[2].name },
+              ],
+              updatedByEmail: "verify@grav.invalid",
+            },
+          },
+          { upsert: true, setDefaultsOnInsert: true },
+        );
+
+        const out = pick(await build(FAKE_COMPANY, run, items, {}));
+        const dr = out.entries.filter((e) => e.type === "Dr" && !/stipend/i.test(e.ledgerName));
+        const onOverride = dr.filter((e) => String(e.ledgerId) === String(expenses[2]._id))
+          .reduce((x, e) => x + e.amount, 0);
+        const onDept = dr.filter((e) => String(e.ledgerId) === String(expenses[0]._id))
+          .reduce((x, e) => x + e.amount, 0);
+
+        check("the designation's own gross went to the override ledger",
+          Math.abs(parseFloat(onOverride.toFixed(2)) - desigGross) < 0.05,
+          `${onOverride.toFixed(2)} vs ${desigGross}`);
+        check("the REST of that department stayed on the department ledger",
+          Math.abs(parseFloat(onDept.toFixed(2)) - (deptGross - desigGross)) < 0.05,
+          `${onDept.toFixed(2)} vs ${(deptGross - desigGross).toFixed(2)}`);
+
+        const total = parseFloat(dr.reduce((x, e) => x + e.amount, 0).toFixed(2));
+        check("and the whole salary side still sums to the staff gross",
+          Math.abs(total - staffGross) < 0.05, `${total} vs ${staffGross}`);
+      }
+    }
   }
 
   /* ── the manual marker ────────────────────────────────────────────────── */
