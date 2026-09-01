@@ -1035,6 +1035,17 @@ app.use("/api/files", require("./routes/Access/files"));
 const publicDepartmentRoutes = require("./routes/Admin/publicDepartments");
 app.use("/api/public", publicDepartmentRoutes);
 
+// The Project Manager's BOM approve/reject, pressed from the request email —
+// unauthenticated by design, a per-request token standing in for login (see
+// the router's own header comment for why). Belongs beside the other public
+// surface above, not under any department's middleware.
+//
+// 1 Sept 2026 bug fix: this line never existed. A stale comment further down
+// this file claimed the mount was "much earlier in this file", which was
+// true of the INTENT but not the code — every BOM approval email link 404'd
+// ("Cannot GET /api/public/bom-approval/...") since the feature shipped.
+app.use("/api/public/bom-approval", require("./routes/CMS_Routes/Sales/sampleBomApproval"));
+
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
 
@@ -1248,6 +1259,15 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+
+// The sales roster — which employees are on sales duty, and the corporate
+// phone number that stands for each of them in the call log and the tracking
+// map (30 Aug 2026). Deliberately NOT behind salesWrites: the roster decides
+// whose calls get attributed to whom, which is an access-control-shaped
+// decision, and parking it in an approval queue would leave the call log
+// unattributed until somebody approved it. RequireRole on the settings screen
+// is what gates it.
+app.use("/api/cms/sales/sales-persons", require("./routes/CMS_Routes/Sales/salesPersons"));
 // Emails exchanged with a customer, read live from the salesperson's own
 // connected Gmail — the email sibling of call-events and crm/whatsapp. Scoped
 // to the caller's own mailbox via the JWT; see that route file's header.
@@ -1391,6 +1411,30 @@ app.use(
 app.use(
   "/api/cms/measurement-templates",
   require("./routes/CMS_Routes/Configurations/measurementTemplateRoutes"),
+);
+
+// Global switches for the Requests system (currently: whether MRF involves
+// finance/budget) — read by Store's fulfilment screen and mrfRoutes.js,
+// written from the CEO settings page (30 Aug 2026).
+app.use(
+  "/api/cms/requests/settings",
+  require("./routes/CMS_Routes/Configurations/requestsSettingsRoutes"),
+);
+
+// The Project Manager's own settings — the "new Manufacturing Order" email's
+// wording, its on/off switch, and whether the order PDF is attached
+// (31 Aug 2026). Read by the notification sender, written from
+// /project-manager/dashboard/settings.
+app.use(
+  "/api/cms/production/settings",
+  require("./routes/CMS_Routes/Manufacturing/productionSettingsRoutes"),
+);
+
+// The letterhead production's own PDFs print — same schema as the store and
+// sales letterheads, its own `key: "production"` record (31 Aug 2026).
+app.use(
+  "/api/cms/production/pdf-settings",
+  require("./routes/CMS_Routes/Manufacturing/productionPdfSettingsRoutes"),
 );
 
 // Manufacturing Routes

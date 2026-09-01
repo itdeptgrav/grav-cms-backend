@@ -129,13 +129,23 @@ async function styleEmailContext(style) {
 
   let customerName = account?.displayName || account?.companyName;
   if (!customerName) {
-    // The Account this style's Journey pointed at is gone (a dangling
-    // reference — observed live: an Account deleted after its Journey was
-    // created). A bare "—" here IS the "customer information skipped" bug;
-    // the Journey's own name is still resolvable and is a real identifier a
-    // reader can act on, even when the Account underneath it no longer is.
-    const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
-    customerName = journey?.name || "—";
+    // An in-house sample has no account and no journey to fall back to at
+    // all — `style.journeyId` is null by design (1 Sept 2026 bug fix: this
+    // fell through to the journey lookup below with a null id and landed on
+    // a bare "—", which every email reading "Customer: —" made a house
+    // sample look like a broken/incomplete record rather than the thing it
+    // actually is).
+    if (style.sampleType === "house") {
+      customerName = "In-house sample — no customer";
+    } else {
+      // The Account this style's Journey pointed at is gone (a dangling
+      // reference — observed live: an Account deleted after its Journey was
+      // created). A bare "—" here IS the "customer information skipped" bug;
+      // the Journey's own name is still resolvable and is a real identifier a
+      // reader can act on, even when the Account underneath it no longer is.
+      const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
+      customerName = journey?.name || "—";
+    }
   }
   const b = style.brief || {};
   const finishes = [b.logo && "Logo", b.embroidery && "Embroidery", b.printing && "Printing"].filter(Boolean).join(", ");

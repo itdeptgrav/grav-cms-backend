@@ -138,6 +138,66 @@ const EVENT_REGISTRY = [
     departments: ["merchandiser", "project-manager"],
   },
   {
+    // 31 Aug 2026, explicit request: "in the product manager side basically it
+    // is needed to notify about the order ok, means when when the
+    // manufacturing order goona create (means the customer request sent to
+    // production)".
+    //
+    // Fired from services/manufacturingOrderNotify.service.js, which is called
+    // from inside `createWorkOrdersAndProgress` — the one factory every route
+    // that raises an MO goes through, so no entry point can quietly skip it.
+    // Carries a full order summary in the body AND the same thing as a PDF
+    // attachment.
+    key: "manufacturing_order_created",
+    label: "Manufacturing Order created",
+    description:
+      "The Project Manager is notified whenever an order reaches production — with the order type " +
+      "(customer / sampling / internal / testing), its quantities, its work orders, and a PDF summary attached.",
+    departments: ["project-manager"],
+    templateKey: "manufacturingOrder",
+    // This event's copy belongs to the PROJECT MANAGER, not Sales — it is
+    // their own inbound notification, edited on their own settings page. See
+    // ProductionSettings' header for why that is a separate collection.
+    templateStore: "production",
+  },
+  // ── The same moment, told to three more audiences ──────────────────────
+  //
+  // 31 Aug 2026, explicit request: "whatever actions are goona happened upon
+  // considering an order, so make sure to notify to the sales team,
+  // merchantiser, project manager, r&d and all... and the format should be
+  // different ok as per there department wise responsibility".
+  //
+  // Four separate EVENTS rather than one event with four recipient lists,
+  // because each has its own wording, its own attached PDF, and its own
+  // on/off switch — a merchandiser silencing the material notice must not
+  // silence the project manager's schedule.
+  {
+    key: "mo_rnd_notice",
+    label: "Order in production — R&D notice",
+    description:
+      "R&D is told when a style they developed enters production. Most useful on a sampling order, where R&D " +
+      "asked for the run and otherwise never hears that it started.",
+    departments: ["research-development"],
+    templateKey: "researchDevelopment",
+    templateStore: "production",
+  },
+  {
+    key: "mo_merchandiser_notice",
+    label: "Order in production — Merchandising notice",
+    description: "Merchandising is told what a released order will consume, so procurement can cover any shortfall.",
+    departments: ["merchandiser"],
+    templateKey: "merchandiser",
+    templateStore: "production",
+  },
+  {
+    key: "mo_sales_notice",
+    label: "Order in production — Sales notice",
+    description: "Sales is told their customer's order has entered production, and what may be confirmed to the customer.",
+    departments: ["sales"],
+    templateKey: "sales",
+    templateStore: "production",
+  },
+  {
     key: "customer_decision_recorded",
     label: "Customer approved / rejected quote",
     description: "Merchandising and the Project Manager are notified when Sales records what the customer decided.",
@@ -187,6 +247,16 @@ function listEventsWithTemplates() {
 }
 
 async function isEventEnabled(eventKey) {
+  // An event whose copy belongs to another department is switched off from
+  // THAT department's settings — asking Sales whether the Project Manager
+  // wants their own notification would be the wrong question, and would let
+  // Sales silently mute somebody else's inbox.
+  const event = EVENT_BY_KEY.get(eventKey);
+  if (event?.templateStore === "production") {
+    const ProductionSettings = require("../models/CMS_Models/Manufacturing/ProductionSettings");
+    const settings = await ProductionSettings.findOne({ key: "production" }).select("disabledEvents").lean();
+    return !(settings?.disabledEvents || []).includes(eventKey);
+  }
   const settings = await SalesSettings.findOne().select("departmentNotifications").lean();
   const disabled = settings?.departmentNotifications?.disabledEvents || [];
   return !disabled.includes(eventKey);
@@ -219,9 +289,22 @@ function interpolate(text, vars) {
 async function resolveTemplate(eventKey) {
   const event = EVENT_BY_KEY.get(eventKey);
   if (!event?.templateKey) return null;
-  const settings = await SalesSettings.findOne().select("samplingTemplates").lean();
-  const saved = settings?.samplingTemplates?.[event.templateKey];
-  const fallback = SAMPLING_TEMPLATE_DEFAULTS[event.templateKey];
+
+  // Two stores, one seam. Which department OWNS an event's wording is declared
+  // on the registry entry (`templateStore`), so the merge logic below — which
+  // is the part that actually matters — stays single.
+  let saved;
+  let fallback;
+  if (event.templateStore === "production") {
+    const ProductionSettings = require("../models/CMS_Models/Manufacturing/ProductionSettings");
+    const settings = await ProductionSettings.findOne({ key: "production" }).select("templates").lean();
+    saved = settings?.templates?.[event.templateKey];
+    fallback = ProductionSettings.PRODUCTION_TEMPLATE_DEFAULTS[event.templateKey];
+  } else {
+    const settings = await SalesSettings.findOne().select("samplingTemplates").lean();
+    saved = settings?.samplingTemplates?.[event.templateKey];
+    fallback = SAMPLING_TEMPLATE_DEFAULTS[event.templateKey];
+  }
   // Field-by-field over the defaults, not `saved || fallback`. Mongoose
   // defaults only materialise when a document is CREATED, so every settings
   // singleton that already existed before 28 Aug 2026 has no samplingTemplates
@@ -373,7 +456,16 @@ function wrapEmail({ heading, bodyHtml, details, imageUrl, ctaLabel, ctaUrl, ext
 </div>`;
 }
 
-async function sendCmsEmail({ to, subject, html, text }) {
+/**
+ * @param {object}   opts
+ * @param {Array=}   opts.attachments  `[{ name, content }]` where `content` is
+ *   a Buffer or an already-base64 string. Brevo's /v3/smtp/email takes these
+ *   as `attachment: [{ name, content: <base64> }]` (30 Aug 2026 — added for
+ *   the Project Manager's Manufacturing Order PDF; nothing sent attachments
+ *   before this). Omitted entirely when empty, so every existing caller
+ *   produces a byte-identical request to what it did before.
+ */
+async function sendCmsEmail({ to, subject, html, text, attachments }) {
   if (process.env.ENABLE_EMAILS !== "true") {
     console.warn(`[departmentNotify] SKIPPED "${subject}" — ENABLE_EMAILS is not "true"`);
     return;
@@ -383,6 +475,12 @@ async function sendCmsEmail({ to, subject, html, text }) {
     console.warn("[departmentNotify] BREVO_API_KEY not set");
     return;
   }
+  const attachment = (Array.isArray(attachments) ? attachments : [])
+    .filter((a) => a && a.name && a.content)
+    .map((a) => ({
+      name: a.name,
+      content: Buffer.isBuffer(a.content) ? a.content.toString("base64") : String(a.content),
+    }));
   try {
     await axios.post(
       BREVO_URL,
@@ -392,9 +490,12 @@ async function sendCmsEmail({ to, subject, html, text }) {
         subject,
         htmlContent: html,
         textContent: text,
+        ...(attachment.length ? { attachment } : {}),
         headers: { "X-Mailer": "Grav-CMS-DeptNotify" },
       },
-      { headers: { "api-key": key, "Content-Type": "application/json", Accept: "application/json" }, timeout: 10000 },
+      // Attachments make the body much larger than a plain notification, so the
+      // 10s that suffices for text is not enough once a PDF rides along.
+      { headers: { "api-key": key, "Content-Type": "application/json", Accept: "application/json" }, timeout: attachment.length ? 30000 : 10000 },
     );
   } catch (err) {
     console.error(`[departmentNotify] Brevo failed "${subject}":`, err.response?.data?.message || err.message);
@@ -488,7 +589,13 @@ async function notifyEvent(eventKey, ctx = {}) {
     const text = `${heading}\n\n${tplBody || ctx.bodyText || ""}${textDetails ? `\n\n${textDetails}` : ""}`;
 
     await Promise.all(
-      [...recipients].map(([email, name]) => sendCmsEmail({ to: [{ email, name }], subject, html, text })),
+      [...recipients].map(([email, name]) =>
+        // `ctx.attachments` — `[{ name, content }]`, content a Buffer. Built by
+        // the call site (the Manufacturing Order PDF is the first user), never
+        // by a template: an attachment is a fact about the record, the same
+        // reasoning that keeps the details table and the CTA URL out of Sales'
+        // editable copy.
+        sendCmsEmail({ to: [{ email, name }], subject, html, text, attachments: ctx.attachments })),
     );
     console.log(`[departmentNotify] "${eventKey}" sent to ${recipients.size} recipient(s): ${[...recipients.keys()].join(", ")}`);
     return { sent: recipients.size };
@@ -498,7 +605,62 @@ async function notifyEvent(eventKey, ctx = {}) {
   }
 }
 
+/**
+ * Render an event exactly as `notifyEvent` would, and return it instead of
+ * sending it.
+ *
+ * Added 31 Aug 2026 for the Project Manager's template editor. Deliberately
+ * shares the resolve/interpolate/wrap path above rather than reimplementing it
+ * — a preview that renders through different code is a preview that can be
+ * wrong in exactly the way you were trying to check for.
+ *
+ * Also reports WHO would receive it and whether anything would stop the send,
+ * because "why did nobody get this" is usually a recipients or a switch
+ * problem, not a wording one.
+ */
+async function renderEventPreview(eventKey, ctx = {}) {
+  const event = EVENT_BY_KEY.get(eventKey);
+  if (!event) return { error: `Unknown event "${eventKey}"` };
+
+  const tpl = await resolveTemplate(eventKey);
+  const vars = ctx.vars || {};
+  const tplBody = tpl?.bodyText ? interpolate(tpl.bodyText, vars) : null;
+  const heading = (tpl?.heading && interpolate(tpl.heading, vars)) || ctx.heading || event.label;
+  const subject = (tpl?.subject && interpolate(tpl.subject, vars)) || ctx.subject || event.label;
+  const bodyHtml = tplBody
+    ? tplBody.split(/\n{2,}/).map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br/>")}</p>`).join("")
+    : ctx.bodyHtml;
+  const details = (ctx.details || []).map(([label, value]) => _row(label, value));
+  const html = wrapEmail({
+    heading, bodyHtml, details,
+    imageUrl: ctx.imageUrl || imageUrlFor(ctx.image),
+    ctaLabel: (tpl?.ctaLabel && interpolate(tpl.ctaLabel, vars)) || ctx.ctaLabel,
+    ctaUrl: ctx.ctaUrl,
+    extraHtml: ctx.extraHtml,
+  });
+
+  const lists = await Promise.all(event.departments.map(resolveDepartmentRecipients));
+  const recipients = new Map();
+  for (const list of lists) for (const r of list) recipients.set(r.email, r.name);
+
+  const enabled = await isEventEnabled(eventKey);
+  const blocked = !enabled ? "This notification is switched off in settings."
+    : tpl && tpl.enabled === false ? "This template is switched off in settings."
+    : !recipients.size ? `Nobody currently holds the ${event.departments.join(" / ")} department in Access Control, so this would reach no one.`
+    : null;
+
+  return {
+    subject,
+    html,
+    heading,
+    recipients: [...recipients].map(([email, name]) => ({ email, name })),
+    departments: event.departments,
+    wouldSend: !blocked,
+    blocked,
+  };
+}
+
 module.exports = {
-  EVENT_REGISTRY, APP_URL, listEvents, listEventsWithTemplates, isEventEnabled,
+  EVENT_REGISTRY, APP_URL, listEvents, listEventsWithTemplates, isEventEnabled, renderEventPreview,
   resolveDepartmentRecipients, notifyEvent, imageUrlFor, escapeHtml, interpolate,
 };

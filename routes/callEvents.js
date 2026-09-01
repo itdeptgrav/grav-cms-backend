@@ -60,6 +60,14 @@ router.post("/", checkApiKey, async (req, res) => {
     const received = deriveReceived(callType, durationSec);
     const rejected = deriveRejected(callType);
 
+    // WHOSE HANDSET THIS CAME FROM. Several spellings accepted because the
+    // Android app, the recording uploader and any future device integration
+    // each name it differently, and a call that arrives with the field under
+    // an unexpected key would silently go unattributed — the exact failure
+    // this was added to fix. Optional: a device that doesn't report it still
+    // logs the call, just without an owner.
+    const ownerPhone = b.ownerPhone ?? b.devicePhone ?? b.deviceOwnerPhone ?? b.selfPhone ?? null;
+
     const existing = b.startTime ? await findMatchingCallEvent(phoneNumber, b.startTime) : null;
     if (existing) {
       // Already has a document (most likely the recording upload for this
@@ -72,6 +80,10 @@ router.post("/", checkApiKey, async (req, res) => {
       existing.rejected = rejected;
       existing.durationSec = durationSec;
       existing.endTime = b.endTime ?? existing.endTime;
+      // Only ever FILLS a gap. If the recording upload already established
+      // whose phone this was, a later outcome report arriving without the
+      // field must not blank it back out.
+      if (ownerPhone) existing.ownerPhone = ownerPhone;
       await existing.save();
       return res.json({ success: true, mongoId: String(existing._id), duplicate: true });
     }
@@ -86,6 +98,7 @@ router.post("/", checkApiKey, async (req, res) => {
       durationSec,
       startTime: b.startTime,
       endTime: b.endTime ?? null,
+      ownerPhone,
       source: b.source || "personalcallrecorder",
     });
 
