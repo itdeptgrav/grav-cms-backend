@@ -119,6 +119,30 @@ function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
   };
 }
 
+// ─── FORM VISIBILITY — GET ────────────────────────────────────────────────────
+//
+// Which built-in fields an administrator has hidden, so the employee form can
+// stop rendering them. Under /config/ for the same reason as salary: it must
+// not collide with the /:id param routes.
+//
+// Read by anyone who may open the employee form — this says what the form
+// SHOWS, which is not privileged information, and gating it behind the
+// developer role would leave HR rendering fields the configuration says are
+// gone. Only CHANGING it needs the developer side (routes/DevOps/developer.js).
+//
+// An empty list is the normal answer and means "render everything", so a
+// failure to load this must never blank the form — the client treats an error
+// as "nothing hidden".
+router.get("/config/form-visibility", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const builtInFields = require("../../services/builtInEmployeeFields");
+    res.json({ success: true, hidden: await builtInFields.allHiddenKeys() });
+  } catch (err) {
+    console.error("Form visibility GET error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch form visibility" });
+  }
+});
+
 // ─── SALARY CONFIG — GET ──────────────────────────────────────────────────────
 // Using /config/salary so it never collides with the /:id param routes
 router.get("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
@@ -201,6 +225,19 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const employeeData = req.body;
+
+    /* Administrator-configured extra fields (developer side → Forms). This
+       validates whatever *CustomFields arrays the request carries against the
+       definitions, DROPS unknown keys, forces labels from configuration, and
+       materialises enabled defaults on the new record. Definition errors are
+       the user's to fix, so they come back as a 400 with each field named. */
+    {
+      const { applyEmployeeFormConfig } = require("../../services/formConfig");
+      const formErrors = await applyEmployeeFormConfig(employeeData, { isCreate: true });
+      if (formErrors.length) {
+        return res.status(400).json({ success: false, message: formErrors.join(" ") });
+      }
+    }
 
     // Sanitize fields that are ObjectId references — empty string causes a BSONError cast fail
     const OBJECTID_FIELDS = [
@@ -481,6 +518,17 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     const { user } = req;
     const { id } = req.params;
     const updateData = req.body;
+
+    /* Same contract as on create, partial-update shaped: only the sections
+       this request carries are judged, and required-ness does not apply to
+       fields the request never mentioned. */
+    {
+      const { applyEmployeeFormConfig } = require("../../services/formConfig");
+      const formErrors = await applyEmployeeFormConfig(updateData, { isCreate: false });
+      if (formErrors.length) {
+        return res.status(400).json({ success: false, message: formErrors.join(" ") });
+      }
+    }
 
     const canUpdate = user.role === "hr_manager" || user.id === id;
     if (!canUpdate) {

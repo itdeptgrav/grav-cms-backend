@@ -104,15 +104,15 @@ const { db, admin } = require("./config/firebaseAdmin");
 instrumentFirestore(admin, db);
 bw.instrumentFirestore(admin, db);
 
+/* Static origins first, then the live list from the developer side
+   (ops.extraOrigins) — ADDITIVE only, validated at write and read; see
+   services/allowedOrigins.js. A preview URL or LAN IP no longer needs an
+   edit-and-restart. */
+const originCheck = require("./services/allowedOrigins").makeOriginCheck(allowedOrigins);
+
 app.use(
   cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
+    origin: originCheck,
     credentials: true,
   }),
 );
@@ -148,6 +148,45 @@ if (process.env.BANDWIDTH_ENABLE_GZIP === "1") {
 // Meta's X-Hub-Signature-256 HMAC (which must be computed over the exact bytes
 // Meta sent, not the re-serialized JSON). Harmless for every other route.
 app.use(express.json({ limit: "50mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
+/* Every 5xx becomes a fingerprinted DevAlert on the developer side — see
+   Middlewear/errorWatch.js. Mounted this early so it sees every router below;
+   observation only, hooks res "finish", can never alter a response. */
+app.use(require("./Middlewear/errorWatch"));
+
+/* The developer side's live restrictions — department write-freeze and
+   after-hours blocking, both settings on /developer/settings. Fails open;
+   never blocks sign-in, /api/dev or /api/admin. See Middlewear/opsControls. */
+app.use(require("./Middlewear/opsControls"));
+
+/* Feature flags for the frontends. Public like the notice below, and for the
+   same reasons — flags gate UI, carry no data, and a token check on every page
+   paint for booleans would be cost without protection. Only flag.* keys are
+   ever exposed. */
+app.get("/api/feature-flags", async (req, res) => {
+  try {
+    const { DEFINITIONS, getSetting } = require("./services/devConfig");
+    const flags = {};
+    for (const d of DEFINITIONS) {
+      if (d.key.startsWith("flag.")) flags[d.key] = await getSetting(d.key);
+    }
+    res.json({ success: true, flags });
+  } catch {
+    res.json({ success: true, flags: {} });
+  }
+});
+
+/* The announcement banner every dashboard shows. Public on purpose: it is
+   written BY developers FOR all staff, carries no data, and making every shell
+   authenticate for a banner would put a token check on every page paint. */
+app.get("/api/system-notice", async (req, res) => {
+  try {
+    const { getSetting } = require("./services/devConfig");
+    const text = await getSetting("notice.text");
+    res.json({ success: true, text: String(text || ""), tone: await getSetting("notice.tone") });
+  } catch {
+    res.json({ success: true, text: "", tone: "info" });
+  }
+});
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
@@ -183,7 +222,7 @@ console.log("Drive key loaded:", !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 // Initialize Socket.IO with CORS configuration
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: originCheck,
     credentials: true,
     methods: ["GET", "POST"],
   },
@@ -976,6 +1015,11 @@ app.use("/api/change-requests", require("./routes/Access/changeRequests"));
    manages, reached by that department's OWNER instead of a platform admin. See
    the header of the router for what it refuses and why. */
 app.use("/api/department-team", require("./routes/Access/departmentTeam"));
+
+/* The developer side: cross-department history, anomaly alerts, live
+   settings, job heartbeats. Access = platform admin or a role in the
+   `developer` department (granted from CEO → Access Control). */
+app.use("/api/dev", require("./routes/DevOps/developer"));
 /* Department-facing budget proposals. Mounted HERE, beside the other
  * cross-department surface, and deliberately NOT under /api/accountant — the
  * frontend's authFetch skips that prefix, so a department session would never
@@ -2902,10 +2946,32 @@ server.listen(PORT, () => {
     }
   })();
 
+  /* Register what the recurring jobs PROMISE, so the developer side can alert
+     when one goes quiet — the failure mode of a cron is silence, and silence
+     is invisible everywhere else. beat() calls sit inside each job below. */
+  {
+    const { ensureJob } = require("./services/jobHeartbeats");
+    ensureJob("meeting-reminders", "15-minute meeting reminder push/email sweep", 5 * 60);
+    /* Daily job: expect a beat once per day; the interval FIRES every minute
+       but only acts in its 00:15 IST window, so the promise is the day. */
+    ensureJob("timer-sop-finalize", "Timer-SOP daily finalize (~00:15 IST)", 24 * 60 * 60, 1.25);
+    ensureJob("anomaly-scan", "Developer-side anomaly scan over the change log", 15 * 60, 2);
+
+    /* What "Run now" on /developer/jobs may invoke. A registry of shipped
+       functions, never a code path from the UI — see services/jobRegistry. */
+    const { registerRunner } = require("./services/jobRegistry");
+    registerRunner("anomaly-scan", "Scan the change log for anomalies now", () =>
+      require("./services/anomalyScan").scanChangeLogs());
+    registerRunner("heartbeat-check", "Check every job against its promise now", () =>
+      require("./services/jobHeartbeats").checkOverdue());
+  }
+
   // ── Meeting 15-min reminder cron — runs every 5 minutes ──────────────────
   const _reminderSent = new Set();
   setInterval(
     async () => {
+      if (!(await require("./services/jobRegistry").isEnabled("meeting-reminders"))) return;
+      require("./services/jobHeartbeats").beat("meeting-reminders");
       try {
         const { db } = require("./config/firebaseAdmin");
         const { sendPushToEmployees } = require("./services/fcmPush.service");
@@ -2976,6 +3042,41 @@ server.listen(PORT, () => {
     5 * 60 * 1000,
   );
 
+  // ── Developer side: anomaly scan + job-overdue check ─────────────────────
+  // The scan interval is itself a live setting; the timer fires every minute
+  // and the service decides whether it is due, so a changed interval applies
+  // without a restart. Both are best-effort: monitoring must never crash the
+  // process it monitors.
+  let _lastAnomalyScanAt = 0;
+  setInterval(async () => {
+    try {
+      const { getSetting } = require("./services/devConfig");
+      const every = (await getSetting("anomaly.scanIntervalMinutes")) * 60 * 1000;
+      if (Date.now() - _lastAnomalyScanAt < every) return;
+      if (!(await require("./services/jobRegistry").isEnabled("anomaly-scan"))) return;
+      _lastAnomalyScanAt = Date.now();
+      const startedScan = Date.now();
+      const out = await require("./services/anomalyScan").scanChangeLogs();
+      require("./services/jobHeartbeats").beat("anomaly-scan", { durationMs: Date.now() - startedScan });
+      if (out.raised || out.reopened) {
+        console.log(`[anomaly-scan] raised ${out.raised}, reopened ${out.reopened}`);
+      }
+    } catch (e) {
+      require("./services/jobHeartbeats").beat("anomaly-scan", { error: e.message });
+      console.warn("[anomaly-scan]", e.message);
+    }
+  }, 60 * 1000);
+
+  setInterval(async () => {
+    try {
+      const { overdue, recovered } = await require("./services/jobHeartbeats").checkOverdue();
+      if (overdue.length) console.warn("[heartbeats] overdue:", overdue.join(", "));
+      if (recovered.length) console.log("[heartbeats] recovered:", recovered.join(", "));
+    } catch (e) {
+      console.warn("[heartbeats]", e.message);
+    }
+  }, 5 * 60 * 1000);
+
   let _timerSopLastRunDate = null;
   setInterval(
     async () => {
@@ -2987,7 +3088,9 @@ server.listen(PORT, () => {
           mm = nowIST.getUTCMinutes();
         const inWindow = hh === 0 && mm >= 15 && mm < 25;
         if (!inWindow || _timerSopLastRunDate === todayIST) return;
+        if (!(await require("./services/jobRegistry").isEnabled("timer-sop-finalize"))) return;
         _timerSopLastRunDate = todayIST;
+        require("./services/jobHeartbeats").beat("timer-sop-finalize");
         const {
           evaluateTimerSopForAllEmployees,
         } = require("./services/timerSop.service");

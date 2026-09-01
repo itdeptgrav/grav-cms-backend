@@ -111,7 +111,12 @@ const changeLogSchema = new mongoose.Schema(
 
     action: {
       type: String,
-      enum: ["create", "update", "delete", "approve", "reject", "import", "export", "other"],
+      /* `fail` is an approval that a person granted and that did not land.
+         It used to be filed as `approve`, so the history showed a green
+         "Approved" badge above a sentence explaining the change had NOT been
+         applied — the badge and the summary contradicting each other on the
+         one screen people read to find out what happened. */
+      enum: ["create", "update", "delete", "approve", "reject", "fail", "import", "export", "other"],
       default: "update",
       index: true,
     },

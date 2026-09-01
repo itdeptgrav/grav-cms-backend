@@ -129,7 +129,12 @@ router.get("/:slug", async (req, res) => {
     const { status = "pending", entity, limit = 50 } = req.query;
 
     const query = { departmentSlug: slug };
-    if (status && status !== "all") query.status = status;
+    /* "Waiting" covers `applying` too — a request whose replay is in flight, or
+       whose claim was stranded by a restart. It is a transient state and has no
+       tab of its own, so without this a stuck request would appear in no tab at
+       all and simply vanish from the queue. */
+    if (status === "pending") query.status = { $in: ["pending", "applying"] };
+    else if (status && status !== "all") query.status = status;
     if (entity) query.entity = entity;
 
     // An editor sees only their OWN requests. Somebody else's pending change is
@@ -244,11 +249,19 @@ router.post("/:id/decide", async (req, res) => {
       return res.status(result.code).json({ success: false, message: result.message });
     }
 
-    // An approval whose replay failed is NOT a success, and must not be
-    // reported as one: the approver would close the queue believing the change
-    // had landed.
-    res.status(result.ok ? 200 : 502).json({
+    /* An approval whose replay failed is NOT a success and must not be reported
+       as one — but it is not a broken gateway either, which is what 502 said.
+       The decision was received, recorded and durable; what failed is the
+       change it authorised. 502 also invites a platform error page to replace
+       this body in production, losing the very message the approver needs.
+
+       So: 200, and the OUTCOME in the payload. `outcome` is what callers branch
+       on — "approved", "rejected" or "failed" — because it is unambiguous for
+       all three cases, where a boolean is not: a rejection applied nothing and
+       is still exactly what the approver asked for. */
+    res.status(200).json({
       success: result.ok,
+      outcome: result.request?.status || (result.ok ? "approved" : "failed"),
       message: result.message,
       request: result.request
         ? { id: String(result.request._id), status: result.request.status, applyError: result.request.applyError }
