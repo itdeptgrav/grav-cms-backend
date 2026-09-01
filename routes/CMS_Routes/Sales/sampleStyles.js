@@ -80,7 +80,11 @@ function escapeHtml(s) {
 }
 
 // So every notification email can say WHICH customer this style belongs to.
+// A house sample has none — "—" alone read as customer information having
+// gone missing, not as "there genuinely isn't one" (1 Sept 2026 bug fix,
+// same reasoning as sampleStyleEmail.service.js's styleEmailContext).
 async function customerNameFor(style) {
+  if (style?.sampleType === "house") return "In-house sample — no customer";
   if (!style?.accountId) return "—";
   const acc = await Account.findById(style.accountId).select("displayName companyName").lean();
   return acc?.displayName || acc?.companyName || "—";
@@ -95,6 +99,20 @@ async function referenceImageFor(style) {
   const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
   return enq?.products?.find((p) => p.product === style.productName)?.images?.[0] || null;
 }
+
+// Where Sales reads a style's Style & Sample stage from — the CTA link every
+// notification email below points at. A house sample has no journeyId, so
+// the journey route 404s for it; the correct landing place is the Sampling
+// board, which renders the exact same stage in place (1 Sept 2026 bug fix —
+// three notification emails, materials_change_requested/tech_sheet_submitted/
+// sample_submitted, all built this URL assuming a journey unconditionally,
+// so every one of them sent Sales a dead `/journeys/undefined/style-sample`
+// link for a house sample).
+const styleSampleUrl = (style) => (
+  style?.sampleType === "house"
+    ? `${DEPT_NOTIFY_APP_URL}/sales/dashboard/sampling`
+    : `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Style hand-off emails — Merchandiser, Project Manager, R&D
@@ -745,7 +763,7 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
           image,
           bodyText: `${actor(req).name || "Merchandising"} proposed a materials change for "${style.productName || "a style"}" (${customerName}): ${items.join(", ")}.`,
           ctaLabel: "Review change",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
 
@@ -1225,7 +1243,7 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
           image,
           bodyText: `${actor(req).name || "R&D"} submitted the tech sheet for "${style.productName || "a style"}" (${customerName}) for review.`,
           ctaLabel: "Review tech sheet",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
     } else if (action === "approve" || action === "changes") {
@@ -1475,7 +1493,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
           image: style.sample.photos?.[0],
           bodyText: `${actor(req).name || "R&D"} submitted a sample of "${style.productName || "a style"}" (${customerName}) for approval.`,
           ctaLabel: "Review sample",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
     } else if (action === "approve" || action === "reject") {
@@ -1696,6 +1714,20 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         }
       } else if (account) {
         accountPrefill = { name: account.companyName || account.displayName || "", email: account.primaryEmail || "", phone: account.primaryPhone || "" };
+      } else {
+        // `style.accountId` points at nothing — the Account was deleted
+        // after the journey was created (the same dangling-reference case
+        // sampleStyleEmail.service.js's styleEmailContext already works
+        // around for the email/BOM-approval side). There is genuinely no
+        // account left to read a name, email or phone off of; the journey's
+        // own `name` is the one surviving piece of who this is (1 Sept 2026
+        // bug fix: this fell all the way through to a bare, unprefilled
+        // "search or create" form with nothing to search for — R&D had no
+        // way to tell the style even HAD a customer on record, let alone
+        // find or recreate it, without leaving this page to go read the
+        // Enquiry).
+        const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
+        if (journey?.name) accountPrefill = { name: journey.name, email: "", phone: "" };
       }
     }
 
