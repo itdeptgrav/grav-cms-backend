@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Department = require("../../models/HR_Models/Departments");
 const Employee = require("../../models/Employee");
+const mongoose = require("mongoose");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { recordChange } = require("../../services/changeLog");
 
@@ -293,6 +294,124 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
   }
 });
 
+// ✅ MANAGER CANDIDATES for one department
+//
+// The employee form used to search EVERY employee for a manager, which is how
+// somebody in Cutting ends up reporting to somebody in Accounts by autocomplete
+// accident. A manager comes from the department, so this is the list the picker
+// offers — and the only list the picker accepts.
+//
+// Who qualifies, in order of confidence:
+//   1. the department's own primary/secondary (always, even if their employee
+//      row says a different department — an assignment is a statement);
+//   2. active employees IN the department whose designation is marked as a
+//      manager designation there (Department.designations[].managers);
+//   3. active employees in the department whose designation or job title reads
+//      like a lead — the free-text reality of this data, which nobody has
+//      finished normalising.
+//
+// Falls back to every active employee of the department when none of that
+// matches, because an empty picker is worse than a wide one: it would stop HR
+// setting a manager at all in a department that has not been configured yet.
+router.get("/:id/manager-candidates", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const department = mongoose.Types.ObjectId.isValid(id)
+      ? await Department.findById(id).lean()
+      : await Department.findOne({ name: new RegExp(`^${String(id).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }).lean();
+    if (!department) {
+      return res.status(404).json({ success: false, message: "Department not found" });
+    }
+
+    const inDept = {
+      $and: [
+        {
+          $or: [
+            { departmentId: department._id },
+            { department: new RegExp(`^${department.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+          ],
+        },
+        { $or: [{ isActive: { $ne: false } }, { status: "active" }] },
+      ],
+    };
+
+    const staff = await Employee.find(inDept)
+      .select("firstName lastName biometricId designation jobTitle department")
+      .sort({ firstName: 1 })
+      .lean();
+
+    const managerDesignations = new Set(
+      (department.designations || [])
+        .filter((d) => (d.managers || []).length > 0)
+        .map((d) => String(d.name || "").trim().toLowerCase()),
+    );
+    const LEADISH = /manager|head|lead|supervisor|incharge|in-charge|master|chief|director/i;
+
+    const scored = staff.map((e) => {
+      const desig = String(e.designation || "").trim().toLowerCase();
+      let why = null;
+      if (managerDesignations.has(desig)) why = "manager designation";
+      else if (LEADISH.test(e.designation || "") || LEADISH.test(e.jobTitle || "")) why = "leads by title";
+      return { e, why };
+    });
+
+    let picked = scored.filter((x) => x.why);
+    let widened = false;
+    if (picked.length === 0) {
+      picked = scored.map((x) => ({ ...x, why: "in this department" }));
+      widened = true;
+    }
+
+    const asOption = (e, why) => ({
+      id: String(e._id),
+      fullName: [e.firstName, e.lastName].filter(Boolean).join(" ").trim(),
+      biometricId: e.biometricId || "",
+      designation: e.designation || e.jobTitle || "",
+      department: e.department || department.name,
+      why,
+    });
+
+    const out = [];
+    const seen = new Set();
+    /* The department's own choices lead the list, whatever their row says. */
+    for (const slot of ["primaryManager", "secondaryManager"]) {
+      const m = department[slot];
+      if (!m?.managerId) continue;
+      const key = String(m.managerId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const full = staff.find((e) => String(e._id) === key);
+      out.push(
+        full
+          ? asOption(full, slot === "primaryManager" ? "department primary" : "department secondary")
+          : {
+              id: key,
+              fullName: m.managerName || "",
+              biometricId: "",
+              designation: m.designation || "",
+              department: department.name,
+              why: slot === "primaryManager" ? "department primary" : "department secondary",
+            },
+      );
+    }
+    for (const { e, why } of picked) {
+      if (seen.has(String(e._id))) continue;
+      seen.add(String(e._id));
+      out.push(asOption(e, why));
+    }
+
+    res.json({
+      success: true,
+      department: { _id: department._id, name: department.name },
+      widened,
+      data: out,
+    });
+  } catch (error) {
+    console.error("Manager candidates error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ✅ ASSIGN department managers (+ optional propagation to existing employees)
 //
 // Body: {
@@ -341,24 +460,33 @@ router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
     };
 
     const primary = await resolveManager(primaryManagerId);
-    const secondary = await resolveManager(secondaryManagerId);
-    if (primary === undefined || secondary === undefined) {
+    const secondaryRaw = await resolveManager(secondaryManagerId);
+    if (primary === undefined || secondaryRaw === undefined) {
       return res
         .status(400)
         .json({ success: false, message: "Selected manager not found" });
     }
+
+    /* NOBODY IS LEFT WITHOUT A LEAD. A department left with only a secondary —
+       the primary resigned, say — promotes that person rather than leaving
+       every employee with an empty primary slot and an approval chain that
+       stops. The vacated secondary is not back-filled from thin air; one real
+       manager in the right slot beats two slots pointing at one person. */
+    const promoted = !primary && Boolean(secondaryRaw);
+    const effectivePrimary = primary || secondaryRaw;
+    const effectiveSecondary = promoted ? null : secondaryRaw;
 
     const beforeSnap = {
       primaryManager: department.primaryManager?.managerName || "",
       secondaryManager: department.secondaryManager?.managerName || "",
     };
 
-    department.primaryManager = primary || {
+    department.primaryManager = effectivePrimary || {
       managerId: null,
       managerName: "",
       designation: "",
     };
-    department.secondaryManager = secondary || {
+    department.secondaryManager = effectiveSecondary || {
       managerId: null,
       managerName: "",
       designation: "",
