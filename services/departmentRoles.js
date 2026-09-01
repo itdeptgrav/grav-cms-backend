@@ -121,7 +121,6 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
       { $set: { isActive: false } },
       { new: true },
     );
-    dropRoleCaches(slug, mail);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -157,11 +156,91 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
     { new: true, upsert: true, setDefaultsOnInsert: true },
   );
 
-  // Whole-department, not just this email: promoting an owner demotes the
-  // incumbent above, so somebody else's cached role is stale too.
-  dropRoleCaches(slug, null);
+  /* There was a `dropRoleCaches(slug, null)` here, and another on the revoke
+     path above. Neither ever existed: nothing in this file, or anywhere in the
+     role path, defines or imports it — so every call to setRole threw
+     `ReferenceError: dropRoleCaches is not defined`.
+
+     The damage was worse than a failed request. The throw came AFTER the
+     database write, so the role change landed and was then reported as an
+     error: the caller saw a red banner, the role had actually changed, and
+     re-trying looked like it did nothing.
+
+     Removed rather than implemented. `getRole` and `listRoles` read the
+     database on every call — there is no cache in front of them to invalidate,
+     so a cache-drop here would be a no-op at best. If one is ever added, its
+     invalidation belongs next to it, not as an undefined name here. */
 
   return { role: row.role, created: !before, previous: before?.role || null };
+}
+
+/**
+ * Follow somebody's email when it changes.
+ *
+ * WHY THIS HAS TO EXIST
+ * ---------------------
+ * A role is keyed on an email address, and an email address is editable — by
+ * HR, and by the person themselves on their own record. So changing it
+ * silently orphans every role that person holds: the row still exists, still
+ * says "editor", and matches nobody. They are locked out of the department the
+ * moment they save, and the cause is invisible because the role list still
+ * looks correct.
+ *
+ * That is not hypothetical. An HR editor changed their own email from a work
+ * address to a personal one and immediately got "Not your department." on every
+ * HR screen, with their editor row sitting there pointing at an address no
+ * account had any more.
+ *
+ * Keying on an immutable id instead would be the deeper fix, and is a migration
+ * — DepartmentRole rows exist in production keyed on email, and so does the
+ * accounting side. Following the change keeps the two in step today without
+ * moving anybody's data.
+ *
+ * Best effort and never fatal: an email change that worked must not fail
+ * because the person happened to hold a role.
+ *
+ * @returns {number} how many access records were moved
+ */
+async function followEmailChange(oldEmail, newEmail) {
+  const from = String(oldEmail || "").toLowerCase().trim();
+  const to = String(newEmail || "").toLowerCase().trim();
+  if (!from || !to || from === to) return 0;
+
+  let moved = 0;
+  try {
+    /* Skip any department where the new address ALREADY holds a role — moving
+       onto it would collide with the unique (departmentSlug, email) index, and
+       which of the two roles should win is a decision, not a rename. */
+    const mine = await DepartmentRole.find({ email: from }).select("departmentSlug").lean();
+    for (const row of mine) {
+      const clash = await DepartmentRole.exists({
+        departmentSlug: row.departmentSlug,
+        email: to,
+      });
+      if (clash) continue;
+      await DepartmentRole.updateOne(
+        { departmentSlug: row.departmentSlug, email: from },
+        { $set: { email: to } },
+      );
+      moved += 1;
+    }
+  } catch (err) {
+    console.warn("[department-roles] could not follow an email change:", err.message);
+  }
+
+  /* The accounting module keys on email too, in its own collection. */
+  try {
+    const { Acc_User } = require("../models/Accountant_model/Acc_OrgModels");
+    const clash = await Acc_User.exists({ email: to });
+    if (!clash) {
+      const res = await Acc_User.updateOne({ email: from }, { $set: { email: to } });
+      moved += res.modifiedCount || 0;
+    }
+  } catch (err) {
+    console.warn("[department-roles] could not follow an accounting email:", err.message);
+  }
+
+  return moved;
 }
 
 /* ------------------------------------------------------------------ */
@@ -187,6 +266,14 @@ function requireDepartmentRole(departmentSlug, required = "editor") {
       if (!email) {
         return res.status(401).json({ success: false, message: "Not authenticated" });
       }
+
+      /* A platform administrator is not part of any department's chain.
+         `requireApproval` in services/changeRequests.js already lets them
+         through (`req.user?.isAdmin || req.admin`); this guard did not, so the
+         two disagreed about the same person — an admin could be refused here
+         and waved through there depending on which guard a route happened to
+         reach first. They now agree. */
+      if (req.user?.isAdmin || req.admin) return next();
 
       const slug = String(departmentSlug || "").toLowerCase();
       const assigned = await listRoles(slug);
@@ -226,5 +313,6 @@ module.exports = {
   getRole,
   listRoles,
   setRole,
+  followEmailChange,
   requireDepartmentRole,
 };

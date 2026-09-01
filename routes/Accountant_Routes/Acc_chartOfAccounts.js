@@ -2572,6 +2572,23 @@ router.get("/groups/:id/statement", async (req, res) => {
 //   owner / approver  → act directly
 // GETs (list, preview) are never blocked.
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * May this caller change payroll configuration / posting state?
+ *
+ * The same rule payrollRoleGate applies to bulk actions, factored out so the
+ * ledger-map and manual-marker handlers enforce it and the GET can TELL the
+ * client (canEdit) instead of the screen guessing from a role string. PUT and
+ * DELETE are not covered by the gate below — it only inspects POSTs — so these
+ * handlers check for themselves.
+ */
+function canEditPayroll(req) {
+  const perms = req.user?.permissions || {};
+  return Boolean(
+    perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(req.user?.role),
+  );
+}
+
 function payrollRoleGate(req, res, next) {
   if (req.method !== "POST") return next();
   if (!/\/payroll\//.test(req.path)) return next();
@@ -2670,6 +2687,308 @@ async function findOrCreateLedger(
   return ledger.toObject();
 }
 
+// ── GET /payroll/ledger-map — the configurator's whole payload ────────────
+//
+// Returns the saved map, the departments payroll ACTUALLY contains (with their
+// live figures, so Accounts maps against real money rather than a guess), and
+// the expense/liability ledgers available to map onto. One request because the
+// screen is useless without all three.
+router.get("/payroll/ledger-map", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+
+    const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const HR = loadPayrollModels();
+
+    const [map, ledgers] = await Promise.all([
+      Acc_PayrollLedgerMap.findOne({ companyId }).lean(),
+      Acc_Ledger.find({ companyId, isActive: true })
+        .select("_id name groupName nature")
+        .sort({ name: 1 })
+        .lean(),
+    ]);
+
+    /* The departments as payroll knows them, folded by key so "DESIGNING" and
+       "Designing" are one row to map rather than two that silently differ. */
+    let departments = [];
+    if (HR) {
+      /* Grouped by department AND designation, so the screen can offer a row
+         per designation under each department without a second query. */
+      const agg = await HR.PayrollItem.aggregate([
+        { $match: { isIntern: { $ne: true } } },
+        {
+          $group: {
+            _id: { department: "$department", designation: "$designation" },
+            employees: { $addToSet: "$employeeId" },
+            gross: { $sum: { $ifNull: ["$earnings.grossEarnings", 0] } },
+          },
+        },
+      ]);
+      const folded = new Map();
+      for (const row of agg) {
+        const key = departmentKey(row._id?.department);
+        if (!key) continue;
+        if (!folded.has(key)) {
+          folded.set(key, {
+            key,
+            label: String(row._id.department).trim(),
+            spellings: [],
+            /* Distinct PEOPLE, not a sum of per-designation counts: somebody
+               who was promoted mid-year appears in two groups and adding the
+               counts would report the department as one head larger than it
+               is. */
+            people: new Set(),
+            gross: 0,
+            designations: new Map(),
+          });
+        }
+        const f = folded.get(key);
+        const spelling = String(row._id.department).trim();
+        if (!f.spellings.includes(spelling)) f.spellings.push(spelling);
+        for (const e of row.employees || []) f.people.add(String(e));
+        f.gross += row.gross || 0;
+
+        const gName = String(row._id.designation || "").trim();
+        if (gName) {
+          const gKey = mapKey(row._id.department, gName);
+          if (!f.designations.has(gKey)) {
+            f.designations.set(gKey, { key: gKey, label: gName, people: new Set(), gross: 0 });
+          }
+          const g = f.designations.get(gKey);
+          for (const e of row.employees || []) g.people.add(String(e));
+          g.gross += row.gross || 0;
+        }
+      }
+      departments = [...folded.values()]
+        .map((f) => ({
+          key: f.key,
+          label: f.label,
+          spellings: f.spellings,
+          employees: f.people.size,
+          gross: f.gross,
+          designations: [...f.designations.values()]
+            .map((g) => ({ key: g.key, label: g.label, employees: g.people.size, gross: g.gross }))
+            .sort((a, b) => b.gross - a.gross),
+        }))
+        .sort((a, b) => b.gross - a.gross);
+    }
+
+    res.json({
+      success: true,
+      hrAvailable: Boolean(HR),
+      departments,
+      ledgers,
+      map: map || null,
+      canEdit: canEditPayroll(req),
+    });
+  } catch (e) {
+    console.error("[payroll/ledger-map]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── PUT /payroll/ledger-map — save it ─────────────────────────────────────
+router.put("/payroll/ledger-map", async (req, res) => {
+  try {
+    const { companyId } = req.body || {};
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+    if (!canEditPayroll(req))
+      return res.status(403).json({ success: false, message: "This needs an owner or approver." });
+
+    const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+
+    /* Every ledger id is checked against THIS company before it is stored. The
+       picker only offers this company's ledgers, but a mapping that survives
+       for years must not depend on a client that was honest once. */
+    const valid = new Map(
+      (await Acc_Ledger.find({ companyId, isActive: true }).select("_id name").lean())
+        .map((l) => [String(l._id), l]),
+    );
+    const refOf = (raw) => {
+      const hit = raw?.ledgerId ? valid.get(String(raw.ledgerId)) : null;
+      return hit ? { ledgerId: hit._id, ledgerName: hit.name } : {};
+    };
+
+    const departments = (Array.isArray(req.body.departments) ? req.body.departments : [])
+      .map((d) => {
+        const hit = d?.ledgerId ? valid.get(String(d.ledgerId)) : null;
+        if (!hit) return null; // a row pointing nowhere is not a mapping
+        /* The key is taken as the client sent it when it already carries a
+           designation ("DEPT::ROLE"); otherwise it is folded from the label.
+           Re-folding a composite key here would flatten it back to a
+           department row and silently lose the designation split. */
+        const raw = String(d.key || d.label || "");
+        const key = raw.includes("::")
+          ? mapKey(raw.split("::")[0], raw.split("::").slice(1).join("::"))
+          : departmentKey(raw);
+        return {
+          key,
+          label: String(d.label || raw).trim(),
+          department: String(d.department || "").trim(),
+          designation: String(d.designation || "").trim(),
+          ledgerId: hit._id,
+          ledgerName: hit.name,
+        };
+      })
+      .filter((d) => d && d.key);
+
+    const doc = await Acc_PayrollLedgerMap.findOneAndUpdate(
+      { companyId },
+      {
+        $set: {
+          departments,
+          pfPayable: refOf(req.body.pfPayable),
+          esiPayable: refOf(req.body.esiPayable),
+          otherDeductions: refOf(req.body.otherDeductions),
+          salaryPayable: refOf(req.body.salaryPayable),
+          stipendExpense: refOf(req.body.stipendExpense),
+          stipendPayable: refOf(req.body.stipendPayable),
+          defaultSalaryLedger: refOf(req.body.defaultSalaryLedger),
+          updatedByEmail: String(req.user?.email || "").toLowerCase(),
+          updatedByName: req.user?.name || "",
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    try {
+      const { recordChange } = require("../../services/changeLog");
+      await recordChange(req, {
+        departmentSlug: "accounting",
+        section: "accounting:settings",
+        entity: "payroll-ledger-map",
+        entityId: String(companyId),
+        entityLabel: "Payroll ledger mapping",
+        action: "update",
+        summary:
+          `Payroll ledger mapping saved — ${departments.length} department(s) mapped` +
+          `${departments.length ? ": " + departments.map((d) => `${d.label} → ${d.ledgerName}`).join("; ") : ""}.`,
+      });
+    } catch { /* the map is saved; the log is best-effort */ }
+
+    res.json({ success: true, map: doc });
+  } catch (e) {
+    console.error("[payroll/ledger-map save]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── POST /payroll/runs/:runId/mark-external ───────────────────────────────
+//
+// "This run was posted by hand, before this bridge could do it."
+//
+// It records that fact rather than fabricating a voucher: the run genuinely
+// has no bridge voucher, so a fake one would make Unpost offer to void
+// something that does not exist and send reconciliation after a voucher number
+// nobody issued. The runs list reads this as a third state, and Unpost is
+// refused for it — there is nothing of ours to undo.
+router.post("/payroll/runs/:runId/mark-external", async (req, res) => {
+  try {
+    const { companyId, voucherNumber, note } = req.body || {};
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+    if (!canEditPayroll(req))
+      return res.status(403).json({ success: false, message: "This needs an owner or approver." });
+
+    const HR = loadPayrollModels();
+    const run = HR ? await HR.Payroll.findById(req.params.runId).lean() : null;
+
+    /* A run this bridge already posted must not also be called manual — the
+       two answers would disagree about where the money is. */
+    const existing = await Acc_Voucher.findOne({
+      companyId,
+      sourceSystem: "auto_from_payroll",
+      sourceId: req.params.runId,
+      status: { $ne: "cancelled" },
+    }).select("_id voucherNumber").lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: `This run is already posted by the bridge as ${existing.voucherNumber}. Unpost that first if it was wrong.`,
+      });
+    }
+
+    const { Acc_PayrollExternalPost } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const doc = await Acc_PayrollExternalPost.findOneAndUpdate(
+      { companyId, payrollRunId: req.params.runId },
+      {
+        $set: {
+          month: run?.month,
+          year: run?.year,
+          voucherNumber: String(voucherNumber || "").trim(),
+          note: String(note || "").trim(),
+          markedByEmail: String(req.user?.email || "").toLowerCase(),
+          markedByName: req.user?.name || "",
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    try {
+      const { recordChange } = require("../../services/changeLog");
+      await recordChange(req, {
+        departmentSlug: "accounting",
+        section: "accounting:vouchers",
+        entity: "payroll-run",
+        entityId: String(req.params.runId),
+        entityLabel: run ? `Payroll ${run.month}/${run.year}` : String(req.params.runId),
+        action: "other",
+        summary:
+          `Marked as posted OUTSIDE the bridge` +
+          `${doc.voucherNumber ? ` (voucher ${doc.voucherNumber})` : ""}` +
+          `${doc.note ? ` — ${doc.note}` : ""}. No bridge voucher was created.`,
+      });
+    } catch { /* best effort */ }
+
+    res.json({ success: true, external: doc });
+  } catch (e) {
+    console.error("[payroll/mark-external]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── DELETE /payroll/runs/:runId/mark-external — remove the marker ─────────
+//
+// Not "unpost": it deletes a note, touches no voucher and moves no money. A
+// mis-marked run must be correctable, and the alternative — a marker nobody
+// can lift — is how a wrong record becomes permanent.
+router.delete("/payroll/runs/:runId/mark-external", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+    if (!canEditPayroll(req))
+      return res.status(403).json({ success: false, message: "This needs an owner or approver." });
+
+    const { Acc_PayrollExternalPost } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const gone = await Acc_PayrollExternalPost.findOneAndDelete({
+      companyId,
+      payrollRunId: req.params.runId,
+    });
+    if (!gone) return res.status(404).json({ success: false, message: "No manual marker on this run." });
+
+    try {
+      const { recordChange } = require("../../services/changeLog");
+      await recordChange(req, {
+        departmentSlug: "accounting",
+        section: "accounting:vouchers",
+        entity: "payroll-run",
+        entityId: String(req.params.runId),
+        entityLabel: `Payroll ${gone.month}/${gone.year}`,
+        action: "other",
+        summary: "Removed the manual-posting marker. The run is unposted again; no voucher was touched.",
+      });
+    } catch { /* best effort */ }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── GET /payroll/runs — list payroll runs with posting status ─────────────
 router.get("/payroll/runs", async (req, res) => {
   try {
@@ -2732,6 +3051,15 @@ router.get("/payroll/runs", async (req, res) => {
       )
       .lean();
 
+    /* Runs somebody posted by hand before this bridge existed — a third
+       posting state, kept as its own record rather than a fake voucher. */
+    const { Acc_PayrollExternalPost } = require("../../models/Accountant_model/Acc_PayrollBridge");
+    const externals = await Acc_PayrollExternalPost.find({
+      companyId,
+      payrollRunId: { $in: runIds },
+    }).lean();
+    const externalById = new Map(externals.map((e) => [String(e.payrollRunId), e]));
+
     // runId → { processing: voucher, payment: voucher }
     const voucherMap = new Map();
     for (const v of existingVouchers) {
@@ -2768,6 +3096,13 @@ router.get("/payroll/runs", async (req, res) => {
         // vouchers. (isPaidRun / hasPayment are kept above for readability.)
         let postingStatus = hasProcessing ? "complete" : "not_posted";
 
+        /* Marked-as-posted-by-hand. Only meaningful when the bridge has NOT
+           posted it — mark-external refuses to co-exist with a real voucher,
+           and reading it in that order here means a stale marker can never
+           hide a genuine one. */
+        const external = !hasProcessing ? externalById.get(String(r._id)) || null : null;
+        if (external) postingStatus = "external";
+
         const live = liveTotalsById.get(String(r._id));
         return {
           _id: r._id,
@@ -2784,8 +3119,12 @@ router.get("/payroll/runs", async (req, res) => {
           totalESIC: live ? live.totalESIC : r.totalESIC || 0,
           createdAt: r.createdAt,
           postingStatus,
+          external,
+          /* There is nothing of OURS to void on a hand-posted run, so the
+             client is told rather than left to infer it from the status. */
+          canUnpost: hasProcessing,
           // Backwards-compat for existing callers — reflects "has any voucher"
-          postedToLedgers: hasProcessing,
+          postedToLedgers: hasProcessing || Boolean(external),
           processingVoucher: vs.processing || null,
           paymentVoucher: vs.payment || null,
           voucher: vs.processing || vs.payment || null,
@@ -2877,8 +3216,24 @@ function getItemAdvance(item) {
 }
 
 async function buildPayrollVouchers(companyId, run, items, opts = {}) {
+  /* The company's configured department → ledger map, if it has one. Absent
+     (or absent for a given slot) the bridge resolves exactly as it always did,
+     so a company that never opens the configurator posts unchanged. */
+  const { Acc_PayrollLedgerMap, departmentKey, mapKey } = require("../../models/Accountant_model/Acc_PayrollBridge");
+  const payrollMap = await Acc_PayrollLedgerMap.findOne({ companyId }).lean();
+
+  /** A configured ledger for `slot`, or null. Verified live: a ledger deleted
+      or deactivated since it was configured must not be posted to. */
+  async function mappedLedger(slot) {
+    const ref = payrollMap?.[slot];
+    if (!ref?.ledgerId) return null;
+    return Acc_Ledger.findOne({ _id: ref.ledgerId, companyId, isActive: true }).lean();
+  }
+
   // Resolve every ledger we'll need
-  const salariesLedger = await findOrCreateLedger(
+  const salariesLedger =
+    (await mappedLedger("defaultSalaryLedger")) ||
+    (await findOrCreateLedger(
     companyId,
     [
       "Salaries (Office Staff)",
@@ -2896,48 +3251,48 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       "expenses",
     ],
     "expense",
-  );
-  const pfPayable = await findOrCreateLedger(
+  ));
+  const pfPayable = (await mappedLedger("pfPayable")) || (await findOrCreateLedger(
     companyId,
     ["PF Payable", "Provident Fund Payable", "EPF Payable"],
     ["duties & taxes", "statutory", "current liab"],
     "liability",
-  );
-  const esiPayable = await findOrCreateLedger(
+  ));
+  const esiPayable = (await mappedLedger("esiPayable")) || (await findOrCreateLedger(
     companyId,
     ["ESI Payable", "ESIC Payable", "Employees State Insurance Payable"],
     ["duties & taxes", "statutory", "current liab"],
     "liability",
-  );
-  const otherDeductionsPayable = await findOrCreateLedger(
+  ));
+  const otherDeductionsPayable = (await mappedLedger("otherDeductions")) || (await findOrCreateLedger(
     companyId,
     ["Other Deductions Payable", "Salary Deductions Payable"],
     ["current liab", "statutory"],
     "liability",
-  );
-  const salaryPayable = await findOrCreateLedger(
+  ));
+  const salaryPayable = (await mappedLedger("salaryPayable")) || (await findOrCreateLedger(
     companyId,
     ["Salary Payable", "Salaries Payable", "Wages Payable"],
     ["provisions", "current liab", "salary"],
     "liability",
-  );
+  ));
   // An intern is paid a stipend, not a salary, and the two are kept apart in
   // the books the same way Salaries A/c and Salary Payable are kept apart
   // from everything else: one expense ledger and one payable, mirroring the
   // staff pair. Folding stipends into Salaries A/c would make them
   // permanently unrecoverable from any report.
-  const stipendExpense = await findOrCreateLedger(
+  const stipendExpense = (await mappedLedger("stipendExpense")) || (await findOrCreateLedger(
     companyId,
     ["Stipend to Interns", "Intern Stipend", "Stipends"],
     ["administrative expenses", "indirect expense", "employee", "expenses"],
     "expense",
-  );
-  const stipendPayable = await findOrCreateLedger(
+  ));
+  const stipendPayable = (await mappedLedger("stipendPayable")) || (await findOrCreateLedger(
     companyId,
     ["Stipend Payable", "Intern Stipend Payable"],
     ["provisions", "current liab", "salary"],
     "liability",
-  );
+  ));
 
   // Aggregate totals from items (re-derive in case the run-level totals are stale)
   const totals = items.reduce(
@@ -3136,14 +3491,84 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   // Each Dr line is omitted when it is zero rather than posted as a nil entry:
   // a company with no interns should not grow a Stipend line in every month's
   // journal, and one with only interns should not carry an empty Salaries A/c.
-  if (staffGross > 0)
-    processingEntries.push({
-      ledgerId: salariesLedger._id,
-      ledgerName: salariesLedger.name,
-      groupName: salariesLedger.groupName,
-      type: "Dr",
-      amount: staffGross,
-    });
+  /* ── The salary expense, split by department ─────────────────────────────
+     One Dr line per CONFIGURED ledger rather than one for the whole run: the
+     department is already on every payroll item, and the map says where each
+     belongs. Departments with no mapping fall into `salariesLedger` (the
+     configured default, else the auto-resolved Salaries head), so a partially
+     configured company still posts a balanced voucher.
+
+     Rounding is settled by giving the LARGEST group the remainder, not by
+     rounding each group independently — independent rounding leaves a few
+     paise that make the voucher refuse to balance, and the largest group is
+     where a paise is least visible. The total is always exactly staffGross. */
+  if (staffGross > 0) {
+    const deptTotals = new Map(); // ledgerKey -> { ledger, amount }
+    const mappedByKey = new Map(
+      (payrollMap?.departments || [])
+        .filter((d) => d.ledgerId)
+        .map((d) => [d.key, d]),
+    );
+
+    for (const item of items) {
+      if (item.isIntern) continue; // stipends are their own line below
+      const gross = item.earnings?.grossEarnings || 0;
+      if (!gross) continue;
+      /* Most specific first: a row for this exact designation, else the
+         department's row, else the default ledger. */
+      const hit =
+        mappedByKey.get(mapKey(item.department, item.designation)) ||
+        mappedByKey.get(departmentKey(item.department));
+      const key = hit ? String(hit.ledgerId) : String(salariesLedger._id);
+      if (!deptTotals.has(key)) {
+        deptTotals.set(key, {
+          ledgerId: hit ? hit.ledgerId : salariesLedger._id,
+          ledgerName: hit ? hit.ledgerName : salariesLedger.name,
+          groupName: hit ? "" : salariesLedger.groupName,
+          amount: 0,
+        });
+      }
+      deptTotals.get(key).amount += gross;
+    }
+
+    const groups = [...deptTotals.values()].map((g) => ({
+      ...g,
+      amount: parseFloat(g.amount.toFixed(2)),
+    }));
+    groups.sort((a, b) => b.amount - a.amount);
+
+    /* Group names for mapped ledgers, read once — the voucher lines carry them
+       and the map stores only the id and name. */
+    const mappedIds = groups.filter((g) => !g.groupName).map((g) => g.ledgerId);
+    if (mappedIds.length) {
+      const rows = await Acc_Ledger.find({ _id: { $in: mappedIds } })
+        .select("_id name groupName")
+        .lean();
+      const byId = new Map(rows.map((r) => [String(r._id), r]));
+      for (const g of groups) {
+        const r = byId.get(String(g.ledgerId));
+        if (r) {
+          g.groupName = r.groupName;
+          g.ledgerName = r.name; // the live name wins over the stored copy
+        }
+      }
+    }
+
+    const summed = parseFloat(groups.reduce((a, g) => a + g.amount, 0).toFixed(2));
+    const drift = parseFloat((staffGross - summed).toFixed(2));
+    if (groups.length && Math.abs(drift) >= 0.01) groups[0].amount = parseFloat((groups[0].amount + drift).toFixed(2));
+
+    for (const g of groups) {
+      if (g.amount <= 0) continue;
+      processingEntries.push({
+        ledgerId: g.ledgerId,
+        ledgerName: g.ledgerName,
+        groupName: g.groupName,
+        type: "Dr",
+        amount: g.amount,
+      });
+    }
+  }
   if (totals.internGross > 0)
     processingEntries.push({
       ledgerId: stipendExpense._id,
@@ -3824,10 +4249,28 @@ router.post("/payroll/runs/:runId/unpost", async (req, res) => {
       sourceSystem: "auto_from_payroll",
       sourceId: req.params.runId,
     });
-    if (vouchers.length === 0)
+    if (vouchers.length === 0) {
+      /* A hand-posted run reaching here means the UI's disabled Unpost was
+         bypassed. Say what is actually true rather than "no vouchers found",
+         which reads like data loss on a run the books consider settled. */
+      const { Acc_PayrollExternalPost } = require("../../models/Accountant_model/Acc_PayrollBridge");
+      const external = await Acc_PayrollExternalPost.findOne({
+        companyId,
+        payrollRunId: req.params.runId,
+      }).lean();
+      if (external) {
+        return res.status(409).json({
+          success: false,
+          code: "EXTERNALLY_POSTED",
+          message:
+            "This run was posted by hand, so there is no bridge voucher to undo. " +
+            "Reverse the manual voucher in the ledger, then remove the manual marker.",
+        });
+      }
       return res
         .status(404)
         .json({ success: false, message: "No vouchers found for this run." });
+    }
 
     const reversed = [];
     const deleted = [];
@@ -5333,6 +5776,10 @@ router.post("/ledgers/:id/merge", async (req, res) => {
 });
 
 module.exports = router;
+/* For verifyPayrollLedgerMap: the department split and its rounding are worth
+   pinning against a real run, and building a voucher in memory is the only way
+   to check it without posting one. */
+module.exports.__buildPayrollVouchers = buildPayrollVouchers;
 module.exports.postPayrollRunById = postPayrollRunById;
 // Exported for scripts/payrollVoucher_test.js. The journal is the one place
 // where a mistake becomes an accounting entry rather than a screen, so it is

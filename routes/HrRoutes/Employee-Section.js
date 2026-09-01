@@ -618,6 +618,22 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
+    /* An email is the key every access record is filed under, and it is
+       editable right here. Changing it without moving those records orphans
+       them: the department role still says "editor" and matches nobody, so the
+       person is locked out of the department the instant they save — which is
+       exactly how an HR editor locked themselves out by correcting their own
+       address. Best effort; it never fails the save. */
+    if (beforeDoc?.email && updated.email && beforeDoc.email !== updated.email) {
+      const { followEmailChange } = require("../../services/departmentRoles");
+      const moved = await followEmailChange(beforeDoc.email, updated.email);
+      if (moved) {
+        console.log(
+          `[employees] ${beforeDoc.email} → ${updated.email}: moved ${moved} access record(s)`,
+        );
+      }
+    }
+
     // App access is cached for five minutes per employee. Moving somebody to
     // or from intern changes whether they may use the app at all, so the
     // stale answer is dropped here instead of being served for another five.

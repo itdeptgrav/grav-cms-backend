@@ -648,7 +648,6 @@ const connectDB = async () => {
  * prints nothing about credentials.
  * --------------------------------------------------------------------- */
 connectDB().then(async () => {
-  await ensureCeoExists();
 
   // Register the department/access tables on whatever database this instance
   // is pointed at, so moving from local to production needs no manual step.
@@ -657,6 +656,36 @@ connectDB().then(async () => {
   const { ensureAccessDepartments } = require("./services/ensureAccessDepartments");
   await ensureAccessDepartments(mongoose.connection);
 });
+
+/* ─── NO ACCOUNTS ARE SEEDED, DELIBERATELY ─────────────────────────────────
+ *
+ * Every seeder that used to live here is gone: the cutting-master, CEO, QC,
+ * embroidery, production-supervisor, accountant and packaging/dispatch
+ * defaults, and the `ensureCeoExists` bootstrap that ran on every boot.
+ *
+ * They were removed because a boot-time "create it if it is missing" is
+ * incompatible with being able to delete an account:
+ *
+ *   • an account removed in CEO → Access Control came back on the next restart,
+ *     which made the delete button a lie
+ *   • the passwords were literals in this file
+ *   • several of them logged working credentials into the boot output on every
+ *     start, where they persist in aggregators and terminal scrollback
+ *
+ * Accounts are created by a person, in CEO → Access Control, and removed the
+ * same way. That screen now lists the legacy department logins as well as the
+ * access table, so there is nothing it cannot see or remove.
+ *
+ * WHAT THIS MEANS FOR AN EMPTY DATABASE: there is no automatic way in. A fresh
+ * deployment needs one administrator inserted by hand (or by
+ * scripts/migrations/001-seed-access-departments.js) before anybody can sign
+ * in. That is the intended trade — an empty database is a one-off event, and a
+ * standing self-healing admin account is a permanent one.
+ *
+ * `ensureAccessDepartments` below is NOT a seeder in this sense. It registers
+ * department rows and mirrors existing logins into the access table; it creates
+ * no credential and invents no password.
+ * ───────────────────────────────────────────────────────────────────────── */
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
@@ -671,253 +700,10 @@ const QCDepartment = require("./models/QCDepartment");
 const CEODepartment = require("./models/CEODepartment");
 const EmbroideryDepartment = require("./models/EmbroideryDepartment");
 
-const createDefaultCuttingMaster = async () => {
-  try {
-    const existingCuttingMaster = await CuttingMaster.findOne({
-      role: "cutting_master",
-      department: "Cutting",
-    });
-
-    if (existingCuttingMaster) {
-      console.log("✅ Cutting Master already exists, skipping creation");
-      return;
-    }
-
-    const defaultCuttingMaster = new CuttingMaster({
-      name: "Cutting Admin",
-      email: "cutting@grav.in",
-      password: "Cut@12345", // will be hashed automatically
-      employeeId: "CUT001",
-      phone: "9999999999",
-      department: "Cutting",
-      role: "cutting_master",
-      isActive: true,
-    });
-
-    await defaultCuttingMaster.save();
-
-    console.log("✅ Default Cutting Master created successfully");
-  } catch (error) {
-    console.error("❌ Cutting Master creation failed:", error.message);
-  }
-};
 
 // ✅ Auto-create default CEO user
-/**
- * Ensure exactly one bootstrap CEO account exists, and say nothing about it.
- *
- * This is the only account created automatically. Everything else — every
- * department, every login — is created by a human in the CEO Access Control
- * screen, which is the point of the access refactor.
- *
- * If the account already exists this returns immediately: it never resets a
- * password, never reactivates a deliberately disabled account, and never logs
- * a credential. The seed password comes from CEO_SEED_PASSWORD when set, so
- * the fallback literal below only ever applies to a brand-new empty database.
- */
-async function ensureCeoExists() {
-  try {
-    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
-    if (existing) return;
-
-    const password = process.env.CEO_SEED_PASSWORD || "CEO@2026";
-
-    await CEODepartment.create({
-      name: "Chief Executive Officer",
-      email: "ceo@grav.in",
-      password,                  // hashed by the model's pre-save hook
-      role: "ceo",
-      department: "Executive",
-      employeeId: "CEO001",
-      isActive: true,
-    });
-
-    // Deliberately no credentials in this message. A boot log is copied into
-    // aggregators, screenshots and terminal scrollback; a password printed
-    // once is a password leaked permanently.
-    console.log(
-      "[bootstrap] No CEO account existed — one was created for ceo@grav.in. " +
-        "Sign in and change the password, then create the remaining " +
-        "departments from CEO → Access Control.",
-    );
-  } catch (err) {
-    console.error("[bootstrap] Could not ensure a CEO account:", err.message);
-  }
-}
-
-// Retained but no longer called on boot — see ensureCeoExists above.
-const seedCEOUser = async () => {
-  try {
-    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
-    if (existing) {
-      console.log("ℹ️  CEO user already exists: ceo@grav.in");
-      return;
-    }
-    await CEODepartment.create({
-      name: "Chief Executive Officer",
-      email: "ceo@grav.in",
-      password: "Ceo@12345",
-      employeeId: "CEO001",
-      phone: "",
-      department: "Executive Office",
-      role: "ceo",
-      isActive: true,
-    });
-    console.log("✅ Seeded default CEO user: ceo@grav.in / Ceo@12345 (CEO001)");
-  } catch (err) {
-    console.error("❌ CEO seed error:", err);
-  }
-};
-
-// ✅ Auto-create default QC user
-const seedQCUser = async () => {
-  try {
-    const existing = await QCDepartment.findOne({ email: "qc1@grav.in" });
-    if (existing) {
-      console.log("ℹ️  QC user already exists: qc1@grav.in");
-      return;
-    }
-    await QCDepartment.create({
-      name: "QC Inspector 1",
-      email: "qc1@grav.in",
-      password: "Qc1@12345",
-      employeeId: "QC001",
-      phone: "",
-      department: "Quality Control",
-      role: "quality_control",
-      isActive: true,
-    });
-    console.log("✅ Seeded default QC user: qc1@grav.in / Qc1@12345 (QC001)");
-  } catch (err) {
-    console.error("❌ QC seed error:", err);
-  }
-};
-
-// ✅ Auto-create default Embroidery user
-const seedEmbroideryUser = async () => {
-  try {
-    const existing = await EmbroideryDepartment.findOne({
-      email: "embroidery@grav.in",
-    });
-    if (existing) {
-      console.log("ℹ️  Embroidery user already exists: embroidery@grav.in");
-      return;
-    }
-    await EmbroideryDepartment.create({
-      name: "Embroidery Supervisor",
-      email: "embroidery@grav.in",
-      password: "Emb@12345",
-      employeeId: "EMB001",
-      phone: "",
-      department: "Embroidery",
-      role: "embroidery",
-      isActive: true,
-    });
-    console.log(
-      "✅ Seeded default Embroidery user: embroidery@grav.in / Emb@12345 (EMB001)",
-    );
-  } catch (err) {
-    console.error("❌ Embroidery seed error:", err);
-  }
-};
 
 
-async function createDefaultProductionSupervisor() {
-  try {
-    const existing = await ProductionSupervisorDepartment.findOne({
-      email: "p1supervisor@grav.in",
-    });
-    if (existing) {
-      console.log("✓ Default Production Supervisor already exists");
-      return;
-    }
-
-    const hashed = await bcrypt.hash("P1supervisor@12345", 10);
-
-    await ProductionSupervisorDepartment.create({
-      name: "Production Supervisor",
-      email: "p1supervisor@grav.in",
-      password: hashed, // ✅ use the hashed value
-      employeeId: "PSUP001",
-      phone: "",
-      role: "production_supervisor",
-      department: "Production Supervisor",
-      isActive: true,
-    });
-
-    console.log(
-      "✅ Default Production Supervisor created: p1supervisor@grav.in",
-    );
-  } catch (err) {
-    console.error("❌ Failed to create default Production Supervisor:", err);
-  }
-}
-
-const createDefaultAccountant = async () => {
-  try {
-    const existingAccountant = await AccountantDepartment.findOne({
-      role: "accountant",
-      department: "Accounting",
-    });
-
-    if (existingAccountant) {
-      console.log("✅ Accountant already exists, skipping creation");
-      return;
-    }
-
-    const defaultAccountant = new AccountantDepartment({
-      name: "Accountant Admin",
-      email: "accounts@grav.in",
-      password: "Account@12345", // will be hashed automatically
-      employeeId: "ACC001",
-      phone: "9999999999",
-      department: "Accounting",
-      role: "accountant",
-      isActive: true,
-    });
-
-    await defaultAccountant.save();
-
-    console.log("✅ Default Accountant created successfully");
-  } catch (error) {
-    console.error("❌ Accountant creation failed:", error.message);
-  }
-};
-
-const createDefaultPackagingDispatch = async () => {
-  try {
-    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne(
-      {
-        role: "packaging_dispatch",
-        department: "Packaging & Dispatch",
-      },
-    );
-
-    if (existingPackagingDispatch) {
-      console.log(
-        "✅ Packaging & Dispatch user already exists, skipping creation",
-      );
-      return;
-    }
-
-    const defaultPackagingDispatch = new PackagingDispatchDepartment({
-      name: "Dispatch Admin",
-      email: "dispatch@grav.in",
-      password: "Dispatch@12345",
-      employeeId: "PKG001",
-      phone: "9999999999",
-      department: "Packaging & Dispatch",
-      role: "packaging_dispatch",
-      isActive: true,
-    });
-
-    await defaultPackagingDispatch.save();
-
-    console.log("✅ Default Packaging & Dispatch user created successfully");
-  } catch (error) {
-    console.error("❌ Packaging & Dispatch creation failed:", error.message);
-  }
-};
 
 // Update the database connection section
 // Accountant / Packaging / Production-Supervisor seeding removed — see the
@@ -951,41 +737,17 @@ const CATEGORY_MEASUREMENTS = {
   ],
 };
 
-const overwriteExistingMeasurements = async () => {
-  try {
-    const existingHR = await HRDepartment.findOne({
-      role: "hr_manager",
-      department: "Human Resources",
-    });
-    for (const [category, measurements] of Object.entries(
-      CATEGORY_MEASUREMENTS,
-    )) {
-      const result = await StockItem.updateMany(
-        { category },
-        { $set: { measurements } },
-      );
-
-      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
-    }
-
-    const defaultHR = new HRDepartment({
-      name: "HR Admin",
-      email: "hr@grav.in",
-      password: "Hr@12345", // will be hashed automatically
-      employeeId: "HR001",
-      phone: "9999999999",
-      department: "Human Resources",
-      role: "hr_manager",
-      isActive: true,
-    });
-
-    await defaultHR.save();
-
-    console.log("✅ Default HR Department created successfully");
-  } catch (error) {
-    console.error("❌ Measurement overwrite failed:", error.message);
-  }
-};
+/* `overwriteExistingMeasurements` was removed with the other seeders.
+ *
+ * It was two unrelated jobs in one function: it rewrote stock-item measurements
+ * for three categories AND created the default `hr@grav.in` login with a
+ * hardcoded password. The second job was invisible from the name, which is how
+ * it survived the earlier seeder cleanup — nobody looks for an account seeder
+ * inside a measurements helper.
+ *
+ * Nothing called it. The measurement half belongs in a migration script if it
+ * is ever wanted again; the account half is what CEO → Access Control is for.
+ */
 
 // CEO Routes
 const ceoHrRoutes = require("./routes/CEO_Routes/hr");
@@ -1051,10 +813,75 @@ app.use(
   router's own auth middleware has resolved req.user, so entries carry a name.
 */
 const auditTrail = require("./Middlewear/auditTrail");
+/* Required here rather than beside the Sales mount further down: HR now uses it
+   too, and the first mount in the file has to be the one that loads it. */
+const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const hrAuditTrail = auditTrail("hr");
 app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
 app.use("/api/employees", hrAuditTrail);
+
+/* ─── HR: role enforcement + the editor-needs-approval queue ───────────────
+ *
+ * See Middlewear/departmentWriteGuard.js. Reads are untouched; an approver or
+ * owner commits directly; an EDITOR's write is held as a ChangeRequest and
+ * answered with 202, and shows up at /hr/dashboard/approvals.
+ *
+ * TWO THINGS TO KNOW BEFORE CHANGING THIS
+ *
+ * 1. It enforces the moment HR has its first role — which it now does. A
+ *    person with NO HR role gets 403 NO_DEPARTMENT_ROLE on every write, so
+ *    every HR user needs a role in CEO → Access Control. Platform
+ *    administrators are exempt (both guards agree on that now).
+ *
+ * 2. The exemptions below are not decoration:
+ *      /profile, /change-password  nobody should need an approver's permission
+ *                                  to change their own password
+ *      /change-history             a read API; a GET is skipped anyway, but it
+ *                                  must never be able to queue
+ *      /import-export              a spreadsheet import exceeds the 256 KB a
+ *                                  held request can store, so it would answer
+ *                                  413 rather than queue — the guard refuses to
+ *                                  truncate, correctly, and the result would
+ *                                  read as a broken importer
+ *      /sync-period, /backfill,    machine operations, not somebody's edit.
+ *      /day-range, /notification-  Queueing a biometric sync means attendance
+ *                                  silently stops updating until an approver
+ *                                  notices.
+ *
+ * Mounted on the three HR prefixes only. `/api/employee` (singular) is the
+ * mobile app and belongs to no department's queue. */
+const hrWrites = departmentWrites("hr", {
+  entity: "HR record",
+  exempt: [
+    /* FULL paths, not bare words. These are matched with `includes`, and the
+       short forms let two administrative writes through by accident:
+
+         "/profile"          also matched /api/employees/:id/profile-photo —
+                             HR changing somebody else's photo, which is an
+                             edit to another person's record and belongs in
+                             the queue like any other.
+         "/change-password"  also matched
+                             /api/hr/password-management/change-password/:type/:id
+                             — that is HR RESETTING SOMEBODY ELSE'S password,
+                             the opposite of the self-service case the
+                             exemption was written for, and the single most
+                             sensitive write in the department.
+
+       The exemption is "changing your OWN credentials", so it says so. */
+    "/api/hr/profile",
+    "/api/hr/change-password",
+    "/change-history",
+    "/import-export",
+    "/sync-period",
+    "/backfill",
+    "/day-range",
+    "/notification-",
+  ],
+});
+app.use("/api/hr", hrWrites);
+app.use("/hr", hrWrites);
+app.use("/api/employees", hrWrites);
 
 /* Two employee-app prefixes, named individually rather than mounting the trail
    on all of /api/employee. Overtime and regularisations are HR facts raised
@@ -1144,6 +971,11 @@ app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 // them. Mounted outside any one department's middleware because the queue spans
 // departments; it authenticates the session itself.
 app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+
+/* A department's own team screen — the same DepartmentRole rows Access Control
+   manages, reached by that department's OWNER instead of a platform admin. See
+   the header of the router for what it refuses and why. */
+app.use("/api/department-team", require("./routes/Access/departmentTeam"));
 /* Department-facing budget proposals. Mounted HERE, beside the other
  * cross-department surface, and deliberately NOT under /api/accountant — the
  * frontend's authFetch skips that prefix, so a department session would never
@@ -1192,7 +1024,6 @@ app.use("/api/ceo/sop", ceoSopRoutes);
 // Role enforcement + the editor-needs-approval queue for the whole Sales API.
 // See Middlewear/departmentWriteGuard.js — reads are untouched, and nothing
 // changes at all until an administrator assigns the first Sales role.
-const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const salesWrites = (entity, extra = {}) =>
   departmentWrites("sales", { entity, ...extra });
 

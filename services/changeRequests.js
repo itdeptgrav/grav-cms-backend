@@ -170,6 +170,27 @@ async function recordDecision(req, cr, { applied, error }) {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Push a notification about this request, without ever letting it matter.
+ *
+ * Deliberately not awaited by any caller and deliberately not throwing: a
+ * change request that is queued, approved or rejected is already correct and
+ * durable at the point this runs. A notification is how somebody FINDS OUT,
+ * which is worth a lot and is worth nothing compared to the decision itself.
+ *
+ * Required lazily so that services/departmentApprovalNotifications — and the
+ * Firebase admin SDK behind it — is not pulled in at boot by every module that
+ * imports this one.
+ */
+function notify(cr, event) {
+  try {
+    const { notifyChangeRequest } = require("./departmentApprovalNotifications.service");
+    Promise.resolve(notifyChangeRequest(cr, event)).catch(() => {});
+  } catch (err) {
+    console.warn("[change-requests] notification skipped:", err.message);
+  }
+}
+
+/**
  * @param {string} departmentSlug  whose approvers decide this
  * @param {object} opts
  * @param {string}   opts.entity      "customer", "purchase-order", "raw-item"…
@@ -278,6 +299,12 @@ function requireApproval(departmentSlug, opts = {}) {
       // disappear with nothing anywhere saying it had ever been asked for.
       // `action: "other"` deliberately: nothing was created, updated or deleted.
       await recordSubmission(req, cr).catch(() => {});
+
+      // Tell the owner and approvers there is something waiting. NOT awaited:
+      // a queued change is already safe, and making the editor wait on FCM —
+      // or fail because of it — would trade the thing that matters for the
+      // thing that does not.
+      notify(cr, "held");
 
       // 202, not 200: the request was accepted, the change has NOT happened.
       // A UI that treats this as success and closes the form having told the
@@ -436,6 +463,7 @@ async function decideChangeRequest({ id, decision, note, actor, req }) {
     cr.status = "rejected";
     await cr.save();
     await recordDecision(decisionReq, cr, { applied: false }).catch(() => {});
+    notify(cr, "rejected");
     return { ok: true, request: cr };
   }
 
@@ -454,6 +482,12 @@ async function decideChangeRequest({ id, decision, note, actor, req }) {
 
   await cr.save();
   await recordDecision(decisionReq, cr, { applied: result.ok, error: cr.applyError }).catch(() => {});
+
+  // Only a change that actually landed is reported as approved. A `failed`
+  // request has been approved by a person but applied by nothing, and telling
+  // the editor it went through would be the one lie this whole queue exists to
+  // prevent — they will see it in the Failed tab instead.
+  if (cr.status === "approved") notify(cr, "approved");
 
   return {
     ok: result.ok,

@@ -2,6 +2,981 @@
 
 ---
 
+## HR write coverage audited — and two exemptions were too broad
+
+> Nothing committed.
+
+### The audit
+
+`verifyHrWriteCoverage.js` (new, **23/23**, read-only — it writes nothing at
+all). It loads all 20 HR routers, walks their route tables, and asks the REAL
+guard logic — the same `READ_SHAPED` list, and an exempt list it asserts against
+`server.js` rather than retyping — what would happen to each path. It answers the
+question a screenshot cannot: not "did this edit get held" but "is there a write
+anywhere in HR that quietly does not".
+
+**85 writes go to the approver · 9 exempt by name · 5 read-shaped.**
+
+Named individually rather than counted, because a count passes while the one
+route that matters is missing: editing, removing and adding an employee, adding a
+department, a leave decision, issuing a document — all held.
+
+**Attendance: 11 held, 5 exempt, and every exemption is a machine operation** —
+`sync-period`, `backfill-hr-leaves`, and the three `notification-*` endpoints.
+The assertion is written as a rule, not a list: *no human-facing attendance edit
+is exempt*. So day-override, bulk-day-override, punch-correction,
+remove-from-month, the three regularisation decisions, holidays and settings all
+go to the approver.
+
+### Two exemptions were letting administrative writes through
+
+The audit's own "nothing is exempt by accident" listing is what surfaced them.
+Both came from matching bare words with `includes`:
+
+| path | matched | what it actually is |
+|---|---|---|
+| `PATCH /api/employees/:id/profile-photo` | `/profile` | HR changing **someone else's** photo |
+| `PATCH /api/hr/password-management/change-password/:userType/:id` | `/change-password` | HR **resetting someone else's password** |
+
+The second is the most sensitive write in the department, and it was skipping the
+queue because "/change-password" is a substring of its path. The exemption was
+written for *changing your own credentials*; it now says so —
+`"/api/hr/profile"` and `"/api/hr/change-password"` — and both routes are held.
+The harness names them individually so shortening the list again fails there
+rather than in production.
+
+**Behaviour change worth knowing:** an editor resetting another person's
+password, or changing their photo, now needs approval. Approvers and owners are
+unaffected.
+
+### The harnesses were writing into the real change log
+
+Fair catch from the screenshot: entries reading **"by Harness"** were mine.
+`verifyHrProfile.js` and friends cleaned up the employees and roles they created
+but not the `change_logs` their actions caused — 7 rows out of 786.
+
+All four harnesses now clear their own log rows, matched narrowly (the `Harness`
+actor, `Verify `-prefixed labels, `@grav.invalid` addresses). Re-running the
+suite removed exactly those 7: **786 → 779, and 0 remaining**, so nothing real
+was caught by the match.
+
+### Verification
+
+`verifyHrWriteCoverage` 23/23 · `verifyHrProfile` 20/20 · `verifyApprovalDetail`
+27/27 · `verifyDepartmentTeam` 22/22 · `verifyHrApprovalFlow` 16/16 ·
+`verifyDepartmentRoles` 15/15 · `verifyHrChangeHistory` 46/46 ·
+`verifyAuditFloor` 22/22 · `npm test` 1462/1465 · server boots clean.
+
+---
+
+## HR: one navigation, not two — and sign-out where people look for it
+
+> Nothing committed.
+
+### The rail is gone, the app switcher is in the bar
+
+HR was carrying a 64px department rail down the left AND a full top nav: two
+navigations for one screen, and most of why HR read as a separate module beside
+Accounts. `"/hr"` joins `RAIL_HIDDEN_PATHS` in `components/shell/AppShell.js`,
+alongside `/accountant`, `/store`, `/budget`, `/files` and `/mrf`.
+
+The prerequisite those entries all name is met the same way: the shell now
+carries `appLogoSlug="hr"`, so the department's own mark sits at the bar's left
+edge and swaps to a back-arrow ("Back to apps") on hover. Dropping the rail
+without it would have removed the only way to reach another department.
+
+### Sign out moved to the account menu
+
+It was in the gear, next to light/dark and effects — settings, not identity.
+It is now the last item in the account dropdown, under a rule, because it is
+that menu's most destructive action and should not sit under a thumb travelling
+towards "Your profile".
+
+`FrostShell` gained `showSignOut`, **defaulting to true**, so Accounts, Store,
+Budget and every other consumer are untouched; HR passes `false`. It gates both
+places the shell can draw one — the gear entry and the standalone button on the
+ungrouped path — so the prop means the same thing whether or not a consumer
+groups its controls. The result is exactly one sign-out in the bar; two is how
+somebody hits the wrong one.
+
+### Verification
+
+9/9 against the sources with comments stripped, including the two that matter
+most for a shared component: **`showSignOut` defaults to true**, and
+**`components/accountant/LayoutShell.js` does not opt out**, so nothing outside
+HR changed. Seven files compile under SWC — every consumer of the shell, not
+just the two I edited.
+
+---
+
+## "Failed to load profile data" — and a name dropdown instead of an icon
+
+> Nothing committed.
+
+### The error had TWO causes, and the bigger one was server-side
+
+**1. `HRDepartment` is empty.** `/api/hr/profile` did
+`HRDepartment.findById(req.user.id)` and 404'd otherwise. That collection now
+has **zero** documents — the boot-time seeding of default department accounts
+was removed a few turns ago, and HR is staffed by employees holding an `hr`
+`DepartmentRole`. All three current role holders are Employees. So the endpoint
+answered 404 for **every user, always**, and the page had never worked since the
+seeding went.
+
+All three routes (`GET /profile`, `PUT /profile`, `PUT /change-password`) now
+resolve through `resolveAccount()`: HRDepartment first so a legacy account is
+untouched, Employee as the fallback and today the only match. `shapeAccount()`
+gives one response shape from two schemas — HRDepartment has `name`, Employee
+has firstName/lastName — and `applyName()` writes a display name back into
+whichever shape, keeping "Mary Anne" out of the surname.
+
+Three things fixed on the way: the email-uniqueness check now looks in BOTH
+collections (checking one would let an employee take an address a legacy account
+already signs in with); an email change here calls `followEmailChange`, since a
+profile edit orphans the person's roles exactly like the employee edit did; and
+an account with **no** password set is told so rather than 500ing out of
+`bcrypt.compare(x, null)`.
+
+**2. The page sent no credential.** It used bare
+`fetch(..., { credentials: "include" })` — cookie only — and Chrome refuses to
+store a cross-origin cookie for `localhost:3000 -> localhost:5000`, which
+`lib/api.js` exists to work around. All three calls now go through `api`, which
+sends the cookie AND `Authorization: Bearer`. Their catch blocks surface the
+server's message instead of a generic string, so "Current password is incorrect"
+reaches the person it is about.
+
+### `employeeId` is a virtual, and virtuals do not survive `.lean()`
+
+Found by a failing assertion. `Employee.employeeId` is a **virtual** aliasing
+`biometricId`, so it is `undefined` on any `.lean()` document and cannot be
+named in a `.select()`. Three places I had written this session read it that way
+and silently showed nothing: the approval card's record label, and both queries
+behind the Team screen. All now read `biometricId`.
+
+### The profile control is a name dropdown
+
+`components/access/ProfileMenu.js`. Geometry copied from the accountant company
+switcher — the same `max-w-[200px] px-2.5 py-1.5 rounded-lg` trigger and `w-72
+rounded-lg` menu — so the two bars read as one product. The COLOURS are not
+copied: that component hardcodes `border-slate-200`/`bg-white`, fine in a module
+that never goes dark and wrong here, so this uses the hairline/frost/ink tokens.
+
+A name rather than an avatar glyph because an icon says "profile" to somebody who
+already knows what it is, while the name says WHOSE session this is — worth
+knowing on a shared machine before you change a record under someone else's
+login.
+
+One request per tab: the in-flight promise is shared across mounts and the result
+cached in localStorage so the bar does not flash on every navigation. Saving the
+profile calls `clearProfileMenuCache()`, or a rename would keep showing the old
+name until the tab closed. The menu is portalled to `document.body` carrying
+`.grav-ui` and the theme attributes — `position: fixed` is not viewport-relative
+under a `backdrop-filter` ancestor, and this hangs off `.frost-bar`. No "Sign
+out": FrostShell's gear menu two inches away already has one.
+
+### Verification
+
+`verifyHrProfile.js` — **20/20**, driving the real handlers with throwaway
+employees. It pins the empty-collection premise, that an employee gets a profile
+rather than a 404, the first/last name round-trip, the cross-collection email
+clash, that a role follows an email change, all four password refusals, that the
+new password is stored **hashed**, and that a passwordless account gets a
+message rather than a 500.
+
+Everything else green: `verifyApprovalDetail` 27/27, `verifyDepartmentTeam`
+22/22, `verifyHrApprovalFlow` 16/16, `verifyDepartmentRoles` 15/15,
+`verifyHrChangeHistory` 46/46, `verifyAuditFloor` 22/22, `npm test` 1462/1465.
+Five frontend files compile under SWC; `/api/hr/profile` answers 401 unauthed.
+
+---
+
+## The HR bar's extra is the profile, not history
+
+> Nothing committed.
+
+History has its own entry under **System** since the nav was regrouped, so the
+top-bar button was spending the most valuable space on the screen duplicating a
+link three inches away. The profile, meanwhile, had no way in at all — and it is
+where somebody changes their own password.
+
+`extras` is now a profile link to `/hr/dashboard/profile`, styled as one of
+FrostShell's own round icon controls and marking itself current on that page.
+
+**An icon, not initials.** The layout has the caller's ROLE (`useDeptRole`) but
+not their name, so initials would mean another request and a letter that pops in
+after paint — to say something the page it opens says properly.
+
+**Removed with it:** `HISTORY_SECTION` and `HISTORY_TITLE`, the ~60-line maps
+from each page's `activeMenu` to its history section. Nothing referenced them
+once the button went, and a dead map that looks live is worse than a gap. A note
+in their place records what they were. `HistoryButton` itself is untouched and
+still used by the departments and new-employee pages, so any page that wants a
+scoped history affordance can still place one.
+
+**A pre-existing bug this surfaced:** `HRProfilePageContent` passed
+`activeMenu="profile"` in its loading branch and `activeMenu="dashboard"` in its
+real one — the two halves of the same page claiming to be different pages. It
+did not matter while nothing keyed on "profile"; now the bar's button does, so
+it would have stayed dark while HR dashboard lit up instead. Both branches say
+"profile".
+
+### Verification
+
+8/8 against the source with comments stripped: the button and its maps are gone,
+a profile link took its place with an accessible name and a current-page state,
+both imports are present, and **history is still reachable from the nav** — the
+thing that would make this a regression rather than a cleanup. All four touched
+files compile under SWC.
+
+---
+
+## The Allow button was checking, not asking
+
+> Nothing committed.
+
+Reported from a screenshot: clicking **Allow notifications** answered
+"Permission was not granted." rather than prompting. That was my bug, not only
+the platform's:
+
+```js
+if (permission === "default" && interactive) {
+  permission = await Notification.requestPermission();
+}
+```
+
+While blocked, `permission` is `"denied"`, so the guard was false and
+`requestPermission()` **was never called**. The code read
+`Notification.permission`, saw the stored answer and printed it back. A button
+that inspects a value and tells you what it already said is not a button.
+
+Now any click asks — `if (interactive && permission !== "granted")`.
+`interactive` still gates it, because calling `requestPermission()` without a
+user gesture is what gets an origin permanently blocked in Chrome, and the
+silent pass on page load must never reach it.
+
+The outcomes are now told apart:
+
+| result | meaning | what is said |
+|---|---|---|
+| `granted` | allowed | registers, banner disappears |
+| `denied` | the browser resolved without prompting — it remembers a block | names the site-settings route |
+| `default` | the prompt was **dismissed**, not refused | "The permission prompt was dismissed." — asking again works |
+
+That last row did not exist before; a dismissed prompt and a hard block both
+read as "not granted", which is wrong advice in one of the two cases.
+
+The static copy no longer says "the button below cannot ask" — it does ask, and
+reports what came back.
+
+**Still true, and not fixable in a page:** a browser that has recorded a block
+resolves the request without showing its dialog, and no web API can reopen it or
+reach site settings. `PermissionStatus.onchange` is what makes the notice clear
+itself the moment the user allows it there.
+
+### Verification
+
+7/7 assertions against the source **with comments stripped** — the first run
+reported three false failures because the checks were matching my own comments
+quoting the old code, and SWC preserves comments so compiling first did not help
+either.
+
+---
+
+## White-on-white: `--accent` is a surface token, not a brand colour
+
+> Nothing committed.
+
+Reported from a screenshot — the banner's button text was unreadable in the
+light theme.
+
+`--accent` is `var(--g-surface-2)` in `app/globals.css`: `#f7f8fa` light,
+`#171f28` dark. White text on it measures **1.06:1** in light — invisible. It
+reads perfectly in dark, which is how it got through.
+
+It was in **seven** places added this session, not just the button: the
+registrar's Enable button, the Team page's "Add someone" and "Try again", the
+owner role chip, and in the holiday calendar the count badge, the month badge
+and **every holiday day cell** — which would have been unreadable squares.
+
+All seven now use `background: var(--ink); color: var(--body-bg)`, the pairing
+FrostShell already uses for its active nav pill:
+
+| | before | after |
+|---|---|---|
+| light | 1.06:1 — fail | **13.38:1** — AA |
+| dark | 16.63:1 | **17.32:1** |
+
+### The banner is one button now
+
+"Copy settings link" is gone, and the primary reads **"Allow notifications"**.
+
+The manual "check again" it replaced is no longer needed:
+`navigator.permissions.query({name:"notifications"})` gives a `PermissionStatus`
+whose `change` event fires the moment the user flips the setting — no reload —
+so the banner registers the device and clears itself. Wrapped in try/catch:
+Safari does not support the query and a few browsers throw rather than reject,
+and losing a live update is not worth a broken dashboard.
+
+**Worth being plain about:** the Allow button cannot grant permission while the
+origin is blocked. `Notification.requestPermission()` returns "denied"
+immediately in that state and no web API can open site settings. The button is
+the real action for the undecided case; for the blocked case the text says the
+browser will not let it ask, and the listener makes the notice disappear by
+itself once they allow it in settings.
+
+### Verification
+
+Contrast ratios computed from the resolved hex values, both themes. All five
+touched files compile under SWC — which again caught a backtick I wrote inside
+the `DASH_CSS` template literal, the second time in this session; SWC reports it
+at the `const DASH_CSS =` line, far from the cause.
+
+---
+
+## HR nav: sixteen top-level items folded into six
+
+> Nothing committed.
+
+The top bar filled and ran off its own end — the last items were reachable only
+by scrolling a nav, which is the one thing a nav must not ask for.
+
+**Now:** HR dashboard · People · Time · Pay & policy · Documents · System.
+
+Nothing was removed and no `key` changed. Pages pass their own `activeMenu` and
+several already byte-match a key in this array; renaming one silently stops that
+page highlighting, which is invisible until somebody notices they cannot tell
+where they are.
+
+### Group menus can carry headings now
+
+`children` previously had to be a flat list of links, so folding Attendance,
+Leaves and Overtime into one "Time" group would have produced an
+undifferentiated list of eight. A child with `{ section: "Attendance" }` now
+renders as a heading instead of a link, in **all three** places children are
+drawn — the top-bar dropdown and both side-rail copies (desktop and mobile), so
+one nav array reads correctly whichever `variant` a department uses. Accounts
+gains the ability for free and is unaffected without it.
+
+### A bug this introduced, and the guard for it
+
+`groupHoldsActive` was `item.children?.some((c) => c.key === activeMenu)`. A
+heading has no key, and a page that passes no `activeMenu` leaves it undefined —
+so `undefined === undefined` is true and **every group carrying a heading would
+light up as the current page**. Guarded with `c.key &&`.
+
+`dropOrphanHeadings` in the HR layout removes a heading whose every item was
+filtered out by `minRole`. No section is all-editor today; it is there so adding
+one later cannot quietly leave a heading over empty space.
+
+### Verification
+
+Eight checks, run against the **shipped array** lifted out of the file rather
+than a copy of it: six top-level items, no duplicate key, **all 25 page keys
+still present**, every destination has an href, no heading has one, no menu ends
+on a heading, and both halves of the `groupHoldsActive` bug — a heading-bearing
+group stays dark for an undefined `activeMenu` and still lights for a real key.
+
+All seven touched frontend files compile under Next's own SWC, including
+`components/accountant/LayoutShell.js`, since FrostShell is shared.
+
+---
+
+## HR: top nav, a Team screen, and the attendance page trimmed
+
+> Nothing committed.
+
+Six things, from one message.
+
+### 1. Sidebar → navbar
+
+`variant="top"` plus `groupControls` on the FrostShell in
+`components/Hr_DashboardLayout.js`. That is the entire change — `variant` is a
+layout choice inside FrostShell, not a second implementation; both variants read
+the same `nav` array. Accounts already runs this way, which is what the request
+pointed at. `groupControls` collapses the clock and chrome buttons into one gear
+so HR's seven sections get the bar's width.
+
+### 2. A Team screen for HR
+
+`app/hr/dashboard/team/page.js` + `routes/Access/departmentTeam.js`
+(`/api/department-team`).
+
+The same `DepartmentRole` rows CEO → Access Control manages — one list, two
+doors. Access Control is behind `requirePlatformAdmin`, so until now making
+somebody an HR editor meant finding an administrator. Accounts never had that
+problem; an org owner manages their own team from inside the module. This gives
+every department the same, over the SAME rows rather than a second vocabulary.
+
+Reading is open to anyone with a role here — an editor should be able to see who
+their approvers are, since that is who they are waiting on. **Writing is
+owner-only**, not approver-and-above: granting a role is how somebody gets the
+ability to approve, so letting approvers grant it lets the approval requirement
+be voted away by the people it constrains.
+
+Two refusals, both so a department can never need a platform admin to dig it out:
+you cannot change your own role, and you cannot remove the last owner.
+
+Adding somebody is a SEARCH over real employees, not a free-text email box. A
+typo does not fail — it creates a role row matching nobody and silently locks out
+the person it was meant for, which is exactly the editor lockout from earlier
+today. For the same reason a member whose email matches no account is flagged on
+its own row.
+
+The session reader moved to `services/cmsSession.js`; the approval-queue router
+now shares it rather than keeping a second copy.
+
+### 3–5. The attendance overview page
+
+- **Recent attendance activity removed.** Its `today` state and the
+  `/hr/attendance/daily` fetch that fed it went with it — one request saved per
+  department/period change.
+- **Upcoming & holidays removed**, replaced by a **Holidays** button above the
+  KPIs opening a year-of-months calendar. Twelve small grids fit a year on one
+  screen: a list answers "when is the next one", a calendar answers "how does
+  this month look", which is what somebody planning a roster is asking. The
+  grids show WHEN, a list underneath shows WHAT — a coloured square cannot carry
+  a holiday's name. Read-only; holidays are configured in Attendance → Settings
+  and a second place to edit them is a second place for them to disagree.
+- **Attendance overview and Insight are now the same height.** Upcoming used to
+  pad the left column out; with it gone the heatmap ended short. `dash-top2`
+  moved from `align-items: start` to `stretch`, the left card fills, and the
+  heat grid centres in the extra space. Only side by side — once stacked below
+  1000px an equal height means one tall empty card.
+
+### 6. The notification banner has a way forward
+
+It was correctly showing "blocked" but offered nothing to click. Added **"I've
+allowed it — check again"** (there is no reliable `permissionchange` event, and
+changing site settings does not reload the page — without this the user allows
+it, comes back, sees the same note and concludes it failed) and a **Copy settings
+link** button, because Chrome refuses navigation to `chrome://` from a page.
+
+### Verification
+
+- `verifyDepartmentTeam.js` — **22/22**, driving the real handlers under a
+  throwaway slug. Pins that an approver cannot promote anybody, an editor cannot
+  promote themselves, an owner cannot demote themselves, the last owner cannot
+  be removed **even by a platform admin**, unknown roles and missing emails are
+  refused, and only an owner may search candidates.
+- Everything else still green: `verifyApprovalDetail` 27/27,
+  `verifyHrApprovalFlow` 16/16, `verifyDepartmentRoles` 15/15,
+  `verifyHrChangeHistory` 46/46, `verifyAuditFloor` 22/22, `npm test`
+  1462/1465. `/api/department-team/hr` answers 401 (mounted).
+- All five edited/new frontend files compile, checked with **Next's own SWC**
+  (`@next/swc-win32-x64-msvc.transformSync`) rather than brace-counting — which
+  is how two real syntax errors were caught: the block removal took `dash-left`'s
+  closing `</div>` with it, and a comment I wrote inside `DASH_CSS` used
+  backticks, terminating the template literal. Brace counting called both
+  "balanced".
+
+**Not verified:** the pages rendered in a browser. Both HR pages sit behind a
+login this session has no credentials for, and a forged cookie 500s on every
+page including ones I never touched, so it proves nothing.
+
+---
+
+## The approval card now says what changed, and the people involved are told
+
+> Nothing committed.
+
+Two problems with the queue as shipped last turn: a card read "Change ·
+employee" and nothing else, and nobody found out a change was waiting unless
+they went looking.
+
+### What the approver is shown
+
+`services/changeRequestDescribe.js` (new) fills the `changes[]`, `entityLabel`
+and `summary` fields the ChangeRequest model and the queue UI **already had** —
+nothing populated them, so every card was bare. It resolves the record from the
+path, diffs the submitted body against it, and labels each path with the same
+table the change history uses. The card now reads:
+
+> pending · Change · employee — RUTUSHREE RAY (GR0067)
+> Changing Email.
+> Email   rutushree.ray@gravclothing.in → rutushree.ray@gmail.com
+
+Wired in as the DEFAULT `describe` for `departmentWrites`, so Sales and
+Production get it too — neither ever passed one.
+
+**The trap it is written around:** a PUT body is usually partial, and diffing
+the whole stored document against it reports every absent field as a deletion.
+An approver reading "Salary: 42000 → (empty)" on an email change would be right
+to refuse it, and wrong. Only keys PRESENT in the body are compared.
+
+Before-values need to know which collection a path writes to, so there is a
+small `REGISTRY` (five HR paths today). An unregistered path is not a failure —
+it shows the submitted value with no from-value, which reads honestly as "this
+is what it will be set to". Adding a row is one line; guessing a model would
+report the wrong before-value, which is worse than none.
+
+`ChangeRequest.changes` gained `path` and `label` alongside `field`. `field` is
+the human label the card prints; the log needs the machine path, because a
+history keyed on a display string cannot be searched for a field. Mongoose
+strict mode drops anything undeclared, so both had to be named.
+
+### Notifications, following the accountant pattern
+
+`services/departmentApprovalNotifications.service.js` (new) is the department
+counterpart to `accountantApprovalNotifications.service.js`:
+
+- editor submits → **owner and approvers** are told, with the field list in the
+  message body, not just "something changed";
+- approved → the **editor** is told, naming who approved it;
+- rejected → the editor is told, with the reason.
+
+The requester is excluded from the "needs approval" message even when they hold
+an approver role — they cannot approve their own change (`SELF_APPROVAL`), so
+telling them it needs approving is noise.
+
+Only a change that actually LANDED is reported as approved. A `failed` request
+was approved by a person and applied by nothing; saying it went through is the
+one lie this queue exists to prevent.
+
+A second service rather than a shared one because only the FCM plumbing
+overlaps: the accountant side resolves recipients from `Acc_User` by
+`organizationId` and reads `fcmTokens` (an array); this side resolves them from
+`DepartmentRole` by slug and reads `Employee.fcmToken` (a string, the field the
+CMS and mobile app already share). Generalising means a branchy resolver and two
+token shapes — more code than two honest services.
+
+`notifyChangeRequest(cr, event, { send })` takes its transport as a parameter.
+That is a real seam, not a test hook: who gets told and what they are told IS
+this service, and a transport reachable only through FCM is a service that
+cannot be verified.
+
+### The prompt in the corner
+
+`components/access/ApprovalPushRegistrar.js` — the generic version of the
+accountant's `PushRegistrar`, mounted in `Hr_DashboardLayout`. Shown **only**
+while the browser permission is undecided; granted registers silently, denied
+shows nothing ever. A banner that reappears after "no" is how people learn to
+ignore banners. Dismissal is remembered per department, so silencing HR's does
+not silence Sales'.
+
+It posts to a new `POST /api/change-requests/push-token`. It could not reuse the
+existing `/api/employee/push-token`: that one is behind
+`AllEmployeeAppMiddleware`, which reads the MOBILE APP's `employee_token`
+cookie, so a department user on the web can never reach it — the token would be
+accepted from the phone and refused from the browser they are sitting at. It
+stores to the same `Employee.fcmToken` field, so one person has one place their
+notifications go.
+
+**Follow-up — "the popup still isn't coming".** Measured it rather than guessed:
+`Notification.permission` for `localhost:3000` is **`denied`**. Permission is per
+ORIGIN, so one "Block" — on localhost or on cms.grav.in — silences HR, Sales and
+the accountant module together, and once denied
+`Notification.requestPermission()` returns immediately without prompting. Both
+registrars gated on `permission !== "default"` and drew **nothing**, so the only
+symptom was a blank corner that reads as "the feature is broken".
+
+The denied state now draws a short note naming the exact clicks that undo it
+(padlock → Site settings → Notifications → Allow → reload), because no button in
+the page can. Still dismissible and still remembered — the rule kept is "never
+nag", not "never explain". The decision is a pure exported `bannerMode()`,
+verified 4/4 by lifting it out of the file (it has no React or DOM dependency).
+
+`components/accountant/PushRegistrar.js` has the identical blind spot and was
+left alone — it is the reference the user asked HR to match, so changing it is
+their call.
+
+`public/firebase-messaging-sw.js` — its raw `push` listener hard-filtered on
+`type === "accountant_approval"`. Widened to a two-entry table so
+`department_approval` draws too, with a per-type tag so the two do not replace
+each other in the tray. Accountant behaviour is byte-identical.
+
+### Verification
+
+`node -r dotenv/config verifyApprovalDetail.js` — **22/22**, under a throwaway
+department slug with throwaway employees, and a stub transport so nothing is
+sent to a real device. It pins both halves:
+
+- the record is named; the old AND new value are shown; the label is human and
+  the machine path survives for the log;
+- **no field the editor never submitted appears** (the partial-body trap);
+- a field resubmitted unchanged is not listed;
+- a password is redacted, never shown;
+- an unregistered path still shows the submitted value, with no invented
+  before-value;
+- owner and approver are told, the requester is not; the message names the
+  fields; on a decision only the editor is told, with the approver's name and
+  the rejection reason; a department with no approvers notifies nobody rather
+  than throwing.
+
+Also green: `verifyHrApprovalFlow` 16/16, `verifyDepartmentRoles` 15/15,
+`verifyHrChangeHistory` 46/46, `verifyAuditFloor` 22/22, `npm test` 1462/1465
+(the same three pre-existing failures), backend boots and answers 200.
+
+**Not verified end-to-end:** an actual FCM delivery — that needs
+`NEXT_PUBLIC_FIREBASE_VAPID_KEY` set in the frontend env and a browser that has
+granted permission. If the banner reports "Missing
+NEXT_PUBLIC_FIREBASE_VAPID_KEY", that is the env, not the code.
+
+### Follow-up: a one-field edit was showing twenty-five rows
+
+Reported straight after the above, with a screenshot. Changing ONE email
+produced 25 rows — twelve of them "Buffer #1: 105 → —". Three separate bugs,
+none of them in the card:
+
+**1. The shared diff walked into every class instance Mongo returns.**
+`isPlainObject` in `services/changeLog.js` was `object && !Array && !Date`,
+which is true of an ObjectId — and an ObjectId is an object with a twelve-byte
+`.buffer` on it. Hence exactly twelve Buffer rows, from an untouched
+`primaryManager.managerId`. Buffers, Decimal128 and Maps had the same problem.
+Now only genuinely plain objects are descended into (prototype is
+`Object.prototype` or null). Not a loss of detail: `sameValue` stringifies both
+sides, so an ObjectId already compares equal to the string form of itself —
+which is what a partially-populated document looks like. **This bug was in the
+change history too, not only the approval card.** `diff()` does not use
+`isPlainObject`, so CRM compatibility is untouched.
+
+**2. Salary is encrypted at rest and the form submits plaintext.** Every save
+compared `enc:f856bc…` against `19227`, so all eleven salary fields read as
+changed on every edit. Registry entries gained an optional `normalise`, and the
+Employee entry runs the stored document through
+`utils/salaryEncryption.decryptEmployeeDoc` before diffing.
+
+**3. Nested omissions were reported as removals.** The top-level rule ("only
+keys present in the body") did not protect one level down: the form posts
+`primaryManager: { managerName }` and omits `managerId`, which read as a
+deletion. JSON cannot express `undefined`, so an undefined AFTER value *always*
+means "not submitted" — clearing a field sends `null` or `""`. Any row with
+`to === undefined` is now dropped.
+
+Replayed the actual stored request through the fixed code: **25 rows → 1**,
+`Changing Email.` The harness grew five checks pinning each shape, using an
+employee fixture that carries a real ObjectId reference and real encrypted
+salary — `verifyApprovalDetail.js` is now **27/27**.
+
+Everything else re-run green after touching the shared diff:
+`verifyHrChangeHistory` 46/46, `verifyAuditFloor` 22/22, `verifyHrApprovalFlow`
+16/16, `verifyDepartmentRoles` 15/15, `verifyCompanyDocuments` 17/17,
+`verifyAccountantPasswordSync` 15/15, `npm test` 1462/1465.
+
+**Noticed in passing, not fixed:** `Employee.gender` declares
+`default: ""` against an enum that does not include `""`, so `Employee.create()`
+without a gender fails validation. Every current create path happens to supply
+one.
+
+---
+
+## HR approvals — the queue is now switched on, and an editor's edit is held
+
+> Nothing committed.
+
+The previous entry (below, superseded) explained why the write guard was *not*
+mounted for HR. Since then you assigned an owner and an editor, and reported the
+symptom that follows from the guard being absent: **the editor changed an
+employee's email and it applied immediately** instead of going to the owner.
+
+So it is mounted now. That was always the switch-on condition — an editor
+existing — and it has been met.
+
+### What was mounted
+
+`server.js`, beside the HR audit trail:
+
+```js
+const hrWrites = departmentWrites("hr", {
+  entity: "HR record",
+  exempt: ["/profile", "/change-password", "/change-history", "/import-export",
+           "/sync-period", "/backfill", "/day-range", "/notification-"],
+});
+app.use("/api/hr", hrWrites);
+app.use("/hr", hrWrites);
+app.use("/api/employees", hrWrites);
+```
+
+The `departmentWrites` require had to be **hoisted**. It sat beside the Sales
+mount 140 lines further down, and a `const` is not hoisted — the HR mount would
+have thrown at boot. Order verified: require 818 → HR 854 → Sales 996.
+
+The exemptions are not decoration. `/profile` and `/change-password` because
+nobody should need an approver's permission to change their own password;
+`/sync-period`, `/backfill`, `/day-range`, `/notification-` because they are
+machine operations, and queueing a biometric sync means attendance silently
+stops updating until somebody notices; `/import-export` because a spreadsheet
+exceeds the 256 KB a held request can store, so it would answer 413 rather than
+queue — the guard is right to refuse to truncate, but the result reads as a
+broken importer.
+
+### The reason the editor was also seeing "Not your department."
+
+Worth stating separately, because it is a trap the whole design walks into.
+
+**A role is keyed on an email address, and an email address is editable.** The
+HR editor changed *their own* email from `rutushree.ray@gravclothing.in` to
+`rutushree.ray@gmail.com` — that is the exact edit in the change-history
+screenshot. Their `DepartmentRole` row still said "editor" and still pointed at
+the old address, which no account had any more. They were locked out the moment
+they saved, and the cause was invisible: Access Control still listed them
+correctly.
+
+`services/departmentRoles.js` now exports `followEmailChange(oldEmail, newEmail)`,
+called from `routes/HrRoutes/Employee-Section.js` whenever an update actually
+changes an email. It moves `DepartmentRole` rows and the matching `Acc_User`,
+best-effort — an email change that worked must not fail because the person held
+a role — and **skips any department where the new address already holds a role**,
+because that would collide with the unique `(departmentSlug, email)` index and
+because which of two roles wins is a decision, not a rename.
+
+Keying on an immutable id would be the deeper fix and is a migration; rows exist
+in production keyed on email, on the accounting side too.
+
+### Two things you have to do before this works for you
+
+1. **Re-point the orphaned editor row.** `followEmailChange` fixes it from now
+   on; it cannot fix the change that already happened. In CEO → Access Control,
+   give `rutushree.ray@gmail.com` the HR editor role and remove the stale
+   `rutushree.ray@gravclothing.in` one. Until then that editor gets 403, not a
+   queued change.
+
+2. **Give every other HR user a role.** This is the warning from the superseded
+   entry, now live: `requireDepartmentRole` refuses an unknown email with
+   `NO_DEPARTMENT_ROLE`. HR has three role rows; every other HR user writes
+   through `EmployeeAuthMiddlewear` with no `DepartmentRole` at all, and their
+   attendance overrides and leave approvals will 403 until they have one.
+   Platform administrators are exempt — both guards now agree on that.
+
+### Verification
+
+`node -r dotenv/config verifyHrApprovalFlow.js` — **16/16**. It creates its own
+roles under a throwaway department slug, never the real `hr`, and cleans up on
+crash as well as on success. It pins:
+
+- an editor's write is **not** applied, answers 202, and queues exactly one
+  pending request;
+- an approver's write goes straight through and queues nothing;
+- somebody with no role is refused (403) rather than queued;
+- a GET is never touched, even for an editor;
+- the role follows an email change, answers at the new address, is gone from the
+  old, and the editor is still an editor rather than locked out;
+- an existing role at the new address is left alone.
+
+Also: `verifyDepartmentRoles.js` 15/15, `npm test` 1462/1465 (the same three
+pre-existing `blockedDeadline` / `salesJourneyOutcome` failures), backend boots
+and answers 200.
+
+---
+
+## (superseded) HR approvals — the page, and why the queue is not switched on with it
+
+> Nothing committed.
+
+### The page
+
+`app/hr/dashboard/approvals/page.js` — 24 lines, because the queue screen is
+already shared. `components/access/ApprovalQueue` takes a slug and nothing in it
+is department-specific; Sales and Production use the same one. Plus an
+**Approvals** nav entry under System, with its own icon rather than reusing the
+SOP clipboard.
+
+Deliberately **not** role-gated. An editor has to be able to open it: it is
+where they see their change is still waiting and read the reason if it was
+refused. The server already decides what each role sees — an editor's queue
+contains only their own requests, and the decision buttons are absent.
+
+### Why the write guard was NOT mounted for HR
+
+`departmentWrites("hr", …)` is the piece that would actually hold an editor's
+write. It is not mounted, and mounting it today would break HR for most of the
+team. Two measured reasons:
+
+**1. There are no HR editors.** The `DepartmentRole` table holds 27 rows; HR's
+three are **two approvers and one owner**. Approvers and owners commit directly —
+`requireApproval` waves them through — so with the guard mounted the queue would
+still be empty. Nothing to approve until an editor exists.
+
+**2. Anyone without an HR role would be locked out.** `requireDepartmentRole`
+refuses an unknown email with `NO_DEPARTMENT_ROLE`. Only three people have an HR
+role row; every other HR user writes today through `EmployeeAuthMiddlewear` with
+no `DepartmentRole` at all. Mounting the guard would 403 their attendance
+overrides, leave approvals and employee edits immediately.
+
+That is not hypothetical — the comment above the Production mount records
+exactly this happening: *"every supervisor's save 403'd with
+NO_DEPARTMENT_ROLE — they have no role in that department"*.
+
+**To switch it on**, in order:
+1. give every HR user a role in CEO → Access Control (editors for the people
+   whose work should be reviewed, approvers for those it should not);
+2. add one line beside the Sales and Production mounts in `server.js`:
+   `app.use("/api/hr", departmentWrites("hr", { entity: "HR record", exempt: [...] }))`.
+
+The `exempt` list matters and is worth writing carefully: HR self-service
+(`/profile`, `/change-password` — nobody should need approval to change their own
+password), the sync and backfill endpoints, and the bulk import, whose payload
+exceeds the 256 KB the queue can store and would 413 rather than queue.
+
+I have left that line out rather than adding it commented-out — a commented mount
+is a thing somebody uncomments without reading the list above it.
+
+### A guard inconsistency fixed on the way
+
+`requireApproval` exempts platform administrators (`req.user?.isAdmin ||
+req.admin`). `requireDepartmentRole` did not. The same admin was therefore
+refused by one guard and waved through by the other, depending on which a route
+reached first — and the write guard runs both in sequence, so the refusal won.
+They now agree.
+
+### Verification
+
+- `node -r dotenv/config verifyDepartmentRoles.js` — **15/15** still green after
+  the guard change.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- The HR approvals page compiles; `/api/change-requests` answers 401 (mounted).
+
+**Not verified:** the queue with a real held request in it — that needs an HR
+editor and the mount, per above.
+
+
+---
+
+## `dropRoleCaches is not defined` — every department role change was failing
+
+> A one-line fix with a wide blast radius. Pre-existing, present at HEAD.
+> Nothing committed.
+
+### What it was
+
+`services/departmentRoles.js` called `dropRoleCaches(slug, mail)` on the revoke
+path and `dropRoleCaches(slug, null)` on the grant path. **Nothing anywhere
+defines or imports it.** So every call to `setRole` threw
+`ReferenceError: dropRoleCaches is not defined` — which is every grant, every
+role change and every revoke, in every department that uses this service.
+
+### Why it was worse than a failed request
+
+The throw came **after** the database write. `findOneAndUpdate` had already
+landed, so the sequence was:
+
+1. the role change is written
+2. the cache-drop throws
+3. the route returns 500 and the screen shows a red banner
+
+The change had actually applied. Anybody seeing that banner would reasonably
+conclude it had not, retry, and watch the same error — with the role quietly
+correct underneath the whole time. **Roles you set while seeing this error are
+very likely already in place**, so it is worth reading the current state before
+redoing anything.
+
+### The fix
+
+Both calls removed, not implemented. `getRole` and `listRoles` read the database
+on every call — there is no cache in front of them, so a cache-drop would be a
+no-op at best. Adding a cache to justify the invalidation would have introduced
+staleness nobody asked for. The comment left in its place says so, and says
+where invalidation should live if a cache is ever added.
+
+### Verification
+
+`node -r dotenv/config verifyDepartmentRoles.js` — **15/15**, new, against the
+dev database. Covers the whole path that was broken: grant, read back, change a
+role, the one-owner-per-department demotion, list, revoke, and the two reads that
+must return null rather than throw (unknown department, blank email). It works in
+a throwaway department slug with throwaway addresses and deletes its own rows,
+including on crash.
+
+`npm test` — 1462/1465, the same three pre-existing failures.
+
+### Two of these now
+
+This is the second bug of exactly this shape found from a screenshot —
+`gstState is not defined` in `Acc_companies.js` was the first, also
+used-but-never-imported, also only firing on one branch. Both were invisible to
+`node --check` because a `ReferenceError` is a runtime event, and both sat on
+paths with no test. Worth a grep for other undefined identifiers in the write
+paths if there is ever a quiet moment.
+
+---
+
+## Access Control can now see — and remove — the accounts that actually sign in
+
+> Nothing committed.
+
+### Why the seeded defaults were invisible
+
+Access Control listed `dept_users`, the access table.
+`services/ensureAccessDepartments` **mirrors** each legacy department login into
+it, reusing the same `_id` — but the mirror is not the credential.
+`routes/login.js` probes the legacy collections themselves (`hrdepartments`,
+`ceodepartments`, …). So:
+
+- an account could exist in a legacy collection with **no mirror**, be invisible
+  on this screen, and still sign in — which is exactly why `hr@grav.in` could
+  not be found; and
+- deleting the mirror would have tidied the screen and **left the login
+  working**, which is worse than not offering the button at all.
+
+There was also already a `showDepartmentLogins` tab, defaulted **off** in the
+CEO console with a reasoned comment: these are the shared legacy passwords the
+access refactor exists to retire, and showing them invites their continued use.
+That was right while they could not be removed. It inverts once they can.
+
+### What was added
+
+| File | Change |
+|---|---|
+| `services/ensureAccessDepartments.js` | Exports `DEPARTMENTS`, the canonical department → legacy-collection map, so Access Control and the mirror service cannot disagree about where a login lives. |
+| `routes/Admin/accessAdmin.js` | `GET /api/admin/department-logins` reads all 13 legacy collections directly — the raw collection, not the models, because a model applies schema defaults and StoreDepartment defaults `role` to `production_manager` while the stored rows say `store_manager`. `DELETE /department-logins/:collection/:id` removes the credential **and** its mirror. Rows with no mirror are flagged, so the previously-invisible ones are named rather than quietly listed. |
+| `lib/accessApi.js`, `components/access/AccessManager.js`, `app/ceo/dashboard/access/page.js` | **One** tab — Department Logins — reading the merged list, with Remove added alongside the existing controls. Turned on for the CEO console. |
+
+**Corrected on review:** the first pass added a second tab beside the existing
+one, so two screens listed overlapping sets of the same people — which is how an
+administrator removes somebody in one place and finds them still able to sign in
+from the other. Merged on the SERVER instead: `/department-logins` now joins each
+legacy credential to its `dept_users` mirror on the shared `_id` and returns one
+row per person, carrying `isAdmin`, department and `mustChangePassword` from the
+mirror. `UserPanel` reads that single endpoint and keeps every control it had —
+move department, reset password, admin toggle, activate — plus Remove. The
+mirror-dependent controls are hidden on an unmirrored credential (marked NOT
+MANAGED), because those routes address the mirror and would 404; Remove is the
+one action that always applies. The second panel is deleted.
+
+Two refusals, both about not locking everybody out: you cannot remove the
+account you are signed in as, and you cannot remove the last active
+administrator. That check reads `dept_users`, because `isAdmin` lives on the
+mirror and Access Control is reachable only by an admin.
+
+### Every seeder is gone
+
+224 lines removed from `server.js` (3175 → 2936). All eight seeder definitions
+plus the `ensureCeoExists()` boot call: cutting-master, CEO, QC, embroidery,
+production-supervisor, accountant, packaging/dispatch — and one more that an
+earlier cleanup had missed.
+
+**`overwriteExistingMeasurements`** was two unrelated jobs in one function: it
+rewrote stock-item measurements for three categories AND created `hr@grav.in`
+with the literal password `Hr@12345`. The account half was invisible from the
+name, which is how it survived a previous seeder sweep — nobody greps for an
+account seeder inside a measurements helper. Nothing called it.
+
+Removing these had to happen for the delete button to mean anything: an account
+removed in Access Control came back on the next restart.
+
+**What this means for an empty database:** there is no automatic way in. A fresh
+deployment needs one administrator inserted by hand, or via
+`scripts/migrations/001-seed-access-departments.js`. That is the intended trade
+— an empty database is a one-off event, a self-healing admin account is a
+permanent one.
+
+`ensureAccessDepartments` stays, and is not a seeder in this sense: it registers
+department rows and mirrors existing logins, creating no credential and
+inventing no password.
+
+### Verification
+
+- Backend restarts clean after the removal; `GET /api/admin/department-logins`
+  answers **401** exactly like its neighbours — mounted and admin-gated.
+- No reference to any removed seeder remains, and no seeded credential
+  (`hr@grav.in`, `Hr@12345`, `CEO@2026`, …) survives anywhere in `server.js`.
+- `npm test` — 1462/1465, the same three pre-existing failures.
+- `verifyAccountantPasswordSync.js` 15/15 still green; Access Control compiles.
+
+**Not verified:** the tab driven from a browser — that needs an admin login. The
+first thing worth checking is that `hr@grav.in` now appears in it.
+
+---
+
 ## One person, one password — and Access Control brought to parity with Team
 
 > Nothing committed.

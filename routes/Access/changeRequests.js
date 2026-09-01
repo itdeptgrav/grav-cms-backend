@@ -27,49 +27,10 @@ const { recordChange } = require("../../services/changeLog");
 /* Session                                                             */
 /* ------------------------------------------------------------------ */
 
-const jwt = require("jsonwebtoken");
-const { SECRET, LEGACY_SECRETS, readToken } = require("../../config/jwt");
-
-/**
- * Resolve the caller from the CMS session.
- *
- * This router is mounted outside any department's own middleware — the queue
- * spans departments — so it reads the token itself rather than depending on
- * whichever guard happens to be in front of it.
- */
-function authenticate(req, res, next) {
-  const token = readToken(req);
-  if (!token) return res.status(401).json({ success: false, message: "Not authenticated" });
-
-  const verify = () => {
-    try {
-      return jwt.verify(token, SECRET);
-    } catch (err) {
-      for (const legacy of LEGACY_SECRETS) {
-        try {
-          return jwt.verify(token, legacy);
-        } catch {
-          /* try the next */
-        }
-      }
-      throw err;
-    }
-  };
-
-  try {
-    const decoded = verify();
-    req.user = {
-      id: decoded.id,
-      email: String(decoded.email || "").toLowerCase(),
-      name: decoded.name || "",
-      isAdmin: Boolean(decoded.isAdmin),
-      deptSlug: decoded.deptSlug || "",
-    };
-    next();
-  } catch {
-    res.status(401).json({ success: false, message: "Invalid or expired session" });
-  }
-}
+/* The session reader lives in services/cmsSession because the team router needs
+   the identical one — see the note there on why these routers read the token
+   themselves rather than sitting behind a department's guard. */
+const { authenticateCmsSession: authenticate } = require("../../services/cmsSession");
 
 /** The caller's role in `slug`, with admins treated as owner. */
 async function roleFor(req, slug) {
@@ -92,6 +53,67 @@ async function canRead(req, slug) {
 }
 
 router.use(authenticate);
+
+/* ------------------------------------------------------------------ */
+/* POST|DELETE /api/change-requests/push-token                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Register this browser for approval notifications.
+ *
+ * It lives here rather than beside the existing /api/employee/push-token
+ * because that route is behind AllEmployeeAppMiddleware, which reads the
+ * MOBILE APP's `employee_token` cookie. A CMS session carries `auth_token`, so
+ * a department user on the web has no way to reach it — the token would be
+ * accepted from the phone and refused from the browser they are standing in
+ * front of. This router already authenticates the CMS session, and approval
+ * notifications are its subject, so the endpoint belongs to it.
+ *
+ * The token is stored on Employee.fcmToken — the SAME field the mobile app
+ * writes. That is deliberate: one person has one place their notifications go,
+ * and the notification service has one field to read.
+ *
+ * Declared above the /:slug routes so a department can never be named
+ * "push-token" and shadow it.
+ */
+router.post("/push-token", async (req, res) => {
+  try {
+    const token = String(req.body?.token || req.body?.fcmToken || "").trim();
+    if (!token) {
+      return res.status(400).json({ success: false, message: "No token supplied." });
+    }
+    if (!req.user?.id) {
+      return res.status(400).json({ success: false, message: "No employee on this session." });
+    }
+
+    const Employee = require("../../models/Employee");
+    const result = await Employee.updateOne(
+      { _id: req.user.id },
+      { $set: { fcmToken: token } },
+    );
+    if (!result.matchedCount) {
+      // A department login with no employee record behind it. Not an error the
+      // user can act on, and not worth failing their page over.
+      return res.json({ success: true, stored: false, message: "No employee record to store it on." });
+    }
+    res.json({ success: true, stored: true });
+  } catch (err) {
+    console.error("[change-requests/push-token]", err.message);
+    res.status(500).json({ success: false, message: "Could not register this device." });
+  }
+});
+
+router.delete("/push-token", async (req, res) => {
+  try {
+    if (!req.user?.id) return res.json({ success: true, cleared: false });
+    const Employee = require("../../models/Employee");
+    await Employee.updateOne({ _id: req.user.id }, { $set: { fcmToken: null } });
+    res.json({ success: true, cleared: true });
+  } catch (err) {
+    console.error("[change-requests/push-token delete]", err.message);
+    res.status(500).json({ success: false, message: "Could not clear this device." });
+  }
+});
 
 /* ------------------------------------------------------------------ */
 /* GET /api/change-requests/:slug                                      */
