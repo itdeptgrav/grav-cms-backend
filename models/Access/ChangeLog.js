@@ -153,6 +153,13 @@ const changeLogSchema = new mongoose.Schema(
       default: "direct",
       index: true,
     },
+    /* CRITICAL — money, or something equally hard to walk back.
+       A salary change is the case this was added for: when one rule moves
+       eighty-eight people's pay at once, those entries must not sit in the log
+       looking like a phone-number edit. Indexed so a history can be filtered
+       down to just them. */
+    critical: { type: Boolean, default: false, index: true },
+
     changeRequestId: { type: String, default: "", index: true },
     approvedById: { type: String, default: "" },
     approvedByName: { type: String, default: "" },

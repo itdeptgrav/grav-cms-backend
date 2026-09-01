@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
 const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
+const { employerPfCosts } = require("../../services/salaryFormula");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
@@ -768,6 +769,10 @@ function computeEmployeePayroll(employee, ctx) {
       employerPF: epf,
       esic: esic,
       employerESIC: erEsic,
+      /* The same source the employee record uses, so a run cannot
+         disagree with the contract it is paying against. An intern
+         has no Basic, and so has neither. */
+      ...employerPfCosts(isIntern ? 0 : basicEarned, salaryCfg),
       professionalTax: pt,
       incomeTax: 0,
       loanDeduction: 0,
@@ -900,6 +905,9 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         totalNetPay: acc.totalNetPay + i.roundedNetPay,
         totalPF: acc.totalPF + i.deductions.providentFund,
         totalESIC: acc.totalESIC + i.deductions.esic,
+        totalEDLI: acc.totalEDLI + (i.deductions.edli || 0),
+        totalAdminCharges:
+          acc.totalAdminCharges + (i.deductions.adminCharges || 0),
         totalLOPDays: acc.totalLOPDays + i.lopDays,
         autoAdjustedCount:
           acc.autoAdjustedCount + (i.autoAdjustedCL > 0 ? 1 : 0),
@@ -912,6 +920,8 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         totalNetPay: 0,
         totalPF: 0,
         totalESIC: 0,
+        totalEDLI: 0,
+        totalAdminCharges: 0,
         totalLOPDays: 0,
         autoAdjustedCount: 0,
         unsyncedCount: 0,
@@ -1019,9 +1029,11 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
           n: acc.n + (i.roundedNetPay || 0),
           pf: acc.pf + (i.deductions?.providentFund || 0),
           esi: acc.esi + (i.deductions?.esic || 0),
+          edli: acc.edli + (i.deductions?.edli || 0),
+          adm: acc.adm + (i.deductions?.adminCharges || 0),
           b: acc.b + (i.earnings?.bonus || 0),
         }),
-        { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+        { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0, edli: 0, adm: 0 },
       );
 
       existing.status = "processed";
@@ -1030,6 +1042,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       existing.totalDeductions = totals.d;
       existing.totalNetPay = totals.n;
       existing.totalPF = totals.pf;
+      existing.totalEDLI = totals.edli;
+      existing.totalAdminCharges = totals.adm;
       existing.totalESIC = totals.esi;
       existing.totalBonus = totals.b;
       existing.processedAt = new Date();
@@ -1094,6 +1108,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet = 0,
       totalPF = 0,
       totalESIC = 0,
+      totalEDLI = 0,
+      totalAdminCharges = 0,
       totalBonus = 0;
     const clBalanceUpdates = [];
 
@@ -1214,6 +1230,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet += computed.roundedNetPay;
       totalPF += computed.deductions.providentFund;
       totalESIC += computed.deductions.esic;
+      totalEDLI += computed.deductions.edli || 0;
+      totalAdminCharges += computed.deductions.adminCharges || 0;
       totalBonus += computed.earnings.bonus || 0;
     }
 
@@ -1230,6 +1248,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.totalNetPay = totalNet;
     payrollRun.totalPF = totalPF;
     payrollRun.totalESIC = totalESIC;
+    payrollRun.totalEDLI = totalEDLI;
+    payrollRun.totalAdminCharges = totalAdminCharges;
     payrollRun.totalBonus = totalBonus;
     payrollRun.status = "processed";
     payrollRun.processedAt = new Date();
@@ -1577,6 +1597,10 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
       employerPF: epf,
       esic: esic,
       employerESIC: erEsic,
+      /* The same source the employee record uses, so a run cannot
+         disagree with the contract it is paying against. An intern
+         has no Basic, and so has neither. */
+      ...employerPfCosts(basicEarned, salaryCfg),
       professionalTax: pt,
       loanDeduction: loan,
       advanceDeduction: advance,
@@ -1912,6 +1936,10 @@ router.patch(
         employerPF: epf,
         esic: esic,
         employerESIC: erEsic,
+        /* The same source the employee record uses, so a run cannot
+           disagree with the contract it is paying against. An intern
+           has no Basic, and so has neither. */
+        ...employerPfCosts(isInternItem ? 0 : basicEarned, salaryCfg),
         professionalTax: pt,
         loanDeduction: loan,
         advanceDeduction: advance,
@@ -2423,9 +2451,11 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       },
     });
 
+    /* One per column, in order. Two were added for EDLI and PF admin; a short
+       list silently leaves the trailing columns at Excel's default width. */
     const COL_WIDTHS = [
       3, 12, 30, 20, 22, 13, 11, 11, 14, 10, 10, 13, 11, 11, 13, 11, 11, 11, 11,
-      11, 14, 13,
+      11, 10, 11, 14, 13,
     ];
     COL_WIDTHS.forEach((w, i) => {
       ws.getColumn(i + 1).width = w;
@@ -2522,8 +2552,12 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       { start: 6, end: 9, label: "Monthly CTC", bg: "FF1D4ED8" },
       { start: 10, end: 11, label: "Attendance", bg: "FF0E7490" },
       { start: 12, end: 15, label: "Earned This Month", bg: "FF166534" },
-      { start: 16, end: 21, label: "Deductions", bg: "FF9F1239" },
-      { start: 22, end: 22, label: "Net Salary", bg: "FF065F46" },
+      /* Widened by two: EDLI and PF admin charges sit with the other
+         employer-side figures (ESIEMPR, PFEMPR) rather than in their own
+         section, because that is what they are. Everything to the right of
+         them shifts by two. */
+      { start: 16, end: 23, label: "Deductions", bg: "FF9F1239" },
+      { start: 24, end: 24, label: "Net Salary", bg: "FF065F46" },
     ];
     SECTIONS.forEach(({ start, end, label, bg }) => {
       if (start !== end) ws.mergeCells(3, start, 3, end);
@@ -2563,6 +2597,8 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       "LN/ADV",
       "PFEMPCONT",
       "PFEMPR",
+      "EDLI",
+      "PF ADMIN",
       "Tot Deductions",
       "Net Salary",
     ];
@@ -2624,6 +2660,10 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         lnAdv,
         d.providentFund || 0,
         d.employerPF || d.providentFund || 0,
+        /* Recorded on the item since payroll started tracking them. A run
+           processed before that carries 0 here rather than a wrong number. */
+        d.edli || 0,
+        d.adminCharges || 0,
         d.totalDeductions || 0,
         it.roundedNetPay ?? it.netPay ?? 0,
       ];
@@ -2900,6 +2940,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet = 0,
       totalPF = 0,
       totalESIC = 0,
+      totalEDLI = 0,
+      totalAdminCharges = 0,
       totalBonus = 0;
 
     for (const employee of decryptedEmployees) {
@@ -3003,6 +3045,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet += computed.roundedNetPay;
       totalPF += computed.deductions.providentFund;
       totalESIC += computed.deductions.esic;
+      totalEDLI += computed.deductions.edli || 0;
+      totalAdminCharges += computed.deductions.adminCharges || 0;
       totalBonus += computed.earnings.bonus || 0;
     }
 
@@ -3012,6 +3056,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.totalNetPay = totalNet;
     payrollRun.totalPF = totalPF;
     payrollRun.totalESIC = totalESIC;
+    payrollRun.totalEDLI = totalEDLI;
+    payrollRun.totalAdminCharges = totalAdminCharges;
     payrollRun.totalBonus = totalBonus;
     await payrollRun.save();
 
@@ -3335,9 +3381,11 @@ router.delete("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
         n: acc.n + (i.roundedNetPay || 0),
         pf: acc.pf + (i.deductions?.providentFund || 0),
         esi: acc.esi + (i.deductions?.esic || 0),
+        edli: acc.edli + (i.deductions?.edli || 0),
+        adm: acc.adm + (i.deductions?.adminCharges || 0),
         b: acc.b + (i.earnings?.bonus || 0),
       }),
-      { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+      { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0, edli: 0, adm: 0 },
     );
 
     await Payroll.updateOne(

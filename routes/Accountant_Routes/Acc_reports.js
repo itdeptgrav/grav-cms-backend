@@ -659,8 +659,19 @@ router.get("/payroll-cost", async (req, res) => {
       totalNetPay: r.totalNetPay || 0,
       totalPF: r.totalPF || 0,
       totalESIC: r.totalESIC || 0,
+      totalEDLI: r.totalEDLI || 0,
+      totalAdminCharges: r.totalAdminCharges || 0,
       employees: r.totalEmployees || 0,
-      employerCost: (r.totalGross || 0) + (r.totalPF || 0) + (r.totalESIC || 0),
+      /* Everything the employer pays for the month. EDLI and PF admin charges
+         are employer costs like PF and ESIC and were simply missing, so this
+         figure understated the cost of every month it reported. Runs processed
+         before they were recorded carry 0 and are unchanged by this. */
+      employerCost:
+        (r.totalGross || 0) +
+        (r.totalPF || 0) +
+        (r.totalESIC || 0) +
+        (r.totalEDLI || 0) +
+        (r.totalAdminCharges || 0),
     }));
 
     const annualSummary = {
@@ -668,6 +679,8 @@ router.get("/payroll-cost", async (req, res) => {
       totalNet: monthlyCost.reduce((s, m) => s + m.totalNetPay, 0),
       totalPF: monthlyCost.reduce((s, m) => s + m.totalPF, 0),
       totalESIC: monthlyCost.reduce((s, m) => s + m.totalESIC, 0),
+      totalEDLI: monthlyCost.reduce((s, m) => s + m.totalEDLI, 0),
+      totalAdminCharges: monthlyCost.reduce((s, m) => s + m.totalAdminCharges, 0),
       totalEmployerCost: monthlyCost.reduce((s, m) => s + m.employerCost, 0),
     };
 

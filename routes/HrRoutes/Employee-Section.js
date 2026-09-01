@@ -15,108 +15,19 @@ const {
   decryptEmployeeDoc,
   decryptEmployeeDocs,
 } = require("../../utils/salaryEncryption");
+const { computeSalary } = require("../../services/salaryFormula");
 
 require("dotenv").config();
 
-// ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
-// Always operates on plain numbers. Caller must decrypt before passing in,
-// and encrypt the result before saving to MongoDB.
+// ─── SALARY CALCULATION ─────────────────────────────────────────────
+// The formula itself lives in services/salaryFormula.js. It used to be copied
+// out in full both here and in the Employee pre-save hook, which meant a rule
+// the company edits had two places to reach and could arrive at only one.
+// This wrapper keeps the decrypt-in / plain-numbers-out contract the callers
+// below rely on.
 function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
-  // Decrypt in case caller passed an encrypted object (belt-and-suspenders)
-  const s = decryptSalaryFields(salary);
-
-  // ── Interns ──────────────────────────────────────────────────────────────
-  // A stipend has no basic, no HRA and no statutory deductions, so none are
-  // computed. This has to live here as well as in the model's pre-save hook
-  // because the update below goes through findByIdAndUpdate, which does not
-  // fire that hook — the two paths would otherwise disagree about what an
-  // intern's salary object contains, and HR editing an intern would quietly
-  // give them an EPF deduction.
-  if (employmentType === "intern") {
-    const stipend = Number(s.stipend) || 0;
-    return {
-      stipend,
-      gross: 0, basic: 0, hra: 0, specialAllowance: 0,
-      epf: 0, edli: 0, adminCharges: 0,
-      epfOverride: false, edliOverride: false, adminOverride: false,
-      eeesic: 0, erEsic: 0, foodAllowance: 0,
-      employerCost: stipend,
-      totalDeduction: 0,
-      netSalary: stipend,
-      allowances: 0, deductions: 0,
-      // HR's input, not a derived figure — and it applies to interns too.
-      otherDeduction: Number(s.otherDeduction) || 0,
-    };
-  }
-
-  const basicPct = (cfg.basicPct ?? 50) / 100;
-  const hraPct = (cfg.hraPct ?? 50) / 100;
-  const eepfPct = (cfg.eepfPct ?? 12) / 100;
-  const epfCapAmount = cfg.epfCapAmount ?? 1800;
-  const edliPct = (cfg.edliPct ?? 0.5) / 100;
-  const edliCapAmount = cfg.edliCapAmount ?? 15000;
-  const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
-  const esiWageLimit = cfg.esiWageLimit ?? 21000;
-  const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
-  const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
-  const foodAllowance = cfg.foodAllowance ?? 1600;
-
-  const gross = s.gross || 0;
-  const basic = Math.round(gross * basicPct);
-  const hra = Math.round(gross * hraPct);
-
-  // EPF — respect HR override. When epfOverride is set, keep the HR-entered
-  // value; otherwise ROUND(MIN(basic * 12%, epfCapAmount)) — rupee cap 1,800/mo
-  const epf = s.epfOverride
-    ? s.epf || 0
-    : Math.round(Math.min(basic * eepfPct, epfCapAmount));
-
-  // EDLI & Admin — respect HR override
-  const edli = s.edliOverride
-    ? s.edli || 0
-    : Math.round(Math.min(basic * edliPct, edliCapAmount));
-  const adminCharges = s.adminOverride
-    ? s.adminCharges || 0
-    : Math.round(basic * adminPct);
-
-  // ESI — calculated on Basic, applies when Basic <= esiWageLimit
-  const esiApplicable = basic <= esiWageLimit;
-  const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
-  const erEsic = esiApplicable ? Math.ceil(basic * erEsicPct) : 0;
-
-  // CTC = Gross + EPF + ESIC(ER) + Food Allowance
-  const employerCost = gross + epf + erEsic + foodAllowance;
-
-  // Employee deductions = EPF + ESIC(EE)
-  const totalDeduction = epf + eeesic;
-  const netSalary = Math.max(gross - totalDeduction, 0);
-
-  // Returns plain numbers — caller encrypts before saving
-  return {
-    gross,
-    basic,
-    hra,
-    epf,
-    edli,
-    adminCharges,
-    epfOverride: s.epfOverride || false,
-    edliOverride: s.edliOverride || false,
-    adminOverride: s.adminOverride || false,
-    eeesic,
-    erEsic,
-    foodAllowance,
-    employerCost,
-    totalDeduction,
-    netSalary,
-    allowances: hra,
-    deductions: totalDeduction,
-    // Zeroed rather than omitted — the caller replaces the whole salary
-    // object, so an intern promoted to staff would otherwise keep a stipend
-    // sitting beside their new gross.
-    stipend: 0,
-    // Kept, not zeroed: HR's input, and it survives a change of type.
-    otherDeduction: Number(s.otherDeduction) || 0,
-  };
+  // Decrypt in case the caller passed an encrypted object (belt-and-suspenders)
+  return computeSalary(decryptSalaryFields(salary), cfg, employmentType);
 }
 
 // ─── FORM VISIBILITY — GET ────────────────────────────────────────────────────
@@ -158,6 +69,43 @@ router.get("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ─── SALARY CONFIG — UPDATE ───────────────────────────────────────────────────
+// SALARY CONFIG - PREVIEW THE IMPACT
+//
+// What WOULD change if these rules were saved. Writes nothing.
+//
+// A company-wide salary rule is not a setting you discover the effect of after
+// the fact: "this moves 47 people's CTC" is the thing that decides whether to
+// save at all. The body carries the proposed values; anything it omits falls
+// back to what is stored.
+router.post("/config/salary/preview", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const saved = await SalaryConfig.getSingleton();
+    const proposed = { ...saved.toObject() };
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (v !== undefined && v !== null && v !== "" && k in proposed) {
+        proposed[k] = Number(v);
+      }
+    }
+
+    const { resyncAllSalaries } = require("../../services/salaryResync");
+    const r = await resyncAllSalaries({ dryRun: true, config: proposed });
+
+    res.json({
+      success: true,
+      scanned: r.scanned,
+      changed: r.changed,
+      skipped: r.skipped,
+      /* Capped for the response, with the true total beside it - a preview
+         that quietly lists 50 of 105 reads as "only 50 change". */
+      employees: r.employees.slice(0, 50),
+      truncated: Math.max(r.employees.length - 50, 0),
+    });
+  } catch (err) {
+    console.error("Salary preview error:", err);
+    res.status(500).json({ success: false, message: "Could not preview the change." });
+  }
+});
+
 router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
@@ -170,7 +118,10 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
       "foodAllowance",
       "edliPct",
       "edliCapAmount",
+      "edliMaxAmount",
       "adminChargesPct",
+      "adminWageCeiling",
+      "adminMaxAmount",
       "esiWageLimit",
       "eeEsicPct",
       "erEsicPct",
@@ -205,7 +156,53 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
       after: Object.fromEntries(allowed.map((k) => [k, config[k]])),
     });
 
-    res.json({ success: true, message: "Salary config updated", data: config });
+    /* THE RULE REACHES THE PEOPLE IT GOVERNS.
+       Salaries are stored, not derived on read, so without this a new EDLI
+       ceiling would apply only to whoever HR happened to re-save afterwards.
+       Overrides and gross are untouched; only derived figures move, and an
+       employee whose numbers do not change is not written at all.
+
+       Awaited rather than backgrounded: the screen reports how many people
+       changed, and a number that arrives after the response is a number
+       nobody sees. Opt out with `resync: false` to stage several edits and
+       sync once at the end. */
+    let resync = null;
+    if (req.body.resync !== false) {
+      try {
+        const { resyncAllSalaries } = require("../../services/salaryResync");
+        const r = await resyncAllSalaries({ config, req });
+        resync = { scanned: r.scanned, changed: r.changed, skipped: r.skipped };
+
+        if (r.changed) {
+          recordChange(req, {
+            departmentSlug: "hr",
+            section: "hr:salary-config",
+            entity: "salary-config",
+            entityId: "global",
+            entityLabel: "Salary configuration",
+            action: "update",
+            critical: true,
+            summary:
+              `Applied the new salary rules to ${r.changed} employee` +
+              `${r.changed === 1 ? "" : "s"}, effective ${r.effectiveFrom}. ` +
+              `${r.skipped} unchanged or excluded. Payroll already processed for ` +
+              `earlier months is unchanged; each affected employee has its own entry.`,
+          });
+        }
+      } catch (e) {
+        /* The config IS saved. Say the resync failed rather than implying the
+           whole edit did - and leave the retry available. */
+        console.error("Salary resync failed:", e);
+        resync = { error: e.message || "The resync did not complete." };
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Salary config updated",
+      data: config,
+      resync,
+    });
   } catch (err) {
     console.error("Salary config PUT error:", err);
     if (err.name === "ValidationError") {
