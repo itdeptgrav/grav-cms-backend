@@ -65,6 +65,19 @@ const callEventSchema = new mongoose.Schema(
     audioFileName: { type: String, default: null },
     createdAtDevice: { type: Number, default: null },
 
+    // ── Recording upload outcome ──────────────────────────────────────────
+    // Whether the audio actually made it to Drive. The device reports a
+    // FAILURE (with a reason) when it couldn't upload — no network, upload
+    // error, or the recorder itself failed — so a call whose audio never
+    // arrived is still visible with WHY, instead of silently missing.
+    recordingUploadStatus: { type: String, default: null }, // "UPLOADED" | "FAILED" | null
+    recordingError: { type: String, default: null },        // human-readable failure reason
+    recordingErrorAt: { type: Date, default: null },
+
+    // "call" (from the phone's call recorder) or "manual" (recorded in-app by
+    // the rep when the contact wasn't over a phone call).
+    kind: { type: String, default: "call" },
+
     // Server-side AI summary — kept separate from `summary` for the same
     // reason CallRecording kept them separate: `summary` is whatever the
     // device shipped (often null), and overwriting it would destroy that

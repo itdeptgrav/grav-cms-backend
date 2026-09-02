@@ -91,6 +91,11 @@ router.post("/", checkApiKey, upload.single("audio"), async (req, res) => {
       driveDownloadUrl: drive?.downloadUrl ?? null,
       driveMimeType: drive?.mimeType ?? null,
       driveSize: drive?.size ? Number(drive.size) : 0,
+      kind: metadata.kind || "call",
+      // Audio arrived — clear any earlier "failed to upload" marker.
+      recordingUploadStatus: drive ? "UPLOADED" : undefined,
+      recordingError: drive ? null : undefined,
+      recordingErrorAt: drive ? null : undefined,
     };
 
     let doc = await findMatchingCallEvent(metadata.phoneNumber ?? null, metadata.startTime);
@@ -126,6 +131,55 @@ router.post("/", checkApiKey, upload.single("audio"), async (req, res) => {
   } catch (error) {
     console.error("[callRecordings] upload failed:", error);
     return res.status(500).json({ success: false, message: "Upload failed", error: error.message });
+  }
+});
+
+/**
+ * POST /api/recordings/failure   (application/json)
+ * Reports that a call happened but its audio could NOT be uploaded (no network,
+ * upload error, or the recorder failed). Records the number, duration and the
+ * REASON onto the same CallEvent, so the CMS shows the contact + why the audio
+ * is missing instead of losing it silently. Never carries audio.
+ */
+router.post("/failure", checkApiKey, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const fields = {
+      recordingUploadStatus: "FAILED",
+      recordingError: (b.error || "Upload failed").toString().slice(0, 500),
+      recordingErrorAt: new Date(),
+      recordingMethod: b.recordingMethod ?? undefined,
+      audioFileName: b.audioFileName ?? undefined,
+      localId: b.localId ?? undefined,
+      kind: b.kind || "call",
+    };
+
+    // Attach to the existing CallEvent for this call if we can find it; else
+    // create one so the failed-to-send call is still recorded.
+    let doc = b.startTime ? await findMatchingCallEvent(b.phoneNumber ?? null, b.startTime) : null;
+    if (doc) {
+      // Don't overwrite a real successful upload with a stale failure report.
+      if (!doc.driveFileId) Object.assign(doc, fields);
+      else return res.json({ success: true, mongoId: String(doc._id), note: "already uploaded; ignored" });
+      await doc.save();
+    } else {
+      doc = await CallEvent.create({
+        phoneNumber: b.phoneNumber ?? null,
+        contactName: b.contactName ?? null,
+        direction: b.direction ?? "UNKNOWN",
+        callType: b.callType ?? "UNKNOWN",
+        received: b.received ?? true,
+        durationSec: b.durationSec ?? (b.durationMillis ? Math.round(b.durationMillis / 1000) : 0),
+        startTime: b.startTime,
+        endTime: b.endTime ?? null,
+        source: b.source || "gravemployeetracker",
+        ...fields,
+      });
+    }
+    res.json({ success: true, mongoId: String(doc._id) });
+  } catch (error) {
+    console.error("[callRecordings] failure report error:", error.message);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

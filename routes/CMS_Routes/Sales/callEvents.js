@@ -183,6 +183,13 @@ router.get("/recent", salesAuth, async (req, res) => {
         notes: r.notes,
         audioFileName: r.audioFileName,
         recordingMethod: r.recordingMethod,
+        // "call" or "manual" (recorded in-app when the contact wasn't a phone call).
+        kind: r.kind || "call",
+        // Audio-upload outcome + reason, so a call whose recording never made it
+        // (no network / upload error / recorder failure) is visible with WHY.
+        recordingUploadStatus: r.recordingUploadStatus || null,
+        recordingError: r.recordingError || null,
+        recordingErrorAt: r.recordingErrorAt || null,
         source: r.source,
         createdAt: r.createdAt,
         // ── Attribution ──────────────────────────────────────────────────
