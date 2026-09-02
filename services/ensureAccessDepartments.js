@@ -80,6 +80,15 @@ const DEPARTMENTS = [
     legacyModel: "QCDepartment", legacyCollection: "qcdepartments",
     legacyUserType: "qc", dashboardPath: "/qc/dashboard",
     description: "Inspection and quality gates." },
+  /* The developer side. No legacy collection — nobody ever signed in to a
+     "developers" module — so like Merchandising it only registers the
+     department, which is exactly what makes it appear in CEO → Access Control
+     and therefore GRANTABLE from there. That grant is the whole access model:
+     routes/DevOps/developer.js checks DepartmentRole("developer"). */
+  { key: "developer", slug: "developer", name: "Developer", sortOrder: 125,
+    legacyModel: null, legacyCollection: "developerdepartments",
+    legacyUserType: "developer", dashboardPath: "/developer",
+    description: "Cross-department history, anomaly alerts, live settings and system health." },
   { key: "packaging", slug: "packaging-dispatch", name: "Packaging & Dispatch", sortOrder: 120,
     legacyModel: "PackagingDispatchDepartment", legacyCollection: "packagingdispatchdepartments",
     legacyUserType: "packaging-dispatch", dashboardPath: "/packaging-dispatch/dashboard",

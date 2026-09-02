@@ -485,114 +485,19 @@ employeeSchema.pre("save", async function (next) {
       encryptSalaryFields,
     } = require("../utils/salaryEncryption");
 
-    // ── Interns take the short road ──────────────────────────────────────────
-    // A stipend has no components. Splitting it into basic and HRA, deducting
-    // provident fund from it and enrolling it in ESI would all be inventions —
-    // there is no such arrangement to describe. So an intern's salary object
-    // holds the stipend and nothing else, and every derived figure is written
-    // as zero rather than left at whatever a previous employment type put
-    // there. Somebody converted from employee to intern must not keep a
-    // basic and an EPF from their old contract.
-    if (this.employmentType === "intern") {
-      const prev = decryptSalaryFields(this.salary);
-      const stipend = Number(prev.stipend) || 0;
-      const encrypted = encryptSalaryFields({
-        stipend,
-        gross: 0,
-        basic: 0,
-        hra: 0,
-        specialAllowance: 0,
-        epf: 0,
-        edli: 0,
-        adminCharges: 0,
-        eeesic: 0,
-        erEsic: 0,
-        foodAllowance: 0,
-        employerCost: stipend,
-        totalDeduction: 0,
-        netSalary: stipend,
-        allowances: 0,
-        deductions: 0,
-        // Carried through: it is HR's input, not a derived figure, and this
-        // hook replaces the whole salary object.
-        otherDeduction: Number(prev.otherDeduction) || 0,
-      });
-      encrypted.epfOverride = false;
-      encrypted.edliOverride = false;
-      encrypted.adminOverride = false;
-      this.salary = encrypted;
-      this.updatedAt = Date.now();
-      return next();
-    }
-
+    /* THE FORMULA LIVES IN services/salaryFormula.js.
+       It was copied out in full here and again in routes/HrRoutes/
+       Employee-Section.js, so a rule the company edits on the salary settings
+       screen had two places to reach and could arrive at only one. Interns,
+       overrides and the intern-to-staff reset all still behave exactly as the
+       block that stood here did — that behaviour moved with the code. */
+    const { computeSalary } = require("../services/salaryFormula");
     const cfg = await SalaryConfig.getSingleton();
-
-    // ── 1. Decrypt first so all arithmetic works on plain numbers ────────────
-    const s = decryptSalaryFields(this.salary);
-
-    const basicPct = (cfg.basicPct ?? 50) / 100;
-    const hraPct = (cfg.hraPct ?? 50) / 100;
-    const eepfPct = (cfg.eepfPct ?? 12) / 100;
-    const epfCapAmount = cfg.epfCapAmount ?? 1800;
-    const edliPct = (cfg.edliPct ?? 0.5) / 100;
-    const edliCapAmount = cfg.edliCapAmount ?? 15000;
-    const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
-    const esiWageLimit = cfg.esiWageLimit ?? 21000;
-    const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
-    const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
-
-    const gross = s.gross || 0;
-    const basic = Math.round(gross * basicPct);
-    const hra = Math.round(gross * hraPct);
-
-    // EPF — respect HR override. When epfOverride is set, the HR-entered epf
-    // value is kept verbatim instead of being recomputed from basic.
-    const epf = s.epfOverride
-      ? s.epf || 0
-      : Math.round(Math.min(basic * eepfPct, epfCapAmount));
-    const edli = s.edliOverride
-      ? s.edli || 0
-      : Math.round(Math.min(basic * edliPct, edliCapAmount));
-    const adminCharges = s.adminOverride
-      ? s.adminCharges || 0
-      : Math.round(basic * adminPct);
-
-    const esiApplicable = basic <= esiWageLimit;
-    const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
-    const erEsic = esiApplicable ? Math.ceil(basic * erEsicPct) : 0;
-
-    const foodAllowance = cfg.foodAllowance ?? 1600;
-    const employerCost = gross + epf + erEsic + foodAllowance;
-    const totalDeduction = epf + eeesic;
-    const netSalary = Math.max(gross - totalDeduction, 0);
-
-    // ── 2. Build the plain calculated object ─────────────────────────────────
-    const calculated = {
-      gross,
-      basic,
-      hra,
-      epf,
-      edli,
-      adminCharges,
-      epfOverride: this.salary.epfOverride || false,
-      edliOverride: this.salary.edliOverride || false,
-      adminOverride: this.salary.adminOverride || false,
-      eeesic,
-      erEsic,
-      foodAllowance,
-      employerCost,
-      totalDeduction,
-      netSalary,
-      allowances: hra,
-      deductions: totalDeduction,
-      // Zeroed, not omitted: encryptSalaryFields replaces this.salary
-      // wholesale, so an intern promoted to staff would otherwise keep a
-      // stipend sitting beside their new gross.
-      stipend: 0,
-      // Kept, not zeroed — unlike the stipend, this is HR's input and applies
-      // to staff and interns alike.
-      otherDeduction: Number(s.otherDeduction) || 0,
-    };
+    const calculated = computeSalary(
+      decryptSalaryFields(this.salary),
+      cfg.toObject ? cfg.toObject() : cfg,
+      this.employmentType,
+    );
 
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────
     const encrypted = encryptSalaryFields(calculated);

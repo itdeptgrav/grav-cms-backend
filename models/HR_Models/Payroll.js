@@ -101,6 +101,13 @@ const payrollItemSchema = new mongoose.Schema(
             employerPF: { type: Number, default: 0 }, // 12% employer contribution
             esic: { type: Number, default: 0 }, // 0.75% of basic (if gross <= 21000)
             employerESIC: { type: Number, default: 0 }, // 3.25% employer
+            /* EMPLOYER-SIDE PF COSTS. Recorded here, beside employerPF and
+               employerESIC, because they are the same kind of figure: money the
+               company pays on top of the salary rather than anything withheld
+               from the employee. They were missing entirely, so every report
+               that added up what a month of payroll cost was short by them. */
+            edli: { type: Number, default: 0 },
+            adminCharges: { type: Number, default: 0 },
             professionalTax: { type: Number, default: 0 }, // state-specific
             incomeTax: { type: Number, default: 0 }, // TDS
             loanDeduction: { type: Number, default: 0 },
@@ -222,6 +229,9 @@ const payrollSchema = new mongoose.Schema(
         totalNetPay: { type: Number, default: 0 },
         totalPF: { type: Number, default: 0 },
         totalESIC: { type: Number, default: 0 },
+        // The run's employer-side PF costs, for the same reason as above.
+        totalEDLI: { type: Number, default: 0 },
+        totalAdminCharges: { type: Number, default: 0 },
         totalBonus: { type: Number, default: 0 },
 
         // Status

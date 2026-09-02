@@ -73,7 +73,7 @@ function getMessaging() {
  * `notification` block here would make the browser draw its own as well and the
  * user would see each message twice.
  */
-async function sendPush(employee, { title, body, url }) {
+async function sendPush(employee, { title, body, url, type = "department_approval" }) {
   const token = employee?.fcmToken;
   if (!token) return false;
 
@@ -87,8 +87,10 @@ async function sendPush(employee, { title, body, url }) {
         title: String(title),
         body: String(body),
         // The service worker filters on this. It must stay in step with the
-        // listener in public/firebase-messaging-sw.js or nothing is drawn.
-        type: "department_approval",
+        // APPROVAL_PUSH map in public/firebase-messaging-sw.js or nothing is
+        // drawn. Parametrised so the developer side's alerts can ride the same
+        // transport under their own type and tray tag.
+        type,
         url: String(url),
         timestamp: String(Date.now()),
       },

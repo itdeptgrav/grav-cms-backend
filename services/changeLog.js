@@ -346,6 +346,7 @@ async function recordChange(req, entry = {}) {
       after: ChangeLog.sanitise(d.after),
       fields,
       origin: entry.origin || (approval ? "approval" : "direct"),
+      critical: Boolean(entry.critical),
       requestMethod: req?.method || "",
       requestPath: req?.originalUrl || req?.url || "",
       ...actorFrom(req),

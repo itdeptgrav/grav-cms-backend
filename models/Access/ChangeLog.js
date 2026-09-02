@@ -111,7 +111,12 @@ const changeLogSchema = new mongoose.Schema(
 
     action: {
       type: String,
-      enum: ["create", "update", "delete", "approve", "reject", "import", "export", "other"],
+      /* `fail` is an approval that a person granted and that did not land.
+         It used to be filed as `approve`, so the history showed a green
+         "Approved" badge above a sentence explaining the change had NOT been
+         applied — the badge and the summary contradicting each other on the
+         one screen people read to find out what happened. */
+      enum: ["create", "update", "delete", "approve", "reject", "fail", "import", "export", "other"],
       default: "update",
       index: true,
     },
@@ -148,6 +153,13 @@ const changeLogSchema = new mongoose.Schema(
       default: "direct",
       index: true,
     },
+    /* CRITICAL — money, or something equally hard to walk back.
+       A salary change is the case this was added for: when one rule moves
+       eighty-eight people's pay at once, those entries must not sit in the log
+       looking like a phone-number edit. Indexed so a history can be filtered
+       down to just them. */
+    critical: { type: Boolean, default: false, index: true },
+
     changeRequestId: { type: String, default: "", index: true },
     approvedById: { type: String, default: "" },
     approvedByName: { type: String, default: "" },

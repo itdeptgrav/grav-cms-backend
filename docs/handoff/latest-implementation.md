@@ -2,6 +2,414 @@
 
 ---
 
+## The admin control center — the delta over the developer side
+
+> Nothing committed. The spec arrived as a 25-section brief; most of it already
+> existed from this session (audit spine, cross-dept history, record timelines,
+> anomaly rules, live per-dept settings, ops freezes, heartbeats, granular-ish
+> roles). This round built the genuinely missing pieces and wired every one
+> into real storage and real routes — no mockups, no fake data.
+
+### Form builder, wired into a real form (spec §6)
+
+The Employee model has carried five per-section custom-field arrays
+(`personalCustomFields` …) since long before this work — storage nothing wrote
+and nothing rendered. Now the full circuit exists:
+
+- `models/DevOps/FormFieldDef` — definitions per form section (10 types,
+  chosen-not-typed validation patterns — a free-text regex from an admin screen
+  is a ReDoS surface; a fixed vocabulary is not). Key immutable after creation:
+  values are stored under it.
+- `services/formConfig` — validate + normalise: unknown keys DROPPED, labels
+  FORCED from definitions (never from the request), typed validation, required
+  on create, defaults materialise on new records, partial-update semantics on
+  edit. Wired into the real `POST /api/employees` and `PUT /api/employees/:id`.
+- `/developer/forms` — add/remove/enable/require/reorder/options/defaults, all
+  audited; delete confirms with reason and NEVER touches stored values.
+- `components/hr/EmployeeExtraFields` on the employee detail page — shows the
+  active tab's extra fields, editor-gated edit modal built from
+  `ConfiguredFields`. The save PUTs one array through the normal employee
+  route, so an HR editor's change here is HELD FOR APPROVAL and audited like
+  any other field — the form builder inherits the governance for free.
+
+### Scheduled tasks become controllable (spec §4)
+
+- `services/jobRegistry` — "Run now" can only invoke a function that shipped in
+  code, by name; the registry IS the security model (verified: an arbitrary
+  name throws). Runs beat the heartbeat with a duration, so manual and
+  scheduled runs are one history.
+- `JobHeartbeat` gained `enabled`, `lastDurationMs`, `failCount`. All three
+  crons (meeting reminders, timer-SOP, anomaly scan) consult `isEnabled()`
+  (30s cache, fails OPEN — a monitoring-store hiccup must not stop production
+  crons). A paused job never raises an overdue alert — pausing is a statement
+  that the silence is intended.
+- `/developer/jobs`: duration and runs/fails columns, Run-now for registered
+  runners, pause/resume behind approver + confirm-with-reason.
+
+### Feature flags that gate real features (spec §3)
+
+`flag.*` keys in the devConfig catalogue, public `GET /api/feature-flags`
+(flags gate UI and carry no data), `lib/featureFlags.useFeatureFlag()` with a
+per-tab minute cache. Two REAL consumers wired — the catalogue's own comment
+forbids flags nothing reads:
+
+- `flag.voiceAssistant` — unmounts the global GRAV assistant overlay
+  everywhere (the always-on-mic + 40MB model that is the first suspect for tab
+  freezes) within a minute, no deploy.
+- `flag.employeeExtraFields` — hides the form-builder surface on employee
+  pages; storage and server validation remain.
+
+### CORS origins, live and additive-only (spec §15)
+
+`ops.extraOrigins` (approver-gated, validated at write AND filtered again at
+read) + `services/allowedOrigins.makeOriginCheck` now backing BOTH the HTTP
+CORS callback and the Socket.IO handshake in server.js. The static code list
+can never be removed from the UI — the screen can open a door, never close the
+ones the code opened. This kills the "add the preview URL to allowedOrigins
+and restart" ritual CLAUDE.md warns about.
+
+### System health, analytics, maintenance, record finder (spec §10, §19, §16, §8)
+
+- `/developer/health` — measured, never asserted: a timed DB ping, job
+  promises vs reality, open criticals, FCM configured + registered devices,
+  env badge (a red row on development is a curiosity; on production an
+  incident), uptime/memory, send-myself-a-test-notification.
+- `/developer/analytics` — server-side aggregations (by department / person /
+  action / day / most-edited fields / alerts by kind / job reliability).
+  Charts follow the dataviz discipline mapped onto the kit: ranked magnitude
+  lists, ONE hue, values at row ends in text tokens — colour carries no
+  identity so there is no palette to validate and nothing for a colorblind
+  reader to lose; status colour only where status is the meaning.
+- `/developer/maintenance` — a registry of shipped checks. Every one earns its
+  place from a real incident: orphaned department roles (THE lockout bug),
+  duplicate employee emails, active-without-password, settings-override
+  survey, purge-resolved-alerts (action, approver + reason).
+- Record finder — `GET /api/dev/find-record?q=` + a name search on the record
+  page: nobody types a Mongo id again.
+
+### Permissions and confirmations (spec §17, §18)
+
+Granular floors on the existing DepartmentRole vocabulary (one grant screen,
+one audit trail — no new permission store): viewer = every read; editor =
+settings, alert decisions, form fields, runs, reports, test pushes; approver =
+freezes, extra origins, job pause/disable, action-maintenance. Sensitive
+settings carry `minRole` IN THE CATALOGUE, enforced by the route and shown by
+the UI. `ConfirmWithReason` fronts freezes, after-hours blocks, job pauses,
+field deletions and maintenance actions — the typed reason lands in the audit
+summary (body or query; DELETEs carry no body).
+
+### Also fixed on the way
+
+- A stray non-code sentence (reads like dictation into the editor) had landed
+  in server.js and broke parsing — removed. Worth knowing it happened.
+- The forms modal scrims were `rgba(0,0,0,.42)` while the kit's own scrim is
+  `black/45` (FrostShell) — all modals aligned to the kit value; the design
+  hook caught it.
+- Health page rows were `<li>` inside `<Link>` — invalid HTML; restructured.
+- devConfig definitions can now carry `validate()` (used by origins) and
+  `minRole` — both consumed from the catalogue by route and UI alike.
+
+### Files
+
+Backend new: `models/DevOps/FormFieldDef`, `services/{formConfig, jobRegistry,
+maintenanceChecks, allowedOrigins}`, `verifyAdminCenter.js`. Backend changed:
+`routes/DevOps/developer.js` (+health/analytics/find-record/forms/jobs/
+maintenance/test/floors/reasons), `routes/HrRoutes/Employee-Section.js` (form
+enforcement), `services/{devConfig, jobHeartbeats}`, `models/DevOps/
+JobHeartbeat`, `server.js` (origin check on CORS + Socket.IO, /api/feature-flags,
+cron enable-gates, runner registrations).
+
+Frontend new: `lib/featureFlags`, `components/access/{ConfirmWithReason,
+ConfiguredFields}`, `components/hr/EmployeeExtraFields`,
+`app/developer/{health, analytics, forms, maintenance}/page.js`. Frontend
+changed: `components/shell/AppShell.js` (flag gate),
+`components/Developer_DashboardLayout.js` (grouped nav),
+`app/developer/{page, jobs, settings, record}.js`,
+`app/hr/dashboard/employees/[id]/page.js` (extra-fields card).
+
+---
+
+## Settings: the scope rail, and per-department switches that act
+
+> Nothing committed.
+
+The settings page now shares the history page's layout — a **Scope** rail on
+the left (Global defaults + every department), values beside it — so the pair
+of screens ("what happened" / "what the rules are") read as one product.
+
+**A department's view is where you act on that department.** At the top, two
+switches:
+
+- **Freeze writes in <dept>** — flips that department in the
+  `ops.freezeWrites.departments` CSV the middleware reads, so nobody hand-types
+  slugs into a comma string. ON renders in the alarm colour and reads
+  "ON — lift"; a frozen department also gets a snowflake on the rail, because
+  an ongoing intervention should be visible from the list, not discovered.
+- **Block after-hours writes in <dept>** — same mechanism over the other list.
+
+A department outside the middleware's route map (inventory, merchandiser) shows
+its toggle disabled with "Not enforceable here yet — no route mapping" — the
+switch tells the truth instead of pretending.
+
+Below the switches: that department's anomaly-rule overrides, inherit-by-default
+as before. Structure checks 8/8 (comments stripped); SWC compiles; both lucide
+icons exist in this version; backend harness still 55/55.
+
+---
+
+## Developer side round three: per-department settings, the HR-style history layout, and "what else happened then"
+
+> Nothing committed.
+
+### Settings are per department now
+
+Every anomaly rule (flip-flop threshold and window, sensitive fields, working
+hours, burst and delete-spree thresholds) can differ per department. The design
+is **override-with-inheritance**, not copies:
+
+- A department starts as EXACTLY the global behaviour. Overriding one key
+  detaches that key only; an **inherit** button deletes the override — deletion,
+  not writing the global value in, so later global changes flow through to
+  everything that never asked to be different.
+- Storage is a composite key (`anomaly.flipflop.minChanges@hr`); "@" cannot
+  appear in a catalogue key, so an override can never shadow a definition.
+  Global-only keys **refuse** a department override rather than accepting one
+  nothing reads.
+- The scan resolves thresholds per row's department (memoised), and burst /
+  delete-spree now group by **actor AND department** — sixty legitimate Sales
+  edits must not trip HR's tighter threshold. Fingerprints carry the department
+  so the same person's behaviour in two departments is two alerts.
+- Known limit, stated in the code: the flip-flop QUERY window is the global
+  value; per-department windows narrow, they do not extend.
+
+The settings page has a Global-defaults / per-department switcher; a department
+view shows only per-department keys, each marked *inherited* or *overridden for
+X*. Rows are keyed on scope so switching never shows one scope's draft in
+another's slot.
+
+### The history page is the HR layout now
+
+Departments rail on the left (counts, sticky), entries beside it — one mental
+model with the per-department history pages. The field table **folds away** by
+default behind "N fields →": every row carrying its full table at once was the
+"making too many things" complaint, and the summary already says what changed.
+Search + action filter stay; actor/from/to arrive via URL.
+
+### "Even with this we can't find the reason" — the context links
+
+The shape of almost every mystery: a change over HERE made the system do
+something over THERE, and the two live in different departments' histories.
+Two links now close that gap:
+
+- **"what else happened then →"** on every record-timeline entry: opens the
+  history filtered to that actor, ±15 minutes, across EVERY department, in
+  order. "Changed the date of joining at 11:02" lands next to "PL granted at
+  11:02" on one screen. The history page shows the window as a named, one-click
+  dismissible banner.
+- **"mentions of this record elsewhere →"** on the record header: every entry
+  anywhere whose text carries this record's id — how a change here is traced to
+  effects in records that reference it.
+
+Plus a `GET /api/dev/around?at=<iso>&minutes=&actor=` endpoint for the same
+query programmatically.
+
+### Verification
+
+`verifyDeveloperSide.js` grew to **55/55**. The new block pins: a department
+reads its own override while every other department and the global read are
+untouched; **the scan judges each department by its own threshold** (the same
+3-hop flip-flop stops firing when its department's threshold is 20 and fires
+again after inherit); inherit deletes rather than copies; a global-only key
+refuses an override; the department listing shows only per-department keys with
+correct overridden flags.
+
+All 9 harnesses green (266 checks), `npm test` 1462/1465, boots clean. All
+touched frontend files compile under SWC; a stale-draft bug on scope switching
+was caught and fixed by keying rows on scope.
+
+---
+
+## Developer side round two: rich entries, live restrictions, a broadcast banner
+
+> Nothing committed.
+
+Two complaints from first use: entries read "(no summary)", and there were not
+enough things changeable without code.
+
+### "(no summary)" — the data was there, unrendered
+
+The change log grew in stages: the oldest rows carry only raw `before`/`after`
+patches, no `summary` and no `fields[]`. Confirmed on a live row — it held a
+full patch and the UI showed "(no summary)".
+
+Fixed at READ time, never by migration (rewriting an audit log to make it
+prettier is how audit logs stop being trusted): `presentEntry` in the dev
+router diffs fields out of before/after (noise like `updatedAt` dropped, labels
+from auditSections), writes a summary from them, and marks the row
+`derived: true` — the UI shows "(reconstructed)" so an original entry and a
+rebuilt one are distinguishable. Applied to `/api/dev/history` and
+`/api/dev/record`; the record page's per-field view now also feeds on enriched
+rows, so old entries contribute their hops instead of vanishing.
+
+Both dev pages now render a from → to field table on every entry, plus
+section, origin, method + path, and the approver.
+
+### Live restrictions — `Middlewear/opsControls.js`
+
+The "stop coding for every little thing" set, enforced on every request, live
+within the 30s settings cache:
+
+- **Freeze writes in departments** (`ops.freezeWrites.departments`) — every
+  write in a listed department answers 503 with a configurable message;
+  reading and read-shaped POSTs keep working. For migrations, incidents, or
+  stopping a runaway user in thirty seconds instead of a deploy.
+- **Block after-hours writes** (`ops.afterHoursBlock.departments`) — outside
+  the working window (same hours the anomaly rule uses), writes in listed
+  departments are refused rather than merely flagged.
+
+Never blocked, even when listed: sign-in, `/api/admin`, and `/api/dev` — the
+freeze must be liftable from the very screen that set it. Fails OPEN on any
+error: an ops control that can take the system down during a Mongo hiccup has
+become the incident it manages. The decision function is exported and driven
+directly by the harness with a pinned clock.
+
+**Deliberately absent:** any switch that would turn off auditing. A kill-switch
+for the record of what happened is the one tunable this screen must never
+offer — noted in the catalogue itself.
+
+### The announcement banner
+
+`notice.text` + `notice.tone` in settings → a strip above EVERY dashboard in
+every department (`components/shell/SystemNotice.js`, mounted once in the
+FrostShell wrapper so both nav variants and all consumers get it). Public
+`GET /api/system-notice`, module-cached one fetch per minute per tab; renders
+nothing while empty. Type a sentence on /developer/settings and the whole
+company sees it within a minute; clear it and it goes.
+
+### Housekeeping
+
+`alerts.retentionDays` — the scan purges RESOLVED alerts past retention. Open
+alerts are never purged, however old: an alert nobody has looked at is
+precisely the thing that must not quietly disappear.
+
+### Verification
+
+`verifyDeveloperSide.js` grew to **45/45**. New coverage: frozen write → 503
+with the configured message while reads, read-shaped POSTs, sign-in, /api/dev
+and unlisted departments all pass; after-hours refusal honours the window with
+a pinned clock and stays observe-only for unlisted departments; a
+before/after-only row gains the correct field table (unchanged and bookkeeping
+fields excluded), a written summary, and the `derived` mark, while an original
+row is left byte-identical; retention purges resolved-only.
+
+All 9 harnesses green (256 checks), `npm test` 1462/1465, boots clean,
+`/api/system-notice` answers `{text:"",tone:"info"}` live.
+
+**Seen in passing:** a real push to the user's developer account failed with
+`SenderId mismatch` — their stored FCM token is from another Firebase sender
+(likely the CRM app). Self-heals: the next HR page load re-registers silently
+and overwrites it.
+
+---
+
+## The developer side — cross-department history, anomaly detection, live settings, job health
+
+> Nothing committed. New app at **/developer**; API at **/api/dev**.
+
+Built for the stated problem: "they change the date of joining, PL is granted,
+they change it back — and we find out from MongoDB." The change log already
+recorded every step; nothing was WATCHING it. This side watches.
+
+### Access — grantable from CEO, as asked
+
+`developer` is now a row in `ensureAccessDepartments.DEPARTMENTS` (no legacy
+collection, same pattern as Merchandising), so it appears in **CEO → Access
+Control** and roles in it are granted exactly like any department's. Every
+`/api/dev` route requires a developer role or platform admin; **viewers see
+everything and can change nothing** (settings, alert decisions and manual scans
+need editor+). Verified registered in the live DB.
+
+### What it does
+
+**Cross-department history** (`/developer/history`). One list over the whole
+`change_logs` spine, department chips to narrow — the merged view the
+per-department history routers' comments always promised. Per-department pages
+are untouched.
+
+**Record timeline** (`/developer/record`). One record's whole life, plus a
+per-field view: `dateOfJoining: A → B → A, three people, six weeks` at a
+glance, with returned-to-an-earlier-value flagged by the same rule the scanner
+uses. Reachable from any history entry and any alert.
+
+**Anomaly detection** (`services/anomalyScan.js`, every N minutes + on demand).
+Four rules, thresholds all live-tunable:
+
+- **field-flipflop** — same field, same record, N+ changes in a window.
+  CRITICAL when the field is sensitive AND an old value came back. The revisit
+  check is seeded with the FIRST hop's `from` — original → temp → original is
+  the archetypal case and checking only `to` values missed it (caught by the
+  harness, fixed).
+- **delete-spree**, **write-burst** (imports exempt — they are supposed to be
+  fast), **after-hours** (IST window; one row per person per day).
+
+**Server errors** (`Middlewear/errorWatch.js`, mounted above every router).
+Every 5xx becomes part of a fingerprinted alert — paths normalised (ids →
+`:id`) so a route failing all afternoon is ONE row counting up. Quiet on first
+occurrence, notifies at the threshold.
+
+**Job heartbeats** (`services/jobHeartbeats.js`). Registered: meeting
+reminders, timer-SOP finalize, the anomaly scan itself. A silent cron → one
+critical alert per outage (never one per check); a beat → the alert resolves
+itself. A job that NEVER beat is caught from registration — the likeliest
+failure after a deploy.
+
+**Alerts are fingerprinted, not appended** (`dev_alerts`): repeat = count++,
+resolved-and-back = reopen + re-notify. NEW fingerprints push (FCM) to everyone
+holding a developer role, over the same transport as approvals under type
+`developer_alert` (service worker map extended; type parametrised in
+`sendPush`). Info stays below the push floor.
+
+**Live settings** (`/developer/settings`, `services/devConfig.js`). ~18 typed,
+bounded tunables; catalogue in code, values in Mongo, 30s cache. A change
+applies without restart, is recorded in the change history, and the row shows
+who set it, with an undo-to-default. Unknown keys THROW — a typo in a caller
+fails its harness, not silently disables a rule.
+
+**AI explain** (`POST /api/dev/alerts/:id/explain`). Gemini reads the alert +
+its surrounding change-log rows and answers "what most likely happened, user
+error / gaming / fault, one step to confirm". 503 without GEMINI_API_KEY;
+nothing else depends on it.
+
+### Verification
+
+`verifyDeveloperSide.js` — **27/27**: the literal date-of-joining scenario is
+flagged critical with the value journey in the detail; dedupe, reopen,
+threshold-obeys-settings, import exemption, heartbeat catch/recover, the
+notification matrix (stub transport), typed-refusal on bad values.
+
+One harness-vs-transport interaction worth remembering: upsertAlert's internal
+notify fired the REAL FCM at the fake token, whose invalid-token cleanup wiped
+`Employee.fcmToken` before the stubbed assertion ran. The harness now creates
+its alert with push disabled.
+
+All 9 backend harnesses green (218 checks), `npm test` 1462/1465, boots clean,
+`/api/dev/overview` answers 401 unauthenticated. All 9 frontend files compile
+under SWC. `/developer` joins RAIL_HIDDEN_PATHS with `appLogoSlug="developer"`
+(SquareTerminal — this lucide version's name for it).
+
+**To start using it — two grants, not one** (found from the first real
+attempt): the Developer department CHIP says you may open the dashboard; the
+ROLE is what /api/dev checks, and the chip alone 403s — the same chip-vs-role
+split Accounting has always had. The People screen only renders a role dropdown
+for modules registered in `components/access/moduleRoles.js`, and Developer was
+not in that registry, so after granting the chip there was nothing to click.
+Added `genericDeptRole("developer", "Developer")` — the one-line pattern the
+registry's own comments prescribe (same as HR, QC, Store). So: grant the chip,
+then set the DEVELOPER dropdown that appears on your row. The 403 now spells
+out both steps.
+
+---
+
 ## HR write coverage audited — and two exemptions were too broad
 
 > Nothing committed.
