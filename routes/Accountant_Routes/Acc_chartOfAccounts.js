@@ -278,13 +278,19 @@ router.get("/tree", async (req, res) => {
 
     ledgers.forEach((l) => {
       // Enrich with computed balance from vouchers
+      /* ALWAYS DERIVED, NEVER THE STORED FIGURE.
+         This used to fall through to the stored `currentBalance` whenever a
+         ledger had no posted vouchers — so a ledger whose only voucher was
+         later CANCELLED kept showing the balance that voucher had once given
+         it, forever. The tree said PURCHASE held 1,55,50,925 while the ledger
+         page, which reads the vouchers, correctly said zero. Eight ledgers in
+         this company were in that state.
+
+         No posted vouchers now means the balance is the opening balance,
+         which is what /ledgers has always done — the two endpoints disagreeing
+         is what made the same figure depend on which screen you opened. */
       const mov = movementByLedger.get(String(l._id));
-      const opening = l.openingBalance || 0;
-      if (mov) {
-        l.currentBalance = opening + mov.net;
-      } else if (!l.currentBalance && opening) {
-        l.currentBalance = opening;
-      }
+      l.currentBalance = (l.openingBalance || 0) + (mov?.net || 0);
 
       // Add vendor code and customer code for search
       l.vendorCode = `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`;
