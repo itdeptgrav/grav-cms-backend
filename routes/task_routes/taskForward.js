@@ -806,6 +806,62 @@ router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmploy
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // ── A self-assigned first task starts when it is APPROVED ─────────────
+      //
+      // OWNER DECISION. On a self-assigned task, raising it and accepting it
+      // are the same instant, so "acceptance" says nothing — the person could
+      // still do no work, because this gate is what releases it. The engine
+      // says so itself in the line below: "You can now begin work." So the
+      // approval is the first moment the work was genuinely theirs, and it is
+      // the anchor, for exactly the reason acceptance is on an assigned task.
+      //
+      // Same guard as the assigned path: only when the person has nothing else
+      // open and unsubmitted (an overdue task counts as open), only when the
+      // task carries an hours window rather than a typed date, and only ever
+      // moving the deadline LATER. A cross-department task never reaches here —
+      // this route refuses anything that is not `isSelfAssigned`.
+      try {
+        const assignee = (task.assigneeIds || [])[0] || null;
+        const windowSecs =
+          Number(task.deadlineWindowSecs) ||
+          Number(task.senderTimerWindowSecs) ||
+          0;
+        const createdMs =
+          readInstantMs(task.createdAtISO) ?? readInstantMs(task.createdAt);
+        const stored = readInstantMs(task.clockStartsAtMs) ?? createdMs;
+
+        if (assignee && windowSecs > 0 && !task.fixedDeadline) {
+          const {
+            resolveAcceptanceAnchor,
+            computeWorkingDeadline,
+          } = require("../../services/officeDeadline.service");
+          const approvedMs = Date.now();
+          const resolved = await resolveAcceptanceAnchor(task, approvedMs, taskId, {
+            considerFirstTask: true,
+          });
+          if (
+            resolved?.source === "first_task" &&
+            Number.isFinite(resolved.anchorMs) &&
+            (!Number.isFinite(stored) || resolved.anchorMs > stored)
+          ) {
+            const dueDate = await computeWorkingDeadline({
+              startMs: resolved.anchorMs,
+              windowSecs,
+            });
+            await taskRef.update({
+              clockStartsAtMs: resolved.anchorMs,
+              // Named for what it is, so the reason on screen matches the date.
+              clockStartsAtSource: "self_approved",
+              dueDate,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+        }
+      } catch (e) {
+        /* A failed re-anchor never costs the approval itself. */
+        console.warn("[self-assign-approve] first-task re-anchor skipped:", e.message);
+      }
+
       // Notify the task creator (self-assignee)
       if (task.assigneeIds?.length) {
         await _notify({

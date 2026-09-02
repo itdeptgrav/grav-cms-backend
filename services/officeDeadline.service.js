@@ -169,6 +169,7 @@ function acceptanceAnchorMs({
   dutyMode,
   dutySessionStartMs,
   nowMs,
+  hasOpenWork,
 }) {
   if (Number.isFinite(tlHoursSetMs) && tlHoursSetMs > 0) {
     /* The grant is the earliest the assignee could begin — nothing was theirs
@@ -190,6 +191,34 @@ function acceptanceAnchorMs({
     }
     return { anchorMs: tlHoursSetMs, source: "hours_granted" };
   }
+  /**
+   * **Their first task — nothing else was open, so nothing was theirs to do.**
+   *
+   * OWNER DECISION. `first_online` below charges an online person from the
+   * moment the task was created, deliberately, so that sitting on an acceptance
+   * buys nothing. That is right while they have work: the time was theirs and
+   * they spent it. It is wrong when they had NOTHING open — there was no work
+   * to sit on, so the gap before they took this on was never work time.
+   *
+   * `hasOpenWork` is resolved by the caller and passed in, so this stays pure.
+   * It is OPT-IN: only an explicit `false` — a caller that actually looked and
+   * found nothing open — takes this branch. `undefined` means nobody asked, and
+   * every existing caller falls through to exactly the rule it had before.
+   *
+   * Deliberately BELOW the grant branch, so a cross-department task never
+   * reaches it: a granted task anchors at its grant and that path is untouched.
+   *
+   * Can only ever move a deadline LATER — acceptance is at or after creation —
+   * which is the same safety property the rest of this function keeps.
+   */
+  if (hasOpenWork === false && Number.isFinite(nowMs)) {
+    const anchorMs =
+      Number.isFinite(createdMs) && createdMs > 0
+        ? Math.max(createdMs, nowMs)
+        : nowMs;
+    return { anchorMs, source: "first_task" };
+  }
+
   if (
     dutyMode === "online" &&
     Number.isFinite(dutySessionStartMs) &&
@@ -621,7 +650,55 @@ async function queueAheadEndMs(task, taskId, employeeId, nowMs) {
     : { endMs: latestMs, taskId: latestId, title: latestTitle };
 }
 
-async function resolveAcceptanceAnchor(task, nowMs = Date.now(), taskId = null) {
+/**
+ * Does this person have any OPEN, UNSUBMITTED work right now?
+ *
+ * The test for "is this their first task", and deliberately built from the two
+ * predicates this file already owns rather than a fifth list of statuses:
+ *
+ *  · `TERMINAL_STATUSES` — finished or cancelled. Not work.
+ *  · `isAwaitingReview`  — handed in and sitting with a reviewer. The person
+ *    has nothing to do on it, so it does not make them busy.
+ *
+ * Everything else counts as open work, INCLUDING an overdue task. An overdue
+ * task is still unfinished work they are meant to be doing, so somebody sitting
+ * on one is not free and gets no acceptance anchor — OWNER DECISION, chosen
+ * over the alternative of releasing them.
+ *
+ * The task being accepted is excluded by id: it is about to become their work,
+ * and counting it would mean nobody could ever qualify.
+ *
+ * Same query shape `queueAheadEndMs` uses — one array-contains read, filtered
+ * in memory — so this needs no new index. Read OUTSIDE any transaction.
+ *
+ * On ANY failure it answers `true` (busy). Failing closed keeps the existing
+ * deadline rather than handing out an anchor on the strength of a read that
+ * did not happen.
+ */
+async function hasOpenUnsubmittedWork(employeeId, excludeTaskId = null) {
+  if (!employeeId) return true;
+  try {
+    const { db } = require("../config/firebaseAdmin");
+    const snap = await db
+      .collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", String(employeeId))
+      .get();
+    const skip = excludeTaskId == null ? null : String(excludeTaskId);
+    for (const d of snap.docs) {
+      if (skip && d.id === skip) continue;
+      const t = d.data();
+      if (TERMINAL_STATUSES.includes(t.status)) continue;
+      if (isAwaitingReview(t)) continue;
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn("[officeDeadline] open-work read failed:", e.message);
+    return true;
+  }
+}
+
+async function resolveAcceptanceAnchor(task, nowMs = Date.now(), taskId = null, opts = {}) {
   const tlHoursSetMs = readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt);
   const createdMs = readMs(task.createdAtISO) ?? readMs(task.createdAt);
   const assignee = (task.assigneeIds || [])[0] || null;
@@ -667,12 +744,32 @@ async function resolveAcceptanceAnchor(task, nowMs = Date.now(), taskId = null) 
     }
   }
 
+  /**
+   * Only an acceptance asks this, and only for a task that is not a grant.
+   *
+   * `opts.considerFirstTask` is passed by the two surfaces where somebody
+   * takes work on — confirming an assignment, and a manager approving a
+   * self-assigned task. Every other caller (the queue rechain above all) leaves
+   * it off and `hasOpenWork` stays `undefined`, so the rule they get is byte
+   * for byte the one they had. That matters most for `rechainQueueFor`, which
+   * re-derives anchors with ITS OWN `nowMs`: were this on there, a re-derived
+   * anchor would creep to the walk's clock and the deadline would walk all day.
+   *
+   * Skipped outright for a granted task — the grant branch wins anyway, so the
+   * read would be a wasted round trip on the cross-department path.
+   */
+  let hasOpenWork;
+  if (opts.considerFirstTask === true && !Number.isFinite(tlHoursSetMs)) {
+    hasOpenWork = await hasOpenUnsubmittedWork(assignee, taskId);
+  }
+
   const personal = acceptanceAnchorMs({
     tlHoursSetMs,
     createdMs,
     dutyMode,
     dutySessionStartMs,
     nowMs,
+    hasOpenWork,
   });
 
   /**
@@ -1488,6 +1585,7 @@ module.exports = {
   readMs,
   acceptanceAnchorMs,
   resolveAcceptanceAnchor,
+  hasOpenUnsubmittedWork,
   queueAheadEndMs,
   rankOf,
   isAwaitingReview,
