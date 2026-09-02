@@ -99,6 +99,11 @@ router.post("/", checkApiKey, upload.single("audio"), async (req, res) => {
     };
 
     let doc = await findMatchingCallEvent(metadata.phoneNumber ?? null, metadata.startTime);
+    // If the nearest document ALREADY holds a (different) recording, this is a
+    // separate call from the same number — give it its own document rather
+    // than overwriting the earlier call's audio. (The idempotency check above
+    // already handled the "same file re-sent" case.)
+    if (doc && doc.driveFileId) doc = null;
     if (doc) {
       Object.assign(doc, recordingFields);
       // A recording only ever exists for a call that connected — fill this
