@@ -142,7 +142,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, requirements, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isImportant, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
+    const { title, description, notes, requirements, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isImportant, isGoalBased, goalBased, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -377,6 +377,15 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       isFolder: folderFlag,
       // A label only — stored, never read by the engine.
       isImportant: isImportant === true || isImportant === "true",
+      // "Taskgoal" — a project (folder) marker. A label only, like isImportant.
+      // NOT the C2 goal task (isGoal/goalConfig). Passed through only with a
+      // real config object; the service stores it verbatim and reads nothing.
+      isGoalBased: (isGoalBased === true || isGoalBased === "true") && !!goalBased,
+      goalBased:
+        (isGoalBased === true || isGoalBased === "true") &&
+        goalBased && typeof goalBased === "object"
+          ? goalBased
+          : null,
       isRepeat: repeatFlag,
       repeatConfig: (repeatFlag && repeatConfig) ? repeatConfig : null,
       isThirdParty: thirdPartyFlag,
@@ -796,6 +805,62 @@ router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmploy
         confirmedBy: admin.firestore.FieldValue.arrayUnion(task.assigneeIds[0]),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      // ── A self-assigned first task starts when it is APPROVED ─────────────
+      //
+      // OWNER DECISION. On a self-assigned task, raising it and accepting it
+      // are the same instant, so "acceptance" says nothing — the person could
+      // still do no work, because this gate is what releases it. The engine
+      // says so itself in the line below: "You can now begin work." So the
+      // approval is the first moment the work was genuinely theirs, and it is
+      // the anchor, for exactly the reason acceptance is on an assigned task.
+      //
+      // Same guard as the assigned path: only when the person has nothing else
+      // open and unsubmitted (an overdue task counts as open), only when the
+      // task carries an hours window rather than a typed date, and only ever
+      // moving the deadline LATER. A cross-department task never reaches here —
+      // this route refuses anything that is not `isSelfAssigned`.
+      try {
+        const assignee = (task.assigneeIds || [])[0] || null;
+        const windowSecs =
+          Number(task.deadlineWindowSecs) ||
+          Number(task.senderTimerWindowSecs) ||
+          0;
+        const createdMs =
+          readInstantMs(task.createdAtISO) ?? readInstantMs(task.createdAt);
+        const stored = readInstantMs(task.clockStartsAtMs) ?? createdMs;
+
+        if (assignee && windowSecs > 0 && !task.fixedDeadline) {
+          const {
+            resolveAcceptanceAnchor,
+            computeWorkingDeadline,
+          } = require("../../services/officeDeadline.service");
+          const approvedMs = Date.now();
+          const resolved = await resolveAcceptanceAnchor(task, approvedMs, taskId, {
+            considerFirstTask: true,
+          });
+          if (
+            resolved?.source === "first_task" &&
+            Number.isFinite(resolved.anchorMs) &&
+            (!Number.isFinite(stored) || resolved.anchorMs > stored)
+          ) {
+            const dueDate = await computeWorkingDeadline({
+              startMs: resolved.anchorMs,
+              windowSecs,
+            });
+            await taskRef.update({
+              clockStartsAtMs: resolved.anchorMs,
+              // Named for what it is, so the reason on screen matches the date.
+              clockStartsAtSource: "self_approved",
+              dueDate,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+        }
+      } catch (e) {
+        /* A failed re-anchor never costs the approval itself. */
+        console.warn("[self-assign-approve] first-task re-anchor skipped:", e.message);
+      }
 
       // Notify the task creator (self-assignee)
       if (task.assigneeIds?.length) {
@@ -1423,6 +1488,153 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
     await postSystemChatMessage(taskId, `⏱ ${name} (TL) set the estimated hours — task is now active.`, employeeId, name);
     await _notify({ recipientIds: [targetId, task.assignedBy].filter(Boolean), type: "department_draft_activated", title: "✅ Task Now Active", body: `${name} set the hours — "${task.title}" is ready.`, data: { taskId }, senderId: employeeId, senderName: name });
     res.json({ success: true, status: "open" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PRE-ASSIGNMENT DEADLINE PUSHBACK ─────────────────────────────────────────
+// The receiver's manager proposes a LATER deadline while the task is still at
+// pending_tl_hours — before hours are set and before anyone is assigned — and
+// the creator approves, counters, or rejects it. Distinct from the assignee's
+// post-assignment extension: this is a DATE, before assignment, and it is the
+// creator (who owns the commitment) who decides. The pure rule that the client
+// gates its UI on is lib/rules/tasks/preAssignDeadline.ts; THIS is the
+// authoritative gate and the only writer.
+const _toMs = (v) => {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") { const p = Date.parse(v); return Number.isNaN(p) ? null : p; }
+  if (typeof v === "object") {
+    if (typeof v._seconds === "number") return v._seconds * 1000;
+    if (typeof v.seconds === "number") return v.seconds * 1000;
+    if (typeof v.toMillis === "function") return v.toMillis();
+  }
+  return null;
+};
+
+router.post("/task/:taskId/preassign-deadline/request", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { proposedDueAt, reason } = req.body;
+    const { employeeId, name } = req.coworkUser;
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const task = snap.data();
+
+    if (task.status !== "pending_tl_hours") {
+      return res.status(400).json({ error: "A deadline can only be pushed back before the task is assigned." });
+    }
+    if (task.preAssignDeadline && task.preAssignDeadline.status === "pending") {
+      return res.status(400).json({ error: "A request is already awaiting a decision." });
+    }
+    // Only the assignee's manager — the same person who sets the hours — may
+    // propose. Same authority check as /department-tl-set-hours.
+    const targetId = task.pendingAssigneeId || (task.assigneeIds && task.assigneeIds[0]);
+    if (!targetId) return res.status(400).json({ error: "This task has no assignee yet." });
+    const manager = await _getPrimaryManagerApprover(targetId);
+    if (!manager || manager.approverId !== employeeId) {
+      return res.status(403).json({ error: `Only ${manager ? manager.approverName : "the assignee's manager"} can push back the deadline for this task.` });
+    }
+
+    if (!reason || !String(reason).trim()) return res.status(400).json({ error: "Say why the deadline needs to move." });
+    const proposedMs = _toMs(proposedDueAt);
+    if (proposedMs === null) return res.status(400).json({ error: "Choose a valid date and time." });
+    if (proposedMs <= Date.now()) return res.status(400).json({ error: "The new deadline must be in the future." });
+    const previousMs = _toMs(task.fixedDeadline) ?? _toMs(task.dueDate);
+    if (previousMs !== null && proposedMs <= previousMs) {
+      return res.status(400).json({ error: "Ask for a LATER date — this is for more time, not less." });
+    }
+
+    const request = {
+      proposedDueAt: new Date(proposedMs).toISOString(),
+      previousDueAt: previousMs !== null ? new Date(previousMs).toISOString() : null,
+      requestedById: employeeId,
+      requestedByName: name,
+      reason: String(reason).trim(),
+      status: "pending",
+      counterDueAt: null,
+      decidedById: null,
+      decidedByName: null,
+      decisionReason: null,
+    };
+    await taskRef.update({ preAssignDeadline: request, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    await _notify({
+      recipientIds: [task.assignedBy || task.createdBy].filter(Boolean),
+      type: "deadline_change_requested",
+      title: "🗓️ Deadline change requested",
+      body: `${name} asked to move the deadline on "${task.title}" before it is assigned. Reason: ${request.reason}`,
+      data: { taskId },
+      senderId: employeeId,
+      senderName: name,
+    });
+
+    res.json({ success: true, preAssignDeadline: request });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post("/task/:taskId/preassign-deadline/decide", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { decision, counterDueAt, reason } = req.body;
+    const { employeeId, name } = req.coworkUser;
+    if (["approve", "reject", "counter"].indexOf(decision) === -1) {
+      return res.status(400).json({ error: "decision must be approve, reject or counter." });
+    }
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const task = snap.data();
+    const openReq = task.preAssignDeadline;
+    if (!openReq || openReq.status !== "pending") {
+      return res.status(400).json({ error: "There is no open deadline request to decide." });
+    }
+    // The creator owns the deadline they committed to.
+    if ((task.assignedBy || task.createdBy) !== employeeId) {
+      return res.status(403).json({ error: "Only the person who set the deadline can decide this." });
+    }
+
+    const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    const next = {
+      ...openReq,
+      decidedById: employeeId,
+      decidedByName: name,
+      decisionReason: (reason && String(reason).trim()) || null,
+      counterDueAt: null,
+    };
+
+    if (decision === "approve") {
+      // The commitment moves. It is a fixed-deadline task, so fixedDeadline is
+      // what the product reads first (fixedDeadline ?? deadline ?? dueDate);
+      // dueDate is kept in step for any reader that uses it.
+      const ms = _toMs(openReq.proposedDueAt);
+      const iso = new Date(ms).toISOString();
+      updates.fixedDeadline = iso;
+      updates.dueDate = iso;
+      next.status = "approved";
+    } else if (decision === "counter") {
+      const ms = _toMs(counterDueAt);
+      if (ms === null) return res.status(400).json({ error: "Offer a valid date to counter with." });
+      // The date does NOT move on a counter — it is a new offer to accept.
+      next.status = "countered";
+      next.counterDueAt = new Date(ms).toISOString();
+    } else {
+      next.status = "rejected";
+    }
+    updates.preAssignDeadline = next;
+    await taskRef.update(updates);
+
+    await _notify({
+      recipientIds: [openReq.requestedById].filter(Boolean),
+      type: "deadline_change_decided",
+      title: "🗓️ Deadline request decided",
+      body: `${name} ${next.status} your deadline request on "${task.title}".`,
+      data: { taskId, status: next.status },
+      senderId: employeeId,
+      senderName: name,
+    });
+
+    res.json({ success: true, preAssignDeadline: next, status: next.status });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

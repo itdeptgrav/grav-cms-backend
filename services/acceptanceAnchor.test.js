@@ -27,15 +27,64 @@ const SCHEDULE = {
 const istOf = (iso) =>
   new Date(Date.parse(iso) + 5.5 * 3600000).toISOString().slice(0, 19);
 
-test("a cross-department grant is the anchor, whatever presence says", () => {
+/* A grant at a clean instant, with sessions either side of it. */
+const GRANT = Date.parse("2026-08-14T07:30:00.000Z"); //         13:00 IST
+const BEFORE_GRANT = Date.parse("2026-08-14T07:00:00.000Z"); //  12:30 IST — online first
+const AFTER_GRANT = Date.parse("2026-08-14T08:30:00.000Z"); //   14:00 IST — online later
+const CONFIRMED = Date.parse("2026-08-14T09:00:00.000Z"); //     14:30 IST
+
+test("granted, and online since before the grant — the clock starts at the grant", () => {
+  /* The assignee was already at their desk when the hours landed, so nothing
+     waited on them: the grant is the earliest they could have begun. */
   const a = acceptanceAnchorMs({
-    tlHoursSetMs: GRANTED,
+    tlHoursSetMs: GRANT,
     createdMs: CREATED,
     dutyMode: "online",
-    dutySessionStartMs: ONLINE,
-    nowMs: ACCEPTED,
+    dutySessionStartMs: BEFORE_GRANT,
+    nowMs: CONFIRMED,
   });
-  assert.deepEqual(a, { anchorMs: GRANTED, source: "hours_granted" });
+  assert.deepEqual(a, { anchorMs: GRANT, source: "hours_granted" });
+});
+
+test("granted while OFFLINE, comes online later — the clock waits for them", () => {
+  /* The reported rule. Hours granted 13:00 while the assignee was offline; they
+     come online 14:00. A 3-hour budget is a promise of 3 WORKING hours, and the
+     hour they could not be present for was not theirs to work — so the clock
+     starts 14:00 (→ due 17:00), not 13:00 (→ 16:00). Mirrors first_online. */
+  const a = acceptanceAnchorMs({
+    tlHoursSetMs: GRANT,
+    createdMs: CREATED,
+    dutyMode: "online",
+    dutySessionStartMs: AFTER_GRANT,
+    nowMs: CONFIRMED,
+  });
+  assert.deepEqual(a, { anchorMs: AFTER_GRANT, source: "hours_granted" });
+});
+
+test("granted while offline and STILL offline at confirm — the grant stands", () => {
+  /* Only PROVABLE online time moves it. Not online now → the grant is the
+     honest floor, exactly as before this rule existed. */
+  const a = acceptanceAnchorMs({
+    tlHoursSetMs: GRANT,
+    createdMs: CREATED,
+    dutyMode: "offline",
+    dutySessionStartMs: AFTER_GRANT,
+    nowMs: CONFIRMED,
+  });
+  assert.deepEqual(a, { anchorMs: GRANT, source: "hours_granted" });
+});
+
+test("granted, online later, but sitting after coming online buys nothing", () => {
+  /* The session start is the anchor, never the confirm press: online 14:00,
+     confirms 14:30 → still 14:00. The same guard first_online makes. */
+  const a = acceptanceAnchorMs({
+    tlHoursSetMs: GRANT,
+    createdMs: CREATED,
+    dutyMode: "online",
+    dutySessionStartMs: AFTER_GRANT,
+    nowMs: CONFIRMED, // 14:30, half an hour after coming online
+  });
+  assert.equal(a.anchorMs, AFTER_GRANT); // 14:00, not 14:30
 });
 
 test("T019: online since 10:56, accepted 12:01 — the clock starts 10:56", () => {
@@ -193,4 +242,37 @@ test("every accept surface writes the deadline WITH the budget", () => {
       route + " anchors at the press again — that rewards sitting on a task",
     );
   }
+});
+
+/* ── The trigger: a granted task re-anchors when the assignee confirms ─────── */
+
+/* Reuses the `src` helper declared above — it resolves against __dirname. */
+const CONFIRM_SRC = src("taskForward.service.js");
+
+test("confirmTaskReceipt re-resolves the anchor for a granted task", () => {
+  /* The rule above is pure, but a granted task's deadline is stamped at the
+     GRANT while the assignee may be offline — so something has to re-run it once
+     they are online. Confirming is that moment. This guards the wiring: the
+     pure rule cannot fire on its own. */
+  const at = CONFIRM_SRC.indexOf("async function confirmTaskReceipt");
+  const fn = CONFIRM_SRC.slice(at, at + 3600);
+  assert.match(fn, /resolveAcceptanceAnchor\(task, Date\.now\(\), taskId\)/);
+});
+
+test("it fires only for a granted task, and only ever moves the deadline later", () => {
+  const at = CONFIRM_SRC.indexOf("async function confirmTaskReceipt");
+  const fn = CONFIRM_SRC.slice(at, at + 3600);
+  /* Guarded on the stored grant anchor, so a normal task is untouched. */
+  assert.match(fn, /clockStartsAtSource === "hours_granted"/);
+  /* Written only when the resolved anchor is LATER than what is stored. */
+  assert.match(fn, /resolved\.anchorMs > stored/);
+  /* And it can never cost the confirmation itself. */
+  assert.match(fn, /catch \(e\)/);
+});
+
+test("the re-anchor recomputes the working deadline from the new anchor", () => {
+  const at = CONFIRM_SRC.indexOf("async function confirmTaskReceipt");
+  const fn = CONFIRM_SRC.slice(at, at + 3600);
+  assert.match(fn, /computeWorkingDeadline\(\{\s*startMs: resolved\.anchorMs/);
+  assert.match(fn, /dueDate,/);
 });
