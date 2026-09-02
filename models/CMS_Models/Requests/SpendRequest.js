@@ -127,6 +127,58 @@ const lineSchema = new mongoose.Schema(
     rate: { type: Number, required: true, min: 0 },
     amount: { type: Number, required: true, min: 0 },
 
+/* ── FUTURE ITEM-WISE BUDGET ATTRIBUTION (INERT) ────────────────────────────
+   Where this line's own budget head will live once a request can charge
+   several unrelated items to several approved lines.
+
+   NOTHING READS THIS YET, and that is deliberate. The request-level
+   `ledgerId` / `budgetLineId` remain the single source of truth for
+   commitments, budget checks and actuals until a later chunk migrates the
+   workflow deliberately. Two authorities for "which budget is this?" running
+   at once is exactly the ambiguity this field exists to remove, so it is
+   added now — additively, so no existing document needs migrating — and left
+   unpopulated.
+
+   `status` is not derivable from `budgetLedgerId` alone. A null head means
+   "unresolved" when nobody has looked and "manual_selection_required" once a
+   human has been asked and has not answered, and the difference decides
+   whether a screen shows a prompt or a warning.
+
+   Vocabulary is shared with services/itemBudgetHead.service.js:
+   `resolutionSource` takes exactly its `source` values. */
+    budgetAllocation: {
+      type: new mongoose.Schema(
+        {
+          budgetLedgerId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Acc_Ledger",
+            default: null,
+          },
+          budgetLedgerName: { type: String, trim: true, default: "" },
+          resolutionSource: {
+            type: String,
+            enum: ["item_override", "category_mapping", "unresolved"],
+            default: "unresolved",
+          },
+          resolutionCategory: { type: String, trim: true, default: "" },
+          selectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+          selectedByName: { type: String, trim: true, default: "" },
+          selectedAt: { type: Date, default: null },
+          status: {
+            type: String,
+            enum: ["resolved", "unresolved", "manual_selection_required"],
+            default: "unresolved",
+          },
+        },
+        { _id: false },
+      ),
+      /* Absent, not defaulted. Every request written before this chunk has no
+         allocation at all, and a default would manufacture an "unresolved"
+         decision on thousands of historical lines that nobody ever made. */
+      default: undefined,
+    },
+
+
     /* ── THE QUOTE THIS LINE WAS PRICED FROM ────────────────────────────────
        Commercial terms used to live only on the request, on the reasoning that
        Store had one quote from one vendor. That is wrong for anything with

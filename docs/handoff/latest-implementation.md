@@ -2,6 +2,92 @@
 
 ---
 
+## Store & Purchase — Chunk 1A: foundation, operational-PO pilot, authority corrections
+
+> **Chunk 1 is NOT complete.** This is 1A: the shared foundation, the
+> operational-PO pilot, and the correction of the authority bypasses that
+> pilot shipped with. Architecture record:
+> `docs/decisions/store-purchase-tenancy-permissions.md`. Chunk 2 is blocked.
+> Paused Budget/Accounting files untouched. Nothing committed.
+
+### Corrections made to the 1A pilot
+
+| Bypass | Was | Now |
+|---|---|---|
+| PO creation | took `status` from the body — `sp.po.create` alone could create an ISSUED (or COMPLETED) order, no issue capability, no policy, no `approvedBy`, supplier emailed | always DRAFT; a non-DRAFT status is a structured 400; supplier email and "issued" notification moved to the transition only |
+| PO edit (PUT) | `if (status) purchaseOrder.status = status` — a second, unguarded issue/cancel path; edits allowed on ISSUED | `status` refused outright; **DRAFT only**; ISSUED/PARTIALLY_RECEIVED/COMPLETED/CANCELLED all refuse; edits write a changed-field summary |
+| Transitions | any of DRAFT/ISSUED/CANCELLED, optional idempotency | explicit table (DRAFT→ISSUED, DRAFT→CANCELLED, ISSUED→CANCELLED-if-no-receipts); receipt states unreachable by request; nothing returns to DRAFT; same-state is a no-op that appends no history; **idempotency mandatory** |
+| Approval policy | `NONE_MATCHED` returned `allowed: true` — an unconfigured company behaved like an approved one, and a capability check was being passed off as policy enforcement | **fails closed** with `POLICY_NOT_CONFIGURED`; empty level set authorises nobody; emergency orders need an emergency rule; capability and policy are two gates and both must pass |
+| Idempotency | protected entry only — mutation could succeed, history fail, key be released, retry repeat the mutation | `EFFECT_APPLIED` marker written **before the first stock write**; `abandon()` refuses to release an applied effect (enforced by the query filter, not the caller); recovery path replays instead of re-running; stale IN_PROGRESS reclaimed after 2 min |
+| Company membership | arbitrary `findOne` across possibly-many memberships | deterministic: one membership decides; several require an explicit `X-Store-Purchase-Company` selection **validated against** the memberships; unknown selection gets the non-disclosing refusal |
+| Site scope | accepted and stamped any browser ObjectId when membership listed no sites | refused: `SITE_NOT_CONFIGURED` (no site master exists), `SITE_NOT_PERMITTED` outside membership, structured validation error for a malformed id |
+| `/api/cms/units` | **no authentication at all** — anonymous writes to the conversion master every stock movement trusts | reads need `sp.read`, writes need `sp.master.maintain` |
+
+New: `services/storePurchase/unitOfWork.service.js` (transaction where the
+deployment supports it — probed with a real write, not by assumption —
+otherwise the effect-marker path), `scripts/migrations/store-purchase-chunk1-indexes.js`,
+`test/store-purchase/idempotency-faults.test.js`, `test/store-purchase/migration-indexes.test.js`.
+
+### The honest guarantee on a standalone MongoDB
+
+Stock moves item by item outside any transaction. The effect marker is
+written **before the first stock write**, so a failure anywhere afterwards
+sends the retry into recovery and the stock never moves twice. Where the
+order did not record the delivery, recovery **refuses** with
+`PARTIAL_RECEIPT_NEEDS_RECONCILIATION` and writes a
+`RECEIPT_RECONCILIATION_REQUIRED` history entry — the inconsistency is
+surfaced for a human rather than repeated or hidden. That is at-most-once,
+not exactly-once, and the difference is stated rather than glossed.
+
+### What remains for Chunk 1 — cross-company access is still possible
+
+These active routers are **unchanged from Chunk 0**: MRF/material request,
+requisitions, stock issuance, stock adjustment, vendor returns, barcodes,
+deliveries, RawItem direct stock writes and hard delete, worksheet PO/WO.
+Each can read and mutate another company's records, has no capability check
+and no idempotency. Also outstanding: legacy-master reference compatibility
+documentation (§8), frontend coverage beyond the two PO screens, and a
+frontend component-test harness (the repo has none).
+
+**Passing tests do not mean the boundary holds.** 472 green tests cover the
+converted routers; they say nothing about the list above.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Chunk 0 pure audit suites | **119/119** |
+| `test/store-purchase` + `test/requests` | **472/472**, 15 suites |
+| — of which fault-injection | 7/7 (`idempotency-faults.test.js`) |
+| — of which migration | 5/5 (`migration-indexes.test.js`) |
+| `test/accountant` | 14 suites fail — **all `budget-*`, all pre-existing**: none loads any file I changed (grep), and `budget-duplicates` fails identically with my files reverted to `HEAD` |
+| Frontend parse (6 files) | pass |
+| `git diff --check` both repos | clean |
+
+**Not a successful frontend build.** `next build` still fails in the
+committed, unmodified `app/accountant/sales-vouchers/new/page.js`
+(`splitGstByRate` imported and defined in one file). Unrelated and
+pre-existing; no full build can be claimed.
+
+**Authenticated visual verification: NOT DONE.** Requires a login I will not
+perform. Assigned manual check: PO register (Cancel not Delete; Create hidden
+without `sp.po.create`), PO detail (Issue/Cancel gated and disabled in
+flight, History drawer — Escape, focus trap, focus restored, retry on load
+failure), and the not-available state for an account with no membership, at
+desktop and mobile widths.
+
+### Migration
+
+`scripts/migrations/store-purchase-chunk1-indexes.js` — dry-run by default,
+`--apply`, `--rollback`. Drops the legacy global `poNumber_1`, creates the
+compound and new-collection indexes, detects duplicate `(companyId, poNumber)`
+pairs as BLOCKING before touching anything, and **reports** legacy unowned
+orders without assigning ownership. Rollback refuses when companies now share
+numbers, because choosing which to renumber is a business decision. **Not run
+against any database.**
+
+---
+
 ## PL eligibility reconcile, overtime & regularisation history, record stamps
 
 > Follow-on to the HR change-history work below. Five items the user raised
@@ -92,6 +178,38 @@ deck:px-8`. Now matches.
 The documents list already showed `generatedByName`, so it was left alone rather
 than given a second, competing attribution line.
 
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
+
 ### Verification
 
 - `node --test services/plEligibility.test.js` — **10/10**.
@@ -165,6 +283,38 @@ Two bugs found and fixed on the way, both in code being touched:
 `app/hr/dashboard/employees/history/page.js` was left as it is at the user's
 direction; it still reads `/api/employees/history` and is unaffected, since every
 model change is additive.
+
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
 
 ### Verification
 
@@ -273,6 +423,38 @@ this work.
 | `components/planner/plannerBits.js` | **New.** Only what the kit genuinely lacks: a task tick, the ladder line under a title, and a progress figure that can say "nothing in it yet" instead of "0%". |
 | `components/shell/DepartmentRail.js` | One fixed Planner control beside "Apps". Not added to the department list, which is data (PRODUCT.md: "Departments are data"). Needed `usePathname` — the rail's existing `current` prop is a department slug and cannot answer "are we on /planner". |
 
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
+
 ### Verification
 
 - **47 backend tests, all passing**: `services/plannerRollup.test.js` (15, `node --test`), `services/plannerAttention.test.js` (20, `node --test`), `test/planner/planner.route.test.js` (27, jest + in-memory Mongo — counted 27 with the 4 review cases).
@@ -314,6 +496,38 @@ The Android app's upload endpoint (`/api/recordings`, shared-API-key gated) is u
 | `app/sales/dashboard/accounts/[id]/_sections/CallRecordingsSection.js` + `page.js` | New "Calls" tab in the account workspace, next to Activities. |
 | `app/sales/dashboard/customers/[id]/page.js` | New "Calls" tab; needs no `fetchTabData` branch since the panel fetches its own data. |
 
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
+
 ### Verification
 
 - Matcher exercised directly against a fixture set: exact number in three formats → `phone`; "Mayfair Textiles" and `call_20250612_mayfair.m4a` → `name`; **"May Flower" and "Rahul Verma" correctly excluded**; empty identity → `null` filter (the caller returns no recordings rather than every call in the company).
@@ -349,6 +563,38 @@ No backend changes — the Chunk 1 central endpoint is reused as-is.
 - **Shortcuts** — `Cmd/Ctrl+O` attempted (browsers may reserve it) + `Ctrl/Cmd+Space` reliable fallback; `Escape` collapses. (On macOS, `Cmd+Space` is Spotlight and never reaches the page — `Ctrl+Space` is the one that works there.)
 - **Route is optional context only** — passed as `routeContext`, never changes identity or gates answers (enforced server-side in Chunk 1).
 - **Single instance / no duplication** — one mount in the persistent root shell.
+
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
 
 ### Verification (live, running stack)
 
@@ -441,6 +687,38 @@ Four fixes applied; no redesign, no voice work.
 - **Existing HR Overview questions still work through the central service** — the HR routes now call `runStructured`; all prior HR tests pass unchanged.
 - **Private HR info not exposed outside permissions** — verified by test and live (Sales user refused, HR user served).
 
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
+
 ### Verification
 
 - **Backend jest:** `test/hr-ai` **45/45** (incl. the real qwen3:8b smoke); full suite **359/359** — the HR-route delegation caused no regressions.
@@ -507,6 +785,38 @@ Four fixes applied; no redesign, no voice work.
 - **No ranking / no conclusions** — ranking, misconduct/performance judgements and employment decisions are refused pre-model and forbidden in the prompt; the model is instructed to describe only what the records show.
 - **Missing ≠ absent** — unsynced days and missed punches are surfaced as data gaps, distinct from absence, in both context and prompt.
 - **No leakage** — `think:false` + `<think>` stripping; prompts/reasoning never returned.
+
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
 
 ### Verification
 
@@ -583,6 +893,38 @@ No `.env` change is required to run with the installed model.
 - **Restricted intents refused pre-model** — pay, personal data, candidate ranking / hiring / firing / promotion, and raw-DB / prompt-extraction phrasings return an instant canned refusal.
 - **Read-only** — no approvals, attendance/leave/regularisation actions, or employee mutations exist in this feature.
 - **No reasoning/prompt leakage** — `think:false` plus `<think>` stripping; the system prompt and model reasoning are never returned.
+
+### Runtime/report-integrity correction (this pass)
+
+`renderItemMasterSummary()` was still reading the pre-correction budget shape
+and printing **7 literal `undefined` values** — status lines, the company
+count, per-company aggregates and the override total. It now consumes the
+authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
+`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
+`itemOverrides.itemsWithOverride`, each company's `states`), renders the
+override and category dimensions on separate lines with an explicit warning
+that they are **not** exclusive and must not be summed, and renders the
+global barcode-identity findings. Tests assert the real values appear and
+that the rendered summary contains **no literal `undefined`** — in both the
+optional-collections-present and optional-collections-absent conditions.
+
+Three further integrity fixes:
+
+- **Complete company universe.** The runner now gathers the committed company
+  master (`acc_companies`, narrow projection, read-only) and every company in
+  it is evaluated — including ones with no mapping, no override-target ledger
+  and no budget configuration at all. Company ids named by data but missing
+  from the master are integrity findings, still evaluated. Without the master
+  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
+- **Mapping absence ≠ never reviewed.** With no mapping collection, a
+  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
+  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
+- **The read-only proof now covers every collection the runner may read**,
+  optional ones included, and exercises both conditions: absent (existence,
+  documents and indexes snapshotted as non-existent) and present with
+  documents and a real index. A latent bug surfaced here — the outer report
+  never forwarded the optional collections to the item-master audit, so
+  budget coverage was silently always "absent"; fixed.
 
 ### Verification
 

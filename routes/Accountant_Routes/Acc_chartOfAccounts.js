@@ -3,6 +3,8 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const classification = require("../../services/budgetClassification.service");
+const itemBudget = require("../../services/itemBudgetHead.service");
+const ItemCategoryBudget = require("../../models/Accountant_model/Acc_ItemCategoryBudget");
 const {
   Acc_Group,
   Acc_Ledger,
@@ -174,16 +176,16 @@ router.get("/version", (req, res) => {
 // Helper — sum currentBalance for a list of leaf ledgers (signed)
 // ─────────────────────────────────────────────────────────────────────────────
 function sumBalances(ledgers = []) {
-  return ledgers.reduce((acc, l) => {
-    // Use currentBalance if set, fall back to openingBalance.
-    // For Tally-imported ledgers, currentBalance may be 0/null while
-    // openingBalance has the actual value from the import.
-    const bal =
-      l.currentBalance != null && l.currentBalance !== 0
-        ? l.currentBalance
-        : l.openingBalance || 0;
-    return acc + bal;
-  }, 0);
+  /* ── NO FALLBACK, DELIBERATELY ──────────────────────────────────────────
+     Callers hand this ledgers whose `currentBalance` has already been
+     recomputed from posted vouchers (see the /tree route). It used to fall
+     back to `openingBalance` whenever `currentBalance` was zero or absent,
+     which meant a ledger correctly computed to ZERO had its opening balance
+     substituted back in — reintroducing at the group level exactly the stale
+     figure the per-ledger computation had just removed.
+
+     A zero is an answer. */
+  return ledgers.reduce((acc, l) => acc + (l.currentBalance || 0), 0);
 }
 
 function rollupGroupTotals(group) {
@@ -278,13 +280,28 @@ router.get("/tree", async (req, res) => {
 
     ledgers.forEach((l) => {
       // Enrich with computed balance from vouchers
+      /* ── THE BALANCE IS THE VOUCHERS, ALWAYS ────────────────────────────
+         This used to leave the stored `currentBalance` untouched when a ledger
+         had NO posted vouchers — the reasoning being that a stale field was
+         better than nothing. It is not. A ledger with no vouchers has, by
+         definition, no movement: its balance is its opening balance and
+         nothing else.
+
+         What that exception actually did was let dead figures through. Nine
+         ledgers on this company had a cached balance and not one posted
+         voucher behind it — PURCHASE showed ₹1.55 crore, Bank Account ₹29.9
+         lakh — and the page reported ₹1.28 crore that the trial balance,
+         which reads vouchers, could not see. Anybody comparing the two would
+         have trusted this screen, because this is the screen people read.
+
+         `/ledgers` (see `l.currentBalance = opening + mov` in that route) has
+         always done it this way. The two now agree.
+
+         Display only: `groups` and `ledgers` are `.lean()`, so this computes a
+         figure to render and never writes back over the stored field. */
       const mov = movementByLedger.get(String(l._id));
       const opening = l.openingBalance || 0;
-      if (mov) {
-        l.currentBalance = opening + mov.net;
-      } else if (!l.currentBalance && opening) {
-        l.currentBalance = opening;
-      }
+      l.currentBalance = opening + (mov ? mov.net : 0);
 
       // Add vendor code and customer code for search
       l.vendorCode = `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`;
@@ -1373,6 +1390,293 @@ router.patch("/ledgers/:id/budget-control", async (req, res) => {
     });
   } catch (e) {
     console.error("[coa] budget-control:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ══ ITEM CATEGORY → BUDGET HEAD ═════════════════════════════════════════════
+ * Which budget a requester's item comes out of, decided once per CATEGORY.
+ *
+ * A requester knows they need cotton fabric. Making them also name the head it
+ * is budgeted under asks the wrong person a question the item already answers,
+ * and every wrong answer is a budget that reads incorrectly for a year.
+ *
+ * Mapped per category, not per item: 15 categories is a meeting finance can
+ * finish, 259 items is a project that never ends and grows every week. An item
+ * may override where it genuinely differs from its siblings.
+ *
+ * ── SAME GATE AS THE CLASSIFICATION ITSELF ──────────────────────────────────
+ * Deciding that Fabric spends out of Raw Materials is a budget decision, so it
+ * is an owner's or approver's call for the same reason budgetControl is. A
+ * requester who could remap their own category could point their spending at
+ * whichever head still had room.
+ */
+function financeOnly(req, res) {
+  const role = String(req.user?.role || "");
+  const perms = req.user?.permissions || {};
+  if (!["owner", "approver", "admin", "accountant"].includes(role) && !perms.canApprove) {
+    res.status(403).json({
+      success: false,
+      message: "Mapping a category to a budget head is an owner's or an approver's call.",
+    });
+    return false;
+  }
+  return true;
+}
+
+/* The company a mapping request is scoped to.
+ *
+ * Taken from the caller's own context first and the request only as a
+ * fallback, and REFUSED where the two disagree — a client-supplied companyId
+ * that overrides the session is how one company reads another's mappings. */
+function mappingCompany(req) {
+  const fromUser = req.user?.companyId ? String(req.user.companyId) : null;
+  const asked = req.body?.companyId || req.query.companyId || null;
+  const askedStr = asked ? String(asked) : null;
+  if (fromUser && askedStr && fromUser !== askedStr) {
+    return { ok: false, message: "That company is not yours to read." };
+  }
+  const companyId = fromUser || askedStr;
+  if (!companyId) return { ok: false, message: "companyId is required." };
+  return { ok: true, companyId };
+}
+
+/* Every category on the item master with its mapping and how many items it
+ * covers — the screen finance fills in, and the honest measure of how far
+ * along it is. Coverage is counted in ITEMS, not categories: "13 of 15 mapped"
+ * reads as nearly finished when the two missing could be half the master. */
+router.get("/item-categories", async (req, res) => {
+  try {
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const data = await itemBudget.coverage({ companyId: scope.companyId, RawItem });
+    res.json({ success: true, ...data });
+  } catch (e) {
+    console.error("[coa] item-categories:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* Set (or clear) one category's head. A null head is stored rather than
+ * deleted: a row with no head is finance saying "looked at it, not decided",
+ * which is a different state from a category nobody has opened. */
+router.put("/item-categories/:category", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+    const companyId = scope.companyId;
+    const category = String(req.params.category || "").trim();
+    if (!category) {
+      return res.status(400).json({ success: false, message: "A category is required." });
+    }
+
+    const raw = req.body?.budgetLedgerId;
+    let ledgerId = null;
+    let ledgerName = "";
+
+    if (raw) {
+      /* Refused here rather than months later on a bill that cannot be
+         checked: a category pointed at a bank or GST head would produce
+         request lines no budget could ever match. */
+      /* Scoped to THIS company. A budget-eligible head belonging to another
+         company is still another company's head, and an id-shaped parameter
+         is exactly what invites someone to try. */
+      const check = await itemBudget.assertMappable(raw, companyId);
+      if (!check.ok) return res.status(400).json({ success: false, message: check.message });
+      ledgerId = check.ledger._id;
+      ledgerName = check.ledger.name;
+    }
+
+    /* Keyed on the normalised form, so setting "fabric" updates the row that
+       "Fabric" created instead of creating a second one the resolver would
+       then have to choose between. */
+    const categoryKey = itemBudget.categoryKeyOf(category);
+    const doc = await ItemCategoryBudget.findOneAndUpdate(
+      { companyId, categoryKey },
+      {
+        $set: {
+          /* The display label follows the latest spelling finance typed; the
+             key is what the row is found by and never changes with it. */
+          category,
+          categoryKey,
+          budgetLedgerId: ledgerId,
+          budgetLedgerName: ledgerName,
+          note: String(req.body?.note || "").trim(),
+          setBy: req.user?.id || undefined,
+          setByName: req.user?.name || "",
+          setAt: new Date(),
+        },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true },
+    ).lean();
+
+    res.json({
+      success: true,
+      message: ledgerId
+        ? `${category} is mapped to ${ledgerName}. This does not move any budget on its own.`
+        : `${category} is unresolved. It will require resolution when item-wise request allocation is enabled.`,
+      mapping: doc,
+    });
+  } catch (e) {
+    console.error("[coa] item-categories set:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── ONE ITEM'S OWN HEAD ────────────────────────────────────────────────────
+ * The override, for the rare item that does not belong with its category.
+ * Meant to stay rare: every override is a fact that has to be maintained by
+ * hand forever, where a category mapping is maintained once for everything
+ * under it. Clearing it (`budgetLedgerId: null`) falls the item back to its
+ * category rather than leaving it unresolved.
+ *
+ * ── COMPANY ISOLATION, HONESTLY ────────────────────────────────────────────
+ * `RawItem` carries no `companyId` — the item master is a single shared
+ * catalogue in this deployment. So this route cannot scope by company and
+ * does not pretend to: the gate here is that only Finance may write at all.
+ * The CATEGORY MAPPING it resolves through is company-scoped, so two
+ * companies would still get different heads for the same item. If the item
+ * master ever becomes multi-company, this route needs the scope added.
+ */
+router.put("/raw-items/:id/budget-head", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    /* Needed even though the ITEM is not company-scoped: the LEDGER is, and
+       an override pointing at another company's head would be exactly the
+       cross-company reference this check exists to refuse. */
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const item = await RawItem.findById(req.params.id);
+    if (!item) return res.status(404).json({ success: false, message: "Item not found." });
+
+    const raw = req.body?.budgetLedgerId;
+    if (raw) {
+      const check = await itemBudget.assertMappable(raw, scope.companyId);
+      if (!check.ok) return res.status(400).json({ success: false, message: check.message });
+      item.budgetLedgerId = check.ledger._id;
+      item.budgetLedgerName = check.ledger.name;
+    } else {
+      item.budgetLedgerId = null;
+      item.budgetLedgerName = "";
+    }
+    item.budgetLedgerSetBy = req.user?.id || null;
+    item.budgetLedgerSetByName = req.user?.name || "";
+    item.budgetLedgerSetAt = new Date();
+    await item.save();
+
+    res.json({
+      success: true,
+      message: item.budgetLedgerId
+        ? `${item.name} is set to ${item.budgetLedgerName}, overriding its category.`
+        : `${item.name} now follows its category again.`,
+      item: {
+        _id: String(item._id),
+        name: item.name,
+        category: item.category || null,
+        budgetLedgerId: item.budgetLedgerId ? String(item.budgetLedgerId) : null,
+        budgetLedgerName: item.budgetLedgerName || null,
+      },
+    });
+  } catch (e) {
+    console.error("[coa] raw-item budget-head:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── FIND AN ITEM, WITH ITS ANSWER ALREADY WORKED OUT ───────────────────────
+ * The inspection surface behind the override panel: search the master and get
+ * back each item together with the head it currently resolves to and why.
+ *
+ * A separate lookup rather than reusing `/api/cms/raw-items` because that
+ * router sits behind EmployeeAuthMiddleware while everything here is
+ * accountantAuth. Making a finance screen carry two session types to fill one
+ * table is a boundary that breaks quietly the first time somebody has one
+ * cookie and not the other. One extra query is the cheaper trade.
+ *
+ * Capped hard: this exists to find the handful of items that need an
+ * exception, not to browse a catalogue.
+ */
+router.get("/item-budget-heads/items", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    const search = String(req.query.search || "").trim();
+    const category = String(req.query.category || "").trim();
+    const onlyOverridden = String(req.query.onlyOverridden || "") === "true";
+
+    const filter = {};
+    if (search) {
+      /* Escaped: an item master legitimately contains "(", "+" and "*", and an
+         unescaped one of those is a 500 or a runaway scan, not a search. */
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$or = [
+        { name: { $regex: safe, $options: "i" } },
+        { sku: { $regex: safe, $options: "i" } },
+      ];
+    }
+    if (category) filter.category = category;
+    if (onlyOverridden) filter.budgetLedgerId = { $ne: null };
+
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const items = await RawItem.find(filter)
+      .select("_id name sku category budgetLedgerId budgetLedgerName budgetLedgerSetByName budgetLedgerSetAt")
+      .sort({ name: 1 })
+      .limit(50)
+      .lean();
+
+    const map = await itemBudget.categoryMap(scope.companyId);
+    res.json({
+      success: true,
+      items: items.map((i) => ({
+        _id: String(i._id),
+        name: i.name,
+        sku: i.sku || null,
+        category: i.category || null,
+        setByName: i.budgetLedgerSetByName || null,
+        setAt: i.budgetLedgerSetAt || null,
+        resolution: itemBudget.headForItem(i, map),
+      })),
+      /* Said rather than left for the reader to infer from a round number. */
+      capped: items.length === 50,
+    });
+  } catch (e) {
+    console.error("[coa] item-budget-heads items:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── WHAT WOULD THIS ITEM RESOLVE TO? ───────────────────────────────────────
+ * Inspection, for finance checking their own setup and for tests. Answers for
+ * every id asked about, including ones that match no item — a caller checking
+ * twenty items needs to see which two do not exist rather than receive
+ * eighteen rows that look like a complete answer.
+ */
+router.post("/item-budget-heads/resolve", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds : [];
+    if (!itemIds.length) {
+      return res.status(400).json({ success: false, message: "itemIds must be a non-empty array." });
+    }
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const results = await itemBudget.resolveItemIds({
+      itemIds,
+      companyId: scope.companyId,
+      RawItem,
+    });
+    res.json({ success: true, results });
+  } catch (e) {
+    console.error("[coa] resolve item budget heads:", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });

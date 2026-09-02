@@ -107,6 +107,58 @@ const lineSchema = new mongoose.Schema(
     /* Unset when the requester described the thing instead of picking it. */
     rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemSku: { type: String, trim: true, default: "" },
+
+/* ── FUTURE ITEM-WISE BUDGET ATTRIBUTION (INERT) ────────────────────────────
+   Where this line's own budget head will live once a request can charge
+   several unrelated items to several approved lines.
+
+   NOTHING READS THIS YET, and that is deliberate. The request-level
+   `ledgerId` / `budgetLineId` remain the single source of truth for
+   commitments, budget checks and actuals until a later chunk migrates the
+   workflow deliberately. Two authorities for "which budget is this?" running
+   at once is exactly the ambiguity this field exists to remove, so it is
+   added now — additively, so no existing document needs migrating — and left
+   unpopulated.
+
+   `status` is not derivable from `budgetLedgerId` alone. A null head means
+   "unresolved" when nobody has looked and "manual_selection_required" once a
+   human has been asked and has not answered, and the difference decides
+   whether a screen shows a prompt or a warning.
+
+   Vocabulary is shared with services/itemBudgetHead.service.js:
+   `resolutionSource` takes exactly its `source` values. */
+    budgetAllocation: {
+      type: new mongoose.Schema(
+        {
+          budgetLedgerId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Acc_Ledger",
+            default: null,
+          },
+          budgetLedgerName: { type: String, trim: true, default: "" },
+          resolutionSource: {
+            type: String,
+            enum: ["item_override", "category_mapping", "unresolved"],
+            default: "unresolved",
+          },
+          resolutionCategory: { type: String, trim: true, default: "" },
+          selectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+          selectedByName: { type: String, trim: true, default: "" },
+          selectedAt: { type: Date, default: null },
+          status: {
+            type: String,
+            enum: ["resolved", "unresolved", "manual_selection_required"],
+            default: "unresolved",
+          },
+        },
+        { _id: false },
+      ),
+      /* Absent, not defaulted. Every request written before this chunk has no
+         allocation at all, and a default would manufacture an "unresolved"
+         decision on thousands of historical lines that nobody ever made. */
+      default: undefined,
+    },
+
     /* The unit the STORE keeps it in, which is not always the unit the
        requester asked in. Carried so the MRF this may become has both. */
     baseUnit: { type: String, trim: true, default: "" },

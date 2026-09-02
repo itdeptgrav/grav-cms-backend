@@ -81,7 +81,16 @@ const stockTransactionSchema = new mongoose.Schema(
     invoiceNumber:   { type: String, default: "" },
     notes:           { type: String, default: "" },
 
-    performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" }
+    performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
+
+    /* ── WHICH OPERATION MOVED THIS STOCK ────────────────────────────────────
+       The `_id` of the Store & Purchase idempotency record whose action wrote
+       this line. It is what lets a retry ask "did MY attempt already move
+       stock?" and get an answer that cannot be confused with an earlier,
+       identical-looking movement of the same item for the same quantity.
+       Null on everything written before, and on movements from routes that are
+       not yet governed. */
+    operationId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
   },
   { timestamps: true }
 );
@@ -116,6 +125,25 @@ const rawItemSchema = new mongoose.Schema(
     sku:  { type: String, required: true, unique: true, trim: true },
 
     category:       { type: String, default: "" },
+
+    /* ── THIS ITEM'S OWN BUDGET HEAD, WHERE IT DIFFERS FROM ITS CATEGORY ───
+       Normally empty. The head comes from the item's CATEGORY (see
+       Acc_ItemCategoryBudget) because mapping 15 categories is a meeting and
+       mapping every item is a project nobody finishes.
+
+       Set only where an item genuinely does not belong with its siblings —
+       a fabric bought for sampling rather than production, say. An empty
+       value is not "unknown", it is "whatever my category says", which is
+       what keeps this field rare and therefore trustworthy. */
+    budgetLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger", default: null },
+    /* Display snapshot, never the authority — the id is. Held so a resolver
+       can name the head without a join per item, and deliberately allowed to
+       go stale: a head renamed next year must not silently restate what this
+       override was set to. */
+    budgetLedgerName: { type: String, trim: true, default: "" },
+    budgetLedgerSetBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User", default: null },
+    budgetLedgerSetByName: { type: String, trim: true, default: "" },
+    budgetLedgerSetAt: { type: Date, default: null },
     customCategory: { type: String, default: "" },
 
     unit:       { type: String, default: "" },

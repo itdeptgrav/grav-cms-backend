@@ -439,6 +439,39 @@ async function checkBudgetAvailability({
        finance overrule it per ledger. Anything not a budget head is skipped
        exactly as an asset leg always was. */
     if (budgetControl === classification.NOT_BUDGETED) {
+      /* ── EXCEPT THE LEG THAT IS THE PURCHASE ITSELF ──────────────────
+         Raw material and equipment capitalise: the bill debits Raw
+         Materials or Plant & Machinery, never a P&L head. Those heads are
+         rightly not budgeted — you budget the buying, not the asset
+         balance — so this skip used to swallow them, and a purchase
+         approved against a real budget line reached that line as nothing
+         at all. The commitment was released on posting and no actual was
+         ever recorded, so the money silently came back as available.
+
+         Attributed here, ahead of the skip, but ONLY for a debit to a head
+         a purchase genuinely capitalises into. The ordering matters: every
+         other leg of the same bill — the bank, the vendor, CGST, SGST,
+         rounding — is also skipped by this branch, and attributing those
+         would charge one ₹60,000 bill against the budget five times. */
+      if (
+        sourceLineId &&
+        p.debit > p.credit &&
+        classification.isCapitalisingSpend(meta)
+      ) {
+        results.push({
+          ...base,
+          status: "ok",
+          note: `Bought against the budget head this request was approved on; posted to ${meta.ledgerName || "this asset head"} because it capitalises.`,
+          allocated: null,
+          actual: null,
+          projectedActual: null,
+          remainingAfter: null,
+          budgets: [],
+          trackedAgainstBudgetLineId: sourceLineId,
+        });
+        continue;
+      }
+
       results.push({
         ...base,
         status: "ok",

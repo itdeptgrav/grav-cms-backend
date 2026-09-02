@@ -71,6 +71,10 @@ const returnReceiptSchema = new mongoose.Schema(
     quantityReceived: { type: Number,  min: 0 },
     receivedDate: { type: Date, default: Date.now },
     notes: { type: String, trim: true, default: "" },
+    /* The operation that recorded this receipt — see RawItem.stockTransactions
+       .operationId. Recovery matches on this and nothing else: an earlier
+       receipt of the same quantity is not evidence that THIS attempt landed. */
+    operationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     receivedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "ProjectManager",
@@ -108,6 +112,9 @@ const returnRequestSchema = new mongoose.Schema(
       default: null,
     },
     reportedAt: { type: Date, default: Date.now },
+    /* The operation that raised this return. Recovery matches on this rather
+       than on (item, quantity), which two separate returns can share. */
+    operationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     receipts: [returnReceiptSchema],
   },
   { timestamps: true },
@@ -164,10 +171,36 @@ const purchaseOrderSchema = new mongoose.Schema(
     },
     spendRequestNumber: { type: String, trim: true },
 
+    /* ── Chunk 1: tenancy ───────────────────────────────────────────────────
+       Declared rather than left to `strict:false`, so it is indexed and can
+       be reasoned about. Absent on every order that predates the boundary —
+       those are legacy-global records, readable only in legacy mode. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+    siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* ── WHY THE UNIQUENESS IS COMPOUND AND NOT ON THE FIELD ────────────────
+       Numbering is per company: two companies each start their own PO
+       sequence at 1, which is what a tenant boundary means. A GLOBAL unique
+       index on `poNumber` therefore makes the second company unable to raise
+       its first order at all — the number is legitimately the same string.
+
+       The uniqueness scope has to match the numbering scope, so it moves to
+       the compound index below. Legacy numbers are untouched by this: they
+       remain exactly as they are, and remain unique among themselves.
+
+       MIGRATION NOTE — this schema change does NOT drop the pre-existing
+       `poNumber_1` index on a database that already has one. Mongoose builds
+       missing indexes; it never removes one. Until an authorised migration
+       drops it, a multi-company deployment will still hit a duplicate-key
+       error on the second company's first order. See
+       docs/decisions/store-purchase-tenancy-permissions.md §6. */
     poNumber: {
       type: String,
       trim: true,
-      unique: true,
       required: [true, "PO number is required"],
     },
     vendor: {
@@ -310,5 +343,11 @@ const purchaseOrderSchema = new mongoose.Schema(
     strict: false,
   },
 );
+
+/* Uniqueness scoped to the tenant, matching how numbers are now allocated.
+   `companyId: null` (a legacy-global order) still participates, so legacy
+   numbers cannot be duplicated among themselves either. */
+purchaseOrderSchema.index({ companyId: 1, poNumber: 1 }, { unique: true });
+purchaseOrderSchema.index({ companyId: 1, status: 1, createdAt: -1 });
 
 module.exports = mongoose.model("PurchaseOrder", purchaseOrderSchema);

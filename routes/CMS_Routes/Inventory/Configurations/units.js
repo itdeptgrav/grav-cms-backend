@@ -5,8 +5,31 @@ const express = require("express");
 const router = express.Router();
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 
+/* ── Chunk 1: this router was mounted with NO AUTHENTICATION AT ALL ─────────
+ * Chunk 0 found and pinned it: `/api/cms/units` answered every request,
+ * signed in or not, including POST, PUT and DELETE. The unit master is what
+ * every stock conversion in the system trusts — a wrong conversion factor
+ * silently changes what a receipt puts on the shelf — so an anonymous writer
+ * could corrupt inventory arithmetic across the whole company.
+ *
+ * Reads now require a signed-in Store/Purchase reader; writes require
+ * master-maintenance authority. If some other application genuinely needs a
+ * public unit vocabulary, it gets its own narrow read-only endpoint with a
+ * stated contract — the administrative router does not stay open for it. */
+const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const {
+  requireTenant, requireCapability, refuseLegacyWrite,
+} = require("../../../../Middlewear/storePurchaseTenant");
+const { CAPABILITIES } = require("../../../../services/storePurchase/capabilities");
+
+router.use(EmployeeAuth);
+router.use(requireTenant);
+
+const canRead = requireCapability(CAPABILITIES.READ);
+const canMaintain = [requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite];
+
 // ─── GET all units (list page) ───────────────────────────────────────────────
-router.get("/", async (req, res) => {
+router.get("/", canRead, async (req, res) => {
   try {
     const units = await Unit.find()
       .populate("conversions.toUnit", "_id name") // ← MUST populate
@@ -20,7 +43,7 @@ router.get("/", async (req, res) => {
 });
 
 // ─── GET available units (for conversion dropdowns) ───────────────────────────
-router.get("/available-units", async (req, res) => {
+router.get("/available-units", canRead, async (req, res) => {
   try {
     const units = await Unit.find({ status: "Active" })
       .select("_id name")
@@ -34,7 +57,7 @@ router.get("/available-units", async (req, res) => {
 });
 
 // ─── GET single unit by ID ────────────────────────────────────────────────────
-router.get("/:id", async (req, res) => {
+router.get("/:id", canRead, async (req, res) => {
   try {
     const unit = await Unit.findById(req.params.id)
       .populate("conversions.toUnit", "_id name"); // ← MUST populate
@@ -51,7 +74,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // ─── CREATE unit ──────────────────────────────────────────────────────────────
-router.post("/", async (req, res) => {
+router.post("/", ...canMaintain, async (req, res) => {
   try {
     const { name, conversions } = req.body;
 
@@ -107,7 +130,7 @@ router.post("/", async (req, res) => {
 });
 
 // ─── UPDATE unit ──────────────────────────────────────────────────────────────
-router.put("/:id", async (req, res) => {
+router.put("/:id", ...canMaintain, async (req, res) => {
   try {
     const { conversions, status } = req.body;
 
@@ -169,7 +192,7 @@ router.put("/:id", async (req, res) => {
 });
 
 // ─── DELETE unit ──────────────────────────────────────────────────────────────
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", ...canMaintain, async (req, res) => {
   try {
     const unit = await Unit.findByIdAndDelete(req.params.id);
     if (!unit) {

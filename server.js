@@ -1460,6 +1460,12 @@ const storepurchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrde
 app.use("/api/cms/store/purchase-orders", storepurchaseOrderRoutes);
 
 // Operations Category
+/* Store & Purchase — Chunk 1. Tenant context, capabilities and the immutable
+   action history the Store screens read. Mounted before the operational
+   routers so a client can ask what it may do before it tries. */
+const storePurchaseContextRoutes = require("./routes/CMS_Routes/StorePurchase/context");
+app.use("/api/cms/store-purchase", storePurchaseContextRoutes);
+
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
 
