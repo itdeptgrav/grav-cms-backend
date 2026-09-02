@@ -145,6 +145,15 @@ const payrollItemSchema = new mongoose.Schema(
         otherDeductionUncollected: { type: Number, default: 0 },
         otherDeductionChargeableDays: { type: Number, default: 0 },
 
+        /* FOOD ALLOWANCE. Never paid through the register — it is not in
+           earnings and never reaches gross or net — but it is part of what the
+           month cost, so the CTC for a month moves with the month.
+           `Full` is the contracted figure; `Earned` is that figure prorated on
+           payable days and then reduced by the other deduction actually
+           charged. */
+        foodAllowanceFull: { type: Number, default: 0 },
+        foodAllowanceEarned: { type: Number, default: 0 },
+
         // ── Manual Override ────────────────────────────────────────────
         isManuallyOverridden: { type: Boolean, default: false },
         overriddenPayableDays: { type: Number },

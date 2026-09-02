@@ -119,9 +119,28 @@ function computeSalary(s = {}, cfg = {}, employmentType = "") {
   const eeesic = esiApplicable ? Math.ceil(basic * k.eeEsicPct) : 0;
   const erEsic = esiApplicable ? Math.ceil(basic * k.erEsicPct) : 0;
 
+  /* THE FOOD ALLOWANCE IS NET OF THE STANDING DEDUCTION.
+     ------------------------------------------------------------------
+     What HR enters as the monthly "other deduction" is what this employee has
+     already taken against their allowance, so the company is only out the
+     remainder. Enter 764 against a 1,600 allowance and the company funds 836 —
+     and the CTC, which is what the company pays, has to say 836.
+
+     BOTH figures are kept. `foodAllowanceFull` is the entitlement from the
+     salary rules and never moves; `foodAllowance` is what it comes to for this
+     employee. Payroll prorates the FULL figure by attendance and subtracts the
+     deduction it actually charged that month — reading the net figure there
+     would subtract the same 764 twice.
+
+     Floored at zero: a deduction larger than the allowance leaves nothing, and
+     a negative would make the employee look cheaper than they are. */
+  const otherDeduction = Number(s.otherDeduction) || 0;
+  const foodAllowanceFull = k.foodAllowance;
+  const foodAllowance = Math.max(0, foodAllowanceFull - otherDeduction);
+
   /* CTC = everything the employer pays: gross, both PF-side employer costs,
-     employer ESI, and the food allowance. */
-  const employerCost = gross + epf + edli + adminCharges + erEsic + k.foodAllowance;
+     employer ESI, and what is left of the food allowance. */
+  const employerCost = gross + epf + edli + adminCharges + erEsic + foodAllowance;
 
   // What comes off the employee: their own PF and their own ESI.
   const totalDeduction = epf + eeesic;
@@ -139,7 +158,8 @@ function computeSalary(s = {}, cfg = {}, employmentType = "") {
     adminOverride: s.adminOverride || false,
     eeesic,
     erEsic,
-    foodAllowance: k.foodAllowance,
+    foodAllowance,
+    foodAllowanceFull,
     employerCost,
     totalDeduction,
     netSalary,

@@ -631,6 +631,40 @@ function computeEmployeePayroll(employee, ctx) {
   const roomForOther = Math.max(0, grossEarned - epf - esic - pt);
   const otherDeduction = Math.min(rawOtherDeduction, roomForOther);
 
+  const foodAllowanceFull = Number(employee.salary?.foodAllowanceFull ?? employee.salary?.foodAllowance ?? 0);
+  /* FOOD ALLOWANCE FOR THIS MONTH.
+     ------------------------------------------------------------------
+     It is not paid through the salary register — it never enters gross, net or
+     the payslip — but it IS part of what the month costs the company, so the
+     CTC for a month has to move with the month rather than repeating the
+     contracted figure regardless.
+
+     Two things move it:
+
+       1. DAYS. The allowance is for being at work, so it is prorated on the
+          same payable days the gross is. Half a month present is half the
+          allowance.
+       2. THE OTHER DEDUCTION. What HR enters there is what the employee has
+          already taken against it, so it comes off. Enter 764 and the month's
+          allowance is 764 lower.
+
+     The CHARGED deduction is used, not the raw one: an amount that could not
+     be collected from pay was not collected, and taking it off the allowance
+     as well would count it twice.
+
+     Floored at zero. A deduction larger than the allowance leaves nothing, and
+     a negative allowance would subtract from the CTC as if the employee were
+     paying the company to employ them. */
+  const foodAllowanceEarned = isIntern
+    ? 0
+    : Math.max(
+        0,
+        roundMoney(
+          (foodAllowanceFull * chargeableDays) / Math.max(1, divisor),
+          settings.roundingMode,
+        ) - otherDeduction,
+      );
+
   const totalDeductions = epf + esic + pt + otherDeduction;
   const netPay = grossEarned - totalDeductions;
   const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
@@ -740,6 +774,11 @@ function computeEmployeePayroll(employee, ctx) {
     // explain when the canteen account does not tie out.
     otherDeductionUncollected: +(rawOtherDeduction - otherDeduction).toFixed(2),
     otherDeductionChargeableDays: +chargeableDays.toFixed(2),
+
+    /* Deliberately OUTSIDE `earnings`: the salary register must not pay it.
+       `Full` is the contracted figure, `Earned` is what this month costs. */
+    foodAllowanceFull,
+    foodAllowanceEarned,
 
     payableDays: +payableDays.toFixed(2),
     effectivePayableDays: +effectivePayableDays.toFixed(2),
@@ -1323,7 +1362,14 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
       ];
     }
 
+    /* WITHOUT THE DAY BREAKDOWN.
+       It is the per-day attendance detail behind one payslip — 93% of this
+       response by size (1.68 MB of 1.8 MB across 200 items) and read by exactly
+       one screen, the detail drawer, for one employee at a time. The drawer
+       fetches it from GET /item/:id when it opens, so the month list no longer
+       carries eighty-odd copies of a month of attendance nobody is looking at. */
     const items = await PayrollItem.find(filter)
+      .select("-dayBreakdown")
       .sort({ employeeName: 1 })
       .lean();
 
@@ -1896,6 +1942,18 @@ router.patch(
       const roomForOther = Math.max(0, grossTotal - epf - esic - pt - loan - advance - otherManual);
       const otherRecurring = Math.min(rawOtherRecurring, roomForOther);
 
+      /* The same two adjustments as the first computation — see the note
+         there. `otherManual + otherRecurring` is everything actually charged
+         this month, which is what comes off the allowance. */
+      const foodAllowanceFull = Number(employee.salary?.foodAllowanceFull ?? employee.salary?.foodAllowance ?? 0);
+      const foodAllowanceEarned = isInternItem
+        ? 0
+        : Math.max(
+            0,
+            Math.round((foodAllowanceFull * otherChargeable) / Math.max(1, divisor)) -
+              (otherManual + otherRecurring),
+          );
+
       const totalDeductions =
         epf + esic + pt + loan + advance + otherManual + otherRecurring;
       const netPay = grossTotal - totalDeductions;
@@ -1929,6 +1987,8 @@ router.patch(
       item.otherDeductionRecurring = otherRecurring;
       item.otherDeductionUncollected = +(rawOtherRecurring - otherRecurring).toFixed(2);
       item.otherDeductionChargeableDays = +otherChargeable.toFixed(2);
+      item.foodAllowanceFull = foodAllowanceFull;
+      item.foodAllowanceEarned = foodAllowanceEarned;
 
       item.deductions = {
         ...(item.deductions || {}),
@@ -2634,7 +2694,14 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       const emp = empById.get(String(it.employeeId)) || {};
       const e = it.earnings || {};
       const d = it.deductions || {};
-      const foodAllow = Number(emp.salary?.foodAllowance || 0);
+      /* The month's allowance, not the contract's: prorated on payable days
+         and net of the other deduction charged. A run processed before this was
+         recorded falls back to the contracted figure, which is what that run
+         was actually costed on. */
+      const foodAllow =
+        it.foodAllowanceEarned !== undefined && it.foodAllowanceEarned !== null
+          ? Number(it.foodAllowanceEarned)
+          : Number(emp.salary?.foodAllowance || 0);
       const lnAdv = (d.loanDeduction || 0) + (d.advanceDeduction || 0);
       const grossEarned = e.grossEarnings || 0;
       const isEvenRow = idx % 2 === 1;

@@ -55,6 +55,28 @@ for (const gross of [20000, 30000, 80000]) {
     r.employerCost - (r.gross + r.epf + r.erEsic + r.foodAllowance) === r.edli + r.adminCharges);
 }
 
+console.log("\nthe food allowance is net of the standing deduction");
+{
+  const r = computeSalary({ gross: 30000, otherDeduction: 764 }, CFG, "employee");
+  check("the entitlement is unchanged at 1,600", r.foodAllowanceFull === 1600, r.foodAllowanceFull);
+  check("764 entered leaves 836", r.foodAllowance === 836, r.foodAllowance);
+  check("and the CTC uses the 836, not the 1,600",
+    r.employerCost === 30000 + r.epf + r.edli + r.adminCharges + r.erEsic + 836,
+    r.employerCost);
+  const none = computeSalary({ gross: 30000 }, CFG, "employee");
+  check("with no deduction the allowance is the full entitlement",
+    none.foodAllowance === 1600 && none.foodAllowanceFull === 1600);
+  const over = computeSalary({ gross: 30000, otherDeduction: 5000 }, CFG, "employee");
+  check("a deduction larger than the allowance floors at zero, never negative",
+    over.foodAllowance === 0, over.foodAllowance);
+  check("and the CTC does not go below gross plus the statutory costs",
+    over.employerCost === 30000 + over.epf + over.edli + over.adminCharges + over.erEsic);
+  check("the deduction still comes off the employee's pay as well",
+    /* It is a deduction from THEM and a reduction of what the company funds:
+       the same 764 does both jobs, in two different places. */
+    none.netSalary === over.netSalary);
+}
+
 console.log("\nthe rest of the formula is unchanged");
 const r = at(30000);
 check("basic is 50% of gross", r.basic === 15000, `${r.basic}`);

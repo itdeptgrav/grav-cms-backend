@@ -59,6 +59,67 @@ async function getRole(departmentSlug, email) {
   return row && row.isActive ? row.role : null;
 }
 
+/**
+ * The strongest role this PERSON holds, across every address they are known by.
+ *
+ * ── WHY ONE EMAIL IS NOT ENOUGH ─────────────────────────────────────────────
+ * A grant is made against whatever address an administrator typed, and people
+ * have more than one: a work address, a personal one, an old domain. When the
+ * address on the grant is not the address on the token, the person signs in and
+ * the system sees no grant at all — so an approver is treated as an editor and
+ * every change they make is held for an approval only they could give.
+ *
+ * So the lookup tries every identity the request carries — the token's email
+ * and the email on their own employee record — and takes the HIGHEST role
+ * found. Highest rather than first because holding two grants is common (an
+ * editor grant made early, an approver grant added later on a different
+ * address) and the answer somebody expects is the better of the two.
+ *
+ * It will NOT match on name. Two people share a name far more often than they
+ * share an address, and quietly granting approver rights to the wrong person is
+ * a worse failure than the one this fixes.
+ */
+async function getEffectiveRole(departmentSlug, req) {
+  const slug = String(departmentSlug || "").toLowerCase().trim();
+  if (!slug) return null;
+
+  const u = req?.user || req?.admin || req?.dept || {};
+  const candidates = new Set();
+  const add = (v) => {
+    const m = String(v || "").toLowerCase().trim();
+    if (m) candidates.add(m);
+  };
+
+  add(u.email);
+
+  /* Their own employee record's address — the one a grant is most often made
+     against, because that is the address the HR list shows. */
+  try {
+    if (u.id || u._id || u.employeeId) {
+      const Employee = require("../models/Employee");
+      const or = [];
+      const mongoose = require("mongoose");
+      const id = u.id || u._id;
+      if (id && mongoose.Types.ObjectId.isValid(String(id))) or.push({ _id: id });
+      if (u.employeeId) or.push({ biometricId: String(u.employeeId) });
+      if (or.length) {
+        const emp = await Employee.findOne({ $or: or }).select("email").lean();
+        add(emp?.email);
+      }
+    }
+  } catch {
+    /* An identity lookup that fails must not take the guard down with it; the
+       token's own email is still tried below. */
+  }
+
+  let best = null;
+  for (const mail of candidates) {
+    const role = await getRole(slug, mail);
+    if (role && (!best || roleAtLeast(role, best))) best = role;
+  }
+  return best;
+}
+
 /** Everyone holding a role in this department. */
 async function listRoles(departmentSlug) {
   const slug = String(departmentSlug || "").toLowerCase().trim();
@@ -279,7 +340,9 @@ function requireDepartmentRole(departmentSlug, required = "editor") {
       const assigned = await listRoles(slug);
       if (assigned.length === 0) return next();   // not yet configured — see above
 
-      const role = await getRole(slug, email);
+      /* Every address this person is known by, not just the token's — a grant
+         made against their other email is still their grant. */
+      const role = await getEffectiveRole(slug, req);
       if (!role) {
         return res.status(403).json({
           success: false,
@@ -307,6 +370,7 @@ function requireDepartmentRole(departmentSlug, required = "editor") {
 }
 
 module.exports = {
+  getEffectiveRole,
   ROLES,
   ROLE_KEYS,
   roleAtLeast,

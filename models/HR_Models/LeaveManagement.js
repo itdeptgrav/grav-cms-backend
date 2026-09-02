@@ -378,6 +378,10 @@ const regularizationRequestSchema = new mongoose.Schema(
     cancelReason: { type: String },
     appliedToAttendance: { type: Boolean, default: false },
     appliedAt: { type: Date },
+    /* Why the attendance write did not land. An approved request whose apply
+       failed is the one case where the queue says "done" and the day says
+       otherwise, and without the reason nobody can do anything about it. */
+    applyError: { type: String, default: "" },
   },
   { timestamps: true },
 );
