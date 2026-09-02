@@ -1992,6 +1992,7 @@ app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 // carried was unreachable dead code until this line; version history is the
 // first thing that made that gap actually load-bearing.)
 app.use("/cowork", require("./routes/task_routes/coworkDocs.routes.js"));
+app.use("/cowork", require("./routes/task_routes/requirementProgress.routes.js"));
 
 // External sharing: /cowork/share/*. Invite/list/revoke are owner-only and
 // Firebase-authenticated; /cowork/share/accept and /cowork/share/guest/* carry

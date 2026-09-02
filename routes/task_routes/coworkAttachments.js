@@ -173,6 +173,91 @@ router.post(
   },
 );
 
+/* ── Resumable upload (browser → Drive direct, kept private) ───────────────
+ *
+ * The additive path beside the multipart one above. The bytes go straight from
+ * the browser to Google — this process never holds the file in RAM, and a
+ * failed upload resumes instead of restarting. Two steps: open a session, then
+ * finalise the uploaded file into the same private record. The old route stays
+ * as a fallback for a client that has not switched.
+ *
+ * Both steps make the SAME `mayViewTask` check as the multipart upload, so only
+ * someone who may attach to the task can open or finalise a session for it.
+ */
+router.post(
+  "/attachments/resumable-session",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { fileName, mimeType, fileSize, entityType, entityId } = req.body;
+      const taskId = taskIdFor(entityType, entityId);
+      if (!taskId) {
+        return res.status(400).json({ error: "entityType and entityId are required." });
+      }
+      const gate = await mayViewTask(taskId, req.coworkUser);
+      if (!gate.ok) {
+        return res
+          .status(gate.reason === "not_found" ? 404 : 403)
+          .json({ error: "You cannot attach files to this task.", code: "PERMISSION_DENIED" });
+      }
+      const { sessionUrl } = await svc.createPrivateResumableSession({
+        fileName,
+        mimeType,
+        fileSize,
+        uploadedBy: req.coworkUser.employeeId,
+        entityType,
+        entityId,
+        origin: req.headers.origin || null,
+      });
+      res.json({ success: true, sessionUrl });
+    } catch (e) {
+      console.error("[cowork/attachments session]", e.code || "", e.message);
+      const status = e.code === "STORAGE_NOT_CONFIGURED" ? 503 : 400;
+      res.status(status).json({ error: e.message, code: e.code || "UPLOAD_FAILED" });
+    }
+  },
+);
+
+router.post(
+  "/attachments/finalize",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { fileId, entityType, entityId } = req.body;
+      const taskId = taskIdFor(entityType, entityId);
+      if (!taskId) {
+        return res.status(400).json({ error: "entityType and entityId are required." });
+      }
+      const gate = await mayViewTask(taskId, req.coworkUser);
+      if (!gate.ok) {
+        return res
+          .status(gate.reason === "not_found" ? 404 : 403)
+          .json({ error: "You cannot attach files to this task.", code: "PERMISSION_DENIED" });
+      }
+      const result = await svc.finalizePrivateUpload({
+        fileId,
+        uploadedBy: req.coworkUser.employeeId,
+        entityType,
+        entityId,
+      });
+      res.status(201).json({ success: true, attachment: result });
+    } catch (e) {
+      console.error("[cowork/attachments finalize]", e.code || "", e.message);
+      const status =
+        e.code === "STORAGE_NOT_CONFIGURED"
+          ? 503
+          : e.code === "FORBIDDEN"
+            ? 403
+            : e.code === "NOT_FOUND"
+              ? 404
+              : 400;
+      res.status(status).json({ error: e.message, code: e.code || "UPLOAD_FAILED" });
+    }
+  },
+);
+
 /* ── Download ────────────────────────────────────────────────────────────── */
 
 router.get(

@@ -17,6 +17,7 @@ const {
   computeWorkingDeadline,
   readMs: readInstantMs,
   rechainQueueFor,
+  resolveAcceptanceAnchor,
 } = require("./officeDeadline.service");
 const c1Svc = require("./c1Service");
 const socket = require("../config/socketInstance");
@@ -310,7 +311,7 @@ async function assigneePrioritiesFor(db, assigneeIds) {
   return map;
 }
 
-async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isImportant = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isImportant = false, isGoalBased = false, goalBased = null, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
@@ -388,6 +389,13 @@ async function createTask({ title, description, notes, requirements = [], satisf
     // A label only — nothing in the engine reads it. Stored so the client can
     // show a tag; it affects no ordering, deadline, score or permission.
     isImportant: isImportant === true,
+    // "Taskgoal" — a project (folder) marked as oriented around a measurable
+    // objective. A label only, exactly like isImportant above: nothing in the
+    // engine reads it. DELIBERATELY NOT the C2 goal task (isGoal/goalConfig
+    // below) — different fields, no scoring, no roadmap. Stored only when a
+    // real config came with it, so an ordinary task keeps no marker.
+    isGoalBased: isGoalBased === true && !!goalBased,
+    goalBased: (isGoalBased === true && goalBased) ? goalBased : null,
     isRepeat: isRepeat || false,
     repeatConfig: isRepeat && repeatConfig ? repeatConfig : null,
     isThirdParty: isThirdParty || false,
@@ -581,6 +589,57 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
     status: "confirmed",
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
+  // ── A granted task's clock waits for the assignee to come online ───────────
+  //
+  // A cross-department grant stamps the deadline at the GRANT, while the
+  // assignee may have been offline. A normal task gets `first_online` at the
+  // moment it is accepted — and acceptance happens while online — so its clock
+  // naturally starts when the person arrived. A granted task has no such step:
+  // this is it. Confirming is the assignee's first deliberate act on the task
+  // and it happens while they are online, so it is where the anchor is
+  // re-resolved to `max(grant, when-they-came-online)`.
+  //
+  // ADDITIVE and one-directional. It runs only for a task whose stored anchor
+  // is the grant (`hours_granted`), and `resolveAcceptanceAnchor` returns a
+  // LATER anchor only when the online session began after the grant — online
+  // since before it, or offline now, leaves everything exactly as it was. No
+  // other task, and no earlier deadline, is ever touched.
+  try {
+    const grantedMs = readInstantMs(task.tlHoursSetAtMs) ?? readInstantMs(task.tlHoursSetAt);
+    if (
+      Number.isFinite(grantedMs) &&
+      grantedMs > 0 &&
+      task.clockStartsAtSource === "hours_granted"
+    ) {
+      const windowSecs =
+        Number(task.deadlineWindowSecs) ||
+        Number(task.senderTimerWindowSecs) ||
+        0;
+      const stored = readInstantMs(task.clockStartsAtMs) ?? grantedMs;
+      const resolved = await resolveAcceptanceAnchor(task, Date.now(), taskId);
+      if (
+        windowSecs > 0 &&
+        Number.isFinite(resolved?.anchorMs) &&
+        resolved.anchorMs > stored
+      ) {
+        const dueDate = await computeWorkingDeadline({
+          startMs: resolved.anchorMs,
+          windowSecs,
+        });
+        await ref.update({
+          clockStartsAtMs: resolved.anchorMs,
+          clockStartsAtSource: resolved.source || "hours_granted",
+          dueDate,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    }
+  } catch (e) {
+    /* Never let a re-anchor cost the confirmation itself — the receipt is
+       recorded, and a stale deadline is the smaller wrong. */
+    console.warn("[confirm] granted re-anchor skipped:", e.message);
+  }
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
   await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `✅ Confirmed · ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });

@@ -171,6 +171,23 @@ function acceptanceAnchorMs({
   nowMs,
 }) {
   if (Number.isFinite(tlHoursSetMs) && tlHoursSetMs > 0) {
+    /* The grant is the earliest the assignee could begin — nothing was theirs
+       to do before it. But if they were OFFLINE when the hours were granted and
+       only came online later, the clock waits for them, exactly as first_online
+       does for a normal task: the granted hours promise that much WORKING time,
+       and time they could not be present for was not time they could work.
+
+       `max` so it only ever moves LATER — online since before the grant keeps
+       the grant; and it reads the SESSION START, not `nowMs`, so sitting on the
+       task while online buys nothing, the same guard first_online makes. */
+    if (
+      dutyMode === "online" &&
+      Number.isFinite(dutySessionStartMs) &&
+      dutySessionStartMs > tlHoursSetMs &&
+      dutySessionStartMs <= nowMs
+    ) {
+      return { anchorMs: dutySessionStartMs, source: "hours_granted" };
+    }
     return { anchorMs: tlHoursSetMs, source: "hours_granted" };
   }
   if (
