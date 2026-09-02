@@ -272,9 +272,52 @@ const decorate = (styleDoc, journey, account, enquiry) => {
   };
 };
 
+// The lowest variant sales price on a stock item — an honest "starting from"
+// figure, not `salesPrice`/`averageSalesPrice` taken as-is (an average or a
+// single base figure reads as a firm quote; the cheapest variant is what
+// "starting from" actually promises and nothing more). Pure — the caller
+// supplies the already-fetched, already-projected StockItem doc.
+function cheapestVariantPrice(item) {
+  if (!item) return null;
+  const variantPrices = (item.variants || [])
+    .map((v) => Number(v.salesPrice))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (variantPrices.length) return Math.min(...variantPrices);
+  // No variant carries one yet (still being priced) — the product-level
+  // figures are the next best honest answer, in order of how firm they are.
+  return Number(item.baseSalesPrice) || Number(item.averageSalesPrice) || null;
+}
+
+// Which stock item a style's price is read off — the style's own registered
+// product first, the already-developed source product second. The same
+// fallback used at sample-approval sync time elsewhere in this file.
+const priceTargetOf = (styleDoc) => styleDoc.production?.stockItemId || styleDoc.sourceStockItemId;
+
+/**
+ * `startingSalesPrice` for a batch of styles, in ONE query rather than one
+ * per style — this runs on every list/board render, not just a single style
+ * page, so an N+1 here would be an N+1 on every page load. Returns a
+ * `Map<styleDoc, price|null>` keyed by object identity (styleDocs are always
+ * freshly fetched Mongoose/lean docs here, never reused across calls, so
+ * identity is a safe key and skips re-deriving each style's target id twice).
+ */
+async function startingSalesPricesFor(styleDocs) {
+  const targets = styleDocs.map((s) => priceTargetOf(s)).filter(Boolean).map(String);
+  const items = targets.length
+    ? await StockItem.find({ _id: { $in: [...new Set(targets)] } })
+        .select("variants.salesPrice baseSalesPrice averageSalesPrice")
+        .lean()
+    : [];
+  const byId = new Map(items.map((it) => [String(it._id), it]));
+  return new Map(styleDocs.map((s) => {
+    const target = priceTargetOf(s);
+    return [s, target ? cheapestVariantPrice(byId.get(String(target))) : null];
+  }));
+}
+
 // Re-decorate a saved style with its journey + customer + enquiry for the response.
 async function withJourney(styleDoc) {
-  const [j, acc, enquiry] = await Promise.all([
+  const [j, acc, enquiry, prices] = await Promise.all([
     SalesJourney.findById(styleDoc.journeyId).select("journeyId name").lean(),
     styleDoc.accountId ? Account.findById(styleDoc.accountId).select("accountId companyName displayName").lean() : null,
     styleDoc.enquiryId
@@ -282,8 +325,9 @@ async function withJourney(styleDoc) {
         .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate")
         .lean()
       : null,
+    startingSalesPricesFor([styleDoc]),
   ]);
-  return decorate(styleDoc, j, acc, enquiry);
+  return { ...decorate(styleDoc, j, acc, enquiry), startingSalesPrice: prices.get(styleDoc) ?? null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -514,10 +558,11 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
       })(),
     });
 
+    const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
       created, renamed, backfilled, waived,
-      sampleStyles: styles.map((s) => decorate(s, journey, account)),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] POST /by-journey/:journeyRef/provision", err);
@@ -539,7 +584,11 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       journey.accountId ? Account.findById(journey.accountId).select("accountId companyName displayName").lean() : null,
     ]);
 
-    return res.json({ success: true, sampleStyles: styles.map((s) => decorate(s, journey, account)) });
+    const prices = await startingSalesPricesFor(styles);
+    return res.json({
+      success: true,
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+    });
   } catch (err) {
     console.error("[sampleStyles] GET /by-journey", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1354,11 +1403,19 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
         return res.status(400).json({ success: false, message: "Attach at least one photo of the sample before submitting." });
       }
 
-      // Operations R&D actually ran making this sample — optional, unlike the
-      // raw items/photo above (24 Aug 2026, explicit request: "don't make it
-      // mandatory"). Blank rows (no type) are dropped rather than rejected.
+      // Operations R&D actually ran making this sample. NOW MANDATORY
+      // (2 Sept 2026, explicit request: "this operation addition is
+      // mandatory ok as it is the proof of the production ki which operation
+      // are exactly made against this product") — this reverses the 24 Aug
+      // 2026 decision to keep it optional. It is also no longer only a
+      // record: on approval these overwrite the product's own operations and
+      // its operation-wise cost, so submitting none would wipe the product's
+      // costing rather than merely leave a gap.
+      //
+      // Blank rows (no type) are still dropped rather than rejected — a half
+      // typed row is a typo, not a refusal to answer.
       const operationsInput = Array.isArray(req.body.operations) ? req.body.operations : [];
-      const operations = operationsInput
+      const cleanedOperations = operationsInput
         .filter((o) => o && String(o.type || "").trim())
         .map((o) => {
           const minutes = Number(o.minutes) || 0;
@@ -1368,10 +1425,23 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
             operationCode: String(o.operationCode || "").trim(),
             machine: String(o.machine || "").trim(),
             machineType: String(o.machineType || "").trim(),
+            salaryDept: String(o.salaryDept || "").trim(),
+            salaryDesig: String(o.salaryDesig || "").trim(),
             minutes, seconds,
             totalSeconds: o.totalSeconds != null ? Number(o.totalSeconds) || 0 : minutes * 60 + seconds,
           };
         });
+      if (!cleanedOperations.length) {
+        return res.status(400).json({
+          success: false,
+          message: "Record at least one operation you ran making this sample before submitting.",
+        });
+      }
+      // Costed here, at submit, rather than at approval — so the Sales
+      // reviewer sees what each operation costs on the screen where they
+      // decide, instead of a figure that only materialises afterwards.
+      const { costOperations } = require("../../../services/operationCosting");
+      const operations = await costOperations(cleanedOperations);
 
       style.sample.consumptionRawItems = consumptionRawItems;
       style.sample.operations = operations;
@@ -1430,10 +1500,31 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
               }
             }
             if (style.sample.operations?.length) {
-              stockItem.operations = style.sample.operations.map((o) => ({
-                type: o.type, operationCode: o.operationCode, machine: o.machine, machineType: o.machineType,
-                minutes: o.minutes, seconds: o.seconds, totalSeconds: o.totalSeconds,
-              }));
+              // Carried across WITH their costing (2 Sept 2026): the salary
+              // basis and per-piece operator cost were resolved when R&D
+              // submitted (services/operationCosting.js), so the product
+              // inherits a priced operation list rather than a bare one that
+              // would silently zero out its operations cost. Re-costed here
+              // rather than trusted blindly, so a sample submitted before a
+              // salary revision is priced at today's rates on approval.
+              const { costOperations } = require("../../../services/operationCosting");
+              const priced = await costOperations(
+                style.sample.operations.map((o) => ({
+                  type: o.type, operationCode: o.operationCode, machine: o.machine,
+                  machineType: o.machineType, minutes: o.minutes, seconds: o.seconds,
+                  totalSeconds: o.totalSeconds, salaryDept: o.salaryDept, salaryDesig: o.salaryDesig,
+                })),
+                // Inherit the salary basis this product already had for the
+                // same operation, where nothing more specific supplies one.
+                // Without this the overwrite would blank a basis that is
+                // filled in on products but (today) on no registered
+                // operation — see the service's own note.
+                { fallbackFrom: stockItem.operations || [] },
+              );
+              stockItem.operations = priced;
+              // The sample keeps the figures it was actually approved on, so
+              // the record and the product agree about what was decided.
+              style.sample.operations = priced;
             }
             recomputeVariantCostsFromBom(stockItem);
             updateStockItemAggregates(stockItem);
@@ -1516,24 +1607,18 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    // Auto-send the WhatsApp approval request the moment Sales approves the
-    // sample internally (26 Aug 2026, explicit request: "this approval
-    // request need to auto sent to that customer ok in whatsapp... so that
-    // will auto trigger here in our website"). Fire-and-forget, same as the
-    // notification block above — a WhatsApp outage or missing template
-    // config must never fail the approval action itself; the result is only
-    // ever visible via style.customerApproval.whatsapp on the next read.
-    if (action === "approve") {
-      (async () => {
-        const [customerName, j] = await Promise.all([
-          customerNameFor(style),
-          SalesJourney.findById(style.journeyId).select("journeyId").lean(),
-        ]);
-        const { sendApprovalRequest } = require("../../../services/sampleWhatsapp");
-        const result = await sendApprovalRequest(style, { customerName, enquiryRef: j?.journeyId, preparedBy: actor(req).name });
-        if (!result.sent) console.warn(`[sampleStyles] WhatsApp approval request not sent for ${style.sampleStyleId || style._id}: ${result.reason}`);
-      })().catch((err) => console.error("[sampleStyles] WhatsApp auto-send failed:", err.message));
-    }
+    // NO AUTO-SEND TO THE CUSTOMER (2 Sept 2026, explicit request: "once the
+    // sales approved the sample product then currently it is auto sent for
+    // customer approval but this is bad... it is needed to keep the button
+    // like for now it's ur turn in order to sent this sample product to the
+    // customer"). This reverses the 26 Aug 2026 auto-trigger.
+    //
+    // Approving internally and putting the sample in front of the customer
+    // are two decisions, and firing the second off the first took the
+    // salesperson's own judgement out of it — there was no moment to attach
+    // context, check the photos, or hold the send while a conversation was
+    // still open. The manual send lives at POST /:id/sample/send-whatsapp-
+    // approval, which this route deliberately no longer calls.
 
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
@@ -1878,7 +1963,7 @@ router.get("/:id/production/stock-items/search", salesAuth, async (req, res) => 
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ success: true, stockItems: [] });
     const re = new RegExp(escapeRegex(q), "i");
-    const rows = await StockItem.find({ $or: [{ name: re }, { reference: re }] })
+    const rows = await StockItem.find({ isActive: { $ne: false }, $or: [{ name: re }, { reference: re }] })
       .select("name reference category variants").limit(10).lean();
     return res.json({ success: true, stockItems: rows.map((s) => ({ id: s._id, name: s.name, reference: s.reference, category: s.category, variantCount: s.variants?.length || 0 })) });
   } catch (err) {

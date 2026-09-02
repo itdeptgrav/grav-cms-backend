@@ -421,6 +421,17 @@ const sampleStyleSchema = new mongoose.Schema(
       // straight onto the product on approval. Deliberately NOT required —
       // R&D may not always time every step, and the raw-item evidence above
       // is what approval actually gates on.
+      // The operations R&D actually ran making this sample — the proof of
+      // what was done, and (since 2 Sept 2026) the source the product's own
+      // operations and operation-wise cost are overwritten from when Sales
+      // approves.
+      //
+      // The four costing fields are resolved SERVER-SIDE at submit, not typed
+      // by R&D: the salary basis comes from the registered operation's own
+      // department/designation and the rate from payroll — see
+      // services/operationCosting.js. They are stored here rather than only
+      // computed at approval so Sales can see what each operation costs on
+      // the review screen, before deciding.
       operations: [
         {
           type: { type: String, trim: true },
@@ -430,6 +441,10 @@ const sampleStyleSchema = new mongoose.Schema(
           minutes: { type: Number, min: 0, default: 0 },
           seconds: { type: Number, min: 0, default: 0 },
           totalSeconds: { type: Number, min: 0, default: 0 },
+          salaryDept: { type: String, trim: true, default: "" },
+          salaryDesig: { type: String, trim: true, default: "" },
+          operatorSalary: { type: Number, min: 0, default: 0 },
+          operatorCost: { type: Number, min: 0, default: 0 },
         },
       ],
       photos: [imageSchema],

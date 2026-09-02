@@ -191,6 +191,30 @@ function planStageTransition(journey = {}, input = {}) {
       const missing = [];
       if (next === "production" && context.poOnFile === false) missing.push("customer PO");
 
+      // ── And nothing gets priced before the customer has seen the sample ──
+      //
+      // 2 Sept 2026, explicit request: "jabtak the customer not approved this
+      // sample, the purchase invoice/order should be initiate against this
+      // customer". Sales approving a sample internally says WE are happy with
+      // it; it says nothing about the person who has to buy it. Quoting and
+      // then invoicing off a sample the customer has not accepted is how an
+      // order gets built on a garment they go on to reject.
+      //
+      // Gated on leaving Style & Sample — the move into Cost & Quote, which
+      // is what opens the path to Purchase Invoice. Styles waived from
+      // sampling are not counted (see the route's own query): there is no
+      // customer verdict to wait for on a product that was never sampled.
+      //
+      // Overridable, like the PO gate above and for the same reason — a rule
+      // with no way to bend it gets defeated by someone recording a verdict
+      // the customer never gave, which costs you the control AND the truth.
+      if (current === "styleSample" && Number(context.samplesAwaitingCustomer) > 0) {
+        const n = Number(context.samplesAwaitingCustomer);
+        missing.push(
+          `the customer's approval on ${n} sample${n === 1 ? "" : "s"}`,
+        );
+      }
+
       // ── And the money the PO promised ────────────────────────────────────
       //
       // A PO on file says the customer committed; it does not say they paid.

@@ -36,7 +36,7 @@ const CATEGORY_MEASUREMENTS = {
 router.get("/data/products-with-sizes", async (req, res) => {
   try {
     const { search = "" } = req.query;
-    const filter = {};
+    const filter = { isActive: { $ne: false } };
     if (search) {
       filter.$or = [
         { name:      { $regex: search, $options: "i" } },

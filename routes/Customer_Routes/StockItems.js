@@ -35,7 +35,8 @@ router.get('/available-items', verifyCustomerToken, async (req, res) => {
 
     let filter = {
       status: { $in: ['In Stock', 'Low Stock'] }, // Only show items that are available
-      productType: 'Goods' // Only show physical goods, not services
+      productType: 'Goods', // Only show physical goods, not services
+      isActive: { $ne: false },
     };
 
     if (search) {
@@ -79,7 +80,8 @@ router.get('/available-items', verifyCustomerToken, async (req, res) => {
     // Get unique categories for filter
     const categories = await StockItem.distinct('category', {
       status: { $in: ['In Stock', 'Low Stock'] },
-      productType: 'Goods'
+      productType: 'Goods',
+      isActive: { $ne: false },
     });
 
     res.status(200).json({

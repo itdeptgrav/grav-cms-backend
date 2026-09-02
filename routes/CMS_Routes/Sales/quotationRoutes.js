@@ -2028,7 +2028,13 @@ router.get("/requests/:requestId/person/:employeeId/edit-context", async (req, r
     const poStockItemIds = (request.items || []).map((i) => (i.stockItemId?._id || i.stockItemId)?.toString()).filter(Boolean);
     const poSet = new Set(poStockItemIds);
 
-    const stockItems = await StockItem.find({})
+    // Active catalogue, plus whatever's already on this PO even if it's
+    // since been deleted — a deleted product shouldn't become newly pickable
+    // here, but a work order already raised against one still needs to
+    // resolve (1 Sept 2026).
+    const stockItems = await StockItem.find({
+      $or: [{ isActive: { $ne: false } }, { _id: { $in: poStockItemIds } }],
+    })
       .select("name reference hsnCode genderCategory baseSalesPrice images additionalNames variants")
       .lean();
 

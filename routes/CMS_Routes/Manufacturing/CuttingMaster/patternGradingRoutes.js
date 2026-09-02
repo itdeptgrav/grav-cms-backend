@@ -161,7 +161,7 @@ router.get("/pattern-grading/stock-items", async (req, res) => {
     const limitNum = Math.min(parseInt(limit) || 30, 100);
     const skip = (parseInt(page) - 1) * limitNum;
 
-    const query = { productType: { $in: ["Goods", "Combo"] } };
+    const query = { productType: { $in: ["Goods", "Combo"] }, isActive: { $ne: false } };
     if (search.trim()) {
       const rx = new RegExp(search.trim(), "i");
       query.$or = [{ name: rx }, { reference: rx }, { category: rx }];
