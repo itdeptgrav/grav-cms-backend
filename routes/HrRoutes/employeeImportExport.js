@@ -199,6 +199,11 @@ const COLUMNS = [
     { header: "HRA", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "EPF (Employee)", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "ESIC (Employee)", field: "_skip", section: "SALARY DETAILS", formula: true },
+    /* HR's own figure, not a derived one — the standing monthly amount this
+       employee has taken against their food allowance. It reduces their net pay
+       AND what the company funds, so the sheet was wrong on both counts while
+       it had nowhere to put it. */
+    { header: "Other Deduction (Monthly)", field: "otherDeduction", section: "SALARY DETAILS" },
     { header: "Total Deductions", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "Net Salary", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "EPF (Employer)", field: "_skip", section: "SALARY DETAILS", formula: true },
@@ -436,8 +441,15 @@ const capFirst = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g,
  *
  * `specialAllowance` is added on top because only the importer records it.
  */
-const recalcSalary = (gross, cfg) => {
-    const out = computeSalary({ gross: Number(gross) || 0 }, cfg, "employee");
+const recalcSalary = (gross, cfg, otherDeduction = 0) => {
+    /* The standing deduction travels with the gross: it reduces net pay and the
+       food allowance, so a row that carries one and is recalculated without it
+       imports a different employee from the one in the sheet. */
+    const out = computeSalary(
+        { gross: Number(gross) || 0, otherDeduction: Number(otherDeduction) || 0 },
+        cfg,
+        "employee",
+    );
     return {
         ...out,
         specialAllowance: Math.max(out.gross - out.basic - out.hra, 0),
@@ -574,7 +586,7 @@ const parseSheet = async (buffer) => {
         const lastName = nameParts.slice(1).join(" ") || "";
 
         const gross = toNum(row.grossSalary);
-        const salary = recalcSalary(gross, cfg);
+        const salary = recalcSalary(gross, cfg, toNum(row.otherDeduction));
 
         const emp = {
             _employeeNum: employeeNum,
@@ -1222,6 +1234,7 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
         hra: letterOf("HRA"),
         epfEE: letterOf("EPF (Employee)"),
         esicEE: letterOf("ESIC (Employee)"),
+        otherDed: letterOf("Other Deduction (Monthly)"),
         totDed: letterOf("Total Deductions"),
         net: letterOf("Net Salary"),
         epfER: letterOf("EPF (Employer)"),
@@ -1257,13 +1270,13 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
         [L.hra]: `IF(${L.gross}${R}="","",ROUND(${L.gross}${R}*${hraPct},0))`,
         [L.epfEE]: `IF(${L.basic}${R}="","",ROUND(MIN(${L.basic}${R}*${eepfPct},${epfCap}),0))`,
         [L.esicEE]: `IF(${L.basic}${R}="","",IF(${L.basic}${R}<=${esiLimit},CEILING(${L.basic}${R}*${eeEsicPct},1),0))`,
-        [L.totDed]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R}+IF(${L.esicEE}${R}="",0,${L.esicEE}${R}))`,
+        [L.totDed]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R}+IF(${L.esicEE}${R}="",0,${L.esicEE}${R})+IF(${L.otherDed}${R}="",0,${L.otherDed}${R}))`,
         [L.net]: `IF(${L.gross}${R}="","",MAX(${L.gross}${R}-IF(${L.totDed}${R}="",0,${L.totDed}${R}),0))`,
         [L.epfER]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R})`,
         [L.esicER]: `IF(${L.basic}${R}="","",IF(${L.basic}${R}<=${esiLimit},CEILING(${L.basic}${R}*${erEsicPct},1),0))`,
         [L.edli]: `IF(${L.basic}${R}="","",MIN(ROUND(MIN(${L.basic}${R},${edliCeil})*${edliPct},0),${edliMax}))`,
         [L.admin]: `IF(${L.basic}${R}="","",MIN(ROUND(MIN(${L.basic}${R},${adminCeil})*${adminPct},0),${adminMax}))`,
-        [L.food]: `IF(${L.gross}${R}="","",${foodAmt})`,
+        [L.food]: `IF(${L.gross}${R}="","",MAX(0,${foodAmt}-IF(${L.otherDed}${R}="",0,${L.otherDed}${R})))`,
         [L.ctc]: `IF(${L.gross}${R}="","",${L.gross}${R}+IF(${L.epfER}${R}="",0,${L.epfER}${R})+IF(${L.esicER}${R}="",0,${L.esicER}${R})+IF(${L.edli}${R}="",0,${L.edli}${R})+IF(${L.admin}${R}="",0,${L.admin}${R})+IF(${L.food}${R}="",0,${L.food}${R}))`,
     });
 
@@ -1319,6 +1332,12 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
             // template full of zeroes would compute a full set of zero
             // deductions instead of staying quiet.
             "Gross Salary": isBlankRow ? "" : (emp.salary?.gross || 0),
+            // Blank rather than 0 for the same reason: an empty cell means "no
+            // standing deduction", and the formulas treat it as zero anyway.
+            "Other Deduction (Monthly)":
+                isBlankRow || !emp.salary?.otherDeduction
+                    ? ""
+                    : emp.salary.otherDeduction,
             "Aadhaar Number": emp.documents?.aadharNumber || "",
             "PAN Number": emp.documents?.panNumber || "",
             "UAN Number": emp.documents?.uanNumber || "",
