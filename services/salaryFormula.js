@@ -142,8 +142,18 @@ function computeSalary(s = {}, cfg = {}, employmentType = "") {
      employer ESI, and what is left of the food allowance. */
   const employerCost = gross + epf + edli + adminCharges + erEsic + foodAllowance;
 
-  // What comes off the employee: their own PF and their own ESI.
-  const totalDeduction = epf + eeesic;
+  /* WHAT COMES OFF THE EMPLOYEE: their own PF, their own ESI, and the standing
+     monthly deduction HR has set against them.
+
+     That last one was missing here while payroll has always included it
+     (computeEmployeePayroll: epf + esic + pt + otherDeduction), so the employee
+     form showed a net salary the payslip then contradicted — the form said
+     28,087 and the month paid 27,323. The form was the one that was wrong.
+
+     The same amount also reduces the food allowance above, and both are
+     correct: it is money the employee has taken, so they receive that much less
+     AND the company funds that much less of the allowance. */
+  const totalDeduction = epf + eeesic + otherDeduction;
   const netSalary = Math.max(gross - totalDeduction, 0);
 
   return {

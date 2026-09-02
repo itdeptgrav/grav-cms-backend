@@ -71,10 +71,19 @@ console.log("\nthe food allowance is net of the standing deduction");
     over.foodAllowance === 0, over.foodAllowance);
   check("and the CTC does not go below gross plus the statutory costs",
     over.employerCost === 30000 + over.epf + over.edli + over.adminCharges + over.erEsic);
-  check("the deduction still comes off the employee's pay as well",
-    /* It is a deduction from THEM and a reduction of what the company funds:
-       the same 764 does both jobs, in two different places. */
-    none.netSalary === over.netSalary);
+  /* THIS CHECK USED TO ASSERT THE OPPOSITE OF ITS OWN NAME.
+     It read "the deduction still comes off the employee's pay" while asserting
+     that net salary was UNCHANGED by it — so the form kept showing a net the
+     payslip contradicted, and the suite said it was fine. A test whose label
+     and assertion disagree is worse than no test: it answers the question
+     nobody asked and vouches for the one they did. */
+  check("the deduction comes off the employee's pay",
+    over.netSalary < none.netSalary, `${over.netSalary} vs ${none.netSalary}`);
+  check("by exactly the amount deducted, and only once",
+    none.netSalary - over.netSalary === 5000,
+    `${none.netSalary - over.netSalary}`);
+  check("and it also reduces what the company funds",
+    over.employerCost < none.employerCost);
 }
 
 console.log("\nthe rest of the formula is unchanged");
