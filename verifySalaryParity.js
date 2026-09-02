@@ -68,14 +68,17 @@ const CONFIGS = [
   ["a different basic split", { basicPct: 60, hraPct: 40 }],
 ];
 const GROSSES = [12000, 20000, 30000, 45000, 80000, 200000];
-const FIELDS = ["basic", "hra", "epf", "edli", "adminCharges", "eeesic", "erEsic", "employerCost", "totalDeduction", "netSalary"];
+const FIELDS = ["basic", "hra", "epf", "edli", "adminCharges", "eeesic", "erEsic", "employerCost", "totalDeduction", "netSalary", "foodAllowance", "foodAllowanceFull"];
 
 for (const [label, cfg] of CONFIGS) {
   const clientCalc = makeClientCalc(cfg);
   let mismatches = [];
   for (const gross of GROSSES) {
-    const client = clientCalc(gross, {});
-    const server = computeSalary({ gross }, cfg, "employee");
+    /* With a standing deduction, because that is what the food allowance and
+       the CTC now depend on — running only the zero case would have missed the
+       whole rule. */
+    const client = clientCalc(gross, { otherDeduction: 764 });
+    const server = computeSalary({ gross, otherDeduction: 764 }, cfg, "employee");
     for (const f of FIELDS) {
       const c = Number(client[f]);
       const s = Number(server[f]);

@@ -938,7 +938,20 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
         .sort(sortSpec)
         .skip(skip)
         .limit(parseInt(limit))
-        .select("-password -temporaryPassword -__v")
+        /* WHAT THE LIST DOES NOT NEED.
+           `sopPoints` is the SOP scoring engine's own state — a per-year array
+           of every bleach and credit an employee has ever received. It was 81%
+           of this response by size (1.59 MB of 1.96 MB across the company) and
+           no list column reads it; the one screen that shows it, the CEO SOP
+           panel, fetches it from its own endpoint per employee.
+
+           The rest are large sub-documents the list has no column for either.
+           The single-employee GET is untouched and still returns everything. */
+        .select(
+          "-password -temporaryPassword -__v -sopPoints " +
+            "-personalCustomFields -workCustomFields -salaryCustomFields " +
+            "-documentCustomFields -addressCustomFields",
+        )
         .lean(),
       Employee.countDocuments(filter),
       // FIX: deptStats must respect the active/inactive tab — add $match on status only

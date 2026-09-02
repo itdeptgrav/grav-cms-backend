@@ -18,6 +18,12 @@ const customFieldSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/** One more image of the same document — the back of a card, a second page. */
+const pageSchema = new mongoose.Schema(
+  { url: String, publicId: String, name: String },
+  { _id: false },
+);
+
 const employeeSchema = new mongoose.Schema({
   // ─── PERSONAL / BASIC INFORMATION ────────────────────────────────────────────
   title: { type: String, enum: ["Mr.", "Mrs.", "Ms.", "Dr.", ""], default: "" },
@@ -257,6 +263,11 @@ const employeeSchema = new mongoose.Schema({
     eeesic: { type: mongoose.Schema.Types.Mixed, default: 0 },
     erEsic: { type: mongoose.Schema.Types.Mixed, default: 0 },
     foodAllowance: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    /* The entitlement from the salary rules, before this employee's standing
+       deduction comes off it. `foodAllowance` above is what is left; payroll
+       prorates THIS one and subtracts the deduction it actually charged, so
+       reading the net figure there would take the same amount twice. */
+    foodAllowanceFull: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Totals (auto) ─────────────────────────────────────────────────────────
     employerCost: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -299,6 +310,17 @@ const employeeSchema = new mongoose.Schema({
   salaryCustomFields: { type: [customFieldSchema], default: [] },
 
   // ─── DOCUMENTS ───────────────────────────────────────────────────────────────
+  /* FIELDS THE EMPLOYEE CONFIRMED THEY DO NOT HAVE.
+     An empty passport number means one of two things — nobody has typed it in
+     yet, or this person has no passport — and HR chasing the first is wasted
+     work while chasing the second is impossible. Holding the field keys here
+     records the answer instead of leaving a blank that has to be interpreted.
+
+     Keys, not values: the field stays genuinely empty, so nothing downstream
+     has to learn a sentinel string like "N/A" and no report has to filter it
+     out. */
+  fieldsNotAvailable: { type: [String], default: [] },
+
   documents: {
     aadharNumber: { type: String, sparse: true },
     panNumber: { type: String, sparse: true },
@@ -309,12 +331,18 @@ const employeeSchema = new mongoose.Schema({
     esicNumber: { type: String },
     pfNumber: { type: String },
 
-    // File uploads
-    aadharFile: { url: String, publicId: String },
-    panFile: { url: String, publicId: String },
-    resumeFile: { url: String, publicId: String },
-    offerLetterFile: { url: String, publicId: String },
-    appointmentLetterFile: { url: String, publicId: String },
+    /* File uploads.
+       `url`/`publicId` is the FIRST page and is unchanged — everything that
+       reads `documents.aadharFile.url` keeps working. `pages` holds every
+       further image of the same document: the back of an Aadhaar card, page
+       two of a contract. Kept as extra pages rather than turning the whole
+       field into an array so that no existing reader had to be found and
+       rewritten, and so "the document" still has one canonical image. */
+    aadharFile: { url: String, publicId: String, name: String, pages: [pageSchema] },
+    panFile: { url: String, publicId: String, name: String, pages: [pageSchema] },
+    resumeFile: { url: String, publicId: String, name: String, pages: [pageSchema] },
+    offerLetterFile: { url: String, publicId: String, name: String, pages: [pageSchema] },
+    appointmentLetterFile: { url: String, publicId: String, name: String, pages: [pageSchema] },
     educationalCertificates: [{ url: String, publicId: String, title: String }],
     additionalDocuments: [
       {

@@ -29,8 +29,9 @@ const mongoose = require("mongoose");
 const ChangeRequest = require("../models/Access/ChangeRequest");
 const { MAX_BODY_BYTES } = ChangeRequest;
 const { SECRET } = require("../config/jwt");
-const { getRole, listRoles, roleAtLeast } = require("./departmentRoles");
+const { getRole, getEffectiveRole, listRoles, roleAtLeast } = require("./departmentRoles");
 const { sectionForPath, sectionLabel } = require("./auditSections");
+const { decideApproval } = require("./approvalPolicy");
 const { recordChange } = require("./changeLog");
 
 /**
@@ -233,7 +234,11 @@ function requireApproval(departmentSlug, opts = {}) {
       const assigned = await listRoles(slug);
       if (assigned.length === 0) return next();
 
-      const role = req.departmentRole || (await getRole(slug, actor.email));
+      /* The same resolution the role guard uses. Looking up only the token's
+         email meant an approver whose grant sits on another of their addresses
+         was read as an editor — and every change they made was held for an
+         approval that only they could have given. */
+      const role = req.departmentRole || (await getEffectiveRole(slug, req));
 
       // Approver and above commit directly. Below editor should never have
       // reached this middleware, but if it is mounted without the role guard,
@@ -271,6 +276,32 @@ function requireApproval(departmentSlug, opts = {}) {
           // lose the change itself.
           console.error(`[change-requests] describe() failed for ${entity}:`, err.message);
         }
+      }
+
+      /* DOES THIS ACTUALLY NEED AN APPROVER?
+         Held everything, this queue filled with spelling corrections and phone
+         numbers, and the changes that matter arrived looking exactly as
+         important as the ones that did not. An editor's routine correction now
+         commits straight away and is recorded in the change history like any
+         other edit; money, access, identity and anything payroll or attendance
+         reads still stops here.
+
+         Decided AFTER describe() because the decision is made on the fields
+         that actually moved, not on the route or the shape of the body. See
+         services/approvalPolicy.js for the classification and why a field
+         nobody has classified waits. */
+      const verdict = decideApproval({
+        path: req.originalUrl || req.url || "",
+        method: req.method,
+        changes: described.changes,
+      });
+      if (!verdict.hold) {
+        /* Left for the route's own logging and for auditTrail: this is now an
+           ordinary write, and it should read as one in the history. Recorded
+           on the request so a route that wants to say "committed directly,
+           no approval needed" can. */
+        req.approvalWaived = verdict.reason;
+        return next();
       }
 
       const resolved = sectionForPath(req.originalUrl || req.url || "");
