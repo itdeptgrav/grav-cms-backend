@@ -32,6 +32,7 @@ const jwt = require("jsonwebtoken");
 const { requireDepartmentRole } = require("../services/departmentRoles");
 const { requireApproval } = require("../services/changeRequests");
 const { sectionForPath } = require("../services/auditSections");
+const describeChange = require("../services/changeRequestDescribe");
 const { SECRET, LEGACY_SECRETS, readToken } = require("../config/jwt");
 
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -114,6 +115,26 @@ const READ_SHAPED = [
   "/login",
   "/logout",
   "/refresh",
+
+  /* Added after these turned up in the change history as edits. Each one is a
+     POST only because its input does not fit in a query string:
+
+       /verify    GSTIN and PAN verification — the accountant company form
+                  fires it on blur, so typing a GSTIN wrote "changed" to the
+                  history twice before anything had been saved
+       /probe, /suggest, /resolve, /parse   read-and-return helpers
+       /status, /ping                       liveness and connector checks
+
+     `/verify` deliberately sits alongside the older `/verify-otp`: that one is
+     a prefix of nothing, and leaving only it meant every plain verification
+     endpoint counted as a write. */
+  "/verify",
+  "/probe",
+  "/suggest",
+  "/resolve",
+  "/parse",
+  "/status",
+  "/ping",
 ];
 
 function isReadShaped(path) {
@@ -133,14 +154,21 @@ function departmentWrites(slug, opts = {}) {
 
   const roleGuard = requireDepartmentRole(slug, "editor");
 
+  // Without a describe() the queue card can only name the entity — "Change ·
+  // employee" — which tells an approver nothing about what they are approving.
+  // services/changeRequestDescribe works from the path and body alone, so every
+  // department gets the field list by default; a mount that knows better still
+  // wins by passing its own.
+  const describeFor = (action) => describe || describeChange(action);
+
   // The action is derived from the verb, which is what the queue shows the
   // approver. It is a heuristic and says so — a POST to an /:id/cancel route
   // reads as "create" without it, which would be actively misleading.
   const guards = {
-    POST: requireApproval(slug, { entity, action: "create", describe }),
-    PUT: requireApproval(slug, { entity, action: "update", describe }),
-    PATCH: requireApproval(slug, { entity, action: "update", describe }),
-    DELETE: requireApproval(slug, { entity, action: "delete", describe }),
+    POST: requireApproval(slug, { entity, action: "create", describe: describeFor("create") }),
+    PUT: requireApproval(slug, { entity, action: "update", describe: describeFor("update") }),
+    PATCH: requireApproval(slug, { entity, action: "update", describe: describeFor("update") }),
+    DELETE: requireApproval(slug, { entity, action: "delete", describe: describeFor("delete") }),
   };
 
   return function departmentWriteGuard(req, res, next) {

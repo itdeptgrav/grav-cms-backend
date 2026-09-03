@@ -2028,7 +2028,13 @@ router.get("/requests/:requestId/person/:employeeId/edit-context", async (req, r
     const poStockItemIds = (request.items || []).map((i) => (i.stockItemId?._id || i.stockItemId)?.toString()).filter(Boolean);
     const poSet = new Set(poStockItemIds);
 
-    const stockItems = await StockItem.find({})
+    // Active catalogue, plus whatever's already on this PO even if it's
+    // since been deleted — a deleted product shouldn't become newly pickable
+    // here, but a work order already raised against one still needs to
+    // resolve (1 Sept 2026).
+    const stockItems = await StockItem.find({
+      $or: [{ isActive: { $ne: false } }, { _id: { $in: poStockItemIds } }],
+    })
       .select("name reference hsnCode genderCategory baseSalesPrice images additionalNames variants")
       .lean();
 
@@ -2864,6 +2870,33 @@ async function createWorkOrdersAndProgress(request, userId) {
         }
       }
     }
+  }
+
+  // ── TELL EVERY DEPARTMENT THAT DEPENDS ON THIS ──────────────────────────
+  //
+  // 31 Aug 2026, explicit request: notify the PM "when when the manufacturing
+  // order goona create", extended the same day to "notify to the sales team,
+  // merchantiser, project manager, r&d and all... and the format should be
+  // different ok as per there department wise responsibility".
+  //
+  // HOOKED HERE, INSIDE THE FACTORY, rather than at each call site. Three
+  // routes raise an MO today — quotation sales-approve, mark-internal-order,
+  // and R&D's sampling production submit — and every one of them funnels
+  // through this function. Wiring the three individually is how the fourth,
+  // added next month, silently sends nothing.
+  //
+  // ONE call, four letters. Each department's own template, on/off switch and
+  // attached PDF cut are applied inside the service; a department that has
+  // muted its notice does not affect the other three.
+  //
+  // NOT AWAITED, and it swallows its own errors: the order is the real work,
+  // the email is a courtesy, and Brevo being down must not fail a production
+  // release that has already been written.
+  try {
+    const { notifyOrderReleasedToProduction } = require("../../../services/manufacturingOrderNotify.service");
+    notifyOrderReleasedToProduction(request, createdWorkOrders).catch(() => {});
+  } catch (err) {
+    console.error("[createWorkOrdersAndProgress] production notify dispatch failed:", err.message);
   }
 
   return { createdWorkOrders, skippedVariants, createdProgressDocs };

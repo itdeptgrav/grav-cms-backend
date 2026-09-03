@@ -117,6 +117,25 @@ router.post("/push-token", AllEmployeeAppMiddleware, async (req, res) => {
         .json({ success: false, message: "Employee not found" });
     }
 
+    // The device registry — what "Manage notifications" reads and what every
+    // send consults first. Same request, so a phone on this route is a device
+    // with its own settings from the moment it signs in. Preferences already
+    // on the row are left alone (see registerDevice).
+    try {
+      const { registerDevice } = require("../../services/notifyDevices.service");
+      const hinted = String(platform || "").toLowerCase();
+      await registerDevice({
+        employeeId: req.user.id,
+        employeeEmail: req.user.email,
+        token: tokenValue,
+        transport: isMobile ? "expo" : "fcm",
+        platform: isWeb ? "web" : ["android", "ios"].includes(hinted) ? hinted : "android",
+        label: typeof req.body.label === "string" ? req.body.label.slice(0, 80) : "",
+      });
+    } catch (e) {
+      console.warn("[PUSH-TOKEN] registry upsert failed:", e.message);
+    }
+
     const kind = isMobile ? "mobile (Expo)" : "web (FCM)";
     console.log(
       `[PUSH-TOKEN] ✅ ${kind} token saved for ${result.firstName} (${req.user.id}): ${tokenValue.substring(0, 35)}...`,
@@ -154,6 +173,21 @@ router.delete("/push-token", AllEmployeeAppMiddleware, async (req, res) => {
       // No platform specified — clear both (legacy behavior, but logs the choice)
       update.pushToken = null;
       update.fcmToken = null;
+    }
+
+    // A signed-out device must not keep hearing about this person — the next
+    // person to sign in on that phone is not them. The registry rows for the
+    // tokens being cleared go too; the cost is that this device's answers are
+    // back to the defaults the next time it signs in.
+    try {
+      const before = await Employee.findById(req.user.id).select("pushToken fcmToken").lean();
+      const gone = Object.keys(update).map((k) => before?.[k]).filter(Boolean);
+      if (gone.length) {
+        const NotificationDevice = require("../../models/Access/NotificationDevice");
+        await NotificationDevice.deleteMany({ token: { $in: gone } });
+      }
+    } catch (e) {
+      console.warn("[PUSH-TOKEN] registry cleanup failed:", e.message);
     }
 
     await Employee.findByIdAndUpdate(

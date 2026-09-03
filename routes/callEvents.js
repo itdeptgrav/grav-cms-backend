@@ -60,7 +60,27 @@ router.post("/", checkApiKey, async (req, res) => {
     const received = deriveReceived(callType, durationSec);
     const rejected = deriveRejected(callType);
 
-    const existing = b.startTime ? await findMatchingCallEvent(phoneNumber, b.startTime) : null;
+    // WHOSE HANDSET THIS CAME FROM. Several spellings accepted because the
+    // Android app, the recording uploader and any future device integration
+    // each name it differently, and a call that arrives with the field under
+    // an unexpected key would silently go unattributed — the exact failure
+    // this was added to fix. Optional: a device that doesn't report it still
+    // logs the call, just without an owner.
+    const ownerPhone = b.ownerPhone ?? b.devicePhone ?? b.deviceOwnerPhone ?? b.selfPhone ?? null;
+
+    let existing = b.startTime ? await findMatchingCallEvent(phoneNumber, b.startTime) : null;
+    // The nearest document already describes a DIFFERENT call (it has its own
+    // outcome and started noticeably earlier/later) — e.g. the same contact
+    // called again a minute later. Give this call its own document instead of
+    // overwriting the previous one's outcome.
+    if (
+      existing &&
+      existing.callType && existing.callType !== "UNKNOWN" &&
+      typeof existing.startTime === "number" &&
+      Math.abs(existing.startTime - Number(b.startTime)) > 30_000
+    ) {
+      existing = null;
+    }
     if (existing) {
       // Already has a document (most likely the recording upload for this
       // same call arrived first) — refresh the outcome fields onto it
@@ -72,6 +92,17 @@ router.post("/", checkApiKey, async (req, res) => {
       existing.rejected = rejected;
       existing.durationSec = durationSec;
       existing.endTime = b.endTime ?? existing.endTime;
+      // Only ever FILLS a gap. If the recording upload already established
+      // whose phone this was, a later outcome report arriving without the
+      // field must not blank it back out.
+      if (ownerPhone) existing.ownerPhone = ownerPhone;
+      // Why there's no audio (recording not set up on the phone). Never
+      // overwrite a real uploaded recording with a stale note.
+      if (b.recordingNote && !existing.driveFileId) {
+        existing.recordingUploadStatus = "FAILED";
+        existing.recordingError = String(b.recordingNote).slice(0, 500);
+        existing.recordingErrorAt = new Date();
+      }
       await existing.save();
       return res.json({ success: true, mongoId: String(existing._id), duplicate: true });
     }
@@ -86,6 +117,14 @@ router.post("/", checkApiKey, async (req, res) => {
       durationSec,
       startTime: b.startTime,
       endTime: b.endTime ?? null,
+      ownerPhone,
+      ...(b.recordingNote
+        ? {
+            recordingUploadStatus: "FAILED",
+            recordingError: String(b.recordingNote).slice(0, 500),
+            recordingErrorAt: new Date(),
+          }
+        : {}),
       source: b.source || "personalcallrecorder",
     });
 

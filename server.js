@@ -104,15 +104,15 @@ const { db, admin } = require("./config/firebaseAdmin");
 instrumentFirestore(admin, db);
 bw.instrumentFirestore(admin, db);
 
+/* Static origins first, then the live list from the developer side
+   (ops.extraOrigins) — ADDITIVE only, validated at write and read; see
+   services/allowedOrigins.js. A preview URL or LAN IP no longer needs an
+   edit-and-restart. */
+const originCheck = require("./services/allowedOrigins").makeOriginCheck(allowedOrigins);
+
 app.use(
   cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
+    origin: originCheck,
     credentials: true,
   }),
 );
@@ -148,6 +148,45 @@ if (process.env.BANDWIDTH_ENABLE_GZIP === "1") {
 // Meta's X-Hub-Signature-256 HMAC (which must be computed over the exact bytes
 // Meta sent, not the re-serialized JSON). Harmless for every other route.
 app.use(express.json({ limit: "50mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
+/* Every 5xx becomes a fingerprinted DevAlert on the developer side — see
+   Middlewear/errorWatch.js. Mounted this early so it sees every router below;
+   observation only, hooks res "finish", can never alter a response. */
+app.use(require("./Middlewear/errorWatch"));
+
+/* The developer side's live restrictions — department write-freeze and
+   after-hours blocking, both settings on /developer/settings. Fails open;
+   never blocks sign-in, /api/dev or /api/admin. See Middlewear/opsControls. */
+app.use(require("./Middlewear/opsControls"));
+
+/* Feature flags for the frontends. Public like the notice below, and for the
+   same reasons — flags gate UI, carry no data, and a token check on every page
+   paint for booleans would be cost without protection. Only flag.* keys are
+   ever exposed. */
+app.get("/api/feature-flags", async (req, res) => {
+  try {
+    const { DEFINITIONS, getSetting } = require("./services/devConfig");
+    const flags = {};
+    for (const d of DEFINITIONS) {
+      if (d.key.startsWith("flag.")) flags[d.key] = await getSetting(d.key);
+    }
+    res.json({ success: true, flags });
+  } catch {
+    res.json({ success: true, flags: {} });
+  }
+});
+
+/* The announcement banner every dashboard shows. Public on purpose: it is
+   written BY developers FOR all staff, carries no data, and making every shell
+   authenticate for a banner would put a token check on every page paint. */
+app.get("/api/system-notice", async (req, res) => {
+  try {
+    const { getSetting } = require("./services/devConfig");
+    const text = await getSetting("notice.text");
+    res.json({ success: true, text: String(text || ""), tone: await getSetting("notice.tone") });
+  } catch {
+    res.json({ success: true, text: "", tone: "info" });
+  }
+});
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
@@ -183,7 +222,7 @@ console.log("Drive key loaded:", !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 // Initialize Socket.IO with CORS configuration
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: originCheck,
     credentials: true,
     methods: ["GET", "POST"],
   },
@@ -617,6 +656,18 @@ const connectDB = async () => {
   try {
     await mongoose.connect(
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
+      {
+        /* Index building is a DEVELOPMENT convenience. With it on, every boot
+           issues a createIndex for each of the ~285 indexes the schemas
+           declare, and Mongoose holds each model's queries until its own
+           indexes are confirmed — so the first requests after a deploy wait
+           behind hundreds of round trips to Atlas. With several deploys a
+           day, that is a minute or two of 502s each time, seen from the CMS
+           as "everything takes two minutes". The indexes already exist in
+           production; a NEW index still gets created by the next dev boot
+           against the same database, or by hand. */
+        autoIndex: process.env.NODE_ENV !== "production",
+      },
     );
     console.log("✅ MongoDB connected successfully");
 
@@ -648,7 +699,6 @@ const connectDB = async () => {
  * prints nothing about credentials.
  * --------------------------------------------------------------------- */
 connectDB().then(async () => {
-  await ensureCeoExists();
 
   // Register the department/access tables on whatever database this instance
   // is pointed at, so moving from local to production needs no manual step.
@@ -657,6 +707,36 @@ connectDB().then(async () => {
   const { ensureAccessDepartments } = require("./services/ensureAccessDepartments");
   await ensureAccessDepartments(mongoose.connection);
 });
+
+/* ─── NO ACCOUNTS ARE SEEDED, DELIBERATELY ─────────────────────────────────
+ *
+ * Every seeder that used to live here is gone: the cutting-master, CEO, QC,
+ * embroidery, production-supervisor, accountant and packaging/dispatch
+ * defaults, and the `ensureCeoExists` bootstrap that ran on every boot.
+ *
+ * They were removed because a boot-time "create it if it is missing" is
+ * incompatible with being able to delete an account:
+ *
+ *   • an account removed in CEO → Access Control came back on the next restart,
+ *     which made the delete button a lie
+ *   • the passwords were literals in this file
+ *   • several of them logged working credentials into the boot output on every
+ *     start, where they persist in aggregators and terminal scrollback
+ *
+ * Accounts are created by a person, in CEO → Access Control, and removed the
+ * same way. That screen now lists the legacy department logins as well as the
+ * access table, so there is nothing it cannot see or remove.
+ *
+ * WHAT THIS MEANS FOR AN EMPTY DATABASE: there is no automatic way in. A fresh
+ * deployment needs one administrator inserted by hand (or by
+ * scripts/migrations/001-seed-access-departments.js) before anybody can sign
+ * in. That is the intended trade — an empty database is a one-off event, and a
+ * standing self-healing admin account is a permanent one.
+ *
+ * `ensureAccessDepartments` below is NOT a seeder in this sense. It registers
+ * department rows and mirrors existing logins into the access table; it creates
+ * no credential and invents no password.
+ * ───────────────────────────────────────────────────────────────────────── */
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
@@ -671,253 +751,10 @@ const QCDepartment = require("./models/QCDepartment");
 const CEODepartment = require("./models/CEODepartment");
 const EmbroideryDepartment = require("./models/EmbroideryDepartment");
 
-const createDefaultCuttingMaster = async () => {
-  try {
-    const existingCuttingMaster = await CuttingMaster.findOne({
-      role: "cutting_master",
-      department: "Cutting",
-    });
-
-    if (existingCuttingMaster) {
-      console.log("✅ Cutting Master already exists, skipping creation");
-      return;
-    }
-
-    const defaultCuttingMaster = new CuttingMaster({
-      name: "Cutting Admin",
-      email: "cutting@grav.in",
-      password: "Cut@12345", // will be hashed automatically
-      employeeId: "CUT001",
-      phone: "9999999999",
-      department: "Cutting",
-      role: "cutting_master",
-      isActive: true,
-    });
-
-    await defaultCuttingMaster.save();
-
-    console.log("✅ Default Cutting Master created successfully");
-  } catch (error) {
-    console.error("❌ Cutting Master creation failed:", error.message);
-  }
-};
 
 // ✅ Auto-create default CEO user
-/**
- * Ensure exactly one bootstrap CEO account exists, and say nothing about it.
- *
- * This is the only account created automatically. Everything else — every
- * department, every login — is created by a human in the CEO Access Control
- * screen, which is the point of the access refactor.
- *
- * If the account already exists this returns immediately: it never resets a
- * password, never reactivates a deliberately disabled account, and never logs
- * a credential. The seed password comes from CEO_SEED_PASSWORD when set, so
- * the fallback literal below only ever applies to a brand-new empty database.
- */
-async function ensureCeoExists() {
-  try {
-    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
-    if (existing) return;
-
-    const password = process.env.CEO_SEED_PASSWORD || "CEO@2026";
-
-    await CEODepartment.create({
-      name: "Chief Executive Officer",
-      email: "ceo@grav.in",
-      password,                  // hashed by the model's pre-save hook
-      role: "ceo",
-      department: "Executive",
-      employeeId: "CEO001",
-      isActive: true,
-    });
-
-    // Deliberately no credentials in this message. A boot log is copied into
-    // aggregators, screenshots and terminal scrollback; a password printed
-    // once is a password leaked permanently.
-    console.log(
-      "[bootstrap] No CEO account existed — one was created for ceo@grav.in. " +
-        "Sign in and change the password, then create the remaining " +
-        "departments from CEO → Access Control.",
-    );
-  } catch (err) {
-    console.error("[bootstrap] Could not ensure a CEO account:", err.message);
-  }
-}
-
-// Retained but no longer called on boot — see ensureCeoExists above.
-const seedCEOUser = async () => {
-  try {
-    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
-    if (existing) {
-      console.log("ℹ️  CEO user already exists: ceo@grav.in");
-      return;
-    }
-    await CEODepartment.create({
-      name: "Chief Executive Officer",
-      email: "ceo@grav.in",
-      password: "Ceo@12345",
-      employeeId: "CEO001",
-      phone: "",
-      department: "Executive Office",
-      role: "ceo",
-      isActive: true,
-    });
-    console.log("✅ Seeded default CEO user: ceo@grav.in / Ceo@12345 (CEO001)");
-  } catch (err) {
-    console.error("❌ CEO seed error:", err);
-  }
-};
-
-// ✅ Auto-create default QC user
-const seedQCUser = async () => {
-  try {
-    const existing = await QCDepartment.findOne({ email: "qc1@grav.in" });
-    if (existing) {
-      console.log("ℹ️  QC user already exists: qc1@grav.in");
-      return;
-    }
-    await QCDepartment.create({
-      name: "QC Inspector 1",
-      email: "qc1@grav.in",
-      password: "Qc1@12345",
-      employeeId: "QC001",
-      phone: "",
-      department: "Quality Control",
-      role: "quality_control",
-      isActive: true,
-    });
-    console.log("✅ Seeded default QC user: qc1@grav.in / Qc1@12345 (QC001)");
-  } catch (err) {
-    console.error("❌ QC seed error:", err);
-  }
-};
-
-// ✅ Auto-create default Embroidery user
-const seedEmbroideryUser = async () => {
-  try {
-    const existing = await EmbroideryDepartment.findOne({
-      email: "embroidery@grav.in",
-    });
-    if (existing) {
-      console.log("ℹ️  Embroidery user already exists: embroidery@grav.in");
-      return;
-    }
-    await EmbroideryDepartment.create({
-      name: "Embroidery Supervisor",
-      email: "embroidery@grav.in",
-      password: "Emb@12345",
-      employeeId: "EMB001",
-      phone: "",
-      department: "Embroidery",
-      role: "embroidery",
-      isActive: true,
-    });
-    console.log(
-      "✅ Seeded default Embroidery user: embroidery@grav.in / Emb@12345 (EMB001)",
-    );
-  } catch (err) {
-    console.error("❌ Embroidery seed error:", err);
-  }
-};
 
 
-async function createDefaultProductionSupervisor() {
-  try {
-    const existing = await ProductionSupervisorDepartment.findOne({
-      email: "p1supervisor@grav.in",
-    });
-    if (existing) {
-      console.log("✓ Default Production Supervisor already exists");
-      return;
-    }
-
-    const hashed = await bcrypt.hash("P1supervisor@12345", 10);
-
-    await ProductionSupervisorDepartment.create({
-      name: "Production Supervisor",
-      email: "p1supervisor@grav.in",
-      password: hashed, // ✅ use the hashed value
-      employeeId: "PSUP001",
-      phone: "",
-      role: "production_supervisor",
-      department: "Production Supervisor",
-      isActive: true,
-    });
-
-    console.log(
-      "✅ Default Production Supervisor created: p1supervisor@grav.in",
-    );
-  } catch (err) {
-    console.error("❌ Failed to create default Production Supervisor:", err);
-  }
-}
-
-const createDefaultAccountant = async () => {
-  try {
-    const existingAccountant = await AccountantDepartment.findOne({
-      role: "accountant",
-      department: "Accounting",
-    });
-
-    if (existingAccountant) {
-      console.log("✅ Accountant already exists, skipping creation");
-      return;
-    }
-
-    const defaultAccountant = new AccountantDepartment({
-      name: "Accountant Admin",
-      email: "accounts@grav.in",
-      password: "Account@12345", // will be hashed automatically
-      employeeId: "ACC001",
-      phone: "9999999999",
-      department: "Accounting",
-      role: "accountant",
-      isActive: true,
-    });
-
-    await defaultAccountant.save();
-
-    console.log("✅ Default Accountant created successfully");
-  } catch (error) {
-    console.error("❌ Accountant creation failed:", error.message);
-  }
-};
-
-const createDefaultPackagingDispatch = async () => {
-  try {
-    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne(
-      {
-        role: "packaging_dispatch",
-        department: "Packaging & Dispatch",
-      },
-    );
-
-    if (existingPackagingDispatch) {
-      console.log(
-        "✅ Packaging & Dispatch user already exists, skipping creation",
-      );
-      return;
-    }
-
-    const defaultPackagingDispatch = new PackagingDispatchDepartment({
-      name: "Dispatch Admin",
-      email: "dispatch@grav.in",
-      password: "Dispatch@12345",
-      employeeId: "PKG001",
-      phone: "9999999999",
-      department: "Packaging & Dispatch",
-      role: "packaging_dispatch",
-      isActive: true,
-    });
-
-    await defaultPackagingDispatch.save();
-
-    console.log("✅ Default Packaging & Dispatch user created successfully");
-  } catch (error) {
-    console.error("❌ Packaging & Dispatch creation failed:", error.message);
-  }
-};
 
 // Update the database connection section
 // Accountant / Packaging / Production-Supervisor seeding removed — see the
@@ -951,41 +788,17 @@ const CATEGORY_MEASUREMENTS = {
   ],
 };
 
-const overwriteExistingMeasurements = async () => {
-  try {
-    const existingHR = await HRDepartment.findOne({
-      role: "hr_manager",
-      department: "Human Resources",
-    });
-    for (const [category, measurements] of Object.entries(
-      CATEGORY_MEASUREMENTS,
-    )) {
-      const result = await StockItem.updateMany(
-        { category },
-        { $set: { measurements } },
-      );
-
-      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
-    }
-
-    const defaultHR = new HRDepartment({
-      name: "HR Admin",
-      email: "hr@grav.in",
-      password: "Hr@12345", // will be hashed automatically
-      employeeId: "HR001",
-      phone: "9999999999",
-      department: "Human Resources",
-      role: "hr_manager",
-      isActive: true,
-    });
-
-    await defaultHR.save();
-
-    console.log("✅ Default HR Department created successfully");
-  } catch (error) {
-    console.error("❌ Measurement overwrite failed:", error.message);
-  }
-};
+/* `overwriteExistingMeasurements` was removed with the other seeders.
+ *
+ * It was two unrelated jobs in one function: it rewrote stock-item measurements
+ * for three categories AND created the default `hr@grav.in` login with a
+ * hardcoded password. The second job was invisible from the name, which is how
+ * it survived the earlier seeder cleanup — nobody looks for an account seeder
+ * inside a measurements helper.
+ *
+ * Nothing called it. The measurement half belongs in a migration script if it
+ * is ever wanted again; the account half is what CEO → Access Control is for.
+ */
 
 // CEO Routes
 const ceoHrRoutes = require("./routes/CEO_Routes/hr");
@@ -1051,10 +864,75 @@ app.use(
   router's own auth middleware has resolved req.user, so entries carry a name.
 */
 const auditTrail = require("./Middlewear/auditTrail");
+/* Required here rather than beside the Sales mount further down: HR now uses it
+   too, and the first mount in the file has to be the one that loads it. */
+const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const hrAuditTrail = auditTrail("hr");
 app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
 app.use("/api/employees", hrAuditTrail);
+
+/* ─── HR: role enforcement + the editor-needs-approval queue ───────────────
+ *
+ * See Middlewear/departmentWriteGuard.js. Reads are untouched; an approver or
+ * owner commits directly; an EDITOR's write is held as a ChangeRequest and
+ * answered with 202, and shows up at /hr/dashboard/approvals.
+ *
+ * TWO THINGS TO KNOW BEFORE CHANGING THIS
+ *
+ * 1. It enforces the moment HR has its first role — which it now does. A
+ *    person with NO HR role gets 403 NO_DEPARTMENT_ROLE on every write, so
+ *    every HR user needs a role in CEO → Access Control. Platform
+ *    administrators are exempt (both guards agree on that now).
+ *
+ * 2. The exemptions below are not decoration:
+ *      /profile, /change-password  nobody should need an approver's permission
+ *                                  to change their own password
+ *      /change-history             a read API; a GET is skipped anyway, but it
+ *                                  must never be able to queue
+ *      /import-export              a spreadsheet import exceeds the 256 KB a
+ *                                  held request can store, so it would answer
+ *                                  413 rather than queue — the guard refuses to
+ *                                  truncate, correctly, and the result would
+ *                                  read as a broken importer
+ *      /sync-period, /backfill,    machine operations, not somebody's edit.
+ *      /day-range, /notification-  Queueing a biometric sync means attendance
+ *                                  silently stops updating until an approver
+ *                                  notices.
+ *
+ * Mounted on the three HR prefixes only. `/api/employee` (singular) is the
+ * mobile app and belongs to no department's queue. */
+const hrWrites = departmentWrites("hr", {
+  entity: "HR record",
+  exempt: [
+    /* FULL paths, not bare words. These are matched with `includes`, and the
+       short forms let two administrative writes through by accident:
+
+         "/profile"          also matched /api/employees/:id/profile-photo —
+                             HR changing somebody else's photo, which is an
+                             edit to another person's record and belongs in
+                             the queue like any other.
+         "/change-password"  also matched
+                             /api/hr/password-management/change-password/:type/:id
+                             — that is HR RESETTING SOMEBODY ELSE'S password,
+                             the opposite of the self-service case the
+                             exemption was written for, and the single most
+                             sensitive write in the department.
+
+       The exemption is "changing your OWN credentials", so it says so. */
+    "/api/hr/profile",
+    "/api/hr/change-password",
+    "/change-history",
+    "/import-export",
+    "/sync-period",
+    "/backfill",
+    "/day-range",
+    "/notification-",
+  ],
+});
+app.use("/api/hr", hrWrites);
+app.use("/hr", hrWrites);
+app.use("/api/employees", hrWrites);
 
 /* Two employee-app prefixes, named individually rather than mounting the trail
    on all of /api/employee. Overtime and regularisations are HR facts raised
@@ -1144,6 +1022,16 @@ app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 // them. Mounted outside any one department's middleware because the queue spans
 // departments; it authenticates the session itself.
 app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+
+/* A department's own team screen — the same DepartmentRole rows Access Control
+   manages, reached by that department's OWNER instead of a platform admin. See
+   the header of the router for what it refuses and why. */
+app.use("/api/department-team", require("./routes/Access/departmentTeam"));
+
+/* The developer side: cross-department history, anomaly alerts, live
+   settings, job heartbeats. Access = platform admin or a role in the
+   `developer` department (granted from CEO → Access Control). */
+app.use("/api/dev", require("./routes/DevOps/developer"));
 /* Department-facing budget proposals. Mounted HERE, beside the other
  * cross-department surface, and deliberately NOT under /api/accountant — the
  * frontend's authFetch skips that prefix, so a department session would never
@@ -1158,6 +1046,17 @@ app.use("/api/files", require("./routes/Access/files"));
 // Returns names and icons only; never emails, counts or user data.
 const publicDepartmentRoutes = require("./routes/Admin/publicDepartments");
 app.use("/api/public", publicDepartmentRoutes);
+
+// The Project Manager's BOM approve/reject, pressed from the request email —
+// unauthenticated by design, a per-request token standing in for login (see
+// the router's own header comment for why). Belongs beside the other public
+// surface above, not under any department's middleware.
+//
+// 1 Sept 2026 bug fix: this line never existed. A stale comment further down
+// this file claimed the mount was "much earlier in this file", which was
+// true of the INTENT but not the code — every BOM approval email link 404'd
+// ("Cannot GET /api/public/bom-approval/...") since the feature shipped.
+app.use("/api/public/bom-approval", require("./routes/CMS_Routes/Sales/sampleBomApproval"));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -1181,7 +1080,6 @@ app.use("/api/ceo/sop", ceoSopRoutes);
 // Role enforcement + the editor-needs-approval queue for the whole Sales API.
 // See Middlewear/departmentWriteGuard.js — reads are untouched, and nothing
 // changes at all until an administrator assigns the first Sales role.
-const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const salesWrites = (entity, extra = {}) =>
   departmentWrites("sales", { entity, ...extra });
 
@@ -1373,6 +1271,15 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+
+// The sales roster — which employees are on sales duty, and the corporate
+// phone number that stands for each of them in the call log and the tracking
+// map (30 Aug 2026). Deliberately NOT behind salesWrites: the roster decides
+// whose calls get attributed to whom, which is an access-control-shaped
+// decision, and parking it in an approval queue would leave the call log
+// unattributed until somebody approved it. RequireRole on the settings screen
+// is what gates it.
+app.use("/api/cms/sales/sales-persons", require("./routes/CMS_Routes/Sales/salesPersons"));
 // Emails exchanged with a customer, read live from the salesperson's own
 // connected Gmail — the email sibling of call-events and crm/whatsapp. Scoped
 // to the caller's own mailbox via the JWT; see that route file's header.
@@ -1522,6 +1429,30 @@ app.use(
 app.use(
   "/api/cms/measurement-templates",
   require("./routes/CMS_Routes/Configurations/measurementTemplateRoutes"),
+);
+
+// Global switches for the Requests system (currently: whether MRF involves
+// finance/budget) — read by Store's fulfilment screen and mrfRoutes.js,
+// written from the CEO settings page (30 Aug 2026).
+app.use(
+  "/api/cms/requests/settings",
+  require("./routes/CMS_Routes/Configurations/requestsSettingsRoutes"),
+);
+
+// The Project Manager's own settings — the "new Manufacturing Order" email's
+// wording, its on/off switch, and whether the order PDF is attached
+// (31 Aug 2026). Read by the notification sender, written from
+// /project-manager/dashboard/settings.
+app.use(
+  "/api/cms/production/settings",
+  require("./routes/CMS_Routes/Manufacturing/productionSettingsRoutes"),
+);
+
+// The letterhead production's own PDFs print — same schema as the store and
+// sales letterheads, its own `key: "production"` record (31 Aug 2026).
+app.use(
+  "/api/cms/production/pdf-settings",
+  require("./routes/CMS_Routes/Manufacturing/productionPdfSettingsRoutes"),
 );
 
 // Manufacturing Routes
@@ -1817,6 +1748,24 @@ console.log("[accountant] mounting routes…");
 //   • /auth has public endpoints (login, accept-invite, bootstrap) that
 //     must work without prior auth
 //   • /team and /approvals self-protect with orgAuth internally
+/* The accountant module's change history, and the floor that fills it.
+
+   Same spine as HR (change_logs, section-scoped) — see
+   routes/Access/changeHistoryRouter.js for why it is one factory rather than a
+   router per department, and for where a merged admin-wide view would come from.
+
+   ORDER IS LOAD-BEARING. Express matches middleware in registration order, so
+   the trail has to be mounted ABOVE every accountant router or it wraps only
+   the ones declared after it — which, mounted at the bottom of this section,
+   was none of the interesting ones. The read API goes above the trail for the
+   same reason: a GET is skipped anyway, but this way the history can never end
+   up logging requests for the history. */
+app.use(
+  "/api/accountant/change-history",
+  require("./routes/Accountant_Routes/Acc_changeHistory"),
+);
+app.use("/api/accountant", auditTrail("accounting"));
+
 app.use("/api/accountant/auth", require("./routes/Accountant_Routes/Acc_auth"));
 app.use("/api/accountant/team", require("./routes/Accountant_Routes/Acc_team"));
 app.use(
@@ -2107,6 +2056,7 @@ app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 // carried was unreachable dead code until this line; version history is the
 // first thing that made that gap actually load-bearing.)
 app.use("/cowork", require("./routes/task_routes/coworkDocs.routes.js"));
+app.use("/cowork", require("./routes/task_routes/requirementProgress.routes.js"));
 
 // External sharing: /cowork/share/*. Invite/list/revoke are owner-only and
 // Firebase-authenticated; /cowork/share/accept and /cowork/share/guest/* carry
@@ -2125,6 +2075,21 @@ app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 
 const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
+
+/* CoWork sign-in recovery and the alternate sign-in door.
+ *
+ * Mounted BEFORE nothing in particular — these paths (/cowork/auth/*) collide
+ * with no existing route — but kept together because they are the two ways into
+ * an account that do not involve typing a password, and a reviewer should see
+ * both at once.
+ *
+ * Both carry their own auth per route rather than sitting behind a blanket
+ * `verifyCoworkToken`: the forgot-password endpoints and the QR redemption are
+ * reached by somebody who by definition cannot present a token yet, while
+ * issuing a QR code requires one. */
+const coworkQrSignIn = require("./routes/task_routes/coworkQrSignIn");
+app.use("/cowork", require("./routes/task_routes/coworkPasswordReset"));
+app.use("/cowork", coworkQrSignIn);
 
 app.use("/cowork", require("./routes/task_routes/c2Band.routes"));
 app.use("/cowork", require("./routes/task_routes/c1Routes"));
@@ -2856,12 +2821,25 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Simple health check for socket
+// Health check — READINESS, not liveness.
+//
+// The port opens before MongoDB is connected (server.listen runs unconditionally;
+// connectDB() resolves later), so a check that answered 200 the moment the
+// process was up let the hosting service route traffic to an instance whose
+// every query was still buffered behind the connection. Requests that arrived
+// in that window took 12–20 seconds (the /verify and /login worst cases in the
+// bandwidth tracker) or died when the previous instance was shut down.
+//
+// 503 until the database is connected. Point the host's health-check path at
+// this route and a deploy only goes live once the new instance can serve.
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
+  const dbReady = mongoose.connection.readyState === 1;
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? "ok" : "starting",
+    database: dbReady ? "connected" : "connecting",
     socket: "running",
     connections: io.engine.clientsCount,
+    uptimeSeconds: Math.round(process.uptime()),
   });
 });
 
@@ -2879,7 +2857,12 @@ app.get("/", (req, res) => {
 });
 
 const payslipRoutes = require("./routes/Employee_Routes/Payslip");
+const notificationSettingsRoutes = require("./routes/Employee_Routes/notificationSettings");
 app.use("/api/employee/payslip", payslipRoutes);
+/* Per-device notification preferences, for the app and the browser alike.
+   Under /api/employee because it is a person managing their own devices,
+   not a department managing anything. */
+app.use("/api/employee/notification-settings", notificationSettingsRoutes);
 
 const overtimeRoutes = require("./routes/Employee_Routes/Overtimeroutes");
 const timerSopRoutes = require("./routes/task_routes/timerSop.routes");
@@ -2936,6 +2919,18 @@ if (attendanceRouter.startHourlyAttendanceSync) {
   console.log("✅ Hourly attendance sync cron initialized");
 } else {
   console.warn("⚠️ Hourly attendance sync not available");
+}
+
+/* "You still have things waiting on you", hourly.
+   Costs one small query when nobody has switched repeats on, which is the
+   default and will be the usual state — the sweep starts from the DEVICES that
+   opted in, not from the staff list. See services/pendingReminders.service. */
+try {
+  const { startPendingReminders } = require("./services/pendingReminders.service");
+  startPendingReminders();
+  console.log("✅ Hourly pending-work reminders initialized");
+} catch (err) {
+  console.warn("⚠️ Pending-work reminders not started:", err.message);
 }
 
 // Close out CoWork sessions left online by somebody who has already punched
@@ -3000,11 +2995,31 @@ const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+  /* The heap limit, in the deploy log, because it is the number that decides
+     whether this process survives a busy afternoon. Node sizes it from the
+     container's memory — ~256 MB on a 512 MB instance — and that is what
+     the process died at on 3 Sep 2026. package.json's start script raises
+     it; if this line still says ~256, the host is not running `npm start`
+     (set the Start Command to it, or NODE_OPTIONS=--max-old-space-size=384). */
+  const heapLimitMb = Math.round(require("v8").getHeapStatistics().heap_size_limit / 1048576);
+  console.log(`✅ V8 heap limit: ${heapLimitMb} MB (rss ${Math.round(process.memoryUsage().rss / 1048576)} MB at boot)`);
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
   console.log(`Server running on port ${PORT}`);
   transcriptModule.startCron();
+
+  /* Spent and expired QR sign-in codes.
+   *
+   * Neither can be redeemed — the transaction in `/auth/qr/redeem` refuses
+   * both — so this is housekeeping, not security: without it the collection
+   * becomes a permanent log of who signed in and when, kept for no reason.
+   * Hourly, and once at boot so a restart after an outage does not wait an
+   * hour to catch up. */
+  const sweepQr = () => void coworkQrSignIn.sweepExpiredQrCodes();
+  sweepQr();
+  const qrSweep = setInterval(sweepQr, 60 * 60 * 1000);
+  if (typeof qrSweep.unref === "function") qrSweep.unref();
 
   // ── One-time repair: fix self-assigned tasks missing approverId ──────────
   (async () => {
@@ -3059,10 +3074,32 @@ server.listen(PORT, () => {
     }
   })();
 
+  /* Register what the recurring jobs PROMISE, so the developer side can alert
+     when one goes quiet — the failure mode of a cron is silence, and silence
+     is invisible everywhere else. beat() calls sit inside each job below. */
+  {
+    const { ensureJob } = require("./services/jobHeartbeats");
+    ensureJob("meeting-reminders", "15-minute meeting reminder push/email sweep", 5 * 60);
+    /* Daily job: expect a beat once per day; the interval FIRES every minute
+       but only acts in its 00:15 IST window, so the promise is the day. */
+    ensureJob("timer-sop-finalize", "Timer-SOP daily finalize (~00:15 IST)", 24 * 60 * 60, 1.25);
+    ensureJob("anomaly-scan", "Developer-side anomaly scan over the change log", 15 * 60, 2);
+
+    /* What "Run now" on /developer/jobs may invoke. A registry of shipped
+       functions, never a code path from the UI — see services/jobRegistry. */
+    const { registerRunner } = require("./services/jobRegistry");
+    registerRunner("anomaly-scan", "Scan the change log for anomalies now", () =>
+      require("./services/anomalyScan").scanChangeLogs());
+    registerRunner("heartbeat-check", "Check every job against its promise now", () =>
+      require("./services/jobHeartbeats").checkOverdue());
+  }
+
   // ── Meeting 15-min reminder cron — runs every 5 minutes ──────────────────
   const _reminderSent = new Set();
   setInterval(
     async () => {
+      if (!(await require("./services/jobRegistry").isEnabled("meeting-reminders"))) return;
+      require("./services/jobHeartbeats").beat("meeting-reminders");
       try {
         const { db } = require("./config/firebaseAdmin");
         const { sendPushToEmployees } = require("./services/fcmPush.service");
@@ -3133,6 +3170,41 @@ server.listen(PORT, () => {
     5 * 60 * 1000,
   );
 
+  // ── Developer side: anomaly scan + job-overdue check ─────────────────────
+  // The scan interval is itself a live setting; the timer fires every minute
+  // and the service decides whether it is due, so a changed interval applies
+  // without a restart. Both are best-effort: monitoring must never crash the
+  // process it monitors.
+  let _lastAnomalyScanAt = 0;
+  setInterval(async () => {
+    try {
+      const { getSetting } = require("./services/devConfig");
+      const every = (await getSetting("anomaly.scanIntervalMinutes")) * 60 * 1000;
+      if (Date.now() - _lastAnomalyScanAt < every) return;
+      if (!(await require("./services/jobRegistry").isEnabled("anomaly-scan"))) return;
+      _lastAnomalyScanAt = Date.now();
+      const startedScan = Date.now();
+      const out = await require("./services/anomalyScan").scanChangeLogs();
+      require("./services/jobHeartbeats").beat("anomaly-scan", { durationMs: Date.now() - startedScan });
+      if (out.raised || out.reopened) {
+        console.log(`[anomaly-scan] raised ${out.raised}, reopened ${out.reopened}`);
+      }
+    } catch (e) {
+      require("./services/jobHeartbeats").beat("anomaly-scan", { error: e.message });
+      console.warn("[anomaly-scan]", e.message);
+    }
+  }, 60 * 1000);
+
+  setInterval(async () => {
+    try {
+      const { overdue, recovered } = await require("./services/jobHeartbeats").checkOverdue();
+      if (overdue.length) console.warn("[heartbeats] overdue:", overdue.join(", "));
+      if (recovered.length) console.log("[heartbeats] recovered:", recovered.join(", "));
+    } catch (e) {
+      console.warn("[heartbeats]", e.message);
+    }
+  }, 5 * 60 * 1000);
+
   let _timerSopLastRunDate = null;
   setInterval(
     async () => {
@@ -3144,7 +3216,9 @@ server.listen(PORT, () => {
           mm = nowIST.getUTCMinutes();
         const inWindow = hh === 0 && mm >= 15 && mm < 25;
         if (!inWindow || _timerSopLastRunDate === todayIST) return;
+        if (!(await require("./services/jobRegistry").isEnabled("timer-sop-finalize"))) return;
         _timerSopLastRunDate = todayIST;
+        require("./services/jobHeartbeats").beat("timer-sop-finalize");
         const {
           evaluateTimerSopForAllEmployees,
         } = require("./services/timerSop.service");

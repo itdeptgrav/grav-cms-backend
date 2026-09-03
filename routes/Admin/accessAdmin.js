@@ -23,9 +23,13 @@ const express = require("express");
 const router = express.Router();
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
+const mongoose = require("mongoose");
 
 const AccessDepartment = require("../../models/Access/AccessDepartment");
 const DeptUser = require("../../models/Access/DeptUser");
+/* The canonical department → legacy-collection map. Shared with the mirror
+   service so both agree on where a login actually lives. */
+const { DEPARTMENTS } = require("../../services/ensureAccessDepartments");
 const { recordChange, historyFor, recentFor } = require("../../services/changeLog");
 
 /* ------------------------------------------------------------------ */
@@ -346,6 +350,198 @@ router.delete("/departments/:id", async (req, res) => {
 /* ================================================================== */
 /* USERS                                                              */
 /* ================================================================== */
+
+/* ══════════════════════════════════════════════════════════════════════════
+   DEPARTMENT LOGINS — the accounts sign-in actually checks
+
+   WHY THIS EXISTS SEPARATELY FROM /users
+   -------------------------------------
+   `/users` lists `dept_users`, the new access table. `services/
+   ensureAccessDepartments` MIRRORS each legacy department login into it,
+   reusing the same _id — but the mirror is not the credential.
+   `routes/login.js` probes the legacy collections themselves
+   (hrdepartments, ceodepartments, …), so:
+
+     • an account can exist in a legacy collection with no mirror, and be
+       invisible in Access Control while still signing in — which is exactly
+       why the seeded defaults could not be found; and
+     • deleting the mirror alone would remove the row from this screen and
+       leave the login working, which is worse than not offering it.
+
+   So this reads the legacy collections directly, and removing an account
+   deletes BOTH — the credential and its mirror.
+
+   Read through the raw collection rather than the models: a model applies
+   schema defaults, and StoreDepartment defaults `role` to "production_manager"
+   while the stored rows say "store_manager". Same reasoning as the mirror
+   service, which is where that was first found out.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * GET /api/admin/department-logins — every account that can sign in, merged.
+ *
+ * ONE LIST, NOT TWO. The credential comes from the legacy collection and the
+ * management fields (`isAdmin`, department assignment, `mustChangePassword`)
+ * come from its `dept_users` mirror, joined on the shared `_id`. Returning them
+ * separately would have meant two screens showing overlapping sets of the same
+ * people, which is how an administrator ends up removing somebody in one place
+ * and finding them still able to sign in from the other.
+ *
+ * `mirrored: false` marks a credential with no access-table row. Those are the
+ * ones this screen could not see before, and the only thing that can be done to
+ * them is removal — the update and reset routes address the mirror, which is
+ * not there.
+ *
+ * ?includeInactive=true to include deactivated accounts.
+ */
+router.get("/department-logins", async (req, res) => {
+  try {
+    const conn = mongoose.connection;
+
+    const mirrors = await DeptUser.find({})
+      .select("_id email isAdmin isActive mustChangePassword departmentId")
+      .populate("departmentId", "name slug")
+      .lean();
+    const mirrorById = new Map(mirrors.map((m) => [String(m._id), m]));
+
+    const includeInactive = req.query.includeInactive === "true";
+    const out = [];
+
+    for (const dept of DEPARTMENTS) {
+      let rows = [];
+      try {
+        rows = await conn.collection(dept.legacyCollection).find({}).toArray();
+      } catch {
+        // Collection absent on this database — nothing to list.
+        continue;
+      }
+
+      for (const row of rows) {
+        const mirror = mirrorById.get(String(row._id));
+        /* The legacy row is the credential, so it decides whether the account
+           is live. The mirror can disagree, and when it does the credential
+           wins — it is the one login reads. */
+        const isActive = row.isActive !== false;
+        if (!isActive && !includeInactive) continue;
+
+        out.push({
+          _id: String(row._id),
+          collection: dept.legacyCollection,
+          departmentKey: dept.key,
+          departmentName: dept.name,
+          name: row.name || row.fullName || "",
+          email: row.email || "",
+          employeeId: row.employeeId || "",
+          role: row.role || dept.legacyUserType || "",
+          isActive,
+          lastLogin: row.lastLogin || row.lastLoginAt || null,
+          createdAt: row.createdAt || null,
+
+          // From the mirror — absent when there is none.
+          mirrored: Boolean(mirror),
+          isAdmin: Boolean(mirror?.isAdmin),
+          mustChangePassword: Boolean(mirror?.mustChangePassword),
+          departmentId: mirror?.departmentId || null,
+        });
+      }
+    }
+
+    out.sort(
+      (a, b) =>
+        a.departmentName.localeCompare(b.departmentName) ||
+        String(a.name).localeCompare(String(b.name)),
+    );
+
+    res.json({ success: true, logins: out, users: out, count: out.length });
+  } catch (error) {
+    console.error("[access-admin] list department logins:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/**
+ * DELETE /api/admin/department-logins/:collection/:id
+ *
+ * Removes the credential and its mirror, so the account genuinely stops being
+ * able to sign in. There is no soft-delete here on purpose: deactivating is
+ * already available on the row itself, and somebody asking to REMOVE a seeded
+ * default wants it gone rather than dormant.
+ *
+ * Two refusals, both about not locking everybody out:
+ *   • you cannot remove the account you are signed in as
+ *   • you cannot remove the last active administrator
+ */
+router.delete("/department-logins/:collection/:id", async (req, res) => {
+  try {
+    const { collection, id } = req.params;
+
+    const dept = DEPARTMENTS.find((d) => d.legacyCollection === collection);
+    if (!dept) return fail(res, 404, "No such department collection");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return fail(res, 400, "That is not a valid account id");
+    }
+
+    const oid = new mongoose.Types.ObjectId(id);
+    const conn = mongoose.connection;
+    const row = await conn.collection(collection).findOne({ _id: oid });
+    if (!row) return fail(res, 404, "That account no longer exists");
+
+    if (String(req.admin?._id || req.admin?.id) === String(id)) {
+      return fail(res, 400, "You cannot remove the account you are signed in with.");
+    }
+
+    /* The mirror is what carries `isAdmin`, and Access Control is reachable
+       only by an admin — so the last-admin check reads dept_users, not the
+       legacy row. Removing the final one would leave this screen unreachable
+       by anybody, with no way back in now that nothing is seeded at boot. */
+    const mirror = await DeptUser.findById(oid).select("isAdmin isActive email").lean();
+    if (mirror?.isAdmin) {
+      const admins = await DeptUser.countDocuments({ isAdmin: true, isActive: true });
+      if (admins <= 1) {
+        return fail(
+          res,
+          400,
+          "This is the last administrator. Make somebody else an administrator " +
+            "first, or nobody will be able to reach Access Control.",
+        );
+      }
+    }
+
+    await conn.collection(collection).deleteOne({ _id: oid });
+    const mirrorDeleted = (await DeptUser.deleteOne({ _id: oid })).deletedCount > 0;
+
+    audit(req, "department-login.remove", row.email || String(id));
+
+    await recordChange(req, {
+      departmentSlug: "access",
+      section: "hr:access",
+      entity: "department-login",
+      entityId: String(id),
+      entityLabel: `${row.name || row.email || id} (${dept.name})`,
+      action: "delete",
+      summary:
+        `Removed the ${dept.name} login for ${row.email || row.name || id}. ` +
+        `The credential itself is gone, so this account can no longer sign in` +
+        (mirrorDeleted ? ", and its Access Control entry was removed with it." : "."),
+      before: {
+        email: row.email,
+        name: row.name,
+        role: row.role,
+        employeeId: row.employeeId,
+        department: dept.name,
+      },
+    });
+
+    res.json({
+      success: true,
+      mirrorDeleted,
+      message: `${row.email || row.name || "That account"} can no longer sign in.`,
+    });
+  } catch (error) {
+    console.error("[access-admin] remove department login:", error);
+    fail(res, 500, error.message);
+  }
+});
 
 /** GET /api/admin/users?departmentId=&search=&includeInactive= */
 router.get("/users", async (req, res) => {
@@ -1101,6 +1297,9 @@ const {
   findAccountantUser,
   setAccountantRole,
   resetAccountantPassword,
+  setAccountantPassword,
+  getAccountantNavPrefs,
+  setAccountantNavPrefs,
   revokeAccountantRole,
   deleteAccountantUser,
 } = require("../../services/accountantAccess");
@@ -1313,8 +1512,13 @@ router.get("/accountant-role/:email", async (req, res) => {
 /**
  * POST /api/admin/accountant-users/:email/set-password
  *
- * Only for accounting-only users. The service refuses employees, because their
- * password lives on the HR record and that is what login actually checks.
+ * Works for everybody with an accounting role, employee or not.
+ *
+ * It used to refuse employees, on the reasoning that their password lives on
+ * the HR record and that is what login checks. That is only half true: the CMS
+ * login checks Employee.password, the books login checks Acc_User.password, so
+ * such a person has TWO passwords and refusing the reset just moved the
+ * surprise. The service now writes both — see setAccountantPassword.
  */
 router.post("/accountant-users/:email/set-password", async (req, res) => {
   try {
@@ -1323,12 +1527,56 @@ router.post("/accountant-users/:email/set-password", async (req, res) => {
       return fail(res, 400, "The password must be at least 8 characters");
     }
 
-    await resetAccountantPassword(req.params.email, password);
+    const { employeeUpdated } = await setAccountantPassword(
+      req.params.email,
+      password,
+    );
     audit(req, "accountant.set-password", req.params.email);
 
     res.json({
       success: true,
-      message: `Password updated for ${req.params.email}. Their open sessions were ended.`,
+      employeeUpdated,
+      message:
+        `Password updated for ${req.params.email}. Their open sessions were ended.` +
+        (employeeUpdated
+          ? " They are also an employee, so their CMS sign-in now uses the same password."
+          : ""),
+    });
+  } catch (error) {
+    fail(res, 400, error.message);
+  }
+});
+
+/**
+ * GET / PUT /api/admin/accountant-users/:email/nav-prefs
+ *
+ * The same "Sidebar access" the accountant Team page offers. Access Control had
+ * no equivalent, so the two screens managed the same people with different
+ * powers — which is the drift this whole file exists to avoid. Both now call
+ * the same helpers in services/accountantAccess.
+ */
+router.get("/accountant-users/:email/nav-prefs", async (req, res) => {
+  try {
+    res.json({ success: true, ...(await getAccountantNavPrefs(req.params.email)) });
+  } catch (error) {
+    fail(res, 404, error.message);
+  }
+});
+
+router.put("/accountant-users/:email/nav-prefs", async (req, res) => {
+  try {
+    const { hiddenNavItems } = req.body || {};
+    if (!Array.isArray(hiddenNavItems)) {
+      return fail(res, 400, "hiddenNavItems must be an array of paths");
+    }
+
+    const saved = await setAccountantNavPrefs(req.params.email, hiddenNavItems);
+    audit(req, "accountant.nav-prefs", req.params.email);
+
+    res.json({
+      success: true,
+      hiddenNavItems: saved?.hiddenNavItems || [],
+      message: `Sidebar updated for ${req.params.email}. They see it on their next page load.`,
     });
   } catch (error) {
     fail(res, 400, error.message);

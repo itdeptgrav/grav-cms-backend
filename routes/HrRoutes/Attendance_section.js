@@ -5,6 +5,22 @@ const cron = require("node-cron");
 const router = express.Router();
 const ExcelJS = require("exceljs");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+
+/* What an attendance read needs from an employee record — and, more to the
+   point, what it does NOT. A full record is ~18 KB: the encrypted salary
+   block, uploaded documents, bank details, custom fields, SOP points, a
+   photo. Attendance uses none of it, and the daily table and the summary
+   load EVERY active employee — so each call carried ~2 MB of payroll and
+   paperwork through the heap for nothing. Thirty-one such calls at once
+   (the month grid) is what pushed the process past its ~256 MB heap on
+   3 Sep 2026 (exit 134, "JavaScript heap out of memory").
+
+   Exclusion rather than inclusion, so a field this router does read is never
+   dropped by omission; only the known-heavy, known-irrelevant ones go. */
+const ATTENDANCE_EMPLOYEE_PROJECTION =
+  "-salary -salaryCustomFields -documents -additionalDocs -bankDetails " +
+  "-sopPoints -profilePhoto -photo -personalCustomFields -workCustomFields " +
+  "-documentCustomFields -addressCustomFields -password -fcmToken -pushToken";
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 const { resolveShift } = require("../../services/shiftPolicy");
 const Employee = require("../../models/Employee");
@@ -530,7 +546,9 @@ async function buildEmployeeMap() {
       { status: { $exists: false } },
       { isActive: true },
     ],
-  }).lean();
+  })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
   const byBiometric = new Map(),
     byName = new Map(),
     bySorted = new Map();
@@ -623,6 +641,47 @@ function getAttendanceValue(status) {
   if (status === "P/LWP") return 0.5;
   if (status === "P/CL" || status === "P/SL" || status === "P/PL") return 1;
   return 1;
+}
+
+/**
+ * A NATIONAL holiday is a national holiday for everyone.
+ *
+ * The device does not know it is a holiday. Somebody who came in on
+ * Independence Day and left after four hours was classified from their punches
+ * like any other day and stored as HD — a half-day deduction on a day the
+ * company owes them in full. On 15 Aug 2026 that happened to all 59 people who
+ * punched; not one was stored as NH.
+ *
+ * So on a national holiday the status is NH regardless of punching, and NH is
+ * a paid day in payroll. The punches are NOT thrown away: rawPunches, the
+ * in/out times, netWorkMins and otMins all stay on the row, and
+ * `punchedOnHoliday` says so, so HR can see who genuinely worked and grant a
+ * comp-off by hand. What is cleared is everything that only means something
+ * against a shift — late, early-out, missed-punch — because no shift applies,
+ * and a "late" on a holiday must never count toward the late-day ladder.
+ *
+ * Only NATIONAL. Company/optional/restricted holidays keep their existing
+ * behaviour; the instruction was specific and the statutory position is too.
+ *
+ * `hrFinalStatus` is untouched: an HR decision on the day still wins, and the
+ * resync merge preserves it before this ever runs.
+ */
+function applyNationalHolidayRule(entry, restDayStatus) {
+  if (restDayStatus !== "NH" || !entry) return entry;
+  const punched = (entry.punchCount || 0) > 0 || !!entry.inTime;
+  return {
+    ...entry,
+    systemPrediction: "NH",
+    attendanceValue: getAttendanceValue(entry.hrFinalStatus || "NH"),
+    punchedOnHoliday: punched,
+    isLate: false,
+    lateMins: 0,
+    lateDisplay: "",
+    isEarlyDeparture: false,
+    earlyDepartureMins: 0,
+    hasMissPunch: false,
+    missingPunchType: null,
+  };
 }
 
 function computeDay(
@@ -886,7 +945,7 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     else if (earlyDepartureMins > 0) systemPrediction = "P~";
     else systemPrediction = "P";
   }
-  return {
+  const merged = {
     employeeDbId: fresh.employeeDbId,
     biometricId: fresh.biometricId,
     numericId: fresh.numericId,
@@ -935,6 +994,14 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     // silently blanked the reviewer's name off the record.
     hrReviewedBy: existing.hrReviewedBy || null,
   };
+  /* The recompute above classified the merged punches against the shift, as
+     it must on a working day. On a national holiday the fresh row arrived
+     already marked NH by the sync; that must survive the merge, or a resync of
+     a day with one manual punch would turn NH back into HD. */
+  return applyNationalHolidayRule(
+    merged,
+    fresh.systemPrediction === "NH" ? "NH" : null,
+  );
 }
 
 async function smartSaveDay(
@@ -1130,27 +1197,35 @@ async function syncDay(dateStr, empCode = "ALL") {
       extraGrace,
       isToday,
     );
-    employees.push({
-      employeeDbId,
-      biometricId: g.biometricId,
-      numericId,
-      identityId,
-      employeeName,
-      department,
-      designation,
-      employeeType,
-      isGhost: g.isGhost,
-      matchMethod: g.method,
-      providerName: g.providerName,
-      ...computed,
-      lateDisplay: computed.lateDisplay || "",
-      attendanceValue:
-        computed.attendanceValue ??
-        getAttendanceValue(computed.systemPrediction),
-      missingPunchType: computed.missingPunchType || null,
-      shiftStart: shift.start,
-      shiftEnd: shift.end,
-    });
+    employees.push(
+      /* A punched row on a national holiday is still NH — see the rule. The
+         holiday-injected rows below never reach here; this is for the people
+         who actually came in. */
+      applyNationalHolidayRule(
+        {
+          employeeDbId,
+          biometricId: g.biometricId,
+          numericId,
+          identityId,
+          employeeName,
+          department,
+          designation,
+          employeeType,
+          isGhost: g.isGhost,
+          matchMethod: g.method,
+          providerName: g.providerName,
+          ...computed,
+          lateDisplay: computed.lateDisplay || "",
+          attendanceValue:
+            computed.attendanceValue ??
+            getAttendanceValue(computed.systemPrediction),
+          missingPunchType: computed.missingPunchType || null,
+          shiftStart: shift.start,
+          shiftEnd: shift.end,
+        },
+        restDayStatus,
+      ),
+    );
     seenBiometricIds.add(g.biometricId);
   }
   if (restDayStatus) {
@@ -1446,27 +1521,35 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       extraGrace,
       isToday,
     );
-    employees.push({
-      employeeDbId,
-      biometricId: g.biometricId,
-      numericId,
-      identityId,
-      employeeName,
-      department,
-      designation,
-      employeeType,
-      isGhost: g.isGhost,
-      matchMethod: g.method,
-      providerName: g.providerName,
-      ...computed,
-      lateDisplay: computed.lateDisplay || "",
-      attendanceValue:
-        computed.attendanceValue ??
-        getAttendanceValue(computed.systemPrediction),
-      missingPunchType: computed.missingPunchType || null,
-      shiftStart: shift.start,
-      shiftEnd: shift.end,
-    });
+    employees.push(
+      /* A punched row on a national holiday is still NH — see the rule. The
+         holiday-injected rows below never reach here; this is for the people
+         who actually came in. */
+      applyNationalHolidayRule(
+        {
+          employeeDbId,
+          biometricId: g.biometricId,
+          numericId,
+          identityId,
+          employeeName,
+          department,
+          designation,
+          employeeType,
+          isGhost: g.isGhost,
+          matchMethod: g.method,
+          providerName: g.providerName,
+          ...computed,
+          lateDisplay: computed.lateDisplay || "",
+          attendanceValue:
+            computed.attendanceValue ??
+            getAttendanceValue(computed.systemPrediction),
+          missingPunchType: computed.missingPunchType || null,
+          shiftStart: shift.start,
+          shiftEnd: shift.end,
+        },
+        restDayStatus,
+      ),
+    );
     seenBids.add(g.biometricId);
   }
   if (restDayStatus) {
@@ -1980,7 +2063,23 @@ async function applyRegularizationToAttendance(r, actor = {}) {
   // has injected missing employee rows since it was written.
   let dayDoc = await DailyAttendance.findOne({ dateStr: r.dateStr });
   if (!dayDoc) {
-    dayDoc = new DailyAttendance({ dateStr: r.dateStr, employees: [] });
+    /* `date` and `yearMonth` are REQUIRED on this schema, and creating the day
+       with only `dateStr` failed validation on save() — which the approval
+       route caught as a generic "apply_failed". So the one case this branch
+       exists for, a day the device never recorded at all, was also the one case
+       that could never be applied: the request was approved, the attendance was
+       not changed, and the reason was thrown away.
+
+       Both are derived from dateStr rather than from the clock: the day being
+       corrected is not necessarily today, and a row stamped with today's date
+       would sort and group under the wrong month. Midnight IST, matching every
+       other date this module writes. */
+    dayDoc = new DailyAttendance({
+      dateStr: r.dateStr,
+      date: new Date(`${r.dateStr}T00:00:00.000+05:30`),
+      yearMonth: String(r.dateStr).slice(0, 7),
+      employees: [],
+    });
   }
 
   let idx = (dayDoc.employees || []).findIndex((e) => e.biometricId === bid);
@@ -2332,32 +2431,54 @@ async function applyApprovedLeavesForDate(dateStr) {
 // Returns { promotedStatus: "HD"|"AB"|null, promoted: bool }
 // ─────────────────────────────────────────────────────────────────────────────
 function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
-  if (!policy?.enabled || entry.hrFinalStatus || dateStr === todayStr)
-    return { promotedStatus: null, promoted: false };
+  const none = { promotedStatus: null, promoted: false };
+  if (!policy?.enabled) return none;
   const lateHDOn = policy.lateHDOnCount ?? 3;
   const lateFullDayOn = policy.lateFullDayOnCount ?? 5;
   const earlyHDOn = policy.earlyOutHDOnCount ?? 3;
   const earlyFullDayOn = policy.earlyOutFullDayOnCount ?? 5;
-  if (entry.isLate && entry.systemPrediction === "P*") {
+
+  /* WHAT COUNTS IS THE RAW LATENESS, NOT WHAT HR DECIDED ABOUT THE DAY.
+     This used to return before incrementing whenever HR had overridden the
+     day. So when HR pardoned somebody's 3rd late by marking it Present, that
+     day vanished from the streak and the NEXT late inherited its position —
+     the 4th late became "the 3rd" and was docked a half day. The pardon
+     moved the penalty instead of removing it.
+
+     A pardon forgives the deduction on that day. It does not un-late the day.
+     So the count always advances on a raw late; only the PROMOTION is
+     withheld when HR has already ruled on the day, or the day is still today
+     and not yet over. */
+  const rawLate =
+    !!entry.isLate && ["P*", "LHD", "LAB"].includes(entry.systemPrediction);
+  const rawEarly =
+    !rawLate &&
+    !!entry.isEarlyDeparture &&
+    ["P~", "EAB"].includes(entry.systemPrediction);
+  const mayPromote = !entry.hrFinalStatus && dateStr !== todayStr;
+
+  if (rawLate) {
     state.lateCount++;
     if (state.lateCount >= lateFullDayOn) {
       state.lateCount = 0;
-      return { promotedStatus: "LAB", promoted: true };
+      return mayPromote ? { promotedStatus: "LAB", promoted: true } : none;
     }
     if (state.lateCount === lateHDOn) {
-      return { promotedStatus: "LHD", promoted: true };
-    } // no reset — count continues to AB
-  } else if (entry.isEarlyDeparture && entry.systemPrediction === "P~") {
+      return mayPromote ? { promotedStatus: "LHD", promoted: true } : none;
+    }
+    return none; // 4th (and any other in-between) late: counted, not docked
+  }
+  if (rawEarly) {
     state.earlyCount++;
     if (state.earlyCount >= earlyFullDayOn) {
       state.earlyCount = 0;
-      return { promotedStatus: "EAB", promoted: true };
+      return mayPromote ? { promotedStatus: "EAB", promoted: true } : none;
     }
     if (state.earlyCount === earlyHDOn) {
-      return { promotedStatus: "HD", promoted: true };
-    } // no reset — count continues to AB
+      return mayPromote ? { promotedStatus: "HD", promoted: true } : none;
+    }
   }
-  return { promotedStatus: null, promoted: false };
+  return none;
 }
 
 async function applyMonthlyLatePromotion(dayDoc, settings) {
@@ -2514,7 +2635,9 @@ async function getDailyAttendance(date, department) {
           { status: { $exists: false } },
           { isActive: true },
         ],
-      }).lean();
+      })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
       const presentBids = new Set(
         (dayDoc.employees || []).map((e) => e.biometricId),
       );
@@ -2985,7 +3108,9 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const settings = await AttendanceSettings.getConfig();
     const _n = new Date(Date.now() + 330 * 60 * 1000);
     const todayStr = `${_n.getUTCFullYear()}-${String(_n.getUTCMonth() + 1).padStart(2, "0")}-${String(_n.getUTCDate()).padStart(2, "0")}`;
@@ -3648,6 +3773,105 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 // 2. PUT /day-override
 // ─────────────────────────────────────────────────────────────────────────────
 
+/* ── The period sync is a JOB, not a request ───────────────────────────────
+ *
+ * It used to loop every day of the range inside one HTTP request. A month is
+ * thirty device fetches, thirty classifications and thirty 70 KB document
+ * writes — several minutes — and the proxy in front of the API (Cloudflare,
+ * then Render) closes a response that has not started after ~100 seconds.
+ * The page saw "Sync error", the server carried on syncing, and the person
+ * clicked Sync again, which started a SECOND loop over the same days on top
+ * of the first. Fourteen days of the bandwidth tracker held no completed
+ * /sync-period at all: not one ever finished from the browser's point of view.
+ *
+ * Now the POST starts the work and waits a short while for it. A single day
+ * or a small range finishes inside that wait and is answered exactly as
+ * before. Anything longer is answered 202 with a job id and the page polls
+ * GET /sync-period/:jobId for progress. A click while the same range is
+ * already running joins that job instead of starting another.
+ *
+ * Jobs live in process memory — a restart forgets them, and the page then
+ * says so and offers the button again. That is the right failure: a sync is
+ * idempotent and re-runnable, and a durable job table for it is more machine
+ * than the problem needs.
+ */
+const syncJobs = new Map();
+const SYNC_JOB_TTL_MS = 30 * 60 * 1000;
+const SYNC_INLINE_WAIT_MS = 15 * 1000;
+
+function pruneSyncJobs() {
+  const cutoff = Date.now() - SYNC_JOB_TTL_MS;
+  for (const [id, job] of syncJobs) {
+    if (job.finishedAt && job.finishedAt < cutoff) syncJobs.delete(id);
+  }
+}
+
+function aggregateSyncResults(results) {
+  return results.reduce(
+    (a, r) => ({
+      daysSynced: a.daysSynced + (r.error ? 0 : 1),
+      daysFailed: a.daysFailed + (r.error ? 1 : 0),
+      daysSkipped: a.daysSkipped + (r.skipped ? 1 : 0),
+      totalFetched: a.totalFetched + (r.fetched || 0),
+      totalEmployees: Math.max(a.totalEmployees, r.employees || 0),
+      totalGhosts: a.totalGhosts + (r.ghostCount || 0),
+    }),
+    { daysSynced: 0, daysFailed: 0, daysSkipped: 0, totalFetched: 0, totalEmployees: 0, totalGhosts: 0 },
+  );
+}
+
+/** What the page is told, for a running or a finished job. */
+function syncJobView(job, { withDetails = false } = {}) {
+  const agg = aggregateSyncResults(job.results);
+  const done = Boolean(job.finishedAt);
+  return {
+    success: true,
+    jobId: job.id,
+    pending: !done,
+    done,
+    range: job.range,
+    total: job.total,
+    completed: job.results.length,
+    current: done ? null : job.current,
+    ...agg,
+    message: done
+      ? `Synced ${agg.daysSynced}/${job.total} days (${agg.daysSkipped} skipped as complete)`
+      : `Syncing ${job.results.length}/${job.total} days…`,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt || null,
+    ...(withDetails || done ? { details: job.results } : {}),
+  };
+}
+
+function startSyncJob({ from, to, datesToSync, force }) {
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id,
+    key: `${from}..${to}|${force ? "force" : "soft"}`,
+    range: { from, to },
+    total: datesToSync.length,
+    results: [],
+    current: null,
+    startedAt: new Date(),
+    finishedAt: null,
+  };
+  job.promise = (async () => {
+    for (const dateStr of datesToSync) {
+      job.current = dateStr;
+      try {
+        job.results.push(force ? await syncDayForce(dateStr) : await syncDay(dateStr));
+      } catch (e) {
+        console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack);
+        job.results.push({ dateStr, error: e.message });
+      }
+    }
+    job.current = null;
+    job.finishedAt = new Date();
+  })();
+  syncJobs.set(id, job);
+  return job;
+}
+
 router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { from, to, onlyMissing = false, force = false } = req.body;
@@ -3669,49 +3893,47 @@ router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
     } else {
       datesToSync = allDaysInRange(from, actualTo);
     }
-    console.log(
-      `[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing} force=${force})`,
-    );
-    const results = [];
-    for (const dateStr of datesToSync) {
-      try {
-        results.push(
-          force ? await syncDayForce(dateStr) : await syncDay(dateStr),
-        );
-      } catch (e) {
-        console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack);
-        results.push({ dateStr, error: e.message });
-      }
+
+    pruneSyncJobs();
+
+    /* The same range is already being synced: join it. This is the double
+       click after a cut-off response, and it used to double the work. */
+    const key = `${from}..${actualTo}|${force ? "force" : "soft"}`;
+    let job = [...syncJobs.values()].find((j) => j.key === key && !j.finishedAt);
+    if (!job) {
+      console.log(
+        `[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing} force=${force})`,
+      );
+      job = startSyncJob({ from, to: actualTo, datesToSync, force });
     }
-    const aggregate = results.reduce(
-      (a, r) => ({
-        daysSynced: a.daysSynced + (r.error ? 0 : 1),
-        daysFailed: a.daysFailed + (r.error ? 1 : 0),
-        daysSkipped: a.daysSkipped + (r.skipped ? 1 : 0),
-        totalFetched: a.totalFetched + (r.fetched || 0),
-        totalEmployees: Math.max(a.totalEmployees, r.employees || 0),
-        totalGhosts: a.totalGhosts + (r.ghostCount || 0),
-      }),
-      {
-        daysSynced: 0,
-        daysFailed: 0,
-        daysSkipped: 0,
-        totalFetched: 0,
-        totalEmployees: 0,
-        totalGhosts: 0,
-      },
-    );
-    res.json({
-      success: true,
-      message: `Synced ${aggregate.daysSynced}/${datesToSync.length} days (${aggregate.daysSkipped} skipped as complete)`,
-      range: { from, to: actualTo },
-      ...aggregate,
-      details: results,
-    });
+
+    /* Wait a little: a day or a week finishes here and is answered as it
+       always was. A month does not, and is answered 202 with the job. */
+    await Promise.race([
+      job.promise,
+      new Promise((resolve) => setTimeout(resolve, SYNC_INLINE_WAIT_MS)),
+    ]);
+
+    if (job.finishedAt) return res.json(syncJobView(job, { withDetails: true }));
+    return res.status(202).json(syncJobView(job));
   } catch (err) {
     console.error("[SYNC-PERIOD]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
+});
+
+/** Progress of one sync job, for the page to poll. */
+router.get("/sync-period/:jobId", EmployeeAuthMiddlewear, (req, res) => {
+  pruneSyncJobs();
+  const job = syncJobs.get(String(req.params.jobId || ""));
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      code: "SYNC_JOB_UNKNOWN",
+      message: "That sync is no longer tracked — the server may have restarted. Run it again; a sync is safe to repeat.",
+    });
+  }
+  res.json(syncJobView(job));
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4689,7 +4911,9 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -5124,7 +5348,9 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -6063,7 +6289,9 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -6210,8 +6438,15 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
               row.totals.NHFH++;
             }
           } else {
-            sheetCode = didPunch ? "P" : toSheetCode(hs);
-            if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+            /* A national holiday is NH on the sheet whether or not they
+               punched — same rule as the attendance record itself. Other
+               holiday types keep the older "punched = P" behaviour. */
+            const nationalWins = hs === "NH";
+            sheetCode = didPunch && !nationalWins ? "P" : toSheetCode(hs);
+            if (
+              nationalWins ||
+              (["FH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+            )
               row.totals.NHFH++;
             else if (didPunch) row.totals.P++;
             if (
@@ -7178,7 +7413,9 @@ router.get("/employees-list", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const list = emps
       .filter((e) => extractBiometricId(e))
       .map((e) => ({
@@ -7209,7 +7446,9 @@ router.get(
           { status: { $exists: false } },
           { isActive: true },
         ],
-      }).lean();
+      })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
       const byDepartment = {},
         allDepartments = new Set(),
         allDesignations = new Set();
@@ -8587,6 +8826,11 @@ module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
 module.exports.syncDay = syncDay;
 module.exports.syncDayForce = syncDayForce;
+// The two attendance rules, exported so they can be verified without a device
+// or an HTTP server: verifyAttendanceRules.js replays real stored days through
+// them.
+module.exports.applyLateCountPromotion = applyLateCountPromotion;
+module.exports.applyNationalHolidayRule = applyNationalHolidayRule;
 // The employee-field extractors. Employee documents are inconsistent — names
 // live at the top level on some records and under basicInfo/personalInfo on
 // others — and these are the versions hardened against every shape in the

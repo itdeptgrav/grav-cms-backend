@@ -5,9 +5,11 @@ const mongoose = require("mongoose");
 
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
 const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
+const { employerPfCosts } = require("../../services/salaryFormula");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 // Push notifications — single fan-out to mobile (Expo) + web (FCM).
 // Fire-and-forget: never awaited, never able to fail the payroll request.
 const { notifyPayslipPublished } = require("../../utils/notifyEmployee");
@@ -183,8 +185,32 @@ function computeEmployeePayroll(employee, ctx) {
     attendanceByDate,
     leaveBalance,
     leaveConfig,
+    latePolicy,
   } = ctx;
   const daysInMonth = new Date(year, month, 0).getDate();
+
+  /* THE LATE LADDER, REPLAYED — because it is never stored.
+     ------------------------------------------------------------------
+     A 3rd late is a half day and a 5th a full absence, and the attendance
+     screens show exactly that. But those codes (LHD, LAB, EAB) are derived at
+     read time by replaying the month; the stored systemPrediction stays "P*".
+     Payroll read the stored value, so it saw "P*" — a paid present day — on
+     the very days the screen showed docked. The ladder had never reached pay.
+
+     Same function, same policy, same order as the screens, so the payslip
+     cannot disagree with the timecard. An HR override on a day is honoured
+     first, exactly as everywhere else. */
+  const promotedByDate = new Map();
+  if (latePolicy?.enabled && attendanceByDate?.size) {
+    const { applyLateCountPromotion } = require("./Attendance_section");
+    const _ist = new Date(Date.now() + 330 * 60 * 1000);
+    const todayStr = `${_ist.getUTCFullYear()}-${String(_ist.getUTCMonth() + 1).padStart(2, "0")}-${String(_ist.getUTCDate()).padStart(2, "0")}`;
+    const state = { lateCount: 0, earlyCount: 0 };
+    for (const [ds, e] of [...attendanceByDate.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const { promotedStatus } = applyLateCountPromotion(e, state, latePolicy, ds, todayStr);
+      if (promotedStatus) promotedByDate.set(ds, promotedStatus);
+    }
+  }
 
   const firstActiveDay = firstActiveDayOfMonth(
     employee.dateOfJoining,
@@ -282,7 +308,11 @@ function computeEmployeePayroll(employee, ctx) {
     let note = "";
 
     if (entry) {
-      const rawStatus = entry.hrFinalStatus || entry.systemPrediction || "AB";
+      const rawStatus =
+        entry.hrFinalStatus ||
+        promotedByDate.get(dateStr) ||
+        entry.systemPrediction ||
+        "AB";
       switch (rawStatus) {
         case "P":
         case "P*":
@@ -293,9 +323,18 @@ function computeEmployeePayroll(employee, ctx) {
           if (isDeclaredHoliday) stats.holidayWorkedDays++;
           break;
         case "HD":
+        /* Promoted by the late/early-out ladder. Same pay weight as HD; the
+           separate code is kept on the day so the payslip can say WHY. */
+        case "LHD":
           category = "HD";
           paid = true;
           lopWeight = 0.5;
+          break;
+        case "LAB":
+        case "EAB":
+          category = "AB";
+          lopWeight = 1;
+          note = rawStatus === "LAB" ? "5th late this month" : "5th early-out this month";
           break;
         case "MP":
           if (settings.mpTreatment === "absent") {
@@ -446,7 +485,11 @@ function computeEmployeePayroll(employee, ctx) {
       isDeclaredHoliday,
       isSundayOff,
       isWorkingSunday,
-      rawStatus: entry?.hrFinalStatus || entry?.systemPrediction || null,
+      rawStatus:
+        entry?.hrFinalStatus ||
+        promotedByDate.get(dateStr) ||
+        entry?.systemPrediction ||
+        null,
       netWorkMins: entry?.netWorkMins || 0,
       otMins: entry?.otMins || 0,
       lateMins: entry?.lateMins || 0,
@@ -630,6 +673,40 @@ function computeEmployeePayroll(employee, ctx) {
   const roomForOther = Math.max(0, grossEarned - epf - esic - pt);
   const otherDeduction = Math.min(rawOtherDeduction, roomForOther);
 
+  const foodAllowanceFull = Number(employee.salary?.foodAllowanceFull ?? employee.salary?.foodAllowance ?? 0);
+  /* FOOD ALLOWANCE FOR THIS MONTH.
+     ------------------------------------------------------------------
+     It is not paid through the salary register — it never enters gross, net or
+     the payslip — but it IS part of what the month costs the company, so the
+     CTC for a month has to move with the month rather than repeating the
+     contracted figure regardless.
+
+     Two things move it:
+
+       1. DAYS. The allowance is for being at work, so it is prorated on the
+          same payable days the gross is. Half a month present is half the
+          allowance.
+       2. THE OTHER DEDUCTION. What HR enters there is what the employee has
+          already taken against it, so it comes off. Enter 764 and the month's
+          allowance is 764 lower.
+
+     The CHARGED deduction is used, not the raw one: an amount that could not
+     be collected from pay was not collected, and taking it off the allowance
+     as well would count it twice.
+
+     Floored at zero. A deduction larger than the allowance leaves nothing, and
+     a negative allowance would subtract from the CTC as if the employee were
+     paying the company to employ them. */
+  const foodAllowanceEarned = isIntern
+    ? 0
+    : Math.max(
+        0,
+        roundMoney(
+          (foodAllowanceFull * chargeableDays) / Math.max(1, divisor),
+          settings.roundingMode,
+        ) - otherDeduction,
+      );
+
   const totalDeductions = epf + esic + pt + otherDeduction;
   const netPay = grossEarned - totalDeductions;
   const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
@@ -740,6 +817,11 @@ function computeEmployeePayroll(employee, ctx) {
     otherDeductionUncollected: +(rawOtherDeduction - otherDeduction).toFixed(2),
     otherDeductionChargeableDays: +chargeableDays.toFixed(2),
 
+    /* Deliberately OUTSIDE `earnings`: the salary register must not pay it.
+       `Full` is the contracted figure, `Earned` is what this month costs. */
+    foodAllowanceFull,
+    foodAllowanceEarned,
+
     payableDays: +payableDays.toFixed(2),
     effectivePayableDays: +effectivePayableDays.toFixed(2),
     sundayExtraPayDays,
@@ -768,6 +850,10 @@ function computeEmployeePayroll(employee, ctx) {
       employerPF: epf,
       esic: esic,
       employerESIC: erEsic,
+      /* The same source the employee record uses, so a run cannot
+         disagree with the contract it is paying against. An intern
+         has no Basic, and so has neither. */
+      ...employerPfCosts(isIntern ? 0 : basicEarned, salaryCfg),
       professionalTax: pt,
       incomeTax: 0,
       loanDeduction: 0,
@@ -807,7 +893,7 @@ async function loadMonthContext(month, year) {
       ? LeaveConfig.getConfig().catch(() => null)
       : Promise.resolve(null);
 
-  const [settings, salaryCfg, dayDocs, holidays, leaveConfig] =
+  const [settings, salaryCfg, dayDocs, holidays, leaveConfig, attendanceSettings] =
     await Promise.all([
       PayrollSettings.getConfig(),
       SalaryConfig.getSingleton(),
@@ -819,6 +905,11 @@ async function loadMonthContext(month, year) {
         },
       }).lean(),
       leaveConfigP,
+      /* The late/early-out ladder. Payroll has to replay it — see
+         computeEmployeePayroll — and a payroll that read a different policy
+         from the one the attendance screens use would dock a day the screen
+         did not show. */
+      AttendanceSettings.getConfig().catch(() => null),
     ]);
 
   const holidayMap = new Map(holidays.map((h) => [h.date, h]));
@@ -832,7 +923,14 @@ async function loadMonthContext(month, year) {
     }
   }
 
-  return { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig };
+  return {
+    settings,
+    salaryCfg,
+    holidayMap,
+    attendanceByEmp,
+    leaveConfig,
+    latePolicy: attendanceSettings?.lateHalfDayPolicy || null,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -858,7 +956,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid month" });
     }
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -887,6 +985,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balanceByEmpId.get(String(emp._id)) || null,
       };
       return computeEmployeePayroll(emp, ctx);
@@ -900,6 +999,9 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         totalNetPay: acc.totalNetPay + i.roundedNetPay,
         totalPF: acc.totalPF + i.deductions.providentFund,
         totalESIC: acc.totalESIC + i.deductions.esic,
+        totalEDLI: acc.totalEDLI + (i.deductions.edli || 0),
+        totalAdminCharges:
+          acc.totalAdminCharges + (i.deductions.adminCharges || 0),
         totalLOPDays: acc.totalLOPDays + i.lopDays,
         autoAdjustedCount:
           acc.autoAdjustedCount + (i.autoAdjustedCL > 0 ? 1 : 0),
@@ -912,6 +1014,8 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         totalNetPay: 0,
         totalPF: 0,
         totalESIC: 0,
+        totalEDLI: 0,
+        totalAdminCharges: 0,
         totalLOPDays: 0,
         autoAdjustedCount: 0,
         unsyncedCount: 0,
@@ -1019,9 +1123,11 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
           n: acc.n + (i.roundedNetPay || 0),
           pf: acc.pf + (i.deductions?.providentFund || 0),
           esi: acc.esi + (i.deductions?.esic || 0),
+          edli: acc.edli + (i.deductions?.edli || 0),
+          adm: acc.adm + (i.deductions?.adminCharges || 0),
           b: acc.b + (i.earnings?.bonus || 0),
         }),
-        { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+        { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0, edli: 0, adm: 0 },
       );
 
       existing.status = "processed";
@@ -1030,6 +1136,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       existing.totalDeductions = totals.d;
       existing.totalNetPay = totals.n;
       existing.totalPF = totals.pf;
+      existing.totalEDLI = totals.edli;
+      existing.totalAdminCharges = totals.adm;
       existing.totalESIC = totals.esi;
       existing.totalBonus = totals.b;
       existing.processedAt = new Date();
@@ -1056,7 +1164,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     // No draft exists → fall through to full recompute (first-time processing
     // straight from Preview without going through Save Draft).
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -1094,6 +1202,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet = 0,
       totalPF = 0,
       totalESIC = 0,
+      totalEDLI = 0,
+      totalAdminCharges = 0,
       totalBonus = 0;
     const clBalanceUpdates = [];
 
@@ -1108,6 +1218,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
       const computed = computeEmployeePayroll(emp, ctx);
@@ -1214,6 +1325,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet += computed.roundedNetPay;
       totalPF += computed.deductions.providentFund;
       totalESIC += computed.deductions.esic;
+      totalEDLI += computed.deductions.edli || 0;
+      totalAdminCharges += computed.deductions.adminCharges || 0;
       totalBonus += computed.earnings.bonus || 0;
     }
 
@@ -1230,6 +1343,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.totalNetPay = totalNet;
     payrollRun.totalPF = totalPF;
     payrollRun.totalESIC = totalESIC;
+    payrollRun.totalEDLI = totalEDLI;
+    payrollRun.totalAdminCharges = totalAdminCharges;
     payrollRun.totalBonus = totalBonus;
     payrollRun.status = "processed";
     payrollRun.processedAt = new Date();
@@ -1303,7 +1418,14 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
       ];
     }
 
+    /* WITHOUT THE DAY BREAKDOWN.
+       It is the per-day attendance detail behind one payslip — 93% of this
+       response by size (1.68 MB of 1.8 MB across 200 items) and read by exactly
+       one screen, the detail drawer, for one employee at a time. The drawer
+       fetches it from GET /item/:id when it opens, so the month list no longer
+       carries eighty-odd copies of a month of attendance nobody is looking at. */
     const items = await PayrollItem.find(filter)
+      .select("-dayBreakdown")
       .sort({ employeeName: 1 })
       .lean();
 
@@ -1577,6 +1699,10 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
       employerPF: epf,
       esic: esic,
       employerESIC: erEsic,
+      /* The same source the employee record uses, so a run cannot
+         disagree with the contract it is paying against. An intern
+         has no Basic, and so has neither. */
+      ...employerPfCosts(basicEarned, salaryCfg),
       professionalTax: pt,
       loanDeduction: loan,
       advanceDeduction: advance,
@@ -1734,6 +1860,7 @@ router.patch(
         holidayMap,
         attendanceByEmp,
         leaveConfig,
+        latePolicy,
       } = await loadMonthContext(item.month, item.year);
       const bid = (employee.biometricId || "").toUpperCase();
       const balance = await LeaveBalance.findOne({
@@ -1749,6 +1876,7 @@ router.patch(
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
 
@@ -1872,6 +2000,18 @@ router.patch(
       const roomForOther = Math.max(0, grossTotal - epf - esic - pt - loan - advance - otherManual);
       const otherRecurring = Math.min(rawOtherRecurring, roomForOther);
 
+      /* The same two adjustments as the first computation — see the note
+         there. `otherManual + otherRecurring` is everything actually charged
+         this month, which is what comes off the allowance. */
+      const foodAllowanceFull = Number(employee.salary?.foodAllowanceFull ?? employee.salary?.foodAllowance ?? 0);
+      const foodAllowanceEarned = isInternItem
+        ? 0
+        : Math.max(
+            0,
+            Math.round((foodAllowanceFull * otherChargeable) / Math.max(1, divisor)) -
+              (otherManual + otherRecurring),
+          );
+
       const totalDeductions =
         epf + esic + pt + loan + advance + otherManual + otherRecurring;
       const netPay = grossTotal - totalDeductions;
@@ -1905,6 +2045,8 @@ router.patch(
       item.otherDeductionRecurring = otherRecurring;
       item.otherDeductionUncollected = +(rawOtherRecurring - otherRecurring).toFixed(2);
       item.otherDeductionChargeableDays = +otherChargeable.toFixed(2);
+      item.foodAllowanceFull = foodAllowanceFull;
+      item.foodAllowanceEarned = foodAllowanceEarned;
 
       item.deductions = {
         ...(item.deductions || {}),
@@ -1912,6 +2054,10 @@ router.patch(
         employerPF: epf,
         esic: esic,
         employerESIC: erEsic,
+        /* The same source the employee record uses, so a run cannot
+           disagree with the contract it is paying against. An intern
+           has no Basic, and so has neither. */
+        ...employerPfCosts(isInternItem ? 0 : basicEarned, salaryCfg),
         professionalTax: pt,
         loanDeduction: loan,
         advanceDeduction: advance,
@@ -2423,9 +2569,11 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       },
     });
 
+    /* One per column, in order. Two were added for EDLI and PF admin; a short
+       list silently leaves the trailing columns at Excel's default width. */
     const COL_WIDTHS = [
       3, 12, 30, 20, 22, 13, 11, 11, 14, 10, 10, 13, 11, 11, 13, 11, 11, 11, 11,
-      11, 14, 13,
+      11, 10, 11, 14, 13,
     ];
     COL_WIDTHS.forEach((w, i) => {
       ws.getColumn(i + 1).width = w;
@@ -2522,8 +2670,12 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       { start: 6, end: 9, label: "Monthly CTC", bg: "FF1D4ED8" },
       { start: 10, end: 11, label: "Attendance", bg: "FF0E7490" },
       { start: 12, end: 15, label: "Earned This Month", bg: "FF166534" },
-      { start: 16, end: 21, label: "Deductions", bg: "FF9F1239" },
-      { start: 22, end: 22, label: "Net Salary", bg: "FF065F46" },
+      /* Widened by two: EDLI and PF admin charges sit with the other
+         employer-side figures (ESIEMPR, PFEMPR) rather than in their own
+         section, because that is what they are. Everything to the right of
+         them shifts by two. */
+      { start: 16, end: 23, label: "Deductions", bg: "FF9F1239" },
+      { start: 24, end: 24, label: "Net Salary", bg: "FF065F46" },
     ];
     SECTIONS.forEach(({ start, end, label, bg }) => {
       if (start !== end) ws.mergeCells(3, start, 3, end);
@@ -2563,6 +2715,8 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       "LN/ADV",
       "PFEMPCONT",
       "PFEMPR",
+      "EDLI",
+      "PF ADMIN",
       "Tot Deductions",
       "Net Salary",
     ];
@@ -2598,7 +2752,14 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
       const emp = empById.get(String(it.employeeId)) || {};
       const e = it.earnings || {};
       const d = it.deductions || {};
-      const foodAllow = Number(emp.salary?.foodAllowance || 0);
+      /* The month's allowance, not the contract's: prorated on payable days
+         and net of the other deduction charged. A run processed before this was
+         recorded falls back to the contracted figure, which is what that run
+         was actually costed on. */
+      const foodAllow =
+        it.foodAllowanceEarned !== undefined && it.foodAllowanceEarned !== null
+          ? Number(it.foodAllowanceEarned)
+          : Number(emp.salary?.foodAllowance || 0);
       const lnAdv = (d.loanDeduction || 0) + (d.advanceDeduction || 0);
       const grossEarned = e.grossEarnings || 0;
       const isEvenRow = idx % 2 === 1;
@@ -2624,6 +2785,10 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         lnAdv,
         d.providentFund || 0,
         d.employerPF || d.providentFund || 0,
+        /* Recorded on the item since payroll started tracking them. A run
+           processed before that carries 0 here rather than a wrong number. */
+        d.edli || 0,
+        d.adminCharges || 0,
         d.totalDeductions || 0,
         it.roundedNetPay ?? it.netPay ?? 0,
       ];
@@ -2859,7 +3024,7 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -2900,6 +3065,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet = 0,
       totalPF = 0,
       totalESIC = 0,
+      totalEDLI = 0,
+      totalAdminCharges = 0,
       totalBonus = 0;
 
     for (const employee of decryptedEmployees) {
@@ -2913,6 +3080,7 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
       const computed = computeEmployeePayroll(employee, ctx);
@@ -3003,6 +3171,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       totalNet += computed.roundedNetPay;
       totalPF += computed.deductions.providentFund;
       totalESIC += computed.deductions.esic;
+      totalEDLI += computed.deductions.edli || 0;
+      totalAdminCharges += computed.deductions.adminCharges || 0;
       totalBonus += computed.earnings.bonus || 0;
     }
 
@@ -3012,6 +3182,8 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.totalNetPay = totalNet;
     payrollRun.totalPF = totalPF;
     payrollRun.totalESIC = totalESIC;
+    payrollRun.totalEDLI = totalEDLI;
+    payrollRun.totalAdminCharges = totalAdminCharges;
     payrollRun.totalBonus = totalBonus;
     await payrollRun.save();
 
@@ -3335,9 +3507,11 @@ router.delete("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
         n: acc.n + (i.roundedNetPay || 0),
         pf: acc.pf + (i.deductions?.providentFund || 0),
         esi: acc.esi + (i.deductions?.esic || 0),
+        edli: acc.edli + (i.deductions?.edli || 0),
+        adm: acc.adm + (i.deductions?.adminCharges || 0),
         b: acc.b + (i.earnings?.bonus || 0),
       }),
-      { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+      { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0, edli: 0, adm: 0 },
     );
 
     await Payroll.updateOne(

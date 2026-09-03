@@ -286,6 +286,39 @@ const salesSettingsSchema = new mongoose.Schema(
       bomRejected:  samplingTemplateField(SAMPLING_TEMPLATE_DEFAULTS.bomRejected),
     },
 
+    // ── The house customer used by in-house sampling (31 Aug 2026) ───────────
+    //
+    // An in-house sample has no customer — but everything downstream of the
+    // sample (the production run, the Manufacturing Order, the work orders)
+    // is built on `CustomerRequest`, which needs a real Customer document to
+    // hang off. So sampling borrows a standing house account.
+    //
+    // Explicit request: "which customer reference need to take for the
+    // manufacturing order, r&d process and all... you can take reference of
+    // the corresponding sales person ok, and the customer company name and
+    // all you can put as like Grav Sampling Order... and also basically keep
+    // the setting in the sales department so that they can also change there
+    // information which is putting in the customer side".
+    //
+    // These are the values used to FIND-OR-CREATE that account — see
+    // services/houseSamplingCustomer.service.js. `email` is the identity key
+    // (Customer's only other required field, and the one the sales customer
+    // route already treats as unique), so changing it here points sampling at
+    // a different account rather than renaming the existing one; changing the
+    // name or phone updates the existing account in place.
+    //
+    // The SALESPERSON who raised the sample is recorded per-order on the
+    // request itself, not here — this block is the company-level identity all
+    // sampling orders share.
+    houseSamplingCustomer: {
+      name:    { type: String, trim: true, default: "Grav Sampling Order" },
+      email:   { type: String, trim: true, lowercase: true, default: "sampling@grav.in" },
+      phone:   { type: String, trim: true, default: "0000000000" },
+      address: { type: String, trim: true, default: "In-house sampling — no customer address" },
+      city:    { type: String, trim: true, default: "Bhubaneswar" },
+      postalCode: { type: String, trim: true, default: "" },
+    },
+
     // ── Audit ─────────────────────────────────────────────────────────────────
     updatedBy:     { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
     updatedByName: { type: String, trim: true },

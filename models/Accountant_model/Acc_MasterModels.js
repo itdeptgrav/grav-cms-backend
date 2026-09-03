@@ -14,6 +14,108 @@
 
 const mongoose = require("mongoose");
 
+/* ══ WHAT DOCUMENTS A COMPANY CAN HAVE ═════════════════════════════════════
+ *
+ * One list, and it is the only one. The enum on the documents sub-document is
+ * derived from it, the API serves it to the form, and the form renders it — so
+ * a kind cannot exist in the dropdown but be rejected by the schema, which is
+ * the failure mode of keeping a label list on the client and an enum on the
+ * server.
+ *
+ * EVERY ONE OF THESE IS OPTIONAL. A sole proprietor has no MOA; a company that
+ * does not import has no IEC. Nothing here is required, nothing is chased, and
+ * a company with four documents on file is not incomplete — it is a company
+ * with four documents. `group` only decides where it sits in the picker.
+ *
+ * `multi` is a HINT, not a rule: it marks the kinds that usually run to more
+ * than one image so the form can say "Front / Back" or "Page 1, 2, 3" without
+ * being asked. Every kind accepts several files regardless.
+ */
+const ACC_COMPANY_DOC_KINDS = [
+  // The four that have their own row on the form, tied to the number above them
+  { value: "gst", label: "GST registration certificate", group: "Statutory", multi: true },
+  { value: "pan", label: "PAN card", group: "Statutory" },
+  { value: "tan", label: "TAN allotment letter", group: "Statutory" },
+  { value: "incorporation", label: "Certificate of incorporation", group: "Statutory", multi: true },
+
+  // Constitution
+  { value: "cin", label: "CIN document", group: "Constitution" },
+  { value: "moa", label: "Memorandum of Association", group: "Constitution", multi: true },
+  { value: "aoa", label: "Articles of Association", group: "Constitution", multi: true },
+  { value: "partnership-deed", label: "Partnership deed", group: "Constitution", multi: true },
+  { value: "llp-agreement", label: "LLP agreement", group: "Constitution", multi: true },
+  { value: "board-resolution", label: "Board resolution", group: "Constitution", multi: true },
+
+  // Premises
+  { value: "address-proof", label: "Address proof", group: "Premises", multi: true },
+  { value: "rent-agreement", label: "Rent / lease agreement", group: "Premises", multi: true },
+  { value: "utility-bill", label: "Utility bill", group: "Premises" },
+  { value: "property-tax", label: "Property tax receipt", group: "Premises" },
+
+  // Banking
+  { value: "bank", label: "Cancelled cheque", group: "Banking" },
+  { value: "bank-statement", label: "Bank statement", group: "Banking", multi: true },
+
+  // Registrations & licences
+  { value: "msme", label: "Udyam / MSME registration", group: "Registrations" },
+  { value: "iec", label: "Import Export Code (IEC)", group: "Registrations" },
+  { value: "shop-establishment", label: "Shops & Establishment licence", group: "Registrations" },
+  { value: "trade-license", label: "Trade licence", group: "Registrations" },
+  { value: "fssai", label: "FSSAI licence", group: "Registrations" },
+  { value: "professional-tax", label: "Professional tax registration", group: "Registrations" },
+  { value: "epf", label: "EPF registration", group: "Registrations" },
+  { value: "esic", label: "ESIC registration", group: "Registrations" },
+  { value: "factory-license", label: "Factory licence", group: "Registrations" },
+  { value: "pollution-consent", label: "Pollution control consent", group: "Registrations" },
+
+  // People
+  { value: "director-kyc", label: "Director / partner KYC", group: "People", multi: true },
+  { value: "aadhaar", label: "Aadhaar (front & back)", group: "People", multi: true },
+  { value: "signatory-authorisation", label: "Authorised signatory letter", group: "People" },
+  { value: "digital-signature", label: "Digital signature certificate", group: "People" },
+
+  // Anything else — the reason `label` exists on a document
+  { value: "other", label: "Other document", group: "Other" },
+];
+
+const ACC_COMPANY_DOC_KIND_VALUES = ACC_COMPANY_DOC_KINDS.map((k) => k.value);
+const ACC_COMPANY_DOC_KIND_BY_VALUE = new Map(
+  ACC_COMPANY_DOC_KINDS.map((k) => [k.value, k]),
+);
+
+/**
+ * A document's files, whichever era it was written in.
+ *
+ * New uploads populate `files`. Rows written before multi-file support carry
+ * one file in the legacy top-level fields; those are synthesised into the same
+ * shape here so every reader has exactly one path. See the note on `files` in
+ * the schema for why this is a read-time fallback rather than a migration.
+ */
+function filesOfDoc(d) {
+  if (!d) return [];
+  if (Array.isArray(d.files) && d.files.length) return d.files;
+  if (!d.driveFileId) return [];
+  return [
+    {
+      _id: d._id,
+      driveFileId: d.driveFileId,
+      name: d.name,
+      mimeType: d.mimeType,
+      bytes: d.bytes,
+      caption: "",
+      uploadedByName: d.uploadedByName,
+      uploadedAt: d.uploadedAt,
+      isLegacy: true,
+    },
+  ];
+}
+
+/** What to call a document on screen: its own label, else its kind's. */
+function labelOfDoc(d) {
+  if (d?.label) return d.label;
+  return ACC_COMPANY_DOC_KIND_BY_VALUE.get(d?.kind)?.label || "Document";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. TALLY COMPANY
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,16 +175,65 @@ const tallyCompanySchema = new mongoose.Schema(
       {
         /* What the file IS, not what it is called. Free text would give us
            "pan", "PAN card", "Pan Card.pdf" and no way to ask whether the
-           GST certificate is on file. */
+           GST certificate is on file.
+
+           The list is long because a company genuinely has this many kinds of
+           proof, and every one of them is OPTIONAL — see ACC_COMPANY_DOC_KINDS
+           below, which is the single place that says what each one is called
+           and whether it usually runs to more than one image. */
         kind: {
           type: String,
-          enum: ["gst", "pan", "cin", "tan", "incorporation", "address-proof", "bank", "other"],
+          enum: ACC_COMPANY_DOC_KIND_VALUES,
           default: "other",
         },
+
+        /* What THIS company calls it, when the kind is not specific enough.
+           "Other" covers a hundred real documents — a franchise agreement, a
+           pollution board consent, a lease addendum — and filing all of them
+           under one word makes the list unreadable. The kind stays machine-
+           readable and answerable ("is the GST certificate on file"); the label
+           is what a person reads. */
+        label: { type: String, trim: true, maxlength: 160, default: "" },
+
+        /* ── ONE DOCUMENT, SEVERAL FILES ───────────────────────────────────
+           An Aadhaar has a front and a back. A certificate of incorporation
+           runs to four pages. A rent agreement runs to twenty. Before this,
+           each of those had to be uploaded as a SEPARATE document, so the
+           list showed "Aadhaar" twice with no way to tell which side was
+           which, and a reader could not tell a two-page certificate from two
+           unrelated files.
+
+           BACKWARDS COMPATIBILITY, deliberately not a migration: rows written
+           before this change carry their single file in the legacy top-level
+           fields below and have an empty `files`. Nothing rewrites them —
+           reads go through `filesOfDoc()`, which returns `files` when it has
+           any and synthesises file zero from the legacy fields when it does
+           not. A migration would have to touch every company on every
+           deployment to fix data that reads correctly as it stands. */
+        files: [
+          {
+            driveFileId: { type: String, default: "" },
+            name: { type: String, trim: true, maxlength: 260 },
+            mimeType: { type: String, default: "application/octet-stream" },
+            bytes: { type: Number, default: 0 },
+            /* "Front", "Back", "Page 2" — what this file is WITHIN the
+               document. Free text on purpose: front/back and page numbers do
+               not share a vocabulary, and an enum would have to guess which
+               one a given document uses. */
+            caption: { type: String, trim: true, maxlength: 80, default: "" },
+            uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+            uploadedByName: { type: String, trim: true, default: "" },
+            uploadedAt: { type: Date, default: Date.now },
+          },
+        ],
+
+        /* ── LEGACY SINGLE-FILE FIELDS ─────────────────────────────────────
+           Kept, never written to by new uploads. See the note on `files`. */
         name: { type: String, trim: true, maxlength: 260 },
         mimeType: { type: String, default: "application/octet-stream" },
         bytes: { type: Number, default: 0 },
         driveFileId: { type: String, default: "" },
+
         note: { type: String, trim: true, maxlength: 300 },
         uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
         uploadedByName: { type: String, trim: true, default: "" },
@@ -819,4 +970,13 @@ module.exports = {
   Acc_StockGroup,
   Acc_StockItem,
   ACC_DEFAULT_GROUPS,
+
+  // The document catalogue and its two readers. Exported so the route can
+  // serve the list to the form and both can agree on what a document is
+  // called — see the note above the catalogue.
+  ACC_COMPANY_DOC_KINDS,
+  ACC_COMPANY_DOC_KIND_VALUES,
+  ACC_COMPANY_DOC_KIND_BY_VALUE,
+  filesOfDoc,
+  labelOfDoc,
 };

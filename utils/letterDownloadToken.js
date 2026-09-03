@@ -46,13 +46,21 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes
  * @param scope    "hr" | "employee" — which gate the download route applies
  * @param subject  the id of the reader the link was minted for
  */
-function mintLetterToken({ docId, scope, subject, ttlMs = DEFAULT_TTL_MS }) {
+function mintLetterToken({ docId, fileId, scope, subject, ttlMs = DEFAULT_TTL_MS }) {
   const payload = {
     d: String(docId),
     s: String(scope),
     u: String(subject || ""),
     e: Date.now() + ttlMs,
   };
+  /* Optional, and only set when the caller names a file. A document that holds
+     several files (a front and a back, a ten-page lease) needs a token that
+     opens ONE of them — without this, a link to page one opens page ten.
+     Omitted when absent so tokens for single-file documents are byte-identical
+     to the ones minted before this existed. */
+  if (fileId !== undefined && fileId !== null && String(fileId)) {
+    payload.f = String(fileId);
+  }
   const body = b64u(JSON.stringify(payload));
   const sig = b64u(crypto.createHmac("sha256", key()).update(body).digest());
   return `${body}.${sig}`;

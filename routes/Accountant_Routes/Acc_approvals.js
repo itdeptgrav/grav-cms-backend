@@ -142,7 +142,7 @@ async function applyLedgerBalances(voucher, direction, session) {
 // ─────────────────────────────────────────────────────────────────────────
 // The executor — turns an approved Acc_ApprovalRequest into a real change
 // ─────────────────────────────────────────────────────────────────────────
-async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, budgetSignatures = [] } = {}) {
+async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, budgetSignatures = [], budgetForce = false } = {}) {
   const { kind, action, payload, target } = reqDoc;
 
   // VOUCHER  ── post an existing draft
@@ -168,6 +168,7 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       const override = await budgetControl.assertClearance({
         voucher,
         overrideReason: budgetOverrideReason,
+        force: budgetForce,
         user: approver,
         signatures: budgetSignatures,
         signing: true,
@@ -219,6 +220,7 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       const override = await budgetControl.assertClearance({
         voucher,
         overrideReason: budgetOverrideReason,
+        force: budgetForce,
         user: approver,
         signatures: budgetSignatures,
         signing: true,
@@ -308,6 +310,7 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
         editOverride = await budgetControl.assertClearance({
           voucher: budgetControl.proposedVoucher(voucher, payload),
           overrideReason: budgetOverrideReason,
+          force: budgetForce,
           user: approver,
           signatures: budgetSignatures,
           signing: true,
@@ -782,6 +785,7 @@ router.post(
       try {
         result = await applyApprovedAction(item, req.user, {
           budgetOverrideReason: req.body?.budgetOverrideReason,
+          budgetForce: Boolean(req.body?.budgetForce),
           budgetSignatures: item.budgetSignatures || [],
         });
       } catch (e) {

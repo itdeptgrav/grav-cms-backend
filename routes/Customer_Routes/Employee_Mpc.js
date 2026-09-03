@@ -756,7 +756,7 @@ router.get("/products/available", verifyCustomerToken, async (req, res) => {
       return res.status(200).json({ success: true, products: [] });
     }
 
-    const filter = { _id: { $in: assignedIds } };
+    const filter = { _id: { $in: assignedIds }, isActive: { $ne: false } };
 
     if (search) {
       filter.$or = [

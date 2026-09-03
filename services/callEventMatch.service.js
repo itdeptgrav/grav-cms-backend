@@ -9,7 +9,12 @@ const CallEvent = require("../models/CallEvent");
 // within a time window rather than an exact `startTime` match — an exact
 // match would silently create two documents for one call, exactly the
 // split-record problem this consolidation exists to remove.
-const DEFAULT_WINDOW_MS = 5 * 60 * 1000;
+// 2 minutes: wide enough to absorb the ring-time / clock skew between the
+// call-log date and the recording's own start, but narrow enough that the
+// SAME number calling again a few minutes later gets its own document
+// instead of being merged into the previous call (it used to be 5 min,
+// which collapsed back-to-back calls from one contact into one record).
+const DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 
 /**
  * Find the CallEvent this data belongs to, or null if none exists yet.

@@ -124,6 +124,23 @@ const enquirySchema = new mongoose.Schema(
            */
           pickedFromRegister: { type: Boolean, default: false },
           quantity: { type: Number, min: 0 },
+          /**
+           * The ceiling this product is allowed to cost to MAKE, per piece
+           * (2 Sept 2026, explicit request: "what's the maximum budget for
+           * this Product u want to set").
+           *
+           * A cost cap, not a price: it is copied onto the registered
+           * StockItem as `maxBudget`, and the stock item's Raw Items and
+           * Operations tabs refuse additions that would push the built-up
+           * cost past it. Distinct from `targetPrice` on the enquiry itself
+           * (what the customer says they'll PAY, per unit) — a budget of
+           * 500 and a target price of 800 are both normal and mean different
+           * things.
+           *
+           * Optional throughout. Unset means no cap, and every restriction
+           * downstream is gated on it being a real number.
+           */
+          maxBudget: { type: Number, min: 0 },
           note: { type: String, trim: true },
 
           // Garment spec

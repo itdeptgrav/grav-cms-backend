@@ -1597,8 +1597,12 @@ router.patch(
 // answering with Store's would be the wrong number presented confidently.
 router.get("/:id/budget-head", async (req, res) => {
   try {
-    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
-      .select("budgetLedgerId budgetLedgerName budgetFinancialYear budgetDepartment budgetHeadRequested requestedForDept companyId siteId status requestedFor requestedForId approverEmployee approverBiometricId approverAltIds")
+    const RequestsSettings = require("../../../../models/CMS_Models/Configurations/RequestsSettings");
+    const requestsSettings = await RequestsSettings.get();
+    const budgetInvolvementEnabled = requestsSettings.mrfBudgetEnabled !== false;
+
+    const mrf = await MRF.findById(req.params.id)
+      .select("budgetLedgerId budgetLedgerName budgetFinancialYear budgetDepartment budgetHeadRequested requestedForDept")
       .lean();
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
     /* Reading a request is an authority question too: relationship
@@ -1608,9 +1612,23 @@ router.get("/:id/budget-head", async (req, res) => {
        the company. Unviewable is answered as missing. */
     await may(req, "VIEW", mrf);
 
+    /* PAUSED. The CEO has switched off finance/budget involvement in MRF —
+       see RequestsSettings' header for what that changes. Reported plainly
+       rather than falling through to "no budget head was set", which reads as
+       a gap in the request instead of a deliberate, reversible setting. */
+    if (!budgetInvolvementEnabled) {
+      return res.json({
+        success: true,
+        budgetInvolvementEnabled: false,
+        head: null,
+        message: "Budget & finance review is currently paused for MRF — Store can buy or arrange this directly.",
+      });
+    }
+
     if (!mrf.budgetLedgerId) {
       return res.json({
         success: true,
+        budgetInvolvementEnabled: true,
         head: null,
         /* A head the department ASKED for is a real decision, not a gap — it
            simply has no envelope behind it yet. Said plainly so the screen can
@@ -1622,12 +1640,10 @@ router.get("/:id/budget-head", async (req, res) => {
       });
     }
 
-    /* The books this request belongs to — the request says so. Scanning for
-       "the only company" refused to answer at all in a multi-company
-       deployment, and answered from the wrong company's budget when it did. */
-    const booksCompanyId = mrf.companyId || req.tenant?.companyId;
-    if (!booksCompanyId) {
-      return res.json({ success: true, head: null, message: "The books are not configured for this yet." });
+    const { Acc_Company } = require("../../../../models/Accountant_model/Acc_MasterModels");
+    const companies = await Acc_Company.find({}).select("_id").limit(2).lean();
+    if (companies.length !== 1) {
+      return res.json({ success: true, budgetInvolvementEnabled: true, head: null, message: "The books are not configured for this yet." });
     }
 
     const budgetMatch = require("../../../../services/budgetCommitment.service");
@@ -1639,6 +1655,7 @@ router.get("/:id/budget-head", async (req, res) => {
 
     res.json({
       success: true,
+      budgetInvolvementEnabled: true,
       head: head
         ? {
             ledgerId: head.ledgerId,
@@ -1706,7 +1723,17 @@ router.post(
     const b = req.body || {};
     const decision = String(b.decision || "").toLowerCase();
 
-    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) });
+    const RequestsSettings = require("../../../../models/CMS_Models/Configurations/RequestsSettings");
+    const requestsSettings = await RequestsSettings.get();
+    /* PAUSED. See RequestsSettings' header. When false, a request that has to
+       be bought skips the budget-head requirement below and the resulting
+       SpendRequest starts already `approved` instead of `pending_finance` —
+       Store can raise the purchase order immediately, no finance step in
+       between. Nothing about SpendRequest or the accountant module changes;
+       only where this one starts on that chain. */
+    const budgetInvolvementEnabled = requestsSettings.mrfBudgetEnabled !== false;
+
+    const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
     /* The authority matrix: relationship authority for the requester and
        the assigned approver, capability authority for the store. A
@@ -1838,8 +1865,11 @@ router.post(
       /* The budget head is the requester's manager's decision, carried. Store
          does not choose it and cannot override it — a head picked by the
          person who knows the shelf rather than the envelope is exactly the
-         mistake the head moved up a level to prevent. */
-      if (!mrf.budgetLedgerId && !mrf.budgetHeadRequested) {
+         mistake the head moved up a level to prevent.
+         SKIPPED WHILE PAUSED: with budget involvement off, a request can
+         become a purchase with no head at all — see the note on
+         budgetInvolvementEnabled above. */
+      if (budgetInvolvementEnabled && !mrf.budgetLedgerId && !mrf.budgetHeadRequested) {
         return res.status(400).json({
           success: false,
           message:
@@ -1929,8 +1959,12 @@ router.post(
           approverResolutionNote: "",
         },
         /* Straight to finance. The TL already agreed the department needs it;
-           sending it back would be the same person answering twice. */
-        startAt: "pending_finance",
+           sending it back would be the same person answering twice.
+           PAUSED: starts already `approved` (services/spendApproval.service.js's
+           APPROVED constant — "Approved — with Store for fulfilment") instead,
+           so Store can raise the purchase order immediately with no finance
+           step in between. */
+        startAt: budgetInvolvementEnabled ? "pending_finance" : "approved",
         tlApproval: mrf.tlApprovedAt
           ? { by: mrf.tlApprovedBy, byName: mrf.tlApprovedByName, at: mrf.tlApprovedAt }
           : null,
@@ -1939,6 +1973,7 @@ router.post(
            who stocks this grade" is most of the case for the figure. */
         historyNote:
           `Raised by ${who} from ${mrf.mrfNumber} — the store could not supply this from stock.` +
+          (budgetInvolvementEnabled ? "" : " Budget & finance review is currently paused for MRF.") +
           (String(b.note || "").trim() ? ` ${String(b.note).trim().slice(0, 400)}` : ""),
         now,
       });
@@ -1987,7 +2022,11 @@ router.post(
       (issuedLines.length
         ? ` — issued ${issuedLines.map((l) => `${l.issuedQty} ${l.unit} of ${l.name}`).join("; ")}`
         : "") +
-      (spend ? ` — ${spend.requestNumber} sent to finance` : "");
+      (spend
+        ? budgetInvolvementEnabled
+          ? ` — ${spend.requestNumber} sent to finance`
+          : ` — ${spend.requestNumber} approved for purchase`
+        : "");
     mrf.logEvent({ action: "STORE_FULFILMENT_DECISION", actorName: who, actorRole: "store", detail });
 
     await commitMrf(req, mrf, {
@@ -2011,9 +2050,13 @@ router.post(
     const decisionPayload = {
       success: true,
       message: spend
-        ? `${spend.requestNumber} is with finance for ${spend.grandTotal ? `₹${spend.grandTotal}` : "pricing"}.` +
-          (issuedLines.length ? " What was on the shelf has been issued." : "")
+        ? budgetInvolvementEnabled
+          ? `${spend.requestNumber} is with finance for ${spend.grandTotal ? `₹${spend.grandTotal}` : "pricing"}.` +
+            (issuedLines.length ? " What was on the shelf has been issued." : "")
+          : `${spend.requestNumber} is approved for purchase.` +
+            (issuedLines.length ? " What was on the shelf has been issued." : "")
         : "Issued from stock — nothing to buy, so finance is not involved.",
+      budgetInvolvementEnabled,
       mrf: obj,
       issued: issuedLines,
       spendRequest: spend

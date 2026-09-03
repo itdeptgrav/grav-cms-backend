@@ -10,6 +10,11 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const creditTerms = require("../../services/creditTerms.service");
 const taxIdentity = require("../../services/taxIdentity.service");
 const gstPortal = require("../../services/gstPortal.service");
+/* Used by the address merge in PUT /:id to derive a state code from the GSTIN.
+   It was referenced there but never imported — a pre-existing ReferenceError
+   that only fired when an update carried an `address` or `contact` object, so
+   editing any other field worked and editing the address did not. */
+const gstState = require("../../services/gstState.util");
 const multer = require("multer");
 const drive = require("../../services/companyDrive.service");
 const {
@@ -21,7 +26,40 @@ const {
   Acc_Company,
   Acc_Group,
   ACC_DEFAULT_GROUPS,
+  ACC_COMPANY_DOC_KINDS,
+  ACC_COMPANY_DOC_KIND_VALUES,
+  filesOfDoc,
+  labelOfDoc,
 } = require("../../models/Accountant_model/Acc_MasterModels");
+
+// Company changes, in the accounting change history. The mount-level trail
+// already records that something happened here; this adds the before/after, so
+// an edit to a GSTIN reads as the old value and the new one rather than "a
+// company was updated".
+const { recordChange } = require("../../services/changeLog");
+const auditCompany = (req, entry) =>
+  recordChange(req, {
+    departmentSlug: "accounting",
+    section: "accounting:companies",
+    entity: "company",
+    ...entry,
+  });
+
+/** The fields on a company worth diffing — identity, tax and the books date. */
+const companySnapshot = (c) => ({
+  companyName: c?.companyName,
+  companyCode: c?.companyCode,
+  gstin: c?.gstin,
+  pan: c?.pan,
+  tan: c?.tan,
+  cin: c?.cin,
+  stateCode: c?.stateCode,
+  booksFrom: c?.booksFrom,
+  isPrimary: c?.isPrimary,
+  isActive: c?.isActive,
+  address: c?.address,
+  contact: c?.contact,
+});
 
 // `/:id/default-credit-days` self-protects with `accountantAuth` +
 // `creditTerms.canEditTerms` below — the SAME permission the party-level
@@ -29,15 +67,47 @@ const {
 // owner-only. It is excluded from the owner-only gate rather than folded
 // into it, because the rest of this router (company CRUD, group reseeding)
 // is deliberately more restrictive than this one field.
+//
+// AUTHENTICATE FIRST. This gate used to read `req.user?.role` with nothing
+// mounted above it to put a user there: this router applies `accountantAuth`
+// on exactly one route (`/:id/default-credit-days`, further down), so on every
+// other write `req.user` was undefined, `isOwner` was false, and the OWNER got
+// "Only the owner can add or manage companies." The gate refused everybody,
+// which is why it looked like the role was not being read — it was not being
+// read, because nothing had resolved it yet.
+//
+// It is the same trap documented in Middlewear/departmentWriteGuard.js: a
+// permission check mounted above a router runs BEFORE that router's own auth.
 router.use((req, res, next) => {
   if (req.method === "GET") return next();
   if (req.path.endsWith("/default-credit-days")) return next();
-  const isOwner =
-    req.user?.role === "owner" || req.user?.isLegacy || req.user?.isDev;
-  if (!isOwner) {
+  // accountantAuth answers 401/403 itself when the session is missing or the
+  // role cannot edit, so reaching the next handler means req.user is populated.
+  return accountantAuth(req, res, next);
+});
+
+router.use((req, res, next) => {
+  if (req.method === "GET") return next();
+  if (req.path.endsWith("/default-credit-days")) return next();
+
+  // Managing companies is the `canManageSettings` capability, which is what the
+  // role system already calls this — owner only, by its own definition. Reading
+  // the capability rather than comparing the role name means a future role that
+  // is allowed to manage settings works without editing this line, and it keeps
+  // the accountant module's two role vocabularies (legacy names, new
+  // capabilities) from having to agree here.
+  const u = req.user || {};
+  const allowed =
+    u.permissions?.canManageSettings === true || u.isLegacy || u.isDev;
+
+  if (!allowed) {
     return res.status(403).json({
       success: false,
-      message: "Only the owner can add or manage companies.",
+      code: "INSUFFICIENT_ROLE",
+      role: u.role || null,
+      message:
+        `Only the owner can add or manage companies.` +
+        (u.role ? ` You are signed in as ${u.role}.` : ""),
     });
   }
   next();
@@ -111,24 +181,91 @@ async function seedDefaultGroups(companyId, createdBy) {
  */
 const uploadDoc = multer({
   storage: multer.memoryStorage(),
-  /* A certificate is a scan, not a video. */
-  limits: { fileSize: 15 * 1024 * 1024 },
+  /* A certificate is a scan, not a video. The COUNT limit is what makes a
+     twenty-page lease possible without making a hundred-file drop possible. */
+  limits: { fileSize: 15 * 1024 * 1024, files: 20 },
 });
+
+/* Accepts both shapes: `file` (one, what the old client sent) and `files`
+   (several, front/back or a multi-page scan). Declaring both means the older
+   client keeps working through the same handler rather than through a second
+   one that would drift from it. */
+const uploadDocFiles = uploadDoc.fields([
+  { name: "file", maxCount: 1 },
+  { name: "files", maxCount: 20 },
+]);
+
+/** Everything multer collected, in the order it was sent. */
+function incomingFiles(req) {
+  const f = req.files || {};
+  return [...(f.file || []), ...(f.files || [])];
+}
+
+/**
+ * A caption for file N of a document.
+ *
+ * The client may send one caption per file (`captions[]`), or none at all. When
+ * it sends none the files still need telling apart, so they are numbered from
+ * what is already on the document — appending two pages to a three-page
+ * certificate gives "Page 4" and "Page 5", not "Page 1" and "Page 2".
+ */
+function captionFor(req, index, existingCount) {
+  const raw = req.body?.captions;
+  const list = Array.isArray(raw) ? raw : raw !== undefined ? [raw] : [];
+  const given = String(list[index] ?? "").trim();
+  if (given) return given.slice(0, 80);
+  return `Page ${existingCount + index + 1}`;
+}
 
 const DOC_TOKEN_SCOPE = "company-doc";
 
 /** A token for one company document, or null. Scope-checked so a letter token
  *  or a drive-file token cannot open one of these. */
-function verifyDocToken(token, docId) {
+function verifyDocToken(token, docId, fileId) {
   const payload = verifyLetterToken(token);
   if (!payload) return null;
   if (payload.s !== DOC_TOKEN_SCOPE) return null;
   if (String(payload.d) !== String(docId)) return null;
+  /* A document now holds several files, so a token for one of them must not
+     open another. Tokens minted before this carry no `f` and are accepted for
+     the document's first file only — which is the only file they could ever
+     have meant. */
+  if (fileId !== undefined && payload.f !== undefined && String(payload.f) !== String(fileId)) {
+    return null;
+  }
   return payload;
 }
 
-/* POST /:id/documents — attach a certificate. */
-router.post("/:id/documents", uploadDoc.single("file"), async (req, res) => {
+/** The file a request is asking for: the named one, else the document's first. */
+function pickFile(doc, fileId) {
+  const files = filesOfDoc(doc);
+  if (!files.length) return null;
+  if (!fileId) return files[0];
+  return files.find((f) => String(f._id) === String(fileId)) || null;
+}
+
+/* GET /document-kinds — the catalogue the form is built from.
+
+   Declared BEFORE `GET /:id`, or Express matches "document-kinds" as a company
+   id. Served rather than duplicated on the client because the enum that
+   validates an upload and the list that offers it have to be the same list —
+   a label-only copy in the form is how a dropdown offers a kind the schema
+   then rejects. */
+router.get("/document-kinds", (_req, res) => {
+  res.json({ success: true, kinds: ACC_COMPANY_DOC_KINDS });
+});
+
+/* POST /:id/documents — attach one or more files.
+
+   Two jobs in one route, chosen by whether `docId` is present:
+     absent  → create a document and put the files in it
+     present → append the files to that document (the back of an Aadhaar, or
+               pages 4 and 5 of a lease)
+
+   Appending is a POST to the collection rather than a PATCH on the document
+   because what is being created IS a file; the document it lands in is the
+   destination, not the subject. */
+router.post("/:id/documents", uploadDocFiles, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(404).json({ success: false, message: "Company not found." });
@@ -137,34 +274,84 @@ router.post("/:id/documents", uploadDoc.single("file"), async (req, res) => {
     if (!company) {
       return res.status(404).json({ success: false, message: "Company not found." });
     }
-    if (!req.file) {
+
+    const incoming = incomingFiles(req);
+    if (!incoming.length) {
       return res.status(400).json({ success: false, message: "No file was sent." });
     }
 
-    const ALLOWED = ["gst", "pan", "cin", "tan", "incorporation", "address-proof", "bank", "other"];
-    const kind = ALLOWED.includes(req.body?.kind) ? req.body.kind : "other";
-    const name = String(req.file.originalname || "Document").slice(0, 260);
+    const kind = ACC_COMPANY_DOC_KIND_VALUES.includes(req.body?.kind)
+      ? req.body.kind
+      : "other";
+    const label = String(req.body?.label || "").trim().slice(0, 160);
 
-    const stored = await drive.uploadCompanyFile(req.file.buffer, {
-      fileName: name,
-      mimeType: req.file.mimetype || "application/octet-stream",
-      folderPath: ["Statutory", company.companyName || "Company"],
-    });
+    /* Appending to an existing document, or starting a new one. */
+    let doc = req.body?.docId ? company.documents.id(req.body.docId) : null;
+    const isNew = !doc;
+    if (isNew) {
+      company.documents.push({
+        kind,
+        label,
+        note: String(req.body?.note || "").slice(0, 300),
+        uploadedBy: mongoose.Types.ObjectId.isValid(req.user?.id) ? req.user.id : null,
+        uploadedByName: req.user?.name || req.user?.email || "",
+        uploadedAt: new Date(),
+        files: [],
+      });
+      doc = company.documents[company.documents.length - 1];
+    } else if (label) {
+      doc.label = label;
+    }
 
-    company.documents.push({
-      kind,
-      name,
-      mimeType: stored.mimeType,
-      bytes: stored.bytes,
-      driveFileId: stored.driveFileId,
-      note: String(req.body?.note || "").slice(0, 300),
-      uploadedBy: mongoose.Types.ObjectId.isValid(req.user?.id) ? req.user.id : null,
-      uploadedByName: req.user?.name || req.user?.email || "",
-      uploadedAt: new Date(),
-    });
+    /* A pre-existing single-file row gets its legacy file promoted into the
+       array the first time something is appended to it, so the two eras never
+       coexist on one document and every reader sees one list. */
+    if (!doc.files?.length && doc.driveFileId) {
+      doc.files.push({
+        driveFileId: doc.driveFileId,
+        name: doc.name,
+        mimeType: doc.mimeType,
+        bytes: doc.bytes,
+        caption: "Page 1",
+        uploadedBy: doc.uploadedBy,
+        uploadedByName: doc.uploadedByName,
+        uploadedAt: doc.uploadedAt,
+      });
+    }
+
+    const before = doc.files.length;
+    for (let i = 0; i < incoming.length; i += 1) {
+      const f = incoming[i];
+      const name = String(f.originalname || "Document").slice(0, 260);
+      const stored = await drive.uploadCompanyFile(f.buffer, {
+        fileName: name,
+        mimeType: f.mimetype || "application/octet-stream",
+        folderPath: ["Statutory", company.companyName || "Company"],
+      });
+      doc.files.push({
+        driveFileId: stored.driveFileId,
+        name,
+        mimeType: stored.mimeType,
+        bytes: stored.bytes,
+        caption: captionFor(req, i, before),
+        uploadedBy: mongoose.Types.ObjectId.isValid(req.user?.id) ? req.user.id : null,
+        uploadedByName: req.user?.name || req.user?.email || "",
+        uploadedAt: new Date(),
+      });
+    }
+
     await company.save();
 
-    const doc = company.documents[company.documents.length - 1];
+    await auditCompany(req, {
+      entityId: String(company._id),
+      entityLabel: company.companyName,
+      action: "update",
+      summary:
+        `${isNew ? "Attached" : "Added"} ${incoming.length} file(s) ` +
+        `${isNew ? "as" : "to"} “${labelOfDoc(doc)}”` +
+        ` — the document now has ${doc.files.length} file(s) on file.`,
+    });
+
     return res.status(201).json({ success: true, document: publicDoc(doc) });
   } catch (err) {
     console.error("[companies] POST /:id/documents:", err?.message);
@@ -172,19 +359,95 @@ router.post("/:id/documents", uploadDoc.single("file"), async (req, res) => {
   }
 });
 
+/* DELETE /:id/documents/:docId/files/:fileId — remove ONE page or side.
+
+   Separate from deleting the document: losing the back of an Aadhaar because
+   you meant to replace it is a different mistake from losing the Aadhaar. When
+   the last file goes the document goes with it — an empty document is a row
+   that says a proof is on file when none is. */
+router.delete("/:id/documents/:docId/files/:fileId", async (req, res) => {
+  try {
+    const company = await Acc_Company.findById(req.params.id);
+    const doc = company && company.documents.id(req.params.docId);
+    if (!doc) return res.status(404).json({ success: false, message: "Document not found." });
+
+    const file = doc.files?.id?.(req.params.fileId);
+    /* A legacy single-file row has no `files` entry to remove — the file IS the
+       document, so removing it removes the document. */
+    const legacyTarget =
+      !file && String(req.params.fileId) === String(doc._id) && doc.driveFileId;
+    if (!file && !legacyTarget) {
+      return res.status(404).json({ success: false, message: "File not found." });
+    }
+
+    const driveFileId = file ? file.driveFileId : doc.driveFileId;
+    const label = labelOfDoc(doc);
+    const caption = file?.caption || "";
+
+    if (file) file.deleteOne();
+    else doc.driveFileId = "";
+
+    const emptied = filesOfDoc(doc).length === 0;
+    if (emptied) doc.deleteOne();
+    await company.save();
+
+    if (driveFileId) {
+      drive.deleteCompanyFile(driveFileId).catch(() => {});
+    }
+
+    await auditCompany(req, {
+      entityId: String(company._id),
+      entityLabel: company.companyName,
+      action: "update",
+      summary:
+        `Removed ${caption ? `“${caption}” from ` : "a file from "}“${label}”. ` +
+        (emptied
+          ? "That was its last file, so the document was removed with it."
+          : `${filesOfDoc(doc).length} file(s) remain on it.`),
+    });
+
+    return res.json({ success: true, removedDocument: emptied });
+  } catch (err) {
+    console.error("[companies] DELETE document file:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not remove that file." });
+  }
+});
+
 /** What a document looks like to the client. `driveFileId` is NOT in it —
  *  the provider's id is not the client's business and leaking it invites
  *  somebody to build a URL out of it. */
 function publicDoc(d) {
+  const files = filesOfDoc(d);
   return {
     id: String(d._id),
     kind: d.kind,
-    name: d.name,
-    mimeType: d.mimeType,
-    bytes: d.bytes,
+    /* What to print. Resolved here rather than on the client so a custom label
+       and a catalogue label arrive already reconciled — the client should not
+       have to know which of the two won. */
+    label: labelOfDoc(d),
+    customLabel: d.label || "",
     note: d.note || "",
     uploadedByName: d.uploadedByName || "—",
     uploadedAt: d.uploadedAt,
+
+    files: files.map((f) => ({
+      id: String(f._id),
+      name: f.name,
+      mimeType: f.mimeType,
+      bytes: f.bytes,
+      caption: f.caption || "",
+      uploadedByName: f.uploadedByName || "—",
+      uploadedAt: f.uploadedAt,
+    })),
+    fileCount: files.length,
+    totalBytes: files.reduce((n, f) => n + (f.bytes || 0), 0),
+
+    /* The first file's shape, kept at the top level so a client written against
+       the single-file API keeps rendering something sensible instead of a blank
+       row. New clients read `files`. */
+    name: files[0]?.name || d.name,
+    mimeType: files[0]?.mimeType || d.mimeType,
+    bytes: files[0]?.bytes || d.bytes,
   };
 }
 
@@ -212,18 +475,29 @@ router.get("/:id/documents/:docId/link", async (req, res) => {
     const doc = company && company.documents.id(req.params.docId);
     if (!doc) return res.status(404).json({ success: false, message: "Document not found." });
 
+    /* `?fileId=` picks a page or a side; without it the document's first file
+       is meant, which is what every existing caller means. */
+    const file = pickFile(doc, req.query.fileId);
+    if (!file) {
+      return res.status(404).json({ success: false, message: "That file is not on this document." });
+    }
+
     const token = mintLetterToken({
       docId: doc._id,
+      fileId: file._id,
       scope: DOC_TOKEN_SCOPE,
       subject: req.user?.id,
     });
     /* The name rides in the path so a framed PDF is titled with the document
        rather than with the word "download" — the same fix the drive viewer
        needed. */
-    const slug = encodeURIComponent(doc.name || "document");
+    const slug = encodeURIComponent(file.name || "document");
+    const qs =
+      `?t=${encodeURIComponent(token)}` +
+      (req.query.fileId ? `&fileId=${encodeURIComponent(String(file._id))}` : "");
     const url = absoluteUrl(
       req,
-      `/api/accountant/tally/companies/${company._id}/documents/${doc._id}/download/${slug}?t=${encodeURIComponent(token)}`,
+      `/api/accountant/tally/companies/${company._id}/documents/${doc._id}/download/${slug}${qs}`,
     );
     return res.json({ success: true, url, document: publicDoc(doc) });
   } catch (err) {
@@ -235,25 +509,30 @@ router.get("/:id/documents/:docId/link", async (req, res) => {
 /* The bytes. Token AND session, re-checked on every request. */
 async function streamCompanyDoc(req, res) {
   try {
-    if (!verifyDocToken(req.query.t, req.params.docId)) return res.status(404).end();
+    if (!verifyDocToken(req.query.t, req.params.docId, req.query.fileId)) {
+      return res.status(404).end();
+    }
 
     const company = await Acc_Company.findById(req.params.id).select("documents");
     const doc = company && company.documents.id(req.params.docId);
     if (!doc) return res.status(404).end();
 
-    const { stream, meta } = await drive.streamCompanyFile(doc.driveFileId);
+    const file = pickFile(doc, req.query.fileId);
+    if (!file || !file.driveFileId) return res.status(404).end();
 
-    const mime = String(meta.mimeType || doc.mimeType || "").toLowerCase();
+    const { stream, meta } = await drive.streamCompanyFile(file.driveFileId);
+
+    const mime = String(meta.mimeType || file.mimeType || "").toLowerCase();
     /* The same inline allowlist the drive settled on: anything that could
        execute is forced to download, because an uploaded .html or .svg served
        inline runs on this origin with this session's cookie. */
     const inlineSafe =
       (mime.startsWith("image/") && mime !== "image/svg+xml") || mime === "application/pdf";
-    res.setHeader("Content-Type", meta.mimeType || doc.mimeType || "application/octet-stream");
+    res.setHeader("Content-Type", meta.mimeType || file.mimeType || "application/octet-stream");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader(
       "Content-Disposition",
-      `${req.query.dl === "1" || !inlineSafe ? "attachment" : "inline"}; filename="${encodeURIComponent(doc.name).replace(/"/g, "")}"`,
+      `${req.query.dl === "1" || !inlineSafe ? "attachment" : "inline"}; filename="${encodeURIComponent(file.name || "document").replace(/"/g, "")}"`,
     );
     res.setHeader("Cache-Control", "private, max-age=300");
     if (meta.size) res.setHeader("Content-Length", meta.size);
@@ -279,19 +558,42 @@ router.delete("/:id/documents/:docId", async (req, res) => {
     const doc = company && company.documents.id(req.params.docId);
     if (!doc) return res.status(404).json({ success: false, message: "Document not found." });
 
-    const driveFileId = doc.driveFileId;
+    /* EVERY file, not just the legacy one. A document now holds several, and
+       reading only `driveFileId` here would drop the record while leaving all
+       but one of its scans on Drive with nothing pointing at them. */
+    const label = labelOfDoc(doc);
+    const driveFileIds = filesOfDoc(doc)
+      .map((f) => f.driveFileId)
+      .filter(Boolean);
+
     doc.deleteOne();
     await company.save();
 
     /* Same order and same trade-off as the drive: an orphaned Drive object
        beats a record pointing at bytes the user believes are gone. */
-    let driveDeleted = false;
-    try {
-      driveDeleted = await drive.deleteCompanyFile(driveFileId);
-    } catch (e) {
-      console.warn("[companies] drive delete failed:", e?.message);
+    let driveDeleted = 0;
+    for (const id of driveFileIds) {
+      try {
+        if (await drive.deleteCompanyFile(id)) driveDeleted += 1;
+      } catch (e) {
+        console.warn("[companies] drive delete failed:", e?.message);
+      }
     }
-    return res.json({ success: true, id: String(req.params.docId), driveDeleted });
+
+    await auditCompany(req, {
+      entityId: String(company._id),
+      entityLabel: company.companyName,
+      action: "update",
+      summary:
+        `Removed the document “${label}” and all ${driveFileIds.length} of its file(s).`,
+    });
+
+    return res.json({
+      success: true,
+      id: String(req.params.docId),
+      driveDeleted,
+      filesRemoved: driveFileIds.length,
+    });
   } catch (err) {
     console.error("[companies] DELETE document:", err?.message);
     return res.status(500).json({ success: false, message: "Could not delete that document." });
@@ -442,6 +744,19 @@ router.post("/", async (req, res) => {
     // Seed the 28 default groups
     const seeded = await seedDefaultGroups(company._id, req.user?.id);
 
+    await auditCompany(req, {
+      entityId: String(company._id),
+      entityLabel: company.companyName,
+      action: "create",
+      summary:
+        `Created company “${company.companyName}”` +
+        `${company.gstin ? ` (GSTIN ${company.gstin})` : ""}` +
+        `${company.booksFrom ? `, books from ${String(company.booksFrom).slice(0, 10)}` : ""}. ` +
+        `${seeded} default chart-of-accounts group(s) were seeded with it.` +
+        `${company.isPrimary ? " Marked as the primary company." : ""}`,
+      after: companySnapshot(company),
+    });
+
     res.status(201).json({
       success: true,
       message: "Company created and default chart-of-accounts groups seeded.",
@@ -533,6 +848,13 @@ router.put("/:id", async (req, res) => {
       }
     }
 
+    // The whole document, before the write.
+    //
+    // NOT the `existing` above: that one is declared inside the address/contact
+    // branch (so it is out of scope here) and is a three-field projection
+    // anyway, which would make every unselected field read as newly added.
+    const before = await Acc_Company.findById(req.params.id).lean();
+
     const company = await Acc_Company.findByIdAndUpdate(
       req.params.id,
       updates,
@@ -542,6 +864,15 @@ router.put("/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Company not found" });
+
+    await auditCompany(req, {
+      entityId: String(req.params.id),
+      entityLabel: company.companyName,
+      action: "update",
+      before: companySnapshot(before),
+      after: companySnapshot(company),
+    });
+
     res.json({ success: true, company });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -562,6 +893,18 @@ router.delete("/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Company not found" });
+
+    await auditCompany(req, {
+      entityId: String(req.params.id),
+      entityLabel: company.companyName,
+      action: "delete",
+      summary:
+        `Deactivated company “${company.companyName}”. The books, vouchers and ` +
+        `ledgers under it are kept — only the company is switched off.`,
+      before: { isActive: true },
+      after: { isActive: false },
+    });
+
     res.json({ success: true, message: "Company deactivated" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

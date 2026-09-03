@@ -45,6 +45,21 @@ const actorSchema = new mongoose.Schema(
     id: { type: String, default: "" },
     email: { type: String, default: "", lowercase: true, trim: true },
     name: { type: String, default: "" },
+
+    /* THE ROLE THE REQUESTER HELD WHEN THEY ASKED.
+       Load-bearing, not descriptive: the approval replays the change as this
+       person, and the routes it replays into check the role — PUT
+       /api/employees/:id wants "hr_manager". Without this the replay had to
+       invent one from the department slug ("hr"), which those routes reject,
+       so every approval of an employee edit died as "Permission denied" no
+       matter who approved it.
+
+       Stored rather than looked up at approval time because it is the role
+       they actually had at submission — the thing the approver is agreeing to
+       — and it stays right even if their role changes while the request
+       waits. */
+    role: { type: String, default: "" },
+    userType: { type: String, default: "" },
   },
   { _id: false },
 );
@@ -82,7 +97,15 @@ const changeRequestSchema = new mongoose.Schema(
     changes: [
       {
         _id: false,
+        // The human label, which is what the approval card prints.
         field: String,
+        // The machine path it came from ("address.city"), kept alongside the
+        // label because this list is replayed into the change log when the
+        // submission and the decision are recorded, and a log keyed on a
+        // display string cannot be searched for a field. Mongoose strict mode
+        // drops anything not declared here, so both have to be named.
+        path: String,
+        label: String,
         from: mongoose.Schema.Types.Mixed,
         to: mongoose.Schema.Types.Mixed,
       },
@@ -99,9 +122,22 @@ const changeRequestSchema = new mongoose.Schema(
       contentType: { type: String, default: "application/json" },
     },
 
+    /* pending  — waiting for a decision
+       applying — claimed by one approver, replay in flight. A transient state,
+                  and the reason it exists is that the replay is an HTTP round
+                  trip: without a claim, two approvers pressing Approve at the
+                  same moment both read "pending" and both replay, applying the
+                  same change twice.
+       approved — replayed and landed
+       rejected — declined
+       failed   — approved by a person, but the replay did not land. NOT
+                  terminal: the cause is usually fixable, and Approve retries
+                  it. It used to be terminal, so an owner whose first attempt
+                  failed was told "this request has already been failed"
+                  forever after. */
     status: {
       type: String,
-      enum: ["pending", "approved", "rejected", "failed"],
+      enum: ["pending", "applying", "approved", "rejected", "failed"],
       default: "pending",
       index: true,
     },

@@ -190,9 +190,38 @@ function auditTrail(departmentSlug, opts = {}) {
       // Held for approval — recorded by services/changeRequests, not applied.
       if (res.statusCode === 202) return;
 
+      /* The response has to have actually gone out. `close` fires for an
+         aborted connection too, where statusCode is still its default 200 and
+         nothing was ever sent — which produced history entries for requests
+         the client hung up on. */
+      if (!res.writableEnded) return;
+
       const resolved = sectionForPath(path) || {};
       const section = req.auditSection || opts.section || resolved.section || "";
-      const entity = req.auditEntity || opts.entity || resolved.entity || "record";
+      const entity = req.auditEntity || opts.entity || resolved.entity || "";
+
+      /* NO SECTION, NO ENTRY.
+         --------------------
+         The floor used to fall back to the word "record" and file the entry
+         with no section, which produced a history full of lines reading
+         "Created record" — true, useless, and impossible to attribute to a
+         page. Worse, it swept up writes that are not business changes at all:
+         sidebar pins, saved filters, nav preferences.
+
+         A section is the definition of "something we keep history for". A path
+         that maps to none is not an unrecorded change; it is a request we never
+         decided to record. Mapping a new one is a line in
+         services/auditSections.js — and the log line below is how anybody finds
+         out that it needs one. */
+      if (!section || !entity) {
+        if (process.env.AUDIT_TRAIL_DEBUG) {
+          console.debug(
+            `[audit-trail] ${req.method} ${path} has no section — not recorded. ` +
+              `Add a pattern to PATH_SECTIONS if this should be.`,
+          );
+        }
+        return;
+      }
       const action = actionFor(req, path);
       const fields = action === "delete" ? [] : fieldsFromBody(body);
       const entityId = idFromPath(path) || body._id || body.id || "";

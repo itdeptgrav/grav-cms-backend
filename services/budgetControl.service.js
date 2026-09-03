@@ -803,6 +803,11 @@ async function clearanceFor({
      sentence came with it — the second signer is allowed to add nothing, and
      it is the escalation service that decides the FIRST one must speak. */
   signing = false,
+  /* The "Force approve" button on the approvals screen. HONOURED ONLY while
+     ACC_BUDGET_ENFORCEMENT is not "on" — the moment enforcement is real this
+     flag is dead weight in a request body, ignored entirely, so no client
+     that learned to send it can weaken the finished control. */
+  force = false,
 } = {}) {
   const reason = String(overrideReason || "").trim();
   const held = signatures || voucher?.budgetOverride?.signatures || [];
@@ -835,6 +840,49 @@ async function clearanceFor({
     });
 
     if (check.requiredOverride) {
+      /* ── THE ENFORCEMENT SWITCH, RESTORED ────────────────────────────────
+         The escalation rework below arrived without this branch, which left
+         `autoClearable` defined and never called — ACC_BUDGET_ENFORCEMENT was
+         being read at boot, logged, and then ignored. A server set to
+         "partial" (as the deployed one is) blocked exactly as if it said
+         "on": the switch's whole promise, silently broken. This branch is
+         what the header comment has claimed all along.
+
+         Two ways through, both stamped on the voucher (auto: true) so the
+         list of what got past the control while it was relaxed is queryable:
+
+           · every offending head's status is auto-clearable under the current
+             mode ("partial" waves missing_budget / needs_cost_centre; "off"
+             waves everything overridable), or
+           · `force` — the approver pressed "Force approve", which exists only
+             while enforcement is relaxed and clears even the statuses the
+             mode alone would keep (a genuinely over-budget head under
+             "partial"). Their name goes on the record; no reason is demanded,
+             because demanding one is precisely what "not in force yet" means
+             this control must not do. */
+      const offending = (check.results || [])
+        .filter((r) => needsOverride(r.status))
+        .map((r) => r.status);
+      const waved = offending.length > 0 && offending.every(autoClearable);
+      const forced = force && ENFORCEMENT !== "on";
+      if (waved || forced) {
+        const base = overrideRecord(check, []);
+        return {
+          blocked: false,
+          check,
+          override: {
+            ...base,
+            auto: true,
+            forced,
+            reason: forced
+              ? "Force-approved: budget control not yet in force (ACC_BUDGET_ENFORCEMENT)."
+              : AUTO_CLEAR_REASON,
+            overriddenBy: user?.id || user?._id || base.overriddenBy,
+            overriddenByName: user?.name || base.overriddenByName,
+          },
+        };
+      }
+
       /* A reason from somebody who may sign is their signature. From anybody
          else it is the case they are making, and it travels on the voucher
          for the two who do have to sign. */
@@ -861,6 +909,9 @@ async function clearanceFor({
                before this still recognise the refusal; the new one tells them
                it is now a queue rather than a prompt for a sentence. */
             code: "BUDGET_OVERRIDE_REQUIRED",
+            /* So the dialog offers "Force approve" exactly when this server
+               would honour it, instead of guessing from its own env. */
+            enforcement: ENFORCEMENT,
             escalation: {
               required: true,
               code: signatureError?.code || "BUDGET_ESCALATION_REQUIRED",

@@ -27,49 +27,10 @@ const { recordChange } = require("../../services/changeLog");
 /* Session                                                             */
 /* ------------------------------------------------------------------ */
 
-const jwt = require("jsonwebtoken");
-const { SECRET, LEGACY_SECRETS, readToken } = require("../../config/jwt");
-
-/**
- * Resolve the caller from the CMS session.
- *
- * This router is mounted outside any department's own middleware — the queue
- * spans departments — so it reads the token itself rather than depending on
- * whichever guard happens to be in front of it.
- */
-function authenticate(req, res, next) {
-  const token = readToken(req);
-  if (!token) return res.status(401).json({ success: false, message: "Not authenticated" });
-
-  const verify = () => {
-    try {
-      return jwt.verify(token, SECRET);
-    } catch (err) {
-      for (const legacy of LEGACY_SECRETS) {
-        try {
-          return jwt.verify(token, legacy);
-        } catch {
-          /* try the next */
-        }
-      }
-      throw err;
-    }
-  };
-
-  try {
-    const decoded = verify();
-    req.user = {
-      id: decoded.id,
-      email: String(decoded.email || "").toLowerCase(),
-      name: decoded.name || "",
-      isAdmin: Boolean(decoded.isAdmin),
-      deptSlug: decoded.deptSlug || "",
-    };
-    next();
-  } catch {
-    res.status(401).json({ success: false, message: "Invalid or expired session" });
-  }
-}
+/* The session reader lives in services/cmsSession because the team router needs
+   the identical one — see the note there on why these routers read the token
+   themselves rather than sitting behind a department's guard. */
+const { authenticateCmsSession: authenticate } = require("../../services/cmsSession");
 
 /** The caller's role in `slug`, with admins treated as owner. */
 async function roleFor(req, slug) {
@@ -94,6 +55,115 @@ async function canRead(req, slug) {
 router.use(authenticate);
 
 /* ------------------------------------------------------------------ */
+/* POST|DELETE /api/change-requests/push-token                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Register this browser for approval notifications.
+ *
+ * It lives here rather than beside the existing /api/employee/push-token
+ * because that route is behind AllEmployeeAppMiddleware, which reads the
+ * MOBILE APP's `employee_token` cookie. A CMS session carries `auth_token`, so
+ * a department user on the web has no way to reach it — the token would be
+ * accepted from the phone and refused from the browser they are standing in
+ * front of. This router already authenticates the CMS session, and approval
+ * notifications are its subject, so the endpoint belongs to it.
+ *
+ * The token is stored on Employee.fcmToken — the SAME field the mobile app
+ * writes. That is deliberate: one person has one place their notifications go,
+ * and the notification service has one field to read.
+ *
+ * Declared above the /:slug routes so a department can never be named
+ * "push-token" and shadow it.
+ */
+router.post("/push-token", async (req, res) => {
+  try {
+    const token = String(req.body?.token || req.body?.fcmToken || "").trim();
+    if (!token) {
+      return res.status(400).json({ success: false, message: "No token supplied." });
+    }
+    if (!req.user?.id) {
+      return res.status(400).json({ success: false, message: "No employee on this session." });
+    }
+
+    // The device registry, keyed by this session's id AND email. The id here
+    // is the department user's, not the Employee _id, so a send that looks
+    // the person up by Employee id finds this browser through the email —
+    // see notifyEmployeeDevices.
+    try {
+      const { registerDevice } = require("../../services/notifyDevices.service");
+      await registerDevice({
+        employeeId: req.user.id,
+        employeeEmail: req.user.email,
+        token,
+        transport: "fcm",
+        platform: "web",
+        label: typeof req.body?.label === "string" ? req.body.label.slice(0, 80) : "",
+      });
+    } catch (e) {
+      console.warn("[change-requests/push-token] registry upsert failed:", e.message);
+    }
+
+    const Employee = require("../../models/Employee");
+    const result = await Employee.updateOne(
+      { _id: req.user.id },
+      { $set: { fcmToken: token } },
+    );
+    if (!result.matchedCount) {
+      // A department login with no employee record behind it. Not an error the
+      // user can act on, and not worth failing their page over.
+      return res.json({ success: true, stored: false, message: "No employee record to store it on." });
+    }
+    res.json({ success: true, stored: true });
+  } catch (err) {
+    console.error("[change-requests/push-token]", err.message);
+    res.status(500).json({ success: false, message: "Could not register this device." });
+  }
+});
+
+router.delete("/push-token", async (req, res) => {
+  try {
+    if (!req.user?.id) return res.json({ success: true, cleared: false });
+    const Employee = require("../../models/Employee");
+    // The registry row for this browser goes with it — a signed-out browser
+    // must not keep receiving. The token comes in the body when the page still
+    // has it, else whatever the employee record holds.
+    try {
+      const NotificationDevice = require("../../models/Access/NotificationDevice");
+      const stored = await Employee.findById(req.user.id).select("fcmToken").lean();
+      const gone = [req.body?.token, stored?.fcmToken].filter(Boolean);
+      if (gone.length) await NotificationDevice.deleteMany({ token: { $in: gone } });
+    } catch (e) {
+      console.warn("[change-requests/push-token delete] registry cleanup failed:", e.message);
+    }
+    await Employee.updateOne({ _id: req.user.id }, { $set: { fcmToken: null } });
+    res.json({ success: true, cleared: true });
+  } catch (err) {
+    console.error("[change-requests/push-token delete]", err.message);
+    res.status(500).json({ success: false, message: "Could not clear this device." });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* /api/change-requests/notification-settings                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * "Manage notifications", for the browser.
+ *
+ * The SAME handlers the mobile app reaches at
+ * /api/employee/notification-settings — behind this router's CMS session
+ * instead of the app's employee_token, for exactly the reason push-token
+ * lives here. One person, every device, one list: the handlers match rows by
+ * id or email, so the phone sees the browser's row and the browser sees the
+ * phone's. Declared before /:slug so no department can shadow it.
+ */
+router.use(
+  "/notification-settings",
+  require("../Employee_Routes/notificationSettings").handlers,
+);
+
+/* ------------------------------------------------------------------ */
 /* GET /api/change-requests/:slug                                      */
 /* ------------------------------------------------------------------ */
 
@@ -107,7 +177,12 @@ router.get("/:slug", async (req, res) => {
     const { status = "pending", entity, limit = 50 } = req.query;
 
     const query = { departmentSlug: slug };
-    if (status && status !== "all") query.status = status;
+    /* "Waiting" covers `applying` too — a request whose replay is in flight, or
+       whose claim was stranded by a restart. It is a transient state and has no
+       tab of its own, so without this a stuck request would appear in no tab at
+       all and simply vanish from the queue. */
+    if (status === "pending") query.status = { $in: ["pending", "applying"] };
+    else if (status && status !== "all") query.status = status;
     if (entity) query.entity = entity;
 
     // An editor sees only their OWN requests. Somebody else's pending change is
@@ -162,6 +237,68 @@ router.get("/:slug", async (req, res) => {
   } catch (err) {
     console.error("[change-requests] list failed:", err.message);
     res.status(500).json({ success: false, message: "Could not load the approval queue." });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/change-requests/:slug/approve-all                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Approve everything waiting in a department, in one press.
+ *
+ * Asked for by the owner once the queue stopped holding routine edits: what
+ * is left is short, and an approver who has read it should not have to press
+ * the same button twelve times. Each request still goes through
+ * decideChangeRequest — the atomic claim, the replay, the log entry, the
+ * notification — one at a time, because the replay is a live HTTP round trip
+ * and a dozen of them at once against the same records is how two approvals
+ * apply on top of each other.
+ *
+ * A request whose replay fails does not stop the rest: it lands in Failed
+ * with its reason, exactly as a single failed approval does, and is counted
+ * back to the caller. Declared before /:id/decide; the paths do not collide,
+ * but the order says which is primary.
+ */
+router.post("/:slug/approve-all", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").toLowerCase();
+    const role = await roleFor(req, slug);
+    if (!roleAtLeast(role, "approver")) {
+      return res.status(403).json({ success: false, message: "Only an approver can approve the queue." });
+    }
+
+    const pending = await ChangeRequest.find({ departmentSlug: slug, status: "pending" })
+      .sort({ createdAt: 1 })
+      .limit(200)
+      .select("_id")
+      .lean();
+
+    const note = String(req.body?.note || "").trim();
+    const actor = actorFrom(req);
+    const result = { approved: 0, failed: 0, skipped: 0, failures: [] };
+
+    for (const row of pending) {
+      const r = await decideChangeRequest({ id: String(row._id), decision: "approve", note, actor, req });
+      if (r.code === 404 || r.code === 409) { result.skipped += 1; continue; }
+      const outcome = r.request?.status || (r.ok ? "approved" : "failed");
+      if (outcome === "approved") result.approved += 1;
+      else {
+        result.failed += 1;
+        result.failures.push({ id: String(row._id), message: r.message || r.request?.applyError || "" });
+      }
+    }
+
+    res.json({
+      success: true,
+      ...result,
+      message: pending.length === 0
+        ? "Nothing was waiting."
+        : `${result.approved} approved${result.failed ? `, ${result.failed} failed` : ""}${result.skipped ? `, ${result.skipped} already decided` : ""}.`,
+    });
+  } catch (err) {
+    console.error("[change-requests] approve-all failed:", err.message);
+    res.status(500).json({ success: false, message: "Could not approve the queue." });
   }
 });
 
@@ -222,11 +359,19 @@ router.post("/:id/decide", async (req, res) => {
       return res.status(result.code).json({ success: false, message: result.message });
     }
 
-    // An approval whose replay failed is NOT a success, and must not be
-    // reported as one: the approver would close the queue believing the change
-    // had landed.
-    res.status(result.ok ? 200 : 502).json({
+    /* An approval whose replay failed is NOT a success and must not be reported
+       as one — but it is not a broken gateway either, which is what 502 said.
+       The decision was received, recorded and durable; what failed is the
+       change it authorised. 502 also invites a platform error page to replace
+       this body in production, losing the very message the approver needs.
+
+       So: 200, and the OUTCOME in the payload. `outcome` is what callers branch
+       on — "approved", "rejected" or "failed" — because it is unambiguous for
+       all three cases, where a boolean is not: a rejection applied nothing and
+       is still exactly what the approver asked for. */
+    res.status(200).json({
       success: result.ok,
+      outcome: result.request?.status || (result.ok ? "approved" : "failed"),
       message: result.message,
       request: result.request
         ? { id: String(result.request._id), status: result.request.status, applyError: result.request.applyError }

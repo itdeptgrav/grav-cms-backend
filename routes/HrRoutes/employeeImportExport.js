@@ -199,10 +199,20 @@ const COLUMNS = [
     { header: "HRA", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "EPF (Employee)", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "ESIC (Employee)", field: "_skip", section: "SALARY DETAILS", formula: true },
+    /* HR's own figure, not a derived one — the standing monthly amount this
+       employee has taken against their food allowance. It reduces their net pay
+       AND what the company funds, so the sheet was wrong on both counts while
+       it had nowhere to put it. */
+    { header: "Other Deduction (Monthly)", field: "otherDeduction", section: "SALARY DETAILS" },
     { header: "Total Deductions", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "Net Salary", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "EPF (Employer)", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "ESIC (Employer)", field: "_skip", section: "SALARY DETAILS", formula: true },
+    /* EDLI and PF admin charges are employer costs like the two above. The
+       sheet computed neither and left both out of its CTC, so a workbook
+       filled in by HR disagreed with the same figures on the employee page. */
+    { header: "EDLI (Employer)", field: "_skip", section: "SALARY DETAILS", formula: true },
+    { header: "PF Admin (Employer)", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "Food Allowance", field: "_skip", section: "SALARY DETAILS", formula: true },
     { header: "Employer Cost (CTC)", field: "_skip", section: "SALARY DETAILS", formula: true },
     // ── STATUTORY DETAILS ─────────────────────────────────────────────────
@@ -415,41 +425,34 @@ const fmtDate = (v) => {
     } catch { return ""; }
 };
 
+const { computeSalary } = require("../../services/salaryFormula");
+
 const capFirst = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, " ") : "";
 
-/** Server-side canonical salary recalculation from Gross */
-const recalcSalary = (gross, cfg) => {
-    gross = Number(gross) || 0;
-    const basicPct = (cfg.basicPct ?? 50) / 100;
-    const hraPct = (cfg.hraPct ?? 50) / 100;
-    const eepfPct = (cfg.eepfPct ?? 12) / 100;
-    const epfCap = cfg.epfCapAmount ?? 1800;
-    const edliPct = (cfg.edliPct ?? 0.5) / 100;
-    const edliCap = cfg.edliCapAmount ?? 15000;
-    const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
-    const esiLimit = cfg.esiWageLimit ?? 21000;
-    const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
-    const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
-    const food = cfg.foodAllowance ?? 1600;
-    const basic = Math.round(gross * basicPct);
-    const hra = Math.round(gross * hraPct);
-    const epf = Math.round(Math.min(basic * eepfPct, epfCap));
-    const edli = Math.round(Math.min(basic * edliPct, edliCap));
-    const adminCharges = Math.round(basic * adminPct);
-    const esiOk = basic <= esiLimit;
-    const eeesic = esiOk ? Math.ceil(basic * eeEsicPct) : 0;
-    const erEsic = esiOk ? Math.ceil(basic * erEsicPct) : 0;
+/**
+ * Salary from Gross, for a bulk import row.
+ *
+ * A fourth handwritten copy of the company formula stood here and had drifted
+ * from all three others: EDLI compared against the wrong side of its ceiling,
+ * admin charges uncapped, and a CTC missing both. An employee created by
+ * import got different numbers from the same person typed into the form.
+ * It delegates now, so there is one formula and imports cannot disagree
+ * with it.
+ *
+ * `specialAllowance` is added on top because only the importer records it.
+ */
+const recalcSalary = (gross, cfg, otherDeduction = 0) => {
+    /* The standing deduction travels with the gross: it reduces net pay and the
+       food allowance, so a row that carries one and is recalculated without it
+       imports a different employee from the one in the sheet. */
+    const out = computeSalary(
+        { gross: Number(gross) || 0, otherDeduction: Number(otherDeduction) || 0 },
+        cfg,
+        "employee",
+    );
     return {
-        gross, basic, hra, epf,
-        edli, edliOverride: false,
-        adminCharges, adminOverride: false,
-        eeesic, erEsic,
-        foodAllowance: food,
-        employerCost: gross + epf + erEsic + food,
-        totalDeduction: epf + eeesic,
-        netSalary: Math.max(gross - (epf + eeesic), 0),
-        allowances: hra, deductions: epf + eeesic,
-        specialAllowance: Math.max(gross - basic - hra, 0),
+        ...out,
+        specialAllowance: Math.max(out.gross - out.basic - out.hra, 0),
     };
 };
 
@@ -583,7 +586,7 @@ const parseSheet = async (buffer) => {
         const lastName = nameParts.slice(1).join(" ") || "";
 
         const gross = toNum(row.grossSalary);
-        const salary = recalcSalary(gross, cfg);
+        const salary = recalcSalary(gross, cfg, toNum(row.otherDeduction));
 
         const emp = {
             _employeeNum: employeeNum,
@@ -1231,10 +1234,13 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
         hra: letterOf("HRA"),
         epfEE: letterOf("EPF (Employee)"),
         esicEE: letterOf("ESIC (Employee)"),
+        otherDed: letterOf("Other Deduction (Monthly)"),
         totDed: letterOf("Total Deductions"),
         net: letterOf("Net Salary"),
         epfER: letterOf("EPF (Employer)"),
         esicER: letterOf("ESIC (Employer)"),
+        edli: letterOf("EDLI (Employer)"),
+        admin: letterOf("PF Admin (Employer)"),
         food: letterOf("Food Allowance"),
         ctc: letterOf("Employer Cost (CTC)"),
     };
@@ -1247,6 +1253,15 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
     const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
     const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
     const foodAmt = cfg.foodAllowance ?? 1600;
+    /* Charged on min(Basic, ceiling) and then held at a hard maximum -- the
+       same two steps services/salaryFormula.js applies, expressed as a
+       spreadsheet formula so the sheet cannot drift from the server. */
+    const edliPct = (cfg.edliPct ?? 0.5) / 100;
+    const edliCeil = cfg.edliCapAmount ?? 15000;
+    const edliMax = cfg.edliMaxAmount ?? 75;
+    const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
+    const adminCeil = cfg.adminWageCeiling ?? cfg.edliCapAmount ?? 15000;
+    const adminMax = cfg.adminMaxAmount ?? 75;
 
     // Every formula is guarded with IF(Gross="","",…) so a blank template row
     // stays visually empty instead of showing a column of zeroes.
@@ -1255,17 +1270,20 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
         [L.hra]: `IF(${L.gross}${R}="","",ROUND(${L.gross}${R}*${hraPct},0))`,
         [L.epfEE]: `IF(${L.basic}${R}="","",ROUND(MIN(${L.basic}${R}*${eepfPct},${epfCap}),0))`,
         [L.esicEE]: `IF(${L.basic}${R}="","",IF(${L.basic}${R}<=${esiLimit},CEILING(${L.basic}${R}*${eeEsicPct},1),0))`,
-        [L.totDed]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R}+IF(${L.esicEE}${R}="",0,${L.esicEE}${R}))`,
+        [L.totDed]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R}+IF(${L.esicEE}${R}="",0,${L.esicEE}${R})+IF(${L.otherDed}${R}="",0,${L.otherDed}${R}))`,
         [L.net]: `IF(${L.gross}${R}="","",MAX(${L.gross}${R}-IF(${L.totDed}${R}="",0,${L.totDed}${R}),0))`,
         [L.epfER]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R})`,
         [L.esicER]: `IF(${L.basic}${R}="","",IF(${L.basic}${R}<=${esiLimit},CEILING(${L.basic}${R}*${erEsicPct},1),0))`,
-        [L.food]: `IF(${L.gross}${R}="","",${foodAmt})`,
-        [L.ctc]: `IF(${L.gross}${R}="","",${L.gross}${R}+IF(${L.epfER}${R}="",0,${L.epfER}${R})+IF(${L.esicER}${R}="",0,${L.esicER}${R})+IF(${L.food}${R}="",0,${L.food}${R}))`,
+        [L.edli]: `IF(${L.basic}${R}="","",MIN(ROUND(MIN(${L.basic}${R},${edliCeil})*${edliPct},0),${edliMax}))`,
+        [L.admin]: `IF(${L.basic}${R}="","",MIN(ROUND(MIN(${L.basic}${R},${adminCeil})*${adminPct},0),${adminMax}))`,
+        [L.food]: `IF(${L.gross}${R}="","",MAX(0,${foodAmt}-IF(${L.otherDed}${R}="",0,${L.otherDed}${R})))`,
+        [L.ctc]: `IF(${L.gross}${R}="","",${L.gross}${R}+IF(${L.epfER}${R}="",0,${L.epfER}${R})+IF(${L.esicER}${R}="",0,${L.esicER}${R})+IF(${L.edli}${R}="",0,${L.edli}${R})+IF(${L.admin}${R}="",0,${L.admin}${R})+IF(${L.food}${R}="",0,${L.food}${R}))`,
     });
 
     const FORMULA_HEADERS = new Set(
         ["Basic Salary", "HRA", "EPF (Employee)", "ESIC (Employee)", "Total Deductions",
-            "Net Salary", "EPF (Employer)", "ESIC (Employer)", "Food Allowance",
+            "Net Salary", "EPF (Employer)", "ESIC (Employer)", "EDLI (Employer)",
+            "PF Admin (Employer)", "Food Allowance",
             "Employer Cost (CTC)"].map(normalizeHeader)
     );
 
@@ -1314,6 +1332,12 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
             // template full of zeroes would compute a full set of zero
             // deductions instead of staying quiet.
             "Gross Salary": isBlankRow ? "" : (emp.salary?.gross || 0),
+            // Blank rather than 0 for the same reason: an empty cell means "no
+            // standing deduction", and the formulas treat it as zero anyway.
+            "Other Deduction (Monthly)":
+                isBlankRow || !emp.salary?.otherDeduction
+                    ? ""
+                    : emp.salary.otherDeduction,
             "Aadhaar Number": emp.documents?.aadharNumber || "",
             "PAN Number": emp.documents?.panNumber || "",
             "UAN Number": emp.documents?.uanNumber || "",
