@@ -10,6 +10,7 @@ const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } 
 
 const svc = require("../../services/cowork.service");
 const { invalidateEmpListCache } = require("../../services/cowork.service");
+const { sendJsonCached } = require("../../services/httpCache");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
 const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
@@ -50,7 +51,11 @@ router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, asy
   try {
     const employees = await svc.listCoworkEmployees();
     const safe = employees.map(({ tempPassword, authUid, fcmTokens, ...emp }) => emp);
-    res.json({ employees: safe });
+    // ETag/304: the directory is byte-identical between reads far more often
+    // than not (measured 99% duplicate). A client that revalidates gets a bare
+    // 304; one that does not gets the full body, exactly as before. The data is
+    // unchanged either way — see services/httpCache.js.
+    sendJsonCached(req, res, { employees: safe });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -93,7 +98,7 @@ router.get("/scheduling/blocked-dates", verifyCoworkToken, async (req, res) => {
       }
     }
 
-    res.json({ success: true, blockedDates: blocked });
+    sendJsonCached(req, res, { success: true, blockedDates: blocked });
   } catch (e) {
     console.error("[blocked-dates]", e.message);
     res.status(500).json({ error: e.message });
@@ -290,7 +295,7 @@ router.get("/employee/my-managers/:employeeId", verifyCoworkToken, verifyEmploye
         ? { name: employee.secondaryManager.managerName, biometricId: "", department: "", designation: "", phone: "", email: "", profilePhotoUrl: null }
         : null;
 
-    res.json({ success: true, primaryManager, secondaryManager });
+    sendJsonCached(req, res, { success: true, primaryManager, secondaryManager });
   } catch (e) {
     console.error("[my-managers]", e.message);
     res.status(500).json({ error: e.message });

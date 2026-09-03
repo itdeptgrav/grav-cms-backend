@@ -181,11 +181,17 @@ async function createResumableSession({ fileName, mimeType, fileSize, origin }) 
 // every Drive image on the site, so it is the one path a quota squeeze shows
 // up on first as an intermittent broken image that reloads fine a moment
 // later.
-async function getDriveFileStream(fileId) {
+async function getDriveFileStream(fileId, range = null) {
     const auth = getServiceAccountAuth();
     const drive = google.drive({ version: "v3", auth });
 
     const fetchStream = async () => {
+        /* Forward the client's `Range` to Drive so a video streams in pieces
+           instead of whole. Drive parses and answers it (206 + Content-Range),
+           which is more robust than re-implementing range maths here. Absent,
+           this is the ordinary full-file request it always was. */
+        const mediaOpts = { responseType: "stream" };
+        if (range) mediaOpts.headers = { Range: range };
         // Metadata alongside the bytes, for the FILENAME.
         //
         // The proxy had none, so it sent no `Content-Disposition` and the
@@ -199,17 +205,38 @@ async function getDriveFileStream(fileId) {
         const [stream, meta] = await Promise.all([
             drive.files.get(
                 { fileId, alt: "media", supportsAllDrives: true },
-                { responseType: "stream" }
+                mediaOpts
             ),
             drive.files
-                .get({ fileId, fields: "name,mimeType", supportsAllDrives: true })
+                .get({ fileId, fields: "name,mimeType,size", supportsAllDrives: true })
                 .catch(() => null),
         ]);
+        /* gaxios returns a Fetch `Headers` object (read with `.get`), not a
+           plain map — so `headers["content-range"]` is undefined and the range
+           reply silently degraded to a full 200. Read both shapes. */
+        const readHeader = (h, name) => {
+            if (!h) return null;
+            if (typeof h.get === "function") return h.get(name);
+            return h[name] ?? h[name.toLowerCase()] ?? null;
+        };
+        const rawLen = readHeader(stream.headers, "content-length");
         const mimeType =
             meta?.data?.mimeType ||
-            stream.headers?.["content-type"] ||
+            readHeader(stream.headers, "content-type") ||
             "application/octet-stream";
-        return { data: stream.data, mimeType, name: meta?.data?.name || null };
+        return {
+            data: stream.data,
+            mimeType,
+            name: meta?.data?.name || null,
+            /* For byte-range replies: the total size (for a full Content-Length
+               and Accept-Ranges), and what Drive answered the range with — its
+               status and its own Content-Range/Content-Length, forwarded as the
+               authority on the bytes it just sent. */
+            size: meta?.data?.size != null ? Number(meta.data.size) : null,
+            status: stream.status,
+            contentRange: readHeader(stream.headers, "content-range") || null,
+            contentLength: rawLen != null ? Number(rawLen) : null,
+        };
     };
 
     try {

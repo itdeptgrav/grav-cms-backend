@@ -62,7 +62,7 @@ test("a task never waits for itself", () => {
   /* Without the id it finds its own document in its own queue, and a task with
      a deadline would push its own anchor past it on every re-resolution. */
   assert.match(src, /if \(taskId && doc\.id === taskId\) return;/);
-  assert.match(src, /async function resolveAcceptanceAnchor\(task, nowMs = Date\.now\(\), taskId = null\)/);
+  assert.match(src, /async function resolveAcceptanceAnchor\(task, nowMs = Date\.now\(\), taskId = null[,)]/);
 });
 
 test("equal ranks are broken by which was raised first", () => {

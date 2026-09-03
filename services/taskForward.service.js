@@ -17,6 +17,7 @@ const {
   computeWorkingDeadline,
   readMs: readInstantMs,
   rechainQueueFor,
+  resolveAcceptanceAnchor,
 } = require("./officeDeadline.service");
 const c1Svc = require("./c1Service");
 const socket = require("../config/socketInstance");
@@ -310,7 +311,7 @@ async function assigneePrioritiesFor(db, assigneeIds) {
   return map;
 }
 
-async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isImportant = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isImportant = false, isGoalBased = false, goalBased = null, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
@@ -388,6 +389,13 @@ async function createTask({ title, description, notes, requirements = [], satisf
     // A label only — nothing in the engine reads it. Stored so the client can
     // show a tag; it affects no ordering, deadline, score or permission.
     isImportant: isImportant === true,
+    // "Taskgoal" — a project (folder) marked as oriented around a measurable
+    // objective. A label only, exactly like isImportant above: nothing in the
+    // engine reads it. DELIBERATELY NOT the C2 goal task (isGoal/goalConfig
+    // below) — different fields, no scoring, no roadmap. Stored only when a
+    // real config came with it, so an ordinary task keeps no marker.
+    isGoalBased: isGoalBased === true && !!goalBased,
+    goalBased: (isGoalBased === true && goalBased) ? goalBased : null,
     isRepeat: isRepeat || false,
     repeatConfig: isRepeat && repeatConfig ? repeatConfig : null,
     isThirdParty: isThirdParty || false,
@@ -581,6 +589,123 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
     status: "confirmed",
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
+  // ── A granted task's clock waits for the assignee to come online ───────────
+  //
+  // A cross-department grant stamps the deadline at the GRANT, while the
+  // assignee may have been offline. A normal task gets `first_online` at the
+  // moment it is accepted — and acceptance happens while online — so its clock
+  // naturally starts when the person arrived. A granted task has no such step:
+  // this is it. Confirming is the assignee's first deliberate act on the task
+  // and it happens while they are online, so it is where the anchor is
+  // re-resolved to `max(grant, when-they-came-online)`.
+  //
+  // ADDITIVE and one-directional. It runs only for a task whose stored anchor
+  // is the grant (`hours_granted`), and `resolveAcceptanceAnchor` returns a
+  // LATER anchor only when the online session began after the grant — online
+  // since before it, or offline now, leaves everything exactly as it was. No
+  // other task, and no earlier deadline, is ever touched.
+  try {
+    const grantedMs = readInstantMs(task.tlHoursSetAtMs) ?? readInstantMs(task.tlHoursSetAt);
+    if (
+      Number.isFinite(grantedMs) &&
+      grantedMs > 0 &&
+      task.clockStartsAtSource === "hours_granted"
+    ) {
+      const windowSecs =
+        Number(task.deadlineWindowSecs) ||
+        Number(task.senderTimerWindowSecs) ||
+        0;
+      const stored = readInstantMs(task.clockStartsAtMs) ?? grantedMs;
+      const resolved = await resolveAcceptanceAnchor(task, Date.now(), taskId);
+      if (
+        windowSecs > 0 &&
+        Number.isFinite(resolved?.anchorMs) &&
+        resolved.anchorMs > stored
+      ) {
+        const dueDate = await computeWorkingDeadline({
+          startMs: resolved.anchorMs,
+          windowSecs,
+        });
+        await ref.update({
+          clockStartsAtMs: resolved.anchorMs,
+          clockStartsAtSource: resolved.source || "hours_granted",
+          dueDate,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    }
+  } catch (e) {
+    /* Never let a re-anchor cost the confirmation itself — the receipt is
+       recorded, and a stale deadline is the smaller wrong. */
+    console.warn("[confirm] granted re-anchor skipped:", e.message);
+  }
+
+  // ── Their FIRST task: the clock starts when they take it on ───────────────
+  //
+  // OWNER DECISION. A normal task anchors at `first_online` — the moment the
+  // person was online at or after it was created — precisely so that sitting on
+  // an acceptance buys no extra deadline. That is right while they already have
+  // work. It is wrong when they had NOTHING open: there was no work to sit on,
+  // so the gap between the task being created and them taking it on was never
+  // work time, and charging it makes their first task short by exactly that gap.
+  //
+  // Runs ONLY when `hasOpenUnsubmittedWork` finds nothing else open and
+  // unsubmitted for them — an overdue task counts as open, so somebody behind on
+  // work gets nothing here.
+  //
+  // ENTIRELY SEPARATE from the granted block above and mutually exclusive with
+  // it: a cross-department task carries `tlHoursSetAt*` and
+  // `clockStartsAtSource === "hours_granted"`, and both are refused here. That
+  // path keeps its own behaviour untouched.
+  //
+  // One-directional, like every other rule here: it writes only when the new
+  // anchor is LATER than the stored one, so no deadline ever becomes harder to
+  // meet than it already was.
+  try {
+    const isGranted =
+      task.clockStartsAtSource === "hours_granted" ||
+      Number.isFinite(readInstantMs(task.tlHoursSetAtMs)) ||
+      Number.isFinite(readInstantMs(task.tlHoursSetAt));
+
+    // A deadline somebody typed outranks anything computed from a window
+    // (`fixedDeadline ?? deadline ?? dueDate`), so recomputing one from hours
+    // would move a date that was deliberately set. Left alone.
+    const hasFixedDate = Boolean(task.fixedDeadline);
+
+    if (!isGranted && !hasFixedDate) {
+      const windowSecs =
+        Number(task.deadlineWindowSecs) ||
+        Number(task.senderTimerWindowSecs) ||
+        0;
+      const createdMs =
+        readInstantMs(task.createdAtISO) ?? readInstantMs(task.createdAt);
+      const stored = readInstantMs(task.clockStartsAtMs) ?? createdMs;
+      const resolved = await resolveAcceptanceAnchor(task, Date.now(), taskId, {
+        considerFirstTask: true,
+      });
+      if (
+        windowSecs > 0 &&
+        resolved?.source === "first_task" &&
+        Number.isFinite(resolved.anchorMs) &&
+        (!Number.isFinite(stored) || resolved.anchorMs > stored)
+      ) {
+        const dueDate = await computeWorkingDeadline({
+          startMs: resolved.anchorMs,
+          windowSecs,
+        });
+        await ref.update({
+          clockStartsAtMs: resolved.anchorMs,
+          clockStartsAtSource: resolved.source,
+          dueDate,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    }
+  } catch (e) {
+    /* Same rule as above: a failed re-anchor never costs the confirmation. */
+    console.warn("[confirm] first-task re-anchor skipped:", e.message);
+  }
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
   await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `✅ Confirmed · ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
@@ -2344,6 +2469,10 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
       newDeadline,
       /* Null when the clock was reset. See `deadlineHeldReason` above. */
       deadlineHeldReason,
+      /* Whether THIS rework's score deduction was waived — recorded so a reader
+         can be told the outcome, not just that a rework happened. The deduction
+         itself is written (or not) below, from the same flag. */
+      deductionWaived: waiveDeduction === true,
     }),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -2375,9 +2504,19 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
     console.warn("[reworkTask] queue re-chain failed:", e.message);
   }
 
+  /* The real deduction, from the admin-set C1 config in Firestore
+     (`cowork_sop_settings/task_events.c1ReworkDeduction`) — the SAME value
+     `writeReworkDeduction` charges below, never a hardcoded number, so the line
+     the reader sees is the amount that was actually taken. */
+  const { c1ReworkDeduction } = await c1Svc.getC1Config();
+  const reworkPts = +Number(c1ReworkDeduction).toFixed(2);
+
   await sendTaskChat({
     taskId, senderId: reviewerId, senderName: reviewerName,
-    text: `🔄 ${reviewerName} sent this task back for rework (rework #${currentReworks + 1}).\n📝 Reason: ${reworkReason || "No reason given"}`,
+    /* The deduction outcome rides on the message itself, on its own line after
+       the reason, so the chat card can state it without re-deriving it: waived
+       means no points were cut; otherwise the configured amount was. */
+    text: `🔄 ${reviewerName} sent this task back for rework (rework #${currentReworks + 1}).\n📝 Reason: ${reworkReason || "No reason given"}\n${waiveDeduction ? "✅ Deduction waived — no points cut for this rework." : `⚠️ Deduction applied — ${reworkPts} points cut for this rework.`}`,
     messageType: "system",
   });
 
