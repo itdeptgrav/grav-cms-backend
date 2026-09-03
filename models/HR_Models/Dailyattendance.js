@@ -98,6 +98,11 @@ const employeeEntrySchema = new mongoose.Schema(
 
     rawPunches: [rawPunchSchema],
     punchCount: { type: Number, default: 0 },
+    /* True when somebody punched on a national holiday. The day is still NH
+       and still paid; this is the evidence HR uses to grant a comp-off by
+       hand. The schema is strict, so without this line the sync set it and
+       Mongoose dropped it. */
+    punchedOnHoliday: { type: Boolean, default: false },
 
     inTime: Date,
     lunchOut: Date,

@@ -9,6 +9,7 @@ const { employerPfCosts } = require("../../services/salaryFormula");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 // Push notifications — single fan-out to mobile (Expo) + web (FCM).
 // Fire-and-forget: never awaited, never able to fail the payroll request.
 const { notifyPayslipPublished } = require("../../utils/notifyEmployee");
@@ -184,8 +185,32 @@ function computeEmployeePayroll(employee, ctx) {
     attendanceByDate,
     leaveBalance,
     leaveConfig,
+    latePolicy,
   } = ctx;
   const daysInMonth = new Date(year, month, 0).getDate();
+
+  /* THE LATE LADDER, REPLAYED — because it is never stored.
+     ------------------------------------------------------------------
+     A 3rd late is a half day and a 5th a full absence, and the attendance
+     screens show exactly that. But those codes (LHD, LAB, EAB) are derived at
+     read time by replaying the month; the stored systemPrediction stays "P*".
+     Payroll read the stored value, so it saw "P*" — a paid present day — on
+     the very days the screen showed docked. The ladder had never reached pay.
+
+     Same function, same policy, same order as the screens, so the payslip
+     cannot disagree with the timecard. An HR override on a day is honoured
+     first, exactly as everywhere else. */
+  const promotedByDate = new Map();
+  if (latePolicy?.enabled && attendanceByDate?.size) {
+    const { applyLateCountPromotion } = require("./Attendance_section");
+    const _ist = new Date(Date.now() + 330 * 60 * 1000);
+    const todayStr = `${_ist.getUTCFullYear()}-${String(_ist.getUTCMonth() + 1).padStart(2, "0")}-${String(_ist.getUTCDate()).padStart(2, "0")}`;
+    const state = { lateCount: 0, earlyCount: 0 };
+    for (const [ds, e] of [...attendanceByDate.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const { promotedStatus } = applyLateCountPromotion(e, state, latePolicy, ds, todayStr);
+      if (promotedStatus) promotedByDate.set(ds, promotedStatus);
+    }
+  }
 
   const firstActiveDay = firstActiveDayOfMonth(
     employee.dateOfJoining,
@@ -283,7 +308,11 @@ function computeEmployeePayroll(employee, ctx) {
     let note = "";
 
     if (entry) {
-      const rawStatus = entry.hrFinalStatus || entry.systemPrediction || "AB";
+      const rawStatus =
+        entry.hrFinalStatus ||
+        promotedByDate.get(dateStr) ||
+        entry.systemPrediction ||
+        "AB";
       switch (rawStatus) {
         case "P":
         case "P*":
@@ -294,9 +323,18 @@ function computeEmployeePayroll(employee, ctx) {
           if (isDeclaredHoliday) stats.holidayWorkedDays++;
           break;
         case "HD":
+        /* Promoted by the late/early-out ladder. Same pay weight as HD; the
+           separate code is kept on the day so the payslip can say WHY. */
+        case "LHD":
           category = "HD";
           paid = true;
           lopWeight = 0.5;
+          break;
+        case "LAB":
+        case "EAB":
+          category = "AB";
+          lopWeight = 1;
+          note = rawStatus === "LAB" ? "5th late this month" : "5th early-out this month";
           break;
         case "MP":
           if (settings.mpTreatment === "absent") {
@@ -447,7 +485,11 @@ function computeEmployeePayroll(employee, ctx) {
       isDeclaredHoliday,
       isSundayOff,
       isWorkingSunday,
-      rawStatus: entry?.hrFinalStatus || entry?.systemPrediction || null,
+      rawStatus:
+        entry?.hrFinalStatus ||
+        promotedByDate.get(dateStr) ||
+        entry?.systemPrediction ||
+        null,
       netWorkMins: entry?.netWorkMins || 0,
       otMins: entry?.otMins || 0,
       lateMins: entry?.lateMins || 0,
@@ -851,7 +893,7 @@ async function loadMonthContext(month, year) {
       ? LeaveConfig.getConfig().catch(() => null)
       : Promise.resolve(null);
 
-  const [settings, salaryCfg, dayDocs, holidays, leaveConfig] =
+  const [settings, salaryCfg, dayDocs, holidays, leaveConfig, attendanceSettings] =
     await Promise.all([
       PayrollSettings.getConfig(),
       SalaryConfig.getSingleton(),
@@ -863,6 +905,11 @@ async function loadMonthContext(month, year) {
         },
       }).lean(),
       leaveConfigP,
+      /* The late/early-out ladder. Payroll has to replay it — see
+         computeEmployeePayroll — and a payroll that read a different policy
+         from the one the attendance screens use would dock a day the screen
+         did not show. */
+      AttendanceSettings.getConfig().catch(() => null),
     ]);
 
   const holidayMap = new Map(holidays.map((h) => [h.date, h]));
@@ -876,7 +923,14 @@ async function loadMonthContext(month, year) {
     }
   }
 
-  return { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig };
+  return {
+    settings,
+    salaryCfg,
+    holidayMap,
+    attendanceByEmp,
+    leaveConfig,
+    latePolicy: attendanceSettings?.lateHalfDayPolicy || null,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -902,7 +956,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid month" });
     }
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -931,6 +985,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balanceByEmpId.get(String(emp._id)) || null,
       };
       return computeEmployeePayroll(emp, ctx);
@@ -1109,7 +1164,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     // No draft exists → fall through to full recompute (first-time processing
     // straight from Preview without going through Save Draft).
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -1163,6 +1218,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
       const computed = computeEmployeePayroll(emp, ctx);
@@ -1804,6 +1860,7 @@ router.patch(
         holidayMap,
         attendanceByEmp,
         leaveConfig,
+        latePolicy,
       } = await loadMonthContext(item.month, item.year);
       const bid = (employee.biometricId || "").toUpperCase();
       const balance = await LeaveBalance.findOne({
@@ -1819,6 +1876,7 @@ router.patch(
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
 
@@ -2966,7 +3024,7 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
-    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig, latePolicy } =
       await loadMonthContext(month, year);
 
     const employees = await Employee.find({
@@ -3022,6 +3080,7 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
         holidayMap,
         leaveConfig,
         attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        latePolicy,
         leaveBalance: balance,
       };
       const computed = computeEmployeePayroll(employee, ctx);

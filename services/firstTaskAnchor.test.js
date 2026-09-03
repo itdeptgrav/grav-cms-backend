@@ -217,7 +217,7 @@ test("only the acceptance surfaces opt in", () => {
 test("confirming an assignment re-anchors, and refuses granted or fixed-date tasks", () => {
   const at = CONFIRM.indexOf("Their FIRST task");
   assert.ok(at > 0, "the confirm path was not wired");
-  const block = CONFIRM.slice(at, at + 3000);
+  const block = CONFIRM.slice(at, at + 6000);
   assert.match(block, /considerFirstTask: true/);
   assert.match(
     block,
@@ -236,4 +236,121 @@ test("approving a self-assigned task re-anchors at the approval", () => {
   assert.match(block, /clockStartsAtSource: "self_approved"/);
   assert.match(block, /task\.fixedDeadline/, "a typed deadline is not protected");
   assert.match(block, /resolved\.anchorMs > stored/, "the write is not one-directional");
+});
+
+/* ── A self-assigned task anchors at its APPROVAL, not a later press ───────── */
+
+const NEGOTIATION = readFileSync("services/budgetNegotiation.service.js", "utf8");
+
+test("the manager's acceptance of a self task is its anchor", () => {
+  /**
+   * Reported: raised 1:00, manager approved 1:30, creator confirmed 2:00, and
+   * the clock started at 2:00. On a self task the person raises the work and
+   * proposes its hours in one act, so the budget opens waiting for their
+   * MANAGER — that acceptance is the approval, and it is the first moment the
+   * work was released. Everything before it was a wait on somebody else.
+   */
+  const at = NEGOTIATION.indexOf("A self-assigned task's APPROVAL is its grant");
+  assert.ok(at > 0, "the self-task approval anchor is not there");
+  const block = NEGOTIATION.slice(at, at + 1600);
+  assert.match(block, /task\.isSelfAssigned === true/, "not scoped to self tasks");
+  assert.match(
+    block,
+    /String\(employeeId\) === String\(partiesOf\(task\)\.assignor/,
+    "any party's acceptance counts, not only the manager's",
+  );
+  /* Asserted against the whole file rather than a window: the source between
+     the condition and the label is prose, and prose moves. */
+  assert.match(
+    NEGOTIATION,
+    /anchorMs === approvalMs\s*\?\s*"self_approved"/,
+    "the anchor is not named for what it is",
+  );
+});
+
+test("the approval layers on top without disturbing the grant", () => {
+  /**
+   * The cross-department expression is left BYTE-IDENTICAL and the approval is
+   * applied after it, so a granted task computes exactly what it always did —
+   * `approvalMs` is null for anything that is not a self task accepted by its
+   * manager. A max for the same reason the grant uses one: the queue-ahead push
+   * must survive it rather than be discarded.
+   */
+  const at = NEGOTIATION.indexOf("const grantAnchorMs =");
+  assert.ok(at > 0, "the grant anchor was removed");
+  const block = NEGOTIATION.slice(at, at + 1400);
+  assert.match(
+    block,
+    /Math\.max\(grantMs, normalAnchor\.anchorMs \?\? grantMs\)/,
+    "the cross-department grant expression was altered",
+  );
+  assert.match(
+    block,
+    /approvalMs != null \? Math\.max\(grantAnchorMs, approvalMs\) : grantAnchorMs/,
+    "the approval does not survive alongside the queue push",
+  );
+});
+
+test("confirming a self task does NOT move its anchor", () => {
+  /* The second press on a self task is the creator's own, and the moment that
+     released the work was the manager's approval — already stamped. */
+  const at = CONFIRM.indexOf("A SELF task is already anchored");
+  assert.ok(at > 0, "the confirm path still re-anchors self tasks");
+  const block = CONFIRM.slice(at, at + 1400);
+  assert.match(block, /task\.isSelfAssigned === true/);
+  assert.match(block, /!isGranted && !hasFixedDate && !isSelfTask/, "the guard is not applied");
+});
+
+test("an ASSIGNED task still anchors at acceptance", () => {
+  /* The self-task guard must not leak into the ordinary case, where the
+     acceptance IS the moment the work became theirs. It may only ever appear
+     as a NEGATION in the guard — never as a condition that enables something —
+     so a task that is not self-assigned reaches the rule untouched. */
+  const at = CONFIRM.indexOf("Their FIRST task");
+  const block = CONFIRM.slice(at, at + 6000);
+  assert.match(block, /!isGranted && !hasFixedDate && !isSelfTask/);
+  const uses = block.match(/isSelfTask/g) || [];
+  const negated = block.match(/!isSelfTask/g) || [];
+  assert.equal(
+    uses.length - negated.length,
+    1,
+    "isSelfTask is used somewhere other than its declaration and the guard",
+  );
+});
+
+/* ── The manager's approval also confirms a self task ──────────────────────── */
+
+test("a self task is confirmed by its approval, so nobody is asked twice", () => {
+  /*
+   * Reported with T220: raised by Pramod, approved by the manager, and the
+   * assignee was then shown "Confirm receipt · Assigned by Pramod Biswal" —
+   * being asked to accept his own task from himself.
+   */
+  const at = NEGOTIATION.indexOf("A self task needs no second acceptance");
+  assert.ok(at > 0, "the self-task confirmation is not there");
+  const block = NEGOTIATION.slice(at, at + 1600);
+  assert.match(block, /approvalMs != null \? partiesOf\(task\)\.assignee/);
+  assert.match(
+    block,
+    /!\(task\.confirmedBy \|\| \[\]\)\.map\(String\)\.includes/,
+    "re-agreeing a budget could drag an in-progress task back to confirmed",
+  );
+});
+
+test("it writes the same two fields the confirm route writes", () => {
+  /* The task must reach the IDENTICAL state by the shorter path — a status
+     without the confirmedBy entry, or the reverse, is a task the rest of the
+     product disagrees with itself about. */
+  const at = NEGOTIATION.indexOf("selfNeedsConfirm");
+  const block = NEGOTIATION.slice(NEGOTIATION.indexOf("...(selfNeedsConfirm"), NEGOTIATION.indexOf("...(selfNeedsConfirm") + 400);
+  assert.ok(at > 0);
+  assert.match(block, /status: "confirmed"/);
+  assert.match(block, /confirmedBy: admin\.firestore\.FieldValue\.arrayUnion\(selfAssignee\)/);
+});
+
+test("a task that is not a self task adds no field to that write", () => {
+  /* Spread on a false condition contributes nothing, so an assigned or a
+     cross-department acceptance writes exactly what it always did. */
+  const block = NEGOTIATION.slice(NEGOTIATION.indexOf("...(selfNeedsConfirm"), NEGOTIATION.indexOf("...(selfNeedsConfirm") + 400);
+  assert.match(block, /:\s*\{\}\),/, "there is no empty branch for the ordinary case");
 });

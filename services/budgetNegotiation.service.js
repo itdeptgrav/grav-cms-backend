@@ -453,14 +453,79 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
        throw that away, leaving one accept surface chaining and the other not.
        Both intents survive a max: never before the hours were granted, and
        never before the higher-priority work above it finishes. */
-    const anchorMs =
+    /**
+     * **A self-assigned task's APPROVAL is its grant.** SELF TASKS ONLY.
+     *
+     * On a self task the person raises the work and proposes its hours in one
+     * act, so the budget opens waiting for their MANAGER, and this acceptance —
+     * by the assignor — is that approval. Until it happened the work was not
+     * released: the engine's own words elsewhere are "You can now begin work".
+     * So the approval instant is the earliest the work was theirs, which is
+     * exactly what `tlHoursSetAt` means for a cross-department grant, and it is
+     * folded in the same way rather than as a second mechanism.
+     *
+     * Without this the anchor fell back to `first_online`, which for somebody
+     * online since the morning is the task's CREATION — charging them for the
+     * whole wait on their manager, which is the wait they had no control over.
+     *
+     * Narrow on purpose: self-assigned only, and only when the accepting party
+     * is the assignor. A normal task, and every cross-department task, reaches
+     * none of this.
+     */
+    const isSelfTask =
+      task.isSelfAssigned === true || task.isSelfAssigned === "true";
+    const approvalMs =
+      isSelfTask &&
+      String(employeeId) === String(partiesOf(task).assignor || "")
+        ? Date.now()
+        : null;
+
+    /**
+     * **A self task needs no second acceptance.** SELF TASKS ONLY.
+     *
+     * The assignee IS the person who raised it: they chose the work and
+     * proposed its hours when they created it. Asking them to "Confirm receipt"
+     * afterwards asks them to accept their own task from themselves — the card
+     * reads "Assigned by <their own name>" — and the one thing it used to
+     * change was the clock, which is now stamped at the approval and no longer
+     * moves for it.
+     *
+     * So the manager's approval confirms it, writing the SAME two fields
+     * `confirmTaskReceipt` writes, exactly as `self-assign-approve` already
+     * does at the other self-task gate. That route still answers "Already
+     * confirmed" to anybody who calls it afterwards.
+     *
+     * Guarded on not being confirmed already, so re-opening a budget later and
+     * agreeing it again cannot drag an in-progress task back to `confirmed`.
+     */
+    const selfAssignee =
+      approvalMs != null ? partiesOf(task).assignee || null : null;
+    const selfNeedsConfirm =
+      selfAssignee != null &&
+      !(task.confirmedBy || []).map(String).includes(String(selfAssignee));
+
+    /* The grant path, computed EXACTLY as it always was — the expression is
+       unchanged so the cross-department guarantee it carries is untouched. */
+    const grantAnchorMs =
       grantMs != null
         ? Math.max(grantMs, normalAnchor.anchorMs ?? grantMs)
         : normalAnchor.anchorMs;
-    const anchorSource =
-      grantMs != null && anchorMs === grantMs
+    const grantAnchorSource =
+      grantMs != null && grantAnchorMs === grantMs
         ? "hours_granted"
         : normalAnchor.source;
+
+    /* The self-task approval, layered ON TOP and never reached by anything
+       else: `approvalMs` is null unless the task is self-assigned AND the
+       accepting party is its manager, so a granted or an ordinary assigned task
+       takes the two values above unchanged. A max for the same reason as the
+       grant — the queue-ahead push must survive it. */
+    const anchorMs =
+      approvalMs != null ? Math.max(grantAnchorMs, approvalMs) : grantAnchorMs;
+    const anchorSource =
+      approvalMs != null && anchorMs === approvalMs
+        ? "self_approved"
+        : grantAnchorSource;
     const earned = addWorkingSecsIST(
       anchorMs,
       secs,
@@ -516,6 +581,14 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
       senderTimerApprovedBy: String(employeeId),
       senderTimerApprovedByName: employeeName || "",
       senderTimerApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      /* Spread, so a task that is not a self task adds no field here at all
+         and this write stays byte-for-byte what it was. */
+      ...(selfNeedsConfirm
+        ? {
+            status: "confirmed",
+            confirmedBy: admin.firestore.FieldValue.arrayUnion(selfAssignee),
+          }
+        : {}),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 

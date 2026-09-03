@@ -87,10 +87,41 @@ async function sendExpoPush(employeeIdOrIds, opts) {
   const filteredIds = ids.filter(Boolean);
   if (filteredIds.length === 0) return result;
 
+  // ── Registered devices decide first ──────────────────────────────────
+  // A person with rows in the device registry has answered, per device and
+  // per type, what they want (services/notifyDevices.service). Those answers
+  // govern. The two single-token fields below are read ONLY for people the
+  // registry has never seen — an older app build, a browser from before the
+  // registry existed — because a registered phone is the same token that sits
+  // in `pushToken`, and running both paths would ring it twice.
+  result.registry = { sent: 0, skipped: 0, removed: 0 };
+  let legacyIds = filteredIds;
+  try {
+    const { notifyEmployeeDevices } = require("../services/notifyDevices.service");
+    const type = data.notificationType || data.type || "general";
+    const unregistered = [];
+    for (const id of filteredIds) {
+      const r = await notifyEmployeeDevices(id, {
+        type, title, body, url, data, channelId, categoryId,
+      });
+      if (r.matched > 0) {
+        result.registry.sent += r.sent;
+        result.registry.skipped += r.skipped;
+        result.registry.removed += r.removed;
+      } else {
+        unregistered.push(id);
+      }
+    }
+    legacyIds = unregistered;
+  } catch (e) {
+    console.warn("[SEND-PUSH] registry pass failed, using stored tokens:", e.message);
+  }
+  if (legacyIds.length === 0) return result;
+
   try {
     // Fetch employees with EITHER a mobile or web token
     const employees = await Employee.find({
-      _id: { $in: filteredIds },
+      _id: { $in: legacyIds },
       $and: [
         { $or: [{ status: "active" }, { isActive: true }] },
         {
@@ -106,7 +137,7 @@ async function sendExpoPush(employeeIdOrIds, opts) {
 
     if (employees.length === 0) {
       console.log(
-        `[SEND-PUSH] No active employees with any token for: ${filteredIds.join(", ")}`,
+        `[SEND-PUSH] No active employees with any token for: ${legacyIds.join(", ")}`,
       );
       return result;
     }

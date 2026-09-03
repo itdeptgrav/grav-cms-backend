@@ -34,6 +34,9 @@ async function _notify({ recipientIds, type, title, body, data, senderId, sender
   if (!recipientIds?.length) return;
   try {
     const batch = db.batch();
+    /* See `_notifyMany` — one id per event, so the service worker can tag on
+       it instead of on the type, which made notifications replace each other. */
+    const eventId = _nuuid();
     recipientIds.forEach(id => {
       batch.set(db.collection("cowork_notifications").doc(_nuuid()), {
         recipientEmployeeId: id, type, title, body,
@@ -46,7 +49,7 @@ async function _notify({ recipientIds, type, title, body, data, senderId, sender
     setImmediate(() => {
       try {
         const { sendPushToEmployees } = require("../../services/fcmPush.service");
-        sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) }).catch(() => { });
+        sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}), notificationId: eventId }).catch(() => { });
       } catch (_) { }
     });
   } catch (e) { console.error("[_notify]", e.message); }

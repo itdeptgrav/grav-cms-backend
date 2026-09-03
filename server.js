@@ -656,6 +656,18 @@ const connectDB = async () => {
   try {
     await mongoose.connect(
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
+      {
+        /* Index building is a DEVELOPMENT convenience. With it on, every boot
+           issues a createIndex for each of the ~285 indexes the schemas
+           declare, and Mongoose holds each model's queries until its own
+           indexes are confirmed — so the first requests after a deploy wait
+           behind hundreds of round trips to Atlas. With several deploys a
+           day, that is a minute or two of 502s each time, seen from the CMS
+           as "everything takes two minutes". The indexes already exist in
+           production; a NEW index still gets created by the next dev boot
+           against the same database, or by hand. */
+        autoIndex: process.env.NODE_ENV !== "production",
+      },
     );
     console.log("✅ MongoDB connected successfully");
 
@@ -2803,12 +2815,25 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Simple health check for socket
+// Health check — READINESS, not liveness.
+//
+// The port opens before MongoDB is connected (server.listen runs unconditionally;
+// connectDB() resolves later), so a check that answered 200 the moment the
+// process was up let the hosting service route traffic to an instance whose
+// every query was still buffered behind the connection. Requests that arrived
+// in that window took 12–20 seconds (the /verify and /login worst cases in the
+// bandwidth tracker) or died when the previous instance was shut down.
+//
+// 503 until the database is connected. Point the host's health-check path at
+// this route and a deploy only goes live once the new instance can serve.
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
+  const dbReady = mongoose.connection.readyState === 1;
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? "ok" : "starting",
+    database: dbReady ? "connected" : "connecting",
     socket: "running",
     connections: io.engine.clientsCount,
+    uptimeSeconds: Math.round(process.uptime()),
   });
 });
 
@@ -2826,7 +2851,12 @@ app.get("/", (req, res) => {
 });
 
 const payslipRoutes = require("./routes/Employee_Routes/Payslip");
+const notificationSettingsRoutes = require("./routes/Employee_Routes/notificationSettings");
 app.use("/api/employee/payslip", payslipRoutes);
+/* Per-device notification preferences, for the app and the browser alike.
+   Under /api/employee because it is a person managing their own devices,
+   not a department managing anything. */
+app.use("/api/employee/notification-settings", notificationSettingsRoutes);
 
 const overtimeRoutes = require("./routes/Employee_Routes/Overtimeroutes");
 const timerSopRoutes = require("./routes/task_routes/timerSop.routes");
@@ -2883,6 +2913,18 @@ if (attendanceRouter.startHourlyAttendanceSync) {
   console.log("✅ Hourly attendance sync cron initialized");
 } else {
   console.warn("⚠️ Hourly attendance sync not available");
+}
+
+/* "You still have things waiting on you", hourly.
+   Costs one small query when nobody has switched repeats on, which is the
+   default and will be the usual state — the sweep starts from the DEVICES that
+   opted in, not from the staff list. See services/pendingReminders.service. */
+try {
+  const { startPendingReminders } = require("./services/pendingReminders.service");
+  startPendingReminders();
+  console.log("✅ Hourly pending-work reminders initialized");
+} catch (err) {
+  console.warn("⚠️ Pending-work reminders not started:", err.message);
 }
 
 // Close out CoWork sessions left online by somebody who has already punched
@@ -2947,6 +2989,14 @@ const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+  /* The heap limit, in the deploy log, because it is the number that decides
+     whether this process survives a busy afternoon. Node sizes it from the
+     container's memory — ~256 MB on a 512 MB instance — and that is what
+     the process died at on 3 Sep 2026. package.json's start script raises
+     it; if this line still says ~256, the host is not running `npm start`
+     (set the Start Command to it, or NODE_OPTIONS=--max-old-space-size=384). */
+  const heapLimitMb = Math.round(require("v8").getHeapStatistics().heap_size_limit / 1048576);
+  console.log(`✅ V8 heap limit: ${heapLimitMb} MB (rss ${Math.round(process.memoryUsage().rss / 1048576)} MB at boot)`);
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
