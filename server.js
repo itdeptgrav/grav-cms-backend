@@ -2974,6 +2974,14 @@ const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+  /* The heap limit, in the deploy log, because it is the number that decides
+     whether this process survives a busy afternoon. Node sizes it from the
+     container's memory — ~256 MB on a 512 MB instance — and that is what
+     the process died at on 3 Sep 2026. package.json's start script raises
+     it; if this line still says ~256, the host is not running `npm start`
+     (set the Start Command to it, or NODE_OPTIONS=--max-old-space-size=384). */
+  const heapLimitMb = Math.round(require("v8").getHeapStatistics().heap_size_limit / 1048576);
+  console.log(`✅ V8 heap limit: ${heapLimitMb} MB (rss ${Math.round(process.memoryUsage().rss / 1048576)} MB at boot)`);
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
