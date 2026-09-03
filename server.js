@@ -656,6 +656,18 @@ const connectDB = async () => {
   try {
     await mongoose.connect(
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
+      {
+        /* Index building is a DEVELOPMENT convenience. With it on, every boot
+           issues a createIndex for each of the ~285 indexes the schemas
+           declare, and Mongoose holds each model's queries until its own
+           indexes are confirmed — so the first requests after a deploy wait
+           behind hundreds of round trips to Atlas. With several deploys a
+           day, that is a minute or two of 502s each time, seen from the CMS
+           as "everything takes two minutes". The indexes already exist in
+           production; a NEW index still gets created by the next dev boot
+           against the same database, or by hand. */
+        autoIndex: process.env.NODE_ENV !== "production",
+      },
     );
     console.log("✅ MongoDB connected successfully");
 

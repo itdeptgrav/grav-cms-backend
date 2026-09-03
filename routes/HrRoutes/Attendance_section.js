@@ -3751,6 +3751,105 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 // 2. PUT /day-override
 // ─────────────────────────────────────────────────────────────────────────────
 
+/* ── The period sync is a JOB, not a request ───────────────────────────────
+ *
+ * It used to loop every day of the range inside one HTTP request. A month is
+ * thirty device fetches, thirty classifications and thirty 70 KB document
+ * writes — several minutes — and the proxy in front of the API (Cloudflare,
+ * then Render) closes a response that has not started after ~100 seconds.
+ * The page saw "Sync error", the server carried on syncing, and the person
+ * clicked Sync again, which started a SECOND loop over the same days on top
+ * of the first. Fourteen days of the bandwidth tracker held no completed
+ * /sync-period at all: not one ever finished from the browser's point of view.
+ *
+ * Now the POST starts the work and waits a short while for it. A single day
+ * or a small range finishes inside that wait and is answered exactly as
+ * before. Anything longer is answered 202 with a job id and the page polls
+ * GET /sync-period/:jobId for progress. A click while the same range is
+ * already running joins that job instead of starting another.
+ *
+ * Jobs live in process memory — a restart forgets them, and the page then
+ * says so and offers the button again. That is the right failure: a sync is
+ * idempotent and re-runnable, and a durable job table for it is more machine
+ * than the problem needs.
+ */
+const syncJobs = new Map();
+const SYNC_JOB_TTL_MS = 30 * 60 * 1000;
+const SYNC_INLINE_WAIT_MS = 15 * 1000;
+
+function pruneSyncJobs() {
+  const cutoff = Date.now() - SYNC_JOB_TTL_MS;
+  for (const [id, job] of syncJobs) {
+    if (job.finishedAt && job.finishedAt < cutoff) syncJobs.delete(id);
+  }
+}
+
+function aggregateSyncResults(results) {
+  return results.reduce(
+    (a, r) => ({
+      daysSynced: a.daysSynced + (r.error ? 0 : 1),
+      daysFailed: a.daysFailed + (r.error ? 1 : 0),
+      daysSkipped: a.daysSkipped + (r.skipped ? 1 : 0),
+      totalFetched: a.totalFetched + (r.fetched || 0),
+      totalEmployees: Math.max(a.totalEmployees, r.employees || 0),
+      totalGhosts: a.totalGhosts + (r.ghostCount || 0),
+    }),
+    { daysSynced: 0, daysFailed: 0, daysSkipped: 0, totalFetched: 0, totalEmployees: 0, totalGhosts: 0 },
+  );
+}
+
+/** What the page is told, for a running or a finished job. */
+function syncJobView(job, { withDetails = false } = {}) {
+  const agg = aggregateSyncResults(job.results);
+  const done = Boolean(job.finishedAt);
+  return {
+    success: true,
+    jobId: job.id,
+    pending: !done,
+    done,
+    range: job.range,
+    total: job.total,
+    completed: job.results.length,
+    current: done ? null : job.current,
+    ...agg,
+    message: done
+      ? `Synced ${agg.daysSynced}/${job.total} days (${agg.daysSkipped} skipped as complete)`
+      : `Syncing ${job.results.length}/${job.total} days…`,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt || null,
+    ...(withDetails || done ? { details: job.results } : {}),
+  };
+}
+
+function startSyncJob({ from, to, datesToSync, force }) {
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id,
+    key: `${from}..${to}|${force ? "force" : "soft"}`,
+    range: { from, to },
+    total: datesToSync.length,
+    results: [],
+    current: null,
+    startedAt: new Date(),
+    finishedAt: null,
+  };
+  job.promise = (async () => {
+    for (const dateStr of datesToSync) {
+      job.current = dateStr;
+      try {
+        job.results.push(force ? await syncDayForce(dateStr) : await syncDay(dateStr));
+      } catch (e) {
+        console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack);
+        job.results.push({ dateStr, error: e.message });
+      }
+    }
+    job.current = null;
+    job.finishedAt = new Date();
+  })();
+  syncJobs.set(id, job);
+  return job;
+}
+
 router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { from, to, onlyMissing = false, force = false } = req.body;
@@ -3772,49 +3871,47 @@ router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
     } else {
       datesToSync = allDaysInRange(from, actualTo);
     }
-    console.log(
-      `[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing} force=${force})`,
-    );
-    const results = [];
-    for (const dateStr of datesToSync) {
-      try {
-        results.push(
-          force ? await syncDayForce(dateStr) : await syncDay(dateStr),
-        );
-      } catch (e) {
-        console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack);
-        results.push({ dateStr, error: e.message });
-      }
+
+    pruneSyncJobs();
+
+    /* The same range is already being synced: join it. This is the double
+       click after a cut-off response, and it used to double the work. */
+    const key = `${from}..${actualTo}|${force ? "force" : "soft"}`;
+    let job = [...syncJobs.values()].find((j) => j.key === key && !j.finishedAt);
+    if (!job) {
+      console.log(
+        `[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing} force=${force})`,
+      );
+      job = startSyncJob({ from, to: actualTo, datesToSync, force });
     }
-    const aggregate = results.reduce(
-      (a, r) => ({
-        daysSynced: a.daysSynced + (r.error ? 0 : 1),
-        daysFailed: a.daysFailed + (r.error ? 1 : 0),
-        daysSkipped: a.daysSkipped + (r.skipped ? 1 : 0),
-        totalFetched: a.totalFetched + (r.fetched || 0),
-        totalEmployees: Math.max(a.totalEmployees, r.employees || 0),
-        totalGhosts: a.totalGhosts + (r.ghostCount || 0),
-      }),
-      {
-        daysSynced: 0,
-        daysFailed: 0,
-        daysSkipped: 0,
-        totalFetched: 0,
-        totalEmployees: 0,
-        totalGhosts: 0,
-      },
-    );
-    res.json({
-      success: true,
-      message: `Synced ${aggregate.daysSynced}/${datesToSync.length} days (${aggregate.daysSkipped} skipped as complete)`,
-      range: { from, to: actualTo },
-      ...aggregate,
-      details: results,
-    });
+
+    /* Wait a little: a day or a week finishes here and is answered as it
+       always was. A month does not, and is answered 202 with the job. */
+    await Promise.race([
+      job.promise,
+      new Promise((resolve) => setTimeout(resolve, SYNC_INLINE_WAIT_MS)),
+    ]);
+
+    if (job.finishedAt) return res.json(syncJobView(job, { withDetails: true }));
+    return res.status(202).json(syncJobView(job));
   } catch (err) {
     console.error("[SYNC-PERIOD]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
+});
+
+/** Progress of one sync job, for the page to poll. */
+router.get("/sync-period/:jobId", EmployeeAuthMiddlewear, (req, res) => {
+  pruneSyncJobs();
+  const job = syncJobs.get(String(req.params.jobId || ""));
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      code: "SYNC_JOB_UNKNOWN",
+      message: "That sync is no longer tracked — the server may have restarted. Run it again; a sync is safe to repeat.",
+    });
+  }
+  res.json(syncJobView(job));
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
