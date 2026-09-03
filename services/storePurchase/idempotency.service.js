@@ -19,6 +19,7 @@
 const crypto = require("crypto");
 
 const SpIdempotencyRecord = require("../../models/CMS_Models/StorePurchase/SpIdempotencyRecord");
+const { buildRecoveryReceipt } = SpIdempotencyRecord;
 const { fail } = require("./errors");
 
 /* How long an IN_PROGRESS claim with no effect may sit before another attempt
@@ -50,8 +51,28 @@ function canonicalise(value) {
   return value;
 }
 
-const hashRequest = (body) =>
-  crypto.createHash("sha256").update(JSON.stringify(canonicalise(body ?? {}))).digest("hex");
+/**
+ * The fingerprint a key is bound to.
+ *
+ * ── WHY A TARGET BELONGS IN HERE ────────────────────────────────────────────
+ * Hashing the body alone means a key is bound to an INTENT but not to the
+ * thing that intent acts on. `PATCH /warehouses/A/lifecycle {action:"archive"}`
+ * and the same body against warehouse B are byte-identical, so the second
+ * replays the first's response and B is never archived — while the caller is
+ * told it was.
+ *
+ * `target` is optional and omitted by every existing caller, so their
+ * fingerprints are unchanged: `undefined` hashes exactly as the bare body did.
+ */
+const hashRequest = (body, target) =>
+  crypto
+    .createHash("sha256")
+    .update(JSON.stringify(
+      target === undefined || target === null || target === ""
+        ? canonicalise(body ?? {})
+        : { target: String(target), body: canonicalise(body ?? {}) },
+    ))
+    .digest("hex");
 
 /**
  * Claim a key before doing the work.
@@ -59,7 +80,7 @@ const hashRequest = (body) =>
  * @returns {Promise<{outcome:"PROCEED"|"REPLAY", record?, response?}>}
  * @throws  409 on key reuse with a different payload, or while in progress
  */
-async function begin({ ctx, operation, key, body }) {
+async function begin({ ctx, operation, key, body, target }) {
   if (!key || !String(key).trim()) {
     throw fail(
       "IDEMPOTENCY_KEY_REQUIRED",
@@ -78,7 +99,7 @@ async function begin({ ctx, operation, key, body }) {
    * window that would otherwise open exactly when a system is newest. */
   await SpIdempotencyRecord.init();
 
-  const requestHash = hashRequest(body);
+  const requestHash = hashRequest(body, target);
   const scope = {
     companyId: ctx.companyId,
     actorId: ctx.actorId,
@@ -184,7 +205,9 @@ async function begin({ ctx, operation, key, body }) {
  * supports one, and immediately after it where it does not. Either way, from
  * this moment a retry may never re-run the work.
  */
-async function markEffectApplied({ record, entityType = "", entityId = null, session = null }) {
+async function markEffectApplied({
+  record, entityType = "", entityId = null, session = null, receipt = undefined,
+}) {
   if (!record?._id) return;
   await SpIdempotencyRecord.updateOne(
     { _id: record._id },
@@ -195,9 +218,23 @@ async function markEffectApplied({ record, entityType = "", entityId = null, ses
         resultEntityType: entityType,
         resultEntityId: entityId,
         heartbeatAt: new Date(),
+        /* ── THE EVIDENCE, WRITTEN WITH THE MARKER ──────────────────────
+           Same update, so a marker can never exist without the receipt that
+           belongs to it, and a receipt can never survive a marker that was
+           rolled back. Optional and omitted by every existing caller, whose
+           records are unchanged — and a record with no receipt is one a
+           recovery must refuse rather than reconstruct.
+
+           A SECOND defence: the receipt is re-validated here even though the
+           unit of work already validated it before the mutation, and the
+           update runs with `runValidators` so the schema itself is the third.
+           Cheap, and it means no path can persist a malformed receipt. */
+        ...(receipt === undefined || receipt === null
+          ? {}
+          : { recoveryReceipt: buildRecoveryReceipt(receipt) }),
       },
     },
-    session ? { session } : {},
+    { ...(session ? { session } : {}), runValidators: true },
   );
 }
 

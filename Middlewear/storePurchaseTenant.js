@@ -100,7 +100,15 @@ function refuseLegacyWrite(req, res, next) {
  * call it instead of `res.json` for the success path, so the response that is
  * replayed is exactly the one the first caller got.
  */
-const withIdempotency = (operation, { required = true } = {}) => async (req, res, next) => {
+/**
+ * @param {string} operation           stays stable — the target goes into the
+ *   fingerprint, not into a new operation name per record.
+ * @param {object} [opts]
+ * @param {boolean} [opts.required]
+ * @param {(req) => string|null} [opts.target]  optional record identity the key
+ *   is bound to. Omitted by existing callers, whose behaviour is unchanged.
+ */
+const withIdempotency = (operation, { required = true, target = null } = {}) => async (req, res, next) => {
   const key = req.get("Idempotency-Key") || req.get("idempotency-key");
 
   if (!key && !required) return next();
@@ -111,6 +119,8 @@ const withIdempotency = (operation, { required = true } = {}) => async (req, res
       operation,
       key,
       body: req.body,
+      /* Only when a route asks for it; `undefined` keeps the legacy hash. */
+      ...(typeof target === "function" ? { target: target(req) } : {}),
     });
 
     if (claim.outcome === "REPLAY") {

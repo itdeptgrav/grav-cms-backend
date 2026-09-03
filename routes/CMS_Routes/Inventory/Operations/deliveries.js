@@ -36,7 +36,7 @@ const {
 } = require("../../../../Middlewear/storePurchaseTenant");
 const { CAPABILITIES } = require("../../../../services/storePurchase/capabilities");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
-const { sendError } = require("../../../../services/storePurchase/errors");
+const { fail, sendError } = require("../../../../services/storePurchase/errors");
 
 router.use(EmployeeAuthMiddleware);
 /* Deliveries are company data. Resolved before any query, so no route below
@@ -73,21 +73,158 @@ function recordedQuantity(delivery) {
  * with the whole order's delivery history, and a date range came back with
  * deliveries outside it.
  */
-function deliveryMatches(delivery, { startDate, endDate, search, orderMatchedSearch }) {
-  if (startDate && new Date(delivery.deliveryDate) < new Date(startDate)) return false;
-  if (endDate && new Date(delivery.deliveryDate) > new Date(endDate)) return false;
+function deliveryMatches(delivery, { from, to, searchRe, orderMatchedSearch }) {
+  const when = new Date(delivery.deliveryDate);
+  if (from && !(when >= from)) return false;
+  if (to && !(when <= to)) return false;
 
   /* With no search, every delivery on a selected order is in scope. With one,
      the order may have been selected because ITS OWN fields matched — a PO
      number or a vendor name — in which case all its deliveries are genuinely
      what was asked for. Only when the order was selected purely because one
      delivery's invoice matched must the siblings be dropped. */
-  if (!search || orderMatchedSearch) return true;
-  return new RegExp(escapeRegex(search), "i").test(delivery.invoiceNumber || "");
+  if (!searchRe || orderMatchedSearch) return true;
+  return searchRe.test(delivery.invoiceNumber || "");
 }
 
-/** A user's search text is data, not a pattern. */
+/**
+ * A user's search text is data, not a pattern.
+ *
+ * It reached `$regex` unescaped. A name containing `(` was a 500; `.*` matched
+ * every order in the company; and `(a+)+$` is the classic catastrophic
+ * backtracking string, which turns one search box into a way to pin the
+ * database. The in-memory pass escaped it and the query did not, so the two
+ * also disagreed about what matched.
+ */
 const escapeRegex = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/* An ISO datetime that STATES its zone: a trailing Z, or ±HH:MM. */
+const DATETIME_WITH_ZONE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A calendar date that actually exists, as a UTC instant.
+ *
+ * `new Date("2026-02-31")` does not throw — it rolls over to March 3rd, and
+ * `2026-02-29` in a non-leap year becomes March 1st. Either way the filter then
+ * covers a day the caller never asked for, and nothing says so. The parsed
+ * date is therefore round-tripped through its UTC calendar components and
+ * compared with what was typed: a date that rolled over no longer matches
+ * itself, and is refused.
+ */
+function utcCalendarDate(text, endOfDay) {
+  const [y, m, d] = text.split("-").map(Number);
+  const parsed = new Date(endOfDay
+    ? Date.UTC(y, m - 1, d, 23, 59, 59, 999)
+    : Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+  if (
+    parsed.getUTCFullYear() !== y
+    || parsed.getUTCMonth() !== m - 1
+    || parsed.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * Parse one end of a date filter.
+ *
+ * ── THE TIMEZONE RULE, STATED ONCE ──────────────────────────────────────────
+ * A date-only bound is a UTC calendar day: `2026-08-31` means
+ * `2026-08-31T00:00:00.000Z` at the start of a range and
+ * `2026-08-31T23:59:59.999Z` at the end. It is deliberately NOT the server's
+ * local day — the same request has to select the same deliveries whether it is
+ * served from a laptop in Mumbai or a container running UTC, and
+ * `new Date("2026-08-31")` gave a different instant depending on which.
+ *
+ * A datetime bound must say which zone it is in: a trailing `Z` or an explicit
+ * `±HH:MM`. `2026-08-31T17:45` names no instant on its own, and inferring one
+ * from the server clock is how a saved report quietly changes meaning when it
+ * is deployed somewhere else. It is refused rather than guessed at.
+ *
+ * ── WHY `endDate` IS NOT WHAT THE CALLER SENT ───────────────────────────────
+ * A date-only end covers the whole day, because midnight excluded every
+ * delivery that arrived during the 31st — the day the person explicitly asked
+ * for. A bound carrying a time is honoured exactly, because somebody who wrote
+ * one meant it.
+ *
+ * Returns `{ ok, value, reason }` rather than a Date, so an unparseable filter
+ * is refused with a sentence instead of becoming `Invalid Date` — which Mongo
+ * accepts as a comparison that quietly matches nothing.
+ */
+function parseBoundary(raw, edge) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return { ok: true, value: null };
+  }
+  const text = String(raw).trim();
+
+  if (DATE_ONLY.test(text)) {
+    const value = utcCalendarDate(text, edge === "end");
+    return value
+      ? { ok: true, value }
+      : { ok: false, reason: `"${text}" is not a date on the calendar.` };
+  }
+
+  const zoned = DATETIME_WITH_ZONE.exec(text);
+  if (zoned) {
+    /* ── THE CALENDAR IS CHECKED HERE TOO ──────────────────────────────────
+     * The regex proves the SHAPE, not that the day exists. `new Date()` is as
+     * forgiving with a time attached as it is without one:
+     * `2026-02-31T17:45:00Z` becomes March 3rd and
+     * `2026-04-31T17:45:00+05:30` becomes May 1st, each filtering by a day
+     * nobody asked for. The date-only branch above already refuses those; a
+     * datetime has to be held to the same standard.
+     *
+     * The calendar portion is validated on its own, independently of the
+     * offset — an offset shifts which instant a valid local date names, it
+     * cannot make the 31st of February exist. Only then is the whole string
+     * converted, and the offset does its ordinary work. */
+    const [, y, m, d, hh, mm, ss] = zoned;
+    if (!utcCalendarDate(`${y}-${m}-${d}`, false)) {
+      return { ok: false, reason: `"${text}" is not a date on the calendar.` };
+    }
+    if (Number(hh) > 23 || Number(mm) > 59 || (ss !== undefined && Number(ss) > 59)) {
+      return { ok: false, reason: `"${text}" is not a time on the clock.` };
+    }
+    const parsed = new Date(text);
+    return Number.isNaN(parsed.getTime())
+      ? { ok: false, reason: `"${text}" is not a date this can filter by.` }
+      : { ok: true, value: parsed };
+  }
+
+  return {
+    ok: false,
+    reason: `"${text}" must be a date (YYYY-MM-DD) or a time that states its zone `
+          + `(ending Z, or +05:30). Without one it means a different instant on every server.`,
+  };
+}
+
+/**
+ * Both ends of the range, or a refusal naming which end is wrong.
+ *
+ * A backwards range used to return an empty list, which reads as "no
+ * deliveries" rather than "you asked for an impossible window".
+ */
+function parseDateRange(query) {
+  const from = parseBoundary(query.startDate, "start");
+  if (!from.ok) {
+    return { ok: false, field: "startDate", message: from.reason };
+  }
+  const to = parseBoundary(query.endDate, "end");
+  if (!to.ok) {
+    return { ok: false, field: "endDate", message: to.reason };
+  }
+  if (from.value && to.value && from.value > to.value) {
+    return {
+      ok: false,
+      field: "endDate",
+      message: "The end of the date range is before its start.",
+    };
+  }
+  return { ok: true, from: from.value, to: to.value };
+}
 
 const DELIVERY_LIMITATIONS = Object.freeze({
   /* No per-line receipt exists. The aggregate below is the only quantity that
@@ -126,24 +263,36 @@ function scopedFilter(req, extra = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
-    const { search = "", rawItem, vendor, status, startDate, endDate } = req.query;
+    const { search = "", rawItem, vendor, status } = req.query;
+
+    /* Parsed once. The same two Date objects bound the database query and the
+       per-delivery pass below, so the two cannot disagree about which day a
+       delivery falls on. */
+    const range = parseDateRange(req.query);
+    if (!range.ok) {
+      return sendError(res, fail("VALIDATION", range.message, { field: range.field }));
+    }
+    const { from, to } = range;
 
     const extra = {};
-    if (search) {
+    const searchRe = search ? new RegExp(escapeRegex(search), "i") : null;
+    if (searchRe) {
+      /* Escaped. See escapeRegex — this string came from a text box. */
       extra.$or = [
-        { poNumber: { $regex: search, $options: "i" } },
-        { vendorName: { $regex: search, $options: "i" } },
-        { "deliveries.invoiceNumber": { $regex: search, $options: "i" } },
+        { poNumber: searchRe },
+        { vendorName: searchRe },
+        { "deliveries.invoiceNumber": searchRe },
       ];
     }
     if (vendor) extra.vendor = vendor;
     if (status) extra.status = status;
     if (rawItem) extra["items.rawItem"] = rawItem;
 
-    if (startDate || endDate) {
-      extra["deliveries.deliveryDate"] = {};
-      if (startDate) extra["deliveries.deliveryDate"].$gte = new Date(startDate);
-      if (endDate) extra["deliveries.deliveryDate"].$lte = new Date(endDate);
+    if (from || to) {
+      extra["deliveries.deliveryDate"] = {
+        ...(from ? { $gte: from } : {}),
+        ...(to ? { $lte: to } : {}),
+      };
     }
 
     // Only orders that have actually taken a delivery.
@@ -159,7 +308,6 @@ router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
     let totalQuantity = 0;
 
     let missingQuantity = 0;
-    const searchRe = search ? new RegExp(escapeRegex(search), "i") : null;
 
     purchaseOrders.forEach((po) => {
       /* Did the ORDER match the search on its own fields, or only through one
@@ -169,7 +317,7 @@ router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
       );
 
       po.deliveries.forEach((delivery) => {
-        if (!deliveryMatches(delivery, { startDate, endDate, search, orderMatchedSearch })) return;
+        if (!deliveryMatches(delivery, { from, to, searchRe, orderMatchedSearch })) return;
 
         const quantityReceived = recordedQuantity(delivery);
         if (quantityReceived === null) missingQuantity++;
@@ -320,6 +468,7 @@ router.get("/stats/summary", requireCapability(CAPABILITIES.READ), async (req, r
     const purchaseOrders = await PurchaseOrder.find(scopedFilter(req, {
       "deliveries.deliveryDate": { $gte: startDate },
     })).select("deliveries vendor vendorName");
+
 
     let totalDeliveries = 0;
     let totalQuantity = 0;

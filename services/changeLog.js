@@ -233,13 +233,27 @@ function buildSummary({ action, entity, entityLabel, fields, section }) {
  * is being replayed — that is the point of the loopback design. Every route
  * that logs a change therefore gets approval attribution for free, and one that
  * is added later gets it without anybody remembering to wire it.
+ *
+ * GATED ON THE VALIDATED REPLAY, NOT ON THE HEADERS.
+ *
+ * These headers are as forgeable as any other. Keyed on their mere presence,
+ * anyone who could reach a logging route could stamp their own change
+ * `origin: "approval"` and name whoever they liked as the approver — a record
+ * saying a second person signed off on something nobody signed off on, which is
+ * worse than no record at all. So the gate is `isApprovalReplay`, the private
+ * flag set only after requireApproval matched the header against a signed
+ * `replayOf` claim; and the id stored is the VALIDATED one, not the header.
+ *
+ * Required lazily: services/changeRequests requires this module at load, so a
+ * top-level require here would close the cycle.
  */
 function approvalFrom(req) {
+  const { isApprovalReplay } = require("./changeRequests");
+  if (!isApprovalReplay(req)) return null;
+
   const h = req?.headers || {};
-  const id = h["x-grav-change-request"];
-  if (!id) return null;
   return {
-    changeRequestId: String(id),
+    changeRequestId: String(req.__approvalReplay.changeRequestId),
     approvedById: String(h["x-grav-approver-id"] || ""),
     approvedByName: String(h["x-grav-approver-name"] || ""),
     approvedByEmail: String(h["x-grav-approver-email"] || ""),

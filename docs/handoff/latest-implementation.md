@@ -3406,3 +3406,1800 @@ the earlier LEAD-2026-0008 / LEAD-2026-0010 the user asked to keep:
   now an Active Lead.
 - **LEAD-2026-0009** ("cc") — submitted then RETURNED; still a Prospect.
 Happy to clean any of these up on request.
+
+---
+
+## Project Manager professionalisation — Chunk 1 (2 Sep 2026)
+
+Trustworthy landing page and contract safety. Read-only: no schema, status,
+generation, approval, planning, scheduling, barcode or socket behaviour was
+touched, and no backend production file was changed at all.
+
+### Files
+
+**Backend (1 new file, no production change)**
+
+- `test/project-manager/manufacturing-order-stats.route.test.js` — new.
+  15 tests over `GET /api/cms/manufacturing/manufacturing-orders/stats/overview`
+  and `GET /api/cms/manufacturing/manufacturing-orders`.
+
+**Frontend**
+
+- `app/project-manager/dashboard/page.js` — rewritten body; live reads.
+- `components/manufacturing/moStatus.js` — new; shared MO read vocabulary.
+- `components/manufacturing/moStatus.test.mjs` — new; 14 tests.
+- `app/project-manager/dashboard/production/manufacturing-orders/page.js` —
+  three minimal edits pointing the register at the shared vocabulary
+  (status label/tone, deadline tone, date format). No restructuring.
+
+### The routing question, answered
+
+`GET /:id` is declared ~800 lines above `GET /stats/overview` in the same
+router. It does **not** shadow it: Express 5 matches per segment, so a
+one-segment `:id` cannot capture a two-segment path. Proven by test rather than
+assumed — `reachability` asserts the stats handler replies (`stats` present,
+`manufacturingOrder` absent) and that the sibling one-segment path still reaches
+`/:id`. **No production reordering was made, because none was needed.**
+
+### Contract pinned
+
+`{ success, stats }`, with all eight established fields — `totalMO`, `totalWO`,
+`ongoingWO`, `completedWO`, `pendingWO`, `forwardedWO`, `newMOThisMonth`,
+`completedWOThisMonth` — required to be present and finite numbers. Each is
+looked up by name, so a removal, a rename or a value that degrades to `NaN`
+still fails; additional fields are permitted, because adding one is a
+backward-compatible change and a test that failed on it would turn a safe
+addition into a broken build.
+
+Anonymous, junk-token and expired-session requests are refused 401 on both
+endpoints, as a matrix over the two paths rather than a spot check. Empty
+collections return real zeroes. Each count's existing meaning is characterized,
+not redefined.
+
+### Follow-up recorded, not acted on
+
+`pendingWO` counts `pending + planned + scheduled + ready_to_start`, so it is
+not "pending" in the ordinary sense — it is "not yet started on the floor".
+The meaning was left alone; the dashboard labels it **"Awaiting or in planning"**
+with a footnote naming the four statuses. Redefining it belongs to the chunk
+that separates planned from scheduled (Chunk 4).
+
+### Verification
+
+- Backend focused: `npx jest test/project-manager` — **15/15 pass.**
+- Backend full: 22 suites / 276 tests fail **with or without** the new
+  directory (2082 pass with, 2069 without) — all pre-existing, none introduced.
+- Frontend: `npm test` — **all pass, 0 fail**; the shared-vocabulary file
+  `components/manufacturing/moStatus.test.mjs` contributes 14 of them.
+- Frontend build: `npm run build` fails on a **pre-existing** duplicate binding
+  in `app/accountant/sales-vouchers/new/page.js` (clean at HEAD, untouched:
+  line 41 imports `splitGstByRate`, line 109 redeclares it). With that one file
+  temporarily set aside the build **succeeds, exit 0**, compiling every
+  `/project-manager/**` route; the file was restored byte-identical.
+- Browser: 375 px / tablet / desktop, against a local stub of the two endpoints
+  (the real backend's `.env` points at the live dev Atlas + Firestore and its
+  boot path writes). Covered loading skeletons, live data, honest empty state,
+  server-returned zeroes, stats-only failure, orders-only failure, retry, and
+  manual refresh. No horizontal overflow at 375 px. All four destination links
+  land inside the Project Manager shell.
+
+### Review corrections (same day, Chunk 1 scope only)
+
+Three findings from review of the above, corrected in place:
+
+1. **Over-strict contract test.** The envelope assertion compared exact key
+   lists, so adding any field to `stats` — or to the response beside it — would
+   have failed the build for a backward-compatible change. Relaxed to
+   presence-and-finiteness per established field; removals, renames, `NaN`,
+   `Infinity`, stringified numbers, a null `stats` and `success: false` all
+   still fail. Verified against mutated payloads before landing. The endpoint
+   and the meaning of every statistic are unchanged.
+2. **`String(undefined)` on the stat strip.** A field the server omitted would
+   have rendered the literal word "undefined", and the month note
+   "+undefined this month". Added two pure helpers to
+   `components/manufacturing/moStatus.js` — `formatCount` (finite → the number,
+   zero included; anything else → "—") and `newThisMonthUnit` (finite → the
+   note; otherwise no unit at all). Nothing missing is converted to zero.
+   Loading, error, partial-success and refresh behaviour are untouched, as is
+   the layout. Seven focused tests cover the pure behaviour.
+3. **An untrue line in this document.** It claimed junk-token and
+   expired-session requests were tested on both endpoints; only the anonymous
+   case existed for the manufacturing-order list. Rather than narrowing the
+   claim, the missing tests were written: authentication now runs all three
+   refusal modes across both paths as a matrix. **The list endpoint behaves
+   exactly as the stats endpoint does — 401 with `success: false` and no
+   payload — so no unexpected behaviour was uncovered and no other statement
+   needed correcting.**
+
+Focused backend suite after the corrections: **15/15 pass.**
+
+---
+
+## Project Manager professionalisation — Chunk 2 (2 Sep 2026)
+
+Endpoint ownership, access and audit boundary. The matrix that drove every
+decision is `docs/audits/project-manager-endpoint-access.md`.
+
+### Files
+
+**Backend**
+
+- `docs/audits/project-manager-endpoint-access.md` — new. **110 HTTP endpoint
+  paths**, each carrying exactly one current-state classification that partitions
+  to 110 (`SAFE_AS_IS` 60, `SHARED_CROSS_DEPARTMENT` 38,
+  `UNKNOWN_REQUIRES_DECISION` 6, `MISSING_AUTHENTICATION` 5,
+  `PM_OWNED_MUTATION` 1). Socket.IO surfaces (6 events + 1 room pattern) and
+  de-navigated PM pages (7) are inventoried separately and are **not** added to
+  that total. File:line evidence throughout, a reproducible grep in §8, and the
+  full classified list in Appendix A.
+- `routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes.js` —
+  `router.use(EmployeeAuthMiddleware)` installed.
+- `routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js` — same.
+- `routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes.js`
+  — per-route `pmOwnedWrite` guard on `share-to-vendor`, plus a `recordChange`
+  audit entry for the direct privileged write.
+- `test/project-manager/pm-access-boundary.route.test.js` — new, 35 tests.
+
+**Frontend:** none. No URL, response field or query parameter changed, so no
+frontend edit was required and none was made.
+
+### Authentication fixed
+
+Both routers required `EmployeeAuthMiddleware` and never installed it, and the
+`departmentWrites` mounts above them do not compensate — that guard ignores GET
+entirely and passes anonymous callers through by design.
+
+- **Production dashboard** (7 routes): machine assignments, live production,
+  who is on the floor today, and a barcode lookup naming the customer order,
+  all readable with no session. Fixed.
+- **Canvas layout** (3 routes): worse — anonymous `POST` and `DELETE` could
+  rewrite or delete the factory's machine layout. Fixed.
+
+Both proved anonymous by failing tests before the fix. Authentication only:
+the Production Supervisor consumes both and holds no `project-manager` role.
+
+### Authorisation fixed
+
+Exactly one route: `POST …/manufacturing-orders/share-to-vendor`. It is the only
+mutation on a PM screen that is simultaneously PM-owned, called from nowhere
+else, and replay-safe (one idempotent `updateMany` with a status filter). Guard
+applied **per route**, never as a mount, reusing `departmentWrites` so there is
+no second role or approval system.
+
+Everything else was left alone on purpose — the planning and allocation
+mutations are not replay-safe, and the floor writes the same records. See the
+audit's §7 for the per-route reasons.
+
+### Legacy ProjectManager
+
+Documented in the audit's §6, **proposed not approved**. The cliff: legacy
+accounts have no `DepartmentRole` row and nothing creates one, so the first
+Production role granted refuses every one of them. Pinned as a test.
+
+### Verification
+
+- `npx jest test/project-manager` — **50/50 pass** (15 Chunk 1 + 35 new).
+- `npx jest test/access test/store-purchase` — **242/242 pass.**
+- Full backend suite: 22 suites / 274 tests fail — the **same 22 pre-existing
+  suites** as Chunk 1 (accountant budget ×14, crm ×7, hr-ai ×1). Only the two
+  Project Manager suites exercise the changed routers, and both pass.
+- `node --check` clean on all changed backend files; `git diff --check` clean in
+  both repositories.
+
+
+---
+
+## Lane A Chunk 2 — review corrections (2 Sep 2026)
+
+Two findings from review of the above, corrected in place. No frontend file was
+touched, no Lane B file was touched, and Chunk 3 was not started.
+
+### 1. Approval replay bypass (security)
+
+`requireApproval` trusted the bare presence of the `x-grav-change-request`
+header:
+
+```js
+if (req.headers[REPLAY_HEADER]) return next();
+```
+
+That header is chosen by the caller. **Any authenticated editor could send an
+ordinary mutation with `x-grav-change-request: anything` and walk past the
+approval hold they were subject to** — in any department using the shared guard,
+not only Project Manager — leaving no ChangeRequest and so no trace in the
+queue. The Chunk 2 test masked it: it replayed with the editor's own token plus
+the header, which is exactly the exploit, and called it an approved replay.
+
+Fixed in the **shared** mechanism, with no PM-specific approval system:
+
+- `services/changeRequests.js` — new `validatedReplayOf(req)`. The bypass now
+  requires the header to equal the `replayOf` claim inside the caller's
+  **verified** JWT. That claim is minted only by `replayToken`, only inside
+  `applyChangeRequest`, only after an approver decides, into a 2-minute token
+  that travels loopback and never reaches a browser. On a match it sets the
+  private `req.__approvalReplay`; on a mismatch it does **not** refuse — the
+  request simply carries on down the ordinary role/approval path, so an editor
+  is held at 202 exactly as if no header had been sent.
+- `Middlewear/departmentWriteGuard.js` — `seedIdentity` carries `replayOf`,
+  because a mount-level approval check runs before router authentication.
+- `Middlewear/EmployeeAuthMiddlewear.js` — carries `replayOf`, because a
+  route-level guard (the PM one) runs after `req.user` has been rebuilt.
+- `services/changeLog.js` — `approvalFrom` is gated on the validated flag
+  instead of the raw header, and stores the **validated** id. Forged
+  `x-grav-approver-*` headers can no longer stamp a write `origin: "approval"`.
+
+`recordSubmission` and `recordDecision` pass `origin: "approval"` explicitly, so
+the held-change audit path is unaffected.
+
+Coverage: 10 new tests. The success case drives the real
+`decideChangeRequest` → loopback replay (via `INTERNAL_API_ORIGIN`), not a
+hand-built imitation. Verified as genuine regressions: restoring the old
+one-line check fails exactly the four exploit tests and nothing else.
+
+### 2. Endpoint audit arithmetic
+
+The classification table mixed current and previous states, HTTP paths, socket
+events and legacy pages, so it did not partition the 110 paths. Rebuilt from the
+regenerated list by an ordered first-match-wins rule set, published in Appendix
+A alongside all 110 paths and their classifications. The four different
+"missing authentication" numbers (8 observed paths, 10 route declarations fixed,
+5 paths still unfixed, 3 routers still unfixed) are now reconciled explicitly in
+§1.4 instead of collapsed into one figure.
+
+### Verification
+
+- `npx jest test/project-manager` — **59/59 pass** (15 Chunk 1 + 44 access).
+- `npx jest test/access test/store-purchase` — **242/242 pass.**
+- Full backend suite: 22 suites / 274 tests fail — the same pre-existing set.
+- `node --check` clean on all changed files; `git diff --check` clean in both
+  repositories.
+
+---
+
+## Project Manager professionalisation — Chunk 3A (3 Sep 2026)
+
+Canonical manufacturing-order list projection and a server-backed query
+contract. **Backend only** — no frontend file was touched, and none needs to
+change to keep working. Detail-page projection and decomposition remain
+**Chunk 3B and are not started.**
+
+### Files
+
+| File | Change |
+|---|---|
+| `services/manufacturing/moListQuery.js` | **new.** Pure query policy: pagination, search escaping, enum filters, deadline-risk vocabulary. No mongoose, no clock of its own. |
+| `services/manufacturing/moListProjection.js` | **new.** Pure aggregation builder + row mapper. Derivation stages lifted verbatim from the route. |
+| `services/manufacturing/moList.service.js` | **new.** The persistence seam — the only file here that knows a database exists. |
+| `routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes.js` | `GET /` reduced from 266 lines to 23: take the query, hand back the page. |
+| `routes/CMS_Routes/pm/pmRequestsRoutes.js` | Phase 0 — nine TL fields added to the MRF `.select(...)`; `tlRejectedByName` additionally published. |
+| `docs/audits/project-manager-endpoint-access.md` | Phase 0 — PM decision method `POST` → `PATCH`; stale `:15` line refs; consumer correction (below). |
+| `test/project-manager/mo-list-query.test.js` | **new**, 41 pure tests. |
+| `test/project-manager/manufacturing-order-list.route.test.js` | **new**, 38 route tests. |
+| `test/project-manager/pm-requests-tl-state.route.test.js` | **new**, 6 route tests. |
+
+### The projection boundary
+
+```
+route  →  moList.service.js  →  moListProjection.js  (pure: pipeline + mapper)
+                             →  moListQuery.js       (pure: what may be asked for)
+```
+
+Query policy and projection are pure and independently testable; persistence is
+one file with the model injected. The derivation stages — work-order count,
+quantities, completion percentage, `derivedStatus` and the four-value
+`displayStatus` — were **lifted verbatim**, comments included. This is a
+relocation, not a rewrite: no stored WorkOrder status is reinterpreted, and no
+`ManufacturingOrder` model was created. A manufacturing order remains a
+sales-approved `CustomerRequest`.
+
+### Preserved response contract
+
+All sixteen established row fields keep their name, fallback and meaning:
+`_id`, `moNumber`, `customerInfo.name`, `customerInfo.email`, `finalOrderPrice`,
+`totalQuantity`, `workOrdersCount`, `completedQuantity`, `completionPercentage`,
+`status`, `displayStatus`, `priority`, `createdAt`, `requestType`,
+`measurementName`, `deliveryDeadline`, `estimatedCompletion`. The envelope
+(`success`, `manufacturingOrders`, `pagination{page,limit,total,pages}`) and the
+URL are unchanged.
+
+**Added, additively:** `deadline` (the effective date) and `deadlineRisk`.
+
+**One value changed deliberately:** `completionPercentage` is now bounded to
+0–100. It previously published the raw ratio, so a work order re-issued after a
+short delivery — 25 units completed against a quantity of 10 — reported
+`250`. `completedQuantity` is untouched, and the bound cannot move a status
+(see the correction pass below).
+
+The strongest compatibility evidence: Chunk 1's contract tests, written against
+the old inline implementation, pass **unmodified**.
+
+### Query normalisation — observed old vs new
+
+Measured against the real route before and after, not assumed:
+
+| Input | Before | After |
+|---|---|---|
+| `?page=abc`, `?limit=abc`, `?page=0`, `?page=-3`, `?limit=0`, `?limit=-5` | **500** | 200, defaults applied |
+| `?limit=1000000000` | 200, honoured verbatim | 200, clamped to 100 |
+| `?page=1e308` | 200, but `skip: Infinity` reached the database | 200, page clamped to 1,000,000 |
+| `?limit=2.7` | 200, floored to 2 | unchanged |
+| `?search=(`, `?search=[a-z`, `?search=*` | **500** (invalid regex) | 200, literal, 0 rows |
+| `?search=.*` | matched the whole register | literal, 0 rows |
+| `?search="  Cust 1  "` | 0 rows (untrimmed) | finds it |
+| `?search=MO-REQ-0001` | 0 rows | finds `REQ-0001` |
+| `?status=bogus` | 0 rows | unchanged — never broadens |
+
+Rules: page/limit via `Number()` (not `parseInt`, which accepts `"12abc"`);
+non-numeric, zero and negative fall back to the default, a positive fraction is
+**floored** (2.7 pages is page 2), and anything oversized is **clamped**.
+**Default limit 12** (unchanged), **maximum limit 100**, **maximum page
+1,000,000**. Clamped rather than refused so no caller can break, with
+`pagination.page` and `pagination.limit` reporting what was applied. Bounding
+both factors is what makes `skip` safe: the largest it can be is
+(1,000,000 − 1) × 100 = 99,999,900, well inside the safe-integer range. Search is trimmed, regex-escaped,
+and a leading `MO-` is stripped for `requestId` comparison only — the stored
+value is untouched. Sorting is `{ updatedAt: -1, _id: -1 }`, the `_id`
+tie-breaker making paging stable when timestamps collide.
+
+### Filters
+
+Both optional and additive; absent, they change nothing.
+
+- `priority` — `low` | `medium` | `high` | `urgent`. Joins the base match, so it
+  narrows before the work-order lookup.
+- `deadlineRisk` — see below. Derived, so matched after the computing stages but
+  **before `$facet`**, which is what makes `pagination.total` count the filtered
+  set.
+
+An unrecognised value for any filter is passed through rather than dropped, so
+it matches nothing. Dropping it would turn a typo into "return everything".
+
+### Deadline-risk vocabulary
+
+Effective deadline = `customerInfo.deliveryDeadline ?? estimatedCompletion` —
+the choice the register already made client-side, moved server-side so filtering
+and display judge an order by the same date.
+
+| Value | Meaning |
+|---|---|
+| `closed` | `displayStatus` is `completed` or `cancelled` — checked first, so a finished order with a March deadline is finished, not late |
+| `none` | no deadline recorded |
+| `overdue` | deadline < reference instant |
+| `due_soon` | reference instant ≤ deadline < reference + **7 days** |
+| `on_track` | later than that |
+
+The 7-day horizon matches the week the register already colours as risk. It is
+mechanical — one date against one instant — and models no capacity or
+production intelligence. The reference instant is injected, so tests name their
+own clock and none reads the wall clock.
+
+### Cross-department consumers
+
+Re-checked exhaustively; the Chunk 2 audit was wrong and is corrected in place.
+**Only two call sites read this list, both Project Manager**
+(`dashboard/page.js:178`, `production/manufacturing-orders/page.js:98`). CEO
+touches only `/stats/overview`. Cutting and Packaging use their own routers; the
+two schedule screens call `sales-schedule/` and `production-schedule/`
+manufacturing-orders, which are different routers. Authentication is unchanged
+and **no department restriction was added** — a test pins that a
+`cutting_master` session still reads the register.
+
+### MRF TL-field dependency (Lane B)
+
+`GET /api/cms/pm/requests` published `approverName` and the whole
+`tlApproved`/`tlRejected` trail but never selected those fields, so every MRF
+arrived as `tlApproved: false, tlRejected: false, approverName: ""` — including
+ones approved months earlier. All nine already existed on the schema; they are
+now loaded, and `tlRejectedByName` is additionally published so a refusal names
+its decider as an approval already did. No schema change, no MRF authority
+change, still read-only on this desk. Proven as a regression: removing the
+fields from the `.select` again fails three of the six new tests.
+
+### Verification
+
+- `npx jest test/project-manager` — **144/144 pass** across 5 suites
+  (manufacturing-order-list 38, mo-list-query 41, pm-access-boundary 44,
+  manufacturing-order-stats 15, pm-requests-tl-state 6).
+- `npx jest test/access test/store-purchase` — **242/242 pass.**
+- Full backend suite: 22 suites / 276 tests fail — the same pre-existing set
+  (accountant budget ×14, crm ×7, hr-ai ×1). Passing rose by exactly the tests
+  added — **85** since the pre-3A Project Manager baseline of 59, counting the
+  correction pass below (41 pure + 38 list route + 6 MRF TL). No suite outside `test/project-manager/` exercises either
+  changed router.
+- `node --check` clean on all changed files; `git diff --check` clean in both
+  repositories.
+
+### Unresolved, carried to Chunk 3B
+
+`GET /:id` and `GET /:id/detailed` derive their own status and progress
+independently of this projection, so the register and the detail page can still
+disagree about the same order. Reconciling them is Chunk 3B's first task, and it
+should consume `moListProjection` rather than re-deriving. No index was added:
+the query shape did not change enough to justify one without measurement, and
+that evidence belongs with 3B's read work.
+
+
+### Chunk 3A correction pass (3 Sep 2026)
+
+Two defects in the work above, both found in review, both real.
+
+**1. Pagination could still produce an unsafe skip.** Clamping the page *size*
+was not enough. `skip` is `(page - 1) * limit`, so `?page=1e308` produced
+`skip: Infinity`, and any page above `Number.MAX_SAFE_INTEGER` produced a skip
+that could not be represented exactly. Both reach the database as an invalid
+`$skip` — the same 500 this normalisation was introduced to prevent, arriving by
+a different door, which made the "malformed pagination cannot produce a 500"
+claim false as written.
+
+`MAX_PAGE = 1_000_000` is now exported from `moListQuery.js` and applied
+alongside `MAX_LIMIT`. Normalised extremes:
+
+| Input | Applied page | skip |
+|---|---|---|
+| `1e308`, `Number.MAX_VALUE`, `MAX_SAFE_INTEGER + 2`, `MAX_PAGE + 1` | 1,000,000 | 99,999,900 |
+| `MAX_PAGE` | 1,000,000 | 99,999,900 |
+| `2.7` | 2 | floored, unchanged |
+| `0`, `-3`, `abc`, absent | 1 | 0 |
+
+A cross-product test asserts `skip` is a non-negative safe integer and `page` is
+within `[1, MAX_PAGE]` for every combination of two dozen hostile inputs. The
+`normalisePagination` doc comment claimed fractional values "resolve to the
+defaults", which was never true — they floor — and has been corrected.
+
+**2. `completionPercentage` was unbounded.** The integration test named
+"completion percentage is finite and bounded" asserted `>= 0` and never the
+upper bound, so its own over-completion fixture published `250` unnoticed.
+
+Bounded to 0–100 **at the canonical projection boundary**, in two places that
+fail independently:
+
+- in the aggregation, so anything filtering or sorting on the field sees the
+  bounded value and the status derivation reads the same number the API
+  publishes;
+- in `projectRow`, defensively, so a row arriving another way cannot publish
+  `250`, `-5` or `NaN`. A missing or unreadable value reads as `0`, matching the
+  "no work orders yet" answer rather than inventing progress.
+
+`completedQuantity` is unchanged — the units behind the figure are still exact,
+only the percentage is bounded. **No status moved:** `derivedStatus` and
+`displayStatus` test `>= 100` and `>= 70`; anything clamped down to 100
+satisfied `>= 100` before and after, and anything clamped up to 0 failed every
+branch before and after. Pinned by a test rather than left as an argument.
+
+Each bound was verified to be load-bearing by removing it and watching tests
+fail: page clamp → 4 failures; mapper bound → 2; aggregation bound → 2. The
+aggregation case matters most, because the mapper masks it for the published
+value — a test reads the raw pipeline row to catch it.
+
+Also corrected: a stale comment in `moListProjection.js` claiming six frontend
+surfaces consume this endpoint. The Chunk 3A consumer audit established two
+exact call sites.
+
+**Verification:** `test/project-manager` **144/144**; `test/access` +
+`test/store-purchase` **242/242**; `node --check` clean on all three service
+files; `git diff --check` clean. Pre-existing failures unchanged.
+
+---
+
+## Project Manager professionalisation — Chunk 3B (3 Sep 2026)
+
+Canonical manufacturing-order **detail summary**. Backend only. The frontend
+detail page is untouched; its decomposition is Lane B's, after this contract is
+stable.
+
+### Files
+
+| File | Change |
+|---|---|
+| `services/manufacturing/moSummary.service.js` | **new.** One order, eight canonical fields, reusing the list's derivation. |
+| `services/manufacturing/moListProjection.js` | `buildSummaryPipeline()` + `projectSummary()`; `derivedStatus` published additively on list rows. |
+| `routes/.../manufacturingOrderRoutes.js` | Two `/:id/detailed` defects fixed; canonical fields spread onto all three detail responses. |
+| `test/project-manager/manufacturing-order-detail-contract.route.test.js` | **new**, 22 tests. |
+| `docs/handoff/latest-implementation.md`, `docs/product/project-manager-professionalization.md` | this record; Phase 0 count corrections. |
+
+### Verified endpoint consumers
+
+Re-audited across the whole frontend before anything was changed:
+
+| Endpoint | Consumer | Note |
+|---|---|---|
+| `GET /:id` | `app/project-manager/dashboard/production/work-orders/[id]/page.js:199` | the work-order detail page |
+| `GET /emplloyeeTracking/:id` | `app/project-manager/dashboard/production/manufacturing-orders/[id]/page.js:294` | the PM MO detail page |
+| `GET /:id/detailed` | **none** | no caller anywhere in `grav-cms` |
+
+The misspelling in `/emplloyeeTracking/` is **load-bearing**: it is the URL the
+live detail page calls. It was not renamed, redirected or aliased.
+
+That `/:id/detailed` has no caller is why its 500 went unnoticed for so long —
+and why it was safe to repair rather than work around.
+
+### The canonical shared summary
+
+`summariseManufacturingOrder(id, { now })` returns:
+
+```
+totalQuantity  workOrdersCount  completedQuantity  completionPercentage
+derivedStatus  displayStatus    deadline           deadlineRisk
+```
+
+It reuses `derivationStages()` and `deadlineStages()` from the list projection —
+**one status formula, one completion formula, one deadline vocabulary, one
+percentage bound, one injected clock.** No second implementation, no
+`ManufacturingOrder` model; an order is still a `CustomerRequest`.
+
+It matches on `_id` **alone**. `buildListPipeline` opens with
+`status: "quotation_sales_approved"`, which is right for the register but wrong
+here: the detail endpoints never imposed that filter and adding it would 404
+orders their pages can open today. A test pins that.
+
+**Published additively on all three detail responses, and on list rows.** The
+top-level `status` on each endpoint is left exactly as it was, because the three
+do not agree on what it means:
+
+| Endpoint | its `status` is |
+|---|---|
+| `/:id` | the CustomerRequest's **stored** status |
+| `/emplloyeeTracking/:id` | the CustomerRequest's **stored** status |
+| `/:id/detailed` | its **own legacy derivation**, in its own vocabulary (`pending` / `planning` / `in_production` / `completed` — note `in_production`, not one of the canonical four) |
+
+Overwriting any of them would silently change what an existing caller receives.
+Nested legacy fields (`progress`, `workOrderStats`) are likewise untouched. The
+new top-level fields are the migration boundary Lane B can consume later.
+
+`completedQuantity` is the real completed-unit count and **may exceed** the
+ordered quantity after a re-issue; only `completionPercentage` is bounded (0–100).
+
+### `/:id/detailed` — old versus new
+
+| | Before | After |
+|---|---|---|
+| Any order **with a work order** | **500** `TypeError: Assignment to constant variable` | 200 |
+| Raw-material requirements | always `[]` | the real allocations |
+| Aggregate `progress.units.total` | never reached | sum of work-order quantities |
+
+The 500 was a shadowed accumulator: `const totalQuantity = wo.quantity` inside
+the work-order mapper shadowed the outer `let totalQuantity`, and the next line
+did `totalQuantity += totalQuantity` — an assignment to a `const`. An order with
+no work orders never entered the mapper, which is why the route appeared to
+work. The inner binding is now `workOrderQuantity`.
+
+The empty raw-material summary was a `.select(...)` that omitted `rawMaterials`
+while the code below read `wo.rawMaterials`. The field is now selected. Both
+were reproduced by failing tests before either was touched.
+
+### Query count and index evidence
+
+Measured with `mongoose.set("debug")` per request:
+
+| Endpoint | Database operations |
+|---|---|
+| `/:id` | `customerrequests.findOne` + `workorders.find` + **1** `customerrequests.aggregate` |
+| `/:id/detailed` | same |
+| `/emplloyeeTracking/:id` | same |
+
+**One additional aggregation per detail request, fixed cost, no N+1** — the work
+orders arrive through the `$lookup` inside `derivationStages()`, the same join
+the register makes for a whole page.
+
+`explain("queryPlanner")`, with the model's declared indexes built:
+
+- the summary's `$match: { _id }` resolves to **IDHACK** (primary-key fast path);
+- the `$lookup`'s correlated match on `customerRequestId` resolves to **IXSCAN**
+  on the **existing** `customerRequestId_1_status_1` index, on its leading field.
+
+**No index is proposed.** A first explain showed COLLSCAN, but that was an
+artifact of the in-memory test database not having built the declared indexes
+yet; after `syncIndexes()` it is an IXSCAN. Recorded because the misleading
+first reading is exactly the kind of evidence that gets an unnecessary index
+added.
+
+### Tests
+
+`test/project-manager` — **166/166 pass** across 6 suites (detail-contract 22,
+list 38, query 41, access-boundary 44, stats 15, MRF TL 6).
+
+The contract suite's core is a matrix: for one stored order, the list row and
+all three detail responses are compared **field by field** on the eight
+canonical values — against each other, not against constants, so a formula that
+drifts fails even when each endpoint stays internally consistent. Covered: no
+work orders, scheduled, planned, partial, completed, over-completion, all
+cancelled, delivery deadline, estimate fallback, no deadline, invalid ObjectId
+(400), missing order (404), anonymous (401).
+
+`test/access` + `test/store-purchase` — **242/242 pass.**
+
+Full backend suite: **22 suites / 276 tests fail — the same pre-existing set**
+(accountant budget x14, crm x7, hr-ai x1). Passing rose 2213 to 2235, exactly
+the 22 tests added. No new failures.
+
+### Remaining for Lane B
+
+The frontend detail page still reads the legacy nested shapes. It can now switch
+to the eight top-level canonical fields, which are guaranteed to match the
+register. Nothing forces that migration: both remain published.
+
+---
+
+## Project Manager professionalisation — Chunk 4A (3 Sep 2026)
+
+Work-order planning integrity **audit**. Documentation and characterisation
+tests only — **no production behaviour was changed.** Chunk 4B is blocked on a
+product decision, and the packet for it is §10 of the audit.
+
+### Files
+
+| File | Change |
+|---|---|
+| `docs/audits/project-manager-work-order-planning-integrity.md` | **new.** The audit: lifecycle vocabulary, endpoint contract table, partial-failure states, stock/conversion authority, query findings, 16 ranked defects, compatibility constraints, decision packet. |
+| `test/project-manager/work-order-planning-characterization.route.test.js` | **new**, 52 tests pinning current behaviour. |
+| `docs/handoff/latest-implementation.md` | this record. |
+
+### How to read the characterisation suite
+
+Assertions describing behaviour that is **wrong** are labelled
+`CHARACTERISATION — UNSAFE` and name what a correct implementation should do.
+Chunk 4B is expected to delete or invert them. A green run means "the system
+still behaves as the audit recorded", **not** "the system is correct".
+
+### Headline findings
+
+Three data-corruption paths, all returning HTTP 200 or a bare 500:
+
+1. **Splitting is a one-shot capability database-wide.** Split children are
+   created with no `workOrderNumber`, which carries a **unique, non-sparse**
+   index. The first split anywhere stores `null`; every later split — any work
+   order, any user — dies on `E11000 duplicate key … workOrderNumber: null`.
+2. **`quantity: true`** passes both guards and mongoose casts it to 1 — a
+   ten-unit order silently becomes one unit, reported as success.
+3. **Omitting `quantity`** unsets the work order's quantity entirely (mongoose
+   treats `undefined` as unset, so `min: 1` never fires) and marks it `planned`.
+
+Plus: `complete-planning` validates nothing and overwrites any state including
+`completed`/`cancelled`; allocation replay shrinks the material requirement
+(100 → 60 → 36 → 21.6); no planning mutation is authorised beyond "is signed in"
+or audited at all; the computed producible limit is calculated then discarded;
+a missing unit conversion silently passes the number through unconverted; and
+`GET /:id/planning` is N+1 in raw items while the allocation route beside it
+already batches.
+
+**Stock authority is sound** — planning never deducts or reserves; Store remains
+authoritative. That should be preserved.
+
+### Suspicions disproven
+
+Split-allocation replay does **not** create a second split (the first call sets
+`quantity`, so the replay computes a zero remainder). Allocation does not touch
+stock. Duplicate operation ids do not double-apply. Each is recorded as a
+passing test so the belief is not re-inherited.
+
+### The decision Chunk 4B needs
+
+`WorkOrder.status` conflates six concepts. *Planning in progress*, *ready to
+schedule* and *released to production* are not representable at all;
+`scheduled` means "planning complete", "ready to schedule" and "on the schedule"
+simultaneously; `ready_to_start` exists in the enum and is written by nothing.
+
+Four options are set out with migration and compatibility effects. **Recommended:
+a separate additive `planningState` field, with anything derivable computed in
+the projection layer instead of stored.** A full lifecycle rewrite is explicitly
+not recommended — the stored statuses are read by the register, the detail
+projections, the schedule and the scan floor.
+
+Mechanism recommendations: orchestration endpoint **yes** (additive),
+idempotency key **yes** (reuse the Store & Purchase convention), conditional
+state transitions **yes** (but this is a real behaviour change needing sign-off),
+MongoDB transaction **not yet** (confirm replica-set support first), immutable
+planning history **yes** (reuse `recordChange`, do not build a second audit).
+
+Defects 1, 2, 3, 11, 13 and 14 are validation bugs with no product question
+attached and can be fixed without waiting on the decision. **1, 2 and 3 are
+data-corruption paths and should go first.**
+
+### Verification
+
+- New suite — **52/52 pass.**
+- `test/project-manager` — **218/218 pass**, 7 suites (baseline was 166/6).
+- `test/access` + `test/store-purchase` — **324/324 pass.**
+- `node --check` clean; `git diff --check` clean in both repositories.
+
+---
+
+## Project Manager professionalisation — Chunk 4A.1 (3 Sep 2026)
+
+**Emergency data-integrity corrections** to one endpoint. Scoped deliberately:
+four proven defects, nothing else. **No lifecycle decision has been approved and
+Chunk 4B has not started.**
+
+### Files
+
+| File | Change |
+|---|---|
+| `routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js` | `PUT /:id/allocate-raw-materials` only — strict quantity validation, stored-quantity guard, ID-derived split-child number, stable scaling basis. |
+| `test/project-manager/work-order-planning-characterization.route.test.js` | 5 unsafe characterisations converted to 16 regressions; 22 unsafe findings left untouched. |
+| `docs/audits/project-manager-work-order-planning-integrity.md` | §11 added; defects 1, 2, 3, 5 marked FIXED. |
+| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+
+### Old versus new
+
+| Defect | Before | After |
+|---|---|---|
+| omitted `quantity` | 200; stored quantity **unset**; status → `planned` | **400**, nothing written |
+| `quantity: true` | 200; cast to 1 — ten units became one | **400**, nothing written |
+| `"abc"` / `{}` | **500** (mongoose cast failure) | **400**, nothing written |
+| split children | no `workOrderNumber`; first stored `null`, every later split anywhere died on `E11000` | `WO-<last 8 of _id>` before first save |
+| allocation replay | 100 → 60 → 36 → 21.6 | 100 → 60 → 60 → 60 |
+
+Accepted `quantity`: a finite JSON **number** > 0 and ≤ the work order's current
+quantity. Numeric strings refused; **fractional quantities still legal** (the
+schema says `min: 1`, not integer). A work order with no usable stored quantity
+is refused rather than divided by.
+
+Split number format `WO-<last 8 of _id>` is the fallback the codebase already
+displays (`productionSyncService.js:106`, `dispatchRoutes.js:325`) and the short
+id the barcode `WO-<shortId>-<unit>` is built from — no second counter, and it
+cannot be read as a scan because all ten parsers require `parts.length >= 3`.
+
+### Preserved
+
+Store remains the stock authority (no reservation or deduction, proven by test);
+allocation-status vocabulary; `planned` vs `partial_allocation`; split/no-split
+semantics; the response envelope; the unique index. Sufficiency enforcement (#8)
+was deliberately **not** added — it is Chunk 4B policy.
+
+### A larger pre-existing finding, reported not fixed
+
+**Neither canonical work-order generator sets `workOrderNumber`**
+(`quotationRoutes.js:1868` and `:2768`), there is no pre-save hook or counter,
+and the field is uniquely and non-sparsely indexed. Proven: two numberless work
+orders collide with `E11000`. Fixing that means changing a Sales write path and
+choosing a scheme for existing records — the broader numbering migration this
+chunk was told to report rather than invent. **A separate decision.** The split
+correction needed no migration and changed no existing document.
+
+### Still unsafe
+
+**22 findings remain pinned** as `CHARACTERISATION — UNSAFE`, including no
+authorization beyond authentication, no audit, `complete-planning` validating
+nothing and overwriting any state, replay destroying `plannedAt`, the discarded
+sufficiency limit, silent unit-conversion pass-through, and the N+1 planning
+read. Nothing here makes the rest of planning safe.
+
+### Verification
+
+Regressions were proven to fail against the old implementation first (12 failing),
+then implemented.
+
+- Planning suite — **62/62 pass** (was 52; +16 regressions, −5 converted).
+- `test/project-manager` — **228/228**, 7 suites (baseline 218).
+- `test/access` + `test/store-purchase` — **344/344**.
+- `node --check` clean; `git diff --check` clean in both repositories.
+
+---
+
+## Project Manager professionalisation — Chunk 4A.2 (3 Sep 2026)
+
+**Canonical work-order identity.** One model-level invariant replacing the
+four-call-site gap. **No migration was executed.** Chunk 4B has not started.
+
+### Files
+
+| File | Change |
+|---|---|
+| `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js` | `pre("validate")` invariant + `WorkOrder.canonicalNumber(id)` static. |
+| `routes/.../WorkOrder/workOrderRoutes.js` | 4A.1's explicit split-path assignment **removed** — the model covers it. |
+| `test/project-manager/work-order-identity.test.js` | **new**, 29 tests. |
+| `test/project-manager/work-order-planning-characterization.route.test.js` | split assertions moved to the canonical format. |
+| `scripts/migrations/work-order-number-backfill.js` | **new**, dry-run by default, never executed. |
+| `docs/audits/…-work-order-planning-integrity.md` | §12 added; the 4A.1 "larger finding" marked resolved. |
+| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+
+### The defect, and the invariant
+
+`workOrderNumber` is declared unique, and **not one** production creation path
+assigned it: `quotationRoutes.js:1868`, `:2768`,
+`returnRequestRoutes.js:340`, `:375`. No hook, no counter. Proven: two
+numberless work orders collide with `E11000 … workOrderNumber: null`, so
+creation was capped at one numberless document.
+
+The rule now lives on the model — a `pre("validate")` hook giving a **new**
+document `WO-<full 24-character ObjectId>` before its first write — so a
+creation path added tomorrow cannot reintroduce it. `validate`, not `save`,
+because it is the only document hook that fires for every persistence API in
+use here, `insertMany` included. Guarded on `isNew`, so **no existing record is
+ever renamed**. Not marked `required`, so a legacy numberless document can
+still be saved for an unrelated edit.
+
+**Full ObjectId, not its last eight characters:** the 8-char form some readers
+display is a presentation fallback. As an identity it keeps 32 bits, and 32 bits
+behind a unique index is a collision waiting for enough rows.
+
+### Compatibility
+
+The scan subsystem never reads `workOrderNumber` — every barcode is built from
+`_id.slice(-8)` and resolved the same way — so it does not move. Tested: the
+bare number is not parsed as a scan (two segments; parsers need three);
+`WO-<id>-001` and `WO-<id>-007-3` parse; **no parser asserts a segment length**;
+legacy and explicitly numbered records read exactly as before.
+
+**Follow-up, since corrected:** `returnRequestRoutes.js` composed a barcode from
+`workOrderNumber`. It produced `"undefined-001"` before and `WO-<full id>-001`
+after — which parses and then resolves to nothing. Fixed in the corrections
+below.
+
+### Existing data
+
+`scripts/migrations/work-order-number-backfill.js` **defaults to dry run**,
+requires `--apply`, and **has not been connected to any database**. It reports
+index presence and sparseness, numberless counts, duplicate non-empty numbers,
+and flags the "index absent while duplicate nulls exist" signature of a failed
+index build. The backfill never renames a non-empty number, refuses to run while
+duplicates exist, is restartable and idempotent, and logs every id. Ensuring the
+unique index is a separate later step.
+
+### Verification
+
+The 15 identity regressions were proven to fail against the old model first,
+then implemented.
+
+- `work-order-identity.test.js` — **29/29**.
+- Planning characterisation — **62/62** (22 unsafe findings still pinned).
+- `test/project-manager` — **254/254**, 8 suites (baseline 228/7).
+- `test/requests` — all pass. `test/crm` — the same 7 pre-existing suites fail.
+- `test/access` + `test/store-purchase` — the only failures are in the other
+  lane's in-progress `catalogue-boundary.route.test.js`, which fails **more**
+  without my change (17) than with it (14) and is being edited concurrently.
+- `node --check` clean; `git diff --check` clean in both repositories.
+
+
+---
+
+## Chunk 4A.2 — corrections (3 Sep 2026)
+
+Four corrections. The model-level identity invariant from 4A.2 is **unchanged**:
+`WO-<full ObjectId>`, explicit numbers preserved, `isNew` guard, no
+`required: true`, unique index intact, `save`/`create`/`insertMany` covered, no
+migration executed, no existing number rewritten. Chunk 4A.1's allocation fixes
+are untouched. Chunk 4B has not started.
+
+**Correcting the 4A.2 file count:** that chunk touched **eight physical files** —
+`WorkOrder.js`, `workOrderRoutes.js`, `work-order-identity.test.js`,
+`work-order-planning-characterization.route.test.js`,
+`work-order-number-backfill.js`, and the three documentation files counted
+individually (`…planning-integrity.md`, `latest-implementation.md`,
+`…professionalization.md`). The earlier report said seven by collapsing the docs.
+
+### Files changed by these corrections
+
+| File | Change |
+|---|---|
+| `routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js` | `scanBarcodeFor()` helper; barcodes derived from `_id`, not `workOrderNumber`. |
+| `scripts/migrations/work-order-number-backfill.js` | exact per-record write log; one numberless definition; canonical-target collision pre-check. |
+| `test/project-manager/return-barcode-identity.route.test.js` | **new**, 9 tests. |
+| `test/project-manager/work-order-number-migration.test.js` | **new**, 21 tests. |
+| `docs/audits/…-work-order-planning-integrity.md` | §13. |
+| `docs/handoff/latest-implementation.md` | this record. |
+| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+
+### 1 — Return/rework scan barcodes
+
+Built through one named helper from `_id.slice(-8)`. Before: `undefined-001`
+(rejected outright). After 4A.2: `WO-<full id>-001` — **parsed and resolved to
+nothing**, a worse failure. Now: `WO-<short id>-<unit>`, which resolves.
+
+`workOrderNumber` (canonical, full ObjectId) and the scan segment
+(`_id.slice(-8)`) are separate identities. The barcode **format** is unchanged,
+no existing barcode was rewritten, no parser was touched.
+
+**A gap found and deliberately left open** — inventoried accurately in the
+audit's §13.2: **5 distinct barcode-building paths** (a shared `barcodesFor`
+helper plus three inline loops in `quotationRoutes.js`, and the corrected
+`scanBarcodeFor` in returns) and **8 persistence/propagation call sites** (7 in
+`quotationRoutes.js`, 1 in returns). **All four Sales paths still build from
+`workOrderNumber`**, and **all eight writes are silently discarded** because
+`EmployeeProductionProgress` does not declare `assignedBarcodeIds`. Adding the
+field would persist the four wrong ones. Pinned by a test.
+
+Safe future order: centralise every builder onto the scan identity →
+characterise consumers and stored/printed formats → then add the schema field →
+verify through real scanners.
+
+### 2 — Exact migration write log
+
+Per-record conditional updates. A record is logged as written **only** when its
+update reports `modifiedCount === 1`; concurrent records are reported separately
+as skipped and excluded from rollback instructions. Exact totals for examined,
+written, skipped and failed. The write log is the rollback list, so logging a
+record the migration never touched could have unset somebody else's number.
+
+### 3 — One definition of a usable number
+
+String, non-empty after trimming. Missing, null, empty, whitespace-only and
+non-string are numberless. One `$expr` drives both the selector and the
+duplicate report, so whitespace-only records are no longer mis-grouped as a
+duplicate identity — which had also blocked their own backfill. Real numbers are
+never normalised or trimmed.
+
+### 4 — Canonical target collision pre-check
+
+**Two separate protections, and neither is the other.** Pre-flight collision
+detection refuses the whole apply before the first write, reporting the target
+and both ids, and runs even when the unique index is absent. The per-candidate
+conditional write preserves a value another writer assigned to *that document*.
+
+**Neither closes the cross-document target race.** An earlier draft claimed the
+conditional write made a post-pre-flight conflict "fail safely" — that is not
+true without a unique index, which this script does not install. Guard two
+proves only that the candidate is still numberless, not that another document
+has not claimed its target. All-or-nothing uniqueness needs either an enforced
+unique index or **a quiesced-writer deployment window**; since there is no
+index, the window is **required**, and the script prints that at apply time. The
+post-run re-report is detection and rollback guidance, not prevention. No
+transaction was introduced. Structural tests keep the warning from vanishing.
+
+### Verification
+
+The unresolvable-barcode assertion was proven to fail first.
+
+- `return-barcode-identity` — **9/9**; `work-order-number-migration` — **21/21**.
+- `work-order-identity` — 29/29; planning characterisation — 62/62.
+- `test/project-manager` — **287/287**, 10 suites (baseline 257/8).
+- `test/requests` — **368/368**. `test/access` + `test/store-purchase` — **386/386**.
+- `node --check` clean; `git diff --check` clean in both repositories.
+- **The migration was not executed.**
+
+
+---
+
+## Chunk 4A.2 — second correction pass (3 Sep 2026)
+
+Four proof and accuracy gaps found in review. No production behaviour changed
+beyond the migration's iteration; the identity invariant and Chunk 4A.1 are
+untouched. Chunk 4B has not started.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js` | unchanged behaviour; no edit was needed for these corrections |
+| `scripts/migrations/work-order-number-backfill.js` | one-pass `_id` cursor; injectable batch size; quiesced-window warning in the header and at apply time |
+| `test/project-manager/return-barcode-identity.route.test.js` | route-wiring capture block added (14 tests, was 9) |
+| `test/project-manager/work-order-number-migration.test.js` | exactly-once, retry-on-later-run, multi-page and deployment-warning tests (26, was 21) |
+| 3 documentation files | §13 rewritten |
+
+### 1 — The route is now proven to use the corrected builder
+
+`assignedBarcodeIds` is discarded by mongoose, so no persisted field reveals
+which builder ran, and the previous suite called the helper itself — a route
+that regressed would have stayed green. The tests now intercept
+`EmployeeProductionProgress.findOneAndUpdate`, capture the update **before**
+mongoose strips the field, and call through so persistence is still exercised.
+
+**Proof:** reverting the route to `${woDoc.workOrderNumber}-${unit}` fails the
+four route-wiring tests while all ten helper-level tests stay green.
+
+### 2 — Each candidate gets exactly one outcome per run
+
+The loop re-selected the first N numberless records every iteration, so a
+**failed** record — still numberless — reappeared and was counted again
+whenever a batch-mate succeeded. Now paged on a stable `_id > lastId` cursor
+that advances before each write.
+
+`examined === written + skipped + failed`, the three sets are disjoint, a failure
+is not retried within the run, and a later run retries it. **Proof:** restoring
+the old loop fails the exactly-once test; the new one passes with one success,
+one concurrent skip and one thrown failure at `batchSize: 1`.
+
+### 3 — The race limitation is stated honestly
+
+See the corrected paragraph above. Structural assertions pin the warning.
+
+### 4 — Accurate barcode inventory
+
+5 building paths, 8 persistence sites, 4 still building from `workOrderNumber`,
+**all 8 discarded**. Stated by behaviour and context name, not line number.
+
+### Verification
+
+- `return-barcode-identity` **14/14** · `work-order-number-migration` **26/26**
+- `work-order-identity` 29/29 · planning characterisation 62/62
+- `test/project-manager` — **297/297**, 10 suites (baseline 287)
+- `test/requests` + `test/access` + `test/store-purchase` — **813/813**, 24 suites
+- `node --check` clean; `git diff --check` clean in both repositories
+- **The migration was not executed.** No index created or removed.
+
+---
+
+## Project Manager professionalisation — Chunk 4B-D (3 Sep 2026)
+
+**Decision package only.** No application code, model, route, test, migration,
+frontend file or database was changed. Chunk 4B implementation has **not**
+started and must not until the questions below are answered.
+
+**Document:** `docs/decisions/project-manager-work-order-planning-lifecycle.md`
+— status **PROPOSED — awaiting user approval**.
+
+### What the evidence changed
+
+Option C (additive `planningState`) + Option A (derive rather than duplicate)
+**remains recommended**, and two findings from the full writer/reader inventory
+made it stronger or sharper:
+
+- **Schedule placement is already stored separately.** `productionScheduleRoutes`
+  and `salesScheduleRoutes` push into `ProductionSchedule.scheduledWorkOrders[]`
+  and **never touch `WorkOrder.status`**. Option A is describing the existing
+  data model, not proposing a change.
+- **Production start is already scan-driven.** `productionSyncService` moves a
+  work order to `in_progress`/`completed` from barcode evidence and stamps
+  `timeline.actualStartDate`, independently of the `start-production` button. So
+  "released" can gate the *button*; it cannot gate the floor. Any design that
+  treated a button press as the definition of "started" would contradict a
+  service already running in production.
+
+Also established: **nine** distinct `WorkOrder.status` writers across five
+applications including the vendor portal in a separate repository;
+`ready_to_start`, `paused` and `delayed` are **written by nothing**; and **no
+reader distinguishes `planned` from `scheduled`** except the start gate and one
+counter — which is what makes an additive axis cheap.
+
+### Contents
+
+Evidence inventory · current contradictions · A/B/C/D comparison · planning-state
+definitions · 16-row transition matrix · derived-fact authority table ·
+orchestration contract for `POST /:id/plan` · conservative legacy classification
+with an explicit `unknown` review queue · compatibility matrix · **14 questions
+requiring approval** · rejected alternatives · post-approval sequence ·
+rollback and observability.
+
+### Not approved, not implemented
+
+No `planningState` field exists. No transition guard exists. No migration was
+written or run. `docs/tasks/current-task.md` untouched; no new active task.
+
+---
+
+## Chunk 4B-D — decision package corrections (3 Sep 2026)
+
+Nine internal contradictions corrected before the package goes for approval.
+**Documentation only.** No application code, model, route, service, test,
+migration, dependency, frontend file or database was touched. Status remains
+**PROPOSED — awaiting user approval**; Chunk 4B has **not** started.
+
+### What was wrong, and what it is now
+
+1. **Writer counts contradicted themselves** ("six, across five applications"
+   above nine rows). Now four explicit measures: **9** mechanisms, **12**
+   route/service functions, **5** execution contexts, **10** HTTP endpoints
+   (W8 is a cron with none), broken down by owner.
+2. **`unknown` vs a four-value vocabulary.** The persisted axis now carries
+   **five** values. **Verified, not assumed:** a Mongoose schema `default`
+   hydrates a legacy document with no stored value as `"not_started"` through
+   the ORM while `.lean()` shows it absent — two readers, two answers. So **no
+   schema default** is proposed; new work orders get `not_started` from an
+   `isNew` invariant (the 4A.2 mechanism), and every reader maps **absent →
+   `unknown`**. `unknown` blocks release, needs an approver classification with
+   a reason, and is in the review queue.
+3. **"All-or-nothing without transactions" was impossible.** **Measured:** the
+   test database is a **standalone** and `withTransaction` fails with
+   *"Transaction numbers are only allowed on a replica set member or mongos."*
+   Three implementable options are set out; **Option 2 recommended** — the first
+   orchestration endpoint plans a single document, splitting stays on its
+   existing route, and atomicity is then true without qualification.
+4. **Scheduled re-planning ignored the calendar.** Now: a work order with active
+   ProductionSchedule membership **cannot** re-enter planning; it must be removed
+   through the existing scheduling authority first; no planning route ever
+   deletes a segment; unresolvable membership **fails closed** into a review
+   state.
+5. **Derived facts were vacuous.** Every rule is now total, with `unavailable`
+   distinct from `false`: empty vs malformed BOM, mixed allocated/issued,
+   accepted shortage, empty/malformed/duplicate/zero-duration operations, and a
+   `canStartProduction` that includes **the existing status gate** it previously
+   dropped. `productionStarted` defines precedence and surfaces contradictions
+   as exceptions.
+6. **Scan bypass** is now an explicit policy exception — never silently
+   released, no fabricated timestamps, visible in observability and the PM
+   queue. *(Superseded: this pass named it `scanStartedWithoutRelease`. It was
+   generalised in the 4B-D package to `productionStartedWithoutRelease` with a
+   `source` dimension, once W10 manual marks were found to write the same
+   ledger.)* **Visibility-only
+   recommended first**; enforcing at ingestion could stop the floor.
+7. **Vendor interaction** specified: forwarding preserves `planningState`;
+   vendor writes touch the execution axis only and can never overwrite the
+   planning axis; returning work internally needs an explicit transition. The
+   separate vendor repository is untouched.
+8. **Authorization is route-specific**, never router-wide — a blanket guard
+   would break Production Supervisor, Store, vendor and scan writers on the
+   shared router. Existing callers were searched: only the two PM planning
+   surfaces call the planning routes.
+9. **Approval checklist normalised** to one consecutive table of **15**
+   decisions, each with recommendation, alternative, compatibility consequence,
+   implementation consequence and default. Two have **no default** and must be
+   answered: the `unknown` treatment's review owner, and who owns the queue.
+
+### Verification
+
+All eleven required consistency checks pass. 4A.2 focused tests re-run as a
+no-regression baseline: **297/297**, 10 suites. `git diff --check` clean in both
+repositories. `planningState` appears in **zero** application files.
+
+---
+
+## Chunk 4B-D — decision package, second correction pass (3 Sep 2026)
+
+Nine further contradictions corrected. **Documentation only.** Status remains
+**PROPOSED — awaiting user approval**; Chunk 4B has **not** started.
+
+1. **Writer arithmetic reconciled — and a writer was missing.** The owner
+   breakdown summed to 11 against a claimed 12. Re-checking the code found
+   `POST /:id/work-orders/:woId/mark-stage` (the PM *Mark Production* action)
+   writes `WorkOrder.status` and had never been inventoried. It is now **W10**.
+   Reconciled: **10** mechanisms · **12** functions · **5** execution contexts ·
+   **11** HTTP endpoints (W8 is a cron with none). One apparent writer was a
+   false positive — `status: "forwarded"` in `GET /stats/overview` is a
+   `countDocuments` filter.
+2. **Legacy classification is now mutually exclusive.** The table of independent
+   rules overlapped: an `in_progress` record with no planning evidence matched
+   both `not_started` and `unknown`. Replaced with an **ordered first-match-wins
+   decision tree** (13 rules) in which execution, exceptional-status, vendor and
+   scheduling evidence all precede the "no planning evidence" conclusion.
+   Schedule membership is read before classification and an unavailable lookup
+   **fails closed to `unknown`**. A truth table demonstrates the sixteen
+   previously overlapping cases, each now claimed by exactly one rule.
+3. **Atomicity honest about the complete write set.** Removing the split did not
+   make the endpoint atomic — an idempotency receipt, planning history and a
+   `ChangeLog` event are also required, and `ChangeLog` is a separate
+   collection. Now: the domain mutation, receipt, replayable result and outbox
+   event are **embedded on the WorkOrder and commit together**; the `ChangeLog`
+   entry is **projected** from the durable outbox, explicitly **not** part of the
+   commit, observable and retryable, and never able to erase the canonical event.
+   Bounded retention specified for receipts and outbox entries.
+4. **`unknown` exits by classification, not reopen.** New transition 17
+   (`planning.classified`, approver-only, reason plus the destination's own
+   evidence, cannot classify to `released`). Transition 16 now refuses `unknown`
+   with `409 UNKNOWN_REQUIRES_CLASSIFICATION`.
+5. **All four legacy planning routes specified**, including `bulk-plan`, which
+   **must not mark work `complete`** — it validates no material line and no
+   operation time, so it sets `in_progress` only. No route may downgrade
+   `complete` or `released`.
+6. **`productionStarted` is no longer self-contradictory** — three dimensions
+   (`state`, `startedAt`, `exceptions`), so a real timestamp establishes a start
+   *and* an incompatible status adds `startedButNotInProgress`. Exceptions never
+   erase execution evidence.
+7. **Scheduling eligibility explicit.** `not_started` and `in_progress` are
+   schedulable. `unknown` is schedulable **until the backfill and review queue
+   are resolved** — otherwise an additive field would break every legacy
+   scheduling client on day one, since absent projects as `unknown`.
+8. **Shortage evidence is structured** — required non-empty reason, actor,
+   timestamp and the short lines, written inside the same atomic mutation, never
+   implicit in `planningNotes`. A recorded shortage still leaves `materialsReady`
+   **not ready**.
+9. **Approval decisions de-duplicated.** 2 is now the `unknown` *policy*; 15 is
+   the named *owner*. Fifteen consecutive rows, and **only 15 has no default.**
+
+### Verification
+
+All ten required checks pass: arithmetic reconciles; every classification case
+receives exactly one outcome; no surviving "atomic"/"partial failure" claim
+contradicts the write set; classification and reopen are distinct; all four
+legacy routes addressed; production start carries evidence and an exception
+together; approval rows consecutive 1–15 with one default-less row;
+`planningState` appears in **zero** application files; focused Project Manager
+baseline **297/297**, 10 suites.
+
+---
+
+## Chunk 4B-D — decision package, final correction pass (3 Sep 2026)
+
+Eight corrections. **Documentation only.** Status remains **PROPOSED — awaiting
+user approval**; Chunk 4B has **not** started.
+
+1. **W10 integrated throughout, not just counted.** `mark-stage` writes the
+   **same** `ProductionCompletionScanRecord` ledger as a device scan, labelled
+   `scannedBy: "<actor> (manual mark)"` — verified in code. It now appears in
+   the derived facts (`productionStarted` gained a **`source`** dimension:
+   `scanner` | `manual_mark` | `unknown`), the transition matrix (**18**
+   transitions), the bypass policy, authorization, observability, the rollout
+   sequence and decisions 9 and 12. The exception is generalised to
+   **`productionStartedWithoutRelease`** — a manual mark is never reported as a
+   device scan. **Visibility-only applies to W10 exactly as to W8**: blocking it
+   first would remove the manual backup flow used when scanners fail. Its
+   capability is **direct, never held** — the route is not replay-safe.
+   *(Superseded: this pass gave the reason as "a replayed hold would
+   double-count production". That is wrong — production, QC and packaging are
+   capped targets. The route is not replay-safe because its **dispatch** stage
+   is incremental; see the 3 Sep 2026 entry below and lifecycle decision §9.3.)*
+2. **No legacy record may be backfilled to `released`.** `released` is an
+   explicit approver decision with `releasedAt`/`releasedBy`; no legacy record
+   contains one, and `in_progress` + `plannedAt` proves work *began*, not that
+   anyone authorised it. The backfill assigns it to **zero** records,
+   classification cannot choose it, and only the post-cutover release transition
+   creates it. Observability should therefore expect
+   `productionStartedWithoutRelease` to **start high and fall**, not to be near
+   zero on day one.
+3. **`plannedAt` is no longer proof of validated completion.** The legacy
+   `complete-planning` validated neither materials nor operations, so its
+   timestamp is a *completion claim*, not verified completion. A record reaches
+   `complete` only when its **current** evidence satisfies the new total rules;
+   a claim without that evidence goes to `unknown` with
+   `legacyCompletionUnverified`.
+4. **"No materials required" needs affirmative evidence** — a recorded BOM
+   snapshot with zero required lines, or an explicit `noMaterialsRequired`
+   decision. An empty array without proof is **unavailable**, never ready, so
+   such a record cannot reach `complete` and goes to review.
+5. **Idempotency retention is honest.** A capped list cannot promise unbounded
+   replay safety, so the promise is a documented **7-day window** ("the greater
+   of 20 receipts or everything within 7 days") with an explicit client
+   contract, plus a deterministic **atomic claim rule** for concurrent requests.
+6. **Audit authority after archival is unambiguous.** Unprojected events are
+   **never evictable**; projection is confirmed by stable event id; eviction is a
+   separate later operation; once evicted, **`ChangeLog` is the canonical
+   archive** for those events — it is no longer described as both a convenience
+   index and the sole surviving copy.
+7. **Authorization table completed** — `bulk-plan`, classify, manual
+   `mark-stage`, release and reopen each carry an exact capability and a mode
+   (direct / held / visibility-only). Never router-wide.
+8. **Internal defects cleaned** — the opening note points at **§13**, the
+   duplicated `To` row is gone, transition counts reconcile, and no "scan"
+   wording silently excludes manual marks.
+
+### Verification
+
+All ten checks pass: W10 appears in seven sections beyond the inventory; the
+only mention of assigning `released` is the rule forbidding it; `verified
+completion` replaces `plannedAt` throughout; unproven empty materials are
+`unavailable`; the 17-rule tree and 20-row truth table give one outcome each;
+concurrency is deterministic; unprojected events are non-evictable;
+cross-references reconcile; `planningState` remains in **zero** application
+files; Project Manager baseline **297/297**, 10 suites.
+
+---
+
+## Chunk 4B-D — decision package, closing cleanup (3 Sep 2026)
+
+Four narrow corrections. **Documentation only**, no design expansion. Status
+remains **PROPOSED — awaiting user approval**; Chunk 4B has **not** started.
+
+1. **W10 replay semantics corrected.** *(This item was itself over-corrected;
+   the accurate version is the 3 Sep 2026 entry below.)* Verified in code that
+   `mark-stage` treats `quantity` as a **capped target** for production, and
+   that QC and packaging are monotonic in the same way — so the
+   "every replay appends units and double-counts production" statement is wrong
+   and was removed from the inventory, transition 18, the authorization table
+   and decision 12. **The replacement claim, that an identical repeat of the
+   whole route is a no-op, was also wrong** — it overlooked the dispatch stage.
+   It keeps a **direct** route-specific capability.
+2. **The unreleased-start exception is durable, not derived.** A comparison of
+   *current* `planningState !== released` would turn false the moment someone
+   released the work, erasing the history. It is now an **appended immutable
+   event** recording source, evidence identity, observed timestamp, WorkOrder id
+   and the planning state at that moment. A later release may **resolve** it but
+   never delete or rewrite it; appending must never reject a valid scan or
+   manual mark; and a reconciliation pass backfills a missing event from
+   execution evidence. Observability now distinguishes **historical occurrences**
+   (immutable, only grows), **unresolved exceptions** (should fall) and
+   **new-occurrence rate** (should fall) — "should fall" no longer applied to the
+   historical total.
+3. **W10's partial-write boundary characterised.** It writes three documents in
+   sequence with **no transaction**: `ProductionCompletionScanRecord` →
+   `WorkOrder` → `EmployeeProductionProgress`. A later failure leaves earlier
+   evidence committed. **Characterisation only** — 4B does not redesign the
+   route, nothing calls it atomic, ledger evidence stays authoritative, and
+   reconciliation must detect disagreement between the three.
+4. **Stale text removed** — the recommendation now names both device scans and
+   manual marks; the authority table says execution-ledger evidence with both
+   sources; §11 says **four** existing routes; the rule count is recalculated
+   for the 17-rule tree (**8 deterministic + 9 review = 17**, disjoint); the
+   duplicated `shortageAccepted` row is gone; all transition counts say **18**.
+
+### Verification
+
+All ten checks pass: the only remaining "double-count" mentions are the
+corrections themselves; a later release cannot erase
+the historical event; the three-write boundary is stated; rule arithmetic is
+disjoint and complete; no duplicate shortage row; counts reconcile;
+`planningState` remains in **zero** application files; Project Manager baseline
+**297/297**, 10 suites; `git diff --check` clean in both repositories.
+
+## Chunk 4B-D — decision package, W10 dispatch correction (3 Sep 2026)
+
+**Documentation only.** Status remains **PROPOSED — awaiting user approval**;
+Chunk 4B has **not** started. This pass corrects the *previous* correction.
+
+1. **`mark-stage` is not replay-idempotent — because of dispatch.** Re-read
+   stage by stage from the route:
+
+   | Stage | Computation | `quantity` | Identical repeat |
+   | --- | --- | --- | --- |
+   | Production | `cap(max(prodBefore, quantity))`, only the delta scanned | target | no-op |
+   | QC | `min(prodAfter, max(qcBefore, quantity))` | target, capped by production | no-op |
+   | Packaging | `min(qcCompleted, max(packBefore, quantity))` | target, capped by QC | no-op |
+   | **Dispatch** | `min(quantity, packagedQuantity − alreadyDispatched)` | **additional amount** | **dispatches again** |
+
+   `alreadyDispatched` is the sum of `bulkDispatchHistory[].quantity`, so each
+   accepted repeat appends a new entry and eats into remaining availability;
+   repeats stop only when packaged stock is exhausted, not because a duplicate
+   was recognised. **Both earlier statements were wrong**: "a replayed hold
+   would double-count production" (production is a capped target) and "an
+   identical repeat is a no-op" (true of three stages, not the fourth).
+
+2. **Effect of repeated dispatch on `EmployeeProductionProgress`** — only what
+   the code proves. The production and packaging reflection loops are
+   quantity-driven and skipped when their delta is zero, so a dispatch-only
+   repeat does not touch them. The dispatch loop is driven by a per-employee
+   **boolean**: it skips documents already `isDispatched`, and flags one only
+   when the remaining delta covers that employee's **whole** `totalUnits`,
+   appending a single `dispatchHistory` entry. So a repeated dispatch **can
+   advance further, not-yet-dispatched records** — one whole allocation at a
+   time — but cannot flag or re-append to the same document twice. A remainder
+   too small for every remaining allocation is dropped: units land in
+   `bulkDispatchHistory` with no employee record advanced, and the loop
+   `continue`s rather than stopping, so a later smaller allocation can still be
+   flagged out of `unitStart` order.
+
+3. **Transition 18 and the authorization decision** now say the capability is
+   direct because the endpoint contains a **non-idempotent dispatch operation**
+   *and* crosses the non-transactional three-write boundary — not because
+   production is double-counted.
+
+4. **Retained unchanged:** the capped-target finding for production/QC/packaging
+   (§9.3), and the three-write partial-failure characterisation (§9.1). The
+   endpoint-access audit keeps its **"not idempotent"** classification, now with
+   the dispatch reason spelled out so it is not read as the disproven
+   double-count claim.
+
+5. **The durable exception is keyed on new *production* evidence** (§9.2): a
+   QC, packaging or dispatch repeat that adds no production is not a production
+   start and appends no further `productionStartedWithoutRelease` occurrence.
+
+6. **Contradictory historical prose marked superseded** rather than silently
+   rewritten: the 4A-era `scanStartedWithoutRelease` name, the "replayed hold
+   would double-count production" reason, the over-corrected "identical repeat
+   is a no-op" entry, and the verification line that claimed
+   `scanStartedWithoutRelease` appeared zero times (it appeared once, in the
+   text now marked superseded).
+
+### Verification
+
+`planningState` in **zero** application files; Project Manager baseline
+**297/297** across 10 suites; `git diff --check` clean in both repositories; no
+`.js`, migration, schema, route, frontend or database change; no database
+connection made.
+
+## Chunk 4B-D — decisions 1–14 approved (3 Sep 2026)
+
+**Approval recorded. No implementation.** No application code, model, route,
+test, migration, frontend file or database was changed. Chunk 4B has **not**
+started.
+
+- **Decisions 1–14 accepted at their recommended defaults.** The "Default"
+  column of §13 is now the accepted position for those rows. Notably: additive
+  five-value `planningState` (1); persist `unknown`, approver-only Classify (2);
+  refuse re-planning while scheduled / in progress / completed (3–5); explicit
+  approver release (6); stored shortage-acceptance marker (7); no scheduling
+  prerequisite yet (8); **visibility-only** production-without-release for both
+  W8 scans and W10 manual marks (9); vendor forwarding preserves the planning
+  axis (10); dead enum values kept (11); route-specific capabilities with a
+  direct, never-held W10 manual-mark capability (12); **Option 2 — defer the
+  split**, no transaction dependency (13); fix explicit zero operation duration
+  (14).
+- **Decision 15 — review-queue owner — is OUTSTANDING.** The approval message
+  left the literal placeholder `[person or team name]` unsubstituted, so no name
+  was supplied and none has been invented. Decision 15 has no default by
+  construction.
+- **What 15 blocks:** per §13, the legacy classification backfill cannot be
+  signed off without a named owner, so that step of the §14 rollout is blocked.
+  Nothing else is: the schema-additive work, the route guards, the orchestration
+  endpoint and the observability work all depend only on decisions 1–14.
+
+Status updated in the decision package header and §13, in
+`docs/product/project-manager-professionalization.md`, and in
+`docs/audits/project-manager-work-order-planning-integrity.md` §10.2. Earlier
+dated handoff entries retain their original "PROPOSED" wording — they were
+accurate when written and are not rewritten.
+
+A stale count was corrected while updating the product doc: the writer inventory
+is **ten** (`W1`–`W10`), not nine; the product summary still said nine.
+
+## Chunk 4B.1 — additive planning-state foundation (3 Sep 2026)
+
+**First implementation slice of the approved decision package.** The decision
+package is now **partially implemented**, not complete: 4B.1 delivers the model
+foundation only. Decision 15 is still unanswered, and **no backfill has been
+approved, applied or dry-run.**
+
+### Files changed (3 code, 3 docs)
+
+| File | Change |
+| --- | --- |
+| `constants/workOrderPlanningState.js` | **New.** The five-value enum, its named constants, and `normalizePlanningState()`. Dependency-free — no mongoose, no models, no services — so the schema and the read side cannot drift apart. |
+| `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js` | Added `planningState` (enum from the constants module, **no default**, **not required**) and extended the existing `pre("validate")` invariant. |
+| `test/project-manager/work-order-planning-state.test.js` | **New**, 27 tests. |
+| `docs/product/project-manager-professionalization.md` | Corrected the "15 decisions required before any 4B code" gate. |
+| `docs/audits/project-manager-work-order-planning-integrity.md` | Same correction, plus header status. |
+| `docs/handoff/latest-implementation.md` | This entry. |
+
+### The two design choices, and the evidence for them
+
+**No schema default.** A default was added experimentally and measured: three
+tests fail, because `findOne()` hydrates the default while `.lean()` shows no
+stored field — so every legacy record would read as `not_started`, a positive
+claim that planning had not begun. Absence is interpreted as `unknown` on
+**read** instead. Reading never writes.
+
+**One hook, not two.** The `planningState` invariant was folded into the
+existing `assignCanonicalWorkOrderNumber` hook rather than added alongside it,
+and the function renamed `assignNewWorkOrderInvariants`. Two `pre("validate")`
+hooks would leave their relative order implicit. `validate` remains the event
+because it is the only document hook `insertMany()` runs. Both invariants share
+the single `isNew` guard, so no existing record is rewritten by an unrelated
+save; removing the guard was verified to fail five tests.
+
+An **explicitly supplied** value is never overwritten — including an invalid
+one, which still fails validation rather than being silently replaced by a
+valid-looking default.
+
+### Verification
+
+| Measurement | Result |
+| --- | --- |
+| PM baseline before | 10 suites / **297** tests |
+| PM baseline after | 11 suites / **324** tests (+27, all new) |
+| `work-order-identity` | 29/29, unchanged |
+| Negative check — add a schema default | **3 tests fail** |
+| Negative check — remove the invariant | **5 tests fail** |
+| `node --check` on all 3 changed `.js` | clean |
+| `git diff --check`, both repos | clean |
+| `accountant` + `crm` + `hr-ai` pre-existing failures | 22 suites / **276** tests — **held constant** |
+
+**The full backend suite is not a stable baseline right now.** Two consecutive
+runs gave 23 suites/296 failures and 27 suites/318 failures, the *worse* run
+being the one with all of this chunk's code removed. The Store/Purchase lane is
+editing shared files concurrently. The one extra failing suite over the known
+groups, `test/store-purchase/warehouse-master.route.test.js`, was proven not to
+be ours: it references neither `WorkOrder` nor `planningState`, and fails
+identically (13/114) with this chunk's model change stashed and restored.
+
+### Scope held
+
+`WorkOrder.status` untouched — the only `status` line in the model diff is a
+comment. `planningState` appears in exactly two application files (the model and
+the constants module) and no route, service, projection or frontend file. No
+route contract, response field, migration, index, capability or database
+changed; no real database was connected. Nothing was implemented from the
+projection/derived-facts slice, the four legacy route transitions, `POST
+/:id/plan`, guards, release/reopen/classify, shortage acceptance, schedule or
+scan-ledger lookups, or `productionStartedWithoutRelease`.
+
+## Chunk 4B.2A — pure planning facts (3 Sep 2026)
+
+Sequence step 2, first half. The §7 facts derivable from **one WorkOrder
+document**, as pure policy. **No database query, no route change.** External-
+evidence facts are deferred to 4B.2B and are **not** partially implemented.
+
+### Files changed (2 new code, 1 doc)
+
+| File | Change |
+| --- | --- |
+| `services/manufacturing/planningFacts.js` | **New.** The pure module. Its only `require` is `constants/workOrderPlanningState.js` — no mongoose, no model, no router, no clock, no I/O. |
+| `test/project-manager/planning-facts.test.js` | **New**, 97 tests, none touching a database. |
+| `docs/handoff/latest-implementation.md` | This entry. |
+
+4B.1's five-value enum, no-default schema and `isNew` invariant are untouched.
+
+### Fact shapes
+
+```
+derivePlanningState(stored)
+  → { value, origin: "stored"|"legacy_absent"|"malformed", storedValue, exceptions[] }
+
+deriveMaterialsReady(rawMaterials, evidence)     // and deriveMaterialsIssued
+  → { state, noMaterialsRequired, lineCount, exceptions[] }
+
+deriveOperationsReady(operations)
+  → { state, operationCount, zeroDurationDegraded, exceptions[] }
+
+derivePlanningCompleteable({ materials, operations, shortage })
+  → { state, materials, operations, acceptedShortage, exceptions[] }
+```
+
+`state` ∈ `ready` | `not_ready` | `unavailable`. Facts are **frozen objects, not
+booleans**: an object is always truthy, so `if (fact)` cannot pass an
+`unavailable` through a gate. `isReady()` / `isUnavailable()` are the safe reads.
+
+### Truth tables as implemented
+
+**Planning state** — `normalizePlanningState()` is unchanged and still answers
+"what value to show". The richer projection additionally records **why**: a
+legacy absence is the review queue's ordinary input, while a value outside the
+enum is a defect. Both render `unknown`; only the second carries
+`planningStateUnrecognized`. Collapsing them would bury a bad write inside the
+legacy population.
+
+**Materials** (`materialsReady` — satisfying set `fully_allocated` ∪ `issued`;
+`materialsIssued` — satisfying set `issued`):
+
+| Input | Result |
+| --- | --- |
+| non-empty, every line satisfying | **ready** |
+| any `not_allocated` / `partially_allocated` (or, for issued, any non-`issued`) | **not ready** |
+| empty **+** zero-line BOM snapshot, or a complete `noMaterialsRequired` decision | **ready**, `noMaterialsRequired: true` |
+| empty **without** that evidence | **unavailable** |
+| missing / not an array / malformed line / absent or unrecognised `allocationStatus` | **unavailable** |
+
+Structural defects are checked across **all** lines before readiness, so an
+`unavailable` is never downgraded to a `not_ready` that happened to match first.
+A recorded shortage is **not a parameter** of these functions at all — that is
+structural, not a rule someone can later relax.
+
+**Operations:**
+
+| Input | Result |
+| --- | --- |
+| ≥1 op, distinct ids, every duration positive and finite | **ready** |
+| empty array | **not ready** — legible, not missing |
+| missing / not an array / malformed entry | **unavailable** |
+| missing or blank `_id`, or duplicate `_id` (compared by string) | **unavailable** |
+| negative, `NaN`, `±Infinity`, numeric **string**, object, boolean | **unavailable** |
+| duration missing | **not ready** |
+| duration **zero** | **not ready** + `operationDurationZeroIndistinguishable` |
+
+**Documented compatibility limitation.** §7 calls an *explicitly set* zero
+**ready**. That is not implementable today: the sub-schema declares
+`plannedTimeSeconds: { default: 0 }`, so a stored `0` cannot be told apart from
+a field nobody filled in. Rather than guess, zero **degrades to not ready** and
+sets `zeroDurationDegraded`. The schema default is **not** changed here — that
+is decision 14, sequence step 4.
+
+**Completeable:** operations must be ready; materials ready **or** a valid
+accepted shortage; any `unavailable` input ⇒ `unavailable`. A shortage cannot
+rescue unavailable material evidence — a shortage is a decision about *known*
+short lines. **The shortage never rewrites `materialsReady`**, which stays
+`not_ready` in the returned facts; it is reported separately as
+`acceptedShortage`.
+
+**Shortage marker** is validated whole against §11.2 and taken as an **input**,
+not read from the document — the field does not exist on the schema yet
+(decision 7, step 4), and adding it here would invent storage ahead of its
+slice. A partial marker (blank reason, no actor, no timestamp, no lines) is
+`shortageMarkerIncomplete` and buys nothing.
+
+### The 4B.2B boundary
+
+`REQUIRED_EXTERNAL_EVIDENCE` names each deferred fact with the evidence its
+adapter must supply — `isScheduled`, `scheduledPlacement`, `productionStarted`,
+`productionStartedSource`, `canStartProduction`,
+`productionStartedWithoutRelease`, `hasPlanningExceptions`. Nothing is stubbed,
+half-computed or defaulted.
+
+### Verification
+
+| Measurement | Result |
+| --- | --- |
+| PM baseline before | 11 suites / **324** |
+| PM baseline after | 12 suites / **421** (+97, all new) |
+| `work-order-planning-state` + `work-order-identity` | 56/56, unchanged |
+| `accountant` + `crm` + `hr-ai` pre-existing | 22 suites / **276** — held constant |
+| `node --check`, both new files | clean |
+| `git diff --check`, both repos | clean |
+
+**Negative regression proof** — each rule most likely to be "simplified" later
+was broken and the suite caught it:
+
+| Injected regression | Tests failed |
+| --- | --- |
+| empty array folded into `.every()` (the `[].every() === true` trap) | **13** |
+| explicit zero guessed as ready (decision 14 pre-empted) | **2** |
+| shortage allowed to rescue `unavailable` materials | **1** |
+
+Restored: 97/97.
+
+### Scope held
+
+No schema, `WorkOrder.status`, planning writer, GET or mutation route, response
+contract, capability, approval workflow, scheduling, scan ingestion, migration,
+backfill, frontend, Lane B or Store/Purchase file changed. No database
+connected; the new suite performs no query. `docs/tasks/current-task.md`
+untouched. Decision 15 remains outstanding and does not gate this slice.
+
+## Chunk 4B.2B — pure external planning evidence (3 Sep 2026)
+
+Sequence step 2, second half. The §7 facts that need evidence from **outside**
+the WorkOrder, still as pure policy over already-loaded data. **No MongoDB
+query, no route.** 4B.1 and 4B.2A are untouched — `planningFacts.js` is
+byte-identical and its 97 tests still pass.
+
+### Files changed (2 new code, 1 doc)
+
+| File | Change |
+| --- | --- |
+| `services/manufacturing/planningEvidence.js` | **New.** Requires only `./planningFacts` and the constants module — no mongoose, model, router, clock or I/O. |
+| `test/project-manager/planning-evidence.test.js` | **New**, 122 tests, no database. |
+| `docs/handoff/latest-implementation.md` | This entry. |
+
+### Input shapes — every lookup carries an EXPLICIT success flag
+
+```
+scheduleLookup { ok, placements?: [ { scheduleId, scheduleDate?, segment } ], reason? }
+ledger         { ok, entries?: [ { barcodeId, scannedAt, scannedBy } ], reason? }
+eventStore     { ok, events?: [ { _id, source, observedAt, workOrderId,
+                                  planningStateAtObservation, evidenceId, resolvedAt? } ], reason? }
+```
+
+An empty array cannot express "could not look", so the flag is mandatory. A
+result with no `ok` boolean is itself `unavailable`. Locating this data is the
+future adapter's job; this module never queries for it.
+
+### Output shapes
+
+```
+deriveScheduleMembership(lookup)
+  → { state: scheduled|not_scheduled|unavailable, placements[], placementCount, exceptions[] }
+    placement: { scheduleId, scheduleDate, segmentId, scheduledStart, scheduledEnd,
+                 position?, status?, isMultiDay?, dayNumber?, totalDays? }
+
+deriveProductionStarted({ status, actualStartDate, ledger })
+  → { state: started|not_started|unavailable, startedAt, source, exceptions[] }   // exactly as approved
+
+deriveProductionSource(entries) → "scanner" | "manual_mark" | "unknown"
+
+deriveCanStartProduction({ planningState, materialsIssued, status, productionStarted })
+  → { state: allowed|blocked|unavailable, blockedBy[], unavailableBecause[], exceptions[] }
+
+deriveUnreleasedStartOccurrences(store, currentPlanningState?)
+  → { state: present|none|unavailable, occurrences[], occurrenceCount, unresolvedCount, exceptions[] }
+
+deriveCombinedExceptions(facts)
+  → { state: present|none|unavailable, exceptions[], count, unexaminedSources[] }
+```
+
+### Schedule truth table
+
+| Input | Result |
+| --- | --- |
+| `ok: true`, zero placements | **not_scheduled** — a confident answer |
+| `ok: true`, ≥1 valid segment | **scheduled**, every segment preserved |
+| `ok: false` / no result / no `ok` flag / no placements array | **unavailable** + `scheduleLookupUnavailable` |
+| `scheduleId` missing | **unavailable** + `scheduleReferenceMalformed` |
+| segment missing, no `_id`, or unreadable start/end time | **unavailable** + `schedulePlacementMalformed` |
+
+`WorkOrder.status` is **not a parameter** — membership is decided by placements
+alone, and a status of `scheduled`, `ready_to_start` or `in_progress` passed
+alongside cannot manufacture it. A multi-day work order keeps **every** segment
+with its `dayNumber`/`totalDays`; nothing is collapsed to one arbitrary day. Only
+established fields are exposed — no capacity, ownership or readiness is invented
+even though the sub-schema carries adjacent fields (`exceedsCapacity`,
+`colorCode`).
+
+### Production-start truth table
+
+| Evidence | state | startedAt | exceptions |
+| --- | --- | --- | --- |
+| valid timestamp + `in_progress` | started | timestamp | — |
+| valid timestamp + `pending`/`planned`/`scheduled` | **started** | timestamp | `startedButNotInProgress` |
+| ledger entries, no timestamp | **started** | `null` | `startedWithoutTimestamp` |
+| `in_progress`, no timestamp, empty readable ledger | not_started | `null` | `inProgressWithoutEvidence` |
+| no evidence, non-progress status | not_started | `null` | — |
+| no timestamp + unreadable ledger | **unavailable** | `null` | `executionEvidenceUnavailable` |
+| valid timestamp + unreadable ledger | **started** | timestamp | `executionEvidenceUnavailable` |
+| non-null unreadable timestamp | malformed, not missing | | `actualStartDateMalformed` |
+
+**Precedence, stated explicitly.** Execution evidence outranks status: a
+timestamp or a ledger entry *establishes* a start, and a contradictory status
+adds an exception beside that conclusion rather than overturning it. §7's
+"ledger unreadable → unavailable" row assumes there is no timestamp — a valid
+`actualStartDate` is independent evidence, so a failed ledger downgrades only
+the **source** to `unknown`. A malformed timestamp likewise does not erase a
+ledger-proven start.
+
+**Timestamps are read, never coerced.** `new Date(true)` yields a
+valid-looking 1ms-after-epoch Date out of a boolean; only a real `Date`, a
+non-empty string or a finite number is considered, and it still has to parse.
+
+### How manual marks stay distinguishable
+
+W8 (`productionSyncService`) and W10 (`mark-stage`) write the **same**
+`ProductionCompletionScanRecord` collection; W10 labels each entry
+`` `${actorName} (manual mark)` `` ([manufacturingOrderRoutes.js:115]).
+The label is read back, matched at the **end** of the string:
+
+| Legible entries | source |
+| --- | --- |
+| all end with `(manual mark)` | `manual_mark` |
+| all without the suffix | `scanner` |
+| mixed | `unknown` |
+| any entry's label unreadable (empty, blank, non-string, absent) | `unknown` |
+| timestamp only, no ledger entries | `unknown` |
+| genuinely not started | `null` |
+
+Source ambiguity only ever blurs the **source**; it never erases the start.
+
+### Start-eligibility truth table
+
+All six approved conditions are evaluated and **every** failing one reported —
+a disabled button needs all the reasons, not the first:
+
+| Condition | Block code |
+| --- | --- |
+| `planningState === "released"` | `planningStateNotReleased` |
+| `planningState !== "unknown"` | `planningStateUnknown` (reported *as well as* not-released: one needs a release, the other a human classification) |
+| materials-issued ready | `materialsNotIssued` |
+| status ∈ {`scheduled`, `ready_to_start`} | `statusNotStartable` |
+| status ∉ {`completed`, `cancelled`, `forwarded`} | `statusTerminal` |
+| not already started | `productionAlreadyStarted` |
+
+Unavailable inputs report `materialsIssuedUnavailable`,
+`productionEvidenceUnavailable`, `planningStateUnavailable`, `statusUnavailable`.
+**`blocked` outranks `unavailable`**: a provably false condition is a definite
+answer whatever else is unreadable. Neither ever reads as `allowed`.
+
+**Schedule membership is deliberately NOT a prerequisite** — the approved
+decision does not require it, and a test pins that an unscheduled or
+lookup-failed schedule leaves the verdict `allowed`, so no new gate slipped in
+behind the refactor.
+
+### How historical exceptions survive a later release
+
+`deriveUnreleasedStartOccurrences` **does not take the current planning state as
+evidence** — structurally, not by rule. A derived
+`planningState !== "released"` comparison turns false the moment someone
+releases the work, and the violation disappears (§9.2). Occurrences arrive as
+durable records or the fact is `unavailable`; **no occurrence is ever
+manufactured from current state**, and an unreleased work order with a started
+production but no event store reports `unavailable`, not `none`.
+
+`currentPlanningState` is accepted for **display only**: it sets
+`resolvableByCurrentRelease` on an unresolved occurrence. It never deletes,
+rewrites or filters one. `resolved` comes from the event's own `resolvedAt`.
+Malformed events (no `_id`, unreadable `observedAt`) → `unavailable` +
+`unreleasedStartEventMalformed`. The event schema and writing path are **not**
+added here — that is step 8.
+
+### Combined exceptions
+
+Fixed source order — `planningState`, `materials`, `materialsIssued`,
+`operations`, `completeable`, `schedule`, `productionStarted`,
+`unreleasedStarts` — so output is deterministic regardless of caller key order.
+De-duplication is by **code + detail**, so a repeated identical contradiction
+collapses while two durable occurrences (distinct `eventId`) both survive:
+losing one would lose a historical violation. The accepted shortage is collected
+**beside** the still-not-ready material fact.
+
+`hasPlanningExceptions` is a structured fact, so **missing external evidence can
+never render as a confident "no exceptions"**: unavailable or unsupplied sources
+are named in `unexaminedSources` and the state becomes `unavailable`, while
+whatever *was* found is still listed. An empty array with `state: none` requires
+that every source was successfully examined.
+
+### Verification
+
+| Measurement | Result |
+| --- | --- |
+| PM baseline before | 12 suites / **421** |
+| PM baseline after | 13 suites / **543** (+122, all new) |
+| `planning-facts` + `work-order-planning-state` + `work-order-identity` | 153/153, unchanged |
+| `planningFacts.js` vs accepted 4B.2A | **byte-identical** |
+| `accountant` + `crm` + `hr-ai` pre-existing | 22 suites / **276** — held constant |
+| `node --check` | clean |
+| `git diff --check`, both repos | clean |
+
+**Negative regression proof** — all four required mutations were injected,
+demonstrated failing, and restored:
+
+| Injected regression | Tests failed |
+| --- | --- |
+| `WorkOrder.status === "scheduled"` used as schedule membership | **2** |
+| ledger lookup failure treated as an empty ledger | **7** |
+| unreleased-start occurrence derived away after release | **3** |
+| manual mark labelled as a scanner event | **6** |
+
+Restored: 122/122. The schedule test was strengthened first — its original form
+caught the regression only by function arity, so a behavioural assertion was
+added that passing a status alongside still cannot manufacture membership.
+
+### Scope held
+
+No schema, route, response contract, planning writer, start-production
+behaviour, scheduling behaviour, scan ingestion, durable event storage,
+migration, backfill, frontend, Lane B or Store/Purchase file changed. No
+database connected; the new suite issues no query. `WorkOrder.status` untouched.
+`docs/tasks/current-task.md` untouched. Decision 15 remains outstanding and no
+backfill work began.

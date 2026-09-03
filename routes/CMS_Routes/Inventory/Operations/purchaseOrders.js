@@ -487,9 +487,24 @@ router.get("/data/raw-items", requireCapability(CAPABILITIES.READ), async (req, 
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/vendors", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
-    const vendors = await Vendor.find({ status: "Active" })
+    /* ── SELECTABLE SUPPLIERS OF THIS COMPANY ONLY ──────────────────────
+     * This read every Active supplier in the database, so the "choose a
+     * supplier" list on a purchase order offered another company's suppliers
+     * — and picking one would have bound this company's order to a record it
+     * does not own. Legacy suppliers (no company) are excluded too: nobody
+     * can say whose they are, so nothing new may be ordered against them. */
+    const vendors = await Vendor.find({
+      /* `$and`, not a second `companyId` key: spreading the tenant filter and
+         then writing `companyId` again REPLACES it, which would drop the
+         company scope entirely. */
+      $and: [
+        tenantContext.tenantFilter(req.tenant),
+        { companyId: { $ne: null } },
+        { status: "Active" },
+      ],
+    })
       .select(
-        "companyName contactPerson phone email address gstNumber vendorType paymentTerms",
+        "companyName contactPerson phone email address gstNumber vendorType paymentTerms supplierCode",
       )
       .sort({ companyName: 1 });
 

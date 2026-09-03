@@ -33,15 +33,74 @@ const { sectionForPath, sectionLabel } = require("./auditSections");
 const { recordChange } = require("./changeLog");
 
 /**
- * The one-shot header that lets a replay past this middleware.
+ * The header that names which approved change is being replayed.
  *
- * It is not a secret and does not need to be: the replay also carries a
- * freshly-minted token for the original requester, and this header only
- * suppresses the SECOND hold. Without it an approved change would be held
- * again on replay — approving would create a new pending request instead of
- * applying the old one, forever.
+ * Without it an approved change would be held again on replay — approving would
+ * create a new pending request instead of applying the old one, forever.
+ *
+ * IT IS NOT, BY ITSELF, PERMISSION TO SKIP THE HOLD.
+ *
+ * It used to be. `if (req.headers[REPLAY_HEADER]) return next()` trusted a
+ * string the caller chooses, so any editor could send their ordinary mutation
+ * with `x-grav-change-request: anything` and walk straight past the approval
+ * they were subject to — the entire "an editor may change it, but not alone"
+ * rule, removed by one header. See `validatedReplayOf` below for what is
+ * required now.
  */
 const REPLAY_HEADER = "x-grav-change-request";
+
+/**
+ * The private, server-side mark that a request IS a genuine approved replay.
+ *
+ * Set only by `validatedReplayOf` after the signature check, and read by
+ * services/changeLog for approval attribution. A property on the request
+ * object, not a header: the caller controls headers, body and query, and
+ * controls none of this.
+ */
+const REPLAY_FLAG = "__approvalReplay";
+
+/**
+ * The change-request id this request is a validated replay of, or null.
+ *
+ * Two things must agree, and one of them cannot be forged:
+ *
+ *   1. the `x-grav-change-request` header — which change is being replayed;
+ *   2. the `replayOf` claim inside the caller's VERIFIED JWT.
+ *
+ * The claim is minted only by `replayToken` below, only inside
+ * `applyChangeRequest`, only after an approver has decided, and the token it
+ * lives in never leaves this server — it goes out on a loopback fetch and comes
+ * straight back. An editor cannot obtain one, cannot mint one without the
+ * signing secret, and cannot move one from another change request, because the
+ * claim is compared against the header rather than merely being present.
+ *
+ * The claim is read off `req.user` rather than re-verified here on purpose:
+ * whatever put it there — `seedIdentity` at the mount, `EmployeeAuthMiddleware`
+ * in the router — got it out of a signature-checked token. Both of those carry
+ * it forward specifically so this comparison has something trustworthy to read;
+ * if a future middleware rebuilds `req.user` and drops it, this returns null
+ * and the request is held rather than let through, which is the safe direction
+ * to fail.
+ */
+function validatedReplayOf(req) {
+  const header = req?.headers?.[REPLAY_HEADER];
+  if (!header) return null;
+
+  const claim =
+    req?.user?.replayOf || req?.admin?.replayOf || req?.dept?.replayOf || null;
+  if (!claim) return null;
+
+  return String(claim) === String(header) ? String(header) : null;
+}
+
+/**
+ * True when this request has been proven to be a server-generated replay of an
+ * approved change. Exported so services/changeLog can ask without repeating the
+ * comparison, and so nothing has to read the raw header to find out.
+ */
+function isApprovalReplay(req) {
+  return Boolean(req?.[REPLAY_FLAG]?.changeRequestId);
+}
 
 /**
  * The approver, spelled out for the change log on the far side of the replay.
@@ -185,8 +244,19 @@ function requireApproval(departmentSlug, opts = {}) {
   return async (req, res, next) => {
     try {
       // A replay of an already-approved request. It has been decided; letting
-      // it through is the whole point of approving it.
-      if (req.headers[REPLAY_HEADER]) return next();
+      // it through is the whole point of approving it — but only once the
+      // signed `replayOf` claim agrees with the header. A header on its own is
+      // a caller's assertion, not a decision.
+      //
+      // A mismatched or missing claim does NOT refuse the request. It simply
+      // is not a replay, so it carries on down the ordinary role-and-approval
+      // path below and an editor is held at 202 exactly as they would be
+      // without the header at all.
+      const replayOf = validatedReplayOf(req);
+      if (replayOf) {
+        req[REPLAY_FLAG] = { changeRequestId: replayOf };
+        return next();
+      }
 
       const actor = actorFrom(req);
       if (!actor.email) {
@@ -467,6 +537,9 @@ async function decideChangeRequest({ id, decision, note, actor, req }) {
 
 module.exports = {
   REPLAY_HEADER,
+  REPLAY_FLAG,
+  validatedReplayOf,
+  isApprovalReplay,
   requireApproval,
   applyChangeRequest,
   decideChangeRequest,

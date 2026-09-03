@@ -35,6 +35,15 @@ const CODES = {
      may well hold the capability — the COMPANY has no rule authorising the
      commitment, and the fix is configuration, not a different signer. */
   POLICY_NOT_CONFIGURED: { status: 409, code: "POLICY_NOT_CONFIGURED" },
+  /* ── A LOST RACE, NOT A BAD REQUEST ────────────────────────────────────
+     An edit refused because the record moved underneath it is not the
+     caller's mistake and nothing about their input is wrong — re-sending it
+     unchanged will fail again. Falling through to VALIDATION returned 400
+     and told them to check the form, which is unfixable advice. 409 says
+     what happened: re-read and decide again.
+
+     Additive: no existing caller uses this key, so nothing changes shape. */
+  CONFLICT: { status: 409, code: "CONFLICT" },
   VALIDATION: { status: 400, code: "VALIDATION" },
 };
 

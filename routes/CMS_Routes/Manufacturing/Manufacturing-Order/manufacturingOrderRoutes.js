@@ -11,8 +11,49 @@ const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
 const mongoose = require("mongoose");
+const departmentWrites = require("../../../../Middlewear/departmentWriteGuard");
+const { recordChange } = require("../../../../services/changeLog");
+const {
+  listManufacturingOrders,
+} = require("../../../../services/manufacturing/moList.service");
+const {
+  summariseManufacturingOrder,
+} = require("../../../../services/manufacturing/moSummary.service");
 
 router.use(EmployeeAuthMiddleware);
+
+/**
+ * Ownership guard for the routes on THIS router that Project Manager owns
+ * outright — currently one.
+ *
+ * Per-route, never mounted over the prefix. server.js deliberately leaves
+ * /api/cms/manufacturing/** ungated because cutting-master, QC,
+ * packaging-dispatch and the production supervisor all write through it, and a
+ * blanket "project-manager" guard would park a cutting master's save in a
+ * production approver's queue. The same reasoning applies inside the file: the
+ * guard goes on the one handler whose business owner is unambiguous.
+ *
+ * It is the ordinary departmentWrites middleware, used as route middleware
+ * rather than mount middleware, so there is exactly one role-and-approval
+ * mechanism in the codebase rather than a second one that behaves almost the
+ * same. Reads are untouched, and it fails open until an administrator grants
+ * the first Production role — see services/departmentRoles.js.
+ */
+const pmOwnedWrite = (entity) => {
+  const guard = departmentWrites("project-manager", { entity });
+  return (req, res, next) => {
+    /* Platform admins go round it. requireApproval already exempts them
+       ("not part of any department's approval chain"), but requireDepartmentRole
+       ahead of it has no such check, so an administrator holding no Production
+       DepartmentRole row would be refused NO_DEPARTMENT_ROLE before the
+       exemption was ever reached. That asymmetry lives in the shared guard and
+       is left there — changing it would change every department that mounts
+       departmentWrites, which is not this chunk's business. Handled here
+       instead, where the blast radius is one route. */
+    if (req.user?.isAdmin) return next();
+    return guard(req, res, next);
+  };
+};
 
 // ── Barcode scan helpers — mirrors routes/CMS_Routes/Manufacturing/Production/
 // productionCompletionRoutes.js exactly (barcode format "WO-<shortId>-<unit>",
@@ -83,261 +124,18 @@ async function addProductionScans(woShortId, alreadyScanned, totalQty, count, ac
 
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 12, search = "", status = "" } = req.query;
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
+    /* The whole projection now lives in services/manufacturing/ — query policy,
+       aggregation and row mapping — so it can be tested without an HTTP server
+       and reused without being copied. This handler is wiring: take the query,
+       hand back the page.
 
-    // Base filter — always restrict to sales-approved (this is what an MO IS)
-    const matchQuery = { status: "quotation_sales_approved" };
-    if (search) {
-      const re = new RegExp(search, "i");
-      matchQuery.$or = [
-        { "customerInfo.name": re },
-        { requestId: re },
-        { "customerInfo.email": re },
-      ];
-    }
+       Every field, every derived value and the URL itself are unchanged. What
+       is new is that malformed input no longer reaches the database: `?page=abc`,
+       `?page=0`, `?limit=0`, `?limit=-5` and `?search=(` each used to answer 500
+       from here, and an unbounded `?limit=` was honoured verbatim. */
+    const page = await listManufacturingOrders(req.query);
 
-    const pipeline = [
-      { $match: matchQuery },
-
-      // Compute totalQuantity in-DB from items[].totalQuantity (no need to ship items)
-      {
-        $addFields: {
-          totalQuantity: {
-            $sum: {
-              $map: {
-                input: { $ifNull: ["$items", []] },
-                as: "it",
-                in: { $ifNull: ["$$it.totalQuantity", 0] }
-              }
-            }
-          }
-        }
-      },
-
-      // Join WO stats per MO in ONE query (replaces the per-MO countDocuments + aggregate)
-      {
-        $lookup: {
-          from: "workorders",
-          let: { reqId: "$_id" },
-          pipeline: [
-            { $match: { $expr: { $eq: ["$customerRequestId", "$$reqId"] } } },
-            {
-              $group: {
-                _id: null,
-                count: { $sum: 1 },
-                totalWoQty: { $sum: { $ifNull: ["$quantity", 0] } },
-                totalCompleted: {
-                  $sum: { $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }
-                },
-                cancelledCount: {
-                  $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] }
-                },
-                anyInProgress: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $or: [
-                          { $eq: ["$status", "in_progress"] },
-                          { $gt: [{ $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }, 0] }
-                        ]
-                      },
-                      1, 0
-                    ]
-                  }
-                },
-                scheduledCount: {
-                  $sum: {
-                    $cond: [
-                      { $in: ["$status", ["scheduled", "planned", "ready_to_start"]] },
-                      1, 0
-                    ]
-                  }
-                }
-              }
-            }
-          ],
-          as: "_woStats"
-        }
-      },
-      { $addFields: { _stats: { $arrayElemAt: ["$_woStats", 0] } } },
-
-      // Flatten + compute completion % at the MO level
-      {
-        $addFields: {
-          workOrdersCount: { $ifNull: ["$_stats.count", 0] },
-          _totalWoQty: { $ifNull: ["$_stats.totalWoQty", 0] },
-          _totalCompleted: { $ifNull: ["$_stats.totalCompleted", 0] },
-          _cancelledCount: { $ifNull: ["$_stats.cancelledCount", 0] },
-          _anyInProgress:  { $ifNull: ["$_stats.anyInProgress",  0] },
-          _scheduledCount: { $ifNull: ["$_stats.scheduledCount", 0] }
-        }
-      },
-      {
-        $addFields: {
-          completionPercentage: {
-            $cond: [
-              { $gt: ["$_totalWoQty", 0] },
-              {
-                $round: [
-                  { $multiply: [{ $divide: ["$_totalCompleted", "$_totalWoQty"] }, 100] },
-                  0
-                ]
-              },
-              0
-            ]
-          }
-        }
-      },
-
-      // Derive the MO status from WO progress
-      {
-        $addFields: {
-          derivedStatus: {
-            $switch: {
-              branches: [
-                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
-                {
-                  case: {
-                    $and: [
-                      { $gt: ["$workOrdersCount", 0] },
-                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
-                    ]
-                  },
-                  then: "cancelled"
-                },
-                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
-                { case: { $gte: ["$completionPercentage", 70] },  then: "about_to_finish" },
-                {
-                  case: {
-                    $or: [
-                      { $gt: ["$completionPercentage", 0] },
-                      { $gt: ["$_anyInProgress", 0] }
-                    ]
-                  },
-                  then: "in_progress"
-                },
-                {
-                  case: { $gt: ["$_scheduledCount", 0] },
-                  then: "on_production"
-                }
-              ],
-              default: "pending"
-            }
-          }
-        }
-      },
-
-      // PM-facing simplified status — collapse everything down to just
-      // pending / in_progress / completed (+ cancelled when it genuinely happened).
-      // Rule: any work order scheduled/planned/in-progress/etc. => "in_progress".
-      {
-        $addFields: {
-          displayStatus: {
-            $switch: {
-              branches: [
-                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
-                {
-                  case: {
-                    $and: [
-                      { $gt: ["$workOrdersCount", 0] },
-                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
-                    ]
-                  },
-                  then: "cancelled"
-                },
-                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
-                {
-                  case: {
-                    $or: [
-                      { $gt: ["$_scheduledCount", 0] },
-                      { $gt: ["$_anyInProgress", 0] },
-                      { $gt: ["$completionPercentage", 0] }
-                    ]
-                  },
-                  then: "in_progress"
-                }
-              ],
-              default: "pending"
-            }
-          }
-        }
-      },
-
-      // Apply simplified status filter if requested (pending/in_progress/completed/cancelled)
-      ...(status ? [{ $match: { displayStatus: status } }] : []),
-
-      // Paginate + count in one go
-      {
-        $facet: {
-          paginated: [
-            { $sort: { updatedAt: -1 } },
-            { $skip: skip },
-            { $limit: limitNum },
-            {
-              $project: {
-                _id: 1,
-                requestId: 1,
-                customerInfo: { name: 1, email: 1, deliveryDeadline: 1 },
-                estimatedCompletion: 1,
-                finalOrderPrice: 1,
-                totalQuantity: 1,
-                priority: 1,
-                createdAt: 1,
-                requestType: 1,
-                measurementName: 1,
-                workOrdersCount: 1,
-                completionPercentage: 1,
-                completedQuantity: "$_totalCompleted",
-                status: "$derivedStatus",
-                displayStatus: 1
-              }
-            }
-          ],
-          totalCount: [{ $count: "count" }]
-        }
-      }
-    ];
-
-    const [result] = await CustomerRequest.aggregate(pipeline);
-    const rows = result?.paginated || [];
-    const total = result?.totalCount?.[0]?.count || 0;
-
-    const manufacturingOrders = rows.map((r) => ({
-      _id: r._id,
-      moNumber: `MO-${r.requestId}`,
-      customerInfo: {
-        name: r.customerInfo?.name || "N/A",
-        email: r.customerInfo?.email || "N/A",
-      },
-      finalOrderPrice: r.finalOrderPrice || 0,
-      totalQuantity: r.totalQuantity || 0,
-      workOrdersCount: r.workOrdersCount || 0,
-      completedQuantity: r.completedQuantity || 0,
-      completionPercentage: r.completionPercentage || 0,
-      status: r.status,
-      // Simplified 3-bucket status for card display (pending/in_progress/completed, +cancelled)
-      displayStatus: r.displayStatus || "pending",
-      priority: r.priority,
-      createdAt: r.createdAt,
-      requestType: r.requestType || "customer_request",
-      measurementName: r.measurementName || null,
-      deliveryDeadline: r.customerInfo?.deliveryDeadline || null,
-      estimatedCompletion: r.estimatedCompletion || null,
-    }));
-
-    res.json({
-      success: true,
-      manufacturingOrders,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        pages: Math.ceil(total / limitNum),
-      },
-    });
+    res.json({ success: true, ...page });
   } catch (error) {
     console.error("Error fetching manufacturing orders:", error);
     res.status(500).json({
@@ -346,6 +144,7 @@ router.get("/", async (req, res) => {
     });
   }
 });
+
 
 router.get("/:id", async (req, res) => {
   try {
@@ -501,9 +300,19 @@ router.get("/:id", async (req, res) => {
       rawMaterialRequirements: rawMaterialRequirements,
     };
 
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
     res.json({
       success: true,
-      manufacturingOrder,
+      manufacturingOrder: { ...manufacturingOrder, ...summary },
     });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
@@ -544,7 +353,11 @@ router.get("/:id/detailed", async (req, res) => {
       customerRequestId: customerRequest._id,
     })
       .select(
-        "workOrderNumber status quantity variantAttributes operations timeline stockItemId productionCompletion",
+        /* `rawMaterials` is read further down to build rawMaterialRequirements
+           and was never selected, so the lean documents did not carry it and
+           the summary was always empty — an order with material allocated
+           reported none. */
+        "workOrderNumber status quantity variantAttributes operations timeline stockItemId productionCompletion rawMaterials",
       )
       .populate("stockItemId", "name reference")
       .sort({ createdAt: 1 })
@@ -562,7 +375,13 @@ router.get("/:id/detailed", async (req, res) => {
     // Transform work orders with accurate progress data
     const transformedWorkOrders = workOrders.map((wo) => {
       const productionCompletion = wo.productionCompletion || {};
-      const totalQuantity = wo.quantity;
+      /* Named for what it is — this work order's quantity — instead of
+         shadowing the outer `totalQuantity` accumulator declared above. The
+         shadow made `totalQuantity += totalQuantity` an assignment to a const,
+         so EVERY order that had a work order threw "Assignment to constant
+         variable" and answered 500. An order with none never entered this
+         mapper, which is why it went unnoticed. */
+      const workOrderQuantity = wo.quantity;
 
       // Get completion data from productionCompletion
       const completedQuantity =
@@ -573,10 +392,10 @@ router.get("/:id/detailed", async (req, res) => {
       // Calculate unit statuses
       let completedUnits = completedQuantity;
       let inProgressUnits = 0;
-      let pendingUnits = totalQuantity - completedQuantity;
+      let pendingUnits = workOrderQuantity - completedQuantity;
 
       // If work order is in progress but not all units completed, estimate in-progress units
-      if (wo.status === "in_progress" && completedQuantity < totalQuantity) {
+      if (wo.status === "in_progress" && completedQuantity < workOrderQuantity) {
         // Look at operation completion to estimate in-progress units
         if (
           productionCompletion.operationCompletion &&
@@ -588,11 +407,11 @@ router.get("/:id/detailed", async (req, res) => {
             ),
           );
           inProgressUnits = Math.max(0, maxOpCompleted - completedQuantity);
-          pendingUnits = totalQuantity - completedQuantity - inProgressUnits;
+          pendingUnits = workOrderQuantity - completedQuantity - inProgressUnits;
         } else {
           // If no operation data, assume 1 unit is in progress
           inProgressUnits = 1;
-          pendingUnits = totalQuantity - completedQuantity - 1;
+          pendingUnits = workOrderQuantity - completedQuantity - 1;
         }
       }
 
@@ -600,7 +419,7 @@ router.get("/:id/detailed", async (req, res) => {
       totalUnitsCompleted += completedUnits;
       totalUnitsInProgress += inProgressUnits;
       totalUnitsPending += pendingUnits;
-      totalQuantity += totalQuantity;
+      totalQuantity += workOrderQuantity;
 
       // Determine work order status based on productionCompletion
       let status = wo.status;
@@ -635,7 +454,7 @@ router.get("/:id/detailed", async (req, res) => {
         workOrderNumber: wo.workOrderNumber,
         status: status,
         derivedStatus: derivedStatus,
-        quantity: totalQuantity,
+        quantity: workOrderQuantity,
         variantAttributes: wo.variantAttributes || [],
         stockItemName: wo.stockItemId?.name || "N/A",
         stockItemReference: wo.stockItemId?.reference || "N/A",
@@ -787,9 +606,19 @@ router.get("/:id/detailed", async (req, res) => {
       },
     };
 
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
     res.json({
       success: true,
-      manufacturingOrder,
+      manufacturingOrder: { ...manufacturingOrder, ...summary },
     });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
@@ -1034,7 +863,17 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       },
     };
 
-    res.json({ success: true, manufacturingOrder });
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
+    res.json({ success: true, manufacturingOrder: { ...manufacturingOrder, ...summary } });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
     res.status(500).json({
@@ -1104,7 +943,16 @@ router.get("/vendors/active", async (req, res) => {
 // =============================================
 // NEW ROUTE: Share work orders to vendor
 // =============================================
-router.post("/share-to-vendor", async (req, res) => {
+// Forwarding production to an outside vendor is a Project Manager decision, it
+// is called from nowhere else in any frontend, and — alone among the planning
+// mutations on this side — it is a single idempotent `updateMany` whose status
+// filter excludes work orders already forwarded, completed or cancelled. That
+// is what makes it safe to hold in the approval queue: replaying an approved
+// change re-applies the same $set, and a second replay matches nothing and says
+// so rather than forwarding twice. Allocation, operation planning and
+// mark-stage are none of those things and are deliberately left alone; see
+// docs/audits/project-manager-endpoint-access.md.
+router.post("/share-to-vendor", pmOwnedWrite("vendor forwarding"), async (req, res) => {
   try {
     const { workOrderIds, vendorId, forwardedBy } = req.body;
 
@@ -1161,6 +1009,27 @@ router.post("/share-to-vendor", async (req, res) => {
       .select("workOrderNumber status forwardedToVendor forwardedAt")
       .populate("forwardedToVendor", "name vendorCode")
       .lean();
+
+    /* An approver or owner commits this directly, which leaves no trace in the
+       change queue the way a held change does — and there is no audit floor
+       under /api/cms/manufacturing the way there is under /api/hr. Recorded
+       through the same services/changeLog used everywhere else rather than a
+       second log of its own. Deliberately narrow: who, which vendor, which work
+       orders, how many moved. Never the request body, which carries the
+       caller's chosen ids and nothing worth keeping, and never headers. */
+    recordChange(req, {
+      departmentSlug: "project-manager",
+      entity: "vendor forwarding",
+      entityId: String(vendor._id),
+      entityLabel: vendor.name,
+      action: "update",
+      summary: `Forwarded ${result.modifiedCount} work order(s) to ${vendor.name}`,
+      fields: [
+        { path: "vendor", label: "Vendor", after: vendor.vendorCode || vendor.name },
+        { path: "workOrders", label: "Work orders", after: updatedWorkOrders.map((w) => w.workOrderNumber).join(", ") },
+        { path: "status", label: "Status", after: "forwarded" },
+      ],
+    }).catch(() => { /* the log must never cost the caller their write */ });
 
     res.json({
       success: true,

@@ -1,6 +1,10 @@
 // models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js
 
 const mongoose = require("mongoose");
+const {
+  PLANNING_STATES,
+  PLANNING_STATE_NOT_STARTED,
+} = require("../../../../constants/workOrderPlanningState");
 
 // ── operationAssignmentSchema ─────────────────────────────────────────────────
 // Stores operation identity (name + code) and planned timing only.
@@ -253,6 +257,29 @@ const workOrderSchema = new mongoose.Schema(
       default: "pending",
     },
 
+    /*
+     * The PLANNING axis, additive and independent of `status` above, which is
+     * left exactly as it was (decision 1, approved 3 Sep 2026).
+     *
+     * NO `default`, and NOT `required`, both deliberately:
+     *
+     * - A default was measured to MASK legacy absence. `findOne()` would
+     *   hydrate `not_started` while `.lean()` showed no stored field, so every
+     *   legacy record would silently read as "planning has not begun" — a
+     *   claim nothing in those records supports. Absence is interpreted as
+     *   `unknown` on READ instead (normalizePlanningState), so reading never
+     *   writes and the stored document stays honest.
+     * - `required` would refuse to save a legacy record for an unrelated edit,
+     *   which is the same reason `workOrderNumber` is not required either.
+     *
+     * New records get `not_started` from the invariant below, where the
+     * `isNew` guard makes the claim true by construction.
+     */
+    planningState: {
+      type: String,
+      enum: PLANNING_STATES,
+    },
+
     // Operations — name + code + timing only. No machine assignment at planning.
     operations: [operationAssignmentSchema],
 
@@ -393,5 +420,79 @@ const workOrderSchema = new mongoose.Schema(
 // order screens on every load and neither was indexed.
 workOrderSchema.index({ status: 1, createdAt: -1 });
 workOrderSchema.index({ customerRequestId: 1, status: 1 });
+
+// ── Identity ────────────────────────────────────────────────────────────────
+//
+// `workOrderNumber` is declared unique, and until now NOTHING assigned it.
+// Neither Sales generator (routes/CMS_Routes/Sales/quotationRoutes.js:1868 and
+// :2768) nor either return/rework generator
+// (routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js:340 and :375)
+// set a number, there was no hook, and there is no counter. On a database where
+// the unique index is actually built, the first numberless work order stores
+// `null` and the SECOND fails with E11000 — work-order creation capped at one
+// document. The scattered `workOrderNumber || "WO-" + _id.slice(-8)` reads
+// throughout the codebase exist because the field is normally empty.
+//
+// The rule lives here, at the model boundary, rather than in the four call
+// sites, so a creation path added tomorrow cannot reintroduce the defect.
+//
+// WHY THE FULL ObjectId, NOT ITS LAST EIGHT CHARACTERS
+// ----------------------------------------------------
+// The eight-character form some readers display is a PRESENTATION fallback. As
+// an identity it keeps 32 bits, and 32 bits behind a unique index is a
+// collision waiting for enough rows — a handful of passing fixtures proves
+// nothing about that. The full id is unique wherever ObjectIds are, needs no
+// counter or coordination service, and is known before the first write.
+//
+// It stays compatible with the scan subsystem because that subsystem is
+// independent: every unit barcode is BUILT from `_id.slice(-8)` and RESOLVED
+// the same way, and none of it reads `workOrderNumber`. Appending the usual
+// `-<unit>` suffix still satisfies every parser's `parts.length >= 3 &&
+// parts[0] === "WO"` guard, and no parser asserts a segment length.
+
+/** The canonical number for a work order that has none of its own. */
+function canonicalWorkOrderNumber(id) {
+  return `WO-${String(id)}`;
+}
+
+/** Shared so a caller that needs the value early uses the same rule. */
+workOrderSchema.statics.canonicalNumber = canonicalWorkOrderNumber;
+
+/*
+ * ONE hook for both new-record invariants, not two.
+ *
+ * `validate` rather than `save`: it is the one document hook that fires for
+ * every persistence API this repository uses — `new X().save()`,
+ * `Model.create()` (single and array) and `Model.insertMany()`, which does not
+ * run save middleware at all.
+ *
+ * Both invariants are guarded on `isNew`, so an EXISTING record — of which
+ * production holds many with neither field — is never silently rewritten by an
+ * unrelated save. Populating those records is a migration, deliberately
+ * separate from this invariant. For the same reason neither field is marked
+ * `required`: that would refuse to save a legacy document for an unrelated
+ * edit.
+ *
+ * They share a hook rather than getting one each because two hooks on the same
+ * event would leave their relative order implicit, and a later reader would
+ * have no way to tell whether that order mattered. It does not — the two are
+ * independent — and keeping them in one function is how that stays visible.
+ */
+workOrderSchema.pre("validate", function assignNewWorkOrderInvariants(next) {
+  if (!this.isNew) return next();
+
+  if (!String(this.workOrderNumber ?? "").trim()) {
+    this.workOrderNumber = canonicalWorkOrderNumber(this._id);
+  }
+
+  // Only when the caller supplied nothing. An explicit value — including an
+  // invalid one — is left alone so schema validation still rejects it rather
+  // than having it quietly replaced with a valid-looking default.
+  if (this.planningState === undefined || this.planningState === null) {
+    this.planningState = PLANNING_STATE_NOT_STARTED;
+  }
+
+  next();
+});
 
 module.exports = mongoose.model("WorkOrder", workOrderSchema);

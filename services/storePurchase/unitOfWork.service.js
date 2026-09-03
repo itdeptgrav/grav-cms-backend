@@ -39,6 +39,7 @@ const mongoose = require("mongoose");
 
 const actionHistory = require("./actionHistory.service");
 const idempotency = require("./idempotency.service");
+const { buildRecoveryReceipt } = require("../../models/CMS_Models/StorePurchase/SpIdempotencyRecord");
 
 /** Does this deployment support transactions? Learned once, then remembered. */
 let transactionsSupported = null;
@@ -91,12 +92,31 @@ async function transactionsAvailable() {
  * @param {object}   ctx        tenant context
  * @param {object}   options
  * @param {object}   options.idempotencyRecord  the claim from `begin()`, if any
+ * @param {object}   [options.recoveryReceipt]  OPTIONAL, and prepared by the
+ *                   CALLER before this runs — never returned from `mutate`. It
+ *                   is validated HERE, before the transaction probe and before
+ *                   `mutate`, so a malformed receipt stops the operation before
+ *                   anything is written rather than after (which would leave a
+ *                   mutation with no marker). Omitted by every existing caller.
  * @param {function} options.mutate   async (session|null) => ({ entry, result, entityId, entityType })
  *                   `entry` is the history entry; `result` is returned to the
  *                   caller; `entityId`/`entityType` identify what was written.
+ *                   Any `receipt` it returns is IGNORED — retaining a
+ *                   post-mutation receipt is the unsafe ordering this removes,
+ *                   and both current consumers (warehouses, suppliers) pass the
+ *                   validated-before-mutation `recoveryReceipt` above instead.
  * @returns {Promise<{result, mode: "TRANSACTIONAL"|"MARKED"}>}
  */
-async function run(ctx, { idempotencyRecord = null, mutate }) {
+async function run(ctx, { idempotencyRecord = null, recoveryReceipt = undefined, mutate }) {
+  /* ── VALIDATE THE RECEIPT FIRST, BEFORE ANYTHING ELSE ──────────────────────
+   * Before the probe, before a session, before `mutate`. If the receipt is
+   * malformed the operation stops here with nothing written — there is no
+   * mutation left un-marked for a retry to repeat. The EXACT validated object
+   * is what later reaches `markEffectApplied`. */
+  const receipt = (recoveryReceipt === undefined || recoveryReceipt === null)
+    ? undefined
+    : buildRecoveryReceipt(recoveryReceipt);
+
   /* Settled before any domain work, so the transactional path is never taken
      on a deployment that would silently drop the session. */
   if (await transactionsAvailable()) {
@@ -108,7 +128,7 @@ async function run(ctx, { idempotencyRecord = null, mutate }) {
         await actionHistory.record(ctx, { ...entry, atomicityDegraded: false }, { session });
         if (idempotencyRecord) {
           await idempotency.markEffectApplied({
-            record: idempotencyRecord, entityType, entityId, session,
+            record: idempotencyRecord, entityType, entityId, session, receipt,
           });
         }
         outcome = result;
@@ -126,7 +146,7 @@ async function run(ctx, { idempotencyRecord = null, mutate }) {
   const { entry, result, entityId, entityType } = await mutate(null);
 
   if (idempotencyRecord) {
-    await idempotency.markEffectApplied({ record: idempotencyRecord, entityType, entityId });
+    await idempotency.markEffectApplied({ record: idempotencyRecord, entityType, entityId, receipt });
   }
 
   await actionHistory.record(ctx, {
