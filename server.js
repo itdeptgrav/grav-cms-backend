@@ -2800,12 +2800,25 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Simple health check for socket
+// Health check — READINESS, not liveness.
+//
+// The port opens before MongoDB is connected (server.listen runs unconditionally;
+// connectDB() resolves later), so a check that answered 200 the moment the
+// process was up let the hosting service route traffic to an instance whose
+// every query was still buffered behind the connection. Requests that arrived
+// in that window took 12–20 seconds (the /verify and /login worst cases in the
+// bandwidth tracker) or died when the previous instance was shut down.
+//
+// 503 until the database is connected. Point the host's health-check path at
+// this route and a deploy only goes live once the new instance can serve.
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
+  const dbReady = mongoose.connection.readyState === 1;
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? "ok" : "starting",
+    database: dbReady ? "connected" : "connecting",
     socket: "running",
     connections: io.engine.clientsCount,
+    uptimeSeconds: Math.round(process.uptime()),
   });
 });
 
