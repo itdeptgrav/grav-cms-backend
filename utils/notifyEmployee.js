@@ -130,8 +130,23 @@ function idsFrom(input) {
  * Build the sendExpoPush options object, normalising/validating everything the
  * app cares about. Returns null when the payload is unusable.
  */
+/* The registry type (services/notificationTypes) each domain tag means when
+   the sender does not say. A kind's default is its OUTCOME ("your leave was
+   decided"); the senders that announce something still PENDING name
+   `type` explicitly, because a pending thing may be repeated hourly and a
+   decided one never is. */
+const DEFAULT_TYPE_FOR_KIND = {
+  leave: "request_decided",
+  regularization: "request_decided",
+  overtime: "request_decided",
+  payroll: "payroll",
+  document: "document",
+};
+
 function buildOptions(opts) {
   const { title, body, kind, screen, id, badge } = opts || {};
+  const notificationType =
+    opts?.type || DEFAULT_TYPE_FOR_KIND[kind] || "general";
   if (!title || !body) {
     console.warn("[NOTIFY] dropped — missing title or body", { kind, screen });
     return null;
@@ -156,6 +171,8 @@ function buildOptions(opts) {
       kind: kind || "general",
       // `type` is kept as an alias of `kind` for older app builds that read it.
       type: kind || "general",
+      // What the device registry filters on — services/notificationTypes.
+      notificationType,
       ...(scr ? { screen: scr } : {}),
       ...(id != null ? { id: String(id) } : {}),
     },
@@ -257,6 +274,7 @@ function notifyLeaveApplied(application, employee) {
     title: "New leave request",
     body: `${name} applied for ${n} day(s) ${leaveOf(a)}, ${shortDate(a.fromDate)} to ${shortDate(a.toDate)}.`,
     kind: "leave",
+    type: "leave_pending",
     screen: "Leave",
     id: a._id,
   });
@@ -275,6 +293,7 @@ function notifyLeaveSecondaryPending(application, primaryManagerName) {
     title: "Leave needs your approval",
     body: `${mgr} approved ${name}'s ${leaveOf(a)}. It's waiting on you.`,
     kind: "leave",
+    type: "leave_pending",
     screen: "Leave",
     id: a._id,
   });
@@ -318,6 +337,7 @@ function notifyLeaveWithdrawRequested(application) {
     title: "Withdrawal requested",
     body: `${firstName(a.employeeName)} wants to withdraw their approved ${leaveOf(a)} for ${shortDate(a.fromDate)}.`,
     kind: "leave",
+    type: "leave_pending",
     screen: "Leave",
     id: a._id,
   });
@@ -369,6 +389,7 @@ function notifyRegularizationSubmitted(request, employee) {
       r.reason ? `Reason: ${r.reason}` : "",
     ),
     kind: "regularization",
+    type: "regularization_pending",
     screen: "Regularize",
     id: r._id,
   });
@@ -385,6 +406,7 @@ function notifyRegularizationSecondaryPending(request, primaryManagerName) {
     title: "Correction needs your approval",
     body: `${firstName(primaryManagerName || "Your manager")} approved ${firstName(r.employeeName)}'s correction for ${shortDate(r.dateStr)}. It's waiting on you.`,
     kind: "regularization",
+    type: "regularization_pending",
     screen: "Regularize",
     id: r._id,
   });
@@ -431,6 +453,7 @@ function notifyOvertimeSubmitted(managerIds, { employeeName, dateStr, stayOverMi
     title: "Overtime report submitted",
     body: `${firstName(employeeName)} stayed late on ${shortDate(dateStr)} (${h}h ${m}m extra). Approve to grant ${graceMinutes}min grace.`,
     kind: "overtime",
+    type: "overtime_pending",
     screen: "Overtime",
     id: reportId,
   });
@@ -468,6 +491,7 @@ function notifyOvertimeReminder(employeeId, { outTime, dateStr }) {
     title: "Overtime report pending",
     body: `You stayed until ${outTime} on ${shortDate(dateStr)}. Submit your OT report to get grace time tomorrow.`,
     kind: "overtime",
+    type: "attendance_alert",
     screen: "Overtime",
     id: dateStr,
   });

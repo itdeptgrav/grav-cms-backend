@@ -118,6 +118,24 @@ router.get("/:employeeId/pdf", AllEmployeeAppMiddleware, async (req, res) => {
         }
         // If the headers are already out the response is half a PDF; there is
         // nothing useful left to say, so just end it.
+        /* THE RENDERER IS NOT AVAILABLE ON THIS SERVER.
+           Chromium could not start — missing from the image, missing a shared
+           library, or out of memory. That is not this request's fault and not
+           something the caller can fix, but it IS something they can work
+           around: every client carries the same payslip template and can
+           render it locally.
+
+           So it answers 503 with a code the clients look for, rather than the
+           bare 500 that told them only that something had gone wrong. A 500 is
+           reserved for a failure that a local render would hit too. */
+        if (err?.rendererUnavailable) {
+            return res.status(503).json({
+                success: false,
+                code: "PDF_RENDERER_UNAVAILABLE",
+                message:
+                    "The server could not render the PDF. Your device will produce it instead.",
+            });
+        }
         if (res.headersSent) return res.end();
         res.status(500).json({ success: false, message: "Could not build the payslip PDF" });
     }

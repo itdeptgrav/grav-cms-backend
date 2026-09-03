@@ -40,6 +40,23 @@ let browserPromise = null;
  * requests await the same launch instead of each starting their own Chromium —
  * which on a small box is how you turn one payslip into an out-of-memory kill.
  */
+/**
+ * Thrown when Chromium itself cannot run.
+ *
+ * Distinct from "the template broke" or "the data was wrong", because the
+ * caller can do something about this one and nothing about the others: the
+ * clients all carry the same template and can render it themselves. Without a
+ * distinguishable error every cause collapsed into one 500, the app treated it
+ * as a genuine failure, and an employee simply could not get their payslip.
+ */
+class RendererUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RendererUnavailableError";
+    this.rendererUnavailable = true;
+  }
+}
+
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = puppeteer
@@ -60,7 +77,13 @@ function getBrowser() {
         // Do not cache a failed launch — the next request should try again
         // rather than inherit a rejected promise forever.
         browserPromise = null;
-        throw err;
+        /* A launch failure is an environment fact, not a bug in this request:
+           Chromium is missing, or its shared libraries are, or the box is out
+           of memory. Named as such so the route can answer usefully instead of
+           returning an unexplained 500. */
+        throw new RendererUnavailableError(
+          `Headless Chromium could not start: ${err.message}`,
+        );
       });
   }
   return browserPromise;
@@ -150,4 +173,4 @@ async function shutdown() {
   if (browserPromise) await resetBrowser();
 }
 
-module.exports = { htmlToPdf, shutdown };
+module.exports = { htmlToPdf, RendererUnavailableError, shutdown };

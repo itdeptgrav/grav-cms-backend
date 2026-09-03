@@ -86,6 +86,24 @@ router.post("/push-token", async (req, res) => {
       return res.status(400).json({ success: false, message: "No employee on this session." });
     }
 
+    // The device registry, keyed by this session's id AND email. The id here
+    // is the department user's, not the Employee _id, so a send that looks
+    // the person up by Employee id finds this browser through the email —
+    // see notifyEmployeeDevices.
+    try {
+      const { registerDevice } = require("../../services/notifyDevices.service");
+      await registerDevice({
+        employeeId: req.user.id,
+        employeeEmail: req.user.email,
+        token,
+        transport: "fcm",
+        platform: "web",
+        label: typeof req.body?.label === "string" ? req.body.label.slice(0, 80) : "",
+      });
+    } catch (e) {
+      console.warn("[change-requests/push-token] registry upsert failed:", e.message);
+    }
+
     const Employee = require("../../models/Employee");
     const result = await Employee.updateOne(
       { _id: req.user.id },
@@ -107,6 +125,17 @@ router.delete("/push-token", async (req, res) => {
   try {
     if (!req.user?.id) return res.json({ success: true, cleared: false });
     const Employee = require("../../models/Employee");
+    // The registry row for this browser goes with it — a signed-out browser
+    // must not keep receiving. The token comes in the body when the page still
+    // has it, else whatever the employee record holds.
+    try {
+      const NotificationDevice = require("../../models/Access/NotificationDevice");
+      const stored = await Employee.findById(req.user.id).select("fcmToken").lean();
+      const gone = [req.body?.token, stored?.fcmToken].filter(Boolean);
+      if (gone.length) await NotificationDevice.deleteMany({ token: { $in: gone } });
+    } catch (e) {
+      console.warn("[change-requests/push-token delete] registry cleanup failed:", e.message);
+    }
     await Employee.updateOne({ _id: req.user.id }, { $set: { fcmToken: null } });
     res.json({ success: true, cleared: true });
   } catch (err) {
@@ -114,6 +143,25 @@ router.delete("/push-token", async (req, res) => {
     res.status(500).json({ success: false, message: "Could not clear this device." });
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* /api/change-requests/notification-settings                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * "Manage notifications", for the browser.
+ *
+ * The SAME handlers the mobile app reaches at
+ * /api/employee/notification-settings — behind this router's CMS session
+ * instead of the app's employee_token, for exactly the reason push-token
+ * lives here. One person, every device, one list: the handlers match rows by
+ * id or email, so the phone sees the browser's row and the browser sees the
+ * phone's. Declared before /:slug so no department can shadow it.
+ */
+router.use(
+  "/notification-settings",
+  require("../Employee_Routes/notificationSettings").handlers,
+);
 
 /* ------------------------------------------------------------------ */
 /* GET /api/change-requests/:slug                                      */
@@ -189,6 +237,68 @@ router.get("/:slug", async (req, res) => {
   } catch (err) {
     console.error("[change-requests] list failed:", err.message);
     res.status(500).json({ success: false, message: "Could not load the approval queue." });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/change-requests/:slug/approve-all                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Approve everything waiting in a department, in one press.
+ *
+ * Asked for by the owner once the queue stopped holding routine edits: what
+ * is left is short, and an approver who has read it should not have to press
+ * the same button twelve times. Each request still goes through
+ * decideChangeRequest — the atomic claim, the replay, the log entry, the
+ * notification — one at a time, because the replay is a live HTTP round trip
+ * and a dozen of them at once against the same records is how two approvals
+ * apply on top of each other.
+ *
+ * A request whose replay fails does not stop the rest: it lands in Failed
+ * with its reason, exactly as a single failed approval does, and is counted
+ * back to the caller. Declared before /:id/decide; the paths do not collide,
+ * but the order says which is primary.
+ */
+router.post("/:slug/approve-all", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").toLowerCase();
+    const role = await roleFor(req, slug);
+    if (!roleAtLeast(role, "approver")) {
+      return res.status(403).json({ success: false, message: "Only an approver can approve the queue." });
+    }
+
+    const pending = await ChangeRequest.find({ departmentSlug: slug, status: "pending" })
+      .sort({ createdAt: 1 })
+      .limit(200)
+      .select("_id")
+      .lean();
+
+    const note = String(req.body?.note || "").trim();
+    const actor = actorFrom(req);
+    const result = { approved: 0, failed: 0, skipped: 0, failures: [] };
+
+    for (const row of pending) {
+      const r = await decideChangeRequest({ id: String(row._id), decision: "approve", note, actor, req });
+      if (r.code === 404 || r.code === 409) { result.skipped += 1; continue; }
+      const outcome = r.request?.status || (r.ok ? "approved" : "failed");
+      if (outcome === "approved") result.approved += 1;
+      else {
+        result.failed += 1;
+        result.failures.push({ id: String(row._id), message: r.message || r.request?.applyError || "" });
+      }
+    }
+
+    res.json({
+      success: true,
+      ...result,
+      message: pending.length === 0
+        ? "Nothing was waiting."
+        : `${result.approved} approved${result.failed ? `, ${result.failed} failed` : ""}${result.skipped ? `, ${result.skipped} already decided` : ""}.`,
+    });
+  } catch (err) {
+    console.error("[change-requests] approve-all failed:", err.message);
+    res.status(500).json({ success: false, message: "Could not approve the queue." });
   }
 });
 

@@ -625,6 +625,47 @@ function getAttendanceValue(status) {
   return 1;
 }
 
+/**
+ * A NATIONAL holiday is a national holiday for everyone.
+ *
+ * The device does not know it is a holiday. Somebody who came in on
+ * Independence Day and left after four hours was classified from their punches
+ * like any other day and stored as HD — a half-day deduction on a day the
+ * company owes them in full. On 15 Aug 2026 that happened to all 59 people who
+ * punched; not one was stored as NH.
+ *
+ * So on a national holiday the status is NH regardless of punching, and NH is
+ * a paid day in payroll. The punches are NOT thrown away: rawPunches, the
+ * in/out times, netWorkMins and otMins all stay on the row, and
+ * `punchedOnHoliday` says so, so HR can see who genuinely worked and grant a
+ * comp-off by hand. What is cleared is everything that only means something
+ * against a shift — late, early-out, missed-punch — because no shift applies,
+ * and a "late" on a holiday must never count toward the late-day ladder.
+ *
+ * Only NATIONAL. Company/optional/restricted holidays keep their existing
+ * behaviour; the instruction was specific and the statutory position is too.
+ *
+ * `hrFinalStatus` is untouched: an HR decision on the day still wins, and the
+ * resync merge preserves it before this ever runs.
+ */
+function applyNationalHolidayRule(entry, restDayStatus) {
+  if (restDayStatus !== "NH" || !entry) return entry;
+  const punched = (entry.punchCount || 0) > 0 || !!entry.inTime;
+  return {
+    ...entry,
+    systemPrediction: "NH",
+    attendanceValue: getAttendanceValue(entry.hrFinalStatus || "NH"),
+    punchedOnHoliday: punched,
+    isLate: false,
+    lateMins: 0,
+    lateDisplay: "",
+    isEarlyDeparture: false,
+    earlyDepartureMins: 0,
+    hasMissPunch: false,
+    missingPunchType: null,
+  };
+}
+
 function computeDay(
   punches,
   employeeType,
@@ -886,7 +927,7 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     else if (earlyDepartureMins > 0) systemPrediction = "P~";
     else systemPrediction = "P";
   }
-  return {
+  const merged = {
     employeeDbId: fresh.employeeDbId,
     biometricId: fresh.biometricId,
     numericId: fresh.numericId,
@@ -935,6 +976,14 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     // silently blanked the reviewer's name off the record.
     hrReviewedBy: existing.hrReviewedBy || null,
   };
+  /* The recompute above classified the merged punches against the shift, as
+     it must on a working day. On a national holiday the fresh row arrived
+     already marked NH by the sync; that must survive the merge, or a resync of
+     a day with one manual punch would turn NH back into HD. */
+  return applyNationalHolidayRule(
+    merged,
+    fresh.systemPrediction === "NH" ? "NH" : null,
+  );
 }
 
 async function smartSaveDay(
@@ -1130,27 +1179,35 @@ async function syncDay(dateStr, empCode = "ALL") {
       extraGrace,
       isToday,
     );
-    employees.push({
-      employeeDbId,
-      biometricId: g.biometricId,
-      numericId,
-      identityId,
-      employeeName,
-      department,
-      designation,
-      employeeType,
-      isGhost: g.isGhost,
-      matchMethod: g.method,
-      providerName: g.providerName,
-      ...computed,
-      lateDisplay: computed.lateDisplay || "",
-      attendanceValue:
-        computed.attendanceValue ??
-        getAttendanceValue(computed.systemPrediction),
-      missingPunchType: computed.missingPunchType || null,
-      shiftStart: shift.start,
-      shiftEnd: shift.end,
-    });
+    employees.push(
+      /* A punched row on a national holiday is still NH — see the rule. The
+         holiday-injected rows below never reach here; this is for the people
+         who actually came in. */
+      applyNationalHolidayRule(
+        {
+          employeeDbId,
+          biometricId: g.biometricId,
+          numericId,
+          identityId,
+          employeeName,
+          department,
+          designation,
+          employeeType,
+          isGhost: g.isGhost,
+          matchMethod: g.method,
+          providerName: g.providerName,
+          ...computed,
+          lateDisplay: computed.lateDisplay || "",
+          attendanceValue:
+            computed.attendanceValue ??
+            getAttendanceValue(computed.systemPrediction),
+          missingPunchType: computed.missingPunchType || null,
+          shiftStart: shift.start,
+          shiftEnd: shift.end,
+        },
+        restDayStatus,
+      ),
+    );
     seenBiometricIds.add(g.biometricId);
   }
   if (restDayStatus) {
@@ -1446,27 +1503,35 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       extraGrace,
       isToday,
     );
-    employees.push({
-      employeeDbId,
-      biometricId: g.biometricId,
-      numericId,
-      identityId,
-      employeeName,
-      department,
-      designation,
-      employeeType,
-      isGhost: g.isGhost,
-      matchMethod: g.method,
-      providerName: g.providerName,
-      ...computed,
-      lateDisplay: computed.lateDisplay || "",
-      attendanceValue:
-        computed.attendanceValue ??
-        getAttendanceValue(computed.systemPrediction),
-      missingPunchType: computed.missingPunchType || null,
-      shiftStart: shift.start,
-      shiftEnd: shift.end,
-    });
+    employees.push(
+      /* A punched row on a national holiday is still NH — see the rule. The
+         holiday-injected rows below never reach here; this is for the people
+         who actually came in. */
+      applyNationalHolidayRule(
+        {
+          employeeDbId,
+          biometricId: g.biometricId,
+          numericId,
+          identityId,
+          employeeName,
+          department,
+          designation,
+          employeeType,
+          isGhost: g.isGhost,
+          matchMethod: g.method,
+          providerName: g.providerName,
+          ...computed,
+          lateDisplay: computed.lateDisplay || "",
+          attendanceValue:
+            computed.attendanceValue ??
+            getAttendanceValue(computed.systemPrediction),
+          missingPunchType: computed.missingPunchType || null,
+          shiftStart: shift.start,
+          shiftEnd: shift.end,
+        },
+        restDayStatus,
+      ),
+    );
     seenBids.add(g.biometricId);
   }
   if (restDayStatus) {
@@ -1980,7 +2045,23 @@ async function applyRegularizationToAttendance(r, actor = {}) {
   // has injected missing employee rows since it was written.
   let dayDoc = await DailyAttendance.findOne({ dateStr: r.dateStr });
   if (!dayDoc) {
-    dayDoc = new DailyAttendance({ dateStr: r.dateStr, employees: [] });
+    /* `date` and `yearMonth` are REQUIRED on this schema, and creating the day
+       with only `dateStr` failed validation on save() — which the approval
+       route caught as a generic "apply_failed". So the one case this branch
+       exists for, a day the device never recorded at all, was also the one case
+       that could never be applied: the request was approved, the attendance was
+       not changed, and the reason was thrown away.
+
+       Both are derived from dateStr rather than from the clock: the day being
+       corrected is not necessarily today, and a row stamped with today's date
+       would sort and group under the wrong month. Midnight IST, matching every
+       other date this module writes. */
+    dayDoc = new DailyAttendance({
+      dateStr: r.dateStr,
+      date: new Date(`${r.dateStr}T00:00:00.000+05:30`),
+      yearMonth: String(r.dateStr).slice(0, 7),
+      employees: [],
+    });
   }
 
   let idx = (dayDoc.employees || []).findIndex((e) => e.biometricId === bid);
@@ -2332,32 +2413,54 @@ async function applyApprovedLeavesForDate(dateStr) {
 // Returns { promotedStatus: "HD"|"AB"|null, promoted: bool }
 // ─────────────────────────────────────────────────────────────────────────────
 function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
-  if (!policy?.enabled || entry.hrFinalStatus || dateStr === todayStr)
-    return { promotedStatus: null, promoted: false };
+  const none = { promotedStatus: null, promoted: false };
+  if (!policy?.enabled) return none;
   const lateHDOn = policy.lateHDOnCount ?? 3;
   const lateFullDayOn = policy.lateFullDayOnCount ?? 5;
   const earlyHDOn = policy.earlyOutHDOnCount ?? 3;
   const earlyFullDayOn = policy.earlyOutFullDayOnCount ?? 5;
-  if (entry.isLate && entry.systemPrediction === "P*") {
+
+  /* WHAT COUNTS IS THE RAW LATENESS, NOT WHAT HR DECIDED ABOUT THE DAY.
+     This used to return before incrementing whenever HR had overridden the
+     day. So when HR pardoned somebody's 3rd late by marking it Present, that
+     day vanished from the streak and the NEXT late inherited its position —
+     the 4th late became "the 3rd" and was docked a half day. The pardon
+     moved the penalty instead of removing it.
+
+     A pardon forgives the deduction on that day. It does not un-late the day.
+     So the count always advances on a raw late; only the PROMOTION is
+     withheld when HR has already ruled on the day, or the day is still today
+     and not yet over. */
+  const rawLate =
+    !!entry.isLate && ["P*", "LHD", "LAB"].includes(entry.systemPrediction);
+  const rawEarly =
+    !rawLate &&
+    !!entry.isEarlyDeparture &&
+    ["P~", "EAB"].includes(entry.systemPrediction);
+  const mayPromote = !entry.hrFinalStatus && dateStr !== todayStr;
+
+  if (rawLate) {
     state.lateCount++;
     if (state.lateCount >= lateFullDayOn) {
       state.lateCount = 0;
-      return { promotedStatus: "LAB", promoted: true };
+      return mayPromote ? { promotedStatus: "LAB", promoted: true } : none;
     }
     if (state.lateCount === lateHDOn) {
-      return { promotedStatus: "LHD", promoted: true };
-    } // no reset — count continues to AB
-  } else if (entry.isEarlyDeparture && entry.systemPrediction === "P~") {
+      return mayPromote ? { promotedStatus: "LHD", promoted: true } : none;
+    }
+    return none; // 4th (and any other in-between) late: counted, not docked
+  }
+  if (rawEarly) {
     state.earlyCount++;
     if (state.earlyCount >= earlyFullDayOn) {
       state.earlyCount = 0;
-      return { promotedStatus: "EAB", promoted: true };
+      return mayPromote ? { promotedStatus: "EAB", promoted: true } : none;
     }
     if (state.earlyCount === earlyHDOn) {
-      return { promotedStatus: "HD", promoted: true };
-    } // no reset — count continues to AB
+      return mayPromote ? { promotedStatus: "HD", promoted: true } : none;
+    }
   }
-  return { promotedStatus: null, promoted: false };
+  return none;
 }
 
 async function applyMonthlyLatePromotion(dayDoc, settings) {
@@ -6210,8 +6313,15 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
               row.totals.NHFH++;
             }
           } else {
-            sheetCode = didPunch ? "P" : toSheetCode(hs);
-            if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+            /* A national holiday is NH on the sheet whether or not they
+               punched — same rule as the attendance record itself. Other
+               holiday types keep the older "punched = P" behaviour. */
+            const nationalWins = hs === "NH";
+            sheetCode = didPunch && !nationalWins ? "P" : toSheetCode(hs);
+            if (
+              nationalWins ||
+              (["FH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+            )
               row.totals.NHFH++;
             else if (didPunch) row.totals.P++;
             if (
@@ -8587,6 +8697,11 @@ module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
 module.exports.syncDay = syncDay;
 module.exports.syncDayForce = syncDayForce;
+// The two attendance rules, exported so they can be verified without a device
+// or an HTTP server: verifyAttendanceRules.js replays real stored days through
+// them.
+module.exports.applyLateCountPromotion = applyLateCountPromotion;
+module.exports.applyNationalHolidayRule = applyNationalHolidayRule;
 // The employee-field extractors. Employee documents are inconsistent — names
 // live at the top level on some records and under basicInfo/personalInfo on
 // others — and these are the versions hardened against every shape in the

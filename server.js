@@ -2810,7 +2810,12 @@ app.get("/", (req, res) => {
 });
 
 const payslipRoutes = require("./routes/Employee_Routes/Payslip");
+const notificationSettingsRoutes = require("./routes/Employee_Routes/notificationSettings");
 app.use("/api/employee/payslip", payslipRoutes);
+/* Per-device notification preferences, for the app and the browser alike.
+   Under /api/employee because it is a person managing their own devices,
+   not a department managing anything. */
+app.use("/api/employee/notification-settings", notificationSettingsRoutes);
 
 const overtimeRoutes = require("./routes/Employee_Routes/Overtimeroutes");
 const timerSopRoutes = require("./routes/task_routes/timerSop.routes");
@@ -2867,6 +2872,18 @@ if (attendanceRouter.startHourlyAttendanceSync) {
   console.log("✅ Hourly attendance sync cron initialized");
 } else {
   console.warn("⚠️ Hourly attendance sync not available");
+}
+
+/* "You still have things waiting on you", hourly.
+   Costs one small query when nobody has switched repeats on, which is the
+   default and will be the usual state — the sweep starts from the DEVICES that
+   opted in, not from the staff list. See services/pendingReminders.service. */
+try {
+  const { startPendingReminders } = require("./services/pendingReminders.service");
+  startPendingReminders();
+  console.log("✅ Hourly pending-work reminders initialized");
+} catch (err) {
+  console.warn("⚠️ Pending-work reminders not started:", err.message);
 }
 
 // Close out CoWork sessions left online by somebody who has already punched

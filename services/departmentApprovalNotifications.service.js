@@ -74,6 +74,17 @@ function getMessaging() {
  * user would see each message twice.
  */
 async function sendPush(employee, { title, body, url, type = "department_approval" }) {
+  /* Registered devices decide first — the rule is in utils/sendExpoPush. The
+     single fcmToken field below is only for a person the registry has never
+     seen. */
+  try {
+    const { notifyEmployeeDevices } = require("./notifyDevices.service");
+    const r = await notifyEmployeeDevices(employee, { type, title, body, url });
+    if (r.matched > 0) return r.sent > 0;
+  } catch {
+    /* fall through to the stored token */
+  }
+
   const token = employee?.fcmToken;
   if (!token) return false;
 
