@@ -2287,6 +2287,235 @@ No Accounts file, no backend application file, and no Lane A or Store/Purchase
 file was changed — the only backend file this lane touches is this handoff. The
 dirty worktree's Lane A / Store-Purchase changes were left intact.
 
+## Visible Batch 2 — Production Schedule polish (complete)
+
+The production-schedule page now wears the Accounts product language, and its
+header figures are honest. No scheduling behaviour, endpoint, payload, role gate
+or mutation sequence changed.
+
+### ⚠ Merge damage found and repaired first (NOT this chunk's design)
+
+The branch would not compile. Merge `d1224ca` (origin/main, 2026-09-03 19:45)
+left three files broken, and Turbopack fails the whole app on any one parse
+error — so **every** dashboard page was returning HTTP 500. Repaired verbatim so
+the department works again; each is a restoration of merge-dropped code, not a
+new feature:
+
+| File | What the merge did | Repair |
+|---|---|---|
+| `components/DashboardLayout.js` | dropped `const NAV = [` and the Dashboard / Production / Setup entries, leaving the array dangling at module scope (syntax error :103) | restored the array head verbatim from the pre-merge version (df64086) |
+| `app/.../manufacturing-orders/[id]/page.js` | concatenated a **duplicate stale `<PageHead>`** after the current B3E `DetailIdentityHeader`, with a trailing spurious `)}` (syntax error :932) | removed the duplicate; the B3E header is intact and unchanged |
+| `components/shell/FrostShell.js` | dropped the `drawerGroups` import, so `initialOpenGroups` / `groupKeyHolding` / `openActiveGroup` were undefined at runtime (every shell crashed) | re-added the import; the helpers are unchanged |
+
+These are flagged so the merge owner (ginguray-art) knows what `d1224ca`
+mangled. `git diff --check` is clean; all suites pass after the repair.
+
+### The Schedule pass
+
+**Summary slab.** The ordinary `PageHead` is gone; the header is now
+`AcctPageSlab` (the shared platform silhouette — no money in it, no Accounts
+file touched) showing the visible period as its subtitle and four truthful
+figures: **Scheduled** (hero), **Unscheduled**, **Scheduled orders (of N)** and
+**Utilisation**. Utilisation colours only when it runs hot (≥ 90%). A "Syncing…"
+pill sits on the slab during a refresh.
+
+**Honest figures.** The old stats block ran `setStats` only for a non-empty MO
+list, so an empty or failed load showed five confident zeros. Now a
+`statsAvailable` flag gates the slab: **"—" until a load succeeds, real counts
+after**, and an empty book reads a genuine **"0"** (utilisation "—" when there is
+nothing to be a fraction of). All in the pure, tested
+`components/manufacturing/scheduleSummary.js`.
+
+**One command bar.** A single `role="toolbar"` row: ‹ · Today · › · Week/Month ·
+Calendar/Overview · Hide tray · Undo (only when a remove is undoable) · Refresh.
+Every control has an accessible name and an `aria-pressed` active state. The
+calendar's own internal toolbar is hidden via an **additive, default-off**
+`hideToolbar` prop on the shared `CalendarView`, so the period controls live in
+one place and Sales — which passes nothing — renders exactly as before (verified:
+its route compiles cleanly). Period nav shows on the calendar tab only; the
+overview tab keeps its own context toolbar, so nothing is duplicated.
+
+**Responsive.** Below `deck`, the 400px resizable rail (which overflowed a phone)
+is replaced by a stacked layout: the unscheduled tray becomes a collapsible
+drawer **above** the calendar rather than crushing it, and the calendar scrolls
+inside its own labelled container. No page-level horizontal overflow at 375 or
+768. Existing drag/drop/move/resize/reorder/remove/undo handlers are untouched;
+the touch day-zoom scheduling path is unchanged (no new workflow invented).
+
+**Honest states.** Initial loading (skeleton under the slab), a partial failure
+(warning close to the workspace, calendar and last-good figures kept), refresh,
+empty schedule and empty tray are visually distinct. A failed refresh keeps the
+previous calendar and figures with a "the last update didn't go through" warning.
+
+### Files (this chunk)
+
+| File | |
+|---|---|
+| `components/manufacturing/scheduleSummary.js` | **new** — period label, slab figures with the missing/zero rule, utilisation tone. |
+| `components/manufacturing/scheduleSummary.test.mjs` | **new** — 12 tests. |
+| `app/.../production/schedule/page.js` | slab header, command bar, stats availability, responsive stacked layout. |
+| `components/schedule/CalendarView.js` | additive `hideToolbar` (default off — Sales unchanged). |
+
+### Tests
+
+- `scheduleSummary` **12/12**. Manufacturing suite **270/270**. Shell
+  `drawerGroups` **6/6**. `npm test` — **838/838, 0 failures**.
+- `git diff --check` clean in both repositories.
+- Syntax verified by the dev server compiling **every** route to 200 after the
+  merge repair (PM schedule, MO detail, and the Sales schedule that shares
+  `CalendarView`).
+
+### Browser verification — 1440 / 768 / 375, zero mutations
+
+Authenticated read-only fixtures; **zero non-GET attempts** and
+`read_network_requests` recorded no backend requests.
+
+| Case | Result |
+|---|---|
+| populated month | slab 8 unscheduled · 2 of 3 orders · 67% util · 4 scheduled; over-capacity day 10 shows its cluster |
+| populated week | Week toggle switches the period and figures |
+| empty schedule / empty book | genuine "0" figures, utilisation "—" |
+| partial failure (MO endpoint) | figures stay last-good (8, **not** 0), warning shown, calendar preserved |
+| refresh failure | calendar + figures kept with an inline warning |
+| never-loaded | "—", never zero (unit-tested) |
+| viewer vs editor | tray/unassign gated `min="editor"`, calendar stays visible to viewers (gates unchanged) |
+| 1440 / 768 / 375 | slab reflows, command bar wraps, tray becomes a drawer; **no page overflow** |
+
+### Preserved
+
+No Accounts file, no backend application file, and no Lane A or Store/Purchase
+file was changed by this chunk (`Store_DashboardLayout.js` shows modified in the
+worktree from the Store lane — left intact). The only backend file this lane
+touches is this handoff. Next visible batch: Products & BOM + Setup consistency.
+
+## Visible Batch 4 — Production trend graph (complete)
+
+The Accounts-style Project Manager Overview now has its graph: **work orders
+started vs completed, per week**, with 4 / 8 / 12-week controls. One small
+read-only endpoint; no schema, lifecycle, planning-state, security, migration or
+mutation change.
+
+### The endpoint (backend, additive)
+
+`GET /api/cms/manufacturing/manufacturing-orders/stats/production-trend?weeks=4|8|12`
+— beside `/stats/overview`, which is untouched. Auth is the router's existing
+`EmployeeAuthMiddleware`. Invalid `weeks` falls back to **8** (the permissive
+convention nearby PM read endpoints use), never a 400.
+
+```
+{ success, bucket:"week", weeks, asOf,
+  points:[{ periodStart, periodEnd, startedWorkOrders, completedWorkOrders }],   // every requested week, zeros included
+  coverage:{ startedWithoutTimestamp, completedWithoutTimestamp } }
+```
+
+Truth rules, enforced and tested:
+- Started reads **only `timeline.actualStartDate`**; completed **only
+  `timeline.actualEndDate`**. `createdAt`/`updatedAt` are never substituted.
+- Monday-based weeks in **Asia/Kolkata** (`services/manufacturing/productionTrend.js`).
+- `completedWithoutTimestamp` = work orders with `status:"completed"` and no
+  `actualEndDate`. `startedWithoutTimestamp` = **execution-status** work orders
+  (`in_progress|paused|delayed|completed`) with no `actualStartDate` — labelled
+  narrowly; the scan ledger is **not** queried, so no ledger certainty is claimed.
+
+Files: `services/manufacturing/productionTrend.js` (pure bucketing), its
+`.test.js` (**10/10**, node --test), the route added to
+`manufacturingOrderRoutes.js`, and `test/project-manager/production-trend.route.test.js`
+(**9/9**, jest + in-memory Mongo: shape, weeks clamp, timestamp-only sourcing,
+the no-`updatedAt` guarantee, coverage, auth, and `/stats/overview` still answers).
+
+### Tests
+
+- `productionTrend` (pure) **10/10**; route contract **9/9**.
+- The known-unrelated `services/salesJourneyOutcome.test.js` failure is a
+  concurrent Sales-lane change (`poContract` vs `purchaseInvoice`) — that file is
+  not touched here and references nothing of this chunk.
+- `git diff --check` clean.
+
+### The graph (frontend)
+
+`app/project-manager/dashboard/page.js` — the reserved graph gap is now a
+full-width **Production trend** panel between the slab and the two-column grid.
+
+- Reuses the unit-neutral Accounts chartkit (`monotonePath`, `niceMax`, `num`,
+  `useMeasuredWidth`); **no** `fmtINR`, `axisMoney`, finance labels or
+  inflow/outflow. Two monotone lines — **Started** (blue) and **Completed**
+  (green) — a whole-count axis, a visible zero line, a legend, a focused-week
+  tooltip with exact values, and a spoken `role="img"` summary.
+- Shows the server `asOf` as **"As of …"**, kept distinct from the slab's
+  browser **"Loaded …"**.
+- Coverage disclosure below the graph: one line per excluded set, hidden when its
+  count is zero, and **"Coverage unavailable"** (never zero) when coverage is
+  absent. Missing data never becomes a fabricated zero — a malformed body is an
+  error, an all-zero body is a real empty-but-valid graph.
+- **Independent lifecycle**: its own section state (`IDLE_SECTION` /
+  `sectionLoaded` / `sectionFailed`). Initial loading, empty-valid, error+Retry,
+  and **failed-refresh-preserves-the-graph** are distinct; a graph failure never
+  blanks the slab, rail or table. A monotonic request token means a slow 12-week
+  answer cannot overwrite a newer 4-week choice.
+- **Range in the URL** (`?weeks=4|8|12`, default 8 omitted) via the History API:
+  pill clicks `pushState`, and Back/Forward restore the range through `popstate`
+  — reloading **only the graph**, no page reload.
+
+Files: `components/manufacturing/productionTrend.js` (policy — classification,
+geometry, coverage sentences, as-of), `components/manufacturing/ProductionTrendPanel.js`
+(the chart), `productionTrend.test.mjs` (**15/15**), and the page wiring. The
+Batch-1 test that asserted the graph's deliberate *absence* was updated to
+assert its real, endpoint-backed *presence*.
+
+### Frontend tests & browser
+
+- `productionTrend` **15/15**; `pmOverview` **33/33**; manufacturing suite and
+  `npm test` — **864/864, 0 failures**. `git diff --check` clean. No Accounts,
+  no Lane A/Store file touched on the frontend.
+- Verified at **1440 / 768 / 375** against intercepted read-only fixtures, **zero
+  non-GET requests, zero backend egress**: populated trend, all-zero trend, both
+  coverage disclosures + "Coverage unavailable", 4↔8↔12 switching (requests only
+  the graph), Back restoring 4w with only-the-graph reloaded, stale 12w losing to
+  a newer 4w, a graph-only error leaving slab/rail/table intact, failed-refresh
+  preserving the graph with a warning, and no horizontal overflow.
+
+## Core Screens — Accounts-style UI pass (complete)
+
+Four connected PM screens brought onto the platform's Accounts visual language.
+Visible only — no backend, no logic, no tests changed; every URL, filter, action
+and role gate preserved.
+
+### Visible before → after
+
+| Screen | Before | After |
+|---|---|---|
+| **Requests desk** | `PageHead` + a 4–5 cell KPI wall Panel | Dark **slab**: hero "Awaiting your decision · N MO requests", figures Approved / Rejected / MRF oversight; loaded/result context strip; Decisions/MRF-oversight tabs kept; MRF TL breakdown as a compact strip; one compact status-filter + search bar with Clear filters. MRFs stay view-only. |
+| **Request detail** | custom header + a full-width "View only" warning wall | **Identity slab**: request number as title, requester/customer as sub, current **state as the hero**, type/on-behalf/"View only · TL decides" as pills; routing as one quiet strip (no wall); MO Approve/Reject prominent on a light action row when allowed; fact panels unchanged. |
+| **MO register** | `PageHead` + heavy Filters Panel + Pagination Panel | Production **slab** (real `pagination.total` hero, on-this-page figure); loaded/range strip; compact search + Status/Priority/Deadline + Grid/List toggle in one bar; active-filter chips as a quiet strip; slim pagination bar. Missing-vs-zero preserved. |
+| **MO detail** | tall `DetailIdentityHeader` (PageHead) | **Slab aligned with Work Order detail**: MO number + customer, status hero, canonical figures (Work orders · Units · Progress · Deadline) folded onto the slab, type/quotation pills, Refresh on the slab, Share/Print on a light action row. Much less vertical bulk before the Plan/Track/Execute/Fulfil nav; every section, deep link and action preserved. (CanonicalSummary's standalone block — already unrendered from an earlier merge — is now carried compactly on the slab.) |
+
+### Files changed (frontend only)
+
+- `app/project-manager/dashboard/requests/page.js`
+- `app/project-manager/dashboard/requests/[type]/[id]/page.js`
+- `app/project-manager/dashboard/production/manufacturing-orders/page.js`
+- `app/project-manager/dashboard/production/manufacturing-orders/[id]/page.js`
+
+All reuse `AcctPageSlab` + existing PM helpers/primitives. No Accounts file, no
+new helper file, no backend touched.
+
+### Verification
+
+- All four routes compile (200). Manufacturing suite **285/285** unchanged;
+  `git diff --check` clean.
+- Browser at **1440 / 768 / 375** with intercepted read-only fixtures, **zero
+  non-GET requests, zero backend egress**: slabs reflow, filters/actions wrap,
+  register/requests become mobile cards, section tabs reachable, **no page-level
+  horizontal overflow** on any screen. Nav keeps its five entries with the
+  correct Requests/Production highlight throughout the flow
+  (Requests → Request detail → MO register → MO detail → Work Order).
+
+### Remaining visible work
+
+- The MO-detail slab now carries the canonical figures; if the fuller
+  `CanonicalSummary` block is wanted back as a section, it can be re-added — its
+  render was lost in the earlier `d1224ca` merge, not this pass.
+
 ## Recommended next
 
 **Superseded — kept for the record.** When B2.2 was written, B3 had not started

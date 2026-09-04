@@ -1,6 +1,7 @@
 # Item-wise Budget Attribution
 
-> **Status:** Chunk 1 (foundation) + Chunk 1.1 (integrity corrections) shipped.
+> **Status:** Chunk 1 (foundation) + Chunk 1.1 (integrity corrections) + B1
+> (service defaults) + B2 (service classification before approval) shipped.
 > The mechanism is INERT — nothing in the live budget path reads it yet, by
 > design.
 >
@@ -263,6 +264,268 @@ Four integrity gaps in the Chunk 1 foundation, all closed:
    Finance page now say the mapping is unresolved and will require resolution
    *when item-wise request allocation is enabled*, and state plainly that
    saving moves no budget.
+
+## Chunk B1 — the service default contract (shipped, inert)
+
+Services are bought and budgeted like materials and behave nothing like them
+afterwards, so the Service Master is a separate master with a separate
+resolution rule. B1 makes its `budgetLedgerId` operational and visible to
+Finance. It does **not** touch the live budget path.
+
+### The rule
+
+| | Item | Service |
+|---|---|---|
+| 1 | `RawItem.budgetLedgerId` → `item_override` | `Service.budgetLedgerId` → `service_default` |
+| 2 | category mapping → `category_mapping` | *(none)* |
+| 3 | nothing → `unresolved` | nothing → `unresolved` |
+
+**A service never falls through to an Item Category mapping.** A service has a
+`category` field that looks exactly like an item's, and the Item Category
+mappings describe what the STORE STOCKS. A service called "Consultancy"
+inheriting the head mapped for consumables would charge professional fees to a
+materials budget and look entirely deliberate on the report.
+
+`headForService(service)` therefore takes **no map** — not "ignores one",
+cannot receive one. `resolveServiceIds` never builds one. Both are pinned by
+tests, one behavioural and one structural. Nothing is inferred from the
+service's category, supplier, SAC code or GST rate either: a supplier sells
+more than one kind of thing, a SAC code is a tax classification rather than a
+budget one, and a GST rate is a percentage.
+
+Result shape is identical to `headForItem`'s, so a caller handling both never
+branches on which it received.
+
+### Company scope — better than the item path
+
+`resolveServiceIds` **is** company-scoped, because `Service` carries a
+`companyId` and `RawItem` does not. Another company's service returns
+`found: false` with no name, category, billing unit or configuration, worded
+identically to a genuinely absent id — telling them apart would confirm that
+the other company holds that record.
+
+### APIs
+
+All under `/api/accountant/chart-of-accounts`, all `accountantAuth`, all
+gated by the same `financeOnly` + `mappingCompany` pair the item routes use.
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/service-budget-heads/services` | search by name/code, `status`, `onlyUnresolved`, capped at 50 with `capped: true`, company-wide `coverage` |
+| PUT | `/services/:id/budget-head` | set or clear one default; clearing writes id **and** name together |
+| POST | `/service-budget-heads/resolve` | bulk, one row per requested id |
+
+### One classification contract, not two
+
+The Service Master's own form validated its budget head with
+`ledger.nature === "expense"`, which is **not** the rule Finance uses.
+Measured against real chart shapes the two disagreed on four heads out of five,
+all permissive: `Round Off`, `Suspense`, `Opening Stock` and any head Finance
+had manually marked `not_budgeted` were accepted by the Store and refused by
+Finance. A service could therefore carry a head that Finance's own screen
+would not let it have.
+
+`routes/CMS_Routes/Inventory/Services/services.js` now calls
+`itemBudgetHead.assertMappable`, and its `/options` picker filters through
+`budgetClassification` so it cannot offer a head the save would refuse.
+`assertMappable` gained an optional `subject` for the noun in its refusal
+message; the gate itself is unchanged, and item behaviour is unchanged.
+
+**A head with no derivable nature is refused, not assumed.** That was already
+true — `classify` lands on `not_budgeted` — but the message now says which of
+the two reasons applied, because "not a budget head" reads as a policy
+decision while a blank nature is a gap in the chart somebody can go and fix.
+
+### The Finance screen
+
+`/accountant/budgets/item-categories` is now **Purchasing budget defaults**,
+with three sections: Item categories, Item overrides, Services. The existing
+two are unchanged. The Services section shows code, name, category, billing
+unit, active/inactive status, current head and resolved/unresolved state, and
+allows change and clear. Inactive services are **labelled and readable** — a
+classification made last year has to stay understandable — and the screen
+cannot reactivate one; that is the Store's decision.
+
+### What B1 deliberately does NOT do
+
+- `SpendRequest.items[].budgetAllocation` is **not** populated for services.
+- `service_default` is **not** added to the request-line `resolutionSource`
+  enum. That enum is `["item_override", "category_mapping", "unresolved"]` and
+  adding a fourth value is Lane B's call once `SpendRequest` and Service Order
+  work settles.
+- No commitment, no budget reduction, no supplier bill, no expense posting,
+  no change to Service Order creation.
+
+A test counts twelve collections before and after a save and asserts none
+moved.
+
+### Known limit
+
+`assertMappable` derives a head's nature from its **group**, not from the
+ledger's own `nature` field. A ledger whose group is missing or has no nature
+is refused even when the ledger itself says `expense`. That is pre-existing
+item behaviour, deliberately left alone here, and worth revisiting on its own
+— changing it would accept heads this gate refuses today.
+
+---
+
+## Chunk B2 — service classification before budget approval (shipped)
+
+B1 made a service's budget default visible to Finance in setup. B2 makes it
+visible **during the request**, before the money is promised.
+
+### The problem
+
+A service line was matched to the Service Master while the SERVICE ORDER was
+raised — which happens after finance approved and after the commitment was
+written. So "this service normally comes out of Repairs; are we approving it
+against Repairs?" was asked at the one moment the answer changed nothing.
+
+### Vocabulary
+
+`budgetAllocation.resolutionSource` gained two values, in both request models:
+
+| Value | Means |
+|---|---|
+| `service_default` | the head in force IS the service's own configured default |
+| `manual_selection` | a person chose it, over or in the absence of a rule |
+
+Plus `resolutionReason` on the subdocument — populated only where a person
+contradicted a configured default. The three item values are unchanged, and
+`budgetAllocation` is still `default: undefined`, so a legacy line has **no**
+allocation rather than a manufactured "unresolved" one.
+
+**The vocabulary lives in `services/budgetAllocationVocabulary.js` — a leaf
+module with no `require` of its own.** The first version defined it in
+`itemBudgetHead.service.js` and had the schemas import that, which pulled in
+`Acc_ItemCategoryBudget` and `Acc_Ledger`; registering a mongoose model builds
+its indexes, which CREATES the collection. The baseline audit reads a
+collection's absence as "never deployed", so merely loading a request model
+started manufacturing that evidence. `itemBudgetHead` re-exports the leaf, so
+there is still exactly one definition.
+
+### Matching moves before finance
+
+`PATCH /api/requests/spend/:id/service-lines` — Store, any stage before
+approval. Validates same company, ACTIVE, real line; snapshots `service`,
+`serviceCode`, `billingUnit`, `sacCode`; records the proposed resolution from
+`headForService`.
+
+`GET /api/requests/spend/:id/service-classification` — what Store and Finance
+both read. Per line: the identity snapshot, the quote, the service default,
+the four-state agreement, and the master/quote differences.
+
+**The quote is never overwritten.** The matching route's projection does not
+even SELECT `defaultRate`, `defaultGstRate` or `preferredVendorId`, so there is
+nothing in scope to copy over a negotiated price. Differences are reported as
+a comparison carrying both figures.
+
+### The four states
+
+| State | Meaning |
+|---|---|
+| `default_matches_request_head` | nothing to decide |
+| `different_head_selected` | finance must say why |
+| `service_default_unresolved` | no head configured on the service |
+| `default_not_available_in_department` | the head exists, this department has no approved budget on it |
+
+**Availability is checked before the comparison.** "Available" means an
+approved BUDGET LINE for this department, from `budgetCommitment.approvedHeadsFor`
+— not the set of mappable expense ledgers. A default this department cannot
+spend against is not "a different head"; it is not a choice at all, and only an
+available head is offerable.
+
+### Finance must answer
+
+Approving a SERVICE request whose lines contradict a **configured** default is
+refused with `SERVICE_CLASSIFICATION_UNRESOLVED`, carrying every mismatched
+line and both head names. Finance re-approves with
+`serviceClassification: { reason }` or `{ lines: [{ spendLineId, reason }] }`.
+
+- **Match** → `service_default`, `resolved`, no reason, no selector.
+- **Deliberate difference** → `manual_selection`, `resolved`, reason + selector
+  id/name/time.
+- **No default** → blocks nothing (nobody expressed an intention to
+  contradict); recorded as `manual_selection`. The Service Master is **not**
+  retroactively called resolved.
+- **Unbudgeted exception path** → preserved unchanged; the line is honestly
+  `unresolved` with a null head, never "manual selection of nothing".
+- **Unmatched line** → does not block. Matching is Store's job; refusing here
+  would strand a priced, confirmed request behind somebody else's queue.
+- **Rejection** → never gated.
+
+### Commitment is unchanged
+
+One request-level commitment, on the request's `ledgerId`, for the approved
+grand total. Every line's stored head is the REQUEST's head — a line claiming a
+different one would be a second authority. Only the SOURCE varies.
+
+### Conversion
+
+The service order is built from the **approved line snapshot**, not the live
+master. This was a real defect found by test: the conversion read
+`svc.serviceCode` straight off the master, so renaming a service after approval
+silently restated the order that approval produced.
+
+`lineMatches` in the body is now **only** the legacy late-match path, for
+requests approved before B2. It cannot reach a line that already stored a
+match, and a response that used it says so (`legacyLateMatch`).
+
+### Correction — unmatched lines now BLOCK
+
+The first pass reported and did not enforce identity, on the reasoning that
+matching is Store's job and blocking would strand a priced request behind
+somebody else's queue. That was wrong. An approval is the moment the money is
+promised, and promising it against lines nobody has identified is the thing
+this chunk exists to stop. The queue argument is an argument for Store
+classifying promptly, not for finance committing blind.
+
+**`SpendRequest.serviceClassificationPolicy`** — a server-stamped version
+marker with **no schema default**. Absence is the legacy signal: a default
+would stamp every historical document on its next save and convert it into a
+new-policy request the late-match door then refuses, stranding
+already-committed work. Stamped in `spendRequestCreate.service.js`, the one
+function all three creation doors call, for `SERVICE`/`SOFTWARE` only. Never
+read from a client payload.
+
+Finance approval of a stamped request is refused with
+`SERVICE_LINES_UNCLASSIFIED` when any line has an identity fault:
+
+| Fault | Cause |
+|---|---|
+| `NOT_MATCHED` | no service on the line |
+| `SERVICE_NOT_IN_COMPANY` | the match is gone, or belongs to another company |
+| `SERVICE_INACTIVE` | the matched service has been retired |
+
+"Gone" and "another company's" share one message deliberately: the lookup is
+company-scoped, and distinguishing them would confirm a record exists
+elsewhere.
+
+**This gate runs before the mismatch check and never consults `reason`.** A
+reason explains WHICH head was chosen; it cannot explain away a line whose
+service is unknown. The finance UI reflects that — an unclassified refusal
+opens a notice with no text box at all, not the reason dialog.
+
+`lineMatches` on the service-order route is now refused outright
+(`LATE_MATCH_NOT_ALLOWED`) for a stamped request: it was classified before
+approval by definition, so a late match could only supply an identity the
+approval never saw. Only an unstamped request may still use it.
+
+### What B2 deliberately does NOT do
+
+No commitment split, no per-line commitment, no budget reduction, no supplier
+bill, no expense posting, no voucher, no PO, no GRN, no stock movement, and no
+change to `ServiceOrder` or `serviceOrders.js`. A test counts seven collections
+before and after and asserts none moved.
+
+### One widened permission, named
+
+`maySeeRequest` admits Store only from APPROVED onward — right while their
+first job was raising the order, wrong now they have an earlier one. Widened on
+the classification READ route only; `maySeeRequest` itself is untouched, because
+changing it would open every other route on that router at once.
+
+---
 
 ## Next chunk (not started)
 

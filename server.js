@@ -849,6 +849,11 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"),
 );
 
+app.use(
+  "/api/cms/inventory/valuation",
+  require("./routes/CMS_Routes/Inventory/valuation/inventoryValuationRoutes"),
+);
+
 /* =====================
     HR CHANGE HISTORY
   =====================
@@ -1341,6 +1346,10 @@ app.use("/api/cms/warehouses", warehousesRoutes);
 const vendorRoutes = require("./routes/CMS_Routes/Inventory/Vendor-Buyer/vendor");
 app.use("/api/cms/vendors", vendorRoutes);
 
+// Services Category — bought and budgeted like items, never stocked like them
+const serviceRoutes = require("./routes/CMS_Routes/Inventory/Services/services");
+app.use("/api/cms/services", serviceRoutes);
+
 // Products Category
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
@@ -1375,6 +1384,11 @@ app.use("/api/cms/store-purchase", storePurchaseContextRoutes);
 
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
+
+// Service Orders — the operational document an approved SERVICE request becomes.
+// Creates no PO, goods receipt, stock or inventory movement (see the router).
+const serviceOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/serviceOrders");
+app.use("/api/cms/service-orders", serviceOrderRoutes);
 
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
