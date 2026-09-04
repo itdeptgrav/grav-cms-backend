@@ -238,9 +238,63 @@ async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
   };
 }
 
+// ── Helper: an id that is safe to use as ONE path segment ────────────────────
+/**
+ * Ids in this file arrive from request bodies, query strings and guest
+ * sessions, and every one of them used to be concatenated straight into a
+ * filesystem path. `path.join` RESOLVES `..` rather than rejecting it, so a
+ * `meetId` of `"../../.."` walked out of TMP_BASE — and because the finalize
+ * paths below end in `fs.rmSync(dir, { recursive: true, force: true })`, an
+ * escaped path was a recursive delete of somebody else's directory.
+ *
+ * `/cowork/audio/beacon-finalize` made that reachable without a token at all:
+ * it is called by `navigator.sendBeacon` on unload, which cannot set an
+ * Authorization header, so the route is deliberately unauthenticated. An
+ * unauthenticated destructive path traversal is the worst shape a bug can take,
+ * and it is closed here rather than at one call site, because there are
+ * eighteen call sites and the next one added would have missed it.
+ *
+ * The rule is deliberately narrow: ids in this product are Firestore document
+ * ids and employee ids, which are alphanumerics with `-` and `_`. Anything else
+ * — a separator, a dot, a control character, an over-long string — is not an id
+ * we issued, so there is no legitimate caller to preserve.
+ */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function safeSegment(value, label) {
+  const s = String(value ?? "");
+  if (!SAFE_ID.test(s)) {
+    throw Object.assign(new Error(`Unsafe ${label}: ${JSON.stringify(s).slice(0, 80)}`), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return s;
+}
+
+/**
+ * Build a path under TMP_BASE and prove it stayed there.
+ *
+ * The segment validation above is the real guard; this is the backstop that
+ * makes an escape impossible rather than merely unlikely, so a future caller
+ * that forgets to validate still cannot reach outside the temp root.
+ */
+function containedPath(...segments) {
+  const joined = path.join(TMP_BASE, ...segments);
+  const resolved = path.resolve(joined);
+  const root = path.resolve(TMP_BASE);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw Object.assign(new Error("Path escaped the audio temp root"), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return resolved;
+}
+
 // ── Helper: get chunk dir for a user ─────────────────────────────────────────
 function getChunkDir(meetId, employeeId) {
-  return path.join(TMP_BASE, meetId, employeeId);
+  return containedPath(safeSegment(meetId, "meetId"), safeSegment(employeeId, "employeeId"));
 }
 
 // ── Helper: get next chunk index ─────────────────────────────────────────────
@@ -606,7 +660,12 @@ module.exports = function (io) {
 
   /** Where a backup's chunks live — never the directory the real one uses. */
   function getBackupChunkDir(meetId, forEmployeeId) {
-    return path.join(TMP_BASE, meetId, `backup__${forEmployeeId}`);
+    /* Both ids are validated before either reaches the path, so the
+       `backup__` prefix cannot be used to smuggle a separator past the check. */
+    return containedPath(
+      safeSegment(meetId, "meetId"),
+      `backup__${safeSegment(forEmployeeId, "forEmployeeId")}`,
+    );
   }
 
   /** Their own recording, if it landed. A backup row never counts as one. */
@@ -1133,8 +1192,20 @@ module.exports = function (io) {
           const { meetId, firstName, mimeType, employeeId: bodyEmpId } = body;
           if (!meetId) return;
 
+          /* This route is unauthenticated BY NECESSITY — `navigator.sendBeacon`
+             cannot set an Authorization header, and the whole point is to save
+             audio from a tab that is already closing. That makes `meetId` the
+             only thing standing between an anonymous request and the finalize
+             paths below, which end in a recursive delete.
+
+             `safeSegment` rejects anything that is not one of our ids, so a
+             traversal attempt stops here instead of resolving out of TMP_BASE.
+             It throws rather than returning, and the surrounding catch turns
+             that into a logged no-op — correct for a fire-and-forget beacon. */
+          const safeMeetId = safeSegment(meetId, "meetId");
+
           // Find all employee chunk dirs for this meeting
-          const meetTmpDir = path.join(TMP_BASE, meetId);
+          const meetTmpDir = containedPath(safeMeetId);
           if (!fs.existsSync(meetTmpDir)) return;
 
           const employeeDirs = fs.readdirSync(meetTmpDir);

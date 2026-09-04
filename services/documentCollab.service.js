@@ -73,6 +73,16 @@ const KINDS = {
     records: "cowork_mindmaps",
     bodies: "cowork_mindmap_bodies",
   },
+  /* Spreadsheet workbooks. Their content is saved by the REST route
+     (`coworkWorkbooks.js`) from each client, so the CRDT state itself is not
+     persisted here: `bodies` is null and the room lives only while somebody
+     is in it. The next person to open an empty room seeds it from the saved
+     workbook. */
+  workbook: {
+    prefix: "workbook:",
+    records: "cowork_workbooks",
+    bodies: null,
+  },
 };
 
 /** How long after the last keystroke the state is written. */
@@ -191,6 +201,12 @@ async function mayOpen(decoded, room) {
  * screen and the socket disagree about who may type.
  */
 function roleOf(doc, employeeId) {
+  /* A workbook record: an owner and shares by principal. */
+  if (typeof doc.ownerId === "string" && Array.isArray(doc.shares)) {
+    if (doc.ownerId === employeeId) return "owner";
+    const share = doc.shares.find((s) => s && s.principalId === employeeId);
+    return share ? share.role || "viewer" : null;
+  }
   if (Array.isArray(doc.members) && doc.members.length) {
     const found = doc.members.find((m) => m && m.employeeId === employeeId);
     return found ? found.role || "viewer" : null;
@@ -227,7 +243,7 @@ async function employeeIdOf(decoded) {
 /** The stored state for a record, or null. */
 async function loadState(room) {
   const cfg = KINDS[room.kind];
-  if (!cfg) return null;
+  if (!cfg || !cfg.bodies) return null;
   const snap = await db.collection(cfg.bodies).doc(room.id).get();
   if (!snap.exists) return null;
   const raw = snap.data();
@@ -251,7 +267,7 @@ async function loadState(room) {
  */
 async function saveState(room, ydoc, roomName) {
   const cfg = KINDS[room.kind];
-  if (!cfg) return;
+  if (!cfg || !cfg.bodies) return;
   const state = Buffer.from(Y.encodeStateAsUpdate(ydoc)).toString("base64");
   await db.collection(cfg.bodies).doc(room.id).set(
     {

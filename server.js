@@ -101,6 +101,8 @@ const {
   bandwidthStatsHandler,
 } = require("./middleware/firestoreBandwidth");
 const { db, admin } = require("./config/firebaseAdmin");
+/* Names a Socket.IO connection at the handshake — see the `io.use` below. */
+const { resolveCoworkUser } = require("./Middlewear/coworkAuth");
 instrumentFirestore(admin, db);
 bw.instrumentFirestore(admin, db);
 
@@ -228,6 +230,68 @@ const io = new Server(server, {
   },
   transports: ["websocket", "polling"],
 });
+
+/**
+ * Name the connection where it can be named.
+ *
+ * **Deliberately does NOT reject an anonymous socket.** This one Socket.IO
+ * server carries three unrelated products: the CMS work-order rooms, the mobile
+ * app, and Cowork. Only Cowork holds a Firebase ID token, so rejecting a
+ * connection without one would disconnect the CMS from its own live updates.
+ *
+ * So the handshake ATTACHES an identity when the client proves one, and the
+ * handlers that need identity require `socket.cowork` rather than trusting what
+ * arrives in a payload. Before this, every meeting handler read the actor out
+ * of the event body — `recording_stop` took `stoppedBy` from the sender and
+ * relayed it — so any connected client could stop any meeting's recording, and
+ * a recording stopped is not recoverable.
+ */
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next();
+  try {
+    const user = await resolveCoworkUser(String(token));
+    socket.cowork = {
+      employeeId: user.employeeId,
+      role: user.role,
+      name: user.name,
+    };
+  } catch (e) {
+    /* An expired or malformed token leaves the socket anonymous rather than
+       refused, for the same reason as above. It simply cannot act on anything
+       that checks `socket.cowork`. */
+    console.warn("[socket] token present but unusable:", e.message);
+  }
+  next();
+});
+
+/**
+ * Whether this socket may control the given meeting's recording.
+ *
+ * The organiser (`createdBy`) runs their own meeting; a CEO or TL may act on
+ * any, which matches the roles the HTTP routes already privilege. Anonymous
+ * sockets never qualify.
+ */
+async function mayControlMeeting(socket, meetId) {
+  const me = socket.cowork?.employeeId;
+  if (!me || !meetId) return false;
+  if (["ceo", "tl"].includes(socket.cowork.role)) return true;
+  try {
+    const snap = await db
+      .collection("cowork_scheduled_meets")
+      .doc(String(meetId))
+      .get();
+    if (!snap.exists) return false;
+    const meet = snap.data() || {};
+    if (meet.createdBy === me) return true;
+    /* A task room has no organiser record here; its control sits with whoever
+       is party to the task, which the token route already gates on entry. */
+    return false;
+  } catch (e) {
+    console.error("[socket] mayControlMeeting:", e.message);
+    return false;
+  }
+}
 
 // WebSocket connection handling
 io.on("connection", (socket) => {
@@ -365,9 +429,21 @@ io.on("connection", (socket) => {
       socket.leave(`meeting_${meetId}`);
     }
   });
-  // CEO/TL starts recording → broadcast to all in meeting room
-  socket.on("recording_start", ({ meetId, startedBy, startedByName }) => {
+  /* The actor is the SOCKET's verified employee, never the payload's.
+     `startedBy`/`stoppedBy` and friends used to be read from the event body, so
+     a client could both act without permission and attribute the act to
+     somebody else. The names below come from the handshake. */
+  socket.on("recording_start", async ({ meetId }) => {
     if (!meetId) return;
+    if (!(await mayControlMeeting(socket, meetId))) {
+      socket.emit("recording_refused", {
+        meetId,
+        reason: "Only the meeting's organiser can control its recording.",
+      });
+      return;
+    }
+    const startedBy = socket.cowork.employeeId;
+    const startedByName = socket.cowork.name;
     const startedAt = new Date().toISOString();
     activeMeetingRecordings.set(meetId, {
       startedBy,
@@ -381,14 +457,17 @@ io.on("connection", (socket) => {
       startedAt,
     });
   });
-  // Each participant broadcasts their own recording+upload status → relay to room
+  /* Each participant broadcasts their OWN record/upload state → relay to room.
+     Unlike the control events this is not privileged, but the employee it is
+     attributed to is still the socket's, so nobody can post a "saved" status
+     under another person's name into the host's panel. */
   socket.on(
     "participant_status",
-    ({ meetId, employeeId, employeeName, recordingState, uploadState }) => {
-      if (!meetId || !employeeId) return;
+    ({ meetId, recordingState, uploadState }) => {
+      if (!meetId || !socket.cowork) return;
       io.to(`meeting_${meetId}`).emit("participant_status", {
-        employeeId,
-        employeeName,
+        employeeId: socket.cowork.employeeId,
+        employeeName: socket.cowork.name,
         recordingState, // "recording" | "paused" | "not_rec" | "failed"
         uploadState, // "idle" | "uploading" | "uploaded" | "failed"
         timestamp: Date.now(),
@@ -408,39 +487,62 @@ io.on("connection", (socket) => {
    * than being started into a room that is not capturing — see the late-joiner
    * notice in `join_meeting_room`.
    */
-  socket.on("recording_pause", ({ meetId, pausedBy, pausedByName }) => {
+  socket.on("recording_pause", async ({ meetId }) => {
     if (!meetId) return;
+    if (!(await mayControlMeeting(socket, meetId))) {
+      socket.emit("recording_refused", {
+        meetId,
+        reason: "Only the meeting's organiser can control its recording.",
+      });
+      return;
+    }
     const info = activeMeetingRecordings.get(meetId);
     if (info) info.paused = true;
     io.to(`meeting_${meetId}`).emit("recording_paused", {
       meetId,
-      pausedBy,
-      pausedByName,
+      pausedBy: socket.cowork.employeeId,
+      pausedByName: socket.cowork.name,
       pausedAt: new Date().toISOString(),
     });
   });
 
-  // CEO/TL resumes a paused recording → broadcast to all in meeting room
-  socket.on("recording_resume", ({ meetId, resumedBy, resumedByName }) => {
+  // The organiser resumes a paused recording → broadcast to all in meeting room
+  socket.on("recording_resume", async ({ meetId }) => {
     if (!meetId) return;
+    if (!(await mayControlMeeting(socket, meetId))) {
+      socket.emit("recording_refused", {
+        meetId,
+        reason: "Only the meeting's organiser can control its recording.",
+      });
+      return;
+    }
     const info = activeMeetingRecordings.get(meetId);
     if (info) info.paused = false;
     io.to(`meeting_${meetId}`).emit("recording_resumed", {
       meetId,
-      resumedBy,
-      resumedByName,
+      resumedBy: socket.cowork.employeeId,
+      resumedByName: socket.cowork.name,
       resumedAt: new Date().toISOString(),
     });
   });
 
-  // CEO/TL stops recording → broadcast to all in meeting room
-  socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
+  /* Stopping finalises every participant's audio to Drive and CANNOT be undone,
+     which is why this one mattered most: any connected client could end any
+     meeting's recording irreversibly. */
+  socket.on("recording_stop", async ({ meetId }) => {
     if (!meetId) return;
+    if (!(await mayControlMeeting(socket, meetId))) {
+      socket.emit("recording_refused", {
+        meetId,
+        reason: "Only the meeting's organiser can control its recording.",
+      });
+      return;
+    }
     activeMeetingRecordings.delete(meetId);
     io.to(`meeting_${meetId}`).emit("recording_stopped", {
       meetId,
-      stoppedBy,
-      stoppedByName,
+      stoppedBy: socket.cowork.employeeId,
+      stoppedByName: socket.cowork.name,
       stoppedAt: new Date().toISOString(),
     });
   });
@@ -2084,6 +2186,10 @@ app.use("/cowork", coworkRoutes);
 const coworkQrSignIn = require("./routes/task_routes/coworkQrSignIn");
 app.use("/cowork", require("./routes/task_routes/coworkPasswordReset"));
 app.use("/cowork", coworkQrSignIn);
+
+/* Cowork spreadsheets. Beside mindmaps and documents, where they should always
+ * have been — see the file header for the data-loss bug this replaces. */
+app.use("/cowork", require("./routes/task_routes/coworkWorkbooks"));
 
 app.use("/cowork", require("./routes/task_routes/c2Band.routes"));
 app.use("/cowork", require("./routes/task_routes/c1Routes"));

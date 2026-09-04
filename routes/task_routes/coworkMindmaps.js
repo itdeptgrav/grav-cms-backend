@@ -198,7 +198,7 @@ function validateNodes(input) {
       if (images.length >= MAX_IMAGES) break;
     }
 
-    nodes.push({
+    const node = {
       id,
       parentId: raw.parentId === null ? null : parentId,
       title: clamp(raw.title, MAX_NODE_TITLE),
@@ -206,10 +206,38 @@ function validateNodes(input) {
       links,
       images,
       collapsed: raw.collapsed === true,
-    });
+    };
+
+    /* ── Optional fields: styling and markers ───────────────────────────
+       Each is kept only when present AND valid, and never defaulted, so a
+       card written before these existed round-trips byte-for-byte. The
+       checks mirror `Cowork/lib/legacy/mindmaps.ts` readMindNode exactly:
+       what the client would drop on read, this drops on write, so nothing is
+       stored that the reader will then refuse to draw. */
+    const style = readStyle(raw.style);
+    if (style) node.style = style;
+    if (typeof raw.icon === "string" && raw.icon.trim()) node.icon = raw.icon.trim().slice(0, 8);
+    if ([1, 2, 3, 4, 5].includes(raw.priority)) node.priority = raw.priority;
+    if ([0, 25, 50, 75, 100].includes(raw.progress)) node.progress = raw.progress;
+    if (Array.isArray(raw.tags)) {
+      const tags = raw.tags
+        .filter((t) => typeof t === "string")
+        .map((t) => t.trim().slice(0, 40))
+        .filter(Boolean)
+        .slice(0, 20);
+      if (tags.length) node.tags = tags;
+    }
+    if (typeof raw.taskId === "string" && raw.taskId) node.taskId = raw.taskId.slice(0, 120);
+    /* A floating topic: parentless by design, placed where it was dropped. */
+    const f = raw.floating;
+    if (f && typeof f === "object" && Number.isFinite(f.x) && Number.isFinite(f.y) && node.parentId === null) {
+      node.floating = { x: Math.round(f.x), y: Math.round(f.y) };
+    }
+
+    nodes.push(node);
   }
 
-  const roots = nodes.filter((n) => n.parentId === null);
+  const roots = nodes.filter((n) => n.parentId === null && !n.floating);
   if (roots.length === 0)
     return {
       error: "This map has no root card, so there is nothing to draw it from.",
@@ -253,6 +281,108 @@ function validateNodes(input) {
     };
 
   return { nodes };
+}
+
+/* ── Styling and map-level extras ──────────────────────────────────────── */
+
+const SHAPES = new Set(["rounded", "rect", "pill", "underline", "ellipse"]);
+const SIZES = new Set(["s", "m", "l", "xl"]);
+const LINES = new Set(["curve", "straight", "elbow"]);
+const LAYOUTS = new Set(["right", "left", "both", "org", "tree", "radial", "timeline", "fishbone"]);
+const THEMES = new Set(["field", "mono", "vivid", "warm", "cool", "night"]);
+const MAX_RELATIONS = 500;
+const MAX_BOUNDARIES = 200;
+const MAX_SUMMARIES = 200;
+
+/** A colour the canvas will paint — a swatch name or a CSS colour token. Never
+    a `url(` or a semicolon: this is written into a style attribute. */
+function colour(v) {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim();
+  return /^[a-zA-Z0-9#(),.% -]{1,40}$/.test(t) ? t : undefined;
+}
+
+function readStyle(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out = {};
+  const fill = colour(raw.fill);
+  const text = colour(raw.text);
+  if (fill) out.fill = fill;
+  if (text) out.text = text;
+  if (SHAPES.has(raw.shape)) out.shape = raw.shape;
+  if (SIZES.has(raw.size)) out.size = raw.size;
+  if (raw.bold === true) out.bold = true;
+  if (raw.underline === true) out.underline = true;
+  if (raw.strike === true) out.strike = true;
+  if (raw.italic === true) out.italic = true;
+  if (LINES.has(raw.line)) out.line = raw.line;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * The map-level extras — layout, theme, relationships, boundaries, summaries —
+ * defaulted and checked against the cards they name.
+ *
+ * Anything that points at a card not in the map is DROPPED rather than
+ * refused: a relationship whose card was deleted in the same edit is an
+ * ordinary thing to send, and refusing the whole save for it would lose the
+ * deletion too. The canvas cannot draw a line to nowhere, so dropping is
+ * exactly what rendering would have done anyway.
+ */
+function validateExtras(raw, nodes) {
+  const ids = new Set(nodes.map((n) => n.id));
+  const out = {
+    settings: { layout: "right", theme: "field" },
+    relations: [],
+    boundaries: [],
+    summaries: [],
+  };
+  if (!raw || typeof raw !== "object") return out;
+
+  const settings = raw.settings && typeof raw.settings === "object" ? raw.settings : {};
+  if (LAYOUTS.has(settings.layout)) out.settings.layout = settings.layout;
+  if (THEMES.has(settings.theme)) out.settings.theme = settings.theme;
+  if (settings.numbering === true) out.settings.numbering = true;
+
+  if (Array.isArray(raw.relations)) {
+    for (const r of raw.relations) {
+      if (!r || typeof r !== "object") continue;
+      const id = str(r.id);
+      const from = str(r.from);
+      const to = str(r.to);
+      if (!id || !from || !to || from === to || !ids.has(from) || !ids.has(to)) continue;
+      const rel = { id, from, to, label: clamp(r.label, 200) };
+      if (r.line === "straight" || r.line === "curve") rel.line = r.line;
+      const c = colour(r.color);
+      if (c) rel.color = c;
+      out.relations.push(rel);
+      if (out.relations.length >= MAX_RELATIONS) break;
+    }
+  }
+  if (Array.isArray(raw.boundaries)) {
+    for (const b of raw.boundaries) {
+      if (!b || typeof b !== "object") continue;
+      const id = str(b.id);
+      const nodeId = str(b.nodeId);
+      if (!id || !nodeId || !ids.has(nodeId)) continue;
+      const bd = { id, nodeId, label: clamp(b.label, 200) };
+      const c = colour(b.color);
+      if (c) bd.color = c;
+      out.boundaries.push(bd);
+      if (out.boundaries.length >= MAX_BOUNDARIES) break;
+    }
+  }
+  if (Array.isArray(raw.summaries)) {
+    for (const s of raw.summaries) {
+      if (!s || typeof s !== "object") continue;
+      const id = str(s.id);
+      const nodeId = str(s.nodeId);
+      if (!id || !nodeId || !ids.has(nodeId)) continue;
+      out.summaries.push({ id, nodeId, text: clamp(s.text, 500) });
+      if (out.summaries.length >= MAX_SUMMARIES) break;
+    }
+  }
+  return out;
 }
 
 /**
@@ -332,11 +462,15 @@ router.get(
       if (!record) return res.status(404).json({ error: "Mindmap not found." });
       const body = await db.collection(BODIES).doc(record.id).get();
       const raw = body.exists ? body.data() || {} : {};
+      const nodes = Array.isArray(raw.nodes) ? raw.nodes : [];
       res.json({
         mindmap: record,
         /* An absent body is an empty array rather than an error: the record is
            real and openable, and the client seeds a root into an empty map. */
-        nodes: Array.isArray(raw.nodes) ? raw.nodes : [],
+        nodes,
+        /* Defaulted for a body written before extras existed, and re-checked
+           against the cards so nothing arrives pointing at a card that is gone. */
+        extras: validateExtras(raw.extras, nodes),
       });
     } catch (err) {
       res.status(500).json({ error: "Could not open mindmap: " + err.message });
@@ -416,11 +550,12 @@ router.post(
         updatedAt: now,
         deletedAt: null,
       };
+      const extras = validateExtras(req.body && req.body.extras, nodes);
       await ref.set(record);
       await db
         .collection(BODIES)
         .doc(ref.id)
-        .set({ mindmapId: ref.id, nodes, updatedAt: now });
+        .set({ mindmapId: ref.id, nodes, extras, updatedAt: now });
 
       res.status(201).json({ mindmap: readRecord(ref.id, record) });
     } catch (err) {
@@ -531,11 +666,22 @@ router.put(
       const checked = validateNodes(req.body && req.body.nodes);
       if (checked.error) return res.status(400).json({ error: checked.error });
 
+      /* Extras travel with the cards, or are kept as they were. A client that
+         predates extras sends none; overwriting a map's layout with the default
+         because an older tab saved a card would be a change nobody made. */
+      let extras;
+      if (req.body && req.body.extras !== undefined) {
+        extras = validateExtras(req.body.extras, checked.nodes);
+      } else {
+        const prior = await db.collection(BODIES).doc(record.id).get();
+        extras = validateExtras(prior.exists ? (prior.data() || {}).extras : undefined, checked.nodes);
+      }
+
       const now = new Date().toISOString();
       await db
         .collection(BODIES)
         .doc(record.id)
-        .set({ mindmapId: record.id, nodes: checked.nodes, updatedAt: now });
+        .set({ mindmapId: record.id, nodes: checked.nodes, extras, updatedAt: now });
       /* `nodeCount` lives on the record so the list never reads a body. Written
          here, in the one place that writes cards, so it cannot drift. */
       await db.collection(MAPS).doc(record.id).update({
@@ -552,6 +698,7 @@ router.put(
           nodeCount: checked.nodes.length,
         },
         nodes: checked.nodes,
+        extras,
       });
     } catch (err) {
       res.status(500).json({ error: "Could not save mindmap: " + err.message });
@@ -638,3 +785,6 @@ router.put(
 router.validateNodes = validateNodes;
 
 module.exports = router;
+/* Exported for tests: what the engine keeps and drops is the contract the
+   Cowork reader mirrors, and a drift between the two loses somebody's styling. */
+module.exports._internals = { validateNodes, validateExtras };
