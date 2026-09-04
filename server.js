@@ -868,6 +868,16 @@ const auditTrail = require("./Middlewear/auditTrail");
    too, and the first mount in the file has to be the one that loads it. */
 const departmentWrites = require("./Middlewear/departmentWriteGuard");
 const hrAuditTrail = auditTrail("hr");
+/* "You already have this", in 200 bytes — see middleware/conditionalGet.js.
+   Mounted ABOVE the audit trail and the write guard so it wraps res.json for
+   every read below it, and so a 304 never reaches code that would log it as a
+   change. Reads only; writes pass straight through. */
+const conditionalGet = require("./middleware/conditionalGet")();
+app.use("/api/hr", conditionalGet);
+app.use("/hr", conditionalGet);
+app.use("/api/employees", conditionalGet);
+app.use("/api/accountant", conditionalGet);
+
 app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
 app.use("/api/employees", hrAuditTrail);

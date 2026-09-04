@@ -863,6 +863,68 @@ router.get("/gst-output-ledgers", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Auto-created posting ledgers                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * "It isn't there, so create it" — except it WAS there, deactivated.
+ *
+ * Both resolvers below look for their ledger with `isActive: true` and, on a
+ * miss, create it. But `acc_ledgers` carries a UNIQUE index on
+ * (companyId, name), and a Tally import had left this company with 466
+ * ledgers of which most are deactivated — including "Purchase — Interstate".
+ * So the lookup missed, the create hit the unique index, and opening a new
+ * purchase voucher died with a raw E11000 in the user's face. Sales had the
+ * identical bug waiting behind it.
+ *
+ * Two guards, and they answer two different failures:
+ *
+ *   1. Before creating, look again WITHOUT the isActive filter. A ledger that
+ *      exists but is switched off is reactivated and used — the alternative
+ *      is a company that can never raise a purchase voucher again, and the
+ *      accounts still need somewhere to post. It is logged, and switching it
+ *      off again is one click.
+ *   2. If the create still collides — a name variant the regex does not
+ *      match, or two vouchers opened in the same second — re-read by exact
+ *      name and return that rather than surfacing a database error. A
+ *      duplicate-key race means somebody else just created the very thing we
+ *      wanted.
+ */
+async function findOrRestoreLedger({ companyId, nameRx, name, build }) {
+  const active = await Acc_Ledger.findOne({ companyId, isActive: true, name: nameRx });
+  if (active) return active;
+
+  /* Deactivated, but it exists. Reactivating beats colliding with it. */
+  const dormant = await Acc_Ledger.findOne({ companyId, name: nameRx });
+  if (dormant) {
+    console.warn(
+      `[ledgers] reactivating "${dormant.name}" for company ${companyId} — ` +
+        `it was deactivated but is needed to post this voucher.`,
+    );
+    dormant.isActive = true;
+    await dormant.save();
+    return dormant;
+  }
+
+  try {
+    return await Acc_Ledger.create(await build());
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+    /* Somebody won the race, or the stored name differs from the regex in a
+       way we did not predict. Either way the ledger now exists. */
+    const raced = await Acc_Ledger.findOne({ companyId, name });
+    if (raced) {
+      if (!raced.isActive) {
+        raced.isActive = true;
+        await raced.save();
+      }
+      return raced;
+    }
+    throw err;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* GET /sales-ledgers — Sales — Local + Interstate                     */
 /* ------------------------------------------------------------------ */
 async function resolveSalesLedger(companyId, kind) {
@@ -880,45 +942,41 @@ async function resolveSalesLedger(companyId, kind) {
   });
   if (salesAccount) return salesAccount;
 
-  const existing = await Acc_Ledger.findOne({
-    companyId,
-    isActive: true,
-    name: nameRx,
-  });
-  if (existing) return existing;
-
-  let group = await Acc_Group.findOne({
-    companyId,
-    isActive: true,
-    name: /^sales\s*accounts$/i,
-  });
-  if (!group) {
+  let group = null;
+  const buildSales = async () => {
     group = await Acc_Group.findOne({
       companyId,
       isActive: true,
-      nature: "revenue",
+      name: /^sales\s*accounts$/i,
     });
-  }
-  if (!group) {
-    throw new Error(
-      "No revenue group found. Create a 'Sales Accounts' group in Chart of Accounts first.",
-    );
-  }
+    if (!group) {
+      group = await Acc_Group.findOne({
+        companyId,
+        isActive: true,
+        nature: "revenue",
+      });
+    }
+    if (!group) {
+      throw new Error(
+        "No revenue group found. Create a 'Sales Accounts' group in Chart of Accounts first.",
+      );
+    }
+    return {
+      companyId,
+      name,
+      groupId: group._id,
+      groupName: group.name,
+      nature: "revenue",
+      openingBalance: 0,
+      currentBalance: 0,
+      balanceType: "Cr",
+      isReserved: false,
+      isActive: true,
+      description: `Auto-created on first sales voucher. Used for ${kind === "interstate" ? "inter-state (IGST)" : "intra-state (CGST+SGST)"} sales.`,
+    };
+  };
 
-  const led = await Acc_Ledger.create({
-    companyId,
-    name,
-    groupId: group._id,
-    groupName: group.name,
-    nature: "revenue",
-    openingBalance: 0,
-    currentBalance: 0,
-    balanceType: "Cr",
-    isReserved: false,
-    isActive: true,
-    description: `Auto-created on first sales voucher. Used for ${kind === "interstate" ? "inter-state (IGST)" : "intra-state (CGST+SGST)"} sales.`,
-  });
-  return led;
+  return findOrRestoreLedger({ companyId, nameRx, name, build: buildSales });
 }
 
 router.get("/sales-ledgers", auth, async (req, res) => {
@@ -948,52 +1006,48 @@ async function resolvePurchaseLedger(companyId, kind) {
       ? /^purchase\s*[—\-–]?\s*interstate$/i
       : /^purchase\s*[—\-–]?\s*local$/i;
 
-  const existing = await Acc_Ledger.findOne({
-    companyId,
-    isActive: true,
-    name: nameRx,
-  });
-  if (existing) return existing;
-
-  let group = await Acc_Group.findOne({
-    companyId,
-    isActive: true,
-    name: /^purchase\s*accounts$/i,
-  });
-  if (!group) {
+  let group = null;
+  const buildPurchase = async () => {
     group = await Acc_Group.findOne({
       companyId,
       isActive: true,
-      name: /^direct\s*expenses$/i,
+      name: /^purchase\s*accounts$/i,
     });
-  }
-  if (!group) {
-    group = await Acc_Group.findOne({
+    if (!group) {
+      group = await Acc_Group.findOne({
+        companyId,
+        isActive: true,
+        name: /^direct\s*expenses$/i,
+      });
+    }
+    if (!group) {
+      group = await Acc_Group.findOne({
+        companyId,
+        isActive: true,
+        nature: "expense",
+      });
+    }
+    if (!group) {
+      throw new Error(
+        "No expense group found. Create a 'Purchase Accounts' group in Chart of Accounts first.",
+      );
+    }
+    return {
       companyId,
-      isActive: true,
+      name,
+      groupId: group._id,
+      groupName: group.name,
       nature: "expense",
-    });
-  }
-  if (!group) {
-    throw new Error(
-      "No expense group found. Create a 'Purchase Accounts' group in Chart of Accounts first.",
-    );
-  }
+      openingBalance: 0,
+      currentBalance: 0,
+      balanceType: "Dr",
+      isReserved: false,
+      isActive: true,
+      description: `Auto-created on first purchase voucher. Used for ${kind === "interstate" ? "inter-state (IGST)" : "intra-state (CGST+SGST)"} purchases.`,
+    };
+  };
 
-  const led = await Acc_Ledger.create({
-    companyId,
-    name,
-    groupId: group._id,
-    groupName: group.name,
-    nature: "expense",
-    openingBalance: 0,
-    currentBalance: 0,
-    balanceType: "Dr",
-    isReserved: false,
-    isActive: true,
-    description: `Auto-created on first purchase voucher. Used for ${kind === "interstate" ? "inter-state (IGST)" : "intra-state (CGST+SGST)"} purchases.`,
-  });
-  return led;
+  return findOrRestoreLedger({ companyId, nameRx, name, build: buildPurchase });
 }
 
 router.get("/purchase-ledgers", auth, async (req, res) => {

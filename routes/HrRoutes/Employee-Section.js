@@ -959,7 +959,16 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       Employee.aggregate([
         ...(status && status !== "all" ? [{ $match: { status } }] : []),
         { $group: { _id: "$department", count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
+        /* The `_id` tiebreak is not cosmetic. Sorting on count alone leaves
+           departments with equal counts in whatever order the aggregation
+           happened to emit them, so this response came back BYTE-DIFFERENT on
+           every call even when not one record had changed. That defeats every
+           cache there is — the browser's, the client cache in
+           lib/dataCache.js, and the ETag in middleware/conditionalGet.js —
+           and it is why a 258 KB roster was re-sent in full to five HR pages
+           on every navigation. A deterministic order makes an unchanged
+           answer identical, which is what lets it be answered 304. */
+        { $sort: { count: -1, _id: 1 } },
       ]),
     ]);
 
