@@ -139,7 +139,19 @@ const AttendanceSettingsSchema = new mongoose.Schema(
 );
 
 // ─── Static helper: always return the singleton, creating if needed ───────────
+/* Memoised for a few seconds — see services/memo.js. Read at 28 call sites,
+   on nearly every attendance request, and each read is a cross-region round
+   trip. Every write path invalidates it (invalidateOnWrite below). The
+   back-fill below runs on the loaded copy; callers receive a clone. */
+const { memo: _memo, invalidateOnWrite: _invalidateOnWrite } = require("../../services/memo");
+const ATTENDANCE_SETTINGS_MEMO = "settings:attendance";
+_invalidateOnWrite(AttendanceSettingsSchema, ATTENDANCE_SETTINGS_MEMO);
+
 AttendanceSettingsSchema.statics.getConfig = async function () {
+  return _memo(ATTENDANCE_SETTINGS_MEMO, 15 * 1000, () => this._loadConfig());
+};
+
+AttendanceSettingsSchema.statics._loadConfig = async function () {
   let doc = await this.findById("singleton").lean();
   if (!doc) {
     doc = await this.create({ _id: "singleton" });

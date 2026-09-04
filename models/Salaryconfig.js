@@ -89,10 +89,19 @@ const salaryConfigSchema = new mongoose.Schema(
 );
 
 // Singleton: always fetch or create the one config doc
+/* Memoised — see services/memo.js. Read by every salary computation and
+   every payroll row; written from one settings page via findOneAndUpdate,
+   which invalidates. */
+const { memo: _memo, invalidateOnWrite: _invalidateOnWrite } = require("../services/memo");
+const SALARY_CONFIG_MEMO = "settings:salary";
+_invalidateOnWrite(salaryConfigSchema, SALARY_CONFIG_MEMO);
+
 salaryConfigSchema.statics.getSingleton = async function () {
-    let config = await this.findOne();
-    if (!config) config = await this.create({});
-    return config;
+    return _memo(SALARY_CONFIG_MEMO, 15 * 1000, async () => {
+        let config = await this.findOne();
+        if (!config) config = await this.create({});
+        return config;
+    });
 };
 
 module.exports = mongoose.model("SalaryConfig", salaryConfigSchema);
