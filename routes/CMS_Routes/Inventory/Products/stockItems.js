@@ -731,13 +731,19 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     let selectFields = "";
 
     switch (tabName) {
-      case "general": selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory"; break;
+      // `maxBudget` rides along on the three tabs that have to respect it
+      // (2 Sept 2026): general edits it, and raw-items/operations refuse
+      // additions that would push the built-up cost past it. Those two also
+      // pull the OTHER cost components — a cap is on the whole product's
+      // cost, so neither tab can judge its own additions from its own slice
+      // alone.
+      case "general": selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory maxBudget"; break;
       case "attributes": selectFields = "attributes"; break;
-      case "variants": selectFields = "variants attributes reference baseCost baseSalesPrice"; break;
-      case "raw-items": selectFields = "variants.rawItems variants._id variants.attributes variants.sku"; break;
-      case "operations": selectFields = "operations"; break;
+      case "variants": selectFields = "variants attributes reference baseCost baseSalesPrice maxBudget"; break;
+      case "raw-items": selectFields = "variants.rawItems variants._id variants.attributes variants.sku maxBudget operations miscellaneousCosts baseCost"; break;
+      case "operations": selectFields = "operations maxBudget variants.rawItems miscellaneousCosts baseCost"; break;
       case "measurements": selectFields = "measurements numberOfPanels"; break;
-      case "costs": selectFields = "miscellaneousCosts"; break;
+      case "costs": selectFields = "miscellaneousCosts maxBudget operations variants.rawItems baseCost"; break;
       default: selectFields = "name category";
     }
 
@@ -808,7 +814,7 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
 
       // ── General Info ────────────────────────────────────────────────────
       case "general": {
-        const { name, additionalNames, productType, category, unit, hsnCode, genderCategory, baseSalesPrice, baseCost, internalNotes, numberOfPanels, images } = body;
+        const { name, additionalNames, productType, category, unit, hsnCode, genderCategory, baseSalesPrice, baseCost, internalNotes, numberOfPanels, images, maxBudget } = body;
         if (name !== undefined) stockItem.name = name.trim();
         if (productType !== undefined) stockItem.productType = productType;
         if (category !== undefined) stockItem.category = category.trim();
@@ -819,6 +825,13 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
         if (baseCost !== undefined) stockItem.baseCost = parseFloat(baseCost) || 0;
         if (genderCategory !== undefined) stockItem.genderCategory = genderCategory;
         if (numberOfPanels !== undefined) stockItem.numberOfPanels = parseInt(numberOfPanels) || 0;
+        // null/""/0 all mean "no cap" — cleared to undefined rather than
+        // stored as 0, which would read as a budget of nothing and block
+        // every raw item and operation on the product (2 Sept 2026).
+        if (maxBudget !== undefined) {
+          const n = parseFloat(maxBudget);
+          stockItem.maxBudget = Number.isFinite(n) && n > 0 ? n : undefined;
+        }
         if (images !== undefined) stockItem.images = images || [];
         if (additionalNames !== undefined) {
           stockItem.additionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
@@ -1359,7 +1372,7 @@ router.post("/", async (req, res) => {
   try {
     const {
       name, additionalNames, productType, category, unit, hsnCode, genderCategory,
-      baseSalesPrice, baseCost, internalNotes,
+      baseSalesPrice, baseCost, internalNotes, maxBudget,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
@@ -1419,6 +1432,10 @@ router.post("/", async (req, res) => {
       category: category.trim(), unit: unit || "Units", hsnCode: hsnCode || "",
       genderCategory: genderCategory || "", internalNotes: internalNotes || "",
       baseSalesPrice: parseFloat(baseSalesPrice) || 0, baseCost: parseFloat(baseCost) || 0,
+      // Left UNDEFINED rather than defaulted to 0 when absent — a 0 budget is
+      // a cap of nothing, which would block every raw item on the product.
+      // Undefined is what "no cap" means (2 Sept 2026).
+      maxBudget: Number.isFinite(parseFloat(maxBudget)) && parseFloat(maxBudget) > 0 ? parseFloat(maxBudget) : undefined,
       attributes: processedAttributes, measurements: measurements || [],
       numberOfPanels: parseInt(numberOfPanels) || 0,
       variants: processedVariants, operations: processedOperations,
@@ -1487,13 +1504,20 @@ router.put("/:id", async (req, res) => {
   try {
     const {
       name, additionalNames, productType, category, unit, hsnCode, internalNotes,
-      baseSalesPrice, baseCost, genderCategory,
+      baseSalesPrice, baseCost, genderCategory, maxBudget,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
 
     const stockItem = await StockItem.findById(req.params.id);
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
+
+    // Explicit null clears the cap; 0 and blank mean the same thing. See the
+    // model's own note on why "no budget" must not be stored as 0.
+    if (maxBudget !== undefined) {
+      const n = parseFloat(maxBudget);
+      stockItem.maxBudget = Number.isFinite(n) && n > 0 ? n : undefined;
+    }
 
     if (name !== undefined) stockItem.name = name.trim();
     if (productType !== undefined) stockItem.productType = productType;

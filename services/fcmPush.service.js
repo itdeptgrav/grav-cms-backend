@@ -229,7 +229,7 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
 
         // ── 3. Send ───────────────────────────────────────────────────────────
         const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`[FCM] ✓ ${response.successCount}/${allTokens.length} delivered`);
+        console.log(`[FCM] ✓ ${response.successCount}/${fcmTokens.length} delivered`);
 
         // ── 4. Log failures + remove stale tokens ─────────────────────────────
         const staleTokens = [];
@@ -247,7 +247,15 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                     code === "messaging/invalid-argument" ||
                     code === "messaging/third-party-auth-error"
                 ) {
-                    staleTokens.push(allTokens[idx]);
+                    // `fcmTokens`, NOT `allTokens`. `responses[idx]` lines up with
+                    // `message.tokens`, which is `fcmTokens` — `allTokens` still
+                    // contains the iOS Web Push subscriptions that were split out
+                    // above. Indexing the wrong array means a failure for one
+                    // device marks a DIFFERENT, working token as stale and the
+                    // cleanup below deletes it, so that device silently stops
+                    // receiving anything until it registers again. Harmless only
+                    // while no iOS subscription exists; wrong the moment one does.
+                    staleTokens.push(fcmTokens[idx]);
                 }
 
                 // Common failure reasons for debugging
