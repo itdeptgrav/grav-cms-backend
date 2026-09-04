@@ -10,6 +10,7 @@ const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufa
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
+const { normaliseWeeks, weekBuckets, buildTrend } = require("../../../../services/manufacturing/productionTrend");
 const { resolveOrderOrigin } = require("../../../../services/orderOrigin");
 const mongoose = require("mongoose");
 const departmentWrites = require("../../../../Middlewear/departmentWriteGuard");
@@ -1377,6 +1378,71 @@ router.get("/stats/overview", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while fetching production stats",
+    });
+  }
+});
+
+// GET /stats/production-trend?weeks=4|8|12 — work orders STARTED vs COMPLETED
+// per Monday-based week (Asia/Kolkata), for the Project Manager Overview graph.
+//
+// Truth rule: the started series reads ONLY `timeline.actualStartDate` and the
+// completed series ONLY `timeline.actualEndDate`. `createdAt` / `updatedAt` are
+// never substituted — a work order that reached a state without its timestamp is
+// disclosed through `coverage`, not folded into a week. This endpoint is
+// additive and read-only; /stats/overview is unchanged.
+router.get("/stats/production-trend", async (req, res) => {
+  try {
+    // Nearby PM read endpoints clamp bad query values to a default rather than
+    // 400 (see /:moId production days). `weeks` follows suit: 4 / 8 / 12, else 8.
+    const weeks = normaliseWeeks(req.query.weeks);
+    const asOf = new Date();
+    const buckets = weekBuckets(asOf, weeks);
+    const rangeStart = new Date(buckets[0].startMs);
+    const rangeEnd = new Date(buckets[buckets.length - 1].endMs);
+
+    // Only the timestamp column each series is allowed to use, only within the
+    // drawn window. `.lean()` + a tight projection so this stays cheap.
+    const [startedRows, completedRows] = await Promise.all([
+      WorkOrder.find({ "timeline.actualStartDate": { $gte: rangeStart, $lt: rangeEnd } })
+        .select("timeline.actualStartDate")
+        .lean(),
+      WorkOrder.find({ "timeline.actualEndDate": { $gte: rangeStart, $lt: rangeEnd } })
+        .select("timeline.actualEndDate")
+        .lean(),
+    ]);
+
+    // Coverage — records that reached a state but lack the stamp the series
+    // needs. `completedWithoutTimestamp`: work orders whose status is
+    // `completed` with no `actualEndDate`. `startedWithoutTimestamp`: work
+    // orders whose STATUS says execution has begun, with no `actualStartDate` —
+    // deliberately narrow. No scan-ledger claim is made; the ledger is not
+    // queried here.
+    const EXECUTION_STATUSES = ["in_progress", "paused", "delayed", "completed"];
+    const [completedWithoutTimestamp, startedWithoutTimestamp] = await Promise.all([
+      WorkOrder.countDocuments({
+        status: "completed",
+        $or: [{ "timeline.actualEndDate": null }, { "timeline.actualEndDate": { $exists: false } }],
+      }),
+      WorkOrder.countDocuments({
+        status: { $in: EXECUTION_STATUSES },
+        $or: [{ "timeline.actualStartDate": null }, { "timeline.actualStartDate": { $exists: false } }],
+      }),
+    ]);
+
+    const body = buildTrend({
+      asOf,
+      weeks,
+      startedDates: startedRows.map((w) => w.timeline?.actualStartDate),
+      completedDates: completedRows.map((w) => w.timeline?.actualEndDate),
+      startedWithoutTimestamp,
+      completedWithoutTimestamp,
+    });
+    res.json(body);
+  } catch (error) {
+    console.error("Error fetching production trend:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching production trend",
     });
   }
 });
