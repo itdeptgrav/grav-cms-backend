@@ -175,7 +175,12 @@ async function decLocationGuarded(session, companyId, itemId, variantId, warehou
 async function incAssignedTotal(session, companyId, itemId, variantId, delta, guardMax) {
   const filter = sentinelFilter(companyId, itemId, variantId);
   if (delta > 0 && guardMax != null) {
-    await LocationBalance.updateOne(filter, { $setOnInsert: { onHand: 0 } }, { upsert: true, session });
+    // Ensure the sentinel exists; tolerate the concurrent-insert race (the
+    // unique index lets exactly one insert win — the loser's E11000 just means
+    // the row is already there).
+    try {
+      await LocationBalance.updateOne(filter, { $setOnInsert: { onHand: 0 } }, { upsert: true, session });
+    } catch (e) { if (!(e && e.code === 11000)) throw e; }
     const res = await LocationBalance.updateOne(
       { ...filter, onHand: { $lte: round4(guardMax - delta) + QTY_TOL } },
       { $inc: { onHand: round4(delta) } },

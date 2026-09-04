@@ -136,72 +136,84 @@ describe("assign existing stock", () => {
   });
 });
 
-// ── Receipt ──────────────────────────────────────────────────────────────────
-describe("receipt to a location", () => {
-  // 1
-  test("a receipt records the selected destination and preserves the company total", async () => {
+// ── Standalone stock-changing endpoints are RETIRED ──────────────────────────
+describe("standalone location endpoints cannot bypass canonical stock", () => {
+  // 8
+  test("the standalone /issue and /receipt are gone (410) and change nothing", async () => {
     const s = await scene({ quantity: 10 });
-    const before = (await RawItem.findById(s.item._id).lean()).quantity;
-    const r = await call("/api/cms/inventory/locations/receipt", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.recv._id), quantity: 4, reference: "GRN-1",
+    const iss = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 1,
     } });
-    expect([200, 201]).toContain(r.status);
-    const after = (await RawItem.findById(s.item._id).lean()).quantity;
-    expect(after).toBe(before); // preserved
-    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
-    const recvBal = view.body.item.balances.find((b) => b.locationId === String(s.recv._id));
-    expect(recvBal.onHand).toBe(4);
-    expect(recvBal.locationCode).toBe("RECV");
+    expect(iss.status).toBe(410);
+    expect(iss.body.reason).toBe("ENDPOINT_RETIRED");
+    const rec = await call("/api/cms/inventory/locations/receipt", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.recv._id), quantity: 1,
+    } });
+    expect(rec.status).toBe(410);
+    expect(rec.body.reason).toBe("ENDPOINT_RETIRED");
+    expect(await LocationMovement.countDocuments({ itemId: s.item._id })).toBe(0);
+    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(10);
   });
 });
 
-// ── Issue ────────────────────────────────────────────────────────────────────
-describe("issue from a location", () => {
-  // 2
-  test("issue refuses more than the selected location holds", async () => {
+// ── Canonical issue (stock adjustment) now carries location ──────────────────
+const ISSUE_REASON = "issued to the production floor for the morning run";
+const canonicalIssue = (s, { direction = "debit", qty = 1, loc, key } = {}) =>
+  call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: key || newKey(), body: {
+    direction, reason: ISSUE_REASON,
+    items: [{ rawItemId: String(s.item._id), issuedQty: qty, issuedUnit: "PCS",
+      ...(loc ? { warehouseId: String(s.wh._id), locationId: String(loc._id) } : {}) }],
+  } });
+
+describe("canonical stock issue with location", () => {
+  async function placed(qty, at) {
     const s = await scene({ quantity: 10 });
     await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5,
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String((at || s.stock)._id), quantity: qty,
     } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 6, reason: "over-issue",
-    } });
+    return s;
+  }
+
+  test("a canonical issue writes stock history AND a location out together", async () => {
+    const s = await placed(8);
+    const r = await canonicalIssue(s, { qty: 3, loc: s.stock });
+    expect([200, 201]).toContain(r.status);
+    const item = await RawItem.findById(s.item._id).lean();
+    expect(item.quantity).toBe(7);
+    const tx = item.stockTransactions.find((t) => t.type === "REDUCE");
+    expect(tx).toBeTruthy();
+    expect(String(tx.locationCode)).toBe("STOCK");
+    const mv = await LocationMovement.findOne({ itemId: s.item._id, type: "issue" }).lean();
+    expect(mv.direction).toBe("out");
+    expect(mv.source.kind).toBe("stock_issue");
+    expect(String(mv.source.id)).toBeTruthy();
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    expect(view.body.item.balances.find((b) => b.locationId === String(s.stock._id)).onHand).toBe(5);
+  });
+
+  test("a canonical issue refuses more than the source location holds", async () => {
+    const s = await placed(5);
+    const r = await canonicalIssue(s, { qty: 6, loc: s.stock });
     expect(r.status).toBe(400);
     expect(r.body.error?.details?.reason).toBe("INSUFFICIENT_AT_LOCATION");
   });
 
-  test("issue reduces the company total and the location together", async () => {
-    const s = await scene({ quantity: 10 });
-    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 8,
-    } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 3, reason: "issued to floor",
-    } });
-    expect([200, 201]).toContain(r.status);
-    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(7); // 10 − 3
-    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
-    const bal = view.body.item.balances.find((b) => b.locationId === String(s.stock._id));
-    expect(bal.onHand).toBe(5); // 8 − 3
-    expect(view.body.item.assigned + view.body.item.unassigned).toBe(7); // reconcile to new total
+  test("when the location side fails neither side is applied", async () => {
+    const s = await placed(5);
+    const before = (await RawItem.findById(s.item._id).lean()).quantity;
+    const r = await canonicalIssue(s, { qty: 6, loc: s.stock });
+    expect(r.status).toBe(400);
+    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(before);
+    expect(await LocationMovement.countDocuments({ itemId: s.item._id, type: "issue" })).toBe(0);
   });
 
-  // 9
-  test("a refused issue leaves no orphan location entry", async () => {
-    const s = await scene({ quantity: 10 });
-    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5,
-    } });
-    // Company on-hand quietly drops to 3 (as if depleted by another flow), while
-    // the location still shows 5. An issue of 5 passes the location soft-check
-    // but the atomic company guard refuses — and must write NO location entry.
-    await RawItem.updateOne({ _id: s.item._id }, { $set: { quantity: 3 } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5, reason: "x",
-    } });
-    expect(r.status).toBe(400);
-    expect(r.body.error?.details?.reason).toBe("INSUFFICIENT_ON_HAND");
-    expect(await LocationMovement.countDocuments({ itemId: s.item._id, type: "issue" })).toBe(0);
+  test("a canonical issue records exactly one canonical stock transaction", async () => {
+    const s = await placed(8);
+    await canonicalIssue(s, { qty: 3, loc: s.stock });
+    const item = await RawItem.findById(s.item._id).lean();
+    const reduces = item.stockTransactions.filter((t) => t.type === "REDUCE");
+    expect(reduces.length).toBe(1);
+    expect(reduces[0].quantity).toBe(3);
   });
 });
 
@@ -339,5 +351,41 @@ describe("warehouse stock view", () => {
     expect(stockLoc.items).toHaveLength(1);
     expect(stockLoc.items[0].onHand).toBe(7);
     expect(String(stockLoc.items[0].itemId)).toBe(String(s.item._id));
+  });
+});
+
+// ── Concurrency: atomic guards prevent oversubscription ──────────────────────
+describe("concurrent oversubscription is refused", () => {
+  // 5 — two simultaneous assignments cannot exceed company on-hand
+  test("two simultaneous assignments of the same headroom: only one wins", async () => {
+    const s = await scene({ quantity: 10 });
+    const body = { rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 6 };
+    const [a, b] = await Promise.all([
+      call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body }),
+      call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body }),
+    ]);
+    const oks = [a, b].filter((r) => r.status === 201 || r.status === 200).length;
+    expect(oks).toBe(1); // exactly one succeeded
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    expect(view.body.item.assigned).toBe(6); // never 12
+    expect(view.body.item.assigned).toBeLessThanOrEqual(view.body.item.onHand);
+  });
+
+  // 4 — two simultaneous issues cannot overspend one location
+  test("two simultaneous canonical issues from one location: only one wins", async () => {
+    const s = await scene({ quantity: 20 }); // company is not the constraint
+    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 8,
+    } });
+    const body = { direction: "debit", reason: ISSUE_REASON, items: [{ rawItemId: String(s.item._id), issuedQty: 6, issuedUnit: "PCS", warehouseId: String(s.wh._id), locationId: String(s.stock._id) }] };
+    const [a, b] = await Promise.all([
+      call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: newKey(), body }),
+      call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: newKey(), body }),
+    ]);
+    const oks = [a, b].filter((r) => r.status === 200 || r.status === 201).length;
+    expect(oks).toBe(1); // location holds 8, only one issue of 6 fits
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    const bal = view.body.item.balances.find((x) => x.locationId === String(s.stock._id));
+    expect(bal.onHand).toBe(2); // 8 − 6, never negative
   });
 });
