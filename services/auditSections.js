@@ -81,6 +81,63 @@ const SECTIONS = [
   { key: "hr:security", label: "Password management", group: "Admin", href: "/hr/dashboard/Passwordmanagement", entities: ["credential"] },
   { key: "hr:app-version", label: "App version", group: "Admin", href: "/hr/dashboard", entities: ["app-version"] },
   { key: "hr:access", label: "Roles & access", group: "Admin", href: "/hr/dashboard/history", entities: ["department-role"] },
+
+  /* ══════════════════════════════════════════════════════════════════════
+     ACCOUNTING
+
+     The accountant module already keeps an ACTIVITY log and an APPROVAL
+     queue, and both stay — they answer different questions. The activity log
+     records that a document was posted; the approval queue records who let it
+     through. Neither answers "who changed this figure, from what, to what",
+     and neither shows a change an OWNER made, because an owner posts directly
+     and never enters the queue. That gap is what these sections are for.
+
+     Grouped the way the accountant sidebar is grouped, so the section rail and
+     the sidebar read in the same order.
+     ══════════════════════════════════════════════════════════════════════ */
+
+  // Receivables
+  { key: "accounting:customers", label: "Customers", group: "Receivables", href: "/accountant/customers", entities: ["customer"] },
+  { key: "accounting:invoices", label: "Invoices", group: "Receivables", href: "/accountant/invoices", entities: ["invoice"] },
+  { key: "accounting:sales-vouchers", label: "Sales vouchers", group: "Receivables", href: "/accountant/sales-vouchers", entities: ["sales-voucher"] },
+  { key: "accounting:receipts", label: "Receipts", group: "Receivables", href: "/accountant/receipts", entities: ["receipt"] },
+  { key: "accounting:credit-notes", label: "Credit notes", group: "Receivables", href: "/accountant/credit-notes", entities: ["credit-note"] },
+  { key: "accounting:proforma", label: "Proforma invoices", group: "Receivables", href: "/accountant/proforma-invoices", entities: ["proforma-invoice"] },
+
+  // Payables
+  { key: "accounting:vendors", label: "Vendors", group: "Payables", href: "/accountant/vendors", entities: ["vendor"] },
+  { key: "accounting:purchase-vouchers", label: "Purchase vouchers", group: "Payables", href: "/accountant/purchase-vouchers", entities: ["purchase-voucher"] },
+  { key: "accounting:expenses", label: "Expenses", group: "Payables", href: "/accountant/expenses", entities: ["expense"] },
+  { key: "accounting:payments", label: "Payments", group: "Payables", href: "/accountant/payments", entities: ["payment"] },
+  { key: "accounting:debit-notes", label: "Debit notes", group: "Payables", href: "/accountant/debit-notes", entities: ["debit-note"] },
+  { key: "accounting:spend-approvals", label: "Spend approvals", group: "Payables", href: "/accountant/payables/spend-approvals", entities: ["spend-approval"] },
+
+  // Banking
+  { key: "accounting:bank-recon", label: "Bank reconciliation", group: "Banking", href: "/accountant/bank-reconciliation", entities: ["bank-reconciliation"] },
+  { key: "accounting:bank-transactions", label: "Bank transactions", group: "Banking", href: "/accountant/bank-transactions", entities: ["bank-transaction"] },
+  { key: "accounting:contra", label: "Contra vouchers", group: "Banking", href: "/accountant/contra-vouchers", entities: ["contra-voucher"] },
+
+  // General ledger
+  { key: "accounting:chart-of-accounts", label: "Chart of accounts", group: "General ledger", href: "/accountant/chart-of-accounts", entities: ["ledger", "group"] },
+  { key: "accounting:journal", label: "Journal entries", group: "General ledger", href: "/accountant/journal-entries", entities: ["journal-entry", "voucher"] },
+  { key: "accounting:parties", label: "Parties", group: "General ledger", href: "/accountant/parties", entities: ["party"] },
+  { key: "accounting:ledger-balances", label: "Ledger balances", group: "General ledger", href: "/accountant/ledger-balances", entities: ["ledger-balance"] },
+
+  // Taxation
+  { key: "accounting:gst", label: "GST", group: "Taxation", href: "/accountant/reports/gst", entities: ["gst-return"] },
+  { key: "accounting:tax-filings", label: "Tax filings", group: "Taxation", href: "/accountant/tax-filings", entities: ["tax-filing"] },
+  { key: "accounting:eway-bills", label: "e-Way bills", group: "Taxation", href: "/accountant/eway-bills", entities: ["eway-bill"] },
+
+  // Planning
+  { key: "accounting:budgets", label: "Budgets", group: "Planning", href: "/accountant/budgets", entities: ["budget", "budget-request"] },
+  { key: "accounting:recurring", label: "Recurring items", group: "Planning", href: "/accountant/recurring-items", entities: ["recurring-item"] },
+
+  // Admin
+  { key: "accounting:companies", label: "Companies", group: "Admin", href: "/accountant/companies", entities: ["company", "company-document"] },
+  { key: "accounting:team", label: "Team & roles", group: "Admin", href: "/accountant/team", entities: ["acc-user", "invite"] },
+  { key: "accounting:settings", label: "Settings", group: "Admin", href: "/accountant/settings", entities: ["acc-setting"] },
+  { key: "accounting:audit-notes", label: "Audit notes", group: "Admin", href: "/accountant/audit-notes", entities: ["audit-note"] },
+  { key: "accounting:data-cleanup", label: "Data cleanup", group: "Admin", href: "/accountant/data-cleanup", entities: ["cleanup"] },
 ];
 
 const BY_KEY = new Map(SECTIONS.map((s) => [s.key, s]));
@@ -151,6 +208,38 @@ const PATH_SECTIONS = [
   // says, and the person asking "why is this day marked present" is in HR.
   [/^\/api\/employee\/overtime/i, "hr:overtime", "overtime"],
   [/^\/api\/employee\/regularizations/i, "hr:attendance-regularizations", "regularization"],
+
+  /* ── Accounting ──────────────────────────────────────────────────────────
+     Ordered specific-before-general, same as HR. `/tally/companies` has to
+     come before the bare `/tally/` reports prefix, and the note routes before
+     the voucher one that would otherwise swallow them. */
+  [/^\/api\/accountant\/tally\/companies/i, "accounting:companies", "company"],
+  [/^\/api\/accountant\/customers/i, "accounting:customers", "customer"],
+  [/^\/api\/accountant\/invoices/i, "accounting:invoices", "invoice"],
+  [/^\/api\/accountant\/proforma/i, "accounting:proforma", "proforma-invoice"],
+  [/^\/api\/accountant\/credit-notes/i, "accounting:credit-notes", "credit-note"],
+  [/^\/api\/accountant\/debit-notes/i, "accounting:debit-notes", "debit-note"],
+  [/^\/api\/accountant\/vendors/i, "accounting:vendors", "vendor"],
+  [/^\/api\/accountant\/expenses/i, "accounting:expenses", "expense"],
+  [/^\/api\/accountant\/payments/i, "accounting:payments", "payment"],
+  [/^\/api\/accountant\/receipts/i, "accounting:receipts", "receipt"],
+  [/^\/api\/accountant\/spend-approvals/i, "accounting:spend-approvals", "spend-approval"],
+  [/^\/api\/accountant\/bank-recon/i, "accounting:bank-recon", "bank-reconciliation"],
+  [/^\/api\/accountant\/bank-transactions/i, "accounting:bank-transactions", "bank-transaction"],
+  [/^\/api\/accountant\/chart-of-accounts/i, "accounting:chart-of-accounts", "ledger"],
+  [/^\/api\/accountant\/journal-entries/i, "accounting:journal", "journal-entry"],
+  [/^\/api\/accountant\/parties/i, "accounting:parties", "party"],
+  [/^\/api\/accountant\/ledger/i, "accounting:ledger-balances", "ledger-balance"],
+  [/^\/api\/accountant\/tax-filings/i, "accounting:tax-filings", "tax-filing"],
+  [/^\/api\/accountant\/(eway|e-way)/i, "accounting:eway-bills", "eway-bill"],
+  [/^\/api\/accountant\/(gst-verification|gstr)/i, "accounting:gst", "gst-return"],
+  [/^\/api\/accountant\/budget/i, "accounting:budgets", "budget"],
+  [/^\/api\/accountant\/recurring/i, "accounting:recurring", "recurring-item"],
+  [/^\/api\/accountant\/team/i, "accounting:team", "acc-user"],
+  [/^\/api\/accountant\/settings/i, "accounting:settings", "acc-setting"],
+  [/^\/api\/accountant\/audit-notes/i, "accounting:audit-notes", "audit-note"],
+  [/^\/api\/accountant\/(merge|data-cleanup|cleanup)/i, "accounting:data-cleanup", "cleanup"],
+  [/^\/api\/accountant\/(vouchers|tally\/vouchers)/i, "accounting:journal", "voucher"],
 ];
 
 /**
@@ -432,6 +521,38 @@ const BY_SECTION = {
     period: "Review period",
     reviewer: "Reviewer",
     goals: "Goals",
+  },
+  "accounting:companies": {
+    name: "Company name",
+    gstin: "GSTIN",
+    pan: "PAN",
+    tan: "TAN",
+    cin: "CIN",
+    booksFrom: "Books from",
+    isPrimary: "Primary company",
+    financialYearStart: "Financial year start",
+  },
+  "accounting:journal": {
+    voucherNumber: "Voucher number",
+    voucherType: "Voucher type",
+    narration: "Narration",
+    totalAmount: "Amount",
+    totalTax: "Tax",
+    status: "Voucher status",
+    entries: "Ledger entries",
+  },
+  "accounting:chart-of-accounts": {
+    name: "Ledger name",
+    parent: "Under group",
+    parentName: "Under group",
+    openingBalance: "Opening balance",
+    nature: "Nature",
+    isReserved: "Reserved group",
+  },
+  "accounting:team": {
+    role: "Accounting role",
+    email: "Email",
+    status: "Account status",
   },
   "hr:security": {
     password: "Password",

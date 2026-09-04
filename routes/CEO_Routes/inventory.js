@@ -163,7 +163,7 @@ router.get("/raw-items", ceoAuth, proxy("/api/cms/raw-items"));
 router.get("/stock-items/stats", ceoAuth, async (req, res) => {
   try {
     const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
-    const items = await StockItem.find({})
+    const items = await StockItem.find({ isActive: { $ne: false } })
       .select("status inventoryValue potentialRevenue profitMargin")
       .lean();
     const total = items.length;
@@ -204,7 +204,7 @@ router.get("/stock-items/stats", ceoAuth, async (req, res) => {
 router.get("/stock-items/categories", ceoAuth, async (req, res) => {
   try {
     const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
-    const cats = await StockItem.distinct("category");
+    const cats = await StockItem.distinct("category", { isActive: { $ne: false } });
     res.json({ success: true, categories: cats.filter(Boolean).sort() });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -236,7 +236,7 @@ router.get("/stock-items", ceoAuth, async (req, res) => {
       page = 1,
       limit = 20,
     } = req.query;
-    const filter = {};
+    const filter = { isActive: { $ne: false } };
     if (search)
       filter.$or = [
         { name: { $regex: search, $options: "i" } },

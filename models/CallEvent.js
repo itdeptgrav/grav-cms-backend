@@ -20,10 +20,28 @@ const { phoneKey } = require("../services/callRecordingMatch.service");
 const callEventSchema = new mongoose.Schema(
   {
     // ── Who / which call ──────────────────────────────────────────────────
+    // `phoneNumber` is the OTHER party — the customer. It is NOT the phone
+    // this call was made from; see `ownerPhone` below for that.
     phoneNumber: { type: String, default: null },
     normalizedPhone: { type: String, default: null }, // digits-only key, for matching against CRM records
     contactName: { type: String, default: null },
     direction: { type: String, default: "UNKNOWN" }, // INCOMING | OUTGOING | UNKNOWN
+
+    // ── WHOSE PHONE REPORTED THIS CALL ────────────────────────────────────
+    //
+    // Added 30 Aug 2026. Until now this schema stored exactly one number —
+    // the customer's — so the log could say a four-minute call happened and
+    // never who at GRAV made it. The device now reports the handset's own
+    // number alongside the call, and `normalizedOwnerPhone` (digits-only,
+    // last 10) is matched against the sales roster's snapshotted corporate
+    // number — see models/CMS_Models/Sales/SalesPerson.js.
+    //
+    // OPTIONAL, AND OLD ROWS STAY NULL. Every call recorded before this
+    // existed genuinely has no owner on record, and inventing one would be
+    // worse than admitting it: the read routes label those "Unattributed"
+    // rather than guessing.
+    ownerPhone: { type: String, default: null },
+    normalizedOwnerPhone: { type: String, default: null, index: true },
 
     // ── Outcome — from the app's CallEventReporter, off the device's own
     //    system call log, so every call gets a row even when nothing was
@@ -47,6 +65,19 @@ const callEventSchema = new mongoose.Schema(
     audioFileName: { type: String, default: null },
     createdAtDevice: { type: Number, default: null },
 
+    // ── Recording upload outcome ──────────────────────────────────────────
+    // Whether the audio actually made it to Drive. The device reports a
+    // FAILURE (with a reason) when it couldn't upload — no network, upload
+    // error, or the recorder itself failed — so a call whose audio never
+    // arrived is still visible with WHY, instead of silently missing.
+    recordingUploadStatus: { type: String, default: null }, // "UPLOADED" | "FAILED" | null
+    recordingError: { type: String, default: null },        // human-readable failure reason
+    recordingErrorAt: { type: Date, default: null },
+
+    // "call" (from the phone's call recorder) or "manual" (recorded in-app by
+    // the rep when the contact wasn't over a phone call).
+    kind: { type: String, default: "call" },
+
     // Server-side AI summary — kept separate from `summary` for the same
     // reason CallRecording kept them separate: `summary` is whatever the
     // device shipped (often null), and overwriting it would destroy that
@@ -67,9 +98,13 @@ const callEventSchema = new mongoose.Schema(
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
 );
 
-// Keep the normalized key in step with the phone number (same helper as CallRecording).
+// Keep the normalized keys in step with their phone numbers (same helper as
+// CallRecording, so the customer side and the owner side normalise
+// identically — a match that depended on two different normalisations would
+// work in testing and fail on the first number written in another format).
 callEventSchema.pre("save", function (next) {
   if (this.isModified("phoneNumber")) this.normalizedPhone = phoneKey(this.phoneNumber);
+  if (this.isModified("ownerPhone")) this.normalizedOwnerPhone = phoneKey(this.ownerPhone);
   next();
 });
 

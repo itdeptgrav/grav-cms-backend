@@ -257,6 +257,25 @@ const stockItemSchema = new mongoose.Schema({
     type: Number,
     min: 0
   },
+  /**
+   * The most this product is allowed to COST to make, per piece — set by
+   * Sales when the product is defined on the enquiry (2 Sept 2026, explicit
+   * request), and carried here so the people actually building the costing
+   * work against it.
+   *
+   * The Raw Items and Operations tabs refuse an addition that would push
+   * raw-material + operations + miscellaneous cost past this, and show how
+   * much of it is spent. A CEILING ON COST, not a price and not a target —
+   * `baseSalesPrice`/`averageSalesPrice` are what it sells FOR.
+   *
+   * Unset (the default) means no cap at all: every restriction downstream is
+   * gated on this being a real number, so products that predate this — and
+   * products nobody set a budget for — behave exactly as they always did.
+   */
+  maxBudget: {
+    type: Number,
+    min: 0
+  },
   salesTax: {
     type: String,
     trim: true
@@ -384,7 +403,24 @@ const stockItemSchema = new mongoose.Schema({
   updatedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "ProjectManager"
-  }
+  },
+
+  // Soft delete (1 Sept 2026, explicit request: "the deleted products
+  // history is not gonna stored hence it is needed to track... need to keep
+  // in an another tab... so that if we want then we can also revert it").
+  // Deleting used to be `stockItem.deleteOne()` — no trace, no way back.
+  // `isActive: false` is the same flag this codebase already uses for a
+  // recoverable delete elsewhere (SampleStyle, SalesJourney, Enquiry); every
+  // list/search endpoint that lets someone PICK a product filters this out,
+  // while GET /:id and every historical reference (work orders, dispatch,
+  // QC, customer requests, …) still resolves it — the record isn't gone,
+  // just off the shelf.
+  isActive: { type: Boolean, default: true, index: true },
+  deletedAt: { type: Date, default: null },
+  deletedBy: {
+    id: { type: mongoose.Schema.Types.ObjectId },
+    name: { type: String, trim: true },
+  },
 }, { timestamps: true });
 
 module.exports = mongoose.model("StockItem", stockItemSchema);

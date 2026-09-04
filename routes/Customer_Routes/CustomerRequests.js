@@ -186,7 +186,7 @@ router.get("/available-items", verifyCustomerToken, async (req, res) => {
     }
 
     // ── 2. Build the filter ─────────────────────────────────────────────
-    const filter = { _id: { $in: assignedIds } };
+    const filter = { _id: { $in: assignedIds }, isActive: { $ne: false } };
 
     if (search && search.trim()) {
       const q = search.trim();

@@ -1,6 +1,7 @@
 // routes/CMS_Routes/Inventory/Products/stockItemRoutes.js
 
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
@@ -730,13 +731,19 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     let selectFields = "";
 
     switch (tabName) {
-      case "general": selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory"; break;
+      // `maxBudget` rides along on the three tabs that have to respect it
+      // (2 Sept 2026): general edits it, and raw-items/operations refuse
+      // additions that would push the built-up cost past it. Those two also
+      // pull the OTHER cost components — a cap is on the whole product's
+      // cost, so neither tab can judge its own additions from its own slice
+      // alone.
+      case "general": selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory maxBudget"; break;
       case "attributes": selectFields = "attributes"; break;
-      case "variants": selectFields = "variants attributes reference baseCost baseSalesPrice"; break;
-      case "raw-items": selectFields = "variants.rawItems variants._id variants.attributes variants.sku"; break;
-      case "operations": selectFields = "operations"; break;
+      case "variants": selectFields = "variants attributes reference baseCost baseSalesPrice maxBudget"; break;
+      case "raw-items": selectFields = "variants.rawItems variants._id variants.attributes variants.sku maxBudget operations miscellaneousCosts baseCost"; break;
+      case "operations": selectFields = "operations maxBudget variants.rawItems miscellaneousCosts baseCost"; break;
       case "measurements": selectFields = "measurements numberOfPanels"; break;
-      case "costs": selectFields = "miscellaneousCosts"; break;
+      case "costs": selectFields = "miscellaneousCosts maxBudget operations variants.rawItems baseCost"; break;
       default: selectFields = "name category";
     }
 
@@ -807,7 +814,7 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
 
       // ── General Info ────────────────────────────────────────────────────
       case "general": {
-        const { name, additionalNames, productType, category, unit, hsnCode, genderCategory, baseSalesPrice, baseCost, internalNotes, numberOfPanels, images } = body;
+        const { name, additionalNames, productType, category, unit, hsnCode, genderCategory, baseSalesPrice, baseCost, internalNotes, numberOfPanels, images, maxBudget } = body;
         if (name !== undefined) stockItem.name = name.trim();
         if (productType !== undefined) stockItem.productType = productType;
         if (category !== undefined) stockItem.category = category.trim();
@@ -818,6 +825,13 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
         if (baseCost !== undefined) stockItem.baseCost = parseFloat(baseCost) || 0;
         if (genderCategory !== undefined) stockItem.genderCategory = genderCategory;
         if (numberOfPanels !== undefined) stockItem.numberOfPanels = parseInt(numberOfPanels) || 0;
+        // null/""/0 all mean "no cap" — cleared to undefined rather than
+        // stored as 0, which would read as a budget of nothing and block
+        // every raw item and operation on the product (2 Sept 2026).
+        if (maxBudget !== undefined) {
+          const n = parseFloat(maxBudget);
+          stockItem.maxBudget = Number.isFinite(n) && n > 0 ? n : undefined;
+        }
         if (images !== undefined) stockItem.images = images || [];
         if (additionalNames !== undefined) {
           stockItem.additionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
@@ -1025,7 +1039,11 @@ router.get("/", async (req, res) => {
     const pageNum = parseInt(page), limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
 
-    let filter = {};
+    // Soft-deleted products live on their own "Deleted" tab (GET /deleted,
+    // below) — everything here, including the stats strip and the
+    // missing-raw-items/missing-operations alerts, is scoped to the active
+    // catalogue only (1 Sept 2026).
+    let filter = { isActive: { $ne: false } };
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
@@ -1139,6 +1157,188 @@ router.get("/", async (req, res) => {
   }
 });
 
+// ✅ GET deleted stock items — the "Deleted" tab (1 Sept 2026). Ahead of
+// GET /:id on purpose (same reason salesCustomers.js flags for its own
+// search route): a static path has to be registered before Express treats
+// the literal word "deleted" as an :id.
+router.get("/deleted", async (req, res) => {
+  try {
+    const { search = "", page = 1, limit = 10 } = req.query;
+    const pageNum = parseInt(page), limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    let filter = { isActive: false };
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { reference: { $regex: search, $options: "i" } },
+        { additionalNames: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const [totalItems, stockItems] = await Promise.all([
+      StockItem.countDocuments(filter),
+      StockItem.find(filter)
+        .select("name additionalNames reference category unit images variants hsnCode genderCategory deletedAt deletedBy")
+        .sort({ deletedAt: -1 }).skip(skip).limit(limitNum),
+    ]);
+
+    res.json({
+      success: true, stockItems,
+      pagination: { currentPage: pageNum, totalPages: Math.ceil(totalItems / limitNum), totalItems, itemsPerPage: limitNum, hasNextPage: skip + limitNum < totalItems, hasPrevPage: pageNum > 1 },
+    });
+  } catch (error) {
+    console.error("Error fetching deleted stock items:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching deleted stock items" });
+  }
+});
+
+// ✅ RESTORE a deleted stock item (1 Sept 2026) — the other half of soft
+// delete below. Reference uniqueness isn't re-checked: the reference was
+// never released while deleted (still present, just inactive), so nothing
+// new can have claimed it in the meantime.
+router.post("/:id/restore", async (req, res) => {
+  try {
+    const stockItem = await StockItem.findById(req.params.id);
+    if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
+    if (stockItem.isActive !== false) {
+      return res.status(400).json({ success: false, message: "This product isn't deleted." });
+    }
+
+    stockItem.isActive = true;
+    stockItem.deletedAt = null;
+    stockItem.deletedBy = undefined;
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+
+    await recordChange(req, {
+      departmentSlug: "inventory",
+      entity: "stock-item",
+      entityId: stockItem._id,
+      entityLabel: stockItem.name,
+      action: "other",
+      summary: `Restored — ${stockItem.name}`,
+      before: {}, after: {},
+    });
+
+    res.json({ success: true, message: "Stock item restored successfully", stockItem });
+  } catch (error) {
+    console.error("Error restoring stock item:", error);
+    res.status(500).json({ success: false, message: "Server error while restoring stock item" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/manufacturing-orders — every order this product appears on.
+//
+// 1 Sept 2026, explicit request: "it is also needed to showcase like which
+// product linked to which mo and all, so that we can also get like which
+// product with associated with which order".
+//
+// The relationship existed in the data all along and had no way to be read
+// from the product's side: a CustomerRequest carries `items[].stockItemId`
+// and a WorkOrder carries `stockItemId`, but every query over them was
+// scoped by request id, never by product. So "what is this product on?" was
+// only answerable by opening orders one at a time.
+//
+// AN MO *IS* A CUSTOMERREQUEST at `status: "quotation_sales_approved"` —
+// there is no separate collection (see manufacturingOrderRoutes.js's own
+// base filter). Rather than return only those, this returns every live
+// request the product is on and flags which ones have actually reached
+// production, so the same endpoint answers "which MO" and the broader "which
+// order" the request also asked for.
+//
+// Neither `items.stockItemId` nor `WorkOrder.stockItemId` is indexed, so
+// this is a collection scan on both — acceptable for a per-product detail
+// view opened one product at a time, and the reason this is NOT called from
+// the product LIST (which would run it once per row).
+router.get("/:id/manufacturing-orders", async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid product id" });
+    }
+    const stockItemId = new mongoose.Types.ObjectId(req.params.id);
+
+    const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
+    const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+
+    // Cancelled/rejected requests are excluded — a product "belongs to" an
+    // order that is still real, not one that was called off.
+    const requests = await CustomerRequest.find({
+      "items.stockItemId": stockItemId,
+      status: { $nin: ["cancelled", "rejected"] },
+    })
+      .select("requestId customerInfo status priority createdAt items orderOrigin isInternalOrder requestType measurementName")
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+
+    // One query for every work order across all those requests, then grouped
+    // in memory — N requests would otherwise mean N round trips.
+    const requestIds = requests.map((r) => r._id);
+    const workOrders = requestIds.length
+      ? await WorkOrder.find({ customerRequestId: { $in: requestIds }, stockItemId })
+          .select("workOrderNumber customerRequestId status quantity completedQuantity variantAttributes")
+          .lean()
+      : [];
+    const woByRequest = new Map();
+    for (const wo of workOrders) {
+      const key = String(wo.customerRequestId);
+      if (!woByRequest.has(key)) woByRequest.set(key, []);
+      woByRequest.get(key).push(wo);
+    }
+
+    const orders = requests.map((r) => {
+      // A request can list the same product more than once (different
+      // variants split across rows), so quantity is summed over every
+      // matching line rather than read off the first one found.
+      const lines = (r.items || []).filter(
+        (i) => String(i.stockItemId || "") === String(stockItemId),
+      );
+      const quantity = lines.reduce((s, i) => s + (Number(i.totalQuantity) || 0), 0);
+      const wos = woByRequest.get(String(r._id)) || [];
+      return {
+        id: r._id,
+        requestId: r.requestId,
+        customerName: r.customerInfo?.name || "—",
+        deliveryDeadline: r.customerInfo?.deliveryDeadline || null,
+        status: r.status,
+        // What makes it an MO rather than a request still being priced.
+        isManufacturingOrder: r.status === "quotation_sales_approved",
+        orderOrigin: r.orderOrigin || null,
+        isInternalOrder: Boolean(r.isInternalOrder),
+        requestType: r.requestType || null,
+        measurementName: r.measurementName || null,
+        priority: r.priority || null,
+        createdAt: r.createdAt,
+        quantity,
+        workOrders: wos.map((w) => ({
+          id: w._id,
+          workOrderNumber: w.workOrderNumber || "",
+          status: w.status,
+          quantity: w.quantity || 0,
+          completedQuantity: w.completedQuantity || 0,
+          variantAttributes: w.variantAttributes || [],
+        })),
+      };
+    });
+
+    res.json({
+      success: true,
+      orders,
+      summary: {
+        totalOrders: orders.length,
+        manufacturingOrders: orders.filter((o) => o.isManufacturingOrder).length,
+        totalQuantity: orders.reduce((s, o) => s + o.quantity, 0),
+        totalWorkOrders: workOrders.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching manufacturing orders for stock item:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching orders for this product" });
+  }
+});
+
 // ✅ GET stock item by ID
 router.get("/:id", async (req, res) => {
   try {
@@ -1172,7 +1372,7 @@ router.post("/", async (req, res) => {
   try {
     const {
       name, additionalNames, productType, category, unit, hsnCode, genderCategory,
-      baseSalesPrice, baseCost, internalNotes,
+      baseSalesPrice, baseCost, internalNotes, maxBudget,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
@@ -1232,6 +1432,10 @@ router.post("/", async (req, res) => {
       category: category.trim(), unit: unit || "Units", hsnCode: hsnCode || "",
       genderCategory: genderCategory || "", internalNotes: internalNotes || "",
       baseSalesPrice: parseFloat(baseSalesPrice) || 0, baseCost: parseFloat(baseCost) || 0,
+      // Left UNDEFINED rather than defaulted to 0 when absent — a 0 budget is
+      // a cap of nothing, which would block every raw item on the product.
+      // Undefined is what "no cap" means (2 Sept 2026).
+      maxBudget: Number.isFinite(parseFloat(maxBudget)) && parseFloat(maxBudget) > 0 ? parseFloat(maxBudget) : undefined,
       attributes: processedAttributes, measurements: measurements || [],
       numberOfPanels: parseInt(numberOfPanels) || 0,
       variants: processedVariants, operations: processedOperations,
@@ -1300,13 +1504,20 @@ router.put("/:id", async (req, res) => {
   try {
     const {
       name, additionalNames, productType, category, unit, hsnCode, internalNotes,
-      baseSalesPrice, baseCost, genderCategory,
+      baseSalesPrice, baseCost, genderCategory, maxBudget,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
 
     const stockItem = await StockItem.findById(req.params.id);
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
+
+    // Explicit null clears the cap; 0 and blank mean the same thing. See the
+    // model's own note on why "no budget" must not be stored as 0.
+    if (maxBudget !== undefined) {
+      const n = parseFloat(maxBudget);
+      stockItem.maxBudget = Number.isFinite(n) && n > 0 ? n : undefined;
+    }
 
     if (name !== undefined) stockItem.name = name.trim();
     if (productType !== undefined) stockItem.productType = productType;
@@ -1454,26 +1665,46 @@ router.post("/:id/clone", async (req, res) => {
   }
 });
 
-// ✅ DELETE stock item
+// ✅ DELETE stock item — SOFT delete (1 Sept 2026, explicit request: "the
+// deleted products history is not gonna stored hence it is needed to
+// track... so that if we want then we can also revert it"). Used to be
+// `stockItem.deleteOne()`, no trace and no way back. Now `isActive: false` —
+// same flag the rest of this codebase already uses for a recoverable delete
+// — with the record surfacing on the "Deleted" tab (GET /deleted) and
+// reversible from there (POST /:id/restore).
 router.delete("/:id", async (req, res) => {
   try {
     const stockItem = await StockItem.findById(req.params.id);
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
-    await stockItem.deleteOne();
+
+    stockItem.isActive = false;
+    stockItem.deletedAt = new Date();
+    stockItem.deletedBy = { id: req.user?.id, name: req.user?.name || "" };
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+
+    await recordChange(req, {
+      departmentSlug: "inventory",
+      entity: "stock-item",
+      entityId: stockItem._id,
+      entityLabel: stockItem.name,
+      action: "delete",
+      summary: `Deleted — ${stockItem.name}`,
+      before: {}, after: {},
+    });
 
     // Drop the product from every customer it was assigned to (26 Aug 2026,
-    // bug fix). Deleting the StockItem used to leave those assignment rows
-    // pointing at a document that no longer exists, and Mongoose `populate`
-    // resolves a dangling reference to `null` rather than leaving the raw id
-    // — so the bulk-order product list rendered one nameless, un-orderable
-    // row per deleted product, all sharing a null React key ("Encountered two
-    // children with the same key, `null`"). The duplicate key was the visible
-    // symptom; the real defect is that an assignment outlived its product.
+    // bug fix) — kept for soft delete too: a deleted product shouldn't stay
+    // orderable off a customer's assignment list while it's off the shelf.
+    // Restoring the product does NOT restore these; re-assigning it is a
+    // separate, deliberate act, same as assigning any other product.
     //
-    // Best-effort: the stock item is already gone, so failing the response
-    // here would report a delete that actually happened as an error. The
-    // read side filters dangling rows out regardless, so a missed sweep
-    // degrades to stale data, never to a broken list.
+    // Best-effort: the delete itself already succeeded, so failing the
+    // response here would report a delete that actually happened as an
+    // error. The read side filters inactive products out regardless, so a
+    // missed sweep degrades to a stale (but still resolvable) reference,
+    // never to a broken list — unlike the hard-delete era this comment
+    // originally described, `populate` still finds the document.
     try {
       const Customer = require("../../../../models/Customer_Models/Customer");
       const { modifiedCount } = await Customer.updateMany(

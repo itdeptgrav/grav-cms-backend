@@ -10,6 +10,7 @@ const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } 
 
 const svc = require("../../services/cowork.service");
 const { invalidateEmpListCache } = require("../../services/cowork.service");
+const { sendJsonCached } = require("../../services/httpCache");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
 const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
@@ -50,7 +51,11 @@ router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, asy
   try {
     const employees = await svc.listCoworkEmployees();
     const safe = employees.map(({ tempPassword, authUid, fcmTokens, ...emp }) => emp);
-    res.json({ employees: safe });
+    // ETag/304: the directory is byte-identical between reads far more often
+    // than not (measured 99% duplicate). A client that revalidates gets a bare
+    // 304; one that does not gets the full body, exactly as before. The data is
+    // unchanged either way — see services/httpCache.js.
+    sendJsonCached(req, res, { employees: safe });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -93,7 +98,7 @@ router.get("/scheduling/blocked-dates", verifyCoworkToken, async (req, res) => {
       }
     }
 
-    res.json({ success: true, blockedDates: blocked });
+    sendJsonCached(req, res, { success: true, blockedDates: blocked });
   } catch (e) {
     console.error("[blocked-dates]", e.message);
     res.status(500).json({ error: e.message });
@@ -290,12 +295,109 @@ router.get("/employee/my-managers/:employeeId", verifyCoworkToken, verifyEmploye
         ? { name: employee.secondaryManager.managerName, biometricId: "", department: "", designation: "", phone: "", email: "", profilePhotoUrl: null }
         : null;
 
-    res.json({ success: true, primaryManager, secondaryManager });
+    sendJsonCached(req, res, { success: true, primaryManager, secondaryManager });
   } catch (e) {
     console.error("[my-managers]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── MY MANAGERS, FOR EVERYONE AT ONCE ────────────────────────────────────────
+// GET /cowork/employee/my-managers-bulk
+//
+// **Why this exists.** There is no org chart in this engine: the only
+// relationship surface is the route above, which answers for ONE person. So a
+// client wanting the reporting tree has to ask once per employee and invert the
+// answers — and it did, in batches of eight, rebuilt every few minutes in every
+// open tab. Measured on the bandwidth dashboard: 288,406 calls in a week, about
+// 1,717 an hour, for a set of answers that changes a handful of times a year.
+//
+// This is the same question asked once. Same collection, same populate, same
+// per-manager shape — only the loop moves from the network into the database.
+//
+// **Purely additive.** The single-employee route above is untouched and still
+// serves every caller it served before. Nothing is obliged to adopt this one,
+// and a client that cannot reach it falls back to asking one at a time.
+//
+// Sends an ETag like its neighbour: reporting lines are byte-identical between
+// reads far more often than not, so a client that revalidates gets a bare 304
+// rather than the whole tree again.
+
+/** One manager, in the exact shape the single-employee route returns. */
+function _managerShape(side) {
+  if (side && side.managerId) {
+    const m = side.managerId;
+    return {
+      name:
+        [m.firstName, m.middleName, m.lastName].filter(Boolean).join(" ").trim() ||
+        side.managerName ||
+        "",
+      biometricId: m.biometricId || "",
+      department: m.department || "",
+      designation: m.designation || m.jobTitle || "",
+      phone: m.phone || "",
+      email: m.email || "",
+      profilePhotoUrl: (m.profilePhoto && m.profilePhoto.url) || null,
+    };
+  }
+  /* Named but unlinkable — the reference is missing and only a plain name
+     survives. Deliberately NOT the same as having no manager: a tree cannot
+     draw an edge to a name, but a profile can still say who somebody reports
+     to, and collapsing the two would lose that. */
+  if (side && side.managerName) {
+    return {
+      name: side.managerName,
+      biometricId: "",
+      department: "",
+      designation: "",
+      phone: "",
+      email: "",
+      profilePhotoUrl: null,
+    };
+  }
+  return null;
+}
+
+router.get(
+  "/employee/my-managers-bulk",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const Employee = require("../../models/Employee");
+
+      const POPULATE =
+        "firstName middleName lastName biometricId department designation jobTitle phone email profilePhoto";
+
+      /* Only the three fields the answer is built from. The rest of an
+         Employee document is large and none of it is sent. */
+      const employees = await Employee.find(
+        { biometricId: { $exists: true, $ne: null } },
+        "biometricId primaryManager secondaryManager"
+      )
+        .populate("primaryManager.managerId", POPULATE)
+        .populate("secondaryManager.managerId", POPULATE)
+        .lean();
+
+      const managers = {};
+      for (const emp of employees) {
+        if (!emp.biometricId) continue;
+        managers[String(emp.biometricId)] = {
+          primaryManager: _managerShape(emp.primaryManager),
+          secondaryManager: _managerShape(emp.secondaryManager),
+        };
+      }
+
+      /* Somebody absent from HR simply has no entry. The caller reads a
+         missing key as "no managers", which is what the single route answers
+         for that person too. */
+      sendJsonCached(req, res, { success: true, managers });
+    } catch (e) {
+      console.error("[my-managers-bulk]", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
 
 
 router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {

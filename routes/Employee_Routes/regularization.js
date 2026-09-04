@@ -264,13 +264,19 @@ router.patch(
 
       // Stage-vs-role gate. A primary may not act on manager_approved; a
       // secondary may not jump ahead of the primary.
-      if (mt === "primary" && r.status !== "pending")
+      /* A RETRY. An already-approved request whose apply never landed may be
+         approved again: the decision has been made, the day is still wrong, and
+         the applier is idempotent so a second attempt cannot double-punch it.
+         Without this the only states were "worked" and "stuck forever". */
+      const isRetry = r.status === "hr_approved" && !r.appliedToAttendance;
+
+      if (!isRetry && mt === "primary" && r.status !== "pending")
         return res.status(400).json({
           success: false,
           code: "INVALID_TRANSITION",
           message: `Cannot approve — ${r.status}`,
         });
-      if (mt === "secondary" && r.status !== "manager_approved")
+      if (!isRetry && mt === "secondary" && r.status !== "manager_approved")
         return res.status(400).json({
           success: false,
           code: "INVALID_TRANSITION",
@@ -293,7 +299,10 @@ router.patch(
       );
 
       // ── Primary hands over to secondary ──────────────────────────────
-      if (mt === "primary" && hasSecondary && r.status === "pending") {
+      /* A retry goes straight to the apply — the approvals already happened
+         and re-running them would re-notify everybody about a decision nobody
+         took twice. */
+      if (!isRetry && mt === "primary" && hasSecondary && r.status === "pending") {
         r.status = "manager_approved";
         await r.save();
 
@@ -350,8 +359,17 @@ router.patch(
         // The decision stands even if the attendance write fails; leaving the
         // request half-approved would be worse than a day HR can re-apply.
         console.error("[REG-APPROVE-APPLY]", e.message);
-        applyRes = { applied: false, skipped: "apply_failed" };
+        /* The MESSAGE, not just the word "apply_failed". Without it the history
+           said a correction had failed and gave nobody a way to find out why,
+           so the only remaining move was to guess. */
+        applyRes = { applied: false, skipped: "apply_failed", error: e.message };
       }
+      /* Recorded on the request itself, which is what makes a retry possible:
+         "approved" alone cannot distinguish a correction that landed from one
+         that did not. */
+      r.appliedToAttendance = Boolean(applyRes.applied);
+      if (applyRes.applied) r.appliedAt = new Date();
+      r.applyError = applyRes.applied ? "" : (applyRes.error || applyRes.skipped || "");
       await r.save();
 
       // Approved and applied are two different facts. A request can be approved
@@ -360,15 +378,27 @@ router.patch(
       await auditReg(req, {
         entityId: String(r._id),
         entityLabel: regLabel(r),
-        action: "approve",
-        summary:
-          `${mgr?.managerName || "A manager"} gave final approval to ${r.employeeName}'s ` +
-          `correction for ${r.dateStr}` +
-          `${r.requestedStatus ? ` (requested ${r.requestedStatus})` : ""}. ` +
-          (applyRes.applied
-            ? "Applied to the attendance record."
-            : `NOTHING was applied to attendance — ${applyRes.skipped}.`) +
-          `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`,
+        /* `approve` only when it LANDED. Filing a failed apply as an approval
+           is what put a green "Approved" badge above a sentence saying nothing
+           had been applied — the badge and the text contradicting each other on
+           the one screen people read to find out what happened. */
+        action: applyRes.applied ? "approve" : "fail",
+        critical: !applyRes.applied,
+        summary: applyRes.applied
+          ? `${mgr?.managerName || "A manager"} gave final approval to ${r.employeeName}'s ` +
+            `correction for ${r.dateStr}` +
+            `${r.requestedStatus ? ` (requested ${r.requestedStatus})` : ""}. ` +
+            `Applied to the attendance record.` +
+            `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`
+          : /* Leads with the outcome. "Approved, but nothing was applied" reads
+               as a success with a caveat, and next to a green badge people took
+               it for one. */
+            `NOT applied — ${r.employeeName}'s correction for ${r.dateStr}` +
+            `${r.requestedStatus ? ` (requested ${r.requestedStatus})` : ""} was ` +
+            `approved by ${mgr?.managerName || "a manager"} but the attendance ` +
+            `record was not changed: ${applyRes.error || applyRes.skipped}. ` +
+            `The day is unchanged — approve it again to retry.` +
+            `${r.hrRemarks ? ` Remarks: ${r.hrRemarks}` : ""}`,
         before: { status: beforeStatus },
         after: {
           status: "hr_approved",
@@ -379,8 +409,13 @@ router.patch(
       });
 
       notify(r.employeeId, {
-        title: "Request approved",
-        body: `Your attendance for ${r.dateStr} has been corrected.`,
+        title: applyRes.applied ? "Request approved" : "Approved — not applied yet",
+        /* An employee told their day was corrected stops checking. If the write
+           did not land, they need to know it is still wrong. */
+        body: applyRes.applied
+          ? `Your attendance for ${r.dateStr} has been corrected.`
+          : `Your correction for ${r.dateStr} was approved but has not reached ` +
+            `the attendance record yet. HR has been notified.`,
         data: pushData(r),
         channelId: "general",
         categoryId: "general",
@@ -391,9 +426,14 @@ router.patch(
         data: r,
         applied: applyRes.applied,
         skipped: applyRes.skipped,
+        // The apply is the point of approving. A caller that only checks
+        // `success` must not report this as done.
+        applied: applyRes.applied,
+        error: applyRes.error || "",
         message: applyRes.applied
           ? "Approved and applied to attendance"
-          : `Approved, but nothing was applied to attendance (${applyRes.skipped})`,
+          : `Approved, but the attendance record was NOT changed: ` +
+            `${applyRes.error || applyRes.skipped}. Approve again to retry.`,
       });
     } catch (err) {
       console.error("[employee/regularizations manager approve]", err);

@@ -2,8 +2,14 @@ const express = require("express");
 const router = express.Router();
 const Department = require("../../models/HR_Models/Departments");
 const Employee = require("../../models/Employee");
+const mongoose = require("mongoose");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { recordChange } = require("../../services/changeLog");
+
+/* Department names are free text and reach Mongo as anchored regexes in three
+   places here. Escaped once, centrally, because a name holding "(" is a
+   crashing regex and a name holding "." silently matches the wrong row. */
+const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Every department edit, in the Departments page history.
 const auditDept = (req, entry) =>
@@ -293,6 +299,134 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
   }
 });
 
+// ✅ MANAGER CANDIDATES for one department (optionally one designation)
+//
+// GET /:id/manager-candidates?designation=Graphic%20Designer&exclude=<employeeId>
+//
+// WHO IS A MANAGER IS ALREADY CONFIGURED — THIS ONLY RESOLVES IT TO PEOPLE
+// -----------------------------------------------------------------------
+// A designation carries `managers`: a list of (department, designation) PAIRS
+// saying who manages that role — "Graphic Designer in Designing is managed by
+// CEO in Corporate". So the answer to "who may manage this employee" is not a
+// search over staff, it is a lookup of the people currently holding those
+// configured roles, plus the department's own primary/secondary if set.
+//
+// Nothing else is offered. Earlier this widened to "everyone in the
+// department" when no configuration matched, which put the employee's own
+// colleagues — and the employee themselves — in the list. An empty list is the
+// honest answer to "no manager has been configured for this role": it sends
+// somebody to the Departments page to say who the manager is, which is the
+// thing that then propagates to everyone.
+//
+// `exclude` is the employee being edited. Nobody manages themselves, and the
+// form was offering exactly that (GR0124 listed as their own primary manager)
+// because the old list was department-wide.
+router.get("/:id/manager-candidates", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const esc = escapeRegex;
+
+    const department = mongoose.Types.ObjectId.isValid(id)
+      ? await Department.findById(id).lean()
+      : await Department.findOne({ name: new RegExp(`^${esc(id)}$`, "i") }).lean();
+    if (!department) {
+      return res.status(404).json({ success: false, message: "Department not found" });
+    }
+
+    const wantedDesignation = String(req.query.designation || "").trim();
+    const excludeId = String(req.query.exclude || "");
+
+    /* The (department, designation) pairs configured as managers. When a
+       designation is named, only its own pairs; otherwise every pair the
+       department configures, so the picker still works before a designation is
+       chosen. */
+    const pairs = [];
+    for (const d of department.designations || []) {
+      if (
+        wantedDesignation &&
+        String(d.name || "").trim().toLowerCase() !== wantedDesignation.toLowerCase()
+      ) {
+        continue;
+      }
+      for (const m of d.managers || []) {
+        if (m?.departmentName && m?.designationName) {
+          pairs.push({ departmentName: m.departmentName, designationName: m.designationName });
+        }
+      }
+    }
+
+    /* Resolve each pair to the people actually holding that role now. This is
+       what makes a manager replacement propagate: nobody is stored here, so
+       whoever holds the role today is who the picker offers. */
+    const holders = pairs.length
+      ? await Employee.find({
+          $and: [
+            { $or: [{ isActive: { $ne: false } }, { status: "active" }] },
+            {
+              $or: pairs.map((pr) => ({
+                department: new RegExp(`^${esc(pr.departmentName)}$`, "i"),
+                designation: new RegExp(`^${esc(pr.designationName)}$`, "i"),
+              })),
+            },
+          ],
+        })
+          .select("firstName lastName biometricId designation department")
+          .sort({ firstName: 1 })
+          .lean()
+      : [];
+
+    const out = [];
+    const seen = new Set();
+    const push = (e, why) => {
+      const key = String(e._id || e.managerId);
+      if (!key || key === excludeId || seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        id: key,
+        fullName:
+          e.fullName ||
+          [e.firstName, e.lastName].filter(Boolean).join(" ").trim() ||
+          e.managerName ||
+          "",
+        biometricId: e.biometricId || "",
+        designation: e.designation || "",
+        department: e.department || department.name,
+        why,
+      });
+    };
+
+    /* The department's own choices lead — they are the most explicit statement
+       of who is in charge here. */
+    for (const slot of ["primaryManager", "secondaryManager"]) {
+      const m = department[slot];
+      if (!m?.managerId) continue;
+      const full = await Employee.findById(m.managerId)
+        .select("firstName lastName biometricId designation department")
+        .lean();
+      push(
+        full || { _id: m.managerId, fullName: m.managerName, designation: m.designation },
+        slot === "primaryManager" ? "department primary" : "department secondary",
+      );
+    }
+    for (const h of holders) {
+      push(h, `manages ${wantedDesignation || "this department"}`);
+    }
+
+    res.json({
+      success: true,
+      department: { _id: department._id, name: department.name },
+      designation: wantedDesignation || null,
+      /* Told rather than implied, so the form can say WHY the list is empty
+         instead of showing a blank box that reads as a loading failure. */
+      configured: pairs.length > 0 || Boolean(department.primaryManager?.managerId),
+      data: out,
+    });
+  } catch (error) {
+    console.error("Manager candidates error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ✅ ASSIGN department managers (+ optional propagation to existing employees)
 //
 // Body: {
@@ -341,24 +475,39 @@ router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
     };
 
     const primary = await resolveManager(primaryManagerId);
-    const secondary = await resolveManager(secondaryManagerId);
-    if (primary === undefined || secondary === undefined) {
+    const secondaryRaw = await resolveManager(secondaryManagerId);
+    if (primary === undefined || secondaryRaw === undefined) {
       return res
         .status(400)
         .json({ success: false, message: "Selected manager not found" });
     }
 
+    /* NOBODY IS LEFT WITHOUT A LEAD. A department left with only a secondary —
+       the primary resigned, say — promotes that person rather than leaving
+       every employee with an empty primary slot and an approval chain that
+       stops. The vacated secondary is not back-filled from thin air; one real
+       manager in the right slot beats two slots pointing at one person. */
+    const promoted = !primary && Boolean(secondaryRaw);
+    const effectivePrimary = primary || secondaryRaw;
+    const effectiveSecondary = promoted ? null : secondaryRaw;
+
     const beforeSnap = {
       primaryManager: department.primaryManager?.managerName || "",
       secondaryManager: department.secondaryManager?.managerName || "",
     };
+    /* Read BEFORE the department is overwritten: clearing a slot has to know
+       who used to be in it to clear exactly the employees who followed them. */
+    const beforeIds = {
+      primary: department.primaryManager?.managerId || null,
+      secondary: department.secondaryManager?.managerId || null,
+    };
 
-    department.primaryManager = primary || {
+    department.primaryManager = effectivePrimary || {
       managerId: null,
       managerName: "",
       designation: "",
     };
-    department.secondaryManager = secondary || {
+    department.secondaryManager = effectiveSecondary || {
       managerId: null,
       managerName: "",
       designation: "",
@@ -366,56 +515,83 @@ router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
     department.updatedBy = user.id;
     await department.save();
 
-    // Propagate to everyone already in the department. Matches by departmentId
-    // OR by the department name string, because older employee rows only carry
-    // the string. The managers themselves are excluded so nobody becomes their
-    // own manager. Slots without a chosen person are left untouched on the
-    // employees (clearing the department slot never mass-wipes employees).
-    let updatedEmployees = 0;
-    if (applyToExisting && (primary || secondary)) {
-      const set = { updatedAt: new Date(), updatedBy: user.id };
-      if (primary)
-        set.primaryManager = {
-          managerId: primary.managerId,
-          managerName: primary.managerName,
-        };
-      if (secondary)
-        set.secondaryManager = {
-          managerId: secondary.managerId,
-          managerName: secondary.managerName,
-        };
-      const excludeIds = [primary?.managerId, secondary?.managerId].filter(
-        Boolean,
-      );
-      const match = {
-        $and: [
-          {
-            $or: [
-              { departmentId: department._id },
-              {
-                department: {
-                  $regex: new RegExp(
-                    `^${department.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-                    "i",
-                  ),
-                },
+    /* PROPAGATE TO EVERYONE ALREADY IN THE DEPARTMENT.
+       This is the half that makes "the manager was replaced" a one-place edit:
+       each employee row carries its own primaryManager/secondaryManager, so
+       without this a replacement would only change the department header and
+       leave every employee still reporting to somebody who has left.
+
+       Matched by departmentId OR by the department name string, because older
+       employee rows only carry the string. The new manager is excluded from
+       their own slot so nobody becomes their own manager. */
+    const inDepartment = () => ({
+      $and: [
+        {
+          $or: [
+            { departmentId: department._id },
+            {
+              department: {
+                $regex: new RegExp(`^${escapeRegex(department.name)}$`, "i"),
               },
-            ],
-          },
-          {
-            $or: [
-              { status: "active" },
-              { status: { $exists: false } },
-              { isActive: true },
-            ],
-          },
-        ],
-      };
-      if (excludeIds.length) match.$and.push({ _id: { $nin: excludeIds } });
-      // Plain $set is safe here: no salary field is touched, so bypassing the
-      // pre-save hook (which recalculates + re-encrypts salary) is fine.
-      const result = await Employee.updateMany(match, { $set: set });
-      updatedEmployees = result.modifiedCount || 0;
+            },
+          ],
+        },
+        {
+          $or: [
+            { status: "active" },
+            { status: { $exists: false } },
+            { isActive: true },
+          ],
+        },
+      ],
+    });
+
+    let updatedEmployees = 0;
+    if (applyToExisting) {
+      const touched = new Set();
+
+      /* A slot that now HAS somebody is pushed to the whole department — that
+         is the replacement case, and it is what makes one edit reach everyone.
+         A slot that has been EMPTIED is cleared only on the employees actually
+         pointing at the person who left: withdrawing the department's choice
+         must not wipe a manager somebody set by hand on one employee. */
+      const slots = [
+        ["primaryManager", effectivePrimary, beforeIds.primary],
+        ["secondaryManager", effectiveSecondary, beforeIds.secondary],
+      ];
+
+      for (const [field, next, previousId] of slots) {
+        const match = inDepartment();
+        let set;
+
+        if (next) {
+          set = {
+            [field]: { managerId: next.managerId, managerName: next.managerName },
+          };
+          match.$and.push({ _id: { $ne: next.managerId } });
+        } else if (previousId) {
+          set = { [field]: { managerId: null, managerName: "" } };
+          match.$and.push({ [`${field}.managerId`]: previousId });
+        } else {
+          continue; // empty before, empty after — nothing to say
+        }
+
+        /* Who is affected is read before the write, because after it the match
+           for a cleared slot no longer selects anybody. */
+        const affected = await Employee.find(match).select("_id").lean();
+        for (const doc of affected) touched.add(String(doc._id));
+
+        set.updatedAt = new Date();
+        set.updatedBy = user.id;
+        /* Plain $set is safe here: no salary field is touched, so bypassing the
+           pre-save hook (which recalculates + re-encrypts salary) is fine. */
+        await Employee.updateMany(match, { $set: set });
+      }
+
+      /* Counted as PEOPLE, not as writes — a run that changes both slots on the
+         same twelve employees affected twelve people, and reporting
+         twenty-four would overstate what happened. */
+      updatedEmployees = touched.size;
     }
 
     recordChange(req, {
@@ -428,8 +604,8 @@ router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
       summary: `Department managers set${applyToExisting ? ` (applied to ${updatedEmployees} employees)` : ""}`,
       before: beforeSnap,
       after: {
-        primaryManager: primary?.managerName || "",
-        secondaryManager: secondary?.managerName || "",
+        primaryManager: effectivePrimary?.managerName || "",
+        secondaryManager: effectiveSecondary?.managerName || "",
       },
     });
 

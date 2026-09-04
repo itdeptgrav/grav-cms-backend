@@ -80,7 +80,11 @@ function escapeHtml(s) {
 }
 
 // So every notification email can say WHICH customer this style belongs to.
+// A house sample has none — "—" alone read as customer information having
+// gone missing, not as "there genuinely isn't one" (1 Sept 2026 bug fix,
+// same reasoning as sampleStyleEmail.service.js's styleEmailContext).
 async function customerNameFor(style) {
+  if (style?.sampleType === "house") return "In-house sample — no customer";
   if (!style?.accountId) return "—";
   const acc = await Account.findById(style.accountId).select("displayName companyName").lean();
   return acc?.displayName || acc?.companyName || "—";
@@ -95,6 +99,20 @@ async function referenceImageFor(style) {
   const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
   return enq?.products?.find((p) => p.product === style.productName)?.images?.[0] || null;
 }
+
+// Where Sales reads a style's Style & Sample stage from — the CTA link every
+// notification email below points at. A house sample has no journeyId, so
+// the journey route 404s for it; the correct landing place is the Sampling
+// board, which renders the exact same stage in place (1 Sept 2026 bug fix —
+// three notification emails, materials_change_requested/tech_sheet_submitted/
+// sample_submitted, all built this URL assuming a journey unconditionally,
+// so every one of them sent Sales a dead `/journeys/undefined/style-sample`
+// link for a house sample).
+const styleSampleUrl = (style) => (
+  style?.sampleType === "house"
+    ? `${DEPT_NOTIFY_APP_URL}/sales/dashboard/sampling`
+    : `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Style hand-off emails — Merchandiser, Project Manager, R&D
@@ -254,9 +272,52 @@ const decorate = (styleDoc, journey, account, enquiry) => {
   };
 };
 
+// The lowest variant sales price on a stock item — an honest "starting from"
+// figure, not `salesPrice`/`averageSalesPrice` taken as-is (an average or a
+// single base figure reads as a firm quote; the cheapest variant is what
+// "starting from" actually promises and nothing more). Pure — the caller
+// supplies the already-fetched, already-projected StockItem doc.
+function cheapestVariantPrice(item) {
+  if (!item) return null;
+  const variantPrices = (item.variants || [])
+    .map((v) => Number(v.salesPrice))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (variantPrices.length) return Math.min(...variantPrices);
+  // No variant carries one yet (still being priced) — the product-level
+  // figures are the next best honest answer, in order of how firm they are.
+  return Number(item.baseSalesPrice) || Number(item.averageSalesPrice) || null;
+}
+
+// Which stock item a style's price is read off — the style's own registered
+// product first, the already-developed source product second. The same
+// fallback used at sample-approval sync time elsewhere in this file.
+const priceTargetOf = (styleDoc) => styleDoc.production?.stockItemId || styleDoc.sourceStockItemId;
+
+/**
+ * `startingSalesPrice` for a batch of styles, in ONE query rather than one
+ * per style — this runs on every list/board render, not just a single style
+ * page, so an N+1 here would be an N+1 on every page load. Returns a
+ * `Map<styleDoc, price|null>` keyed by object identity (styleDocs are always
+ * freshly fetched Mongoose/lean docs here, never reused across calls, so
+ * identity is a safe key and skips re-deriving each style's target id twice).
+ */
+async function startingSalesPricesFor(styleDocs) {
+  const targets = styleDocs.map((s) => priceTargetOf(s)).filter(Boolean).map(String);
+  const items = targets.length
+    ? await StockItem.find({ _id: { $in: [...new Set(targets)] } })
+        .select("variants.salesPrice baseSalesPrice averageSalesPrice")
+        .lean()
+    : [];
+  const byId = new Map(items.map((it) => [String(it._id), it]));
+  return new Map(styleDocs.map((s) => {
+    const target = priceTargetOf(s);
+    return [s, target ? cheapestVariantPrice(byId.get(String(target))) : null];
+  }));
+}
+
 // Re-decorate a saved style with its journey + customer + enquiry for the response.
 async function withJourney(styleDoc) {
-  const [j, acc, enquiry] = await Promise.all([
+  const [j, acc, enquiry, prices] = await Promise.all([
     SalesJourney.findById(styleDoc.journeyId).select("journeyId name").lean(),
     styleDoc.accountId ? Account.findById(styleDoc.accountId).select("accountId companyName displayName").lean() : null,
     styleDoc.enquiryId
@@ -264,9 +325,198 @@ async function withJourney(styleDoc) {
         .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate")
         .lean()
       : null,
+    startingSalesPricesFor([styleDoc]),
   ]);
-  return decorate(styleDoc, j, acc, enquiry);
+  return { ...decorate(styleDoc, j, acc, enquiry), startingSalesPrice: prices.get(styleDoc) ?? null };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/cms/crm/sample-styles/house — raise an IN-HOUSE sample.
+//
+// The customer-less door into the exact same pipeline. Explicit request,
+// 31 Aug 2026: "without any customer reference we are gonna make the sample...
+// most of the time it happen ki some samples are needed to make even though
+// none of any customer make the order... so that we can treat them as an
+// register product once after the sample get approve by the sales person".
+//
+// ── WHY THIS IS A SECOND CREATE ROUTE, NOT A FLAG ON THE FIRST ─────────────
+// `/by-journey/:ref/provision` is a SYNC, not a create: it reads an enquiry's
+// product rows and reconciles one style per row, idempotently. There are no
+// rows to read here — a salesperson is naming a garment they want sampled — so
+// there is nothing for that route's matching logic to match against. Sharing
+// it would mean threading "…unless there is no journey, in which case ignore
+// almost all of this" through every branch.
+//
+// ── WHAT IT DELIBERATELY DOES NOT DO ──────────────────────────────────────
+// It does not skip a single step of the pipeline. The style starts at
+// `stage: "brief"` with `materials.status: "pending"`, exactly like a
+// journey-raised one, and has to travel Merchandiser -> BOM approval -> R&D ->
+// tech sheet -> sample -> Sales approval to finish. The request was explicit
+// that the flow stays identical; the only thing missing is the customer.
+router.post("/house", salesAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const productName = String(b.productName || "").trim();
+    if (!productName) {
+      return res.status(400).json({ success: false, message: "Give the sample a product name." });
+    }
+
+    // Same brief shape the enquiry path builds, from a form instead of a row —
+    // so R&D reads an in-house sample exactly as it reads a customer's.
+    const brief = briefFromProduct({
+      note: b.note,
+      quantity: b.quantity,
+      gender: b.gender,
+      colour: b.colour,
+      fabricPreference: b.fabricPreference,
+      fabricComposition: b.fabricComposition,
+      gsm: b.gsm,
+      fit: b.fit,
+      sizeRange: b.sizeRange,
+      logo: b.logo,
+      embroidery: b.embroidery,
+      printing: b.printing,
+      brandingPlacement: b.brandingPlacement,
+      trims: b.trims,
+      specialConstruction: b.specialConstruction,
+      existingUniform: b.existingUniform,
+      customSpecs: b.customSpecs,
+      images: b.images,
+      stockItemReference: b.stockItemReference,
+    });
+
+    const who = actor(req);
+    const style = await createWithRef(SampleStyle, {
+      sampleType: "house",
+      // No journeyId, no enquiryId, no accountId — that is the whole point.
+      // The partial unique index (see the model) is what makes this safe.
+      productName,
+      // Human code that says at a glance this was not raised off a journey.
+      // Uniqueness is carried by `sampleStyleId`; this is a label.
+      styleCode: `SC-HOUSE-${String(Date.now()).slice(-6)}`,
+      ownerId: who.id,
+      ownerName: who.name,
+      brief,
+      // An in-house sample may still be PROVING an existing register item
+      // (a re-development, a fabric swap). Optional, same meaning as always.
+      sourceStockItemId: b.sourceStockItemId || undefined,
+      sourceStockItemReference: b.sourceStockItemReference || undefined,
+      // `by: who`, matching actorRef() — not `byName`, which the schema does
+      // not declare and Mongoose silently drops (1 Sept 2026 bug fix: the
+      // very first event on a house sample's own timeline was recording no
+      // actor at all).
+      history: [{
+        kind: "house_sample_raised",
+        at: new Date(),
+        by: who,
+        note: `In-house sample raised for "${productName}" — no customer.`,
+      }],
+      createdBy: who.id,
+    });
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /house", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/cms/crm/sample-styles/:id/pictures — add reference pictures to
+// an IN-HOUSE sample's own brief.
+//
+// A journey-raised style's pictures live on the ENQUIRY's product row — this
+// stage only displays them, and its "Add picture" button routes back to
+// Enquiry to add more (see the `pictures()` helper client-side). A house
+// sample has no enquiry to route back to, so it needs a door of its own —
+// this is that door (1 Sept 2026 bug fix: the button was sending house
+// samples to `/sales/dashboard/sampling/null/enquiry`, `null` being the
+// journeyId a house sample does not have).
+//
+// Scoped to house samples for the same reason POST /house is a separate
+// create route rather than a flag: a journey style's pictures are owned by
+// its enquiry, and letting them be edited from two places would let the two
+// disagree about what the customer actually sent.
+router.patch("/:id/pictures", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Sample not found." });
+    if (style.sampleType !== "house") {
+      return res.status(400).json({ success: false, message: "This style's reference pictures come from its Enquiry." });
+    }
+    const incoming = sanitizeImages(req.body?.images);
+    if (!incoming.length) return res.status(400).json({ success: false, message: "No images given." });
+
+    const existing = Array.isArray(style.brief?.images) ? style.brief.images : [];
+    style.brief.images = [...existing, ...incoming].slice(0, 12);
+    logHistory(style, { kind: "reference_picture_added", note: `${incoming.length} reference picture${incoming.length === 1 ? "" : "s"} added.` }, req);
+    await style.save();
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] PATCH /:id/pictures", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/cms/crm/sample-styles/:id/remove — remove an in-house sample.
+//
+// A reason is required — this is a destructive, audit-relevant act, and "who
+// removed what and why" is exactly the trail the rest of this file already
+// keeps for every hop and bounce (see logHistory).
+//
+// Soft delete (isActive: false), matching every other query in this file
+// (resolveStyle, the by-journey and list routes) — the record and its full
+// history stay, just filtered out of the boards. Hard-deleting it would throw
+// away the very audit trail this action is required to explain.
+//
+// Cascades to the StockItem this sample registered. Since 1 Sept 2026 every
+// house sample registers its product atomically as part of being raised (see
+// RaiseHouseSample.js) — the two always travel together, so removing the
+// sample without removing the product it exists to develop would leave an
+// orphaned, unsampled item sitting in the register. StockItem has no soft-
+// delete flag of its own (see routes/CMS_Routes/Inventory/Products/
+// stockItems.js DELETE /:id), so this mirrors that route's hard delete.
+//
+// Scoped to house samples: a customer journey's style is never removed this
+// way — the enquiry that raised it is the one place its product row (and the
+// style it provisions) is managed.
+router.post("/:id/remove", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Sample not found." });
+    if (style.sampleType !== "house") {
+      return res.status(400).json({ success: false, message: "Only in-house samples can be removed here." });
+    }
+    if (!bypassesApproval(req.user)) {
+      return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can remove this sample." });
+    }
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ success: false, message: "Give a reason for removing this sample." });
+
+    if (style.sourceStockItemId) {
+      try {
+        const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+        await StockItem.deleteOne({ _id: style.sourceStockItemId });
+      } catch (cleanupErr) {
+        // Best-effort, same posture as stockItems.js's own delete route: the
+        // sample removal is the request that was made, and failing it here
+        // would report a product cleanup issue as if the sample survived.
+        console.error("[sampleStyles] POST /:id/remove stock item cleanup failed:", cleanupErr.message);
+      }
+    }
+
+    logHistory(style, { kind: "house_sample_removed", note: reason }, req);
+    style.isActive = false;
+    await style.save();
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/remove", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/cms/crm/sample-styles/by-journey/:journeyRef
@@ -308,10 +558,11 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
       })(),
     });
 
+    const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
       created, renamed, backfilled, waived,
-      sampleStyles: styles.map((s) => decorate(s, journey, account)),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] POST /by-journey/:journeyRef/provision", err);
@@ -333,7 +584,11 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       journey.accountId ? Account.findById(journey.accountId).select("accountId companyName displayName").lean() : null,
     ]);
 
-    return res.json({ success: true, sampleStyles: styles.map((s) => decorate(s, journey, account)) });
+    const prices = await startingSalesPricesFor(styles);
+    return res.json({
+      success: true,
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+    });
   } catch (err) {
     console.error("[sampleStyles] GET /by-journey", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -353,6 +608,15 @@ router.get("/", salesAuth, async (req, res) => {
     if (req.query.stage) {
       const list = String(req.query.stage).split(",").map((s) => s.trim()).filter(Boolean);
       q.stage = list.length > 1 ? { $in: list } : list[0];
+    }
+    // `sampleType=house` is what the Sales -> Sampling board asks for. Legacy
+    // rows predate the field and have no value at all, so "journey" has to
+    // match those too — filtering on the bare string would hide every style
+    // raised before 31 Aug 2026.
+    if (req.query.sampleType === "house") {
+      q.sampleType = "house";
+    } else if (req.query.sampleType === "journey") {
+      q.sampleType = { $ne: "house" };
     }
 
     const docs = await SampleStyle.find(q)
@@ -548,7 +812,7 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
           image,
           bodyText: `${actor(req).name || "Merchandising"} proposed a materials change for "${style.productName || "a style"}" (${customerName}): ${items.join(", ")}.`,
           ctaLabel: "Review change",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
 
@@ -1028,7 +1292,7 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
           image,
           bodyText: `${actor(req).name || "R&D"} submitted the tech sheet for "${style.productName || "a style"}" (${customerName}) for review.`,
           ctaLabel: "Review tech sheet",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
     } else if (action === "approve" || action === "changes") {
@@ -1139,11 +1403,19 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
         return res.status(400).json({ success: false, message: "Attach at least one photo of the sample before submitting." });
       }
 
-      // Operations R&D actually ran making this sample — optional, unlike the
-      // raw items/photo above (24 Aug 2026, explicit request: "don't make it
-      // mandatory"). Blank rows (no type) are dropped rather than rejected.
+      // Operations R&D actually ran making this sample. NOW MANDATORY
+      // (2 Sept 2026, explicit request: "this operation addition is
+      // mandatory ok as it is the proof of the production ki which operation
+      // are exactly made against this product") — this reverses the 24 Aug
+      // 2026 decision to keep it optional. It is also no longer only a
+      // record: on approval these overwrite the product's own operations and
+      // its operation-wise cost, so submitting none would wipe the product's
+      // costing rather than merely leave a gap.
+      //
+      // Blank rows (no type) are still dropped rather than rejected — a half
+      // typed row is a typo, not a refusal to answer.
       const operationsInput = Array.isArray(req.body.operations) ? req.body.operations : [];
-      const operations = operationsInput
+      const cleanedOperations = operationsInput
         .filter((o) => o && String(o.type || "").trim())
         .map((o) => {
           const minutes = Number(o.minutes) || 0;
@@ -1153,10 +1425,23 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
             operationCode: String(o.operationCode || "").trim(),
             machine: String(o.machine || "").trim(),
             machineType: String(o.machineType || "").trim(),
+            salaryDept: String(o.salaryDept || "").trim(),
+            salaryDesig: String(o.salaryDesig || "").trim(),
             minutes, seconds,
             totalSeconds: o.totalSeconds != null ? Number(o.totalSeconds) || 0 : minutes * 60 + seconds,
           };
         });
+      if (!cleanedOperations.length) {
+        return res.status(400).json({
+          success: false,
+          message: "Record at least one operation you ran making this sample before submitting.",
+        });
+      }
+      // Costed here, at submit, rather than at approval — so the Sales
+      // reviewer sees what each operation costs on the screen where they
+      // decide, instead of a figure that only materialises afterwards.
+      const { costOperations } = require("../../../services/operationCosting");
+      const operations = await costOperations(cleanedOperations);
 
       style.sample.consumptionRawItems = consumptionRawItems;
       style.sample.operations = operations;
@@ -1215,10 +1500,31 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
               }
             }
             if (style.sample.operations?.length) {
-              stockItem.operations = style.sample.operations.map((o) => ({
-                type: o.type, operationCode: o.operationCode, machine: o.machine, machineType: o.machineType,
-                minutes: o.minutes, seconds: o.seconds, totalSeconds: o.totalSeconds,
-              }));
+              // Carried across WITH their costing (2 Sept 2026): the salary
+              // basis and per-piece operator cost were resolved when R&D
+              // submitted (services/operationCosting.js), so the product
+              // inherits a priced operation list rather than a bare one that
+              // would silently zero out its operations cost. Re-costed here
+              // rather than trusted blindly, so a sample submitted before a
+              // salary revision is priced at today's rates on approval.
+              const { costOperations } = require("../../../services/operationCosting");
+              const priced = await costOperations(
+                style.sample.operations.map((o) => ({
+                  type: o.type, operationCode: o.operationCode, machine: o.machine,
+                  machineType: o.machineType, minutes: o.minutes, seconds: o.seconds,
+                  totalSeconds: o.totalSeconds, salaryDept: o.salaryDept, salaryDesig: o.salaryDesig,
+                })),
+                // Inherit the salary basis this product already had for the
+                // same operation, where nothing more specific supplies one.
+                // Without this the overwrite would blank a basis that is
+                // filled in on products but (today) on no registered
+                // operation — see the service's own note.
+                { fallbackFrom: stockItem.operations || [] },
+              );
+              stockItem.operations = priced;
+              // The sample keeps the figures it was actually approved on, so
+              // the record and the product agree about what was decided.
+              style.sample.operations = priced;
             }
             recomputeVariantCostsFromBom(stockItem);
             updateStockItemAggregates(stockItem);
@@ -1278,7 +1584,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
           image: style.sample.photos?.[0],
           bodyText: `${actor(req).name || "R&D"} submitted a sample of "${style.productName || "a style"}" (${customerName}) for approval.`,
           ctaLabel: "Review sample",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+          ctaUrl: styleSampleUrl(style),
         });
       })().catch(() => {});
     } else if (action === "approve" || action === "reject") {
@@ -1301,24 +1607,18 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    // Auto-send the WhatsApp approval request the moment Sales approves the
-    // sample internally (26 Aug 2026, explicit request: "this approval
-    // request need to auto sent to that customer ok in whatsapp... so that
-    // will auto trigger here in our website"). Fire-and-forget, same as the
-    // notification block above — a WhatsApp outage or missing template
-    // config must never fail the approval action itself; the result is only
-    // ever visible via style.customerApproval.whatsapp on the next read.
-    if (action === "approve") {
-      (async () => {
-        const [customerName, j] = await Promise.all([
-          customerNameFor(style),
-          SalesJourney.findById(style.journeyId).select("journeyId").lean(),
-        ]);
-        const { sendApprovalRequest } = require("../../../services/sampleWhatsapp");
-        const result = await sendApprovalRequest(style, { customerName, enquiryRef: j?.journeyId, preparedBy: actor(req).name });
-        if (!result.sent) console.warn(`[sampleStyles] WhatsApp approval request not sent for ${style.sampleStyleId || style._id}: ${result.reason}`);
-      })().catch((err) => console.error("[sampleStyles] WhatsApp auto-send failed:", err.message));
-    }
+    // NO AUTO-SEND TO THE CUSTOMER (2 Sept 2026, explicit request: "once the
+    // sales approved the sample product then currently it is auto sent for
+    // customer approval but this is bad... it is needed to keep the button
+    // like for now it's ur turn in order to sent this sample product to the
+    // customer"). This reverses the 26 Aug 2026 auto-trigger.
+    //
+    // Approving internally and putting the sample in front of the customer
+    // are two decisions, and firing the second off the first took the
+    // salesperson's own judgement out of it — there was no moment to attach
+    // context, check the photos, or hold the send while a conversation was
+    // still open. The manual send lives at POST /:id/sample/send-whatsapp-
+    // approval, which this route deliberately no longer calls.
 
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
@@ -1499,6 +1799,20 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         }
       } else if (account) {
         accountPrefill = { name: account.companyName || account.displayName || "", email: account.primaryEmail || "", phone: account.primaryPhone || "" };
+      } else {
+        // `style.accountId` points at nothing — the Account was deleted
+        // after the journey was created (the same dangling-reference case
+        // sampleStyleEmail.service.js's styleEmailContext already works
+        // around for the email/BOM-approval side). There is genuinely no
+        // account left to read a name, email or phone off of; the journey's
+        // own `name` is the one surviving piece of who this is (1 Sept 2026
+        // bug fix: this fell all the way through to a bare, unprefilled
+        // "search or create" form with nothing to search for — R&D had no
+        // way to tell the style even HAD a customer on record, let alone
+        // find or recreate it, without leaving this page to go read the
+        // Enquiry).
+        const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
+        if (journey?.name) accountPrefill = { name: journey.name, email: "", phone: "" };
       }
     }
 
@@ -1649,7 +1963,7 @@ router.get("/:id/production/stock-items/search", salesAuth, async (req, res) => 
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ success: true, stockItems: [] });
     const re = new RegExp(escapeRegex(q), "i");
-    const rows = await StockItem.find({ $or: [{ name: re }, { reference: re }] })
+    const rows = await StockItem.find({ isActive: { $ne: false }, $or: [{ name: re }, { reference: re }] })
       .select("name reference category variants").limit(10).lean();
     return res.json({ success: true, stockItems: rows.map((s) => ({ id: s._id, name: s.name, reference: s.reference, category: s.category, variantCount: s.variants?.length || 0 })) });
   } catch (err) {
@@ -1882,11 +2196,48 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    // ── AN IN-HOUSE SAMPLE HAS NO CUSTOMER TO LINK ────────────────────────
+    // Every other style reaches here with `production.customerId` already set
+    // by R&D's own Step 1. A house sample has nobody to put there, so it
+    // borrows the standing "Grav Sampling Order" account instead — created on
+    // first use, renameable from Sales Settings. See
+    // services/houseSamplingCustomer.service.js for why one shared account
+    // rather than a throwaway customer per sample.
+    //
+    // Done HERE rather than at creation because the account is only needed at
+    // the moment an order is actually raised — a sample that never reaches
+    // production should not conjure a customer record as a side effect.
+    if (style.sampleType === "house" && !style.production?.customerId) {
+      const { resolveHouseSamplingCustomer } = require("../../../services/houseSamplingCustomer.service");
+      const house = await resolveHouseSamplingCustomer();
+      style.production = style.production || {};
+      style.production.customerId = house._id;
+      if (style.production.status === "not_started") style.production.status = "customer_linked";
+      style.production.log = style.production.log || [];
+      style.production.log.push({
+        kind: "customer_linked",
+        at: new Date(),
+        byName: actor(req).name,
+        note: `In-house sample — billed to the house account "${house.name}".`,
+      });
+    }
+
     if (!style.production?.customerId) return res.status(400).json({ success: false, message: "Link a customer first." });
-    if (!style.production?.stockItemId) return res.status(400).json({ success: false, message: "Register the product first." });
+    // `sourceStockItemId` is the FALLBACK, not an alternative — see GET
+    // /:id/production's own comment. `production.stockItemId` is only set by
+    // walking this wizard's own Product step; a style whose product was
+    // already registered when it was raised (every house sample, since
+    // 1 Sept 2026 — see RaiseHouseSample.js) never sets it, and reported
+    // "Register the product first" at the very last step even though the
+    // product plainly existed the whole time and Sales had already set
+    // quantities against its variants (1 Sept 2026 bug fix — this was the
+    // one place left still checking only `production.stockItemId`).
+    const targetStockItemId = style.production?.stockItemId || style.sourceStockItemId;
+    if (!targetStockItemId) return res.status(400).json({ success: false, message: "Register the product first." });
     if (style.production.status === "submitted") return res.status(400).json({ success: false, message: "Already sent to production." });
 
-    const stockItem = await StockItem.findById(style.production.stockItemId).select("name reference variants").lean();
+    const stockItem = await StockItem.findById(targetStockItemId).select("name reference variants").lean();
     if (!stockItem) return res.status(404).json({ success: false, message: "The registered product could not be found." });
     const customer = await Customer.findById(style.production.customerId).select("name email phone profile").lean();
     if (!customer) return res.status(404).json({ success: false, message: "The linked customer could not be found." });
@@ -1927,7 +2278,9 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
         name: customer.name, email: customer.email, phone: customer.phone,
         address: customer.profile?.address?.street || "", city: customer.profile?.address?.city || "",
         postalCode: customer.profile?.address?.pincode || "",
-        description: `Sampling production run for "${style.productName}" (${style.sampleStyleId}).`,
+        description: style.sampleType === "house"
+          ? `In-house sampling run for "${style.productName}" (${style.sampleStyleId}) — no customer order behind it.`
+          : `Sampling production run for "${style.productName}" (${style.sampleStyleId}).`,
         deliveryDeadline,
         preferredContactMethod: "phone",
       },
@@ -1936,6 +2289,15 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
       priority,
       createdBySales: true,
       createdBySalesId: req.user?.id,
+      // WHAT KIND OF ORDER THIS IS, stated once and read everywhere — the MO
+      // badge, the Project Manager's email and the order PDF all take it from
+      // here rather than each re-deriving it from `isInternalOrder` (which is
+      // also set by a salesperson marking a real customer's order as
+      // company-funded, and so cannot tell the two apart). Every style that
+      // reaches this route is a sampling run; `house` vs journey-linked only
+      // changes whose name is on it, not what it is.
+      orderOrigin: "sampling",
+      sampleStyleId: style._id,
       // Internal / company order — R&D's own sample run, not a real customer
       // order, so it bypasses PI/payment exactly like Sales' own "mark as
       // internal order" (quotationRoutes.js).

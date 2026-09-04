@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --max-old-space-size=384 server.js",
     "dev": "nodemon server.js",
     "test": "node --test \"services/**/*.test.js\"",
     "face:service": "bash services/face-biometric/run.sh service",

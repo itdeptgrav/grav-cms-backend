@@ -35,12 +35,27 @@ const salaryConfigSchema = new mongoose.Schema(
         edliCapAmount: {
             type: Number, default: 15000,
             min: [0],
-            comment: "Monthly cap on EDLI basic wage for calculation. Statutory: ₹15,000.",
+            comment: "EDLI wage ceiling. The percentage is charged on min(basic, this). Statutory: 15,000, giving 75/mo at 0.5%.",
+        },
+        edliMaxAmount: {
+            type: Number, default: 75,
+            min: [0],
+            comment: "Hard monthly rupee maximum for EDLI, applied after the wage ceiling. Default: 75.",
         },
         adminChargesPct: {
             type: Number, default: 0.5,
             min: [0], max: [10],
             comment: "EPF admin charges % of Basic. Statutory: 0.5%. HR can override per employee.",
+        },
+        adminWageCeiling: {
+            type: Number, default: 15000,
+            min: [0],
+            comment: "Admin-charges wage ceiling. Charged on min(basic, this). Default: 15,000, giving 75/mo at 0.5%.",
+        },
+        adminMaxAmount: {
+            type: Number, default: 75,
+            min: [0],
+            comment: "Hard monthly rupee maximum for admin charges. Default: 75.",
         },
 
         foodAllowance: {

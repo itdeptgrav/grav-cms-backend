@@ -137,9 +137,33 @@ const sampleStyleSchema = new mongoose.Schema(
     // The stable per-journey style code both apps compute (SC-<journeyRef>-NN).
     styleCode: { type: String, trim: true },
 
+    // WHERE THIS STYLE CAME FROM.
+    //
+    // `journey` — the original and still the common case: a customer enquired,
+    //   a journey was raised, and this style is one product row on it.
+    // `house`   — an IN-HOUSE SAMPLE with no customer behind it at all
+    //   (31 Aug 2026, explicit request: "without any customer reference we are
+    //   gonna make the sample... most of the time it happen ki some samples are
+    //   needed to make even though none of any customer make the order").
+    //   Raised from Sales -> Sampling, it runs the SAME merchandiser -> PM ->
+    //   R&D -> production -> sales-approval pipeline; the only thing it lacks
+    //   is a journey and a real customer.
+    //
+    // Stored explicitly rather than inferred from `journeyId == null`, because
+    // "has no journey" and "is deliberately an in-house sample" are different
+    // claims, and every screen that badges these needs the second one.
+    sampleType: { type: String, enum: ["journey", "house"], default: "journey", index: true },
+
     // Linkage — the journey is the spine; the enquiry is where the product row
     // (this style's origin) lives.
-    journeyId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesJourney", required: true, index: true },
+    //
+    // OPTIONAL SINCE 31 Aug 2026. A house sample has no journey, and inventing
+    // a fake one to satisfy a required field would put a phantom journey in
+    // every Pipeline list and report. Everything downstream already tolerates a
+    // null here — `withJourney()` resolves it to null, the R&D board never
+    // filters on it, and `createWorkOrdersAndProgress` never reads it. The
+    // uniqueness rule that DID depend on it is now a partial index (see below).
+    journeyId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesJourney", index: true },
     enquiryId: { type: mongoose.Schema.Types.ObjectId, ref: "Enquiry", index: true },
     accountId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMAccount", index: true },
 
@@ -397,6 +421,17 @@ const sampleStyleSchema = new mongoose.Schema(
       // straight onto the product on approval. Deliberately NOT required —
       // R&D may not always time every step, and the raw-item evidence above
       // is what approval actually gates on.
+      // The operations R&D actually ran making this sample — the proof of
+      // what was done, and (since 2 Sept 2026) the source the product's own
+      // operations and operation-wise cost are overwritten from when Sales
+      // approves.
+      //
+      // The four costing fields are resolved SERVER-SIDE at submit, not typed
+      // by R&D: the salary basis comes from the registered operation's own
+      // department/designation and the rate from payroll — see
+      // services/operationCosting.js. They are stored here rather than only
+      // computed at approval so Sales can see what each operation costs on
+      // the review screen, before deciding.
       operations: [
         {
           type: { type: String, trim: true },
@@ -406,6 +441,10 @@ const sampleStyleSchema = new mongoose.Schema(
           minutes: { type: Number, min: 0, default: 0 },
           seconds: { type: Number, min: 0, default: 0 },
           totalSeconds: { type: Number, min: 0, default: 0 },
+          salaryDept: { type: String, trim: true, default: "" },
+          salaryDesig: { type: String, trim: true, default: "" },
+          operatorSalary: { type: Number, min: 0, default: 0 },
+          operatorCost: { type: Number, min: 0, default: 0 },
         },
       ],
       photos: [imageSchema],
@@ -571,7 +610,25 @@ const sampleStyleSchema = new mongoose.Schema(
 // NOTE for deploys: this replaces a unique { journeyId, productName }. Mongo
 // does not drop a renamed index on its own — run scripts/dropLegacyStyleIndex.js
 // once, or the old one keeps refusing the second variant.
-sampleStyleSchema.index({ journeyId: 1, productName: 1, variantKey: 1 }, { unique: true });
+//
+// PARTIAL SINCE 31 Aug 2026, for the house-sample flow. The rule this encodes
+// is "one style per product per JOURNEY" — which is meaningless without a
+// journey. Left unfiltered, every in-house sample carries `journeyId: null`,
+// Mongo indexes null as an ordinary value, and the SECOND house sample ever
+// raised for "Polo Shirt" would be refused as a duplicate of the first.
+//
+// The filter covers exactly the rows the rule was written for, so uniqueness
+// for journey-linked styles is unchanged. House samples are deliberately left
+// UNCONSTRAINED: sampling the same garment twice — a year apart, or two
+// colourways by two salespeople — is normal work, not a mistake to block.
+//
+// NOTE for deploys: Mongo will not re-spec an existing index in place. Run
+// scripts/migrateSampleStyleIndex.js once after deploying, or the old
+// non-partial index keeps rejecting the second house sample.
+sampleStyleSchema.index(
+  { journeyId: 1, productName: 1, variantKey: 1 },
+  { unique: true, partialFilterExpression: { journeyId: { $type: "objectId" } } },
+);
 
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old
 // rows validate against the current enum instead of throwing on save.

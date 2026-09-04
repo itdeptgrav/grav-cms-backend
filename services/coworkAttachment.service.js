@@ -351,11 +351,193 @@ async function storageHealth() {
   }
 }
 
+/**
+ * A resumable Drive session for a private attachment the BROWSER uploads
+ * directly — the bytes never enter this process.
+ *
+ * **Why this exists.** `uploadAttachment` above takes the whole file into the
+ * CMS's RAM (`multer.memoryStorage`) and a failed upload restarts from zero.
+ * This is the direct-to-Drive path the upload route's own comment points at,
+ * kept PRIVATE: the file is created with NO permission grant, exactly like the
+ * multipart path, and is only ever reachable through the authenticated download
+ * route.
+ *
+ * A marker in `appProperties` records who this session is for and what it is
+ * attached to. `finalizePrivateUpload` refuses any fileId whose marker does not
+ * match the caller and entity — the client hands the fileId back, and without
+ * the marker it could hand back somebody else's private file to be recorded
+ * under a task it can see.
+ */
+async function createPrivateResumableSession({
+  fileName,
+  mimeType,
+  fileSize,
+  uploadedBy,
+  entityType,
+  entityId,
+  origin,
+}) {
+  if (!uploadedBy) throw new Error("A session needs an uploader.");
+  if (!entityType || !entityId) throw new Error("A session must belong to something.");
+
+  const auth = getServiceAccountAuth();
+  const drive = google.drive({ version: "v3", auth });
+  const folderId = await getOrCreateFolder(drive);
+
+  const client = await auth.getClient();
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error("Could not get service account access token");
+
+  const res = await fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": mimeType || "application/octet-stream",
+        "X-Upload-Content-Length": String(fileSize),
+        ...(origin ? { Origin: origin } : {}),
+      },
+      body: JSON.stringify({
+        name: safeName(fileName),
+        mimeType: mimeType || "application/octet-stream",
+        parents: folderId ? [folderId] : [],
+        /* NOT a permission — the file stays private. This records intent so
+           finalize can verify the fileId came from this caller's session. */
+        appProperties: {
+          coworkUploader: String(uploadedBy),
+          coworkEntityType: String(entityType),
+          coworkEntityId: String(entityId),
+          coworkPending: "1",
+        },
+      }),
+    },
+  );
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new AttachmentError(
+      "UPLOAD_FAILED",
+      `The upload could not be started (${res.status}). ${txt}`.trim(),
+    );
+  }
+  const sessionUrl = res.headers.get("location");
+  if (!sessionUrl) throw new Error("Drive did not return a resumable session URL.");
+  return { sessionUrl };
+}
+
+/**
+ * Record a file the browser uploaded directly through a private session.
+ *
+ * The bytes are already in Drive. This verifies the session marker, sniffs the
+ * REAL mime from the first bytes — a small range read, not the whole file, so
+ * the security sniff the multipart path did survives without pulling the file
+ * back through the process — and writes the same attachment record. No
+ * permission grant: the file stays private, reachable only through the
+ * authenticated download route.
+ */
+async function finalizePrivateUpload({ fileId, uploadedBy, entityType, entityId }) {
+  if (!fileId) throw new Error("A file id is required.");
+  if (!uploadedBy) throw new Error("An attachment needs an uploader.");
+  if (!entityType || !entityId) throw new Error("An attachment must belong to something.");
+
+  const auth = getServiceAccountAuth();
+  const drive = google.drive({ version: "v3", auth });
+
+  let meta;
+  try {
+    meta = await drive.files.get({
+      fileId,
+      supportsAllDrives: true,
+      fields: "id,name,size,appProperties",
+    });
+  } catch {
+    throw new AttachmentError("NOT_FOUND", "That upload could not be found.");
+  }
+
+  /* Idempotent FIRST, so a retry after a lost response returns the record
+     rather than being refused — the marker is cleared once recorded, and a
+     legitimate retry must not read that as "not yours". A record that exists
+     for a DIFFERENT uploader is somebody else's file, and refused. */
+  const existing = await db
+    .collection(COLLECTION)
+    .where("storageFileId", "==", fileId)
+    .limit(1)
+    .get();
+  if (!existing.empty) {
+    const d = existing.docs[0];
+    const r = d.data();
+    if (
+      r.uploadedBy !== String(uploadedBy) ||
+      r.entityType !== String(entityType) ||
+      r.entityId !== String(entityId)
+    ) {
+      throw new AttachmentError("FORBIDDEN", "This upload cannot be finalized here.");
+    }
+    return { id: d.id, name: r.originalName, type: r.mimeType, size: r.size };
+  }
+
+  /* First finalize: the marker must say this caller uploaded it for this
+     entity and it is still pending. This is what stops one person recording
+     another's private file under a task they can see. */
+  const props = meta.data.appProperties || {};
+  if (
+    props.coworkUploader !== String(uploadedBy) ||
+    props.coworkEntityType !== String(entityType) ||
+    props.coworkEntityId !== String(entityId) ||
+    props.coworkPending !== "1"
+  ) {
+    throw new AttachmentError("FORBIDDEN", "This upload cannot be finalized here.");
+  }
+
+  /* The security sniff, from the leading bytes only. The client's label is not
+     trusted here any more than in the multipart path — the download route
+     decides inline-vs-attachment from this. */
+  let sniffed = "application/octet-stream";
+  try {
+    const head = await drive.files.get(
+      { fileId, alt: "media", supportsAllDrives: true },
+      { responseType: "arraybuffer", headers: { Range: "bytes=0-511" } },
+    );
+    sniffed = sniffMimeType(Buffer.from(head.data), null) || "application/octet-stream";
+  } catch (e) {
+    console.warn("[cowork-attachment] finalize sniff failed, defaulting:", e.message);
+  }
+
+  const size = meta.data.size != null ? Number(meta.data.size) : 0;
+  const name = safeName(meta.data.name);
+  const ref = await db.collection(COLLECTION).add({
+    storageFileId: fileId,
+    originalName: name,
+    mimeType: sniffed,
+    size,
+    uploadedBy: String(uploadedBy),
+    uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+    entityType: String(entityType),
+    entityId: String(entityId),
+  });
+
+  /* Clear the pending marker so the same fileId cannot be finalized twice. */
+  try {
+    await drive.files.update({
+      fileId,
+      supportsAllDrives: true,
+      requestBody: { appProperties: { coworkPending: "" } },
+    });
+  } catch (e) {
+    console.warn("[cowork-attachment] could not clear pending marker:", e.message);
+  }
+
+  return { id: ref.id, name, type: sniffed, size };
+}
+
 module.exports = {
   AttachmentError,
   storageConfigured,
   storageHealth,
   uploadAttachment,
+  createPrivateResumableSession,
+  finalizePrivateUpload,
   getAttachment,
   listAttachments,
   streamAttachment,

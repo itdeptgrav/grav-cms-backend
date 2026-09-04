@@ -58,42 +58,19 @@ const STATUS_META = {
   CO: { label: "Comp. Off", color: "violet" },
 };
 
-// ─── Late-count promotion (mirrors HR logic) ──────────────────────────────────
-// Replays applyLateCountPromotion over the full month so effectiveStatus
-// includes LAB / LHD / EAB exactly as the HR timecard shows.
+// ─── Late-count promotion ─────────────────────────────────────────────────────
+// ONE function, imported from the HR router — not a mirror of it.
 //
-// policy comes from AttendanceSettings.lateHalfDayPolicy:
-//   { enabled, lateHDOnCount (3), lateFullDayOnCount (5),
-//     earlyOutHDOnCount (3), earlyOutFullDayOnCount (5) }
+// This file used to carry its own copy, "mirroring HR logic". The copy had the
+// same defect the original had: it returned before counting whenever HR had
+// overridden a day, so a pardoned 3rd late dropped out of the streak and the
+// 4th late was docked in its place. The HR copy was fixed; a mirror would have
+// kept showing the employee, on their phone, a half-day the HR screen no
+// longer showed. Two implementations of one rule is two rules.
 //
-// state = { lateCount, earlyCount } — mutated in place
-// Returns { promotedStatus: "LAB"|"LHD"|"EAB"|"HD"|null }
-function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
-  if (!policy?.enabled || entry.hrFinalStatus || dateStr === todayStr)
-    return { promotedStatus: null };
-
-  const lateHDOn = policy.lateHDOnCount ?? 3;
-  const lateFullDayOn = policy.lateFullDayOnCount ?? 5;
-  const earlyHDOn = policy.earlyOutHDOnCount ?? 3;
-  const earlyFullOn = policy.earlyOutFullDayOnCount ?? 5;
-
-  if (entry.isLate && entry.systemPrediction === "P*") {
-    state.lateCount++;
-    if (state.lateCount >= lateFullDayOn) {
-      state.lateCount = 0;
-      return { promotedStatus: "LAB" };
-    }
-    if (state.lateCount === lateHDOn) return { promotedStatus: "LHD" };
-  } else if (entry.isEarlyDeparture && entry.systemPrediction === "P~") {
-    state.earlyCount++;
-    if (state.earlyCount >= earlyFullOn) {
-      state.earlyCount = 0;
-      return { promotedStatus: "EAB" };
-    }
-    if (state.earlyCount === earlyHDOn) return { promotedStatus: "HD" };
-  }
-  return { promotedStatus: null };
-}
+// Return shape is a superset of what this file expects ({ promotedStatus,
+// promoted }); callers read promotedStatus only.
+const { applyLateCountPromotion } = AttendanceRouter;
 
 function enrichEntry(entry, dayDoc, effectiveStatus) {
   const rawStatus =
@@ -236,7 +213,25 @@ router.get("/monthly", AllEmployeeAppMiddleware, async (req, res) => {
     const bid = String(emp.biometricId).toUpperCase();
     const todayStr = getTodayIST();
 
-    const dayDocs = await DailyAttendance.find({ yearMonth })
+    /* One person's row per day, projected in the database. This used to load
+       the whole month of day documents — 31 × ~97 KB, every employee's row in
+       each — and pick one row out of each in JavaScript. $elemMatch returns
+       only the matching row, which is ~1 KB a day instead of ~97 KB: a
+       hundredfold less through the heap for the busiest endpoint in the
+       mobile app (32 seconds in the log just before the 3 Sep OOM). The
+       fields listed are everything enrichEntry and the promotion replay
+       read from the day itself. */
+    const dayDocs = await DailyAttendance.find(
+      { yearMonth },
+      {
+        dateStr: 1,
+        yearMonth: 1,
+        dayOfWeek: 1,
+        holiday: 1,
+        summary: 1,
+        employees: { $elemMatch: { biometricId: bid } },
+      },
+    )
       .sort({ dateStr: 1 })
       .lean();
 

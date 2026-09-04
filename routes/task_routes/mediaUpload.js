@@ -9,6 +9,7 @@ const {
     finalizeDriveFile,
     getDriveFileStream,
 } = require("../../services/mediaUpload.service");
+const { mediaResponse } = require("../../services/mediaRange");
 
 // ── TEMP DEBUG: remove after verifying backend load stays flat ──
 function logBackendLoad(label, req) {
@@ -92,9 +93,25 @@ router.post(
 router.get("/media/view/:fileId", async (req, res) => {
     try {
         const { fileId } = req.params;
-        const stream = await getDriveFileStream(fileId);
+        // Forward the browser's Range so a video streams in pieces, not whole.
+        const range = req.headers.range || null;
+        const stream = await getDriveFileStream(fileId, range);
         res.setHeader("Content-Type", stream.mimeType || "application/octet-stream");
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+        // Advertise range support and set the status/headers for this reply —
+        // 206 + Content-Range when Drive honoured a range, 200 otherwise. Pure
+        // decision in services/mediaRange.js; nothing here changes for an image
+        // or a plain download, which send no Range and take the 200 branch.
+        const shaped = mediaResponse({
+            range,
+            driveStatus: stream.status,
+            contentRange: stream.contentRange,
+            contentLength: stream.contentLength,
+            size: stream.size,
+        });
+        for (const [k, v] of Object.entries(shaped.headers)) res.setHeader(k, v);
+        res.status(shaped.status);
 
         // ── The filename, which this route never sent ────────────────────────
         //

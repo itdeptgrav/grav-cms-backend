@@ -147,7 +147,7 @@ router.get("/", verifyCustomerToken, async (req, res) => {
     }
 
     // ── Build query ─────────────────────────────────────────────────
-    const filter = { _id: { $in: assignedIds } };
+    const filter = { _id: { $in: assignedIds }, isActive: { $ne: false } };
 
     if (search && search.trim()) {
       const q = search.trim();

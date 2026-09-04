@@ -18,6 +18,39 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RETIRED — the books have been imported, and they are imported once.
+//
+// The UI is gone (the wizard, its history and the Tally variant were removed
+// along with the sidebar entry), but removing a screen is not the same as
+// removing a capability: the endpoints below still accept a file and still
+// write vouchers, and anything holding an old URL — a bookmark, a stale tab, a
+// script somebody wrote — could still re-run an import over books that are now
+// live. That is the thing being prevented, so it is prevented HERE, where the
+// writing actually happens.
+//
+// 410 rather than 404: the route existed, the data it created is still in the
+// books, and it is not coming back. A 404 would read as "wrong URL" and invite
+// somebody to go looking for the right one.
+//
+// The handlers below are left intact rather than deleted. They are the only
+// written record of how the existing data was mapped and committed, and reading
+// them is how anybody would ever reconcile an oddity in the imported books.
+// Nothing reaches them.
+//
+// To re-enable: delete this one middleware. Nothing else was changed.
+// ─────────────────────────────────────────────────────────────────────────────
+router.use((req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "IMPORT_RETIRED",
+    message:
+      "Importing from Tally has been switched off. The books were already " +
+      "imported and are now maintained in this system; re-importing would " +
+      "write over live data.",
+  });
+});
 const multer = require("multer");
 const path = require("path");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");

@@ -1041,6 +1041,21 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
       context = {
         poOnFile: Boolean(journey.po?.number),
         advance: await advanceStatus(journey),
+        // Styles Sales has approved but the CUSTOMER has not (2 Sept 2026,
+        // explicit request: "jabtak the customer not approved this sample,
+        // the purchase invoice/order should be initiate against this
+        // customer"). Derived here, never trusted from the client, same as
+        // poOnFile. Only styles that actually went through development count
+        // — one waived from sampling has no customer verdict to wait for.
+        samplesAwaitingCustomer: await require("../../../models/CMS_Models/Sales/SampleStyle").countDocuments({
+          journeyId: journey._id,
+          isActive: true,
+          "sample.status": "approved",
+          $or: [
+            { "customerApproval.approved": { $ne: true } },
+            { "customerApproval.approved": { $exists: false } },
+          ],
+        }),
         isManager: isOwner ? await isSalesManager(req.user) : true,
         overrideReason: b.overrideReason || b.reason || "",
         actor: { employeeId: req.user?.employeeId || "", name: req.user?.name || "" },

@@ -247,7 +247,7 @@ router.post("/", salesAuth, async (req, res) => {
 router.get("/stock-items/search", salesAuth, async (req, res) => {
   try {
     const { q = "", limit = 200, category } = req.query;
-    const filter = {};
+    const filter = { isActive: { $ne: false } };
     if (q) {
       const re = new RegExp(q, "i");
       filter.$or = [{ name: re }, { reference: re }, { category: re }];
@@ -262,6 +262,101 @@ router.get("/stock-items/search", salesAuth, async (req, res) => {
       .lean();
 
     res.json({ success: true, items });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/cms/sales/customers/for-account/:accountId ─────────────────────
+//
+// Resolving the portal Customer BEHIND a CRM Account — the one thing Cost &
+// Quote's "raise a PI" flow and the Purchase Invoice stage both need and, until
+// now, both got wrong the same way: they searched the portal Customer
+// collection BY THE ACCOUNT'S NAME (lib/salesJourney/piResolve.js), while this
+// exact bridge already exists, explicit and authoritative, as
+// `Account.linkedCustomer` — built for the Account workspace's MPC/measurement
+// sections (app/sales/dashboard/accounts/[id]/_sections/_linkedCustomer.js).
+// Name-searching a DIFFERENT collection instead of reading the field built
+// for this is why raising an invoice could fail with "no customer record
+// matches" even when the account was fully set up — the invoice code simply
+// never looked at the one field that would have answered it (2 Sept 2026,
+// explicit report: PI stage dead-ending on a real, active account).
+//
+// linkedCustomer wins outright when set — it is a deliberate choice someone
+// made, not a guess to second-guess. It is emphatically NOT second-guessed by
+// comparing the account's name to the customer's name: real accounts here
+// link to a personal contact name or a different trading name on purpose
+// (checked against live data — 4 of 5 existing links would have "failed" a
+// name-similarity check while being entirely correct), so that check was
+// tried and thrown out as pure alarm-fatigue noise.
+//
+// What IS a genuine anomaly — found on real data while building this route —
+// is the SAME portal customer linked from TWO DIFFERENT accounts (Umung Pvt
+// Ltd and Soumya Pvt Ltd both pointing at one customer, evidently a mistake
+// made linking one of them). A portal login belongs to one company; two
+// unrelated CRM accounts sharing one is the actual "linked to the wrong
+// thing" signal, and writing an invoice against the wrong customer is not a
+// recoverable mistake — so `sharedWithAccounts` names every OTHER account
+// that resolves to this same customer, for the frontend to warn on rather
+// than hide.
+//
+// Falls back to a name search only when there is NO explicit link — the
+// legacy behaviour, kept so accounts nobody has linked yet (there is at least
+// one on real data) still resolve when a same-named Customer exists, rather
+// than breaking something that happened to work.
+router.get("/for-account/:accountId", salesAuth, async (req, res) => {
+  try {
+    const Account = require("../../../models/CMS_Models/Sales/Account");
+    const account = await Account.findById(req.params.accountId)
+      .select("companyName displayName normalizedName linkedCustomer")
+      .populate("linkedCustomer", "name email phone customerId profile.companyName isActive")
+      .lean();
+    if (!account) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const accountName = account.displayName || account.companyName || "";
+
+    if (account.linkedCustomer) {
+      const sharedWith = await Account.find({
+        _id: { $ne: account._id },
+        linkedCustomer: account.linkedCustomer._id,
+      }).select("companyName displayName").lean();
+      return res.json({
+        success: true,
+        customer: account.linkedCustomer,
+        matchedBy: "linked",
+        sharedWithAccounts: sharedWith.map((a) => a.displayName || a.companyName),
+        accountName,
+      });
+    }
+
+    // No explicit link — fall back to the old name search rather than a hard
+    // failure, so an account nobody has linked yet (but that happens to have
+    // a same-named portal Customer) keeps working exactly as before.
+    const re = new RegExp(accountName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const rows = accountName
+      ? await Customer.find({
+          $or: [{ name: re }, { email: re }, { phone: re }, { customerId: re }, { "profile.companyName": re }],
+        }).select("name email phone customerId profile.companyName isActive").limit(5).lean()
+      : [];
+    const norm = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    let customer = null;
+    if (rows.length === 1) customer = rows[0];
+    else if (rows.length > 1) {
+      const exact = rows.filter((c) => norm(c.profile?.companyName || c.name) === norm(accountName));
+      customer = exact.length === 1 ? exact[0] : null;
+    }
+
+    return res.json({
+      success: true,
+      customer,
+      matchedBy: customer ? "name" : "none",
+      sharedWithAccounts: [],
+      accountName,
+      // So the frontend can tell "no match" from "matched more than one" —
+      // the two need different guidance, and the old code showed the same
+      // sentence for both.
+      candidateCount: rows.length,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

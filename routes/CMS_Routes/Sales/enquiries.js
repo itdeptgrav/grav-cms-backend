@@ -431,6 +431,15 @@ function sanitizeProducts(input) {
         // with nothing for it to describe.
         pickedFromRegister: validSid ? Boolean(p.pickedFromRegister) : false,
         quantity: Number.isFinite(qty) && qty >= 0 ? qty : undefined,
+        // The per-piece cost ceiling for this product (2 Sept 2026). Same
+        // treatment as quantity: an empty box means "no cap", not zero — a
+        // zero budget would read as "this must cost nothing" and block every
+        // raw item downstream.
+        maxBudget: (() => {
+          if (p.maxBudget === "" || p.maxBudget == null) return undefined;
+          const n = Number(p.maxBudget);
+          return Number.isFinite(n) && n >= 0 ? n : undefined;
+        })(),
         gender: GARMENT_GENDER_CODES.includes(p.gender) ? p.gender : undefined,
         logo: Boolean(p.logo),
         embroidery: Boolean(p.embroidery),

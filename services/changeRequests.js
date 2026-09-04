@@ -24,12 +24,14 @@
 "use strict";
 
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 
 const ChangeRequest = require("../models/Access/ChangeRequest");
 const { MAX_BODY_BYTES } = ChangeRequest;
 const { SECRET } = require("../config/jwt");
-const { getRole, listRoles, roleAtLeast } = require("./departmentRoles");
+const { getRole, getEffectiveRole, listRoles, roleAtLeast } = require("./departmentRoles");
 const { sectionForPath, sectionLabel } = require("./auditSections");
+const { decideApproval } = require("./approvalPolicy");
 const { recordChange } = require("./changeLog");
 
 /**
@@ -139,6 +141,10 @@ function actorFrom(req) {
     id: String(u.id || u._id || ""),
     email: String(u.email || "").toLowerCase(),
     name: u.name || [u.firstName, u.lastName].filter(Boolean).join(" ") || "",
+    /* Captured because the replay has to run as this person, and the routes it
+       replays into check the role. See the note on actorSchema. */
+    role: String(u.role || ""),
+    userType: String(u.userType || ""),
   };
 }
 
@@ -207,7 +213,12 @@ async function recordDecision(req, cr, { applied, error }) {
   } else if (applied) {
     summary = `Approved ${asked}’s change to ${what} — applied.`;
   } else {
-    summary = `Approved ${asked}’s change to ${what}, but it could not be applied: ${error || "unknown error"}.`;
+    /* Leads with the outcome, not the intention. "Approved …, but it could not
+       be applied" reads as a success with a caveat, and next to a green badge
+       people took it for one. What happened is that nothing changed. */
+    summary =
+      `NOT applied — ${asked}’s change to ${what} was approved but failed: ` +
+      `${error || "unknown error"}. The record is unchanged.`;
   }
   if (cr.decisionNote) summary += ` Note: ${cr.decisionNote}`;
 
@@ -217,7 +228,9 @@ async function recordDecision(req, cr, { applied, error }) {
     entity: cr.entity,
     entityId: cr.entityId,
     entityLabel: cr.entityLabel,
-    action: cr.status === "rejected" ? "reject" : "approve",
+    /* Three outcomes, three actions. Filing a failed apply as "approve" is what
+       put a green Approved badge on a change that never happened. */
+    action: cr.status === "rejected" ? "reject" : applied ? "approve" : "fail",
     origin: "approval",
     fields: fieldsFromRequest(cr),
     summary: `${summary} (decided by ${who})`,
@@ -227,6 +240,27 @@ async function recordDecision(req, cr, { applied, error }) {
 /* ------------------------------------------------------------------ */
 /* Holding                                                             */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Push a notification about this request, without ever letting it matter.
+ *
+ * Deliberately not awaited by any caller and deliberately not throwing: a
+ * change request that is queued, approved or rejected is already correct and
+ * durable at the point this runs. A notification is how somebody FINDS OUT,
+ * which is worth a lot and is worth nothing compared to the decision itself.
+ *
+ * Required lazily so that services/departmentApprovalNotifications — and the
+ * Firebase admin SDK behind it — is not pulled in at boot by every module that
+ * imports this one.
+ */
+function notify(cr, event) {
+  try {
+    const { notifyChangeRequest } = require("./departmentApprovalNotifications.service");
+    Promise.resolve(notifyChangeRequest(cr, event)).catch(() => {});
+  } catch (err) {
+    console.warn("[change-requests] notification skipped:", err.message);
+  }
+}
 
 /**
  * @param {string} departmentSlug  whose approvers decide this
@@ -270,7 +304,11 @@ function requireApproval(departmentSlug, opts = {}) {
       const assigned = await listRoles(slug);
       if (assigned.length === 0) return next();
 
-      const role = req.departmentRole || (await getRole(slug, actor.email));
+      /* The same resolution the role guard uses. Looking up only the token's
+         email meant an approver whose grant sits on another of their addresses
+         was read as an editor — and every change they made was held for an
+         approval that only they could have given. */
+      const role = req.departmentRole || (await getEffectiveRole(slug, req));
 
       // Approver and above commit directly. Below editor should never have
       // reached this middleware, but if it is mounted without the role guard,
@@ -308,6 +346,32 @@ function requireApproval(departmentSlug, opts = {}) {
           // lose the change itself.
           console.error(`[change-requests] describe() failed for ${entity}:`, err.message);
         }
+      }
+
+      /* DOES THIS ACTUALLY NEED AN APPROVER?
+         Held everything, this queue filled with spelling corrections and phone
+         numbers, and the changes that matter arrived looking exactly as
+         important as the ones that did not. An editor's routine correction now
+         commits straight away and is recorded in the change history like any
+         other edit; money, access, identity and anything payroll or attendance
+         reads still stops here.
+
+         Decided AFTER describe() because the decision is made on the fields
+         that actually moved, not on the route or the shape of the body. See
+         services/approvalPolicy.js for the classification and why a field
+         nobody has classified waits. */
+      const verdict = decideApproval({
+        path: req.originalUrl || req.url || "",
+        method: req.method,
+        changes: described.changes,
+      });
+      if (!verdict.hold) {
+        /* Left for the route's own logging and for auditTrail: this is now an
+           ordinary write, and it should read as one in the history. Recorded
+           on the request so a route that wants to say "committed directly,
+           no approval needed" can. */
+        req.approvalWaived = verdict.reason;
+        return next();
       }
 
       const resolved = sectionForPath(req.originalUrl || req.url || "");
@@ -348,6 +412,12 @@ function requireApproval(departmentSlug, opts = {}) {
       // disappear with nothing anywhere saying it had ever been asked for.
       // `action: "other"` deliberately: nothing was created, updated or deleted.
       await recordSubmission(req, cr).catch(() => {});
+
+      // Tell the owner and approvers there is something waiting. NOT awaited:
+      // a queued change is already safe, and making the editor wait on FCM —
+      // or fail because of it — would trade the thing that matters for the
+      // thing that does not.
+      notify(cr, "held");
 
       // 202, not 200: the request was accepted, the change has NOT happened.
       // A UI that treats this as success and closes the form having told the
@@ -396,6 +466,54 @@ function selfOrigin() {
 }
 
 /**
+ * The role the replay must run with.
+ *
+ * ── WHY THIS IS NOT JUST THE DEPARTMENT SLUG ────────────────────────────────
+ * It used to be. The token carried `role: cr.departmentSlug` — "hr" — and the
+ * routes being replayed into check the LOGIN role, which for HR is
+ * "hr_manager". So `PUT /api/employees/:id` refused every replay with
+ * "Permission denied", and an owner approving an employee edit watched their
+ * approval fail no matter what they did. The slug was never a role; it only
+ * looked like one for departments where the two strings happen to match.
+ *
+ * Three sources, most trustworthy first:
+ *   1. What the requester actually held when they submitted. Stored on the
+ *      request since this bug was found, and correct even if their role
+ *      changes while the request waits.
+ *   2. For requests held BEFORE that — the ones already sitting in the queue —
+ *      the same collection `routes/login.js` reads the role from. Resolved by
+ *      email through the department registry, so it is the real role rather
+ *      than a guess.
+ *   3. The slug, as it was. Reached only when the requester can no longer be
+ *      found at all, and it will fail the same way it always did — but by then
+ *      the approver has a specific error saying so, rather than silence.
+ */
+async function requesterIdentity(cr) {
+  const stored = cr.requestedBy || {};
+  if (stored.role) {
+    return { role: stored.role, userType: stored.userType || cr.departmentSlug };
+  }
+
+  try {
+    const { DEPARTMENTS } = require("./ensureAccessDepartments");
+    const dept = DEPARTMENTS.find((d) => d.slug === cr.departmentSlug || d.key === cr.departmentSlug);
+    if (dept?.legacyCollection && stored.email) {
+      const doc = await mongoose.connection.db
+        .collection(dept.legacyCollection)
+        .findOne({ email: String(stored.email).toLowerCase() }, { projection: { role: 1 } });
+      if (doc?.role) {
+        return { role: doc.role, userType: dept.legacyUserType || cr.departmentSlug };
+      }
+    }
+  } catch {
+    // Fall through to the slug — never let resolution failure throw away the
+    // approval; the replay's own error is the more useful one to report.
+  }
+
+  return { role: cr.departmentSlug, userType: cr.departmentSlug };
+}
+
+/**
  * A short-lived token for the person who asked for the change.
  *
  * The replay runs AS THE REQUESTER, not as the approver. That keeps every
@@ -405,7 +523,7 @@ function selfOrigin() {
  * scopes by the caller's identity behaves as it did when the form was
  * submitted.
  */
-function replayToken(cr) {
+function replayToken(cr, identity) {
   return jwt.sign(
     {
       v: 2,
@@ -413,8 +531,8 @@ function replayToken(cr) {
       email: cr.requestedBy?.email || "",
       name: cr.requestedBy?.name || "",
       deptSlug: cr.departmentSlug,
-      role: cr.departmentSlug,
-      userType: cr.departmentSlug,
+      role: identity.role,
+      userType: identity.userType,
       // Marks this as a replay for anything downstream that wants to know.
       replayOf: String(cr._id),
     },
@@ -436,7 +554,8 @@ async function applyChangeRequest(cr) {
     return { ok: false, status: 0, body: { message: "The stored request has no valid path." } };
   }
 
-  const token = replayToken(cr);
+  const identity = await requesterIdentity(cr);
+  const token = replayToken(cr, identity);
   const url = `${selfOrigin()}${path}`;
 
   try {
@@ -488,28 +607,79 @@ async function decideChangeRequest({ id, decision, note, actor, req }) {
   // is used directly; otherwise a stand-in carries the actor so the entry still
   // has a name on it rather than being filed as anonymous.
   const decisionReq = req || { user: actor, method: "POST", originalUrl: "" };
-  const cr = await ChangeRequest.findById(id);
-  if (!cr) return { ok: false, code: 404, message: "That request no longer exists." };
-  if (cr.status !== "pending") {
+
+  /* CLAIM IT ATOMICALLY, rather than read-then-check-then-write.
+     The replay is an HTTP round trip, so between "it is pending" and "it is
+     approved" there is a window wide enough for a second approver — or a
+     double-clicked button — to slip through and apply the same change twice.
+     The status guard inside the update is what closes that: exactly one caller
+     can move a request out of a decidable state.
+
+     `failed` is decidable. A failed request was approved by a person and simply
+     did not land; the fix is usually a permission or a stale field, and once
+     that is sorted the approver's answer is still yes. Refusing to reconsider
+     it — which is what "already been failed" did — left the queue with rows
+     nobody could ever resolve. */
+  /* A claim that was never released — the process restarted mid-replay, say —
+     must not strand the request forever. The replay token lives two minutes, so
+     anything still "applying" after five is not in flight any more and may be
+     claimed again. */
+  const staleClaim = new Date(Date.now() - 5 * 60 * 1000);
+  const cr = await ChangeRequest.findOneAndUpdate(
+    {
+      _id: id,
+      $or: [
+        { status: { $in: ["pending", "failed"] } },
+        { status: "applying", decidedAt: { $lt: staleClaim } },
+      ],
+    },
+    {
+      $set: {
+        status: decision === "reject" ? "rejected" : "applying",
+        decidedBy: actor,
+        decidedAt: new Date(),
+        decisionNote: String(note || ""),
+        /* Cleared on retry so a stale message from the previous attempt cannot
+           be mistaken for the outcome of this one. */
+        applyError: "",
+      },
+    },
+    { new: true },
+  );
+
+  if (!cr) {
+    const existing = await ChangeRequest.findById(id).select("status").lean();
+    if (!existing) return { ok: false, code: 404, message: "That request no longer exists." };
+    if (existing.status === "applying") {
+      return {
+        ok: false,
+        code: 409,
+        message: "Someone is applying this right now — give it a moment and refresh.",
+      };
+    }
     return {
       ok: false,
       code: 409,
-      message: `This request has already been ${cr.status}.`,
+      message: `This request has already been ${existing.status}.`,
     };
   }
 
-  cr.decidedBy = actor;
-  cr.decidedAt = new Date();
-  cr.decisionNote = String(note || "");
-
   if (decision === "reject") {
-    cr.status = "rejected";
-    await cr.save();
     await recordDecision(decisionReq, cr, { applied: false }).catch(() => {});
+    notify(cr, "rejected");
     return { ok: true, request: cr };
   }
 
-  const result = await applyChangeRequest(cr);
+  /* The claim is held from here until the status is written below. Any throw
+     in between would strand the request as "applying", so the replay is
+     wrapped: applyChangeRequest is written not to throw, and this makes that
+     a guarantee rather than a convention. */
+  let result;
+  try {
+    result = await applyChangeRequest(cr);
+  } catch (err) {
+    result = { ok: false, status: 0, body: { message: err?.message || "The replay threw." } };
+  }
 
   if (result.ok) {
     cr.status = "approved";
@@ -520,10 +690,25 @@ async function decideChangeRequest({ id, decision, note, actor, req }) {
     cr.applyError =
       (result.body && (result.body.message || result.body.error)) ||
       `The change could not be applied (HTTP ${result.status}).`;
+    /* Says WHOSE permission was refused. "Permission denied" alone sent an
+       owner looking at their own rights, when the replay runs as the editor
+       and it was the editor's role the route turned away. */
+    if (result.status === 403 || result.status === 401) {
+      const who = cr.requestedBy?.name || cr.requestedBy?.email || "the editor";
+      cr.applyError =
+        `${cr.applyError} — the change is replayed as ${who}, and that account ` +
+        `was refused by the route. Approving again will retry it.`;
+    }
   }
 
   await cr.save();
   await recordDecision(decisionReq, cr, { applied: result.ok, error: cr.applyError }).catch(() => {});
+
+  // Only a change that actually landed is reported as approved. A `failed`
+  // request has been approved by a person but applied by nothing, and telling
+  // the editor it went through would be the one lie this whole queue exists to
+  // prevent — they will see it in the Failed tab instead.
+  if (cr.status === "approved") notify(cr, "approved");
 
   return {
     ok: result.ok,
