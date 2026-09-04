@@ -151,6 +151,11 @@ function _buildTitle(type, title) {
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
+  /* One id for this event, carried into the push. The service worker tags a
+     notification with it: without one, every notification of a type shared a
+     tag and the browser REPLACED the previous one, so a second task assignment
+     silently overwrote the first before it was read. */
+  const eventId = uuidv4();
   recipientIds.forEach(id => {
     batch.set(db.collection("cowork_notifications").doc(uuidv4()), {
       recipientEmployeeId: id, type, title, body,
@@ -167,7 +172,7 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
       const { sendPushToEmployees } = require("./fcmPush.service");
       const richTitle = _buildTitle(type, title);
       const richBody = _buildRichBody(type, body, data || {});
-      sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
+      sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}), notificationId: eventId })
         .catch(e => console.error("[FCM taskForward]", e.message));
     } catch (e) { console.error("[FCM taskForward init]", e.message); }
   });
@@ -673,7 +678,25 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
     // would move a date that was deliberately set. Left alone.
     const hasFixedDate = Boolean(task.fixedDeadline);
 
-    if (!isGranted && !hasFixedDate) {
+    // ── A SELF task is already anchored, at its approval ─────────────────────
+    //
+    // On a self-assigned task the person raises the work AND does it, so this
+    // confirmation is their second press on their own task: the first was
+    // creating it. The moment that actually released the work was their
+    // MANAGER approving the budget, and `acceptBudgetProposal` stamps the
+    // anchor there.
+    //
+    // Re-anchoring here would throw that away and charge them for the gap
+    // between the approval and their own click — reported: raised 1:00,
+    // approved 1:30, confirmed 2:00, and the clock started at 2:00 instead of
+    // 1:30. The approval is the honest start and it is already recorded.
+    //
+    // Assigned tasks are untouched: there the acceptance IS the moment the
+    // work became theirs, which is the whole point of the rule.
+    const isSelfTask =
+      task.isSelfAssigned === true || task.isSelfAssigned === "true";
+
+    if (!isGranted && !hasFixedDate && !isSelfTask) {
       const windowSecs =
         Number(task.deadlineWindowSecs) ||
         Number(task.senderTimerWindowSecs) ||

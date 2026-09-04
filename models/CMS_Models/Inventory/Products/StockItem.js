@@ -257,6 +257,25 @@ const stockItemSchema = new mongoose.Schema({
     type: Number,
     min: 0
   },
+  /**
+   * The most this product is allowed to COST to make, per piece — set by
+   * Sales when the product is defined on the enquiry (2 Sept 2026, explicit
+   * request), and carried here so the people actually building the costing
+   * work against it.
+   *
+   * The Raw Items and Operations tabs refuse an addition that would push
+   * raw-material + operations + miscellaneous cost past this, and show how
+   * much of it is spent. A CEILING ON COST, not a price and not a target —
+   * `baseSalesPrice`/`averageSalesPrice` are what it sells FOR.
+   *
+   * Unset (the default) means no cap at all: every restriction downstream is
+   * gated on this being a real number, so products that predate this — and
+   * products nobody set a budget for — behave exactly as they always did.
+   */
+  maxBudget: {
+    type: Number,
+    min: 0
+  },
   salesTax: {
     type: String,
     trim: true

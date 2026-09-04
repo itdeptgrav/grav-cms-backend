@@ -100,7 +100,18 @@ payrollSettingsSchema.statics.DEFAULT_PT_SLABS = [
     { minBasic: 15000, maxBasic: 999999, amount: 0 },
 ];
 
+/* Memoised — see services/memo.js and the note on Attendancesettings. A
+   hydrated document is handed out (callers use ptForBasic on it); writers go
+   through findByIdAndUpdate, which invalidates. */
+const { memo: _memo, invalidateOnWrite: _invalidateOnWrite } = require("../../services/memo");
+const PAYROLL_SETTINGS_MEMO = "settings:payroll";
+_invalidateOnWrite(payrollSettingsSchema, PAYROLL_SETTINGS_MEMO);
+
 payrollSettingsSchema.statics.getConfig = async function () {
+    return _memo(PAYROLL_SETTINGS_MEMO, 15 * 1000, () => this._loadConfig());
+};
+
+payrollSettingsSchema.statics._loadConfig = async function () {
     let cfg = await this.findById("singleton");
     if (!cfg) {
         cfg = await this.create({

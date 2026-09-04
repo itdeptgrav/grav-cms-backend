@@ -5,6 +5,22 @@ const cron = require("node-cron");
 const router = express.Router();
 const ExcelJS = require("exceljs");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+
+/* What an attendance read needs from an employee record — and, more to the
+   point, what it does NOT. A full record is ~18 KB: the encrypted salary
+   block, uploaded documents, bank details, custom fields, SOP points, a
+   photo. Attendance uses none of it, and the daily table and the summary
+   load EVERY active employee — so each call carried ~2 MB of payroll and
+   paperwork through the heap for nothing. Thirty-one such calls at once
+   (the month grid) is what pushed the process past its ~256 MB heap on
+   3 Sep 2026 (exit 134, "JavaScript heap out of memory").
+
+   Exclusion rather than inclusion, so a field this router does read is never
+   dropped by omission; only the known-heavy, known-irrelevant ones go. */
+const ATTENDANCE_EMPLOYEE_PROJECTION =
+  "-salary -salaryCustomFields -documents -additionalDocs -bankDetails " +
+  "-sopPoints -profilePhoto -photo -personalCustomFields -workCustomFields " +
+  "-documentCustomFields -addressCustomFields -password -fcmToken -pushToken";
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 const { resolveShift } = require("../../services/shiftPolicy");
 const Employee = require("../../models/Employee");
@@ -530,7 +546,9 @@ async function buildEmployeeMap() {
       { status: { $exists: false } },
       { isActive: true },
     ],
-  }).lean();
+  })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
   const byBiometric = new Map(),
     byName = new Map(),
     bySorted = new Map();
@@ -2617,7 +2635,9 @@ async function getDailyAttendance(date, department) {
           { status: { $exists: false } },
           { isActive: true },
         ],
-      }).lean();
+      })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
       const presentBids = new Set(
         (dayDoc.employees || []).map((e) => e.biometricId),
       );
@@ -3088,7 +3108,9 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const settings = await AttendanceSettings.getConfig();
     const _n = new Date(Date.now() + 330 * 60 * 1000);
     const todayStr = `${_n.getUTCFullYear()}-${String(_n.getUTCMonth() + 1).padStart(2, "0")}-${String(_n.getUTCDate()).padStart(2, "0")}`;
@@ -4889,7 +4911,9 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -5324,7 +5348,9 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -6263,7 +6289,9 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -7385,7 +7413,9 @@ router.get("/employees-list", EmployeeAuthMiddlewear, async (req, res) => {
         { status: { $exists: false } },
         { isActive: true },
       ],
-    }).lean();
+    })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
     const list = emps
       .filter((e) => extractBiometricId(e))
       .map((e) => ({
@@ -7416,7 +7446,9 @@ router.get(
           { status: { $exists: false } },
           { isActive: true },
         ],
-      }).lean();
+      })
+      .select(ATTENDANCE_EMPLOYEE_PROJECTION)
+      .lean();
       const byDepartment = {},
         allDepartments = new Set(),
         allDesignations = new Set();

@@ -213,7 +213,25 @@ router.get("/monthly", AllEmployeeAppMiddleware, async (req, res) => {
     const bid = String(emp.biometricId).toUpperCase();
     const todayStr = getTodayIST();
 
-    const dayDocs = await DailyAttendance.find({ yearMonth })
+    /* One person's row per day, projected in the database. This used to load
+       the whole month of day documents — 31 × ~97 KB, every employee's row in
+       each — and pick one row out of each in JavaScript. $elemMatch returns
+       only the matching row, which is ~1 KB a day instead of ~97 KB: a
+       hundredfold less through the heap for the busiest endpoint in the
+       mobile app (32 seconds in the log just before the 3 Sep OOM). The
+       fields listed are everything enrichEntry and the promotion replay
+       read from the day itself. */
+    const dayDocs = await DailyAttendance.find(
+      { yearMonth },
+      {
+        dateStr: 1,
+        yearMonth: 1,
+        dayOfWeek: 1,
+        holiday: 1,
+        summary: 1,
+        employees: { $elemMatch: { biometricId: bid } },
+      },
+    )
       .sort({ dateStr: 1 })
       .lean();
 

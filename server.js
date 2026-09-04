@@ -2080,6 +2080,21 @@ app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
+/* CoWork sign-in recovery and the alternate sign-in door.
+ *
+ * Mounted BEFORE nothing in particular — these paths (/cowork/auth/*) collide
+ * with no existing route — but kept together because they are the two ways into
+ * an account that do not involve typing a password, and a reviewer should see
+ * both at once.
+ *
+ * Both carry their own auth per route rather than sitting behind a blanket
+ * `verifyCoworkToken`: the forgot-password endpoints and the QR redemption are
+ * reached by somebody who by definition cannot present a token yet, while
+ * issuing a QR code requires one. */
+const coworkQrSignIn = require("./routes/task_routes/coworkQrSignIn");
+app.use("/cowork", require("./routes/task_routes/coworkPasswordReset"));
+app.use("/cowork", coworkQrSignIn);
+
 app.use("/cowork", require("./routes/task_routes/c2Band.routes"));
 app.use("/cowork", require("./routes/task_routes/c1Routes"));
 
@@ -2984,11 +2999,31 @@ const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+  /* The heap limit, in the deploy log, because it is the number that decides
+     whether this process survives a busy afternoon. Node sizes it from the
+     container's memory — ~256 MB on a 512 MB instance — and that is what
+     the process died at on 3 Sep 2026. package.json's start script raises
+     it; if this line still says ~256, the host is not running `npm start`
+     (set the Start Command to it, or NODE_OPTIONS=--max-old-space-size=384). */
+  const heapLimitMb = Math.round(require("v8").getHeapStatistics().heap_size_limit / 1048576);
+  console.log(`✅ V8 heap limit: ${heapLimitMb} MB (rss ${Math.round(process.memoryUsage().rss / 1048576)} MB at boot)`);
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
   console.log(`Server running on port ${PORT}`);
   transcriptModule.startCron();
+
+  /* Spent and expired QR sign-in codes.
+   *
+   * Neither can be redeemed — the transaction in `/auth/qr/redeem` refuses
+   * both — so this is housekeeping, not security: without it the collection
+   * becomes a permanent log of who signed in and when, kept for no reason.
+   * Hourly, and once at boot so a restart after an outage does not wait an
+   * hour to catch up. */
+  const sweepQr = () => void coworkQrSignIn.sweepExpiredQrCodes();
+  sweepQr();
+  const qrSweep = setInterval(sweepQr, 60 * 60 * 1000);
+  if (typeof qrSweep.unref === "function") qrSweep.unref();
 
   // ── One-time repair: fix self-assigned tasks missing approverId ──────────
   (async () => {

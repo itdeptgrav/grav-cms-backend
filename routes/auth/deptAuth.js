@@ -70,6 +70,18 @@ const {
  * because a guess that opens the wrong dashboard is far worse than an
  * administrator making one explicit assignment.
  */
+/* The active departments — 21 rows that change when an administrator edits
+   Access Control and at no other time — read once every 30 s rather than
+   once or twice on EVERY session check. Each read was a cross-region round
+   trip on the most-called route on the server. Hydrated documents, because
+   the callers use toPublicTile(); nothing mutates them. */
+const { memo: _memo } = require("../../services/memo");
+function activeDepartments() {
+  return _memo("access-departments:active", 30 * 1000, () =>
+    AccessDepartment.find({ isActive: true }),
+  );
+}
+
 async function resolveEmployeeDepartments(employee) {
   const ids = [];
   if (employee.accessDepartmentId) ids.push(employee.accessDepartmentId);
@@ -77,23 +89,31 @@ async function resolveEmployeeDepartments(employee) {
     if (!ids.some((x) => String(x) === String(id))) ids.push(id);
   }
 
+  const active = await activeDepartments();
+
   if (ids.length) {
-    const found = await AccessDepartment.find({ _id: { $in: ids }, isActive: true });
     // Preserve the caller's order so the primary stays first.
-    const byId = new Map(found.map((d) => [String(d._id), d]));
+    const byId = new Map(active.map((d) => [String(d._id), d]));
     return ids.map((id) => byId.get(String(id))).filter(Boolean);
   }
 
   const label = String(employee.department || "").trim();
   if (!label) return [];
 
-  const matches = await AccessDepartment.find({
-    name: new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-    isActive: true,
-  });
+  const wanted = label.toLowerCase();
+  const matches = active.filter((d) => String(d.name || "").trim().toLowerCase() === wanted);
 
   return matches.length === 1 ? matches : [];
 }
+
+/* What a session check needs from the employee record: identity, status and
+   department pointers. Not the encrypted salary, the documents, the bank
+   account or the SOP history — ~17 KB per verify that was loaded and thrown
+   away, several times per page. */
+const EMPLOYEE_SESSION_PROJECTION =
+  "-salary -salaryCustomFields -documents -additionalDocs -bankDetails " +
+  "-sopPoints -profilePhoto -photo -personalCustomFields -workCustomFields " +
+  "-documentCustomFields -addressCustomFields -password";
 
 /* ------------------------------------------------------------------ */
 /* Legacy fallback — deleted at rollout step 8                         */
@@ -836,7 +856,7 @@ router.post("/verify", async (req, res) => {
     // Un-assigning someone in the admin UI has to take their access away on
     // their very next request — not whenever their week-long token expires.
     if (decoded.v === 2 && decoded.subject === "employee") {
-      const employee = await Employee.findById(decoded.id);
+      const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
 
       if (!employee || employee.isActive === false || employee.status === "inactive") {
         return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -873,9 +893,12 @@ router.post("/verify", async (req, res) => {
       // token — whose role is the DEPARTMENT role, "accountant". That is why an
       // Owner's sidebar read ACCOUNTANT. Minting it here means every page load
       // of the module carries the person's real accounting role.
-      const accSession = await attachAccountantSession(
-        res, dept, employee.email, decoded.iat,
-      );
+      /* Two independent lookups, one round trip's worth of waiting instead
+         of two. Each is a cross-region query on the most-called route. */
+      const [accSession, deptRole] = await Promise.all([
+        attachAccountantSession(res, dept, employee.email, decoded.iat),
+        require("../../services/departmentRoles").getRole(dept.slug, employee.email),
+      ]);
 
       return res.status(200).json({
         success: true,
@@ -884,7 +907,7 @@ router.post("/verify", async (req, res) => {
           name: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
           email: employee.email,
           role: dept.legacyRole || dept.slug,
-          deptRole: await require("../../services/departmentRoles").getRole(dept.slug, employee.email),
+          deptRole,
           employeeId: employee.biometricId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -1152,7 +1175,7 @@ router.post("/switch-department", async (req, res) => {
 
     /* ---- employee session ---- */
     if (decoded.subject === "employee") {
-      const employee = await Employee.findById(decoded.id);
+      const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
       if (!employee || employee.isActive === false || employee.status === "inactive") {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
@@ -1331,7 +1354,7 @@ router.post("/change-password", async (req, res) => {
         upgradeEmployeePassword,
       } = require("../../utils/employeePassword");
 
-      const employee = await Employee.findById(decoded.id);
+      const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
       if (!employee) return res.status(401).json({ success: false, message: "Unauthorized" });
 
       if (currentPassword) {
@@ -1446,7 +1469,7 @@ router.post("/cowork-sso", async (req, res) => {
       });
     }
 
-    const employee = await Employee.findById(decoded.id);
+    const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
     if (!employee || employee.isActive === false || employee.status === "inactive") {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
