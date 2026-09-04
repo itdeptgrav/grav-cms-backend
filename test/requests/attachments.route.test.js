@@ -278,10 +278,10 @@ describe("who can open a quote", () => {
 /* ═══ ADDING ONE LATER ════════════════════════════════════════════════════ */
 
 describe("adding proof after submitting", () => {
-  async function pending() {
+  async function pending(over = {}) {
     const s = await seed();
     const { body: out } = await call(s.emp, "/", {
-      method: "POST", body: body({ ledgerId: String(s.ledger._id) }),
+      method: "POST", body: body({ ledgerId: String(s.ledger._id), ...over }),
     });
     return { ...s, id: out.request._id };
   }
@@ -314,7 +314,13 @@ describe("adding proof after submitting", () => {
   });
 
   test("nobody can once it is decided — that would be evidence for a decision already taken", async () => {
-    const { emp, tl, finEmp, id } = await pending();
+    /* ── RAISED AS A PRODUCT, DELIBERATELY ────────────────────────────────
+       The rule under test is about DECISION STATE — no evidence for a
+       decision already taken — and holds for either request type. A SERVICE
+       request cannot reach a decision without its lines being matched to a
+       live service first, and dragging that whole step in here would make the
+       fixture, rather than the rule, the thing this test exercises. */
+    const { emp, tl, finEmp, id } = await pending({ requestType: "PRODUCT" });
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
     await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
     const { status, body: out } = await call(emp, `/${id}/attachments`, {

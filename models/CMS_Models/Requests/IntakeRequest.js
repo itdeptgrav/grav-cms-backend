@@ -38,6 +38,12 @@
 // classification, by the people who know it does.
 
 const mongoose = require("mongoose");
+/* One vocabulary for budget-head resolution, shared with the resolver and
+   the Finance APIs. A LEAF module on purpose: importing the resolver here
+   would register its mongoose models, and registering a model creates its
+   collection — which the baseline audit reads as "this feature is
+   deployed". See services/budgetAllocationVocabulary.js. */
+const budgetHead = require("../../../services/budgetAllocationVocabulary");
 
 const intake = require("../../../services/requestIntake.service");
 
@@ -136,19 +142,32 @@ const lineSchema = new mongoose.Schema(
             default: null,
           },
           budgetLedgerName: { type: String, trim: true, default: "" },
+          /* ── THE ENUM COMES FROM THE RESOLVER, NOT FROM A LIST HERE ────
+             Three copies of these strings — this model, the intake model and
+             the service — drift one value at a time, and the drift shows up
+             as a stored document the schema then refuses to load. B2 added
+             `service_default` (a service's own configured head) and
+             `manual_selection` (a person chose, over or in the absence of any
+             rule); both arrive from the one place they are defined. */
           resolutionSource: {
             type: String,
-            enum: ["item_override", "category_mapping", "unresolved"],
-            default: "unresolved",
+            enum: budgetHead.RESOLUTION_SOURCES,
+            default: budgetHead.SOURCE_NONE,
           },
           resolutionCategory: { type: String, trim: true, default: "" },
+          /* ── WHY A PERSON OVERRODE A CONFIGURED DEFAULT ─────────────────
+             Required by the route, not by the schema: a line that simply took
+             the service's own default has no reason to give, and making the
+             field mandatory would produce "n/a" on thousands of rows and
+             teach everyone to stop reading it. */
+          resolutionReason: { type: String, trim: true, default: "" },
           selectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
           selectedByName: { type: String, trim: true, default: "" },
           selectedAt: { type: Date, default: null },
           status: {
             type: String,
-            enum: ["resolved", "unresolved", "manual_selection_required"],
-            default: "unresolved",
+            enum: budgetHead.RESOLUTION_STATUSES,
+            default: budgetHead.STATUS_UNRESOLVED,
           },
         },
         { _id: false },

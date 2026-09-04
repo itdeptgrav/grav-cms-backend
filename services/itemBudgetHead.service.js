@@ -35,9 +35,20 @@ const classification = require("./budgetClassification.service");
    `budgetAllocation.resolutionSource` on a request line, and eventually into
    whatever reads that line. Renaming one of them later means rewriting stored
    documents, so they are named once, here, and re-used rather than retyped. */
-const SOURCE_ITEM = "item_override";
-const SOURCE_CATEGORY = "category_mapping";
-const SOURCE_NONE = "unresolved";
+/* ── ONE VOCABULARY, DEFINED IN A LEAF MODULE ───────────────────────────────
+   These lived here, and the two request SCHEMAS imported this file to get the
+   enum — which pulled `Acc_ItemCategoryBudget` and `Acc_Ledger` in with it.
+   Registering a mongoose model builds its indexes, which creates the
+   collection, and the baseline audit reads a collection's ABSENCE as "this
+   feature was never deployed". Merely loading a request model had started
+   manufacturing that evidence. The strings moved to a file with no requires;
+   they are re-exported here so every existing caller is unaffected. */
+const vocabulary = require("./budgetAllocationVocabulary");
+const {
+  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL, SOURCE_NONE,
+  RESOLUTION_SOURCES,
+  STATUS_RESOLVED, STATUS_UNRESOLVED, STATUS_MANUAL_REQUIRED, RESOLUTION_STATUSES,
+} = vocabulary;
 
 /* ── ONE NORMALISATION, USED EVERYWHERE ─────────────────────────────────────
  * "Fabric", "fabric" and " Fabric " are one category to everyone except a
@@ -160,6 +171,234 @@ function headForItem(item = {}, map = new Map()) {
       ? `No budget head mapped for category "${category}".`
       : "This item has no category, so no budget head can be derived.",
   };
+}
+
+/* ══ SERVICES ═══════════════════════════════════════════════════════════════
+ * ── WHY THIS IS NOT `headForItem` WITH A DIFFERENT ARGUMENT ─────────────────
+ * An item resolves through THREE steps and a service through ONE. A service
+ * has a `category` field, and it looks exactly like an item's — but the Item
+ * Category mappings are a statement about what the STORE stocks, and letting
+ * a service called "Consultancy" inherit the head somebody mapped for the
+ * consumables category would charge professional fees to a materials budget
+ * and look completely deliberate on the report.
+ *
+ * So this function takes NO map. Not "ignores one" — cannot receive one. The
+ * rule is enforced by the signature rather than by remembering to obey it.
+ *
+ * Nor is anything inferred from the supplier, the SAC code or the GST rate.
+ * A supplier sells more than one kind of thing (the item path learned this
+ * from VRL Logistics: 83% freight, 17% labour), a SAC code is a tax
+ * classification rather than a budget one, and a GST rate is a percentage.
+ * None of them is evidence about which envelope the money leaves.
+ */
+
+/**
+ * The head for one service.
+ *
+ * `service` is a Service-shaped object — needs `budgetLedgerId` and, where
+ * set, `budgetLedgerName`. The result shape is identical to `headForItem`'s so
+ * a caller handling both never has to branch on which it received.
+ */
+function headForService(service = {}) {
+  const category = service.category || null;
+
+  if (service.budgetLedgerId) {
+    return {
+      budgetLedgerId: service.budgetLedgerId,
+      budgetLedgerName: service.budgetLedgerName || null,
+      source: SOURCE_SERVICE,
+      category,
+      message: `Set on this service directly${
+        service.budgetLedgerName ? ` — ${service.budgetLedgerName}` : ""
+      }.`,
+    };
+  }
+
+  /* ── AND THE CATEGORY IS NOT A SECOND CHANCE ──────────────────────────
+     Named in the message so the reader can see it was considered and
+     deliberately not used, rather than wondering whether it was missed. */
+  return {
+    budgetLedgerId: null,
+    budgetLedgerName: null,
+    source: SOURCE_NONE,
+    category,
+    message: "No budget head is set on this service."
+      + (category ? ` Its category ("${category}") does not supply one.` : ""),
+  };
+}
+
+/* ── DOES THE SERVICE'S DEFAULT AGREE WITH THE HEAD THE REQUEST IS ON? ──────
+ * Four answers, and they are genuinely four. Collapsing "no default was ever
+ * configured" into "the default disagrees" would make Finance answer for a
+ * decision nobody made; collapsing "the default is not budgeted in this
+ * department" into "it agrees" would let a request be approved against an
+ * envelope that does not exist.
+ *
+ * `availableHeadIds` is the department's APPROVED BUDGET LINES — not the set
+ * of mappable expense ledgers. A ledger being classifiable as spend says
+ * nothing about whether this department has money on it, and calling the
+ * first thing "available budget" is the misreading this argument exists to
+ * prevent. Pass the ids from `budgetCommitment.approvedHeadsFor`.
+ */
+const AGREEMENT = Object.freeze({
+  MATCHES: "default_matches_request_head",
+  DIFFERENT: "different_head_selected",
+  NO_DEFAULT: "service_default_unresolved",
+  NOT_AVAILABLE: "default_not_available_in_department",
+});
+
+function serviceHeadAgreement({ resolution, requestLedgerId, availableHeadIds = [] } = {}) {
+  const defaultId = resolution?.budgetLedgerId ? String(resolution.budgetLedgerId) : null;
+  const requestId = requestLedgerId ? String(requestLedgerId) : null;
+  const available = new Set((availableHeadIds || []).map(String));
+
+  if (!defaultId) {
+    return {
+      state: AGREEMENT.NO_DEFAULT,
+      /* Not an error, and never a reason to block: a service nobody has
+         classified is finance's decision to make now, not a fault. */
+      adoptable: false,
+      message: "This service has no budget default. Finance chooses the head.",
+    };
+  }
+
+  /* Checked BEFORE the comparison. A default that this department cannot
+     spend against is not "a different head" — it is not a choice at all, and
+     offering it as one is how a request gets pointed at an empty envelope. */
+  if (!available.has(defaultId)) {
+    return {
+      state: AGREEMENT.NOT_AVAILABLE,
+      adoptable: false,
+      message: `${resolution.budgetLedgerName || "The service default"} is not an approved budget head for this department.`,
+    };
+  }
+
+  if (requestId && defaultId === requestId) {
+    return {
+      state: AGREEMENT.MATCHES,
+      adoptable: false, // already on it
+      message: `The request is on this service's default head.`,
+    };
+  }
+
+  return {
+    state: AGREEMENT.DIFFERENT,
+    /* Offerable precisely because it IS an approved head for this department.
+       Adopting is always an explicit action — nothing here rewrites the
+       request's head on its own. */
+    adoptable: true,
+    message: `This service normally uses ${resolution.budgetLedgerName || "another head"}, and the request is on a different one.`,
+  };
+}
+
+/**
+ * The allocation to store on one classified SERVICE line.
+ *
+ * Pure. Returns the exact `budgetAllocation` subdocument shape both request
+ * models declare, so the route stores what this decides rather than
+ * assembling its own version beside it.
+ *
+ * `chosen` is the head actually in force for the line — the request-level
+ * head, since B2 keeps ONE request-level commitment. Whether that counts as
+ * `service_default` or `manual_selection` is decided by whether it equals the
+ * service's configured default.
+ */
+function serviceLineAllocation({ resolution, chosenLedgerId, chosenLedgerName, actor, reason = "" } = {}) {
+  const defaultId = resolution?.budgetLedgerId ? String(resolution.budgetLedgerId) : null;
+  const chosenId = chosenLedgerId ? String(chosenLedgerId) : null;
+  const agrees = !!defaultId && !!chosenId && defaultId === chosenId;
+
+  /* No head in force at all: honestly unresolved. NOT "manual_selection with
+     a null head", which would read as a decision somebody made. */
+  if (!chosenId) {
+    return {
+      budgetLedgerId: null,
+      budgetLedgerName: "",
+      resolutionSource: SOURCE_NONE,
+      resolutionCategory: resolution?.category || "",
+      resolutionReason: "",
+      selectedBy: null,
+      selectedByName: "",
+      selectedAt: null,
+      status: defaultId ? STATUS_MANUAL_REQUIRED : STATUS_UNRESOLVED,
+    };
+  }
+
+  return {
+    budgetLedgerId: chosenId,
+    budgetLedgerName: chosenLedgerName || resolution?.budgetLedgerName || "",
+    resolutionSource: agrees ? SOURCE_SERVICE : SOURCE_MANUAL,
+    resolutionCategory: resolution?.category || "",
+    /* Recorded only where it means something: a reason on a line that simply
+       took the service's own default is noise, and noise in an audit field is
+       how the field stops being read. */
+    resolutionReason: agrees ? "" : String(reason || "").trim().slice(0, 300),
+    selectedBy: agrees ? null : (actor?.id || null),
+    selectedByName: agrees ? "" : (actor?.name || ""),
+    selectedAt: agrees ? null : new Date(),
+    status: STATUS_RESOLVED,
+  };
+}
+
+/**
+ * Resolve a set of service ids — the inspection path behind the Finance API.
+ *
+ * One row per REQUESTED id, in three honest flavours: found and resolved,
+ * found and unresolved, and not found in this company. A caller checking
+ * twenty services needs to see which two are missing rather than receive
+ * eighteen rows that look like a complete answer.
+ *
+ * ── SCOPED, UNLIKE THE ITEM PATH ────────────────────────────────────────────
+ * `RawItem` carries no `companyId`, so `resolveItemIds` cannot scope and says
+ * so. `Service` does, so this DOES — and another company's service comes back
+ * as `found: false` carrying no name, no category and no configuration. The
+ * wording is identical to a genuinely absent id on purpose: distinguishing
+ * them would confirm that another company holds that record.
+ */
+async function resolveServiceIds({ serviceIds = [], companyId, Service }) {
+  const ids = [...new Set(serviceIds.map(String).filter(Boolean))];
+  if (!ids.length) return [];
+  if (!companyId) throw new Error("resolveServiceIds needs a company.");
+
+  /* Ids arrive from a client, so anything that is not an ObjectId would throw
+     a CastError for the WHOLE query and lose the valid ids with it. Filtered
+     here; they still get a row below, as not found. */
+  const mongoose = require("mongoose");
+  const queryable = ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+
+  const found = queryable.length
+    ? await Service.find({ companyId, _id: { $in: queryable } })
+      .select("_id serviceCode name category billingUnit status budgetLedgerId budgetLedgerName")
+      .lean()
+    : [];
+  const byId = new Map(found.map((s) => [String(s._id), s]));
+
+  return ids.map((id) => {
+    const service = byId.get(id);
+    if (!service) {
+      return {
+        serviceId: id,
+        found: false,
+        budgetLedgerId: null,
+        budgetLedgerName: null,
+        source: SOURCE_NONE,
+        category: null,
+        message: "No service with this id in this company.",
+      };
+    }
+    return {
+      serviceId: id,
+      found: true,
+      serviceCode: service.serviceCode || null,
+      serviceName: service.name,
+      billingUnit: service.billingUnit || null,
+      /* Carried because Finance may legitimately inspect a retired service —
+         a classification made last year has to stay understandable — and a
+         row that does not say so reads as one still in use. */
+      status: service.status || "ACTIVE",
+      ...headForService(service),
+    };
+  });
 }
 
 /** The same, for a list — one query for the whole set. */
@@ -316,7 +555,20 @@ async function coverage({ companyId, RawItem }) {
  * budgetable classes because the budget PICKERS legitimately need both; this
  * gate is narrower on purpose, and the difference is the point.
  */
-async function assertMappable(ledgerId, companyId) {
+async function assertMappable(ledgerId, companyId, opts = {}) {
+  /* The noun in the refusal. The GATE is identical for an item category and a
+     service — one classification contract, no second opinion — but "a category
+     cannot be mapped to it" is nonsense on a service screen, and a message a
+     reader cannot act on is a message they raise a ticket about. */
+  const subject = opts.subject || "a category";
+
+  /* An id that is not an ObjectId throws a CastError out of `findById` and
+     surfaces as a 500. It is a refusal, not a server fault. */
+  const mongooseLib = require("mongoose");
+  if (!ledgerId || !mongooseLib.Types.ObjectId.isValid(String(ledgerId))) {
+    return { ok: false, message: "That head does not exist." };
+  }
+
   const ledger = await Acc_Ledger.findById(ledgerId)
     .select("_id name companyId groupId groupName budgetControl")
     .lean();
@@ -334,23 +586,40 @@ async function assertMappable(ledgerId, companyId) {
     ? await Acc_Group.findById(ledger.groupId).select("nature name").lean()
     : null;
 
+  /* ── A HEAD WITH NO NATURE IS REFUSED, NOT ASSUMED ────────────────────────
+     Derived from the GROUP's nature, exactly as before — the item path relies
+     on this and B1 does not renegotiate it. When the group has none, nothing
+     is derivable and `classify` lands on `not_budgeted`, so such a head is
+     already refused; the refusal below now SAYS which of the two reasons it
+     was, because "not a budget head" reads as a policy decision while a blank
+     nature is a gap in the chart somebody can go and fix.
+
+     (The ledger's own `nature` is deliberately NOT consulted. Preferring it
+     would accept heads this gate refuses today — a behaviour change to the
+     item path, which is out of scope here. Worth revisiting on its own.) */
+  const nature = group?.nature || null;
+
   const control = classification.budgetControlOf({
     budgetControl: ledger.budgetControl,
     name: ledger.name,
     groupName: ledger.groupName || group?.name || "",
-    nature: group?.nature || null,
+    nature,
   });
 
   if (control === classification.REVENUE_TARGET) {
     return {
       ok: false,
-      message: `${ledger.name} is a revenue target, not a spending budget — an item cannot be charged to it.`,
+      message: `${ledger.name} is a revenue target, not a spending budget — spend cannot be charged to it.`,
     };
   }
   if (control !== classification.EXPENSE_BUDGET) {
     return {
       ok: false,
-      message: `${ledger.name} is not a budget head, so a category cannot be mapped to it.`,
+      message: nature
+        ? `${ledger.name} is not a budget head, so ${subject} cannot be mapped to it.`
+        /* Named separately: "not a budget head" reads as a policy decision,
+           and this one is a gap in the chart that somebody can go and fix. */
+        : `${ledger.name} has no recorded nature, so it cannot be confirmed as a budget head.`,
     };
   }
   return { ok: true, ledger, budgetControl: control };
@@ -360,11 +629,23 @@ module.exports = {
   categoryKeyOf,
   SOURCE_ITEM,
   SOURCE_CATEGORY,
+  SOURCE_SERVICE,
+  SOURCE_MANUAL,
   SOURCE_NONE,
+  RESOLUTION_SOURCES,
+  STATUS_RESOLVED,
+  STATUS_UNRESOLVED,
+  STATUS_MANUAL_REQUIRED,
+  RESOLUTION_STATUSES,
+  AGREEMENT,
+  serviceHeadAgreement,
+  serviceLineAllocation,
   categoryMap,
   headForItem,
   headsForItems,
   coverage,
   resolveItemIds,
+  headForService,
+  resolveServiceIds,
   assertMappable,
 };
