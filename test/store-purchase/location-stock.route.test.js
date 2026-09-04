@@ -25,6 +25,9 @@ beforeAll(async () => {
   const app = express();
   app.use(express.json());
   app.use("/api/cms/inventory/locations", require("../../routes/CMS_Routes/Inventory/Operations/locationStockRoutes"));
+  // The CANONICAL manual stock in/out — now location-aware. Location tests use
+  // it to prove issues go through real stock history, not a standalone path.
+  app.use("/api/cms/inventory/stock-adjustments", require("../../routes/CMS_Routes/Inventory/Products/stockAdjustments"));
   await new Promise((r) => { server = app.listen(0, r); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
