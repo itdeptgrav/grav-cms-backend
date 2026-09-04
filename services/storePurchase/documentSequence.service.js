@@ -29,6 +29,15 @@ const DOCUMENT_TYPES = Object.freeze({
      their own requests independently is the point, and the old global
      read-last-plus-one could not express that. */
   MATERIAL_REQUEST: { prefix: "MRF", pad: 4, perSite: false },
+  /* The Service Master's internal code. A master record is not a document, so
+     the financial year in the number reads as "registered in 2026-27" rather
+     than as a document date — deliberate, because the alternative is a second
+     numbering scheme that races exactly the way this service exists to stop. */
+  SERVICE: { prefix: "SVC", pad: 4, perSite: false },
+  /* Service ORDERS — the operational document, numbered per company/FY like
+     every other. Distinct from the Service master code (`SERVICE`/`SVC`
+     above), which is Lane A's and left exactly as it is. */
+  SERVICE_ORDER: { prefix: "SVO", pad: 4, perSite: false },
 });
 
 /**
