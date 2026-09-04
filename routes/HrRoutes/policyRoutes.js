@@ -21,6 +21,9 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+/* The presence passes below start on require, not from server.js, so the
+   instance-level switch has to be consulted here. See config/backgroundJobs. */
+const { backgroundJobsEnabled } = require("../../config/backgroundJobs");
 
 const Policy = require("../../models/HR_Models/Policy");
 const C4Config = require("../../models/HR_Models/C4Config");
@@ -349,6 +352,11 @@ async function runPresenceCredits(fromStr, toStr, opts = {}) {
 const PRESENCE_THROTTLE_MS = 60 * 60 * 1000;
 
 function maybeRunPresenceCredits(trigger) {
+  /* Request-driven, so it survives the boot-time guards below and needs its
+     own. The atomic claim keeps two instances from double-crediting, but an
+     instance that is not supposed to be writing should not take the claim at
+     all — winning it would leave the live instance thinking the hour is done. */
+  if (!backgroundJobsEnabled()) return;
   (async () => {
     const cutoff = new Date(Date.now() - PRESENCE_THROTTLE_MS);
     // Atomic claim: only one request wins the slot; missing field (older
@@ -378,7 +386,7 @@ function maybeRunPresenceCredits(trigger) {
 
 // Interval + boot pass still run whenever the instance happens to be awake —
 // a free bonus, but the lazy trigger above is what guarantees correctness.
-if (!global.__c4PresenceTimer) {
+if (!global.__c4PresenceTimer && backgroundJobsEnabled()) {
   const kick = () => {
     const today = todayLocalStr();
     const d = new Date(`${today}T00:00:00`);
@@ -403,7 +411,7 @@ if (!global.__c4PresenceTimer) {
 // (shifts and punches are settled by then) plus yesterday as self-heal in case
 // the previous night's tick was missed. Dedup makes both free on re-runs.
 // To change the time, edit the "30 21" cron string below (min hour).
-if (!global.__c4PresenceCron) {
+if (!global.__c4PresenceCron && backgroundJobsEnabled()) {
   try {
     const nodeCron = require("node-cron");
     global.__c4PresenceCron = nodeCron.schedule(

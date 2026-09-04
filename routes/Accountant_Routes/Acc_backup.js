@@ -32,6 +32,7 @@ const jwt = require("jsonwebtoken");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const backupService = require("../../services/accountantBackup.service");
 const backupScheduler = require("../../services/accountantBackupScheduler");
+const { backgroundJobsEnabled } = require("../../config/backgroundJobs");
 const {
   Acc_BackupConfig,
   Acc_BackupRecord,
@@ -39,7 +40,10 @@ const {
 
 // Start the in-process scheduler once (best-effort automatic backups).
 try {
-  backupScheduler.start();
+  /* Starts on require, so the instance switch has to be consulted here and
+     not in server.js: two instances would each upload an hourly backup to
+     Drive and write duplicate backup records. */
+  if (backgroundJobsEnabled()) backupScheduler.start();
 } catch (e) {
   console.error("[backup] scheduler failed to start:", e.message);
 }

@@ -22,6 +22,13 @@ const { Server } = require("socket.io");
 const activeMeetingRecordings = new Map();
 // IMPORT PRODUCTION SYNC SERVICE
 const productionSyncService = require("./services/productionSyncService");
+/* Whether THIS process is the one that runs the schedules. See
+   config/backgroundJobs — unset, everything below registers as it always has. */
+const {
+  backgroundJobsEnabled,
+  skipBackgroundJob,
+  announceBackgroundJobMode,
+} = require("./config/backgroundJobs");
 
 const app = express();
 
@@ -2872,7 +2879,10 @@ const overtimeRoutes = require("./routes/Employee_Routes/Overtimeroutes");
 const timerSopRoutes = require("./routes/task_routes/timerSop.routes");
 app.use("/api/employee/overtime", overtimeRoutes);
 app.use("/cowork", timerSopRoutes);
-overtimeRoutes.startOvertimeReminders(io);
+/* Called again (guarded) further down, but `_otCronStarted` makes the second
+   call a no-op -- whichever runs FIRST wins. So this one needs the guard too,
+   or the loop is already running by the time the guarded call is reached. */
+if (backgroundJobsEnabled()) overtimeRoutes.startOvertimeReminders(io);
 
 /* =====================
     PRODUCTION SYNC MANAGEMENT ROUTES
@@ -2918,11 +2928,13 @@ app.get("/api/app/version", (req, res) => {
   });
 });
 
-if (attendanceRouter.startHourlyAttendanceSync) {
-  attendanceRouter.startHourlyAttendanceSync();
-  console.log("✅ Hourly attendance sync cron initialized");
-} else {
-  console.warn("⚠️ Hourly attendance sync not available");
+if (!skipBackgroundJob("hourly attendance sync (eTimeOffice pull + write)")) {
+  if (attendanceRouter.startHourlyAttendanceSync) {
+    attendanceRouter.startHourlyAttendanceSync();
+    console.log("✅ Hourly attendance sync cron initialized");
+  } else {
+    console.warn("⚠️ Hourly attendance sync not available");
+  }
 }
 
 /* "You still have things waiting on you", hourly.
@@ -2930,9 +2942,11 @@ if (attendanceRouter.startHourlyAttendanceSync) {
    default and will be the usual state — the sweep starts from the DEVICES that
    opted in, not from the staff list. See services/pendingReminders.service. */
 try {
-  const { startPendingReminders } = require("./services/pendingReminders.service");
-  startPendingReminders();
-  console.log("✅ Hourly pending-work reminders initialized");
+  if (!skipBackgroundJob("hourly pending-work reminders (push)")) {
+    const { startPendingReminders } = require("./services/pendingReminders.service");
+    startPendingReminders();
+    console.log("✅ Hourly pending-work reminders initialized");
+  }
 } catch (err) {
   console.warn("⚠️ Pending-work reminders not started:", err.message);
 }
@@ -2942,17 +2956,21 @@ try {
 // sync above has brought the evening's punches in — it reads that data rather
 // than calling eTimeOffice again.
 try {
-  const {
-    startCoworkPunchOutOfflineSync,
-  } = require("./services/coworkPunchOutOffline.service");
-  startCoworkPunchOutOfflineSync();
+  if (!skipBackgroundJob("cowork punch-out offline sync (23:30 IST)")) {
+    const {
+      startCoworkPunchOutOfflineSync,
+    } = require("./services/coworkPunchOutOffline.service");
+    startCoworkPunchOutOfflineSync();
+  }
 } catch (e) {
   console.warn("⚠️ Cowork punch-out offline sync not available:", e.message);
 }
 
 // Start persistent OT reminder notifications (random 5-20 min intervals)
-overtimeRoutes.startOvertimeReminders(io);
-console.log("✅ Overtime reminder cron initialized");
+if (!skipBackgroundJob("overtime stay-over reminders (push)")) {
+  overtimeRoutes.startOvertimeReminders(io);
+  console.log("✅ Overtime reminder cron initialized");
+}
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -3011,6 +3029,15 @@ server.listen(PORT, () => {
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
   console.log(`Server running on port ${PORT}`);
+
+  /* Everything past this point is scheduled or boot-time background work:
+     the transcript expiry cron, the QR sweep, the cowork_tasks repair pass,
+     the job registry, and the four setIntervals (meeting reminders, anomaly
+     scan, heartbeat check, Timer-SOP finalize). A process that is not the one
+     running the schedules stops here and simply serves requests. */
+  announceBackgroundJobMode();
+  if (!backgroundJobsEnabled()) return;
+
   transcriptModule.startCron();
 
   /* Spent and expired QR sign-in codes.
