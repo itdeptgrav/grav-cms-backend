@@ -376,6 +376,122 @@ describe("which legs are budget-controlled", () => {
     expect(row.status).not.toBe("no_budget");
   });
 
+  test("a bill posting to INVENTORY still lands on the request's budget line", async () => {
+    /* Raw material is the case this exists for. A purchase debits the Raw
+       Materials INVENTORY account — correct bookkeeping, and an asset, so the
+       leg is not budget-controlled on its own. But the request behind it was
+       approved against a real spend head, and the budget has to see the money
+       land or the line silently frees up: commitment released on posting,
+       actual recorded nowhere. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const budget = await liveBudget({
+      companyId: company._id, ledger: expenseLedger, allocated: 500000, department: "Production",
+    });
+    const lineId = budget.items[0]._id;
+
+    const invGroup = await Acc_Group.create({
+      companyId: company._id, name: "Inventory", nature: "asset",
+    });
+    const rawMaterials = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "Raw Materials",
+      groupId: invGroup._id,
+      groupName: invGroup.name,
+      nature: "asset",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: rawMaterials._id, type: "Dr", amount: 60000 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 60000 },
+      ],
+      releasingCommitment: { budgetLineId: lineId, ledgerId: expenseLedger._id },
+    });
+
+    const row = rowFor(res, rawMaterials._id);
+    expect(String(row.trackedAgainstBudgetLineId)).toBe(String(lineId));
+  });
+
+  test("only the purchase leg is attributed — not the tax, vendor or bank on the same bill", async () => {
+    /* The guard on the fix above. Every leg of this voucher is skipped by the
+       not-budgeted branch, and a source line exists, so the danger is that all
+       five claim the same allocation and one ₹60,000 bill eats ₹1,40,000 of
+       budget. Exactly one leg may be tracked. */
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const budget = await liveBudget({
+      companyId: company._id, ledger: expenseLedger, allocated: 500000, department: "Production",
+    });
+    const lineId = budget.items[0]._id;
+    const { cgst, tds, party } = await chartWithTaxAndParty(company);
+
+    const invGroup = await Acc_Group.create({
+      companyId: company._id, name: "Inventory", nature: "asset",
+    });
+    const rawMaterials = await Acc_Ledger.create({
+      companyId: company._id, name: "Raw Materials",
+      groupId: invGroup._id, groupName: invGroup.name, nature: "asset",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: rawMaterials._id, type: "Dr", amount: 60000 },
+        { ledgerId: cgst._id, type: "Dr", amount: 5400 },
+        { ledgerId: tds._id, type: "Cr", amount: 600 },
+        { ledgerId: party._id, type: "Cr", amount: 70800 },
+        { ledgerId: bankLedger._id, type: "Cr", amount: 60000 },
+      ],
+      releasingCommitment: { budgetLineId: lineId, ledgerId: expenseLedger._id },
+    });
+
+    const tracked = res.results.filter((r) => r.trackedAgainstBudgetLineId);
+    expect(tracked).toHaveLength(1);
+    expect(tracked[0].ledgerName).toBe("Raw Materials");
+
+    /* Named individually too, so a future change that starts attributing one
+       of these fails on the leg it broke rather than on a count. */
+    for (const l of [cgst, tds, party, bankLedger])
+      expect(rowFor(res, l._id).trackedAgainstBudgetLineId).toBeUndefined();
+  });
+
+  test("a CREDIT to inventory is consumption, not a purchase", async () => {
+    /* Issuing material to production credits Raw Materials. That is the stock
+       leaving, not money being spent, and must never consume a budget. */
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await liveBudget({
+      companyId: company._id, ledger: expenseLedger, allocated: 500000, department: "Production",
+    });
+    const invGroup = await Acc_Group.create({
+      companyId: company._id, name: "Inventory", nature: "asset",
+    });
+    const rawMaterials = await Acc_Ledger.create({
+      companyId: company._id, name: "Raw Materials",
+      groupId: invGroup._id, groupName: invGroup.name, nature: "asset",
+    });
+    const wipGroup = await Acc_Group.create({
+      companyId: company._id, name: "Work In Progress", nature: "asset",
+    });
+    const wip = await Acc_Ledger.create({
+      companyId: company._id, name: "WIP", groupId: wipGroup._id,
+      groupName: wipGroup.name, nature: "asset",
+    });
+
+    const res = await control.checkBudgetAvailability({
+      companyId: company._id,
+      voucherDate: "2026-08-10",
+      ledgerEntries: [
+        { ledgerId: wip._id, type: "Dr", amount: 40000 },
+        { ledgerId: rawMaterials._id, type: "Cr", amount: 40000 },
+      ],
+      releasingCommitment: { budgetLineId: budget.items[0]._id, ledgerId: expenseLedger._id },
+    });
+
+    expect(rowFor(res, rawMaterials._id).trackedAgainstBudgetLineId).toBeUndefined();
+  });
+
   test("with no source request, the posting ledger is still matched on its own", async () => {
     /* The attribution above must not become a blanket pass. A bill typed
        straight into the purchase module has no request behind it and is
