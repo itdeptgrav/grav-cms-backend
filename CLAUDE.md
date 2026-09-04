@@ -37,6 +37,8 @@ npm run dev        # nodemon server.js → http://localhost:5000
 npm start          # node server.js
 ```
 
+`npm run verify` runs the verification harnesses — the hand-written end-to-end checks in the repo root. Two tiers, and the split matters: the default set touches no data (pure business rules, plus read-only checks against the dev database) and takes seconds; `npm run verify:all` adds the ones that WRITE throwaway rows to the shared dev database and delete them again. `node verify.js --list` shows what exists; `node verify.js salary` runs one subject. Add a new harness to the right tier in `verify.js` or nobody will ever run it.
+
 `npm test` runs the node:test files under `services/` and `middleware/`. Coverage is thin — a handful of pure services plus the three `middleware/bandwidth*.test.js` suites. **Most of the codebase has no tests.** The root-level `*_test.js`, `verify*.js`, `fix-*.js`, `backfill_*.js`, and `seed*.js` files are hand-run interactive scripts that read and write the **live dev MongoDB and Firestore**:
 
 ```bash
