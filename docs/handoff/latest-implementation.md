@@ -5203,3 +5203,343 @@ migration, backfill, frontend, Lane B or Store/Purchase file changed. No
 database connected; the new suite issues no query. `WorkOrder.status` untouched.
 `docs/tasks/current-task.md` untouched. Decision 15 remains outstanding and no
 backfill work began.
+
+## Visible Batch 3 — Products & BOM + Setup consistency (4 Sep 2026)
+
+**Frontend only** (`/Users/risheeray/grav-cms`). No Chunk 4B work. No backend,
+API, migration or database change. Existing APIs only.
+
+### The problem
+
+Six screens are SHARED — one component rendered under `/sales/dashboard`,
+`/merchandiser`, `/production-supervisor` and `/project-manager`, given the
+matching chrome by `AutoDashboardLayout`. The sharing is right and was
+preserved; what leaked was identity. Every one of them hardcoded
+`kicker="Sales"`, so a Project Manager on a PM URL, in the PM shell, with PM
+navigation highlighted, read **"Sales"** above the title — and carried Sales'
+vocabulary ("Size Configuration", "Registered Operations") for things the floor
+calls something else.
+
+### Files changed (8)
+
+| File | Change |
+| --- | --- |
+| `components/pm/deptPageIdentity.js` | **New.** Department-aware `{kicker, title, sub, addLabel}` adapter. React-free so the existing `node --test` runner loads it. |
+| `components/pm/deptPageIdentity.test.mjs` | **New**, 10 tests. |
+| `app/sales/dashboard/stock-items/page.js` | Identity adapter; **table/grid toggle**; `countOrDash`. |
+| `app/sales/dashboard/size-config/page.js` | Identity adapter. |
+| `app/sales/dashboard/inventory-configurations/{units-packaging,registered-operations,warehouse,devices-machines}/page.js` | Identity adapter. |
+| `.claude/launch.json` | Port corrected 3000 → 3001 to match `next dev -p 3001`. |
+
+**No page was forked.** The five PM Setup routes stay one-line re-exports; a
+sixth copy of each page was the alternative and was rejected.
+
+### What changed on screen
+
+- **PM:** "Products & BOM", kicker "Project Manager", sub naming variants,
+  operations and the bill of materials work orders are planned from; **Add
+  product** (still `RoleGate min="editor"`).
+- **PM Setup titles now match the nav words** — Measurements, Units & packaging,
+  Operations, Warehouses, Devices & machines — each with a one-line purpose.
+- **Table/grid toggle** on the catalogue (table stays default). The grid shows
+  image, name/reference, status, category and the three figures a planner opens
+  this page for — variants, operations, materials — with the same View/Edit
+  links and the same role gates as the row.
+- **`countOrDash`:** an absent array renders **—**, an empty one renders 0.
+  `item.operations?.length || 0` claimed "0 operations" for data never loaded,
+  directly beside a warning telling the PM to go fix it.
+- **Sales is untouched** — same titles, same subs, same "Add new product". Six
+  of the ten tests exist to pin that.
+
+### Verification
+
+- New tests **10/10**. Full frontend suite **793 tests, 1 failure** —
+  `components/store/catalogue-access/screens.test.mjs`, which asserts on
+  `components/store/item-master/` (Store/Purchase lane, edited 08:17 today).
+  Not ours.
+- SWC parse clean on all 7 changed `.js` files. `git diff --check` clean.
+- PM nav key resolution confirmed for all six routes (`products`,
+  `size-config`, `units-packaging`, `operations`, `warehouse`,
+  `devices-machines`).
+
+### Blocker — browser verification could not be run
+
+Two independent causes, neither ours:
+
+1. **`components/DashboardLayout.js` does not parse — and it is committed.**
+   Line 103 begins an orphaned array body (`{ section: "Desk" }, …` through
+   `];` at 129) whose declaration was dropped in merge **d1224ca**
+   (3 Sep, `origin/main` → `rishee_sales_frontend`). `withIcons` now sits where
+   the declaration was. HEAD and the working tree fail identically; the file is
+   unmodified, so this is on the branch, not in someone's editor. It poisons
+   **every** department, because `AutoDashboardLayout` imports it — Sales 500s
+   too. Left untouched: it is the PM shell owner's file, and the extracted
+   `components/pm/projectManagerNavigation.js` already exports `PM_NAV`, so the
+   intended end state is theirs to declare.
+2. **No API and an auth wall.** Port 5000 answers as macOS AirPlay Receiver, not
+   the CMS backend, and PM routes redirect to `/?next=…`. Populated, empty,
+   refresh-failure and viewer-vs-editor states are unreachable without a backend
+   and credentials regardless of (1).
+
+Once (1) is fixed and a backend is up, the outstanding checks are the three
+viewports, the data states and horizontal-overflow.
+
+**Re-checked 4 Sep, later.** Blocker (1) is cleared — `DashboardLayout.js`
+parses. Two *different* committed defects in the same lane's files now block
+rendering, and browser verification is still not possible:
+
+- `components/shell/FrostShell.js:511` calls `initialOpenGroups(nav, activeMenu)`
+  but the file never imports it. The function exists and is already unit-tested
+  (`components/shell/drawerGroups.js`, `drawerGroups.test.mjs`), so the fix is
+  one line — `import { initialOpenGroups } from "./drawerGroups";`. The file is
+  clean against HEAD, so this is committed. It throws inside the shell, so it
+  takes down **every** dashboard page in every department.
+- `app/project-manager/dashboard/production/manufacturing-orders/[id]/page.js:932`
+  fails to parse (`Unexpected token` on `)}`). Also committed.
+
+Blocker (2) is unchanged: port 5000 still answers as macOS AirPlay Receiver, not
+the CMS backend, so the populated/empty/refresh-failure and viewer-versus-editor
+states remain unreachable even with a working shell.
+
+Batch 3 itself re-verified at that point: focused tests **10/10**, full frontend
+suite **818/818** (the Store/Purchase failure noted above is fixed), SWC parse
+clean on all 7 changed files, `git diff --check` clean.
+
+## Visible Batch 3 — completed (4 Sep 2026)
+
+Blockers cleared and browser verification done against intercepted read-only
+fixtures. No backend work; the live API was never written to.
+
+### Changes this pass
+
+| File | Change |
+| --- | --- |
+| `components/DashboardLayout.js` | `const NAV = withIcons(PM_NAV)`. Removed the legacy array restored after merge d1224ca — it had reintroduced Dashboard, the Production/Desk section headings, "MF production schedule" and "Setting & Config". Visible nav is now the five entries: **Overview, Requests, Production, Pipeline, Setup**. All 13 `ICONS` keys still map; no icon import became unused. |
+| `app/sales/dashboard/stock-items/page.js` | Fixed a real rendering bug found in the browser: the grid's warning printed a literal `—` because the escape sat in **JSX text**, not a string. Now a real em dash. The reference fallback (a valid string escape) was made a literal character too. |
+
+`components/shell/FrostShell.js` — **no change needed**: the
+`initialOpenGroups` import is already present at line 31. The MO detail page
+parses clean, so per the brief it was left untouched.
+
+### Browser verification (fixtures, zero mutations)
+
+`NEXT_PUBLIC_API_URL` is **:5050** with a live backend; the code's `:5000`
+default is what my earlier note wrongly assumed. Verification used a `fetch`
+interceptor on :5050 that serves fixtures for GETs, answers `/api/auth/verify`
+locally, and **refuses every non-GET with 405**. **Final mutation count: 0**,
+with an empty mutation log — nothing was written to the live API.
+
+Verified at **1440 / 768 / 375**:
+
+- **PM Products & BOM** — kicker `PROJECT MANAGER`, title `Products & BOM`, the
+  variants/operations/materials purpose line, five-entry nav with Production
+  active, role-gated **Add product**, Refresh, Download Excel, KPI strip,
+  completeness ring, search, category and status filters.
+- **Table/grid toggle** — both render; grid shows image, name, reference,
+  status, category and the Variants / Operations / Materials figures.
+- **`—`, not zero** — the fixture's legacy row (no `operations`, no
+  `rawMaterials` arrays) renders `Operations —` and `Materials —`.
+- **States** — populated, empty ("No products found"), refresh-error (toast
+  shown, existing rows **kept**), initial-error (heading and nav intact, no
+  rows).
+- **Links** — `/project-manager/products/stock-item-view/:id` and
+  `/new-stock-item/:id`; department-scoped, no PM route hard-coded in shared
+  content.
+- **Setup** — Measurements, Units & packaging, Operations and Warehouses all
+  render with the PM kicker, the correct title, a purpose line and the
+  five-entry nav. No Sales heading anywhere under the PM shell.
+- **Role gating live** — with the cached role at `viewer`, a Setup destination
+  refuses with "This section needs Editor access"; owner-only Delete is absent
+  at editor.
+- **Sales route intact** — `/sales/dashboard/stock-items` keeps kicker `SALES`,
+  title `Finished Products`, its original sub, "Add new product", Sales
+  navigation and `/sales/dashboard/stock-items/...` links.
+- **No horizontal overflow** at any of the three widths, in either view mode.
+
+### Not verified
+
+`devices-machines` would not render under fixtures — it throws inside its own
+row rendering against synthetic machine data (first `warehouse.itemsCount`, then
+further fields), and once React's boundary latches it survives soft navigation.
+Five attempts with progressively complete payloads did not clear it. Batch 3
+changed only that page's three `PageHead` props; its identity is covered by the
+adapter's unit tests and the file parses clean. It remains unverified **in a
+browser** under fixtures.
+
+### Verification
+
+Focused tests **30/30**; `npm test` **864/864**; SWC parse clean on all 10
+touched or reported files; `git diff --check` clean in both repositories.
+
+## Visible Batch 3 — Accounts design language applied (4 Sep 2026)
+
+The earlier pass changed headings and vocabulary; it did not change how the
+pages look. This one does.
+
+### What now renders the Accounts language
+
+Not an approximation — the PM path imports and renders the books' own
+components, and reuses their class vocabulary verbatim:
+
+| Accounts source | Used by PM |
+| --- | --- |
+| `components/accountant/ui/AcctPageSlab` | the page slab on Products & BOM and all five Setup pages |
+| `SlabAction` / `SlabGhost` | Add product / Refresh / Export, in the slab |
+| the invoices context strip (`rounded-inset` on `--surface-sunken`, 11px faint) | "Loaded · Showing · Filters" |
+| the invoices control row (`frost-panel` + hairline + `rounded-card`, `p-3`) | search, category, status, Table/Grid, Clear filters |
+| its segmented pills (`--surface-sunken` track, `--ink` active fill) | the view toggle |
+| its table (sunken thead, `tracking-[0.09em]` uppercase, `px-3 py-2.5`) | the catalogue table |
+
+This works without touching a single Accounts file because the slab's tokens
+(`--slab`, `--slab-ink`) live on `.grav-ui`, which `FrostShell` already carries.
+
+### Files
+
+| File | Change |
+| --- | --- |
+| `components/pm/ProductCatalogue.js` | **New.** The whole PM catalogue in the Accounts silhouette. |
+| `components/pm/SetupPageHead.js` | **New.** Department-aware head: slab for PM, `PageHead` everywhere else. |
+| `components/pm/deptPageIdentity.js` | Added `slabSub` — a short label for the slab (its sub truncates); the full purpose sentence moved to the context strip. |
+| `app/sales/dashboard/stock-items/page.js` | PM render branch; `clearFilters`; `loadedAt`; tabs hoisted so the slab leads. |
+| the five Setup pages | `PageHead` → `SetupPageHead`, plus the icon imports it needs. |
+| `components/pm/deptPageIdentity.test.mjs` | +2 tests (12 total). |
+
+**Only the presentation forks.** Every fetch, handler, filter and role gate is
+shared; Sales, Merchandising and Production keep the body they had.
+
+### Judgement calls worth recording
+
+- **"Loaded", never "as of".** The stock-items response carries no timestamp,
+  so the strip stamps the client clock and says so. "As of" would claim the
+  server vouched for the time.
+- **Needs-attention is built from the loaded rows, not `stats.*.samples`.**
+  The samples are names with no ids, so they cannot honour "every item links to
+  a real product". The panel is labelled "on this page" for that reason.
+- **Slab figures are dropped where a KPI strip already exists** (warehouse,
+  devices, units, operations) — the books' own rule from
+  `app/accountant/invoices`: a slab must not say the figures twice. Size-config
+  keeps one figure because it has no strip.
+- **Setup Add links still point at `/sales/dashboard/...`** because no PM
+  add/edit routes exist. Left alone rather than pointed at a 404; it means an
+  Add from PM Setup lands in the Sales shell. Flagged, not fixed — creating
+  routes was not in scope.
+
+### Verification
+
+Screenshots at **1440 / 768 / 375** for Products & BOM and Setup. No horizontal
+overflow at any width (`scrollWidth === innerWidth`); mobile switches to cards
+at `md`. Sales re-checked at 1440: `SALES` kicker, "Finished Products", its own
+KPI strip, completeness ring, toolbar, table and navigation — **no slab**.
+Fixtures were read-only; **final mutation count 0**, empty mutation log.
+
+`npm test` **907/907**. SWC parse clean on all 9 touched files.
+`git diff --check` clean. `app/accountant/**`, `components/accountant/**`,
+`app/accountant-ui.css` and `components/ceo/ui/**` are **untouched** (empty
+`git status`).
+
+**Not captured:** a live Accounts page for a side-by-side. The accountant shell
+has its own onboarding/company gate and memoises its session verify, so it
+bounces to `/onboarding` under fixtures. The comparison in this entry is
+therefore component-level and exact — PM renders the same `AcctPageSlab` — not
+photographic.
+
+## PM shell — sidebar removed (4 Sep 2026)
+
+The PM app had no desktop sidebar; below `deck` (1180px) its rail hid and a
+288px full-height left drawer took over. That drawer is now gone for this
+department only.
+
+### Change
+
+`components/shell/FrostShell.js` gains one opt-in prop, `railAtAllWidths`
+(default **false**), alongside the existing `spreadNav` /
+`collapsibleTopDrawerGroups` opt-ins. When set it drops the drawer, its scrim
+and its toggle, and keeps the rail at every width.
+`components/DashboardLayout.js` (PM) passes it. **No other department moves** —
+removing the drawer globally would leave five shells with no navigation at all
+under 1180px.
+
+### Three follow-on defects the change exposed, each measured
+
+1. **A `flex-1 deck:hidden` spacer stole half the bar.** It exists to push the
+   controls right when the rail is hidden; with the rail visible it took 360 of
+   720px at 1024 and pushed Pipeline and Setup off the end. Gated.
+2. **The rail scrolls with a hidden scrollbar,** so a clipped entry was not
+   merely off-screen but unreachable and unhinted — 549px of items in a 476px
+   rail at 768 put Setup past the edge. It now **wraps** instead of scrolling.
+3. **Five entries wrapped one-per-row on a phone**, making the header 194px.
+   The rail now takes a full-width row of its own below `sm`: three rows, 167px.
+
+### Sizing and margins after
+
+| Width | Bar inset | Content inset | Nav | Drawer | Overflow |
+| --- | --- | --- | --- | --- | --- |
+| 1440 | 12px | 32px (`px-8`) | 5 items, 1 row | none | no |
+| 1024 | 12px | 16px (`px-4`) | 5 items, 1 row | none | no |
+| 768 | 12px | 16px | 5 items, 2 rows | none | no |
+| 375 | 12px | 16px | 5 items, 3 rows | none | no |
+
+The bar floats at a 12px inset by design (`mx-3` — "visible field/gap around
+it"); content sits at 16/32px. Left as-is: the bar is deliberately not aligned
+to the content edge, and its padding is shared by every department.
+
+**Also:** the catalogue's table/cards switch moved `md` → `lg`. At 768 the
+seven-column table needed 855px inside a 734px scroller; cards read better on a
+tablet than a table you drag sideways.
+
+### Verification
+
+Sales re-checked at 1024: **drawer and hamburger still present**, page
+unchanged. `npm test` **916/916** — this included updating
+`components/shell/drawerGroups.test.mjs`, which asserted PM passes
+`collapsibleTopDrawerGroups`; that prop configured a drawer this department no
+longer has. The rule it protected (opt-in, nobody by accident) is still checked,
+now for `railAtAllWidths`, plus a new test that the other five keep their
+drawer. The unrelated failure in the Store lane's new `nav.test.mjs` was proven
+theirs — it reproduced with my changes stashed — and they have since fixed it.
+SWC parse clean; `git diff --check` clean.
+
+## PM shell — the left department rail removed (4 Sep 2026, corrected)
+
+### I removed the wrong thing first
+
+The earlier entry removed PM's **mobile drawer**. The screenshot showed the
+target was the **64px department rail down the left edge** — HR, Executive,
+Production, Sales, … — rendered by `components/shell/AppShell.js`, above
+FrostShell in the tree. That earlier change is **reverted**: `railAtAllWidths`
+is gone from FrostShell, and PM has its drawer back, so its shell now matches
+Accounts exactly rather than being bespoke.
+
+### The change
+
+`AppShell` already has `RAIL_HIDDEN_PATHS` — eight apps opted out before this,
+each on one stated condition: the app's own shell must carry FrostShell's
+`appLogoSlug`, so "Back to apps" survives the rail going.
+
+- `components/DashboardLayout.js` — `appLogoSlug="project-manager"`.
+- `components/shell/AppShell.js` — `/project-manager` added to
+  `RAIL_HIDDEN_PATHS`.
+
+Exactly the arrangement `/accountant`, `/store`, `/hr` and `/budget` use. The
+list is an explicit allowlist, so no other department can be affected.
+
+### Verified
+
+At 1440: rail gone, `g-shell-body--full`, body `x=0 w=1440`, header inset 12px,
+five nav entries, no overflow. The **"Switch application"** control sits at the
+far left of the top bar and opens listing the other departments. At 768: rail
+gone, drawer and hamburger restored (as Accounts has them), no overflow.
+
+`npm test` **921/921**. SWC parse clean; `git diff --check` clean.
+
+### Two things worth recording
+
+- **`git checkout` on FrostShell wiped an uncommitted fix.** Reverting my change
+  restored HEAD, which is still missing the `initialOpenGroups` import another
+  lane had added in the working tree — the app crashed until I put that line
+  back. HEAD remains broken for anyone who checks it out fresh.
+- **The drawer peeks 64px when closed.** Its `<aside>` measures `x=-224` with
+  `width: 288` and `transform: none` — `-translate-x-full` is not applying.
+  **Sales measures identically**, so this predates and is unrelated to this
+  change; it only became visible in PM again because the drawer came back. Left
+  alone: it is in FrostShell, shared by ten departments.
