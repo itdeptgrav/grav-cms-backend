@@ -27,6 +27,47 @@ const {
 
 const { admin, db } = require("../../config/firebaseAdmin");
 
+/**
+ * Whether this meeting is over — by ANY of the names it has been given.
+ *
+ * ## The split this closes
+ *
+ * There were two vocabularies for one fact, and they did not overlap.
+ *
+ *  · This file wrote `status: "ended"` and gated the guest link on
+ *    `status !== "ended"`.
+ *  · `services/cowork.service.js` declares the real set — `MEET_STATUSES` —
+ *    and `"ended"` is NOT in it. The Cowork UI's "End for everyone" writes
+ *    `"completed"`.
+ *
+ * So a meeting ended from the product satisfied `"completed" !== "ended"` and
+ * its PUBLIC GUEST LINK stayed joinable after the call was over. In the other
+ * direction, a doc written `"ended"` by this file hit the `default:` branch of
+ * `readMeetingStatus` in the frontend's `workMap.ts` and was rendered as
+ * **"scheduled"** — a finished meeting reappearing as one that had not happened
+ * yet.
+ *
+ * Writes are now `"completed"`, which is the vocabulary the rest of the product
+ * shares. Reads accept every terminal name, because documents written by the
+ * old code still exist and a meeting that ended last week must not reopen
+ * because the word for it changed.
+ */
+const CLOSED_STATUSES = new Set([
+  "completed",
+  "cancelled",
+  "archived",
+  /* Legacy: written by this file before the vocabularies were reconciled. */
+  "ended",
+]);
+
+function meetingIsOver(meet) {
+  if (!meet) return true;
+  /* The live legacy app reads this boolean and will never learn to read the
+     string — see the note in cowork.service.js. */
+  if (meet.isCancelled === true) return true;
+  return CLOSED_STATUSES.has(meet.status);
+}
+
 // ── Read LiveKit env vars ─────────────────────────────────────────────────────
 const LK_URL = process.env.LIVEKIT_URL;
 const LK_KEY = process.env.LIVEKIT_API_KEY;
@@ -207,7 +248,7 @@ router.post(
         .get();
       const meet = meetDoc.exists ? meetDoc.data() : null;
 
-      if (!meet || meet.status === "ended") {
+      if (meetingIsOver(meet)) {
         return res.status(400).json({ error: "This meeting has ended." });
       }
 
@@ -347,7 +388,7 @@ router.post(
       // Update meet status — publicShareEnabled:false is the explicit
       // "no one can join with that link anymore" kill switch.
       await db.collection("cowork_scheduled_meets").doc(meetId).update({
-        status: "ended",
+        status: "completed",
         publicShareEnabled: false,
         livekitEndedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -386,7 +427,7 @@ router.post(
           error: "Only the meeting's organiser can create a public link.",
         });
       }
-      if (meet.status === "ended") {
+      if (meetingIsOver(meet)) {
         return res
           .status(400)
           .json({ error: "This meeting has already ended." });
@@ -482,7 +523,7 @@ router.get("/public/meeting-info/:token", async (req, res) => {
       meetId,
       meetTitle: meet.title || "CoWork Meeting",
       status: meet.status || "scheduled",
-      canJoin: meet.publicShareEnabled === true && meet.status !== "ended",
+      canJoin: meet.publicShareEnabled === true && !meetingIsOver(meet),
       participantCount,
     });
   } catch (e) {
@@ -513,7 +554,7 @@ router.post("/public/guest-join", async (req, res) => {
     const meet = meetDoc.data();
     const meetId = meetDoc.id;
 
-    if (meet.publicShareEnabled !== true || meet.status === "ended") {
+    if (meet.publicShareEnabled !== true || meetingIsOver(meet)) {
       return res.status(400).json({ error: "This meeting has ended." });
     }
     if (!meet.livekitRoomName || meet.status !== "live") {
