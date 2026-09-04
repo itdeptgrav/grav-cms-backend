@@ -101,6 +101,8 @@ const {
   bandwidthStatsHandler,
 } = require("./middleware/firestoreBandwidth");
 const { db, admin } = require("./config/firebaseAdmin");
+/* Names a Socket.IO connection at the handshake — see the `io.use` below. */
+const { resolveCoworkUser } = require("./Middlewear/coworkAuth");
 instrumentFirestore(admin, db);
 bw.instrumentFirestore(admin, db);
 
