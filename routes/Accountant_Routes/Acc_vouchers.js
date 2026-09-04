@@ -22,6 +22,11 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
+const {
+  resolveServiceOrderBilling,
+  voucherSummary,
+  PROVENANCE_FIELDS,
+} = require("../../services/serviceOrderBilling.service");
 
 const auth = accountantAuth;
 
@@ -1566,6 +1571,93 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
 });
 
 /* GET /po-lookup                                                       */
+/* ══════════════════════════════════════════════════════════════════════════
+ * ACCEPTED SERVICE ORDER → PURCHASE-VOUCHER PREFILL
+ *
+ * The service counterpart of the PO→voucher flow. It returns an ACCEPTED
+ * Service Order as prefill for the EXISTING purchase-voucher form — supplier,
+ * the accepted service lines, the approved quantity/rate/GST, the Service
+ * Order number, the Spend Request and commitment links, and the approved
+ * totals. It creates nothing, and it carries NO stock/GRN/warehouse/inventory
+ * semantics: a service line is a non-stock expense charge.
+ *
+ * Only an ACCEPTED order may be billed — a completion-reported, cancelled or
+ * unaccepted one is a clear business refusal, never an empty prefill.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.get("/service-order/:id/billable", auth, async (req, res) => {
+  try {
+    const companyId = req.query.companyId || req.body?.companyId;
+
+    /* One authoritative resolver decides what this order may be billed as —
+       the SAME one the create route enforces, so prefill and creation can
+       never disagree about acceptance, provenance or the linked bills. */
+    const r = await resolveServiceOrderBilling({
+      serviceOrderId: req.params.id,
+      companyId,
+    });
+    if (!r.ok) {
+      return res.status(r.status).json({
+        success: false,
+        reason: r.code,
+        currentStatus: r.currentStatus,
+        message: r.message,
+      });
+    }
+    const so = r.order;
+
+    return res.json({
+      success: true,
+      /* Prefill for the EXISTING purchase-voucher form. The provenance the
+         form sends back is server-derived here; the create route re-derives
+         and enforces it and does not trust these values. */
+      prefill: {
+        serviceOrderId: r.provenance.serviceOrderId,
+        serviceOrderNumber: r.provenance.serviceOrderNumber,
+        spendRequestId: r.provenance.spendRequestId,
+        spendRequestNumber: r.provenance.spendRequestNumber,
+        budgetCommitmentId: r.provenance.budgetCommitmentId,
+        commitmentStatus: r.commitmentStatus,
+        vendor: {
+          id: so.vendor ? String(so.vendor) : null,
+          name: so.vendorName || "",
+          gstin: so.vendorGstin || "",
+        },
+        budgetLedgerId: so.budgetLedgerId ? String(so.budgetLedgerId) : null,
+        budgetLedgerName: so.budgetLedgerName || "",
+        /* Non-stock expense/charge lines — never inventory items. Each GST
+           rate is the ACCEPTED snapshot, including an explicit 0. */
+        lines: (so.lines || []).map((l) => ({
+          isCharge: true,
+          stockItemId: null,
+          description: l.description || l.serviceName || "",
+          serviceCode: l.serviceCode || "",
+          billingUnit: l.billingUnit || "",
+          sacCode: l.sacCode || "",
+          quantity: l.quantity,
+          rate: l.rate,
+          gstRate: l.gstRate,
+          netAmount: l.netAmount,
+          gstAmount: l.gstAmount,
+          lineTotal: l.lineTotal,
+        })),
+        /* Approved figures, offered ONLY as comparison values. They are not
+           the actual cost — that exists once the voucher is posted. */
+        approved: {
+          subtotal: so.subtotal || 0,
+          taxAmount: so.taxAmount || 0,
+          totalAmount: so.totalAmount || 0,
+        },
+      },
+      /* Already-linked bills, returned separately with honest statuses. */
+      linkedVouchers: r.vouchers.map(voucherSummary),
+      hasLiveVoucher: r.hasLiveVoucher,
+    });
+  } catch (e) {
+    console.error("[voucher] service-order billable:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get("/po-lookup", auth, async (req, res) => {
   try {
     const { q, vendorId, limit = 20, page = 1 } = req.query;
@@ -2591,6 +2683,70 @@ router.post("/", auth, async (req, res) => {
         body.sourceReference || body.purchaseOrderNumber || "";
     }
 
+    // ── SERVICE-ORDER-SOURCED VOUCHER — AUTHORITATIVE ENFORCEMENT (S3 fix) ────
+    // A service-order link is never taken on trust. The same resolver the
+    // billable endpoint uses re-verifies acceptance and company on the create
+    // path, DERIVES every provenance field server-side (overwriting whatever
+    // the client sent), and refuses a second live bill without an explicit
+    // decision. An unaccepted, cancelled, nonexistent or cross-company order
+    // creates no voucher. `allowAdditionalServiceBill` is a control flag only —
+    // it is stripped below and never persisted.
+    const wantsAdditionalBill = body.allowAdditionalServiceBill === true;
+    delete body.allowAdditionalServiceBill;
+    if (body.serviceOrderId) {
+      // A voucher cannot be both a goods PO bill and a service bill.
+      if (body.purchaseOrderId) {
+        return res.status(400).json({
+          error:
+            "A voucher cannot carry both a purchase order and a service order link.",
+          reason: "SERVICE_AND_PO_CONFLICT",
+        });
+      }
+      // Services are billed as purchase vouchers only.
+      if (body.voucherType !== "purchase") {
+        return res.status(400).json({
+          error: "A service order can only be billed on a purchase voucher.",
+          reason: "SERVICE_BILL_NOT_PURCHASE",
+        });
+      }
+
+      const r = await resolveServiceOrderBilling({
+        serviceOrderId: body.serviceOrderId,
+        companyId: body.companyId,
+      });
+      if (!r.ok) {
+        return res
+          .status(r.status)
+          .json({ error: r.message, reason: r.code, currentStatus: r.currentStatus });
+      }
+
+      // Duplicate guard on the server — the browser's "Record another supplier
+      // bill" decision is confirmation, not a database restriction. A live
+      // draft/pending/posted bill refuses ordinary creation; only an explicit
+      // flag lets a genuine additional bill through. Cancelled/void bills are
+      // not live and never trigger this.
+      if (r.hasLiveVoucher && !wantsAdditionalBill) {
+        return res.status(409).json({
+          error:
+            "This service order already has a supplier bill. Use “Record another supplier bill” to add another.",
+          reason: "SERVICE_ORDER_BILL_EXISTS",
+          linkedVouchers: r.live.map(voucherSummary),
+        });
+      }
+
+      // Provenance is the server's, not the client's: overwrite every field so
+      // a spoofed number, spend-request id or commitment id cannot be persisted
+      // and another company's commitment can never be attached.
+      body.serviceOrderId = r.provenance.serviceOrderId;
+      body.serviceOrderNumber = r.provenance.serviceOrderNumber;
+      body.spendRequestId = r.provenance.spendRequestId;
+      body.spendRequestNumber = r.provenance.spendRequestNumber;
+      body.budgetCommitmentId = r.provenance.budgetCommitmentId;
+      body.sourceSystem = "auto_from_service_order";
+      body.sourceId = r.provenance.sourceId;
+      body.sourceReference = r.provenance.sourceReference;
+    }
+
     // Resolve partyLedgerName if missing. Accept both legacy `partyLedger`
     // and current `partyLedgerId` field names.
     const partyId = body.partyLedgerId || body.partyLedger;
@@ -2809,6 +2965,44 @@ router.put("/:id", auth, async (req, res) => {
     delete body.autoPost;
     delete body.createdBy;
     delete body.createdAt;
+    // A control flag, never a stored field, on any path.
+    delete body.allowAdditionalServiceBill;
+
+    // ── SERVICE-ORDER PROVENANCE IS IMMUTABLE (S3 fix) ───────────────────────
+    // Once a voucher is linked to a Service Order, its provenance is the record
+    // of which accepted service it bills and which commitment it releases.
+    // Ordinary editing must not replace or remove it. A no-op (same value)
+    // passes; any attempt to change it is refused; the stored value is
+    // preserved either way. A normal, non-service voucher is untouched here.
+    if (existing.serviceOrderId) {
+      // A field absent from the body is not an attempt; a field present with a
+      // different value — INCLUDING null/"" to remove it — is refused.
+      const norm = (x) => (x === undefined || x === null ? "" : String(x));
+      for (const f of PROVENANCE_FIELDS) {
+        if (f in body && norm(body[f]) !== norm(existing[f])) {
+          return res.status(409).json({
+            error:
+              "This voucher's service-order provenance cannot be changed by editing.",
+            reason: "SERVICE_PROVENANCE_IMMUTABLE",
+            field: f,
+          });
+        }
+        delete body[f];
+      }
+      // The service-order source system is part of that provenance too.
+      if (
+        "sourceSystem" in body &&
+        body.sourceSystem !== existing.sourceSystem
+      ) {
+        return res.status(409).json({
+          error:
+            "This voucher's service-order provenance cannot be changed by editing.",
+          reason: "SERVICE_PROVENANCE_IMMUTABLE",
+          field: "sourceSystem",
+        });
+      }
+      delete body.sourceSystem;
+    }
 
     // Canonicalise party (accept legacy field name).
     if ("partyLedger" in body || "partyLedgerId" in body) {

@@ -1681,6 +1681,201 @@ router.post("/item-budget-heads/resolve", async (req, res) => {
   }
 });
 
+
+/* ══ SERVICE BUDGET DEFAULTS ═════════════════════════════════════════════════
+ * Which budget head a bought SERVICE normally consumes — an AMC contract, a
+ * software subscription, a transport retainer, a consultancy engagement.
+ *
+ * ── WHY THIS IS NOT THE ITEM SCREEN WITH A DIFFERENT NOUN ───────────────────
+ * An item resolves through three steps: its own override, its category's
+ * mapping, then nothing. A service resolves through ONE — the Service Master's
+ * own `budgetLedgerId` — and deliberately has no category fallback. The Item
+ * Category mappings describe what the store stocks; letting a service called
+ * "Consultancy" inherit the head somebody mapped for consumables would charge
+ * professional fees to a materials budget and look entirely deliberate on the
+ * report. `headForService` takes no map, so the rule is enforced by the
+ * signature rather than by remembering it.
+ *
+ * ── WHAT SETTING A DEFAULT IS NOT ───────────────────────────────────────────
+ * It is a suggested classification for FUTURE service requests. It is not a
+ * budget approval, not a commitment, not an accounting posting, not the
+ * supplier's price and not permission to exceed anything. Nothing on these
+ * three routes writes a commitment, a voucher, a purchase order, a service
+ * order or a stock record, and a test pins that.
+ */
+
+/* The same authority that maps an item category. Deciding what a service
+   spends out of is the same kind of decision about the same money. */
+const SERVICE_SUBJECT = "a service";
+
+/** The Service Master, required lazily — same pattern as RawItem above. */
+const ServiceModel = () =>
+  require("../../models/CMS_Models/Inventory/Services/Service");
+
+/** One service as this screen reads it, with its answer already worked out. */
+const serviceRow = (s) => ({
+  _id: String(s._id),
+  serviceCode: s.serviceCode || null,
+  name: s.name,
+  category: s.category || null,
+  billingUnit: s.billingUnit || null,
+  /* Finance may inspect a retired service — a classification made last year
+     has to stay understandable — so the status travels with every row and is
+     never inferred from its absence. */
+  status: s.status || "ACTIVE",
+  setByName: s.budgetLedgerSetByName || null,
+  setAt: s.budgetLedgerSetAt || null,
+  resolution: itemBudget.headForService(s),
+});
+
+/* ── FIND A SERVICE, WITH ITS DEFAULT ───────────────────────────────────────
+ * Search by name or code. Company-scoped at the query, not filtered
+ * afterwards: `Service` carries a `companyId` (unlike `RawItem`), so this
+ * route can do what the item equivalent honestly cannot.
+ *
+ * Capped, and the cap is REPORTED. A silently truncated list reads as "these
+ * are all the services", which is how a screen convinces somebody their setup
+ * is complete.
+ */
+router.get("/service-budget-heads/services", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    const search = String(req.query.search || "").trim();
+    const status = String(req.query.status || "").toUpperCase();
+    const onlyUnresolved = String(req.query.onlyUnresolved || "") === "true";
+
+    const filter = { companyId: scope.companyId };
+    if (search) {
+      /* Escaped. A service master legitimately contains "(", "+" and "&", and
+         an unescaped one of those is a 500 or a runaway scan, not a search. */
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$or = [
+        { name: { $regex: safe, $options: "i" } },
+        { serviceCode: { $regex: safe, $options: "i" } },
+      ];
+    }
+    /* Default: everything. Finance needs retired services visible here, so an
+       unstated status must not quietly mean ACTIVE. */
+    if (status === "ACTIVE" || status === "INACTIVE") filter.status = status;
+    if (onlyUnresolved) filter.budgetLedgerId = null;
+
+    const Service = ServiceModel();
+    const [rows, total, resolved] = await Promise.all([
+      Service.find(filter)
+        .select("_id serviceCode name category billingUnit status budgetLedgerId "
+          + "budgetLedgerName budgetLedgerSetByName budgetLedgerSetAt")
+        .sort({ name: 1, _id: 1 })
+        .limit(50)
+        .lean(),
+      Service.countDocuments({ companyId: scope.companyId }),
+      Service.countDocuments({
+        companyId: scope.companyId, budgetLedgerId: { $ne: null },
+      }),
+    ]);
+
+    res.json({
+      success: true,
+      services: rows.map(serviceRow),
+      capped: rows.length === 50,
+      /* Counted over the company, not over the page — a coverage figure that
+         changes when you type in the search box is not a coverage figure. */
+      coverage: { total, resolved, unresolved: total - resolved },
+    });
+  } catch (e) {
+    console.error("[coa] service-budget-heads services:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── SET OR CLEAR ONE SERVICE'S DEFAULT ─────────────────────────────────────
+ * Clearing writes id AND name together. Leaving a stale name behind a null id
+ * is how a screen shows a head that nothing resolves to any more — the two
+ * fields are one fact and they move together.
+ */
+router.put("/services/:id/budget-head", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.id))) {
+      return res.status(404).json({ success: false, message: "Service not found." });
+    }
+    const Service = ServiceModel();
+    /* Scoped in the QUERY. Another company's service is not found, which is
+       the same answer an invented id gets — telling them apart would confirm
+       that the other company holds that record. */
+    const service = await Service.findOne({
+      _id: req.params.id, companyId: scope.companyId,
+    });
+    if (!service) return res.status(404).json({ success: false, message: "Service not found." });
+
+    const raw = req.body?.budgetLedgerId;
+    if (raw) {
+      /* The SAME gate an item category passes, with the noun changed. One
+         classification contract: a head this screen accepts is a head the
+         budget check will recognise, and the Service Master will too. */
+      const check = await itemBudget.assertMappable(raw, scope.companyId, {
+        subject: SERVICE_SUBJECT,
+      });
+      if (!check.ok) return res.status(400).json({ success: false, message: check.message });
+      service.budgetLedgerId = check.ledger._id;
+      service.budgetLedgerName = check.ledger.name;
+    } else {
+      service.budgetLedgerId = null;
+      service.budgetLedgerName = "";
+    }
+    service.budgetLedgerSetBy = req.user?.id || null;
+    service.budgetLedgerSetByName = req.user?.name || "";
+    service.budgetLedgerSetAt = new Date();
+    /* The Service Master's own audit fields belong to whoever edits the
+       service; this route touches only the budget default and stamps its own
+       three fields, so a Finance change does not masquerade as a Store edit. */
+    await service.save();
+
+    res.json({
+      success: true,
+      message: service.budgetLedgerId
+        ? `${service.name} defaults to ${service.budgetLedgerName}. This is a suggested `
+          + `classification for future service requests — it approves nothing and moves no budget.`
+        : `${service.name} has no budget default. It will require resolution when a `
+          + `service request is raised for it.`,
+      service: serviceRow(service.toObject()),
+    });
+  } catch (e) {
+    console.error("[coa] service budget-head:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── WHAT WOULD THESE SERVICES RESOLVE TO? ──────────────────────────────────
+ * One row per requested id, including ids that match nothing in this company.
+ */
+router.post("/service-budget-heads/resolve", async (req, res) => {
+  try {
+    if (!financeOnly(req, res)) return;
+    const scope = mappingCompany(req);
+    if (!scope.ok) return res.status(400).json({ success: false, message: scope.message });
+
+    const serviceIds = Array.isArray(req.body?.serviceIds) ? req.body.serviceIds : [];
+    if (!serviceIds.length) {
+      return res.status(400).json({ success: false, message: "serviceIds must be a non-empty array." });
+    }
+    const results = await itemBudget.resolveServiceIds({
+      serviceIds,
+      companyId: scope.companyId,
+      Service: ServiceModel(),
+    });
+    res.json({ success: true, results });
+  } catch (e) {
+    console.error("[coa] resolve service budget heads:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.put("/ledgers/:id", async (req, res) => {
   try {
     const updates = { ...req.body };
