@@ -10,10 +10,52 @@ const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufa
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
+const { normaliseWeeks, weekBuckets, buildTrend } = require("../../../../services/manufacturing/productionTrend");
 const { resolveOrderOrigin } = require("../../../../services/orderOrigin");
 const mongoose = require("mongoose");
+const departmentWrites = require("../../../../Middlewear/departmentWriteGuard");
+const { recordChange } = require("../../../../services/changeLog");
+const {
+  listManufacturingOrders,
+} = require("../../../../services/manufacturing/moList.service");
+const {
+  summariseManufacturingOrder,
+} = require("../../../../services/manufacturing/moSummary.service");
 
 router.use(EmployeeAuthMiddleware);
+
+/**
+ * Ownership guard for the routes on THIS router that Project Manager owns
+ * outright — currently one.
+ *
+ * Per-route, never mounted over the prefix. server.js deliberately leaves
+ * /api/cms/manufacturing/** ungated because cutting-master, QC,
+ * packaging-dispatch and the production supervisor all write through it, and a
+ * blanket "project-manager" guard would park a cutting master's save in a
+ * production approver's queue. The same reasoning applies inside the file: the
+ * guard goes on the one handler whose business owner is unambiguous.
+ *
+ * It is the ordinary departmentWrites middleware, used as route middleware
+ * rather than mount middleware, so there is exactly one role-and-approval
+ * mechanism in the codebase rather than a second one that behaves almost the
+ * same. Reads are untouched, and it fails open until an administrator grants
+ * the first Production role — see services/departmentRoles.js.
+ */
+const pmOwnedWrite = (entity) => {
+  const guard = departmentWrites("project-manager", { entity });
+  return (req, res, next) => {
+    /* Platform admins go round it. requireApproval already exempts them
+       ("not part of any department's approval chain"), but requireDepartmentRole
+       ahead of it has no such check, so an administrator holding no Production
+       DepartmentRole row would be refused NO_DEPARTMENT_ROLE before the
+       exemption was ever reached. That asymmetry lives in the shared guard and
+       is left there — changing it would change every department that mounts
+       departmentWrites, which is not this chunk's business. Handled here
+       instead, where the blast radius is one route. */
+    if (req.user?.isAdmin) return next();
+    return guard(req, res, next);
+  };
+};
 
 // ── Barcode scan helpers — mirrors routes/CMS_Routes/Manufacturing/Production/
 // productionCompletionRoutes.js exactly (barcode format "WO-<shortId>-<unit>",
@@ -84,21 +126,16 @@ async function addProductionScans(woShortId, alreadyScanned, totalQty, count, ac
 
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 12, search = "", status = "" } = req.query;
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
+    /* The whole projection now lives in services/manufacturing/ — query policy,
+       aggregation and row mapping — so it can be tested without an HTTP server
+       and reused without being copied. This handler is wiring: take the query,
+       hand back the page.
 
-    // Base filter — always restrict to sales-approved (this is what an MO IS)
-    const matchQuery = { status: "quotation_sales_approved" };
-    if (search) {
-      const re = new RegExp(search, "i");
-      matchQuery.$or = [
-        { "customerInfo.name": re },
-        { requestId: re },
-        { "customerInfo.email": re },
-      ];
-    }
+       Every field, every derived value and the URL itself are unchanged. What
+       is new is that malformed input no longer reaches the database: `?page=abc`,
+       `?page=0`, `?limit=0`, `?limit=-5` and `?search=(` each used to answer 500
+       from here, and an unbounded `?limit=` was honoured verbatim. */
+    const page = await listManufacturingOrders(req.query);
 
     const pipeline = [
       { $match: matchQuery },
@@ -362,6 +399,7 @@ router.get("/", async (req, res) => {
   }
 });
 
+
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -516,9 +554,19 @@ router.get("/:id", async (req, res) => {
       rawMaterialRequirements: rawMaterialRequirements,
     };
 
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
     res.json({
       success: true,
-      manufacturingOrder,
+      manufacturingOrder: { ...manufacturingOrder, ...summary },
     });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
@@ -559,7 +607,11 @@ router.get("/:id/detailed", async (req, res) => {
       customerRequestId: customerRequest._id,
     })
       .select(
-        "workOrderNumber status quantity variantAttributes operations timeline stockItemId productionCompletion",
+        /* `rawMaterials` is read further down to build rawMaterialRequirements
+           and was never selected, so the lean documents did not carry it and
+           the summary was always empty — an order with material allocated
+           reported none. */
+        "workOrderNumber status quantity variantAttributes operations timeline stockItemId productionCompletion rawMaterials",
       )
       .populate("stockItemId", "name reference")
       .sort({ createdAt: 1 })
@@ -577,7 +629,13 @@ router.get("/:id/detailed", async (req, res) => {
     // Transform work orders with accurate progress data
     const transformedWorkOrders = workOrders.map((wo) => {
       const productionCompletion = wo.productionCompletion || {};
-      const totalQuantity = wo.quantity;
+      /* Named for what it is — this work order's quantity — instead of
+         shadowing the outer `totalQuantity` accumulator declared above. The
+         shadow made `totalQuantity += totalQuantity` an assignment to a const,
+         so EVERY order that had a work order threw "Assignment to constant
+         variable" and answered 500. An order with none never entered this
+         mapper, which is why it went unnoticed. */
+      const workOrderQuantity = wo.quantity;
 
       // Get completion data from productionCompletion
       const completedQuantity =
@@ -588,10 +646,10 @@ router.get("/:id/detailed", async (req, res) => {
       // Calculate unit statuses
       let completedUnits = completedQuantity;
       let inProgressUnits = 0;
-      let pendingUnits = totalQuantity - completedQuantity;
+      let pendingUnits = workOrderQuantity - completedQuantity;
 
       // If work order is in progress but not all units completed, estimate in-progress units
-      if (wo.status === "in_progress" && completedQuantity < totalQuantity) {
+      if (wo.status === "in_progress" && completedQuantity < workOrderQuantity) {
         // Look at operation completion to estimate in-progress units
         if (
           productionCompletion.operationCompletion &&
@@ -603,11 +661,11 @@ router.get("/:id/detailed", async (req, res) => {
             ),
           );
           inProgressUnits = Math.max(0, maxOpCompleted - completedQuantity);
-          pendingUnits = totalQuantity - completedQuantity - inProgressUnits;
+          pendingUnits = workOrderQuantity - completedQuantity - inProgressUnits;
         } else {
           // If no operation data, assume 1 unit is in progress
           inProgressUnits = 1;
-          pendingUnits = totalQuantity - completedQuantity - 1;
+          pendingUnits = workOrderQuantity - completedQuantity - 1;
         }
       }
 
@@ -615,7 +673,7 @@ router.get("/:id/detailed", async (req, res) => {
       totalUnitsCompleted += completedUnits;
       totalUnitsInProgress += inProgressUnits;
       totalUnitsPending += pendingUnits;
-      totalQuantity += totalQuantity;
+      totalQuantity += workOrderQuantity;
 
       // Determine work order status based on productionCompletion
       let status = wo.status;
@@ -650,7 +708,7 @@ router.get("/:id/detailed", async (req, res) => {
         workOrderNumber: wo.workOrderNumber,
         status: status,
         derivedStatus: derivedStatus,
-        quantity: totalQuantity,
+        quantity: workOrderQuantity,
         variantAttributes: wo.variantAttributes || [],
         stockItemName: wo.stockItemId?.name || "N/A",
         stockItemReference: wo.stockItemId?.reference || "N/A",
@@ -802,9 +860,19 @@ router.get("/:id/detailed", async (req, res) => {
       },
     };
 
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
     res.json({
       success: true,
-      manufacturingOrder,
+      manufacturingOrder: { ...manufacturingOrder, ...summary },
     });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
@@ -1057,7 +1125,17 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       },
     };
 
-    res.json({ success: true, manufacturingOrder });
+    /* The canonical shared summary — the same eight values the register
+       publishes for this order, from the same aggregation, so the two cannot
+       disagree. Spread LAST and additively: it introduces `derivedStatus` and
+       `displayStatus` under their own names and never touches the top-level
+       `status`, which on these endpoints is the CustomerRequest's STORED value
+       and means something different. Nested legacy fields (`progress`,
+       `workOrderStats`) are left exactly as they are — these top-level fields
+       are the migration boundary, not a replacement. */
+    const summary = await summariseManufacturingOrder(id);
+
+    res.json({ success: true, manufacturingOrder: { ...manufacturingOrder, ...summary } });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
     res.status(500).json({
@@ -1127,7 +1205,16 @@ router.get("/vendors/active", async (req, res) => {
 // =============================================
 // NEW ROUTE: Share work orders to vendor
 // =============================================
-router.post("/share-to-vendor", async (req, res) => {
+// Forwarding production to an outside vendor is a Project Manager decision, it
+// is called from nowhere else in any frontend, and — alone among the planning
+// mutations on this side — it is a single idempotent `updateMany` whose status
+// filter excludes work orders already forwarded, completed or cancelled. That
+// is what makes it safe to hold in the approval queue: replaying an approved
+// change re-applies the same $set, and a second replay matches nothing and says
+// so rather than forwarding twice. Allocation, operation planning and
+// mark-stage are none of those things and are deliberately left alone; see
+// docs/audits/project-manager-endpoint-access.md.
+router.post("/share-to-vendor", pmOwnedWrite("vendor forwarding"), async (req, res) => {
   try {
     const { workOrderIds, vendorId, forwardedBy } = req.body;
 
@@ -1184,6 +1271,27 @@ router.post("/share-to-vendor", async (req, res) => {
       .select("workOrderNumber status forwardedToVendor forwardedAt")
       .populate("forwardedToVendor", "name vendorCode")
       .lean();
+
+    /* An approver or owner commits this directly, which leaves no trace in the
+       change queue the way a held change does — and there is no audit floor
+       under /api/cms/manufacturing the way there is under /api/hr. Recorded
+       through the same services/changeLog used everywhere else rather than a
+       second log of its own. Deliberately narrow: who, which vendor, which work
+       orders, how many moved. Never the request body, which carries the
+       caller's chosen ids and nothing worth keeping, and never headers. */
+    recordChange(req, {
+      departmentSlug: "project-manager",
+      entity: "vendor forwarding",
+      entityId: String(vendor._id),
+      entityLabel: vendor.name,
+      action: "update",
+      summary: `Forwarded ${result.modifiedCount} work order(s) to ${vendor.name}`,
+      fields: [
+        { path: "vendor", label: "Vendor", after: vendor.vendorCode || vendor.name },
+        { path: "workOrders", label: "Work orders", after: updatedWorkOrders.map((w) => w.workOrderNumber).join(", ") },
+        { path: "status", label: "Status", after: "forwarded" },
+      ],
+    }).catch(() => { /* the log must never cost the caller their write */ });
 
     res.json({
       success: true,
@@ -1270,6 +1378,71 @@ router.get("/stats/overview", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while fetching production stats",
+    });
+  }
+});
+
+// GET /stats/production-trend?weeks=4|8|12 — work orders STARTED vs COMPLETED
+// per Monday-based week (Asia/Kolkata), for the Project Manager Overview graph.
+//
+// Truth rule: the started series reads ONLY `timeline.actualStartDate` and the
+// completed series ONLY `timeline.actualEndDate`. `createdAt` / `updatedAt` are
+// never substituted — a work order that reached a state without its timestamp is
+// disclosed through `coverage`, not folded into a week. This endpoint is
+// additive and read-only; /stats/overview is unchanged.
+router.get("/stats/production-trend", async (req, res) => {
+  try {
+    // Nearby PM read endpoints clamp bad query values to a default rather than
+    // 400 (see /:moId production days). `weeks` follows suit: 4 / 8 / 12, else 8.
+    const weeks = normaliseWeeks(req.query.weeks);
+    const asOf = new Date();
+    const buckets = weekBuckets(asOf, weeks);
+    const rangeStart = new Date(buckets[0].startMs);
+    const rangeEnd = new Date(buckets[buckets.length - 1].endMs);
+
+    // Only the timestamp column each series is allowed to use, only within the
+    // drawn window. `.lean()` + a tight projection so this stays cheap.
+    const [startedRows, completedRows] = await Promise.all([
+      WorkOrder.find({ "timeline.actualStartDate": { $gte: rangeStart, $lt: rangeEnd } })
+        .select("timeline.actualStartDate")
+        .lean(),
+      WorkOrder.find({ "timeline.actualEndDate": { $gte: rangeStart, $lt: rangeEnd } })
+        .select("timeline.actualEndDate")
+        .lean(),
+    ]);
+
+    // Coverage — records that reached a state but lack the stamp the series
+    // needs. `completedWithoutTimestamp`: work orders whose status is
+    // `completed` with no `actualEndDate`. `startedWithoutTimestamp`: work
+    // orders whose STATUS says execution has begun, with no `actualStartDate` —
+    // deliberately narrow. No scan-ledger claim is made; the ledger is not
+    // queried here.
+    const EXECUTION_STATUSES = ["in_progress", "paused", "delayed", "completed"];
+    const [completedWithoutTimestamp, startedWithoutTimestamp] = await Promise.all([
+      WorkOrder.countDocuments({
+        status: "completed",
+        $or: [{ "timeline.actualEndDate": null }, { "timeline.actualEndDate": { $exists: false } }],
+      }),
+      WorkOrder.countDocuments({
+        status: { $in: EXECUTION_STATUSES },
+        $or: [{ "timeline.actualStartDate": null }, { "timeline.actualStartDate": { $exists: false } }],
+      }),
+    ]);
+
+    const body = buildTrend({
+      asOf,
+      weeks,
+      startedDates: startedRows.map((w) => w.timeline?.actualStartDate),
+      completedDates: completedRows.map((w) => w.timeline?.actualEndDate),
+      startedWithoutTimestamp,
+      completedWithoutTimestamp,
+    });
+    res.json(body);
+  } catch (error) {
+    console.error("Error fetching production trend:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching production trend",
     });
   }
 });

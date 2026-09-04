@@ -2944,6 +2944,16 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
       name: perLine?.newItemName || l.name,
       /* The requester's own words, kept beside Store's. */
       requestedName: l.name,
+      /* ── THE MATCHED CATALOGUE ITEM TRAVELS WITH THE LINE ────────────────
+         The intake line knows which RawItem it is (the requester picked it, or
+         the store matched it during classification), with the SKU and base
+         unit as they stood. Carrying that identity onto the spend line is what
+         lets the eventual purchase order link back to the same RawItem rather
+         than re-guessing from the name — the same precedence the MRF path uses:
+         a per-line match the store just made wins, then the line's own match. */
+      rawItem: perLine?.rawItemId || l.rawItem || null,
+      rawItemSku: perLine?.rawItemSku || l.rawItemSku || "",
+      baseUnit: l.baseUnit || "",
       spec: perLine?.spec || l.note || "",
       /* Both names, so finance can see that Store went somewhere other than
          where the requester pointed them — and why. */

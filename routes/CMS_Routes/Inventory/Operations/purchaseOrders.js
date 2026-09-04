@@ -21,7 +21,29 @@ const NotificationService = require("../../../../services/NotificationService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const mongoose = require("mongoose");
 
+/* ── Chunk 1: tenancy, capabilities, numbering, idempotency, history ───────
+ * Authentication stays exactly where it was; these add the two questions it
+ * never asked (whose company, and may they do this) plus the three guarantees
+ * Chunk 0 proved were missing (one number, one effect, one record). */
+const {
+  requireTenant, requireCapability, refuseLegacyWrite, withIdempotency,
+} = require("../../../../Middlewear/storePurchaseTenant");
+const { CAPABILITIES } = require("../../../../services/storePurchase/capabilities");
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+const sequences = require("../../../../services/storePurchase/documentSequence.service");
+const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
+const approvalPolicy = require("../../../../services/storePurchase/approvalPolicy.service");
+const lifecycle = require("../../../../services/storePurchase/lifecycle.service");
+const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
+const idempotencyService = require("../../../../services/storePurchase/idempotency.service");
+const { fail, sendError } = require("../../../../services/storePurchase/errors");
+
+const ENTITY = "PURCHASE_ORDER";
+
 router.use(EmployeeAuthMiddleware);
+/* Every route below is tenant-resolved. A caller whose company cannot be
+   proved gets a 403 here rather than an unscoped result set. */
+router.use(requireTenant);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -102,10 +124,13 @@ const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET all purchase orders
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/", async (req, res) => {
+router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const { search = "", status, vendor, startDate, endDate } = req.query;
-    let filter = {};
+    /* THE tenant boundary for this register. In legacy mode this selects the
+       records with no company at all — never both, so an ordinary list can
+       never quietly include unowned documents. */
+    let filter = { ...tenantContext.tenantFilter(req.tenant) };
 
     if (search) {
       filter.$or = [
@@ -130,14 +155,17 @@ router.get("/", async (req, res) => {
   .populate("payments.recordedBy", "name email")
   .sort({ createdAt: -1 });
 
-    const total = await PurchaseOrder.countDocuments();
-    const draft = await PurchaseOrder.countDocuments({ status: "DRAFT" });
-    const issued = await PurchaseOrder.countDocuments({ status: "ISSUED" });
+    /* Scoped like the list itself. An unscoped countDocuments() would leak
+       another company's volume even while the rows stayed hidden. */
+    const scope = tenantContext.tenantFilter(req.tenant);
+    const total = await PurchaseOrder.countDocuments(scope);
+    const draft = await PurchaseOrder.countDocuments({ ...scope, status: "DRAFT" });
+    const issued = await PurchaseOrder.countDocuments({ ...scope, status: "ISSUED" });
     const partiallyReceived = await PurchaseOrder.countDocuments({
-      status: "PARTIALLY_RECEIVED",
+      ...scope, status: "PARTIALLY_RECEIVED",
     });
     const completed = await PurchaseOrder.countDocuments({
-      status: "COMPLETED",
+      ...scope, status: "COMPLETED",
     });
 
     let totalAmount = 0,
@@ -153,13 +181,13 @@ router.get("/", async (req, res) => {
     });
 
     const paymentPending = await PurchaseOrder.countDocuments({
-      paymentStatus: "PENDING",
+      ...scope, paymentStatus: "PENDING",
     });
     const paymentPartial = await PurchaseOrder.countDocuments({
-      paymentStatus: "PARTIAL",
+      ...scope, paymentStatus: "PARTIAL",
     });
     const paymentCompleted = await PurchaseOrder.countDocuments({
-      paymentStatus: "COMPLETED",
+      ...scope, paymentStatus: "COMPLETED",
     });
 
     res.json({
@@ -189,7 +217,7 @@ router.get("/", async (req, res) => {
 });
 
 //    vendor's price + deliveryDays + the alias _id (needed for price write-back).
-router.get("/data/vendor-items/:vendorId", async (req, res) => {
+router.get("/data/vendor-items/:vendorId", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const { vendorId } = req.params;
 
@@ -258,7 +286,7 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
   }
 });
 
-router.get("/data/raw-items-with-variants", async (req, res) => {
+router.get("/data/raw-items-with-variants", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const rawItems = await RawItem.find({})
       .select(
@@ -306,7 +334,7 @@ router.get("/data/raw-items-with-variants", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET available units for a raw item
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/data/raw-items/:id/units", async (req, res) => {
+router.get("/data/raw-items/:id/units", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
       .select("unit customUnit name")
@@ -374,9 +402,14 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PO by ID
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:id", async (req, res) => {
+router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id)
+    /* Scoped find, not findById: another company's id must answer exactly as
+       a missing one does. A 403 here would confirm the document exists. */
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    })
       .populate(
         "vendor",
         "companyName contactPerson phone email address gstNumber bankDetails",
@@ -403,7 +436,7 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET available raw items for PO
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/data/raw-items", async (req, res) => {
+router.get("/data/raw-items", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const { search = "", limit = 0 } = req.query;
     // limit=0 (default) → NO limit: return the full catalog.
@@ -452,11 +485,26 @@ router.get("/data/raw-items", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET available vendors for PO
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/data/vendors", async (req, res) => {
+router.get("/data/vendors", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
-    const vendors = await Vendor.find({ status: "Active" })
+    /* ── SELECTABLE SUPPLIERS OF THIS COMPANY ONLY ──────────────────────
+     * This read every Active supplier in the database, so the "choose a
+     * supplier" list on a purchase order offered another company's suppliers
+     * — and picking one would have bound this company's order to a record it
+     * does not own. Legacy suppliers (no company) are excluded too: nobody
+     * can say whose they are, so nothing new may be ordered against them. */
+    const vendors = await Vendor.find({
+      /* `$and`, not a second `companyId` key: spreading the tenant filter and
+         then writing `companyId` again REPLACES it, which would drop the
+         company scope entirely. */
+      $and: [
+        tenantContext.tenantFilter(req.tenant),
+        { companyId: { $ne: null } },
+        { status: "Active" },
+      ],
+    })
       .select(
-        "companyName contactPerson phone email address gstNumber vendorType paymentTerms",
+        "companyName contactPerson phone email address gstNumber vendorType paymentTerms supplierCode",
       )
       .sort({ companyName: 1 });
 
@@ -485,8 +533,52 @@ router.get("/data/vendors", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // CREATE new PO  (now uses findVariantNickname)
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/", async (req, res) => {
+router.post(
+  "/",
+  requireCapability(CAPABILITIES.PO_CREATE),
+  refuseLegacyWrite,
+  withIdempotency("PO_CREATE"),
+  async (req, res) => {
   try {
+    /* A companyId in the body is a client asking for something it must never
+       get. Answering with a silent substitution would teach it the field
+       works. */
+    tenantContext.assertNoForeignCompany(req.tenant, req.body);
+
+    /* ── RECOVERY ───────────────────────────────────────────────────────────
+     * An earlier attempt with this key already created the order and then
+     * failed before the response was recorded. Creating another would give
+     * one user action two orders — and two numbers off the sequence. */
+    if (req.idempotent?.recovering?.entityId) {
+      const existing = await PurchaseOrder.findOne({
+        _id: req.idempotent.recovering.entityId,
+        ...tenantContext.tenantFilter(req.tenant),
+      })
+        .populate("vendor", "companyName contactPerson email phone address")
+        .populate("items.rawItem", "name sku unit")
+        .populate("createdBy", "name email");
+      if (existing) {
+        await unitOfWork.recover(req.tenant, {
+          entityType: ENTITY,
+          entityId: existing._id,
+          idempotencyKey: req.idempotent.key,
+          entry: {
+            documentNumber: existing.poNumber,
+            action: "CREATED",
+            resultingState: existing.status,
+            requestId: req.id || "",
+            idempotencyKey: req.idempotent.key,
+            metadata: { recovered: true },
+          },
+        });
+        return await req.idempotent.succeed(201, {
+          success: true,
+          message: "Purchase order created successfully",
+          purchaseOrder: existing,
+        }, { entityType: ENTITY, entityId: existing._id });
+      }
+    }
+
     const {
       vendor,
       vendorName,
@@ -499,8 +591,27 @@ router.post("/", async (req, res) => {
       notes,
       termsConditions,
       paymentTerms,
-      status = "DRAFT",
     } = req.body;
+
+    /* ── A NEW ORDER IS ALWAYS A DRAFT ──────────────────────────────────────
+     * Creation used to take `status` straight from the body, so a caller
+     * holding only `sp.po.create` could POST `status: "ISSUED"` and skip the
+     * transition endpoint entirely — no issue capability, no approval policy,
+     * no `approvedBy`, and the supplier emailed on the way past. It could
+     * even create a "COMPLETED" order that had received nothing.
+     *
+     * Refused explicitly rather than ignored: a client that sends a status
+     * believes it is setting one, and silently downgrading it would leave
+     * somebody convinced they had issued an order they had not. */
+    const requestedStatus = req.body?.status;
+    if (requestedStatus !== undefined && requestedStatus !== null && requestedStatus !== "DRAFT") {
+      throw fail(
+        "VALIDATION",
+        "A new purchase order is always created as a draft. Issue it from the order itself once it is ready.",
+        { field: "status", supplied: String(requestedStatus), allowed: ["DRAFT"] },
+      );
+    }
+    const status = "DRAFT";
 
     const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true"
     if (!vendor && !isEmergency)
@@ -510,22 +621,18 @@ router.post("/", async (req, res) => {
         .status(400)
         .json({ success: false, message: "At least one item is required" });
 
-    // Generate unique PO number
-    let poNumber,
-      isUnique = false,
-      attempts = 0;
-    while (!isUnique && attempts < 10) {
-      poNumber = generatePONumber();
-      const existingPO = await PurchaseOrder.findOne({ poNumber });
-      if (!existingPO) isUnique = true;
-      attempts++;
-    }
-    if (!isUnique) {
-      return res.status(500).json({
-        success: false,
-        message: "Failed to generate unique PO number",
-      });
-    }
+    /* ── Chunk 1: the number comes from the atomic allocator ───────────────
+     * The previous scheme minted `PO<yy><mm><rand4>`, checked whether it
+     * already existed and retried ten times — which can still collide, and
+     * gives up with a 500 when it does. One $inc against a unique key cannot
+     * hand the same number to two callers. A number in the request body is
+     * ignored: numbering is server-owned. */
+    const allocated = await sequences.allocate({
+      companyId: req.tenant.companyId,
+      documentType: "PURCHASE_ORDER",
+      siteId: req.tenant.siteId,
+    });
+    const poNumber = allocated.number;
 
     // Build items — looks up baseUnit + per-variant vendor nickname
     const itemsWithDetails = await Promise.all(
@@ -606,6 +713,8 @@ router.post("/", async (req, res) => {
       customChargesTotal;
 
     const purchaseOrderData = {
+      /* Tenancy from context ONLY — never from the payload. */
+      ...tenantContext.stamp(req.tenant),
       poNumber,
       vendor,
       vendorName: vendorName || "",
@@ -632,19 +741,36 @@ router.post("/", async (req, res) => {
       createdBy: req.user.id,
     };
 
-    let purchaseOrder;
-    try {
-      purchaseOrder = new PurchaseOrder(purchaseOrderData);
-      await purchaseOrder.save();
-    } catch (saveError) {
-      console.error("Save error:", saveError);
-      try {
-        purchaseOrder = new PurchaseOrder(purchaseOrderData);
-        await purchaseOrder.save({ validateBeforeSave: false });
-      } catch (secondError) {
-        throw secondError;
-      }
-    }
+    /* Creation, its history entry and the idempotency effect marker as one
+       unit. Without the marker a failure anywhere after the save — the
+       history write, the response record — would release the key and let the
+       retry create a SECOND order against the same allocated number. */
+    const purchaseOrder = new PurchaseOrder(purchaseOrderData);
+    await unitOfWork.run(req.tenant, {
+      idempotencyRecord: req.idempotent?.record,
+      mutate: async (session) => {
+        await purchaseOrder.save(session ? { session } : {});
+        return {
+          entityType: ENTITY,
+          entityId: purchaseOrder._id,
+          result: true,
+          entry: {
+            entityType: ENTITY,
+            entityId: purchaseOrder._id,
+            documentNumber: poNumber,
+            action: "CREATED",
+            resultingState: purchaseOrder.status,
+            requestId: req.id || "",
+            idempotencyKey: req.idempotent?.key || "",
+            metadata: {
+              lineCount: itemsWithDetails.length,
+              totalAmount,
+              isEmergencyOrder: isEmergency,
+            },
+          },
+        };
+      },
+    });
 
     let populatedPO;
     try {
@@ -657,53 +783,77 @@ router.post("/", async (req, res) => {
       populatedPO = purchaseOrder;
     }
 
-    if (status === "ISSUED") {
-      try {
-        const vendorData = await Vendor.findById(vendor).select(
-          "companyName contactPerson email phone address",
-        );
-        if (vendorData?.email) {
-          await VendorEmailService.sendPurchaseOrderEmail(
-            populatedPO.toObject(),
-            vendorData.toObject(),
-            {
-              name: req.user.name || "Project Manager",
-              email: req.user.email || "admin@example.com",
-            },
-          );
-        }
-      } catch (emailError) {
-        console.error("Failed to send PO email (non-critical):", emailError);
-      }
+    /* No supplier email and no "issued" notification here. A draft has not
+       been issued to anybody, and both of those used to fire during creation
+       whenever the body said ISSUED. They belong to the transition endpoint,
+       which is the only place issuance now happens. */
 
-      NotificationService.sendToRole("ceo", {
-        title: "New Purchase Order Issued",
-        body: `${poNumber} — ₹${totalAmount.toLocaleString("en-IN")} to ${vendorName || "vendor"}`,
-        type: "request",
-        url: `/ceo/dashboard/purchase-orders/${purchaseOrder._id}`,
-        tag: `po-${purchaseOrder._id}`,
-      }).catch(() => {});
-    }
-
-    return res.status(201).json({
+    const body = {
       success: true,
       message: "Purchase order created successfully",
       purchaseOrder: populatedPO || purchaseOrder,
-    });
+    };
+    /* Recorded as the replayable result, so an identical retry returns THIS
+       order rather than creating a second one. */
+    return req.idempotent
+      ? await req.idempotent.succeed(201, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+      : res.status(201).json(body);
   } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
     console.error("Error creating purchase order:", error);
     return res.status(500).json({
       success: false,
       message: `Server error while creating purchase order: ${error.message}`,
     });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UPDATE PO  (now uses findVariantNickname)
 // ─────────────────────────────────────────────────────────────────────────────
-router.put("/:id", async (req, res) => {
+router.put(
+  "/:id",
+  requireCapability(CAPABILITIES.PO_CREATE),
+  refuseLegacyWrite,
+  async (req, res) => {
   try {
+    tenantContext.assertNoForeignCompany(req.tenant, req.body);
+
+    /* ── RECOVERY ───────────────────────────────────────────────────────────
+     * An earlier attempt with this key already created the order and then
+     * failed before the response was recorded. Creating another would give
+     * one user action two orders — and two numbers off the sequence. */
+    if (req.idempotent?.recovering?.entityId) {
+      const existing = await PurchaseOrder.findOne({
+        _id: req.idempotent.recovering.entityId,
+        ...tenantContext.tenantFilter(req.tenant),
+      })
+        .populate("vendor", "companyName contactPerson email phone address")
+        .populate("items.rawItem", "name sku unit")
+        .populate("createdBy", "name email");
+      if (existing) {
+        await unitOfWork.recover(req.tenant, {
+          entityType: ENTITY,
+          entityId: existing._id,
+          idempotencyKey: req.idempotent.key,
+          entry: {
+            documentNumber: existing.poNumber,
+            action: "CREATED",
+            resultingState: existing.status,
+            requestId: req.id || "",
+            idempotencyKey: req.idempotent.key,
+            metadata: { recovered: true },
+          },
+        });
+        return await req.idempotent.succeed(201, {
+          success: true,
+          message: "Purchase order created successfully",
+          purchaseOrder: existing,
+        }, { entityType: ENTITY, entityId: existing._id });
+      }
+    }
+
     const {
       vendor,
       vendorName,
@@ -716,24 +866,54 @@ router.put("/:id", async (req, res) => {
       notes,
       termsConditions,
       paymentTerms,
-      status,
     } = req.body;
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id);
+    /* ── EDITING IS NOT A TRANSITION ────────────────────────────────────────
+     * This route used to accept `status` and assign it directly, which made
+     * it a second, unguarded way to issue or cancel an order: no issue
+     * capability, no approval policy, no reason, no history. Status changes
+     * belong to PATCH /:id/status and nowhere else. */
+    if (req.body?.status !== undefined) {
+      throw fail(
+        "VALIDATION",
+        "An order's status is changed from the order itself, not by editing it.",
+        { field: "status" },
+      );
+    }
+
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    });
     if (!purchaseOrder)
       return res
         .status(404)
         .json({ success: false, message: "Purchase order not found" });
 
-    if (
-      purchaseOrder.status === "PARTIALLY_RECEIVED" ||
-      purchaseOrder.status === "COMPLETED"
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot edit purchase order that has already been received",
-      });
+    /* ── ONLY A DRAFT IS EDITABLE ───────────────────────────────────────────
+     * The old guard refused only PARTIALLY_RECEIVED and COMPLETED, so an
+     * ISSUED order — a commitment the supplier has already been sent — could
+     * have its lines, prices and vendor rewritten, and a CANCELLED one could
+     * be edited back into use. An issued order is immutable until the PO
+     * amendment document exists (Chunk 6). */
+    if (purchaseOrder.status !== "DRAFT") {
+      throw fail(
+        "INVALID_TRANSITION",
+        `A purchase order that is ${lifecycle.humanState(purchaseOrder.status)} cannot be edited.`,
+        { state: purchaseOrder.status, editableStates: ["DRAFT"] },
+      );
     }
+
+    /* A summary of what the edit changed, for history. Field names and short
+       scalars only — never the line arrays themselves. */
+    const before = {
+      vendorName: purchaseOrder.vendorName,
+      totalAmount: purchaseOrder.totalAmount,
+      lineCount: (purchaseOrder.items || []).length,
+      expectedDeliveryDate: purchaseOrder.expectedDeliveryDate
+        ? new Date(purchaseOrder.expectedDeliveryDate).toISOString()
+        : null,
+    };
 
     if (vendor) purchaseOrder.vendor = vendor;
     if (vendorName) purchaseOrder.vendorName = vendorName;
@@ -752,7 +932,9 @@ router.put("/:id", async (req, res) => {
     if (termsConditions !== undefined)
       purchaseOrder.termsConditions = termsConditions;
     if (paymentTerms !== undefined) purchaseOrder.paymentTerms = paymentTerms;
-    if (status) purchaseOrder.status = status;
+    /* No status assignment here. This line was the second, unguarded way to
+       issue or cancel an order; status changes go through PATCH /:id/status,
+       which checks capability, policy, the transition table and history. */
     if (req.body.piInvoiceNumber !== undefined)
       purchaseOrder.piInvoiceNumber = req.body.piInvoiceNumber || "";
     if (req.body.piInvoicePhoto !== undefined)
@@ -820,6 +1002,10 @@ router.put("/:id", async (req, res) => {
             gstAmount: itemGstAmount_put,
             itemCharges: resolvedCharges_put,
             itemChargesTotal: itemChargesTotal_put,
+            /* A draft has received nothing, so these start at zero — but they
+               are written from the EXISTING line where one matches, never
+               reset blindly. Editing must not be a way to make a received
+               quantity disappear. */
             receivedQuantity: 0,
             pendingQuantity: qty_put,
             status: "PENDING",
@@ -858,6 +1044,31 @@ router.put("/:id", async (req, res) => {
 
     await purchaseOrder.save();
 
+    const changes = [];
+    const after = {
+      vendorName: purchaseOrder.vendorName,
+      totalAmount: purchaseOrder.totalAmount,
+      lineCount: (purchaseOrder.items || []).length,
+      expectedDeliveryDate: purchaseOrder.expectedDeliveryDate
+        ? new Date(purchaseOrder.expectedDeliveryDate).toISOString()
+        : null,
+    };
+    for (const key of Object.keys(before)) {
+      if (String(before[key]) !== String(after[key])) {
+        changes.push({ field: key, from: before[key], to: after[key] });
+      }
+    }
+    await actionHistory.record(req.tenant, {
+      entityType: ENTITY,
+      entityId: purchaseOrder._id,
+      documentNumber: purchaseOrder.poNumber,
+      action: "EDITED",
+      previousState: "DRAFT",
+      resultingState: "DRAFT",
+      requestId: req.id || "",
+      changes,
+    });
+
     const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
       .populate("vendor", "companyName contactPerson")
       .populate("items.rawItem", "name sku unit")
@@ -869,18 +1080,27 @@ router.put("/:id", async (req, res) => {
       purchaseOrder: populatedPO,
     });
   } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
     console.error("Error updating purchase order:", error);
     res.status(500).json({
       success: false,
       message: "Server error while updating purchase order",
     });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RECORD PAYMENT
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/:id/payment", async (req, res) => {
+router.post(
+  "/:id/payment",
+  /* Chunk 8 removes Store's payment recording entirely (Accounting owns
+     settlement). Until then it is at least scoped and permissioned. */
+  requireCapability(CAPABILITIES.PO_APPROVE),
+  refuseLegacyWrite,
+  withIdempotency("PO_PAYMENT"),
+  async (req, res) => {
   try {
     const { amount, paymentMethod, referenceNumber, paymentDate, notes } =
       req.body;
@@ -896,7 +1116,10 @@ router.post("/:id/payment", async (req, res) => {
         .json({ success: false, message: "Payment method is required" });
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id);
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    });
     if (!purchaseOrder)
       return res
         .status(404)
@@ -941,30 +1164,45 @@ router.post("/:id/payment", async (req, res) => {
     ).populate("payments.recordedBy", "name email");
     const latestPayment = populatedPO.payments[0];
 
-    res.json({
+    await actionHistory.record(req.tenant, {
+      entityType: ENTITY,
+      entityId: purchaseOrder._id,
+      documentNumber: purchaseOrder.poNumber,
+      action: "PAYMENT_RECORDED",
+      requestId: req.id || "",
+      idempotencyKey: req.idempotent?.key || "",
+      metadata: { amount: Number(amount), paymentMethod, paymentStatus: purchaseOrder.paymentStatus },
+    });
+
+    const body = {
       success: true,
       message: `Payment of ₹${amount} recorded successfully`,
       payment: latestPayment,
       paymentStatus: purchaseOrder.paymentStatus,
       totalPaid: newTotalPaid,
       remainingAmount: purchaseOrder.totalAmount - newTotalPaid,
-    });
+    };
+    return req.idempotent
+      ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+      : res.json(body);
   } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
     console.error("Error recording payment:", error);
     res.status(500).json({
       success: false,
       message: "Server error while recording payment",
     });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PO by vendor
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/vendor/:vendorId", async (req, res) => {
+router.get("/vendor/:vendorId", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const { status } = req.query;
-    let filter = { vendor: req.params.vendorId };
+    let filter = { vendor: req.params.vendorId, ...tenantContext.tenantFilter(req.tenant) };
     if (status && status !== "all") filter.status = status;
 
     const purchaseOrders = await PurchaseOrder.find(filter)
@@ -1000,10 +1238,10 @@ router.get("/vendor/:vendorId", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PO by raw item
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/raw-item/:itemId", async (req, res) => {
+router.get("/raw-item/:itemId", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const { status } = req.query;
-    let filter = { "items.rawItem": req.params.itemId };
+    let filter = { "items.rawItem": req.params.itemId, ...tenantContext.tenantFilter(req.tenant) };
     if (status && status !== "all") filter.status = status;
 
     const purchaseOrders = await PurchaseOrder.find(filter)
@@ -1048,33 +1286,114 @@ router.get("/raw-item/:itemId", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGE PO status
 // ─────────────────────────────────────────────────────────────────────────────
-router.patch("/:id/status", async (req, res) => {
+router.patch(
+  "/:id/status",
+  /* Issuing an order and cancelling one are different authorities; the
+     handler checks the specific one once it knows which was asked for. Both
+     are strictly narrower than today's "any authenticated caller". */
+  requireCapability(CAPABILITIES.READ),
+  refuseLegacyWrite,
+  /* Mandatory, not optional. Issuing and cancelling are exactly the actions
+     a retry must not repeat. */
+  withIdempotency("PO_STATUS"),
+  async (req, res) => {
   try {
-    const { status, notes } = req.body;
+    const { status, notes, reason } = req.body;
     if (!status)
       return res
         .status(400)
         .json({ success: false, message: "Status is required" });
 
-    const validStatuses = ["DRAFT", "ISSUED", "CANCELLED"];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status. Use DRAFT, ISSUED, or CANCELLED",
-      });
+    /* Only these may be ASKED for. PARTIALLY_RECEIVED and COMPLETED are
+       consequences of receiving goods, and DRAFT is not reachable from
+       anywhere — see lifecycle.PO_TRANSITIONS. */
+    if (!lifecycle.PO_REQUESTABLE.includes(status)) {
+      throw fail(
+        "VALIDATION",
+        "An order can only be issued or cancelled from here. Receipt status follows from recording deliveries.",
+        { requested: status, allowed: lifecycle.PO_REQUESTABLE },
+      );
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id);
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    });
     if (!purchaseOrder)
       return res
         .status(404)
         .json({ success: false, message: "Purchase order not found" });
 
-    if (purchaseOrder.totalReceived > 0 && status === "CANCELLED") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot cancel purchase order that has already been received",
+    const previousState = purchaseOrder.status;
+
+    /* ── The transition table decides what is even possible ─────────────── */
+    const { noop } = lifecycle.assertTransition({ from: previousState, to: status });
+    if (noop) {
+      /* Already in this state. Succeed without appending a second history
+         entry — a re-issue of an issued order is not a second issuance. */
+      const body = {
+        success: true,
+        message: `Purchase order is already ${lifecycle.humanState(status)}`,
+        purchaseOrder,
+      };
+      return req.idempotent
+        ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+        : res.json(body);
+    }
+
+    /* ── Capability, per transition ─────────────────────────────────────── */
+    if (status === "ISSUED" && !req.tenant.capabilitySet.has(CAPABILITIES.PO_ISSUE)) {
+      return sendError(res, fail("FORBIDDEN", "You do not have permission to issue purchase orders.", {
+        required: [CAPABILITIES.PO_ISSUE],
+      }));
+    }
+    if (status === "CANCELLED" && !req.tenant.capabilitySet.has(CAPABILITIES.PO_CANCEL)) {
+      return sendError(res, fail("FORBIDDEN", "You do not have permission to cancel purchase orders.", {
+        required: [CAPABILITIES.PO_CANCEL],
+      }));
+    }
+
+    if (status === "CANCELLED" && purchaseOrder.totalReceived > 0) {
+      throw fail(
+        "LIFECYCLE_BLOCKED",
+        "This order has received goods and cannot be cancelled. Return the goods to the supplier instead.",
+        {
+          reason: "HAS_RECEIPTS",
+          blockingReferences: [{
+            collection: "deliveries", count: (purchaseOrder.deliveries || []).length,
+            description: `${purchaseOrder.totalReceived} unit(s) already received`,
+          }],
+        },
+      );
+    }
+
+    /* ── Cancellation is a recorded decision, so it owes a reason ───────── */
+    if (status === "CANCELLED") {
+      lifecycle.assertCancellable({
+        entityLabel: "purchase order",
+        state: previousState,
+        cancellableStates: ["DRAFT", "ISSUED"],
+        reason,
       });
+    }
+
+    /* ── Approval policy, where one is configured ───────────────────────── */
+    let policyOutcome = "NONE_MATCHED";
+    if (status === "ISSUED") {
+      const resolution = await approvalPolicy.resolvePolicy({
+        companyId: req.tenant.companyId,
+        documentType: "PURCHASE_ORDER",
+        amount: purchaseOrder.totalAmount || 0,
+        siteId: req.tenant.siteId,
+        isEmergency: Boolean(purchaseOrder.isEmergencyOrder),
+      });
+      const decision = approvalPolicy.evaluate({ resolution, ctx: req.tenant });
+      policyOutcome = decision.policy;
+      if (!decision.allowed) {
+        return sendError(res, fail("FORBIDDEN",
+          "Your approval authority does not cover an order of this value.",
+          { required: [decision.requiredCapability], level: decision.level }));
+      }
     }
 
     const wasIssuedBefore = purchaseOrder.status === "ISSUED";
@@ -1098,24 +1417,54 @@ router.patch("/:id/status", async (req, res) => {
     }
 
     await purchaseOrder.save();
-    res.json({
+
+    await actionHistory.record(req.tenant, {
+      entityType: ENTITY,
+      entityId: purchaseOrder._id,
+      documentNumber: purchaseOrder.poNumber,
+      action: status === "CANCELLED" ? "CANCELLED" : status === "ISSUED" ? "ISSUED" : "STATUS_CHANGED",
+      previousState,
+      resultingState: status,
+      reason: reason || "",
+      requestId: req.id || "",
+      idempotencyKey: req.idempotent?.key || "",
+      /* The policy outcome is recorded rather than assumed: "no policy
+         matched" is a fact somebody may need to see later, and a silent
+         absence would look identical to an approval. */
+      metadata: { policy: policyOutcome, totalAmount: purchaseOrder.totalAmount || 0 },
+    });
+
+    const body = {
       success: true,
       message: `Purchase order status updated to ${status}`,
       purchaseOrder,
-    });
+    };
+    return req.idempotent
+      ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+      : res.json(body);
   } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
     console.error("Error updating purchase order status:", error);
     res.status(500).json({
       success: false,
       message: "Server error while updating purchase order status",
     });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RECEIVE delivery (unchanged from your version — handles unit conversion)
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/:id/receive", async (req, res) => {
+router.post(
+  "/:id/receive",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  /* THE reason idempotency exists. Chunk 0's characterisation test proved a
+     re-posted receipt is accepted and silently books the whole delivery into
+     stock a second time as "surplus". A key makes the retry a replay. */
+  withIdempotency("PO_RECEIVE"),
+  async (req, res) => {
   try {
     const { deliveryDate, items, invoiceNumber, notes } = req.body;
 
@@ -1125,13 +1474,67 @@ router.post("/:id/receive", async (req, res) => {
         .json({ success: false, message: "At least one item is required" });
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id).populate(
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    }).populate(
       "items.rawItem",
       "name sku unit customUnit variants quantity status minStock maxStock",
     );
 
     if (!purchaseOrder)
       return res.status(404).json({ success: false, message: "PO not found" });
+
+    /* ── RECOVERY ───────────────────────────────────────────────────────────
+     * A previous attempt with this key already moved the stock and saved the
+     * order; something after that failed. Re-running would receive the same
+     * delivery twice — the exact defect Chunk 0 pinned. So the work is not
+     * redone: the missing history entry is written if it is missing, and the
+     * caller is handed the order as it now stands. */
+    if (req.idempotent?.recovering) {
+      /* Did the order record the delivery, or did the previous attempt die
+         between moving stock and saving the order? The two need different
+         answers: one is a clean replay, the other needs a human. */
+      const deliveryRecorded = (purchaseOrder.deliveries || []).length > 0
+        && (purchaseOrder.totalReceived || 0) > 0;
+
+      await unitOfWork.recover(req.tenant, {
+        entityType: ENTITY,
+        entityId: purchaseOrder._id,
+        idempotencyKey: req.idempotent.key,
+        entry: {
+          documentNumber: purchaseOrder.poNumber,
+          action: deliveryRecorded ? "RECEIVED" : "RECEIPT_RECONCILIATION_REQUIRED",
+          resultingState: purchaseOrder.status,
+          requestId: req.id || "",
+          idempotencyKey: req.idempotent.key,
+          reason: deliveryRecorded ? "" : "Stock moved but the order did not record the delivery.",
+          metadata: { recovered: true, totalReceived: purchaseOrder.totalReceived || 0 },
+        },
+      });
+
+      if (!deliveryRecorded) {
+        /* Never re-run: the stock already moved. Say so plainly instead of
+           repeating it or pretending it succeeded. */
+        throw fail(
+          "LIFECYCLE_BLOCKED",
+          "This delivery was partly recorded before an error interrupted it. The stock has already been received, but the order was not updated. Check the item's stock and correct the order — do not record the delivery again.",
+          { reason: "PARTIAL_RECEIPT_NEEDS_RECONCILIATION", poNumber: purchaseOrder.poNumber },
+        );
+      }
+      const recovered = await PurchaseOrder.findById(purchaseOrder._id)
+        .populate("vendor", "companyName contactPerson")
+        .populate("items.rawItem", "name sku unit customUnit")
+        .populate("deliveries.receivedBy", "name email");
+      return await req.idempotent.succeed(200, {
+        success: true,
+        message: "This delivery was already recorded.",
+        purchaseOrder: recovered,
+        processed: [],
+      }, { entityType: ENTITY, entityId: purchaseOrder._id });
+    }
+
+    const previousState = purchaseOrder.status;
     if (purchaseOrder.status === "DRAFT")
       return res
         .status(400)
@@ -1210,6 +1613,24 @@ router.post("/:id/receive", async (req, res) => {
 
     let totalReceivedInPoUnits = 0;
     const processed = [];
+
+    /* ── THE MARKER GOES BEFORE THE FIRST STOCK WRITE ───────────────────────
+     * Stock moves item by item, outside any transaction on a standalone
+     * deployment. If the marker were written after the loop — or after the
+     * order save — a failure part-way through would release the key and the
+     * retry would move the SAME stock again. Marking first makes the effect
+     * at-most-once: any failure from here on sends the retry into recovery,
+     * which never re-runs the movement. The price is that a receipt can be
+     * left half-applied; that is surfaced for reconciliation below rather
+     * than silently repeated, which is the trade every stock system has to
+     * make without transactions. */
+    if (req.idempotent?.record) {
+      await idempotencyService.markEffectApplied({
+        record: req.idempotent.record,
+        entityType: ENTITY,
+        entityId: purchaseOrder._id,
+      });
+    }
 
     for (const u of updates) {
       const {
@@ -1392,29 +1813,67 @@ router.post("/:id/receive", async (req, res) => {
           ? "PARTIALLY_RECEIVED"
           : purchaseOrder.status;
 
-    await purchaseOrder.save();
+    /* The order save, the history entry and the idempotency effect marker as
+       one unit. On a replica set they commit together; on a standalone the
+       marker lands the instant the save does, so a later failure cannot let
+       a retry receive this delivery again. */
+    await unitOfWork.run(req.tenant, {
+      idempotencyRecord: req.idempotent?.record,
+      mutate: async (session) => {
+        await purchaseOrder.save(session ? { session } : {});
+        return {
+          entityType: ENTITY,
+          entityId: purchaseOrder._id,
+          result: true,
+          entry: {
+            entityType: ENTITY,
+            entityId: purchaseOrder._id,
+            documentNumber: purchaseOrder.poNumber,
+            action: "RECEIVED",
+            previousState,
+            resultingState: purchaseOrder.status,
+            requestId: req.id || "",
+            idempotencyKey: req.idempotent?.key || "",
+            metadata: {
+              quantityReceived: totalReceivedInPoUnits,
+              lineCount: processed.length,
+              invoiceNumber: invoiceNumber || "",
+            },
+          },
+        };
+      },
+    });
 
     const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
       .populate("vendor", "companyName contactPerson")
       .populate("items.rawItem", "name sku unit customUnit")
       .populate("deliveries.receivedBy", "name email");
 
-    res.json({
+    const body = {
       success: true,
       message: `Delivery received. ${totalReceivedInPoUnits} unit(s) recorded.`,
       purchaseOrder: populatedPO,
       processed,
-    });
+    };
+    return req.idempotent
+      ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+      : res.json(body);
   } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
     console.error("Error receiving delivery:", err);
     res.status(500).json({ success: false, message: err.message });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UPDATE PAYMENT STATUS
 // ─────────────────────────────────────────────────────────────────────────────
-router.patch("/:id/payment-status", async (req, res) => {
+router.patch(
+  "/:id/payment-status",
+  requireCapability(CAPABILITIES.PO_APPROVE),
+  refuseLegacyWrite,
+  async (req, res) => {
   try {
     const { status } = req.body;
     if (!status)
@@ -1429,7 +1888,10 @@ router.patch("/:id/payment-status", async (req, res) => {
         .json({ success: false, message: "Invalid payment status" });
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id);
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    });
     if (!purchaseOrder)
       return res
         .status(404)
@@ -1444,20 +1906,25 @@ router.patch("/:id/payment-status", async (req, res) => {
       purchaseOrder,
     });
   } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
     console.error("Error updating payment status:", error);
     res.status(500).json({
       success: false,
       message: "Server error while updating payment status",
     });
   }
-});
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PAYMENT HISTORY
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:id/payments", async (req, res) => {
+router.get("/:id/payments", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id)
+    const purchaseOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantContext.tenantFilter(req.tenant),
+    })
       .select("payments poNumber totalAmount")
       .populate("payments.recordedBy", "name email");
 

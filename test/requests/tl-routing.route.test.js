@@ -115,6 +115,11 @@ const call = (emp, path, { method = "GET", body, app = "intake" } = {}) => {
     method,
     headers: {
       "Content-Type": "application/json",
+      /* Chunk 1B: the material door refuses an effectful call without an
+         idempotency key, so a double-tap in CoWork cannot raise the same
+         request twice. Every call here gets a fresh one — these tests are
+         about routing, not about replay. */
+      "Idempotency-Key": `req-${Math.random().toString(36).slice(2)}`,
       Authorization: `Bearer ${jwt.sign(
         {
           id: String(emp._id),

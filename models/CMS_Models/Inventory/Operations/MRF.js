@@ -176,7 +176,31 @@ const statusEventSchema = new mongoose.Schema(
 // ── Main MRF schema ───────────────────────────────────────────────────────────
 const mrfSchema = new mongoose.Schema(
   {
-    mrfNumber: { type: String, unique: true, trim: true, required: true },
+    /* ── Chunk 1B: tenant ownership ─────────────────────────────────────────
+       Optional, and deliberately so: every request raised before the boundary
+       existed carries no company and is a legacy-global record. Absence never
+       means "visible to everybody" — the list filters exclude it, and reading
+       it needs the explicit legacy mode plus sp.legacy.read. Nothing here is
+       backfilled; adopting a legacy request is a separate authorised action
+       this chunk does not perform. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+    siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* Numbering stays globally unique: MRF numbers are minted by the existing
+       read-max+1 hook and every current one is unique across the database.
+       Scoping this the way the PO number was scoped would need those numbers
+       re-issued, which Chunk 1 forbids. The sequence allocator will take this
+       over when material requests move to it — not in 1B. */
+    /* Not `unique` here any more: uniqueness is company-scoped, declared as a
+       compound index below. Mongoose never DROPS an index it stops declaring,
+       so the legacy global `mrfNumber_1` survives on existing deployments and
+       has to be retired deliberately — see
+       scripts/migrations/store-purchase-mrf-number-index.js. */
+    mrfNumber: { type: String, trim: true, required: true },
 
     // Who the materials are FOR
     requestedFor: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", required: true },
@@ -435,6 +459,18 @@ mrfSchema.index({ creationMode: 1, createdAt: -1 });
 mrfSchema.index({ approverBiometricId: 1, status: 1, createdAt: -1 });
 mrfSchema.index({ approverAltIds: 1, status: 1 });
 
+/* ── Company-scoped variants of the hot paths ────────────────────────────────
+   Every list, queue and count now carries `companyId`, so the pre-existing
+   indexes above would be prefix-mismatched for them. These lead with the
+   company for the same reason the queries do. */
+/* One number per company. Two companies may both hold MRF/2026-27/0001;
+   within a company the number is the identity of the paper. */
+mrfSchema.index({ companyId: 1, mrfNumber: 1 }, { unique: true });
+mrfSchema.index({ companyId: 1, status: 1, createdAt: -1 });
+mrfSchema.index({ companyId: 1, requestedFor: 1, status: 1, createdAt: -1 });
+mrfSchema.index({ companyId: 1, approverBiometricId: 1, status: 1, createdAt: -1 });
+mrfSchema.index({ companyId: 1, approverAltIds: 1, status: 1 });
+
 // Append an audit event. Callers should use this rather than pushing directly
 // so every entry carries a consistent shape.
 mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "", detail = "" }) {
@@ -443,20 +479,47 @@ mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "",
 };
 
 // Auto-generate MRF number
+/**
+ * A number for a request that arrived without one.
+ *
+ * ── WHY THIS NO LONGER NUMBERS COMPANY-OWNED REQUESTS ───────────────────────
+ * It used to read the highest existing number and add one. Two requests
+ * submitted in the same moment both read the same "last", both computed the
+ * same next, and the second lost — either to the unique index, or, worse, to a
+ * silent collision on a deployment where that index was missing. It also
+ * scanned every company's numbers to decide one company's next, which is not a
+ * per-company sequence at all.
+ *
+ * Company-owned requests are now numbered by SpDocumentSequence, which is a
+ * single atomic `$inc` and cannot hand the same value to two callers. This
+ * hook refuses to invent one for them: a missing number here means a creation
+ * path skipped the allocator, and quietly papering over that would restore the
+ * race the allocator exists to remove.
+ *
+ * The read-last fallback survives for company-less records only — legacy
+ * fixtures and pre-boundary data, which no longer grow.
+ */
 mrfSchema.pre("validate", async function (next) {
-  if (!this.mrfNumber) {
-    const now = new Date();
-    const yy = String(now.getFullYear()).slice(-2);
-    const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const prefix = `MRF-${yy}${mm}-`;
-    const last = await mongoose
-      .model("MRF")
-      .findOne({ mrfNumber: { $regex: `^${prefix}` } })
-      .sort({ mrfNumber: -1 })
-      .lean();
-    const seq = last ? parseInt(last.mrfNumber.slice(-4), 10) + 1 : 1;
-    this.mrfNumber = `${prefix}${String(seq).padStart(4, "0")}`;
+  if (this.mrfNumber) return next();
+
+  if (this.companyId) {
+    return next(new Error(
+      "A material request must be numbered through SpDocumentSequence " +
+      "(documentSequence.allocate with MATERIAL_REQUEST) before it is saved.",
+    ));
   }
+
+  const now = new Date();
+  const yy = String(now.getFullYear()).slice(-2);
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const prefix = `MRF-${yy}${mm}-`;
+  const last = await mongoose
+    .model("MRF")
+    .findOne({ mrfNumber: { $regex: `^${prefix}` } })
+    .sort({ mrfNumber: -1 })
+    .lean();
+  const seq = last ? parseInt(last.mrfNumber.slice(-4), 10) + 1 : 1;
+  this.mrfNumber = `${prefix}${String(seq).padStart(4, "0")}`;
   next();
 });
 

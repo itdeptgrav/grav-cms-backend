@@ -17,6 +17,21 @@ const issuanceItemSchema = new mongoose.Schema({
 
 const stockIssuanceSchema = new mongoose.Schema(
   {
+    /* ── Chunk 1C: tenancy ─────────────────────────────────────────────────
+       Server-owned, from the resolved tenant context only. An issuance is a
+       stock movement, so it cannot be written without an owner; records
+       predating the boundary have none and are legacy-global. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+    siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* Which user action produced this, so a replay is recognised rather than
+       issuing the same stock twice. */
+    idempotencyKey: { type: String, trim: true, default: "", index: true },
+
     direction: { type: String, enum: ["debit", "credit"], required: true },
 
     // Optional MO reference

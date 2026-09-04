@@ -764,6 +764,44 @@ async function _appendMeetEvent({ meetId, type, actorId, actorName, detail }) {
   });
 }
 
+/**
+ * Close every way into a meeting: the LiveKit room, the join code, the link.
+ *
+ * Best-effort by design — see the caller. Each step is independent so one
+ * failure does not skip the others.
+ */
+async function _tearDownMeetingRoom(meet, meetId) {
+  /* The join code is a 6-digit space and therefore guessable; leaving one
+     active after the meeting is the cheapest way in. */
+  if (meet.joinCode) {
+    await db
+      .collection("cowork_join_codes")
+      .doc(String(meet.joinCode))
+      .update({ active: false })
+      .catch((e) =>
+        console.error(`[meet ${meetId}] join code deactivate:`, e.message),
+      );
+  }
+
+  if (!meet.livekitRoomName) return;
+  const url = (process.env.LIVEKIT_URL || "")
+    .replace("wss://", "https://")
+    .replace("ws://", "http://");
+  if (!url || !process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) {
+    return;
+  }
+  const { RoomServiceClient } = require("livekit-server-sdk");
+  const svc = new RoomServiceClient(
+    url,
+    process.env.LIVEKIT_API_KEY,
+    process.env.LIVEKIT_API_SECRET,
+  );
+  /* Disconnects everybody still in it. A token already minted stays
+     cryptographically valid until it expires, so deleting the room is what
+     actually removes the ability to be in it. */
+  await svc.deleteRoom(meet.livekitRoomName);
+}
+
 async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status }) {
   if (!MEET_STATUSES.includes(status)) {
     throw new Error(`Unknown meeting status. Expected one of: ${MEET_STATUSES.join(", ")}.`);
@@ -801,6 +839,32 @@ async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status })
     updates.cancelledByName = employeeName || "";
     updates.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
   }
+
+  /**
+   * Ending a meeting must actually END it.
+   *
+   * **The gap this closes.** Status was the only thing this wrote, so "End for
+   * everyone" relabelled the document and left every way IN still open: the
+   * LiveKit room stayed up, the 6-digit join code stayed `active`, and the
+   * public guest link stayed live. `POST /cowork/livekit/end` did all three —
+   * and had no caller anywhere in the product, so it never ran.
+   *
+   * Doing it here rather than asking the client to make a second call means
+   * every caller of this service gets the teardown: the UI, the legacy app, and
+   * anything added later. A meeting is over exactly when its status says so.
+   */
+  if (status === "completed" || status === "archived" || status === "cancelled") {
+    updates.publicShareEnabled = false;
+    try {
+      await _tearDownMeetingRoom(meet, meetId);
+    } catch (e) {
+      /* The document must still close even if LiveKit is unreachable — a
+         meeting that cannot be ended because a third party is down is worse
+         than a room that lingers until its own empty-timeout. */
+      console.error(`[meet ${meetId}] room teardown failed:`, e.message);
+    }
+  }
+
   await ref.update(updates);
 
   await _appendMeetEvent({

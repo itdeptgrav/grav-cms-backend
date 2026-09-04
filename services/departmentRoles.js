@@ -33,6 +33,25 @@ function normaliseBudgetDepartments(value) {
   ];
 }
 
+/**
+ * Clear any per-department identity cache a role change invalidates.
+ *
+ * QC caches "which role does this email hold" for a minute to keep its
+ * dashboard off nine redundant lookups per page load (see services/qcViewer.js).
+ * That is fine for a role that has not changed and visibly wrong for one that
+ * just did — granting somebody owner and having them still be refused for the
+ * next sixty seconds reads as a broken grant. Required lazily so qcViewer can
+ * keep requiring this module without a cycle.
+ */
+function dropRoleCaches(slug, email) {
+  if (slug !== "qc") return;
+  try {
+    require("./qcViewer").invalidateViewer(email);
+  } catch (e) {
+    console.warn("[departmentRoles] qc viewer cache invalidation skipped:", e.message);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Reading                                                             */
 /* ------------------------------------------------------------------ */

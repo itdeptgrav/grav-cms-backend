@@ -9,6 +9,9 @@
 
 const mongoose = require("mongoose");
 
+/* An attachment is part of a message and has no separate owner: it is reached
+   only through the message, so scoping it independently protects nothing and
+   invites the two from disagreeing. Ownership lives on the message below. */
 const attachmentSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true },
@@ -30,6 +33,27 @@ const mrfChatMessageSchema = new mongoose.Schema(
       default: "MRF",
     },
     subject: { type: mongoose.Schema.Types.ObjectId, index: true },
+
+    /* ── Tenant ownership ───────────────────────────────────────────────────
+       A message inherits the company of the request it is about, taken from
+       the authoritative parent document and never from a request payload.
+       Optional for the same reason MRF.companyId is: messages written before
+       the boundary existed carry none, and those are legacy-global — excluded
+       from ordinary reads rather than adopted by whoever asks first. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      default: null,
+      index: true,
+    },
+    siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* The key of the action that produced this message. A unique index over
+       (companyId, subject, idempotencyKey) is what makes posting at-most-once:
+       creation itself is the effect marker, so a retry collides here instead
+       of writing a second message. Null for system messages and for anything
+       written before chat was idempotent, which is why the index is partial. */
+    idempotencyKey: { type: String, trim: true, default: null },
 
     // Legacy field, kept populated for MRF threads so messages written before
     // subjectType existed still resolve. Reads match on either.
@@ -64,6 +88,23 @@ const mrfChatMessageSchema = new mongoose.Schema(
 
 mrfChatMessageSchema.index({ mrf: 1, createdAt: 1 });
 mrfChatMessageSchema.index({ subject: 1, createdAt: 1 });
+/* Company-scoped variants of the two hot paths, so a scoped read is not a
+   prefix mismatch against the indexes above. */
+/* Company-scoped variants of the two hot paths, so a scoped read is not a
+   prefix mismatch against the indexes above. */
+mrfChatMessageSchema.index({ companyId: 1, subject: 1, createdAt: 1 });
+mrfChatMessageSchema.index({ companyId: 1, mrf: 1, createdAt: 1 });
+
+/* At-most-once posting. Partial so the millions of messages with no key do not
+   collide with each other on null. */
+mrfChatMessageSchema.index(
+  { companyId: 1, subject: 1, idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { idempotencyKey: { $type: "string" } },
+    name: "sp_chat_idempotency",
+  },
+);
 
 module.exports =
   mongoose.models.MrfChatMessage ||

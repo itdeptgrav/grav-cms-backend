@@ -10,11 +10,48 @@ const Vendor   = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/V
 const MRF      = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+const valuation = require("../valuation/inventoryValuationRoutes");
 
 router.use(EmployeeAuthMiddleware);
 
 router.get("/", async (req, res) => {
   try {
+    /* The inventory value comes from the ONE valuation engine, not a second
+       "quantity × last price" formula. Scoped best-effort to the caller's
+       company so the overview and the Inventory-valuation report agree; if a
+       company cannot be resolved (a multi-company caller with no selection),
+       the figure falls back to the legacy unscoped set rather than 500-ing a
+       dashboard. */
+    let valuationScope = {};
+    try {
+      const ctx = await tenantContext.resolveForActor(req.user, {
+        requestedCompanyId:
+          req.headers["x-store-purchase-company"] || req.query.actingCompanyId,
+      });
+      if (ctx && ctx.companyId) valuationScope = tenantContext.tenantFilter(ctx);
+    } catch {
+      valuationScope = {};
+    }
+    const valuationResult = await valuation
+      .summarizeCompany(valuationScope)
+      .catch(() => null);
+    const inventoryValuation = valuationResult ? valuationResult.summary : null;
+    /* Top items by KNOWN value, from the same engine (no separate formula). */
+    const topByKnownValue = valuationResult
+      ? [...valuationResult.valued]
+          .filter((v) => (v.knownValue || 0) > 0)
+          .sort((a, b) => (b.knownValue || 0) - (a.knownValue || 0))
+          .slice(0, 5)
+          .map((v) => ({
+            name: v.name,
+            quantity: v.replayedOnHand,
+            unit: v.unit,
+            unitPrice: v.avgCost,
+            stockValue: v.knownValue,
+            status: v.status,
+          }))
+      : [];
     const now        = new Date();
     const sevenDaysAgo = new Date(now); sevenDaysAgo.setDate(now.getDate() - 7);
     const todayStart = new Date(now); todayStart.setHours(0,0,0,0);
@@ -41,8 +78,6 @@ router.get("/", async (req, res) => {
       mrfStats,
       // ── NEW: product registration request stats ──
       productRequestStats,
-      // ── NEW: correct value — qty × last purchase price from stockTransactions ──
-      rawItemsForValue,
     ] = await Promise.all([
 
       // ── Raw Items aggregation (status counts + quantities only) ─────────────
@@ -280,87 +315,6 @@ router.get("/", async (req, res) => {
           },
         },
       ]),
-
-      // ── NEW: correct inventory value — qty × last unitPrice per item ─────────
-      // We pull only items that are In Stock / Low Stock (have qty > 0)
-      RawItem.aggregate([
-        { $match: { quantity: { $gt: 0 } } },
-        {
-          $project: {
-            name:     1,
-            quantity: 1,
-            status:   1,
-            // Last purchase unitPrice from stockTransactions
-            lastUnitPrice: {
-              $let: {
-                vars: {
-                  purchaseTxns: {
-                    $filter: {
-                      input: { $ifNull: ["$stockTransactions", []] },
-                      as:    "tx",
-                      cond:  {
-                        $and: [
-                          { $in:  ["$$tx.type", ["ADD","PURCHASE_ORDER","VARIANT_ADD"]] },
-                          { $gt:  ["$$tx.unitPrice", 0] },
-                        ],
-                      },
-                    },
-                  },
-                },
-                in: {
-                  $ifNull: [
-                    { $arrayElemAt: [{ $slice: ["$$purchaseTxns", -1] }, 0] },
-                    null,
-                  ],
-                },
-              },
-            },
-          },
-        },
-        {
-          $project: {
-            name:     1,
-            quantity: 1,
-            status:   1,
-            unitPrice: { $ifNull: ["$lastUnitPrice.unitPrice", 0] },
-            stockValue: {
-              $multiply: [
-                { $ifNull: ["$quantity", 0] },
-                { $ifNull: ["$lastUnitPrice.unitPrice", 0] },
-              ],
-            },
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            totalStockValue: { $sum: "$stockValue" },
-            itemsWithPrice:  { $sum: { $cond: [{ $gt: ["$unitPrice", 0] }, 1, 0] } },
-            // Top 5 by stock value
-            items: {
-              $push: {
-                name:       "$name",
-                quantity:   "$quantity",
-                unitPrice:  "$unitPrice",
-                stockValue: "$stockValue",
-                status:     "$status",
-              },
-            },
-          },
-        },
-        {
-          $project: {
-            totalStockValue: 1,
-            itemsWithPrice:  1,
-            topByValue: {
-              $slice: [
-                { $sortArray: { input: "$items", sortBy: { stockValue: -1 } } },
-                5
-              ],
-            },
-          },
-        },
-      ]),
     ]);
 
     // ── Unwrap single-doc aggregations ────────────────────────────────────────
@@ -376,7 +330,13 @@ router.get("/", async (req, res) => {
       awaitingStore:0, notYetReviewed:0, awaitingTl:0,
     };
     const prS = productRequestStats[0] || { total:0, awaitingTl:0, awaitingStore:0, todayCount:0 };
-    const valData = rawItemsForValue[0] || { totalStockValue:0, itemsWithPrice:0, topByValue:[] };
+    /* The one honest valuation answer, from the shared engine. `knownValue` is
+       what CAN be valued from recorded movements — not a "total". Items that
+       cannot be valued reliably are counted, not hidden as ₹0. */
+    const iv = inventoryValuation || {
+      knownInventoryValue: 0, completeCount: 0, incompleteCount: 0,
+      unreconciledCount: 0, excludedCount: 0,
+    };
 
     res.json({
       success: true,
@@ -387,9 +347,16 @@ router.get("/", async (req, res) => {
           lowStock:       r.lowStock,
           outOfStock:     r.outOfStock,
           totalQuantity:  r.totalQuantity,
-          // Correct value: qty × last purchase price (only in-stock items)
-          totalValue:     valData.totalStockValue,
-          itemsWithPrice: valData.itemsWithPrice,
+          // Known inventory value from the moving weighted-average engine, plus
+          // how many items could NOT be valued reliably. `totalValue` is kept
+          // as an alias for existing readers but means the KNOWN value.
+          knownInventoryValue: iv.knownInventoryValue,
+          totalValue:          iv.knownInventoryValue,
+          incompleteItems:     iv.incompleteCount,
+          unreconciledItems:   iv.unreconciledCount,
+          completeItems:       iv.completeCount,
+          itemsWithPrice:      iv.completeCount,
+          valuationAvailable:  inventoryValuation != null,
         },
         stockItems: {
           total:         s.total,
@@ -435,8 +402,11 @@ router.get("/", async (req, res) => {
         },
         overall: {
           totalItems:          r.total + s.total,
-          // Combined: raw stock value (purchase-price based) + stock items value
-          totalValue:          valData.totalStockValue + s.totalValue,
+          // Combined KNOWN inventory value (weighted-average raw stock) + stock
+          // items value. Not labelled a "total" downstream when incomplete.
+          totalValue:          iv.knownInventoryValue + s.totalValue,
+          knownInventoryValue: iv.knownInventoryValue,
+          incompleteItems:     iv.incompleteCount,
           totalStockQuantity:  r.totalQuantity + s.totalQuantity,
         },
       },
@@ -455,7 +425,7 @@ router.get("/", async (req, res) => {
         stockIns:  todayStockIns,
       },
       topUsedItems,
-      topValueItems: valData.topByValue,
+      topValueItems: topByKnownValue,
     });
 
   } catch (error) {
