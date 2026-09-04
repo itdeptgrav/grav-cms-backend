@@ -45,17 +45,26 @@ const REASON = Object.freeze({
   BALANCE_MISMATCH: "BALANCE_MISMATCH",
   VARIANT_TOTAL_MISMATCH: "VARIANT_TOTAL_MISMATCH",
   NEGATIVE_REPLAY: "NEGATIVE_REPLAY",
+  // An outbound happened while unpriced stock was on hand: we can no longer say
+  // which units left, so the remaining cost composition is unknowable.
+  COST_COMPOSITION_INDETERMINATE: "COST_COMPOSITION_INDETERMINATE",
+  // A correction row exists that has not been APPLIED to stock — it is a claim,
+  // not a movement, so it changes nothing but is worth attention.
+  UNAPPLIED_CORRECTION: "UNAPPLIED_CORRECTION",
 });
 
 const STATUS = Object.freeze({
   COMPLETE: "complete",
   INCOMPLETE: "incomplete",
+  INDETERMINATE: "indeterminate",
   UNRECONCILED: "unreconciled",
 });
 
 const isNum = (x) => typeof x === "number" && Number.isFinite(x);
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 const round4 = (n) => Math.round((n + Number.EPSILON) * 10000) / 10000;
+// Null-safe rounder — an indeterminate quantity/value stays null, never 0.
+const r4 = (n) => (n == null ? null : round4(n));
 
 function timeOf(m) {
   const d = m && (m.createdAt || m.updatedAt);
@@ -120,19 +129,41 @@ function classify(m) {
   return { ok: true, dir: "in", qty, type, priced: false, reason: REASON.MISSING_INBOUND_PRICE };
 }
 
-// Replay a chronological list of movements through a moving weighted-average.
-// Two lanes are kept: a VALUED pool (quantity with a known cost) and an
-// UNVALUED pool (quantity whose cost we cannot know). An issue depletes the
-// valued pool first at the average, then the unvalued pool — value is never
-// removed at an invented cost.
+// Replay a chronological list of movements through a moving weighted-average,
+// WITHOUT ever guessing which units left the shelf.
+//
+//   · While no unpriced stock has been received, ordinary moving average works.
+//   · An unpriced inbound creates an identifiable UNVALUED portion — the item
+//     is incomplete but its known (valued) portion is still exact.
+//   · The moment an OUTBOUND happens while unpriced stock is on hand, we can no
+//     longer say whether valued or unvalued units left. The remaining cost
+//     composition is INDETERMINATE: from here we return no current average and
+//     no current known value (null, not ₹0), only the on-hand quantity.
+//   · If the replayed balance later reaches EXACTLY zero, the uncertainty
+//     resets — nothing is left, so the remaining value is exactly zero — and a
+//     subsequent fully-priced receipt starts a clean valuation period.
 function replayMovements(sortedWithClass) {
-  let valuedQty = 0;
-  let value = 0;
-  let unvaluedQty = 0;
+  let qtyOnHand = 0; // running replayed balance across ALL movements
+  let valuedQty = 0; // meaningful only while !indeterminate
+  let value = 0; // meaningful only while !indeterminate
+  let unvaluedQty = 0; // meaningful only while !indeterminate
+  let indeterminate = false;
+  let indeterminateFrom = null;
   let latestPricedAt = null;
   const reasons = new Set();
   const exceptions = [];
   let negativeReplay = false;
+
+  const resetIfEmpty = () => {
+    if (Math.abs(qtyOnHand) <= QTY_TOL) {
+      qtyOnHand = 0;
+      valuedQty = 0;
+      value = 0;
+      unvaluedQty = 0;
+      indeterminate = false;
+      indeterminateFrom = null; // a clean slate — remaining value is exactly 0
+    }
+  };
 
   for (const m of sortedWithClass) {
     const c = m.__class;
@@ -142,46 +173,74 @@ function replayMovements(sortedWithClass) {
       continue; // an exception moves no stock — it is reported, not guessed
     }
     if (c.dir === "in") {
+      qtyOnHand += c.qty;
       if (c.priced) {
-        valuedQty += c.qty;
-        value += c.qty * c.unitCost;
+        if (!indeterminate) {
+          valuedQty += c.qty;
+          value += c.qty * c.unitCost;
+        }
         const t = timeOf(m);
         if (t && (latestPricedAt == null || t > latestPricedAt)) latestPricedAt = t;
       } else {
-        unvaluedQty += c.qty;
+        if (!indeterminate) unvaluedQty += c.qty;
         reasons.add(c.reason || REASON.MISSING_INBOUND_PRICE);
       }
+      resetIfEmpty();
     } else {
-      // out — remove at the moving average of the valued pool first
-      let out = c.qty;
-      const avg = valuedQty > QTY_TOL ? value / valuedQty : 0;
-      const fromValued = Math.min(out, valuedQty);
-      valuedQty -= fromValued;
-      value -= fromValued * avg;
-      out -= fromValued;
-      if (out > QTY_TOL) {
-        const fromUnvalued = Math.min(out, unvaluedQty);
-        unvaluedQty -= fromUnvalued;
-        out -= fromUnvalued;
+      // OUTBOUND. If unpriced stock is present now, composition becomes
+      // indeterminate from this movement on.
+      if (!indeterminate && unvaluedQty > QTY_TOL) {
+        indeterminate = true;
+        indeterminateFrom = {
+          reason: REASON.COST_COMPOSITION_INDETERMINATE,
+          _id: String(m._id || ""),
+          at: timeOf(m) ? new Date(timeOf(m)) : null,
+        };
+        reasons.add(REASON.COST_COMPOSITION_INDETERMINATE);
       }
-      if (out > QTY_TOL) negativeReplay = true; // issued more than we ever held
+      if (!indeterminate) {
+        // Clean moving average: no unvalued stock exists here, so removal is
+        // unambiguous — at the average of the valued pool.
+        const avg = valuedQty > QTY_TOL ? value / valuedQty : 0;
+        const fromValued = Math.min(c.qty, valuedQty);
+        valuedQty -= fromValued;
+        value -= fromValued * avg;
+        if (c.qty - fromValued > QTY_TOL) negativeReplay = true; // out > on hand
+      }
+      qtyOnHand -= c.qty;
+      if (qtyOnHand < -QTY_TOL) negativeReplay = true;
+      resetIfEmpty();
     }
   }
 
   if (Math.abs(value) < 0.005) value = 0; // clear float dust to a clean zero
   if (valuedQty < 0 && valuedQty > -QTY_TOL) valuedQty = 0;
   if (unvaluedQty < 0 && unvaluedQty > -QTY_TOL) unvaluedQty = 0;
-
-  const replayQty = valuedQty + unvaluedQty;
-  const avgCost = valuedQty > QTY_TOL ? round4(value / valuedQty) : null;
   if (negativeReplay) reasons.add(REASON.NEGATIVE_REPLAY);
 
+  // Value state on the value dimension (reconciliation is separate).
+  let valueState;
+  if (indeterminate) valueState = "indeterminate";
+  else if (unvaluedQty > QTY_TOL) valueState = "partly_unvalued";
+  else valueState = "complete";
+
+  const avgCost = indeterminate
+    ? null
+    : valuedQty > QTY_TOL
+      ? round4(value / valuedQty)
+      : null;
+  const knownValue = indeterminate ? null : round2(value);
+
   return {
-    valuedQty,
-    unvaluedQty,
-    replayQty,
-    value: round2(value),
-    avgCost,
+    qtyOnHand,
+    valuedQty: indeterminate ? null : valuedQty,
+    unvaluedQty: indeterminate ? null : unvaluedQty,
+    replayQty: qtyOnHand,
+    value: knownValue, // null when indeterminate — never ₹0
+    avgCost, // null when indeterminate
+    valueState,
+    indeterminate,
+    indeterminateFrom,
     latestPricedAt: latestPricedAt ? new Date(latestPricedAt) : null,
     reasons: [...reasons],
     exceptions,
@@ -197,10 +256,13 @@ const variantKeyOf = (m) => (m.variantId != null ? String(m.variantId) : "__unas
  *
  * @param {object} item  lean RawItem: { _id, sku, name, unit, category,
  *   quantity, variants[], stockTransactions[] }
- * @param {object} [opts] { withVariants }
+ * @param {object} [opts] { withVariants, pendingCorrectionCount }
  */
 function valueItem(item, opts = {}) {
   const withVariants = opts.withVariants === true;
+  const pendingCorrectionCount = Number.isFinite(opts.pendingCorrectionCount)
+    ? opts.pendingCorrectionCount
+    : 0;
   const unit = item.unit || item.customUnit || "";
   const txns = Array.isArray(item.stockTransactions) ? item.stockTransactions : [];
   const sorted = chronological(txns).map((m) => ({ ...m, __class: classify(m) }));
@@ -246,10 +308,12 @@ function valueItem(item, opts = {}) {
         unit, // variants share the item's base unit — never a second unit
         storedOnHand: storedQty,
         replayedOnHand: round4(r.replayQty),
-        valuedQty: round4(r.valuedQty),
-        unvaluedQty: round4(r.unvaluedQty),
-        avgCost: r.avgCost,
-        knownValue: r.value,
+        valuedQty: r4(r.valuedQty),
+        unvaluedQty: r4(r.unvaluedQty),
+        avgCost: r.avgCost, // null when indeterminate
+        knownValue: r.value, // null when indeterminate — never ₹0
+        valueState: r.valueState,
+        indeterminate: r.indeterminate,
         reconciled: vReconciled,
         difference: vDiff,
         reasons: r.reasons,
@@ -266,13 +330,23 @@ function valueItem(item, opts = {}) {
     }
   }
 
+  // A pending / unapplied correction is a claim, not a movement: it changed no
+  // quantity or value above, but it IS attention evidence.
+  if (pendingCorrectionCount > 0) reasons.add(REASON.UNAPPLIED_CORRECTION);
+
+  const indeterminate = itemReplay.indeterminate;
   const fullyValued =
-    itemReplay.unvaluedQty <= QTY_TOL && itemReplay.exceptions.length === 0;
+    itemReplay.valueState === "complete" &&
+    itemReplay.exceptions.length === 0 &&
+    pendingCorrectionCount === 0;
+
   const status = !reconciled
     ? STATUS.UNRECONCILED
-    : fullyValued
-      ? STATUS.COMPLETE
-      : STATUS.INCOMPLETE;
+    : indeterminate
+      ? STATUS.INDETERMINATE
+      : fullyValued
+        ? STATUS.COMPLETE
+        : STATUS.INCOMPLETE;
 
   return {
     itemId: String(item._id || ""),
@@ -282,15 +356,19 @@ function valueItem(item, opts = {}) {
     unit,
     storedOnHand,
     replayedOnHand: round4(itemReplay.replayQty),
-    valuedQty: round4(itemReplay.valuedQty),
-    unvaluedQty: round4(itemReplay.unvaluedQty),
-    avgCost: itemReplay.avgCost, // moving weighted-average unit cost, or null
-    knownValue: itemReplay.value, // known inventory value (valued pool only)
+    valuedQty: r4(itemReplay.valuedQty), // null when indeterminate
+    unvaluedQty: r4(itemReplay.unvaluedQty), // null when indeterminate
+    avgCost: itemReplay.avgCost, // moving weighted-average, or null when indeterminate
+    knownValue: itemReplay.value, // known value, or null when indeterminate — never ₹0
+    valueState: itemReplay.valueState, // complete | partly_unvalued | indeterminate
+    indeterminate,
+    indeterminateFrom: itemReplay.indeterminateFrom, // first movement where certainty was lost
     reconciled,
     difference,
     fullyValued,
     hasExceptions: itemReplay.exceptions.length > 0,
     exceptions: itemReplay.exceptions,
+    pendingCorrections: pendingCorrectionCount,
     variantTotalMismatch,
     status,
     reasons: [...reasons],
@@ -308,21 +386,25 @@ function summarizeValued(valuedItems) {
   let knownInventoryValue = 0;
   let completeCount = 0;
   let incompleteCount = 0;
+  let indeterminateCount = 0;
   let unreconciledCount = 0;
   let excludedCount = 0; // items whose value is partly/fully excluded
   const onHandByUnit = {};
   const unvaluedByUnit = {};
 
   for (const it of rows) {
+    // Only a genuinely-known value contributes. An indeterminate item's
+    // knownValue is null and is excluded from the company total — never as ₹0.
     knownInventoryValue += isNum(it.knownValue) ? it.knownValue : 0;
     if (it.status === STATUS.COMPLETE) completeCount += 1;
-    if (!it.fullyValued) incompleteCount += 1;
+    if (it.indeterminate) indeterminateCount += 1;
+    else if (!it.fullyValued) incompleteCount += 1; // partly-unvalued / exceptions / pending
     if (!it.reconciled) unreconciledCount += 1;
-    if (!it.fullyValued || it.hasExceptions) excludedCount += 1;
+    if (!it.fullyValued || it.indeterminate || it.hasExceptions) excludedCount += 1;
 
     const unit = it.unit || "—";
     onHandByUnit[unit] = round4((onHandByUnit[unit] || 0) + (isNum(it.replayedOnHand) ? it.replayedOnHand : 0));
-    if (it.unvaluedQty > QTY_TOL) {
+    if (isNum(it.unvaluedQty) && it.unvaluedQty > QTY_TOL) {
       unvaluedByUnit[unit] = round4((unvaluedByUnit[unit] || 0) + it.unvaluedQty);
     }
   }
@@ -332,6 +414,7 @@ function summarizeValued(valuedItems) {
     totalItems: rows.length,
     completeCount,
     incompleteCount,
+    indeterminateCount,
     unreconciledCount,
     excludedCount,
     onHandByUnit,
@@ -340,12 +423,13 @@ function summarizeValued(valuedItems) {
 }
 
 // Match a valued item against the API status filter. An item can qualify under
-// both "incomplete" and "unreconciled" — the filter tests the real condition,
-// not only the single display status.
+// more than one real condition — the filter tests the condition, not only the
+// single display status.
 function matchesStatus(it, status) {
   if (!status || status === "all") return true;
-  if (status === STATUS.COMPLETE) return it.reconciled && it.fullyValued;
-  if (status === STATUS.INCOMPLETE) return !it.fullyValued;
+  if (status === STATUS.COMPLETE) return it.reconciled && it.fullyValued && !it.indeterminate;
+  if (status === STATUS.INDETERMINATE) return !!it.indeterminate;
+  if (status === STATUS.INCOMPLETE) return !it.fullyValued && !it.indeterminate;
   if (status === STATUS.UNRECONCILED) return !it.reconciled;
   return true;
 }

@@ -71,32 +71,46 @@ function compensatingToMovements(rows) {
   }));
 }
 
-// Fetch compensating corrections for a set of item ids, grouped by item.
+// Fetch compensating corrections for a set of item ids, grouped by item and
+// split by whether they were actually APPLIED to stock. A correction row starts
+// as a PENDING claim and may never move stock; only `applicationState:"APPLIED"`
+// rows enter the movement stream. PENDING / unknown-state rows change nothing,
+// but are surfaced as attention evidence.
 async function compensatingByItem(itemIds) {
-  if (!itemIds.length) return new Map();
+  const applied = new Map();
+  const pendingCount = new Map();
+  if (!itemIds.length) return { applied, pendingCount };
   const rows = await StockLedger.find({
     rawItem: { $in: itemIds },
     txnType: "COMPENSATING",
   })
-    .select("rawItem variantId direction quantity createdAt editedAt")
+    .select("rawItem variantId direction quantity createdAt editedAt applicationState")
     .lean();
-  const map = new Map();
   for (const r of rows) {
     const k = String(r.rawItem);
-    if (!map.has(k)) map.set(k, []);
-    map.get(k).push(r);
+    if (r.applicationState === "APPLIED") {
+      if (!applied.has(k)) applied.set(k, []);
+      applied.get(k).push(r);
+    } else {
+      // PENDING, undefined (legacy) or any non-APPLIED value — never merged.
+      pendingCount.set(k, (pendingCount.get(k) || 0) + 1);
+    }
   }
-  return map;
+  return { applied, pendingCount };
 }
 
-// Attach compensating movements and value each item.
-function valueAll(items, compMap, withVariants) {
+// Attach ONLY applied compensating movements and value each item; pending
+// corrections are passed as a count so they show as attention, not as stock.
+function valueAll(items, comp, withVariants) {
+  const applied = comp.applied || new Map();
+  const pendingCount = comp.pendingCount || new Map();
   return items.map((it) => {
-    const comp = compMap.get(String(it._id)) || [];
-    const merged = comp.length
-      ? { ...it, stockTransactions: [...(it.stockTransactions || []), ...compensatingToMovements(comp)] }
+    const key = String(it._id);
+    const rows = applied.get(key) || [];
+    const merged = rows.length
+      ? { ...it, stockTransactions: [...(it.stockTransactions || []), ...compensatingToMovements(rows)] }
       : it;
-    return valueItem(merged, { withVariants });
+    return valueItem(merged, { withVariants, pendingCorrectionCount: pendingCount.get(key) || 0 });
   });
 }
 
