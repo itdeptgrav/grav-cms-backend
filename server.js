@@ -954,6 +954,16 @@ app.use(
   require("./routes/CMS_Routes/Inventory/valuation/inventoryValuationRoutes"),
 );
 
+app.use(
+  "/api/cms/inventory/landed-costs",
+  require("./routes/CMS_Routes/Inventory/valuation/landedCostRoutes"),
+);
+
+app.use(
+  "/api/cms/inventory/locations",
+  require("./routes/CMS_Routes/Inventory/Operations/locationStockRoutes"),
+);
+
 /* =====================
     HR CHANGE HISTORY
   =====================
@@ -1438,6 +1448,19 @@ app.use(
   "/api/cms/crm/pending-changes",
   require("./routes/CMS_Routes/Sales/pendingChanges"),
 );
+
+// ── CENTRAL COSTING ─────────────────────────────────────────────────────────
+// Chunk 1: the company-scoped, capability-gated, immutably-versioned costing
+// contract. Mounted ONCE, at a neutral top-level URL, and deliberately NOT
+// under /api/cms/crm: costing is a shared company capability that consumes
+// Store, Manufacturing and Finance facts and hands Sales one approved number —
+// it is not a Sales feature, and a second endpoint under Sales would say it
+// was. The existing Enquiry costing routes above are untouched; they remain
+// the legacy path until Chunk 2's adapter imports them.
+//
+// Every endpoint applies EmployeeAuth, then server-side company resolution,
+// then a costing capability. Authentication alone reaches nothing.
+app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
 
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");

@@ -17,26 +17,32 @@ router.use(EmployeeAuthMiddleware);
 
 router.get("/", async (req, res) => {
   try {
-    /* The inventory value comes from the ONE valuation engine, not a second
-       "quantity × last price" formula. Scoped best-effort to the caller's
-       company so the overview and the Inventory-valuation report agree; if a
-       company cannot be resolved (a multi-company caller with no selection),
-       the figure falls back to the legacy unscoped set rather than 500-ing a
-       dashboard. */
-    let valuationScope = {};
+    /* The inventory value comes from the ONE valuation engine, scoped to the
+       caller's company. If a company CANNOT be resolved (ambiguous or missing
+       context), valuation is reported UNAVAILABLE — never computed across every
+       company, and never rendered as ₹0. */
+    let companyId = null;
+    let valuationMessage = null;
     try {
       const ctx = await tenantContext.resolveForActor(req.user, {
         requestedCompanyId:
           req.headers["x-store-purchase-company"] || req.query.actingCompanyId,
       });
-      if (ctx && ctx.companyId) valuationScope = tenantContext.tenantFilter(ctx);
-    } catch {
-      valuationScope = {};
+      companyId = ctx && ctx.companyId ? ctx.companyId : null;
+      if (!companyId) {
+        valuationMessage = "Inventory valuation is unavailable: your company context could not be resolved.";
+      }
+    } catch (e) {
+      valuationMessage = "Inventory valuation is unavailable: your company context could not be resolved.";
     }
-    const valuationResult = await valuation
-      .summarizeCompany(valuationScope)
-      .catch(() => null);
+    let valuationResult = null;
+    if (companyId) {
+      valuationResult = await valuation
+        .summarizeCompany({ companyId }, companyId)
+        .catch((e) => { valuationMessage = "Inventory valuation is temporarily unavailable."; return null; });
+    }
     const inventoryValuation = valuationResult ? valuationResult.summary : null;
+    const valuationAvailable = inventoryValuation != null;
     /* Top items by KNOWN value, from the same engine (no separate formula). */
     const topByKnownValue = valuationResult
       ? [...valuationResult.valued]
@@ -330,13 +336,12 @@ router.get("/", async (req, res) => {
       awaitingStore:0, notYetReviewed:0, awaitingTl:0,
     };
     const prS = productRequestStats[0] || { total:0, awaitingTl:0, awaitingStore:0, todayCount:0 };
-    /* The one honest valuation answer, from the shared engine. `knownValue` is
-       what CAN be valued from recorded movements — not a "total". Items that
-       cannot be valued reliably are counted, not hidden as ₹0. */
-    const iv = inventoryValuation || {
-      knownInventoryValue: 0, completeCount: 0, incompleteCount: 0,
-      unreconciledCount: 0, excludedCount: 0,
-    };
+    /* The one honest valuation answer, from the shared engine. Raw-material
+       KNOWN value only — NOT a "total", and never combined with the legacy
+       StockItem figure, which has no evidence-based valuation yet. When company
+       context could not be resolved, `inventoryValuation` is null and the value
+       is UNAVAILABLE (not ₹0). */
+    const iv = inventoryValuation;
 
     res.json({
       success: true,
@@ -347,16 +352,22 @@ router.get("/", async (req, res) => {
           lowStock:       r.lowStock,
           outOfStock:     r.outOfStock,
           totalQuantity:  r.totalQuantity,
-          // Known inventory value from the moving weighted-average engine, plus
-          // how many items could NOT be valued reliably. `totalValue` is kept
-          // as an alias for existing readers but means the KNOWN value.
-          knownInventoryValue: iv.knownInventoryValue,
-          totalValue:          iv.knownInventoryValue,
-          incompleteItems:     iv.incompleteCount,
-          unreconciledItems:   iv.unreconciledCount,
-          completeItems:       iv.completeCount,
-          itemsWithPrice:      iv.completeCount,
-          valuationAvailable:  inventoryValuation != null,
+          // Raw-material known value from the moving weighted-average engine.
+          // null (not 0) when unavailable. `totalValue` is a compatibility
+          // alias for the SAME raw-material known value — never a combined
+          // figure, and null when valuation is unavailable.
+          valuationAvailable:  valuationAvailable,
+          valuationMessage:    valuationAvailable ? null : valuationMessage,
+          knownInventoryValue: iv ? iv.knownInventoryValue : null,
+          totalValue:          iv ? iv.knownInventoryValue : null,
+          baseStockValue:      iv ? iv.baseStockValue : null,
+          landedInStock:       iv ? iv.landedInStock : null,
+          itemsWithLandedCost: iv ? iv.itemsWithLandedCost : null,
+          incompleteItems:     iv ? iv.incompleteCount : null,
+          indeterminateItems:  iv ? iv.indeterminateCount : null,
+          unreconciledItems:   iv ? iv.unreconciledCount : null,
+          completeItems:       iv ? iv.completeCount : null,
+          itemsWithPrice:      iv ? iv.completeCount : null,
         },
         stockItems: {
           total:         s.total,
@@ -364,7 +375,11 @@ router.get("/", async (req, res) => {
           lowStock:      s.lowStock,
           outOfStock:    s.outOfStock,
           totalQuantity: s.totalQuantity,
+          // Legacy figure — NOT an evidence-based valuation. Labelled so no
+          // caller mistakes it for a known inventory value.
+          legacyValue:   s.totalValue,
           totalValue:    s.totalValue,
+          valuationBasis: "legacy",
         },
         purchaseOrders: {
           total:             p.total,
@@ -402,12 +417,16 @@ router.get("/", async (req, res) => {
         },
         overall: {
           totalItems:          r.total + s.total,
-          // Combined KNOWN inventory value (weighted-average raw stock) + stock
-          // items value. Not labelled a "total" downstream when incomplete.
-          totalValue:          iv.knownInventoryValue + s.totalValue,
-          knownInventoryValue: iv.knownInventoryValue,
-          incompleteItems:     iv.incompleteCount,
-          totalStockQuantity:  r.totalQuantity + s.totalQuantity,
+          // Raw-material evidence-based value and the legacy stock-item value
+          // are kept SEPARATE — they are not the same kind of number, so there
+          // is no combined "known inventory value". `totalValue` is retired to
+          // null to stop any consumer reading an incompatible sum.
+          rawMaterialKnownValue: iv ? iv.knownInventoryValue : null,
+          rawValuationAvailable: valuationAvailable,
+          stockItemsLegacyValue: s.totalValue,
+          combinedValueAvailable: false,
+          totalValue:            null,
+          totalStockQuantity:    r.totalQuantity + s.totalQuantity,
         },
       },
       recentActivities: {
