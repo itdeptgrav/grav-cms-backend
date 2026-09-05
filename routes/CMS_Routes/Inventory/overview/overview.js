@@ -10,11 +10,54 @@ const Vendor   = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/V
 const MRF      = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+const valuation = require("../valuation/inventoryValuationRoutes");
 
 router.use(EmployeeAuthMiddleware);
 
 router.get("/", async (req, res) => {
   try {
+    /* The inventory value comes from the ONE valuation engine, scoped to the
+       caller's company. If a company CANNOT be resolved (ambiguous or missing
+       context), valuation is reported UNAVAILABLE — never computed across every
+       company, and never rendered as ₹0. */
+    let companyId = null;
+    let valuationMessage = null;
+    try {
+      const ctx = await tenantContext.resolveForActor(req.user, {
+        requestedCompanyId:
+          req.headers["x-store-purchase-company"] || req.query.actingCompanyId,
+      });
+      companyId = ctx && ctx.companyId ? ctx.companyId : null;
+      if (!companyId) {
+        valuationMessage = "Inventory valuation is unavailable: your company context could not be resolved.";
+      }
+    } catch (e) {
+      valuationMessage = "Inventory valuation is unavailable: your company context could not be resolved.";
+    }
+    let valuationResult = null;
+    if (companyId) {
+      valuationResult = await valuation
+        .summarizeCompany({ companyId }, companyId)
+        .catch((e) => { valuationMessage = "Inventory valuation is temporarily unavailable."; return null; });
+    }
+    const inventoryValuation = valuationResult ? valuationResult.summary : null;
+    const valuationAvailable = inventoryValuation != null;
+    /* Top items by KNOWN value, from the same engine (no separate formula). */
+    const topByKnownValue = valuationResult
+      ? [...valuationResult.valued]
+          .filter((v) => (v.knownValue || 0) > 0)
+          .sort((a, b) => (b.knownValue || 0) - (a.knownValue || 0))
+          .slice(0, 5)
+          .map((v) => ({
+            name: v.name,
+            quantity: v.replayedOnHand,
+            unit: v.unit,
+            unitPrice: v.avgCost,
+            stockValue: v.knownValue,
+            status: v.status,
+          }))
+      : [];
     const now        = new Date();
     const sevenDaysAgo = new Date(now); sevenDaysAgo.setDate(now.getDate() - 7);
     const todayStart = new Date(now); todayStart.setHours(0,0,0,0);
@@ -41,8 +84,6 @@ router.get("/", async (req, res) => {
       mrfStats,
       // ── NEW: product registration request stats ──
       productRequestStats,
-      // ── NEW: correct value — qty × last purchase price from stockTransactions ──
-      rawItemsForValue,
     ] = await Promise.all([
 
       // ── Raw Items aggregation (status counts + quantities only) ─────────────
@@ -280,87 +321,6 @@ router.get("/", async (req, res) => {
           },
         },
       ]),
-
-      // ── NEW: correct inventory value — qty × last unitPrice per item ─────────
-      // We pull only items that are In Stock / Low Stock (have qty > 0)
-      RawItem.aggregate([
-        { $match: { quantity: { $gt: 0 } } },
-        {
-          $project: {
-            name:     1,
-            quantity: 1,
-            status:   1,
-            // Last purchase unitPrice from stockTransactions
-            lastUnitPrice: {
-              $let: {
-                vars: {
-                  purchaseTxns: {
-                    $filter: {
-                      input: { $ifNull: ["$stockTransactions", []] },
-                      as:    "tx",
-                      cond:  {
-                        $and: [
-                          { $in:  ["$$tx.type", ["ADD","PURCHASE_ORDER","VARIANT_ADD"]] },
-                          { $gt:  ["$$tx.unitPrice", 0] },
-                        ],
-                      },
-                    },
-                  },
-                },
-                in: {
-                  $ifNull: [
-                    { $arrayElemAt: [{ $slice: ["$$purchaseTxns", -1] }, 0] },
-                    null,
-                  ],
-                },
-              },
-            },
-          },
-        },
-        {
-          $project: {
-            name:     1,
-            quantity: 1,
-            status:   1,
-            unitPrice: { $ifNull: ["$lastUnitPrice.unitPrice", 0] },
-            stockValue: {
-              $multiply: [
-                { $ifNull: ["$quantity", 0] },
-                { $ifNull: ["$lastUnitPrice.unitPrice", 0] },
-              ],
-            },
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            totalStockValue: { $sum: "$stockValue" },
-            itemsWithPrice:  { $sum: { $cond: [{ $gt: ["$unitPrice", 0] }, 1, 0] } },
-            // Top 5 by stock value
-            items: {
-              $push: {
-                name:       "$name",
-                quantity:   "$quantity",
-                unitPrice:  "$unitPrice",
-                stockValue: "$stockValue",
-                status:     "$status",
-              },
-            },
-          },
-        },
-        {
-          $project: {
-            totalStockValue: 1,
-            itemsWithPrice:  1,
-            topByValue: {
-              $slice: [
-                { $sortArray: { input: "$items", sortBy: { stockValue: -1 } } },
-                5
-              ],
-            },
-          },
-        },
-      ]),
     ]);
 
     // ── Unwrap single-doc aggregations ────────────────────────────────────────
@@ -376,7 +336,12 @@ router.get("/", async (req, res) => {
       awaitingStore:0, notYetReviewed:0, awaitingTl:0,
     };
     const prS = productRequestStats[0] || { total:0, awaitingTl:0, awaitingStore:0, todayCount:0 };
-    const valData = rawItemsForValue[0] || { totalStockValue:0, itemsWithPrice:0, topByValue:[] };
+    /* The one honest valuation answer, from the shared engine. Raw-material
+       KNOWN value only — NOT a "total", and never combined with the legacy
+       StockItem figure, which has no evidence-based valuation yet. When company
+       context could not be resolved, `inventoryValuation` is null and the value
+       is UNAVAILABLE (not ₹0). */
+    const iv = inventoryValuation;
 
     res.json({
       success: true,
@@ -387,9 +352,22 @@ router.get("/", async (req, res) => {
           lowStock:       r.lowStock,
           outOfStock:     r.outOfStock,
           totalQuantity:  r.totalQuantity,
-          // Correct value: qty × last purchase price (only in-stock items)
-          totalValue:     valData.totalStockValue,
-          itemsWithPrice: valData.itemsWithPrice,
+          // Raw-material known value from the moving weighted-average engine.
+          // null (not 0) when unavailable. `totalValue` is a compatibility
+          // alias for the SAME raw-material known value — never a combined
+          // figure, and null when valuation is unavailable.
+          valuationAvailable:  valuationAvailable,
+          valuationMessage:    valuationAvailable ? null : valuationMessage,
+          knownInventoryValue: iv ? iv.knownInventoryValue : null,
+          totalValue:          iv ? iv.knownInventoryValue : null,
+          baseStockValue:      iv ? iv.baseStockValue : null,
+          landedInStock:       iv ? iv.landedInStock : null,
+          itemsWithLandedCost: iv ? iv.itemsWithLandedCost : null,
+          incompleteItems:     iv ? iv.incompleteCount : null,
+          indeterminateItems:  iv ? iv.indeterminateCount : null,
+          unreconciledItems:   iv ? iv.unreconciledCount : null,
+          completeItems:       iv ? iv.completeCount : null,
+          itemsWithPrice:      iv ? iv.completeCount : null,
         },
         stockItems: {
           total:         s.total,
@@ -397,7 +375,11 @@ router.get("/", async (req, res) => {
           lowStock:      s.lowStock,
           outOfStock:    s.outOfStock,
           totalQuantity: s.totalQuantity,
+          // Legacy figure — NOT an evidence-based valuation. Labelled so no
+          // caller mistakes it for a known inventory value.
+          legacyValue:   s.totalValue,
           totalValue:    s.totalValue,
+          valuationBasis: "legacy",
         },
         purchaseOrders: {
           total:             p.total,
@@ -435,9 +417,16 @@ router.get("/", async (req, res) => {
         },
         overall: {
           totalItems:          r.total + s.total,
-          // Combined: raw stock value (purchase-price based) + stock items value
-          totalValue:          valData.totalStockValue + s.totalValue,
-          totalStockQuantity:  r.totalQuantity + s.totalQuantity,
+          // Raw-material evidence-based value and the legacy stock-item value
+          // are kept SEPARATE — they are not the same kind of number, so there
+          // is no combined "known inventory value". `totalValue` is retired to
+          // null to stop any consumer reading an incompatible sum.
+          rawMaterialKnownValue: iv ? iv.knownInventoryValue : null,
+          rawValuationAvailable: valuationAvailable,
+          stockItemsLegacyValue: s.totalValue,
+          combinedValueAvailable: false,
+          totalValue:            null,
+          totalStockQuantity:    r.totalQuantity + s.totalQuantity,
         },
       },
       recentActivities: {
@@ -455,7 +444,7 @@ router.get("/", async (req, res) => {
         stockIns:  todayStockIns,
       },
       topUsedItems,
-      topValueItems: valData.topByValue,
+      topValueItems: topByKnownValue,
     });
 
   } catch (error) {

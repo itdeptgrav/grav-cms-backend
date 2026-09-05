@@ -34,6 +34,7 @@
 const SpendRequest = require("../models/CMS_Models/Requests/SpendRequest");
 const budgetMatch = require("./budgetCommitment.service");
 const chain = require("./spendApproval.service");
+const vocabulary = require("./budgetAllocationVocabulary");
 
 /**
  * Which envelope this asks to use.
@@ -167,9 +168,25 @@ async function createSpendRequest({
       hasApprover: !!approver.approverEmployee,
     });
 
+  /* ── EVERY NEW SERVICE REQUEST IS STAMPED, ON EVERY DOOR ────────────────
+     This is the one function all three creation paths go through — the
+     requests router, the intake conversion and the MRF route — so stamping
+     here is what makes the rule unavoidable rather than something two of the
+     three doors happen to do.
+
+     A PRODUCT request is not stamped: it has no service lines to classify,
+     and marking it would make it look like a request the service gate had
+     opinions about. */
+  const classifiedPolicy = (requestType === "SERVICE" || requestType === "SOFTWARE")
+    ? vocabulary.SERVICE_CLASSIFICATION_POLICY
+    : undefined;
+
   const created = await SpendRequest.create({
     title,
     requestType,
+    /* Server-controlled. Never read from the caller's payload — a request that
+       could name its own policy could opt itself out of the rule. */
+    serviceClassificationPolicy: classifiedPolicy,
     requestedBy: emp._id,
     requestedByName: actorName,
     /* `identityId` as the fallback, matching what the intake door writes and

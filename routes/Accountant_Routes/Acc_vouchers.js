@@ -22,6 +22,11 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
+const {
+  resolveServiceOrderBilling,
+  voucherSummary,
+  PROVENANCE_FIELDS,
+} = require("../../services/serviceOrderBilling.service");
 
 const auth = accountantAuth;
 
@@ -394,6 +399,175 @@ function loadCMSStockItem() {
   } catch (e) {
     return null;
   }
+}
+
+
+/* ══ PROVENANCE AND LINE IDENTITY, DERIVED ON THE SERVER ═════════════════════
+ *
+ * ── THE GAP THIS CLOSES ─────────────────────────────────────────────────────
+ * Service Order billing already derived `spendRequestId` and
+ * `budgetCommitmentId` from the order and overwrote whatever the client sent.
+ * A PO-linked purchase voucher did not: it carried whatever provenance the
+ * form happened to include, which in practice was none — so a bill for goods
+ * had no link to the request it was paying for, and the commitment behind it
+ * could never be released correctly.
+ *
+ * ── AND WHY THE LINE IDS ARE NEVER THE CLIENT'S ─────────────────────────────
+ * `spendLineId` decides which budget allocation a bill line discharges. A
+ * client that could set it could point a bill at whichever allocation had the
+ * most budget left. So every one is re-derived here from the authoritative
+ * order, matched by the ORDER LINE the entry names — and an entry naming no
+ * order line simply gets none, which is what makes it release nothing.
+ */
+
+/* ══ THE PROMISE MEETS THE ACTUAL ═══════════════════════════════════════════
+ *
+ * Posting a bill discharges the part of the commitment its lines cover — and
+ * only that part. Before this, release was whole-document: a bill for one line
+ * of a four-line request freed the budget on all four, and three heads got
+ * money back that nothing had been billed against.
+ *
+ * ── POSTING IS NEVER BLOCKED BY THIS ────────────────────────────────────────
+ * The voucher IS the actual. If the commitment cannot be resolved — no link,
+ * no mapped lines, a commitment from another company — the posting stands and
+ * the commitment stays live carrying a visible reason. Refusing a real
+ * supplier bill because a promise could not be reconciled would be a far worse
+ * failure than an unreleased commitment somebody can see and fix.
+ */
+/* ── THE RELEASE LIVES IN THE MODEL HOOK ────────────────────────────────────
+ * Three helpers stood here — a release, a restore and a summary — and none of
+ * them is called any more. They are deleted rather than left: a second
+ * implementation of "which part of the promise does this discharge" is a
+ * second answer waiting for somebody to wire it back up, and the whole point
+ * of this correction is that there is exactly one.
+ *
+ * See `commitmentRelease.orchestrate`, reached from the voucher's post-save
+ * hook — the one chokepoint every posting path passes through.
+ */
+
+/**
+ * Stamp `spendLineId` on service bill lines, from the linked Service Order.
+ *
+ * The service chain already carried `ServiceOrder.lines[].spendLineId`; what
+ * it lacked was a way for a BILL line to say which order line it is. The form
+ * now returns `serviceOrderLineId`, and this resolves it — the client's own
+ * `spendLineId` is deleted first, exactly as on the goods path.
+ */
+async function applyServiceOrderLineIdentity(body) {
+  if (!body?.serviceOrderId) return { applied: false };
+
+  const ServiceOrder = require("../../models/CMS_Models/Inventory/Operations/ServiceOrder");
+  const so = await ServiceOrder.findById(body.serviceOrderId)
+    .select("_id companyId lines").lean().catch(() => null);
+  if (!so) return { applied: false };
+  if (body.companyId && so.companyId && String(body.companyId) !== String(so.companyId)) {
+    return { applied: false, why: "different_company" };
+  }
+
+  const byLine = new Map();
+  for (const l of so.lines || []) {
+    if (l.spendLineId) byLine.set(String(l._id), String(l.spendLineId));
+  }
+
+  let mapped = 0;
+  for (const e of Array.isArray(body.inventoryEntries) ? body.inventoryEntries : []) {
+    delete e.spendLineId;
+    if (e.serviceOrderLineId && byLine.has(String(e.serviceOrderLineId))) {
+      e.spendLineId = byLine.get(String(e.serviceOrderLineId));
+      mapped += 1;
+    }
+  }
+  return { applied: true, mappedLines: mapped, orderLines: byLine.size };
+}
+
+async function applyPurchaseOrderProvenance(body) {
+  if (!body?.purchaseOrderId) return { applied: false };
+
+  const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
+
+  const po = await PurchaseOrder.findById(body.purchaseOrderId)
+    .select("_id poNumber spendRequestId spendRequestNumber companyId items")
+    .lean()
+    .catch(() => null);
+  if (!po) return { applied: false };
+
+  /* One company's bill must never carry another's request or commitment. */
+  if (body.companyId && po.companyId && String(body.companyId) !== String(po.companyId)) {
+    return { applied: false, why: "different_company" };
+  }
+
+  if (po.spendRequestId) {
+    body.spendRequestId = String(po.spendRequestId);
+    body.spendRequestNumber = po.spendRequestNumber || body.spendRequestNumber || "";
+
+    const commitment = await Commitment.findOne({
+      spendRequestId: po.spendRequestId,
+      ...(po.companyId ? { companyId: po.companyId } : {}),
+    }).select("_id companyId spendRequestId").lean().catch(() => null);
+
+    /* Defence in depth: anything that somehow crossed either boundary is
+       dropped rather than attached. */
+    if (commitment
+      && (!po.companyId || String(commitment.companyId) === String(po.companyId))
+      && String(commitment.spendRequestId) === String(po.spendRequestId)) {
+      body.budgetCommitmentId = String(commitment._id);
+    }
+  }
+
+  /* ── THE LINE IDS ────────────────────────────────────────────────────────
+     `poItemId` is the key, because it is the only one that is unique. Two PO
+     lines can name the SAME raw item — two rolls of the same fabric bought
+     against two different request lines — and item, amount and position tell
+     them apart in none of those cases.
+
+     A raw-item fallback exists ONLY for orders raised before the form carried
+     `poItemId`, and only where exactly one line matches. Where several do, the
+     entry stays unmapped and says so: releasing the wrong allocation would be
+     worse than releasing none, and it would look entirely correct. */
+  const byOrderLine = new Map();
+  const rawItemCounts = new Map();
+  for (const it of po.items || []) {
+    if (!it.spendLineId) continue;
+    byOrderLine.set(String(it._id), String(it.spendLineId));
+    if (it.rawItem) {
+      const k = String(it.rawItem);
+      const seen = rawItemCounts.get(k) || { count: 0, spendLineId: null };
+      seen.count += 1;
+      seen.spendLineId = String(it.spendLineId);
+      rawItemCounts.set(k, seen);
+    }
+  }
+
+  let mapped = 0;
+  let ambiguous = 0;
+  for (const e of Array.isArray(body.inventoryEntries) ? body.inventoryEntries : []) {
+    /* Whatever the client sent is discarded first — including a plausible id.
+       A client that could set `spendLineId` could point a bill at whichever
+       allocation had the most budget left. */
+    delete e.spendLineId;
+
+    if (e.poItemId && byOrderLine.has(String(e.poItemId))) {
+      e.spendLineId = byOrderLine.get(String(e.poItemId));
+      mapped += 1;
+      continue;
+    }
+
+    const rawKey = e.rawItem || e.stockItemId ? String(e.rawItem || e.stockItemId) : null;
+    const seen = rawKey ? rawItemCounts.get(rawKey) : null;
+    if (seen && seen.count === 1) {
+      e.spendLineId = seen.spendLineId;
+      mapped += 1;
+    } else if (seen && seen.count > 1) {
+      /* Several order lines carry this item. Unmapped, deliberately. */
+      ambiguous += 1;
+    }
+  }
+
+  return {
+    applied: true, mappedLines: mapped, ambiguousLines: ambiguous,
+    orderLines: byOrderLine.size,
+  };
 }
 
 router.get("/stock-items", auth, async (req, res) => {
@@ -1620,6 +1794,100 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
 });
 
 /* GET /po-lookup                                                       */
+/* ══════════════════════════════════════════════════════════════════════════
+ * ACCEPTED SERVICE ORDER → PURCHASE-VOUCHER PREFILL
+ *
+ * The service counterpart of the PO→voucher flow. It returns an ACCEPTED
+ * Service Order as prefill for the EXISTING purchase-voucher form — supplier,
+ * the accepted service lines, the approved quantity/rate/GST, the Service
+ * Order number, the Spend Request and commitment links, and the approved
+ * totals. It creates nothing, and it carries NO stock/GRN/warehouse/inventory
+ * semantics: a service line is a non-stock expense charge.
+ *
+ * Only an ACCEPTED order may be billed — a completion-reported, cancelled or
+ * unaccepted one is a clear business refusal, never an empty prefill.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.get("/service-order/:id/billable", auth, async (req, res) => {
+  try {
+    const companyId = req.query.companyId || req.body?.companyId;
+
+    /* One authoritative resolver decides what this order may be billed as —
+       the SAME one the create route enforces, so prefill and creation can
+       never disagree about acceptance, provenance or the linked bills. */
+    const r = await resolveServiceOrderBilling({
+      serviceOrderId: req.params.id,
+      companyId,
+    });
+    if (!r.ok) {
+      return res.status(r.status).json({
+        success: false,
+        reason: r.code,
+        currentStatus: r.currentStatus,
+        message: r.message,
+      });
+    }
+    const so = r.order;
+
+    return res.json({
+      success: true,
+      /* Prefill for the EXISTING purchase-voucher form. The provenance the
+         form sends back is server-derived here; the create route re-derives
+         and enforces it and does not trust these values. */
+      prefill: {
+        serviceOrderId: r.provenance.serviceOrderId,
+        serviceOrderNumber: r.provenance.serviceOrderNumber,
+        spendRequestId: r.provenance.spendRequestId,
+        spendRequestNumber: r.provenance.spendRequestNumber,
+        budgetCommitmentId: r.provenance.budgetCommitmentId,
+        commitmentStatus: r.commitmentStatus,
+        vendor: {
+          id: so.vendor ? String(so.vendor) : null,
+          name: so.vendorName || "",
+          gstin: so.vendorGstin || "",
+        },
+        budgetLedgerId: so.budgetLedgerId ? String(so.budgetLedgerId) : null,
+        budgetLedgerName: so.budgetLedgerName || "",
+        /* Non-stock expense/charge lines — never inventory items. Each GST
+           rate is the ACCEPTED snapshot, including an explicit 0. */
+        lines: (so.lines || []).map((l) => ({
+          isCharge: true,
+          stockItemId: null,
+          /* ── THE ORDER LINE, CARRIED THROUGH THE FORM ──────────────────
+             The form returns this on submit and the server resolves it back
+             to the order to stamp `spendLineId`. The AUTHORITATIVE spend line
+             is sent too, read-only — for the screen, never as the value the
+             server trusts. */
+          serviceOrderLineId: String(l._id),
+          spendLineId: l.spendLineId ? String(l.spendLineId) : null,
+          description: l.description || l.serviceName || "",
+          serviceCode: l.serviceCode || "",
+          billingUnit: l.billingUnit || "",
+          sacCode: l.sacCode || "",
+          quantity: l.quantity,
+          rate: l.rate,
+          gstRate: l.gstRate,
+          netAmount: l.netAmount,
+          gstAmount: l.gstAmount,
+          lineTotal: l.lineTotal,
+        })),
+        /* Approved figures, offered ONLY as comparison values. They are not
+           the actual cost — that exists once the voucher is posted. */
+        approved: {
+          subtotal: so.subtotal || 0,
+          taxAmount: so.taxAmount || 0,
+          totalAmount: so.totalAmount || 0,
+        },
+      },
+      /* Already-linked bills, returned separately with honest statuses. */
+      linkedVouchers: r.vouchers.map(voucherSummary),
+      hasLiveVoucher: r.hasLiveVoucher,
+    });
+  } catch (e) {
+    console.error("[voucher] service-order billable:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get("/po-lookup", auth, async (req, res) => {
   try {
     const { q, vendorId, limit = 20, page = 1 } = req.query;
@@ -2551,7 +2819,23 @@ router.get("/:id", auth, async (req, res) => {
       voucher = await Acc_Voucher.findById(req.params.id).lean();
     }
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
-    res.json(voucher);
+
+    /* ── THE RECONCILIATION, READ FROM WHAT IS STORED ────────────────────
+       It used to ride back only on the response to voucher CREATION, so it
+       appeared once and was gone on the next page load. Reconstructed here
+       from the commitment's own release rows, so reopening this voucher
+       tomorrow shows exactly what it showed today.
+
+       Never fatal: a voucher reads perfectly well without it. */
+    let commitmentRelease = null;
+    try {
+      commitmentRelease = await require("../../services/commitmentRelease.service")
+        .reconciliationFor(voucher);
+    } catch (relErr) {
+      console.warn("[voucher/:id] reconciliation unavailable:", relErr.message);
+    }
+
+    res.json({ ...voucher, ...(commitmentRelease ? { commitmentRelease } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2644,6 +2928,77 @@ router.post("/", auth, async (req, res) => {
       body.sourceReference =
         body.sourceReference || body.purchaseOrderNumber || "";
     }
+
+    // ── SERVICE-ORDER-SOURCED VOUCHER — AUTHORITATIVE ENFORCEMENT (S3 fix) ────
+    // A service-order link is never taken on trust. The same resolver the
+    // billable endpoint uses re-verifies acceptance and company on the create
+    // path, DERIVES every provenance field server-side (overwriting whatever
+    // the client sent), and refuses a second live bill without an explicit
+    // decision. An unaccepted, cancelled, nonexistent or cross-company order
+    // creates no voucher. `allowAdditionalServiceBill` is a control flag only —
+    // it is stripped below and never persisted.
+    const wantsAdditionalBill = body.allowAdditionalServiceBill === true;
+    delete body.allowAdditionalServiceBill;
+    if (body.serviceOrderId) {
+      // A voucher cannot be both a goods PO bill and a service bill.
+      if (body.purchaseOrderId) {
+        return res.status(400).json({
+          error:
+            "A voucher cannot carry both a purchase order and a service order link.",
+          reason: "SERVICE_AND_PO_CONFLICT",
+        });
+      }
+      // Services are billed as purchase vouchers only.
+      if (body.voucherType !== "purchase") {
+        return res.status(400).json({
+          error: "A service order can only be billed on a purchase voucher.",
+          reason: "SERVICE_BILL_NOT_PURCHASE",
+        });
+      }
+
+      const r = await resolveServiceOrderBilling({
+        serviceOrderId: body.serviceOrderId,
+        companyId: body.companyId,
+      });
+      if (!r.ok) {
+        return res
+          .status(r.status)
+          .json({ error: r.message, reason: r.code, currentStatus: r.currentStatus });
+      }
+
+      // Duplicate guard on the server — the browser's "Record another supplier
+      // bill" decision is confirmation, not a database restriction. A live
+      // draft/pending/posted bill refuses ordinary creation; only an explicit
+      // flag lets a genuine additional bill through. Cancelled/void bills are
+      // not live and never trigger this.
+      if (r.hasLiveVoucher && !wantsAdditionalBill) {
+        return res.status(409).json({
+          error:
+            "This service order already has a supplier bill. Use “Record another supplier bill” to add another.",
+          reason: "SERVICE_ORDER_BILL_EXISTS",
+          linkedVouchers: r.live.map(voucherSummary),
+        });
+      }
+
+      // Provenance is the server's, not the client's: overwrite every field so
+      // a spoofed number, spend-request id or commitment id cannot be persisted
+      // and another company's commitment can never be attached.
+      body.serviceOrderId = r.provenance.serviceOrderId;
+      body.serviceOrderNumber = r.provenance.serviceOrderNumber;
+      body.spendRequestId = r.provenance.spendRequestId;
+      body.spendRequestNumber = r.provenance.spendRequestNumber;
+      body.budgetCommitmentId = r.provenance.budgetCommitmentId;
+      body.sourceSystem = "auto_from_service_order";
+      body.sourceId = r.provenance.sourceId;
+      body.sourceReference = r.provenance.sourceReference;
+    }
+
+    /* Service lines: the same rule, on the order this bill belongs to. */
+    await applyServiceOrderLineIdentity(body);
+
+    /* The same for GOODS. A PO-linked bill carried no request link at all,
+       so the commitment behind it could never be released correctly. */
+    await applyPurchaseOrderProvenance(body);
 
     // Resolve partyLedgerName if missing. Accept both legacy `partyLedger`
     // and current `partyLedgerId` field names.
@@ -2817,8 +3172,19 @@ router.post("/", auth, async (req, res) => {
       await writePaymentToPO(voucher).catch((e) =>
         console.error("[PO payment writeback]", e.message),
       );
+      /* ── THE RELEASE IS NOT CALLED HERE ────────────────────────────────
+         It happens in the voucher's post-save hook, which is the one
+         chokepoint every posting path passes through. Calling it here as well
+         gave two competing releases on one transition, and the hook — running
+         first, on the legacy whole-document path — freed commitments this
+         path was about to release correctly. */
     }
 
+    /* ── THE RECONCILIATION IS READ, NOT RETURNED ────────────────────────
+       It used to ride back on this one response, so it appeared once and
+       vanished on the next page load. It is now stored on the commitment and
+       read by `GET /vouchers/:id`, which is the only way somebody reopening
+       the voucher tomorrow sees the same thing. */
     res.status(201).json(voucher);
   } catch (e) {
     // Friendly message for the unique-index race (should be rare now that we
@@ -2863,6 +3229,44 @@ router.put("/:id", auth, async (req, res) => {
     delete body.autoPost;
     delete body.createdBy;
     delete body.createdAt;
+    // A control flag, never a stored field, on any path.
+    delete body.allowAdditionalServiceBill;
+
+    // ── SERVICE-ORDER PROVENANCE IS IMMUTABLE (S3 fix) ───────────────────────
+    // Once a voucher is linked to a Service Order, its provenance is the record
+    // of which accepted service it bills and which commitment it releases.
+    // Ordinary editing must not replace or remove it. A no-op (same value)
+    // passes; any attempt to change it is refused; the stored value is
+    // preserved either way. A normal, non-service voucher is untouched here.
+    if (existing.serviceOrderId) {
+      // A field absent from the body is not an attempt; a field present with a
+      // different value — INCLUDING null/"" to remove it — is refused.
+      const norm = (x) => (x === undefined || x === null ? "" : String(x));
+      for (const f of PROVENANCE_FIELDS) {
+        if (f in body && norm(body[f]) !== norm(existing[f])) {
+          return res.status(409).json({
+            error:
+              "This voucher's service-order provenance cannot be changed by editing.",
+            reason: "SERVICE_PROVENANCE_IMMUTABLE",
+            field: f,
+          });
+        }
+        delete body[f];
+      }
+      // The service-order source system is part of that provenance too.
+      if (
+        "sourceSystem" in body &&
+        body.sourceSystem !== existing.sourceSystem
+      ) {
+        return res.status(409).json({
+          error:
+            "This voucher's service-order provenance cannot be changed by editing.",
+          reason: "SERVICE_PROVENANCE_IMMUTABLE",
+          field: "sourceSystem",
+        });
+      }
+      delete body.sourceSystem;
+    }
 
     // Canonicalise party (accept legacy field name).
     if ("partyLedger" in body || "partyLedgerId" in body) {
@@ -3184,6 +3588,8 @@ router.post("/:id/cancel", auth, async (req, res) => {
       await removePaymentFromPO(v).catch((e) =>
         console.error("[PO payment reversal]", e.message),
       );
+      /* The restore, like the release, is the post-save hook's — `v.save()`
+         above already carried the `cancelled` transition through it. */
       res.json(v);
     } catch (e) {
       await session.abortTransaction();

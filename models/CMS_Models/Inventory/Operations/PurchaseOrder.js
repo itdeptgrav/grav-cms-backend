@@ -4,6 +4,15 @@ const mongoose = require("mongoose");
 
 const purchaseOrderItemSchema = new mongoose.Schema(
   {
+    /* ── THE REQUEST LINE THIS ORDER LINE IS ────────────────────────────────
+       Carried so a supplier bill can say which budget allocation it discharges.
+       The service chain already had this (`ServiceOrder.lines[].spendLineId`);
+       goods did not, so a bill for one line of a four-line request could only
+       release the whole commitment.
+
+       Optional and additive: an order raised before this has none, and falls
+       back to the whole-document behaviour it has always had. */
+    spendLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",
@@ -14,7 +23,20 @@ const purchaseOrderItemSchema = new mongoose.Schema(
     baseUnit: { type: String, trim: true, default: "" }, // ← NEW: raw-item registered unit at PO time
     quantity: { type: Number, min: 0},
     unitPrice: { type: Number, min: 0 },
-    totalPrice: { type: Number, min: 0, default: 0 },
+    totalPrice: { type: Number, min: 0, default: 0 }, // net line amount (qty × price)
+    /* ── LINE-LEVEL TAX, RETAINED EXPLICITLY ────────────────────────────────
+       A spend request prices tax per line — a laptop and an annual service
+       contract can carry different GST rates — and collapsing them into one
+       header figure loses the per-line fact the invoice is checked against.
+       Declared on the line schema itself: this is a nested subdocument, and a
+       nested schema discards values it does not declare regardless of the
+       parent's `strict:false`. Additive and optional; a line without tax reads
+       as zero, exactly as before. */
+    gstRate: { type: Number, min: 0, max: 100, default: 0 },
+    gstAmount: { type: Number, min: 0, default: 0 },
+    /* The vendor's quote this line's terms were taken from, snapshotted so the
+       order can be reconciled against the quote it was raised from. */
+    quoteRef: { type: String, trim: true, default: "" },
     receivedQuantity: { type: Number, min: 0, default: 0 }, // (only one — remove the duplicate)
     pendingQuantity: { type: Number, min: 0, default: 0 },
     status: {
@@ -71,6 +93,10 @@ const returnReceiptSchema = new mongoose.Schema(
     quantityReceived: { type: Number,  min: 0 },
     receivedDate: { type: Date, default: Date.now },
     notes: { type: String, trim: true, default: "" },
+    /* The operation that recorded this receipt — see RawItem.stockTransactions
+       .operationId. Recovery matches on this and nothing else: an earlier
+       receipt of the same quantity is not evidence that THIS attempt landed. */
+    operationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     receivedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "ProjectManager",
@@ -108,6 +134,9 @@ const returnRequestSchema = new mongoose.Schema(
       default: null,
     },
     reportedAt: { type: Date, default: Date.now },
+    /* The operation that raised this return. Recovery matches on this rather
+       than on (item, quantity), which two separate returns can share. */
+    operationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     receipts: [returnReceiptSchema],
   },
   { timestamps: true },
@@ -160,14 +189,43 @@ const purchaseOrderSchema = new mongoose.Schema(
     spendRequestId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "SpendRequest",
-      index: true,
+      /* Uniqueness (for non-null values) is enforced by the partial index
+         below — one approved spend request converts to at most one order, so a
+         double submission or a retry cannot mint a second. The same index
+         serves the lookups this field is read by. */
     },
     spendRequestNumber: { type: String, trim: true },
 
+    /* ── Chunk 1: tenancy ───────────────────────────────────────────────────
+       Declared rather than left to `strict:false`, so it is indexed and can
+       be reasoned about. Absent on every order that predates the boundary —
+       those are legacy-global records, readable only in legacy mode. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+    siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* ── WHY THE UNIQUENESS IS COMPOUND AND NOT ON THE FIELD ────────────────
+       Numbering is per company: two companies each start their own PO
+       sequence at 1, which is what a tenant boundary means. A GLOBAL unique
+       index on `poNumber` therefore makes the second company unable to raise
+       its first order at all — the number is legitimately the same string.
+
+       The uniqueness scope has to match the numbering scope, so it moves to
+       the compound index below. Legacy numbers are untouched by this: they
+       remain exactly as they are, and remain unique among themselves.
+
+       MIGRATION NOTE — this schema change does NOT drop the pre-existing
+       `poNumber_1` index on a database that already has one. Mongoose builds
+       missing indexes; it never removes one. Until an authorised migration
+       drops it, a multi-company deployment will still hit a duplicate-key
+       error on the second company's first order. See
+       docs/decisions/store-purchase-tenancy-permissions.md §6. */
     poNumber: {
       type: String,
       trim: true,
-      unique: true,
       required: [true, "PO number is required"],
     },
     vendor: {
@@ -207,6 +265,21 @@ const purchaseOrderSchema = new mongoose.Schema(
       min: 0,
       max: 100,
       default: 0,
+    },
+    /* ── HOW TO READ `taxRate` ──────────────────────────────────────────────
+       On a SINGLE_RATE order every line shares one GST rate and `taxRate`
+       holds it. On a MIXED_RATE order the lines carry different rates, so no
+       single number is the order's rate and `taxRate` is left 0 — which alone
+       reads as "zero-rated", a false claim on an order that has tax. This says
+       which case it is, so a reader never mistakes a mixed order for a tax-free
+       one. The per-line `gstRate`/`gstAmount` stay authoritative either way.
+
+       Defaults to SINGLE_RATE so every historical or manually-created order —
+       which has one header `taxRate` — reads correctly without migration. */
+    taxMode: {
+      type: String,
+      enum: ["SINGLE_RATE", "MIXED_RATE"],
+      default: "SINGLE_RATE",
     },
     taxAmount: {
       type: Number,
@@ -308,6 +381,36 @@ const purchaseOrderSchema = new mongoose.Schema(
     timestamps: true,
     // Disable strict mode to allow additional fields
     strict: false,
+  },
+);
+
+/* Uniqueness scoped to the tenant, matching how numbers are now allocated.
+   `companyId: null` (a legacy-global order) still participates, so legacy
+   numbers cannot be duplicated among themselves either. */
+purchaseOrderSchema.index({ companyId: 1, poNumber: 1 }, { unique: true });
+purchaseOrderSchema.index({ companyId: 1, status: 1, createdAt: -1 });
+
+/* ── ONE PURCHASE ORDER PER APPROVED SPEND REQUEST ──────────────────────────
+   The conversion writes `spendRequestId` back onto the order it produces. A
+   concurrent double submission or a retry that lost the request→order link
+   would otherwise create a second order for the same approval; the database
+   refuses the second write instead, and the route catches the duplicate-key
+   error and returns the order that already exists.
+
+   Partial, on non-null values only: the eighty-odd orders that predate this
+   were typed by hand with no spend request and must not collide with each
+   other on a null key.
+
+   MIGRATION NOTE — mongoose builds a missing index but never drops one, and
+   this build fails if the collection already holds two live orders for one
+   spend request. That would itself be the bug this prevents; resolve any such
+   pair by hand before the index can be created. */
+purchaseOrderSchema.index(
+  { spendRequestId: 1 },
+  {
+    unique: true,
+    name: "one_po_per_spend_request",
+    partialFilterExpression: { spendRequestId: { $type: "objectId" } },
   },
 );
 

@@ -102,6 +102,24 @@ function cmsAttach(req, res, next) {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/* ── Chunk 1B: tenancy, idempotency and history on the requester door ──────
+ * This door already scopes correctly by RELATIONSHIP — a requester sees their
+ * own requests, an approver sees the ones routed to them — which is why it
+ * keeps that logic unchanged. What it never had is a company boundary, a
+ * defence against a retried submission, or an immutable record of the
+ * decisions taken through it. */
+const {
+  requireTenantForEmployee, withIdempotency, refuseLegacyWrite,
+} = require("../../../../Middlewear/storePurchaseTenant")
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service")
+const mrfAuthority = require("../../../../services/storePurchase/mrfAuthority.service")
+const actionHistory = require("../../../../services/storePurchase/actionHistory.service")
+const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service")
+const documentSequence = require("../../../../services/storePurchase/documentSequence.service")
+const { fail, sendError } = require("../../../../services/storePurchase/errors")
+
+const MRF_ENTITY = "MRF"
+
 const buildFullName = mrfApprover.buildFullName
 
 // Resolve biometricId string → Employee doc
@@ -223,46 +241,127 @@ function withContext(mrfs, audience) {
 }
 
 /**
- * Who may see and act on this MRF.
+ * The one thing this door decides for itself: which TL a pre-routing MRF
+ * belongs to.
  *
- * The stored approverBiometricId is the fast path, but MRFs raised before
- * approver routing existed have no approver stored at all — those are matched
- * to a TL through the requester's live HR primaryManager link (the same
- * fallback GET /approvals uses to list them). Without this, such a request
- * shows up in a TL's queue and then refuses every action they take on it.
+ * MRFs raised before approver routing existed have no approver stored at all.
+ * Those are matched to a TL through the requester's live HR primaryManager
+ * link — the same fallback GET /approvals uses to list them. Without it, such
+ * a request appears in a TL's queue and then refuses every action they take.
  *
- * Returns { canView, canApprove, backfill } — `backfill` means the approver
- * was resolved live and should be written onto the MRF the next time it is
- * saved, so the fallback only ever runs once per request.
+ * This resolves an IDENTITY. It does not decide authority: the resolved
+ * approver is written onto the request and the canonical matrix is then asked,
+ * exactly as it is for every other request.
  */
-async function resolveAccess(mrf, user) {
-  if (!mrf) return { canView: false, canApprove: false }
+async function backfillApprover(mrf, user) {
+  if (!mrf || mrf.approverBiometricId) return null
+  const requester = await Employee.findById(mrf.requestedFor)
+    .select("primaryManager").lean()
+  const managerId = requester?.primaryManager?.managerId
+  if (!managerId) return null
+  const me = await resolveEmployee(user.id)
+  return me && String(me._id) === String(managerId) ? me : null
+}
 
-  const isRequester =
-    (!!mrf.requestedForId && mrf.requestedForId === user.id) ||
-    (!!mrf.requesterCoworkId && mrf.requesterCoworkId === user.id)
-  const isApprover =
-    (!!mrf.approverBiometricId && mrf.approverBiometricId === user.id) ||
-    (mrf.approverAltIds || []).includes(user.id)
-
-  if (isApprover) return { canView: true, canApprove: true }
-  if (user.role === "ceo") return { canView: true, canApprove: true }
-  if (isRequester) return { canView: true, canApprove: false, isRequester: true }
-
-  // ── Legacy: no approver was ever stored on this MRF ──────────────────
-  if (!mrf.approverBiometricId) {
-    const requester = await Employee.findById(mrf.requestedFor)
-      .select("primaryManager").lean()
-    const managerId = requester?.primaryManager?.managerId
-    if (managerId) {
-      const me = await resolveEmployee(user.id)
-      if (me && String(me._id) === String(managerId)) {
-        return { canView: true, canApprove: true, backfill: me }
+/**
+ * Authority on the Cowork door — the SAME matrix the store door uses.
+ *
+ * ── WHY THERE IS NO SECOND IMPLEMENTATION ANY MORE ──────────────────────────
+ * This door used to answer the question itself, and the two answers had
+ * already drifted: the local version returned `canApprove: true` for every
+ * user whose session role was "ceo", so a chief executive could approve any
+ * request in the company regardless of who the org chart routed it to, and it
+ * checked "is this person the approver" before "is this person the requester",
+ * so a record naming somebody as their own approver let them approve
+ * themselves. Neither was true on the store door. One matrix, asked from both
+ * doors, is the only way those cannot diverge again — a CEO now reads what
+ * their capabilities allow and approves what is actually assigned to them.
+ */
+/**
+ * Commit a governed change to a material request — save and immutable history
+ * as one step, with an effect marker where the deployment cannot give a
+ * transaction. Mirrors commitMrf on the store door; see the note there for why
+ * saving and recording separately was unsafe.
+ */
+const commitMrf = (req, mrf, entry) =>
+  unitOfWork.run(req.tenant, {
+    idempotencyRecord: req.idempotent?.record,
+    mutate: async (session) => {
+      await mrf.save(session ? { session } : {})
+      return {
+        entityType: MRF_ENTITY,
+        entityId: mrf._id,
+        result: true,
+        entry: {
+          entityType: MRF_ENTITY,
+          entityId: mrf._id,
+          documentNumber: mrf.mrfNumber,
+          requestId: req.id || "",
+          idempotencyKey: req.idempotent?.key || "",
+          ...entry,
+        },
       }
-    }
-  }
+    },
+  })
 
-  return { canView: false, canApprove: false }
+/**
+ * A retry whose effect already landed: repair the history if that is what
+ * went missing, then answer as the first attempt would have.
+ */
+const recoverMrf = async (req, mrf, entry, payload, status = 200) => {
+  await unitOfWork.recover(req.tenant, {
+    entityType: MRF_ENTITY,
+    entityId: mrf._id,
+    idempotencyKey: req.idempotent.key,
+    entry: {
+      documentNumber: mrf.mrfNumber,
+      requestId: req.id || "",
+      idempotencyKey: req.idempotent.key,
+      resultingState: mrf.status,
+      metadata: { recovered: true },
+      ...entry,
+    },
+  })
+  return req.idempotent.succeed(status, payload, { entityType: MRF_ENTITY, entityId: mrf._id })
+}
+
+/**
+ * The request is already in the state this call wanted.
+ *
+ * ── WHY THIS IS NOT JUST AN EARLY RETURN ────────────────────────────────────
+ * It used to answer "Already approved" and stop. That is right about the
+ * request and wrong about the record: if the decision committed and the
+ * history write then failed, every retry took this path and cheerfully
+ * reported success while nothing immutable said who decided. The state agreed;
+ * the audit trail was missing, permanently and invisibly.
+ *
+ * So the shortcut repairs first. `unitOfWork.recover` writes the entry only if
+ * it is genuinely absent, which makes calling it on every replay harmless.
+ */
+const alreadyInState = async (req, mrf, entry, message) => {
+  const payload = { success: true, message, mrf, alreadyDone: true }
+  return recoverMrf(req, mrf, entry, payload)
+}
+
+/**
+ * Note a state change in the request's own thread.
+ *
+ * Awaited rather than fired and forgotten: the thread is how the requester
+ * finds out why their request changed, and a promise nobody waits on loses
+ * that silently. Keyed off the action's own idempotency key, so a retry
+ * recovers the same note — which is what makes awaiting safe.
+ */
+const noteInThread = (req, mrf, text, who) => mrfChat.systemMessage(mrf, text, who, {
+  ctx: req.tenant,
+  idempotencyKey: req.idempotent?.key ? `${req.idempotent.key}:system` : null,
+})
+
+async function may(req, action, mrf) {
+  return mrfAuthority.assertMay(action, {
+    mrf,
+    ctx: req.tenant,
+    employee: req.tenant?.employee || (await resolveEmployee(req.user?.id)),
+  })
 }
 
 /** Write a live-resolved approver onto the MRF so the fallback runs once. */
@@ -340,6 +439,9 @@ router.get("/data/raw-items", async (req, res) => {
     })
     res.json({ success: true, rawItems: formatted })
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     res.status(500).json({ success: false, message: err.message })
   }
 })
@@ -386,10 +488,14 @@ router.get("/approvals", async (req, res) => {
     const { status = "PENDING", page = 1, limit = 20, search = "" } = req.query
 
     const legacyIds = await mrfApprover.listManagedEmployeeIds(req.user.id)
+    /* Tenancy first, relationship second: an approver may only ever decide a
+       request inside their own company, even one the org chart routed to
+       them. */
     const scope = {
+      ...tenantContext.tenantFilter(req.tenant),
       $or: [
         // Either id the approver's HR record carries may be the one their
-        // cowork session presents — match both, same as resolveAccess does.
+        // cowork session presents — match both, same as the authority matrix does.
         { approverBiometricId: req.user.id },
         { approverAltIds: req.user.id },
         ...(legacyIds.length
@@ -453,6 +559,9 @@ router.get("/approvals", async (req, res) => {
       pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) },
     })
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     console.error("[CoworkMRF GET /approvals]", err)
     res.status(500).json({ success: false, message: err.message })
   }
@@ -466,20 +575,40 @@ router.get("/approvals", async (req, res) => {
  * approval; a TL approving "yes, this person may have it" is a separate
  * question from "does the store have it today".
  */
-router.patch("/:id/tl-approve", async (req, res) => {
+router.patch(
+  "/:id/tl-approve",
+  refuseLegacyWrite,
+  withIdempotency("MRF_TL_APPROVE"),
+  async (req, res) => {
   try {
-    const mrf = await MRF.findById(req.params.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
 
-    const access = await resolveAccess(mrf.toObject(), req.user)
-    if (!access.canApprove)
-      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
-    if (access.backfill) applyBackfill(mrf, access.backfill)
+    /* ── AN INTERRUPTED DECISION FINISHES; IT DOES NOT START AGAIN ──────────
+     * The change committed on an earlier attempt and something after it did
+     * not — usually the history write. Falling through to the transition
+     * checks below would refuse this as "already {state}": true of the
+     * request, useless to the caller, and it would leave the missing history
+     * missing forever. So recovery comes first — repair the record, then
+     * answer as the first attempt would have. */
+    if (req.idempotent?.recovering) {
+      return await recoverMrf(req, mrf, { action: "TL_APPROVED", previousState: "PENDING" }, {
+        success: true, message: "Already approved", mrf, alreadyDone: true,
+      })
+    }
+
+    /* Resolve a pre-routing approver onto the request FIRST, so the matrix
+       judges the request as it will be stored, then ask the one matrix. */
+    const backfill = await backfillApprover(mrf, req.user)
+    if (backfill) applyBackfill(mrf, backfill)
+    await may(req, "APPROVE", mrf)
 
     if (mrf.status === "CANCELLED")
       return res.status(400).json({ success: false, message: "This request was cancelled by the requester." })
     if (mrf.tlApproved)
-      return res.json({ success: true, message: "Already approved", mrf, alreadyDone: true })
+      return await alreadyInState(req, mrf, {
+        action: "TL_APPROVED", previousState: "PENDING",
+      }, "Already approved")
     if (mrf.status !== "PENDING")
       return res.status(400).json({ success: false, message: `Cannot approve — this request is already ${mrf.status.toLowerCase().replace(/_/g, " ")}.` })
 
@@ -526,39 +655,76 @@ router.patch("/:id/tl-approve", async (req, res) => {
         : (note || "Approved and forwarded to the Store."),
     })
 
-    await mrf.save()
+    /* The decision and the record of it land together. Written separately,
+       a history failure left the request approved with nothing immutable
+       saying who approved it — and the `alreadyDone` shortcut below then
+       hid that gap from every retry. */
+    await commitMrf(req, mrf, {
+      action: "TL_APPROVED",
+      previousState: "PENDING",
+      resultingState: mrf.status,
+      reason: note || "",
+      metadata: { lineCount: (mrf.items || []).length },
+    })
 
-    mrfChat.systemMessage(mrf, `${actorName || "The TL"} approved this request — it is now with the Store.`, actorName)
+    await noteInThread(req, mrf, `${actorName || "The TL"} approved this request — it is now with the Store.`, actorName)
     mrfNotify.tlApproved(mrf).catch(e => console.error("[tlApprove notify]", e.message))
 
-    res.json({ success: true, message: "Approved and sent to the Store", mrf, context: buildContext(mrf.toObject(), "tl") })
+    const approvedPayload = { success: true, message: "Approved and sent to the Store", mrf, context: buildContext(mrf.toObject(), "tl") }
+    return req.idempotent
+      ? await req.idempotent.succeed(200, approvedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
+      : res.json(approvedPayload)
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     console.error("[CoworkMRF tl-approve]", err)
     res.status(500).json({ success: false, message: err.message })
   }
-})
+},
+)
 
 /** PATCH /:id/tl-reject — reason is mandatory, the requester is told why. */
-router.patch("/:id/tl-reject", async (req, res) => {
+router.patch(
+  "/:id/tl-reject",
+  refuseLegacyWrite,
+  withIdempotency("MRF_TL_REJECT"),
+  async (req, res) => {
   try {
     const note = String(req.body.note || req.body.rejectionNote || "").trim()
     if (!note)
       return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
 
-    const mrf = await MRF.findById(req.params.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
 
-    const access = await resolveAccess(mrf.toObject(), req.user)
-    if (!access.canApprove)
-      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
-    if (access.backfill) applyBackfill(mrf, access.backfill)
+    /* ── AN INTERRUPTED DECISION FINISHES; IT DOES NOT START AGAIN ──────────
+     * The change committed on an earlier attempt and something after it did
+     * not — usually the history write. Falling through to the transition
+     * checks below would refuse this as "already {state}": true of the
+     * request, useless to the caller, and it would leave the missing history
+     * missing forever. So recovery comes first — repair the record, then
+     * answer as the first attempt would have. */
+    if (req.idempotent?.recovering) {
+      return await recoverMrf(req, mrf, { action: "TL_REJECTED", previousState: "PENDING" }, {
+        success: true, message: "Already rejected", mrf, alreadyDone: true,
+      })
+    }
+
+    /* Resolve a pre-routing approver onto the request FIRST, so the matrix
+       judges the request as it will be stored, then ask the one matrix. */
+    const backfill = await backfillApprover(mrf, req.user)
+    if (backfill) applyBackfill(mrf, backfill)
+    await may(req, "REJECT", mrf)
 
     if (["ISSUED", "PARTIALLY_ISSUED", "PARTIALLY_RETURNED", "COMPLETED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: "Cannot reject — the Store has already issued material against this request." })
     if (mrf.status === "CANCELLED")
       return res.status(400).json({ success: false, message: "This request was already cancelled." })
     if (mrf.tlRejected)
-      return res.json({ success: true, message: "Already rejected", mrf, alreadyDone: true })
+      return await alreadyInState(req, mrf, {
+        action: "TL_REJECTED", previousState: "PENDING",
+      }, "Already rejected")
 
     const actor = await resolveEmployee(req.user.id)
     const actorName = buildFullName(actor) || req.user.name || ""
@@ -575,17 +741,34 @@ router.patch("/:id/tl-reject", async (req, res) => {
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
 
     mrf.logEvent({ action: "TL_REJECTED", actorName, actorRole: "tl", detail: note })
-    await mrf.save()
+    /* The change and the record of it land together — written separately,
+       a history failure left the request changed with nothing immutable
+       saying who changed it, and the `alreadyDone` shortcut then hid the
+       gap from every retry. */
+    await commitMrf(req, mrf, {
+      action: "TL_REJECTED",
+      previousState: "PENDING",
+      resultingState: mrf.status,
+      reason: req.body?.note || req.body?.reason || "",
+      metadata: { lineCount: (mrf.items || []).length },
+    })
 
-    mrfChat.systemMessage(mrf, `${actorName || "The TL"} rejected this request. Reason: ${note}`, actorName)
+    await noteInThread(req, mrf, `${actorName || "The TL"} rejected this request. Reason: ${note}`, actorName)
     mrfNotify.tlRejected(mrf).catch(e => console.error("[tlReject notify]", e.message))
 
-    res.json({ success: true, message: "Request rejected", mrf, context: buildContext(mrf.toObject(), "tl") })
+    const rejectedPayload = { success: true, message: "Request rejected", mrf, context: buildContext(mrf.toObject(), "tl") }
+    return req.idempotent
+      ? await req.idempotent.succeed(200, rejectedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
+      : res.json(rejectedPayload)
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     console.error("[CoworkMRF tl-reject]", err)
     res.status(500).json({ success: false, message: err.message })
   }
-})
+},
+)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // REQUESTER — own requests
@@ -602,7 +785,7 @@ router.get("/", async (req, res) => {
       pagination: { total: 0, page: 1, totalPages: 1 },
     })
 
-    const filter = { requestedFor: emp._id }
+    const filter = { requestedFor: emp._id, ...tenantContext.tenantFilter(req.tenant) }
     if (status) filter.status = status
     if (requestType) filter.requestType = requestType
     if (priority) filter.priority = priority
@@ -617,7 +800,7 @@ router.get("/", async (req, res) => {
     withContext(mrfs, "requester")
 
     const statsAgg = await MRF.aggregate([
-      { $match: { requestedFor: emp._id } },
+      { $match: { requestedFor: emp._id, ...tenantContext.tenantFilter(req.tenant) } },
       {
         $group: {
           _id: null,
@@ -633,6 +816,9 @@ router.get("/", async (req, res) => {
 
     res.json({ success: true, mrfs, stats, pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) } })
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     console.error("[CoworkMRF GET /]", err)
     res.status(500).json({ success: false, message: err.message })
   }
@@ -678,7 +864,35 @@ async function createMrfRequest(req, res) {
     const signature = builtItems
       .map(i => `${i.rawItem}:${i.rawItemName}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
       .sort().join("|")
+    /* ── AN INTERRUPTED CREATION IS FINISHED, NOT REPEATED ─────────────────
+     * The request was saved on an earlier attempt and something after it
+     * failed. Without this the retry would build and save a SECOND request,
+     * with a second number, for one person asking once. The effect marker
+     * recorded which request was made; recovery repairs its history and
+     * hands it back. */
+    if (req.idempotent?.recovering) {
+      const existing = await MRF.findOne({
+        _id: req.idempotent.recovering.entityId,
+        ...tenantContext.tenantFilter(req.tenant),
+      })
+      if (existing) {
+        return await recoverMrf(req, existing, {
+          action: "CREATED", previousState: null,
+        }, {
+          success: true,
+          message: `${existing.mrfNumber} was already submitted.`,
+          mrf: existing,
+          alreadyDone: true,
+        }, 201)
+      }
+    }
+
+    /* Scoped like every other read. A person can hold membership in more than
+       one company, and an unscoped scan would call their request in company A
+       a duplicate of the one they just raised in company B — and then answer
+       with the other company's number. */
     const recent = await MRF.find({
+      ...tenantContext.tenantFilter(req.tenant),
       requestedFor: emp._id,
       status: { $in: ["PENDING", "APPROVED"] },
       createdAt: { $gte: new Date(Date.now() - 2 * 60 * 1000) },
@@ -688,6 +902,23 @@ async function createMrfRequest(req, res) {
         .sort().join("|") === signature
     )
     if (dupe) {
+      /* A double-tap without a matching key — kinder than an error, and it is
+         still a real request, so its history must exist before we say so.
+         `recover` writes only if the entry is genuinely absent. */
+      await unitOfWork.recover(req.tenant, {
+        entityType: MRF_ENTITY,
+        entityId: dupe._id,
+        idempotencyKey: "",
+        entry: {
+          documentNumber: dupe.mrfNumber,
+          action: "CREATED",
+          previousState: null,
+          resultingState: dupe.status,
+          requestId: req.id || "",
+          idempotencyKey: "",
+          metadata: { recovered: true, reason: "NEAR_DUPLICATE_SUBMIT" },
+        },
+      })
       return res.status(200).json({
         success: true,
         duplicate: true,
@@ -701,7 +932,17 @@ async function createMrfRequest(req, res) {
     const approver = await mrfApprover.resolveApprover(emp)
     const autoForward = approver.approvalRoute === "AUTO_STORE"
 
+    /* Server-owned and atomic: one $inc, so two requests submitted in
+       the same moment cannot receive the same number. */
+    const allocated = await documentSequence.allocate({
+      companyId: req.tenant.companyId,
+      documentType: "MATERIAL_REQUEST",
+      siteId: req.tenant.siteId || null,
+    })
     const mrf = new MRF({
+      mrfNumber: allocated.number,
+      /* Tenancy from resolved context ONLY — never from the payload. */
+    ...tenantContext.stamp(req.tenant),
       requestedFor: emp._id,
       requestedForName: fullName || req.user.name || "",
       requestedForDept: emp.department || "",
@@ -744,8 +985,14 @@ async function createMrfRequest(req, res) {
       })
     }
 
-    await mrf.save()
+    await commitMrf(req, mrf, {
+      action: "CREATED",
+      previousState: null,
+      resultingState: mrf.status,
+      metadata: { itemCount: (mrf.items || []).length, autoForwarded: Boolean(autoForward) },
+    })
 
+    // Only once the creation is authoritative.
     if (autoForward) {
       mrfNotify.autoForwarded(mrf).catch(e => console.error("[mrf autoForward notify]", e.message))
     } else {
@@ -753,20 +1000,26 @@ async function createMrfRequest(req, res) {
     }
 
     const obj = mrf.toObject()
-    res.status(201).json({
+    const createdPayload = {
       success: true,
       message: autoForward
         ? approver.autoForwardReason
         : `${mrf.mrfNumber} submitted — waiting for approval from ${approver.approverName}.`,
       mrf: obj,
       context: buildContext(obj, "requester"),
-    })
+    }
+    return req.idempotent
+      ? await req.idempotent.succeed(201, createdPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
+      : res.status(201).json(createdPayload)
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     console.error("[CoworkMRF POST /]", err)
     res.status(500).json({ success: false, message: err.message })
   }
 }
-router.post("/", createMrfRequest)
+router.post("/", refuseLegacyWrite, withIdempotency("MRF_REQUESTER_CREATE"), createMrfRequest)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /product-requests — employee's own raw-item add requests
@@ -777,11 +1030,11 @@ router.post("/", createMrfRequest)
 // the catalogue" items are just MRF items with itemStatus UNMATCHED, created
 // via POST / like everything else. See createMrfRequest above.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/product-requests", async (req, res) => {
+router.get("/product-requests", requireLegacyRead, async (req, res) => {
   try {
     const emp = await resolveEmployee(req.user.id)
     if (!emp) return res.json({ success: true, requests: [] })
-    const requests = await RawItemAddRequest.find({ requestedBy: emp._id })
+    const requests = await RawItemAddRequest.find({ requestedBy: emp._id, ...tenantContext.tenantFilter(req.tenant) })
       .sort({ createdAt: -1 })
       .populate("matchedTo", "name sku")
       .populate("products.matchedTo", "name sku")
@@ -789,6 +1042,9 @@ router.get("/product-requests", async (req, res) => {
       .lean()
     res.json({ success: true, requests })
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     res.status(500).json({ success: false, message: err.message })
   }
 })
@@ -807,7 +1063,15 @@ router.get("/product-requests", async (req, res) => {
  * forwards into createMrfRequest. Delete this route once Coworking has
  * redeployed against POST / directly.
  */
-router.post("/product-requests", async (req, res) => {
+router.post(
+  "/product-requests",
+  /* It creates a real, company-owned MRF, so it is governed exactly like the
+     endpoint it forwards into — same legacy refusal, same required key, same
+     stamping, numbering, history and recovery. A compatibility shim that
+     skipped those would be a second, ungoverned way to create a request. */
+  refuseLegacyWrite,
+  withIdempotency("MRF_REQUESTER_CREATE"),
+  async (req, res) => {
   const { products, priority, reason, neededBy } = req.body
   if (!Array.isArray(products) || !products.length)
     return res.status(400).json({ success: false, message: "At least one product is required" })
@@ -831,200 +1095,72 @@ router.post("/product-requests", async (req, res) => {
       })),
   }
   return createMrfRequest(req, res)
-})
+},
+)
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Product request — TL approval
+// Product requests — LEGACY, READ-ONLY
 //
-// Mirrors the MRF approval endpoints. Only after the TL approves does the
-// Store see the request at all, so matching against the catalogue never
-// happens ahead of approval.
+// `RawItemAddRequest` has no company field, so every record that exists
+// predates the tenant boundary and nothing creates another (the shim above
+// makes a real MRF instead). The adopted legacy policy applies in full:
+// excluded from ordinary reads, reachable only with `sp.legacy.read` AND an
+// explicit `?scope=legacy`, and never writable — no TL decision, no chat post,
+// not even a mark-read, because marking read is still a write to a record
+// nobody owns. Adopting one into whichever company asked first would be a
+// silent, unauditable transfer of somebody else's data.
+//
+// The approve/reject/chat implementations that used to live here are gone
+// rather than commented out; git history is the record.
 // ═════════════════════════════════════════════════════════════════════════════
 
-/** Same legacy-safe approver check used for MRFs, applied to product requests. */
-async function resolvePrAccess(doc, user) {
-  if (!doc) return { canView: false, canApprove: false }
-
-  const isRequester =
-    (!!doc.requesterCoworkId && doc.requesterCoworkId === user.id)
-  const isApprover =
-    (!!doc.approverBiometricId && doc.approverBiometricId === user.id) ||
-    (doc.approverAltIds || []).includes(user.id)
-
-  if (isApprover) return { canView: true, canApprove: true }
-  if (user.role === "ceo") return { canView: true, canApprove: true }
-  if (isRequester) return { canView: true, canApprove: false, isRequester: true }
-
-  // Raised before approver routing existed — fall back to the live HR link.
-  if (!doc.approverBiometricId) {
-    const requester = await Employee.findById(doc.requestedBy).select("primaryManager").lean()
-    const managerId = requester?.primaryManager?.managerId
-    if (managerId) {
-      const me = await resolveEmployee(user.id)
-      if (me && String(me._id) === String(managerId)) {
-        return { canView: true, canApprove: true, backfill: me }
-      }
-    }
+/** Legacy records answer only in explicit legacy mode. */
+function requireLegacyRead(req, res, next) {
+  if (!req.tenant?.legacyMode) {
+    return sendError(res, fail(
+      "LEGACY_ACCESS_REQUIRED",
+      "Product requests are legacy records. Ask for them explicitly with ?scope=legacy.",
+      { scope: "legacy", readOnly: true },
+    ))
   }
-  return { canView: false, canApprove: false }
+  next()
 }
 
-// LEGACY — for pre-cutover RawItemAddRequest docs only. A not-yet-catalogued
-// item on a NEW request is TL-approved on the same /:id/tl-approve every
-// other MRF item uses (see createMrfRequest / nextStatus above); nothing
-// creates a new RawItemAddRequest any more. This pair stays so a request
-// that was still PENDING_TL at cutover isn't stranded with no way to ever be
-// decided — delete once none remain in that state.
-router.patch("/product-requests/:id/tl-approve", async (req, res) => {
+const refuseLegacyProductRequestWrite = (replacedBy) => (req, res) =>
+  sendError(res, fail(
+    "LEGACY_ACCESS_REQUIRED",
+    "Product requests are read-only. Raise a material request instead.",
+    { readOnly: true, ...(replacedBy ? { replacedBy } : {}) },
+  ))
+
+router.patch("/product-requests/:id/tl-approve", refuseLegacyProductRequestWrite("PATCH /api/cowork/mrf/:id/tl-approve"))
+router.patch("/product-requests/:id/tl-reject", refuseLegacyProductRequestWrite("PATCH /api/cowork/mrf/:id/tl-reject"))
+router.post("/product-requests/:id/chat", refuseLegacyProductRequestWrite("POST /api/cowork/mrf/:id/chat"))
+router.patch("/product-requests/:id/chat/read", refuseLegacyProductRequestWrite())
+
+/** The thread is history. Readable under explicit legacy scope; not marked read. */
+router.get("/product-requests/:id/chat", requireLegacyRead, async (req, res) => {
   try {
-    const doc = await RawItemAddRequest.findById(req.params.id)
+    const doc = await RawItemAddRequest.findOne({
+      _id: req.params.id, ...tenantContext.tenantFilter(req.tenant),
+    }).select("products status companyId").lean()
     if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
 
-    const access = await resolvePrAccess(doc.toObject(), req.user)
-    if (!access.canApprove)
-      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
-
-    if (access.backfill) {
-      const ids = mrfApprover.coworkIdsOf(access.backfill)
-      doc.approverEmployee = access.backfill._id
-      doc.approverBiometricId = ids[0] || ""
-      doc.approverAltIds = ids
-      doc.approverName = buildFullName(access.backfill)
-    }
-
-    if (doc.approvalStatus === "TL_APPROVED")
-      return res.json({ success: true, message: "Already approved", request: doc, alreadyDone: true })
-    if (doc.approvalStatus === "TL_REJECTED")
-      return res.status(400).json({ success: false, message: "This request was already rejected." })
-
-    const actor = await resolveEmployee(req.user.id)
-    const actorName = buildFullName(actor) || req.user.name || ""
-
-    doc.approvalStatus = "TL_APPROVED"
-    doc.tlApproved = true
-    doc.tlApprovedBy = actor?._id || null
-    doc.tlApprovedByName = actorName
-    doc.tlApprovedAt = new Date()
-    doc.tlRejected = false
-    doc.tlRejectedAt = null
-    doc.tlRejectionNote = ""
-    await doc.save()
-
-    mrfNotify.productRequestTlApproved(doc).catch(e => console.error("[pr approve notify]", e.message))
-
-    res.json({ success: true, message: "Approved — the Store can now register or match this product.", request: doc })
-  } catch (err) {
-    console.error("[CoworkMRF pr tl-approve]", err)
-    res.status(500).json({ success: false, message: err.message })
-  }
-})
-
-router.patch("/product-requests/:id/tl-reject", async (req, res) => {
-  try {
-    const note = String(req.body.note || "").trim()
-    if (!note)
-      return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
-
-    const doc = await RawItemAddRequest.findById(req.params.id)
-    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
-
-    const access = await resolvePrAccess(doc.toObject(), req.user)
-    if (!access.canApprove)
-      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
-
-    if (doc.approvalStatus === "TL_REJECTED")
-      return res.json({ success: true, message: "Already rejected", request: doc, alreadyDone: true })
-    if (doc.products.some(p => p.status !== "PENDING"))
-      return res.status(400).json({ success: false, message: "The Store has already acted on this request — it cannot be rejected now." })
-
-    const actor = await resolveEmployee(req.user.id)
-    const actorName = buildFullName(actor) || req.user.name || ""
-
-    doc.approvalStatus = "TL_REJECTED"
-    doc.tlRejected = true
-    doc.tlRejectedBy = actor?._id || null
-    doc.tlRejectedByName = actorName
-    doc.tlRejectedAt = new Date()
-    doc.tlRejectionNote = note
-    doc.tlApproved = false
-    doc.status = "REJECTED"
-    doc.products.forEach(p => {
-      if (p.status === "PENDING") {
-        p.status = "REJECTED"
-        p.storeNote = `Rejected by ${actorName || "Primary Manager/TL"}: ${note}`
-        p.resolvedAt = new Date()
-      }
+    const messages = await mrfChat.listMessages(doc, {
+      ctx: req.tenant, subjectType: "PRODUCT_REQUEST",
+      limit: req.query.limit, before: req.query.before,
     })
-    await doc.save()
-
-    mrfNotify.productRequestTlRejected(doc).catch(e => console.error("[pr reject notify]", e.message))
-
-    res.json({ success: true, message: "Product request rejected", request: doc })
-  } catch (err) {
-    console.error("[CoworkMRF pr tl-reject]", err)
-    res.status(500).json({ success: false, message: err.message })
-  }
-})
-
-// ── Product request chat — same thread mechanism as MRFs ─────────────────
-// READ-ONLY-DATA LEGACY: the thread itself (and posting to it) still works
-// for old RawItemAddRequest docs; nothing new creates one of these docs.
-router.get("/product-requests/:id/chat", async (req, res) => {
-  try {
-    const doc = await RawItemAddRequest.findById(req.params.id).lean()
-    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
-    const access = await resolvePrAccess(doc, req.user)
-    if (!access.canView)
-      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
-
-    const messages = await mrfChat.listMessages(doc._id, {
-      subjectType: "PRODUCT_REQUEST", limit: req.query.limit, before: req.query.before,
-    })
-    await mrfChat.markRead(doc._id, req.user.id, "PRODUCT_REQUEST")
-
     res.json({
       success: true,
       messages,
       mrfNumber: mrfChat.describeSubject(doc, "PRODUCT_REQUEST").label,
-      status: doc.approvalStatus,
-      isFinal: doc.approvalStatus === "TL_REJECTED" || doc.status === "RESOLVED",
+      status: doc.status,
+      isFinal: true,
     })
-  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
-})
-
-router.post("/product-requests/:id/chat", async (req, res) => {
-  try {
-    const doc = await RawItemAddRequest.findById(req.params.id)
-    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
-    const access = await resolvePrAccess(doc.toObject(), req.user)
-    if (!access.canView)
-      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
-
-    const emp = await resolveEmployee(req.user.id)
-    const message = await mrfChat.postMessage(doc, {
-      subjectType: "PRODUCT_REQUEST",
-      body: req.body.body,
-      attachments: cleanImages(req.body.attachments).map(a => ({ ...a, type: "image" })),
-      ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
-    })
-
-    // See the note on the MRF chat route below: the notifier existed and was
-    // wired to nothing, so these conversations reached only whoever was
-    // already looking at them.
-    mrfNotify.productRequestChatMessage(doc, message)
-      .catch(e => console.error("[pr chat notify]", e.message))
-
-    res.status(201).json({ success: true, message })
   } catch (err) {
-    res.status(err.status || 500).json({ success: false, message: err.message })
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
+    res.status(500).json({ success: false, message: err.message })
   }
-})
-
-router.patch("/product-requests/:id/chat/read", async (req, res) => {
-  try {
-    const r = await mrfChat.markRead(req.params.id, req.user.id, "PRODUCT_REQUEST")
-    res.json({ success: true, ...r })
-  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1034,16 +1170,16 @@ router.patch("/product-requests/:id/chat/read", async (req, res) => {
 /** GET /:id — full detail with live stock, for requester / TL / CEO. */
 router.get("/:id", async (req, res) => {
   try {
-    const mrf = await MRF.findById(req.params.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
       .populate("requestedFor", "firstName middleName lastName name department designation email biometricId identityId")
       .lean()
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-    const access = await resolveAccess(mrf, req.user)
-    if (!access.canView)
-      return res.status(403).json({ success: false, message: "You do not have access to this request." })
+    /* Unviewable answers as missing, the same way it does on the store door —
+       a 403 here confirmed that a request with that id exists. */
+    const via = await may(req, "VIEW", mrf)
 
     markOverdue([mrf])
-    const audience = access.isRequester ? "requester" : "tl"
+    const audience = via?.via === "requester" ? "requester" : "tl"
     const itemsWithStock = await enrichItemsWithStock(mrf.items || [])
 
     res.json({
@@ -1062,11 +1198,35 @@ router.get("/:id", async (req, res) => {
  * Allowed while PENDING, and while APPROVED as long as nothing has been
  * issued yet; once material has moved, cancelling would desync stock.
  */
-router.patch("/:id/cancel", async (req, res) => {
+router.patch(
+  "/:id/cancel",
+  refuseLegacyWrite,
+  withIdempotency("MRF_REQUESTER_CANCEL"),
+  async (req, res) => {
   try {
     const emp = await resolveEmployee(req.user.id)
-    const mrf = await MRF.findOne({ _id: req.params.id, requestedFor: emp?._id })
+    const mrf = await MRF.findOne({ _id: req.params.id, requestedFor: emp?._id, ...tenantContext.tenantFilter(req.tenant) })
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+
+    /* Captured before the cancellation mutates it — reading `mrf.status`
+       after the save would record the new state as the old one. */
+    const stateBeforeCancel = mrf.status
+
+    /* An interrupted cancellation finishes rather than being refused as
+       "already cancelled", which would strand the missing history. */
+    if (req.idempotent?.recovering) {
+      return await recoverMrf(req, mrf, {
+        action: "CANCELLED",
+        previousState: stateBeforeCancel,
+        /* A cancellation must record why, on the recovery path as much as the
+           first one — an entry written without it is refused by the schema,
+           which is the schema doing its job. */
+        reason: req.body?.cancellationNote || req.body?.reason
+          || mrf.cancellationNote || "Withdrawn by the requester",
+      }, {
+        success: true, message: "Request cancelled", mrf, alreadyDone: true,
+      })
+    }
 
     if (["CANCELLED", "REJECTED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: `This request is already ${mrf.status.toLowerCase()}.` })
@@ -1093,30 +1253,45 @@ router.patch("/:id/cancel", async (req, res) => {
       action: "CANCELLED", actorName, actorRole: "employee",
       detail: mrf.cancellationNote + (wasApproved ? " (was already with the Store)" : ""),
     })
-    await mrf.save()
+    /* The change and the record of it land together — written separately,
+       a history failure left the request changed with nothing immutable
+       saying who changed it, and the `alreadyDone` shortcut then hid the
+       gap from every retry. */
+    await commitMrf(req, mrf, {
+      action: "CANCELLED",
+      previousState: stateBeforeCancel,
+      resultingState: mrf.status,
+      reason: req.body?.reason || req.body?.note || "Withdrawn by the requester",
+      metadata: { lineCount: (mrf.items || []).length },
+    })
 
-    mrfChat.systemMessage(mrf, `${actorName || "The requester"} cancelled this request. ${mrf.cancellationNote}`, actorName)
+    await noteInThread(req, mrf, `${actorName || "The requester"} cancelled this request. ${mrf.cancellationNote}`, actorName)
     mrfNotify.cancelled(mrf).catch(e => console.error("[mrf cancel notify]", e.message))
 
-    res.json({ success: true, message: "Request cancelled", mrf, context: buildContext(mrf.toObject(), "requester") })
+    const cancelledPayload = { success: true, message: "Request cancelled", mrf, context: buildContext(mrf.toObject(), "requester") }
+    return req.idempotent
+      ? await req.idempotent.succeed(200, cancelledPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
+      : res.json(cancelledPayload)
   } catch (err) {
+    /* A structured refusal (forbidden, wrong tenant, invalid transition)
+       must reach the client as itself, not as a generic 500. */
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     res.status(500).json({ success: false, message: err.message })
   }
-})
+},
+)
 
 /** GET /:id/chat — the MRF's own thread. */
 router.get("/:id/chat", async (req, res) => {
   try {
-    const mrf = await MRF.findById(req.params.id).lean()
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) }).lean()
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-    const access = await resolveAccess(mrf, req.user)
-    if (!access.canView)
-      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
+    await may(req, "VIEW", mrf)
 
-    const messages = await mrfChat.listMessages(mrf._id, {
-      limit: req.query.limit, before: req.query.before,
+    const messages = await mrfChat.listMessages(mrf, {
+      ctx: req.tenant, limit: req.query.limit, before: req.query.before,
     })
-    await mrfChat.markRead(mrf._id, req.user.id)
+    await mrfChat.markRead(mrf, { ctx: req.tenant, readerId: req.user.id })
 
     res.json({
       success: true,
@@ -1131,43 +1306,91 @@ router.get("/:id/chat", async (req, res) => {
 })
 
 /** POST /:id/chat — requester or TL posts a message. */
-router.post("/:id/chat", async (req, res) => {
+router.post(
+  "/:id/chat",
+  refuseLegacyWrite,
+  withIdempotency("MRF_REQUESTER_CHAT"),
+  async (req, res) => {
   try {
-    const mrf = await MRF.findById(req.params.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-    const access = await resolveAccess(mrf.toObject(), req.user)
-    if (!access.canView)
-      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
-    if (access.backfill) { applyBackfill(mrf, access.backfill); await mrf.save() }
+    const backfill = await backfillApprover(mrf, req.user)
+    if (backfill) { applyBackfill(mrf, backfill); await mrf.save() }
+    const via = await may(req, "CHAT", mrf)
 
     const emp = await resolveEmployee(req.user.id)
-    const message = await mrfChat.postMessage(mrf, {
+    /* Creation of the message IS the effect marker — the unique index over
+       (company, subject, key) means a retry recovers this message instead of
+       posting a second one. See services/mrfChat.service.js. */
+    const { message, created } = await mrfChat.postMessage(mrf, {
+      ctx: req.tenant,
+      idempotencyKey: req.idempotent?.key || null,
       body: req.body.body,
       attachments: cleanImages(req.body.attachments).map(a => ({ ...a, type: "image" })),
       // Label by role ON THIS REQUEST, not the account's global role — a TL
       // raising their own MRF is the requester in that thread.
-      ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
+      ...chatSenderFor(req, emp, via?.via === "requester" ? "employee" : undefined),
     })
 
-    // `mrfNotify.chatMessage` was written for exactly this and wired to
-    // nothing, so an MRF conversation notified nobody: the requester answering
-    // the store's question, or the store answering theirs, reached only whoever
-    // happened to have the thread open. It already addresses the requester and
-    // the TL and excludes the sender, so there is nothing to decide here.
-    mrfNotify.chatMessage(mrf, message).catch(e => console.error("[mrf chat notify]", e.message))
+    /* Recorded whether or not this call created the message. A retry that
+       recovered an existing message is exactly the case where the first
+       attempt's history write may be what failed — skipping it here would
+       make the gap permanent. `recover` writes only if the entry is absent. */
+    await unitOfWork.recover(req.tenant, {
+      entityType: MRF_ENTITY,
+      entityId: mrf._id,
+      idempotencyKey: req.idempotent?.key || "",
+      entry: {
+        documentNumber: mrf.mrfNumber,
+        action: "CHAT_MESSAGE",
+        previousState: mrf.status,
+        resultingState: mrf.status,
+        requestId: req.id || "",
+        idempotencyKey: req.idempotent?.key || "",
+        metadata: { messageId: String(message._id) },
+      },
+    })
 
-    res.status(201).json({ success: true, message })
+    if (created) {
+
+      // `mrfNotify.chatMessage` was written for exactly this and wired to
+      // nothing, so an MRF conversation notified nobody. Only for a message
+      // this call created — a replay must not notify twice.
+      mrfNotify.chatMessage(mrf, message).catch(e => console.error("[mrf chat notify]", e.message))
+    }
+
+    const payload = { success: true, message }
+    return req.idempotent
+      ? await req.idempotent.succeed(201, payload, { entityType: MRF_ENTITY, entityId: mrf._id })
+      : res.status(201).json(payload)
   } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
     res.status(err.status || 500).json({ success: false, message: err.message })
   }
 })
 
-/** PATCH /:id/chat/read — clear this user's unread badge. */
+/**
+ * PATCH /:id/chat/read — clear this user's unread badge.
+ *
+ * Marking read writes to somebody else's conversation, so it needs the same
+ * parent load, tenant scope and authority as reading it. It previously passed
+ * `req.params.id` straight to the chat service, which meant a guessed id from
+ * another company marked that company's messages read.
+ */
 router.patch("/:id/chat/read", async (req, res) => {
   try {
-    const r = await mrfChat.markRead(req.params.id, req.user.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
+      .select("companyId siteId status requestedFor requestedForId requesterCoworkId approverEmployee approverBiometricId approverAltIds")
+      .lean()
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+    await may(req, "VIEW", mrf)
+
+    const r = await mrfChat.markRead(mrf, { ctx: req.tenant, readerId: req.user.id })
     res.json({ success: true, ...r })
-  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
+    res.status(500).json({ success: false, message: err.message })
+  }
 })
 
 module.exports = router
@@ -1180,5 +1403,17 @@ module.exports = router
  *
  * So the router carries handlers only, and server.js puts the right chain in
  * front of each mount. */
-module.exports.firebaseChain = [verifyCoworkToken, verifyEmployeeToken, attach]
-module.exports.cmsChain = [require("../../../../Middlewear/EmployeeAuthMiddlewear"), cmsAttach]
+/**
+ * Tenant context for this door.
+ *
+ * Both chains end at a biometricId on `req.user.id` and nothing else — no
+ * ObjectId, no email — so the company cannot be resolved from the token. The
+ * HR employee record is the authority, looked up the same way every other
+ * handler here looks it up, and the context is built from that.
+ */
+const mrfTenant = requireTenantForEmployee(async (req) => resolveEmployee(req.user?.id))
+
+module.exports.firebaseChain = [verifyCoworkToken, verifyEmployeeToken, attach, mrfTenant]
+module.exports.cmsChain = [
+  require("../../../../Middlewear/EmployeeAuthMiddlewear"), cmsAttach, mrfTenant,
+]

@@ -856,6 +856,21 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"),
 );
 
+app.use(
+  "/api/cms/inventory/valuation",
+  require("./routes/CMS_Routes/Inventory/valuation/inventoryValuationRoutes"),
+);
+
+app.use(
+  "/api/cms/inventory/landed-costs",
+  require("./routes/CMS_Routes/Inventory/valuation/landedCostRoutes"),
+);
+
+app.use(
+  "/api/cms/inventory/locations",
+  require("./routes/CMS_Routes/Inventory/Operations/locationStockRoutes"),
+);
+
 /* =====================
     HR CHANGE HISTORY
   =====================
@@ -1341,6 +1356,19 @@ app.use(
   require("./routes/CMS_Routes/Sales/pendingChanges"),
 );
 
+// ── CENTRAL COSTING ─────────────────────────────────────────────────────────
+// Chunk 1: the company-scoped, capability-gated, immutably-versioned costing
+// contract. Mounted ONCE, at a neutral top-level URL, and deliberately NOT
+// under /api/cms/crm: costing is a shared company capability that consumes
+// Store, Manufacturing and Finance facts and hands Sales one approved number —
+// it is not a Sales feature, and a second endpoint under Sales would say it
+// was. The existing Enquiry costing routes above are untouched; they remain
+// the legacy path until Chunk 2's adapter imports them.
+//
+// Every endpoint applies EmployeeAuth, then server-side company resolution,
+// then a costing capability. Authentication alone reaches nothing.
+app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
+
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
@@ -1357,6 +1385,10 @@ app.use("/api/cms/warehouses", warehousesRoutes);
 // Vendor-Buyer Category
 const vendorRoutes = require("./routes/CMS_Routes/Inventory/Vendor-Buyer/vendor");
 app.use("/api/cms/vendors", vendorRoutes);
+
+// Services Category — bought and budgeted like items, never stocked like them
+const serviceRoutes = require("./routes/CMS_Routes/Inventory/Services/services");
+app.use("/api/cms/services", serviceRoutes);
 
 // Products Category
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
@@ -1384,8 +1416,19 @@ const storepurchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrde
 app.use("/api/cms/store/purchase-orders", storepurchaseOrderRoutes);
 
 // Operations Category
+/* Store & Purchase — Chunk 1. Tenant context, capabilities and the immutable
+   action history the Store screens read. Mounted before the operational
+   routers so a client can ask what it may do before it tries. */
+const storePurchaseContextRoutes = require("./routes/CMS_Routes/StorePurchase/context");
+app.use("/api/cms/store-purchase", storePurchaseContextRoutes);
+
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
+
+// Service Orders — the operational document an approved SERVICE request becomes.
+// Creates no PO, goods receipt, stock or inventory movement (see the router).
+const serviceOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/serviceOrders");
+app.use("/api/cms/service-orders", serviceOrderRoutes);
 
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
@@ -3265,3 +3308,4 @@ server.listen(PORT, () => {
   );
   console.log("✅ Timer SOP daily finalize cron initialized (runs ~00:15 IST)");
 });
+

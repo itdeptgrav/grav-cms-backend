@@ -126,6 +126,7 @@ async function seed({ allocated = 50000, budgetStatus = "active", lineDepartment
     department: "Store", accessDepartmentId: storeDept._id,
   });
 
+  storeActor = store;
   return { company, ledger, budget, emp, tl, finEmp, store };
 }
 
@@ -143,6 +144,45 @@ const raise = (emp, ledger, amount, over = {}) =>
       ...over,
     },
   });
+
+/* ── FINANCE'S APPROVAL, WITH THE SERVICE LINES CLASSIFIED ──────────────────
+ * A SERVICE request raised today is stamped with the classification policy,
+ * and finance may not approve one whose lines are not matched to a live
+ * service — an approval is the moment the money is promised, and promising it
+ * against a line nobody has identified is what that rule exists to stop.
+ *
+ * This suite is about BUDGET, not about services: its requests are SERVICE
+ * only incidentally. So the matching step happens here, once, rather than
+ * every assertion below carrying it. A PRODUCT request passes straight
+ * through — it has no service lines and is never stamped.
+ */
+async function classifyThenApprove(actor, id, over = {}) {
+  const Service = require("../../models/CMS_Models/Inventory/Services/Service");
+  const doc = await SpendRequest.findById(id).lean();
+
+  if (doc?.serviceClassificationPolicy) {
+    const lines = [];
+    for (const line of doc.items || []) {
+      if (line.service) continue;
+      const svc = await Service.create({
+        companyId: doc.companyId,
+        serviceCode: `SVC/2026-27/${String(++seq).padStart(4, "0")}`,
+        name: `Matched ${seq}`,
+        status: "ACTIVE",
+      });
+      lines.push({ spendLineId: String(line._id), serviceId: String(svc._id) });
+    }
+    if (lines.length) {
+      /* Store's door, not finance's — the same one the real flow uses. */
+      await call(storeActor, `/${id}/service-lines`, { method: "PATCH", body: { lines } });
+    }
+  }
+  return call(actor, `/${id}/approve`, { method: "PATCH", body: {}, ...over });
+}
+
+/* Set by `seed()`; the classification step needs somebody who may act for
+   Store, and every seed in this file creates one. */
+let storeActor = null;
 
 const liveCommitments = (requestId) =>
   Commitment.countDocuments({ spendRequestId: requestId });
@@ -258,7 +298,7 @@ describe("a commitment is finance's yes, and only finance's", () => {
     const id = body.request._id;
 
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    const decided = await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    const decided = await classifyThenApprove(finEmp, id);
 
     expect(decided.status).toBe(200);
     expect(decided.body.request.status).toBe("approved");
@@ -287,7 +327,7 @@ describe("a commitment is finance's yes, and only finance's", () => {
     );
 
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(finEmp, id);
 
     const c = await Commitment.findOne({ spendRequestId: id }).lean();
     expect(c.amount).toBe(1416);
@@ -303,7 +343,7 @@ describe("a commitment is finance's yes, and only finance's", () => {
     await SpendRequest.updateOne({ _id: id }, { $unset: { grandTotal: "" } });
 
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(finEmp, id);
 
     const c = await Commitment.findOne({ spendRequestId: id }).lean();
     expect(c.amount).toBe(900);
@@ -342,9 +382,9 @@ describe("a commitment is finance's yes, and only finance's", () => {
     const { body } = await raise(emp, ledger, 12000);
     const id = body.request._id;
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(finEmp, id);
 
-    const again = await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    const again = await classifyThenApprove(finEmp, id);
     /* Already approved — the chain refuses it, and nothing new is written. */
     expect(again.status).toBe(403);
     await expect(liveCommitments(id)).resolves.toBe(1);
@@ -368,7 +408,7 @@ describe("a commitment is finance's yes, and only finance's", () => {
     const { body } = await raise(emp, ledger, 25000);
     const id = body.request._id;
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    const decided = await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    const decided = await classifyThenApprove(finEmp, id);
 
     expect(decided.body.request.budgetApprovalKind).toBe("over_budget");
     /* It still commits — the money IS promised. What changes is the record. */
@@ -390,7 +430,7 @@ describe("a commitment is finance's yes, and only finance's", () => {
     })).body;
     const id = body.request._id;
     await call(tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    const decided = await call(finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    const decided = await classifyThenApprove(finEmp, id);
 
     expect(decided.body.request.budgetApprovalKind).toBe("unbudgeted");
     const c = await Commitment.findOne({ spendRequestId: id }).lean();
@@ -407,7 +447,7 @@ describe("committed money is no longer available to promise", () => {
 
     const first = await raise(emp, ledger, 30000);
     await call(tl, `/${first.body.request._id}/approve`, { method: "PATCH", body: {} });
-    await call(finEmp, `/${first.body.request._id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(finEmp, first.body.request._id);
 
     const second = await raise(emp, ledger, 12000);
     expect(second.body.request.budgetSnapshot).toMatchObject({
@@ -459,7 +499,7 @@ describe("cancelling an approved request", () => {
     const { body } = await raise(s.emp, s.ledger, 12000);
     const id = body.request._id;
     await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(s.finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
     return { ...s, id };
   }
 
@@ -600,35 +640,38 @@ describe("a spend request must name an account head", () => {
  */
 describe("converting an approved quote into a purchase order", () => {
   const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 
-  /** Raise → TL → finance approve, and return the approved request's id. */
-  async function approved(s, amount = 1200, over = {}) {
-    const { body } = await raise(s.emp, s.ledger, amount, over);
+  /* A purchase order receives goods, so only a PRODUCT converts — a SERVICE is
+     its own workflow chunk (see the refusal test). Raise → TL → finance
+     approve, and return the approved request's id. */
+  async function approvedProduct(s, amount = 1200, over = {}) {
+    const { body } = await raise(s.emp, s.ledger, amount, { requestType: "PRODUCT", ...over });
     const id = body.request._id;
     await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(s.finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
     return id;
   }
 
   test("the order carries the vendor, the lines and the approved figure", async () => {
     const s = await seed({ allocated: 50000 });
-    const id = await approved(s);
+    const id = await approvedProduct(s);
+    /* Tax is per LINE now, not one request-level figure. */
     await SpendRequest.updateOne(
       { _id: id },
       {
         $set: {
-          gstPercent: 18, taxAmount: 216, grandTotal: 1416,
           "items.0.vendorName": "Fancy Corner",
+          "items.0.gstPercent": 18,
+          "items.0.taxAmount": 216,
           "items.0.expectedDeliveryDate": new Date("2026-09-20"),
         },
       },
     );
 
-    const { status, body } = await call(s.store, `/${id}/purchase-order`, {
-      method: "POST", body: {},
-    });
-
+    const { status, body } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
     expect(status).toBe(201);
+
     const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
     expect(po).toBeTruthy();
     expect(po.vendorName).toBe("Fancy Corner");
@@ -637,10 +680,7 @@ describe("converting an approved quote into a purchase order", () => {
     expect(po.subtotal).toBe(1200);
     expect(po.taxAmount).toBe(216);
     expect(po.totalAmount).toBe(1416);
-    /* DRAFT, not ISSUED: approving the money is not the same as sending the
-       order to the vendor, and that is the PO module's own step. */
     expect(po.status).toBe("DRAFT");
-    /* The link that makes "was this approved?" answerable. */
     expect(po.spendRequestNumber).toBe(body.request.requestNumber);
 
     const doc = await SpendRequest.findById(id).lean();
@@ -648,37 +688,301 @@ describe("converting an approved quote into a purchase order", () => {
     expect(doc.purchaseOrderNumber).toBe(po.poNumber);
   });
 
-  test("a quote that has not been approved cannot become an order", async () => {
-    /* The rule that previously had nothing to attach to. */
+  /* ── DEFECT 1 & 3: catalogue identity survives to the PO line ──────────── */
+  test("a matched RawItem's id, SKU and base unit reach the PO line", async () => {
     const s = await seed({ allocated: 50000 });
-    const { body } = await raise(s.emp, s.ledger, 1200);
+    const id = await approvedProduct(s);
+    /* The identity an IntakeRequest's matched line carries, and that
+       spawnSpend now copies onto the spend line. */
+    const rawItemId = new mongoose.Types.ObjectId();
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.rawItem": rawItemId,
+          "items.0.rawItemSku": "SKU-COTTON-60",
+          "items.0.baseUnit": "Metre",
+          "items.0.vendorName": "Mill Co",
+        } },
+    );
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(String(po.items[0].rawItem)).toBe(String(rawItemId));
+    expect(po.items[0].sku).toBe("SKU-COTTON-60");
+    expect(po.items[0].baseUnit).toBe("Metre");
+  });
+
+  test("the SpendRequest line schema retains catalogue identity (defect 2)", async () => {
+    /* The schema had no fields for these, so a strict subdocument dropped
+       them silently. This proves they now persist. */
+    const s = await seed({ allocated: 50000 });
+    const rawItemId = new mongoose.Types.ObjectId();
+    const doc = await SpendRequest.create({
+      title: "x", requestType: "PRODUCT", requestedBy: s.emp._id, requestedByName: "x",
+      department: "Logistics", companyId: s.company._id, purpose: "x",
+      items: [{ name: "Fabric", whyNeeded: "x", quantity: 2, unit: "m", rate: 100, amount: 200,
+                rawItem: rawItemId, rawItemSku: "SKU-1", baseUnit: "Metre" }],
+      totalAmount: 200, status: "approved",
+    });
+    const reloaded = await SpendRequest.findById(doc._id).lean();
+    expect(String(reloaded.items[0].rawItem)).toBe(String(rawItemId));
+    expect(reloaded.items[0].rawItemSku).toBe("SKU-1");
+    expect(reloaded.items[0].baseUnit).toBe("Metre");
+  });
+
+  test("the create service carries catalogue identity from an intake line onto the spend line", async () => {
+    /* This is the seam spawnSpend uses: it copies rawItem/rawItemSku/baseUnit
+       from the IntakeRequest line onto the spend line, and createSpendRequest
+       forwards the whole line onto the SpendRequest. Exercising the service
+       directly proves the identity survives that hand-off. */
+    const spendCreate = require("../../services/spendRequestCreate.service");
+    const s = await seed({ allocated: 50000 });
+    const rawItemId = new mongoose.Types.ObjectId();
+    const { request } = await spendCreate.createSpendRequest({
+      emp: { _id: s.emp._id, biometricId: s.emp.biometricId, department: "Logistics" },
+      actorName: "Rutu", company: s.company, title: "Cotton", purpose: "restock",
+      requestType: "PRODUCT",
+      /* Shaped exactly as spawnSpend now shapes a line from a matched intake line. */
+      lines: [{ name: "Cotton 60s", whyNeeded: "restock", quantity: 2, unit: "m", rate: 100, amount: 200,
+                rawItem: rawItemId, rawItemSku: "SKU-COT", baseUnit: "Metre" }],
+      totalAmount: 200, ledger: s.ledger, now: new Date(),
+    });
+    expect(String(request.items[0].rawItem)).toBe(String(rawItemId));
+    expect(request.items[0].rawItemSku).toBe("SKU-COT");
+    expect(request.items[0].baseUnit).toBe("Metre");
+  });
+
+  test("a direct historical request without a RawItem still converts", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Plain Co" } });
+
+    const { status } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(201);
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.items[0].rawItem == null).toBe(true);
+    expect(po.items[0].sku).toBe("");
+  });
+
+  /* ── DEFECT 4: company ownership ──────────────────────────────────────── */
+  test("the order inherits the request's company and a null site", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(String(po.companyId)).toBe(String(s.company._id));
+    expect(po.siteId == null).toBe(true);
+  });
+
+  test("a request with no company is refused before any PO is created", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $unset: { companyId: 1 } });
+
+    const { status, body } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(409);
+    expect(body.reason).toBe("REQUEST_HAS_NO_COMPANY");
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(0);
+    /* Still approved — nothing was half-done. */
+    expect((await SpendRequest.findById(id).lean()).status).toBe("approved");
+  });
+
+  /* ── DEFECT 5: vendor scoped to the company ───────────────────────────── */
+  test("a same-name vendor in another company is never attached", async () => {
+    const s = await seed({ allocated: 50000 });
+    /* Approve first: a second company must not exist while the request is
+       raised, because the create door refuses when it cannot tell which books
+       a request belongs to. The extra company only has to exist for the
+       vendor lookup at conversion time. */
+    const id = await approvedProduct(s);
+    const other = await Acc_Company.create({ companyName: "Other Co", booksFromDate: new Date("2026-04-01") });
+    await Vendor.create({ companyName: "Shared Name", companyId: other._id });
+    const mine = await Vendor.create({ companyName: "Shared Name", companyId: s.company._id });
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Shared Name" } });
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    /* The in-company vendor is chosen; the other company's is never seen. */
+    expect(String(po.vendor)).toBe(String(mine._id));
+  });
+
+  test("a name that matches only another company's vendor attaches none", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    const other = await Acc_Company.create({ companyName: "Other Co 2", booksFromDate: new Date("2026-04-01") });
+    await Vendor.create({ companyName: "Foreign Only", companyId: other._id });
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Foreign Only" } });
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.vendor == null).toBe(true);
+    /* The name is still recorded — only the cross-company id link is refused. */
+    expect(po.vendorName).toBe("Foreign Only");
+  });
+
+  /* ── DEFECT 6: the shared PO number sequence ──────────────────────────── */
+  test("the PO number uses the shared company/financial-year sequence", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.poNumber).toMatch(/^PO\/\d{4}-\d{2}\/\d+$/);
+  });
+
+  /* ── DEFECT 7: per-line GST is authoritative ──────────────────────────── */
+  test("two lines with different GST rates keep their own rates and amounts", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "Laptop", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "Cable", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 2000 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "One Vendor", "items.0.gstPercent": 18, "items.0.taxAmount": 180,
+          "items.1.vendorName": "One Vendor", "items.1.gstPercent": 5, "items.1.taxAmount": 100,
+        } },
+    );
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    const byName = Object.fromEntries(po.items.map((i) => [i.itemName, i]));
+    expect(byName.Laptop.gstRate).toBe(18);
+    expect(byName.Laptop.gstAmount).toBe(180);
+    expect(byName.Cable.gstRate).toBe(5);
+    expect(byName.Cable.gstAmount).toBe(100);
+    /* Reconciles exactly: subtotal + tax = total. */
+    expect(po.subtotal).toBe(3000);
+    expect(po.taxAmount).toBe(280);
+    expect(po.totalAmount).toBe(3280);
+    expect(po.subtotal + po.taxAmount).toBe(po.totalAmount);
+    /* Mixed rates: no single header rate is claimed for the whole order. */
+    expect(po.taxRate).toBe(0);
+  });
+
+  test("one common GST rate is compatible with the header taxRate", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "A", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "B", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "V", "items.0.gstPercent": 18, "items.0.taxAmount": 180,
+          "items.1.vendorName": "V", "items.1.gstPercent": 18, "items.1.taxAmount": 180,
+        } },
+    );
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.taxRate).toBe(18);
+    expect(po.taxAmount).toBe(360);
+    expect(po.totalAmount).toBe(2360);
+  });
+
+  /* ── DEFECT 6 (services): refusal ─────────────────────────────────────── */
+  test("a service request is refused without a PO or a status change", async () => {
+    const s = await seed({ allocated: 50000 });
+    /* A SERVICE request, approved. */
+    const { body } = await raise(s.emp, s.ledger, 1200, { requestType: "SERVICE" });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+
+    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(400);
+    expect(refusal.reason).toBe("SERVICE_ORDER_NOT_SUPPORTED");
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(0);
+    expect((await SpendRequest.findById(id).lean()).status).toBe("approved");
+  });
+
+  /* ── DEFECT 8: at most one PO per approval ────────────────────────────── */
+  test("a retry after an existing order repairs the link instead of creating another", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Retry Co" } });
+    const doc = await SpendRequest.findById(id).lean();
+
+    /* An order that was created but whose request link was never written — the
+       exact state a crash between the two writes leaves behind. */
+    const orphan = await PurchaseOrder.create({
+      spendRequestId: id, spendRequestNumber: doc.requestNumber, companyId: s.company._id,
+      poNumber: "PO/2026-27/9999", vendorName: "Retry Co", status: "DRAFT",
+      items: [{ itemName: "Fabric", quantity: 1, unitPrice: 1200, totalPrice: 1200 }],
+      subtotal: 1200, totalAmount: 1200, createdBy: s.store._id,
+    });
+
+    const { status, body } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(String(body.purchaseOrder._id)).toBe(String(orphan._id));
+    /* No second order, and the request is now linked to the one that exists. */
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(1);
+    const repaired = await SpendRequest.findById(id).lean();
+    expect(repaired.status).toBe("ordered");
+    expect(String(repaired.purchaseOrderId)).toBe(String(orphan._id));
+  });
+
+  test("a plain repeat returns the existing order, not a second one", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Once Co" } });
+
+    const first = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(first.status).toBe(201);
+    const second = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(second.status).toBe(200);
+    expect(second.body.success).toBe(true);
+    expect(second.body.message).toMatch(/already raised/i);
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(1);
+  });
+
+  test("two concurrent submissions create exactly one PO", async () => {
+    /* The partial unique index is the guarantee; make sure it is built before
+       the race so the DB can enforce it. */
+    await PurchaseOrder.createIndexes();
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Race Co" } });
+
+    const [a, b] = await Promise.all([
+      call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} }),
+      call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} }),
+    ]);
+    /* Both succeed — one created, one handed the winner — and neither 500s. */
+    expect([a.status, b.status].every((x) => x === 200 || x === 201)).toBe(true);
+    expect([a.body.success, b.body.success]).toEqual([true, true]);
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(1);
+  });
+
+  test("a quote that has not been approved cannot become an order", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1200, { requestType: "PRODUCT" });
     const id = body.request._id;
 
-    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, {
-      method: "POST", body: {},
-    });
+    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
     expect(status).toBe(409);
     expect(refusal.message).toMatch(/can only be raised against an approved one/i);
     expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(0);
   });
 
-  test("one approval cannot become two orders", async () => {
-    const s = await seed({ allocated: 50000 });
-    const id = await approved(s);
-    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Fancy Corner" } });
-
-    expect((await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} })).status).toBe(201);
-    const second = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
-    expect(second.status).toBe(409);
-    expect(second.body.message).toMatch(/already been raised/i);
-    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(1);
-  });
-
   test("a quote naming two suppliers is refused rather than ordered from one", async () => {
-    /* A purchase order is one document to one vendor. Picking whichever line
-       came first would send an order to a supplier who never quoted for it. */
     const s = await seed({ allocated: 50000 });
     const { body } = await raise(s.emp, s.ledger, 1200, {
+      requestType: "PRODUCT",
       items: [
         { name: "Laptop", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
         { name: "AMC", whyNeeded: "x", quantity: 1, unit: "yr", rate: 200 },
@@ -686,22 +990,170 @@ describe("converting an approved quote into a purchase order", () => {
     });
     const id = body.request._id;
     await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
-    await call(s.finEmp, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
     await SpendRequest.updateOne(
       { _id: id },
       { $set: { "items.0.vendorName": "Sharma", "items.1.vendorName": "Verma" } },
     );
 
-    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, {
-      method: "POST", body: {},
-    });
+    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
     expect(status).toBe(400);
     expect(refusal.message).toMatch(/names 2 suppliers/i);
   });
 
+  /* ── CORRECTION: one supplier by IDENTITY, not display name ──────────── */
+  test("two different vendor ids with the same name are refused as multiple suppliers", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "Laptop", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "Cable", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 500 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    /* Same displayed NAME, two different supplier IDS. */
+    const v1 = await Vendor.create({ companyName: "Same Name", companyId: s.company._id });
+    const v2 = await Vendor.create({ companyName: "Same Name", companyId: s.company._id });
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "Same Name", "items.0.vendorId": v1._id,
+          "items.1.vendorName": "Same Name", "items.1.vendorId": v2._id,
+        } },
+    );
+
+    const { status, body: refusal } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(400);
+    expect(refusal.reason).toBe("MULTIPLE_SUPPLIERS");
+    /* The old rule saw one name and would have taken the first id silently. */
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: id })).toBe(0);
+  });
+
+  test("one vendor id repeated across lines becomes one order to that vendor", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "Laptop", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "Bag", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 500 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    const v = await Vendor.create({ companyName: "One Vendor", companyId: s.company._id });
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "One Vendor", "items.0.vendorId": v._id,
+          "items.1.vendorName": "One Vendor", "items.1.vendorId": v._id,
+        } },
+    );
+
+    const { status } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(201);
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(String(po.vendor)).toBe(String(v._id));
+  });
+
+  test("a name-only supplier (no id) still converts", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "Typed Only" } });
+    const { status } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(201);
+  });
+
+  /* ── CORRECTION: mixed GST is honest, not "zero-rated" ────────────────── */
+  test("a mixed-rate order is marked MIXED_RATE with tax > 0 that reconciles", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "Laptop", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "Cable", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 2000 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "V", "items.0.gstPercent": 18, "items.0.taxAmount": 180,
+          "items.1.vendorName": "V", "items.1.gstPercent": 5, "items.1.taxAmount": 100,
+        } },
+    );
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.taxMode).toBe("MIXED_RATE");
+    /* The header rate is 0, but the mode says why — NOT that it is tax-free. */
+    expect(po.taxRate).toBe(0);
+    expect(po.taxAmount).toBe(280);
+    expect(po.taxAmount).toBeGreaterThan(0);
+    /* Line taxes are authoritative and reconcile to the header. */
+    expect(po.items.reduce((t, i) => t + i.gstAmount, 0)).toBe(po.taxAmount);
+    expect(po.subtotal + po.taxAmount).toBe(po.totalAmount);
+  });
+
+  test("a single-rate order is marked SINGLE_RATE with the common header rate", async () => {
+    const s = await seed({ allocated: 50000 });
+    const { body } = await raise(s.emp, s.ledger, 1000, {
+      requestType: "PRODUCT",
+      items: [
+        { name: "A", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+        { name: "B", whyNeeded: "x", quantity: 1, unit: "pcs", rate: 1000 },
+      ],
+    });
+    const id = body.request._id;
+    await call(s.tl, `/${id}/approve`, { method: "PATCH", body: {} });
+    await classifyThenApprove(s.finEmp, id);
+    await SpendRequest.updateOne(
+      { _id: id },
+      { $set: {
+          "items.0.vendorName": "V", "items.0.gstPercent": 18, "items.0.taxAmount": 180,
+          "items.1.vendorName": "V", "items.1.gstPercent": 18, "items.1.taxAmount": 180,
+        } },
+    );
+
+    await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    const po = await PurchaseOrder.findOne({ spendRequestId: id }).lean();
+    expect(po.taxMode).toBe("SINGLE_RATE");
+    expect(po.taxRate).toBe(18);
+    expect(po.taxAmount).toBe(360);
+  });
+
+  /* ── CORRECTION: never repair a PO that belongs to another company ───── */
+  test("a PO for this request under another company is not repaired onto it", async () => {
+    const s = await seed({ allocated: 50000 });
+    const id = await approvedProduct(s);
+    await SpendRequest.updateOne({ _id: id }, { $set: { "items.0.vendorName": "X" } });
+    const other = await Acc_Company.create({ companyName: "Elsewhere Co", booksFromDate: new Date("2026-04-01") });
+    const doc = await SpendRequest.findById(id).lean();
+    /* A PO carrying this spendRequestId but a DIFFERENT company. */
+    await PurchaseOrder.create({
+      spendRequestId: id, spendRequestNumber: doc.requestNumber, companyId: other._id,
+      poNumber: "PO/2026-27/8888", vendorName: "X", status: "DRAFT",
+      items: [{ itemName: "F", quantity: 1, unitPrice: 1200, totalPrice: 1200 }],
+      subtotal: 1200, totalAmount: 1200, createdBy: s.store._id,
+    });
+
+    const { status, body } = await call(s.store, `/${id}/purchase-order`, { method: "POST", body: {} });
+    expect(status).toBe(409);
+    expect(body.reason).toBe("PO_COMPANY_MISMATCH");
+    /* The request was NOT linked to the foreign order. */
+    const after = await SpendRequest.findById(id).lean();
+    expect(after.status).toBe("approved");
+    expect(after.purchaseOrderId == null).toBe(true);
+  });
+
   test("only Store may raise it", async () => {
     const s = await seed({ allocated: 50000 });
-    const id = await approved(s);
+    const id = await approvedProduct(s);
     const { status } = await call(s.emp, `/${id}/purchase-order`, { method: "POST", body: {} });
     expect(status).toBe(403);
   });

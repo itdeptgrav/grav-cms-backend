@@ -188,6 +188,69 @@ function budgetControlOf(ledger = {}) {
 }
 
 /** Can spend be budgeted against this head? */
+/* ── WHERE A PURCHASE LANDS WHEN IT IS NOT AN EXPENSE ───────────────────────
+ * Raw material and equipment do not go to a P&L head. They capitalise: the
+ * bill debits Raw Materials or Plant & Machinery, and the cost reaches the
+ * P&L later, as consumption or depreciation. That is correct bookkeeping and
+ * this module does not argue with it — those heads stay `not_budgeted`,
+ * because what you budget is the buying, not the asset balance.
+ *
+ * But the buying still has to be visible to a budget when a request was
+ * approved for it. `isCapitalisingSpend` names the narrow set of heads where
+ * a DEBIT means "we bought something", so the budget check can attribute that
+ * one leg to the head the request was approved on and leave every other leg
+ * of the voucher alone.
+ *
+ * ── WHY THIS IS NOT JUST "nature === asset" ─────────────────────────────────
+ * The bank the bill was paid from is an asset. So is the cash, the advance to
+ * the supplier, and the GST input credit. Every one of those is a DEBIT on
+ * some voucher, and treating them as purchases would charge one ₹60,000 bill
+ * to the budget five times over. So this asks for a POSITIVE match on the
+ * groups a purchase actually capitalises into, and refuses everything else —
+ * an unfamiliar group is not spend, it is unknown, and unknown must not
+ * consume somebody's budget.
+ */
+const CAPITALISING_GROUPS = [
+  /\binventor(y|ies)\b/i,
+  /\bstock[-\s]?in[-\s]?hand\b/i,
+  /\bfixed\s+assets?\b/i,
+  /\bplant\s*(&|and)?\s*machinery\b/i,
+  /\bcapital\s+work[-\s]in[-\s]progress\b/i,
+  /\bcwip\b/i,
+];
+
+/* Asset groups that are funding or receivables, never a purchase. Checked
+ * first so a "Fixed Deposit" parked under Bank Accounts can never qualify on
+ * the word "Fixed". */
+const NEVER_CAPITALISING_GROUPS = [
+  /\bbank\b/i,
+  /\bcash[-\s]?in[-\s]?hand\b/i,
+  /\bsundry\s+debtors?\b/i,
+  /\bloans?\s*(&|and)?\s*advances?\b/i,
+  /\bdeposits?\b/i,
+  /\bduties\s*(&|and)?\s*taxes\b/i,
+  /\bgst\s+input\b/i,
+  /\binvestments?\b/i,
+];
+
+/**
+ * Is a DEBIT to this head the act of buying something?
+ *
+ * True only for the asset heads a purchase capitalises into. False for every
+ * funding leg, every receivable, and anything whose group is not recognised.
+ * The caller must still check the leg is a debit — a CREDIT to Raw Materials
+ * is an issue to production, which is consumption, not a purchase.
+ */
+function isCapitalisingSpend(ledger = {}) {
+  if (String(ledger.nature || "").toLowerCase() !== "asset") return false;
+  const groupName = ledger.groupName || "";
+  const name = ledger.name || "";
+  if (matchesAny(groupName, NEVER_CAPITALISING_GROUPS)) return false;
+  if (matchesAny(name, NEVER_CAPITALISING_GROUPS)) return false;
+  if (matchesAny(name, TAX_CONTROL_PATTERNS)) return false;
+  return matchesAny(groupName, CAPITALISING_GROUPS) || matchesAny(name, CAPITALISING_GROUPS);
+}
+
 const isExpenseBudget = (ledger) => budgetControlOf(ledger) === EXPENSE_BUDGET;
 /** Is this head a revenue target? */
 const isRevenueTarget = (ledger) => budgetControlOf(ledger) === REVENUE_TARGET;
@@ -227,4 +290,5 @@ module.exports = {
   isRevenueTarget,
   isNotBudgeted,
   isAmbiguous,
+  isCapitalisingSpend,
 };

@@ -743,11 +743,51 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 
     const workOrder = await WorkOrder.findById(id);
     if (!workOrder) return res.status(404).json({ success: false, message: "Work order not found" });
-    if (quantity <= 0) return res.status(400).json({ success: false, message: "Quantity must be at least 1" });
-    if (quantity > workOrder.quantity) return res.status(400).json({ success: false, message: "Quantity cannot exceed original work order quantity" });
 
-    if (!workOrder.originalQuantity) workOrder.originalQuantity = workOrder.quantity;
-    const remainingQuantity = workOrder.quantity - quantity;
+    /* Strict input. `quantity <= 0` and `quantity > workOrder.quantity` were the
+       only checks, and JavaScript coercion let three different kinds of junk
+       past them:
+         • "abc" / {}  cast-failed inside mongoose and surfaced as a 500;
+         • true        passed both comparisons and was cast to 1, silently
+                       reducing a ten-unit order to one;
+         • omitted     passed both comparisons and assigning `undefined`
+                       UNSET the stored quantity — `min: 1` never fires for an
+                       absent field — leaving a work order with no quantity at
+                       all, reported as success.
+       Only a real, finite JSON number is accepted now. No coercion: a numeric
+       STRING is refused too, because a caller sending "5" is a caller whose
+       contract we cannot vouch for. Fractional values stay legal — nothing
+       durable forbids them, and the schema says `min: 1`, not integer. */
+    if (typeof quantity !== "number" || !Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Quantity must be a positive number",
+      });
+    }
+
+    /* The basis every per-unit figure below is derived from: the work order's
+       quantity BEFORE this request changes it. Read once, here, because the
+       loop further down used to divide the already-rescaled requirement by
+       `originalQuantity`, so replaying the same allocation shrank the
+       requirement every time (100 → 60 → 36 → 21.6). */
+    const basisQuantity = workOrder.quantity;
+
+    /* A work order whose own quantity is missing or unusable cannot be divided
+       by. Refuse rather than invent a replacement — defect #3 above is exactly
+       how such a record comes into existence. */
+    if (typeof basisQuantity !== "number" || !Number.isFinite(basisQuantity) || basisQuantity <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "This work order has no usable quantity to allocate against",
+      });
+    }
+
+    if (quantity > basisQuantity) {
+      return res.status(400).json({ success: false, message: "Quantity cannot exceed original work order quantity" });
+    }
+
+    if (!workOrder.originalQuantity) workOrder.originalQuantity = basisQuantity;
+    const remainingQuantity = basisQuantity - quantity;
     let newWorkOrder = null;
 
     // ── Batch-fetch RawItems + Units up front so the two loops below don't do
@@ -788,7 +828,7 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
       const rawItem = rawItemMap.get(rm.rawItemId.toString());
       if (!rawItem) continue;
       const rawItemRegisteredUnit = rawItem.customUnit || rawItem.unit;
-      const requiredPerUnitBom    = workOrder.quantity > 0 ? rm.quantityRequired / workOrder.quantity : 0;
+      const requiredPerUnitBom    = rm.quantityRequired / basisQuantity;
       const requiredPerUnit       =
         rm.unit && rawItemRegisteredUnit && rm.unit !== rawItemRegisteredUnit
           ? await convertQuantity(requiredPerUnitBom, rm.unit, rawItemRegisteredUnit, unitMap)
@@ -815,7 +855,7 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 
     if (splitRemaining && remainingQuantity > 0) {
       const newRawMaterials = workOrder.rawMaterials.map(rm => {
-        const req = workOrder.quantity > 0 ? rm.quantityRequired / workOrder.quantity : 0;
+        const req = rm.quantityRequired / basisQuantity;
         return {
           rawItemId: rm.rawItemId, name: rm.name, sku: rm.sku,
           rawItemVariantId: rm.rawItemVariantId,
@@ -843,11 +883,20 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
           status: "pending", notes: op.notes || "",
         })),
         rawMaterials: newRawMaterials,
-        timeline: { totalEstimatedSeconds: (workOrder.timeline?.totalEstimatedSeconds || 0) * (remainingQuantity / workOrder.quantity) },
+        timeline: { totalEstimatedSeconds: (workOrder.timeline?.totalEstimatedSeconds || 0) * (remainingQuantity / basisQuantity) },
         specialInstructions: workOrder.specialInstructions, createdBy: workOrder.createdBy,
         isSplitOrder: true, parentWorkOrderId: workOrder._id,
         splitReason: "Split due to raw material allocation",
       });
+
+      /* No number is assigned here on purpose.
+         Chunk 4A.1 set one on this line; Chunk 4A.2 moved the rule to the
+         WorkOrder model's pre-validate hook, so EVERY creation path gets a
+         canonical `WO-<full ObjectId>` before its first write — the two Sales
+         generators and both return/rework generators included, not just this
+         one. Re-assigning here would be a second numbering standard for the
+         same records. The saved document carries the number, so the response
+         below reports the real stored value. */
       await newWorkOrder.save();
     }
 
@@ -855,7 +904,13 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 
     for (const rm of workOrder.rawMaterials) {
       const rawItem = rm.rawItemId ? (rawItemMap.get(rm.rawItemId.toString()) || null) : null;
-      const requiredPerUnitBom = workOrder.originalQuantity > 0 ? rm.quantityRequired / workOrder.originalQuantity : 0;
+      /* Scaled from `basisQuantity` — the quantity this work order had when the
+         request arrived — not from `originalQuantity`. The old form divided the
+         ALREADY-RESCALED stored requirement by the original quantity, so the
+         same request applied twice compounded: 100 → 60 → 36 → 21.6. Using the
+         current basis makes a replay a no-op and a genuine later reduction
+         scale from where the record actually is. */
+      const requiredPerUnitBom = rm.quantityRequired / basisQuantity;
       rm.quantityRequired = isNaN(requiredPerUnitBom * quantity) ? 0 : requiredPerUnitBom * quantity;
 
       if (!rawItem) { rm.quantityAllocated = 0; rm.allocationStatus = "not_allocated"; continue; }

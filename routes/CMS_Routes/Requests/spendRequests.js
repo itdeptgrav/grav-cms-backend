@@ -33,14 +33,19 @@ const { Acc_Company, Acc_Ledger } = require("../../../models/Accountant_model/Ac
 const mrfApprover = require("../../../services/mrfApprover.service");
 const fulfilment = require("../../../services/storeFulfilment.service");
 const financeDecision = require("../../../services/spendFinanceDecision.service");
+/* The service-classification read lives beside the finance gate that is
+   blocked on it, so the screen and the refusal cannot disagree. */
+const { serviceClassification, isServiceRequest, allocationSummary } = financeDecision;
 const chain = require("../../../services/spendApproval.service");
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 const budgetMatch = require("../../../services/budgetCommitment.service");
+const itemBudgetHead = require("../../../services/itemBudgetHead.service");
 /* The same Store/board/finance grant the intake door reads. Shared so
    "Store & Purchase" means one thing across both routers. */
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
 const vendorResolve = require("../../../services/vendorResolve.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
+const documentSequence = require("../../../services/storePurchase/documentSequence.service");
 const multer = require("multer");
 const {
   uploadVoucherAttachment,
@@ -324,6 +329,11 @@ const publicRequest = (r) => ({
   neededBy: r.neededBy || null,
   priority: r.priority,
   purpose: r.purpose,
+  /* ── WHICH RULES THIS REQUEST WAS RAISED UNDER ───────────────────────────
+     `null` on a request raised before service classification was required, so
+     a screen can say "this predates the rule" rather than rendering a legacy
+     request as one somebody failed to classify. */
+  serviceClassificationPolicy: r.serviceClassificationPolicy || null,
   items: (r.items || []).map((l) => ({
     _id: String(l._id),
     name: l.name,
@@ -343,6 +353,28 @@ const publicRequest = (r) => ({
     vendorNote: l.vendorNote || null,
     gstin: l.gstin || null,
     quoteRef: l.quoteRef || null,
+    /* The matched Service Master identity, so the classified-quote screen can
+       show which line still needs a match before a service order can be
+       raised. Null on a product line or an unmatched service line. */
+    service: l.service ? String(l.service) : null,
+    serviceCode: l.serviceCode || null,
+    billingUnit: l.billingUnit || null,
+    sacCode: l.sacCode || null,
+    /* ── NULL, NOT AN EMPTY ALLOCATION ─────────────────────────────────────
+       A line nobody has classified has NO allocation. Emitting a default
+       "unresolved" object would put a decision on every legacy request that
+       nobody ever made, and a screen cannot tell the two apart afterwards. */
+    budgetAllocation: l.budgetAllocation
+      ? {
+        budgetLedgerId: l.budgetAllocation.budgetLedgerId ? String(l.budgetAllocation.budgetLedgerId) : null,
+        budgetLedgerName: l.budgetAllocation.budgetLedgerName || null,
+        resolutionSource: l.budgetAllocation.resolutionSource || null,
+        resolutionReason: l.budgetAllocation.resolutionReason || null,
+        selectedByName: l.budgetAllocation.selectedByName || null,
+        selectedAt: l.budgetAllocation.selectedAt || null,
+        status: l.budgetAllocation.status || null,
+      }
+      : null,
     gstPercent: typeof l.gstPercent === "number" ? l.gstPercent : null,
     taxAmount: typeof l.taxAmount === "number" ? l.taxAmount : null,
     lineTotal: typeof l.lineTotal === "number" ? l.lineTotal : null,
@@ -399,6 +431,8 @@ const publicRequest = (r) => ({
      question without inferring it from the status string. */
   purchaseOrderNumber: r.purchaseOrderNumber || null,
   purchaseOrderId: r.purchaseOrderId ? String(r.purchaseOrderId) : null,
+  serviceOrderNumber: r.serviceOrderNumber || null,
+  serviceOrderId: r.serviceOrderId ? String(r.serviceOrderId) : null,
   requesterConfirmedAt: r.requesterConfirmedAt || null,
   requesterConfirmedByName: r.requesterConfirmedByName || null,
   revisionRequestedAt: r.revisionRequestedAt || null,
@@ -1064,11 +1098,37 @@ async function decide(req, res, outcome) {
       outcome,
       note,
       expectedPaymentDate: req.body?.expectedPaymentDate || null,
+      /* Finance's deliberate answer where a service's configured default does
+         not match the head being approved. Absent on an ordinary approval. */
+      lineDecisions: req.body?.serviceClassification || null,
+      /* Finance's per-line budget heads. Absent when every line resolves on
+         its own, which is the common case. */
+      lineAllocations: req.body?.lineAllocations || null,
     });
     if (!r.ok) {
-      return res.status(r.status).json({ success: false, code: r.code, message: r.message });
+      return res.status(r.status).json({
+        success: false, code: r.code, message: r.message,
+        /* The mismatch travels with the refusal, so the screen can render the
+           choice instead of sending finance off to find it. */
+        ...(r.classification ? { classification: r.classification } : {}),
+        ...(r.unresolved ? { unresolved: r.unresolved } : {}),
+        ...(r.unclassified ? { unclassified: r.unclassified } : {}),
+        /* Which lines still need a head, and why — so the screen can render
+           the choice rather than send finance off to find it. */
+        ...(r.problems ? { problems: r.problems } : {}),
+        ...(r.totals ? { totals: r.totals } : {}),
+      });
     }
-    return res.json({ success: true, request: publicRequest(doc.toObject()) });
+    return res.json({
+      success: true,
+      request: publicRequest(doc.toObject()),
+      /* ── WHAT WAS PROMISED, AND OUT OF WHAT ─────────────────────────────
+         Per line and grouped per head, from the plan the approval used —
+         not recomputed, so the result and the commitment cannot disagree.
+         A promise, not an accounting actual: nothing posts until a voucher
+         does. */
+      ...(r.plan ? { allocation: allocationSummary(r.plan) } : {}),
+    });
   }
 
   /* ── THE TL STEP ────────────────────────────────────────────────────────
@@ -1272,6 +1332,77 @@ router.get("/:id", async (req, res) => {
  * approved. Orders typed directly into the PO module are unaffected and remain
  * unlinked — that is a separate door and closing it is a separate decision.
  */
+/**
+ * Move an approved request onto the order that fulfils it — once.
+ *
+ * Idempotent by the link: if the request already points at this order, nothing
+ * is written. Otherwise the status advances to ORDERED, the order's number is
+ * recorded, and one history line is added. This is the second write of the
+ * conversion; the order is created first, so a failure here leaves an order
+ * whose request a retry repairs through exactly this function.
+ */
+/**
+ * Is this purchase order really the one for this request?
+ *
+ * A link — the request pointing at an order, or an order carrying this
+ * request's id — is trusted only when BOTH the spend request and the company
+ * match. A PO for another request, or one belonging to another company, is
+ * never returned as this request's and never repaired onto it.
+ */
+function poBelongsTo(po, doc) {
+  return (
+    po &&
+    String(po.spendRequestId || "") === String(doc._id) &&
+    String(po.companyId || "") === String(doc.companyId || "")
+  );
+}
+
+async function linkOrder(doc, po, emp) {
+  if (doc.purchaseOrderId && String(doc.purchaseOrderId) === String(po._id)) return doc;
+  const now = new Date();
+  const who = mrfApprover.buildFullName(emp);
+  doc.status = chain.ORDERED;
+  doc.purchaseOrderId = po._id;
+  doc.purchaseOrderNumber = po.poNumber;
+  doc.orderReference = po.poNumber;
+  doc.history.push({
+    at: now, by: emp._id, byName: who,
+    action: `raised purchase order ${po.poNumber}`,
+    note: po.vendorName ? `To ${po.vendorName}` : "",
+  });
+  await doc.save();
+  return doc;
+}
+
+/**
+ * The conversion response, in the shape callers already read.
+ *
+ * `mode` shades only the message — "created" for a fresh order, "already" for
+ * a repeat, "repaired" where a lost link was mended — while `success`, the
+ * request and the order block stay exactly as before, so an existing caller
+ * cannot tell a recovery apart from a first success it did not need to.
+ */
+function orderResponse(doc, po, mode = "created") {
+  const message =
+    mode === "already"
+      ? `${po.poNumber} was already raised for this.`
+      : mode === "repaired"
+        ? `${po.poNumber} was already raised for this; its link has been repaired.`
+        : `${po.poNumber} raised for ${po.vendorName || "the vendor"}.`;
+  return {
+    success: true,
+    request: publicRequest(doc.toObject ? doc.toObject() : doc),
+    purchaseOrder: {
+      _id: String(po._id),
+      poNumber: po.poNumber,
+      vendorName: po.vendorName,
+      totalAmount: po.totalAmount,
+      status: po.status,
+    },
+    message,
+  };
+}
+
 router.post("/:id/purchase-order", async (req, res) => {
   try {
     const emp = await requester(req);
@@ -1292,6 +1423,13 @@ router.post("/:id/purchase-order", async (req, res) => {
        Not "confirmed", not "with finance". The money has to have been agreed
        before anything is ordered from a vendor. */
     if (doc.status !== chain.APPROVED) {
+      /* An already-ordered request is not an error to the caller: hand back the
+         order that exists rather than a 409 they cannot act on. */
+      if (doc.status === chain.ORDERED && doc.purchaseOrderId) {
+        const PurchaseOrder = require("../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+        const existing = await PurchaseOrder.findById(doc.purchaseOrderId).lean();
+        if (poBelongsTo(existing, doc)) return res.status(200).json(orderResponse(doc, existing, "already"));
+      }
       return res.status(409).json({
         success: false,
         message:
@@ -1300,122 +1438,713 @@ router.post("/:id/purchase-order", async (req, res) => {
             : `This request is ${chain.STAGE_LABEL[doc.status] || doc.status} — a purchase order can only be raised against an approved one.`,
       });
     }
-    /* Belt and braces: the link is what makes a second order detectable even
-       if the status were moved by hand. */
-    if (doc.purchaseOrderId) {
+
+    /* ── PRODUCTS ONLY, FOR NOW ──────────────────────────────────────────
+       A purchase order receives goods; a service has nothing to receive.
+       Pushing a repair or a subscription through goods-receiving would bake
+       physical-stock semantics into something that has none, so a SERVICE (and
+       the legacy SOFTWARE, which is a service) is refused here — service
+       ordering is its own workflow chunk. This is checked after the approval
+       gate, so an unapproved request is still told it is unapproved first. */
+    if (doc.requestType === "SERVICE" || doc.requestType === "SOFTWARE") {
+      return res.status(400).json({
+        /* Machine-readable code kept for compatibility; the message now tells
+           the user where to go — Create service order — rather than saying it
+           is "not supported". */
+        success: false,
+        reason: "SERVICE_ORDER_NOT_SUPPORTED",
+        message:
+          "This is a service request. Use \"Create service order\" — a purchase order is only for a product request.",
+      });
+    }
+
+    /* ── A COMPANY, OR NOTHING ────────────────────────────────────────────
+       The order inherits the approved request's company and nothing else may
+       set it. A request with no company cannot produce a tenanted order, and
+       creating a tenantless one — as this route used to — puts an operational
+       record outside every company boundary. Refuse it plainly instead. */
+    if (!doc.companyId) {
       return res.status(409).json({
         success: false,
-        message: `${doc.purchaseOrderNumber || "An order"} has already been raised for this.`,
+        reason: "REQUEST_HAS_NO_COMPANY",
+        message:
+          "This approved request has no company recorded, so a purchase order cannot be raised for it. It must be migrated before it can be ordered.",
       });
     }
 
     const PurchaseOrder = require("../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
     const Vendor = require("../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 
-    /* ── THE VENDOR, WHERE STORE PICKED ONE OFF THE BOOKS ─────────────────
-       Lines carry `vendorId` when the supplier was chosen rather than typed.
-       Several lines could name several suppliers; a purchase order is one
-       document to one vendor, so a request spanning two is refused rather than
-       silently ordered from whichever line came first. */
-    const vendorNames = [...new Set((doc.items || []).map((l) => (l.vendorName || "").trim()).filter(Boolean))];
-    if (vendorNames.length > 1) {
-      return res.status(400).json({
+    /* ── ALREADY ORDERED, OR HALF-ORDERED ────────────────────────────────
+       Two ways a PO can already exist for this request:
+         · the link is set — an ordinary repeat, answered with that order;
+         · a PO carries this `spendRequestId` but the link was never written,
+           because a previous attempt created the order and then failed before
+           it could move the request. A retry REPAIRS the request rather than
+           creating a second order. The unique index below is what guarantees
+           there is at most one to find. */
+    if (doc.purchaseOrderId) {
+      const existing = await PurchaseOrder.findById(doc.purchaseOrderId).lean();
+      if (poBelongsTo(existing, doc)) return res.status(200).json(orderResponse(doc, existing, "already"));
+    }
+    /* A PO may already carry this request's id — because a previous attempt
+       created it and failed before linking the request back. If it belongs to
+       this company it is repaired onto the request; if it belongs to another,
+       it is a conflict to reconcile, never a record to repair onto this one. */
+    const orphan = await PurchaseOrder.findOne({ spendRequestId: doc._id }).lean();
+    if (orphan) {
+      if (poBelongsTo(orphan, doc)) {
+        const repaired = await linkOrder(doc, orphan, emp);
+        return res.status(200).json(orderResponse(repaired, orphan, "repaired"));
+      }
+      return res.status(409).json({
         success: false,
-        message: `This quote names ${vendorNames.length} suppliers (${vendorNames.join(", ")}). A purchase order goes to one — raise it in the purchase-order module, or split the request.`,
+        reason: "PO_COMPANY_MISMATCH",
+        message:
+          "A purchase order already references this request but belongs to a different company. Reconcile it before ordering.",
       });
     }
-    const vendorName = vendorNames[0] || doc.vendorName || "";
-    const vendorId =
-      (doc.items || []).map((l) => l.vendorId).find(Boolean) ||
-      (vendorName
-        ? (await Vendor.findOne({ companyName: vendorName }).select("_id").lean().catch(() => null))?._id
-        : null) ||
-      null;
 
-    /* ── THE LINES, AS AGREED ─────────────────────────────────────────────
-       Quantity and rate straight off the approved quote. Nothing is recomputed
-       from a body: the figure finance committed is the figure ordered. */
-    const items = (doc.items || []).map((l) => ({
-      rawItem: l.rawItemId || undefined,
-      itemName: l.name,
-      unit: l.unit || "unit",
-      quantity: Number(l.quantity) || 0,
-      unitPrice: Number(l.rate) || 0,
-      totalPrice: Math.round((Number(l.quantity) || 0) * (Number(l.rate) || 0) * 100) / 100,
-      pendingQuantity: Number(l.quantity) || 0,
-      expectedDeliveryDate: l.expectedDeliveryDate || doc.expectedDeliveryDate || null,
-    }));
+    /* ── THE VENDOR, SCOPED TO THIS COMPANY ──────────────────────────────
+       Lines carry `vendorId` when the supplier was chosen off the books.
+       Several lines could name several suppliers; a purchase order is one
+       document to one vendor, so a request spanning two is refused rather than
+       silently ordered from whichever line came first. And every vendor lookup
+       is scoped to the request's company: a supplier of the same name — or the
+       same id — belonging to another company is never attached. */
+    /* ── ONE SUPPLIER, BY IDENTITY FIRST ──────────────────────────────────
+       A display name is not identity: two suppliers can share a name, and
+       collapsing them because the string matched would send one order to the
+       wrong one. So the distinct-supplier test is on the stored `vendorId`
+       (the id chosen off the supplier master), and only lines that carry no
+       reliable id fall back to a normalised-name comparison. Never the first
+       of several ids — several ids IS several suppliers. */
+    const vendorIds = [...new Set((doc.items || []).map((l) => l.vendorId).filter(Boolean).map(String))];
+    if (vendorIds.length > 1) {
+      return res.status(400).json({
+        success: false,
+        reason: "MULTIPLE_SUPPLIERS",
+        message: `This quote names ${vendorIds.length} suppliers by id. A purchase order goes to one — raise it in the purchase-order module, or split the request.`,
+      });
+    }
+    /* Lines with no id are compared on their name, case- and space-normalised,
+       so "Sharma" and "sharma " are one supplier and "Sharma" and "Verma" are
+       two. A genuinely name-only supplier is fully supported. */
+    const idlessNames = [...new Set((doc.items || [])
+      .filter((l) => !l.vendorId)
+      .map((l) => (l.vendorName || "").trim())
+      .filter(Boolean))];
+    if ([...new Set(idlessNames.map((x) => x.toLowerCase()))].length > 1) {
+      return res.status(400).json({
+        success: false,
+        reason: "MULTIPLE_SUPPLIERS",
+        message: `This quote names ${idlessNames.length} suppliers (${idlessNames.join(", ")}). A purchase order goes to one — raise it in the purchase-order module, or split the request.`,
+      });
+    }
+
+    const vendorName =
+      (doc.items || []).map((l) => (l.vendorName || "").trim()).find(Boolean) || doc.vendorName || "";
+    let vendorId = null;
+    if (vendorIds.length === 1) {
+      /* The one chosen id, trusted only if it really belongs to this company —
+         a supplier of the same id in another company is never attached. */
+      const v = await Vendor.findOne({ _id: vendorIds[0], companyId: doc.companyId }).select("_id").lean().catch(() => null);
+      if (v) vendorId = v._id;
+    }
+    if (!vendorId && vendorName) {
+      const v = await Vendor.findOne({ companyName: vendorName, companyId: doc.companyId }).select("_id").lean().catch(() => null);
+      if (v) vendorId = v._id;
+    }
+
+    /* ── THE LINES, WITH EVERY APPROVED COMMERCIAL FACT ──────────────────
+       Quantity, rate, tax and delivery straight off the approved quote, and
+       the catalogue identity the spend line carried. Nothing is recomputed
+       from a body: the figures finance committed are the figures ordered, and
+       a RawItem id is taken from the stored line — never from the request. */
+    const items = (doc.items || []).map((l) => {
+      const quantity = Number(l.quantity) || 0;
+      const unitPrice = Number(l.rate) || 0;
+      const net = Math.round(quantity * unitPrice * 100) / 100;
+      const gstRate = Number(l.gstPercent) || 0;
+      const gstAmount =
+        typeof l.taxAmount === "number"
+          ? Math.round(l.taxAmount * 100) / 100
+          : Math.round(((net * gstRate) / 100) * 100) / 100;
+      return {
+        /* ── THE REQUEST LINE THIS ORDER LINE IS ──────────────────────────
+           So a supplier bill can later say which budget allocation it
+           discharges. The service chain already carried this; goods did not,
+           which is why billing one line of a four-line request released the
+           whole commitment. */
+        spendLineId: l._id,
+        rawItem: l.rawItem || undefined,
+        itemName: l.name,
+        sku: l.rawItemSku || "",
+        baseUnit: l.baseUnit || "",
+        unit: l.unit || "unit",
+        quantity,
+        unitPrice,
+        totalPrice: net,
+        gstRate,
+        gstAmount,
+        quoteRef: l.quoteRef || "",
+        pendingQuantity: quantity,
+        expectedDeliveryDate: l.expectedDeliveryDate || doc.expectedDeliveryDate || null,
+      };
+    });
     if (!items.length) {
       return res.status(400).json({ success: false, message: "This request has no lines to order." });
     }
 
+    /* ── THE HEADER TOTALS RECONCILE FROM THE LINES ──────────────────────
+       Subtotal is the sum of approved net line amounts; tax is the sum of
+       approved line tax amounts; the total is the two added. Not one request-
+       level GST percentage applied to everything — a request can mix rates,
+       and re-deriving the whole order from one of them restates what was
+       approved. */
     const subtotal = Math.round(items.reduce((t, i) => t + i.totalPrice, 0) * 100) / 100;
-    const taxAmount = Math.round((Number(doc.taxAmount) || 0) * 100) / 100;
+    const taxAmount = Math.round(items.reduce((t, i) => t + i.gstAmount, 0) * 100) / 100;
+    const totalAmount = Math.round((subtotal + taxAmount) * 100) / 100;
 
-    /* Same generator the purchase-order module uses, so an order raised here
-       is indistinguishable in the register from one raised there. */
-    const poNumber = await (async () => {
-      for (let i = 0; i < 8; i += 1) {
-        const n = `PO${String(new Date().getFullYear()).slice(-2)}${String(new Date().getMonth() + 1).padStart(2, "0")}${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
-        if (!(await PurchaseOrder.exists({ poNumber: n }))) return n;
-      }
-      return null;
-    })();
-    if (!poNumber) {
+    /* The legacy header `taxRate` holds a rate only when there is ONE across
+       every line. Where the lines mix rates, no single number is the order's
+       rate, so it is left at zero and the line rates stay authoritative —
+       `taxMode` records which case this is, so a downstream reader never takes
+       a mixed-rate order's zero header rate for a zero-rated order. */
+    const distinctRates = [...new Set(items.map((i) => i.gstRate))];
+    const taxMode = distinctRates.length <= 1 ? "SINGLE_RATE" : "MIXED_RATE";
+    const headerTaxRate = taxMode === "SINGLE_RATE" ? (distinctRates[0] || 0) : 0;
+
+    /* ── THE NUMBER FROM THE ATOMIC ALLOCATOR ────────────────────────────
+       The same company/financial-year sequence the purchase-order module
+       uses, so an order raised here is indistinguishable in the register from
+       one raised there — `PO/<financial-year>/<sequence>`. The old random loop
+       could still collide and gave up with a 500. */
+    let poNumber;
+    try {
+      const allocated = await documentSequence.allocate({
+        companyId: doc.companyId,
+        documentType: "PURCHASE_ORDER",
+        siteId: null,
+      });
+      poNumber = allocated.number;
+    } catch (allocErr) {
       return res.status(500).json({ success: false, message: "Could not allocate a PO number. Try again." });
     }
 
-    const po = await PurchaseOrder.create({
-      spendRequestId: doc._id,
-      spendRequestNumber: doc.requestNumber,
-      poNumber,
-      vendor: vendorId || undefined,
-      vendorName,
-      orderDate: new Date(),
-      expectedDeliveryDate: items[0].expectedDeliveryDate || null,
-      items,
-      subtotal,
-      taxRate: Number(doc.gstPercent) || 0,
-      taxAmount,
-      totalAmount: Math.round((subtotal + taxAmount) * 100) / 100,
-      totalPending: items.reduce((t, i) => t + i.quantity, 0),
-      /* DRAFT, not ISSUED. Approving the money is not the same as sending the
-         order — somebody in Store still reads it and sends it, and that is the
-         purchase-order module's own step. */
-      status: "DRAFT",
-      notes: [doc.purpose, doc.items?.[0]?.quoteRef ? `Quote ${doc.items[0].quoteRef}` : ""]
-        .filter(Boolean)
-        .join(" · "),
-      createdBy: emp._id,
-    });
+    /* ── CREATE FIRST, THEN LINK ─────────────────────────────────────────
+       The order is written with its `spendRequestId` before the request is
+       moved. If this write fails, the request is untouched and stays approved,
+       ready to be raised again. If a concurrent attempt has already written an
+       order for this request, the partial unique index rejects this one; the
+       duplicate-key error is caught and the order that won is returned. */
+    let po;
+    try {
+      po = await PurchaseOrder.create({
+        spendRequestId: doc._id,
+        spendRequestNumber: doc.requestNumber,
+        companyId: doc.companyId,
+        /* SpendRequest carries no site yet; do not invent one. */
+        siteId: null,
+        poNumber,
+        vendor: vendorId || undefined,
+        vendorName,
+        orderDate: new Date(),
+        expectedDeliveryDate: items[0].expectedDeliveryDate || null,
+        items,
+        subtotal,
+        taxRate: headerTaxRate,
+        taxMode,
+        taxAmount,
+        totalAmount,
+        totalPending: items.reduce((t, i) => t + i.quantity, 0),
+        /* DRAFT, not ISSUED. Approving the money is not the same as sending the
+           order — somebody in Store still reads it and sends it, and that is
+           the purchase-order module's own step. */
+        status: "DRAFT",
+        notes: [doc.purpose, doc.items?.[0]?.quoteRef ? `Quote ${doc.items[0].quoteRef}` : ""]
+          .filter(Boolean)
+          .join(" · "),
+        createdBy: emp._id,
+      });
+    } catch (createErr) {
+      if (createErr && createErr.code === 11000) {
+        /* A concurrent call won the race. Return the order that exists, and
+           repair this request's link to it if it was not written. */
+        const winner = await PurchaseOrder.findOne({ spendRequestId: doc._id, companyId: doc.companyId }).lean();
+        if (poBelongsTo(winner, doc)) {
+          const repaired = await linkOrder(doc, winner, emp);
+          return res.status(200).json(orderResponse(repaired, winner, "already"));
+        }
+      }
+      throw createErr;
+    }
 
-    const now = new Date();
-    const who = mrfApprover.buildFullName(emp);
-    doc.status = chain.ORDERED;
-    doc.purchaseOrderId = po._id;
-    doc.purchaseOrderNumber = po.poNumber;
-    doc.orderReference = po.poNumber;
-    doc.history.push({
-      at: now, by: emp._id, byName: who,
-      action: `raised purchase order ${po.poNumber}`,
-      note: vendorName ? `To ${vendorName}` : "",
-    });
-    await doc.save();
-
-    res.status(201).json({
-      success: true,
-      request: publicRequest(doc.toObject()),
-      purchaseOrder: {
-        _id: String(po._id),
-        poNumber: po.poNumber,
-        vendorName: po.vendorName,
-        totalAmount: po.totalAmount,
-        status: po.status,
-      },
-      message: `${po.poNumber} raised for ${vendorName || "the vendor"}.`,
-    });
+    const linked = await linkOrder(doc, po, emp);
+    return res.status(201).json(orderResponse(linked, po, "created"));
   } catch (e) {
     console.error("[spend] purchase-order:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * APPROVED SERVICE REQUEST → SERVICE ORDER
+ *
+ * The service counterpart of the purchase-order conversion. It creates NO
+ * purchase order, no goods receipt, no stock and no inventory movement — a
+ * service has nothing to receive. It carries the approved quote's own vendor,
+ * rate, quantity and tax, matches each line to an ACTIVE Service Master record
+ * for the code/billing-unit/SAC snapshot, and links the order back to the
+ * request. The same at-most-one-order guarantee and recovery as the PO path.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/** Is this service order really the one for this request AND this company? */
+function soBelongsTo(so, doc) {
+  return (
+    so &&
+    String(so.spendRequestId || "") === String(doc._id) &&
+    String(so.companyId || "") === String(doc.companyId || "")
+  );
+}
+
+/** Move the request onto the service order that fulfils it — once. */
+/**
+ * Snapshot each spend line from the authoritative service-order lines, keyed
+ * by `spendLineId` → the spend line's index. Used on every path, so a normal
+ * conversion and a recovery restore the same fields: service id, code, billing
+ * unit, SAC.
+ */
+function lineSetsFromOrder(doc, so) {
+  const byLineId = new Map();
+  for (const l of (so.lines || [])) if (l.spendLineId) byLineId.set(String(l.spendLineId), l);
+  const sets = {};
+  (doc.items || []).forEach((item, idx) => {
+    const sl = byLineId.get(String(item._id));
+    if (!sl) return;
+    sets[`items.${idx}.service`] = sl.service || null;
+    sets[`items.${idx}.serviceCode`] = sl.serviceCode || "";
+    sets[`items.${idx}.billingUnit`] = sl.billingUnit || "";
+    sets[`items.${idx}.sacCode`] = sl.sacCode || "";
+  });
+  return sets;
+}
+
+/**
+ * Link the request onto its service order — EXACTLY ONCE.
+ *
+ * ── WHY IT IS CONDITIONAL, NOT A SAVE OR A BLIND UPDATE ──────────────────────
+ * Two concurrent conversions can both reach this with an unlinked request. A
+ * plain `$push` of the "raised service order" history would then append it
+ * twice, and a versioned `save()` would raise a version error. Instead the
+ * link is one conditional atomic write: it fires ONLY while the request is
+ * still unlinked, so exactly one caller writes the status, the order id and the
+ * one history event.
+ *
+ * The loser — and any later recovery — finds the request already linked, and
+ * REPAIRS the line snapshots (idempotent `$set`, reconstructed from the order's
+ * own lines) WITHOUT appending a second history event. After it, the request
+ * reads exactly as a first successful conversion would have left it.
+ */
+async function linkServiceOrder(doc, so, emp) {
+  const now = new Date();
+  const who = mrfApprover.buildFullName(emp);
+  const lineSets = lineSetsFromOrder(doc, so);
+
+  const linked = await SpendRequest.findOneAndUpdate(
+    {
+      _id: doc._id,
+      companyId: doc.companyId,
+      $or: [{ serviceOrderId: { $exists: false } }, { serviceOrderId: null }],
+    },
+    {
+      $set: {
+        status: chain.ORDERED,
+        serviceOrderId: so._id,
+        serviceOrderNumber: so.serviceOrderNumber,
+        /* Kept for every existing reader that already renders `orderReference`. */
+        orderReference: so.serviceOrderNumber,
+        ...lineSets,
+      },
+      $push: {
+        history: {
+          at: now, by: emp._id, byName: who,
+          action: `raised service order ${so.serviceOrderNumber}`,
+          note: so.vendorName ? `To ${so.vendorName}` : "",
+        },
+      },
+    },
+    { new: true },
+  );
+  if (linked) return linked;
+
+  /* Already linked — by an earlier attempt or a concurrent winner. Repair any
+     missing line snapshots without touching status or history. */
+  const fresh = await SpendRequest.findById(doc._id);
+  if (fresh && String(fresh.serviceOrderId) === String(so._id) && Object.keys(lineSets).length) {
+    await SpendRequest.updateOne({ _id: doc._id }, { $set: lineSets });
+    return SpendRequest.findById(doc._id);
+  }
+  return fresh || doc;
+}
+
+function serviceOrderResponse(doc, so, mode = "created", warnings = []) {
+  const message =
+    mode === "already"
+      ? `${so.serviceOrderNumber} was already raised for this.`
+      : mode === "repaired"
+        ? `${so.serviceOrderNumber} was already raised for this; its link has been repaired.`
+        : `${so.serviceOrderNumber} raised for ${so.vendorName || "the supplier"}.`;
+  return {
+    success: true,
+    request: publicRequest(doc.toObject ? doc.toObject() : doc),
+    serviceOrder: {
+      _id: String(so._id),
+      serviceOrderNumber: so.serviceOrderNumber,
+      vendorName: so.vendorName,
+      totalAmount: so.totalAmount,
+      status: so.status,
+    },
+    ...(warnings.length ? { warnings } : {}),
+    message,
+  };
+}
+
+router.post("/:id/service-order", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "Only Store & Purchase can raise a service order." });
+    }
+
+    const ServiceOrder = require("../../../models/CMS_Models/Inventory/Operations/ServiceOrder");
+    const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
+    const Vendor = require("../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+
+    /* ── APPROVED, AND ONLY APPROVED ─────────────────────────────────────── */
+    if (doc.status !== chain.APPROVED) {
+      if (doc.status === chain.ORDERED && doc.serviceOrderId) {
+        const existing = await ServiceOrder.findById(doc.serviceOrderId).lean();
+        if (soBelongsTo(existing, doc)) return res.status(200).json(serviceOrderResponse(doc, existing, "already"));
+      }
+      return res.status(409).json({
+        success: false,
+        message:
+          doc.status === chain.ORDERED
+            ? `${doc.serviceOrderNumber || doc.purchaseOrderNumber || "An order"} has already been raised for this.`
+            : `This request is ${chain.STAGE_LABEL[doc.status] || doc.status} — a service order can only be raised against an approved one.`,
+      });
+    }
+
+    /* ── SERVICES ONLY ────────────────────────────────────────────────────
+       A PRODUCT is received into stock through a purchase order; it has no
+       place here. Refused and pointed at the PO route, which is untouched. */
+    if (doc.requestType !== "SERVICE" && doc.requestType !== "SOFTWARE") {
+      return res.status(400).json({
+        success: false,
+        reason: "PRODUCT_ORDER_NOT_SUPPORTED",
+        message: "This is a product request. Raise a purchase order for it — a service order is only for a service request.",
+      });
+    }
+
+    if (!doc.companyId) {
+      return res.status(409).json({
+        success: false,
+        reason: "REQUEST_HAS_NO_COMPANY",
+        message: "This approved request has no company recorded, so a service order cannot be raised for it. It must be migrated first.",
+      });
+    }
+
+    /* ── ALREADY ORDERED, OR HALF-ORDERED ─────────────────────────────────── */
+    if (doc.serviceOrderId) {
+      const existing = await ServiceOrder.findById(doc.serviceOrderId).lean();
+      if (soBelongsTo(existing, doc)) return res.status(200).json(serviceOrderResponse(doc, existing, "already"));
+    }
+    const orphan = await ServiceOrder.findOne({ spendRequestId: doc._id }).lean();
+    if (orphan) {
+      if (soBelongsTo(orphan, doc)) {
+        const repaired = await linkServiceOrder(doc, orphan, emp);
+        return res.status(200).json(serviceOrderResponse(repaired, orphan, "repaired"));
+      }
+      return res.status(409).json({
+        success: false,
+        reason: "SO_COMPANY_MISMATCH",
+        message: "A service order already references this request but belongs to a different company. Reconcile it before ordering.",
+      });
+    }
+
+    /* ── ONE SUPPLIER, BY IDENTITY FIRST (the corrected C1 rule) ──────────── */
+    const vendorIds = [...new Set((doc.items || []).map((l) => l.vendorId).filter(Boolean).map(String))];
+    if (vendorIds.length > 1) {
+      return res.status(400).json({
+        success: false, reason: "MULTIPLE_SUPPLIERS",
+        message: `This quote names ${vendorIds.length} suppliers by id. A service order goes to one — split the request.`,
+      });
+    }
+    const idlessNames = [...new Set((doc.items || [])
+      .filter((l) => !l.vendorId).map((l) => (l.vendorName || "").trim()).filter(Boolean))];
+    if ([...new Set(idlessNames.map((x) => x.toLowerCase()))].length > 1) {
+      return res.status(400).json({
+        success: false, reason: "MULTIPLE_SUPPLIERS",
+        message: `This quote names ${idlessNames.length} suppliers (${idlessNames.join(", ")}). A service order goes to one — split the request.`,
+      });
+    }
+    const vendorName = (doc.items || []).map((l) => (l.vendorName || "").trim()).find(Boolean) || doc.vendorName || "";
+    let vendorId = null;
+    if (vendorIds.length === 1) {
+      const v = await Vendor.findOne({ _id: vendorIds[0], companyId: doc.companyId }).select("_id").lean().catch(() => null);
+      if (v) vendorId = v._id;
+    }
+    if (!vendorId && vendorName) {
+      const v = await Vendor.findOne({ companyName: vendorName, companyId: doc.companyId }).select("_id").lean().catch(() => null);
+      if (v) vendorId = v._id;
+    }
+    const vendorGstin = (doc.items || []).map((l) => (l.gstin || "").trim()).find(Boolean) || doc.gstin || "";
+
+    /* ── THE APPROVED SNAPSHOT IS WHAT THE ORDER IS BUILT FROM ────────────
+       Since B2, a service line is matched BEFORE finance approves, so by the
+       time an order is raised the line already carries `service`, its code,
+       billing unit and SAC — and the order consumes those. A Service Master
+       renamed, repriced, re-taxed, re-suppliered or reclassified after the
+       approval therefore cannot restate an approved request.
+
+       ── AND THE LEGACY DOOR, DELIBERATELY LEFT OPEN ────────────────────────
+       `lineMatches` in the body is the LATE-MATCH COMPATIBILITY PATH, and it
+       is now only that: requests approved before B2 have no stored match and
+       would otherwise be unorderable forever. It cannot reach a line that
+       already stored one (`l.service` wins below), so it can only fill a gap,
+       never rewrite an approved decision.
+
+       Nothing commercial is read from the body either way. A service is used
+       only when it belongs to this company and is ACTIVE — never by name. */
+    /* ── AND THE DOOR IS BOLTED FOR EVERYTHING BUT LEGACY ─────────────────
+       A request stamped with the classification policy was matched before
+       finance approved, by definition — the finance gate refuses to approve
+       one that was not. So `lineMatches` on such a request can only be an
+       attempt to supply an identity the approval never saw, and accepting it
+       would put a service on an order that nobody approved against.
+
+       Only a request with NO policy marker — genuinely raised before the rule
+       — may still be matched here. */
+    const isLegacyRequest = !doc.serviceClassificationPolicy;
+    const postedMatches = Array.isArray(req.body?.lineMatches) ? req.body.lineMatches : [];
+    if (postedMatches.length && !isLegacyRequest) {
+      return res.status(409).json({
+        success: false,
+        reason: "LATE_MATCH_NOT_ALLOWED",
+        message: "This request was classified before it was approved. Its service lines "
+          + "cannot be re-matched now — the approved match is what the order uses.",
+      });
+    }
+
+    const matchFor = new Map();
+    for (const m of (isLegacyRequest ? postedMatches : [])) {
+      if (m && m.spendLineId && m.serviceId && mongoose.isValidObjectId(m.serviceId)) {
+        matchFor.set(String(m.spendLineId), String(m.serviceId));
+      }
+    }
+    /* Reported on the response so a late match is visible as one rather than
+       looking like the ordinary path. */
+    const lateMatched = (doc.items || [])
+      .filter((l) => !l.service && matchFor.has(String(l._id)))
+      .map((l) => String(l._id));
+    const wantedIds = (doc.items || [])
+      .map((l) => (l.service ? String(l.service) : matchFor.get(String(l._id))))
+      .filter((id) => id && mongoose.isValidObjectId(id));
+    const services = wantedIds.length
+      ? new Map((await Service.find({ _id: { $in: wantedIds }, companyId: doc.companyId })
+          .select("_id serviceCode name billingUnit sacCode status defaultGstRate defaultRate preferredVendorId preferredVendorName")
+          .lean()).map((sv) => [String(sv._id), sv]))
+      : new Map();
+
+    const lineErrors = [];
+    const soLines = [];
+    const warnings = [];
+    for (const l of (doc.items || [])) {
+      /* The stored match always wins; `matchFor` is empty unless this is a
+         legacy request, so on a new-policy one there is nothing else to fall
+         back to and nothing that could override the approved identity. */
+      const matchedSid = l.service ? String(l.service) : (matchFor.get(String(l._id)) || null);
+      if (!matchedSid) {
+        lineErrors.push({
+          spendLineId: String(l._id), name: l.name,
+          reason: isLegacyRequest ? "SERVICE_MATCH_REQUIRED" : "APPROVED_WITHOUT_SERVICE",
+        });
+        continue;
+      }
+      const svc = services.get(matchedSid);
+      if (!svc) {
+        /* Not found under this company — either missing or another company's. */
+        lineErrors.push({ spendLineId: String(l._id), name: l.name, reason: "SERVICE_NOT_IN_COMPANY" });
+        continue;
+      }
+      if (svc.status !== "ACTIVE") {
+        lineErrors.push({ spendLineId: String(l._id), name: l.name, reason: "SERVICE_INACTIVE" });
+        continue;
+      }
+
+      const quantity = Number(l.quantity) || 0;
+      const rate = Number(l.rate) || 0;
+      const net = Math.round(quantity * rate * 100) / 100;
+      const gstRate = Number(l.gstPercent) || 0;
+      const gstAmount = typeof l.taxAmount === "number"
+        ? Math.round(l.taxAmount * 100) / 100
+        : Math.round(((net * gstRate) / 100) * 100) / 100;
+
+      /* The Service Master's defaults never overwrite the approved quote — a
+         difference is surfaced as a visible warning, nothing more. */
+      if (svc.defaultGstRate != null && Number(svc.defaultGstRate) !== gstRate) {
+        warnings.push({ spendLineId: String(l._id), field: "gst", masterDefault: svc.defaultGstRate, approved: gstRate });
+      }
+      if (svc.defaultRate != null && Number(svc.defaultRate) !== rate) {
+        warnings.push({ spendLineId: String(l._id), field: "rate", masterDefault: svc.defaultRate, approved: rate });
+      }
+      if (svc.preferredVendorId && vendorId && String(svc.preferredVendorId) !== String(vendorId)) {
+        warnings.push({ spendLineId: String(l._id), field: "vendor", masterDefault: svc.preferredVendorName || String(svc.preferredVendorId), approved: vendorName });
+      }
+
+      /* ── THE APPROVED SNAPSHOT WINS OVER THE LIVE MASTER ────────────────
+         This read the service's CURRENT code, billing unit and SAC straight
+         off the master, so renaming or reclassifying a service after finance
+         approved silently restated the order that approval produced — the
+         order said one thing and the request it came from said another.
+
+         A line matched before approval carries its own snapshot, and that is
+         what the order is built from. The master is consulted only where
+         there is no snapshot to use, which is the legacy late-match path. */
+      const approvedSnapshot = !!l.serviceCode;
+      soLines.push({
+        spendLineId: l._id,
+        service: svc._id,
+        serviceCode: l.serviceCode || svc.serviceCode || "",
+        /* The name is not snapshotted on the request line, so it comes from
+           the master either way — and is labelled as the display name it is,
+           not as part of the approved identity. */
+        serviceName: svc.name || "",
+        description: l.name,
+        specification: l.spec || "",
+        billingUnit: (approvedSnapshot ? l.billingUnit : "") || svc.billingUnit || l.unit || "",
+        sacCode: (approvedSnapshot ? l.sacCode : "") || svc.sacCode || "",
+        quantity,
+        rate,
+        netAmount: net,
+        gstRate,
+        gstAmount,
+        lineTotal: Math.round((net + gstAmount) * 100) / 100,
+        quoteRef: l.quoteRef || "",
+        expectedCompletionDate: l.expectedDeliveryDate || doc.expectedDeliveryDate || null,
+      });
+
+    }
+
+    if (lineErrors.length) {
+      return res.status(400).json({
+        success: false,
+        reason: isLegacyRequest ? "SERVICE_MATCH_REQUIRED" : "APPROVED_WITHOUT_SERVICE",
+        message: isLegacyRequest
+          ? "Every service line must be matched to an active service in this company before an order can be raised."
+          /* Should be unreachable: the finance gate refuses to approve a
+             new-policy request with an unmatched line. If it happens, the
+             approval and the order disagree about what was bought, and
+             saying so is more use than a message about matching. */
+          : "This request was approved without a service on every line, which the "
+            + "classification policy should have prevented. It needs finance to look at it.",
+        lineErrors,
+      });
+    }
+    if (!soLines.length) {
+      return res.status(400).json({ success: false, message: "This request has no lines to order." });
+    }
+
+    const subtotal = Math.round(soLines.reduce((t, i) => t + i.netAmount, 0) * 100) / 100;
+    const taxAmount = Math.round(soLines.reduce((t, i) => t + i.gstAmount, 0) * 100) / 100;
+    const totalAmount = Math.round((subtotal + taxAmount) * 100) / 100;
+    const distinctRates = [...new Set(soLines.map((i) => i.gstRate))];
+    const taxMode = distinctRates.length <= 1 ? "SINGLE_RATE" : "MIXED_RATE";
+    const taxRate = taxMode === "SINGLE_RATE" ? (distinctRates[0] || 0) : 0;
+    const expectedCompletionDate = soLines.map((i) => i.expectedCompletionDate).filter(Boolean)[0] || null;
+
+    let serviceOrderNumber;
+    try {
+      const allocated = await documentSequence.allocate({
+        companyId: doc.companyId, documentType: "SERVICE_ORDER", siteId: null,
+      });
+      serviceOrderNumber = allocated.number;
+    } catch (allocErr) {
+      return res.status(500).json({ success: false, message: "Could not allocate a service-order number. Try again." });
+    }
+
+    /* Create first (with the request id), then link. A failure before linking
+       leaves the request approved for a clean retry; a concurrent winner is
+       caught on the partial unique index and returned. */
+    let so;
+    try {
+      so = await ServiceOrder.create({
+        companyId: doc.companyId,
+        siteId: null,
+        serviceOrderNumber,
+        spendRequestId: doc._id,
+        spendRequestNumber: doc.requestNumber,
+        vendor: vendorId || null,
+        vendorName,
+        vendorGstin,
+        title: doc.title || "",
+        purpose: doc.purpose || "",
+        department: doc.department || "",
+        /* The requester's stable Employee id — the ownership key acceptance
+           checks compare first; the biometric string is the legacy fallback. */
+        requestedBy: doc.requestedBy || null,
+        requestedById: doc.requestedById || "",
+        requestedByName: doc.requestedByName || "",
+        budgetLedgerId: doc.ledgerId || null,
+        budgetLedgerName: doc.ledgerName || "",
+        commitmentId: doc.commitmentId || null,
+        lines: soLines,
+        subtotal,
+        taxAmount,
+        totalAmount,
+        taxMode,
+        taxRate,
+        expectedCompletionDate,
+        status: "DRAFT",
+        createdBy: emp._id,
+        createdByName: mrfApprover.buildFullName(emp),
+        history: [{
+          at: new Date(), by: emp._id, byName: mrfApprover.buildFullName(emp),
+          action: "created", note: `From approved request ${doc.requestNumber}`,
+        }],
+      });
+    } catch (createErr) {
+      if (createErr && createErr.code === 11000) {
+        const winner = await ServiceOrder.findOne({ spendRequestId: doc._id, companyId: doc.companyId }).lean();
+        if (soBelongsTo(winner, doc)) {
+          const repaired = await linkServiceOrder(doc, winner, emp);
+          return res.status(200).json(serviceOrderResponse(repaired, winner, "already"));
+        }
+      }
+      throw createErr;
+    }
+
+    const linked = await linkServiceOrder(doc, so, emp);
+    const payload = serviceOrderResponse(linked, so, "created", warnings);
+    if (lateMatched.length) {
+      /* Said plainly. A request that had to be matched at order time predates
+         B2 — the classification finance approved never included a service. */
+      payload.legacyLateMatch = {
+        spendLineIds: lateMatched,
+        message: "This request was approved before service lines were classified, "
+          + "so its services were matched now. Finance approved it without them.",
+      };
+    }
+    return res.status(201).json(payload);
+  } catch (e) {
+    console.error("[spend] service-order:", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
@@ -1665,6 +2394,286 @@ router.patch("/:id/confirm", async (req, res) => {
  * requester still has to look again — this is the same door they came through
  * the first time, not a shortcut around it.
  */
+
+/* ══ SERVICE CLASSIFICATION, BEFORE FINANCE DECIDES ══════════════════════════
+ *
+ * ── THE PROBLEM THIS CLOSES ─────────────────────────────────────────────────
+ * A service line was matched to the Service Master while the SERVICE ORDER was
+ * being raised — which happens AFTER finance has approved and the commitment
+ * has been written. So the one moment the company had to look at "which budget
+ * does this service normally come out of, and is that the head we are
+ * approving against?" was the one moment it could not: the money was already
+ * promised.
+ *
+ * Matching therefore moves before finance. Nothing else moves with it.
+ *
+ * ── WHAT REMAINS AUTHORITATIVE ──────────────────────────────────────────────
+ * The Service Master's budget default is a RECOMMENDATION. The request-level
+ * `ledgerId` / `budgetLineId` stay the live commitment authority in this
+ * chunk, there is still exactly ONE commitment per request, and nothing here
+ * writes a voucher, an actual, a PO, a GRN or a stock movement.
+ *
+ * And the approved quotation stays authoritative over the master: a service's
+ * default rate, GST and preferred supplier are never copied over what a vendor
+ * actually quoted. A difference is a visible note, never a silent edit.
+ */
+
+/* ── WHAT STORE AND FINANCE BOTH LOOK AT ──────────────────────────────────── */
+
+/* ══ LINE-WISE BUDGET ALLOCATION ═════════════════════════════════════════════
+ * A request buys fabric from Raw Materials, packaging from Packaging and a
+ * repair from Repairs & Maintenance. Finance is not made to force all three
+ * into one head; each line commits against its own, and the request still
+ * produces exactly ONE commitment document.
+ *
+ * A promise, never an accounting actual. Nothing posts until a voucher does.
+ */
+
+/* ── WHAT FINANCE REVIEWS BEFORE APPROVING ──────────────────────────────────
+ * The same plan the approval will use, computed the same way, so the screen
+ * and the decision cannot disagree about what a line resolves to.
+ *
+ * Read-only. It never refuses: an unresolved line comes back as a `problem`
+ * for the screen to render, because this is the surface on which finance
+ * fixes it.
+ */
+router.get("/:id/line-allocations", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!maySeeRequest(doc, emp, viewer) && !viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "This request is not yours to read." });
+    }
+
+    const plan = await financeDecision.planLineAllocations({
+      request: doc,
+      body: req.query.dryRun ? null : null,
+      actor: { id: emp._id, name: mrfApprover.buildFullName(emp) },
+    });
+
+    if (!plan.ok) {
+      return res.json({
+        success: true,
+        /* Not an error on a REVIEW surface — this is exactly what finance is
+           here to resolve. */
+        allocation: null,
+        code: plan.code,
+        message: plan.message,
+        problems: plan.problems || [],
+        totals: plan.totals || null,
+        heads: await approvedHeadOptions(doc),
+      });
+    }
+
+    res.json({
+      success: true,
+      allocation: allocationSummary(plan),
+      problems: [],
+      heads: await approvedHeadOptions(doc),
+    });
+  } catch (e) {
+    console.error("[spend] line-allocations:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** The heads this department may actually choose — approved lines, not the
+ *  chart of accounts. */
+async function approvedHeadOptions(doc) {
+  if (!doc.companyId) return [];
+  const { heads } = await budgetMatch.approvedHeadsFor({
+    companyId: doc.companyId,
+    department: doc.budgetDepartment || doc.department || "",
+  }).catch(() => ({ heads: [] }));
+  return heads.map((h) => ({
+    budgetLineId: String(h.budgetLineId),
+    ledgerId: String(h.ledgerId),
+    name: h.name,
+    financialYear: h.financialYear,
+    approved: h.approved,
+    committed: h.committed,
+    actual: h.actual,
+    available: h.available,
+  }));
+}
+
+router.get("/:id/service-classification", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    /* ── STORE MAY READ WHAT STORE MAY CLASSIFY ───────────────────────────
+       `maySeeRequest` admits Store only once a request is APPROVED, which was
+       right while their first job on it was raising the order. B2 gives them
+       an earlier job — matching service lines before finance decides — and a
+       screen they may act on but not read is not a screen.
+
+       Widened HERE and only here. Changing `maySeeRequest` itself would open
+       every other route on this router at once, which is a bigger claim than
+       this chunk has any business making. */
+    if (!maySeeRequest(doc, emp, viewer) && !viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "This request is not yours to read." });
+    }
+    if (!isServiceRequest(doc)) {
+      return res.status(400).json({
+        success: false,
+        reason: "NOT_A_SERVICE_REQUEST",
+        message: "This is a product request. Service classification does not apply to it.",
+      });
+    }
+
+    res.json({ success: true, classification: await serviceClassification(doc) });
+  } catch (e) {
+    console.error("[spend] service-classification:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ── STORE MATCHES EVERY SERVICE LINE, BEFORE FINANCE SEES IT ────────────────
+ * Body: { lines: [{ spendLineId, serviceId }] }
+ *
+ * Nothing commercial is read. This stores the service IDENTITY and the
+ * PROPOSED budget resolution; it does not touch rate, GST, supplier, quantity
+ * or the request's own budget head.
+ */
+router.patch("/:id/service-lines", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "Only Store & Purchase can classify a service line." });
+    }
+    if (!isServiceRequest(doc)) {
+      return res.status(400).json({
+        success: false, reason: "NOT_A_SERVICE_REQUEST",
+        message: "This is a product request. Match its lines to the item catalogue instead.",
+      });
+    }
+    /* ── BEFORE FINANCE, NOT AFTER ────────────────────────────────────────
+       Once finance has approved, the commitment exists and the classification
+       it was made against must stop moving. A late match on an already
+       approved request goes down the isolated legacy path on the service-order
+       route, which is deliberately the only door left open for it. */
+    if ([chain.APPROVED, chain.ORDERED, chain.REJECTED, chain.CANCELLED].includes(doc.status)) {
+      return res.status(409).json({
+        success: false, reason: "TOO_LATE_TO_CLASSIFY",
+        message: `This request is ${chain.STAGE_LABEL[doc.status] || doc.status}. Service lines are classified before finance approves.`,
+      });
+    }
+    if (!doc.companyId) {
+      return res.status(409).json({
+        success: false, reason: "REQUEST_HAS_NO_COMPANY",
+        message: "This request has no company recorded, so its services cannot be matched.",
+      });
+    }
+
+    const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
+
+    const wanted = new Map();
+    for (const m of Array.isArray(req.body?.lines) ? req.body.lines : []) {
+      if (m && m.spendLineId && m.serviceId && mongoose.isValidObjectId(m.serviceId)) {
+        wanted.set(String(m.spendLineId), String(m.serviceId));
+      }
+    }
+    if (!wanted.size) {
+      return res.status(400).json({ success: false, message: "No service match was sent." });
+    }
+
+    /* Company-scoped in the query. Another company's service is not found,
+       which is the same answer an invented id gets. */
+    const found = new Map((await Service.find({
+      _id: { $in: [...wanted.values()] }, companyId: doc.companyId,
+    }).select("_id serviceCode name category billingUnit sacCode status budgetLedgerId budgetLedgerName")
+      .lean()).map((sv) => [String(sv._id), sv]));
+
+    const lineErrors = [];
+    const staged = [];
+    for (const [spendLineId, serviceId] of wanted) {
+      const line = (doc.items || []).id(spendLineId);
+      if (!line) {
+        lineErrors.push({ spendLineId, reason: "LINE_NOT_ON_REQUEST" });
+        continue;
+      }
+      const svc = found.get(serviceId);
+      if (!svc) {
+        lineErrors.push({ spendLineId, name: line.name, reason: "SERVICE_NOT_IN_COMPANY" });
+        continue;
+      }
+      if (svc.status !== "ACTIVE") {
+        /* A retired service may be READ — last year's requests name it — but
+           it may not be chosen for new work. */
+        lineErrors.push({ spendLineId, name: line.name, reason: "SERVICE_INACTIVE" });
+        continue;
+      }
+      staged.push({ line, svc });
+    }
+
+    if (lineErrors.length) {
+      return res.status(400).json({
+        success: false, reason: "SERVICE_MATCH_INVALID",
+        message: "Every match must name an active service in this company.",
+        lineErrors,
+      });
+    }
+
+    const now = new Date();
+    const who = mrfApprover.buildFullName(emp);
+    for (const { line, svc } of staged) {
+      /* ── IDENTITY ONLY ────────────────────────────────────────────────
+         Code, billing unit and SAC are the service's own facts and are
+         snapshotted. Rate, GST and supplier are the QUOTE's facts and are
+         left exactly as quoted — the master's defaults are guidance, and a
+         quotation a buyer negotiated is not overwritten by a suggestion. */
+      line.service = svc._id;
+      line.serviceCode = svc.serviceCode || "";
+      line.billingUnit = svc.billingUnit || "";
+      line.sacCode = svc.sacCode || "";
+
+      /* The PROPOSED resolution, recorded now so finance sees it. The head in
+         force is still the request-level one; this says what the service
+         itself recommends. */
+      const resolution = itemBudgetHead.headForService(svc);
+      line.budgetAllocation = itemBudgetHead.serviceLineAllocation({
+        resolution,
+        chosenLedgerId: resolution.budgetLedgerId || null,
+        chosenLedgerName: resolution.budgetLedgerName || "",
+        actor: { id: emp._id, name: who },
+      });
+    }
+
+    doc.history.push({
+      at: now, by: emp._id, byName: who,
+      action: "classified service lines",
+      note: staged.map(({ svc }) => svc.serviceCode || svc.name).join(", ").slice(0, 500),
+    });
+    await doc.save();
+
+    res.json({
+      success: true,
+      request: publicRequest(doc.toObject()),
+      classification: await serviceClassification(doc),
+      message: `${staged.length} line${staged.length === 1 ? "" : "s"} matched. This records the service and its suggested budget head — it approves nothing and moves no budget.`,
+    });
+  } catch (e) {
+    console.error("[spend] service-lines:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.patch("/:id/requote", async (req, res) => {
   try {
     const emp = await requester(req);
