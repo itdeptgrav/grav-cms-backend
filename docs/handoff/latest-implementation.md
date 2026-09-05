@@ -2,6 +2,81 @@
 
 ---
 
+## Cowork Sheets — `/cowork/workbooks` implemented (OUT OF ACTIVE SCOPE)
+
+> **Scope conflict, stated rather than resolved silently.** The active task in
+> `docs/tasks/current-task.md` is Store & Purchase Chunk 1. This is not that.
+> It was done at the user's direct request, in response to a live defect, and is
+> recorded here so the next reader is not surprised by an unrelated router.
+> Nothing committed. No Store/Purchase file touched.
+
+### The defect
+
+Cowork's Sheets surface showed `0 sheets` under "Couldn't load your sheets."
+The Cowork client had been migrated to call `/cowork/workbooks…`, and **that
+router was never written** — `routes/task_routes/` had `coworkMindmaps.js` and
+`coworkDocs.routes.js` but no `coworkWorkbooks.js`. Every workbook call answered
+404. Confirmed by probe against the running dev server: `/cowork/mindmaps` and
+`/cowork/me` answered 401 (registered, unauthenticated), `/cowork/workbooks`
+answered 404 under every path variant.
+
+Before the migration, workbooks were stored on the Cowork Next server's own
+disk (a JSON file), which does not survive a redeploy. The client half of the
+move to Firestore shipped; this half did not.
+
+### What was added
+
+`routes/task_routes/coworkWorkbooks.js`, mounted in `server.js` beside
+mindmaps. Twelve endpoints, matching the client's existing contract exactly
+(`lib/spreadsheet/workbookClient.ts` in the Cowork repo — unchanged):
+
+| | |
+|---|---|
+| `GET/POST /workbooks` | list (records only), create |
+| `GET/PUT/PATCH/DELETE /workbooks/:id` | open (with body), save, rename, soft-delete |
+| `GET/PUT /workbooks/:id/shares` | owner-only grant list |
+| `GET/POST /workbooks/:id/versions` | history, snapshot |
+| `POST /workbooks/:id/versions/:versionId/restore`, `DELETE …/:versionId` | restore, remove |
+
+Storage follows `coworkMindmaps` exactly: `cowork_workbooks` (record),
+`cowork_workbook_bodies` (grid), `cowork_workbook_versions` (snapshots), split
+so a listing does not read every grid. Membership is denormalised to
+`memberIds` for one `array-contains` query; every listing and version query
+sorts in memory so **no composite index is required**.
+
+Decisions worth knowing: a workbook you hold no grant on answers **404, not
+403** (matching mindmaps — a 403 confirms the id is real), except `/shares`,
+which answers 403 to a non-owner who can already open it. Saves use optimistic
+concurrency **inside a transaction** — the read-check and the revision bump must
+not be separable, or two tabs both read 4, both write 5, and one edit vanishes
+with no conflict reported. A restore is a **new** revision carrying old content,
+never a rewind, so an open editor's `baseRevision` can still conflict. Deletes
+are soft. Automatic snapshots are capped at 20 per workbook; **named versions
+are never pruned**.
+
+### Known limit
+
+The body is one Firestore document, refused above 900KB with a message naming
+the size — the same ceiling and the same refusal style as `coworkMindmaps`. A
+workbook that outgrows it needs the body split per sheet, which is a change to
+that file and to nothing above it. Not hit yet; a clear refusal was preferred to
+a partial write.
+
+### Verification
+
+- `node --check` on both files.
+- Router loaded in isolation against real config: all 12 routes register.
+- Booted `PORT=5099 node -r dotenv/config server.js`: `/cowork/workbooks`,
+  `/cowork/workbooks/:id/versions` now answer **401** (authenticated route
+  present) where they previously answered 404 — identical to `/cowork/mindmaps`.
+  Instance stopped afterwards.
+- **Not verified:** no signed-in end-to-end pass. No workbook has been created,
+  saved, shared or restored through a browser, and no Firestore document has
+  been written by this router. The dev server on :5000 was not listening during
+  this work, so the shipping instance has not yet loaded the route.
+
+---
+
 ## Store & Purchase — Chunk 1A: foundation, operational-PO pilot, authority corrections
 
 > **Chunk 1 is NOT complete.** This is 1A: the shared foundation, the

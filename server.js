@@ -2175,6 +2175,13 @@ app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 // drawing for everybody on the map, and that check has to be unskippable.
 app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 
+// Sheets: /cowork/workbooks. The Cowork client was migrated onto these paths
+// and this router was never written, so every call answered 404 and the Sheets
+// surface showed "0 sheets" under an error. Stored in Firestore beside every
+// other Cowork collection — before the migration workbooks lived on the Cowork
+// Next server's own disk, which does not survive a redeploy.
+app.use("/cowork", require("./routes/task_routes/coworkWorkbooks.js"));
+
 // Document notifications and version history: /cowork/documents/:id/*.
 // (Was written but never mounted — the notify-member route it already
 // carried was unreachable dead code until this line; version history is the
