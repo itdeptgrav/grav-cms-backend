@@ -85,4 +85,48 @@ async function reverseGeocode(lat, lng) {
   return result;
 }
 
-module.exports = { reverseGeocode };
+/* ── Forward search (place name → coordinates) ─────────────────────────────
+ * The other direction, for "jump the map to Patia" and for placing a zone by
+ * typing an address rather than hunting for it (6 Sep 2026). Same throttle
+ * chain and the same User-Agent, so the two directions share Nominatim's one
+ * request-per-second allowance instead of each spending it. Biased to India
+ * (`countrycodes=in`) — every rep this tracks is here, and an unqualified
+ * "Patia" otherwise returns a village in Poland first. */
+const NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search";
+const searchCache = new Map(); // normalised query → results
+
+async function callSearch(q) {
+  const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastCallAt));
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastCallAt = Date.now();
+  const res = await axios.get(NOMINATIM_SEARCH_URL, {
+    params: { format: "jsonv2", q, limit: 6, addressdetails: 1, countrycodes: "in" },
+    headers: { "User-Agent": USER_AGENT, "Accept-Language": "en" },
+    timeout: 8000,
+  });
+  return (res.data || []).map((r) => ({
+    lat: parseFloat(r.lat),
+    lng: parseFloat(r.lon),
+    displayName: r.display_name || "",
+    short: shorten(r.address, r.display_name || ""),
+    type: r.type || "",
+  }));
+}
+
+/** Resolve a typed place to candidate coordinates. Cached + throttled; [] on failure. */
+async function searchPlace(q) {
+  const key = String(q || "").trim().toLowerCase();
+  if (key.length < 2) return [];
+  if (searchCache.has(key)) return searchCache.get(key);
+  const result = await (chain = chain.then(
+    () => callSearch(key).catch(() => []),
+    () => callSearch(key).catch(() => []),
+  ));
+  if (result.length) {
+    if (searchCache.size >= 1000) searchCache.delete(searchCache.keys().next().value);
+    searchCache.set(key, result);
+  }
+  return result;
+}
+
+module.exports = { reverseGeocode, searchPlace };

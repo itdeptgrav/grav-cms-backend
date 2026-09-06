@@ -5543,3 +5543,365 @@ gone, drawer and hamburger restored (as Accounts has them), no overflow.
   **Sales measures identically**, so this predates and is unrelated to this
   change; it only became visible in PM again because the drawer came back. Left
   alone: it is in FrostShell, shared by ten departments.
+
+## Field tracking rebuilt as an evidence tool; WhatsApp templates shown as messages (6 Sep 2026)
+
+Explicit request: the tracking map "is not representing any strong thing or
+like any evidence or like proper logs which helps the owner"; "minimum 20
+features"; and in Contact Logs, template messages must show "like a normal
+message", not a "Template · name" chip over "Sent the X template".
+
+### The change — backend
+
+- `services/whatsappTemplates.js` (new): cached WABA template list;
+  `renderStoredText()` turns the two legacy `[template: name]` rows into the
+  template's real body (`{{n}}` → `…`). `whatsappSend.js` resolves a missing
+  `bodyText` from it so no new placeholder row can be written;
+  `routes/CMS_Routes/Sales/whatsapp.js` maps thread, conversation-preview and
+  for-lead reads through it. Stored rows are not rewritten.
+- `routes/fieldTracking.js`: `/sessions?from&to`, `/summary` (one row per
+  person per IST day, with visits and roster-matched calls), `/session/:id/calls`
+  (salesAuth; joins SalesPerson.employeeCode → normalizedPhone →
+  CallEvent.normalizedOwnerPhone), `PATCH /session/:id/notes`, zones CRUD,
+  visits upsert/list/delete (keyed session+stopFrom), `/places` (customers
+  learned from past tags — the CRM has 0 addresses with coordinates),
+  `/search` (Nominatim forward, India-biased), `POST /geocode/batch`. Session
+  delete now cascades to visits.
+- Models: `FieldZone`, `FieldVisit` (new); `FieldTrackingSession.notes`.
+- `reverseGeocode.service.js`: `searchPlace()` on the same 1 req/s chain.
+
+### The change — frontend (grav-clothing)
+
+`components/sales/field-tracking/fieldAnalytics.js` — pure, dependency-free:
+stops (closing at any silence over `gapMs`), trips, gaps, integrity flags
+(jump / frozen / zero-accuracy / clock), speed events, path-vs-device distance
+reconciliation, data quality, timeline segments, zone dwell, attendance,
+GPX/KML. `fieldAnalytics.test.mjs`: 17 tests, all pass under `npm test`.
+`FieldSessionDetail.js` rewritten: Summary · Timeline · Visits (tag a stop
+with customer/outcome/note, known-place suggestions) · Trips · Calls · Zones ·
+Gaps & flags · Quality · Log · Notes · Rules. New: `DayTimeline`,
+`AttentionPanel`, `ZonesManager`, `RangeReport` (per-day, attendance,
+leaderboard, trend), `FeatureGuide` (33 entries, what/why/how),
+`DayReportPDF` (letterhead via pdfChrome). Page: modes Live/Reports, map
+layers for zones/calls/gaps/flags, measure, nearest-reps, place search,
+replay speed, export CSV/GPX/KML, deep links.
+
+### Verified
+
+Real UI, CEO login. Template rows render as "Hi …, Your new account has been
+created successfully…" / "Hello," with no chip. Synthetic duty (walk → 25 m
+stop → drive with 95 km/h burst → 12 m stop → 20 m gap → return), created
+through the app's own write endpoints and deleted afterwards: 2 stops with
+reverse-geocoded addresses, 3 trips, 1 gap, 1 speed event, distance
+reconciled, attendance "left early", quality 83 %; visit tag saved and
+surfaced in `/places` and the summary; zone created by map click; Reports
+tiles/leaderboard/attendance/trend; PDF built
+(`field-day-Aroona_Panda-2026-09-06.pdf`); measure 6.87 km; copy-link; rules
+change recomputes (min stop 30 → Visits 0 → reset 2).
+
+### Two things worth recording
+
+- **Leaflet's SVG renderer sizes itself once.** A route drawn while the map
+  container is 0 px wide stays `width="0"`, every path `M0 0`, whatever the
+  container does later; `invalidateSize()` does not re-project. The page now
+  refuses to draw into a zero-width map and re-draws from a ResizeObserver —
+  coalesced with `setTimeout`, not `requestAnimationFrame`, because rAF is
+  starved in a hidden pane and that is precisely when the recovery must run.
+- `npm test` in grav-clothing: 1119/1125. The 6 failures are pre-existing
+  `ReferenceError`s in `components/budget/*` and `components/store/
+  deliveryFigures` source-text tests, untouched by this work.
+
+### Addendum — the person's position card (6 Sep 2026, later)
+
+Request: "properly showcase the current location / last location... proper
+human icon, with the name and all... as much as informative u can make".
+The end of a route was a purple heading arrow with a hover-only name.
+
+- Page: the last position is now a large human pin in the rep's colour with a
+  PERMANENT card (`positionCardHtml`): name + id, status (Live / Idle /
+  Signal lost / Waiting for GPS / Duty ended), place, "last seen HH:MM · N m
+  ago" (or "duty ended HH:MM · last position HH:MM"), speed, accuracy,
+  distance, on-duty time, and the zone it lies in. Live duties pulse; a known
+  bearing draws a compass badge on the pin. Un-selected live reps carry an
+  always-on name pill; the "Names" toggle hides pills for a crowded map. A
+  session with a last position but no route still gets the pin. The device's
+  own place name is preferred over the server geocode, matching the ping
+  route's stated policy. `nav-arrow-icon` is gone.
+- Backend: `FieldTrackingSession.lastSpeed/lastBearing/lastAccuracy` written
+  on every ping, so `/live` (the 8 s poll) carries what the socket push
+  already did — the heading badge no longer depends on a live socket.
+- Verified in the real UI on the one real session (ended, one fix) and on a
+  throwaway live duty created through the app's endpoints and deleted after:
+  poll-path pin shows pulse + "Heading 135°" + pill "Aroona Panda · Live,
+  just now"; selected card reads "Live · Nandankanan Road… · Last seen
+  12:11 pm · 1m ago · Speed 15 km/h · Accuracy ±11 m · Distance 2.30 km ·
+  On duty 25m".
+
+### Addendum — history, navigation certainty, map performance, layering (6 Sep 2026, later)
+
+Request: a proper end-to-end history for a finished trip ("where where area
+he covered"); clicks that always go to the person; a map that does not hang;
+dropdowns that never hide behind it; "so many features you skipped".
+
+- **Story of the day** (`narrative()` + Story tab): the duty as ordered
+  events with every name the page knows — started at X, travelled 7.08 km
+  in 15 m (top 95 km/h), stopped 25 m at Y (tagged / in zone / not tagged),
+  no signal 20 m, ended at Z — plus **Copy summary** as plain text and
+  **Areas covered** (a dozen route samples geocoded and collapsed to
+  localities in order). `deriveTrips` now splits a leg at a signal gap —
+  the test suite caught a leg silently swallowing a 15-minute silence.
+- **History tab**: the person's last 14 days from `/summary` (rows keep
+  `sessionIds` so a day opens with one click) with a delta against the
+  previous duty. **Unexplained stops** stat; **visits target** rule;
+  per-stop Google Maps link; speed sparkline; Reports **Export CSV**;
+  distance-from-Office on the card; **fullscreen**; keyboard (Esc, ← →,
+  space).
+- **Navigation certainty**: `selectPerson()` sets the view on every click,
+  repeat clicks included, and every move (`goTo`, `fitBounds`) is followed
+  by a settle check on a timer that snaps the map if an animation was cut
+  short. Verified through Leaflet's own projection: after a repeat click the
+  pin sits at container point (480, 280) — the centre.
+- **Performance**: `preferCanvas: true`; speed colouring draws one polyline
+  per colour (≤ 5) instead of one per fix (was 1,027 SVG paths for one
+  route); `selectedSession` is stable by content so the 8 s poll no longer
+  recomputes the scorecard and redraws every layer; live markers are
+  reconciled in place rather than rebuilt.
+- **Layering**: the map wrapper is `isolate z-0`, containing Leaflet's
+  z-indexes (200–1000); overlays inside are z-1100, page dropdowns z-1200.
+  The Export menu now hit-tests on top of the map.
+- **Two bugs found while verifying**: React rewrites a div's `class` when its
+  className prop changes, which wiped Leaflet's `leaflet-container` class
+  the first time Fullscreen was pressed (the map div's className is now
+  constant; sizing lives on the wrapper); and an earlier search-replace had
+  glued `z-[1200]` to the next class token, leaving the dropdown at z auto.
+
+`fieldAnalytics.test.mjs`: 20/20. Synthetic duty and all its tags deleted
+after verification.
+
+## Production Supervisor: offline-first Production Record, Orders section, nav trim; PM manufacturing-orders 500 fixed (6 Sep 2026)
+
+Explicit request: remove "Raw Item Uses" and "Device Wifi Change" from the
+supervisor portal; make Production Record user-friendly with **offline
+support** ("if the network got offline… the scans are gonna store in the
+localstorage… when network come the supervisor can sync"); add an **Orders**
+section — MO cards, click → that MO's work orders with how much is completed /
+remaining, "exactly as like happened in the qc dashboard"; formal UI; and fix
+the Project Manager dashboard where the MO pages showed nothing.
+
+### 1. PM "Manufacturing orders" register — 500 fixed (backend)
+
+`GET /api/cms/manufacturing/manufacturing-orders` answered **500 "Server error
+while fetching manufacturing orders"** on every request, so the PM register,
+the PM dashboard home (limit=5) and everything opened from them were empty.
+Cause: a half-merged handler in
+`routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes.js`
+— it called the new `listManufacturingOrders(req.query)` service and then fell
+through into the OLD inline pipeline, which referenced `matchQuery`, `status`,
+`skip`, `limitNum`, `pageNum` that no longer exist → `ReferenceError` → 500.
+(The merge `e7038b1` combined the service refactor with the 31 Aug
+`orderOrigin` badges.)
+
+- Handler is now wiring only: `res.json({ success: true, ...page })`.
+- The one thing the inline copy had that the service lacked — `orderOrigin`
+  (sampling / internal / testing / customer badge) — moved INTO the canonical
+  projection: `services/manufacturing/moListProjection.js` projects
+  `orderOrigin, isInternalOrder, sampleStyleId` and `projectRow` publishes
+  `orderOrigin: resolveOrderOrigin(r)` (`services/orderOrigin.js` is pure, so
+  the projection stays model-free).
+- Verified live with a CEO Bearer token: `?limit=3` → 200, 11 rows,
+  `orderOrigin` present; `page=abc`, `limit=0`, `search=(`, `status=bogus`,
+  `deadlineRisk=overdue` all 200; `/:id`, `/:id/detailed`,
+  `/emplloyeeTracking/:id`, `/:id/work-orders`, `/stats/overview`,
+  `/stats/production-trend`, `/:id/bulk-tracking`, `/:id/dispatch-history`
+  all 200. In the browser the PM register lists 11 orders with status /
+  priority / deadline filters and the PM dashboard shows its 5 recent MOs.
+- NOT run: `test/project-manager/*.route.test.js` — jest and
+  mongodb-memory-server are absent from this checkout's node_modules
+  (`npx jest` → "Cannot find module 'mongodb-memory-server'"). Run them once
+  devDependencies are installed.
+
+### 2. Supervisor nav (frontend)
+
+`components/ProductionSupervisor_DashboardLayout.js`: menu is now Overview ·
+Production Record · **Orders** · Live Production Tracker. "Raw Item Uses" and
+"Device Wifi Change" are gone and their pages deleted
+(`app/production-supervisor/dashboard/raw-item-tracker/`, `…/wifi-config/`);
+nothing else linked them (the cutting master keeps its own raw-item tracker).
+`/production-supervisor/dashboard/raw-item-tracker` now 404s.
+
+### 3. Orders section (backend + frontend)
+
+Backend, `routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js`
+(both behind `EmployeeAuthMiddleware`; the whole `/api/cms` prefix is in any
+case gated by `operations.js`'s router-level auth — see the gotcha below):
+
+- `GET /orders` — one card per Manufacturing Order rolled up from every
+  non-cancelled work order: `total, completed, remaining, today, extra,
+  percent, workOrdersCount, completedWorkOrders, inProgressWorkOrders,
+  notStartedWorkOrders, lastScanAt` + MO header (`requestId, customerName,
+  customerEmail, requestType, measurementName, status, createdAt, deadline`).
+  Work orders with no MO collect under `"unassigned"`, as /overview does.
+- `GET /orders/:moId` — that MO's work orders with the same figures plus
+  photo (`resolveProductImage`, same rule as QC), gender, reference, variants,
+  WO status, `assignedDeadline`, `lastScanAt/lastScannedBy`, `doneUnits`,
+  `pendingUnits` (the unit numbers still to make); `totals`; `trend` (units by
+  IST day of first scan); `contributors` (units by scannedBy).
+- What is counted: the `ProductionCompletionScanRecord` ledger — the same one
+  the barcode scanner writes to. COMPLETED = distinct unit numbers scanned
+  (any day) within 1..quantity; REMAINING = quantity − completed; TODAY =
+  units whose FIRST scan is in today's IST bucket; a unit number above the
+  ordered quantity is `extra`, never progress. One ledger read per request
+  (`loadScanIndex`, one doc per day).
+- `GET /ping` — reachability probe for the offline page (see 4).
+
+Frontend: `app/production-supervisor/dashboard/orders/page.js` (MO cards —
+header + state chip, customer, deadline, measurement tag, work-orders-done /
+units / last-scan row, progress bar + Completed · Remaining · Today · Ordered
+figures, "View work orders"; search; Still to make / Completed / All filter;
+"Across these orders" rollup) and `orders/[moId]/page.js` (MO head, "Where
+production stands", Day by day table, Who scanned, work-order cards with photo
+zoom, WO status, deadline risk, per-WO figures and an expandable "Units still
+to make" list shown as ranges, All / Not started / In production / Completed
+filter). Shared: `components/production-supervisor/ProductionProgress.js`
+(`ProductionProgressBar`, `FigureGrid`, `sumProduction`, `stateOf`,
+`STATE_META`) — the supervisor's counterpart of `components/qc/OrderProgress.js`,
+same shape on purpose. Built on `components/ceo/ui/Primitives` (neutral,
+formal), which the supervisor shell's `.grav-ui` root already supports.
+
+Verified in the browser as CEO: 11 MO cards (e.g. REQ-2026-0012 "1 / 19 done ·
+6 / 92 (7%) · 86 remaining"; REQ-2026-0011 "629 / 632 (100%)"); the MO page
+lists all 19 work orders with photos, references, sizes and "Units still to
+make (3)"; filter counts 17 / 1 / 1.
+
+### 4. Production Record — the previous page, with offline safety underneath
+
+An offline-first rebuild (status chips, sync history, auto-sync, a "how this
+works" panel, Primitives styling) shipped first and was rejected the same day
+— feedback: "this page need to change completely because as like previously
+it treats… these offline feature and all are just extra features… treat as
+like previously". So `app/production-supervisor/dashboard/production-record/page.js`
+is the previous page again — Barcode Scanner card, camera that closes after
+one read, manual entry, the scanned list, **Save Record (N)** → preview →
+confirm modal → save, the already-scanned / invalid result panels — and the
+offline support is only what was asked for:
+
+- The scanned list is kept in **localStorage** (`grav.productionRecord.queue.v1`,
+  via `components/production-supervisor/scanQueue.js` — `safeStorage`,
+  `loadQueue`, `saveQueue`; `scanQueue.test.mjs`, 5 tests). Scans survive a
+  reload, a closed tab and a dead connection; nothing about scanning touches
+  the network. Footer note: "Kept on this device until saved".
+- A small header pill — **Online** (grey) / **Server unreachable — scans kept
+  on this device** (amber) / **Offline — scans kept on this device** (red) —
+  from `navigator.onLine` + `online/offline` events + `GET /ping` every 30 s
+  (sent with the session, see the gotcha below).
+- Pressing **Save Record** without a connection loses nothing: the list
+  stays, and an amber message says "No connection right now. Your N scans are
+  saved on this device — press Save Record again once the network is back."
+  A network failure during preview or save says the same. The list is
+  cleared only when the server has answered for every code (recorded /
+  skipped / invalid).
+- `scannedBy` now carries the signed-in user's name (was blank for every
+  scanner entry), so the MO page's "Who scanned" is populated going forward.
+- Two modal texts corrected: already-recorded barcodes are *skipped by the
+  server, never counted twice* (the old copy said they would be duplicated).
+
+Verified in the browser as CEO: the page renders as before (header badge,
+scanner card, list, Save Record); added codes survive a reload; with the
+network simulated off, Save Record shows the amber kept-on-device message and
+the list stays; back online, Save Record → Confirm Save modal → save records
+the new codes, the list clears, the result panels show what was skipped /
+invalid. Test scans were removed from the ledger afterwards.
+
+### Gotcha recorded
+
+`app.use("/api/cms", productOperations)` in server.js (~line 1352) carries a
+router-level `EmployeeAuthMiddleware`, so every `/api/cms/**` route mounted
+after it needs the session even when its own file has no auth — an
+unauthenticated `GET …/production-completion/ping` answered 401. The record
+page therefore sends the session on the probe and reads 401/403 as "Signed
+out" rather than "unreachable".
+
+Frontend `node --test`: scanQueue 5/5, fieldAnalytics 20/20.
+
+## Work-order numbers were blank on every Project Manager screen (6 Sep 2026)
+
+Reported: "in the product manager side, the wo number are not showing… the mo
+view page, list page got affected" plus "keep an list view to showcase the wo
+in form of list".
+
+### The cause — a data gap, not a regression
+
+**Every one of the 143 work orders in the database has an empty
+`workOrderNumber`.** The model assigns one in a `pre("validate")` hook guarded
+on `isNew`, so it has never touched a single existing row; the model's own
+comment says as much ("production holds many with neither field… populating
+those records is a migration, deliberately separate"). That migration has never
+been run, and there is no counter, so the field has always been empty.
+
+Screens printing the field raw therefore showed nothing. On the PM's work-order
+panel it was worse than blank: `woReferenceLabel()` in
+`components/manufacturing/moWorkOrders.js` returns the literal string
+**"Work order — no number"** when the field is empty, which is what was on
+screen for all 19 rows of every order.
+
+This is unrelated to the manufacturing-orders 500 fixed earlier the same day —
+the list endpoint's fields are a strict superset of what the old inline
+pipeline projected (verified field by field), and it never carried work-order
+numbers at all.
+
+### The fix — resolve at the API boundary, one rule
+
+New `services/manufacturing/workOrderNumber.js`: `displayWorkOrderNumber(wo)`
+returns the stored number, else `WO-<last 8 of the _id>`; plus
+`withWorkOrderNumbers(rows)` for lists. Nothing writes to the database — if the
+migration is ever run, the stored value wins and the module stops mattering.
+
+**Why the short form and not `WorkOrder.canonicalNumber()`** (which returns
+`WO-<full ObjectId>` and is the right choice for a stored unique key, left
+untouched): every unit barcode is `WO-<last 8>-<unit>`, built and parsed that
+way by the scanner, the QC pipeline and the production ledger. Showing
+`WO-6a79a588da39e282a6b160a3` beside a label reading `WO-a6b16a8f-001` gives one
+work order two different numbers — worse than the blank it replaces. The model's
+own comment already calls the eight-character form "a PRESENTATION fallback".
+
+Applied to every endpoint a PM screen reads work orders from:
+
+| Endpoint | File |
+|---|---|
+| `GET /manufacturing-orders/:id` | manufacturingOrderRoutes.js |
+| `GET /manufacturing-orders/:id/detailed` | " |
+| `GET /manufacturing-orders/:id/work-orders` | " (also `/employeeTracking/:id/work-orders`; both needed `.lean()` added) |
+| `GET /manufacturing-orders/emplloyeeTracking/:id` | " — the detail page and every tab under it |
+| `GET /manufacturing-orders/:id/bulk-tracking` | " |
+| `GET /production-completion/manufacturing-orders/:moId` | productionCompletionRoutes.js — the PM Production tab |
+| `GET /employee-tracking/manufacturing-order/:id/employees` | employeeTrackingRoutes.js — published a literal `"—"` |
+
+The supervisor Orders route added earlier had its own inline
+`workOrderNumber || \`WO-${shortId}\`` — switched to the shared resolver so
+there is one definition of the number rather than two.
+
+Verified live, all eight sources: 19 rows each (1 for QC inspections, 12 for
+employee tracking), **0 blanks**, e.g. `WO-a6b16a8f`. In the browser the PM
+detail page shows real numbers on every card and row and **0** occurrences of
+"Work order — no number" (was 19); the register still lists 11 orders with no
+error.
+
+### The list view
+
+It already existed — `WorkOrdersPanel` renders `WorkOrderRow` when `view ===
+"list"`, wired to `woViewMode` on the page. It was hidden behind two unlabelled
+16px glyphs. `WorkOrderStats.js` now renders that switch as labelled pills —
+**Grid** / **List**, icon plus word — so the choice is visible. No behaviour
+change; `aria-label`, `aria-pressed` and the callbacks are as they were.
+Verified: clicking List switches to rows reading e.g. "WO-a6b16a8f · Scheduled ·
+F&B Service Shirt · Male · Size: 30 · — / 12 · View", and back to Grid.
+
+### Still outstanding
+
+The same empty field reaches other departments' screens through their own
+routers — `grep` finds ~10 more route files publishing `workOrderNumber` raw
+(CEO production and dispatch, cutting master, embroidery, stock items, barcode
+tracking, wastage). They were left alone: this change was scoped to the Project
+Manager side that was reported. The durable fix for all of them is either the
+model's migration (with a decision about which form to store) or applying the
+same resolver in each router.

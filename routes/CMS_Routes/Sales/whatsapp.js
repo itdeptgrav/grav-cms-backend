@@ -14,11 +14,18 @@ const { cfg, canSend, canReceive, graphBase } = require("../../../config/whatsap
 const { sendText, sendTemplate, WhatsAppError } = require("../../../services/whatsappSend");
 const { findOrCreateByPhone } = require("../../../services/whatsappStore");
 const { identityFor } = require("../../../services/customerIdentityLookup.service");
+const { getApprovedTemplates, withReadableText, renderStoredText, placeholderName } = require("../../../services/whatsappTemplates");
 
 router.use(salesAuth);
 
 const windowOpen = (c) => Boolean(c?.windowExpiresAt && new Date(c.windowExpiresAt) > new Date());
-const withWindow = (c) => ({ ...c, windowOpen: windowOpen(c) });
+// A conversation's `lastMessagePreview` can be a `[template: name]` placeholder
+// left by an old send — shown as the template's real words, same as the thread.
+const withWindow = (c) => ({
+  ...c,
+  windowOpen: windowOpen(c),
+  lastMessagePreview: placeholderName(c?.lastMessagePreview) ? renderStoredText(c.lastMessagePreview) : c?.lastMessagePreview,
+});
 const POP_ACCOUNT = ["accountId", "companyName accountId"];
 const POP_LEAD = ["leadId", "leadId firstName lastName company"];
 const digits = (v) => String(v || "").replace(/\D/g, "");
@@ -67,18 +74,10 @@ router.get("/status", async (req, res) => {
 router.get("/templates", async (req, res) => {
   if (!cfg.wabaId || !cfg.accessToken) return res.json({ success: true, templates: [] });
   try {
-    const r = await fetch(`${graphBase()}/${cfg.wabaId}/message_templates?fields=name,language,status,category,components&limit=200&access_token=${cfg.accessToken}`);
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ success: false, message: d?.error?.message || `Could not load templates (HTTP ${r.status}).` });
-    const templates = (d.data || [])
-      .filter((t) => t.status === "APPROVED")
-      .map((t) => {
-        const body = (t.components || []).find((c) => c.type === "BODY");
-        const bodyText = body?.text || "";
-        const varCount = new Set((bodyText.match(/\{\{\d+\}\}/g) || [])).size;
-        return { name: t.name, language: t.language, category: t.category, bodyText, varCount };
-      });
-    res.json({ success: true, templates });
+    // Shared, cached list — the same one the thread uses to render old
+    // placeholder rows, so the composer and the log can never disagree about
+    // what a template says.
+    res.json({ success: true, templates: await getApprovedTemplates() });
   } catch (e) {
     res.status(502).json({ success: false, message: e.message });
   }
@@ -127,6 +126,9 @@ router.get("/conversations", async (req, res) => {
       .sort({ lastMessageAt: -1, updatedAt: -1 })
       .limit(Math.min(Number(limit) || 50, 200))
       .populate(...POP_ACCOUNT).populate(...POP_LEAD).lean();
+    // Warm the template cache once if any preview still carries a placeholder,
+    // so `withWindow` can render it — a miss just falls back to the name.
+    if (rows.some((c) => placeholderName(c.lastMessagePreview))) await getApprovedTemplates().catch(() => {});
     res.json({ success: true, conversations: rows.map(withWindow) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -151,7 +153,9 @@ router.get("/conversations/:id/messages", async (req, res) => {
     const messages = await WhatsAppMessage.find({ conversationId: req.params.id })
       .sort({ timestamp: 1, createdAt: 1 })
       .limit(Math.min(Number(limit) || 100, 500)).lean();
-    res.json({ success: true, messages });
+    // Old `[template: name]` rows come back as the template's own words — the
+    // thread shows a message, never a description of one.
+    res.json({ success: true, messages: await withReadableText(messages) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -295,7 +299,7 @@ router.get("/for-lead", async (req, res) => {
       .sort({ timestamp: -1, createdAt: -1 })
       .limit(20)
       .lean();
-    return res.json({ success: true, conversationId: conv._id, messages });
+    return res.json({ success: true, conversationId: conv._id, messages: await withReadableText(messages) });
   } catch (err) {
     console.error("[crm/whatsapp] for-lead failed:", err);
     return res.status(500).json({ success: false, message: err.message });

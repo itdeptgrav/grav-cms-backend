@@ -21,6 +21,13 @@ const {
 const {
   summariseManufacturingOrder,
 } = require("../../../../services/manufacturing/moSummary.service");
+/* Every work order in the database has an empty `workOrderNumber` — the model
+   only assigns one to NEW records — so screens printing it raw showed a blank.
+   Resolved at the boundary; see services/manufacturing/workOrderNumber.js. */
+const {
+  withWorkOrderNumbers,
+  displayWorkOrderNumber,
+} = require("../../../../services/manufacturing/workOrderNumber");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -136,260 +143,7 @@ router.get("/", async (req, res) => {
        `?page=0`, `?limit=0`, `?limit=-5` and `?search=(` each used to answer 500
        from here, and an unbounded `?limit=` was honoured verbatim. */
     const page = await listManufacturingOrders(req.query);
-
-    const pipeline = [
-      { $match: matchQuery },
-
-      // Compute totalQuantity in-DB from items[].totalQuantity (no need to ship items)
-      {
-        $addFields: {
-          totalQuantity: {
-            $sum: {
-              $map: {
-                input: { $ifNull: ["$items", []] },
-                as: "it",
-                in: { $ifNull: ["$$it.totalQuantity", 0] }
-              }
-            }
-          }
-        }
-      },
-
-      // Join WO stats per MO in ONE query (replaces the per-MO countDocuments + aggregate)
-      {
-        $lookup: {
-          from: "workorders",
-          let: { reqId: "$_id" },
-          pipeline: [
-            { $match: { $expr: { $eq: ["$customerRequestId", "$$reqId"] } } },
-            {
-              $group: {
-                _id: null,
-                count: { $sum: 1 },
-                totalWoQty: { $sum: { $ifNull: ["$quantity", 0] } },
-                totalCompleted: {
-                  $sum: { $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }
-                },
-                cancelledCount: {
-                  $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] }
-                },
-                anyInProgress: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $or: [
-                          { $eq: ["$status", "in_progress"] },
-                          { $gt: [{ $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }, 0] }
-                        ]
-                      },
-                      1, 0
-                    ]
-                  }
-                },
-                scheduledCount: {
-                  $sum: {
-                    $cond: [
-                      { $in: ["$status", ["scheduled", "planned", "ready_to_start"]] },
-                      1, 0
-                    ]
-                  }
-                }
-              }
-            }
-          ],
-          as: "_woStats"
-        }
-      },
-      { $addFields: { _stats: { $arrayElemAt: ["$_woStats", 0] } } },
-
-      // Flatten + compute completion % at the MO level
-      {
-        $addFields: {
-          workOrdersCount: { $ifNull: ["$_stats.count", 0] },
-          _totalWoQty: { $ifNull: ["$_stats.totalWoQty", 0] },
-          _totalCompleted: { $ifNull: ["$_stats.totalCompleted", 0] },
-          _cancelledCount: { $ifNull: ["$_stats.cancelledCount", 0] },
-          _anyInProgress:  { $ifNull: ["$_stats.anyInProgress",  0] },
-          _scheduledCount: { $ifNull: ["$_stats.scheduledCount", 0] }
-        }
-      },
-      {
-        $addFields: {
-          completionPercentage: {
-            $cond: [
-              { $gt: ["$_totalWoQty", 0] },
-              {
-                $round: [
-                  { $multiply: [{ $divide: ["$_totalCompleted", "$_totalWoQty"] }, 100] },
-                  0
-                ]
-              },
-              0
-            ]
-          }
-        }
-      },
-
-      // Derive the MO status from WO progress
-      {
-        $addFields: {
-          derivedStatus: {
-            $switch: {
-              branches: [
-                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
-                {
-                  case: {
-                    $and: [
-                      { $gt: ["$workOrdersCount", 0] },
-                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
-                    ]
-                  },
-                  then: "cancelled"
-                },
-                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
-                { case: { $gte: ["$completionPercentage", 70] },  then: "about_to_finish" },
-                {
-                  case: {
-                    $or: [
-                      { $gt: ["$completionPercentage", 0] },
-                      { $gt: ["$_anyInProgress", 0] }
-                    ]
-                  },
-                  then: "in_progress"
-                },
-                {
-                  case: { $gt: ["$_scheduledCount", 0] },
-                  then: "on_production"
-                }
-              ],
-              default: "pending"
-            }
-          }
-        }
-      },
-
-      // PM-facing simplified status — collapse everything down to just
-      // pending / in_progress / completed (+ cancelled when it genuinely happened).
-      // Rule: any work order scheduled/planned/in-progress/etc. => "in_progress".
-      {
-        $addFields: {
-          displayStatus: {
-            $switch: {
-              branches: [
-                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
-                {
-                  case: {
-                    $and: [
-                      { $gt: ["$workOrdersCount", 0] },
-                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
-                    ]
-                  },
-                  then: "cancelled"
-                },
-                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
-                {
-                  case: {
-                    $or: [
-                      { $gt: ["$_scheduledCount", 0] },
-                      { $gt: ["$_anyInProgress", 0] },
-                      { $gt: ["$completionPercentage", 0] }
-                    ]
-                  },
-                  then: "in_progress"
-                }
-              ],
-              default: "pending"
-            }
-          }
-        }
-      },
-
-      // Apply simplified status filter if requested (pending/in_progress/completed/cancelled)
-      ...(status ? [{ $match: { displayStatus: status } }] : []),
-
-      // Paginate + count in one go
-      {
-        $facet: {
-          paginated: [
-            { $sort: { updatedAt: -1 } },
-            { $skip: skip },
-            { $limit: limitNum },
-            {
-              $project: {
-                _id: 1,
-                requestId: 1,
-                customerInfo: { name: 1, email: 1, deliveryDeadline: 1 },
-                estimatedCompletion: 1,
-                finalOrderPrice: 1,
-                totalQuantity: 1,
-                priority: 1,
-                createdAt: 1,
-                requestType: 1,
-                measurementName: 1,
-                // What KIND of order this is — sampling / internal / testing /
-                // a real customer's. Projected because anything absent here
-                // never reaches the UI, and the MO list badges on it
-                // (31 Aug 2026). `isInternalOrder` rides along so an older row
-                // written before `orderOrigin` existed can still be read as
-                // internal rather than silently badged as a customer order.
-                orderOrigin: 1,
-                isInternalOrder: 1,
-                sampleStyleId: 1,
-                workOrdersCount: 1,
-                completionPercentage: 1,
-                completedQuantity: "$_totalCompleted",
-                status: "$derivedStatus",
-                displayStatus: 1
-              }
-            }
-          ],
-          totalCount: [{ $count: "count" }]
-        }
-      }
-    ];
-
-    const [result] = await CustomerRequest.aggregate(pipeline);
-    const rows = result?.paginated || [];
-    const total = result?.totalCount?.[0]?.count || 0;
-
-    const manufacturingOrders = rows.map((r) => ({
-      _id: r._id,
-      moNumber: `MO-${r.requestId}`,
-      customerInfo: {
-        name: r.customerInfo?.name || "N/A",
-        email: r.customerInfo?.email || "N/A",
-      },
-      finalOrderPrice: r.finalOrderPrice || 0,
-      totalQuantity: r.totalQuantity || 0,
-      workOrdersCount: r.workOrdersCount || 0,
-      completedQuantity: r.completedQuantity || 0,
-      completionPercentage: r.completionPercentage || 0,
-      status: r.status,
-      // Simplified 3-bucket status for card display (pending/in_progress/completed, +cancelled)
-      displayStatus: r.displayStatus || "pending",
-      priority: r.priority,
-      createdAt: r.createdAt,
-      requestType: r.requestType || "customer_request",
-      measurementName: r.measurementName || null,
-      deliveryDeadline: r.customerInfo?.deliveryDeadline || null,
-      estimatedCompletion: r.estimatedCompletion || null,
-      // What kind of order this is, resolved once server-side so the list, the
-      // detail page and the Project Manager's email cannot disagree — see
-      // services/orderOrigin.js for why older rows are inferred rather than
-      // read straight off the field.
-      orderOrigin: resolveOrderOrigin(r),
-    }));
-
-    res.json({
-      success: true,
-      manufacturingOrders,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        pages: Math.ceil(total / limitNum),
-      },
-    });
+    res.json({ success: true, ...page });
   } catch (error) {
     console.error("Error fetching manufacturing orders:", error);
     res.status(500).json({
@@ -439,7 +193,7 @@ router.get("/:id", async (req, res) => {
     // OPTIMIZED: Transform work orders for frontend
     const optimizedWorkOrders = workOrders.map((wo) => ({
       _id: wo._id,
-      workOrderNumber: wo.workOrderNumber,
+      workOrderNumber: displayWorkOrderNumber(wo),
       status: wo.status,
       quantity: wo.quantity,
       variantAttributes: wo.variantAttributes || [],
@@ -705,7 +459,7 @@ router.get("/:id/detailed", async (req, res) => {
 
       return {
         _id: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: status,
         derivedStatus: derivedStatus,
         quantity: workOrderQuantity,
@@ -895,11 +649,12 @@ router.get("/:id/work-orders", async (req, res) => {
       .populate("stockItemId", "name reference images")
       .populate("createdBy", "name email")
       .populate("plannedBy", "name email")
-      .sort({ createdAt: 1 });
+      .sort({ createdAt: 1 })
+      .lean();
 
     res.json({
       success: true,
-      workOrders,
+      workOrders: withWorkOrderNumbers(workOrders),
     });
   } catch (error) {
     console.error("Error fetching work orders:", error);
@@ -952,7 +707,8 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       .populate("stockItemId", "name reference genderCategory images variants")
       .populate("forwardedToVendor", "name vendorCode")
       .sort({ createdAt: 1 })
-      .lean();
+      .lean()
+      .then(withWorkOrderNumbers);
 
     // ── Stats ───────────────────────────────────────────────────────────────
     const totalWorkOrders = workOrders.length;
@@ -1158,11 +914,12 @@ router.get("/employeeTracking/:id/work-orders", async (req, res) => {
       .populate("stockItemId", "name reference images")
       .populate("createdBy", "name email")
       .populate("plannedBy", "name email")
-      .sort({ createdAt: 1 });
+      .sort({ createdAt: 1 })
+      .lean();
 
     res.json({
       success: true,
-      workOrders,
+      workOrders: withWorkOrderNumbers(workOrders),
     });
   } catch (error) {
     console.error("Error fetching work orders:", error);
@@ -1510,7 +1267,7 @@ router.get("/:id/bulk-tracking", async (req, res) => {
       const available = Math.max(0, completedQty - totalDisp);
       return {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
         productName: wo.stockItemId?.name || wo.stockItemName || "—",
         productRef: wo.stockItemId?.reference || wo.stockItemReference || "",

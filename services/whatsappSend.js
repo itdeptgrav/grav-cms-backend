@@ -72,12 +72,20 @@ function renderTemplateText(name, bodyText, components) {
 // An approved template — the way to (re)start a conversation outside the window.
 // `bodyText` (the template's body with {{n}} placeholders) is passed from the UI
 // so we can store the fully-rendered message in the chat, not a raw label.
-function sendTemplate(conv, { name, language = "en_US", components, bodyText } = {}, actor) {
+//
+// When the caller does NOT pass it, the body is looked up from the WABA's own
+// template list (services/whatsappTemplates.js, cached) before falling back to
+// the `[template: name]` placeholder. That fallback is what produced the rows
+// the chat showed as "Sent the "Test" template." — a description of a message
+// in place of the message — and this is the send-side half of making sure no
+// new row is ever written that way. The read side is `withReadableText()`.
+async function sendTemplate(conv, { name, language = "en_US", components, bodyText } = {}, actor) {
   if (!name) throw new WhatsAppError("A template name is required.", 400);
+  const body = bodyText || (await require("./whatsappTemplates").resolveBody(name));
   return sendMessage({
     conv,
     payload: { type: "template", template: { name, language: { code: language }, ...(components ? { components } : {}) } },
-    previewText: renderTemplateText(name, bodyText, components),
+    previewText: renderTemplateText(name, body, components),
     actor,
   });
 }

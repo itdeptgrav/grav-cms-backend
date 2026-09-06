@@ -166,16 +166,33 @@ router.post("/:id/summarize", salesAuth, async (req, res) => {
 
     const out = await summariseCall(rec);
     if (!out.ok) {
-      const status = out.reason === "no_transcript" || out.reason === "not_configured" ? 422 : 502;
-      return res.status(status).json({ success: false, reason: out.reason, message: out.message });
+      /* 422 = nothing this server can do about it (no audio, not configured,
+         the recording is a 2-second misdial). 502 = the provider let us down
+         and a retry might work. The button says which, so a user is never told
+         to "try again" on a call that will never have anything to summarise. */
+      const unprocessable = ["no_audio", "not_configured", "too_short", "too_long"].includes(out.reason);
+      return res.status(unprocessable ? 422 : 502).json({ success: false, reason: out.reason, message: out.message });
     }
 
     rec.aiSummary = out.summary;
     rec.aiSummaryModel = out.model;
     rec.aiSummaryAt = new Date();
+    /* The transcript is the expensive half of the audio pass — persisting it
+       means a re-summarise (or the transcript panel) never re-uploads the
+       audio. Only ever FILLS a blank: a transcript the device supplied is not
+       overwritten by ours, same rule `aiSummary` follows against `summary`. */
+    if (out.transcript && !(rec.transcription || "").trim()) rec.transcription = out.transcript;
     await rec.save();
 
-    return res.json({ success: true, cached: false, aiSummary: rec.aiSummary, aiSummaryAt: rec.aiSummaryAt });
+    return res.json({
+      success: true,
+      cached: false,
+      aiSummary: rec.aiSummary,
+      aiSummaryAt: rec.aiSummaryAt,
+      transcription: rec.transcription || null,
+      transcribed: Boolean(out.transcript),
+      source: out.source,
+    });
   } catch (error) {
     console.error("[crm/call-recordings] summarize failed:", error);
     return res.status(500).json({ success: false, message: error.message });
