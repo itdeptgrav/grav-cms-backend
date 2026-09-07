@@ -11,6 +11,13 @@ const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
 const { resolveOrderOrigin } = require("../../../../services/orderOrigin");
+/* Every work order in the database has an empty `workOrderNumber` — the model
+   only assigns one to NEW records — so screens printing it raw showed a blank.
+   Resolved at the boundary; see services/manufacturing/workOrderNumber.js. */
+const {
+  withWorkOrderNumbers,
+  displayWorkOrderNumber,
+} = require("../../../../services/manufacturing/workOrderNumber");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -401,7 +408,7 @@ router.get("/:id", async (req, res) => {
     // OPTIMIZED: Transform work orders for frontend
     const optimizedWorkOrders = workOrders.map((wo) => ({
       _id: wo._id,
-      workOrderNumber: wo.workOrderNumber,
+      workOrderNumber: displayWorkOrderNumber(wo),
       status: wo.status,
       quantity: wo.quantity,
       variantAttributes: wo.variantAttributes || [],
@@ -647,7 +654,7 @@ router.get("/:id/detailed", async (req, res) => {
 
       return {
         _id: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: status,
         derivedStatus: derivedStatus,
         quantity: totalQuantity,
@@ -827,11 +834,12 @@ router.get("/:id/work-orders", async (req, res) => {
       .populate("stockItemId", "name reference images")
       .populate("createdBy", "name email")
       .populate("plannedBy", "name email")
-      .sort({ createdAt: 1 });
+      .sort({ createdAt: 1 })
+      .lean();
 
     res.json({
       success: true,
-      workOrders,
+      workOrders: withWorkOrderNumbers(workOrders),
     });
   } catch (error) {
     console.error("Error fetching work orders:", error);
@@ -884,7 +892,8 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       .populate("stockItemId", "name reference genderCategory images variants")
       .populate("forwardedToVendor", "name vendorCode")
       .sort({ createdAt: 1 })
-      .lean();
+      .lean()
+      .then(withWorkOrderNumbers);
 
     // ── Stats ───────────────────────────────────────────────────────────────
     const totalWorkOrders = workOrders.length;
@@ -1080,11 +1089,12 @@ router.get("/employeeTracking/:id/work-orders", async (req, res) => {
       .populate("stockItemId", "name reference images")
       .populate("createdBy", "name email")
       .populate("plannedBy", "name email")
-      .sort({ createdAt: 1 });
+      .sort({ createdAt: 1 })
+      .lean();
 
     res.json({
       success: true,
-      workOrders,
+      workOrders: withWorkOrderNumbers(workOrders),
     });
   } catch (error) {
     console.error("Error fetching work orders:", error);
@@ -1337,7 +1347,7 @@ router.get("/:id/bulk-tracking", async (req, res) => {
       const available = Math.max(0, completedQty - totalDisp);
       return {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
         productName: wo.stockItemId?.name || wo.stockItemName || "—",
         productRef: wo.stockItemId?.reference || wo.stockItemReference || "",
@@ -1402,7 +1412,7 @@ router.get("/:id/bulk-dispatch-history/:woId", async (req, res) => {
     const wo = await WorkOrder.findById(woId).select("workOrderNumber bulkDispatchHistory").lean();
     if (!wo) return res.status(404).json({ success: false, message: "WO not found" });
     const history = [...(wo.bulkDispatchHistory || [])].reverse();
-    return res.json({ success: true, workOrderNumber: wo.workOrderNumber, history });
+    return res.json({ success: true, workOrderNumber: displayWorkOrderNumber(wo), history });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Server error" });
   }

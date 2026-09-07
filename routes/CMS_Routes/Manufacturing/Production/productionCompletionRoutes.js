@@ -6,6 +6,11 @@ const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
+/* Work orders carry no stored number (the model assigns one only to new
+   records), so a screen printing the field raw shows a blank — which is what
+   the Project Manager's production tab did. See
+   services/manufacturing/workOrderNumber.js. */
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const parseBarcode = (barcodeId) => {
@@ -491,7 +496,7 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
       const done = units.size;
       return {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         productName: wo.stockItemName || "—",
         total,
         done,
@@ -525,5 +530,306 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
+
+// ── GET /ping ────────────────────────────────────────────────────────────────
+// A reachability probe for the Production Record page (6 Sep 2026). That page
+// keeps scans on the device while the network is away and offers "Sync" only
+// once THIS server answers — `navigator.onLine` knows whether the machine has
+// a network, not whether the API is reachable through it. Unauthenticated and
+// tiny on purpose: it answers one question and carries nothing.
+router.get("/ping", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ success: true, serverTime: new Date().toISOString() });
+});
+
+// ─── GET /orders, GET /orders/:moId ───────────────────────────────────────────
+//
+// THE SUPERVISOR'S BOOK OF ORDERS, MO FIRST (explicit request, 6 Sep 2026:
+// "showcase order section where the mo are gonna showcase and upon click on
+// any mo then the corresponding wo will gonna showcase so here the completion
+// details we can get to see ki how much production completion happened...
+// exactly as like happened in the qc dashboard"). Same shape as QC's
+// /orders → /orders/:moId (qcRoutes.js): one card per Manufacturing Order
+// (== CustomerRequest, `WorkOrder.customerRequestId` is the FK) rolling up
+// every work order under it; opening one lists that MO's own work orders.
+//
+// What is COUNTED is different from QC's. QC counts inspection outcomes; this
+// counts the production-completion scan ledger — the very same
+// ProductionCompletionScanRecord the barcode scanner on this dashboard writes
+// to — so a supervisor reads back exactly what has been scanned as finished,
+// not a separately-tracked number. Three figures per work order, one garment
+// in exactly one of the first two:
+//   COMPLETED  distinct unit numbers scanned (any day, ever) within 1..quantity
+//   REMAINING  ordered quantity minus completed
+//   TODAY      units whose FIRST scan landed in today's IST bucket
+// A unit number beyond the ordered quantity (a re-issued or over-produced work
+// order) is reported separately as `extra` and never inflates the percentage.
+//
+// A work order with no `customerRequestId` collects under a synthetic
+// "unassigned" card — the same convention /overview and QC's book already use.
+
+const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+
+// Mirrors qcRoutes.js resolveProductImage — duplicated locally, matching how
+// this file already keeps its own copy of parseBarcode rather than sharing.
+const resolveProductImage = (wo, siMap) => {
+  if (!wo) return null;
+  const si = wo.stockItemId ? siMap.get(wo.stockItemId.toString()) : null;
+  if (!si) return null;
+  if (wo.variantAttributes?.length && si.variants?.length) {
+    const match = si.variants.find((v) =>
+      (v.attributes || []).length > 0 &&
+      (v.attributes || []).every((va) =>
+        wo.variantAttributes.some(
+          (woAttr) =>
+            woAttr.name?.toLowerCase() === va.name?.toLowerCase() &&
+            String(woAttr.value).toLowerCase() === String(va.value).toLowerCase(),
+        ),
+      ),
+    );
+    if (match?.images?.[0]) return match.images[0];
+  }
+  const anyVariantImage = (si.variants || []).find((v) => v.images?.[0]);
+  return si.images?.[0] || anyVariantImage?.images?.[0] || null;
+};
+
+/** Every scan ever recorded, indexed work-order short id → unit number →
+ *  { at, by } of its FIRST scan. One read of the ledger per request; the
+ *  ledger is one document per day, so this stays small. */
+async function loadScanIndex() {
+  const docs = await ProductionCompletionScanRecord.find({}).select("date scans").lean();
+  const byShortId = new Map();
+  for (const doc of docs) {
+    for (const s of doc.scans || []) {
+      const p = parseBarcode(s.barcodeId);
+      if (!p.success) continue;
+      if (!byShortId.has(p.woShortId)) byShortId.set(p.woShortId, new Map());
+      const units = byShortId.get(p.woShortId);
+      const at = s.scannedAt ? new Date(s.scannedAt) : (doc.date ? new Date(doc.date) : null);
+      const prev = units.get(p.unitNumber);
+      if (!prev || (at && prev.at && at < prev.at)) units.set(p.unitNumber, { at, by: s.scannedBy || "" });
+    }
+  }
+  return byShortId;
+}
+
+const istDayKey = (d) => new Date(d.getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+/** Every non-cancelled work order matching `extraQuery`, with its production
+ *  figures attached. `withDetail: true` adds the photo, gender, reference and
+ *  the unit-number lists — worth the StockItem batch only where a card shows
+ *  them (the per-MO list), not the MO rollup. */
+async function computeWorkOrderProduction(extraQuery = {}, { withDetail = false } = {}) {
+  const workOrders = await WorkOrder.find({ status: { $ne: "cancelled" }, ...extraQuery })
+    .select("workOrderNumber quantity stockItemName stockItemReference stockItemId variantAttributes customerName status createdAt customerRequestId assignedDeadline")
+    .sort({ createdAt: -1 })
+    .lean();
+  if (!workOrders.length) return [];
+
+  let siMap = new Map();
+  if (withDetail) {
+    const stockItemIds = [...new Set(workOrders.map((wo) => wo.stockItemId?.toString()).filter(Boolean))];
+    const stockItems = stockItemIds.length
+      ? await StockItem.find({ _id: { $in: stockItemIds } })
+        .select("images genderCategory variants.images variants.attributes").lean()
+      : [];
+    siMap = new Map(stockItems.map((si) => [si._id.toString(), si]));
+  }
+
+  const index = await loadScanIndex();
+  const todayStart = getISTMidnight(new Date());
+  const todayEnd = new Date(todayStart);
+  todayEnd.setDate(todayEnd.getDate() + 1);
+
+  return workOrders.map((wo) => {
+    const shortId = wo._id.toString().slice(-8);
+    const units = index.get(shortId) || new Map();
+    const total = wo.quantity || 0;
+
+    let completed = 0, extra = 0, today = 0, lastScanAt = null, lastScannedBy = "";
+    const doneUnits = [];
+    for (const [unit, meta] of units) {
+      if (unit > total) { extra++; continue; }
+      completed++;
+      doneUnits.push(unit);
+      if (meta.at && meta.at >= todayStart && meta.at < todayEnd) today++;
+      if (meta.at && (!lastScanAt || meta.at > lastScanAt)) { lastScanAt = meta.at; lastScannedBy = meta.by; }
+    }
+    const remaining = Math.max(0, total - completed);
+    const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    const state = total > 0 && completed >= total ? "completed" : completed > 0 ? "in_progress" : "not_started";
+
+    const row = {
+      workOrderId: String(wo._id),
+      workOrderNumber: displayWorkOrderNumber(wo),
+      shortId,
+      customerRequestId: wo.customerRequestId ? String(wo.customerRequestId) : null,
+      productName: wo.stockItemName || "—",
+      customerName: wo.customerName || "—",
+      status: wo.status,
+      assignedDeadline: wo.assignedDeadline || null,
+      total,
+      completed,
+      remaining,
+      today,
+      extra,
+      percent,
+      state,
+      lastScanAt,
+    };
+    if (withDetail) {
+      doneUnits.sort((a, b) => a - b);
+      const doneSet = new Set(doneUnits);
+      const pendingUnits = [];
+      for (let u = 1; u <= total; u++) if (!doneSet.has(u)) pendingUnits.push(u);
+      Object.assign(row, {
+        stockItemReference: wo.stockItemReference || null,
+        variantAttributes: wo.variantAttributes || [],
+        productImage: resolveProductImage(wo, siMap),
+        genderCategory: (wo.stockItemId && siMap.get(wo.stockItemId.toString())?.genderCategory) || null,
+        createdAt: wo.createdAt || null,
+        lastScannedBy,
+        doneUnits,
+        pendingUnits,
+        // Day-by-day, for this work order alone: when its units were first
+        // scanned. The MO page sums these into its own trend.
+        byDay: [...units.entries()]
+          .filter(([unit, meta]) => unit <= total && meta.at)
+          .reduce((acc, [, meta]) => {
+            const key = istDayKey(meta.at);
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {}),
+        contributors: [...units.entries()]
+          .filter(([unit]) => unit <= total)
+          .reduce((acc, [, meta]) => {
+            const who = (meta.by || "").trim() || "Unrecorded";
+            acc[who] = (acc[who] || 0) + 1;
+            return acc;
+          }, {}),
+      });
+    }
+    return row;
+  });
+}
+
+const ZERO_FIGURES = { total: 0, completed: 0, remaining: 0, today: 0, extra: 0 };
+
+const moHeader = (mo, key) => ({
+  manufacturingOrderId: key,
+  requestId: mo?.requestId || (key === "unassigned" ? "Unassigned" : `MO-${key.slice(-6)}`),
+  customerName: mo?.customerInfo?.name || "—",
+  customerEmail: mo?.customerInfo?.email || null,
+  requestType: mo?.requestType || null,
+  measurementName: mo?.measurementName || null,
+  status: mo?.status || null,
+  createdAt: mo?.createdAt || null,
+  // The same choice the register makes: the delivery deadline, else the estimate.
+  deadline: mo?.customerInfo?.deliveryDeadline || mo?.deliveryDeadline || mo?.estimatedCompletion || null,
+});
+
+const MO_FIELDS = "requestId customerInfo requestType measurementName status createdAt deliveryDeadline estimatedCompletion";
+
+// GET /orders — one card per Manufacturing Order, production completion rolled
+// up across every work order under it.
+router.get("/orders", EmployeeAuthMiddleware, async (_req, res) => {
+  try {
+    const perWo = await computeWorkOrderProduction();
+    if (!perWo.length) return res.json({ success: true, manufacturingOrders: [] });
+
+    const moIds = [...new Set(perWo.map((o) => o.customerRequestId).filter(Boolean))];
+    const mos = await CustomerRequest.find({ _id: { $in: moIds } }).select(MO_FIELDS).lean();
+    const moMap = new Map(mos.map((m) => [String(m._id), m]));
+
+    const rollups = new Map();
+    for (const o of perWo) {
+      const key = o.customerRequestId || "unassigned";
+      if (!rollups.has(key)) {
+        rollups.set(key, {
+          ...ZERO_FIGURES,
+          workOrdersCount: 0, completedWorkOrders: 0, inProgressWorkOrders: 0, notStartedWorkOrders: 0,
+          lastScanAt: null,
+        });
+      }
+      const r = rollups.get(key);
+      r.workOrdersCount++;
+      for (const f of Object.keys(ZERO_FIGURES)) r[f] += o[f];
+      if (o.state === "completed") r.completedWorkOrders++;
+      else if (o.state === "in_progress") r.inProgressWorkOrders++;
+      else r.notStartedWorkOrders++;
+      if (o.lastScanAt && (!r.lastScanAt || o.lastScanAt > r.lastScanAt)) r.lastScanAt = o.lastScanAt;
+    }
+
+    const manufacturingOrders = [...rollups.entries()].map(([key, r]) => {
+      const mo = key === "unassigned" ? null : moMap.get(key);
+      return {
+        ...moHeader(mo, key),
+        ...r,
+        percent: r.total ? Math.min(100, Math.round((r.completed / r.total) * 100)) : 0,
+      };
+    }).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    res.json({ success: true, manufacturingOrders });
+  } catch (err) {
+    console.error("[Production orders] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /orders/:moId — the work orders under one Manufacturing Order, each with
+// its own figures and unit lists, plus the MO's day-by-day trend and who
+// scanned. `moId` is "unassigned" for the synthetic card, else a
+// CustomerRequest _id.
+router.get("/orders/:moId", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { moId } = req.params;
+    const isUnassigned = moId === "unassigned";
+    if (!isUnassigned && !mongoose.Types.ObjectId.isValid(moId)) {
+      return res.status(400).json({ success: false, message: "That is not a valid order id." });
+    }
+
+    const [orders, mo] = await Promise.all([
+      computeWorkOrderProduction(
+        isUnassigned
+          ? { $or: [{ customerRequestId: null }, { customerRequestId: { $exists: false } }] }
+          : { customerRequestId: moId },
+        { withDetail: true },
+      ),
+      isUnassigned ? null : CustomerRequest.findById(moId).select(MO_FIELDS).lean(),
+    ]);
+
+    if (!isUnassigned && !mo) {
+      return res.status(404).json({ success: false, message: "That manufacturing order no longer exists." });
+    }
+
+    const totals = { ...ZERO_FIGURES, workOrdersCount: orders.length, completedWorkOrders: 0, inProgressWorkOrders: 0, notStartedWorkOrders: 0 };
+    const byDay = {};
+    const contributors = {};
+    for (const o of orders) {
+      for (const f of Object.keys(ZERO_FIGURES)) totals[f] += o[f];
+      if (o.state === "completed") totals.completedWorkOrders++;
+      else if (o.state === "in_progress") totals.inProgressWorkOrders++;
+      else totals.notStartedWorkOrders++;
+      for (const [day, n] of Object.entries(o.byDay || {})) byDay[day] = (byDay[day] || 0) + n;
+      for (const [who, n] of Object.entries(o.contributors || {})) contributors[who] = (contributors[who] || 0) + n;
+    }
+    totals.percent = totals.total ? Math.min(100, Math.round((totals.completed / totals.total) * 100)) : 0;
+
+    res.json({
+      success: true,
+      manufacturingOrder: moHeader(mo, isUnassigned ? "unassigned" : String(mo._id)),
+      totals,
+      orders: orders.map(({ byDay: _b, contributors: _c, ...rest }) => rest),
+      trend: Object.entries(byDay).map(([date, completedUnits]) => ({ date, completedUnits }))
+        .sort((a, b) => (a.date < b.date ? -1 : 1)),
+      contributors: Object.entries(contributors).map(([name, units]) => ({ name, units }))
+        .sort((a, b) => b.units - a.units),
+    });
+  } catch (err) {
+    console.error("[Production orders detail] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 
 module.exports = router;

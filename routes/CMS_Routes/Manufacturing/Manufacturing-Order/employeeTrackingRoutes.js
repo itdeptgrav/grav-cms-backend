@@ -12,6 +12,7 @@ const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufa
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 // ── NOTE: adjust this path to match your EmployeeMpc model location ──────────
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -95,7 +96,11 @@ async function buildEmployeeRecords(docs) {
       dispatchedBy:  doc.dispatchedBy || null,
       // identity fields
       workOrderId:          doc.workOrderId,
-      workOrderNumber:      wo?.workOrderNumber    || "—",
+      /* Was `|| "—"`: no work order carries a stored number, so the Project
+         Manager's Employee Tracking tab printed a dash for every row. The
+         resolver gives the same WO-<short id> the barcode and every other
+         screen use. See services/manufacturing/workOrderNumber.js. */
+      workOrderNumber:      displayWorkOrderNumber(wo) || "—",
       productName,
       productRef:           wo?.stockItemReference || "",
       variantName,

@@ -127,6 +127,26 @@ router.get("/recent", salesAuth, async (req, res) => {
     const { search, status, direction } = req.query;
 
     const filter = { startTime: { $gte: Date.now() - days * 86400000 } };
+
+    /* ── kind: phone calls vs in-person meeting recordings ──────────────────
+       5 Sep 2026, explicit request: "2 type of recording is showing in one
+       area ok, but it is needed to separate ok because the voice note needed
+       to create as an Meeting recordings ok, so these are needed to keep in
+       one more tab ok called Meetings".
+
+       Both live in CallEvent because both are "audio the sales team captured
+       against a contact", and splitting the COLLECTION would have re-created
+       the exact two-collections problem this schema's header describes fixing.
+       They are different things to READ, though — a missed call is a call
+       outcome, a voice note has no outcome at all — so the split is a filter
+       and two tabs, not two models.
+
+       Absent/blank `kind` means "call": every row written before the field
+       existed was a phone call, so treating null as "call" is a statement
+       about the data rather than a default. */
+    if (req.query.kind === "manual") filter.kind = "manual";
+    else if (req.query.kind === "call") filter.kind = { $ne: "manual" };
+
     if (direction && ["INCOMING", "OUTGOING"].includes(direction)) filter.direction = direction;
     if (status === "received") filter.received = true;
     else if (status === "rejected") filter.rejected = true;

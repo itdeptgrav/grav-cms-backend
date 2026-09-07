@@ -32,12 +32,26 @@ const fieldTrackingSessionSchema = new mongoose.Schema(
     lastLat: { type: Number, default: null },
     lastLng: { type: Number, default: null },
     lastPingAt: { type: Date, default: null },
+    // The rest of the newest fix, so the CMS's live poll can draw a heading
+    // badge and print speed/accuracy on a rep's card without a socket push
+    // (6 Sep 2026). Null on rows written before these existed.
+    lastSpeed: { type: Number, default: null }, // m/s
+    lastBearing: { type: Number, default: null }, // degrees
+    lastAccuracy: { type: Number, default: null }, // metres
 
     // Human place names (free reverse geocoding via OpenStreetMap Nominatim),
     // filled asynchronously so the CMS can show "where" without every row
     // hitting the geocoder itself.
     startPlaceName: { type: String, default: "" },
     lastPlaceName: { type: String, default: "" },
+
+    // A supervisor's remark on the day — "approved", "asked about the 2h gap",
+    // "rep says phone died" — written from the CMS, never by the device
+    // (6 Sep 2026). Kept on the session so it travels with the route in
+    // every report and export.
+    notes: { type: String, default: "", trim: true, maxlength: 2000 },
+    notesUpdatedAt: { type: Date, default: null },
+    notesUpdatedBy: { type: String, default: "", trim: true },
 
     source: { type: String, default: "gravemployeetracker" },
   },
