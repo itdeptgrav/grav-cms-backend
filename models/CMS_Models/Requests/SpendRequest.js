@@ -29,6 +29,12 @@
 // twelve times and writing down nothing.
 
 const mongoose = require("mongoose");
+/* One vocabulary for budget-head resolution, shared with the resolver and
+   the Finance APIs. A LEAF module on purpose: importing the resolver here
+   would register its mongoose models, and registering a model creates its
+   collection — which the baseline audit reads as "this feature is
+   deployed". See services/budgetAllocationVocabulary.js. */
+const budgetHead = require("../../../services/budgetAllocationVocabulary");
 
 /**
  * What is being asked for. Not a spend category — that is the account head.
@@ -122,10 +128,103 @@ const lineSchema = new mongoose.Schema(
        `whyNeeded`, which is the reason rather than the thing. Carried on the
        line because it belongs to the item, not to the request. */
     spec: { type: String, trim: true },
+
+    /* ── THE CATALOGUE ITEM THIS LINE WAS MATCHED TO ────────────────────────
+       When the requester picked the thing out of the store's catalogue — or
+       the store matched it during classification — the line knows which
+       RawItem it is, and the SKU and base unit as they stood then. Carried
+       here so the identity survives all the way to the purchase order rather
+       than being re-guessed from the item name.
+
+       All three are OPTIONAL and additive. A request typed directly, or one
+       raised before this existed, has them empty and converts on its name
+       alone exactly as it did — nothing about the existing fields changes. */
+    rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
+    rawItemSku: { type: String, trim: true, default: "" },
+    baseUnit: { type: String, trim: true, default: "" },
+
+    /* ── THE SERVICE MASTER RECORD THIS LINE WAS MATCHED TO ──────────────────
+       A service line, matched to the Service Master so the Request → Service →
+       Order chain is inspectable and the order can snapshot its code, billing
+       unit and SAC. Optional and additive: a free-text service line, or any
+       request raised before this existed, has them empty and is matched at
+       service-order creation time. `unit`/`quantity`/`rate`/GST are unchanged
+       — a service may be billed per visit, hour, month, licence or job, so
+       quantity is never forced to 1. */
+    service: { type: mongoose.Schema.Types.ObjectId, ref: "Service", default: null },
+    serviceCode: { type: String, trim: true, default: "" },
+    billingUnit: { type: String, trim: true, default: "" },
+    sacCode: { type: String, trim: true, default: "" },
+
     quantity: { type: Number, required: true, min: 0 },
     unit: { type: String, required: true, trim: true },
     rate: { type: Number, required: true, min: 0 },
     amount: { type: Number, required: true, min: 0 },
+
+/* ── FUTURE ITEM-WISE BUDGET ATTRIBUTION (INERT) ────────────────────────────
+   Where this line's own budget head will live once a request can charge
+   several unrelated items to several approved lines.
+
+   NOTHING READS THIS YET, and that is deliberate. The request-level
+   `ledgerId` / `budgetLineId` remain the single source of truth for
+   commitments, budget checks and actuals until a later chunk migrates the
+   workflow deliberately. Two authorities for "which budget is this?" running
+   at once is exactly the ambiguity this field exists to remove, so it is
+   added now — additively, so no existing document needs migrating — and left
+   unpopulated.
+
+   `status` is not derivable from `budgetLedgerId` alone. A null head means
+   "unresolved" when nobody has looked and "manual_selection_required" once a
+   human has been asked and has not answered, and the difference decides
+   whether a screen shows a prompt or a warning.
+
+   Vocabulary is shared with services/itemBudgetHead.service.js:
+   `resolutionSource` takes exactly its `source` values. */
+    budgetAllocation: {
+      type: new mongoose.Schema(
+        {
+          budgetLedgerId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Acc_Ledger",
+            default: null,
+          },
+          budgetLedgerName: { type: String, trim: true, default: "" },
+          /* ── THE ENUM COMES FROM THE RESOLVER, NOT FROM A LIST HERE ────
+             Three copies of these strings — this model, the intake model and
+             the service — drift one value at a time, and the drift shows up
+             as a stored document the schema then refuses to load. B2 added
+             `service_default` (a service's own configured head) and
+             `manual_selection` (a person chose, over or in the absence of any
+             rule); both arrive from the one place they are defined. */
+          resolutionSource: {
+            type: String,
+            enum: budgetHead.RESOLUTION_SOURCES,
+            default: budgetHead.SOURCE_NONE,
+          },
+          resolutionCategory: { type: String, trim: true, default: "" },
+          /* ── WHY A PERSON OVERRODE A CONFIGURED DEFAULT ─────────────────
+             Required by the route, not by the schema: a line that simply took
+             the service's own default has no reason to give, and making the
+             field mandatory would produce "n/a" on thousands of rows and
+             teach everyone to stop reading it. */
+          resolutionReason: { type: String, trim: true, default: "" },
+          selectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+          selectedByName: { type: String, trim: true, default: "" },
+          selectedAt: { type: Date, default: null },
+          status: {
+            type: String,
+            enum: budgetHead.RESOLUTION_STATUSES,
+            default: budgetHead.STATUS_UNRESOLVED,
+          },
+        },
+        { _id: false },
+      ),
+      /* Absent, not defaulted. Every request written before this chunk has no
+         allocation at all, and a default would manufacture an "unresolved"
+         decision on thousands of historical lines that nobody ever made. */
+      default: undefined,
+    },
+
 
     /* ── THE QUOTE THIS LINE WAS PRICED FROM ────────────────────────────────
        Commercial terms used to live only on the request, on the reasoning that
@@ -278,6 +377,22 @@ const spendRequestSchema = new mongoose.Schema(
        an approval that has one cannot be ordered again. */
     purchaseOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "PurchaseOrder" },
     purchaseOrderNumber: { type: String, trim: true },
+    /* ── THE RULES THIS REQUEST WAS RAISED UNDER ────────────────────────
+       Stamped by the server on every new SERVICE/SOFTWARE request, and never
+       accepted from a client. Its ABSENCE is what marks a genuinely legacy
+       request — one raised before service lines had to be classified before
+       finance — so there is deliberately NO default: defaulting it would
+       stamp every historical document on its next save and make it
+       unorderable through the legacy door it depends on.
+
+       See services/budgetAllocationVocabulary.js. */
+    serviceClassificationPolicy: { type: String, trim: true, default: undefined },
+
+    /* The service order raised from an approved SERVICE request — the same
+       both-directions link a purchase order has, so neither screen has to
+       search the other collection to answer "has this been ordered yet". */
+    serviceOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "ServiceOrder" },
+    serviceOrderNumber: { type: String, trim: true },
 
     requesterConfirmedAt: { type: Date },
     requesterConfirmedByName: { type: String, trim: true },

@@ -47,6 +47,13 @@ const EmployeeAuthMiddleware = (req, res, next) => {
       deptId: decoded.deptId || null,
       deptSlug: decoded.deptSlug || "",
       isAdmin: Boolean(decoded.isAdmin),
+      // Set only on the short-lived token services/changeRequests mints when an
+      // approver's decision is replayed against this server. Carried through
+      // because a ROUTE-level approval guard runs after this middleware has
+      // already rebuilt `req.user`, so this is the only copy of the claim it can
+      // see. Purely additive: nothing that ignored it reads it now, and it is
+      // null for every ordinary session.
+      replayOf: decoded.replayOf || null,
     };
 
     next();

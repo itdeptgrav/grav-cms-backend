@@ -81,6 +81,13 @@ function seedIdentity(req) {
     role: decoded.role,
     isAdmin: Boolean(decoded.isAdmin),
     deptSlug: decoded.deptSlug || "",
+    /* Carried because this guard runs BEFORE the router's own authentication,
+       so on a mount-level approval check this object is the only thing
+       requireApproval has to read the claim from. Dropping it here would make
+       a genuine approved replay look like an ordinary editor write and hold it
+       a second time, which is the "approving creates another pending request"
+       loop. It comes out of a signature-checked token above. */
+    replayOf: decoded.replayOf || null,
   };
 }
 

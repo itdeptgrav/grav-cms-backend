@@ -6,6 +6,30 @@ const router   = express.Router();
 const mongoose = require("mongoose");
 
 const EmployeeAuthMiddleware     = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+
+/**
+ * The scan identity for a unit of a work order: `WO-<short id>-<unit>`.
+ *
+ * Built from `_id`, NOT from `workOrderNumber`, and the difference matters.
+ * Since Chunk 4A.2 every work order carries a canonical
+ * `workOrderNumber = WO-<full 24-character ObjectId>`; the scan subsystem is a
+ * separate identity that is built from `_id.toString().slice(-8)` everywhere
+ * (packagingRoutes.js:1249, productionCompletionRoutes.js:331,
+ * embroideryRoutes.js:42, manufacturingOrderRoutes.js:113,
+ * markAsDoneRoutes.js:113) and RESOLVED the same way at 11 call sites.
+ *
+ * Composing a scan barcode from the canonical number produces a string that
+ * parses cleanly — `parts.length >= 3 && parts[0] === "WO"` — and then resolves
+ * to no work order at all, because the resolvers compare against the last eight
+ * characters. A barcode that parses and resolves to nothing is a worse failure
+ * than one that is rejected outright, which is what this call site produced
+ * before 4A.2 (`undefined-001`).
+ *
+ * The format itself is unchanged; only the identifier fed into it.
+ */
+function scanBarcodeFor(workOrderId, unitNumber) {
+  return `WO-${workOrderId.toString().slice(-8)}-${String(unitNumber).padStart(3, "0")}`;
+}
 const ReturnRequest              = require("../../../../models/CMS_Models/Manufacturing/Return/ReturnRequest");
 const CustomerRequest            = require("../../../../models/Customer_Models/CustomerRequest");
 const WorkOrder                  = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
@@ -347,7 +371,7 @@ router.post("/:id/create-mo", async (req, res) => {
         for (const person of woEntry.persons) {
           const unitStart = unitCursor, unitEnd = unitCursor + person.qty - 1;
           const barcodes = [];
-          for (let u = unitStart; u <= unitEnd; u++) barcodes.push(`${woEntry.woDoc.workOrderNumber}-${u.toString().padStart(3, "0")}`);
+          for (let u = unitStart; u <= unitEnd; u++) barcodes.push(scanBarcodeFor(woEntry.woDoc._id, u));
           try { await EmployeeProductionProgress.findOneAndUpdate({ workOrderId: woEntry.woDoc._id, employeeId: person.employeeId }, { $set: { measurementId: newMeasurement._id, manufacturingOrderId: newRequest._id, employeeName: person.employeeName, employeeUIN: person.employeeUIN || "", gender: person.gender || "", unitStart, unitEnd, totalUnits: person.qty, assignedBarcodeIds: barcodes, completedUnits: 0, completedUnitNumbers: [], completionPercentage: 0, packagedUnits: 0, isFullyPackaged: false, isDispatched: false, lastSyncedAt: new Date() } }, { upsert: true, new: true }); }
           catch (e) { console.error(`Progress doc error for ${person.employeeName}:`, e.message); }
           unitCursor = unitEnd + 1;
@@ -394,3 +418,6 @@ router.post("/:id/create-mo", async (req, res) => {
 });
 
 module.exports = router;
+/* Exposed for test only — see test/project-manager/return-barcode-identity.route.test.js.
+   Mirrors the `__hooks` convention in routes/CMS_Routes/Inventory/Operations/returnRequests.js. */
+module.exports.__scanBarcodeFor = scanBarcodeFor;

@@ -311,6 +311,60 @@ async function uploadAudioToDrive(chunkFiles, baseFileName, mimeType, meetId) {
   };
 }
 
+// ── Helper: an id that is safe to use as ONE path segment ────────────────────
+/**
+ * Ids in this file arrive from request bodies, query strings and guest
+ * sessions, and every one of them used to be concatenated straight into a
+ * filesystem path. `path.join` RESOLVES `..` rather than rejecting it, so a
+ * `meetId` of `"../../.."` walked out of TMP_BASE — and because the finalize
+ * paths below end in `fs.rmSync(dir, { recursive: true, force: true })`, an
+ * escaped path was a recursive delete of somebody else's directory.
+ *
+ * `/cowork/audio/beacon-finalize` made that reachable without a token at all:
+ * it is called by `navigator.sendBeacon` on unload, which cannot set an
+ * Authorization header, so the route is deliberately unauthenticated. An
+ * unauthenticated destructive path traversal is the worst shape a bug can take,
+ * and it is closed here rather than at one call site, because there are
+ * eighteen call sites and the next one added would have missed it.
+ *
+ * The rule is deliberately narrow: ids in this product are Firestore document
+ * ids and employee ids, which are alphanumerics with `-` and `_`. Anything else
+ * — a separator, a dot, a control character, an over-long string — is not an id
+ * we issued, so there is no legitimate caller to preserve.
+ */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function safeSegment(value, label) {
+  const s = String(value ?? "");
+  if (!SAFE_ID.test(s)) {
+    throw Object.assign(new Error(`Unsafe ${label}: ${JSON.stringify(s).slice(0, 80)}`), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return s;
+}
+
+/**
+ * Build a path under TMP_BASE and prove it stayed there.
+ *
+ * The segment validation above is the real guard; this is the backstop that
+ * makes an escape impossible rather than merely unlikely, so a future caller
+ * that forgets to validate still cannot reach outside the temp root.
+ */
+function containedPath(...segments) {
+  const joined = path.join(TMP_BASE, ...segments);
+  const resolved = path.resolve(joined);
+  const root = path.resolve(TMP_BASE);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw Object.assign(new Error("Path escaped the audio temp root"), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return resolved;
+}
+
 // ── Helper: get chunk dir for a user ─────────────────────────────────────────
 function getChunkDir(meetId, employeeId) {
   return containedPath(safeSegment(meetId), safeSegment(employeeId));

@@ -3553,3 +3553,124 @@ describe("requoting replaces the vendor id along with the vendor name", () => {
     expect(String(spend.items[0].vendorId)).not.toBe(String(oldVendor._id));
   });
 });
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * CATALOGUE IDENTITY, ALL THE WAY THROUGH THE REAL PATH
+ *
+ * The regex/source and already-shaped-line tests never exercised the actual
+ * classification path. This one does: a matched IntakeRequest line, classified
+ * as a purchase, becomes a SpendRequest, is approved by finance, and is
+ * converted to a product PO. The RawItem id, its SKU and its base unit must be
+ * the SAME across all three stored documents.
+ * ═════════════════════════════════════════════════════════════════════════ */
+describe("a matched item's identity survives intake → spend → purchase order", () => {
+  const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+
+  /* Confirm what Store found, send it to finance, and have finance approve —
+     the three spend-side steps between classification and conversion. */
+  async function toApproved(s, spendId) {
+    const conf = await call(s.emp, `/${spendId}/confirm`, {
+      method: "PATCH", app: "spend", body: { lines: { 0: { confirm: true } } },
+    });
+    if (conf.status !== 200) console.error("confirm refused:", conf.body);
+    const sent = await call(s.store, `/${spendId}/send-to-finance`, {
+      method: "PATCH", app: "spend", body: {},
+    });
+    if (sent.status !== 200) console.error("send refused:", sent.body);
+    const app = await call(s.fin, `/${spendId}/approve`, { method: "PATCH", app: "spend", body: {} });
+    if (app.status !== 200) console.error("approve refused:", app.body);
+    return app;
+  }
+
+  test("full purchase: the same RawItem id, SKU and base unit reach the PO line", async () => {
+    const s = await seed();
+    /* customUnit distinct from unit, so the base-unit assertion is meaningful. */
+    const item = await RawItem.create({
+      name: "Logitech Mouse", sku: "SKU-MOUSE-1", unit: "pcs", customUnit: "Box", quantity: 20,
+    });
+
+    /* The requester PICKED it out of the catalogue — buildLines resolves the
+       match onto the intake line. */
+    const { id } = await askAndApprove(s, {
+      items: [{ name: "A good mouse", quantity: 4, unit: "pcs", rate: 500, rawItemId: String(item._id) }],
+    });
+
+    /* Stage 1 — the IntakeRequest line carries the matched identity. */
+    const intake = await IntakeRequest.findById(id).lean();
+    expect(String(intake.items[0].rawItem)).toBe(String(item._id));
+    expect(intake.items[0].rawItemSku).toBe("SKU-MOUSE-1");
+    expect(intake.items[0].baseUnit).toBe("Box");
+
+    /* Store classifies the whole requirement as a purchase, with a vendor. */
+    const vendor = await Vendor.create({ companyName: "Mouse Mill", companyId: s.company._id });
+    const cls = await call(s.store, `/${id}/classify`, {
+      method: "PATCH",
+      body: { kind: "purchase", lines: { 0: { rate: 500, vendorId: String(vendor._id), vendorName: "Mouse Mill" } } },
+    });
+    expect(cls.status).toBe(200);
+
+    /* Stage 2 — the SpendRequest line preserves the identity. */
+    const saved = await IntakeRequest.findById(id).lean();
+    const spendId = saved.spendRequestId;
+    const spend = await SpendRequest.findById(spendId).lean();
+    expect(String(spend.items[0].rawItem)).toBe(String(item._id));
+    expect(spend.items[0].rawItemSku).toBe("SKU-MOUSE-1");
+    expect(spend.items[0].baseUnit).toBe("Box");
+    expect(spend.items[0].quantity).toBe(4);
+
+    /* Finance approves, then Store converts to a product PO. */
+    const approved = await toApproved(s, spendId);
+    expect(approved.status).toBe(200);
+    expect(approved.body.request.status).toBe("approved");
+
+    const conv = await call(s.store, `/${spendId}/purchase-order`, { method: "POST", app: "spend", body: {} });
+    expect(conv.status).toBe(201);
+
+    /* Stage 3 — the PO line carries the same identity, unchanged. */
+    const po = await PurchaseOrder.findOne({ spendRequestId: spendId }).lean();
+    expect(String(po.items[0].rawItem)).toBe(String(item._id));
+    expect(po.items[0].sku).toBe("SKU-MOUSE-1");
+    expect(po.items[0].baseUnit).toBe("Box");
+    expect(po.items[0].quantity).toBe(4);
+  });
+
+  test("partial stock: only the buy balance changes quantity; the identity is unchanged", async () => {
+    const s = await seed();
+    const item = await RawItem.create({
+      name: "Cutting Blade", sku: "SKU-BLADE-9", unit: "pcs", customUnit: "Strip", quantity: 8,
+    });
+    /* Ask for 20 of a matched item the shelf only has 8 of. */
+    const { id } = await askAndApprove(s, {
+      items: [{ name: "Cutting blades", quantity: 20, unit: "pcs", rate: 100, rawItemId: String(item._id) }],
+    });
+
+    /* Store issues the 8 it holds and buys the 12-unit balance — same item. */
+    const cls = await call(s.store, `/${id}/classify`, {
+      method: "PATCH",
+      body: { lines: { 0: { rawItemId: String(item._id), issueQty: 8, rate: 100 } } },
+    });
+    expect(cls.status).toBe(200);
+    const saved = await IntakeRequest.findById(id).lean();
+    expect(saved.fulfilmentKind).toBe("partial");
+
+    const spend = await SpendRequest.findById(saved.spendRequestId).lean();
+    /* Only the BUY balance is on the spend request. */
+    expect(spend.items[0].quantity).toBe(12);
+    /* Identity is unchanged by the split. */
+    expect(String(spend.items[0].rawItem)).toBe(String(item._id));
+    expect(spend.items[0].rawItemSku).toBe("SKU-BLADE-9");
+    expect(spend.items[0].baseUnit).toBe("Strip");
+
+    const approved = await toApproved(s, saved.spendRequestId);
+    expect(approved.status).toBe(200);
+    const conv = await call(s.store, `/${saved.spendRequestId}/purchase-order`, { method: "POST", app: "spend", body: {} });
+    expect(conv.status).toBe(201);
+
+    const po = await PurchaseOrder.findOne({ spendRequestId: saved.spendRequestId }).lean();
+    expect(String(po.items[0].rawItem)).toBe(String(item._id));
+    expect(po.items[0].sku).toBe("SKU-BLADE-9");
+    expect(po.items[0].baseUnit).toBe("Strip");
+    /* The balance, not the whole requirement. */
+    expect(po.items[0].quantity).toBe(12);
+  });
+});

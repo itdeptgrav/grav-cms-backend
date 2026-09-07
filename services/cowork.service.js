@@ -833,6 +833,32 @@ async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status })
     updates.cancelledByName = employeeName || "";
     updates.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
   }
+
+  /**
+   * Ending a meeting must actually END it.
+   *
+   * **The gap this closes.** Status was the only thing this wrote, so "End for
+   * everyone" relabelled the document and left every way IN still open: the
+   * LiveKit room stayed up, the 6-digit join code stayed `active`, and the
+   * public guest link stayed live. `POST /cowork/livekit/end` did all three —
+   * and had no caller anywhere in the product, so it never ran.
+   *
+   * Doing it here rather than asking the client to make a second call means
+   * every caller of this service gets the teardown: the UI, the legacy app, and
+   * anything added later. A meeting is over exactly when its status says so.
+   */
+  if (status === "completed" || status === "archived" || status === "cancelled") {
+    updates.publicShareEnabled = false;
+    try {
+      await _tearDownMeetingRoom(meet, meetId);
+    } catch (e) {
+      /* The document must still close even if LiveKit is unreachable — a
+         meeting that cannot be ended because a third party is down is worse
+         than a room that lingers until its own empty-timeout. */
+      console.error(`[meet ${meetId}] room teardown failed:`, e.message);
+    }
+  }
+
   await ref.update(updates);
 
   await _appendMeetEvent({
