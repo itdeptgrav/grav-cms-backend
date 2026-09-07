@@ -477,12 +477,33 @@ router.get("/public/meeting-info/:token", async (req, res) => {
       }
     }
 
+    /**
+     * **A meeting that is over cannot be joined, whichever way it ended.**
+     *
+     * This tested `meet.status !== "ended"` — and `"ended"` is not one of the
+     * statuses the product writes. `setCoworkMeetStatus` only accepts
+     * MEET_STATUSES (scheduled, waiting, live, completed, cancelled, archived),
+     * so "End for everyone" writes `completed`, and the check was true for
+     * every meeting there has ever been. The result: after the organiser ended
+     * a meeting, reloading the guest link still rendered a full lobby with a
+     * live camera preview and a Join button that then answered "The meeting
+     * hasn't started yet."
+     *
+     * `isCancelled` is read as well as `status`: the legacy application sets
+     * the boolean, and `setCoworkMeetStatus` keeps the two in step for exactly
+     * that reason. `"ended"` stays in the list defensively — one route in this
+     * file still writes it.
+     */
+    const finished =
+      meet.isCancelled === true ||
+      ["completed", "cancelled", "archived", "ended"].includes(meet.status);
+
     res.json({
       success: true,
       meetId,
       meetTitle: meet.title || "CoWork Meeting",
       status: meet.status || "scheduled",
-      canJoin: meet.publicShareEnabled === true && meet.status !== "ended",
+      canJoin: meet.publicShareEnabled === true && !finished,
       participantCount,
     });
   } catch (e) {
