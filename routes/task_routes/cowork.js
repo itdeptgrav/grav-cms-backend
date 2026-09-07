@@ -1004,6 +1004,215 @@ router.get("/schedule-meet/:meetId/events", verifyCoworkToken, verifyEmployeeTok
   try { res.json({ events: await svc.listCoworkMeetEvents(req.params.meetId) }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
+// ══════════════════════════════════════════════════════════════════════════
+// MEETING CHAT — the durable ledger under the LiveKit data channel.
+//
+// Delivery is still LiveKit's: instant, free to run, works for guests, and it
+// reconnects on its own. These routes only STORE what was said, so a refresh
+// does not lose it and somebody joining late can read back. If they are down,
+// chat keeps working exactly as it does today.
+//
+// Two things here are deliberately unlike their neighbours:
+//
+//   1. A real membership check. The meeting read routes above carry only
+//      `verifyCoworkToken + verifyEmployeeToken`, so any signed-in employee can
+//      read any meeting. That is worth fixing and is NOT fixed here — copying
+//      it would spread the hole, and quietly widening it inside a chat feature
+//      would be the wrong place to decide it.
+//
+//   2. Writes are idempotent. The document id is the sender's LiveKit stream
+//      id, so a retry or an offline replay answers 200 with the row already
+//      stored rather than writing a second one.
+// ══════════════════════════════════════════════════════════════════════════
+
+const meetChat = require("../../services/coworkMeetingChat.service");
+
+// GET /cowork/schedule-meet/:meetId/messages?beforeMs=&afterMs=&limit=
+router.get(
+  "/schedule-meet/:meetId/messages",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+      const { employeeId } = req.coworkUser;
+
+      const meet = await meetChat._readMeet(meetId);
+      if (!meet) return res.status(404).json({ error: "Meeting not found." });
+      if (!meetChat.isMember(meet, employeeId)) {
+        return res.status(403).json({
+          error: "This chat is for the people in that meeting.",
+          code: "NOT_A_PARTICIPANT",
+        });
+      }
+
+      const page = await meetChat.listMeetingMessages({
+        meetId,
+        beforeMs: req.query.beforeMs,
+        afterMs: req.query.afterMs,
+        limit: req.query.limit,
+      });
+      res.json({ success: true, ...page });
+    } catch (e) {
+      console.error("[meeting-chat] read:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// POST /cowork/schedule-meet/:meetId/messages
+// Body: { messageId, text, attachments? }  — messageId is the LiveKit stream id.
+router.post(
+  "/schedule-meet/:meetId/messages",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+      const { employeeId, name } = req.coworkUser;
+      const { messageId, text, attachments } = req.body || {};
+
+      const meet = await meetChat._readMeet(meetId);
+      if (!meet) return res.status(404).json({ error: "Meeting not found." });
+      if (!meetChat.isMember(meet, employeeId)) {
+        return res.status(403).json({
+          error: "This chat is for the people in that meeting.",
+          code: "NOT_A_PARTICIPANT",
+        });
+      }
+
+      /* A finished, cancelled or archived meeting takes no new messages.
+         Reading its history is still allowed — that is the point of storing
+         it. */
+      const status = meetChat.statusOf(meet);
+      if (!meetChat.WRITABLE_STATUSES.includes(status)) {
+        return res.status(409).json({
+          error: `That meeting is ${status}, so its chat is closed.`,
+          code: "MEETING_CLOSED",
+        });
+      }
+
+      const result = await meetChat.appendMeetingMessage({
+        meetId,
+        messageId,
+        senderId: employeeId,
+        senderName: name || employeeId,
+        senderKind: "employee",
+        text,
+        attachments,
+      });
+
+      /* 200 either way. A duplicate is a retry that already succeeded, and
+         answering an error would make a client that is behaving correctly
+         look broken. */
+      res.json({ success: true, duplicate: result.duplicate });
+    } catch (e) {
+      if (e.code === "BAD_MEETING" || e.code === "BAD_REQUEST") {
+        return res.status(400).json({ error: e.message, code: e.code });
+      }
+      console.error("[meeting-chat] write:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// GUEST meeting-chat — the SAME durable ledger, reached without a Firebase
+// login. A guest carries a `guestSessionId` instead of an employee token; it is
+// validated against `cowork_guest_sessions` (exactly as the guest audio routes
+// already do) and, when good, hands back { guestId, guestName } to stamp the
+// row. Responses are the employee routes' shapes byte-for-byte so the frontend
+// can treat an employee message and a guest message identically. There is no
+// isMember() check: for a guest, the session validation IS the access control.
+// ══════════════════════════════════════════════════════════════════════════
+
+const guestSession = require("../../services/coworkGuestSession.service");
+
+// POST /cowork/schedule-meet/:meetId/guest-messages
+// Body: { guestSessionId, messageId, text, attachments? } — messageId is the
+// LiveKit stream id, exactly as on the employee route.
+router.post(
+  "/schedule-meet/:meetId/guest-messages",
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+      const { guestSessionId, messageId, text, attachments } = req.body || {};
+
+      const session = await guestSession.validateGuestSession(
+        meetId,
+        guestSessionId,
+      );
+      if (!session) {
+        return res
+          .status(403)
+          .json({ error: "Invalid or expired guest session." });
+      }
+
+      const meet = await meetChat._readMeet(meetId);
+      if (!meet) return res.status(404).json({ error: "Meeting not found." });
+
+      /* A finished, cancelled or archived meeting takes no new messages — the
+         same gate and the same code as the employee route, so a client reacts
+         identically whoever sent it. */
+      const status = meetChat.statusOf(meet);
+      if (!meetChat.WRITABLE_STATUSES.includes(status)) {
+        return res.status(409).json({
+          error: `That meeting is ${status}, so its chat is closed.`,
+          code: "MEETING_CLOSED",
+        });
+      }
+
+      const result = await meetChat.appendMeetingMessage({
+        meetId,
+        messageId,
+        senderId: session.guestId,
+        senderName: session.guestName || "Guest",
+        senderKind: "guest",
+        text,
+        attachments,
+      });
+
+      res.json({ success: true, duplicate: result.duplicate });
+    } catch (e) {
+      if (e.code === "BAD_MEETING" || e.code === "BAD_REQUEST") {
+        return res.status(400).json({ error: e.message, code: e.code });
+      }
+      console.error("[meeting-chat] guest write:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// GET /cowork/schedule-meet/:meetId/guest-messages?guestSessionId=&beforeMs=&afterMs=&limit=
+router.get(
+  "/schedule-meet/:meetId/guest-messages",
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+
+      const session = await guestSession.validateGuestSession(
+        meetId,
+        req.query.guestSessionId,
+      );
+      if (!session) {
+        return res
+          .status(403)
+          .json({ error: "Invalid or expired guest session." });
+      }
+
+      const page = await meetChat.listMeetingMessages({
+        meetId,
+        beforeMs: req.query.beforeMs,
+        afterMs: req.query.afterMs,
+        limit: req.query.limit,
+      });
+      res.json({ success: true, ...page });
+    } catch (e) {
+      console.error("[meeting-chat] guest read:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
 
 /* ── Lifecycle beyond cancel (organiser only; enforced in the service) ─────
  *
