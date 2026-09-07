@@ -764,6 +764,38 @@ async function _appendMeetEvent({ meetId, type, actorId, actorName, detail }) {
   });
 }
 
+/**
+ * Take the LiveKit room down when the meeting is over.
+ *
+ * The part of End for everyone that needs no cooperation from anybody's
+ * browser: deleting the room disconnects every participant — guests included,
+ * and a client that heard none of the socket events — with
+ * `DisconnectReason.ROOM_DELETED`, which the rooms treat as the meeting having
+ * ended. It is called AFTER the socket has been told, so the normal path is
+ * "finalise your audio, then leave", and this is the floor under it.
+ *
+ * Same credentials as `/livekit/end`: the frontend's meeting token route signs
+ * with the same key on the same host, so this reaches the rooms it mints.
+ * Best effort throughout — a room that was never created, or already emptied
+ * and timed out, is not an error worth failing a status change over.
+ */
+async function _tearDownMeetingRoom(meet) {
+  const roomName = meet && meet.livekitRoomName;
+  if (!roomName) return;
+  const url = (process.env.LIVEKIT_URL || "")
+    .replace("wss://", "https://")
+    .replace("ws://", "http://");
+  const key = process.env.LIVEKIT_API_KEY;
+  const secret = process.env.LIVEKIT_API_SECRET;
+  if (!url || !key || !secret) return;
+  try {
+    const { RoomServiceClient } = require("livekit-server-sdk");
+    await new RoomServiceClient(url, key, secret).deleteRoom(roomName);
+  } catch (e) {
+    console.warn("[meet] deleteRoom " + roomName + ":", e && e.message);
+  }
+}
+
 async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status }) {
   if (!MEET_STATUSES.includes(status)) {
     throw new Error(`Unknown meeting status. Expected one of: ${MEET_STATUSES.join(", ")}.`);
@@ -813,6 +845,47 @@ async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status })
 
   const recipients = (meet.participants || []).filter(id => id !== employeeId);
   socket.emitToMany(recipients, "meet_status", { meetId, status, title: meet.title });
+
+  // ── End for everyone ─────────────────────────────────────────────────────
+  // `completed`, `cancelled` and `archived` all mean there is no meeting to be
+  // in any more. The emit above reaches the invited employees' personal rooms
+  // — never a guest, and not the organiser. The meeting's socket room holds
+  // every browser actually in the call, so that is where the end is announced:
+  //
+  //   1. `recording_stopped` first. It is the event every recorder already
+  //      obeys, so each participant's audio is finalised to Drive by the same
+  //      code a host's Stop runs — from their own browser, which is the only
+  //      place it can be done — including a browser built before
+  //      `meet_status` existed.
+  //   2. `meet_status`, which the rooms answer by disconnecting themselves
+  //      (after their recorder has been told, see useMeetingRecording).
+  //   3. The LiveKit room itself, so a browser that heard neither is
+  //      disconnected regardless (`ROOM_DELETED`).
+  //
+  // The live-recording registry is cleared first, or a socket joining the room
+  // afterwards — the organiser's wrap-up panel does — would be replayed a
+  // `recording_started` into a finished meeting.
+  if (status === "completed" || status === "cancelled" || status === "archived") {
+    const signal = {
+      meetId,
+      status,
+      title: meet.title,
+      endedBy: employeeId,
+      endedByName: employeeName || "",
+    };
+    const room = `meeting_${meetId}`;
+    socket.clearActiveRecording(meetId);
+    socket.emitToRoom(room, "recording_stopped", {
+      meetId,
+      stoppedBy: employeeId,
+      stoppedByName: employeeName || "",
+      stoppedAt: new Date().toISOString(),
+      endedMeeting: true,
+    });
+    socket.emitToRoom(room, "meet_status", signal);
+    socket.markMeetingEnded(meetId, signal);
+    await _tearDownMeetingRoom(meet);
+  }
 
   // ── A durable record, not only a socket event ────────────────────────────
   // The emit above reaches whoever has the app open at that instant and nobody

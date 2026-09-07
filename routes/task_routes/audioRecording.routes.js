@@ -39,6 +39,30 @@ const {
 const TMP_BASE = path.join(os.tmpdir(), "cowork_audio");
 fs.mkdirSync(TMP_BASE, { recursive: true });
 
+// ── Path safety — ids from request bodies must never become path segments ─────
+// `meetId`, `employeeId` and `guestId` all arrive from callers. `path.join`
+// RESOLVES `..` rather than rejecting it, so an id of "../../.." walked out of
+// TMP_BASE — and the finalize paths end in a recursive `fs.rmSync`, so an
+// escaped path was a delete of somebody else's files, reachable unauthenticated
+// through the beacon route. Two layers guard it: `safeSegment` rejects any id
+// that is not a single, separator-free token, and `containedPath` proves the
+// resolved path still sits under TMP_BASE even if a caller forgets to validate.
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+function safeSegment(id) {
+  if (typeof id !== "string" || !SAFE_ID.test(id)) {
+    throw new Error(`Unsafe path segment: ${JSON.stringify(id)}`);
+  }
+  return id;
+}
+function containedPath(...segments) {
+  const root = path.resolve(TMP_BASE);
+  const resolved = path.resolve(path.join(TMP_BASE, ...segments));
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new Error(`Resolved path escapes the temp root: ${resolved}`);
+  }
+  return resolved;
+}
+
 // ── Multer — memory storage for incoming audio chunks ─────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -145,33 +169,82 @@ async function uploadFileWithRetry(
   finalFileName,
   mimeType,
   meetFolderId,
-  buffer,
+  chunkFiles,
 ) {
   const RETRIES = 3;
   let lastErr;
   for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    // A FRESH stream every attempt — streams are single-use, and a retry must
+    // re-read from disk rather than replay a consumed one. `createMergedStream`
+    // reads the chunk files one at a time, so only a single chunk is ever in
+    // memory; googleapis pipes this body straight to Drive (it does not buffer
+    // a stream — see multipartUpload in googleapis-common), so a recording of
+    // any size uploads with flat memory instead of a whole-file Buffer.concat.
+    const body = createMergedStream(chunkFiles);
+    /**
+     * Keep a chunk read fault from crashing the whole server.
+     *
+     * If a chunk file cannot be read mid-upload — a disk error, or a concurrent
+     * finalize clearing the directory — the async generator throws and `body`
+     * emits `error`. googleapis pipes the media body WITHOUT ever listening for
+     * that (multipartUpload in googleapis-common does `part.body.pipe(...)`
+     * only), and Node's `pipe()` does not forward a source error to the
+     * destination — so an unhandled `error` here reaches the process as an
+     * `uncaughtException` and takes the backend down for everyone. The old
+     * in-memory `mergeChunks` never could: it read the chunks synchronously
+     * inside the route's try/catch, so a read fault was a clean 500.
+     *
+     * Listening for the error and ABORTING the request turns the fault back
+     * into an ordinary rejection of `drive.files.create` — caught below and, on
+     * the employee path, followed by restoring the claimed chunks — rather than
+     * a request left hanging on a body that will never finish. gaxios honours
+     * `signal`, and a googleapis method's second argument is passed straight
+     * through to it as request options.
+     */
+    const controller = new AbortController();
+    body.on("error", (err) => controller.abort(err));
     try {
-      // Streams are single-use — must rebuild fresh on every attempt,
-      // or a retry silently uploads zero bytes.
-      const readable = new Readable();
-      readable._read = () => {};
-      readable.push(buffer);
-      readable.push(null);
-
-      return await drive.files.create({
-        supportsAllDrives: true,
-        requestBody: { name: finalFileName, mimeType, parents: [meetFolderId] },
-        media: { mimeType, body: readable },
-        fields: "id, name, webViewLink, size",
-      });
+      return await drive.files.create(
+        {
+          supportsAllDrives: true,
+          requestBody: {
+            name: finalFileName,
+            mimeType,
+            parents: [meetFolderId],
+          },
+          media: { mimeType, body },
+          fields: "id, name, webViewLink, size",
+        },
+        { signal: controller.signal },
+      );
     } catch (e) {
+      // Release the file descriptor this attempt opened before a retry builds a
+      // fresh stream — a no-op on an already-errored or aborted stream.
+      body.destroy();
       lastErr = e;
       const reason = e?.errors?.[0]?.reason || "";
+      /**
+       * Rate limits and dropped connections are transient too.
+       *
+       * Everyone's browser finalizes at the same instant — that is what Stop
+       * and End for everyone both do — so several uploads hit Drive together
+       * and it answers 429, or 403 `userRateLimitExceeded`. Neither was in
+       * this list, so the upload failed on the first try and the whole
+       * recording fell back to the browser's own slow retry. A socket reset
+       * mid-upload was treated the same way.
+       */
       const isTransient =
         reason === "transientFailure" ||
         reason === "backendError" ||
+        reason === "rateLimitExceeded" ||
+        reason === "userRateLimitExceeded" ||
+        e?.code === 429 ||
         e?.code === 500 ||
-        e?.code === 503;
+        e?.code === 502 ||
+        e?.code === 503 ||
+        e?.code === "ECONNRESET" ||
+        e?.code === "ETIMEDOUT" ||
+        e?.code === "EPIPE";
       console.warn(
         `[Drive] Upload attempt ${attempt}/${RETRIES} failed${isTransient ? " (transient — retrying)" : " (not retryable)"}: ${e.message}`,
       );
@@ -182,7 +255,7 @@ async function uploadFileWithRetry(
   throw lastErr;
 }
 
-async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
+async function uploadAudioToDrive(chunkFiles, baseFileName, mimeType, meetId) {
   const drive = getDriveClient();
 
   // Level 1: fixed parent folder
@@ -218,7 +291,7 @@ async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
     finalFileName,
     mimeType,
     meetFolderId,
-    buffer,
+    chunkFiles,
   );
 
   // Make file publicly readable
@@ -240,7 +313,7 @@ async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
 
 // ── Helper: get chunk dir for a user ─────────────────────────────────────────
 function getChunkDir(meetId, employeeId) {
-  return path.join(TMP_BASE, meetId, employeeId);
+  return containedPath(safeSegment(meetId), safeSegment(employeeId));
 }
 
 // ── Helper: get next chunk index ─────────────────────────────────────────────
@@ -250,24 +323,175 @@ function getNextChunkIndex(chunkDir) {
   return files.length;
 }
 
-// ── Helper: merge all chunks into one Buffer ──────────────────────────────────
-function mergeChunks(chunkDir) {
-  if (!fs.existsSync(chunkDir)) return null;
-  const files = fs
+// ── Helpers: the chunk files, their size, and a STREAM over them ──────────────
+// Streaming replaces the old `mergeChunks` Buffer.concat, which read every chunk
+// into memory and concatenated the whole recording into one Buffer — a 500 MB
+// recording became 500 MB of RAM and, with several people finalizing at once,
+// an out-of-memory kill. Nothing here reads a chunk's bytes into memory:
+// `listChunkFiles` returns the ordered paths (zero-padded names sort correctly),
+// `chunkFilesSize` sums their on-disk sizes for the "was anything recorded?"
+// check, and `createMergedStream` yields the bytes one chunk at a time.
+function listChunkFiles(chunkDir) {
+  if (!fs.existsSync(chunkDir)) return [];
+  return fs
     .readdirSync(chunkDir)
     .filter((f) => f.startsWith("chunk_"))
-    .sort(); // chunk_000, chunk_001, ... natural sort works for zero-padded
+    .sort()
+    .map((f) => path.join(chunkDir, f));
+}
 
-  if (files.length === 0) return null;
+function chunkFilesSize(files) {
+  return files.reduce((sum, fp) => sum + fs.statSync(fp).size, 0);
+}
 
-  const buffers = files.map((f) => fs.readFileSync(path.join(chunkDir, f)));
-  return Buffer.concat(buffers);
+// A fresh Readable that streams the chunk files in order — ONE chunk's buffer in
+// flight at a time, never the whole recording. Rebuildable, because a stream is
+// single-use and an upload retry needs a new one.
+function createMergedStream(files) {
+  async function* concat() {
+    for (const fp of files) {
+      for await (const buf of fs.createReadStream(fp)) yield buf;
+    }
+  }
+  return Readable.from(concat());
 }
 
 // ── Helper: cleanup temp chunk dir ───────────────────────────────────────────
 function cleanupChunkDir(meetId, employeeId) {
   const dir = getChunkDir(meetId, employeeId);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ── The claim, and why it must never destroy audio ───────────────────────────
+//
+// `renameSync` is the lock that stops two finalizes merging one recording twice.
+// Its FAILURE used to be read as "there is nothing here" — and answered by
+// deleting the live chunk directory and replying `skipped`, which a browser
+// reads as "nothing to upload" and responds to by dropping the retry marker
+// that is the only thing that would ever have sent the audio again.
+//
+// On Windows that is a whole recording destroyed by a routine flake: a
+// directory cannot be renamed while any file inside it holds an open handle, so
+// a chunk still landing — or a virus scanner reading the one just written —
+// fails the rename with EPERM/EBUSY. The audio was deleted, the browser was
+// told everything was fine, and nothing ever retried. Two meeting folders in
+// Drive with nothing in them, and an abandoned claim directory still sitting in
+// the temp folder, are what that looked like from the outside.
+//
+// So a claim now has three distinct answers and only one of them means absence:
+//   · ENOENT               — genuinely nothing to merge.
+//   · EPERM/EBUSY/EACCES   — locked; retried briefly, then reported as HELD.
+//   · anything else        — reported as held, never mistaken for absence.
+// No path here deletes a chunk. The worst case is that the audio stays exactly
+// where the next attempt will look for it.
+const CLAIM_MARK = ".merging-";
+const CLAIM_LOCK_RETRIES = 5;
+const CLAIM_LOCK_DELAY_MS = 120;
+/** Past this, a claim belongs to a finalize that died, and is re-adopted. */
+const STALE_CLAIM_MS = 5 * 60 * 1000;
+
+const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Move chunk files from one directory into another, keeping their names.
+ *
+ * Chunks are keyed by index, so a name already present in the destination is
+ * the SAME chunk — the copy on disk is kept and the duplicate dropped, which
+ * is what makes merging a claim back into a live directory safe.
+ */
+function moveChunksInto(fromDir, toDir) {
+  fs.mkdirSync(toDir, { recursive: true });
+  let moved = 0;
+  for (const name of fs.readdirSync(fromDir)) {
+    const from = path.join(fromDir, name);
+    const to = path.join(toDir, name);
+    try {
+      if (fs.existsSync(to)) fs.rmSync(from, { force: true });
+      else {
+        fs.renameSync(from, to);
+        moved++;
+      }
+    } catch {
+      /* Leave it where it is — a later claim re-adopts the directory. */
+    }
+  }
+  try {
+    if (fs.readdirSync(fromDir).length === 0)
+      fs.rmSync(fromDir, { recursive: true, force: true });
+  } catch {
+    /* Not empty, or gone. Either way there is nothing to clean up here. */
+  }
+  return moved;
+}
+
+/** Claim directories left behind by a finalize that died mid-upload. */
+function staleClaims(meetId, employeeId) {
+  const meetDir = containedPath(safeSegment(meetId));
+  if (!fs.existsSync(meetDir)) return [];
+  const prefix = `${safeSegment(employeeId)}${CLAIM_MARK}`;
+  const now = Date.now();
+  const out = [];
+  for (const name of fs.readdirSync(meetDir)) {
+    if (!name.startsWith(prefix)) continue;
+    const full = path.join(meetDir, name);
+    try {
+      const st = fs.statSync(full);
+      if (st.isDirectory() && now - st.mtimeMs > STALE_CLAIM_MS) out.push(full);
+    } catch {
+      /* Vanished under us — another finalize finished with it. */
+    }
+  }
+  return out;
+}
+
+/**
+ * Take exclusive hold of one participant's chunks.
+ *
+ * → { dir }    the claim; merge from here.
+ * → { empty }  there is genuinely nothing to merge.
+ * → { held }   somebody else has it, or it is locked. RETRYABLE — never to be
+ *              reported to a browser as "no audio", because that is what makes
+ *              it throw away the marker that would have retried.
+ */
+async function claimChunks(meetId, employeeId) {
+  const live = getChunkDir(meetId, employeeId);
+
+  /* Re-adopt anything a dead finalize walked off with, so a retry rescues that
+     audio instead of stepping over it for ever. */
+  for (const abandoned of staleClaims(meetId, employeeId)) {
+    const n = moveChunksInto(abandoned, live);
+    if (n > 0)
+      console.warn(
+        `[AudioFinalize] re-adopted ${n} chunk(s) from an abandoned claim: ${path.basename(abandoned)}`,
+      );
+  }
+
+  for (let attempt = 1; attempt <= CLAIM_LOCK_RETRIES; attempt++) {
+    const dir = `${live}${CLAIM_MARK}${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    try {
+      /* Deliberately NOT guarded by `existsSync`: the throw IS the lock. */
+      fs.renameSync(live, dir);
+      return { dir };
+    } catch (e) {
+      if (e.code === "ENOENT") return { empty: true };
+      const locked =
+        e.code === "EPERM" || e.code === "EBUSY" || e.code === "EACCES";
+      if (!locked) {
+        console.error(
+          `[AudioFinalize] claim failed for ${employeeId} (${e.code}): ${e.message}`,
+        );
+        return { held: true, reason: e.code || "unknown" };
+      }
+      if (attempt < CLAIM_LOCK_RETRIES)
+        await waitMs(CLAIM_LOCK_DELAY_MS * attempt);
+    }
+  }
+  console.warn(
+    `[AudioFinalize] ${employeeId}'s chunks are locked — left for the retry`,
+  );
+  return { held: true, reason: "locked" };
 }
 
 // ── Helper: validate a guest session is real and still tied to this meeting ──
@@ -402,39 +626,12 @@ module.exports = function (io) {
          * `skipped`, which is exactly what "somebody already finalized this"
          * should look like.
          */
-        const liveDir = getChunkDir(meetId, employeeId);
-        /**
-         * A name only THIS call can be holding.
-         *
-         * The first version of this renamed to a fixed `<dir>.merging` and
-         * guarded with `if (fs.existsSync(liveDir))`. That has a hole big
-         * enough to drive the original bug through: when the directory is
-         * already claimed, `existsSync` is false, so no rename is attempted, no
-         * error is thrown, and the caller falls straight through to merging
-         * `<dir>.merging` — which is the directory the FIRST caller is using.
-         * The second finalize merged the first one's audio and wrote a second
-         * Drive file. Observed as two 32 KB files two seconds apart.
-         *
-         * Unique-per-call plus an unguarded rename fixes both halves: the
-         * rename THROWS when there is nothing to claim, so "already taken" and
-         * "nothing here" both land in the catch, and no two callers can ever
-         * name the same directory.
-         */
-        const chunkDir = `${liveDir}.merging-${process.pid}-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)}`;
-        try {
-          /* Deliberately NOT guarded by `existsSync`: the throw IS the lock. */
-          fs.renameSync(liveDir, chunkDir);
-          claimedDir = chunkDir;
-        } catch {
-          /* Either another finalize holds the audio, or there is none. Both
-             mean the same thing to this caller: there is nothing here to
-             upload, and saying so is the honest answer. */
+        const claim = await claimChunks(meetId, employeeId);
+
+        if (claim.empty) {
           console.log(
-            `[AudioFinalize] nothing to claim for ${employeeId} — already finalized or empty`,
+            `[AudioFinalize] nothing to merge for ${employeeId} — already finalized, or never recorded`,
           );
-          cleanupChunkDir(meetId, employeeId);
           return res.json({
             success: true,
             skipped: true,
@@ -442,9 +639,33 @@ module.exports = function (io) {
           });
         }
 
-        const merged = mergeChunks(chunkDir);
+        if (claim.held) {
+          /**
+           * **Held is not empty, and the difference is a recording.**
+           *
+           * Another finalize is merging this audio, or the directory is
+           * momentarily locked. Answered as `skipped`, as it used to be, the
+           * browser concludes there was nothing to upload and deletes the
+           * marker that drives its retry — so a failure in that other finalize
+           * became permanent, silently. Answered as a retryable error, the
+           * marker survives and the drain tries again a minute later.
+           */
+          return res.status(409).json({
+            success: false,
+            pending: true,
+            reason: claim.reason,
+            error:
+              "This recording is already being saved. It will finish or retry on its own.",
+          });
+        }
 
-        if (!merged || merged.length === 0) {
+        const chunkDir = claim.dir;
+        claimedDir = chunkDir;
+
+        const chunkFiles = listChunkFiles(chunkDir);
+        const totalBytes = chunkFilesSize(chunkFiles);
+
+        if (!chunkFiles.length || totalBytes === 0) {
           // No audio was recorded for this user (e.g. joined but never unmuted)
           fs.rmSync(chunkDir, { recursive: true, force: true });
           cleanupChunkDir(meetId, employeeId);
@@ -472,12 +693,12 @@ module.exports = function (io) {
             .slice(0, 20) || employeeId;
         const baseFileName = `${safeName}_audio_${meetId}.${ext}`;
         console.log(
-          `[AudioFinalize] Merging ${merged.length} bytes for ${employeeId} → ${baseFileName}`,
+          `[AudioFinalize] Streaming ${totalBytes} bytes for ${employeeId} → ${baseFileName}`,
         );
 
         // Upload to Google Drive — returns actual fileName (may have (1) suffix)
         const driveResult = await uploadAudioToDrive(
-          merged,
+          chunkFiles,
           baseFileName,
           mimeType,
           meetId,
@@ -501,7 +722,7 @@ module.exports = function (io) {
           firstName: (firstName || name || "").split(" ")[0],
           fileName: actualFileName,
           mimeType,
-          fileSize: merged.length,
+          fileSize: totalBytes,
           driveFileId: driveResult.fileId,
           driveViewUrl: driveResult.viewUrl,
           driveDownloadUrl: driveResult.downloadUrl,
@@ -515,11 +736,35 @@ module.exports = function (io) {
           .doc(docId)
           .set(firestoreData);
 
-        /* The claimed copy, and the live directory in case a late chunk landed
-           while this was uploading. Both, because the claim renamed the audio
-           out of the way rather than deleting it — see the note above. */
-        fs.rmSync(chunkDir, { recursive: true, force: true });
-        cleanupChunkDir(meetId, employeeId);
+        /**
+         * **Past this line the recording is SAVED, and nothing may undo it.**
+         *
+         * The row is written, so tidying up is housekeeping — but it used to
+         * sit inside the route's own `try`, so a `rmSync` refused by Windows
+         * (an open handle on a chunk, the same flake that breaks the rename)
+         * threw AFTER a successful upload. The catch then answered 500 and
+         * handed the chunks back, and the browser's retry uploaded the very
+         * same audio again: that is how one person ends up with two and three
+         * files in a meeting folder.
+         *
+         * Clearing `claimedDir` first is the other half — it stops the restore
+         * path putting back audio that is already in Drive.
+         */
+        claimedDir = null;
+        try {
+          /* The claimed copy, and the live directory in case a late chunk
+             landed while this was uploading. Both, because the claim renamed
+             the audio out of the way rather than deleting it. */
+          fs.rmSync(chunkDir, { recursive: true, force: true });
+          cleanupChunkDir(meetId, employeeId);
+        } catch (cleanupError) {
+          /* Left on disk, and that is the harmless outcome: the next claim for
+             this participant re-adopts it as a stale claim and finds the same
+             chunks, while the recording itself is already safely in Drive. */
+          console.warn(
+            `[AudioFinalize] could not clear ${employeeId}'s temp chunks: ${cleanupError.message}`,
+          );
+        }
 
         console.log(
           `[AudioFinalize] ✅ ${actualFileName} uploaded to Drive: ${driveResult.viewUrl}`,
@@ -541,7 +786,7 @@ module.exports = function (io) {
           driveViewUrl: driveResult.viewUrl,
           driveDownloadUrl: driveResult.downloadUrl,
           driveFileId: driveResult.fileId,
-          fileSize: merged.length,
+          fileSize: totalBytes,
           isRejoin,
         });
       } catch (e) {
@@ -565,10 +810,20 @@ module.exports = function (io) {
              is entitled to give back. Guessing a fixed name here would either
              miss it or, worse, hand back a directory another finalize is
              actively merging. */
-          if (claimedDir && fs.existsSync(claimedDir) && !fs.existsSync(live)) {
-            fs.renameSync(claimedDir, live);
+          if (claimedDir && fs.existsSync(claimedDir)) {
+            /**
+             * **Merged back, not merely renamed.**
+             *
+             * This required that the live directory did NOT exist — so a single
+             * late chunk arriving during the upload recreated it, the rename
+             * was skipped, and the whole claimed recording was orphaned under a
+             * name nothing ever looks for. One of those was sitting in the temp
+             * directory when this was found. Chunks are keyed by index, so
+             * merging is exactly as safe as the comment always said it was.
+             */
+            const moved = moveChunksInto(claimedDir, live);
             console.warn(
-              `[AudioFinalize] restored ${employeeId}'s chunks after a failed finalize`,
+              `[AudioFinalize] restored ${moved} chunk(s) for ${employeeId} after a failed finalize`,
             );
           }
         } catch (restoreError) {
@@ -606,7 +861,10 @@ module.exports = function (io) {
 
   /** Where a backup's chunks live — never the directory the real one uses. */
   function getBackupChunkDir(meetId, forEmployeeId) {
-    return path.join(TMP_BASE, meetId, `backup__${forEmployeeId}`);
+    return containedPath(
+      safeSegment(meetId),
+      `backup__${safeSegment(forEmployeeId)}`,
+    );
   }
 
   /** Their own recording, if it landed. A backup row never counts as one. */
@@ -763,8 +1021,9 @@ module.exports = function (io) {
             .json({ error: "meetId and forEmployeeId required" });
 
         const chunkDir = getBackupChunkDir(meetId, forEmployeeId);
-        const merged = mergeChunks(chunkDir);
-        if (!merged || merged.length === 0) {
+        const chunkFiles = listChunkFiles(chunkDir);
+        const totalBytes = chunkFilesSize(chunkFiles);
+        if (!chunkFiles.length || totalBytes === 0) {
           fs.rmSync(chunkDir, { recursive: true, force: true });
           return res.json({
             success: true,
@@ -804,7 +1063,7 @@ module.exports = function (io) {
         const baseFileName = `${safeName}_audio_${meetId}_backup.${ext}`;
 
         const driveResult = await uploadAudioToDrive(
-          merged,
+          chunkFiles,
           baseFileName,
           mimeType,
           meetId,
@@ -820,7 +1079,7 @@ module.exports = function (io) {
             firstName: (forName || "").split(" ")[0],
             fileName: driveResult.fileName,
             mimeType,
-            fileSize: merged.length,
+            fileSize: totalBytes,
             driveFileId: driveResult.fileId,
             driveViewUrl: driveResult.viewUrl,
             driveDownloadUrl: driveResult.downloadUrl,
@@ -845,7 +1104,7 @@ module.exports = function (io) {
           fileName: driveResult.fileName,
           driveViewUrl: driveResult.viewUrl,
           driveFileId: driveResult.fileId,
-          fileSize: merged.length,
+          fileSize: totalBytes,
         });
       } catch (e) {
         console.error("[AudioBackup] finalize error:", e.message);
@@ -935,9 +1194,10 @@ module.exports = function (io) {
       const guestName = session.guestName || "Guest";
 
       const chunkDir = getChunkDir(meetId, guestId);
-      const merged = mergeChunks(chunkDir);
+      const chunkFiles = listChunkFiles(chunkDir);
+      const totalBytes = chunkFilesSize(chunkFiles);
 
-      if (!merged || merged.length === 0) {
+      if (!chunkFiles.length || totalBytes === 0) {
         cleanupChunkDir(meetId, guestId);
         return res.json({
           success: true,
@@ -957,7 +1217,7 @@ module.exports = function (io) {
       const baseFileName = `${safeName}_audio_${meetId}.${ext}`;
 
       const driveResult = await uploadAudioToDrive(
-        merged,
+        chunkFiles,
         baseFileName,
         mimeType,
         meetId,
@@ -974,7 +1234,7 @@ module.exports = function (io) {
           firstName: guestName.split(" ")[0],
           fileName: driveResult.fileName,
           mimeType,
-          fileSize: merged.length,
+          fileSize: totalBytes,
           driveFileId: driveResult.fileId,
           driveViewUrl: driveResult.viewUrl,
           driveDownloadUrl: driveResult.downloadUrl,
@@ -1005,7 +1265,7 @@ module.exports = function (io) {
         driveViewUrl: driveResult.viewUrl,
         driveDownloadUrl: driveResult.downloadUrl,
         driveFileId: driveResult.fileId,
-        fileSize: merged.length,
+        fileSize: totalBytes,
       });
     } catch (e) {
       console.error("[GuestAudioFinalize] Error:", e.stack || e.message);
@@ -1133,8 +1393,12 @@ module.exports = function (io) {
           const { meetId, firstName, mimeType, employeeId: bodyEmpId } = body;
           if (!meetId) return;
 
-          // Find all employee chunk dirs for this meeting
-          const meetTmpDir = path.join(TMP_BASE, meetId);
+          // Find all employee chunk dirs for this meeting. `safeSegment(meetId)`
+          // runs HERE, before the directory is read or touched — this route has
+          // no auth token (sendBeacon cannot set headers), so an unvalidated
+          // `meetId` of "../../.." would otherwise walk out of TMP_BASE and, via
+          // cleanupChunkDir's recursive rmSync, delete somebody else's files.
+          const meetTmpDir = containedPath(safeSegment(meetId));
           if (!fs.existsSync(meetTmpDir)) return;
 
           const employeeDirs = fs.readdirSync(meetTmpDir);
@@ -1143,9 +1407,14 @@ module.exports = function (io) {
           );
 
           for (const empId of employeeDirs) {
+            // Skip transient claim dirs (`<id>.merging-…`) and anything else
+            // that is not a plain id — a name with a separator would throw in
+            // getChunkDir and abort the whole sweep.
+            if (!SAFE_ID.test(empId)) continue;
             const chunkDir = getChunkDir(meetId, empId);
-            const merged = mergeChunks(chunkDir);
-            if (!merged || merged.length < 100) {
+            const chunkFiles = listChunkFiles(chunkDir);
+            const totalBytes = chunkFilesSize(chunkFiles);
+            if (!chunkFiles.length || totalBytes < 100) {
               cleanupChunkDir(meetId, empId);
               continue;
             }
@@ -1162,7 +1431,7 @@ module.exports = function (io) {
 
             try {
               const driveResult = await uploadAudioToDrive(
-                merged,
+                chunkFiles,
                 fileName,
                 mimeType || "audio/webm",
                 meetId,
@@ -1176,7 +1445,7 @@ module.exports = function (io) {
                   employeeId: empId,
                   fileName,
                   mimeType: mimeType || "audio/webm",
-                  fileSize: merged.length,
+                  fileSize: totalBytes,
                   driveFileId: driveResult.fileId,
                   driveViewUrl: driveResult.viewUrl,
                   driveDownloadUrl: driveResult.downloadUrl,

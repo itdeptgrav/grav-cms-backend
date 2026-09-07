@@ -20,6 +20,7 @@ const bcrypt = require("bcryptjs");
 const http = require("http");
 const { Server } = require("socket.io");
 const activeMeetingRecordings = new Map();
+const socketInstance = require("./config/socketInstance");
 // IMPORT PRODUCTION SYNC SERVICE
 const productionSyncService = require("./services/productionSyncService");
 /* Whether THIS process is the one that runs the schedules. See
@@ -266,6 +267,13 @@ bw.attachSocketMeter(io);
 
 // Make io accessible to routes
 app.set("io", io);
+/* Meeting rooms only — see socketInstance.attachMeetingRooms for why this is
+   not `init(io)`. Lets the meeting-status service reach every socket in a
+   meeting, guests included, and forget a finished meeting's live recording. */
+socketInstance.attachMeetingRooms({
+  io,
+  activeRecordings: activeMeetingRecordings,
+});
 
 // ─── WebSocket connection handling ────────────────────────────────────────────
 io.on("connection", (socket) => {
@@ -347,6 +355,12 @@ io.on("connection", (socket) => {
     if (meetId) {
       socket.join(`meeting_${meetId}`);
       console.log(`Socket ${socket.id} joined meeting_${meetId}`);
+      /* A meeting already ended for everyone. A socket (re)joining it — a
+         participant whose connection came back after the organiser pressed
+         End — is told at once, so it cannot sit alone in a room the meeting
+         has left. */
+      const ended = socketInstance.endedMeeting(meetId);
+      if (ended) socket.emit("meet_status", ended);
       if (activeMeetingRecordings.has(meetId)) {
         const info = activeMeetingRecordings.get(meetId);
         socket.emit("recording_started", {

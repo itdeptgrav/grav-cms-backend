@@ -10,6 +10,7 @@ const {
     getDriveFileStream,
 } = require("../../services/mediaUpload.service");
 const { mediaResponse } = require("../../services/mediaRange");
+const { validateGuestSession } = require("../../services/coworkGuestSession.service");
 
 // ── TEMP DEBUG: remove after verifying backend load stays flat ──
 function logBackendLoad(label, req) {
@@ -82,6 +83,59 @@ router.post(
         }
     }
 );
+
+// ══════════════════════════════════════════════════════════
+// GUEST resumable Drive upload — the SAME two-step direct-to-Google flow as
+// the employee routes above, reached without a Firebase login. A guest carries
+// { guestSessionId, meetId } and is validated against cowork_guest_sessions
+// (exactly as the guest audio + guest chat routes do) instead of the token
+// middleware. The backend still never touches file bytes; the browser streams
+// straight to Google via the returned sessionUrl. Response shapes match the
+// employee routes so the frontend can treat both identically.
+// ══════════════════════════════════════════════════════════
+
+// Step 1 (guest): create resumable session (no file bytes involved)
+// POST /cowork/upload/guest/drive-session
+router.post("/upload/guest/drive-session", async (req, res) => {
+    try {
+        const { guestSessionId, meetId, fileName, mimeType, fileSize } = req.body;
+        const session = await validateGuestSession(meetId, guestSessionId);
+        if (!session) {
+            return res.status(403).json({ error: "Invalid or expired guest session." });
+        }
+        if (!fileName || !fileSize) {
+            return res.status(400).json({ error: "fileName and fileSize are required" });
+        }
+        const sessionUrl = await createResumableSession({
+            fileName,
+            mimeType,
+            fileSize,
+            origin: req.headers.origin,
+        });
+        res.json({ success: true, sessionUrl });
+    } catch (e) {
+        console.error("[guest drive-session]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Step 3 (guest): finalize — make public, return renderable URLs (no file bytes)
+// POST /cowork/upload/guest/drive-finalize
+router.post("/upload/guest/drive-finalize", async (req, res) => {
+    try {
+        const { guestSessionId, meetId, fileId } = req.body;
+        const session = await validateGuestSession(meetId, guestSessionId);
+        if (!session) {
+            return res.status(403).json({ error: "Invalid or expired guest session." });
+        }
+        if (!fileId) return res.status(400).json({ error: "fileId required" });
+        const result = await finalizeDriveFile(fileId);
+        res.json({ success: true, ...result });
+    } catch (e) {
+        console.error("[guest drive-finalize]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
 
 // ── Guaranteed-render fallback: proxy-stream the file ────
 // GET /cowork/media/view/:fileId
