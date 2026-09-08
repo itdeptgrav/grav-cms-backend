@@ -44,6 +44,7 @@ const PURE = [
 ];
 
 const READONLY = [
+  "auditAccounting",          // the books hold together: balances, bills, payroll
   "verifyAttendanceRules",     // the late ladder, and the national-holiday rule
   "verifyPayrollLadder",       // that ladder reaching pay
   "verifyLedgerBalances",      // chart of accounts equals the ledger page
@@ -63,6 +64,8 @@ const WRITES = [
   "verifyPayrollLedgerMap",    // the payroll → accounting bridge balances
   "verifyDeveloperSide",       // the anomaly scan catches what it promises
   "verifyAdminCenter",         // form definitions, job control, role floors
+  "verifyBillMatching",        // a receipt settles the invoice it is matched to
+  "verifyPayrollPaymentLink",  // payroll posts a journal; a linked payment marks it paid
 ];
 
 const TIERS = { pure: PURE, readonly: READONLY, writes: WRITES };

@@ -2438,13 +2438,30 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     // Unallocated" reconciliation line) now lives in the shared service —
     // this route no longer has its own copy of any of it.
     if (isPartyLedger) {
-      const foldedBills = await openItems.billsByLedger(ledger.companyId, [
-        ledger._id,
-      ]);
+      /* AS AT THE STATEMENT'S OWN END DATE — not "as of now".
+         `closing` above covers the requested date range. The bills beside it
+         must cover the same period, or their difference is meaningless — and
+         that difference is exactly what agedBillsForLedger prints as the
+         "Opening / Unallocated" line.
+
+         Folded over all time, this happened: match a receipt, then filter the
+         ledger to the previous year, and the settled invoice came back at its
+         full value labelled "Unallocated". The allocation existed; it simply
+         fell outside the balance's period. Both halves now share one date, so
+         a settled bill stays settled and the phantom line disappears. */
+      const asOfDate = endDate
+        ? new Date(`${endDate}T23:59:59.999+05:30`)
+        : new Date();
+
+      const foldedBills = await openItems.billsByLedger(
+        ledger.companyId,
+        [ledger._id],
+        { asOf: asOfDate },
+      );
       const { bills: openBills, buckets } = openItems.agedBillsForLedger(
         [...foldedBills.values()],
         {
-          asOf: new Date(),
+          asOf: asOfDate,
           closingBalance: closing,
           fallbackFirstDate: ledger.openingBalanceDate || startDate || null,
         },
@@ -3274,12 +3291,55 @@ router.get("/payroll/ledger-map", async (req, res) => {
         .sort((a, b) => b.gross - a.gross);
     }
 
+    /* WHAT THIS COMPANY HAS CHOSEN BEFORE, for anything not mapped yet.
+       ------------------------------------------------------------------
+       An unmapped slot falls back to a hardcoded list of ledger names. That
+       guess is reasonable once and wrong every time after somebody corrects
+       it, because nothing remembers the correction — a new department next
+       month gets the same guess again.
+
+       So each saved choice is recorded (see the `learned` array on
+       Acc_PayrollLedgerMap) and offered back here. Only for rows that have NO
+       mapping: an explicit answer is never second-guessed by a remembered one.
+
+       These are SUGGESTIONS. Nothing posts to them until a person accepts
+       one — a ledger silently adopted from history misstates the P&L every
+       month afterwards and looks exactly like a correct one. */
+    const suggestions = {};
+    if (map?.learned?.length) {
+      const mappedDeptKeys = new Set((map.departments || []).map((d) => d.key));
+      /* Most-used wins; a tie goes to the most recent. */
+      const ranked = [...map.learned].sort(
+        (a, b) =>
+          (b.count || 0) - (a.count || 0) ||
+          new Date(b.lastChosenAt || 0) - new Date(a.lastChosenAt || 0),
+      );
+      for (const row of ranked) {
+        const isDept = row.slot === "department";
+        const id = isDept ? `department:${row.key}` : row.slot;
+        if (suggestions[id]) continue; // the best one for this target already
+        // Skip anything already answered explicitly.
+        if (isDept ? mappedDeptKeys.has(row.key) : map?.[row.slot]?.ledgerId) continue;
+        suggestions[id] = {
+          ledgerId: row.ledgerId,
+          ledgerName: row.ledgerName,
+          count: row.count || 1,
+          lastChosenAt: row.lastChosenAt,
+          why:
+            (row.count || 1) > 1
+              ? `Chosen ${row.count} times before`
+              : `Chosen before${row.lastChosenByName ? ` by ${row.lastChosenByName}` : ""}`,
+        };
+      }
+    }
+
     res.json({
       success: true,
       hrAvailable: Boolean(HR),
       departments,
       ledgers,
       map: map || null,
+      suggestions,
       canEdit: canEditPayroll(req),
     });
   } catch (e) {
@@ -3334,10 +3394,45 @@ router.put("/payroll/ledger-map", async (req, res) => {
       })
       .filter((d) => d && d.key);
 
+    /* REMEMBER WHAT WAS CHOSEN — see the `learned` array on the model.
+       Merged with what is already there rather than replacing it: the value
+       of this record is that it accumulates, so a ledger picked for three
+       departments outranks one picked once. Clearing a mapping does not
+       erase the memory of it, which is deliberate — it is exactly the moment
+       somebody is most likely to want the old answer offered back. */
+    const existingDoc = await Acc_PayrollLedgerMap.findOne({ companyId }).lean();
+    const learned = new Map(
+      (existingDoc?.learned || []).map((l) => [`${l.slot}|${l.key}|${l.ledgerId}`, { ...l }]),
+    );
+    const remember = (slot, key, ref) => {
+      if (!ref?.ledgerId) return;
+      const k = `${slot}|${key || ""}|${ref.ledgerId}`;
+      const prev = learned.get(k);
+      learned.set(k, {
+        slot,
+        key: key || "",
+        ledgerId: ref.ledgerId,
+        ledgerName: ref.ledgerName || "",
+        count: (prev?.count || 0) + 1,
+        lastChosenAt: new Date(),
+        lastChosenByName: req.user?.name || "",
+      });
+    };
+    for (const slot of [
+      "pfPayable", "esiPayable", "otherDeductions", "salaryPayable",
+      "stipendExpense", "stipendPayable", "defaultSalaryLedger",
+    ]) {
+      remember(slot, "", refOf(req.body[slot]));
+    }
+    for (const d of departments) {
+      remember("department", d.key, { ledgerId: d.ledgerId, ledgerName: d.ledgerName });
+    }
+
     const doc = await Acc_PayrollLedgerMap.findOneAndUpdate(
       { companyId },
       {
         $set: {
+          learned: [...learned.values()],
           departments,
           pfPayable: refOf(req.body.pfPayable),
           esiPayable: refOf(req.body.esiPayable),
@@ -3763,11 +3858,32 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     ["duties & taxes", "statutory", "current liab"],
     "liability",
   ));
+  /* OTHER DEDUCTIONS GO TO STAFF WELFARE, NOT TO A PAYABLE.
+     ------------------------------------------------------------------
+     Owner's decision. What this line actually holds is money recovered from
+     staff for canteen, festival and entertainment spending the company has
+     already paid for. Crediting it to "Other Deductions Payable" said the
+     company still owed it to somebody, which it does not — the spending
+     happened. Crediting the expense head instead REDUCES that expense by what
+     was recovered, which is what the P&L should show.
+
+     The nature changes with it: this is now an expense ledger, not a
+     liability, and `findOrCreateLedger` is told so — otherwise a company
+     without this ledger would have one created under Current Liabilities and
+     the group would contradict the name.
+
+     A company that has mapped this slot explicitly still wins; the map is
+     consulted first, exactly as before. */
   const otherDeductionsPayable = (await mappedLedger("otherDeductions")) || (await findOrCreateLedger(
     companyId,
-    ["Other Deductions Payable", "Salary Deductions Payable"],
-    ["current liab", "statutory"],
-    "liability",
+    [
+      "Staff Welfare/Festival/Entertainment Expenses A/c",
+      "Staff Welfare/Festival/Entertainment Expenses",
+      "Staff Welfare Expenses",
+      "Staff Welfare",
+    ],
+    ["indirect expense", "administrative expenses", "expenses", "welfare"],
+    "expense",
   ));
   const salaryPayable = (await mappedLedger("salaryPayable")) || (await findOrCreateLedger(
     companyId,
@@ -4145,8 +4261,26 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     },
   ];
 
-  // ── Voucher 2: PAYMENT (only if run.status === "paid") ────────────────
-  if (run.status === "paid" && totals.net > 0) {
+  /* ── NO PAYMENT VOUCHER HERE. ────────────────────────────────────────
+     Posting payroll records the COST and what is now owed to staff. It does
+     not record money leaving the bank, because at the moment of posting no
+     money has left — the two events are usually days apart and are two
+     different vouchers in any set of books.
+
+     This used to create a payment voucher whenever HR had already ticked the
+     run as "paid", which coupled the accountant's posting to an HR checkbox
+     and produced a bank entry dated by when somebody clicked rather than by
+     when the bank was debited.
+
+     The payment is now recorded the normal way — a payment voucher — and
+     LINKED to this run (POST /payroll/runs/:runId/link-payment). Linking is
+     what marks the run paid, so the bank entry and the "paid" status come
+     from the same fact instead of from two people's clicks.
+
+     `buildPaymentVoucherDraft` below still knows how to shape that voucher,
+     so the link screen can offer to create it rather than making somebody
+     type the split by hand. */
+  if (opts.includePaymentVoucher === true && totals.net > 0) {
     const bankLedger = await resolveBankLedgerForPayroll(
       companyId,
       opts.bankLedgerId,
@@ -4472,6 +4606,202 @@ async function postPayrollRun(companyId, run, items, opts = {}) {
 
   return { created, skipped, totals: built.totals };
 }
+
+/* ------------------------------------------------------------------ */
+/* Payroll payment — linking the money to the run                      */
+/* ------------------------------------------------------------------ */
+/*
+ * Posting a payroll run records the cost and the liability. Paying it is a
+ * separate event, and this is where the two are joined: link the payment
+ * voucher that actually cleared the bank, and the run becomes "paid".
+ *
+ * WHY LINKING IS WHAT MARKS IT PAID
+ * "Paid" used to be a checkbox in HR, ticked by whoever remembered, and the
+ * accountant's posting then invented a bank entry to match it. So the books
+ * could say salaries were paid on a date no money moved. Now the payment
+ * voucher IS the evidence: no voucher, no "paid".
+ *
+ * Unlinking reverses both halves — the stamp on the voucher and the run's
+ * status — because a payment linked to the wrong run has to be correctable
+ * without an accountant editing the payroll collection by hand.
+ */
+
+/** Payment vouchers that could plausibly be this run's payment. */
+router.get("/payroll/runs/:runId/payment-candidates", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+
+    const HR = loadPayrollModels();
+    if (!HR) return res.status(503).json({ success: false, message: "Payroll models unavailable." });
+    const run = await HR.Payroll.findById(req.params.runId).lean();
+    if (!run) return res.status(404).json({ success: false, message: "Payroll run not found." });
+
+    const already = await Acc_Voucher.findOne({
+      companyId,
+      sourceSystem: "auto_from_payroll",
+      sourceId: run._id,
+      voucherType: "payment",
+      status: { $ne: "cancelled" },
+    })
+      .select("_id voucherNumber voucherDate grandTotal status")
+      .lean();
+
+    /* Unlinked payments only. One already tied to another run must not be
+       offered — that is how one bank payment ends up marking two months
+       paid. */
+    const candidates = await Acc_Voucher.find({
+      companyId,
+      voucherType: "payment",
+      status: { $nin: ["cancelled", "void"] },
+      $or: [{ sourceId: { $exists: false } }, { sourceId: null }, { sourceId: run._id }],
+    })
+      .select("_id voucherNumber voucherDate grandTotal partyLedgerName narration sourceId")
+      .sort({ voucherDate: -1 })
+      .limit(100)
+      .lean();
+
+    res.json({
+      success: true,
+      run: {
+        _id: run._id,
+        payPeriod: run.payPeriod || `${run.year}-${run.month}`,
+        status: run.status,
+        netPayable: run.totalNetPayable ?? run.netPayable ?? null,
+      },
+      linked: already || null,
+      candidates,
+    });
+  } catch (e) {
+    console.error("[payroll payment-candidates]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** Link a payment voucher to this run — and mark the run paid. */
+router.post("/payroll/runs/:runId/link-payment", async (req, res) => {
+  try {
+    const { companyId, paymentVoucherId } = req.body || {};
+    if (!companyId || !paymentVoucherId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId and paymentVoucherId are required." });
+    if (!canEditPayroll(req))
+      return res.status(403).json({ success: false, message: "This needs an owner or approver." });
+
+    const HR = loadPayrollModels();
+    if (!HR) return res.status(503).json({ success: false, message: "Payroll models unavailable." });
+
+    const run = await HR.Payroll.findById(req.params.runId);
+    if (!run) return res.status(404).json({ success: false, message: "Payroll run not found." });
+
+    const voucher = await Acc_Voucher.findOne({ _id: paymentVoucherId, companyId });
+    if (!voucher)
+      return res.status(404).json({ success: false, message: "Payment voucher not found." });
+    if (voucher.voucherType !== "payment")
+      return res.status(400).json({
+        success: false,
+        message: `Only a payment voucher can settle payroll — that is a ${voucher.voucherType}.`,
+      });
+    if (["cancelled", "void"].includes(voucher.status))
+      return res
+        .status(400)
+        .json({ success: false, message: `That voucher is ${voucher.status}.` });
+    if (voucher.sourceId && String(voucher.sourceId) !== String(run._id))
+      return res.status(400).json({
+        success: false,
+        message: "That payment is already linked to another payroll run.",
+      });
+
+    const period = run.payPeriod || `${run.year}-${run.month}`;
+    voucher.sourceSystem = "auto_from_payroll";
+    voucher.sourceId = run._id;
+    voucher.sourceReference = `Payroll/${period}/payment`;
+    await voucher.save();
+
+    /* The run and its items, together — a run reading "paid" over items that
+       still read "processed" is what makes a payslip disagree with the
+       register. */
+    await HR.PayrollItem.updateMany(
+      { month: run.month, year: run.year, status: { $ne: "paid" } },
+      { $set: { status: "paid", paymentDate: voucher.voucherDate || new Date() } },
+    );
+    run.status = "paid";
+    if ("paymentDate" in run) run.paymentDate = voucher.voucherDate || new Date();
+    await run.save();
+
+    try {
+      const { recordChange } = require("../../services/changeLog");
+      await recordChange(req, {
+        departmentSlug: "accounting",
+        section: "accounting:settings",
+        entity: "payroll-run",
+        entityId: String(run._id),
+        entityLabel: `Payroll ${period}`,
+        action: "update",
+        summary: `Payroll ${period} marked paid — settled by payment ${voucher.voucherNumber}.`,
+      });
+    } catch { /* the link is saved; the log is best-effort */ }
+
+    res.json({
+      success: true,
+      message: `Payroll ${period} is now paid, settled by ${voucher.voucherNumber}.`,
+      runStatus: run.status,
+      voucher: { _id: voucher._id, voucherNumber: voucher.voucherNumber },
+    });
+  } catch (e) {
+    console.error("[payroll link-payment]", e);
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+/** Unlink — the run goes back to unpaid and the voucher stops claiming it. */
+router.post("/payroll/runs/:runId/unlink-payment", async (req, res) => {
+  try {
+    const { companyId } = req.body || {};
+    if (!companyId)
+      return res.status(400).json({ success: false, message: "companyId required" });
+    if (!canEditPayroll(req))
+      return res.status(403).json({ success: false, message: "This needs an owner or approver." });
+
+    const HR = loadPayrollModels();
+    if (!HR) return res.status(503).json({ success: false, message: "Payroll models unavailable." });
+    const run = await HR.Payroll.findById(req.params.runId);
+    if (!run) return res.status(404).json({ success: false, message: "Payroll run not found." });
+
+    const voucher = await Acc_Voucher.findOne({
+      companyId,
+      voucherType: "payment",
+      sourceId: run._id,
+      status: { $ne: "cancelled" },
+    });
+    if (voucher) {
+      voucher.sourceId = undefined;
+      voucher.sourceReference = "";
+      voucher.sourceSystem = "manual";
+      await voucher.save();
+    }
+
+    /* Back to processed, not to draft: the run was processed and posted, and
+       only the PAYMENT is being undone. */
+    await HR.PayrollItem.updateMany(
+      { month: run.month, year: run.year, status: "paid" },
+      { $set: { status: "processed" }, $unset: { paymentDate: "" } },
+    );
+    run.status = "processed";
+    await run.save();
+
+    res.json({
+      success: true,
+      message: `Payroll ${run.payPeriod || `${run.year}-${run.month}`} is no longer marked paid.`,
+      runStatus: run.status,
+    });
+  } catch (e) {
+    console.error("[payroll unlink-payment]", e);
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
 
 // ── POST /payroll/runs/:runId/post ────────────────────────────────────────
 router.post("/payroll/runs/:runId/post", async (req, res) => {

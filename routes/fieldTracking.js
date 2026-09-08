@@ -11,16 +11,30 @@ const { SalesPerson } = require("../models/CMS_Models/Sales/SalesPerson");
 const salesAuth = require("../Middlewear/SalesAuthMiddlewear");
 const { reverseGeocode, searchPlace } = require("../services/reverseGeocode.service");
 
+/** IST is UTC+5:30. Every "day" in this feature is an Indian calendar day. */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
 /** "YYYY-MM-DD" in IST for an epoch-ms value — the day a duty belongs to. */
 function istDayKey(ms) {
   if (!ms) return null;
-  return new Date(ms + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
-/** Start/end epoch-ms of a "YYYY-MM-DD" day window in the server's zone. */
+/**
+ * Start/end epoch-ms of a "YYYY-MM-DD" IST day.
+ *
+ * This used to build the window from `new Date(dateStr + "T00:00:00")`, i.e.
+ * midnight in whatever zone the SERVER happens to run in. On a UTC host that
+ * shifted every day filter by 5h30m against `istDayKey` above, so a duty
+ * started before 05:30 IST was filed under the previous day and one started
+ * after 18:30 IST could vanish from "today" entirely — the reps whose routes
+ * "sometimes don't show". Both helpers now agree on IST.
+ */
 function dayWindow(dateStr) {
-  const day = new Date(dateStr + "T00:00:00");
-  if (isNaN(day.getTime())) return null;
-  return { start: day.getTime(), end: day.getTime() + 24 * 60 * 60 * 1000 };
+  if (typeof dateStr !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+  const utcMidnight = Date.parse(dateStr + "T00:00:00Z");
+  if (isNaN(utcMidnight)) return null;
+  const start = utcMidnight - IST_OFFSET_MS; // 00:00 IST on that date
+  return { start, end: start + 24 * 60 * 60 * 1000 };
 }
 const num = (v, d = 0) => (typeof v === "number" && !isNaN(v) ? v : d);
 
@@ -49,6 +63,31 @@ async function enrichSessionPlaces(sessionId, startPoint, lastPoint) {
     }
   } catch (_e) {
     /* geocoding is best-effort; never let it break tracking */
+  }
+}
+
+/**
+ * Trust the stored fixes over the device's reported total. Uses the largest
+ * `cumulativeDistance` we hold for the session (the app computes it as it
+ * walks, so the newest fix carries the running total) and, as a floor, the
+ * distance actually walked by the stored polyline. Never lowers a total.
+ */
+async function reconcileDistanceFromPings(sessionId, reportedMeters) {
+  try {
+    const [top] = await FieldLocationPing.find({ sessionId })
+      .sort({ cumulativeDistance: -1 })
+      .limit(1)
+      .select("cumulativeDistance -_id")
+      .lean();
+    const fromPings = num(top?.cumulativeDistance);
+    if (fromPings > num(reportedMeters)) {
+      await FieldTrackingSession.updateOne(
+        { sessionId },
+        { $max: { totalDistanceMeters: fromPings } },
+      );
+    }
+  } catch (_e) {
+    /* best-effort: never fail a stop because of a distance touch-up */
   }
 }
 
@@ -228,13 +267,33 @@ router.post("/session/stop", checkApiKey, async (req, res) => {
       $set: {
         active: false,
         endTime: b.endTime ?? Date.now(),
+        ...(b.employeeId ? { employeeId: b.employeeId } : {}),
+      },
+      /* A stop can be the FIRST thing we hear about a duty: the app buffers
+         start/ping/stop while offline and replays them, and a duty that both
+         began and ended without signal used to 404 here and be dropped on the
+         floor. Upsert instead, so the day is recorded either way. */
+      $setOnInsert: {
+        sessionId: b.sessionId,
+        startTime: b.startTime ?? b.endTime ?? Date.now(),
+        source: b.source || "gravemployeetracker",
       },
     };
     if (typeof b.totalDistanceMeters === "number") {
       update.$max = { totalDistanceMeters: b.totalDistanceMeters };
     }
-    const doc = await FieldTrackingSession.findOneAndUpdate({ sessionId: b.sessionId }, update, { new: true });
-    if (!doc) return res.status(404).json({ success: false, message: "Unknown sessionId" });
+    const doc = await FieldTrackingSession.findOneAndUpdate({ sessionId: b.sessionId }, update, {
+      new: true,
+      upsert: true,
+      setDefaultsOnInsert: true,
+    });
+
+    /* The device's own running total can be behind (or zero) if its last
+       batches were still queued when the rep ended duty. The pings we hold are
+       the record of what actually happened, so close the session on the larger
+       of the two rather than publishing a distance we know is short. */
+    await reconcileDistanceFromPings(doc.sessionId, doc.totalDistanceMeters);
+
     // Final place name from the last known position.
     if (typeof doc.lastLat === "number" && typeof doc.lastLng === "number") {
       enrichSessionPlaces(doc.sessionId, null, { lat: doc.lastLat, lng: doc.lastLng });

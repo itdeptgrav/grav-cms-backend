@@ -609,14 +609,43 @@ router.get("/", auth, async (req, res) => {
       Acc_Voucher.countDocuments(filter),
     ]);
 
+    /* A NAME FOR THE PARTY COLUMN, WHEN THE VOUCHER CARRIES NONE.
+       ------------------------------------------------------------------
+       This used to take "the first Dr line" for every voucher type, which is
+       only ever right for a purchase. The party sits on whichever side the
+       voucher type puts it:
+
+         sales / payment / debit_note   → Dr   (the customer owes / we pay)
+         receipt / credit_note          → Cr   (money in / the debt drops)
+
+       Taking Dr regardless printed the BANK as the party on every receipt —
+       "INDIAN BANK -> INDIAN BANK" — and "Sales Returns" as the customer on
+       every credit note. Same bug, two registers.
+
+       A real party line wins over the side rule: an entry flagged
+       isPartyLedger is the answer whatever side it is on. */
+    const PARTY_SIDE_FOR_LIST = {
+      receipt: "Cr",
+      credit_note: "Cr",
+      payment: "Dr",
+      debit_note: "Dr",
+      sales: "Dr",
+      purchase: "Cr",
+    };
     for (const v of items) {
       if (!v.partyLedgerName && (!v.partyLedgerId || !v.partyLedgerId.name)) {
-        const firstDr = (v.ledgerEntries || []).find(
-          (e) => e.type === "Dr" || (e.signedAmount || 0) > 0,
-        );
-        if (firstDr) {
-          v.partyLedgerName = firstDr.ledgerName || "";
-        }
+        const entries = v.ledgerEntries || [];
+        const side = PARTY_SIDE_FOR_LIST[v.voucherType] || "Dr";
+        const pick =
+          entries.find((e) => e.isPartyLedger && e.type === side) ||
+          entries.find((e) => e.isPartyLedger) ||
+          /* No flag anywhere: fall back to the biggest line on the party's
+             side, which for a one-party voucher is the party. Biggest rather
+             than first, so a rounding-off or tax line never wins. */
+          entries
+            .filter((e) => e.type === side)
+            .sort((a, b) => (b.amount || 0) - (a.amount || 0))[0];
+        if (pick) v.partyLedgerName = pick.ledgerName || "";
       }
     }
 
@@ -644,11 +673,42 @@ router.get("/", auth, async (req, res) => {
           for (const a of e.billAllocations || [])
             if (a.billName) paidBillNames.add(a.billName);
       }
+      /* A BILL CAN ALSO BE CLOSED BY A DEBIT NOTE, NOT ONLY BY PAYING IT.
+         ------------------------------------------------------------------
+         This only looked at payment vouchers, so a bill fully reversed by a
+         debit note — goods sent back, supplier overbilled — still showed a
+         "Pay" button. Inviting somebody to pay a bill that no longer exists
+         is the payables twin of calling a credited invoice "Paid".
+
+         `closedBy` names the voucher type that actually closed it, so the
+         register can say WHICH, instead of a bare paid/unpaid flag that
+         cannot tell money from a reversal. */
+      const debitNotes = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            companyId: new mongoose.Types.ObjectId(String(companyId)),
+            voucherType: "debit_note",
+            status: { $in: ["posted", "pending_approval"] },
+            "originalBill.voucherId": { $in: items.map((v) => v._id) },
+          },
+        },
+        { $group: { _id: "$originalBill.voucherId", total: { $sum: "$grandTotal" } } },
+      ]);
+      const debitedById = new Map(debitNotes.map((d) => [String(d._id), d.total]));
+
       for (const v of items) {
-        v.isPaid =
+        const paid =
           paidBillNames.has(v.voucherNumber) ||
           paidBillNames.has(v.referenceNumber) ||
           (v.purchaseOrderId && paidPOs.has(String(v.purchaseOrderId)));
+        const debited = debitedById.get(String(v._id)) || 0;
+        const fullyDebited = debited > 0 && debited >= (v.grandTotal || 0) - 0.01;
+
+        v.debitedAmount = debited;
+        v.closedBy = paid && debited > 0 ? "both" : paid ? "payment" : fullyDebited ? "debit_note" : null;
+        /* Still the flag the register reads to decide whether to offer "Pay".
+           A bill reversed in full has nothing left to pay. */
+        v.isPaid = paid || fullyDebited;
       }
     }
 
@@ -2618,6 +2678,201 @@ router.post("/:id/match-payment", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("[match-payment]", e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Bill matching — which invoice did this money settle?                */
+/* ------------------------------------------------------------------ */
+/*
+ * A receipt records that money arrived; the ALLOCATION records which invoice
+ * it was for. Without one the invoice stays outstanding forever, which is
+ * exactly what the reports were showing: bills chased months after they were
+ * paid. The new-receipt form has an allocation picker, but it is optional and
+ * was usually skipped — 124 of 139 receipts carried nothing at all — and no
+ * form can help a receipt that was entered last quarter.
+ *
+ * So: match an EXISTING receipt or payment, in part or in full, and unmatch it
+ * again. The rules live in services/billMatching.service.js; these routes are
+ * transport, permission and persistence only.
+ *
+ * Declared BEFORE `/:id` so "unmatched" can never be read as a voucher id.
+ */
+
+/* GET /unmatched — the worklist: money that settles nothing yet.        */
+router.get("/unmatched", auth, async (req, res) => {
+  try {
+    const { companyId, voucherType = "receipt", partyLedgerId, q, limit = 100 } = req.query;
+    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    if (!billMatching.SETTLING_TYPES.has(voucherType)) {
+      return res.status(400).json({
+        error: `voucherType must be one of: ${[...billMatching.SETTLING_TYPES].join(", ")}.`,
+      });
+    }
+
+    const filter = {
+      companyId,
+      voucherType,
+      status: { $nin: ["cancelled", "void"] },
+    };
+    if (partyLedgerId) filter.partyLedgerId = partyLedgerId;
+    if (q) {
+      const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ voucherNumber: rx }, { partyLedgerName: rx }, { narration: rx }];
+    }
+
+    const vouchers = await Acc_Voucher.find(filter)
+      .sort({ voucherDate: -1 })
+      .limit(Math.min(Number(limit) || 100, 500))
+      .select("voucherNumber voucherDate grandTotal partyLedgerName partyLedgerId ledgerEntries status")
+      .lean();
+
+    /* Summarised in memory rather than by an aggregation: the "how much is
+       still unallocated" rule lives in one place in the service, and a second
+       copy of it written in Mongo's query language is a copy that will drift. */
+    const rows = vouchers
+      .map((v) => {
+        const state = billMatching.matchStateOf(v);
+        return {
+          _id: v._id,
+          voucherNumber: v.voucherNumber,
+          voucherDate: v.voucherDate,
+          partyLedgerName: state.partyLedgerName || v.partyLedgerName || "",
+          partyLedgerId: state.partyLedgerId || (v.partyLedgerId ? String(v.partyLedgerId) : null),
+          status: v.status,
+          total: state.total || v.grandTotal || 0,
+          allocated: state.allocated,
+          unallocated: state.unallocated,
+          fullyMatched: !!state.fullyMatched,
+          matchable: state.matchable,
+          reason: state.reason || null,
+        };
+      })
+      .filter((r) => r.matchable);
+
+    res.json({
+      vouchers: rows,
+      summary: {
+        count: rows.length,
+        unmatchedCount: rows.filter((r) => !r.fullyMatched).length,
+        unallocatedTotal: billMatching.money(
+          rows.reduce((s, r) => s + r.unallocated, 0),
+        ),
+      },
+    });
+  } catch (e) {
+    console.error("[unmatched]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* GET /:id/match — this voucher's match state, and the bills it can settle. */
+router.get("/:id/match", auth, async (req, res) => {
+  try {
+    const voucher = await Acc_Voucher.findById(req.params.id).lean();
+    billMatching.assertMatchable(voucher);
+
+    /* A voucher settling several parties has one match state PER party — pass
+       `partyLedgerId` to pick one. Without it the first is used, and `parties`
+       in the response is what lets a screen offer the choice. */
+    const partyLedgerId = req.query.partyLedgerId || null;
+    const state = billMatching.matchStateOf(voucher, partyLedgerId);
+    const openBills = state.matchable
+      ? await billMatching.openBillsForVoucher(voucher, {
+          excludeVoucherId: voucher._id,
+          partyLedgerId: state.partyLedgerId,
+        })
+      : [];
+
+    res.json({
+      voucher: {
+        _id: voucher._id,
+        voucherNumber: voucher.voucherNumber,
+        voucherDate: voucher.voucherDate,
+        voucherType: voucher.voucherType,
+        status: voucher.status,
+        partyLedgerName: state.partyLedgerName,
+      },
+      ...state,
+      openBills,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher match get]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /:id/match — set this voucher's allocations.                     */
+/* Body: { allocations: [{ billName, amount }] }   — [] unmatches it.    */
+router.post("/:id/match", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false) {
+      return res.status(403).json({ error: "Read-only access — you can't match receipts." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    billMatching.assertMatchable(voucher);
+
+    const state = await billMatching.applyAllocations(
+      voucher,
+      Array.isArray(req.body?.allocations) ? req.body.allocations : [],
+      { partyLedgerId: req.body?.partyLedgerId || null },
+    );
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+
+    /* Named for the change history, which files this under the voucher rather
+       than under a bare "record". */
+    req.auditEntity = "voucher";
+    req.auditSection = "accounting:vouchers";
+
+    res.json({
+      success: true,
+      message: state.allocated
+        ? `${voucher.voucherNumber} matched to ${state.allocations.length} bill${state.allocations.length === 1 ? "" : "s"}.`
+        : `${voucher.voucherNumber} is no longer matched to any bill.`,
+      ...state,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher match]", e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* DELETE /:id/match — unmatch everything on this voucher.               */
+router.delete("/:id/match", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false) {
+      return res.status(403).json({ error: "Read-only access — you can't unmatch receipts." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    billMatching.assertMatchable(voucher);
+
+    const state = await billMatching.clearAllocations(voucher, {
+      partyLedgerId: req.body?.partyLedgerId || req.query?.partyLedgerId || null,
+    });
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+
+    req.auditEntity = "voucher";
+    req.auditSection = "accounting:vouchers";
+
+    res.json({
+      success: true,
+      message: `${voucher.voucherNumber} unmatched — those bills are outstanding again.`,
+      ...state,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher unmatch]", e);
     res.status(400).json({ error: e.message });
   }
 });
