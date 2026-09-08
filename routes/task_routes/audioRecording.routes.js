@@ -897,15 +897,33 @@ module.exports = function (io) {
     );
   }
 
-  /** Their own recording, if it landed. A backup row never counts as one. */
-  async function realRecordingExists(meetId, forEmployeeId) {
-    const own = await db
+  /**
+   * What is already filed for this person in this meeting.
+   *
+   * One query answers both questions, because both are asked together and the
+   * rows are the same rows: is their OWN recording there (a backup must never
+   * be uploaded beside it), and is a backup ALREADY there (a second one is
+   * the same voice twice). M066 held three backup files for one participant
+   * because nothing asked the second question — the host's room closed three
+   * times, and each close offered again.
+   */
+  async function existingRecordings(meetId, forEmployeeId) {
+    const snap = await db
       .collection("meeting_audio_recordings")
       .where("meetId", "==", meetId)
       .where("employeeId", "==", forEmployeeId)
-      .limit(5)
+      .limit(10)
       .get();
-    return own.docs.some((d) => d.data().isBackup !== true);
+    const rows = snap.docs.map((d) => d.data());
+    return {
+      real: rows.some((r) => r.isBackup !== true),
+      backup: rows.some((r) => r.isBackup === true),
+    };
+  }
+
+  /** Their own recording, if it landed. A backup row never counts as one. */
+  async function realRecordingExists(meetId, forEmployeeId) {
+    return (await existingRecordings(meetId, forEmployeeId)).real;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1067,7 +1085,8 @@ module.exports = function (io) {
            since — a slow connection finishing, or the drain on another page
            catching up. Uploading now would put the same voice in the folder
            twice, which is the one outcome this feature must never cause. */
-        if (await realRecordingExists(meetId, forEmployeeId)) {
+        const already = await existingRecordings(meetId, forEmployeeId);
+        if (already.real) {
           fs.rmSync(chunkDir, { recursive: true, force: true });
           console.log(
             `[AudioBackup] their own file arrived first — discarding backup for ${forEmployeeId}`,
@@ -1076,6 +1095,21 @@ module.exports = function (io) {
             success: true,
             skipped: true,
             message: "Their own recording arrived; backup discarded",
+          });
+        }
+        /* And never a SECOND backup of one voice. The host's room can close
+           more than once in a meeting — navigating away, a reconnect, popping
+           the window out — and each close offers again. The browser guards
+           this too; this is the half that cannot be skipped by a reload. */
+        if (already.backup) {
+          fs.rmSync(chunkDir, { recursive: true, force: true });
+          console.log(
+            `[AudioBackup] a backup for ${forEmployeeId} already exists — discarding this one`,
+          );
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "A backup for this participant already exists",
           });
         }
 
