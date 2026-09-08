@@ -62,6 +62,8 @@
     "yjs": "^13.6.31"
   },
   "devDependencies": {
+    "jest": "^30.5.0",
+    "mongodb-memory-server": "^10.4.3",
     "nodemon": "^3.1.11"
   }
 }

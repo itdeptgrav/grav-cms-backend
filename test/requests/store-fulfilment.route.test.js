@@ -51,6 +51,12 @@ const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalMod
 const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
 const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
 const SpendRequest = require("../../models/CMS_Models/Requests/SpendRequest");
+/* Chunk 1B: the store's fulfilment work is now tenant-scoped and
+   capability-gated. The seed gives the store actor what a real deployment
+   gives them — a company membership and the `store` department grant — so
+   this suite keeps testing the BUSINESS rules rather than the new gate. */
+const DepartmentRole = require("../../models/Access/DepartmentRole");
+const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
 const MRF = require("../../models/CMS_Models/Inventory/Operations/MRF");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const Employee = require("../../models/Employee");
@@ -72,12 +78,16 @@ beforeAll(async () => {
 });
 afterAll(async () => { await new Promise((r) => server.close(r)); });
 
-const call = (emp, path, { method = "GET", body, app = "mrf" } = {}) => {
+let idemSeq = 0;
+const newKey = () => `sf-${++idemSeq}-${Math.random().toString(36).slice(2)}`;
+
+const call = (emp, path, { method = "GET", body, app = "mrf", idempotencyKey } = {}) => {
   const url = app === "mrf" ? `${base}/cms/inventory/mrf${path}` : `${base}/requests/spend${path}`;
   return fetch(url, {
     method,
     headers: {
       "Content-Type": "application/json",
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
       Authorization: `Bearer ${jwt.sign(
         { id: String(emp._id), role: "employee", employeeId: emp.biometricId,
           name: `${emp.firstName} ${emp.lastName}`, email: emp.email },
@@ -130,6 +140,14 @@ async function seed({ stockQty = 50, requestedQty = 10, withHead = true } = {}) 
     firstName: "Bikash", lastName: `S${n}`, email: `store${n}@demo.example`,
     biometricId: `ST${n}`, department: "Store",
   });
+  /* Store & Purchase authority: the grant that carries sp.mrf.fulfil and
+     sp.stock.issue, plus membership of the company these books belong to. */
+  await DepartmentRole.create({
+    departmentSlug: "store", email: store.email, role: "approver", isActive: true,
+  });
+  await SpCompanyMembership.create({
+    companyId: company._id, email: store.email, employeeRef: store._id, personName: "Bikash",
+  });
   const fin = await person({
     firstName: "Soumya", lastName: `F${n}`, email: `fin${n}@demo.example`,
     biometricId: `FN${n}`, department: "Accounts",
@@ -147,6 +165,10 @@ async function seed({ stockQty = 50, requestedQty = 10, withHead = true } = {}) 
   /* TL-approved and with the store — exactly what the intake desk spawns for
      a store-issue classification, head and all. */
   const mrf = await MRF.create({
+    /* Company-owned requests are numbered through SpDocumentSequence now,
+       and the model refuses to invent one. A fixture states its own. */
+    mrfNumber: `MRF/2026-27/${String(++seq).padStart(4, "0")}`,
+    companyId: company._id,
     requestedFor: emp._id, requestedForName: "Rutu", requestedForDept: "Tech",
     requestedForId: emp.biometricId, requestType: "USES_BASED", status: "APPROVED",
     createdByRef: emp._id, createdByModel: "Employee", createdByName: "Rutu",
@@ -174,7 +196,9 @@ async function seed({ stockQty = 50, requestedQty = 10, withHead = true } = {}) 
 }
 
 const decide = (s, body) =>
-  call(s.store, `/${s.mrf._id}/fulfilment-decision`, { method: "POST", body });
+  call(s.store, `/${s.mrf._id}/fulfilment-decision`, {
+    method: "POST", body, idempotencyKey: newKey(),
+  });
 
 /* ═══ 1 · IT IS ON THE SHELF ═══════════════════════════════════════════════ */
 
@@ -364,7 +388,12 @@ describe("the gate on the decision itself", () => {
     await MRF.updateOne({ _id: s.mrf._id }, { $set: { status: "PENDING", tlApproved: false } });
 
     const r = await decide(s, { decision: "issue_from_stock" });
-    expect(r.status).toBe(403);
+    /* CONTRACT CHANGE (Chunk 1B): 409, not 403. The store actor HAS the
+       authority; the request has not reached them yet. The old 403 said "you
+       do not have permission" while its own message said "still awaiting
+       approval" — the two disagreed, and the frontend showed the wrong one. */
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("INVALID_TRANSITION");
     expect(r.body.message).toMatch(/has not been approved yet/);
   });
 
@@ -373,8 +402,10 @@ describe("the gate on the decision itself", () => {
     await MRF.updateOne({ _id: s.mrf._id }, { $set: { status: "CANCELLED" } });
 
     const r = await decide(s, { decision: "issue_from_stock" });
-    expect(r.status).toBe(400);
-    expect(r.body.message).toMatch(/cancelled/);
+    /* Same reasoning: a closed request is a state, not a permission. */
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("INVALID_TRANSITION");
+    expect(r.body.message).toMatch(/closed/i);
   });
 
   test("an unknown decision is refused", async () => {

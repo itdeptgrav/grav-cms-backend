@@ -41,7 +41,17 @@ router.get("/", async (req, res) => {
   try {
     const [mrfs, moRequests] = await Promise.all([
       MRF.find({})
-        .select("mrfNumber requestedForName requestedForDept requestedForId creationMode createdByName requestType deadline reason priority status items pmApproved pmApprovedAt pmRejected pmRejectedAt pmRejectionNote createdAt")
+        /* The TL block is load-bearing, not decoration. The mapper below already
+           publishes approverName and the tlApproved/tlRejected trail, but they
+           were never selected, so every MRF in this list arrived as
+           `tlApproved: false, tlRejected: false, approverName: ""` — including
+           ones a TL approved months ago. The requests desk could not tell an
+           awaiting request from a decided one and had to fall back to the
+           lifecycle `status`. All nine already exist on the schema
+           (models/CMS_Models/Inventory/Operations/MRF.js:280-405); this loads
+           the fields the route was already promising. No schema change, and
+           MRF approval authority is untouched — these are read-only here. */
+        .select("mrfNumber requestedForName requestedForDept requestedForId creationMode createdByName requestType deadline reason priority status items pmApproved pmApprovedAt pmRejected pmRejectedAt pmRejectionNote createdAt approverName tlApproved tlApprovedAt tlApprovedByName tlRejected tlRejectedAt tlRejectedByName tlRejectionNote autoForwarded")
         .sort({ createdAt: -1 }).lean(),
       CustomerRequest.find({ status: { $in: STORE_VISIBLE_STATUSES } })
         .select("requestId customerInfo status priority requestType items pmApproved pmApprovedAt pmRejected pmRejectedAt pmRejectionNote createdAt")
@@ -95,6 +105,9 @@ router.get("/", async (req, res) => {
       tlApproved: !!m.tlApproved, tlApprovedAt: m.tlApprovedAt || null,
       tlApprovedByName: m.tlApprovedByName || "",
       tlRejected: !!m.tlRejected, tlRejectedAt: m.tlRejectedAt || null,
+      // Additive: the approval trail already named its decider, the rejection
+      // trail did not, so a refused request could not say who refused it.
+      tlRejectedByName: m.tlRejectedByName || "",
       tlRejectionNote: m.tlRejectionNote || "",
       autoForwarded: !!m.autoForwarded,
       createdAt: m.createdAt,

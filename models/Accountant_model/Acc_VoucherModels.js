@@ -536,6 +536,19 @@ const tallyVoucherSchema = new mongoose.Schema(
       index: true,
     },
     purchaseOrderNumber: { type: String, trim: true },
+
+    // ─── Service-order linkage ──────────────────────────────────────────────
+    // Set when a purchase voucher is raised against an ACCEPTED Service Order.
+    // A service is NOT a purchase order: it has no goods, no receipt and no
+    // stock, so it gets its OWN link rather than being squeezed into
+    // `purchaseOrderId`. This is what lets the Service Order know it has been
+    // billed — which is not the same as paid.
+    serviceOrderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ServiceOrder",
+      index: true,
+    },
+    serviceOrderNumber: { type: String, trim: true },
     // Slice of a payment voucher applied to the linked PO. A vendor payment
     // can span several POs; only this amount is written to the PO's payments[].
     // Absent → the whole party-leg amount is treated as applied to this PO.
@@ -548,6 +561,7 @@ const tallyVoucherSchema = new mongoose.Schema(
         "manual",
         "auto_from_quotation",
         "auto_from_po",
+        "auto_from_service_order",
         "auto_from_payroll",
         "expense_module",
         "tally_import",
