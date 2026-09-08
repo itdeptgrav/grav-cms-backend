@@ -22,6 +22,7 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
+const billMatching = require("../../services/billMatching.service");
 
 const auth = accountantAuth;
 
@@ -2526,6 +2527,189 @@ router.post("/:id/match-payment", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("[match-payment]", e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Bill matching — which invoice did this money settle?                */
+/* ------------------------------------------------------------------ */
+/*
+ * A receipt records that money arrived; the ALLOCATION records which invoice
+ * it was for. Without one the invoice stays outstanding forever, which is
+ * exactly what the reports were showing: bills chased months after they were
+ * paid. The new-receipt form has an allocation picker, but it is optional and
+ * was usually skipped — 124 of 139 receipts carried nothing at all — and no
+ * form can help a receipt that was entered last quarter.
+ *
+ * So: match an EXISTING receipt or payment, in part or in full, and unmatch it
+ * again. The rules live in services/billMatching.service.js; these routes are
+ * transport, permission and persistence only.
+ *
+ * Declared BEFORE `/:id` so "unmatched" can never be read as a voucher id.
+ */
+
+/* GET /unmatched — the worklist: money that settles nothing yet.        */
+router.get("/unmatched", auth, async (req, res) => {
+  try {
+    const { companyId, voucherType = "receipt", partyLedgerId, q, limit = 100 } = req.query;
+    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    if (!billMatching.SETTLING_TYPES.has(voucherType)) {
+      return res.status(400).json({ error: "voucherType must be receipt or payment." });
+    }
+
+    const filter = {
+      companyId,
+      voucherType,
+      status: { $nin: ["cancelled", "void"] },
+    };
+    if (partyLedgerId) filter.partyLedgerId = partyLedgerId;
+    if (q) {
+      const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ voucherNumber: rx }, { partyLedgerName: rx }, { narration: rx }];
+    }
+
+    const vouchers = await Acc_Voucher.find(filter)
+      .sort({ voucherDate: -1 })
+      .limit(Math.min(Number(limit) || 100, 500))
+      .select("voucherNumber voucherDate grandTotal partyLedgerName partyLedgerId ledgerEntries status")
+      .lean();
+
+    /* Summarised in memory rather than by an aggregation: the "how much is
+       still unallocated" rule lives in one place in the service, and a second
+       copy of it written in Mongo's query language is a copy that will drift. */
+    const rows = vouchers
+      .map((v) => {
+        const state = billMatching.matchStateOf(v);
+        return {
+          _id: v._id,
+          voucherNumber: v.voucherNumber,
+          voucherDate: v.voucherDate,
+          partyLedgerName: state.partyLedgerName || v.partyLedgerName || "",
+          partyLedgerId: state.partyLedgerId || (v.partyLedgerId ? String(v.partyLedgerId) : null),
+          status: v.status,
+          total: state.total || v.grandTotal || 0,
+          allocated: state.allocated,
+          unallocated: state.unallocated,
+          fullyMatched: !!state.fullyMatched,
+          matchable: state.matchable,
+          reason: state.reason || null,
+        };
+      })
+      .filter((r) => r.matchable);
+
+    res.json({
+      vouchers: rows,
+      summary: {
+        count: rows.length,
+        unmatchedCount: rows.filter((r) => !r.fullyMatched).length,
+        unallocatedTotal: billMatching.money(
+          rows.reduce((s, r) => s + r.unallocated, 0),
+        ),
+      },
+    });
+  } catch (e) {
+    console.error("[unmatched]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* GET /:id/match — this voucher's match state, and the bills it can settle. */
+router.get("/:id/match", auth, async (req, res) => {
+  try {
+    const voucher = await Acc_Voucher.findById(req.params.id).lean();
+    billMatching.assertMatchable(voucher);
+
+    const state = billMatching.matchStateOf(voucher);
+    const openBills = state.matchable
+      ? await billMatching.openBillsForVoucher(voucher, { excludeVoucherId: voucher._id })
+      : [];
+
+    res.json({
+      voucher: {
+        _id: voucher._id,
+        voucherNumber: voucher.voucherNumber,
+        voucherDate: voucher.voucherDate,
+        voucherType: voucher.voucherType,
+        status: voucher.status,
+        partyLedgerName: state.partyLedgerName,
+      },
+      ...state,
+      openBills,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher match get]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /:id/match — set this voucher's allocations.                     */
+/* Body: { allocations: [{ billName, amount }] }   — [] unmatches it.    */
+router.post("/:id/match", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false) {
+      return res.status(403).json({ error: "Read-only access — you can't match receipts." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    billMatching.assertMatchable(voucher);
+
+    const state = await billMatching.applyAllocations(
+      voucher,
+      Array.isArray(req.body?.allocations) ? req.body.allocations : [],
+    );
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+
+    /* Named for the change history, which files this under the voucher rather
+       than under a bare "record". */
+    req.auditEntity = "voucher";
+    req.auditSection = "accounting:vouchers";
+
+    res.json({
+      success: true,
+      message: state.allocated
+        ? `${voucher.voucherNumber} matched to ${state.allocations.length} bill${state.allocations.length === 1 ? "" : "s"}.`
+        : `${voucher.voucherNumber} is no longer matched to any bill.`,
+      ...state,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher match]", e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* DELETE /:id/match — unmatch everything on this voucher.               */
+router.delete("/:id/match", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false) {
+      return res.status(403).json({ error: "Read-only access — you can't unmatch receipts." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    billMatching.assertMatchable(voucher);
+
+    const state = await billMatching.clearAllocations(voucher);
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+
+    req.auditEntity = "voucher";
+    req.auditSection = "accounting:vouchers";
+
+    res.json({
+      success: true,
+      message: `${voucher.voucherNumber} unmatched — those bills are outstanding again.`,
+      ...state,
+    });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error("[voucher unmatch]", e);
     res.status(400).json({ error: e.message });
   }
 });

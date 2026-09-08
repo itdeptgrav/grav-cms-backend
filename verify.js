@@ -63,6 +63,7 @@ const WRITES = [
   "verifyPayrollLedgerMap",    // the payroll → accounting bridge balances
   "verifyDeveloperSide",       // the anomaly scan catches what it promises
   "verifyAdminCenter",         // form definitions, job control, role floors
+  "verifyBillMatching",        // a receipt settles the invoice it is matched to
 ];
 
 const TIERS = { pure: PURE, readonly: READONLY, writes: WRITES };
