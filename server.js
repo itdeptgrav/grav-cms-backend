@@ -2228,6 +2228,9 @@ app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
+// Universal chat link previews — GET /cowork/link-preview?url=...
+app.use("/cowork", require("./routes/task_routes/coworkLinkPreview"));
+
 /* CoWork sign-in recovery and the alternate sign-in door.
  *
  * Mounted BEFORE nothing in particular — these paths (/cowork/auth/*) collide
