@@ -82,8 +82,41 @@ function money(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
-/** Voucher types that PAY money against a bill. */
-const SETTLING_TYPES = new Set(["receipt", "payment"]);
+/**
+ * Voucher types that REDUCE what a party owes, and therefore settle a bill.
+ *
+ * Two pairs, and the difference between them is worth stating because it is
+ * the thing people get wrong:
+ *
+ *   receipt / payment       — money moved. The debt is paid.
+ *   credit_note / debit_note — money did NOT move. The debt was reduced
+ *                             because goods came back, or were never
+ *                             delivered, or were overbilled.
+ *
+ * A CREDIT NOTE DOES NOT CANCEL THE INVOICE. Under GST the invoice has
+ * already been reported in GSTR-1; it cannot be unreported. The credit note
+ * is the legal instrument that reverses it, and is itself reported (Table
+ * 9B). Cancelling the invoice would erase a filed sale and break the audit
+ * trail. So a matched credit note LINKS to its invoice and reduces the
+ * outstanding — the invoice stays, permanently, with a credit against it.
+ */
+const SETTLING_TYPES = new Set(["receipt", "payment", "credit_note", "debit_note"]);
+
+/** Which side of a voucher faces the party, per type. */
+const PARTY_SIDE = {
+  receipt: "Cr",
+  credit_note: "Cr", // the customer owes less
+  payment: "Dr",
+  debit_note: "Dr", // we owe the supplier less
+};
+
+/** The document type a settlement of this voucher applies against. */
+const SOURCE_TYPE = {
+  receipt: "sales",
+  credit_note: "sales",
+  payment: "purchase",
+  debit_note: "purchase",
+};
 
 /** A voucher whose allocations may be edited at all. */
 function assertMatchable(voucher) {
@@ -94,7 +127,7 @@ function assertMatchable(voucher) {
   }
   if (!SETTLING_TYPES.has(voucher.voucherType)) {
     const e = new Error(
-      `Only receipts and payments can be matched to bills — this is a ${voucher.voucherType}.`,
+      `Only receipts, payments, credit notes and debit notes can be matched to bills — this is a ${voucher.voucherType}.`,
     );
     e.status = 400;
     throw e;
@@ -122,9 +155,43 @@ function assertMatchable(voucher) {
  * A screen that asks somebody to fix 66 things that are not broken is worse
  * than one that says nothing.
  */
-function findPartyEntry(voucher) {
+/**
+ * EVERY party line on the settling side, not just the first.
+ *
+ * One cheque can settle two customers — RC/2627/00007 credits two Mayfair
+ * hotels out of one ₹3,00,000 receipt. Taking `find()` and stopping made that
+ * receipt look matchable for ₹1,52,000 while quietly ignoring the other
+ * ₹1,48,000, which is worse than refusing it: half a receipt allocated looks
+ * exactly like a whole one.
+ */
+function partyEntriesOf(voucher) {
   const entries = voucher.ledgerEntries || [];
-  const wantSide = voucher.voucherType === "receipt" ? "Cr" : "Dr";
+  const wantSide = PARTY_SIDE[voucher.voucherType] || "Cr";
+  const flagged = entries.filter((e) => e.isPartyLedger && e.type === wantSide);
+  if (flagged.length) return flagged;
+  if (voucher.partyLedgerId) {
+    return entries.filter(
+      (e) => e.ledgerId && String(e.ledgerId) === String(voucher.partyLedgerId) && e.type === wantSide,
+    );
+  }
+  return [];
+}
+
+/**
+ * The one party line this call is about.
+ *
+ * `partyLedgerId` picks a leg on a voucher that settles several parties; with
+ * one party it is ignored, so every existing caller behaves as before.
+ */
+function findPartyEntry(voucher, partyLedgerId = null) {
+  const parties = partyEntriesOf(voucher);
+  if (partyLedgerId) {
+    return parties.find((e) => String(e.ledgerId) === String(partyLedgerId)) || null;
+  }
+  if (parties.length) return parties[0];
+
+  const entries = voucher.ledgerEntries || [];
+  const wantSide = PARTY_SIDE[voucher.voucherType] || "Cr";
 
   const flagged = entries.find((e) => e.isPartyLedger && e.type === wantSide);
   if (flagged) return flagged;
@@ -155,8 +222,8 @@ function settlementRows(entry) {
  * `unallocated` is the headline: it is what the matching screen offers, and
  * zero means this voucher is fully matched and must be left alone.
  */
-function matchStateOf(voucher) {
-  const entry = findPartyEntry(voucher);
+function matchStateOf(voucher, partyLedgerId = null) {
+  const entry = findPartyEntry(voucher, partyLedgerId);
   if (!entry) {
     return {
       matchable: false,
@@ -173,8 +240,18 @@ function matchStateOf(voucher) {
   const allocated = money(rows.reduce((s, a) => s + (Number(a.amount) || 0), 0));
   const total = money(entry.amount);
 
+  const parties = partyEntriesOf(voucher);
   return {
     matchable: true,
+    /* Every party this voucher settles, so a screen can offer a choice
+       instead of silently working on the first. One entry for the ordinary
+       case; the caller can ignore it entirely. */
+    parties: parties.map((e) => ({
+      ledgerId: e.ledgerId ? String(e.ledgerId) : null,
+      ledgerName: e.ledgerName || "",
+      amount: money(e.amount),
+    })),
+    multiParty: parties.length > 1,
     partyLedgerId: entry.ledgerId ? String(entry.ledgerId) : null,
     partyLedgerName: entry.ledgerName || voucher.partyLedgerName || "",
     total,
@@ -203,8 +280,8 @@ function matchStateOf(voucher) {
  * this receipt already settled is still offered, at its pre-settlement figure,
  * rather than vanishing.
  */
-async function openBillsForVoucher(voucher, { excludeVoucherId = null } = {}) {
-  const state = matchStateOf(voucher);
+async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedgerId = null } = {}) {
+  const state = matchStateOf(voucher, partyLedgerId);
   if (!state.matchable || !state.partyLedgerId) return [];
 
   const folded = await openItems.billsByLedger(voucher.companyId, [
@@ -222,7 +299,7 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null } = {}) {
     }
   }
 
-  const wantPositive = voucher.voucherType === "receipt";
+  const wantPositive = (PARTY_SIDE[voucher.voucherType] || "Cr") === "Cr";
 
   const fromFold = [...folded.values()]
     .map((bill) => {
@@ -250,7 +327,7 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null } = {}) {
   /* Invoices that never established a bill. Without these the screen tells a
      customer with a real unpaid invoice that they owe nothing — see
      unbilledInvoicesForParty. */
-  const fromInvoices = await unbilledInvoicesForParty(voucher, folded);
+  const fromInvoices = await unbilledInvoicesForParty(voucher, folded, partyLedgerId);
 
   const seen = new Set(fromFold.map((b) => b.billName));
   const all = [
@@ -285,12 +362,12 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null } = {}) {
  * original, whose folded remaining is negative and reads as a credit the
  * customer never had.
  */
-async function unbilledInvoicesForParty(voucher, foldedBills) {
-  const state = matchStateOf(voucher);
+async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = null) {
+  const state = matchStateOf(voucher, partyLedgerId);
   if (!state.matchable || !state.partyLedgerId) return [];
 
-  const sourceType = voucher.voucherType === "receipt" ? "sales" : "purchase";
-  const noteType = voucher.voucherType === "receipt" ? "credit_note" : "debit_note";
+  const sourceType = SOURCE_TYPE[voucher.voucherType] || "sales";
+  const noteType = sourceType === "sales" ? "credit_note" : "debit_note";
 
   const invoices = await Acc_Voucher.find({
     companyId: voucher.companyId,
@@ -319,6 +396,10 @@ async function unbilledInvoicesForParty(voucher, foldedBills) {
   const ids = candidates.map((i) => i._id);
 
   /* Credit/debit notes raised against these invoices reduce what is owed. */
+  /* Credit/debit notes raised against these invoices reduce what is owed —
+     but ONLY the ones that do not already carry a bill allocation of their
+     own. A note that is allocated is already counted in `settled` below, and
+     subtracting it here as well would halve the invoice twice. */
   const notes = await Acc_Voucher.aggregate([
     {
       $match: {
@@ -326,6 +407,7 @@ async function unbilledInvoicesForParty(voucher, foldedBills) {
         voucherType: noteType,
         status: { $in: ["posted", "pending_approval"] },
         "originalInvoice.voucherId": { $in: ids },
+        "ledgerEntries.billAllocations.billType": { $ne: "agst_ref" },
       },
     },
     { $group: { _id: "$originalInvoice.voucherId", total: { $sum: "$grandTotal" } } },
@@ -417,10 +499,10 @@ async function ensureBillReference(sourceVoucherId) {
  * @param {Array}  requested          [{ billName, amount }]
  * @returns {Promise<object>}         the new match state
  */
-async function applyAllocations(voucher, requested = []) {
+async function applyAllocations(voucher, requested = [], { partyLedgerId = null } = {}) {
   assertMatchable(voucher);
 
-  const entry = findPartyEntry(voucher);
+  const entry = findPartyEntry(voucher, partyLedgerId);
   if (!entry) {
     const e = new Error(
       "This voucher has no single party ledger line, so there is nothing to match it against.",
@@ -466,6 +548,7 @@ async function applyAllocations(voucher, requested = []) {
     // Rules 2–4 — measured against the books with THIS voucher undone.
     const available = await openBillsForVoucher(voucher, {
       excludeVoucherId: voucher._id,
+      partyLedgerId: entry.ledgerId,
     });
     const byName = new Map(available.map((b) => [b.billName, b]));
 
@@ -523,16 +606,52 @@ async function applyAllocations(voucher, requested = []) {
   entry.billAllocations = [...kept, ...fresh];
   voucher.markModified("ledgerEntries");
 
-  return matchStateOf(voucher);
+  /* A CREDIT OR DEBIT NOTE ALSO CARRIES A GST LINK.
+     `originalInvoice` / `originalBill` is what GSTR-1 Table 9B (and GSTR-2B
+     reconciliation) reads to say which invoice a note reverses. The bill
+     allocation above is what the outstanding reports read. They are two
+     different consumers of the same fact, so matching sets both — a note
+     that reduces a customer's balance but does not name the invoice on the
+     return is a filing problem, not just a reporting one.
+
+     Only when exactly ONE bill is settled: the field holds a single
+     reference, and a note spread over three invoices has no honest answer
+     to put in it. */
+  if (["credit_note", "debit_note"].includes(voucher.voucherType)) {
+    const field = voucher.voucherType === "credit_note" ? "originalInvoice" : "originalBill";
+    if (fresh.length === 1) {
+      const src = await Acc_Voucher.findOne({
+        companyId: voucher.companyId,
+        voucherNumber: fresh[0].billName,
+        voucherType: SOURCE_TYPE[voucher.voucherType],
+      }).select("_id voucherNumber voucherDate").lean();
+      if (src) {
+        voucher[field] = {
+          voucherId: src._id,
+          voucherNumber: src.voucherNumber,
+          voucherDate: src.voucherDate,
+        };
+        voucher.markModified(field);
+      }
+    } else if (fresh.length === 0) {
+      voucher[field] = {};
+      voucher.markModified(field);
+    }
+  }
+
+  return matchStateOf(voucher, entry.ledgerId);
 }
 
 /** Unmatch: drop this voucher's settlements, keeping everything else. */
-async function clearAllocations(voucher) {
-  return applyAllocations(voucher, []);
+async function clearAllocations(voucher, { partyLedgerId = null } = {}) {
+  return applyAllocations(voucher, [], { partyLedgerId });
 }
 
 module.exports = {
   EPSILON,
+  PARTY_SIDE,
+  SOURCE_TYPE,
+  partyEntriesOf,
   unbilledInvoicesForParty,
   ensureBillReference,
   SETTLING_TYPES,

@@ -79,12 +79,57 @@ async function putBack() {
 
   check("a sales voucher is refused outright", (() => {
     try { bm.assertMatchable({ voucherType: "sales", status: "posted" }); return false; }
-    catch (e) { return e.status === 400 && /Only receipts and payments/.test(e.message); }
+    catch (e) { return e.status === 400 && /can be matched to bills/.test(e.message); }
   })());
   check("so is a cancelled receipt", (() => {
     try { bm.assertMatchable({ voucherType: "receipt", status: "cancelled" }); return false; }
     catch (e) { return e.status === 400; }
   })());
+
+  /* ── credit and debit notes settle bills too ─────────────────────── */
+  // A credit note does NOT cancel its invoice. Under GST the invoice has been
+  // filed in GSTR-1 and cannot be unreported; the note is the instrument that
+  // reverses it, and is itself reported (Table 9B). So matching must reduce
+  // the invoice and record the GST link — never cancel anything.
+  console.log("\ncredit and debit notes match like receipts, and never cancel");
+  const cn = await Acc_Voucher.findOne({ voucherType: "credit_note", status: { $nin: ["cancelled", "void"] } });
+  if (cn) {
+    const cst = bm.matchStateOf(cn);
+    check("a credit note is matchable, on its Cr party line", cst.matchable === true, JSON.stringify(cst).slice(0, 120));
+    const cbills = await bm.openBillsForVoucher(cn, { excludeVoucherId: cn._id });
+    check("and it is offered that customer's open invoices", cbills.length > 0, `${cbills.length}`);
+
+    const invBefore = await Acc_Voucher.findOne({ voucherNumber: cbills[0]?.billName }).lean();
+    const cEntry = bm.findPartyEntry(cn);
+    const cSnap = JSON.parse(JSON.stringify(cEntry.billAllocations || []));
+    const cOrig = JSON.parse(JSON.stringify(cn.originalInvoice || {}));
+    try {
+      const amt = money(Math.min(cst.unallocated, cbills[0].outstanding) / 2);
+      if (amt > 0) {
+        await bm.applyAllocations(cn, [{ billName: cbills[0].billName, amount: amt }]);
+        await cn.save();
+        const after = await Acc_Voucher.findById(cn._id).lean();
+        check("matching a credit note records the GSTR-1 link to that invoice",
+          after.originalInvoice?.voucherNumber === cbills[0].billName,
+          JSON.stringify(after.originalInvoice));
+        const invAfter = await Acc_Voucher.findById(invBefore._id).lean();
+        check("and the INVOICE is untouched — not cancelled, not voided",
+          invAfter.status === invBefore.status && invAfter.status !== "cancelled",
+          `${invBefore.status} -> ${invAfter.status}`);
+      } else {
+        check("(this credit note has nothing left to allocate)", true);
+      }
+    } finally {
+      const back = await Acc_Voucher.findById(cn._id);
+      const be = bm.findPartyEntry(back);
+      if (be) { be.billAllocations = cSnap; back.markModified("ledgerEntries"); }
+      back.originalInvoice = cOrig;
+      back.markModified("originalInvoice");
+      await back.save();
+    }
+  } else {
+    check("(no credit note in this database)", true);
+  }
 
   /* ── a real receipt with money left to allocate ──────────────────── */
   console.log("\nfinding a real receipt with money still unallocated");
@@ -314,6 +359,61 @@ async function putBack() {
       if (iEnt) { iEnt.billAllocations = invBefore; iDoc.markModified("ledgerEntries"); await iDoc.save(); }
       console.log("  restored both the receipt and the invoice");
     }
+  }
+
+  /* ── the date-filtered ledger ─────────────────────────────────────── */
+  // The complaint this pins: match a receipt, then filter the ledger to the
+  // previous year, and the settled invoice came back at its full value under
+  // the name "Opening / Unallocated". Cause: the bills were folded over ALL
+  // time while the closing balance covered the filtered range, and that line
+  // IS the difference between the two. Both now share one as-at date.
+  console.log("\nthe ledger's bills and its closing balance cover the same period");
+  {
+    const asOfEarly = new Date("2020-01-01T00:00:00.000+05:30");
+    const early = await openItems.billsByLedger(
+      subject.companyId,
+      [before.partyLedgerId],
+      { asOf: asOfEarly },
+    );
+    const now = await openItems.billsByLedger(subject.companyId, [before.partyLedgerId]);
+    check("folding as at an early date sees fewer bills than folding as of now",
+      early.size <= now.size, `${early.size} vs ${now.size}`);
+
+    /* The real shape of the bug: a settlement dated AFTER the statement's end
+       date must not be counted, or the bill reads settled while the balance
+       still carries it — and the difference surfaces as a phantom line. */
+    const anyBill = [...now.values()][0];
+    if (anyBill) {
+      const asOfBefore = new Date(new Date(anyBill.firstVoucherDate).getTime() - 86400000);
+      const beforeItExisted = await openItems.billsByLedger(
+        subject.companyId,
+        [before.partyLedgerId],
+        { asOf: asOfBefore },
+      );
+      check("a bill is invisible before the date it was raised",
+        !beforeItExisted.has([...now.keys()].find((k) => now.get(k) === anyBill)),
+        "it appeared in a period that predates it");
+    }
+
+    /* And the reconciliation line stays quiet when the two halves agree. */
+    const billSigned = [...now.values()]
+      .filter((b) => Math.abs(b.remaining) >= openItems.LEDGER_DETAIL_SETTLED_THRESHOLD)
+      .reduce((s, b) => s + b.remaining, 0);
+    const { unallocated } = openItems.agedBillsForLedger([...now.values()], {
+      asOf: new Date(),
+      closingBalance: billSigned,
+    });
+    check("when the balance equals the bills, no 'Opening / Unallocated' line is invented",
+      Math.abs(unallocated) < openItems.LEDGER_DETAIL_SETTLED_THRESHOLD,
+      `unallocated ₹${unallocated}`);
+
+    const aged = openItems.agedBillsForLedger([...now.values()], {
+      asOf: new Date(),
+      closingBalance: billSigned,
+    });
+    check("each open bill names the vouchers that touched it",
+      aged.bills.every((b) => Array.isArray(b.voucherNumbers)),
+      JSON.stringify(aged.bills[0]?.voucherNumbers || []));
   }
 
   console.log("\na receipt with no real party is not offered for matching");

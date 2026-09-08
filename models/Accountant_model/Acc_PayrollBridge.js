@@ -67,6 +67,41 @@ const ledgerRefSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/**
+ * A choice somebody actually made, kept so the screen can offer it again.
+ *
+ * ── WHY REMEMBER RATHER THAN JUST DEFAULT ───────────────────────────────────
+ * The bridge falls back to a hardcoded list of ledger names when a slot is not
+ * mapped. That guess is fine the first time and wrong forever after: Accounts
+ * corrects it, and the next company, the next new department, the next slot
+ * that nobody has mapped yet gets the same hardcoded guess again.
+ *
+ * So every explicit choice is recorded here with when and how often it was
+ * made. Anything still unmapped can then be offered what this company has
+ * chosen before, instead of what the code guessed.
+ *
+ * ── SUGGESTED, NEVER APPLIED ────────────────────────────────────────────────
+ * A remembered choice is shown as a suggestion for a human to accept. It is
+ * never posted to on its own. A wrong ledger silently adopted from history
+ * misstates the P&L every month afterwards and looks exactly like a correct
+ * one, which is precisely the failure the mapping screen exists to prevent.
+ */
+const learnedChoiceSchema = new mongoose.Schema(
+  {
+    /** Which slot, or "department" for a department/designation row. */
+    slot: { type: String, required: true, trim: true },
+    /** The department key for a department row; empty for a fixed slot. */
+    key: { type: String, default: "", trim: true },
+    ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+    ledgerName: { type: String, default: "" },
+    /** How many separate saves picked this. Ties break by recency. */
+    count: { type: Number, default: 1 },
+    lastChosenAt: { type: Date, default: Date.now },
+    lastChosenByName: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
 const payrollLedgerMapSchema = new mongoose.Schema(
   {
     companyId: {
@@ -101,6 +136,10 @@ const payrollLedgerMapSchema = new mongoose.Schema(
     esiPayable: { type: ledgerRefSchema, default: () => ({}) },
     otherDeductions: { type: ledgerRefSchema, default: () => ({}) },
     salaryPayable: { type: ledgerRefSchema, default: () => ({}) },
+
+    /* Every choice ever saved — see learnedChoiceSchema. Not a mapping in
+       itself: the fields above are what the bridge posts to. */
+    learned: { type: [learnedChoiceSchema], default: [] },
     stipendExpense: { type: ledgerRefSchema, default: () => ({}) },
     stipendPayable: { type: ledgerRefSchema, default: () => ({}) },
 

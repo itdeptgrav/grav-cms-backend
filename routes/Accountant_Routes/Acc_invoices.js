@@ -323,16 +323,57 @@ async function enrichInvoices(invoices, companyId) {
     const isOverdue =
       inv.dueDate && outstanding > 0.01 && today > new Date(inv.dueDate);
 
+    /* PAID AND CREDITED ARE NOT THE SAME THING.
+       ------------------------------------------------------------------
+       An invoice can reach zero outstanding two completely different ways:
+       the customer paid it, or it was reversed by a credit note. This used
+       to call both "paid", so an invoice cancelled by a credit note showed
+       as PAID with a receipt figure of nothing — money that never arrived,
+       reported as collected. That is wrong on the screen and wrong in any
+       conversation with an auditor.
+
+       So the four ways an invoice can close are kept apart:
+
+         paid      the customer paid it, in money
+         credited  a credit note reversed it — goods returned, order
+                   cancelled, overbilling corrected. No money moved.
+         settled   part paid, part credited
+         written_off  closed with neither (kept for completeness)
+
+       "credited" is what somebody means when they say the invoice was
+       cancelled. The document still exists — under GST it has been filed and
+       cannot be unreported — but nothing is owed on it. */
+    const paidPart = received.amount > 0.01;
+    const creditPart = credited.amount > 0.01;
+
     let paymentStatus;
-    if (outstanding < 0.01) paymentStatus = "paid";
-    else if (received.amount > 0.01 || credited.amount > 0.01)
-      paymentStatus = "partial";
+    if (outstanding < 0.01) {
+      if (paidPart && creditPart) paymentStatus = "settled";
+      else if (creditPart) paymentStatus = "credited";
+      else if (paidPart) paymentStatus = "paid";
+      else paymentStatus = "written_off";
+    } else if (paidPart || creditPart) paymentStatus = "partial";
     else if (isOverdue) paymentStatus = "overdue";
     else paymentStatus = "unpaid";
 
     return {
       ...inv,
       paymentStatus,
+      /* WHICH VOUCHER TYPE CLOSED IT. The register labels the status from
+         this rather than from a generic word, so a sales invoice reversed by
+         a credit note reads "Credit Note" and a purchase bill reversed by a
+         debit note reads "Debit Note" — each named after the document that
+         actually did it. */
+      closedBy:
+        outstanding >= 0.01
+          ? null
+          : paidPart && creditPart
+            ? "both"
+            : creditPart
+              ? "credit_note"
+              : paidPart
+                ? "receipt"
+                : null,
       receivedAmount: received.amount,
       receiptCount: received.count,
       creditedAmount: credited.amount,
@@ -455,7 +496,7 @@ router.get("/summary", async (req, res) => {
       totalReceived: 0,
       totalCredited: 0,
       totalOutstanding: 0,
-      counts: { paid: 0, partial: 0, unpaid: 0, overdue: 0 },
+      counts: { paid: 0, credited: 0, settled: 0, partial: 0, unpaid: 0, overdue: 0, written_off: 0 },
       aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
       byCustomer: new Map(),
     };
@@ -520,7 +561,7 @@ router.get("/all", async (req, res) => {
       totalReceived: 0,
       totalCredited: 0,
       totalOutstanding: 0,
-      counts: { paid: 0, partial: 0, unpaid: 0, overdue: 0 },
+      counts: { paid: 0, credited: 0, settled: 0, partial: 0, unpaid: 0, overdue: 0, written_off: 0 },
       aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
     };
     const byCustomer = new Map();

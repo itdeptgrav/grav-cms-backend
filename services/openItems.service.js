@@ -210,7 +210,7 @@ function castId(v) {
  *
  * Not exported: the two named entry points below are the public surface.
  */
-async function fetchAllocationRows(companyId, ledgerIds) {
+async function fetchAllocationRows(companyId, ledgerIds, { asOf = null } = {}) {
   const ids = (ledgerIds || []).map(castId).filter(Boolean);
   if (ids.length === 0) return [];
 
@@ -218,6 +218,25 @@ async function fetchAllocationRows(companyId, ledgerIds) {
   if (!cid) return []; // never guess the scope — no company, no query, no rows
 
   const match = { status: "posted", isOptional: { $ne: true }, companyId: cid };
+
+  /* AS AT A DATE — and why it matters.
+     ------------------------------------------------------------------
+     The ledger statement shows a closing balance for whatever date range
+     the user picked, and beside it the bills that make that balance up.
+     Those two have to cover the SAME period or their difference is
+     meaningless — and `agedBillsForLedger` presents exactly that difference
+     as a bill called "Opening / Unallocated".
+
+     Folding over all time while the balance covered one year produced this:
+     match a receipt, filter to the previous year, and the settled invoice
+     reappeared at its full value under that "Unallocated" name. The money
+     had been allocated; it was just allocated in a period the balance did
+     not include. Passing the statement's own end date makes both halves
+     agree, and the phantom row goes away.
+
+     Omitted (the parties list, the matching screen) it means "as of now",
+     which is the right question for "what does this party still owe". */
+  if (asOf) match.voucherDate = { $lte: asOf instanceof Date ? asOf : new Date(asOf) };
 
   return Acc_Voucher.aggregate([
     { $match: { ...match, "ledgerEntries.ledgerId": { $in: ids } } },
@@ -283,10 +302,10 @@ async function openItemsByLedger(companyId, ledgerIds = []) {
  * so a caller who wants settled bills too (an export, an audit view) still
  * can. `agedBillsForLedger` does its own open/settled filtering.
  */
-async function billsByLedger(companyId, ledgerIds = []) {
+async function billsByLedger(companyId, ledgerIds = [], { asOf = null } = {}) {
   const ids = (ledgerIds || []).map(castId).filter(Boolean);
   if (ids.length === 0) return new Map();
-  const rows = await fetchAllocationRows(companyId, ids);
+  const rows = await fetchAllocationRows(companyId, ids, { asOf });
   return foldAllocations(rows);
 }
 
@@ -360,6 +379,10 @@ function agedBillsForLedger(bills, { asOf, closingBalance, fallbackFirstDate = n
       daysOverdue,
       bucket,
       voucherCount: bill.voucherNumbers ? bill.voucherNumbers.size : 0,
+      /* WHICH vouchers touched this bill — the invoice that raised it and
+         every receipt that settled part of it. "3 vouchers" tells somebody
+         chasing a payment nothing; the numbers let them go and look. */
+      voucherNumbers: bill.voucherNumbers ? [...bill.voucherNumbers] : [],
     });
   }
 

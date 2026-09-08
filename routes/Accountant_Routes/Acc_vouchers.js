@@ -605,14 +605,43 @@ router.get("/", auth, async (req, res) => {
       Acc_Voucher.countDocuments(filter),
     ]);
 
+    /* A NAME FOR THE PARTY COLUMN, WHEN THE VOUCHER CARRIES NONE.
+       ------------------------------------------------------------------
+       This used to take "the first Dr line" for every voucher type, which is
+       only ever right for a purchase. The party sits on whichever side the
+       voucher type puts it:
+
+         sales / payment / debit_note   → Dr   (the customer owes / we pay)
+         receipt / credit_note          → Cr   (money in / the debt drops)
+
+       Taking Dr regardless printed the BANK as the party on every receipt —
+       "INDIAN BANK -> INDIAN BANK" — and "Sales Returns" as the customer on
+       every credit note. Same bug, two registers.
+
+       A real party line wins over the side rule: an entry flagged
+       isPartyLedger is the answer whatever side it is on. */
+    const PARTY_SIDE_FOR_LIST = {
+      receipt: "Cr",
+      credit_note: "Cr",
+      payment: "Dr",
+      debit_note: "Dr",
+      sales: "Dr",
+      purchase: "Cr",
+    };
     for (const v of items) {
       if (!v.partyLedgerName && (!v.partyLedgerId || !v.partyLedgerId.name)) {
-        const firstDr = (v.ledgerEntries || []).find(
-          (e) => e.type === "Dr" || (e.signedAmount || 0) > 0,
-        );
-        if (firstDr) {
-          v.partyLedgerName = firstDr.ledgerName || "";
-        }
+        const entries = v.ledgerEntries || [];
+        const side = PARTY_SIDE_FOR_LIST[v.voucherType] || "Dr";
+        const pick =
+          entries.find((e) => e.isPartyLedger && e.type === side) ||
+          entries.find((e) => e.isPartyLedger) ||
+          /* No flag anywhere: fall back to the biggest line on the party's
+             side, which for a one-party voucher is the party. Biggest rather
+             than first, so a rounding-off or tax line never wins. */
+          entries
+            .filter((e) => e.type === side)
+            .sort((a, b) => (b.amount || 0) - (a.amount || 0))[0];
+        if (pick) v.partyLedgerName = pick.ledgerName || "";
       }
     }
 
@@ -640,11 +669,42 @@ router.get("/", auth, async (req, res) => {
           for (const a of e.billAllocations || [])
             if (a.billName) paidBillNames.add(a.billName);
       }
+      /* A BILL CAN ALSO BE CLOSED BY A DEBIT NOTE, NOT ONLY BY PAYING IT.
+         ------------------------------------------------------------------
+         This only looked at payment vouchers, so a bill fully reversed by a
+         debit note — goods sent back, supplier overbilled — still showed a
+         "Pay" button. Inviting somebody to pay a bill that no longer exists
+         is the payables twin of calling a credited invoice "Paid".
+
+         `closedBy` names the voucher type that actually closed it, so the
+         register can say WHICH, instead of a bare paid/unpaid flag that
+         cannot tell money from a reversal. */
+      const debitNotes = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            companyId: new mongoose.Types.ObjectId(String(companyId)),
+            voucherType: "debit_note",
+            status: { $in: ["posted", "pending_approval"] },
+            "originalBill.voucherId": { $in: items.map((v) => v._id) },
+          },
+        },
+        { $group: { _id: "$originalBill.voucherId", total: { $sum: "$grandTotal" } } },
+      ]);
+      const debitedById = new Map(debitNotes.map((d) => [String(d._id), d.total]));
+
       for (const v of items) {
-        v.isPaid =
+        const paid =
           paidBillNames.has(v.voucherNumber) ||
           paidBillNames.has(v.referenceNumber) ||
           (v.purchaseOrderId && paidPOs.has(String(v.purchaseOrderId)));
+        const debited = debitedById.get(String(v._id)) || 0;
+        const fullyDebited = debited > 0 && debited >= (v.grandTotal || 0) - 0.01;
+
+        v.debitedAmount = debited;
+        v.closedBy = paid && debited > 0 ? "both" : paid ? "payment" : fullyDebited ? "debit_note" : null;
+        /* Still the flag the register reads to decide whether to offer "Pay".
+           A bill reversed in full has nothing left to pay. */
+        v.isPaid = paid || fullyDebited;
       }
     }
 
@@ -2555,7 +2615,9 @@ router.get("/unmatched", auth, async (req, res) => {
     const { companyId, voucherType = "receipt", partyLedgerId, q, limit = 100 } = req.query;
     if (!companyId) return res.status(400).json({ error: "companyId required" });
     if (!billMatching.SETTLING_TYPES.has(voucherType)) {
-      return res.status(400).json({ error: "voucherType must be receipt or payment." });
+      return res.status(400).json({
+        error: `voucherType must be one of: ${[...billMatching.SETTLING_TYPES].join(", ")}.`,
+      });
     }
 
     const filter = {
@@ -2620,9 +2682,16 @@ router.get("/:id/match", auth, async (req, res) => {
     const voucher = await Acc_Voucher.findById(req.params.id).lean();
     billMatching.assertMatchable(voucher);
 
-    const state = billMatching.matchStateOf(voucher);
+    /* A voucher settling several parties has one match state PER party — pass
+       `partyLedgerId` to pick one. Without it the first is used, and `parties`
+       in the response is what lets a screen offer the choice. */
+    const partyLedgerId = req.query.partyLedgerId || null;
+    const state = billMatching.matchStateOf(voucher, partyLedgerId);
     const openBills = state.matchable
-      ? await billMatching.openBillsForVoucher(voucher, { excludeVoucherId: voucher._id })
+      ? await billMatching.openBillsForVoucher(voucher, {
+          excludeVoucherId: voucher._id,
+          partyLedgerId: state.partyLedgerId,
+        })
       : [];
 
     res.json({
@@ -2660,6 +2729,7 @@ router.post("/:id/match", auth, async (req, res) => {
     const state = await billMatching.applyAllocations(
       voucher,
       Array.isArray(req.body?.allocations) ? req.body.allocations : [],
+      { partyLedgerId: req.body?.partyLedgerId || null },
     );
     voucher.updatedBy = req.user?.id;
     await voucher.save();
@@ -2695,7 +2765,9 @@ router.delete("/:id/match", auth, async (req, res) => {
     const voucher = await Acc_Voucher.findById(req.params.id);
     billMatching.assertMatchable(voucher);
 
-    const state = await billMatching.clearAllocations(voucher);
+    const state = await billMatching.clearAllocations(voucher, {
+      partyLedgerId: req.body?.partyLedgerId || req.query?.partyLedgerId || null,
+    });
     voucher.updatedBy = req.user?.id;
     await voucher.save();
 
