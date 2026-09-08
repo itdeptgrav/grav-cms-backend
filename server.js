@@ -1339,6 +1339,18 @@ app.use(
 );
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
+/* ── FABRIC CATEGORIES (Merchandising) ───────────────────────────────────────
+ * The categories merchandisers import from the shade-card page's Excel
+ * template, shared by everyone: the shade-card page plans leaves from them
+ * and the fabric library lists their shades. Same door as the desks above —
+ * it is the same app and the same person. Mounted just above the generic
+ * /api/cms router, so nothing else answers for the path first. */
+app.use(
+  "/api/cms/merchandising/fabric-categories",
+  require("./Middlewear/EmployeeAuthMiddlewear"),
+  require("./routes/CMS_Routes/Merchandising/fabricCategories"),
+);
+
 app.use("/api/cms", productOperations);
 
 const productionCompletionRoutes = require("./routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js");
@@ -1666,6 +1678,7 @@ app.use(
   require("./Middlewear/EmployeeAuthMiddlewear"),
   require("./routes/CMS_Routes/Requests/intakeRequests"),
 );
+
 
 // Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
 // actually owns. Deliberately NOT applied to /api/cms/manufacturing/* at large:

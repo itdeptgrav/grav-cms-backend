@@ -107,6 +107,65 @@ const imageSchema = new mongoose.Schema(
  * the requester too meant the same answer collected twice from the person less
  * qualified to give it, plus a second row of inputs on every line of the form.
  */
+/* ── A FILE ON THE REQUEST ─────────────────────────────────────────────
+   Not a line's reference photo: a document the request is about, put on
+   Drive by whatever raised it. The first user is the shade-card page, which
+   attaches the print file it built so the printing house gets exactly what
+   the merchandiser checked. `fileId` is the Drive id (the app's service
+   account can read it back); `url` is the link a person opens. */
+const attachmentSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true, default: "" },
+    url: { type: String, trim: true, required: true },
+    fileId: { type: String, trim: true, default: "" },
+    mimeType: { type: String, trim: true, default: "" },
+    sizeBytes: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false },
+);
+
+/* ── A PRINT RUN ───────────────────────────────────────────────────────
+   What the attached print file holds, written down by the shade-card page
+   when it built the file: every leaf, and per category how many leaves and
+   small cards. This is what makes the request COUNT as a print once it is
+   approved — the shade-card page reads approved requests back and shows,
+   per category, how many times it has gone to press. Nothing here is
+   editable on the desk; it is the file's own description of itself. */
+const printRunSchema = new mongoose.Schema(
+  {
+    kind: { type: String, enum: ["SHADE_CARDS"], required: true },
+    builtAt: { type: Date, default: null },
+    catalogueSource: { type: String, trim: true, default: "" },
+    leafCount: { type: Number, default: 0, min: 0 },
+    sheets: { type: Number, default: 0, min: 0 },
+    leaves: [
+      {
+        _id: false,
+        title: { type: String, trim: true, default: "" },
+        names: { type: [String], default: [] },
+        type: { type: String, trim: true, default: "" },
+        columns: { type: Number, default: 0 },
+        small: { type: Boolean, default: false },
+        twoUp: { type: Boolean, default: false },
+        leaf: { type: Number, default: 0 },
+        leafCount: { type: Number, default: 0 },
+        boxes: { type: Number, default: 0 },
+      },
+    ],
+    qualities: [
+      {
+        _id: false,
+        name: { type: String, trim: true, required: true },
+        boxes: { type: Number, default: 0 },
+        leaves: { type: Number, default: 0 },
+        smallCards: { type: Number, default: 0 },
+        twoUp: { type: Boolean, default: false },
+      },
+    ],
+  },
+  { _id: false },
+);
+
 const lineSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -269,6 +328,12 @@ const intakeRequestSchema = new mongoose.Schema(
        by whoever classifies it, because "quarterly from April" is a commercial
        term and not something the person who needs the thing decides. */
     repeats: { type: Boolean, default: false },
+
+    /* Files the request is about (see attachmentSchema) and, when the
+       request is a print run, what the file holds (see printRunSchema).
+       Both additive: every request raised before them has neither. */
+    attachments: { type: [attachmentSchema], default: [] },
+    printRun: { type: printRunSchema, default: undefined },
 
     status: { type: String, enum: intake.STATUSES, default: intake.PENDING_TL, index: true },
 

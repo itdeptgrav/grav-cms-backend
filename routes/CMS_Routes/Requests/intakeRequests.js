@@ -88,6 +88,71 @@ function cleanImages(images) {
       name: text(im.name, 120),
     }));
 }
+/* A file on the request. The URL is what a person opens; the Drive id is
+   what the app can read back with its own credentials. Ten at most — a
+   request is not a folder. */
+const MAX_ATTACHMENTS = 10;
+function cleanAttachments(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((a) => a && typeof a.url === "string" && /^https?:\/\//i.test(a.url))
+    .slice(0, MAX_ATTACHMENTS)
+    .map((a) => ({
+      name: text(a.name, 200),
+      url: a.url.trim(),
+      fileId: text(a.fileId, 120),
+      mimeType: text(a.mimeType, 100),
+      sizeBytes: Math.max(0, Number(a.sizeBytes) || 0),
+    }));
+}
+
+/* The print run a request carries — the shade-card page's own description of
+   the file it attached (lib/shadeCard/printRun.js on the frontend). Absent on
+   an ordinary request; refused rather than trimmed when it is malformed,
+   because a print run that lost its categories would later be counted as a
+   print of nothing. Returns null, the run, or { error }. */
+const PRINT_RUN_KIND = "SHADE_CARDS";
+function cleanPrintRun(run) {
+  if (run === undefined || run === null || run === "") return null;
+  if (typeof run !== "object" || run.kind !== PRINT_RUN_KIND) {
+    return { error: "The print run attached to this request cannot be read." };
+  }
+  const leaves = Array.isArray(run.leaves) ? run.leaves.slice(0, 400) : [];
+  const qualities = Array.isArray(run.qualities) ? run.qualities.slice(0, 200) : [];
+  if (!leaves.length || !qualities.length) return { error: "The print run has no leaves in it." };
+  const n = (v, fallback = 0) => {
+    const x = Number(v);
+    return Number.isFinite(x) ? x : fallback;
+  };
+  return {
+    kind: PRINT_RUN_KIND,
+    builtAt: run.builtAt && !Number.isNaN(new Date(run.builtAt).getTime()) ? new Date(run.builtAt) : new Date(),
+    catalogueSource: text(run.catalogueSource, 200),
+    leafCount: leaves.length,
+    sheets: n(run.sheets, leaves.length * 2),
+    leaves: leaves.map((l) => ({
+      title: text(l?.title, 120),
+      names: (Array.isArray(l?.names) ? l.names : []).slice(0, 4).map((x) => text(x, 60)),
+      type: text(l?.type, 20),
+      columns: n(l?.columns),
+      small: Boolean(l?.small),
+      twoUp: Boolean(l?.twoUp),
+      leaf: n(l?.leaf),
+      leafCount: n(l?.leafCount),
+      boxes: n(l?.boxes),
+    })),
+    qualities: qualities
+      .map((q) => ({
+        name: text(q?.name, 60),
+        boxes: n(q?.boxes),
+        leaves: n(q?.leaves),
+        smallCards: n(q?.smallCards),
+        twoUp: Boolean(q?.twoUp),
+      }))
+      .filter((q) => q.name),
+  };
+}
+
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
@@ -615,7 +680,19 @@ function intakeRow(r, linked, stock = null, { withMoney = false } = {}) {
     classified: Boolean(kind),
     /* The requester's own reference photos, across every line. Nothing else is
        attachable at intake yet, so this is the whole count. */
-    attachmentCount: (r.items || []).reduce((n, l) => n + (l.images || []).length, 0),
+    attachmentCount:
+      (r.items || []).reduce((n, l) => n + (l.images || []).length, 0) + (r.attachments || []).length,
+    /* The request's own files, and what a print run holds — so the desk can
+       open the print file and say what is being printed. */
+    attachments: (r.attachments || []).map((a) => ({
+      name: a.name || "", url: a.url, fileId: a.fileId || "", mimeType: a.mimeType || "", sizeBytes: a.sizeBytes || 0,
+    })),
+    printRun: r.printRun
+      ? {
+          kind: r.printRun.kind, sheets: r.printRun.sheets, leafCount: r.printRun.leafCount,
+          builtAt: r.printRun.builtAt || null, qualities: r.printRun.qualities || [],
+        }
+      : null,
     accountHead: null,
     /* An intake request holds no stock report of its own. Once it has become
        an MRF the store's findings live there, and they are read through
@@ -1395,6 +1472,11 @@ router.post("/", async (req, res) => {
     const now = new Date();
     const fullName = mrfApprover.buildFullName(emp);
 
+    /* Files and, for a print run, what the file holds — see the model. */
+    const attachments = cleanAttachments(b.attachments);
+    const printRun = cleanPrintRun(b.printRun);
+    if (printRun?.error) return res.status(400).json({ success: false, message: printRun.error });
+
     const created = await IntakeRequest.create({
       title,
       purpose,
@@ -1411,6 +1493,8 @@ router.post("/", async (req, res) => {
          again. The schedule is captured later, by whoever classifies it. */
       repeats: b.repeats === true,
       items: lines,
+      attachments,
+      ...(printRun ? { printRun } : {}),
       estimatedTotal,
       estimateComplete,
       /* Waiting on the first approver, or straight to Store when there is
@@ -1528,6 +1612,51 @@ async function buildLines(raw) {
  * be — asking three endpoints would have meant the screen guessing which
  * answer to show when a person wears two hats.
  */
+/* ══ PRINT RUNS ═════════════════════════════════════════════════════════════
+ * Every request that carried a print run, newest first, for the shade-card
+ * page's history: which categories have gone to press, and how many times.
+ * Whoever can read the desk can read this — a print run is a fact about the
+ * catalogue, not about the requester.
+ *
+ * `approved` is the one thing the page keys on: the request has passed the
+ * TL, or had no TL to pass. A rejected or cancelled request is not a print.
+ */
+router.get("/print-runs", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.json({ success: true, runs: [], identityMissing: true });
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const docs = await IntakeRequest.find({ "printRun.kind": { $exists: true } })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .select("requestNumber title status requestedByName department createdAt tlApprovedAt tlApprovedByName attachments printRun")
+      .lean();
+    const runs = docs.map((r) => {
+      const dead = ["rejected", "cancelled", "draft"].includes(r.status);
+      const approved = !dead && (Boolean(r.tlApprovedAt) || r.status !== "pending_tl");
+      return {
+        id: String(r._id),
+        number: r.requestNumber,
+        title: r.title,
+        status: r.status,
+        stageLabel: intake.STAGE_LABEL[r.status] || r.status,
+        approved,
+        approvedAt: r.tlApprovedAt || (approved ? r.createdAt : null),
+        approvedByName: r.tlApprovedByName || "",
+        createdAt: r.createdAt,
+        requestedByName: r.requestedByName || "",
+        department: r.department || "",
+        attachments: (r.attachments || []).map((a) => ({ name: a.name || "", url: a.url, fileId: a.fileId || "", mimeType: a.mimeType || "", sizeBytes: a.sizeBytes || 0 })),
+        printRun: r.printRun,
+      };
+    });
+    res.json({ success: true, runs });
+  } catch (e) {
+    console.error("[intake] print-runs:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get("/approvals", async (req, res) => {
   try {
     const emp = await requester(req);
