@@ -39,30 +39,6 @@ const {
 const TMP_BASE = path.join(os.tmpdir(), "cowork_audio");
 fs.mkdirSync(TMP_BASE, { recursive: true });
 
-// ── Path safety — ids from request bodies must never become path segments ─────
-// `meetId`, `employeeId` and `guestId` all arrive from callers. `path.join`
-// RESOLVES `..` rather than rejecting it, so an id of "../../.." walked out of
-// TMP_BASE — and the finalize paths end in a recursive `fs.rmSync`, so an
-// escaped path was a delete of somebody else's files, reachable unauthenticated
-// through the beacon route. Two layers guard it: `safeSegment` rejects any id
-// that is not a single, separator-free token, and `containedPath` proves the
-// resolved path still sits under TMP_BASE even if a caller forgets to validate.
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-function safeSegment(id) {
-  if (typeof id !== "string" || !SAFE_ID.test(id)) {
-    throw new Error(`Unsafe path segment: ${JSON.stringify(id)}`);
-  }
-  return id;
-}
-function containedPath(...segments) {
-  const root = path.resolve(TMP_BASE);
-  const resolved = path.resolve(path.join(TMP_BASE, ...segments));
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(`Resolved path escapes the temp root: ${resolved}`);
-  }
-  return resolved;
-}
-
 // ── Multer — memory storage for incoming audio chunks ─────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -334,7 +310,7 @@ async function uploadAudioToDrive(chunkFiles, baseFileName, mimeType, meetId) {
  */
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-function safeSegment(value, label) {
+function safeSegment(value, label = "id") {
   const s = String(value ?? "");
   if (!SAFE_ID.test(s)) {
     throw Object.assign(new Error(`Unsafe ${label}: ${JSON.stringify(s).slice(0, 80)}`), {
