@@ -5,6 +5,17 @@ const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const CanvasLayout = require("../../../../models/CMS_Models/Manufacturing/Production/CanvasLayout");
 
+// The same omission as productionDashboardRoutes.js next door, and worse: this
+// router has a POST and a DELETE. The productionSupervisorWrites guard on the
+// mount passes an anonymous caller straight through on purpose — its comment
+// says "let the router's own auth middleware refuse it" — and this router had
+// none, so the factory's machine layout could be rewritten or deleted with no
+// session.
+//
+// Authentication only. The layout belongs to the Production Supervisor's floor
+// and the department guard on the mount already decides who may write it.
+router.use(EmployeeAuthMiddleware);
+
 /**
  * GET /api/cms/production/canvas-layout
  * Fetch saved canvas layout

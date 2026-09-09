@@ -13,6 +13,24 @@ const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufa
 const Measurement = require("../../../../models/Customer_Models/Measurement");
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
 
+// Authentication for the whole router.
+//
+// EmployeeAuthMiddleware was required on line 5 from the day this file was
+// written and never installed, so every endpoint below answered a caller with
+// no session at all. The mount in server.js does not cover it either: the
+// pmWrites guard there only inspects writes, waves GET straight through, and
+// treats the one POST as read-shaped because its path ends in "/refresh".
+// Nothing else stood between these handlers and the open internet — they return
+// machine assignments, live production, who is on the floor today and, via
+// /find-piece, a barcode lookup naming the customer order.
+//
+// Authentication only, deliberately. Both consumers of this router — the
+// Project Manager's production stats page and the Production Supervisor's
+// tracker — send credentials already, and the supervisor holds no
+// project-manager role, so gating these reads on a department would break the
+// floor to fix a login check.
+router.use(EmployeeAuthMiddleware);
+
 // ============================================================================
 // HELPERS
 // ============================================================================

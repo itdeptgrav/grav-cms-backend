@@ -96,31 +96,6 @@ function fmtDuration(secs) {
     return days === 1 ? "1 day" : `${days} days`;
 }
 
-// One-time repair script — run once, then delete
-const { db } = require("./config/firebaseAdmin");
-
-async function repairDeadlineWindowSecs() {
-    const snap = await db.collection("cowork_tasks")
-        .where("status", "==", "pending_deadline_approval")
-        .get();
-
-    for (const doc of snap.docs) {
-        const t = doc.data();
-        const original = Number(t.originalWindowSecs) || 0;
-        const extTotal = (t.extensions || [])
-            .reduce((s, e) => s + (Number(e.addedSecs) || 0), 0);
-        const correct = original + extTotal;
-
-        if (correct > 0 && correct !== Number(t.deadlineWindowSecs)) {
-            console.log(`Fixing ${doc.id}: ${t.deadlineWindowSecs} → ${correct}`);
-            await doc.ref.update({ deadlineWindowSecs: correct });
-        }
-    }
-    console.log("Done.");
-}
-
-repairDeadlineWindowSecs();
-
 // ─── Regex patterns that identify stale messages ──────────────────────────────
 // We match the exact prefixes written by the old backend, followed by a
 // wall-clock substring (something like "21 Apr 2026, 10:11 am").

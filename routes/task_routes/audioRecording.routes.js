@@ -39,30 +39,6 @@ const {
 const TMP_BASE = path.join(os.tmpdir(), "cowork_audio");
 fs.mkdirSync(TMP_BASE, { recursive: true });
 
-// ── Path safety — ids from request bodies must never become path segments ─────
-// `meetId`, `employeeId` and `guestId` all arrive from callers. `path.join`
-// RESOLVES `..` rather than rejecting it, so an id of "../../.." walked out of
-// TMP_BASE — and the finalize paths end in a recursive `fs.rmSync`, so an
-// escaped path was a delete of somebody else's files, reachable unauthenticated
-// through the beacon route. Two layers guard it: `safeSegment` rejects any id
-// that is not a single, separator-free token, and `containedPath` proves the
-// resolved path still sits under TMP_BASE even if a caller forgets to validate.
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-function safeSegment(id) {
-  if (typeof id !== "string" || !SAFE_ID.test(id)) {
-    throw new Error(`Unsafe path segment: ${JSON.stringify(id)}`);
-  }
-  return id;
-}
-function containedPath(...segments) {
-  const root = path.resolve(TMP_BASE);
-  const resolved = path.resolve(path.join(TMP_BASE, ...segments));
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(`Resolved path escapes the temp root: ${resolved}`);
-  }
-  return resolved;
-}
-
 // ── Multer — memory storage for incoming audio chunks ─────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -309,6 +285,60 @@ async function uploadAudioToDrive(chunkFiles, baseFileName, mimeType, meetId) {
     webViewLink: response.data.webViewLink,
     size: response.data.size,
   };
+}
+
+// ── Helper: an id that is safe to use as ONE path segment ────────────────────
+/**
+ * Ids in this file arrive from request bodies, query strings and guest
+ * sessions, and every one of them used to be concatenated straight into a
+ * filesystem path. `path.join` RESOLVES `..` rather than rejecting it, so a
+ * `meetId` of `"../../.."` walked out of TMP_BASE — and because the finalize
+ * paths below end in `fs.rmSync(dir, { recursive: true, force: true })`, an
+ * escaped path was a recursive delete of somebody else's directory.
+ *
+ * `/cowork/audio/beacon-finalize` made that reachable without a token at all:
+ * it is called by `navigator.sendBeacon` on unload, which cannot set an
+ * Authorization header, so the route is deliberately unauthenticated. An
+ * unauthenticated destructive path traversal is the worst shape a bug can take,
+ * and it is closed here rather than at one call site, because there are
+ * eighteen call sites and the next one added would have missed it.
+ *
+ * The rule is deliberately narrow: ids in this product are Firestore document
+ * ids and employee ids, which are alphanumerics with `-` and `_`. Anything else
+ * — a separator, a dot, a control character, an over-long string — is not an id
+ * we issued, so there is no legitimate caller to preserve.
+ */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function safeSegment(value, label = "id") {
+  const s = String(value ?? "");
+  if (!SAFE_ID.test(s)) {
+    throw Object.assign(new Error(`Unsafe ${label}: ${JSON.stringify(s).slice(0, 80)}`), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return s;
+}
+
+/**
+ * Build a path under TMP_BASE and prove it stayed there.
+ *
+ * The segment validation above is the real guard; this is the backstop that
+ * makes an escape impossible rather than merely unlikely, so a future caller
+ * that forgets to validate still cannot reach outside the temp root.
+ */
+function containedPath(...segments) {
+  const joined = path.join(TMP_BASE, ...segments);
+  const resolved = path.resolve(joined);
+  const root = path.resolve(TMP_BASE);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw Object.assign(new Error("Path escaped the audio temp root"), {
+      statusCode: 400,
+      unsafeId: true,
+    });
+  }
+  return resolved;
 }
 
 // ── Helper: get chunk dir for a user ─────────────────────────────────────────
@@ -867,15 +897,33 @@ module.exports = function (io) {
     );
   }
 
-  /** Their own recording, if it landed. A backup row never counts as one. */
-  async function realRecordingExists(meetId, forEmployeeId) {
-    const own = await db
+  /**
+   * What is already filed for this person in this meeting.
+   *
+   * One query answers both questions, because both are asked together and the
+   * rows are the same rows: is their OWN recording there (a backup must never
+   * be uploaded beside it), and is a backup ALREADY there (a second one is
+   * the same voice twice). M066 held three backup files for one participant
+   * because nothing asked the second question — the host's room closed three
+   * times, and each close offered again.
+   */
+  async function existingRecordings(meetId, forEmployeeId) {
+    const snap = await db
       .collection("meeting_audio_recordings")
       .where("meetId", "==", meetId)
       .where("employeeId", "==", forEmployeeId)
-      .limit(5)
+      .limit(10)
       .get();
-    return own.docs.some((d) => d.data().isBackup !== true);
+    const rows = snap.docs.map((d) => d.data());
+    return {
+      real: rows.some((r) => r.isBackup !== true),
+      backup: rows.some((r) => r.isBackup === true),
+    };
+  }
+
+  /** Their own recording, if it landed. A backup row never counts as one. */
+  async function realRecordingExists(meetId, forEmployeeId) {
+    return (await existingRecordings(meetId, forEmployeeId)).real;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1037,7 +1085,8 @@ module.exports = function (io) {
            since — a slow connection finishing, or the drain on another page
            catching up. Uploading now would put the same voice in the folder
            twice, which is the one outcome this feature must never cause. */
-        if (await realRecordingExists(meetId, forEmployeeId)) {
+        const already = await existingRecordings(meetId, forEmployeeId);
+        if (already.real) {
           fs.rmSync(chunkDir, { recursive: true, force: true });
           console.log(
             `[AudioBackup] their own file arrived first — discarding backup for ${forEmployeeId}`,
@@ -1046,6 +1095,21 @@ module.exports = function (io) {
             success: true,
             skipped: true,
             message: "Their own recording arrived; backup discarded",
+          });
+        }
+        /* And never a SECOND backup of one voice. The host's room can close
+           more than once in a meeting — navigating away, a reconnect, popping
+           the window out — and each close offers again. The browser guards
+           this too; this is the half that cannot be skipped by a reload. */
+        if (already.backup) {
+          fs.rmSync(chunkDir, { recursive: true, force: true });
+          console.log(
+            `[AudioBackup] a backup for ${forEmployeeId} already exists — discarding this one`,
+          );
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "A backup for this participant already exists",
           });
         }
 
