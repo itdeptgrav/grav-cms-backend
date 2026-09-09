@@ -3543,6 +3543,48 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
 
     await ref.update(update);
 
+    /**
+     * The receipt for the hours, so the budget history can explain itself.
+     *
+     * **Nothing wrote one of these before, and the gap was visible.** The Time
+     * budget panel lists rows from `cowork_task_budget_credits`; an approved
+     * extension changed `deadlineWindowSecs` and filed nothing, so a task whose
+     * budget had grown from 7h to 7h30m reported "Nothing has been credited —
+     * this is the budget it was given". The hours were right and the account of
+     * them did not exist.
+     *
+     * Written AFTER the update, and never allowed to throw: the budget is the
+     * product and the receipt is the record of it. A receipt that fails to
+     * write must cost the history, never the approval.
+     *
+     * Shape matches the frontend's own writer (`#fileBudgetCredit`), so both
+     * kinds of growth — a rule compensating for an offline stretch, and a
+     * manager granting an extension — read out of one collection.
+     * `automatic: false` is what tells them apart: a person decided this one.
+     */
+    if (wasExtension) {
+      try {
+        const previousSecs = Number(task.pendingExtensionPrevWindowSecs) || 0;
+        if (approvedWindowSecs > previousSecs) {
+          await db.collection("cowork_task_budget_credits").add({
+            taskId: String(taskId),
+            /* Assignees are an ARRAY on the task; `assigneeId` does not exist and
+               would have filed every receipt against an empty id. */
+            forEmployeeId: String((task.assigneeIds || [])[0] || ""),
+            previousSecs,
+            newSecs: approvedWindowSecs,
+            reason: `Extension approved by ${approverName || approverId}`,
+            at: new Date().toISOString(),
+            automatic: false,
+            approvedBy: approverId,
+            approvedByName: approverName || "",
+          });
+        }
+      } catch (e) {
+        console.error("[budget] extension credit receipt failed:", e.message);
+      }
+    }
+
     // Approval chat message — show the right phrasing for extensions.
     // For extensions we add a nudge about the new Start-Timer flow so the
     // employee knows the +N min starts when they press Start, not now.

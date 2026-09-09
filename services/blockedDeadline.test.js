@@ -86,15 +86,28 @@ test("the never-pull-earlier rail has exactly one exception, and it is named", (
    *
    * The one exception is the owner rule of 21 Aug 2026: the head of a queue
    * takes the QUEUE's start so the number does not change with whichever task
-   * leads. It can only tighten (the queue start is adopted only when it is
-   * earlier), it never applies inside a preview, and it is the only clause
-   * beside `anchorIsQueueDerived`.
+   * leads. It never applies inside a preview, and it is the only clause beside
+   * `anchorIsQueueDerived`.
+   *
+   * **It no longer reaches the rail at all.** The description above used to end
+   * "it can only tighten (the queue start is adopted only when it is earlier)",
+   * which was the shape of a guard that has since been removed, and then of
+   * nothing: with the guard gone the head adopted the queue start in BOTH
+   * directions, so this exception could pull a start earlier after all. That is
+   * the reported 13:03 -> 13:00. The start is now floored at the earliest clock
+   * already stamped on the queue — see the test below — so it cannot name an
+   * origin before one the holder has already been shown, and the rail holds
+   * here too. What the exception still does is move a start LATER when the
+   * queue's own start is later, which the rail has never objected to.
    */
   assert.match(
     office,
     /const correctsItself =\s*\n\s*\(anchorIsQueueDerived \|\| headTakesQueueStart\) &&/,
   );
-  assert.match(office, /!sim &&\n      previousEndMs === null &&/);
+  /* `\s*\n\s*`, not a bare `\n`: this repo is committed LF and checks out CRLF
+     under `core.autocrlf`, so a literal newline in a source-text pattern makes
+     the test fail on Windows and pass on CI — a red suite that says nothing. */
+  assert.match(office, /!sim &&\s*\n\s*previousEndMs === null &&/);
   assert.doesNotMatch(office, /blockRuleWroteIt|autoExtendedDueToP1 === true/);
   assert.match(office, /dueMs > task\.dueMs/);
   assert.match(office, /anchorMs > task\.anchorMs/);
@@ -243,13 +256,107 @@ test("a dry run writes no position at all", () => {
   /* The rejection preview asks this on every keystroke. */
   const i = office.indexOf("async function rechainQueueFor(");
   const body = office.slice(i);
-  const guard = body.indexOf('if (!opts.dryRun) {\n    const admin');
+  /* `search`, not `indexOf`: a literal newline does not match this file's
+     CRLF checkout — see the note in the rail test above. */
+  const guard = body.search(/if \(!opts\.dryRun\) \{\s*\n\s*const admin/);
   assert.ok(guard !== -1, "the position write is not behind a dryRun guard");
   /* The STANDALONE write specifically — `effectivePriority: position` also
      matches `positionOf` in the deadline update further up. */
   const standalone = body.indexOf("t.ref.update({ effectivePriority: position })");
   assert.ok(standalone !== -1, "the standalone position write has moved");
   assert.ok(guard < standalone, "the position write escapes the dryRun guard");
+});
+
+test("the queue's start is floored at the earliest clock stamped on the queue", () => {
+  /**
+   * **The head may not be given an origin before one already recorded.**
+   * OWNER DECISION, 9 Sep 2026.
+   *
+   * Reported with real documents: a task read "Created 13:00 · Counted from
+   * 13:03", an extension was approved, the next walk ran, and the same task
+   * read "Counted from 13:00". Three minutes of budget gone, and the two rows
+   * that exist to be compared collapsed onto one instant. 13:03 was a
+   * `first_online` — a real statement about when the person could have started,
+   * which `personalAnchorMs` already says "still stands".
+   *
+   * The floor is a MINIMUM across the queue, and both halves of that matter:
+   *
+   *  · a minimum, so it is invariant under reordering. A `Math.max` on the
+   *    head against its OWN anchor would fix this number and bring back the
+   *    12:28:55 / 13:21:24 flip-flop, because the start would move again with
+   *    whichever task led.
+   *  · of the STAMPS, not the leader's stamp. Every stamp but the earliest
+   *    encodes its own queue position, so reading the leader's would feed a
+   *    position-derived value back in as the floor for recomputing positions.
+   *
+   * And it cannot freeze a ghost — the case the old guard was removed for. An
+   * anchor of 16:19:02 inherited from a deleted task, with the earliest
+   * surviving task created 16:33:46, is still corrected: a floor made of minima
+   * cannot hold the start below `earliestCreated`, which is later.
+   */
+  const body = office.slice(office.indexOf("async function rechainQueueFor("));
+
+  /* The stamps, and that it is their minimum. */
+  assert.match(body, /\.map\(\(t\) => t\.anchorMs\)/);
+  assert.match(body, /const earliestStamped =\s*\n?\s*stamped\.length > 0 \? Math\.min\(\.\.\.stamped\) : null;/);
+
+  /* The preview's own `startMs` is not a stamp anybody was shown. */
+  assert.match(body, /\.filter\(\(t\) => !t\.isRework\)/);
+
+  /* Folded into the queue start itself, beside the other two floors — not
+     bolted onto the head, which is where reorder-invariance would be lost. */
+  const max = body.slice(body.indexOf("queueAnchorMs = Math.max("));
+  assert.ok(max.startsWith("queueAnchorMs = Math.max("), "the three-way floor has moved");
+  const args = max.slice(0, max.indexOf(");"));
+  for (const floor of ["earliestCreated", "sessionStartMs", "earliestStamped"]) {
+    assert.ok(args.includes(floor), `${floor} is no longer a floor on the queue start`);
+  }
+
+  /* The head does NOT take that start whole. The floor is a minimum across
+     every task, so on its own it still let a task whose own clock was recorded
+     later than the earliest one have it taken away — see the test below. */
+  assert.doesNotMatch(
+    body,
+    /!task\.isRework && Number\.isFinite\(queueAnchorMs\)\s*\n\s*\? queueAnchorMs\s*\n\s*:/,
+  );
+});
+
+test("a recorded start is never pulled EARLIER by the queue's own start", () => {
+  /**
+   * **The second half of the 9 Sep 2026 decision.** The floor above keeps the
+   * queue's start from falling behind the earliest clock on the queue; this
+   * keeps the HEAD from being handed a start behind its own.
+   *
+   * They are different failures. The floor is a minimum across the queue, so
+   * with A stamped 13:03 and B stamped 14:00 it sits at 13:03 — and B leading
+   * was re-stamped 13:03, losing an hour for no reason but its rank. That is
+   * the reported 13:03 -> 13:00 with bigger numbers.
+   *
+   * Scoped to a stamp that says something. `after_priority_work` was written by
+   * this walk on a previous run and was never a claim about the person, so it
+   * still follows the queue in BOTH directions — which is what keeps the ghost
+   * correction working, an anchor inherited from a deleted task being the case
+   * that removed the old guard. Everything else — `first_online`,
+   * `hours_granted`, `acceptance`, a handover — is a statement about when
+   * somebody could have started, and is now protected.
+   */
+  const body = office.slice(office.indexOf("async function rechainQueueFor("));
+  const head = body.slice(body.indexOf("const headAnchorMs ="));
+  const decision = head.slice(0, head.indexOf(";") + 1);
+
+  /* A queue-derived stamp still follows the queue, both ways. */
+  assert.match(decision, /anchorIsQueueDerived\s*\n?\s*\? queueAnchorMs/);
+  /* Anything else is a floor, never a replacement. */
+  assert.match(decision, /: Math\.max\(queueAnchorMs, ownAnchorMs\)/);
+  /* And the preview is still answering its own question, not this one. */
+  assert.match(decision, /!task\.isRework && Number\.isFinite\(queueAnchorMs\)/);
+
+  /* `ownAnchorMs` is the task's own stamp, or the personal one recovered from
+     under a queue push — never a figure this walk computed. */
+  assert.match(
+    body,
+    /const ownAnchorMs = personalAnchorMs \?\? task\.anchorMs;/,
+  );
 });
 
 test("the re-anchor can only pull a start EARLIER, never later", () => {

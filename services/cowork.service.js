@@ -688,7 +688,7 @@ async function cancelCoworkMeet({ meetId, cancelledBy, cancelledByName }) {
 }
 
 // ── UPDATE / EDIT MEETING ─────────────────────────────────
-async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTime, googleMeetLink, participants }) {
+async function updateCoworkMeet({ meetId, updatedBy, updatedByName, title, description, dateTime, endsAt, agenda, googleMeetLink, participants }) {
   const ref = db.collection("cowork_scheduled_meets").doc(meetId);
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Meeting not found.");
@@ -699,15 +699,50 @@ async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTim
   if (meet.createdBy !== updatedBy) throw new Error("Only the meeting organiser can edit it.");
 
   const updates = {};
-  if (title !== undefined && title !== null) updates.title = title.trim();
+  if (title !== undefined && title !== null) {
+    const trimmed = String(title).trim();
+    if (!trimmed) throw new Error("Give the meeting a title.");
+    updates.title = trimmed;
+  }
   if (description !== undefined) updates.description = description || "";
   if (dateTime !== undefined && dateTime !== null) updates.dateTime = dateTime;
+  /* Additive, like the fields scheduleCoworkMeet writes: the new meetings page
+     edits the end time and the agenda as well as the start. `null` clears the
+     end; an agenda is kept to its non-empty lines. A meeting that ends before
+     it starts is refused here rather than stored and rendered as a negative
+     duration. */
+  if (endsAt !== undefined) updates.endsAt = endsAt || null;
+  if (Array.isArray(agenda)) {
+    updates.agenda = agenda.filter(a => typeof a === "string" && a.trim()).map(a => a.trim());
+  }
+  const startAfter = updates.dateTime !== undefined ? updates.dateTime : meet.dateTime;
+  const endAfter = updates.endsAt !== undefined ? updates.endsAt : meet.endsAt;
+  if (typeof startAfter === "string" && typeof endAfter === "string" && Date.parse(endAfter) <= Date.parse(startAfter)) {
+    throw new Error("The meeting has to end after it starts.");
+  }
   if (googleMeetLink !== undefined) updates.googleMeetLink = googleMeetLink || null;
-  if (participants !== undefined && Array.isArray(participants)) updates.participants = participants;
+  if (participants !== undefined && Array.isArray(participants)) {
+    /* THE ORGANISER IS A PARTICIPANT (see scheduleCoworkMeet). A list sent
+       without them (the edit dialog sends who was TICKED) must not remove
+       them from their own meeting, or it vanishes from their meetings page. */
+    updates.participants = [...new Set([meet.createdBy, ...participants].filter(Boolean))];
+  }
   updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
   updates.updatedBy = updatedBy;
 
   await ref.update(updates);
+
+  /* On the History panel like every other change to the meeting. */
+  const changed = Object.keys(updates).filter(k => k !== "updatedAt" && k !== "updatedBy");
+  if (changed.length) {
+    await _appendMeetEvent({
+      meetId,
+      type: "updated",
+      actorId: updatedBy,
+      actorName: updatedByName || updatedBy,
+      detail: `Changed ${changed.join(", ")}`,
+    });
+  }
 
   // Notify all participants (old + new) except the editor
   const allParticipants = [...new Set([...(meet.participants || []), ...(participants || meet.participants || [])])];
@@ -754,6 +789,78 @@ const MEET_STATUSES = ["scheduled", "waiting", "live", "completed", "cancelled",
  * document each time, and two people joining at once would lose one of the
  * entries to a last-write-wins overwrite.
  */
+/**
+ * Delete a meeting outright: the organiser only, and never one that is running.
+ *
+ * Distinct from cancel, which keeps the record (with `isCancelled`) so the
+ * history and the invitees can see a meeting WAS called and then called off.
+ * Delete is for a booking that should not exist: it removes the document, its
+ * audit trail and its chat, and the join codes that pointed at it, and tells
+ * the invitees. Recordings already in Drive are not touched. They belong to
+ * the participant who made them, uploaded from their own browser, and a
+ * booking going away is no reason to destroy them.
+ *
+ * A live or waiting room is refused rather than torn down from here: people
+ * are in it, and End for everyone is the path that finalises their audio
+ * before the room goes.
+ */
+async function deleteCoworkMeet({ meetId, deletedBy, deletedByName }) {
+  const ref = db.collection("cowork_scheduled_meets").doc(meetId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Meeting not found.");
+  const meet = snap.data();
+  if (meet.createdBy !== deletedBy) throw new Error("Only the meeting organiser can delete it.");
+  const current = meet.isCancelled === true ? "cancelled" : (meet.status || "scheduled");
+  if (current === "live" || current === "waiting") {
+    throw new Error("End the meeting for everyone before deleting it.");
+  }
+
+  /* Subcollections do not go with their document; each is emptied first. */
+  await _deleteCollection(ref.collection("events"));
+  await _deleteCollection(ref.collection("messages"));
+  const codes = await db.collection("cowork_join_codes").where("meetId", "==", meetId).get();
+  await _deleteDocs(codes.docs.map(d => d.ref));
+  await ref.delete();
+  try {
+    await rtdb.ref(`cowork/meets/${meetId}`).remove();
+  } catch (error) {
+    console.error(`RTDB remove error for meets/${meetId}:`, error);
+  }
+
+  const recipients = (meet.participants || []).filter(id => id !== deletedBy);
+  socket.emitToMany(recipients, "meet_deleted", { meetId, title: meet.title });
+  const when = typeof meet.dateTime === "string" && !Number.isNaN(Date.parse(meet.dateTime))
+    ? ` (it was booked for ${new Date(meet.dateTime).toLocaleString("en-IN")})`
+    : "";
+  await _notifyMany({
+    recipientIds: recipients,
+    type: "meet_deleted",
+    title: `🗑️ Meeting removed · ${meet.title}`,
+    body: `${deletedByName || deletedBy} deleted this meeting${when}.`,
+    data: { meetId, meetTitle: meet.title },
+    senderId: deletedBy,
+    senderName: deletedByName || deletedBy,
+  });
+  return { success: true, meetId };
+}
+
+/* Pages of 400, under the 500-write batch limit. */
+async function _deleteCollection(colRef) {
+  for (;;) {
+    const page = await colRef.limit(400).get();
+    if (page.empty) return;
+    await _deleteDocs(page.docs.map(d => d.ref));
+    if (page.size < 400) return;
+  }
+}
+
+async function _deleteDocs(refs) {
+  if (!refs.length) return;
+  const batch = db.batch();
+  refs.forEach(r => batch.delete(r));
+  await batch.commit();
+}
+
 async function _appendMeetEvent({ meetId, type, actorId, actorName, detail }) {
   await db.collection("cowork_scheduled_meets").doc(meetId).collection("events").add({
     type,
@@ -1485,6 +1592,7 @@ module.exports = {
   updateCoworkMeet,
   listCoworkMeets,
   cancelCoworkMeet,
+  deleteCoworkMeet,
   getCoworkMeet,
   setCoworkMeetStatus,
   recordCoworkMeetPresence,

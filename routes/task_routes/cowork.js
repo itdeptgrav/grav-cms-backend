@@ -1255,12 +1255,22 @@ router.patch("/schedule-meet/:meetId/edit", verifyCoworkToken, verifyEmployeeTok
   try {
     const { meetId } = req.params;
     const { employeeId } = req.coworkUser;
-    const { title, description, dateTime, googleMeetLink, participants } = req.body;
+    const { title, description, dateTime, endsAt, agenda, googleMeetLink, participants } = req.body;
     const result = await svc.updateCoworkMeet({
       meetId,
       updatedBy: employeeId,
-      title, description, dateTime, googleMeetLink, participants,
+      updatedByName: req.coworkUser.name,
+      title, description, dateTime, endsAt, agenda, googleMeetLink, participants,
     });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Delete Meeting (the organiser; never while the room is open; enforced in the service)
+router.delete("/schedule-meet/:meetId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId, name } = req.coworkUser;
+    const result = await svc.deleteCoworkMeet({ meetId: req.params.meetId, deletedBy: employeeId, deletedByName: name });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });

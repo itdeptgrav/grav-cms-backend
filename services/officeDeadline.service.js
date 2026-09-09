@@ -1069,10 +1069,60 @@ async function rechainQueueFor(employeeId, opts = {}) {
          exactly the behaviour that predates this rule. */
       console.warn("[officeDeadline] duty read failed for queue anchor:", e.message);
     }
+    /**
+     * **And floored at the earliest clock ALREADY STAMPED on this queue.**
+     * OWNER DECISION, 9 Sep 2026.
+     *
+     * Without it the queue's start could pull a task's origin EARLIER than the
+     * moment the product had already told its holder the clock began. Reported
+     * exactly that way: a task read "Created 13:00 · Counted from 13:03", an
+     * extension was approved, the next walk ran, and it read "Counted from
+     * 13:00" — the same task, three minutes of its budget gone, and the two
+     * rows that exist to be compared collapsed onto one instant. `13:03` was
+     * a `first_online`: a real statement about when the person could have
+     * started, which the note on `personalAnchorMs` below already says "still
+     * stands". The head rule was overwriting it anyway.
+     *
+     * **Why here and not on the head.** Guarding `headAnchorMs` with a
+     * `Math.max` against that one task's own anchor would fix the number and
+     * lose the property the queue start exists for: a per-task floor is not
+     * invariant under reordering, so the queue's start would move again with
+     * whichever task happened to lead it — the 12:28:55 / 13:21:24 flip-flop
+     * this rule was written to end. A MINIMUM across the queue is invariant,
+     * so both guarantees hold at once.
+     *
+     * **Why the minimum and not the leader's.** Every stamp but the earliest
+     * encodes its own queue position — the engine writes `max(availability,
+     * end of the work ahead)` — so reading the leader's would feed a
+     * position-derived value back in as the floor for recomputing positions.
+     * The earliest stamp is the one with no queue baked into it.
+     *
+     * **It cannot freeze a ghost.** That was the case this rule's guard was
+     * removed for: an anchor of 16:19:02 inherited from a deleted task, while
+     * the queue's earliest survivor was created 16:33:46. A floor made of
+     * minima cannot hold the start below `earliestCreated`, which is later —
+     * so the correction still lands. This floor only ever refuses to move an
+     * origin BACKWARDS onto a start earlier than one already recorded.
+     *
+     * This is also the figure `priorityDeadline.ts` has been computing all
+     * along (`earliestClockStartMs`, folded into its `queueStartMs`). The two
+     * disagreed, which is why the panel's preview and the engine's write could
+     * name different origins for one task. They agree now.
+     */
+    const stamped = ordered
+      /* The simulated task carries the preview's own `startMs`, not a stamp
+         anybody was ever shown — see `headAnchorMs`. */
+      .filter((t) => !t.isRework)
+      .map((t) => t.anchorMs)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const earliestStamped = stamped.length > 0 ? Math.min(...stamped) : null;
+
     if (Number.isFinite(earliestCreated)) {
-      queueAnchorMs = Number.isFinite(sessionStartMs)
-        ? Math.max(sessionStartMs, earliestCreated)
-        : earliestCreated;
+      queueAnchorMs = Math.max(
+        earliestCreated,
+        Number.isFinite(sessionStartMs) ? sessionStartMs : earliestCreated,
+        Number.isFinite(earliestStamped) ? earliestStamped : earliestCreated,
+      );
     }
   }
   const moved = [];
@@ -1178,8 +1228,9 @@ async function rechainQueueFor(employeeId, opts = {}) {
     }
 
     /* The head carries the QUEUE's start, so the number does not change with
-       whichever task happens to lead. Never later than the task's own anchor —
-       this rule may tighten a deadline, never loosen one. */
+       whichever task happens to lead. That start is itself floored at the
+       earliest clock already stamped on the queue, so adopting it here cannot
+       pull an origin back behind a moment somebody has already been shown. */
     /**
      * **The head takes the queue's start, whichever direction that moves it.**
      *
@@ -1203,13 +1254,46 @@ async function rechainQueueFor(employeeId, opts = {}) {
      * it unconditionally cannot drift — it can only follow the queue it
      * describes.
      */
+    /**
+     * **And a RECORDED start is never pulled back by it.**
+     * OWNER DECISION, 9 Sep 2026 — "that is not good logic, fix this".
+     *
+     * The floor on `queueAnchorMs` above stops the queue's start falling behind
+     * the earliest clock on the queue. It is not enough on its own, because the
+     * head takes that start WHOLE, and the floor is a minimum across every task
+     * — so a task whose own clock was recorded LATER than the earliest one
+     * still had it taken away:
+     *
+     *   A stamped 13:03, B stamped 14:00 (B came online at 14:00)
+     *   B leads -> queue start = 13:03 -> B is re-stamped 13:03
+     *
+     * B did not become available an hour earlier because its rank changed.
+     * Its deadline just moved an hour earlier, which is the reported fault in
+     * its general form: 13:03 -> 13:00 is this same line with smaller numbers.
+     *
+     * **Only a stamp that says something.** `after_priority_work` means THIS
+     * walk wrote it on a previous run — it was never a claim about the person,
+     * only about work that was ahead — so it still follows the queue in both
+     * directions, and the ghost correction (an anchor inherited from a deleted
+     * task) still lands. `first_online`, `hours_granted`, `acceptance` and a
+     * handover are statements about when somebody could actually have started,
+     * and the note on `personalAnchorMs` above already says such a stamp
+     * "still stands". This is the line that makes that true.
+     *
+     * The queue's start may still push a start LATER — chaining has always
+     * done that, and nobody loses time by it. What it may no longer do is take
+     * back time already granted by a clock the holder has been shown.
+     */
+    const ownAnchorMs = personalAnchorMs ?? task.anchorMs;
     const headAnchorMs =
       /* A simulation carries its own `startMs` — the rejection preview asks
          "what if I sent this back, starting now", and answering from the
          queue's start instead would answer a different question. */
       !task.isRework && Number.isFinite(queueAnchorMs)
-        ? queueAnchorMs
-        : (personalAnchorMs ?? task.anchorMs);
+        ? anchorIsQueueDerived
+          ? queueAnchorMs
+          : Math.max(queueAnchorMs, ownAnchorMs)
+        : ownAnchorMs;
 
     /* `let`, because the unblocking floor below may raise it. */
     let anchorMs =
