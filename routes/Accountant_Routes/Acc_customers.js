@@ -802,13 +802,30 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
           const openSigned =
             (ll.openingBalanceType === "Cr" ? -1 : 1) *
             Math.abs(ll.openingBalance || 0);
-          // Sundry Debtor: positive closing = they owe us
+          /* Sundry Debtor: positive closing = they owe us.
+             ------------------------------------------------------------
+             "PAID" USED TO MEAN "THE LEDGER WENT INTO CREDIT", which is a
+             different fact entirely. A customer invoiced ₹12,30,553 and
+             credited ₹12,30,554.18 sits ₹1.18 in credit — and the register
+             reported that as "Paid ₹1", as though ₹1 was all they had ever
+             paid. It is the same mistake as calling a credited invoice
+             "Paid": treating "nothing is owed" as "money arrived".
+
+             So the two are separated. `paid` is what has actually been
+             credited against them — receipts and notes, the real movement.
+             A negative closing is an ADVANCE or overpayment and is reported
+             as such, never folded into `paid`. */
           const closingSigned = openSigned + (a.dr || 0) - (a.cr || 0);
           const outstanding = closingSigned > 0 ? closingSigned : 0;
-          const paid = closingSigned < 0 ? Math.abs(closingSigned) : 0;
+          const creditBalance = closingSigned < 0 ? Math.abs(closingSigned) : 0;
+          const paid = a.cr || 0;
           ledgerVoucherBalByCustomerId.set(String(ll.linkedCustomerId), {
             outstanding: parseFloat(outstanding.toFixed(2)),
             paid: parseFloat(paid.toFixed(2)),
+            /* They are in credit with us — an overpayment or an advance.
+               Kept apart from `outstanding` (which is never negative) so a
+               screen can say which way the balance runs. */
+            creditBalance: parseFloat(creditBalance.toFixed(2)),
             revenue: parseFloat(
               (Math.abs(closingSigned) + (a.cr || 0)).toFixed(2),
             ),
@@ -834,6 +851,7 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
       const ledgerBal = ledgerVoucherBalByCustomerId.get(String(c._id));
       const combinedRevenue = totalRevenue + (ledgerBal?.revenue || 0);
       const combinedPaid = totalPaid + (ledgerBal?.paid || 0);
+      const combinedCreditBalance = ledgerBal?.creditBalance || 0;
       const combinedOutstanding = Math.max(
         0,
         totalRevenue - totalPaid + (ledgerBal?.outstanding || 0),
@@ -864,6 +882,9 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
         ledgerRevenue: parseFloat((ledgerBal?.revenue || 0).toFixed(2)),
         ledgerPaid: parseFloat((ledgerBal?.paid || 0).toFixed(2)),
         ledgerOutstanding: parseFloat((ledgerBal?.outstanding || 0).toFixed(2)),
+        /* Owed the other way — an overpayment or an advance sitting on their
+           ledger. Never folded into `paid`; see the note where it is derived. */
+        ledgerCreditBalance: parseFloat(combinedCreditBalance.toFixed(2)),
         voucherCount: ledgerBal?.orderCount || 0,
         ledgerLastDate: ledgerBal?.lastOrderDate || null,
         // Legacy combined fields (kept so other callers don't break)
