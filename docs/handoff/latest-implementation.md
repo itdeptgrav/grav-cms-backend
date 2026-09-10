@@ -2,6 +2,1662 @@
 
 ---
 
+## Merchandising Lane A — Routes extracted from the Sales router (10 Sep 2026)
+
+**The final checkpoint blocker, cleared.** Eleven Merchandising endpoints lived
+inside `routes/CMS_Routes/Sales/sampleStyles.js`, a 4,500-line Sales router
+carrying seventy-four hunks of another lane's in-flight rewrite. The staged
+Merchandising application could not be assembled without them. They now live in
+`routes/CMS_Routes/Merchandising/styleRoute.js`, and the Sales router in the
+staged snapshot is byte-identical to `HEAD`.
+
+### Old address → new address
+
+Every one of these was `/api/cms/crm/sample-styles/**` on the Sales router.
+
+| Method | Was | Is now | Owner |
+|---|---|---|---|
+| GET | `/` (Merchandising list) | `/api/cms/merchandising/styles` | Merchandising |
+| GET | `/:id` (Merchandising read) | `/api/cms/merchandising/styles/:id` | Merchandising |
+| GET | `/:id/packaging` | `/api/cms/merchandising/styles/:id/packaging` | Merchandising |
+| GET | `/:id/development` | `/api/cms/merchandising/styles/:id/development` | Merchandising |
+| PUT | `/:id/development` | `/api/cms/merchandising/styles/:id/development` | Merchandising |
+| PUT | `/:id/development/decision` | `/api/cms/merchandising/styles/:id/development/decision` | Merchandising |
+| GET | `/:id/packaging-selections` | `/api/cms/merchandising/styles/:id/packaging-selections` | Merchandising |
+| PUT | `/:id/packaging-decision` | `/api/cms/merchandising/styles/:id/packaging-decision` | Merchandising |
+| POST | `/:id/packaging-selections` | `/api/cms/merchandising/styles/:id/packaging-selections` | Merchandising |
+| PATCH | `/:id/packaging-selections/:rowId` | `/api/cms/merchandising/styles/:id/packaging-selections/:rowId` | Merchandising |
+| PATCH | `/:id/packaging-requirements/:rowId` | `/api/cms/merchandising/styles/:id/packaging-requirements/:rowId` | Merchandising |
+
+Five of them keep answering at the old address as well, for the R&D
+application, which was not changed: the packaging-selection list, create, status
+and requirement routes plus the packaging decision, re-exported as
+`legacyPackagingCompat` and mounted at `/api/cms/crm/sample-styles` behind the
+Sales middleware R&D authenticates with. Same handler objects — a second
+doorway onto one room, not a second implementation.
+
+### What stayed with Sales
+
+Thirty-eight routes on `sampleStyles.js` are untouched: style creation, the
+stage machine, the Sales-facing surface, the tech pack and sample submissions,
+the materials form R&D reads, the raw-item search, and the notification
+helpers. Sales owns style identity; Merchandising owns the operations recorded
+against it. ADR-006 states the rule and the alternatives rejected.
+
+### Shared schema fields, named as a contract
+
+`Enquiry.companyId`, `SalesJourney.companyId`, `Enquiry.products[].productLineRef`
+and `CustomerRequest` order-line `sampleStyleId` are staged, and they are a
+Sales-to-Merchandising CONTRACT rather than Merchandising ownership of a Sales
+record. Sales writes all four; Merchandising reads them and writes none. The
+first two make the acting company provable on records Merchandising must scope
+by; `productLineRef` is the permanent line identity ADR-005 rule 1 requires; and
+`sampleStyleId` lets a confirmed order line name the style it was developed
+from.
+
+### No duplicated logic
+
+The handlers moved rather than being copied. `publicPackagingSelection`, the
+response shape both surfaces need, moved to
+`services/sales/packagingBom.service.js` as `publicSelection`; both routers
+already imported that service. The Merchandising router imports no Sales router,
+and the Sales router imports no Merchandising router.
+
+### Tests
+
+Four Merchandising suites now mount the Merchandising router. Two suites turned
+out to be about SALES helpers and moved to `test/sales/` with their assertions
+unchanged — `sample-style-surface.test.js` (R&D's raw-item search, stage
+routing, the legacy material routes) and `sample-style-customer-name.test.js`
+(the `customerNameFor` notification lookup, whose fix is another lane's hunk on
+the Sales router). They are working-tree files, deliberately not in the
+Merchandising checkpoint: their subject is a file the checkpoint does not
+change.
+
+**Staged snapshot, built from the Git index alone and run in a temporary
+directory: 20 suites, 645 tests, 645 passed.** Frontend Merchandising suites:
+105 suites, 593 tests, 593 passed. No commit, no push, no deployment, no
+production data command.
+
+---
+
+## Merchandising Lane A — CLOSED (9 Sep 2026)
+
+**This lane is closed. Nothing committed, nothing deployed, no shared or
+production data changed.**
+
+Final state, recorded:
+
+```text
+Merchandising feature development        COMPLETE
+Local ephemeral backfill proof           PASSED
+Local starter-configuration proof        PASSED
+Production backfill and seed             INTENTIONALLY UNEXECUTED
+Authenticated browser verification       A RELEASE ACTIVITY, NOT DONE
+Outstanding test and build failures      OWNED BY OTHER LANES
+```
+
+**Feature development is complete.** M1 through M7, the pre-order development
+correction, the production closure and this data closure. The navigation is four
+entries — Overview, Development, Order Execution, Time & Action — and the
+journey runs end to end: Sales Journey → Development Request → Development BOM →
+Sales release → R&D and Costing → confirmed-order adoption → Execution File →
+Materials, Approvals and Time & Action → PPC handover → Change Control.
+
+**The local proof passed.** A real MongoDB, started by the harness, loaded with
+the dev cluster's exact shape. 27 product-line references minted across 12
+enquiries with none refused, idempotent on re-run, byte-identical, and a
+backfilled line then issued a real development request. One starter calendar and
+one starter template published per Merchandising-enabled company, ten milestones
+across five departments, skipped rather than re-versioned on a second run, and
+Merchandising completing no other department's milestone.
+
+**The production commands are deliberately not run.** `MONGODB_URI` points at a
+shared remote Atlas cluster and no local mongod exists; on instruction, nothing
+was written to it. Both commands are recorded below and in the entry beneath
+this one.
+
+**Authenticated browser verification is a release activity.** It was not
+performed — two Chrome sessions were available and their use was declined. The
+ten-section manual pass is `docs/handoff/merchandising-browser-checklist.md`.
+
+**What is failing is not this lane's.** The concurrent order-demand-release work
+inside `test/merchandising`, the Central Costing tenancy scan, and four
+untracked pages that abort the production export. None was touched. This lane's
+twenty Merchandising suites are 639 passed, 0 failed; the frontend is 515
+passed; `tsc` is clean; `next build` compiles.
+
+### The two production data commands — NOT EXECUTED
+
+```bash
+node -r dotenv/config scripts/readiness/backfill-product-line-refs.js --apply
+```
+
+```bash
+node -r dotenv/config scripts/readiness/seed-tna-starter.js --apply
+```
+
+Both default to a dry run without `--apply`. Read each dry run against the
+target database before applying either. Until the first runs, Development
+accepts no requests; until the second runs, Time & Action creates no plans.
+
+---
+
+## Merchandising Lane A — Data and go-live closure (9 Sep 2026)
+
+**MERCHANDISING: FEATURE-COMPLETE. LOCAL DATA: READY. PRODUCTION DATA: DRY RUN
+READY, NOT APPLIED. Nothing committed. No shared or production data touched.**
+
+The feature work was finished; this run made it usable with real data and found
+one more defect while doing it.
+
+### Where "local" actually is
+
+`MONGODB_URI` points at a shared remote Atlas cluster, and no local mongod is
+running. A backfill is not something to try out on shared infrastructure, so on
+the user's instruction nothing was written to it. Instead
+`scripts/readiness/local-data-closure.js` stands up a REAL MongoDB of its own,
+loads it with the exact shape the dry run found on the dev cluster, and runs the
+actual migration and seed against it. All 22 checks pass.
+
+Running the real scripts matters: both were refactored so their logic is
+exported and the CLI is a thin wrapper behind `require.main`. Proving the export
+proves what a person runs. (It also removed four short-lived child processes
+racing a freshly-started server, which was producing failures that belonged to
+the harness rather than to the migration.)
+
+### The backfill — before and after
+
+| | Before | After |
+|---|---|---|
+| Enquiries | 12 | 12 |
+| Product lines | 27 | 27 |
+| Carrying a permanent reference | 0 | 27 |
+| Refused | — | 0 |
+
+Every reference matches `PL-` + 12 hex, all 27 are distinct, and none appears
+anywhere in the script. The script never mints one: its only write is
+`enquiry.save()`, so the value can only come from the pre-validate hook — the
+code that refuses a duplicate and refuses one this system did not issue.
+Writing the field with `updateOne` would bypass exactly that.
+
+**Idempotency.** A second `--apply` finds nothing to do, every reference is
+byte-identical, and a following dry run reports zero.
+
+**And it does the job it exists for:** after the backfill, a previously
+unreferenced line issued development request `DRQ-…`, version 1, ISSUED.
+
+### The starter Time & Action configuration
+
+`scripts/readiness/seed-tna-starter.js`. Company-scoped, dry run by default, and
+it SKIPS any company that already has a published template or calendar — not
+merged, not versioned, not overwritten, because a published version is what live
+plans were scheduled against.
+
+Local identifiers from the proof run:
+
+```text
+calendar   "Standard factory week"    v1   id 6aa180ea5f7fd6f94762d02f
+template   "Standard garment order"   v1   id 6aa180eb5f7fd6f94762d045
+```
+
+Ten milestones across five departments: MERCHANDISING, PRODUCT_DEVELOPMENT,
+STORE_SUPPLY_CHAIN, IE_PPC_PRODUCTION and QUALITY.
+
+**Merchandising completes no other department's milestone.** Every milestone is
+checked: `completionAuthority: MERCHANDISING` appears nowhere that
+`ownerDepartment` is not also MERCHANDISING. Where an owning application does
+not yet publish a consumable event, `sourceEventKinds` is deliberately empty and
+the milestone stays visibly awaiting one — a tick box Merchandising fills in on
+Production's behalf is a lie about who did the work.
+
+After seeding, the company's own selector rules resolve that published template
+for a new plan, so a file with no plan can be given one.
+
+### The defect this run found
+
+**An approved reschedule never moved the date.** `approveReschedule` set
+`forecastDate` and then `repropagate` recomputed every forecast from its anchor.
+Propagation honours exactly two floors — the predecessor chain and the stated
+`manualForecastDate` — and this path set only the first. So a move could be
+requested, previewed, approved by a second person and recorded as APPROVED while
+the date stayed exactly where it was.
+
+`updateForecast` had that line from the beginning; the reviewed route did not,
+which is why the defect showed only on the path with the approval gate on it.
+One line, and the journey test now proves the forecast actually lands on the
+approved date.
+
+Also fixed: the pending-reschedule band added in the previous run queried
+`state: "REQUESTED"`. The model's state is `PREVIEWED`, so the query succeeded
+and returned nothing — the band never appeared and nothing said why.
+
+### The connected smoke test — all eleven steps
+
+`test/merchandising/production-closure.journey.test.js`, one walk through the
+real routers:
+
+1. Sales sends a Journey product line to Development — and Merchandising cannot
+   send one to itself (403).
+2. Merchandising accepts, selects three identities, submits.
+3. A different user approves; the author is refused.
+4. Sales releases to R&D; Merchandising has no such route at all (404).
+5. The R&D shortlist resolves `source: DEVELOPMENT_BOM` at the approved
+   revision, ahead of the registered product's.
+6. A confirmed order opens a SEPARATE execution file.
+7. It adopts the approved selection into a DRAFT, carrying the lineage.
+8. Materials, packaging and development requirements are each approved by
+   somebody who did not write them.
+9. A plan is created and baselined; one reschedule is requested by one person,
+   refused for that person, found by a second, and approved — moving the
+   forecast and writing a NEW baseline while keeping the one it replaced.
+10. The pack is submitted, refusing to take the completion declaration
+    implicitly, and the file is not handed over until PPC accepts.
+11. A post-handover change is issued; the approved development revision and the
+    order's approved materials are byte-identical afterwards, and the pack
+    version PPC received is unchanged.
+
+### Verification
+
+| Suite | Result |
+|---|---|
+| `test/merchandising`, this lane's 20 suites | 639 passed |
+| `test/merchandising`, all 21 including another lane's | 685 passed, 1 failed |
+| `test/sales` + `test/costing` (67 suites) | 1819 passed, 1 failed |
+| Frontend (16 suites) | 515 passed |
+| `npx tsc --noEmit` | clean |
+| `next build` | `✓ Compiled successfully` |
+
+### Two capability pins, made precise
+
+The Merchandising suite failed on two of my own assertions after another lane
+added a fifteenth capability, `PROCUREMENT_RELEASE`, plus a new service, route
+and suite at 19:00 today. Both pins asserted the vocabulary had exactly fourteen
+entries. What they were written to prove is narrower and is unchanged: this
+work introduced none of its own.
+
+So they now NAME the fourteen M0 capabilities and assert none exists whose name
+mentions development or change. A fifteenth constant for somebody else's feature
+is that lane's decision to defend; counting it here proved nothing about either.
+The new capability and its suite are recorded, not judged — they are not this
+lane's work.
+
+**And that lane is still editing.** `orderDemandRelease.service.js` and its test
+changed at 21:40 and 21:42, mid-run; the suite grew from 680 tests to 686
+between two consecutive runs, and one of them —
+"recovering an interrupted release › a crash after the drafts exist returns the
+SAME requests" — now fails. It is entirely inside their order-demand-release
+feature and touches nothing this lane owns: not development, not adoption, not
+Time & Action, not the reschedule path. This lane's twenty suites are 639
+passed, 0 failed.
+
+### Recorded, not touched
+
+- **`test/costing/sales-tenancy-guard.test.js`** — the Central Costing lane's
+  static scan, 16 offenders across `leads.js`, `leadContactPromotion.js`,
+  `ieOrders.service.js` and `sampleBomApproval.js`. None is this work.
+- **Four untracked pages** using `useSearchParams` with no Suspense boundary,
+  each producing the identical prerender error and aborting the export:
+  `app/accountant/budgets/item-usage/page.js`,
+  `app/store/dashboard/operations/reservations/page.js`,
+  `app/store/dashboard/operations/stock-exceptions/page.js`,
+  `app/store/dashboard/supplier-offers/new/page.js`.
+  Setting exactly those four aside gives a clean build with every Merchandising
+  route rendering; all four were restored byte-identical.
+
+### Authenticated browser result
+
+**Not performed.** Two Chrome sessions were available and the user declined
+their use. The in-app browser holds no session: all Merchandising routes answer
+`307 → /?next=…`, which is the auth guard working. Every route resolves and
+redirects identically, so the Development entry is wired into the same guard as
+the established four and is not a 404.
+
+`docs/handoff/merchandising-browser-checklist.md` is the manual pass: ten
+sections covering what a harness cannot see.
+
+### The production commands that remain UNEXECUTED
+
+Run in this order, against the target database, reading each dry run first:
+
+```bash
+node -r dotenv/config scripts/readiness/merchandising-closure-dryrun.js
+node -r dotenv/config scripts/readiness/backfill-product-line-refs.js
+node -r dotenv/config scripts/readiness/backfill-product-line-refs.js --apply
+node -r dotenv/config scripts/readiness/seed-tna-starter.js
+node -r dotenv/config scripts/readiness/seed-tna-starter.js --apply
+```
+
+None has been run against the Atlas cluster or anywhere but the ephemeral local
+server. The first three lines are the gate on Development accepting requests;
+the last two are the gate on Time & Action creating plans.
+
+### Deployment and rollback
+
+1. **Backend.** Additive only: new collections, new routers, two optional
+   fields, one widened audit schema. The previous frontend works against it.
+2. **Frontend.** It calls routes that must already exist.
+3. **Backfill**, `--apply`, after reading its dry run.
+4. **Seed**, `--apply`, per company.
+
+**Rollback.** Redeploy the previous frontend; the backend can stay, because
+nothing in step 1 changes an existing document's meaning. Steps 3 and 4 are the
+only irreversible ones, and both only ADD: references onto lines that had none,
+and a template and calendar where a company had neither. Rolling the code back
+leaves both unused rather than wrong.
+
+---
+
+## Merchandising Lane A — Production closure (9 Sep 2026)
+
+**M1–M7: DELIVERED. PRE-ORDER DEVELOPMENT: DELIVERED. MERCHANDISING:
+FEATURE-COMPLETE. Nothing committed. No data changed.**
+
+A stabilisation run, not a milestone. No feature was added and nothing was
+redesigned; the navigation is the same four entries. What this did was walk the
+whole journey once, end to end, through the real routers — and that walk found
+four places where the product was broken at a seam rather than inside a piece.
+
+### The four defects, and why nobody's own test saw them
+
+**1. The development-to-execution adoption link was never written.**
+`developmentReference` was declared on the handover version AND on the execution
+file, `sourceFor` read it, and no code anywhere in the application ever set it.
+So every real order answered "this order did not come from a development job",
+and the entire adoption path — the step where a confirmed order picks up what
+the buyer's sample was actually made from — was unreachable in production.
+
+Nothing failed, which is why it survived: a preview that is *allowed* to answer
+"nothing to adopt" cannot tell that apart from a broken link. The milestone's
+own tests asserted the field's shape and the service's refusal to auto-approve,
+both of which were true.
+
+Merchandising now resolves its own two records — on `sampleStyleId` where the
+projection carries one, else `styleRef` — and RECORDS the answer the first time
+it is used, so it is a join once and a fact thereafter. Sales was the obvious
+place to stamp it and is the wrong one: giving Sales a Development File id hands
+Sales a handle on a Merchandising record, which is what ADR-005 decision 2
+exists to prevent.
+
+**2. Every adopted row was refused, and the adoption reported success.**
+The adoption service sent `rawItemId`, `note` and no `group` to
+`selection.addRow`. An M3 row has none of those — it references the catalogue
+through `catalogueRef`, spells the field `notes`, and requires a `group`. Each
+row was refused by name, so `families` reported `revisionNo: 1`, `adopted`
+reported 0, and the drafts it created were empty. Fixed by mapping the
+development row to the M3 shape the way it was always meant to: the SKU into
+`componentCode`, the catalogue id into `catalogueRef`, and sample packaging into
+`OTHER` rather than a guess from the component's name.
+
+**3. A file with no Time & Action plan could not be given one.**
+The empty state said "a plan is created from a published process template" and
+offered no control. `createTnaPlan` existed in the client and on the server and
+nothing called it, so every file that had not been given a plan by hand sat
+permanently outside the one register whose job is controlling dates. The empty
+state now offers the act at the manage rung, and neither the template nor the
+start date is decided by the browser — an empty template resolves by the
+company's own selector rules, which is the rule a merchandiser questioning a
+date needs to be able to point at.
+
+**4. The reschedule dialog offered Approve to the one person who cannot use it.**
+The maker/checker rule was already enforced — `TNA_SELF_APPROVAL` — and the
+screen offered the requester an Approve button straight after their own preview,
+whose only possible outcome for that reader was a refusal. The request had
+nowhere else to appear, so in practice a date move needed a second person who
+had no way of knowing one was waiting. Requesting now ends at the request, and a
+new band lists what is waiting with Approve, Reject and Withdraw. Approve is
+offered to anybody at approver level and the SERVER decides: a browser that
+tried to work out who requested what would be wrong exactly when it mattered.
+
+### The reconciliation
+
+Every one of the **117 distinct call sites** in `lib/merchandising/api.js` and
+`lib/salesJourney/developmentRequests.js` was matched against the **201 routes**
+mounted across the eleven Merchandising, Sales, PPC and sample-style routers.
+Zero unmatched. The reverse scan — exported client functions no screen calls —
+produced 27 names, of which 13 are lookup maps read through their own accessor,
+10 are detail reads whose list form is wired, and 4 were the dead ends above.
+
+No placeholder prose, no `TODO`, and no control without a handler exists under
+`app/merchandiser` or `components/merchandiser`.
+
+### The connected journey test
+
+`test/merchandising/production-closure.journey.test.js` walks the chain once, in
+order, through the real routers: Sales issues a versioned request against a
+permanent product-line reference → Merchandising accepts and selects → a second
+person approves → Sales authorises the release → R&D reads the approved
+selection first → the buyer confirms and a SEPARATE execution file opens → the
+order adopts the approved selection into a draft → each family is approved by
+somebody who did not write it → Time & Action plans and baselines the order →
+the pack goes downstream → a Sales change lands and the approved development
+revision is byte-identical afterwards.
+
+It is one `test` and not eleven on purpose: `test/setup.js` clears every
+collection after each test, and eleven tests would each rebuild the world and
+prove nothing about the seams between them.
+
+The boundaries are asserted AT each seam: Merchandising cannot issue a
+development request, Sales cannot edit a Merchandising selection, a platform
+administrator without a Merchandising grant reaches nothing, Merchandising has
+no release route at all (404, not 403), the author cannot approve their own
+revision in any of the four families, submitting the pack refuses to take
+Merchandising's completion declaration implicitly, and the file is not handed
+over until PPC's own receiver says so.
+
+### Final route and navigation map
+
+The bar is four entries and unchanged:
+
+```text
+Overview            /merchandiser/dashboard
+Development         /merchandiser/development
+Order Execution     /merchandiser/execution
+Time & Action       /merchandiser/time-action
+```
+
+Reached from those, never from the bar:
+
+```text
+/merchandiser/development/[fileId]   6 tabs
+/merchandiser/execution/[fileId]     9 tabs
+/merchandiser/changes                from the Overview's two change counts
+/merchandiser/management             reports, bulk, configuration, archive, ops
+```
+
+Sales' own surface is the Development panel on the Style & Sample stage,
+rendered only in Sales scope because that stage is also mounted inside the
+Merchandiser and Project Manager dashboards.
+
+The transitional deep links (`/merchandiser/work`, `/merchandiser/styles`) and
+the fifteen compatibility redirects are unchanged.
+
+### Verification
+
+| Suite | Result |
+|---|---|
+| `test/merchandising` (20 suites, `--maxWorkers=2`) | 639 passed |
+| `test/sales` + `test/costing` (67 suites) | 1819 passed, 1 failed |
+| `test/costing/rnd-technical-record.test.js` | passed |
+| Frontend (16 suites) | 515 passed |
+| `npx tsc --noEmit` | clean |
+
+`--maxWorkers=2` is required: the default worker count OOM-kills the
+Merchandising suite and reports false failures.
+
+**Production build.** `✓ Compiled successfully`. Prerendering then fails on four
+UNTRACKED pages belonging to other lanes, each using `useSearchParams` with no
+Suspense boundary and each producing the identical error:
+
+```text
+⨯ useSearchParams() should be wrapped in a suspense boundary at page "<path>".
+Error occurred prerendering page "<path>".
+```
+
+- `app/accountant/budgets/item-usage/page.js`
+- `app/store/dashboard/operations/reservations/page.js`
+- `app/store/dashboard/operations/stock-exceptions/page.js`
+- `app/store/dashboard/supplier-offers/new/page.js`
+
+None was edited. Setting exactly those four aside gives a clean build in which
+`/merchandiser/dashboard`, `/merchandiser/development`, `/merchandiser/management`
+and `/merchandiser/development/[fileId]` all render; all four were restored
+byte-identical afterwards.
+
+**The one other failing suite** is `test/costing/sales-tenancy-guard.test.js`, a
+static scan owned by the Central Costing lane. It lists 16 offenders across
+`leads.js`, `leadContactPromotion.js`, `ieOrders.service.js` and
+`sampleBomApproval.js`; none is this work. The four it originally raised against
+`services/sales/developmentRequest.service.js` were addressed — one of them, the
+buyer-label lookup, was genuinely reading an account by id alone on the strength
+of having come from a scoped journey, which is a cross-tenant read the moment
+somebody passes a journey from elsewhere.
+
+### Data readiness — DRY RUNS ONLY, nothing applied
+
+`scripts/readiness/merchandising-closure-dryrun.js` (reads only; the file
+contains no create, update, delete or index build). Run against the dev
+database:
+
+| Check | Result |
+|---|---|
+| Journey product lines with no permanent reference | 27 of 27, across 12 enquiries |
+| Development requests whose line no longer resolves | 0 of 0 |
+| Execution files needing an adoption backfill | 0 — the link is self-healing |
+| Published T&A template versions | 0 |
+| Published working-calendar versions | 0 |
+| Execution files predating the development flow | 0 |
+| Audit events lost to the `fileId` defect | 0 of 0 |
+
+Two of those are real deployment gates:
+
+**Product-line references.** Every existing enquiry line lacks one, so no line
+can be sent for development until they are minted. The Sales panel already says
+so per line and offers no button, which is honest but is not a working feature.
+`scripts/readiness/backfill-product-line-refs.js` performs it and **defaults to
+a dry run** — a script that writes when you forget a flag is a script somebody
+runs against production while reading its help. It loads and saves each affected
+enquiry rather than using `updateOne`, because the pre-validate hook is what
+mints and validates the reference, and writing the field directly would bypass
+exactly the code that makes the value trustworthy. Safe to repeat. NOT APPLIED.
+
+**T&A configuration.** No published template or calendar exists, so no plan can
+be created for any file in any company. The screen offers the act and the server
+refuses it with the reason, which is the honest behaviour. Publishing one of each
+is a manager decision made through the configuration editor, not a migration.
+
+**The `fileId` audit defect.** 0 affected rows in this database. The field was
+absent from a strict schema, so the value was dropped at write time and was
+never stored — it cannot be recovered from those rows. Reconstruction is
+possible only where an event's own `recordId` still resolves to a record naming
+its file, which is a join rather than an invention. Where it does not, the gap
+stays a gap: a fabricated audit event is indistinguishable from one that
+happened, which is worse than a hole.
+
+### Browser walkthrough — NOT PERFORMED
+
+Both servers are running (frontend 3001, backend 5050) and every Merchandising
+route serves, but the in-app browser holds no session and all five routes answer
+`307 → /?next=…`, which is the authentication guard doing its job. Completing a
+walkthrough needs a real user's password. Credentials were not requested and
+authentication was not bypassed.
+
+What was verified without them: all five routes resolve and redirect
+identically, so `/merchandiser/development` is wired into the same guard as the
+four established routes and is not a 404. Everything else on the walkthrough
+list — populated states, the approval workflow, CSV preview, configuration —
+remains unverified in a browser and is covered only by the test suites.
+
+### Changed and untracked Merchandising files
+
+Backend, created: `models/CMS_Models/Merchandising/**`, `models/CMS_Models/PPC/**`,
+`models/CMS_Models/Sales/{DevelopmentRequest,SalesChangeNotice,SalesHandoverEvent,SalesHandoverVersion,enquiryProductLineIdentity,executionProjection}.js`,
+`routes/CMS_Routes/Merchandising/**`, `routes/CMS_Routes/PPC/**`,
+`routes/CMS_Routes/Sales/{developmentRequests,changeNotices,merchandisingHandovers}.js`,
+`services/merchandising/**` (32 modules), `services/sales/**`, `services/ppc/**`,
+`services/integration/**`, `services/companyContext/merchandisingScope.service.js`,
+`services/approvedMaterialShortlist.service.js`, `scripts/seed-tna-process.js`,
+`scripts/readiness/**` (new), `test/merchandising/**` (20 suites).
+
+Backend, modified: `models/CMS_Models/Sales/Enquiry.js`, `server.js`,
+`services/storePurchase/errors.js`, `docs/product/merchandising-app-final-plan.md`,
+`docs/decisions/architecture-decisions.md`, `docs/tasks/current-task.md`,
+`docs/handoff/latest-implementation.md`.
+
+Frontend, created: `app/merchandiser/development/**`,
+`components/merchandiser/{DevelopmentRecords,DevelopmentBomTab,DevelopmentAdoptionBand,ConfigurationEditor,developmentPresentation}.js`,
+`components/sales/crm/journey/DevelopmentRequestPanel.js`,
+`lib/merchandising/bulkCsv.js`, `lib/salesJourney/developmentRequests.js`,
+plus `preorderDevelopment.test.mjs` and `bulkCsv.test.mjs`.
+
+Frontend, modified: `lib/merchandising/api.js`,
+`components/merchandiser/{merchandisingNavigation,FileTabs,TimeActionTab}.js`,
+`app/merchandiser/{dashboard,management}/page.js`,
+`app/merchandiser/execution/[fileId]/page.js`,
+`components/sales/crm/journey/stages/StyleSampleStage.js`, and the nav, shell,
+compat-route, approvals, change-control, department-status, selection and
+Time & Action test suites where a pinned boundary moved.
+
+The working tree also carries other lanes' uncommitted work (Central Costing,
+IE, HR, Help, Marketing). None of it was touched.
+
+### Deployment order, and rolling back
+
+1. **Backend first.** Every Merchandising-facing change is additive: new
+   collections, new routers, two new optional fields (`Enquiry.products.productLineRef`,
+   `executionProjection.sampleStyleId`) and one widened audit schema. A frontend
+   still running the previous build works against it unchanged.
+2. **Frontend second.** It calls routes that must already exist. Deploying it
+   first gives a Development entry whose register cannot load.
+3. **Then the product-line backfill**, with `--apply`, once somebody has read
+   its dry run against the target database. Until it runs, Development accepts
+   no new requests — the register, the file and every existing surface work.
+4. **Then publish one T&A template and one working calendar** per company,
+   through the configuration editor. Until then, plans cannot be created.
+
+**Rollback.** Redeploy the previous frontend build; the backend can stay. Nothing
+in step 1 changes an existing document's meaning, so the old frontend reads the
+new backend correctly. The backfill in step 3 is the only irreversible step, and
+what it writes is a fresh reference on lines that had none — no existing value
+is overwritten, so rolling the code back leaves those references unused rather
+than wrong.
+
+---
+
+## Merchandising Lane A — Pre-order development and material selection (9 Sep 2026)
+
+**PRE-ORDER DEVELOPMENT: DELIVERED. M1–M7: DELIVERED. MERCHANDISING:
+FEATURE-COMPLETE. Nothing committed.**
+
+The correction to a premature claim. M1–M7 built the half of Merchandising that
+begins when Sales confirms an order. The company does most of its merchandising
+before that: a buyer is interested, Sales asks for a product to be developed,
+and somebody has to decide which fabric, which trims, which labels. That
+decision is Merchandising's, everything downstream is computed against it, and
+the application had no home for it.
+
+What existed instead was a Sales-authenticated form writing raw items onto
+`SampleStyle.materials`. It put a Merchandising decision behind a Sales seat,
+addressed a product line by its name, and carried a quantity nobody had
+engineered. It is now read, offered for adoption, and never written.
+
+### The seven ownership decisions
+
+Recorded permanently as ADR-005. They are the whole of the correction:
+
+1. **A Journey product line has a permanent, server-minted reference.**
+   `PL-` + twelve hex, minted in a pre-validate hook on `Enquiry.products`, and
+   a client may NAME one but never invent one. Position, product name and style
+   text are all refused as identities, because one enquiry legitimately carries
+   "Polo" twice in two colourways and those are two development jobs.
+2. **Sales owns the ask; Merchandising owns the file.** `SalesDevelopmentRequest`
+   is a versioned Sales record on a Sales router behind the live Sales grant.
+   Three source scans assert that no Merchandising route or service creates one
+   and that no Sales route reads or writes a Development File.
+3. **The Development File is its own aggregate.** Keyed on
+   `company + journey + productLineRef`, opened by the request's carrier, and
+   existing long before any Execution File does.
+4. **The development BOM holds identity only.** Eight fields. Seventeen others
+   are refused BY NAME, and each refusal says whose fact it is — consumption
+   and allowance are R&D's, rate and cost are Costing's, the supplier is chosen
+   when it is bought, stock and issue are Store's.
+5. **Approval is maker/checker and freezes.** Approver ≠ author ≠ submitter,
+   owners not exempt, approved revisions immutable, previous revisions readable.
+6. **Release to R&D is Sales'.** Merchandising has no route for it. Approving
+   says the materials are settled; releasing says the buyer relationship
+   justifies the spend.
+7. **The approved development selection outranks the registered product BOM**
+   for R&D's shortlist and Costing's identity.
+
+### What was built
+
+**Backend.** `enquiryProductLineIdentity.js`, `SalesDevelopmentRequest`, the
+three Merchandising development models (`DevelopmentRequestReceipt`,
+`DevelopmentFile`, `DevelopmentBomRevision`) with their partial unique indexes,
+`developmentRequest.service.js`, `developmentIntake.service.js`, the fifth
+outbox carrier, `development.service.js`, `developmentAdoption.service.js`,
+`developmentLegacy.service.js`, `developmentPublication.service.js` and the two
+routers. Fourteen new error codes, twenty new audit actions, two new outbox
+kinds, and NO new capability constant — the fixed fourteen cover all of it.
+
+**What Sales sees back.** `developmentPublication.service.js` is the one door.
+It reads Merchandising's records and returns STATEMENTS: the state, the version,
+the words, and the approved identities. No document id, no revision handle, no
+row reference, and no write anywhere in the module — a test scans the source
+for `create`, `save`, `findOneAndUpdate`, `updateOne`, `deleteOne`, `bulkWrite`
+and `startSession` and finds none. Only an APPROVED revision is published,
+because a draft is Merchandising still working and publishing one would let a
+salesperson quote a fabric nobody agreed to.
+
+The alternative — having the Sales service query the Merchandising collections
+itself — works exactly once. The second time somebody changes what a development
+file means, the change lands in Merchandising and the Sales copy of the query
+keeps answering the old question, silently, because a stale join returns rows
+rather than an error.
+
+**Frontend.** Navigation became four entries with Development second, in the
+order the work happens. The Development register (`/merchandiser/development`)
+with seven views; the development file workspace with six tabs — Summary, Sales
+Brief, Materials & Trims, Packaging, Approvals & Handover, Changes & History.
+No sample-round tab, no consumption editor, no Sales control. The Overview
+gained a second, separately-read indicator deck, so a development read that
+fails leaves the order figures standing and the reverse.
+
+The Sales Journey's Style & Sample stage gained a Development panel: send a line
+for development, read Merchandising's published answer, authorise the release.
+It carries no material-selection control at all — not disabled, absent — and it
+is Sales-scope only, because that same stage is mounted inside the Merchandiser
+and Project Manager dashboards and a merchandiser must not raise development
+work against a buyer's opportunity on Sales' behalf.
+
+### The two M7 gaps, closed
+
+**Configuration.** M7 said "manager-only configuration without adding daily
+navigation" and shipped endpoints with no way to reach the writes from a
+browser. A manager wanting to change a milestone offset had to ask somebody
+with a terminal. `ConfigurationEditor` covers the three things a plan is built
+from — templates, working calendars, reason codes — as a section of the
+management page, off the navigation, offered only at the owner rung. A published
+version is never edited: a new draft starts FROM the published one, and
+publishing closes the previous version's window while leaving every plan already
+scheduled against it alone.
+
+**Bulk.** The preview-first contract was sound and the front door was a textarea
+taking hand-written JSON. The people who reassign forty files keep those files
+in a spreadsheet. `lib/merchandising/bulkCsv.js` reads one: RFC-4180 quoting,
+header matching by name rather than position, and a report of what will NOT be
+sent — unrecognised columns named rather than dropped, short rows refused rather
+than padded, each with the line number the person's own spreadsheet shows. A
+missing required column makes nothing previewable, because a preview built from
+three of four columns previews the wrong act.
+
+### Defects found and fixed on the way
+
+- **The Merchandising audit schema had no `fileId`.** It is `strict: true`, so
+  every M3–M7 write of that field had been silently discarded and an Execution
+  File's Changes & History showed only handover-lineage events. Added, and the
+  history query widened.
+- **The Sales outbox required handover fields on every event.** A development
+  event has no order line. Replaced the blanket `required: true` with a
+  per-kind requirement map and a pre-validate guard.
+- **The R&D shortlist blocker message** was reworded rather than its test
+  edited, so the phrase another lane pins stayed intact.
+
+### Verification
+
+- `npx jest test/merchandising --maxWorkers=2` — 19 suites, 638 tests, all
+  passing. The default worker count OOM-kills this suite and produces false
+  failures; `--maxWorkers=2` is required.
+- `test/merchandising/preorder-development.route.test.js` — 51 tests.
+- `test/costing/rnd-technical-record.test.js` — 47 tests, unchanged.
+- `test/sales` — every suite passing.
+- Frontend: 16 suites, 515 tests, all passing, including a new
+  `preorderDevelopment.test.mjs` (58) and `bulkCsv.test.mjs` (18).
+- `npx tsc --noEmit` — clean.
+- `next build` compiles (`✓ Compiled successfully`). Prerendering still fails on
+  four UNTRACKED pages from other lanes that use `useSearchParams` with no
+  Suspense boundary — Accounting item usage, Store reservations, Store stock
+  exceptions, Store supplier-offers/new. None was touched. Setting exactly
+  those four aside gives a clean build in which `/merchandiser/development`,
+  `/merchandiser/dashboard` and `/merchandiser/management` all render, and all
+  four were restored byte-identical afterwards.
+
+### Failures recorded and not fixed
+
+Four `test/costing` suites fail on the Central Costing lane's own in-progress
+work: `sales-tenancy-guard`, `costing-foundation.route`,
+`sales-prepare-authorisation` and `costing-contract`. Three are that lane's
+capability map disagreeing with that lane's capability test over
+`costing.commercial.approve` and `costing.commercial.submit`; the source and the
+tests are both modified in the working tree and neither was touched here.
+
+The fourth, `sales-tenancy-guard`, is a static scan for Sales queries that do
+not use one of the scoping idioms. It lists 16 offenders across `leads.js`,
+`leadContactPromotion.js`, `ieOrders.service.js` and `sampleBomApproval.js` —
+none of them this work. The four entries it originally raised against
+`services/sales/developmentRequest.service.js` were real in the sense the guard
+means: the queries were company-scoped but wrote the clause inline rather than
+through the `companyClause` idiom the guard recognises. They were changed to use
+it, and one of them — the buyer-label lookup — was genuinely reading an account
+by id alone on the strength of having come from a scoped journey, which is a
+cross-tenant read the moment somebody passes a journey from elsewhere. It now
+states its own clause.
+
+---
+
+## Merchandising Lane A — M7 Change Control and Enterprise Scale (9 Sep 2026)
+
+**M7: DELIVERED. Nothing committed.** (The `MERCHANDISING: FEATURE-COMPLETE`
+claim originally written here was premature and has been moved to the pre-order
+development entry above, which is where it became true.)
+Sales-authorised change intake, Merchandising impact coordination, affected-
+application acknowledgements, preview-first bulk operations, exports and
+operational reporting, archive, integration observability, and manager-only
+configuration off the navigation. M0–M6 are untouched.
+
+### The five decisions everything follows from
+
+**Sales owns and authorises commercial change.** Merchandising has no route,
+no service and no model path that creates a notice — three source scans assert
+it, and a Merchandising owner is refused on Sales' own route. What Merchandising
+does is receive, acknowledge, assess and coordinate. There is no reject: it
+asks Sales for clarification, exactly as it cannot decline a handover.
+
+**No buyer conversation crosses.** `before`/`after` are the typed M2.1
+projection and nothing else. Fourteen forbidden field names — message, contact,
+thread, negotiation, quotation, price, margin, payment terms, internal notes —
+are refused at issue BY NAME saying whose record each is, including nested
+inside the projection. The schema has no field that could hold one, walked to
+full depth by a test.
+
+**`before` is derived, never sent.** It is read from the accepted handover
+version inside the service. A merchandiser therefore compares a fact against a
+claim, not two claims. Both sides are COMPLETE projections rather than a patch:
+the typed schema requires what makes a requirement executable, and a reader
+sees what the requirement now *is*.
+
+**Impact creates revisions; it never overwrites.** The change service imports
+no revision model, no baseline and no pack — a scan asserts that — and records
+only the NUMBER of a revision produced elsewhere, through the owning service's
+own command and guards. An approved revision is byte-identical after a change
+has been through it.
+
+**An acknowledgement is owned by its application, and a stale one is not
+coverage.** Exactly one service writes one, and it is the receiver. An answer
+naming an older change version is shown with the version it answered and never
+counted. `ACCEPTED` is not readiness, and the register says so on the row.
+
+### Bulk, exports, archive, observability
+
+Preview-first with a stored preview, a source checksum and a 30-minute expiry:
+apply against a moved source is refused with `BULK_PREVIEW_STALE` rather than
+silently applied. Per-row outcomes, partial success reported, 500 rows is a
+refusal with the number in it, results downloadable as formula-safe CSV. Every
+command delegates to the service that owns the record, and asks for exactly the
+capability its single-record equivalent asks for.
+
+Reports refuse to calculate a positive from missing data — a company with no
+plans gets a sentence, not 100%. Exports are the caller's current filtered view,
+company-scoped, audited with the filter, formula-safe, and carry no rate, cost,
+margin, supplier or contact. Archiving sets a flag; there is no delete anywhere
+in that service, and a scan asserts it. Stuck detection is a query with no
+timer, cron or worker — asserted by a scan — and the panel says so in the
+payload, not just the UI.
+
+### Defects found and fixed
+
+1. **The register never filtered archived files.** The field and index existed
+   from the model change; the query did not use them. Archived files stayed in
+   the default list.
+2. **The Sales audit and outbox schemas rejected change events** — a closed
+   action enum and a required `handoverVersionId`. Both extended additively so
+   handovers and changes share one Sales trail.
+3. **I overwrote `/merchandiser/settings`**, which is a compatibility redirect
+   to Sales' own settings, and then destroyed the uncommitted redirect with a
+   `git checkout`. Reconstructed from its siblings and verified by the three
+   structural tests that guard it. The management page moved to
+   `/merchandiser/management`, and the redirect now documents why.
+
+### Verification
+
+- `test/merchandising` — **587 passed, 18 suites**, in two orderings
+  (default/UTC and `--randomize --runInBand` under `TZ=America/Los_Angeles`).
+  61 of those are M7's. **Run with `--maxWorkers=2`**: the default worker count
+  OOM-kills on this machine and produces false failures.
+- Frontend `node --test` — **397 passed**, including 42 new M7 checks.
+- `npx tsc --noEmit` clean.
+- `git diff --check` clean on every M7 file.
+
+**The production build does not complete, and it is not M7's.** `next build`
+reports `✓ Compiled successfully` for all 361 pages. Prerendering then fails on
+four **untracked** pages from the Accounting and Store lanes, each using
+`useSearchParams` with no Suspense boundary:
+
+```
+app/accountant/budgets/item-usage/page.js
+app/store/dashboard/operations/reservations/page.js
+app/store/dashboard/operations/stock-exceptions/page.js
+app/store/dashboard/supplier-offers/new/page.js
+```
+
+Setting exactly those four aside and building gives **exit 0**, with
+`/merchandiser/changes`, `/merchandiser/management` and `/merchandiser/time-action`
+all prerendered. All four were restored byte-identical and remain untracked.
+Every Merchandising page wraps `useSearchParams` in Suspense.
+
+`npx jest test/` across the whole repository is 48 failed suites — accountant,
+crm, requests, costing, project-manager, store-purchase, auth, access —
+**Merchandising 0, PPC 0**, against a tree carrying 200+ modified files of other
+lanes' in-progress work.
+
+### What M7 did not do
+
+No Sales CRM, Tasks, Store or PPC screen inside Merchandising. No new capability
+constant — the fourteen from M0 are still the complete vocabulary, asserted by a
+test. No fourth navigation destination: the bar is exactly Overview, Order
+Execution, Time & Action, and the changes register and management page are
+reached from counts and from settings. No daemon, timer, broker or scheduler.
+
+### Honest gaps carried forward
+
+- **No application publishes a change acknowledgement yet**, so every announced
+  application reads PENDING. The door is `receive(event)`; the register says
+  "has not answered yet" rather than showing a gap.
+- **Bulk rows are entered as JSON** on the management page. It is honest and
+  complete but plain; a CSV upload would be the natural next iteration.
+- **Configuration is read-only in the UI.** Templates, calendars and reason
+  codes have full APIs and are managed through them; the management page
+  surfaces reports, bulk, exports, archive and integration health.
+
+---
+
+## Merchandising Lane A — M6 Department Status and Downstream Handover (9 Sep 2026)
+
+**M6: DELIVERED. Nothing committed.** Source-backed department projections, a
+versioned immutable Execution Pack, Merchandising completion and submission, a
+PPC receiver-owned receipt, the accept/clarification lifecycle, and a
+functional `Handed Over` view. M0–M5 are untouched — their 475 tests pass
+unchanged.
+
+**Exit condition met:** Merchandising can submit one exact, immutable pack
+version downstream while every other department keeps authority over its own
+readiness and its own decision.
+
+### The four decisions everything follows from
+
+**Merchandising never marks another department ready.** Projections are written
+by exactly one thing — `departmentStatusIntake.service.js`, applying an event
+the owning application published. There is no route, no service export and no
+model path that lets Merchandising author one, and the projection model has no
+Merchandising actor field at all. A source scan asserts each of those.
+
+**No completeness gate is another department's readiness.** Seven gates, every
+one a Merchandising-owned fact: an accepted handover, three approved revisions,
+a settled Merchandising-owned approval position, an approved T&A baseline, and
+units that reconcile. Nothing about Store stock, suppliers, PPC capacity,
+production planning, Quality or logistics. **A pack submits successfully with
+all eight departments UNKNOWN**, and a test proves it. Department status sits
+in its own band, under a heading that says *"context, not a submission gate"*,
+and is never counted.
+
+**A submitted pack is frozen.** `contents`, `completeness` and `declaration`
+are refused by a pre-save guard once the state leaves DRAFT. A change is a new
+version; the old one is superseded, kept, and stays readable. `completeness` is
+frozen too — recomputing on read would make a pack that was correct in March
+display as incomplete in June.
+
+**PPC owns the receiving decision.** The receipt is a PPC-owned record under
+`models/CMS_Models/PPC/`, written by PPC's own route behind a live `ppc`
+department grant. A Merchandising grant of any level — viewer to owner — is
+refused there. Acceptance is what moves the file to `HANDED_OVER`; submitting
+alone does not, because the decision has not been made yet.
+
+One defect found while reviewing this path and fixed: superseding a pack PPC
+had already ACCEPTED left the file showing `HANDED_OVER`, resting on a decision
+about a version no longer in force. It now returns to `OPEN` until PPC decides
+on the replacement, and PPC's decision on the superseded version is preserved.
+
+### The lifecycle defect, closed
+
+`LIFECYCLE` gained `HANDED_OVER` and `executionPhase` gained `COORDINATION`,
+`PACK_SUBMITTED`, `HANDED_OVER`. The register's `handed-over` view already
+mapped that name onto nothing; it now holds records, its count is real in
+`getExecutionOverview`, and the *"honestly empty"* comment is gone. `OPEN`,
+`ON_HOLD`, `CLOSED` and `CANCELLED` behaviour and history are untouched.
+`OPEN → HANDED_OVER` on PPC acceptance; back to `OPEN` on clarification.
+
+### Honest reconciliation findings
+
+**There was no PPC application in this repository** — no `models/CMS_Models/PPC`,
+no PPC routes, no PPC seat screen. The spec assumed one. What exists is the
+shared `getEffectiveRole` department-grant mechanism, so M6 adds the smallest
+PPC surface that makes the boundary real: one slug, two capabilities
+(`ppc.inbound.read` at viewer, `ppc.inbound.decide` at approver), a queue, and
+the two decisions. It deliberately invents no PPC planning, capacity, line
+allocation or release — those are PPC's application to build.
+
+**The spec's `drain()` for department status could not exist honestly.** Those
+eight event kinds belong to other applications and live in their stores;
+putting them in Merchandising's outbox enum would be Merchandising publishing
+on their behalf. The integration point is `receive(event)`, called by each
+producing app's own carrier — exactly how `salesHandoverDelivery` calls
+`handoverIntake.receive`. **No app publishes any of the eight yet**, so every
+department currently reads UNKNOWN or UNAVAILABLE and the register says so.
+
+**The projection's identity is `sourceObservedAt`, not `sourceRecordVersion`.**
+A GRN partially received on the 3rd and fully received on the 9th is one record
+at one version making two true statements; a version-keyed index rejected the
+second as a duplicate. The version is still recorded beside it.
+
+**The spec's "TABS becomes seven" was written pre-M4/M5.** The task's nine-tab
+order was followed; `Department Status & Handover` is ninth, before History.
+
+### Verification
+
+- `test/merchandising` — **526 passed, 17 suites**, in two orderings
+  (default/UTC, and `--randomize --runInBand` under `TZ=America/Los_Angeles`).
+  51 of those are M6's.
+- Frontend `node --test` — **355 passed**, including 36 new M6 checks.
+- `npx tsc --noEmit` clean; `npx next build` exit 0.
+- `git diff --check` clean on every M6 file.
+
+**Browser verification was partial, and this is the honest limit.** The app
+boots with M6 compiled in, `/merchandiser/**` is correctly behind the session
+gate, and the console shows only the expected 401s — no runtime error from M6
+code. The Department Status & Handover tab itself was **not** exercised
+visually: doing so needs an authenticated session and seeded records in the
+live dev database, which is not authorised. A dev server was already running on
+port 3001 and was left alone.
+
+**Repository-wide failures, none of them M6's — exact evidence.** The full
+`npx jest test/` tree is **48 failed suites / 459 failed tests out of 297
+suites / 8045 tests**, deterministic across two runs. Every failing suite is
+another lane's: accountant 17, crm 9, requests 7, costing 7, project-manager 4,
+store-purchase 2, auth 1, access 1. **Merchandising 0, PPC 0.** The working
+tree carries 202 modified files of concurrent in-progress work, which is where
+those come from. `npm test` (node:test) is 1898 pass / 1 fail — the fail is
+`services/salesJourneyOutcome.test.js`, which fails identically with M6 stashed
+out because a concurrent Sales lane renamed a stage `poContract` →
+`purchaseInvoice`.
+
+**One thing worth flagging:** the M6 error codes were added to
+`services/storePurchase/errors.js`, lost when a concurrent lane rewrote that
+file, and re-added. An unregistered code silently becomes `VALIDATION`, so a
+merge that drops them again would turn every pack refusal into an
+uninterpretable one. They are verified present by `fail()` resolution, not by
+grep.
+
+### What M6 does not do
+
+No Store, Supply Chain, Product Development, IE, PPC, Quality, Production or
+Logistics features inside Merchandising. No supplier, rate, PO, consumption or
+cost. No generic `REJECTED` on the receipt — PPC asks for clarification, it
+does not refuse the confirmed commercial requirement. No change control; that
+is M7.
+
+---
+
+## Merchandising Lane A — M5 Time & Action (9 Sep 2026)
+
+**M5: DELIVERED. Nothing committed.** The date control: templates, working
+calendars, plans, baselines, forecasts, blocks, source-owned completion,
+rescheduling with previewed impact, a cross-file register, and the frontend for
+all of it. M0–M4 are untouched — their 410 tests pass unchanged.
+
+It answers one question — *which milestone threatens the committed delivery
+date, and what is being done about it* — and deliberately answers no other. It
+is not a task manager: nothing on the surface carries an assignee, a reminder, a
+checklist, a subtask or a snooze, and a source scan pins that.
+
+### The four decisions everything else follows from
+
+**A baseline is a commitment, and only re-committing moves one.** Three dates
+per milestone: `baselineDate` (what was promised), `forecastDate` (what is now
+expected), `actualDate` (what happened). Forecast changes, blocks, completions
+and reschedule applications may not write `baselineDate` — only baseline
+creation and revision. If any one of them could, "four working days late" would
+silently rewrite itself as "on time" and the slip would vanish. A revision
+writes a NEW immutable `TnaBaseline` and supersedes the old one, which stays
+readable for the life of the file, so *what did we originally promise* never
+stops being answerable. A partial unique index allows exactly one ACTIVE
+baseline per plan; two concurrent approvals leave one winner.
+
+**A milestone another department owns cannot be signed for here.** Where
+`completionAuthority` is `SOURCE_EVENT`, `POST /complete` is refused with
+`TNA_SOURCE_OWNED` naming the department, and the screen offers **no control at
+all** — not a disabled one, because a greyed-out button still says "you do this
+here, later". Those close through `tnaIntake.service.js`, which consumes M4's
+three published approval events. The milestone records a REFERENCE back to the
+record that closed it and no actor, because nobody signed for it.
+
+**An approver approves the impact they were shown.** Rescheduling is preview,
+then decide. The preview computes the whole downstream effect in memory, writes
+one `PREVIEWED` row and freezes the plan revision it was computed against; if
+the plan moved underneath, approval is refused with `TNA_IMPACT_STALE` and the
+requester previews again. Where the move breaks a committed delivery date it
+carries `createsBaselineRevision`, and then the requester may not approve their
+own — owners included.
+
+**Every date is a calendar date, never an instant.** `^\d{4}-\d{2}-\d{2}$`
+throughout, with working-day arithmetic on a published calendar. A suite runs
+under `TZ=America/Los_Angeles` and produces byte-identical dates.
+
+### Integration, and what it deliberately does not touch
+
+T&A reads M4 through its published outbox events and never its collections. The
+carrier is `services/integration/tnaSourceDelivery.service.js`, called by the
+selection route AFTER an approval commits and never inside it — an approval must
+not be able to fail because a schedule is malformed. It never throws.
+Idempotency is a database fact: `MerchandisingIntakeLedger`, unique on
+`sourceEventId`.
+
+M4's approval REGISTER emits no outbox events, so a milestone waiting on a
+buyer's or Quality's sign-off stays visibly `AWAITING_SOURCE_RECORD` rather than
+pretending to know. That is the honest state and it is shown as neutral, not as
+a risk: nobody in Merchandising is late.
+
+### Three defects the tests found and fixed
+
+1. **The anchor floor was applied after the graph pass**, so every milestone
+   downstream of an anchored one computed from nothing — baselining was
+   impossible on any realistic template. The floor now enters the ranked pass.
+2. **A stated forecast was erased by the next propagation**, making
+   `updateForecast` a no-op for any milestone with a predecessor. A manual
+   forecast is now its own field and a floor: propagation may push it later,
+   never pull it earlier than what somebody actually said.
+3. **A malformed calendar exception was coerced into a holiday**, shifting every
+   downstream date with nothing in the record explaining why. It is now ignored.
+
+### Verification
+
+- `test/merchandising` — **475 passed, 16 suites**, in two orderings
+  (default/UTC, and `--randomize --runInBand` under
+  `TZ=America/Los_Angeles`). 69 of those are M5's.
+- Frontend `node --test` — **319 passed**, including 33 new M5 checks.
+- `npx tsc --noEmit` clean; `npx next build` exit 0.
+- `git diff --check` clean on every M5 file.
+
+**Two failures that are not M5's and were not touched.**
+`services/salesJourneyOutcome.test.js` fails identically with the M5 files
+stashed out (a concurrent Sales lane renamed a stage `poContract` →
+`purchaseInvoice`). And `app/accountant/reports/payables-aging/page.js` has a
+`git diff --check` blank-line warning from the Accounting lane.
+
+One genuine pre-existing bug WAS fixed, in M2.1's test rather than its code:
+`handover-contract-integrity.test.js` asserted a stored UTC date with
+`getMonth()`, which reads the LOCAL month — it passed only at or east of UTC.
+The value under test never changed; the assertion now reads it as the UTC
+calendar date it was stored as. The non-UTC run is what surfaced it.
+
+### Seeding
+
+`scripts/seed-tna-process.js` writes a fourteen-milestone starting process and a
+Monday–Friday calendar. Dry run by default; `--apply` is refused without
+`--authorized-by`. It declares no holidays, and it REFUSES rather than repairs
+if the company already has published configuration — a second published template
+would make resolution ambiguous and every plan creation would then be refused.
+**It has not been run against any data.**
+
+### What M5 does not do
+
+No personal tasks, to-dos, checklists, delegation or reminders. No Store
+readiness, PPC capacity or production scheduling. No second approval model —
+M4's register is untouched and no approval state is duplicated. Nothing claims
+production readiness, a PPC release, or a buyer approval authored by
+Merchandising.
+
+---
+
+## Merchandising Lane A — M4: Development Requirements and Approvals (8 Sep 2026)
+
+Baseline at start: frontend FROZEN, M1+M2 FROZEN, M3 DELIVERED. No M0–M3
+contract was reopened.
+
+### Permanent models
+
+**Development Requirements** are a THIRD family of the M3 revision record, not
+a third machine: `MerchandisingDevelopmentRevision`
+(`merchandising_development_revisions`), built from the same base schema in
+`SelectionRevision.js`. It inherits one draft / one submitted / one approved
+per file, stable row identity, maker/checker, optimistic concurrency,
+idempotency, the audit vocabulary and the approval transaction. Only the row
+shape differs: `requirementType` (12 codes), `title`, `brief`,
+`requiredByDate`, `responsibleApplication`, `approvedReferenceExpected`,
+`coordinationNote`, applicability. The row's storage field is `rowRef` for all
+three families; the Development view calls it `requirementRef`.
+
+**Approval Register** — `MerchandisingApprovalRegister`
+(`merchandising_approval_registers`), one per Execution File, NOT versioned.
+Each row: `approvalRequirementRef`, category (14, each with an owning
+application), `owningApplication`, applicability, `requiredByDate`,
+`sourceRef`, and an `observation` block carrying status, decision actor/time,
+`observedAt` and a reason.
+
+### The ownership rule, and how it is enforced
+
+> Merchandising may state a REQUIREMENT for anybody. It may record a RESULT
+> only for itself.
+
+- **Internal rows** (`MATERIAL_TRIM_CARD`, `PACKAGING_SPEC`,
+  `DEVELOPMENT_SCHEDULE`) **resolve live** from Merchandising's own approved
+  revisions. Nothing is stored — a copy would be a second place for the truth
+  to go stale.
+- **External rows** (Sales / Product Development / Quality) are **observed**.
+  `observe` reads the source and records what it said with the moment it was
+  read. It takes no status, no outcome and no actor from the caller: there is
+  no parameter, no body field and no branch through which one could arrive.
+- `addRequirement`/`updateRequirement` refuse 22 fields **by name** —
+  `observation`, `status`, `decidedBy`, `approved`, `result`, `testResult`,
+  `buyerDecision`, … — and `owningApplication` follows the category rather than
+  the body.
+- `EXTERNAL_READERS` is deliberately **empty**: Sales, Product Development and
+  Quality publish no record this register can read. Those rows read
+  `AWAITING_SOURCE_RECORD` with the department named — not "outstanding",
+  which would imply somebody is working on it, and not a blank, which would
+  read as fine. When a producer exists, its reader goes in that map and every
+  row of that class starts answering with no other change.
+
+### APIs (permanent Merchandising execution mount)
+
+Development requirements reuse the M3 selection endpoints with
+`:family = DEVELOPMENT` — current, revision, cursor-paged history, create/clone
+draft, add/edit/withdraw row, submit, approve, request-changes. New:
+
+```
+GET    /files/:id/development-adoption/preview     read-only
+POST   /files/:id/development-adoption/adopt
+GET    /files/:id/approvals                        register + category vocabulary
+GET    /files/:id/approvals/summary
+GET    /files/:id/approvals/:ref
+POST   /files/:id/approvals                        add a REQUIREMENT
+PATCH  /files/:id/approvals/:ref                   edit the REQUIREMENT
+POST   /files/:id/approvals/observe                re-read the sources
+```
+
+There is no endpoint that completes an approval; its absence is asserted by
+test. Nothing was placed on the Sales, R&D or Quality routers.
+
+### Permissions
+
+`merchandising.file.read` reads; `merchandising.selection.write` authors drafts
+and register requirements and runs `observe`; `merchandising.selection.approve`
+approves and requests changes. Live grants only — JWT role text, assignment,
+CEO, platform admin, Sales access and authorship grant nothing. Maker/checker
+applies to development revisions exactly as to M3, owners included.
+
+### Legacy adoption
+
+From `SampleStyle.sample.serviceRequirements[]` where
+`purpose: DEVELOPMENT_TOOLING`. Read-only preview, idempotent adopt into a
+DRAFT, never approved. Preserved: source record, source row id, and the
+inclusion decision as `sourceRef.sourceState` (`INCLUDED`/`EXCLUDED`). NOT
+copied: `quantity`, `billingUnit`, `basis`, `owner`, `evidence`, `included`,
+`excludedReason` — costing and consumption facts owned elsewhere. Requirement
+type arrives as `OTHER`; a costing charge key is not a statement that something
+is a fit sample. Legacy data is never edited, marked or deleted.
+
+### Events
+
+Audit added: `APPROVAL_REQUIREMENT_CREATED`, `APPROVAL_REQUIREMENT_UPDATED`,
+`APPROVAL_SOURCE_OBSERVED` (record type `APPROVAL_REGISTER`) — plus the M3
+`SELECTION_*` vocabulary now carrying the DEVELOPMENT family. Outbox added:
+`merchandising.development_requirements.{submitted,approved,superseded}`,
+committed in the approval transaction. **No consumer for another department
+was built.** An observation that found the same answer writes no history line.
+
+### Frontend
+
+Execution File tabs are now seven: Summary · Sales Handover · Materials & Trims
+· Packaging · Development Requirements · Approvals · Changes & History.
+Development reuses `SelectionTab` with its own columns and row editor;
+`ApprovalsTab.js` is new. Navigation is unchanged (Overview, Order Execution).
+Summary gained an approval-count section that reports `awaitingSource`
+separately and says "Couldn't check" when its own read fails. History gained
+M4 sentences; an observation reads "Sales now reports approved…", never
+"Ada approved…".
+
+### Verification (8 Sep 2026)
+
+- `npx jest test/merchandising --runInBand` → **406/406, 14 suites**, in two
+  orderings. New: `m4-development-approvals.route.test.js` (45).
+- Frontend `node --test` → **467/467, 83 suites**. New:
+  `components/merchandiser/approvalsTab.test.mjs` (29).
+- `npx tsc --noEmit` → exit 0. `git diff --check` clean on every M4 file.
+- Recorded unrelated failures: `test/costing/{costing-approved-handoff,
+  quotation-approved-price.route,production-actual.route}.test.js` fail with
+  `COSTING_PREPARATION_MOVED_TO_SALES` — the concurrent Central Costing Lane A
+  session's uncommitted work (1,676 insertions in
+  `routes/CMS_Routes/Costing/costings.js`); no Merchandising file is involved.
+  `test/crm/sample-style.route.test.js` fails 6/6, the known pre-existing red.
+  Zero failures anywhere mention the M4 surface.
+
+### Known exclusions
+
+No buyer communication or buyer decision (Sales). No tech pack, measurements,
+patterns, consumption, samples or technical corrections (Product Development).
+No tests, inspections, holds or releases (Quality). No external producer, no
+consumer, no Time & Action, no Department Status. M5–M7 not started.
+
+M4 is not declared frozen.
+
+---
+
+## Merchandising Lane A — M3: Materials, Trim Card and Packaging (8 Sep 2026)
+
+```
+Frontend: FROZEN
+M1+M2: FROZEN
+M3 start gate: PASSED
+```
+
+Both independent Lane B audits returned before M3 continued: `FRONTEND FROZEN`
+and `M1+M2 FROZEN`, with zero blocking defects and zero audit-authored
+application changes. The controlled-override caveat this entry carried at M3
+start is withdrawn — it no longer describes the state of the work.
+
+The M1+M2.1 backend contracts were treated as frozen inputs and were not
+reopened: `lineRef` semantics, allocation derivation, Sales/Merchandising event
+ownership, receiver idempotency, live Sales authorisation and the shared
+execution-projection contract are all untouched. No backfill or adoption was
+run in apply mode.
+
+### Permanent models
+
+`models/CMS_Models/Merchandising/SelectionRevision.js` — one base schema, two
+models, two collections:
+
+| Model | Collection | Rows |
+|---|---|---|
+| `MerchandisingMaterialTrimRevision` | `merchandising_material_trim_revisions` | fabric / trim / label / accessory / other |
+| `MerchandisingPackagingRevision` | `merchandising_packaging_revisions` | polybag / carton / tag / sticker / tissue-or-insert / other, plus revision-level packing instructions |
+
+Both are rooted on `fileId` + `companyId` — the Execution File, never the
+shared `SampleStyle`. Row shapes differ; lifecycle, numbering, identity and
+audit vocabulary are written once.
+
+Also added: `MerchandisingCommandLedger` (`merchandising_command_ledger`) for
+idempotency, and `OUTBOX_KIND` / `OUTBOX_REQUIRED` on `MerchandisingEvent.js`
+with a per-kind payload rule.
+
+### Revision state machine
+
+`DRAFT → SUBMITTED → APPROVED`, and an approved revision becomes `SUPERSEDED`
+when a later one is approved. **Changes-required is a decision, not a state**:
+it returns the revision to `DRAFT` with the reason kept on the record.
+
+Database-enforced invariants — three partial unique indexes on
+`(companyId, fileId)`, one per state: at most one `DRAFT`, one `SUBMITTED` and
+one `APPROVED` per file and family. Approval demotes the outgoing revision
+*before* promoting the incoming one, inside one transaction (the index is
+checked per write). `revisionNo` counts from the highest ever used and never
+resets. Approved revisions are immutable; a submitted one cannot be edited.
+
+### Row identity
+
+`MTR-`/`PKG-` plus twelve hex characters, minted once and carried unchanged by
+every clone. Cloning a revision preserves every row's reference — that is what
+makes "this label moved at revision 4" expressible. A withdrawn row leaves the
+DRAFT only; every revision it was approved in keeps it for ever. Applicability
+is `appliesToAllUnits` or a list of `unitDiscriminator` values, each validated
+against the same file and company.
+
+### Permission matrix and approval separation
+
+| Act | Capability | Minimum role |
+|---|---|---|
+| read current, revision, history, printable, adoption preview | `merchandising.file.read` | viewer |
+| create draft, add/edit/withdraw row, instructions, submit, adopt | `merchandising.selection.write` | editor |
+| approve, request changes | `merchandising.selection.approve` | approver |
+
+`submit` sits with the writer, not the approver: it advances your own draft for
+somebody else to read, and putting it behind `selection.approve` would mean an
+editor could never move their own work and every file would need two approvers.
+The separation the process needs is enforced in `approve` instead.
+
+**Maker/checker:** the approver may not be the actor who authored *or*
+submitted the revision, compared on both email and id. **An owner is not an
+exception.** Refusal is `SELECTION_APPROVAL_SEPARATION` (409). Live grants
+only — `isAdmin`, JWT role text, CEO, Sales, assignment and being the row's
+creator grant nothing; revocation and downgrade take effect on the next
+request.
+
+### API — all on the permanent Merchandising execution mount
+
+`/api/cms/merchandising/files/:id/…`
+
+```
+GET    /selections                                  both families, for Summary
+GET    /selections/:family                          current + working + units
+GET    /selections/:family/revisions                history (cursor paged)
+GET    /selections/:family/revisions/:no            one revision
+GET    /selections/:family/revisions/:no/printable  the frozen card
+POST   /selections/:family/revisions                create draft (clone optional)
+POST   /selections/:family/rows                     add row
+PATCH  /selections/:family/rows/:rowRef             edit row
+POST   /selections/:family/rows/:rowRef/withdraw    withdraw row
+PUT    /selections/:family/instructions             packing instructions
+POST   /selections/:family/submit
+POST   /selections/:family/approve
+POST   /selections/:family/request-changes
+GET    /packaging-adoption/preview                  read-only
+POST   /packaging-adoption/adopt
+```
+
+Every write carries `expectedRevision`; every retry-sensitive command carries
+an idempotency key (header `Idempotency-Key` or body). Nothing permanent was
+placed on the Sales or R&D routers.
+
+### Legacy adoption rules
+
+`services/merchandising/packagingAdoption.service.js` traces
+file → accepted handover version → CustomerRequest → order line → SampleStyle,
+proving each link and reporting a broken one rather than guessing. It reads
+`materials.packagingSelections[]` only — never `sample.packagingRequirements[]`,
+which is Product Development's consumption array — and imports no Sales/R&D
+module, restating the three legacy statuses locally.
+
+Adopted rows arrive as `OTHER` (the legacy card has no component class, and
+inferring one from a product name would be a guess), in a **DRAFT**, never
+approved. Preserved per row: source record, source row id, source timestamp and
+source decision state. Excluded with reasons: `WITHDRAWN`, `NO_COMPONENT_NAME`,
+`ALREADY_ADOPTED`, plus whole-source reasons when the chain cannot be proved.
+Idempotent twice over — the command ledger and per-row source references. The
+legacy record is never edited, marked or deleted.
+
+### Events
+
+Audit (`merchandising_audit_events`, record type `SELECTION_REVISION`):
+`SELECTION_DRAFT_CREATED`, `_ROW_ADDED`, `_ROW_UPDATED`, `_ROW_WITHDRAWN`,
+`_INSTRUCTIONS_UPDATED`, `_SUBMITTED`, `_CHANGES_REQUESTED`, `_APPROVED`,
+`_SUPERSEDED`, `_LEGACY_ADOPTED`.
+
+Outbox (`merchandising_outbox_events`), committed in the same transaction:
+`merchandising.material_trim_card.{submitted,approved,superseded}` and
+`merchandising.packaging_spec.{submitted,approved,superseded}`. **Nothing
+consumes them** — no Store, Supply Chain, R&D, Costing or Production consumer
+was built.
+
+### Frontend
+
+Execution File tabs are now Summary · Sales Handover · Materials & Trims ·
+Packaging · Changes & History. No new navigation destination: Overview and
+Order Execution are unchanged. New:
+`components/merchandiser/SelectionTab.js` (one component, both families) and
+`components/merchandiser/FrozenCard.js` (printable, authenticated, marked
+FROZEN or SUPERSEDED, `window.print()` with no PDF dependency and no QR
+claimed). Summary gained a source-backed selection section that reads
+"Couldn't check" when its own read fails. History gained business-language M3
+sentences.
+
+### Verification (8 Sep 2026)
+
+- `npx jest test/merchandising --runInBand` → **361/361, 13 suites**, in two
+  orderings. New: `selection-revisions.route.test.js` (58).
+- Frontend `node --test`, Merchandising surface → **304/304, 60 suites**
+  (`app/merchandiser`, `components/merchandiser`, `lib/merchandising`).
+  `components/merchandiser/selectionTab.test.mjs` is 45, having gained four
+  pins for the QR: that it links rather than copies, that it is never a public
+  or token-bearing address, that a code which could not resolve is not printed
+  at all, and that the open card is addressable.
+- Merchandising + Sales together → **745/745, 71 suites**. The suite count is
+  the same 71 this entry first recorded; the test count is not the 412 recorded
+  then, because concurrent Sales/CRM lanes have added to those files since. The
+  Merchandising figure above is the one this milestone owns.
+- Regressions: costing handoff/quotation-price/production-actual + `test/sales`
+  → 115/121 passing; the 6 failures are `test/crm/sample-style.route.test.js`,
+  the known pre-existing red verified failing at committed HEAD.
+- `npx tsc --noEmit` → exit 0. `git diff --check` clean on every M3 file.
+- No migration or adoption command was run in apply mode.
+
+### The frozen card carries a QR back to its own revision
+
+`components/merchandiser/FrozenCard.js` renders a `QRCodeSVG` of the canonical
+in-app address of the revision the sheet states —
+`/merchandiser/execution/<fileId>?tab=<family>&card=<family>&revision=<n>` —
+built from the browser's own origin, so a card printed from staging never
+points at production. The open card moved from component state into the URL to
+make that address answer: `?card=&revision=` opens exactly that card on exactly
+that tab.
+
+This reverses a decision recorded earlier in M3, and the reversal is narrow.
+That decision refused a QR on the grounds that scannability would require an
+unauthenticated public record; the premise is right and is now pinned as a hard
+rule — no `/public/`, no `token=`, no `share=`, no signed address, and nothing
+about the components encoded in the code itself. What it concluded was too
+broad: an ordinary authenticated deep link needs none of that. Somebody who may
+open the record opens it and is told whether the sheet in their hand is still
+in force; somebody who may not meets the same sign-in they would anywhere else.
+The plan's `printable/QR-linked frozen card` (§6.3) is the requirement this
+closes. Lane B should rule on the reversal.
+
+### Known exclusions
+
+No supplier, rate, quotation, purchase order, stock, lot, reservation,
+consumption, wastage or laboratory result — refused by name at the door and
+absent from the schema. No Development Requirements, Approvals register, Time &
+Action or Department Status tab. No outbox consumer. No public or token-bearing
+document address. M4–M7 not started.
+
+M3 is not declared frozen; Lane B performs the release audit.
+
+---
+
+## Merchandising Lane A — M1+M2.1 Contract-Integrity Correction (8 Sep 2026)
+
+Three structural defects in the accepted M1+M2 release, corrected while the
+new records were still uncommitted, plus a schema tightening.
+
+### A. Order lines have a permanent identity
+
+`CustomerRequest.items[]` was `{_id: false}` and the handover used
+`sampleStyleId` as the line key — so one order carrying the same style on two
+commercial lines was refused as `AMBIGUOUS_LINE`. Added server-minted
+`lineRef` (`LN-` + 12 hex), assigned by a `pre("validate")` hook on
+`customerRequestSchema` — a complete chokepoint, since all sixteen writers
+persist through `.save()` (audited; no raw `$set` touches items). A client may
+NAME a reference the order already holds, never invent one
+(`carryLineIdentities`). `handoverRef`/`handoverLineRef`/`orderLineRef` and the
+route param are now `lineRef`; `AMBIGUOUS_LINE` is gone.
+Backfill: `scripts/backfill-customer-request-line-refs.js` — dry run default,
+`--apply` + `--authorized-by` required, idempotent, refuses duplicate/malformed
+references, batch identity = rollback identity, and a rollback that will not
+withdraw a reference a handover already names.
+
+### B. Multi-axis Execution Units
+
+`deriveUnits` built one unit per breakdown AND one per delivery, so a two-axis
+line stored twice the order quantity with no split→drop mapping. Added
+Sales-authored `allocations[]` (`allocationRef`, `lineSplitRef`, `dropRef`,
+`quantity` — a join, repeating nothing). One rule for both applications in
+`services/sales/handoverContract.js`: DEFAULT / `DROP:<ref>` / `SPLIT:<ref>` /
+`UNIT:<split>|<drop>`, identity from source references only (never attribute
+text or factory), all units totalling the line exactly once. Missing, orphaned,
+duplicated or unbalanced mappings are refused at issue in business words.
+
+### C. Producer/receiver ownership
+
+The producer wrote the Merchandising Execution File and audit trail directly.
+Now: `models/CMS_Models/Sales/SalesHandoverVersion.js` (moved from the
+Merchandising namespace, collection pinned), `SalesHandoverEvent.js` (Sales
+history + outbox, events `sales.merchandising_handover.{issued,superseded,
+cancelled}`). Sales writes only Sales records — enforced by a structural test.
+`services/merchandising/handoverIntake.service.js` is the only code that
+mutates Merchandising records from a Sales event, idempotent through a
+`merchandising_intake_ledger` keyed on the event id, refusing to move a record
+backwards. `services/integration/salesHandoverDelivery.service.js` carries
+events after the producer commits; a receiver failure leaves the event PENDING
+and never rolls back the commercial act. `POST /delivery/retry` drains.
+
+### D. Live Sales authority on the producer
+
+`bypassesApproval` (JWT `role`/`isAdmin`) replaced for this producer only by
+`services/sales/handoverAuthority.js`, reading the live `sales` DepartmentRole:
+viewer/editor may inspect, approver/owner may issue, supersede and cancel.
+Platform admin, CEO, Merchandising and any other department without a Sales
+grant are denied; revocation and downgrade take effect on the next request.
+Unrelated legacy Sales routes untouched.
+
+### E. The execution projection has a shape
+
+`models/CMS_Models/Sales/executionProjection.js` — one declared schema for
+`SalesHandoverVersion.executionProjection` AND the Execution File's accepted
+copy, which was `Schema.Types.Mixed`. Unexpected nested fields can no longer
+persist or escape through a response.
+
+### F. Honest legacy tooling
+
+The dual-mode "migration" (which advertised `--apply` and rollback while
+containing no write) is replaced by
+`scripts/merchandising-legacy-eligibility-report.js` — read-only, no apply, no
+authorization flag, no rollback claim. Dev run 8 Sep: 19 confirmed requests,
+115 lines, 0 issuable (115 lack a line reference and a delivery commitment,
+110 lack PO proof). The backfill in §A is the separate tool that writes.
+
+### Frontend
+
+`components/sales/MerchandisingHandoverCard.js` addresses lines by `lineRef`,
+gates controls on the server's `mayIssue`, and grows an accessible allocation
+matrix (per-split and per-drop remaining, issuance blocked until both
+reconcile) that appears only for genuinely two-axis lines. Order Execution,
+the Execution File screen, the Overview, navigation, deep links and all 15
+compatibility redirects are unchanged.
+
+### Verification (8 Sep 2026)
+
+- `npx jest test/merchandising --runInBand` → **303/303, 12 suites**, in two
+  orderings. Includes the new `handover-contract-integrity.test.js` (48) and
+  `legacy-tooling.test.js`.
+  <br>*(Corrected 8 Sep: this line first read 302, written from a run taken
+  before the last contract test landed. Lane B's independent audit reproduced
+  303/303 across 12 suites, and a second ordering of the six critical contract
+  suites at 175/175. The count is the only thing corrected here.)*
+- Frontend `node --test` merchandising + sales suites → **288/288**
+  (new `components/sales/merchandisingHandoverCard.test.mjs`, 19).
+- `npx tsc --noEmit` → exit 0.
+- Concurrent-session note: three merchandising suites failed transiently
+  mid-session with `approveCharges is not defined` while another session was
+  editing those fixtures for its development-charges work; they pass now and
+  no file of theirs was modified here.
+
+M3 not started. Nothing committed or pushed.
+
+---
+
+## Merchandising Lane A — M1+M2 Vertical Release (8 Sep 2026)
+
+Navigation cut from `Overview | My Work | Styles` to `Overview | Order
+Execution`. Sales issues a versioned handover on a confirmed order line; the
+Merchandising inbox accepts it (or requests clarification — there is no
+decline) into an idempotent Execution File with derived Execution Units,
+assignment and lifecycle, all on the live-grant capability vocabulary.
+
+### Backend
+
+- Models (`models/CMS_Models/Merchandising/`): `SalesHandoverVersion`
+  (immutable payload, mutable `publication`, one CURRENT per line by partial
+  unique index), `ExecutionFile` (`MEF-YYYY-NNNN`, unique per
+  company+handoverRef+handoverLineRef, lifecycle OPEN/ON_HOLD/CLOSED/CANCELLED),
+  `ExecutionUnit` (split/drop axes, withdrawn = `active:false`),
+  `HandoverReceipt` (one per version; PENDING is computed, not stored),
+  `MerchandisingEvent` (append-only audit + outbox, committed in the txn).
+- Producer `services/sales/merchandisingHandover.service.js` +
+  `routes/CMS_Routes/Sales/merchandisingHandovers.js` (salesAuth +
+  `bypassesApproval`): inspect / issue / cancel on
+  `/api/cms/sales/merchandising-handovers/requests/:id[/lines/:lineId/...]`.
+  Confirmation = `quotation_sales_approved` or later; customer approval alone
+  is NOT confirmation. `committedDeliveryDate` is Sales-authored per drop and
+  must reconcile to the line total; `targetExFactoryDate` never derived.
+- Receiver `services/merchandising/execution.service.js` +
+  `routes/CMS_Routes/Merchandising/executionRoute.js`: handover inbox,
+  accept (idempotent — unique index + txn + 11000 catch), clarify (category +
+  reason mandatory), register (5 views), file, history, PATCH
+  (note/tags/expectedRevision only), assignment (assignee must hold a live
+  merchandiser grant + membership; grants no authority), lifecycle
+  hold/resume/close/reopen (CANCELLED only mirrored from Sales). No decline,
+  no `POST /files`, no Merchandising cancel/rescope.
+- Capabilities: `CAPABILITY` map (14 names) +
+  `requireMerchandisingCapability` in `services/merchandising/access.service.js`,
+  derived from the live DepartmentRole ladder; refusals name
+  `{department, capability, minimumRole}`.
+- Observation-only migration: superseded by the M2.1 correction — see
+  `scripts/merchandising-legacy-eligibility-report.js` (read-only) and
+  `scripts/backfill-customer-request-line-refs.js` (the one tool that writes).
+
+### Frontend
+
+- `app/merchandiser/execution/page.js` (register: 5 views, URL state,
+  workFeed staleness, accept/clarify), `app/merchandiser/execution/[fileId]/page.js`
+  (Summary / read-only Sales Handover / Changes & History; CommandDialog),
+  `app/merchandiser/dashboard/page.js` (4 real-record indicators; failure =
+  "Couldn't check", never zero), `components/merchandiser/merchandisingNavigation.js`
+  (2 entries + `TRANSITIONAL_DEEP_LINKS`), `components/sales/MerchandisingHandoverCard.js`
+  mounted in `CustomerRequestDetail` execution branch,
+  `CompanyContextRequired` now shows membership display names via
+  `GET /api/cms/merchandising/companies`.
+
+### Verification (8 Sep 2026)
+
+- Backend: `npx jest test/merchandising --runInBand` → **234/234** (10 suites),
+  plus `migration-utility.test.js` → **8/8** (242 total, 11 suites).
+- Sales/R&D regressions: `test/sales/packaging-bom-link.test.js` +
+  `test/sales/sample-requirements.test.js` → 63/63.
+  `test/crm/sample-style.route.test.js` fails 6/6 **identically at committed
+  HEAD in a clean worktree** — pre-existing from the concurrent CRM merge, not
+  Lane A.
+- Frontend: `node --test` merchandising suites → **156/156**;
+  `npx tsc --noEmit` → exit 0; `npx next build` → compilation ✓ (3.1 min),
+  **export FAILED** at `/accountant/budgets/item-usage` (missing Suspense,
+  Accountant lane, pre-existing class) → build exit 1. Do not read that as a
+  Lane A pass; all Lane A pages compile and carry Suspense boundaries.
+- `git diff --check` clean on every Lane A file in both repos.
+- No browser walkthrough: no authenticated session existed (frontend not
+  running; no credentials held).
+
+**Verdict: `M1+M2 RELEASE-READY`** (with the pre-existing repo-wide build/CRM
+failures outside Lane A recorded above). M3 not started.
+
+---
+
 ## Store & Purchase — Chunk 1A: foundation, operational-PO pilot, authority corrections
 
 > **Chunk 1 is NOT complete.** This is 1A: the shared foundation, the

@@ -1,6 +1,7 @@
 // models/Customer_models/CustomerRequest.js
 
 const mongoose = require("mongoose");
+const { ensureLineIdentities } = require("./customerRequestLineIdentity");
 
 // ========== REQUEST ITEM SCHEMAS ==========
 const requestItemVariantSchema = new mongoose.Schema(
@@ -67,9 +68,36 @@ const requestItemVariantSchema = new mongoose.Schema(
 
 const requestItemSchema = new mongoose.Schema(
   {
+    // ── THIS LINE'S PERMANENT NAME ────────────────────────────────────────
+    //
+    // Server-minted, unique within the request, and never reissued. It is the
+    // identity anything outside this record points at — the Sales →
+    // Merchandising handover above all, which used to point at
+    // `sampleStyleId` and therefore could not tell two commercial lines of
+    // the same style apart.
+    //
+    // Position cannot be that identity: the quotation paths filter emptied
+    // lines out and reassign the array. Neither can the style: one order
+    // legitimately carries a style twice, for two destinations or two
+    // delivery commitments. See customerRequestLineIdentity.js for how it is
+    // minted and why a client can name one but never invent one.
+    lineRef: {
+      type: String,
+      trim: true,
+      index: true,
+    },
     stockItemId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "StockItem",
+    },
+    // The approved style this customer-request line represents. This is the
+    // durable identity bridge to Central Costing; the quotation never infers a
+    // price from a product name or SKU.
+    sampleStyleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SampleStyle",
+      default: null,
+      index: true,
     },
     stockItemName: {
       type: String,
@@ -1105,5 +1133,38 @@ customerRequestSchema.index({ status: 1, createdAt: -1 });
 customerRequestSchema.index({ createdAt: -1 });
 customerRequestSchema.index({ customerId: 1, createdAt: -1 });
 customerRequestSchema.index({ requestId: 1 });
+
+/* ── WHICH BACKFILL RUN GAVE THIS ORDER'S LINES THEIR NAMES ───────────────
+   Present only on records whose lines predated permanent line references and
+   were filled in by `scripts/backfill-customer-request-line-refs.js`. It is
+   what makes that run reversible: the batch identity, who authorised it, and
+   exactly which references it assigned. Absent on every record created since,
+   because those lines were minted by the hook below as they were written. */
+customerRequestSchema.add({
+  lineRefBackfill: {
+    batchId: { type: String, trim: true },
+    at: { type: Date },
+    authorizedBy: { type: String, trim: true },
+    assigned: [{ type: String, trim: true }],
+  },
+});
+
+/* ── EVERY ORDER LINE LEAVES HERE WITH A NAME ──────────────────────────────
+   Sixteen writers across customer self-service, Sales, measurement
+   conversion, sampling, return cloning and six quotation paths all persist
+   through `.save()`, so this is the one place identity has to be handled. It
+   mints only for lines that have none, which makes a filtered-and-reassigned
+   array, an in-place quantity edit and a pushed line all behave correctly
+   without any of those writers knowing this exists. */
+customerRequestSchema.pre("validate", function ensureCustomerRequestLineIdentities(next) {
+  try {
+    ensureLineIdentities(this.items);
+    /* An edit proposal's lines are a payload, not the record — they are given
+       identities only if and when they are adopted onto `items`. */
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = mongoose.model("CustomerRequest", customerRequestSchema);

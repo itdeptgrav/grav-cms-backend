@@ -1462,6 +1462,79 @@ app.use(
 // then a costing capability. Authentication alone reaches nothing.
 app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
 
+
+/* ── MERCHANDISING'S OWN READ DOOR ───────────────────────────────────────
+   Mounted ONCE, at its own top-level URL, and gated on the `merchandiser`
+   department grant rather than on a Sales session. Merchandising's style
+   reads once lived on the Sales sample-style router and inherited its broad
+   CRM allowlist; the Overview and Style Work queue never did, and now neither
+   do they. Aggregation and response shaping stay in services/merchandising/ —
+   nothing about the contract is expressed here. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/merchandisingWorkRoute"));
+/* Merchandising's own doors onto the shared style record — the material and
+   packaging operations that used to sit inside the Sales style router. Same
+   handlers, same services, same live grant; a file of their own so a
+   Merchandising release does not depend on that router's state. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/styleRoute"));
+/* And the five legacy packaging URLs the R&D application still calls, wired to
+   THE SAME handlers. Mounted BEFORE the Sales router so they answer first; it
+   is a second doorway onto one room, not a second room. */
+app.use(
+  "/api/cms/crm/sample-styles",
+  require("./routes/CMS_Routes/Merchandising/styleRoute").legacyPackagingCompat,
+);
+/* Order Execution — the M1/M2 receiver: the handover inbox, the two
+   decisions, and the Execution File register. Same mount, second router;
+   distinct paths, one access implementation behind both. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/executionRoute"));
+/* Time & Action — the M5 date control: templates, calendars, plans,
+   baselines, reschedules, and the cross-file register. Third router on the
+   same mount for the same reason as the second: distinct paths, one access
+   implementation, and a surface that has no business growing onto the
+   execution file's own router. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/tnaRoute"));
+/* Department status and the downstream handover — the M6 surface: the
+   read-only projection register, the versioned execution pack, and the
+   delivery sweep. Fourth router on the same mount, same access implementation.
+   Note what is NOT here: no route writes a department's status, and accepting
+   a pack is PPC's, mounted separately below. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/handoverPackRoute"));
+
+/* ── PPC RECEIVES THE HANDOVER ───────────────────────────────────────────
+   Its own mount, its own live `ppc` department grant, its own record. A
+   Merchandising grant of any level opens nothing here — which is the whole
+   point: Merchandising hands off, and the receiving decision stays PPC's. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
+
+/* Change control and the enterprise operations — the M7 surface: Sales-
+   authorised change intake, impact coordination, acknowledgements, bulk tools,
+   reports, exports, archive and integration health. Fifth router on the
+   Merchandising mount, same access implementation. None of it is a daily
+   destination: the navigation stays at three entries. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/changeControlRoute"));
+
+/* ── SALES AUTHORISES THE CHANGE ─────────────────────────────────────────
+   The producer's door, beside its handover sibling. Sales owns and authorises
+   commercial change; a Merchandising grant opens nothing here. */
+app.use("/api/cms/sales/change-notices", require("./routes/CMS_Routes/Sales/changeNotices"));
+
+/* ── PRE-ORDER DEVELOPMENT ───────────────────────────────────────────────
+   Merchandising works BEFORE an order exists too: Sales asks for materials
+   against a Journey product line, Merchandising selects and approves them,
+   and R&D and Costing read the approved selection. Sixth router on the
+   Merchandising mount; the request itself is Sales', mounted below. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/developmentRoute"));
+
+/* Sales owns the Journey and asks for the work. A Merchandising grant opens
+   nothing here, and Sales has no handle on the Development File. */
+app.use("/api/cms/sales/development-requests", require("./routes/CMS_Routes/Sales/developmentRequests"));
+
+/* ── SALES ISSUES THE MERCHANDISING HANDOVER ─────────────────────────────
+   The producer's door: issuance, supersession and cancellation of the
+   versioned confirmed requirement, on the proven order line, behind Sales'
+   own authority. A Merchandising grant opens none of it. */
+app.use("/api/cms/sales/merchandising-handovers", require("./routes/CMS_Routes/Sales/merchandisingHandovers"));
+
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);

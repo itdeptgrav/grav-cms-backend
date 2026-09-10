@@ -22,6 +22,8 @@
 // fields — nothing here needs migrating when they do.
 
 const mongoose = require("mongoose");
+
+const { ensureProductLineIdentities } = require("./enquiryProductLineIdentity");
 const {
   ENQUIRY_STATUS_CODES,
   ENQUIRY_SOURCE_CODES,
@@ -43,6 +45,47 @@ const enquirySchema = new mongoose.Schema(
     // The human reference the customer and audit trail see. Minted by
     // services/enquiryRef.js under an atomic counter; immutable once set.
     enquiryId: { type: String, required: true, unique: true, immutable: true, trim: true },
+
+    /* ── WHOSE COMPANY THIS ENQUIRY BELONGS TO ─────────────────────────────
+     *
+     * ── WHY SALES SUDDENLY NEEDS ONE ───────────────────────────────────────
+     * Central Costing raises costings against an enquiry product, and a
+     * costing must never be built from another company's enquiry — its buyer,
+     * its quantities and, from Chunk 3, the supplier prices attached to it are
+     * all commercial facts belonging to one company. Nothing else in Sales
+     * carries a company (`CRMAccount` and `SalesJourney` do not either), so
+     * costing had to fall back to "only where exactly one company exists".
+     * This is what replaces that.
+     *
+     * ── AND WHY `null` IS ALLOWED ──────────────────────────────────────────
+     * Every enquiry created before this field existed has no company, and
+     * refusing to create new ones when the actor's membership cannot be proved
+     * would stop Sales working to improve a boundary costing enforces on its
+     * own read path anyway. So an enquiry may be UNOWNED — which is not
+     * "owned by everybody": costing treats an unowned enquiry the way the
+     * tenant rules treat every unowned record, usable only where ownership
+     * cannot be ambiguous and refused outright once a second company exists.
+     *
+     * Filled from the actor's server-owned membership at creation
+     * (services/companyContext/ownershipStamp.service.js) and NEVER from the
+     * request. Backfilled for existing single-company deployments by
+     * scripts/migrations/backfill-enquiry-company.js, which is reviewable and
+     * has not been run. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      default: null,
+      index: true,
+    },
+
+    /* How that answer was reached, so a later reader — or the backfill — can
+       tell an enquiry PROVEN to belong to a company from one that merely had
+       no other candidate. */
+    companyOwnership: {
+      source: { type: String, trim: true, default: "" },
+      resolvedAt: { type: Date },
+      proven: { type: Boolean, default: false },
+    },
 
     // The Journey this enquiry belongs to. Unique — one enquiry per journey.
     journeyId: {
@@ -86,6 +129,20 @@ const enquirySchema = new mongoose.Schema(
     products: [
       new mongoose.Schema(
         {
+    /* ── THIS PRODUCT LINE'S PERMANENT NAME ────────────────────────────
+       Server-minted, unique within the enquiry, never reissued. It is the
+       identity anything outside this record points at — a Merchandising
+       Development File above all, which is rooted on it and must survive the
+       buyer changing a fabric preference or Sales reordering the rows.
+
+       Position cannot be that identity: rows are added, removed and
+       reordered. Neither can the product name: one enquiry legitimately
+       carries "Polo" twice, in two colourways, and those are two development
+       jobs with two different material selections. See
+       enquiryProductLineIdentity.js for how it is minted and why a client can
+       name one but never invent one. */
+    productLineRef: { type: String, trim: true, index: true },
+
           product: { type: String, trim: true, required: true },
           /**
            * The item-master record this row names, when it names one.
@@ -719,5 +776,16 @@ const enquirySchema = new mongoose.Schema(
   },
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
 );
+
+/* ── ONE CHOKEPOINT, SO NO WRITER CAN FORGET ────────────────────────────
+   Every path that writes these rows persists through `.save()`. */
+enquirySchema.pre("validate", function ensureEnquiryProductLineIdentities(next) {
+  try {
+    ensureProductLineIdentities(this.products);
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = mongoose.models.Enquiry || mongoose.model("Enquiry", enquirySchema);

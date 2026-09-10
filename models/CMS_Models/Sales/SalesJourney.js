@@ -74,6 +74,29 @@ const salesJourneySchema = new mongoose.Schema(
     // rewriting it would break every link and audit row that names it.
     journeyId: { type: String, required: true, unique: true, immutable: true, trim: true },
 
+    /* ── WHOSE COMPANY THIS JOURNEY BELONGS TO ─────────────────────────────
+     * Added by Chunk 3A's correction. A journey is the record an Enquiry is
+     * created FROM, so an unscoped journey lookup is a way to claim one: open
+     * another company's journey, and the enquiry created from it is stamped
+     * with YOUR company — a foreign customer's opportunity quietly adopted,
+     * with the adoption looking like ordinary use.
+     *
+     * Stamped at creation from the actor's server-owned membership and never
+     * from the request, exactly as `Enquiry.companyId` is. `null` means a
+     * journey that predates this field, usable only where ownership cannot be
+     * ambiguous — see services/companyContext/salesScope.service.js. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      default: null,
+      index: true,
+    },
+    companyOwnership: {
+      source: { type: String, trim: true, default: "" },
+      resolvedAt: { type: Date },
+      proven: { type: Boolean, default: false },
+    },
+
     name: { type: String, required: true, trim: true },
     accountId: { ...accountRef(), required: true, index: true },
 

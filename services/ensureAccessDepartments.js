@@ -44,14 +44,23 @@ const DEPARTMENTS = [
     legacyModel: "SalesDepartment", legacyCollection: "salesdepartments",
     legacyUserType: "sales", dashboardPath: "/sales/dashboard",
     description: "Customer requests, quotations and orders." },
-  // Merchandising — the app holding what was pulled out of the Sales nav:
-  // Purchase Orders / PI, Customers, and Products & BOM. No legacy collection of
-  // its own (no legacy merchandiser logins exist), so it only registers the
-  // department + onboarding tile; a platform admin can open it today.
+  // Merchandising — internal coordination of a confirmed requirement, worked
+  // from a Style. No legacy collection of its own (no legacy merchandiser
+  // logins exist), so it only registers the department + onboarding tile; a
+  // platform admin can open it today.
+  //
+  // ── THE DESCRIPTION USED TO NAME THREE OTHER APPS' RECORDS ──────────────
+  // "Purchase orders & PI, customers, and products & BOM" described the pages
+  // Merchandising had BORROWED from Sales and Store, not the work it owns.
+  // Purchase orders and customers are Sales'; the downstream product record is
+  // Inventory's. It is corrected below, and because this seeder is and stays
+  // strictly additive, existing databases are moved by the one-off migration
+  // scripts/migrations/merchandising-department-description.js — never by a
+  // restart, which would also overwrite an administrator's own wording.
   { key: "merchandiser", slug: "merchandiser", name: "Merchandising", sortOrder: 45,
     legacyModel: null, legacyCollection: "merchandiserdepartments",
     legacyUserType: "merchandiser", dashboardPath: "/merchandiser/dashboard",
-    description: "Purchase orders & PI, customers, and products & BOM." },
+    description: "Style execution, component selection and development coordination." },
   { key: "accountant", slug: "accountant", name: "Accounting", sortOrder: 50,
     legacyModel: "Acc_Department", legacyCollection: "acc_departments",
     legacyUserType: "accountant", dashboardPath: "/accountant/",

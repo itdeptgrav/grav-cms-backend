@@ -38,3 +38,161 @@ Use the following template for each approved architecture decision.
 - **Alternatives considered:** Continue the legacy Lead pipeline through proposal/negotiation/won; rejected because it duplicates Cost & Quote and PO/Contract. Eliminate Lead and create Journeys for every unqualified prospect; rejected because it pollutes customer and Journey records with low-confidence prospects. Merge Lead into Account; rejected because a person or company can be discovered before its durable organization identity is verified.
 - **Consequences:** Lead and Journey need an explicit, idempotent conversion bridge. New Lead activities must use the shared CRM Activity architecture rather than a second embedded activity system. Legacy Lead stages and embedded activities remain readable for backward compatibility but are not offered for new work. Navigation and reporting must distinguish pre-Journey Leads from active Sales Journeys.
 - **Related task/files:** `docs/tasks/lead-to-journey-roadmap.md`, `docs/tasks/lead-chunk-01-foundation.md`, `models/CMS_Models/Sales/Lead.js`, `models/CMS_Models/Sales/SalesJourney.js`, `models/CMS_Models/Sales/Activity.js`
+
+---
+
+## ADR-005: Pre-order development is Merchandising's, and its ownership is split seven ways
+
+- **Decision ID:** ADR-005
+- **Date:** 2026-09-09
+- **Status:** Approved
+- **Context:** The Merchandising application was declared feature-complete at
+  the end of M7 while implementing only the confirmed-order half of the work.
+  Before an order exists, Sales asks for a product to be developed and
+  Merchandising decides what it is made from — and everything downstream (R&D's
+  engineered consumption, Costing's rates, the sample itself) is computed
+  against that decision. The application had no home for it. What existed
+  instead was a Sales-authenticated materials form writing raw items onto
+  `SampleStyle.materials`, which put a Merchandising decision behind a Sales
+  seat, addressed a product line by its name, and carried a quantity nobody had
+  engineered. Two departments held one fact, and neither version had an
+  approver.
+- **Decision:** Pre-order development is a first-class Merchandising workflow
+  with a navigation entry of its own, and its ownership is settled by seven
+  rules that do not move:
+  1. **A Journey product line has a permanent, server-minted reference.**
+     Nothing outside the enquiry may address a line by array position, product
+     name, style display text or a mutable index. One enquiry legitimately
+     carries the same product twice in two colourways, and those are two
+     development jobs with two different selections.
+  2. **Sales owns the ask; Merchandising owns the file.** The development
+     request is a versioned Sales record on a Sales router behind the live
+     Sales grant. Merchandising has no route that creates one, and Sales has no
+     route that reads or writes a Development File. A second ask against an
+     open line becomes version 2 on the same file.
+  3. **The Development File is a separate aggregate from the Execution File.**
+     It is keyed on `company + journey + productLineRef` and exists before any
+     order does. Merging the two would mean either an execution file with no
+     confirmed requirement or a development decision that cannot be made until
+     the buyer has ordered.
+  4. **The development BOM holds identity and nothing else.** Quantity,
+     consumption, unit, allowance, wastage, rate, cost, price, supplier,
+     supplier quotation, purchase order, stock, reservation, issue quantity and
+     sample construction result are each refused by name, and each refusal says
+     which department owns the fact. Merchandising selects the material; it
+     does not engineer it, price it, buy it or test it.
+  5. **Approval is maker/checker and freezes.** The approver may not be the
+     author or the submitter, and an owner is not exempt. An approved revision
+     is immutable; change means a new revision, and the previous one stays
+     readable because R&D and Costing consumed it.
+  6. **Release to R&D is Sales'.** Merchandising approving says the materials
+     are settled. Sales authorising the release says the buyer relationship
+     justifies spending the development budget on them. That is a commercial
+     judgement, so Merchandising has no route for it.
+  7. **The approved development selection outranks the registered product's
+     BOM.** R&D's shortlist and Costing's identity both read the approved
+     development revision first. A product-level BOM is what the product is
+     usually made from; a development revision is what somebody agreed for this
+     buyer's sample.
+- **Alternatives considered:** Extend the Execution File backwards to cover
+  pre-order work; rejected because it would require an execution file with no
+  confirmed requirement, and every field on it would then be conditionally
+  meaningless. Keep the Sales materials form and add an approval step; rejected
+  because the authority is wrong at the root — a Sales seat should not be the
+  gate on a Merchandising decision — and because the form addresses lines by
+  name. Let Merchandising raise its own development work; rejected because the
+  ask commits company money against a buyer relationship Sales owns. Let
+  Merchandising release to R&D once it has approved; rejected for the reason in
+  rule 6. Delete the legacy materials form immediately; rejected because live
+  styles hold data in it, so it is read and offered for adoption and retired
+  only behind a verified migration gate.
+- **Consequences:** Merchandising's primary navigation becomes four entries —
+  Overview, Development, Order Execution, Time & Action — with Development
+  second, in the order the work happens. The Sales Journey gains a surface that
+  sends a line for development, shows Merchandising's published answer and
+  authorises the release, and carries no material-selection control at all.
+  What Sales sees of the selection is a projection Merchandising publishes: a
+  statement of state and the approved identities, with no document identifier a
+  caller could act on and no write anywhere in the module. Only an APPROVED
+  revision is published, because a draft is Merchandising still working and
+  publishing one would let a salesperson quote a fabric nobody agreed. A
+  confirmed order adopts the approved development BOM into a DRAFT selection,
+  never an approved one, so the order-stage approval is a real decision rather
+  than a formality. No new capability constant was introduced: the fixed
+  fourteen-capability vocabulary covers all of it.
+- **Related task/files:** `docs/product/merchandising-app-final-plan.md`,
+  `models/CMS_Models/Sales/enquiryProductLineIdentity.js`,
+  `models/CMS_Models/Sales/DevelopmentRequest.js`,
+  `models/CMS_Models/Merchandising/Development.js`,
+  `services/sales/developmentRequest.service.js`,
+  `services/merchandising/development.service.js`,
+  `services/merchandising/developmentPublication.service.js`,
+  `services/merchandising/developmentAdoption.service.js`,
+  `services/merchandising/developmentLegacy.service.js`,
+  `services/approvedMaterialShortlist.service.js`,
+  `routes/CMS_Routes/Sales/developmentRequests.js`,
+  `routes/CMS_Routes/Merchandising/developmentRoute.js`,
+  `test/merchandising/preorder-development.route.test.js`
+
+## ADR-006: Sales owns style identity; Merchandising owns the operations on it
+
+- **Decision ID:** ADR-006
+- **Date:** 2026-09-10
+- **Status:** Approved
+- **Context:** Eleven Merchandising endpoints — the style list and identity
+  read, the Development File read and write, the packaging decision, and the
+  packaging-selection and packaging-requirement lifecycle — were registered
+  inside `routes/CMS_Routes/Sales/sampleStyles.js`. They were written there
+  because that is where the `SampleStyle` record's own doors already were, and
+  the shortest way to reach the record was to add a route beside them. The cost
+  only became visible at release: the file is a 4,500-line Sales router under
+  concurrent rewrite, so a Merchandising release could not be assembled without
+  taking whatever state seventy-four unrelated in-flight hunks happened to be
+  in. Merchandising's own tests mounted that router to reach eleven endpoints,
+  and Merchandising's client held a second base URL pointing at a Sales mount.
+- **Decision:** Ownership of a route follows the DECISION it records, not the
+  record it touches.
+  1. **Sales owns style identity.** The `SampleStyle` record, its creation, its
+     stage, its Sales-facing surface and its notification helpers stay on the
+     Sales router. Merchandising has no route that creates a style.
+  2. **Merchandising owns every Merchandising operation on that style**, in
+     `routes/CMS_Routes/Merchandising/styleRoute.js`, under
+     `/api/cms/merchandising`. Same handlers, same services, same live
+     `merchandiser` grant as the rest of the application.
+  3. **No logic is duplicated.** The handlers moved; they were not copied. One
+     implementation answers every address, and `publicSelection` — the response
+     shape the two surfaces share — moved into
+     `services/sales/packagingBom.service.js`, which both already import.
+  4. **An old URL that must keep answering gets a thin compatibility mount, not
+     a second implementation.** The five packaging URLs the R&D application
+     still calls are re-exported from the Merchandising router as
+     `legacyPackagingCompat`, mounted at the old prefix behind the Sales
+     middleware R&D authenticates with. It is a second doorway onto one room.
+  5. **Three schema fields are a Sales-to-Merchandising CONTRACT, not
+     Merchandising ownership of a Sales record.** `Enquiry.companyId` and
+     `SalesJourney.companyId` make the acting company provable on a record
+     Merchandising must scope by; `Enquiry.products[].productLineRef` is the
+     permanent, server-minted line identity ADR-005 rule 1 requires; and
+     `CustomerRequest` order lines carry `sampleStyleId` so a confirmed line
+     names the style it was developed from. Sales writes all three. Merchandising
+     reads them and writes none of them.
+- **Alternatives considered:** Leave the endpoints on the Sales router and
+  release the two lanes together; rejected because it makes every Merchandising
+  release wait on an unrelated rewrite and gives Merchandising's authorisation
+  boundary a Sales-shaped hole. Copy the handlers into a Merchandising router
+  and leave the originals; rejected because two implementations of one decision
+  drift, and the packaging lifecycle has maker/checker rules that must not exist
+  twice. Move the `SampleStyle` model to Merchandising; rejected because Sales
+  genuinely owns the record — the style exists before Merchandising is involved
+  and is presented on Sales' own journey stage. Redirect the old URLs with a
+  3xx; rejected because the R&D client sends PATCH and POST bodies and would
+  need its own change to follow one.
+- **Consequences:** The Sales sample-style router loses 689 lines and is
+  byte-identical to its committed state in the Merchandising checkpoint, so the
+  two lanes no longer share a file. Merchandising's client names one base URL.
+  Four Merchandising test suites mount the Merchandising router instead of the
+  Sales one, and two suites whose subject turned out to be a SALES helper —
+  the R&D raw-item search, the stage routing, the legacy material routes and
+  the `customerNameFor` notification lookup — moved to `test/sales/`, where
+  their subject lives. Not one assertion changed. The R&D application needs no
+  change at all.

@@ -38,6 +38,13 @@ const actorRef = () => ({
   name: { type: String, trim: true },
 });
 
+/* ── "THIS STYLE DOES NOT NEED ONE", RECORDED WHERE THE ROWS ARE ──────────
+   Three explicit, department-owned answers, all the same three fields. See
+   `services/styleApplicability.js` for why `required` has no default: absent
+   is a question nobody asked, and it must never read as "no". */
+const { decisionSchemaFields } = require("../../../services/styleApplicability");
+const applicabilityDecision = () => decisionSchemaFields(mongoose);
+
 const imageSchema = new mongoose.Schema(
   { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
   { _id: false },
@@ -290,6 +297,70 @@ const sampleStyleSchema = new mongoose.Schema(
       // `items` alone (a name and a vendor, no real rawItemId/variantId/
       // quantity) can't drive either.
       rawItems: [rawItemPickSchema],
+
+      /* ══ WHAT THE GARMENT IS PACKED IN — MERCHANDISING'S SELECTION ═════
+         Which packaging components this style needs: poly bag, hang tag,
+         barcode sticker, carton, label.
+
+         ── WHY THIS IS SEPARATE FROM R&D'S ROW ─────────────────────────
+         Merchandising knows WHICH components a style requires; they are not
+         measuring the garment. How many of each is confirmed after sampling
+         and is R&D's, in `sample.packagingRequirements`. One record holding
+         both is how a figure nobody measured ends up presented as a fact —
+         the same mistake the material shortlist had to be corrected for.
+
+         So there is deliberately no quantity, no unit, no basis, no supplier
+         and no rate here. Identity, a readable snapshot, and what to make
+         of it. */
+      packagingSelections: [
+        new mongoose.Schema({
+          /* Stable row identity, minted server-side. Two legitimate rows may
+             name the same item — two different printed bags — and keying by
+             what they name would silently merge them. */
+          rowId: { type: String, trim: true, maxlength: 40 },
+          /* The company-scoped ITEM MASTER. A poly bag is a material the
+             company buys; it needs no second master, and giving it one would
+             mean two places to quote the same thing. */
+          rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+          /* Snapshots, for readability only. The id is the identity — a
+             renamed master must not orphan the row, and a name must never be
+             what a lookup matches on. */
+          rawItemName: { type: String, trim: true, default: "" },
+          rawItemSku: { type: String, trim: true, default: "" },
+          variantId: { type: mongoose.Schema.Types.ObjectId },
+          variantLabel: { type: String, trim: true, default: "" },
+          /* "Printed poly bag, 300x400mm" — the packing instruction, which
+             is Merchandising's to state and R&D's to work to. */
+          specification: { type: String, trim: true, default: "", maxlength: 2000 },
+          status: {
+            type: String,
+            enum: ["proposed", "approved", "withdrawn"],
+            default: "proposed",
+          },
+          selectedBy: actorRef(),
+          selectedAt: { type: Date, default: Date.now },
+          /* Withdrawn rather than deleted: a component that was required and
+             then dropped is a decision somebody may need to explain. */
+          withdrawnAt: { type: Date },
+          withdrawnBy: actorRef(),
+          withdrawnReason: { type: String, trim: true, maxlength: 1000 },
+        }, { _id: false }),
+      ],
+
+      /* ══ IS THIS STYLE PACKED AT ALL? — MERCHANDISING'S ANSWER ════════
+         An EMPTY `packagingSelections` is not "no packaging". It is a style
+         nobody has looked at yet, and those two states are the whole reason
+         this field exists: Central Costing used to be unable to tell them
+         apart, so somebody costing the garment declared packaging "not
+         applicable" from a screen that could not know.
+
+         Merchandising chooses the components, so Merchandising answers this.
+         `false` means the customer supplies the packaging, or the goods ship
+         loose — a commercial fact, with its reason. R&D then measures only
+         what was selected; they do not get to decide that a selected
+         component is unnecessary. */
+      packagingDecision: applicabilityDecision(),
+
       selectedBy: actorRef(),
       selectedAt: { type: Date },
       // Optional target date Sales sets when routing to the Merchandiser
@@ -381,6 +452,177 @@ const sampleStyleSchema = new mongoose.Schema(
       approvedAt: { type: Date },
       approvedBy: actorRef(),
       revisions: [revisionSchema],
+
+      /* ══ THE STRUCTURED TECHNICAL RECORD ═══════════════════════════════
+         R&D's own facts about this style, as data rather than as a PDF.
+
+         ── WHY THIS EXISTS ──────────────────────────────────────────────
+         The tech sheet has always been a FILE. Everything a costing needs —
+         what each material actually consumes per finished piece, in what
+         unit, with what allowance — lived either in a drawing nobody can
+         read programmatically, or in `materials.rawItems`, where the
+         Merchandiser had typed it.
+
+         That second one is the ownership mistake this corrects. The
+         Merchandiser selects WHICH materials; they are not measuring the
+         garment. A quantity they entered was being read as a final
+         per-garment consumption and shown as "0.2625 kg + 5%" as though it
+         had been established. It had not been.
+
+         So consumption, unit, allowance and specification are recorded HERE,
+         by R&D, who own the fact. The file stays as supporting evidence.
+
+         ── AND WHY IT IS SEPARATE FROM `sample.consumptionRawItems` ──────
+         That records what one physical sample round actually consumed, and
+         it is only meaningful once Sales approves the sample. This is the
+         engineered figure for the style, which a costing needs long before
+         any sample exists. Two different facts; two records. */
+      technical: {
+        /* `draft` while R&D works, `submitted` awaiting Sales, `approved`
+           once Sales accepts, `rework` when Sales sends it back. Distinct
+           from `techSheet.status` above, which is the FILE's gate and stays
+           exactly as it was. */
+        status: {
+          type: String,
+          enum: ["not_started", "draft", "submitted", "approved", "rework"],
+          default: "not_started",
+        },
+        /* Increments on every submission. The frozen copy in
+           `technicalRevisions` carries the same number, so an approved
+           costing can always name the revision it read. */
+        revision: { type: Number, default: 0 },
+        startedAt: { type: Date },
+        startedBy: actorRef(),
+        submittedAt: { type: Date },
+        submittedBy: actorRef(),
+        approvedAt: { type: Date },
+        approvedBy: actorRef(),
+
+        /* ── ONE ROW PER APPROVED MATERIAL ──────────────────────────────
+           The identity half (rawItemId, name, sku, variant) is COPIED from
+           the approved BOM and is not editable here — R&D may not silently
+           substitute another item. If the wrong material was selected, the
+           row is sent back to Merchandising with a reason, which is an
+           action with a history rather than an edit. */
+        materials: [
+          new mongoose.Schema({
+            /* Identity — from the approved BOM, never chosen on this screen. */
+            rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+            rawItemName: { type: String, trim: true },
+            rawItemSku: { type: String, trim: true },
+            variantId: { type: mongoose.Schema.Types.ObjectId },
+            variantCombination: [{ type: String, trim: true }],
+
+            /* R&D's facts. */
+            specification: { type: String, trim: true, default: "", maxlength: 2000 },
+            /* Per FINISHED PIECE. Named in full because "quantity" is what
+               the Merchandiser's shortlist used to hold, and the whole point
+               of this record is that the two are different claims. */
+            consumptionPerPiece: { type: Number, min: 0 },
+            unit: { type: String, trim: true, default: "" },
+            /* Explicit, and separate from the consumption. Never folded into
+               it: `sample.consumptionRawItems` learned that lesson the hard
+               way, where an allowance already inside the quantity had to be
+               documented so nothing multiplied it in twice. */
+            allowancePercent: { type: Number, min: 0, default: null },
+            evidenceNote: { type: String, trim: true, default: "", maxlength: 1000 },
+
+            /* Which product variants this row applies to. Empty with
+               `appliesToAllVariants` true means every size — the usual case
+               for a trim; a fabric often differs by size, which is why this
+               is expressible at all. */
+            appliesToAllVariants: { type: Boolean, default: true },
+            appliesToVariantIds: [{ type: mongoose.Schema.Types.ObjectId }],
+            appliesToVariantLabels: [{ type: String, trim: true }],
+
+            /* Set when R&D sends this material back to Merchandising. The row
+               stays, so the record shows what was questioned and why. */
+            returnedToMaterials: {
+              at: { type: Date },
+              by: actorRef(),
+              reason: { type: String, trim: true, maxlength: 1000 },
+            },
+          }, { _id: false }),
+        ],
+
+        /* ── OPERATIONS AND THEIR SAM ────────────────────────────────────
+           Chosen from the registered Operation master by identity. R&D
+           records the TIME; what a minute costs is company policy, read at
+           costing time. No rate is entered here and none is stored. */
+        operations: [
+          new mongoose.Schema({
+            operationId: { type: mongoose.Schema.Types.ObjectId, ref: "Operation", required: true },
+            operationCode: { type: String, trim: true, default: "" },
+            name: { type: String, trim: true },
+            machineType: { type: String, trim: true, default: "" },
+            minutes: { type: Number, min: 0, default: 0 },
+            seconds: { type: Number, min: 0, default: 0 },
+            notes: { type: String, trim: true, default: "", maxlength: 1000 },
+          }, { _id: false }),
+        ],
+
+        /* ── PACKAGING, OUTSIDE SERVICES AND DEVELOPMENT WORK ────────────
+           Only where applicable. Each maps to an EXISTING central-costing
+           requirement family rather than becoming a free-text cost line —
+           that is the difference between a requirement the costing can
+           source and a number somebody typed. */
+        requirements: [
+          new mongoose.Schema({
+            family: {
+              type: String,
+              /* ── PACKAGING IS NOT HERE, DELIBERATELY ──────────────────
+                 It has its own record — `sample.packagingRequirements`, the
+                 R&D technical consumption source the costing has read since
+                 the family was built, with its own basis, evidence and
+                 include/exclude decision. Listing it here as well made two
+                 writable homes for one fact, and only one of them was ever
+                 read: a packaging row recorded through this generic field
+                 would have been invisible to every costing.
+
+                 Kept OUT of the enum rather than merely unused, so the
+                 mistake is refused at the schema instead of discovered when
+                 a costing reports no packaging for a style that plainly has
+                 some. */
+              enum: ["SERVICE", "DEVELOPMENT_TOOLING"],
+              required: true,
+            },
+            name: { type: String, trim: true, required: true, maxlength: 200 },
+            specification: { type: String, trim: true, default: "", maxlength: 2000 },
+            quantity: { type: Number, min: 0 },
+            /* "per garment", "per run", "per screen" — what the quantity is
+               counted in. A quantity with no basis is not a requirement. */
+            basis: { type: String, trim: true, default: "" },
+            unit: { type: String, trim: true, default: "" },
+            rationale: { type: String, trim: true, default: "", maxlength: 1000 },
+          }, { _id: false }),
+        ],
+      },
+
+      /* ── EVERY SUBMITTED REVISION, FROZEN ──────────────────────────────
+         Appended on submission and never edited. Sales returning a sheet
+         starts a new revision; the one they saw stays exactly as it was, so
+         "what did we approve in September" has an answer. */
+      technicalRevisions: [
+        new mongoose.Schema({
+          revision: { type: Number, required: true },
+          submittedAt: { type: Date, required: true },
+          submittedBy: actorRef(),
+          /* The file as it stood at submission — the record and its evidence
+             are frozen together, or the pair proves nothing. */
+          file: { name: { type: String, trim: true }, url: { type: String, trim: true }, uploadedAt: { type: Date } },
+          /* Deliberately `Mixed`: a frozen snapshot must keep the shape it
+             had, not be re-validated against a schema that has moved on. */
+          snapshot: { type: mongoose.Schema.Types.Mixed },
+          outcome: {
+            type: String,
+            enum: ["submitted", "approved", "returned"],
+            default: "submitted",
+          },
+          decidedAt: { type: Date },
+          decidedBy: actorRef(),
+          decisionNote: { type: String, trim: true, maxlength: 2000 },
+        }, { _id: false }),
+      ],
     },
 
     // ── Sample — R&D runs sampling production; Sales approves (gate 2).
@@ -415,6 +657,293 @@ const sampleStyleSchema = new mongoose.Schema(
           notes: { type: String, trim: true, default: "" },
         },
       ],
+      // ── WHAT THE GARMENT IS PACKED IN ────────────────────────────────
+      // Poly bags, hang tags, cartons. Costing had no way to answer packaging
+      // at all before this: the ITEMS existed in the item master and could
+      // carry supplier quotations, and nothing anywhere connected a garment to
+      // them — so every costing reported packaging as a family with no source
+      // and offered a hand-typed override instead.
+      //
+      // Shaped like `consumptionRawItems` on purpose. It is the same kind of
+      // fact: R&D says WHICH item and HOW MUCH, and the Store quotation
+      // register says what it costs. No rate lives here — duplicating a
+      // supplier price onto the technical record is how the costing and the
+      // quotation start disagreeing, and only one of them is dated.
+      packagingRequirements: [
+        {
+          /* This row's own identity — minted server-side and preserved across
+             edits. Two legitimate rows naming the same item and variant are
+             two rows; keyed by what they name they would be one. */
+          rowId: { type: String, trim: true, maxlength: 40 },
+          /* ── WHICH MERCHANDISING SELECTION THIS ANSWERS ─────────────────
+             The `rowId` of the approved `materials.packagingSelections` row.
+             Additive and optional: every requirement written before the
+             selection layer existed has none, keeps working, and is reported
+             as legacy rather than backfilled into a selection nobody made.
+
+             The link is by ROW, not by item, because two legitimate
+             selections may name the same item — an inner bag and an outer
+             bag — and joining on the item would collapse them into one
+             requirement and lose a component. */
+          sourceSelectionRowId: { type: String, trim: true, maxlength: 40 },
+          /* The company-scoped item master. A poly bag is a material the
+             company buys; it needs no second master, and giving it one would
+             mean two places to quote the same thing. */
+          rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
+          rawItemName: { type: String, trim: true, default: "" },
+          rawItemSku: { type: String, trim: true, default: "" },
+          variantId: { type: mongoose.Schema.Types.ObjectId },
+          variantLabel: { type: String, trim: true, default: "" },
+          /* What R&D actually specified — "printed poly bag, 300×400mm".
+             Distinct from the item's own name, which is the master's. */
+          specification: { type: String, trim: true, default: "", maxlength: 2000 },
+          /* ── MISSING IS MISSING, NEVER ZERO ────────────────────────────
+             No default. A packaging row whose quantity nobody recorded is an
+             unfinished technical record, and defaulting it to 0 would cost
+             the garment as though it shipped unpacked. The assembly blocks
+             on it and names R&D. */
+          quantity: { type: Number, min: 0, default: undefined },
+          unit: { type: String, trim: true, default: "" },
+          /* ── PER GARMENT, OR PER RUN ──────────────────────────────────
+             A poly bag is one per garment and scales with the order. A master
+             carton holds forty and is bought per run; a shipping mark plate
+             is bought once whatever the run. Costing dilutes the second kind
+             across the quantity, which is a different number, so it cannot be
+             guessed from the item. */
+          basis: {
+            type: String,
+            /* ── THREE GENUINELY DIFFERENT SHAPES ───────────────────────
+               PER_GARMENT   a poly bag: one each, scales with the run.
+               PER_CARTON    a master carton: one per N garments, so it
+                             scales in STEPS — 26 garments at 25 to a carton
+                             is two cartons, not 1.04.
+               FIXED_PER_RUN a shipping-mark plate: bought once whatever the
+                             run, diluted across it. Does not scale at all.
+
+               PER_CARTON is additive and is NOT a synonym for
+               FIXED_PER_RUN — neither of the original two could express
+               "one carton per 25 garments", which is why it exists. */
+            enum: ["PER_GARMENT", "PER_CARTON", "FIXED_PER_RUN"],
+            default: "PER_GARMENT",
+          },
+          /* ── THE CONVERSION LIVES ON THE SHIPMENT, NOT HERE ────────────
+             A carton basis needs "how many garments per carton", and that
+             fact ALREADY EXISTS as `sample.shipment.garmentsPerCarton` —
+             R&D-recorded, with the same ceiling rule, and read by the
+             freight family since it was built.
+
+             Repeating it on the packaging row would be two answers to one
+             question about one style: a carton that holds 25 for freight and
+             40 for packaging is a contradiction nobody would ever be told
+             about. So there is deliberately no field here — the assembly
+             reads the shipment, and refuses the row when it is unset. */
+          /* Where the figure came from — measured on the approved sample, or
+             planned by merchandising. The costing labels it, and treats a
+             planned figure as provisional evidence. */
+          /* ── THE SAME TWO WORDS THE TECHNICAL SOURCE SPEAKS ──────────
+             `BOM_PLANNED` is what a planned MATERIAL row is called
+             (`technicalSource.EVIDENCE`), and a planned packaging or service
+             row is the same kind of claim. A synonym here would mean the
+             costing had to translate between two vocabularies for one fact,
+             and the translation is where they stop agreeing.
+
+             Defaulted to PLANNED, never MEASURED: "measured on the sample" is
+             a claim the sample demonstrated this figure, and it is what lets
+             a costing treat the row as verified. A row nobody answered for
+             has demonstrated nothing. */
+          /* -- NO DEFAULT, BECAUSE NOBODY ANSWERED --------------------
+             `BOM_PLANNED` looked like the safe default and was still a
+             claim the schema made on somebody's behalf. It also contradicted
+             the write path, which REQUIRES the answer: a row could only
+             acquire this value by never being asked, and at rest it read
+             identically to a row where a person had chosen "planned".
+
+             Missing stays missing. Costing reads an absent evidence AS
+             planned — the weaker reading, applied where the consequence
+             lives — and it can never become "measured" on its own. */
+          evidence: {
+            type: String,
+            enum: ["SAMPLE_MEASURED", "BOM_PLANNED"],
+            default: undefined,
+          },
+          /* Recorded and then decided against. Kept rather than deleted: "we
+             considered a hang tag and dropped it" is a fact worth having, and
+             a removed row leaves no trace of the decision. */
+          included: { type: Boolean, default: true },
+          excludedReason: { type: String, trim: true, default: "", maxlength: 500 },
+          notes: { type: String, trim: true, default: "" },
+        },
+      ],
+
+      // ── WHAT IS SENT OUTSIDE, AND HOW MUCH OF IT ─────────────────────
+      // Dyeing, printing, embroidery, washing, testing. The Service master
+      // records what the company BUYS; nothing recorded what a style
+      // REQUIRES, so outside services were a family with no source in exactly
+      // the same way packaging was.
+      //
+      // This describes the requirement, never the charge. `Service.defaultRate`
+      // is planning guidance by its own schema's account, and the costing
+      // never reads it: the rate comes from a dated service quotation.
+      /* ── WHAT THE FINISHED GARMENT SHIPS AS ─────────────────────────
+         Freight is quoted per kilogram or per carton, and neither could be
+         answered anywhere in this system: there was no weight field on the
+         style, the product or the item, and the packaging rows record that a
+         carton is USED without ever saying how many garments one holds.
+
+         So a freight rate could be configured, be applicable, and still
+         produce nothing. These are the two facts that make it calculable,
+         and they are R&D's: they are measured on the sample, like every
+         other fact in this block.
+
+         Absent, never zero — a garment of no weight would cost nothing to
+         send, which is the failure this whole family exists to avoid. */
+      shipment: {
+        /* ── GRAMS, SAID IN THE FIELD NAME ────────────────────────────
+           A bare `packedWeight` is a number whose unit lives in somebody's
+           head, and a costing that reads kilograms as grams is out by a
+           thousand. Packed, not net: the freight bill is for what leaves the
+           building, bag and tag included. */
+        packedWeightGrams: { type: Number, min: 0, default: undefined },
+        /* How many finished garments one shipping carton holds. Used with
+           ceiling division — 250 garments at 40 a carton is 7 cartons, and
+           the seventh is charged in full. */
+        garmentsPerCarton: { type: Number, min: 1, default: undefined },
+        /* What was actually weighed or counted, in R&D's words. */
+        notes: { type: String, trim: true, default: "", maxlength: 500 },
+      },
+
+      /* ══ DOES ANYTHING GO OUTSIDE? — PRODUCTION'S ANSWER ══════════════
+         `serviceRequirements` holds two departments' rows and an empty array
+         answers neither of them. Production owns the outside-process half
+         (`services/production/styleRoute.service.js` is the only door), so
+         Production is asked whether this style is finished entirely in-house.
+
+         `false` — with its reason — is what makes the outside-services family
+         answerable. An empty list on its own never was and never will be: a
+         style whose finishing nobody has considered looks identical to one
+         that genuinely goes nowhere, and costing the second is right only by
+         luck. */
+      outsideProcessDecision: applicabilityDecision(),
+
+      /* ══ IS THERE DEVELOPMENT OR TOOLING? — MERCHANDISING'S ANSWER ═════
+         The other half of the same array, and the same argument. Merchandising
+         states what one-time work a style needs — pattern, marker, screens,
+         moulds, a machine setup — through
+         `services/merchandising/styleDevelopment.service.js`, and answers here
+         whether it needs any at all.
+
+         Row-level exclusions are a different and narrower fact: "we considered
+         screens and dropped them" lives on the row, with its own reason, and
+         says nothing about whether the style needs development work. */
+      developmentDecision: applicabilityDecision(),
+
+      serviceRequirements: [
+        {
+          /* ── THIS ROW'S OWN IDENTITY ──────────────────────────────
+             A style may legitimately need the same service twice — two
+             different washes quoted separately — or the same charge type
+             twice, screens for the body and screens for the sleeve. Keyed by
+             what they NAME, those two rows are one row: they collide in the
+             costing, and one of them is either merged away or counted
+             twice. Neither is a thing anybody asked for.
+
+             Minted server-side, preserved across edits and resubmissions, and
+             never taken from the browser unless the style already carries it.
+             The costing's line key is built from it. */
+          rowId: { type: String, trim: true, maxlength: 40 },
+          /* The company-scoped Service master. */
+          serviceId: { type: mongoose.Schema.Types.ObjectId, ref: "Service" },
+          serviceCode: { type: String, trim: true, default: "" },
+          serviceName: { type: String, trim: true, default: "" },
+          /* ── RECURRING WORK, OR ONE-TIME SETUP ──────────────────
+             The same Service master answers both, and they are completely
+             different costs. A wash is bought per garment and scales with the
+             run; making the screens to print with is bought ONCE and diluted
+             across it. Costing them alike is a hundredfold error in one
+             direction or the other on a 500-piece order.
+
+             `OUTSIDE_PROCESS` is the default because every row written before
+             this field existed is one — that is what the collection was for.
+             `DEVELOPMENT_TOOLING` is a deliberate statement, and it forces
+             the basis to the whole run. */
+          purpose: {
+            type: String,
+            enum: ["OUTSIDE_PROCESS", "DEVELOPMENT_TOOLING"],
+            default: "OUTSIDE_PROCESS",
+          },
+          /* ── AND WHERE A ONE-TIME CHARGE COMES FROM ───────────────
+             `SUPPLIER_QUOTATION` when somebody outside does the work and has
+             quoted for it; `COMPANY_POLICY` when the company does it itself
+             and Finance has published a standing charge. Never both: two
+             sources for one requirement is two answers, and nothing here
+             chooses between them.
+
+             Absent on an OUTSIDE_PROCESS row, which has only one source. */
+          developmentSource: {
+            type: String,
+            enum: ["SUPPLIER_QUOTATION", "COMPANY_POLICY"],
+            default: undefined,
+          },
+          /* Which configured charge, by its policy key. NOT an amount: R&D
+             says what work is needed, Finance says what the company charges
+             for it, and the engine reads the effective entry at calculation
+             time. A figure typed here would be a second, undated answer. */
+          developmentChargeKey: { type: String, trim: true, default: "", maxlength: 60 },
+          /* What R&D asked for — "garment wash, enzyme, 2 cycles". The
+             master's description is generic; this is about this style. */
+          specification: { type: String, trim: true, default: "", maxlength: 2000 },
+          /* ── MISSING IS MISSING HERE TOO ──────────────────────────────── */
+          quantity: { type: Number, min: 0, default: undefined },
+          /* How the supplier bills it — per piece, per kg, per lot. Text, for
+             the reason `Service.billingUnit` gives: service billing units are
+             not stock units and forcing them into the Unit Master corrupts
+             both. */
+          billingUnit: { type: String, trim: true, default: "" },
+          basis: {
+            type: String,
+            enum: ["PER_GARMENT", "FIXED_PER_RUN"],
+            default: "PER_GARMENT",
+          },
+          /* Which desk stated the requirement. The SAM beside it is R&D's;
+             a finishing process is often Production's call, and a costing
+             that cannot say which has nobody to ask when it is wrong. */
+          owner: {
+            type: String,
+            enum: ["RND", "PRODUCTION"],
+            default: "RND",
+          },
+          /* ── THE SAME TWO WORDS THE TECHNICAL SOURCE SPEAKS ──────────
+             `BOM_PLANNED` is what a planned MATERIAL row is called
+             (`technicalSource.EVIDENCE`), and a planned packaging or service
+             row is the same kind of claim. A synonym here would mean the
+             costing had to translate between two vocabularies for one fact,
+             and the translation is where they stop agreeing.
+
+             Defaulted to PLANNED, never MEASURED: "measured on the sample" is
+             a claim the sample demonstrated this figure, and it is what lets
+             a costing treat the row as verified. A row nobody answered for
+             has demonstrated nothing. */
+          /* -- NO DEFAULT, BECAUSE NOBODY ANSWERED --------------------
+             `BOM_PLANNED` looked like the safe default and was still a
+             claim the schema made on somebody's behalf. It also contradicted
+             the write path, which REQUIRES the answer: a row could only
+             acquire this value by never being asked, and at rest it read
+             identically to a row where a person had chosen "planned".
+
+             Missing stays missing. Costing reads an absent evidence AS
+             planned — the weaker reading, applied where the consequence
+             lives — and it can never become "measured" on its own. */
+          evidence: {
+            type: String,
+            enum: ["SAMPLE_MEASURED", "BOM_PLANNED"],
+            default: undefined,
+          },
+          included: { type: Boolean, default: true },
+          excludedReason: { type: String, trim: true, default: "", maxlength: 500 },
+          notes: { type: String, trim: true, default: "" },
+        },
+      ],
+
       // The operations (process steps + time) R&D actually ran making this
       // sample — raised alongside consumptionRawItems (24 Aug 2026, explicit
       // request), same shape as StockItem.operations so it can be synced
