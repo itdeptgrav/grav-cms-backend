@@ -1,170 +1,288 @@
-# Running the face engine in production
+# Hosting the face engine on GravServer
 
-## The thing that confuses everyone first
+Written against `GRAVSERVER_INFRASTRUCTURE_HANDOFF.md` (snapshot 2026-09-10,
+host `RISHALIENWARE`). Every value in that snapshot — ports, PM2 process names,
+free memory, LAN address — is described there as stale-able. **Inspect before
+relying on any of it, including anything quoted below.**
 
-**You do not open a port on `grav.in`.** The hosted API and the face engine are
-not the same machine and never will be, so "which port on the domain" is the
-wrong question. The right one is *"what URL does the API call to reach the
-engine"* — and the answer is an ordinary `https://` hostname on port 443, with
-no port in it at all.
+## The short version
+
+The face engine is a Python process that must run **on the same machine as the
+API**, reachable only over loopback. It is not a web app, it gets no hostname,
+and it must never be put behind a Cloudflare tunnel.
 
 ```
-  browser                    hosted API                  punch-in machine
-  (cms.grav.in)              (Render)                    (factory floor)
-      │                          │                              │
-      │  POST /hr/face-enroll/session/<token>/upload             │
-      ├─────────────────────────►│                              │
-      │                          │  POST /register/upload       │
-      │                          │  X-Face-Key: <secret>        │
-      │                          ├─────────────────────────────►│
-      │                          │   https://face.grav.in:443   │  Python
-      │                          │◄─────────────────────────────┤  InsightFace
-      │◄─────────────────────────┤        {"readiness":"READY"} │  + the photos
+   cms.grav.in ──► Cloudflare ──► RISHALIENWARE
+                                    │
+                                    ├── grav-cms (Next.js, PM2)      :3001
+                                    ├── grav-cms-backend (PM2)       :5000
+                                    │        │
+                                    │        │ 127.0.0.1 only, never routed
+                                    │        ▼
+                                    └── grav-face-engine (PM2)       :5001
+                                             │
+                                             ▼
+                                    C:\GravServer\data\face-biometric
+                                    (photos — OUTSIDE any app directory)
 ```
 
-The engine has to run where the photos are. `REGISTERED_PEOPLE`, the gallery
-and the model live on the punch-in machine's disk. Render's filesystem is
-ephemeral and has no camera attached, so the engine cannot move there.
+Because the API and the engine share a host, `FACE_BIOMETRIC_SERVICE_URL` stays
+`http://127.0.0.1:5001` and **no tunnel, hostname or DNS record is involved**.
 
-### Why the default fails in production, silently
+An earlier draft of this document assumed the API was hosted elsewhere and
+described a Cloudflare tunnel for the engine. On GravServer that would publish a
+service whose entire security model is that it is not reachable.
 
-`FACE_BIOMETRIC_SERVICE_URL` defaults to `http://127.0.0.1:5001`. On a laptop
-that is correct. On Render, `127.0.0.1` is *Render's own loopback*, where
-nothing is listening — so every face call answers
-`face_service_unreachable` and the UI says the service is offline. Nothing is
-broken; it is pointing at the wrong machine.
+## The one thing that will lose the photos
 
-## Setting it up
+**`FACE_BIOMETRIC_ROOT` must point outside every application directory.**
 
-### 1. A hostname for the engine
+The deployment watcher replaces the app working tree on each promotion. Photos
+under `C:\GravServer\apps\<backend>\...` would be untracked files inside a
+directory that deployment automation manages, and the handoff warns specifically
+against `git clean` behaviour that removes untracked files. Registrations are
+not re-creatable: every employee would have to sit for their photographs again.
 
-The punch-in machine is behind a home/office router with no static IP, so the
-engine must dial **out**. `cloudflared` is already vendored in this repo.
+Put them where deployment never looks:
+
+```
+C:\GravServer\data\face-biometric\
+    REGISTERED_PEOPLE\        one folder per employee, named by biometricId
+    biometric_people.json     folder -> employee mapping
+    biometric_status.json     exported snapshot (fallback only)
+```
+
+There is a private Drive backup and the embeddings are in MongoDB, so a loss is
+*recoverable* — but recovery is manual, and the local folder is what the engine
+actually reads.
+
+## Step 1 — Inspect (do not skip)
+
+```powershell
+hostname
+pm2 status
+Get-NetTCPConnection -State Listen | Sort-Object LocalPort |
+  Select-Object LocalAddress,LocalPort,OwningProcess
+Get-Service cloudflared, MongoDB
+Get-CimInstance Win32_OperatingSystem |
+  Select-Object TotalVisibleMemorySize,FreePhysicalMemory
+```
+
+Three things to establish:
+
+1. **Is 5001 free?** The handoff lists 3000/3001/3002/3300/4500/5000 as *not
+   exhaustive*. If 5001 is taken, pick another and set `FACE_BIOMETRIC_PORT` —
+   nothing hardcodes it.
+2. **Does a `grav-face-engine` process already exist?** PM2 names must be unique.
+3. **Free memory.** The engine holds one InsightFace model; budget roughly 700MB
+   resident. On 32GB that is nothing, but check rather than assume.
+
+## Step 2 — Python
+
+The engine is Python; everything else on GravServer is Node. This is the one
+place that differs, and it does **not** mean Docker or WSL — a native Windows
+Python is what is wanted, which is what the handoff asks for.
+
+```powershell
+python -m venv C:\GravServer\venvs\face
+C:\GravServer\venvs\face\Scripts\python.exe -m pip install --upgrade pip
+C:\GravServer\venvs\face\Scripts\python.exe -m pip install numpy opencv-python-headless onnxruntime insightface
+```
+
+`opencv-python-headless`, not `opencv-python`: the server has no display, and
+the headless build drops the GUI dependencies.
+
+**The model downloads on first run** — buffalo_l, about 280MB, into
+`%USERPROFILE%\.insightface`. That lands in the home directory of **whichever
+Windows account PM2 runs as**, which is not necessarily the account you are
+typing in. Start the engine once by hand as that account, watch it print
+`buffalo_l ready`, and only then hand it to PM2. A first boot under PM2 with no
+model cached looks exactly like a hang.
+
+## Step 3 — The data directory
+
+```powershell
+New-Item -ItemType Directory -Force C:\GravServer\data\face-biometric\REGISTERED_PEOPLE
+```
+
+Confirm the PM2 account can write there.
+
+## Step 4 — Environment
+
+These go in the **backend's** `.env`. Back it up before editing, per the
+handoff's rules, and keep its contents out of deployment logs.
 
 ```bash
-cloudflared tunnel login
-cloudflared tunnel create grav-face
-cloudflared tunnel route dns grav-face face.grav.in
-cloudflared tunnel run --url http://127.0.0.1:5001 grav-face
+# Where the photos live — OUTSIDE any app directory. See above.
+FACE_BIOMETRIC_ROOT=C:/GravServer/data/face-biometric
+
+# The interpreter that has insightface.
+FACE_PYTHON=C:/GravServer/venvs/face/Scripts/python.exe
+
+# Loopback. No tunnel, no hostname. Change only if 5001 was taken.
+FACE_BIOMETRIC_SERVICE_URL=http://127.0.0.1:5001
+FACE_BIOMETRIC_PORT=5001
+
+# What enrolment links are built from. Without it the backend falls back to the
+# request Origin — usually right, still a guess.
+FRONTEND_URL=https://cms.grav.in
+
+# Optional on loopback, recommended on a shared host: without it, any process on
+# this machine can POST a face into any employee's gallery. Same value on both
+# sides. The engine refuses to start non-loopback without one.
+FACE_ENGINE_KEY=<openssl rand -base64 32>
 ```
 
-No port forwarding, no firewall rule, no static IP. Cloudflare terminates TLS
-and you get `https://face.grav.in` on 443.
+Forward slashes work through both Node and Python on Windows and avoid the
+backslash-escaping problem in `.env` files.
 
-Run it as a service so it survives reboots (`cloudflared service install` on
-Windows, a `launchd` plist on macOS).
+Set `FACE_BIOMETRIC_ROOT` and `FACE_PYTHON` **only** on the host that runs the
+engine. The API never touches those paths.
 
-### 2. A shared secret — not optional
+## Step 5 — Prove it by hand before PM2
 
-The engine has no user accounts. Before this was added it simply trusted its
-caller, which was safe only because it was bound to loopback. **A tunnel makes
-it reachable by anyone who learns the hostname**, and unauthenticated it would:
-
-- accept `/register/upload` — enrol a stranger's face against an employee ID,
-  which puts a stranger's face on file as an employee;
-- answer `/health` with `gallery: [...]`, i.e. **every enrolled biometric ID**;
-- answer `/verify` for anybody's photo.
-
-So generate one secret and set it on **both** sides:
-
-```bash
-openssl rand -base64 32
-```
-
-| Where | Variable |
-|---|---|
-| punch-in machine (engine) | `FACE_ENGINE_KEY` |
-| hosted API (Render env) | `FACE_ENGINE_KEY` — the same value |
-
-The API sends it as `X-Face-Key` on every engine call; the engine compares it
-with `hmac.compare_digest` and answers `401 unauthorised` otherwise.
-
-**The engine refuses to start** bound to anything but loopback without a key.
-That interlock is deliberate: forgetting an environment variable should cost
-you a failed start, not a silent open endpoint.
-
-### 3. Environment
-
-On the **punch-in machine**:
-
-```bash
-FACE_PYTHON=/path/to/venv/bin/python        # Windows: .../Scripts/python.exe
-FACE_BIOMETRIC_ROOT=/Volumes/ESD-USB/GRAV_BIOMETRIC
-FACE_ENGINE_KEY=<the secret>
-FACE_BIOMETRIC_PORT=5001                    # local only; not the public port
-```
-
-Start it:
-
-```bash
+```powershell
+cd C:\GravServer\apps\<backend>
 npm run face:service
 ```
 
-**On Windows, run that from PowerShell, not from a WSL/Git-Bash prompt.** The
-runner is `services/face-biometric/run.js` (Node) precisely because `bash` on
-Windows resolves to WSL, where the Windows venv path in `FACE_PYTHON` does not
-exist — and the old shell entry point failed with "not an executable
-interpreter" naming a file that was plainly there. `run.sh` is now a shim that
-detects WSL and says so.
+Expect:
 
-On the **hosted API** (Render environment):
-
-```bash
-FACE_BIOMETRIC_SERVICE_URL=https://face.grav.in
-FACE_ENGINE_KEY=<the same secret>
-FRONTEND_URL=https://cms.grav.in
+```
+   buffalo_l ready (CPU, det_size=(640, 640))
+gallery: N employee(s) usable for sign-in — ...
+face service on http://127.0.0.1:5001   auth=key
 ```
 
-`FRONTEND_URL` is what the self-registration link is built from. Without it the
-backend falls back to the request `Origin`, which is usually right but is a
-guess; set it and the link is always `https://cms.grav.in/face-enroll/<token>`.
+`auth=loopback-only` there means `FACE_ENGINE_KEY` did not reach the process.
 
-Note `FACE_BIOMETRIC_ROOT` and friends are **not** set on Render. The API never
-touches those paths — only the engine does. Setting them there is harmless but
-misleading.
+Then from another shell:
 
-### 4. Check it
-
-From the hosted API's shell:
-
-```bash
-curl -s -H "X-Face-Key: $FACE_ENGINE_KEY" https://face.grav.in/health
+```powershell
+curl.exe -s -H "X-Face-Key: <the key>" http://127.0.0.1:5001/health
 ```
 
-Expect JSON with `gallery_size`. Then, in the CMS, an HR user opening any
-employee's **Biometric** tab should see readiness rather than "the face service
-is not running".
+Do not continue until this works by hand. A PM2 process that fails at startup is
+much harder to read than a terminal printing the reason.
 
-Two failure signatures worth knowing:
+## Step 6 — PM2
+
+The entry point is `services/face-biometric/run.js` — a **Node** script that
+reads the `FACE_*` keys from `.env`, resolves the interpreter and data paths,
+fixes the console encoding, and spawns Python. Giving PM2 the Node wrapper
+rather than `python.exe` directly means the engine is managed exactly like every
+other GravServer process, and one file decides those paths.
+
+```powershell
+cd C:\GravServer\apps\<backend>
+pm2 start services/face-biometric/run.js --name grav-face-engine -- service
+pm2 status
+pm2 logs grav-face-engine --lines 50
+pm2 save
+```
+
+Verify restart behaviour and that the environment survives it. The handoff is
+explicit that boot persistence is not to be claimed without testing it in a
+maintenance window.
+
+## Step 7 — Restart the API, then verify
+
+The backend reads `FACE_BIOMETRIC_SERVICE_URL` and `FACE_ENGINE_KEY` at boot.
+
+```powershell
+pm2 restart <backend-process-name>
+curl.exe -s http://127.0.0.1:5000/hr/face-registration/health
+```
+
+Expect `"running": true` and a model name. The three failure signatures are
+deliberately distinct, because they need different actions:
 
 | Symptom | Cause |
 |---|---|
-| `face_service_unreachable` | tunnel down, or `FACE_BIOMETRIC_SERVICE_URL` still loopback |
-| every call `401 unauthorised` | the two `FACE_ENGINE_KEY` values differ |
+| `face_service_unreachable` | engine not running, or the URL/port disagree |
+| `face_engine_unauthorised` | the two `FACE_ENGINE_KEY` values differ |
+| `face_service_timeout` | engine running but busy — **not** a restart signal |
 
-## Hardening beyond the shared secret
+Then in the CMS: open any employee's **Biometric** tab — it should show
+readiness rather than "the face service is not running". Generate a
+self-registration link and open it on a phone: it must greet by first name with
+**Start enabled**. Start disabled means the page correctly detected an
+unreachable engine.
 
-The secret is the floor, not the ceiling. On the same tunnel you can add:
+## Step 8 — The deployment gotcha
 
-- **Cloudflare Access** with a service token, so unauthenticated requests are
-  dropped at Cloudflare and never reach the machine.
-- **A WAF rule** limiting the hostname to Render's egress IPs.
+The engine's code lives inside the backend repo (`services/face-biometric/`), so
+a backend deployment updates the Python files — **but restarts only the backend
+process.** The engine keeps running the code it loaded at start.
 
-Both are configuration, not code, and neither replaces the key — if either is
-ever misconfigured, the key is what still holds.
+After any deployment that touches `services/face-biometric/*.py`:
 
-## What is still not solved
+```powershell
+pm2 restart grav-face-engine
+```
 
-**There is no liveness check, and registration is the only consumer.** Face
-SIGN-IN was removed — nothing is mounted at `/api/auth/face` any more, and a
-face no longer opens a session. What remains registers faces and reports
-whether a gallery is good enough to be used.
+Until that is wired into the deploy step, treat it as a manual follow-up. It is
+the most likely way for this to go quietly wrong: everything looks deployed, and
+the engine is running last week's rules.
 
-That matters for anything built on this later: a printed photograph held to a
-camera passes the quality gate as readily as a person does. Whatever eventually
-consumes these registrations — a gate, a kiosk, another system reading the
-stored embeddings — has to decide for itself whether it needs liveness. It does
-not get it from here.
+Restarting the engine drops its in-memory gallery and rebuilds it from disk — a
+few seconds during which registration reports the service as busy. Harmless, but
+not something to do mid-enrolment.
 
-**One engine, one site.** A second factory needs a second engine, a second
-hostname and a routing decision the code does not currently make.
+## Step 9 — Record it
+
+Per the handoff's new-project standard:
+
+```text
+Project name:       grav-face-engine
+Repository:         grav-cms-backend (services/face-biometric)
+Production branch:  main
+Server path:        C:\GravServer\apps\<backend>\services\face-biometric
+Runtime:            Python 3.x via C:\GravServer\venvs\face
+Build command:      (none — pip install once)
+Start command:      pm2 start services/face-biometric/run.js --name grav-face-engine -- service
+PM2 process name:   grav-face-engine
+Local port:         5001 (loopback only — NOT routed)
+Public hostname:    (none, deliberately)
+Health endpoint:    http://127.0.0.1:5001/health   (requires X-Face-Key)
+Database:           none directly; the API writes face_photos to MongoDB
+Environment file:   the backend's .env (FACE_* keys)
+Log location:       PM2 logs, grav-face-engine
+Deployment method:  ships with the backend repo; needs a manual pm2 restart
+Rollback method:    pm2 stop grav-face-engine — the API degrades gracefully
+Data directory:     C:\GravServer\data\face-biometric   (NOT in an app dir)
+```
+
+## What happens if you deploy without any of this
+
+Nothing breaks. Verified against a backend pointed at a dead engine:
+
+- everything unrelated to faces is unaffected;
+- **sign-in is unaffected** — face login was removed, so nothing in the login
+  path touches the engine;
+- the HR Biometric tab answers `HTTP 200` with "the face service is not
+  running", not a 500;
+- HR **can** still generate a registration link (that only needs the database);
+- the employee opens it, is greeted by name, and sees "registration service is
+  offline" with **Start disabled** — so nobody takes photos that would be
+  refused.
+
+Face registration is simply inert until the engine is up. That is a safe state
+to deploy into, which means the engine can be set up after the code ships rather
+than as a precondition.
+
+## What this does not solve
+
+**There is no liveness check.** A printed photograph held to a camera passes the
+quality gate as readily as a person does. Face SIGN-IN has been removed, so this
+is not an authentication weakness today — but anything built on these
+registrations later (a gate, a kiosk, another system reading the stored
+embeddings) has to decide for itself whether it needs liveness. It does not get
+it from here.
+
+**The engine is single-instance.** It holds its gallery in memory and rebuilds
+from disk. Two engines against one data directory is not a configuration anyone
+has tested.
+
+**One engine, one site.** A second factory needs a second engine, its own data
+directory, and a routing decision the code does not currently make.

@@ -231,12 +231,12 @@ That map is process-local, so recording state does not survive a restart or scal
 `.env` is untracked. Required: `MONGODB_URI` (defaults to `mongodb://localhost:27017/grav_clothing`), `PORT` (5000), `JWT_SECRET`, `JWT_EXPIRE`, `NODE_ENV`, `FIREBASE_PROJECT_ID` / `FIREBASE_CLIENT_EMAIL` / `FIREBASE_PRIVATE_KEY` / `FIREBASE_SERVICE_ACCOUNT` / `FIREBASE_DATABASE_URL` / `FIREBASE_STORAGE_BUCKET`, `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, `GEMINI_API_KEY`, `GOOGLE_SERVICE_ACCOUNT_KEY` / `GOOGLE_DRIVE_FOLDER_ID` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN`, `BREVO_API_KEY` / `ENABLE_EMAILS` / `CUSTOMER_SENDER_EMAIL`, `TEAMOFFICE_*` (biometric sync), `SALARY_ENCRYPTION_KEY`, `COWORK_FRONTEND_URL`, `PM_APPROVAL_FOR_MRF`.
 
 Face biometrics adds `FACE_PYTHON`, `FACE_BIOMETRIC_ROOT`,
-`FACE_BIOMETRIC_SERVICE_URL` and `FACE_ENGINE_KEY`. The last two are the ones
-that matter in production and are explained in
-`docs/face-biometric-deployment.md`: **the engine is not on the API host**, so
-the service URL must be the punch-in machine's tunnel hostname, and the key is
-the engine's only authentication. The engine refuses to bind anything but
-loopback without it.
+`FACE_BIOMETRIC_SERVICE_URL` and `FACE_ENGINE_KEY`, all explained in
+`docs/face-biometric-deployment.md`. On GravServer the engine runs as its own
+PM2 process on the **same host**, so the service URL stays loopback and it is
+never routed through Cloudflare. The one that will bite you is
+`FACE_BIOMETRIC_ROOT`: it must point OUTSIDE any app directory, or a deployment
+that replaces the working tree takes the registration photos with it.
 
 `NODE_ENV=production` flips cookies to `secure: true, sameSite: "none"` — cross-site auth silently breaks in production if it isn't set.
 
