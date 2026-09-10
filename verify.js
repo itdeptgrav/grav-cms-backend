@@ -41,6 +41,7 @@ const PURE = [
   "verifyBuiltInFields",       // the field registry still matches the form
   "verifyCompanyDocuments",    // the company-documents model
   "verifyHrWriteCoverage",     // every HR write is guarded or deliberately exempt
+  "verifyNoUndefinedRefs",     // no route uses a name it never imported
 ];
 
 const READONLY = [
@@ -66,7 +67,9 @@ const WRITES = [
   "verifyDeveloperSide",       // the anomaly scan catches what it promises
   "verifyAdminCenter",         // form definitions, job control, role floors
   "verifyBillMatching",        // a receipt settles the invoice it is matched to
+  "verifyJournalMatching",     // a payment settles the payroll journal it is matched to
   "verifyPayrollPaymentLink",  // payroll posts a journal; a linked payment marks it paid
+  "verifyFaceEnrollInvite",    // the self-registration link, and what it refuses
 ];
 
 const TIERS = { pure: PURE, readonly: READONLY, writes: WRITES };

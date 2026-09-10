@@ -44,10 +44,59 @@ const FACE_BIOMETRIC_STATUS_FILE =
 
 const FACE_BIOMETRIC_PORT = Number(process.env.FACE_BIOMETRIC_PORT || 5001);
 
-/** Where the running engine answers. Localhost: it has no auth of its own. */
+/**
+ * Where the running engine answers.
+ *
+ * Loopback by default, which is the right answer whenever Node and the engine
+ * are the same machine. THEY ARE NOT THE SAME MACHINE IN PRODUCTION: the API
+ * is hosted, the engine runs on the punch-in machine with the photos. There,
+ * this must be the engine's tunnel hostname over https — a URL, not a port on
+ * the API's own domain. See docs/face-biometric-deployment.md.
+ */
 const FACE_BIOMETRIC_SERVICE_URL =
   process.env.FACE_BIOMETRIC_SERVICE_URL ||
   `http://127.0.0.1:${FACE_BIOMETRIC_PORT}`;
+
+/**
+ * Shared secret with the engine, sent as X-Face-Key.
+ *
+ * The engine has no user accounts; this is the whole of its authentication.
+ * Empty is correct ONLY on loopback, and the engine itself refuses to bind
+ * anything else without one, so the two halves cannot disagree in the unsafe
+ * direction.
+ */
+const FACE_ENGINE_KEY = (process.env.FACE_ENGINE_KEY || "").trim();
+
+/** True when the engine is somewhere a stranger could also reach. */
+function engineIsRemote() {
+  try {
+    const host = new URL(FACE_BIOMETRIC_SERVICE_URL).hostname.toLowerCase();
+    return !["127.0.0.1", "::1", "localhost", "[::1]"].includes(host);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Headers for every engine call. One definition, because the alternative is
+ * four copies of a fetch that each have to remember the key — and the one
+ * that forgets fails closed with a 401 nobody can explain.
+ */
+function engineHeaders(extra = {}) {
+  const headers = { "Content-Type": "application/json", ...extra };
+  if (FACE_ENGINE_KEY) headers["X-Face-Key"] = FACE_ENGINE_KEY;
+  return headers;
+}
+
+/* Said once at boot rather than per request. A remote engine with no key is
+   an open enrolment endpoint, and /health hands out every biometric ID. */
+if (engineIsRemote() && !FACE_ENGINE_KEY) {
+  console.warn(
+    `[face] FACE_BIOMETRIC_SERVICE_URL points at ${FACE_BIOMETRIC_SERVICE_URL} ` +
+      `but FACE_ENGINE_KEY is not set. The engine will refuse these calls. ` +
+      `Set the same key on both sides.`,
+  );
+}
 
 /** The command an operator should run when the engine is not up. */
 const START_COMMAND = "npm run face:service";
@@ -74,7 +123,7 @@ async function callEngine(endpoint, body, timeoutMs = 20000) {
   try {
     const res = await fetch(`${FACE_BIOMETRIC_SERVICE_URL}${endpoint}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: engineHeaders(),
       body: JSON.stringify(body || {}),
       signal: ctrl.signal,
     });
@@ -96,6 +145,7 @@ async function engineHealth(timeoutMs = 4000) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${FACE_BIOMETRIC_SERVICE_URL}/health`, {
+      headers: engineHeaders(),
       signal: ctrl.signal,
     });
     const json = await res.json();
@@ -144,5 +194,8 @@ module.exports = {
   engineEnv,
   callEngine,
   engineHealth,
+  engineHeaders,
+  engineIsRemote,
+  FACE_ENGINE_KEY,
   serviceUnavailable,
 };

@@ -31,6 +31,7 @@ its own gate, and gates expire.
 import argparse
 import base64
 import binascii
+import hmac
 import json
 import os
 import sys
@@ -41,10 +42,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+# Windows consoles default to cp1252, which cannot encode the characters used
+# in this file's own status lines — the engine loaded its model fine and then
+# died printing a warning about the gallery. Status output must never be able
+# to kill the service, so the streams are widened before anything prints.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import face_biometric as FB
 import face_biometric_service as SVC
 
 DEFAULT_PORT = 5001
+
+# Shared secret with the Node API. Empty means "no key", which is only
+# allowed while bound to loopback — see main(). When set, EVERY request must
+# carry it in X-Face-Key, /health included: health lists the gallery, and the
+# gallery is a list of real employee IDs.
+ENGINE_KEY = os.environ.get("FACE_ENGINE_KEY", "").strip()
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_loopback(host):
+    return str(host).strip().lower() in _LOOPBACK_HOSTS
 # One frame of a webcam, generously. A request larger than this is not a
 # face capture, so it is refused before it is decoded rather than after.
 MAX_BODY_BYTES = 6 * 1024 * 1024
@@ -123,6 +146,10 @@ class Engine:
         self.hr_map = hr_map or SVC.HR_MAP_PATH
         self.debug_dir = debug_dir
         self.app = None
+        # A second, leaner model used ONLY by verify(). Registration keeps the
+        # full-size detector; sign-in runs several times a second and pays for
+        # its detector on every frame. See FB.build_live_face_app.
+        self.live_app = None
         self.gallery = {}
         self.report = {}
         self.loaded_at = None
@@ -134,6 +161,28 @@ class Engine:
         print("loading face model ...", flush=True)
         self.app = FB.build_face_app(verbose=True)
         self.reload_gallery()
+
+    def get_live_app(self):
+        """The lean model used by /verify, built on first use.
+
+        It used to load at boot beside the registration model. Face SIGN-IN has
+        since been removed from the CMS, so on a server that only registers
+        faces — which is every deployment now — that was a second ~300MB model
+        held for a request that never arrives. Memory is the binding constraint
+        on a small host, so it is paid for only when something actually calls
+        /verify (the CLI kiosk path).
+        """
+        if self.live_app is None:
+            self.live_app = FB.build_live_face_app(verbose=True)
+            # The first inference pays for lazily-allocated arenas and thread
+            # pools — roughly twice the steady-state cost. Spend it here rather
+            # than on the person standing at the camera.
+            try:
+                import numpy as _np
+                self.live_app.get(_np.zeros((360, 640, 3), dtype=_np.uint8))
+            except Exception:
+                pass
+        return self.live_app
 
     def reload_gallery(self):
         # Only the punchable gallery is ever loaded: an unlinked or
@@ -183,7 +232,8 @@ class Engine:
             return out
 
         try:
-            faces = self.app.get(img)
+            # The live model, not the registration one. Built on first use.
+            faces = self.get_live_app().get(img)
         except Exception as e:
             out["reason"] = f"detect_error:{type(e).__name__}"
             return out
@@ -334,7 +384,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorised(self):
+        """True when the caller proved it is the Node API.
+
+        No key configured means the service is on loopback (main() refuses
+        any other binding without one), where the OS is the boundary.
+        """
+        if not ENGINE_KEY:
+            return True
+        got = self.headers.get("X-Face-Key") or ""
+        # compare_digest so a wrong key cannot be found one byte at a time.
+        return hmac.compare_digest(got, ENGINE_KEY)
+
     def do_GET(self):
+        if not self._authorised():
+            return self._json(401, {"ok": False, "error": "unauthorised"})
         if self.path.rstrip("/") in ("/health", ""):
             rep = ENGINE.report or {}
             return self._json(200, {
@@ -356,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
+        if not self._authorised():
+            return self._json(401, {"ok": False, "error": "unauthorised"})
         path = self.path.rstrip("/")
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -397,14 +463,83 @@ class Handler(BaseHTTPRequestHandler):
                 hr_map_path=ENGINE.hr_map)
             if refusal:
                 return self._json(400, {"ok": False, "error": refusal})
+
+            # QUICK MODE — judge ONLY what was just written.
+            #
+            # The full path below re-embeds the entire gallery twice (once to
+            # reload it, once to build the report). HR uploading twenty photos
+            # in one go pays that once and it is fine. Self-registration sends
+            # ONE photo at a time, so the same work is paid per photo, and it
+            # grows with the gallery: at 200 enrolled employees a single
+            # snapshot means thousands of CPU embeddings, the request passes
+            # the API's timeout, and the phone is told the service is
+            # unreachable while the engine is busy and healthy.
+            #
+            # One photo needs one embedding to answer "was that usable?".
+            # The whole-gallery recompute is deferred to /register/finalise,
+            # which the enrolment flow calls once at the end.
+            # Judge each photo that was just written, on BOTH paths. One
+            # embedding per new photo is cheap next to anything else here, and
+            # it is what the API stores so other systems can recognise this
+            # person without holding the photograph. Doing it only on the quick
+            # path meant a phone upload produced an embedding and an HR upload
+            # did not.
+            #
+            # Same fallback save_registration_photos applies: the engine carries
+            # None when it was not given an explicit directory.
+            reg_root = ENGINE.registered_dir or FB.REGISTERED_PEOPLE_DIR
+            verdicts, accepted_now = [], 0
+            for item in res["saved"]:
+                photo = os.path.join(reg_root, res["folder"], item["filename"])
+                rec = FB.analyse_photo(ENGINE.app, photo)
+                if rec["accepted"]:
+                    accepted_now += 1
+                emb = rec.get("embedding")
+                verdicts.append({"filename": item["filename"],
+                                 "accepted": bool(rec["accepted"]),
+                                 "role": rec["role"],
+                                 "reason": rec["reason"],
+                                 "embedding": ([float(x) for x in emb]
+                                               if emb is not None else None),
+                                 "model": FB.FACE_MODEL_NAME})
+
+            if payload.get("quick"):
+                # Stop here: no gallery reload, no whole-folder report.
+                return self._json(200, {"ok": True, **res, "quick": True,
+                                        "verdicts": verdicts,
+                                        "accepted_now": accepted_now,
+                                        "status": None})
+
             # A gallery that changed on disk is stale in memory. Reloading
             # here is what makes the status the operator sees after an
-            # upload the status the sign-in page will actually use.
+            # upload the status the operator sees.
             ENGINE.reload_gallery()
             report = SVC.employee_registration_report(
                 res["folder"], ENGINE.registered_dir, ENGINE.hr_map,
                 app=ENGINE.app)
-            return self._json(200, {"ok": True, **res, "status": report})
+            return self._json(200, {"ok": True, **res, "status": report,
+                                    "verdicts": verdicts,
+                                    "accepted_now": accepted_now})
+
+        if path == "/register/finalise":
+            # The expensive half of an upload, once, at the end of a
+            # self-registration: reload the sign-in gallery so the employee
+            # can actually be recognised, then report their readiness.
+            folder = payload.get("folder")
+            if not folder:
+                return self._json(400, {"ok": False, "error": "missing_folder"})
+            ENGINE.reload_gallery()
+            # reload_gallery already embedded every photo on disk. Handing that
+            # result to the report is the difference between one pass over the
+            # gallery and two.
+            report = SVC.employee_registration_report(
+                folder, ENGINE.registered_dir, ENGINE.hr_map, app=ENGINE.app,
+                preloaded=(ENGINE.folder_gallery, ENGINE.report))
+            if report is None:
+                return self._json(404, {"ok": False,
+                                        "error": "folder_not_found"})
+            return self._json(200, {"ok": True, "status": report,
+                                    "gallery_size": len(ENGINE.gallery)})
 
         if path == "/register/archive":
             res, refusal = SVC.archive_registration_photo(
@@ -420,14 +555,57 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, **res, "status": report})
 
         if path == "/register/snapshot":
-            # The whole picture, live from disk. The HR page reads this
-            # instead of a file somebody has to remember to regenerate —
-            # a status that needs a manual refresh is a status that is
-            # wrong most of the time.
-            return self._json(200, {"ok": True,
-                                    "snapshot": SVC.status_snapshot(
-                                        ENGINE.registered_dir,
-                                        ENGINE.hr_map, app=ENGINE.app)})
+            # The whole picture, from the gallery this process already holds.
+            #
+            # This used to recompute from disk on every call, which means one
+            # embedding per registration photo: measured at 19-40s for a SINGLE
+            # employee with six photos, against the API's 20s budget — so the
+            # HR page reported "the face service is not running" while the
+            # service was running and merely thinking. With a real roster it
+            # would be minutes.
+            #
+            # The engine already loaded exactly this at boot and reloads it
+            # whenever the gallery changes (upload, archive, finalise), so the
+            # recompute was redundant as well as slow. generated_at is set to
+            # when that load happened, not to now — a cached answer that claims
+            # to be live is worse than a slow one.
+            if payload.get("refresh"):
+                # The explicit "recheck" path, for when photos reached the
+                # folder by some route this process did not see.
+                ENGINE.reload_gallery()
+            snap = SVC.status_snapshot(
+                ENGINE.registered_dir, ENGINE.hr_map, app=ENGINE.app,
+                preloaded=(ENGINE.folder_gallery, ENGINE.report))
+            snap["generated_at"] = ENGINE.loaded_at
+            return self._json(200, {"ok": True, "snapshot": snap})
+
+        if path == "/register/embed":
+            # The embedding for a photo already on disk, so registrations made
+            # before the API started storing them can be filled in without
+            # asking anybody to sit for their photograph again. Reads one file
+            # and returns numbers; writes nothing.
+            folder = payload.get("folder")
+            filename = payload.get("filename")
+            if not folder or not filename:
+                return self._json(400, {"ok": False, "error": "missing_target"})
+            safe, why = SVC.safe_image_name(filename, 0)
+            if not safe or SVC.safe_folder_name(folder) != folder:
+                return self._json(400, {"ok": False, "error": why or "bad_target"})
+            reg_root = ENGINE.registered_dir or FB.REGISTERED_PEOPLE_DIR
+            photo = os.path.join(reg_root, folder, filename)
+            if not os.path.isfile(photo):
+                return self._json(404, {"ok": False, "error": "not_found"})
+            rec = FB.analyse_photo(ENGINE.app, photo)
+            emb = rec.get("embedding")
+            return self._json(200, {
+                "ok": True,
+                "filename": filename,
+                "accepted": bool(rec["accepted"]),
+                "reason": rec["reason"],
+                "embedding": ([float(x) for x in emb]
+                              if emb is not None else None),
+                "model": FB.FACE_MODEL_NAME,
+            })
 
         if path == "/register/photo":
             data, why = SVC.read_registration_photo(
@@ -438,10 +616,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "image": data})
 
         if path == "/register/status":
+            # Same economics as /register/snapshot: served from the gallery in
+            # memory unless the caller explicitly asks for a re-read. HR's
+            # "recheck" button is that caller, and is the one place where
+            # paying for a full pass is the whole point.
             folder = payload.get("folder")
+            if payload.get("refresh"):
+                ENGINE.reload_gallery()
             report = SVC.employee_registration_report(
                 folder, ENGINE.registered_dir, ENGINE.hr_map,
-                app=ENGINE.app)
+                app=ENGINE.app,
+                preloaded=(ENGINE.folder_gallery, ENGINE.report))
             if report is None:
                 return self._json(404, {"ok": False,
                                         "error": "folder_not_found"})
@@ -490,8 +675,12 @@ def main(argv=None):
                     "records no attendance.")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1",
-                    help="default 127.0.0.1 — this service has no auth of "
-                         "its own and must not be exposed")
+                    help="default 127.0.0.1. Any other binding requires "
+                         "FACE_ENGINE_KEY to be set")
+    ap.add_argument("--key", default=None,
+                    help="shared secret the Node API must send in "
+                         "X-Face-Key. Prefer the FACE_ENGINE_KEY env var; "
+                         "an argument is visible in the process list")
     ap.add_argument("--registered-dir", default=None)
     ap.add_argument("--hr-map", default=None)
     ap.add_argument("--debug", action="store_true",
@@ -499,6 +688,26 @@ def main(argv=None):
                          "default; frames are otherwise never written)")
     ap.add_argument("--debug-dir", default=None)
     args = ap.parse_args(argv)
+
+    global ENGINE_KEY
+    if args.key:
+        ENGINE_KEY = args.key.strip()
+
+    # THE INTERLOCK. Binding anywhere but loopback puts the gallery, the
+    # upload path and /verify on a network. Without a key that is an open
+    # endpoint that will happily enrol a stranger's face as an employee, and
+    # /health hands out every biometric ID before they even try. Refusing to
+    # start is the only behaviour that cannot be got wrong by forgetting a
+    # variable.
+    if not _is_loopback(args.host) and not ENGINE_KEY:
+        print(f"refusing to bind {args.host} with no key. "
+              f"Set FACE_ENGINE_KEY (the same value as the backend's) and "
+              f"restart. On loopback no key is needed.", file=sys.stderr)
+        return 2
+
+    if ENGINE_KEY and len(ENGINE_KEY) < 24:
+        print("⚠ FACE_ENGINE_KEY is short. Use 32+ random characters: "
+              "`openssl rand -base64 32`.", file=sys.stderr)
 
     debug_dir = None
     if args.debug:
@@ -515,7 +724,8 @@ def main(argv=None):
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"face service on http://{args.host}:{args.port}  "
-          f"(POST /verify, /reset, /reload;  GET /health)", flush=True)
+          f"(POST /verify, /reset, /reload;  GET /health)  "
+          f"auth={'key' if ENGINE_KEY else 'loopback-only'}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

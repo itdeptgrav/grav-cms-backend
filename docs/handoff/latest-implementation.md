@@ -2,6 +2,514 @@
 
 ---
 
+## Face registration by link — employees enrol themselves (OUT OF ACTIVE SCOPE)
+
+> **Scope note, stated rather than resolved silently.** This was done at the
+> user's direct request and is not the task in `docs/tasks/current-task.md`.
+> Nothing committed. Touches this repo and `grav-cms` only.
+
+### What already existed (and was NOT rebuilt)
+
+The face biometric subsystem is complete and was left alone:
+
+- `services/face-biometric/` — the Python InsightFace engine on :5001, which
+  owns `REGISTERED_PEOPLE`, the quality gate and the folder → employee mapping.
+- `routes/auth/faceSignin.js` at `/api/auth/face` — face sign-in that already
+  mints a real v2 session via `deptAuth.signToken` with `via: "face"`.
+- `routes/HrRoutes/FaceRegistration_section.js` at `/hr/face-registration` —
+  HR-authenticated gallery management and photo upload.
+- In `grav-cms`: `components/auth/FaceSignIn.js` (already wired into
+  `app/login/page.js`) and `components/hr/FaceRegistrationStatus.js`.
+
+No second face stack was introduced. An earlier plan to add `face-api.js` in
+the browser was abandoned once the InsightFace engine was found — a second
+recogniser would have been less accurate and would have drifted from the first.
+
+### The actual gap, and what was added
+
+Registering a face required an HR user driving `/hr/face-registration/upload/
+:employeeId` from an HR machine. There was no way to hand an employee a link.
+
+**Backend**
+
+- `models/HR_Models/FaceEnrollInvite.js` — collection `face_enroll_invites`.
+  Stores only `sha256(token)`, never the token, so an issued link cannot be
+  re-displayed; re-issuing revokes the previous one. TTL index drops rows a day
+  after expiry. `isActive()` / `inactiveReason()` / `toStatus()` are the single
+  definition of "this link still works".
+- `routes/HrRoutes/FaceEnrollInvite_section.js`, mounted at `/hr/face-enroll`
+  (`server.js`, beside the face-registration mount).
+  - HR, authenticated: `POST /invite/:employeeId` (revokes any live invite,
+    returns the one and only copy of the URL), `GET /invite/:employeeId`
+    (status, never the token), `POST /invite/:employeeId/revoke`.
+  - Employee, **unauthenticated by design** — the token is the authorisation:
+    `GET /session/:token`, `POST /session/:token/upload`,
+    `POST /session/:token/complete`.
+  - Bounds on the public half: expiry (`FACE_ENROLL_TTL_MS`, default 48h),
+    `FACE_ENROLL_MAX_UPLOADS` (15), `FACE_ENROLL_MAX_PHOTOS` (60),
+    per-IP throttle `FACE_ENROLL_MAX_PER_IP` (40/min), the same image-type and
+    size gate as the HR path, and a `biometricId` re-check so an invite cannot
+    file photos under a gallery the employee no longer owns.
+  - `GET /session/:token` returns the employee's **first name only**.
+- Uploads are forwarded to the engine's `/register/upload`; nothing here writes
+  to `REGISTERED_PEOPLE`.
+
+**Frontend (`grav-cms`)**
+
+- `app/face-enroll/[token]/page.js` — public (no `middleware.js` change needed;
+  anything outside `PROTECTED_PREFIXES` is public). Mobile-first guided capture
+  of six poses, uploaded one at a time so a dropped connection still leaves
+  usable photos. Written against the global `--g-*` tokens, so it follows the
+  app's light/dark switch.
+- `components/hr/FaceEnrollInvitePanel.js` — generate / revoke, QR (via the
+  existing `qrcode` dep) and copy-link, plus issued/opened/completed state.
+  Mounted in `components/hr/FaceRegistrationStatus.js` under the HR upload
+  panel, so it appears on both the employee form and the Biometric tab.
+
+### Verification
+
+`verifyFaceEnrollInvite.js`, registered in `verify.js` under **WRITES**
+(`node -r dotenv/config verifyFaceEnrollInvite.js`). Creates and deletes its own
+rows marked `createdByName: "verify-harness"`; reads one employee to borrow a
+real `biometricId` and writes nothing to the employee collection. It
+deliberately does **not** exercise the upload path — that would put harness
+photos into a real person's gallery.
+
+**27 passed, 0 failed** against the dev database and the API on :5000 — token is
+never stored raw, hash lookup matches, expired/revoked/completed invites are all
+refused with 410, unknown and short tokens 404, a revoked token cannot upload,
+and both HR endpoints refuse an unauthenticated caller.
+
+Also verified in the browser: the enrolment page renders in light and dark, is
+greeted by first name, and correctly reports the engine as offline (the Python
+engine is not running on this Windows checkout) with Start disabled.
+
+### Follow-up: the engine now runs here, and can run in production
+
+**Local (Windows).** The engine had never run on this checkout. What it needed:
+
+- a venv with `numpy opencv-python-headless onnxruntime insightface`
+  (`C:/Users/soumy/phone_detc_venv`), pointed at by `FACE_PYTHON`;
+- `FACE_BIOMETRIC_ROOT=C:/Users/soumy/Desktop/GRAV_BIOMETRIC` — a **local test
+  gallery**, deliberately not the real USB volume;
+- a **Windows console fix**: `face_biometric_server.py` loaded its model fine
+  and then died printing a `⚠` status line, because a cp1252 console cannot
+  encode it. `sys.stdout/stderr` are now reconfigured to utf-8 in the server,
+  and `run.sh` exports `PYTHONIOENCODING` for the other entry points.
+
+`npm run face:service` now works on Windows. buffalo_l downloads to
+`~/.insightface` on first run (~280MB, cached after).
+
+**The entry point moved from bash to Node** (`services/face-biometric/run.js`,
+with `run.sh` left as a shim). `npm run face:service` was `bash run.sh`, and in
+PowerShell `bash` is **WSL** — so the script ran inside Linux, where the
+Windows venv path in `FACE_PYTHON` does not exist. The only symptom was "not an
+executable interpreter" naming a file that was plainly there. It worked under
+Git Bash, which is why the first pass missed it: it was never tested from the
+shell the user actually uses. The shim now detects WSL and says which shell to
+use, and the missing-interpreter error prints the exact commands to build the
+venv on this platform.
+
+**Production: the engine is not on the API host.** `FACE_BIOMETRIC_SERVICE_URL`
+defaults to `http://127.0.0.1:5001`, which on Render is Render's own loopback —
+so every face call answers `face_service_unreachable` and the UI says the
+service is offline. The engine has to run where the photos and the camera are.
+The fix is a Cloudflare tunnel from the punch-in machine and
+`FACE_BIOMETRIC_SERVICE_URL=https://face.grav.in` — an https hostname on 443,
+never a port published on the API's domain. Written up in
+`docs/face-biometric-deployment.md`.
+
+**That required giving the engine authentication.** It had none — safe only
+while bound to loopback. Exposed, it would accept `/register/upload` (enrol a
+stranger's face against an employee ID) and answer `/health` with every
+enrolled biometric ID. Added:
+
+- `FACE_ENGINE_KEY`, sent as `X-Face-Key`, compared with
+  `hmac.compare_digest`. Required on **every** route, `/health` included.
+- `engineHeaders()` in `config/faceBiometric.js` — one definition, used by all
+  four engine callers, because the copy that forgets fails with a 401 nobody
+  can explain.
+- **An interlock**: the engine refuses to start bound to anything but loopback
+  without a key (exit 2, before loading the model). Forgetting an environment
+  variable should cost a failed start, not a silent open endpoint.
+
+### Two bugs this testing found
+
+1. **`photosAccepted` counted junk.** The engine's `saved` list means "written
+   to disk"; its `rejected` list only carries *structural* failures. A photo of
+   a wall comes back saved, with nothing rejected. Progress was accumulating
+   `saved.length`, so six pictures of a ceiling completed the six poses. Now the
+   route takes the engine's own `status.images_accepted` (a whole-folder total)
+   and returns `usable`, and the page holds on the pose when it is false.
+   Verified: uploading the company logo returns `usable:false` and leaves the
+   count at 1.
+
+2. **`GET /api/auth/face/health` fetched the engine with no headers**, so once
+   the key existed it got a 401 — valid JSON, nothing threw — and a healthy
+   engine reported itself unavailable. Fixed, and a 401 now says the keys
+   differ instead of blaming the engine.
+
+### Verification of the full pipeline
+
+Against a live engine, with **StyleGAN-generated faces** (people who do not
+exist — no real biometrics entered the test) and a throwaway employee
+`ZZTEST001` in the local test gallery:
+
+- link → phone upload → Node → keyed engine call → InsightFace → gallery;
+- readiness climbed `WEAK → READY`, `punchable: true`, over six accepted photos;
+- a near-duplicate crop was deduplicated (`usable:false`);
+- a **different** person's face was refused into the same gallery;
+- a non-face image was refused;
+- `complete` retired the link (session and upload both 410 afterwards);
+- `/api/auth/face/health` then reported `available:true, employeesEnrolled:1`.
+
+**All test state was removed**: the employee row, the invite rows, the gallery
+folder, the people-map entry, and the engine restarted to drop it from memory
+(`gallery: [] size: 0`).
+
+`verifyFaceEnrollInvite.js` now covers the key plumbing too, including a
+**source check** that every engine `fetch` sends `engineHeaders()` — the
+behavioural test only catches that when the engine happens to be running.
+Confirmed non-vacuous by deliberately removing the header and watching it fail.
+**35 passed, 0 failed.**
+
+### Follow-up 2: the camera preview never started
+
+Reported as a black frame and "The camera is not ready yet" on every press.
+
+`startCamera()` assigned `videoRef.current.srcObject = stream` and *then* called
+`setPhase("camera")`. The `<video>` is rendered by the camera phase, so at the
+moment of the assignment the element did not exist and `videoRef.current` was
+`null`. The element then mounted with no stream: preview black, `videoWidth` 0,
+`grabFrame()` returning null forever. Permission had been granted and the track
+was live, which is why the tab showed a recording indicator throughout.
+
+Fixed by attaching the stream in an effect that runs once the element is
+mounted (`phase === "camera"`), plus a `videoReady` flag driven by
+`loadedmetadata`/`loadeddata`/`playing`. The shutter is now **disabled** until
+the first frame exists, behind a "Starting the camera…" overlay, instead of
+accepting a press and apologising afterwards.
+
+Verified in the browser by stubbing `navigator.mediaDevices.getUserMedia` with
+a canvas `captureStream` painting a synthetic face: `srcObject` attached,
+`videoWidth 640`, `readyState 4`, shutter enabled, preview visible, and two
+captures uploaded and advanced the pose (step 1 → 3). All test state removed
+afterwards.
+
+**Why the first pass missed both this and the WSL bug: neither the camera path
+nor PowerShell was ever exercised.** The API was tested thoroughly and the UI
+only in the states reachable without a camera.
+
+### Follow-up 3: enrolment was unusably slow, then failed
+
+Reported as "too long to take a picture" and, after five photos, "the
+registration service is not reachable" — while the engine was up and healthy.
+
+**Cause.** The engine's `/register/upload` ran `reload_gallery()` **and** a full
+`employee_registration_report()` after every upload, and each of those embeds
+*every registration photo on disk*. HR uploading twenty photos at once pays
+that once. Self-registration sends one photo at a time, so the same
+whole-gallery work was paid per capture — measured here at **26s rising to 36s**
+across six photos, until the call outlived the API's 60s timeout and the
+backend correctly reported `face_service_unreachable`. At production scale it
+is far worse: the cost also grows with the number of employees already
+enrolled.
+
+**Fix, in three parts.**
+
+1. `"quick": true` on `/register/upload`. The engine judges only the photos
+   just written, via `FB.analyse_photo` — one embedding per photo — and returns
+   a per-file verdict (`verdicts`, `accepted_now`). No gallery reload, no
+   snapshot. **26–36s and rising → a flat ~2s.**
+2. A new `/register/finalise {folder}`, called once from
+   `/session/:token/complete`: reloads the sign-in gallery so the employee can
+   actually be recognised, and reports final readiness.
+3. `registration_status` / `status_snapshot` / `employee_registration_report`
+   take an optional `preloaded=(gallery, report)`. Finalise had been embedding
+   the whole gallery twice — once to reload it, once to report on it — so it
+   now hands the first result to the second. **32s → 17s.**
+
+The employee's wait on finalise is bounded (`FACE_ENROLL_FINALISE_TIMEOUT_MS`,
+20s). Abandoning the wait does not abandon the work: the engine finishes and
+reloads its gallery regardless; all that is lost is the readiness line on the
+final screen, which is HR's number. A new "Finishing up" screen covers it, and
+per-photo refusal reasons (`small(42px)`, `yaw=35`) are now translated into
+something an employee can act on.
+
+`invite.folder` is recorded from the first upload so finalise knows which
+gallery to recompute, falling back to the biometric id (which is how the engine
+names a new folder) for invites issued before that field existed.
+
+### A crash found while testing the above
+
+Hammering the shutter took the page down with
+`Cannot read properties of undefined (reading 'label')`. `capture()` guarded on
+`busy`, which is React state and therefore stale for the rest of the tick — two
+quick taps both saw `false`, both uploaded, and both advanced the pose. Six
+poses, eight advances, and the render read `POSES[7].label`.
+
+Fixed with a `capturingRef` that flips synchronously, plus a clamp on the pose
+index so a future regression shows a repeated pose rather than a white screen.
+Re-tested by clicking the shutter every 120ms for the whole enrolment: no
+crash, steps advanced one-for-one, finished at "6 photos registered".
+
+### Follow-up 4: the HR Biometric tab said the service was not running
+
+It was running. The tab reads `/register/snapshot`, which recomputed the whole
+gallery from disk on every call — **19-43s for ONE employee with six photos**,
+measured, against the API's 20s budget. The abort was then reported as
+"the face service is not running at http://127.0.0.1:5001", which sends an
+operator to restart a service that is working.
+
+The engine already loads exactly that data at boot and reloads it whenever the
+gallery changes (upload, archive, finalise), so the recompute was redundant as
+well as slow. `/register/snapshot` and `/register/status` now serve from
+`ENGINE.folder_gallery`/`ENGINE.report` via the same `preloaded` parameter, with
+`generated_at` set to when that load happened rather than to now — a cached
+answer that claims to be live is worse than a slow one.
+
+**19-43s → ~100ms** at the engine; the HR tab end to end went from timing out to
+**84ms**, showing `readiness=READY punchable=true accepted=6/6`.
+
+`{"refresh": true}` forces the full re-read, and HR's **Recheck** button is the
+one caller that sends it — that is the one place where paying for a full pass is
+the point. Its timeout was raised to 120s to match.
+
+Three failure states are now three messages instead of one: timed out (running
+but busy), unauthorised (the two `FACE_ENGINE_KEY` values differ), and actually
+not running. The "start it with…" line only renders for the last, and takes the
+command from the API rather than repeating a stale one.
+
+### Follow-up 5: face sign-in was arithmetically unable to succeed
+
+Reported as slow scanning that restarted from 1/3 on any disturbance. It was
+worse than slow: **the gate could not be reached.**
+
+`VERIFY_HITS = 3` within `VERIFY_WINDOW_SEC = 2.0`, against a measured **~2000ms
+per frame**. Three hits cannot fit in a two-second window when each hit takes
+two seconds, so the streak decayed as fast as it built — measured 1/3, 1/3, 2/3,
+2/3, 1/3, 1/3 over six frames without ever signing in. Any pause made it worse.
+
+**Where the 2000ms went.** `FaceAnalysis` with no `allowed_modules` loads five
+models and runs all of them per frame — detection, recognition, *two* landmark
+models and gender/age — at `det_size=(640, 640)`. Sign-in reads exactly two of
+those plus pose. Benchmarked on a real 720x405 capture:
+
+| configuration | median |
+|---|---|
+| all modules, det 640 (what it was doing) | 1153ms |
+| all modules, det 320 | 960ms |
+| detection+recognition+pose, det 640 | 994ms |
+| **detection+recognition+pose, det 320** | **629ms** |
+| detection+recognition only, det 320 | 299ms |
+
+**Chosen: 629ms**, not the 299ms. Dropping `landmark_3d_68` removes `face.pose`,
+and `is_live_quality_face` reads pose for its yaw check — the guard is written
+as `if pose is not None`, so losing it would *silently* disable the yaw gate
+rather than fail. Speed is not worth turning off a check without saying so.
+
+**Changes.**
+
+- `FB.build_live_face_app()` — a second, leaner model used ONLY by `verify()`.
+  Registration keeps the full detector at 640 with every module; the two jobs
+  have different needs and now have different models.
+- `LIVE_DETECTION_SIZE` (`FACE_LIVE_DET_SIZE`, default 320).
+- The live model is pre-warmed with a blank frame at boot — the first inference
+  costs roughly double, and the person at the camera should not pay it.
+- `VERIFY_HITS` / `VERIFY_WINDOW_SEC` are now env-tunable, and the window
+  default moves 2.0 → 4.0s. **The window must exceed hits x frame time or the
+  gate is unreachable**; at ~630ms a 4s window holds five frames, so three is
+  comfortable and a stumble no longer starts the user over. The intent is
+  unchanged: several recent recognitions of the same person, not one lucky frame.
+- Client `CAPTURE_INTERVAL_MS` 400 → 120. It already had an in-flight guard, so
+  this is not more requests — it is less idle tail between them.
+
+**Result: sign-in went from never completing to VERIFIED on the third frame,
+~2.5s end to end**, repeatably. Gates verified unchanged afterwards: pose
+present (yaw -2.1 degrees), `is_live_quality_face` passing, `LIVE_MAX_YAW` 50,
+`LIVE_MIN_FACE_SIZE` 50, hits still 3. Registration and the HR tab re-checked
+(75ms, READY, 6/6).
+
+**Not done, deliberately:** `FACE_VERIFY_HITS=2` would sign in ~800ms sooner and
+is a one-line env change, but halving the anti-fluke evidence is a security
+call for the owner, not a performance tweak to make quietly. Genuinely instant
+recognition needs a GPU — phones do this on dedicated silicon, and this is
+CPU-only onnxruntime.
+
+### Follow-up 6: sign-in taken to under a second
+
+At the owner's explicit request, `FACE_VERIFY_HITS=2` is now set in `.env` —
+faster sign-in for less evidence, recorded there with that reason.
+
+**Where the remaining time was.** Profiling the live model per frame at det 320:
+
+| stage | cost |
+|---|---|
+| detection | 50ms |
+| + recognition | 246ms |
+| + landmark_3d_68 (pose) | **313ms** |
+
+Pose cost more than the recognition it was guarding, and it existed only to
+feed the yaw gate. Detection already returns five keypoints — both eyes, nose,
+both mouth corners — free, as part of finding the face at all.
+
+`estimate_yaw_from_kps()` derives yaw from those: the nose's offset from the
+eye midpoint, measured along the eye axis in eye-widths. **Calibrated against
+landmark_3d_68's own output** on the six-photo registration in this database
+(front/left/right/up/down): 107.1 degrees per unit, max error **4.6 degrees**
+across a +-40 degree range, against a 50 degree gate.
+
+`face_yaw()` prefers the real model when it is loaded and falls back to the
+estimate when it is not — so **registration is untouched** (full model, real
+pose) and only live frames use the approximation. Verified side by side:
+left 39.9 (kps) vs 39.7 (model), right -31.7 vs -32.3. And verified to still
+REJECT: the gate flips at exactly 50 degrees, symmetric.
+
+**Also:** `OMP_NUM_THREADS` is now set from the core count in `run.js`
+(onnxruntime otherwise ignores the machine — 435ms vs 296ms measured on 12
+cores).
+
+**Client capture is now adaptive** rather than a fixed interval. A
+self-scheduling timeout replaces `setInterval`, which fired on a clock that
+knew nothing about request duration: it either queued behind a slow answer or
+idled after a fast one. Now the next frame goes out the instant the last
+answer lands while a face is in view (`CAPTURE_ACTIVE_MS = 0`), and backs off
+to 450ms when the frame is empty — a CPU-bound face model should not be
+chewing on an empty room, or it is busy when somebody finally walks up.
+`activeRef` stops the loop from scheduling one more frame after `stop()` lands
+mid-request.
+
+**Result, measured over three runs: VERIFIED on the second frame, 0.86s-1.18s
+end to end.** For context this began at ~2000ms per frame with a gate that
+could never complete.
+
+Confirmed in the browser against a real registered frame: face scan →
+recognised → **redirected to `/hr/dashboard`**, the correct destination for
+that person's role.
+
+### Follow-up 7: sign-in UI, gallery UI, the 6-photo cap, and Drive backup
+
+**Sign-in now just scans.** The auto/manual radiogroup is gone — a switch
+asking how you would like to sign in is a decision put to somebody who came to
+be recognised. Where the browser has already granted the camera it starts
+silently on load; where it has not, a single button remains, because calling
+getUserMedia on "prompt" throws a permission dialog at anyone who merely opened
+the login page. That button IS the consent and cannot be assumed away.
+
+**The status line is announced but not drawn**, unless it is something to act
+on (`UNKNOWN`, `RECOGNISED_NOT_PERMITTED`, `VERIFIED_BUT_UNLINKED`, errors).
+Watching "Recognising… 1/2" tick over does not make recognition faster; it
+makes the wait something to measure. The ring animation carries the progress.
+The element stays in the DOM as `sr-only` so aria-live still announces every
+state — a silent scanner would be worse than a chatty one for anyone who cannot
+see the ring. Also removed a stale line claiming face sign-in "is not yet
+enabled for access", which has been untrue since it started minting sessions.
+
+**"Show photos" was slow because I made it slow.** It called `/recheck`, which
+follow-up 4 deliberately turned into a full gallery re-read. Seeing the photos
+does not need a recompute — it needs a directory listing. `status_snapshot`
+now carries `photos` per person (an `os.listdir`, no decoding), so filenames
+arrive with the ordinary status and the gallery renders on load. Thumbnails
+were already downscaled to 320px by the engine and are fetched per file.
+**A 20-120s recheck → status 81ms, all six thumbnails 562ms.**
+
+**The gallery is capped at 6**, enforced in `save_registration_photos` — the
+one place both upload paths pass through, because a cap living in one caller is
+not a cap. Refused whole before anything is written (`gallery_full:<have>/<max>`),
+surfaced as HTTP 409 with the numbers intact. Verified: a 7th photo is refused
+and the folder stays at 6. The enrolment flow's target drops 8 → 6 to match its
+six poses, and a `gallery_full` mid-enrolment now *finishes* rather than
+erroring — retakes are what get somebody there.
+
+**The photo grid replaces the button.** Thumbnails with a remove control on
+each, "Photos · 6 of 6", and the Add Photos panel withheld entirely at the cap
+rather than shown and then refused.
+
+**Drive backup — a MIRROR, not a move.** `services/faceGalleryDrive.service.js`
+plus `models/HR_Models/FacePhoto.js` (pointers only, no image bytes).
+
+The photos cannot move to Drive: the engine reads every one off local disk to
+build its gallery, at boot and on every change, and it runs on the punch-in
+machine rather than this API host. Drive as primary would mean downloading the
+whole gallery before anyone could sign in. So the local folder stays the
+working copy, and both upload paths mirror to private Drive at the one moment
+this process holds the bytes. Private by construction — no
+`permissions.create()` — and nothing serves these back to a browser; HR
+thumbnails still come from the local copy. Best effort and not awaited: a Drive
+outage must never fail a registration. Archiving a photo trashes the Drive copy
+(trashed, not deleted, matching `_archive/`) and stamps `archivedAt`.
+
+Round-trip verified live: uploaded (7.3s, not on the request path) and trashed.
+`FACE_DRIVE_BACKUP=0` disables it.
+
+### Follow-up 8: face SIGN-IN removed; storage answered
+
+**Sign-in is gone**, at the owner's request. Registration stays.
+
+Removed: `routes/auth/faceSignin.js` and its mount at `server.js`, its test
+`services/face-biometric/faceSignin.test.js`, and in the frontend
+`components/auth/FaceSignIn.js` + `FaceScanAnimation.js` (which nothing else
+imported) and the whole face block in `app/login/page.js`. Verified:
+`/api/auth/face/health` now 404s, `/hr/face-registration/health` still 200s,
+`/hr/face-enroll/session/…` still answers, login page renders password-only
+with no console errors, harness 34/34, `npm test` unchanged from its known
+3-failure baseline.
+
+**A trap worth recording:** `verifyFaceEnrollInvite.js` listed
+`routes/auth/faceSignin.js` in `ENGINE_CALLERS` and `readFileSync`s each entry,
+so deleting the route would have failed the harness with ENOENT rather than
+anything legible. Fixed with the list.
+
+The engine keeps `/verify`, `SessionGates` and `Engine.live_app`. They are
+now unreachable from the CMS but are still what the kiosk path
+(`face_biometric.py --camera`) uses, and `is_live_quality_face` / `identify` /
+`VerificationGate` are shared with `verify_face_image`. Removing them is a
+separate decision about the kiosk, not a consequence of this one.
+
+### The storage question, answered with evidence
+
+The owner suspected photos were still only local. **They are not.** Audited
+directly against Drive: folder `Face Registrations` holds the 6 current photos,
+`face_photos` holds 12 rows (6 live, 6 archived), and the archived rows' Drive
+copies were correctly trashed when those photos were removed. Local, Drive and
+Mongo agree.
+
+**Why the photos cannot be Drive-only today:** the engine still reads
+`REGISTERED_PEOPLE` off local disk for *registration readiness* — the READY /
+punchable / embeddings figures on the HR tab come from
+`load_registered_gallery`, via `/register/snapshot` and `/register/status`.
+That is now the only reason. Confirmed by search: the kiosk `run_live` has no
+production wiring (no npm script, no Node spawns it, nothing reads the
+attendance CSV it would write), and `services/BiometricSyncService.js` is
+TeamOffice fingerprint devices with no face code at all.
+
+**What was built instead — the embedding.** `FacePhoto` now stores the 512
+numbers InsightFace produces, plus `embeddingModel` (vectors are only
+comparable within one model). Recognition is a distance between two of these,
+so any other system can match faces from Mongo alone, without downloading a
+photo or running the model. `select: false`, so it is never returned by
+accident.
+
+Both upload paths store it: the engine now computes the per-file verdict on the
+full path as well as the quick one, so an HR upload and a phone upload behave
+the same. `POST /register/embed` plus `backfill_face_embeddings.js` fill in
+registrations made before this — run against the existing gallery: **6 embedded,
+0 skipped, 0 failed, 512 dims, model buffalo_l.**
+
+### Known limits, unresolved
+
+- **Face login is spoofable with a photo.** The existing `/api/auth/face` path
+  has no liveness check, and this change does not add one. It is convenience-
+  grade auth. Whether CEO/accountant should be excluded from face sign-in is a
+  decision that has not been made.
+- **The link's host** comes from `FRONTEND_URL`, else the request `Origin`. In
+  dev that yields `http://localhost:3001`, which will not open on a phone — use
+  a LAN IP or tunnel, and note `getUserMedia` needs https off localhost. The
+  page says so when the camera API is missing.
+- The per-IP throttle is in-process, so it is per-instance.
+
+---
+
 ## Cowork Sheets — `/cowork/workbooks` implemented (OUT OF ACTIVE SCOPE)
 
 > **Scope conflict, stated rather than resolved silently.** The active task in

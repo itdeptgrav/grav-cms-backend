@@ -84,6 +84,23 @@ REGISTERED_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 FACE_MODEL_NAME = "buffalo_l"
 DETECTION_SIZE = (640, 640)
 
+# The detector size used for LIVE sign-in frames, which is a different job
+# from judging a registration photo.
+#
+# Registration is rare, offline, and wants every pixel: a photo that is
+# marginal must be caught now rather than at the gate. Sign-in is the opposite
+# — it runs several times a second on a face that is already large and centred
+# in the frame, and its cost lands directly on how long somebody stands there.
+# Detection scales with pixels, so halving the side quarters that work.
+#
+# Measured on this machine, on a real 720x405 capture: 1153ms at 640 with every
+# module loaded, 629ms at 320 with detection + recognition + pose. The quality
+# gates are unchanged — pose is still computed, so the yaw check still runs.
+LIVE_DETECTION_SIZE = (
+    int(os.environ.get("FACE_LIVE_DET_SIZE", 320)),
+    int(os.environ.get("FACE_LIVE_DET_SIZE", 320)),
+)
+
 # ── registration quality (copied unchanged from the tracker) ─────
 # A registered identity is permanent, so it has to be EARNED by the photo
 # set. Two tiers: a core anchor is a straight, sharp, confident face and is
@@ -135,8 +152,18 @@ LIVE_MAX_YAW       = 50
 # Frames, not seconds, because the count is what proves persistence; the
 # window only stops a match assembling itself out of three moments minutes
 # apart.
-VERIFY_HITS       = 3
-VERIFY_WINDOW_SEC = 2.0
+VERIFY_HITS       = int(os.environ.get("FACE_VERIFY_HITS", 3))
+# THIS MUST BE LARGER THAN (VERIFY_HITS x the time one frame takes).
+#
+# It was 2.0 against ~2000ms per frame, which made the gate arithmetically
+# unreachable: three hits could not fit in the window, so the streak decayed as
+# fast as it built and sign-in read 1/3, 2/3, 1/3 forever. Any pause made it
+# worse. With live inference at ~630ms a 4s window holds five frames, so three
+# is comfortable and a stumble no longer starts you over.
+#
+# The gate's intent is unchanged: several recognitions of the SAME person,
+# recent, rather than one lucky frame.
+VERIFY_WINDOW_SEC = float(os.environ.get("FACE_VERIFY_WINDOW_SEC", 4.0))
 
 # ── attendance ───────────────────────────────────────────────────
 ATTENDANCE_DIR    = os.path.join(DATA_DIR, "ATTENDANCE")
@@ -229,6 +256,50 @@ def classify_registration_face(size, det, yaw, blur=None):
 
 
 # ── model loading ────────────────────────────────────────────────
+def build_live_face_app(verbose=True):
+    """A second, leaner buffalo_l for live sign-in frames.
+
+    Separate from build_face_app on purpose. Registration keeps the full
+    detector and every module; this one runs at LIVE_DETECTION_SIZE and loads
+    only what a verification actually reads:
+
+        detection   - to find the face, and its five keypoints
+        recognition - the embedding that is compared
+
+    Measured per frame at det 320 on this machine: detection 50ms, recognition
+    a further ~246ms, landmark_3d_68 a further ~313ms. genderage and
+    landmark_2d_106 are loaded by default and read by nothing.
+
+    landmark_3d_68 is dropped even though the yaw gate used its pose output —
+    it cost more than the recognition it was guarding. The gate is NOT dropped
+    with it: estimate_yaw_from_kps derives yaw from the keypoints detection
+    already returns, calibrated against this very model to within 4.6 deg.
+    Registration still loads it and still uses the real thing.
+    """
+    try:
+        import onnxruntime
+        available = onnxruntime.get_available_providers()
+    except Exception:
+        available = []
+    use_gpu = "CUDAExecutionProvider" in available
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if use_gpu else ["CPUExecutionProvider"])
+    modules = ["detection", "recognition"]
+    try:
+        app = FaceAnalysis(name=FACE_MODEL_NAME, providers=providers,
+                           allowed_modules=modules)
+        app.prepare(ctx_id=0 if use_gpu else -1, det_size=LIVE_DETECTION_SIZE)
+    except Exception:
+        # Older insightface builds may not accept allowed_modules. A slower
+        # sign-in is a far better outcome than one that will not start.
+        return build_face_app(verbose=False)
+    if verbose:
+        print(f"   {FACE_MODEL_NAME} live "
+              f"({'GPU' if use_gpu else 'CPU'}, det_size={LIVE_DETECTION_SIZE}, "
+              f"modules={'+'.join(modules)})")
+    return app
+
+
 def build_face_app(verbose=True):
     """InsightFace buffalo_l, GPU when the runtime actually offers it."""
     try:
@@ -495,6 +566,66 @@ def _f(v, nd=0):
 
 
 # ── live verification ────────────────────────────────────────────
+# Degrees of yaw per unit of the keypoint ratio below.
+#
+# Calibrated against landmark_3d_68's own yaw on a real six-photo registration
+# spanning front / left / right / up / down: least squares through the origin
+# gives 107.1 deg per unit, with a maximum error of 4.6 deg across a +-40 deg
+# range. That is comfortably inside the tolerance of a 50 deg gate.
+KPS_YAW_DEGREES = float(os.environ.get("FACE_KPS_YAW_DEGREES", 107.0))
+
+
+def estimate_yaw_from_kps(kps):
+    """Approximate yaw, in degrees, from the detector's five keypoints.
+
+    WHY THIS EXISTS: the yaw gate used to read `face.pose`, which is produced
+    by landmark_3d_68 — a model that costs ~313ms per frame, more than the
+    recognition it is guarding. The detector already returns five keypoints
+    (both eyes, nose, both mouth corners) for free as part of finding the face
+    at all, and how far the nose sits from the midpoint between the eyes,
+    measured along the eye axis and scaled by the distance between them, is a
+    good proxy for how far the head has turned.
+
+    Deliberately NOT used for registration, which keeps the real model: a
+    registration photo is judged once, offline, and can afford the truth.
+
+    Returns degrees, or None when the keypoints are unusable.
+    """
+    if kps is None or len(kps) < 3:
+        return None
+    try:
+        left_eye = (float(kps[0][0]), float(kps[0][1]))
+        right_eye = (float(kps[1][0]), float(kps[1][1]))
+        nose = (float(kps[2][0]), float(kps[2][1]))
+    except (TypeError, IndexError, ValueError):
+        return None
+    ax, ay = right_eye[0] - left_eye[0], right_eye[1] - left_eye[1]
+    inter = (ax * ax + ay * ay) ** 0.5
+    if inter < 1e-6:
+        return None
+    mx, my = (left_eye[0] + right_eye[0]) / 2.0, (left_eye[1] + right_eye[1]) / 2.0
+    # Component of (nose - eye midpoint) along the eye axis, in eye-widths.
+    ratio = ((nose[0] - mx) * ax + (nose[1] - my) * ay) / (inter * inter)
+    return ratio * KPS_YAW_DEGREES
+
+
+def face_yaw(face):
+    """The best yaw available for this face, or None.
+
+    Prefers the pose model when it was loaded — registration keeps it — and
+    falls back to the keypoint estimate for live frames, where it is not.
+    Returning None from both is what disables the yaw check, so it is a state
+    that has to be reached honestly rather than by a model quietly missing.
+    """
+    pose = getattr(face, "pose", None)
+    if pose is not None:
+        try:
+            return float(pose[1])
+        except (TypeError, IndexError, ValueError):
+            pass
+    return estimate_yaw_from_kps(getattr(face, "kps", None))
+
+
 def is_live_quality_face(face):
     """Is this frame's face worth measuring at all?"""
     fx1, fy1, fx2, fy2 = face.bbox
@@ -504,13 +635,9 @@ def is_live_quality_face(face):
     det = float(getattr(face, "det_score", 0.0))
     if det < LIVE_MIN_DET_SCORE:
         return False, f"det={det:.2f}"
-    if getattr(face, "pose", None) is not None:
-        try:
-            yaw = float(face.pose[1])
-        except Exception:
-            yaw = None
-        if yaw is not None and abs(yaw) > LIVE_MAX_YAW:
-            return False, f"yaw={yaw:.0f}"
+    yaw = face_yaw(face)
+    if yaw is not None and abs(yaw) > LIVE_MAX_YAW:
+        return False, f"yaw={yaw:.0f}"
     return True, "ok"
 
 

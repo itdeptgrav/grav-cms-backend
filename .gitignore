@@ -81,3 +81,7 @@ coverage/
 docker-compose.override.yml
 .env.bak-lan
 .history/
+
+# Python bytecode from the face engine (services/face-biometric)
+__pycache__/
+*.pyc

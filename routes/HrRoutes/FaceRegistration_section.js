@@ -32,6 +32,8 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 // Giving this process a second write path into that directory would mean two
 // codebases enforcing the same filename and traversal rules, and eventually
 // only one of them doing it correctly.
+const FacePhoto = require("../../models/HR_Models/FacePhoto");
+const faceDrive = require("../../services/faceGalleryDrive.service");
 const faceConfig = require("../../config/faceBiometric");
 const FACE_SERVICE_URL = faceConfig.FACE_BIOMETRIC_SERVICE_URL;
 const FACE_SERVICE_TIMEOUT_MS = Number(
@@ -53,7 +55,7 @@ async function callEngine(path, body, timeoutMs = FACE_SERVICE_TIMEOUT_MS) {
   try {
     const res = await fetch(`${FACE_SERVICE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: faceConfig.engineHeaders(),
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -97,6 +99,34 @@ async function loadSnapshot() {
   }
   const file = readSnapshotFile();
   if (file.ok) return { ...file, live: false };
+
+  /* A running-but-slow engine and a stopped one used to produce the same
+     sentence — "the face service is not running" — which sent operators to
+     restart a service that was working. Three states, three answers. */
+  if (r.error === "timeout") {
+    return {
+      ok: false,
+      reason: "face_service_timeout",
+      message:
+        `The face service at ${FACE_SERVICE_URL} did not answer in time. It ` +
+        `is running, but busy. Try again in a moment.`,
+      serviceUrl: FACE_SERVICE_URL,
+      path: file.path,
+      engineError: "timeout",
+    };
+  }
+  if (r.status === 401) {
+    return {
+      ok: false,
+      reason: "face_engine_unauthorised",
+      message:
+        `The face service refused this server's key. Set the same ` +
+        `FACE_ENGINE_KEY on the engine and on this API.`,
+      serviceUrl: FACE_SERVICE_URL,
+      path: file.path,
+      engineError: "unauthorised",
+    };
+  }
   return {
     ok: false,
     reason: "face_service_unreachable",
@@ -172,6 +202,9 @@ function shapePerson(p) {
     retakeReasons: p.retake_reasons || [],
     nearestOther: p.nearest_other || null,
     nearestOtherDist: p.nearest_other_dist ?? null,
+    /* Filenames, so the page can render the gallery straight from this. The
+       thumbnails are fetched per file, on demand. */
+    photos: p.photos || [],
   };
 }
 
@@ -208,6 +241,9 @@ router.get("/status", EmployeeAuthMiddlewear, async (req, res) => {
       success: false,
       reason: r.reason,
       message: r.message || "Snapshot unavailable",
+      /* Only set when restarting is actually the fix, so the page can show
+         the command for that case and stay quiet for the others. */
+      startCommand: r.startCommand || null,
       snapshotPath: r.path,
       data: null,
     });
@@ -239,6 +275,9 @@ router.get("/status/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
       success: false,
       reason: r.reason,
       message: r.message || "Snapshot unavailable",
+      /* Only set when restarting is actually the fix, so the page can show
+         the command for that case and stay quiet for the others. */
+      startCommand: r.startCommand || null,
       snapshotPath: r.path,
       data: null,
     });
@@ -382,11 +421,36 @@ router.post("/upload/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
   });
   if (r.status === 0) return engineUnavailable(res, r.error);
   if (r.status !== 200 || !r.json || r.json.ok !== true) {
-    return res.status(r.status === 413 ? 413 : 400).json({
-      success: false,
-      reason: (r.json && r.json.error) || "upload_failed",
-    });
+    const reason = (r.json && r.json.error) || "upload_failed";
+    /* `gallery_full:<have>/<max>` from the engine, kept legible so the page
+       can tell the operator to remove one rather than just refusing. */
+    if (String(reason).startsWith("gallery_full")) {
+      const [, counts = ""] = String(reason).split(":");
+      const [have, max] = counts.split("/");
+      return res.status(409).json({
+        success: false,
+        reason: "gallery_full",
+        have: Number(have) || null,
+        maxPhotos: Number(max) || null,
+        message:
+          `This employee already has ${have || "the maximum"} of ` +
+          `${max || "the allowed"} photos. Remove one before adding another.`,
+      });
+    }
+    return res.status(r.status === 413 ? 413 : 400).json({ success: false, reason });
   }
+  /* Mirror to private Drive, after the engine has the photos. Best effort and
+     not awaited: the registration that matters is the one on the punch-in
+     machine, and a Drive outage must not fail an HR upload. */
+  backupToDrive(
+    r.json.saved || [],
+    files,
+    employee,
+    r.json.folder,
+    "hr-upload",
+    r.json.verdicts || [],
+  ).catch(() => {});
+
   return res.status(200).json({
     success: true,
     folder: r.json.folder,
@@ -451,6 +515,19 @@ router.post("/archive/:employeeId", EmployeeAuthMiddlewear, async (req, res) => 
       reason: (r.json && r.json.error) || "archive_failed",
     });
   }
+  /* Retire the Drive copy alongside the local one. Trashed rather than
+     deleted, and the row is kept with archivedAt set — the same reasoning the
+     engine uses when it moves a photo to _archive/ instead of removing it. */
+  FacePhoto.find({ biometricId: String(employee.biometricId), filename, archivedAt: null })
+    .then(async (rows) => {
+      for (const row of rows) {
+        await faceDrive.trashFacePhoto(row.driveFileId);
+        row.archivedAt = new Date();
+        await row.save();
+      }
+    })
+    .catch((err) => console.warn("[face-drive] archive mirror failed:", err.message));
+
   return res.status(200).json({
     success: true,
     archivedTo: r.json.archived_to,
@@ -467,7 +544,10 @@ router.post("/recheck", EmployeeAuthMiddlewear, async (req, res) => {
   if (!folder) {
     return res.status(400).json({ success: false, reason: "missing_folder" });
   }
-  const r = await callEngine("/register/status", { folder }, 30000);
+  /* The one call that should pay for a full re-read of the folder: this is
+     the operator explicitly asking "look again". Everything else is served
+     from the gallery the engine already holds. */
+  const r = await callEngine("/register/status", { folder, refresh: true }, 120000);
   if (r.status === 0) return engineUnavailable(res, r.error);
   if (r.status !== 200 || !r.json || r.json.ok !== true) {
     return res.status(404).json({
@@ -527,5 +607,57 @@ router.post("/photo/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
   }
   return res.status(200).json({ success: true, image: r.json.image });
 });
+
+
+/**
+ * Copy the photos that actually landed to private Drive, and record where.
+ * See services/faceGalleryDrive.service.js for why this is a mirror and not
+ * a move. Never throws — the caller does not await it.
+ */
+async function backupToDrive(saved, files, employee, folder, source, verdicts = []) {
+  try {
+    if (!faceDrive.backupEnabled() || !saved.length) return;
+    /* The engine renames on write, so pair its saved names back to the bytes
+       we were posted, in order. */
+    const pairs = saved
+      .map((s, i) => ({ filename: s.filename, data: files[i] && files[i].data }))
+      .filter((p) => p.data);
+    if (!pairs.length) return;
+
+    const name = [employee.firstName, employee.middleName, employee.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    const stored = await faceDrive.backupFacePhotos(pairs, {
+      employeeId: String(employee.biometricId),
+      employeeName: name,
+    });
+    if (!stored.length) return;
+
+    /* Keyed by filename so a partial upload cannot pair one photo's numbers
+       with another photo's row. */
+    const byName = new Map((verdicts || []).map((v) => [v.filename, v]));
+
+    await FacePhoto.insertMany(
+      stored.map((s) => {
+        const v = byName.get(s.filename);
+        return {
+          employee: employee._id,
+          biometricId: String(employee.biometricId),
+          folder: folder || "",
+          filename: s.filename,
+          driveFileId: s.driveFileId,
+          bytes: s.bytes,
+          source,
+          embedding: v && Array.isArray(v.embedding) ? v.embedding : undefined,
+          embeddingModel: (v && v.model) || "",
+        };
+      }),
+      { ordered: false },
+    );
+  } catch (err) {
+    console.warn("[face-drive] mirror failed:", err.message);
+  }
+}
 
 module.exports = router;
