@@ -6527,6 +6527,8 @@ router.post("/ledgers/:id/merge", async (req, res) => {
       signed(dest.currentBalance, dest.currentBalanceType) +
       signed(source.currentBalance, source.currentBalanceType);
 
+    const partyLinks = inheritablePartyLinks(source, dest);
+
     await Acc_Ledger.updateOne(
       { _id: dest._id },
       {
@@ -6540,15 +6542,12 @@ router.post("/ledgers/:id/merge", async (req, res) => {
             : {}),
           // Inherit party links only where the destination has none, so a
           // merge never silently steals an existing vendor/customer link.
-          ...(source.linkedVendorId && !dest.linkedVendorId
-            ? { linkedVendorId: source.linkedVendorId }
-            : {}),
-          ...(source.linkedCustomerId && !dest.linkedCustomerId
-            ? { linkedCustomerId: source.linkedCustomerId }
-            : {}),
-          ...(source.linkedEmployeeId && !dest.linkedEmployeeId
-            ? { linkedEmployeeId: source.linkedEmployeeId }
-            : {}),
+          /* Party links are inherited only when the two ledgers are the
+             same party. The old guard checked only that the DESTINATION
+             had no link of its own, so merging a ledger linked to customer
+             X into an unrelated ledger Y handed Y's page X's books. See
+             services/partyLinkSafety.js. */
+          ...partyLinks.$set,
         },
       },
     );
@@ -6591,6 +6590,10 @@ router.post("/ledgers/:id/merge", async (req, res) => {
         ? `Merged "${cleanName}" into "${dest.name}". ${counts.ledgerEntries} voucher line(s), ${counts.partyVouchers} party reference(s) and ${counts.bankVouchers} bank reference(s) moved.${deactivateSource ? " The old ledger is now inactive." : " The old ledger is now empty."}`
         : `Merged "${cleanName}" into "${dest.name}". It had no transactions; balances folded in.`,
       counts,
+      /* Said out loud, not swallowed. A refused link is a merge that did
+         only part of what the person expected, and they are the only one
+         who can tell whether the two really are the same party. */
+      ...(partyLinks.skipped.length ? { warnings: partyLinks.skipped } : {}),
       destination: {
         _id: dest._id,
         name: dest.name,

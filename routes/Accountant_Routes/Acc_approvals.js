@@ -502,6 +502,8 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       signed(dest.currentBalance, dest.currentBalanceType) +
       signed(source.currentBalance, source.currentBalanceType);
 
+    const partyLinks = inheritablePartyLinks(source, dest);
+
     await Acc_Ledger.updateOne(
       { _id: dest._id },
       {
@@ -513,15 +515,12 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
           ...(dest.balanceFromTrialBalance || source.balanceFromTrialBalance
             ? { balanceFromTrialBalance: true }
             : {}),
-          ...(source.linkedVendorId && !dest.linkedVendorId
-            ? { linkedVendorId: source.linkedVendorId }
-            : {}),
-          ...(source.linkedCustomerId && !dest.linkedCustomerId
-            ? { linkedCustomerId: source.linkedCustomerId }
-            : {}),
-          ...(source.linkedEmployeeId && !dest.linkedEmployeeId
-            ? { linkedEmployeeId: source.linkedEmployeeId }
-            : {}),
+          /* Party links are inherited only when the two ledgers are the
+             same party. The old guard checked only that the DESTINATION
+             had no link of its own, so merging a ledger linked to customer
+             X into an unrelated ledger Y handed Y's page X's books. See
+             services/partyLinkSafety.js. */
+          ...partyLinks.$set,
         },
       },
     );

@@ -50,6 +50,7 @@ const READONLY = [
   "verifyLedgerBalances",      // chart of accounts equals the ledger page
   "verifyRoleResolution",      // approvers resolve; orphan grants are named
   "verifyManagerChain",        // who may be offered as a manager
+  "verifyPartyLinkSafety",     // a merge never hands one party another's books
 ];
 
 const WRITES = [
