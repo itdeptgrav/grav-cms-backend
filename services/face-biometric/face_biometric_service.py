@@ -266,10 +266,19 @@ def load_registered_gallery(registered_dir=None, hr_map_path=HR_MAP_PATH,
 
 
 def registration_status(registered_dir=None, hr_map_path=HR_MAP_PATH,
-                        app=None):
-    """The whole picture, as data. No printing, no side effects."""
-    gallery, report = load_registered_gallery(registered_dir, hr_map_path,
-                                              verbose=False, app=app)
+                        app=None, preloaded=None):
+    """The whole picture, as data. No printing, no side effects.
+
+    `preloaded` is a (gallery, report) pair a caller has ALREADY paid for.
+    Loading the gallery means embedding every registration photo on disk, and
+    a caller that has just reloaded it into memory should not pay that twice
+    — which is exactly what finalising an enrolment used to do.
+    """
+    if preloaded is not None:
+        gallery, report = preloaded
+    else:
+        gallery, report = load_registered_gallery(registered_dir, hr_map_path,
+                                                  verbose=False, app=app)
     return {"gallery_size": {k: len(v) for k, v in gallery.items()},
             **report}
 
@@ -412,6 +421,15 @@ def verify_face_image(image, gallery=None, app=None, hr_map_path=HR_MAP_PATH,
 ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024     # one phone photo, generously
 MAX_UPLOAD_PIXELS = 60_000_000
+
+# How many photos one employee's gallery may hold.
+#
+# Enforced HERE rather than in either caller, because there are two ways in —
+# HR uploading from the desk and the employee registering from their phone —
+# and a cap that lives in one of them is not a cap. A gallery is a handful of
+# good views of one face; past that, more photos add matching cost on every
+# sign-in and nothing to recognition.
+MAX_PHOTOS_PER_EMPLOYEE = int(os.environ.get("FACE_MAX_PHOTOS_PER_EMPLOYEE", 6))
 ARCHIVE_DIRNAME = "_archive"
 
 
@@ -555,6 +573,12 @@ def save_registration_photos(employee_id, files, employee_name=None,
         # the boundary that keeps an upload inside REGISTERED_PEOPLE.
         return None, "path_escapes_registered_people"
     os.makedirs(dest, exist_ok=True)
+
+    # Refused whole, before a single file is written: half an upload landing
+    # and the rest silently dropped is worse than being told to remove one.
+    existing = len(list_registration_photos(folder, reg_root))
+    if existing + len(files) > MAX_PHOTOS_PER_EMPLOYEE:
+        return None, (f"gallery_full:{existing}/{MAX_PHOTOS_PER_EMPLOYEE}")
 
     saved, rejected = [], []
     for i, f in enumerate(files):
@@ -705,9 +729,11 @@ def read_registration_photo(folder, filename, registered_dir=None,
 
 
 def employee_registration_report(folder, registered_dir=None,
-                                 hr_map_path=HR_MAP_PATH, app=None):
+                                 hr_map_path=HR_MAP_PATH, app=None,
+                                 preloaded=None):
     """One employee's readiness, re-checked from disk after an upload."""
-    snap = status_snapshot(registered_dir, hr_map_path, app=app)
+    snap = status_snapshot(registered_dir, hr_map_path, app=app,
+                           preloaded=preloaded)
     for p in snap["people"]:
         if p["folder"] == folder:
             p = dict(p)
@@ -740,7 +766,8 @@ def readiness_band(rec):
     return NOT_READY
 
 
-def status_snapshot(registered_dir=None, hr_map_path=HR_MAP_PATH, app=None):
+def status_snapshot(registered_dir=None, hr_map_path=HR_MAP_PATH, app=None,
+                    preloaded=None):
     """Everything the HR page needs, as plain JSON-able data.
 
     Written to a file rather than served live on purpose: the face model
@@ -748,7 +775,8 @@ def status_snapshot(registered_dir=None, hr_map_path=HR_MAP_PATH, app=None):
     business importing it. A snapshot with its own timestamp is honest
     about being a snapshot — a page can say how old it is.
     """
-    st = registration_status(registered_dir, hr_map_path, app=app)
+    st = registration_status(registered_dir, hr_map_path, app=app,
+                             preloaded=preloaded)
     people = []
     for folder, r in st["people"].items():
         band = readiness_band(r)
@@ -788,6 +816,11 @@ def status_snapshot(registered_dir=None, hr_map_path=HR_MAP_PATH, app=None):
             "retake_reasons": retake,
             "nearest_other": r["nearest_other"],
             "nearest_other_dist": r["nearest_other_dist"],
+            # Filenames only, and only a directory listing — no decoding, no
+            # embedding. Carried here so the HR page can draw the gallery from
+            # the status it already has, instead of triggering a full re-read
+            # of every photo on disk just to learn their names.
+            "photos": list_registration_photos(folder, registered_dir),
         })
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
