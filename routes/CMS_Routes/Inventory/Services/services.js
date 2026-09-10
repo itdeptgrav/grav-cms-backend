@@ -179,7 +179,7 @@ async function resolveReferences(req, body) {
          second `companyId` key in the same object REPLACES it — which silently
          turns "this company's suppliers" into "everyone's". */
       const vendor = await Vendor.findOne({
-        $and: [tenantContext.tenantFilter(req.tenant), { companyId: { $ne: null } }],
+        $and: [tenantContext.tenantFilter(req.tenant), tenantContext.ownedOnly()],
         _id: id,
       }).select("_id companyName status").lean();
       if (!vendor) {
@@ -247,7 +247,7 @@ router.get("/options", canRead, async (req, res) => {
   try {
     const [suppliers, ledgers] = await Promise.all([
       Vendor.find({
-        $and: [tenantContext.tenantFilter(req.tenant), { companyId: { $ne: null } }],
+        $and: [tenantContext.tenantFilter(req.tenant), tenantContext.ownedOnly()],
         status: "Active",
       }).select("_id companyName supplierCode").sort({ companyName: 1 }).lean(),
       /* `groupName` and `budgetControl` are selected because the

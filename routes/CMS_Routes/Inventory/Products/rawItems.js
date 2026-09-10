@@ -151,12 +151,19 @@ const SUPPLIER_NOT_SELECTABLE = "SUPPLIER_NOT_SELECTABLE";
 const supplierScope = (req, extra = {}) => ({
   $and: [
     tenantContext.tenantFilter(req.tenant),
-    { companyId: { $ne: null } },
+    tenantContext.ownedOnly(),
     /* A company-owned supplier part-way through migration has no code yet.
        It is visible in the Supplier Master for remediation, and must not be
        offered here: an order or alias bound to it would carry no identity
-       anybody can quote back. */
-    { supplierCode: { $gt: "" } },
+       anybody can quote back.
+
+       Stood down while the legacy window is open. NOT ONE of the 94 suppliers
+       in this database carries a code — the supplier-code scheme shipped after
+       them and the migration script deliberately never derives one — so
+       enforcing it emptied the vendor dropdown on every Raw Item form in Store
+       and Sales (reported 10 Sep 2026). It comes back with
+       STORE_PURCHASE_STRICT_TENANCY=1, by which time codes must exist. */
+    ...(tenantContext.legacyWindowOpen() ? [] : [{ supplierCode: { $gt: "" } }]),
     ...(Object.keys(extra).length ? [extra] : []),
   ],
 });

@@ -499,7 +499,7 @@ router.get("/data/vendors", requireCapability(CAPABILITIES.READ), async (req, re
          company scope entirely. */
       $and: [
         tenantContext.tenantFilter(req.tenant),
-        { companyId: { $ne: null } },
+        tenantContext.ownedOnly(),
         { status: "Active" },
       ],
     })
