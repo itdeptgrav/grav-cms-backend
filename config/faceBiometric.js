@@ -15,6 +15,7 @@
  * individual paths) and nothing else changes.
  */
 
+const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
 
@@ -66,6 +67,69 @@ const FACE_BIOMETRIC_SERVICE_URL =
  * direction.
  */
 const FACE_ENGINE_KEY = (process.env.FACE_ENGINE_KEY || "").trim();
+
+/**
+ * Signing key for BROWSER tokens. Deliberately not FACE_ENGINE_KEY.
+ *
+ * FACE_ENGINE_KEY is this backend's credential: it never expires and it
+ * authorises everything the engine can do, enrolment included. It must never
+ * leave this process. What a browser gets instead is a token signed with this
+ * separate key, valid for two minutes, scoped to one action and one session.
+ *
+ * Two keys rather than one so that a mistake in token handling — a claim
+ * echoed into an error, a token logged — cannot expose the credential that
+ * would let somebody enrol a stranger's face as an employee.
+ */
+const FACE_BROWSER_TOKEN_SECRET = (process.env.FACE_BROWSER_TOKEN_SECRET || "").trim();
+
+/** Seconds a browser token is good for. Short: the page asks for one when it
+    starts capturing and streams frames for a few seconds. */
+const BROWSER_TOKEN_TTL_SEC = 120;
+
+const b64url = (buf) => Buffer.from(buf).toString("base64url");
+
+/**
+ * Mint a short-lived token a BROWSER may send to the engine.
+ *
+ * Claims, and why each is there:
+ *
+ *   aud  the engine, so a token minted for anything else is not accepted here
+ *   act  what it permits — "verify" and nothing else. The engine enforces its
+ *        own allowlist too, so a mis-minted act cannot widen anything
+ *   sid  the capture session it belongs to; the engine rate-limits per session
+ *   sub  OPTIONAL. Face sign-in identifies an unknown person FROM their face,
+ *        so demanding a subject would mean naming the employee before the
+ *        recognition that is supposed to determine it. Where the caller
+ *        already knows who this is — re-verifying a signed-in employee — it is
+ *        carried; otherwise the token is scoped to the kiosk session alone
+ *   iat  when it was minted, so a token from a badly-skewed clock is refused
+ *   exp  when it stops working, which is the main control here
+ *   jti  a unique id, so the engine can bound replay
+ *
+ * Returns null when no signing key is configured. Callers must treat that as
+ * "browser access is not available", never as "no token needed".
+ */
+function mintBrowserToken({ sessionId, employeeId = null, action = "verify", ttlSec = BROWSER_TOKEN_TTL_SEC }) {
+  if (!FACE_BROWSER_TOKEN_SECRET) return null;
+  const sid = String(sessionId || "").trim();
+  if (!sid || sid.length > 128) throw new Error("a session id is required to mint a face token");
+
+  const now = Math.floor(Date.now() / 1000);
+  const claims = {
+    aud: "face-engine",
+    act: [String(action)],
+    sid,
+    iat: now,
+    exp: now + Math.min(Number(ttlSec) || BROWSER_TOKEN_TTL_SEC, BROWSER_TOKEN_TTL_SEC),
+    jti: crypto.randomBytes(16).toString("hex"),
+  };
+  if (employeeId) claims.sub = String(employeeId).slice(0, 64);
+
+  const payload = b64url(JSON.stringify(claims));
+  const sig = crypto.createHmac("sha256", FACE_BROWSER_TOKEN_SECRET).update(payload).digest();
+  return { token: `${payload}.${b64url(sig)}`, expiresAt: new Date(claims.exp * 1000).toISOString(),
+           expiresInSec: claims.exp - now, sessionId: sid };
+}
 
 /** True when the engine is somewhere a stranger could also reach. */
 function engineIsRemote() {
@@ -197,5 +261,12 @@ module.exports = {
   engineHeaders,
   engineIsRemote,
   FACE_ENGINE_KEY,
+  /* Exported for the route that issues browser tokens. FACE_BROWSER_TOKEN_SECRET
+     itself deliberately is NOT: nothing outside this module needs the key, and
+     a value that cannot be reached cannot be logged, serialised into a response
+     or spread into an object by accident. */
+  mintBrowserToken,
+  BROWSER_TOKEN_TTL_SEC,
+  browserTokensConfigured: () => Boolean(FACE_BROWSER_TOKEN_SECRET),
   serviceUnavailable,
 };

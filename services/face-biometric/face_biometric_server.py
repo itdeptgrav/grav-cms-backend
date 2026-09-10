@@ -31,6 +31,7 @@ its own gate, and gates expire.
 import argparse
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import os
@@ -68,6 +69,200 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 def _is_loopback(host):
     return str(host).strip().lower() in _LOOPBACK_HOSTS
+
+
+# ---------------------------------------------------------------------------
+# BROWSER AUTHORISATION
+#
+# The engine is reachable from the internet on one hostname and one path,
+# through the Cloudflare tunnel. It still binds loopback only; the tunnel is
+# the transport. That hostname is random, and a random hostname is obscurity,
+# not authentication — so every public request must prove itself here.
+#
+# It cannot prove itself with FACE_ENGINE_KEY. That key is the backend's, it
+# never expires, and it authorises everything including enrolment; putting it
+# in a browser would publish the ability to enrol a stranger as an employee.
+#
+# So a browser carries a SEPARATE, short-lived, scoped token minted by the
+# backend and verified here independently. Independently is the point: the
+# backend deciding a request is fine is not a control the engine has applied,
+# and the engine is the thing on the public hostname.
+#
+# The token is deliberately small: a signed JSON payload, HMAC-SHA256, base64url,
+# no library. hmac and base64 are in the standard library, so this adds nothing
+# to the dependency set that a model server has to carry.
+# ---------------------------------------------------------------------------
+
+# Signing key for browser tokens. NOT the engine key: a flaw in token handling
+# must not be able to leak the credential that authorises enrolment.
+BROWSER_TOKEN_SECRET = os.environ.get("FACE_BROWSER_TOKEN_SECRET", "").strip()
+
+# The audience this engine will accept. A token minted for anything else — a
+# different service, a different environment — is not for us.
+TOKEN_AUDIENCE = "face-engine"
+
+# What a browser token may ever authorise, whatever its claims say.
+#
+# An allowlist of (method, path), not a rule derived from the token. A token is
+# an attacker-influenced document: if the set of permitted paths came out of it,
+# a forged or mis-minted `act` would decide its own permissions. /verify runs
+# recognition and returns a decision. Everything else either enrols a face,
+# deletes state, or lists the gallery, and none of those is a browser's
+# business at any expiry.
+BROWSER_ALLOWED = {("POST", "/verify")}
+
+# Origins allowed to make a cross-origin request, exactly. Comma-separated,
+# from the environment, so adding the employee app later is configuration and
+# not a code change. Never "*": these requests carry a biometric frame and an
+# authorisation token, and a wildcard would let any page on the internet spend
+# this machine's CPU on inference.
+ALLOWED_ORIGINS = tuple(
+    o.strip() for o in os.environ.get("FACE_ALLOWED_ORIGINS", "").split(",") if o.strip()
+)
+
+# How long a browser token is good for. The sign-in page asks for one when it
+# starts capturing and streams frames for a few seconds; two minutes covers a
+# slow camera and a retry without leaving a usable token lying in a log.
+MAX_TOKEN_LIFETIME_SEC = 120
+# A clock that is a little ahead should not reject its own fresh token.
+CLOCK_SKEW_SEC = 30
+
+# Public request budget, per session. The legitimate page sends a few frames a
+# second; MIN_FRAME_INTERVAL_SEC already paces one session's captures. This is
+# the coarser limit that stops a token being replayed as a CPU tap: inference
+# is the expensive thing on this box, and it is what a public endpoint invites.
+PUBLIC_RATE_WINDOW_SEC = 10.0
+PUBLIC_RATE_MAX_REQUESTS = 60          # ~6/s sustained, far above a real capture
+PUBLIC_BURST_MAX = 20
+
+
+def _b64url_decode(s):
+    """base64url without padding, as the token is written."""
+    s = str(s)
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+class _BrowserTokens:
+    """Verification, replay tracking and rate limiting for browser tokens.
+
+    Kept in one object because all three answer the same question — may this
+    request run inference — and splitting them invites a caller that checks two
+    of the three.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._seen = {}        # jti -> expiry, so a token cannot outlive itself
+        self._hits = {}        # session id -> [timestamps]
+
+    # -- verification -------------------------------------------------------
+    def verify(self, token, method, path):
+        """(claims, None) when the token authorises this exact request.
+
+        Returns (None, reason) otherwise. `reason` is a fixed short string: it
+        goes back over the internet, so it must not describe which claim failed
+        in a way that helps somebody assemble a working one.
+        """
+        if not BROWSER_TOKEN_SECRET:
+            # No signing key configured means browser tokens were never set up.
+            # Refusing is the only safe reading: accepting would make the public
+            # path open the moment somebody forgot a variable.
+            return None, "unauthorised"
+        if not token or len(token) > 4096:
+            return None, "unauthorised"
+
+        parts = token.split(".")
+        if len(parts) != 2:
+            return None, "unauthorised"
+        payload_b64, sig_b64 = parts
+
+        try:
+            expected = hmac.new(BROWSER_TOKEN_SECRET.encode("utf-8"),
+                                payload_b64.encode("ascii"), hashlib.sha256).digest()
+            got = _b64url_decode(sig_b64)
+        except (binascii.Error, ValueError, UnicodeEncodeError):
+            return None, "unauthorised"
+        # compare_digest so a signature cannot be found one byte at a time.
+        if not hmac.compare_digest(expected, got):
+            return None, "unauthorised"
+
+        try:
+            claims = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return None, "unauthorised"
+        if not isinstance(claims, dict):
+            return None, "unauthorised"
+
+        # A valid signature only proves the backend wrote it. What it PERMITS
+        # is a separate question, and every part of it is checked.
+        if claims.get("aud") != TOKEN_AUDIENCE:
+            return None, "forbidden"
+
+        now = time.time()
+        try:
+            iat = float(claims.get("iat", 0))
+            exp = float(claims.get("exp", 0))
+        except (TypeError, ValueError):
+            return None, "unauthorised"
+        if exp <= now:
+            return None, "expired"
+        if iat > now + CLOCK_SKEW_SEC:
+            return None, "unauthorised"
+        # A token minted with a long life is refused even though it is signed:
+        # the lifetime is part of the contract, not a suggestion the minter can
+        # opt out of.
+        if exp - iat > MAX_TOKEN_LIFETIME_SEC + CLOCK_SKEW_SEC:
+            return None, "forbidden"
+
+        sid = str(claims.get("sid") or "")
+        if not sid or len(sid) > 128:
+            return None, "forbidden"
+
+        act = claims.get("act")
+        acts = act if isinstance(act, list) else [act]
+        if (method, path) not in BROWSER_ALLOWED or "verify" not in acts:
+            return None, "forbidden"
+
+        jti = str(claims.get("jti") or "")
+        if not jti or len(jti) > 128:
+            return None, "forbidden"
+        with self._lock:
+            self._sweep(now)
+            # NOT single-use: a sign-in streams several frames under one token,
+            # and a token consumed by the first frame would break the flow it
+            # exists for. What replay is bounded by is the expiry and the rate
+            # limit below — a captured token is worth at most a few seconds of
+            # inference against one session.
+            self._seen[jti] = exp
+        return claims, None
+
+    # -- rate limiting ------------------------------------------------------
+    def allow(self, sid):
+        """False when this session has asked for too much, too fast."""
+        now = time.time()
+        with self._lock:
+            hits = [t for t in self._hits.get(sid, ()) if now - t < PUBLIC_RATE_WINDOW_SEC]
+            if len(hits) >= PUBLIC_RATE_MAX_REQUESTS:
+                self._hits[sid] = hits
+                return False
+            recent = [t for t in hits if now - t < 1.0]
+            if len(recent) >= PUBLIC_BURST_MAX:
+                self._hits[sid] = hits
+                return False
+            hits.append(now)
+            self._hits[sid] = hits
+            if len(self._hits) > 4000:
+                self._hits = {k: v for k, v in self._hits.items()
+                              if v and now - v[-1] < PUBLIC_RATE_WINDOW_SEC}
+            return True
+
+    def _sweep(self, now):
+        if len(self._seen) < 4000:
+            return
+        self._seen = {k: v for k, v in self._seen.items() if v > now}
+
+
+BROWSER = _BrowserTokens()
 # One frame of a webcam, generously. A request larger than this is not a
 # face capture, so it is refused before it is decoded rather than after.
 MAX_BODY_BYTES = 6 * 1024 * 1024
@@ -374,15 +569,65 @@ class Handler(BaseHTTPRequestHandler):
         # worth reading.
         pass
 
+    def _allowed_origin(self):
+        """The request's Origin, if it is one we serve. Never a wildcard.
+
+        Returned rather than compared in place so the SAME value is echoed
+        back: replying with a wildcard, or with an origin we did not check,
+        would let any page on the internet read a biometric decision.
+        """
+        origin = self.headers.get("Origin")
+        if origin and origin in ALLOWED_ORIGINS:
+            return origin
+        return None
+
+    def _cors_headers(self):
+        origin = self._allowed_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        # Sent whether or not this request matched, so a cache cannot serve one
+        # origin's response to another.
+        self.send_header("Vary", "Origin")
+
     def _json(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        # Bound to localhost; the Node API is the only intended caller.
         self.send_header("Cache-Control", "no-store")
+        # This engine answers a public hostname on one path. Nothing it returns
+        # should ever be framed, sniffed into another type, or referred onward.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        """CORS preflight.
+
+        Only for an origin on the list and only for what a browser is allowed
+        to do here. An unknown origin gets 403 with no CORS headers, which is
+        what makes the browser refuse the real request that would follow.
+        """
+        origin = self._allowed_origin()
+        path = self.path.rstrip("/")
+        if not origin or ("POST", path) not in BROWSER_ALLOWED:
+            return self._json(403, {"ok": False, "error": "forbidden"})
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        # Exactly what the sign-in page sends. Not a wildcard: the header list
+        # is part of the contract, and widening it later should be deliberate.
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        # No Access-Control-Allow-Credentials. The token travels in a header,
+        # not a cookie, so the browser never needs to attach ambient
+        # authority — and asking for credentials would make an origin mistake
+        # far more dangerous than it already is.
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _authorised(self):
         """True when the caller proved it is the Node API.
@@ -396,7 +641,49 @@ class Handler(BaseHTTPRequestHandler):
         # compare_digest so a wrong key cannot be found one byte at a time.
         return hmac.compare_digest(got, ENGINE_KEY)
 
+    def _authorise(self, method, path):
+        """Decide who this is and whether they may do this, before anything costs.
+
+        Two callers exist and they are not equivalent:
+
+          the Node API   proves itself with X-Face-Key and may do everything.
+          a browser      proves itself with a short-lived scoped token and may
+                         do exactly one thing.
+
+        Returns (kind, sid, None) or (None, None, (code, error)). The checks run
+        cheapest-and-most-decisive first — signature before claims, claims
+        before rate limit, all of it before a single byte of the body is read —
+        because the body is a photograph and the work after it is model
+        inference. An unauthorised request must never be able to spend that.
+        """
+        key = self.headers.get("X-Face-Key")
+        if key is not None:
+            if ENGINE_KEY and hmac.compare_digest(key, ENGINE_KEY):
+                return "engine", None, None
+            return None, None, (401, "unauthorised")
+
+        auth = self.headers.get("Authorization") or ""
+        if auth[:7].lower() == "bearer ":
+            claims, reason = BROWSER.verify(auth[7:].strip(), method, path)
+            if reason:
+                return None, None, (403 if reason == "forbidden" else 401, reason)
+            sid = str(claims.get("sid"))
+            if not BROWSER.allow(sid):
+                return None, None, (429, "rate_limited")
+            return "browser", sid, None
+
+        # No credential at all. On loopback with no key configured the OS is
+        # the boundary and the Node API is the only caller — that is the
+        # development case main() allows. Otherwise this is a refusal.
+        if not ENGINE_KEY:
+            return "engine", None, None
+        return None, None, (401, "unauthorised")
+
     def do_GET(self):
+        # X-Face-Key only, deliberately. /health lists the gallery — every
+        # enrolled employee's biometric id — so it is not something a browser
+        # token may reach at any expiry, and the public hostname does not route
+        # it either. Two independent refusals for the same fact.
         if not self._authorised():
             return self._json(401, {"ok": False, "error": "unauthorised"})
         if self.path.rstrip("/") in ("/health", ""):
@@ -420,9 +707,24 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
-        if not self._authorised():
-            return self._json(401, {"ok": False, "error": "unauthorised"})
         path = self.path.rstrip("/")
+
+        # ORDER MATTERS, and this is the order.
+        #
+        #   1. what path is this            — an unknown path costs nothing
+        #   2. who is this, and may they    — signature, then claims, then rate
+        #   3. how big is the body          — refused by header, before reading
+        #   4. read and parse               — first time we touch attacker bytes
+        #   5. decode the image, infer      — the expensive part
+        #
+        # Inference is the only genuinely costly thing here, and a public
+        # endpoint is an invitation to spend it. Nothing above step 5 is
+        # reachable without a valid, unexpired, correctly scoped token.
+        kind, browser_sid, refusal = self._authorise("POST", path)
+        if refusal:
+            code, error = refusal
+            return self._json(code, {"ok": False, "error": error})
+
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -434,6 +736,15 @@ class Handler(BaseHTTPRequestHandler):
         if length > limit:
             # Refused before reading: a body this size is not a webcam
             # frame, and reading it to find that out is the attack.
+            #
+            # The connection is closed rather than kept alive, because the
+            # sender is still writing a body nobody will consume. Draining it
+            # to be polite would be doing the work we just refused; leaving the
+            # socket open would hold a connection for a client that has been
+            # told no. A client mid-upload sees the reset — which is the
+            # honest outcome of a refusal that happens before the transfer
+            # finishes.
+            self.close_connection = True
             return self._json(413, {"ok": False, "error": "body_too_large",
                                     "max_bytes": limit})
         raw = self.rfile.read(length)

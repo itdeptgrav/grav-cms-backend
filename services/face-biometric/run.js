@@ -166,3 +166,40 @@ child.on("error", (err) => {
 child.on("exit", (code, signal) => {
   process.exit(signal ? 1 : (code ?? 0));
 });
+
+/**
+ * Take python down with us.
+ *
+ * PM2 supervises THIS process, not the interpreter it spawns, and the venv's
+ * launcher means the real engine is a grandchild — node -> python -> python.
+ * Without this, stopping or restarting the service kills only the launcher and
+ * leaves the engine alive, still holding 127.0.0.1:5001. The replacement then
+ * cannot bind, and the symptom is a service that PM2 reports as online while
+ * every request reaches a process from the previous version. A deployment that
+ * restarts the engine would produce exactly that.
+ *
+ * taskkill /T on Windows because the tree is what has to go, not just the
+ * child: killing the launcher stub would orphan the interpreter under it and
+ * change nothing. SIGKILL elsewhere, where the process group already covers it.
+ */
+let stopping = false;
+function stopChild() {
+  if (stopping || child.exitCode !== null || child.signalCode !== null) return;
+  stopping = true;
+  if (isWindows) {
+    try {
+      require("child_process").spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"],
+                                         { stdio: "ignore", timeout: 10000 });
+    } catch (e) { /* falls through to kill() below */ }
+  }
+  try { child.kill("SIGKILL"); } catch (e) {}
+}
+
+process.on("exit", stopChild);
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
+  /* Handled rather than left to the default, because the default terminates
+     this process without ever running the exit hook above. */
+  try {
+    process.on(sig, () => { stopChild(); process.exit(1); });
+  } catch (e) { /* not every signal exists on every platform */ }
+}

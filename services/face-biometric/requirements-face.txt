@@ -1,0 +1,41 @@
+# Face biometric engine — services/face-biometric/face_biometric_server.py
+#
+# The engine imports exactly four third-party packages: numpy, cv2, onnxruntime
+# and insightface. Everything else in the venv is pulled in by those, and is
+# deliberately NOT pinned here — a full `pip freeze` of the machine would nail
+# down two dozen transitive versions nobody chose, and the first one to yank a
+# release would break a deployment for a reason unrelated to this service.
+#
+# Pinned exactly, not with >=, because this is a deployment input: a model
+# loader that silently picks up a new onnxruntime is a change to production
+# nobody made. Versions are the ones proven working on RISHALIENWARE under
+# Python 3.14.6 (verified 10 Sep 2026).
+#
+# ONE THING TO KNOW BEFORE EDITING:
+#
+#   insightface 2.0 declares `opencv-python` — the DESKTOP build, with GUI
+#   bindings — as a hard dependency. Installing from this file therefore
+#   produces BOTH opencv distributions:
+#
+#       opencv-python==5.0.0.93           (pulled by insightface)
+#       opencv-python-headless==5.0.0.93  (requested below)
+#
+#   That is what the production venv already contains and it works: the two
+#   ship the same `cv2` module and, at equal versions, whichever landed last
+#   wins with no behavioural difference for what this engine does — decode a
+#   frame, resize it, hand it to the model. It never opens a window.
+#
+#   The headless build is still requested explicitly so the version is pinned
+#   rather than inherited, and so an environment that lacks the desktop GUI
+#   libraries has a build that does not need them. Do not "clean this up" by
+#   removing it: the resolver would then take opencv-python at whatever version
+#   insightface's range allows.
+#
+# The venv this installs into is C:\GravServer\venvs\face, created once and
+# never recreated by a deployment. scripts/deploy.js runs pip against it ONLY
+# when this file changes between the previously deployed commit and the new one.
+
+numpy==2.5.3
+onnxruntime==1.29.0
+opencv-python-headless==5.0.0.93
+insightface==2.0
