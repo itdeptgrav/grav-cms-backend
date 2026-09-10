@@ -286,3 +286,40 @@ has tested.
 
 **One engine, one site.** A second factory needs a second engine, its own data
 directory, and a routing decision the code does not currently make.
+
+## The public /verify path
+
+Since 10 Sep 2026 the engine answers ONE path from the internet:
+
+    https://<public-hostname>/verify
+
+It reaches the engine through the existing Cloudflare tunnel; the process still
+binds `127.0.0.1` only and no port is forwarded. The tunnel rule carries
+`path: ^/verify$`, so `/health`, `/register/*`, `/reset` and `/reload` are not
+routed at all — a request for one of them is refused at the edge before it
+reaches this machine.
+
+That matters most for `/health`, which returns the gallery: a list of every
+enrolled employee's biometric ID.
+
+Two credentials, and they are not interchangeable:
+
+| Variable | Held by | Authorises |
+|---|---|---|
+| `FACE_ENGINE_KEY` | the backend, server to server | everything, no expiry |
+| `FACE_BROWSER_TOKEN_SECRET` | signs tokens given to browsers | `POST /verify`, 120 s, one session |
+
+`FACE_ENGINE_KEY` must never reach a browser. A page gets a token from
+`POST /hr/face-registration/verify-token` (authenticated), and the engine
+verifies that token itself — signature, audience, action, session, expiry —
+rather than trusting that the backend already did.
+
+`FACE_ALLOWED_ORIGINS` is the exact CORS allow-list for that path. Never `*`:
+these requests carry a biometric frame, and a wildcard would let any page on the
+internet spend this machine's CPU on model inference.
+
+Deployment restarts the engine only when files under `services/face-biometric/`
+actually changed between the previously deployed commit and the new one, and
+runs `pip install -r services/face-biometric/requirements-face.txt` only when
+that file itself changed. The venv at `C:\GravServer\venvs\face` is never
+recreated by a deployment.
