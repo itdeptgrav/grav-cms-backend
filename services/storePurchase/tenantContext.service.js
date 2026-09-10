@@ -238,10 +238,53 @@ function forService({ companyId, reason, capabilities = null }) {
  * because a list that mixes owned and unowned records is exactly the
  * ambiguity Chunk 0 recorded.
  */
+/* ── TEMPORARY: legacy read-through during the company-scoping migration ──────
+ *
+ * Every Store & Purchase record in this database predates company ownership —
+ * 301 raw items, 100 purchase orders, 90 vendors, 24 units, 1 warehouse, all
+ * with `companyId: null`, and not one company-stamped record anywhere. The
+ * scoping shipped; the backfill never ran. So `{ companyId: ctx.companyId }`
+ * matched nothing: every store screen rendered empty, and every write touching
+ * one of those records was refused as LEGACY_GLOBAL_RECORD. That is the
+ * "sections not showing / not responding" report of 9 Sep 2026.
+ *
+ * Until the backfill runs, a company sees its OWN records and the unowned
+ * legacy ones, and may act on both. This is deliberately NOT `legacyMode`:
+ * that one is capability-gated and returns ONLY unowned records — the right
+ * tool for an audit screen, the wrong one for "the store works again".
+ *
+ * Writes are unaffected: stamp() still puts the real companyId on everything
+ * new, so data created from here on is already migrated.
+ *
+ * TO END IT: backfill companyId onto the legacy rows, then set
+ * STORE_PURCHASE_STRICT_TENANCY=1 — or delete this block and the two branches
+ * that read LEGACY_READTHROUGH.
+ */
+const LEGACY_READTHROUGH = process.env.STORE_PURCHASE_STRICT_TENANCY !== "1";
+if (LEGACY_READTHROUGH) {
+  console.warn(
+    "[store-purchase] TEMPORARY: legacy read-through is ON — unowned (companyId:null) " +
+    "records are visible and actionable. Backfill companyId, then set " +
+    "STORE_PURCHASE_STRICT_TENANCY=1.",
+  );
+}
+
 function tenantFilter(ctx) {
   if (!ctx) throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
   if (ctx.legacyMode) {
     return { $or: [{ companyId: { $exists: false } }, { companyId: null }] };
+  }
+  if (LEGACY_READTHROUGH) {
+    /* An $or here is already the shape callers handle — legacyMode above
+       returns one, which is why scopedSearch() folds caller clauses into
+       $and rather than assigning $or. */
+    return {
+      $or: [
+        { companyId: ctx.companyId },
+        { companyId: { $exists: false } },
+        { companyId: null },
+      ],
+    };
   }
   return { companyId: ctx.companyId };
 }
@@ -319,6 +362,12 @@ function assertNoForeignCompany(ctx, body = {}) {
 function assertSameTenant(ctx, doc, label = "record") {
   if (!doc) throw fail("NOT_FOUND", `That ${label} was not found.`);
   const owner = doc.companyId ?? null;
+  if (owner === null && LEGACY_READTHROUGH) {
+    /* Same migration window as tenantFilter above: every record in this
+       database is legacy, so refusing them here would leave the screens
+       readable and every action on them broken. */
+    return doc;
+  }
   if (owner === null) {
     /* A legacy-global record cannot join a company-scoped write. Reading it
        is a separate, capability-gated mode. */
