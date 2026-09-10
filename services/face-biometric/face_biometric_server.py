@@ -758,6 +758,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False,
                                     "error": "missing_session_id"})
 
+        # THE TOKEN'S SESSION IS THE ONLY SESSION IT MAY DRIVE.
+        #
+        # The signature proves the backend minted this token for session A. It
+        # says nothing about the session_id in the body, which is a separate
+        # attacker-controlled field — so without this comparison one legitimate
+        # token could build, extend or complete a verification streak under any
+        # session id its holder chose.
+        #
+        # That matters because a streak is the unit of evidence: the engine
+        # requires several matching frames in a window before it says VERIFIED,
+        # and the whole point of scoping streaks to a session is that two
+        # browsers cannot pool their frames into one. A token free to name its
+        # own session defeats that, and would defeat it hardest in the flow this
+        # endpoint exists for — the one where a completed streak is meant to
+        # mean somebody is standing there.
+        #
+        # Checked HERE: after the cheap parse that yields session_id, and before
+        # decode_image and inference. A mismatch costs a JSON parse, not a model
+        # pass.
+        if kind == "browser" and not hmac.compare_digest(str(browser_sid), sid):
+            return self._json(403, {"ok": False, "error": "forbidden"})
+
         if path == "/register/upload":
             eid = payload.get("employee_id")
             files = payload.get("files") or []
