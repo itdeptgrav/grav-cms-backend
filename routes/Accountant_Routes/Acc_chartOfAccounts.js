@@ -20,6 +20,7 @@ const {
 // contactDetails still trigger "no state code" errors on the voucher form.
 const { applyGstAutoState } = require("../../services/gstState.util");
 const openItems = require("../../services/openItems.service");
+const { inheritablePartyLinks } = require("../../services/partyLinkSafety");
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -6540,8 +6541,6 @@ router.post("/ledgers/:id/merge", async (req, res) => {
           ...(dest.balanceFromTrialBalance || source.balanceFromTrialBalance
             ? { balanceFromTrialBalance: true }
             : {}),
-          // Inherit party links only where the destination has none, so a
-          // merge never silently steals an existing vendor/customer link.
           /* Party links are inherited only when the two ledgers are the
              same party. The old guard checked only that the DESTINATION
              had no link of its own, so merging a ledger linked to customer

@@ -110,6 +110,14 @@ const PARTY_SIDE = {
   debit_note: "Dr", // we owe the supplier less
 };
 
+/**
+ * Types that can settle an obligation the books recorded WITHOUT a party —
+ * a payroll journal's Cr Salary Payable being the case that forced this.
+ * Receipts are absent on purpose: money coming in settles a customer, and
+ * widening that side is how the 66 false positives came back.
+ */
+const OBLIGATION_TYPES = new Set(["payment", "debit_note"]);
+
 /** The document type a settlement of this voucher applies against. */
 const SOURCE_TYPE = {
   receipt: "sales",
@@ -164,17 +172,75 @@ function assertMatchable(voucher) {
  * ₹1,48,000, which is worse than refusing it: half a receipt allocated looks
  * exactly like a whole one.
  */
-function partyEntriesOf(voucher) {
+function partyEntriesOf(voucher, liabilityLedgerIds = null) {
   const entries = voucher.ledgerEntries || [];
   const wantSide = PARTY_SIDE[voucher.voucherType] || "Cr";
   const flagged = entries.filter((e) => e.isPartyLedger && e.type === wantSide);
   if (flagged.length) return flagged;
   if (voucher.partyLedgerId) {
-    return entries.filter(
+    const byId = entries.filter(
       (e) => e.ledgerId && String(e.ledgerId) === String(voucher.partyLedgerId) && e.type === wantSide,
+    );
+    if (byId.length) return byId;
+  }
+
+  /* ── PAYING SOMETHING THE BOOKS ALREADY OWE ───────────────────────────────
+     Not every payable is a supplier bill. Posting payroll writes a JOURNAL —
+     Dr Salaries, Cr Salary Payable — and the money leaves later on a payment
+     voucher: Dr Salary Payable, Cr Bank. Neither carries a party: salary is
+     owed to staff, not to a Sundry Creditor, so `isPartyLedger` is false on
+     every line and `partyLedgerId` is unset. The payment was therefore
+     "not against a customer or supplier account" and could not be matched to
+     anything — the JV stayed open forever and the payment settled nothing.
+
+     So a payment's Dr leg counts when it lands on a LIABILITY ledger: the
+     books said we owed this, and this voucher is us paying it. The ids are
+     passed in rather than guessed from the group name, because "Provisions",
+     "Current Liabilities" and "Duties & Taxes" are all liabilities and no
+     string test gets that right for long. Without the set, this returns
+     nothing and every existing caller behaves exactly as it did.
+
+     Deliberately NOT "the only line on that side". That fallback claimed a
+     party for 66 of 139 receipts that have none — see the note above. A
+     ledger's nature is a fact about the account; line count is a coincidence. */
+  if (liabilityLedgerIds && OBLIGATION_TYPES.has(voucher.voucherType)) {
+    return entries.filter(
+      (e) =>
+        e.type === wantSide &&
+        e.ledgerId &&
+        liabilityLedgerIds.has(String(e.ledgerId)),
     );
   }
   return [];
+}
+
+/**
+ * Which ledgers on these vouchers are liabilities?
+ *
+ * One query for the whole page rather than one per voucher — `/unmatched`
+ * summarises up to 500 at a time, and a lookup per voucher there is 500 round
+ * trips to Mumbai for a fact that fits in a single `$in`.
+ */
+async function liabilityLedgerIdsFor(vouchers) {
+  const list = Array.isArray(vouchers) ? vouchers : [vouchers];
+  const ids = new Set();
+  for (const v of list) {
+    if (!v || !OBLIGATION_TYPES.has(v.voucherType)) continue;
+    const wantSide = PARTY_SIDE[v.voucherType] || "Cr";
+    for (const e of v.ledgerEntries || []) {
+      if (e.type === wantSide && e.ledgerId) ids.add(String(e.ledgerId));
+    }
+  }
+  if (!ids.size) return new Set();
+
+  const { Acc_Ledger } = require("../models/Accountant_model/Acc_MasterModels");
+  const rows = await Acc_Ledger.find({
+    _id: { $in: [...ids] },
+    nature: "liability",
+  })
+    .select("_id")
+    .lean();
+  return new Set(rows.map((r) => String(r._id)));
 }
 
 /**
@@ -183,8 +249,8 @@ function partyEntriesOf(voucher) {
  * `partyLedgerId` picks a leg on a voucher that settles several parties; with
  * one party it is ignored, so every existing caller behaves as before.
  */
-function findPartyEntry(voucher, partyLedgerId = null) {
-  const parties = partyEntriesOf(voucher);
+function findPartyEntry(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
   if (partyLedgerId) {
     return parties.find((e) => String(e.ledgerId) === String(partyLedgerId)) || null;
   }
@@ -222,8 +288,8 @@ function settlementRows(entry) {
  * `unallocated` is the headline: it is what the matching screen offers, and
  * zero means this voucher is fully matched and must be left alone.
  */
-function matchStateOf(voucher, partyLedgerId = null) {
-  const entry = findPartyEntry(voucher, partyLedgerId);
+function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
+  const entry = findPartyEntry(voucher, partyLedgerId, liabilityLedgerIds);
   if (!entry) {
     return {
       matchable: false,
@@ -240,7 +306,7 @@ function matchStateOf(voucher, partyLedgerId = null) {
   const allocated = money(rows.reduce((s, a) => s + (Number(a.amount) || 0), 0));
   const total = money(entry.amount);
 
-  const parties = partyEntriesOf(voucher);
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
   return {
     matchable: true,
     /* Every party this voucher settles, so a screen can offer a choice
@@ -280,8 +346,10 @@ function matchStateOf(voucher, partyLedgerId = null) {
  * this receipt already settled is still offered, at its pre-settlement figure,
  * rather than vanishing.
  */
-async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedgerId = null } = {}) {
-  const state = matchStateOf(voucher, partyLedgerId);
+async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedgerId = null, liabilityLedgerIds = null } = {}) {
+  const liabilities =
+    liabilityLedgerIds || (await liabilityLedgerIdsFor(voucher));
+  const state = matchStateOf(voucher, partyLedgerId, liabilities);
   if (!state.matchable || !state.partyLedgerId) return [];
 
   const folded = await openItems.billsByLedger(voucher.companyId, [
@@ -329,10 +397,20 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedg
      unbilledInvoicesForParty. */
   const fromInvoices = await unbilledInvoicesForParty(voucher, folded, partyLedgerId);
 
+  /* Journals that put an obligation on this very ledger — payroll's
+     Cr Salary Payable being the one that matters. Only for the types that
+     can settle one; for a receipt this is an empty list. */
+  const fromJournals = await openJournalObligations(
+    voucher,
+    state.partyLedgerId,
+    folded,
+  );
+
   const seen = new Set(fromFold.map((b) => b.billName));
   const all = [
     ...fromFold,
     ...fromInvoices.filter((b) => !seen.has(b.billName)),
+    ...fromJournals.filter((b) => !seen.has(b.billName)),
   ];
 
   return all.sort((a, b) => {
@@ -445,6 +523,96 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
 }
 
 /**
+ * Obligations a JOURNAL put on this ledger, and what is left on each.
+ *
+ * ── WHY A JOURNAL IS A BILL HERE ────────────────────────────────────────────
+ * Posting payroll records the cost and the debt in one journal — Dr Salaries,
+ * Cr Salary Payable — and paying it is a separate voucher, Dr Salary Payable /
+ * Cr Bank. That Cr is a real obligation with a number on it. It is a bill in
+ * every sense that matters to matching: an amount the books say we owe, on a
+ * named ledger, that a payment can discharge in part or in full.
+ *
+ * A journal can credit several liability ledgers at once — PF Payable, ESI
+ * Payable and Salary Payable all come out of the same payroll run — so the
+ * obligation offered is this journal's Cr on THIS ledger only. Paying Salary
+ * Payable must never look like it cleared the PF.
+ *
+ * The fold is ledger-scoped for the same reason, so a journal that is already
+ * carrying its `new_ref` is handled by `fromFold` and skipped here.
+ */
+async function openJournalObligations(voucher, ledgerId, foldedBills) {
+  if (!OBLIGATION_TYPES.has(voucher.voucherType) || !ledgerId) return [];
+
+  const journals = await Acc_Voucher.find({
+    companyId: voucher.companyId,
+    voucherType: "journal",
+    status: "posted",
+    ledgerEntries: {
+      $elemMatch: { ledgerId, type: "Cr" },
+    },
+  })
+    .select("voucherNumber voucherDate narration ledgerEntries")
+    .sort({ voucherDate: 1 })
+    .limit(500)
+    .lean();
+
+  if (!journals.length) return [];
+
+  /* Already carrying a reference — the fold owns it, and offering it twice
+     would let one obligation be allocated against two copies of itself. */
+  const billed = new Set(
+    [...foldedBills.values()]
+      .filter((b) => b.originalAmount > EPSILON)
+      .map((b) => b.billName),
+  );
+
+  /* What any voucher has already put against these numbers on this ledger. */
+  const settledByName = new Map();
+  for (const b of foldedBills.values()) {
+    settledByName.set(b.billName, Math.abs(b.remaining));
+  }
+
+  const out = [];
+  for (const j of journals) {
+    if (billed.has(j.voucherNumber)) continue;
+
+    const owed = (j.ledgerEntries || [])
+      .filter(
+        (e) => e.ledgerId && String(e.ledgerId) === String(ledgerId) && e.type === "Cr",
+      )
+      .reduce((s, e) => s + (Number(e.amount) || 0), 0);
+    if (owed <= EPSILON) continue;
+
+    const settled = settledByName.get(j.voucherNumber) || 0;
+    const outstanding = money(Math.max(0, owed - settled));
+    if (outstanding <= EPSILON) continue;
+
+    out.push({
+      billName: j.voucherNumber,
+      originalAmount: money(owed),
+      outstanding,
+      /* Payables are negative in the fold's sign convention, and a screen
+         filtering on it must see this the same way as a purchase bill. */
+      signedRemaining: money(-outstanding),
+      alreadyOnThisVoucher: 0,
+      firstVoucherDate: j.voucherDate || null,
+      dueDate: null,
+      voucherNumbers: [j.voucherNumber],
+      /* What it is, so the screen can say "Journal" rather than implying a
+         supplier invoice that does not exist. */
+      sourceVoucherType: "journal",
+      sourceLabel: j.narration || "Journal",
+      needsBillReference: true,
+      sourceVoucherId: j._id,
+      /* ensureBillReference cannot infer which line to stamp on a journal —
+         a payroll JV credits three different liabilities. */
+      referenceLedgerId: String(ledgerId),
+    });
+  }
+  return out;
+}
+
+/**
  * Give an invoice the bill reference it should always have carried.
  *
  * Writing an `agst_ref` settlement against an invoice that has no `new_ref`
@@ -454,18 +622,33 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
  * implies, at its face value. Idempotent, and it changes no total on the
  * invoice — `billAllocations` are a reference, not a posting.
  */
-async function ensureBillReference(sourceVoucherId) {
+async function ensureBillReference(sourceVoucherId, referenceLedgerId = null) {
   const invoice = await Acc_Voucher.findById(sourceVoucherId);
   if (!invoice) return false;
 
   const wantSide = invoice.voucherType === "sales" ? "Dr" : "Cr";
   const entries = invoice.ledgerEntries || [];
-  const party =
-    entries.find((e) => e.isPartyLedger && e.type === wantSide) ||
-    (invoice.partyLedgerId &&
-      entries.find(
-        (e) => e.ledgerId && String(e.ledgerId) === String(invoice.partyLedgerId) && e.type === wantSide,
-      ));
+
+  /* A journal has no party line, and picking the wrong one would put the
+     reference on the PF when the payment cleared the salary. The caller names
+     the ledger; without a name there is nothing safe to guess, so refuse. */
+  let party;
+  if (invoice.voucherType === "journal") {
+    if (!referenceLedgerId) return false;
+    party = entries.find(
+      (e) =>
+        e.ledgerId &&
+        String(e.ledgerId) === String(referenceLedgerId) &&
+        e.type === "Cr",
+    );
+  } else {
+    party =
+      entries.find((e) => e.isPartyLedger && e.type === wantSide) ||
+      (invoice.partyLedgerId &&
+        entries.find(
+          (e) => e.ledgerId && String(e.ledgerId) === String(invoice.partyLedgerId) && e.type === wantSide,
+        ));
+  }
   if (!party) return false;
 
   const existing = (party.billAllocations || []).find(
@@ -502,7 +685,11 @@ async function ensureBillReference(sourceVoucherId) {
 async function applyAllocations(voucher, requested = [], { partyLedgerId = null } = {}) {
   assertMatchable(voucher);
 
-  const entry = findPartyEntry(voucher, partyLedgerId);
+  /* Resolved here too, or a payroll payment would pass the read path and then
+     be refused at the write with "no single party ledger line" — the screen
+     offering bills it cannot then accept. */
+  const liabilities = await liabilityLedgerIdsFor(voucher);
+  const entry = findPartyEntry(voucher, partyLedgerId, liabilities);
   if (!entry) {
     const e = new Error(
       "This voucher has no single party ledger line, so there is nothing to match it against.",
@@ -549,6 +736,7 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
     const available = await openBillsForVoucher(voucher, {
       excludeVoucherId: voucher._id,
       partyLedgerId: entry.ledgerId,
+      liabilityLedgerIds: liabilities,
     });
     const byName = new Map(available.map((b) => [b.billName, b]));
 
@@ -558,7 +746,7 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
     for (const [billName] of wanted) {
       const bill = byName.get(billName);
       if (bill?.needsBillReference && bill.sourceVoucherId) {
-        await ensureBillReference(bill.sourceVoucherId);
+        await ensureBillReference(bill.sourceVoucherId, bill.referenceLedgerId || null);
       }
     }
 
@@ -639,7 +827,10 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
     }
   }
 
-  return matchStateOf(voucher, entry.ledgerId);
+  /* The same liability set the leg was resolved with. Recomputing without it
+     reported `matchable: false, allocated: 0` for a payroll payment that had
+     just been allocated correctly — the write landed, the answer denied it. */
+  return matchStateOf(voucher, entry.ledgerId, liabilities);
 }
 
 /** Unmatch: drop this voucher's settlements, keeping everything else. */
@@ -651,6 +842,9 @@ module.exports = {
   EPSILON,
   PARTY_SIDE,
   SOURCE_TYPE,
+  OBLIGATION_TYPES,
+  liabilityLedgerIdsFor,
+  openJournalObligations,
   partyEntriesOf,
   unbilledInvoicesForParty,
   ensureBillReference,

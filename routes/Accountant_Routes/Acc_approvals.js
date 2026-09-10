@@ -22,6 +22,7 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+const { inheritablePartyLinks } = require("../../services/partyLinkSafety");
 /* ── BUDGET CONTROL (Chunk 6A) ────────────────────────────────────────────
  * Three of the executors below turn an approval into POSTED spend — create,
  * post, and update. They bypass the voucher routes entirely, so the gates
@@ -56,6 +57,40 @@ const {
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
+const Acc_LedgerReclassRequest = require("../../models/Accountant_model/Acc_LedgerReclassRequest");
+
+/* GET /list read these three and this file defined none of them, so every
+   call to it threw "requireOrg is not defined" before a single query ran.
+   The two guards are file-local in Acc_ledgerReclass.js and
+   Acc_cashflowAdjustments.js too — same logic, wording matched to whichever
+   route reports it. They are copied rather than shared because those two
+   files work today and this fix has no business editing them. */
+function requireOrg(req, res) {
+  if (req.user?.isDev || req.user?.isLegacy) {
+    res
+      .status(400)
+      .json({ success: false, message: "Sub-account session required." });
+    return false;
+  }
+  if (!req.user?.organizationId) {
+    res
+      .status(401)
+      .json({ success: false, message: "No organization context." });
+    return false;
+  }
+  return true;
+}
+
+function requireCanApprove(req, res) {
+  if (!req.user?.permissions?.canApprove) {
+    res.status(403).json({
+      success: false,
+      message: "Your role doesn't allow approving requests.",
+    });
+    return false;
+  }
+  return true;
+}
 
 router.use(orgAuth);
 

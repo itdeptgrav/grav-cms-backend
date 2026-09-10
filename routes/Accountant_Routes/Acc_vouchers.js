@@ -45,6 +45,13 @@ const auth = accountantAuth;
  * ────────────────────────────────────────────────────────────────────────── */
 const budgetControl = require("../../services/budgetControl.service");
 
+/* The bill-matching rules used by the four /match routes near the bottom of
+   this file. This import was missing: the routes referenced `billMatching`
+   directly, so every one of them threw "billMatching is not defined" the
+   moment it was called. Locally a nodemon reload masked it often enough to
+   look intermittent; on the server it failed every time. */
+const billMatching = require("../../services/billMatching.service");
+
 /**
  * Run work inside a transaction, retrying the ones Mongo says to retry.
  *
@@ -2725,15 +2732,26 @@ router.get("/unmatched", auth, async (req, res) => {
     const vouchers = await Acc_Voucher.find(filter)
       .sort({ voucherDate: -1 })
       .limit(Math.min(Number(limit) || 100, 500))
-      .select("voucherNumber voucherDate grandTotal partyLedgerName partyLedgerId ledgerEntries status")
+      /* voucherType is load-bearing, not decoration: PARTY_SIDE is keyed on
+         it, and without it every voucher here was read as Cr-sided. Payments
+         and debit notes face their party on the Dr side, so this worklist
+         found none of them and reported an empty register for both — the
+         projection quietly deciding an accounting rule. */
+      .select("voucherNumber voucherType voucherDate grandTotal partyLedgerName partyLedgerId ledgerEntries status")
       .lean();
 
     /* Summarised in memory rather than by an aggregation: the "how much is
        still unallocated" rule lives in one place in the service, and a second
        copy of it written in Mongo's query language is a copy that will drift. */
+    /* One query for the whole page: which of the ledgers these vouchers touch
+       are liabilities. That is what lets a payroll payment — Dr Salary Payable
+       / Cr Bank, no party on it anywhere — be recognised as settling something
+       the books already owe. Resolved per voucher it would be 500 round trips. */
+    const liabilities = await billMatching.liabilityLedgerIdsFor(vouchers);
+
     const rows = vouchers
       .map((v) => {
-        const state = billMatching.matchStateOf(v);
+        const state = billMatching.matchStateOf(v, null, liabilities);
         return {
           _id: v._id,
           voucherNumber: v.voucherNumber,
@@ -2777,11 +2795,13 @@ router.get("/:id/match", auth, async (req, res) => {
        `partyLedgerId` to pick one. Without it the first is used, and `parties`
        in the response is what lets a screen offer the choice. */
     const partyLedgerId = req.query.partyLedgerId || null;
-    const state = billMatching.matchStateOf(voucher, partyLedgerId);
+    const liabilities = await billMatching.liabilityLedgerIdsFor(voucher);
+    const state = billMatching.matchStateOf(voucher, partyLedgerId, liabilities);
     const openBills = state.matchable
       ? await billMatching.openBillsForVoucher(voucher, {
           excludeVoucherId: voucher._id,
           partyLedgerId: state.partyLedgerId,
+          liabilityLedgerIds: liabilities,
         })
       : [];
 
