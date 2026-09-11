@@ -51,6 +51,9 @@ const budgetControl = require("../../services/budgetControl.service");
    moment it was called. Locally a nodemon reload masked it often enough to
    look intermittent; on the server it failed every time. */
 const billMatching = require("../../services/billMatching.service");
+const {
+  applyDefaultNarration,
+} = require("../../services/voucherNarration.service");
 
 /**
  * Run work inside a transaction, retrying the ones Mongo says to retry.
@@ -852,6 +855,100 @@ router.get("/invoice-lookup", auth, async (req, res) => {
     res.json({ invoices: filtered });
   } catch (e) {
     console.error("[invoice-lookup]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * GET /:id/note-source — the document a credit or debit note is reversing,
+ * in the shape the note form's own line table uses.
+ *
+ * A note almost always reverses something that was already typed once. The
+ * forms knew which invoice or bill was selected and still made the accountant
+ * re-key every line of it — name, HSN, quantity, rate, GST — off a printout,
+ * which is slow and is exactly where a wrong rate gets introduced. The picker
+ * could not do better: /invoice-lookup and /bill-lookup select only
+ * `voucherNumber voucherDate grandTotal …`, so the lines were never sent.
+ *
+ * They stay that way — those two feed a 200-row dropdown and have no business
+ * carrying every line of every invoice. This fetches ONE document, on demand,
+ * when a selection is made.
+ *
+ * Returned lines are a starting point, not a commitment: a partial return is
+ * the normal case, so the form lets rows be edited or removed afterwards.
+ * ───────────────────────────────────────────────────────────────────────── */
+router.get("/:id/note-source", auth, async (req, res) => {
+  try {
+    const v = await Acc_Voucher.findById(req.params.id)
+      .select(
+        "voucherNumber voucherType voucherDate grandTotal subtotal partyLedgerId partyLedgerName placeOfSupply placeOfSupplyCode gstBreakup inventoryEntries ledgerEntries referenceNumber narration status",
+      )
+      .lean();
+    if (!v) return res.status(404).json({ error: "Voucher not found." });
+    /* Journals are allowed through for the OTHER caller: "Pay this" on a
+       posted payroll journal, which opens a payment already pointed at the
+       liability the journal created. A journal has no line items, so the
+       items array comes back empty and the payment form uses `settles`
+       instead — which is the whole information a payment needs. */
+    if (!["sales", "purchase", "journal"].includes(v.voucherType)) {
+      return res.status(400).json({
+        error: `A note is raised against a sales invoice or a purchase bill — this is a ${v.voucherType}.`,
+      });
+    }
+
+    /* Mapped to the field names the note forms already use, so the form can
+       drop them straight into its item state without a second translation
+       that would drift from this one. */
+    const items = (v.inventoryEntries || []).map((e) => ({
+      name: e.stockItemName || "",
+      stockItemId: e.stockItemId ? String(e.stockItemId) : "",
+      hsn: e.hsnCode || "",
+      qty: Number(e.quantity) || 0,
+      unit: e.unit || "",
+      rate: Number(e.rate) || 0,
+      discount: Number(e.discount) || 0,
+      gstRate: Number(e.taxRate) || 0,
+    }));
+
+    res.json({
+      source: {
+        _id: v._id,
+        voucherNumber: v.voucherNumber,
+        voucherType: v.voucherType,
+        voucherDate: v.voucherDate,
+        grandTotal: v.grandTotal,
+        subtotal: v.subtotal,
+        partyLedgerId: v.partyLedgerId,
+        partyLedgerName: v.partyLedgerName,
+        placeOfSupply: v.placeOfSupply,
+        placeOfSupplyCode: v.placeOfSupplyCode,
+        gstBreakup: v.gstBreakup,
+        referenceNumber: v.referenceNumber || "",
+      },
+      items,
+      /* Said plainly so the form can tell the user why nothing filled in,
+         rather than silently doing nothing. Older Tally imports frequently
+         carry no line detail at all — only the ledger postings. */
+      itemsAvailable: items.length > 0,
+      /* For a journal: the obligations it created, one per liability ledger
+         it credited. A payroll run credits Salary Payable, PF Payable and
+         ESI Payable together, and each is paid separately — so the payment
+         form asks which, rather than assuming the biggest. */
+      settles:
+        v.voucherType === "journal"
+          ? (v.ledgerEntries || [])
+              .filter((e) => e.type === "Cr" && e.ledgerId)
+              .map((e) => ({
+                ledgerId: String(e.ledgerId),
+                ledgerName: e.ledgerName || "",
+                amount: Number(e.amount) || 0,
+                billName: v.voucherNumber,
+              }))
+              .sort((a, b) => b.amount - a.amount)
+          : [],
+    });
+  } catch (e) {
+    console.error("[note-source]", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2426,11 +2523,25 @@ router.get("/raw-materials", auth, async (req, res) => {
     try {
       const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
       const filter = {};
-      if (rx) filter.$or = [{ name: rx }, { sku: rx }, { hsnCode: rx }];
+      /* `vendorNicknames` is the purchase-side equivalent of a stock item's
+         additionalNames: the names a SUPPLIER puts on the same material. It
+         was never searched or returned, so a material the vendor calls
+         something else could not be found by the name on their bill, and the
+         line was typed out by hand. RawItem has carried the field all along —
+         it is simply empty on every one of the 303 items today, so nothing
+         changes until somebody records a nickname. */
+      if (rx)
+        filter.$or = [
+          { name: rx },
+          { sku: rx },
+          { hsnCode: rx },
+          { vendorNicknames: rx },
+          { "vendorNicknames.name": rx },
+        ];
       const items = await RawItem.find(filter)
         .sort({ name: 1 })
         .limit(lim)
-        .select("name sku unit category hsnCode gstRate basePrice")
+        .select("name sku unit category hsnCode gstRate basePrice vendorNicknames")
         .lean();
       rawItems = items.map((r) => ({
         _id: r._id,
@@ -2441,6 +2552,13 @@ router.get("/raw-materials", auth, async (req, res) => {
         taxRate: r.gstRate || 0,
         standardCost: r.basePrice || 0,
         category: r.category || "",
+        /* Normalised to `aliases`, the name the picker already understands,
+           so the purchase side behaves exactly like the sales side. Entries
+           may be plain strings or {name, vendor} objects depending on who
+           wrote them. */
+        aliases: (r.vendorNicknames || [])
+          .map((v) => (typeof v === "string" ? v : v?.name || v?.nickname || ""))
+          .filter(Boolean),
         source: "cms_raw",
       }));
     } catch {
@@ -3098,6 +3216,12 @@ router.post("/", auth, async (req, res) => {
     await resolveLedgerEntries(body.ledgerEntries, body.companyId);
 
     const voucher = new Acc_Voucher(body);
+
+    /* A default narration when the box was left empty — see
+       services/voucherNarration.service.js. Done here, after the ledger
+       entries are resolved, so it can name the party and the bills this
+       settles. Anything typed is left exactly as typed. */
+    applyDefaultNarration(voucher);
 
     // Persist debit note classification fields even if not in schema (strict bypass)
     if (body.debitNoteType) {
