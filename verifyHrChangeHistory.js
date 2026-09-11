@@ -34,13 +34,34 @@ function check(name, ok, detail = "") {
 }
 
 /** A stand-in for an Express request: the actor, and nothing else. */
+/**
+ * A request as some HR user made it.
+ *
+ * ── WHY THE REPLAY FLAG IS SET HERE ─────────────────────────────────────────
+ * Approval attribution used to key off the `x-grav-change-request` header
+ * alone. It no longer does, and deliberately: headers are forgeable, so anyone
+ * who could reach a logging route could stamp their own edit `origin:
+ * "approval"` and name whoever they liked as the approver — a record saying a
+ * second person signed off on something nobody signed off on, which is worse
+ * than no record. `approvalFrom()` now requires `req.__approvalReplay`, the
+ * private flag `requireApproval` sets only after matching that header against
+ * a `replayOf` claim inside the caller's VERIFIED token.
+ *
+ * This harness was written before that gate and still sent only the headers,
+ * so four checks failed against code that is correct and safer than the code
+ * they were written for. Setting the flag is what the middleware does on a
+ * genuine replay; without it this tests a path that no longer exists.
+ */
 function reqAs(name, email, headers = {}) {
-  return {
+  const req = {
     user: { name, email, role: "hr_manager", id: "000000000000000000000001" },
     method: "PUT",
     originalUrl: "/api/employees/68f0a1b2c3d4e5f60718293a",
     headers,
   };
+  const replayOf = headers["x-grav-change-request"];
+  if (replayOf) req.__approvalReplay = { changeRequestId: replayOf };
+  return req;
 }
 
 (async () => {

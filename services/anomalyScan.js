@@ -138,6 +138,22 @@ async function notifyDevelopers(alert, { send } = {}) {
 const sameish = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /**
+ * Field paths the flip-flop rule ignores: written by the framework, not by a
+ * person.
+ *
+ * `updatedAt` changes on every save, so a record edited a dozen times trips
+ * the rule on it alone. `__v` is mongoose's version key. A subdocument's own
+ * `_id` and `createdAt` appear whenever a list is rewritten. None of them is
+ * anybody changing their mind, and an alert list full of them is one nobody
+ * reads — which costs the alerts that matter.
+ *
+ * Anchored at a path segment, so `salary.updatedAt` is ignored while a field
+ * genuinely called `lastUpdatedBy` is not.
+ */
+const IGNORED_FLIPFLOP_PATHS =
+  /(^|\.)(updatedAt|createdAt|__v|_id|modifiedAt|lastModified)$/;
+
+/**
  * Run every rule over the recent change log.
  *
  * `now` is injectable so the harness can pin time. Reads are capped: the rules
@@ -212,6 +228,27 @@ async function scanChangeLogs({ now = new Date() } = {}) {
     for (const row of rows) {
       for (const f of row.fields || []) {
         if (!f?.path) continue;
+        /* A "change" whose before and after are the same value is not a hop.
+           ------------------------------------------------------------------
+           The change log used to record one for every ObjectId on every save
+           — two ObjectIds holding the same bytes are not `===`, and the
+           equality test bailed before it compared them as strings. That is
+           1,258 "Id" rows in this database, and to this rule they looked like
+           a field being changed over and over: it reported 405 flip-flops,
+           essentially all of them on fields nobody had touched, which buries
+           the handful that are real.
+
+           services/changeLog.js no longer writes them. This skips the ones
+           already written, so the scanner tells the truth about history too —
+           and it is the correct rule regardless: a value that did not move
+           cannot have been moved back. */
+        if (sameish(f.from, f.to)) continue;
+        /* Bookkeeping the system writes itself is not somebody changing their
+           mind. `updatedAt` moves on every single save, so any record edited
+           a dozen times "flip-flops" on it — and the alert is filed beside
+           the ones about salary and email, where it buries them. `__v` and a
+           subdocument's own `_id` and `createdAt` are the same story. */
+        if (IGNORED_FLIPFLOP_PATHS.test(f.path)) continue;
         const key = `${row.departmentSlug}|${row.entity}|${row.entityId}|${f.path}`;
         if (!byField.has(key)) byField.set(key, { row, path: f.path, hops: [] });
         byField.get(key).hops.push({

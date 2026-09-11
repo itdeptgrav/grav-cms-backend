@@ -39,6 +39,7 @@ const PURE = [
   "verifyFoodAllowance",       // proration and the other deduction
   "verifyAuditFloor",          // what the change log will and will not record
   "verifyBuiltInFields",       // the field registry still matches the form
+  "verifyConfirmationDate",    // probation ends when joining + probation says
   "verifyCompanyDocuments",    // the company-documents model
   "verifyHrWriteCoverage",     // every HR write is guarded or deliberately exempt
   "verifyNoUndefinedRefs",     // no route uses a name it never imported
@@ -61,6 +62,7 @@ const WRITES = [
   "verifyDepartmentTeam",      // an owner manages roles, and cannot lock the door
   "verifyHrChangeHistory",     // the audit spine end to end
   "verifyNotificationSettings",// per-device notification preferences
+  "verifyRepeatReminders",    // a repeat switch actually repeats
   "verifyRegularizationApply", // an approved correction reaches attendance
   "verifySalaryResyncHistory", // a rule change records who it moved
   "verifyFieldHiding",         // hiding a built-in field reaches the form
@@ -70,6 +72,7 @@ const WRITES = [
   "verifyBillMatching",        // a receipt settles the invoice it is matched to
   "verifyJournalMatching",     // a payment settles the payroll journal it is matched to
   "verifyPayrollPaymentLink",  // payroll posts a journal; a linked payment marks it paid
+  "verifyRegularizationRules", // a client visit is Present; a present day brings its hours
   "verifyFaceEnrollInvite",    // the self-registration link, and what it refuses
 ];
 

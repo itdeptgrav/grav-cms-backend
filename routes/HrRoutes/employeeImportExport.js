@@ -31,6 +31,9 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const ExcelJS = require("exceljs");
 const Employee = require("../../models/Employee");
+const {
+  deriveConfirmationDate,
+} = require("../../services/confirmationDate.service");
 const SalaryConfig = require("../../models/Salaryconfig");
 // Salary is AES-encrypted at rest. Anything that READS a salary for display
 // has to decrypt first, and anything that WRITES one has to go through the
@@ -768,7 +771,14 @@ const toEmployeeData = (row) => ({
     workLocation: row.workLocation || undefined,
     shift: row.shift || undefined,
     dateOfJoining: row.dateOfJoining || undefined,
-    confirmationDate: row.confirmationDate || undefined,
+    /* A spreadsheet almost never carries this column, and leaving it blank is
+       what put 84 of 91 active employees here without one. Derived from the
+       joining date and the probation when the sheet is silent; a value IN the
+       sheet always wins. */
+    confirmationDate:
+      row.confirmationDate ||
+      deriveConfirmationDate(row.dateOfJoining, row.probationPeriod) ||
+      undefined,
     probationPeriod: row.probationPeriod || undefined,
     salary: row.salary,
     bankDetails: row.bankDetails,

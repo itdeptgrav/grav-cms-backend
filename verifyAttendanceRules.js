@@ -138,7 +138,20 @@ function replay(fn, entries) {
   const withHr = applyNationalHolidayRule({ ...punched[0], hrFinalStatus: "CO" }, "NH");
   check("an HR override on the day survives the rule and decides the pay weight", withHr.hrFinalStatus === "CO" && withHr.systemPrediction === "NH");
   const other = applyNationalHolidayRule({ ...punched[0] }, "FH");
-  check("a COMPANY holiday is left alone — only national is forced", other.systemPrediction === punched[0].systemPrediction && other.punchedOnHoliday === undefined);
+  /* UNCHANGED, not absent. This asserted `punchedOnHoliday === undefined`,
+     which held only while no stored row had the field. The national-holiday
+     rule has since been applied to real attendance, so those rows now carry
+     `punchedOnHoliday: true` — and the check failed against a rule that does
+     exactly what it should: a non-national holiday returns the entry as it
+     was. What matters is that the rule touched nothing, whatever the row
+     happened to arrive with. */
+  check(
+    "a COMPANY holiday is left alone — only national is forced",
+    other.systemPrediction === punched[0].systemPrediction &&
+      other.punchedOnHoliday === punched[0].punchedOnHoliday &&
+      other.attendanceValue === punched[0].attendanceValue &&
+      other.isLate === punched[0].isLate,
+  );
   const wo = applyNationalHolidayRule({ ...punched[0] }, "WO");
   check("a weekly off is left alone too", wo.systemPrediction === punched[0].systemPrediction);
 

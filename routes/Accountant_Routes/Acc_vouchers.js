@@ -51,6 +51,7 @@ const budgetControl = require("../../services/budgetControl.service");
    moment it was called. Locally a nodemon reload masked it often enough to
    look intermittent; on the server it failed every time. */
 const billMatching = require("../../services/billMatching.service");
+const { settlementOf } = require("../../services/poSettlement.service");
 const {
   applyDefaultNarration,
 } = require("../../services/voucherNarration.service");
@@ -1985,30 +1986,37 @@ router.get("/po-lookup", auth, async (req, res) => {
       paymentStatus: po.paymentStatus || "PENDING",
       ...(() => {
         const b = billMap.get(String(po._id)) || {};
-        const billedAmount = b.billedAmount || 0;
-        const total = Number(po.totalAmount) || 0;
-        // 1% tolerance — freight, rounding and rate tweaks make exact
-        // equality between a PO and its bill unrealistic in practice.
-        const billingStatus =
-          billedAmount <= 0
-            ? "NOT_BILLED"
-            : billedAmount >= total * 0.99
-              ? "FULLY_BILLED"
-              : "PARTIALLY_BILLED";
+        /* One rule for "fully billed" and "left to bill", so the page cannot
+           say a PO is complete and still owes ₹0.32 — see
+           services/poSettlement.service.js. */
+        const st = settlementOf(po, {
+          billedAmount: b.billedAmount,
+          billCount: b.postedCount || b.voucherCount,
+          paidAmount: b.paidAmount,
+          paymentCount: b.paymentCount,
+          pendingAmount: b.pendingAmount,
+        });
         return {
-          billedAmount,
-          pendingBillAmount: b.pendingAmount || 0,
-          remainingToBill: Math.max(total - billedAmount, 0),
+          billedAmount: st.billedAmount,
+          pendingBillAmount: st.pendingBillAmount,
+          remainingToBill: st.remainingToBill,
+          overBilledBy: st.overBilledBy,
           voucherCount: b.voucherCount || 0,
           postedVoucherCount: b.postedCount || 0,
-          billingStatus,
-          paidAmount: b.paidAmount || 0,
-          remainingToPay: Math.max(total - (b.paidAmount || 0), 0),
+          billingStatus: st.billingStatus,
+          paidAmount: st.paidAmount,
+          remainingToPay: st.remainingToPay,
+          overPaidBy: st.overPaidBy,
           paymentCount: b.paymentCount || 0,
+          /* Derived from the vouchers, not read from the PO's stored
+             `paymentStatus` — that field is only written by the CMS
+             record-payment route, so a PO settled with a payment VOUCHER keeps
+             saying PENDING. Eleven of the 27 POs with payments here are stale
+             that way, which is why the store page and this one disagreed. */
           paymentStatusComputed:
-            (b.paidAmount || 0) >= total * 0.99
+            st.paymentStatusComputed === "COMPLETED"
               ? "PAID"
-              : (b.paidAmount || 0) > 0
+              : st.paymentStatusComputed === "PARTIAL"
                 ? "PARTIALLY_PAID"
                 : "UNPAID",
         };
@@ -2117,14 +2125,15 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
       .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
 
     const total = Number(po.totalAmount) || 0;
-    // 1% tolerance — freight, rounding and rate tweaks make exact equality
-    // between a PO and its bill unrealistic.
-    const billingStatus =
-      billedAmount <= 0
-        ? "NOT_BILLED"
-        : billedAmount >= total * 0.99
-          ? "FULLY_BILLED"
-          : "PARTIALLY_BILLED";
+    /* Same rule as the list — see services/poSettlement.service.js. */
+    const _st = settlementOf(po, {
+      billedAmount,
+      billCount: billingVouchers.filter((v) => v.status === "posted").length,
+      paidAmount: paidThroughBooks,
+      paymentCount: paymentVouchers.filter((v) => v.status === "posted").length,
+      pendingAmount: pendingBillAmount,
+    });
+    const billingStatus = _st.billingStatus;
 
     // PO-side payments recorded in the CMS (separate from accounting payment
     // vouchers — this is the Store/Inventory dept's own record).

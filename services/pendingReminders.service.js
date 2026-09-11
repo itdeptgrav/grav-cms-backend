@@ -109,6 +109,98 @@ const PENDING_COUNTERS = [
       body: `${n} change${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} waiting in your queue.`,
     }),
   },
+
+  /* ── THE TWO THAT HAD A SWITCH AND NO SWEEP ──────────────────────────────
+     `accountant_approval` and `attendance_alert` are both marked repeatable in
+     services/notificationTypes.js, so the settings screen has been offering a
+     "remind me again" toggle for them. Neither had a counter here, and the
+     sweep only visits types it can count — so ticking either box did nothing
+     at all, silently, forever. That is the whole of the reported bug: the
+     repeat machinery works, it was just never asked about these two.
+
+     A type that offers the switch has to answer "how many are still waiting".
+     verifyRepeatReminders.js now fails if a repeatable type has no counter,
+     so the two cannot drift apart again. */
+  {
+    type: "accountant_approval",
+    async count(employee) {
+      let Acc_ApprovalRequest, Acc_User;
+      try {
+        ({ Acc_ApprovalRequest, Acc_User } = require("../models/Accountant_model/Acc_OrgModels"));
+      } catch { return 0; }
+      if (!Acc_ApprovalRequest || !Acc_User) return 0;
+
+      const email = String(employee.email || "").toLowerCase();
+      if (!email) return 0;
+
+      /* The books are a separate account system: an employee is only an
+         approver there if they have an Acc_User with the standing to decide.
+         Counting the queue for somebody who cannot clear it would be a
+         reminder about other people's work. */
+      const me = await Acc_User.findOne({
+        email,
+        isActive: { $ne: false },
+        role: { $in: ["owner", "approver"] },
+      })
+        .select("organizationId")
+        .lean();
+      if (!me?.organizationId) return 0;
+
+      return Acc_ApprovalRequest.countDocuments({
+        organizationId: me.organizationId,
+        status: "pending_approval",
+      });
+    },
+    say: (n) => ({
+      title: "Accounting approvals waiting",
+      body: `${n} entr${n === 1 ? "y" : "ies"} in the books still need${n === 1 ? "s" : ""} your approval.`,
+    }),
+  },
+
+  {
+    type: "attendance_alert",
+    async count(employee) {
+      /* The file is `Dailyattendance.js` — lowercase "a". Windows resolves
+         either spelling, Linux does not, and the catch below would have turned
+         a production-only MODULE_NOT_FOUND into a silent zero: the reminder
+         would simply never fire on the server and nothing would say why.
+         Every other caller in this repo spells it this way too. */
+      const DailyAttendance = (() => {
+        try { return require("../models/HR_Models/Dailyattendance"); } catch { return null; }
+      })();
+      if (!DailyAttendance) return 0;
+
+      /* A missed punch is the employee's OWN outstanding item — the day
+         cannot be paid correctly until it is corrected. Bounded to a
+         fortnight: an older one is a conversation with HR, not something an
+         hourly reminder will move, and an unbounded scan would grow with the
+         collection.
+
+         `hrFinalStatus` set means somebody has already decided the day, so it
+         is no longer outstanding whatever the punch flags say. */
+      const since = new Date(Date.now() - 14 * 864e5).toISOString().slice(0, 10);
+      const rows = await DailyAttendance.aggregate([
+        { $match: { dateStr: { $gte: since } } },
+        { $unwind: "$employees" },
+        {
+          $match: {
+            "employees.employeeDbId": employee._id,
+            "employees.hasMissPunch": true,
+            $or: [
+              { "employees.hrFinalStatus": { $in: [null, ""] } },
+              { "employees.hrFinalStatus": { $exists: false } },
+            ],
+          },
+        },
+        { $count: "n" },
+      ]);
+      return rows[0]?.n || 0;
+    },
+    say: (n) => ({
+      title: "A day of yours needs correcting",
+      body: `${n} day${n === 1 ? "" : "s"} in the last fortnight ${n === 1 ? "has" : "have"} a missing punch. Raise a correction so it is paid right.`,
+    }),
+  },
 ];
 
 /** Has this device already had this type within the hour? */

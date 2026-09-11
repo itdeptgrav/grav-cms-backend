@@ -10,7 +10,7 @@
 //   6. _otCronStarted guard makes startOvertimeReminders idempotent.
 //   7. /check looks back 7 days, hides expired entries.
 //   8. /my returns CURRENT MONTH ONLY.
-//   9. /submit rejects if past the 12:00 PM IST cutoff the day after stay-over.
+//   9. /submit rejects if past 23:59 IST on the day the overtime was worked.
 //  10. PERSISTENT NOTIFICATION DEDUP via OvertimeNotificationLog.
 //      In-memory Map removed entirely. The cron tries to INSERT a dedup row
 //      before sending — duplicate key error means "already notified", we skip.
@@ -76,14 +76,35 @@ const PUNCH_THRESHOLDS = {
 //  HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
+/* An overtime report is filed on the night it was worked.
+   ------------------------------------------------------------------------
+   The deadline used to be NOON THE FOLLOWING DAY, which let a report be
+   written most of a day later, about hours nobody could still check, and put
+   yesterday's overtime in front of an approver in the middle of today's work.
+   It now closes at 23:59 on the day itself: the report is written while the
+   person is still there, and a day's overtime is settled before the next one
+   starts.
+
+   23:59:59.999 IST, not 23:59:00 — a report submitted at 23:59:30 is filed at
+   11:59 PM by any reading a person would give it, and cutting it off
+   thirty seconds earlier would be a rule nobody could see. */
+const OT_CUTOFF_UTC_HOUR = 18; // 23:59 IST − 5:30 = 18:29 UTC, same date
+const OT_CUTOFF_UTC_MIN = 29;
+
 function isOvertimeExpired(dateStr) {
-  // dateStr is "YYYY-MM-DD" (IST). Cutoff = next day at 12:00 PM IST.
-  // 12:00 PM IST = 06:30 UTC.
   if (!dateStr) return false;
   const [y, m, d] = dateStr.split("-").map(Number);
   if (!y || !m || !d) return false;
-  const cutoffUtcMs = Date.UTC(y, m - 1, d + 1, 6, 30, 0, 0);
-  return Date.now() >= cutoffUtcMs;
+  const cutoffUtcMs = Date.UTC(
+    y,
+    m - 1,
+    d,
+    OT_CUTOFF_UTC_HOUR,
+    OT_CUTOFF_UTC_MIN,
+    59,
+    999,
+  );
+  return Date.now() > cutoffUtcMs;
 }
 
 function punchMinsIST(date) {
@@ -286,7 +307,7 @@ router.post(
         return res.status(400).json({
           success: false,
           message:
-            "This overtime report has expired (deadline was 12:00 PM the next day). Contact HR if you need an exception.",
+            "This overtime report has expired — it has to be filed by 11:59 PM on the day you worked it. Contact HR if you need an exception.",
         });
       }
 
@@ -728,7 +749,7 @@ async function detectAndNotifyStayOvers(dateStr, io) {
         continue;
       }
 
-      // Skip if past the noon-next-day expiry — pinging is pointless
+      // Skip if past the 23:59 same-day expiry — pinging is pointless
       if (isOvertimeExpired(dateStr)) {
         skippedExpired++;
         continue;

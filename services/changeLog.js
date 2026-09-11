@@ -99,7 +99,30 @@ function sameValue(a, b) {
     const tb = b instanceof Date ? b.getTime() : new Date(b).getTime();
     if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta === tb;
   }
-  if (a && b && typeof a === "object" && typeof b === "object") return false;
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    /* A plain object or an array reaching here means fieldDiff hit its depth
+       cap rather than walking in, so the honest answer is "something below
+       this differs, and we are not going to say what". Report it changed. */
+    if (
+      (isPlainObject(a) || Array.isArray(a)) &&
+      (isPlainObject(b) || Array.isArray(b))
+    ) {
+      return false;
+    }
+
+    /* Everything else here is a VALUE wearing an object: ObjectId,
+       Decimal128, Buffer, Long. Two ObjectIds holding the same twelve bytes
+       are not `===`, and bailing out above meant the String comparison below
+       never ran — so every id was reported as changing to itself on every
+       save. That is 1,258 of the "Id" rows in this database's change log,
+       roughly one entry in six, and it is what made the anomaly scanner
+       report hundreds of flip-flops on fields nobody had touched.
+
+       The comment on isPlainObject already promised this behaviour —
+       "sameValue() stringifies both sides, so an ObjectId compares equal to
+       the string form of itself" — it just never reached the code. */
+    return String(a) === String(b);
+  }
   return String(a) === String(b);
 }
 

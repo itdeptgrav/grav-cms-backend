@@ -2,6 +2,9 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
+const {
+  fillConfirmationDate,
+} = require("../../services/confirmationDate.service");
 const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
@@ -328,6 +331,14 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Password = employee's mobile number (fallback to "password123" if no phone)
     const temporaryPassword =
       (employeeData.phone || "").trim() || "password123";
+
+    /* Probation arithmetic, if nobody supplied the answer. The HR form works
+       it out as you type, but the form is not the only door: the spreadsheet
+       import and any direct API call arrive here too, and 84 of the 91 active
+       employees in this database have an empty confirmation date beside a
+       perfectly good joining date. Only ever fills a blank — a confirmation
+       that was moved is a decision, not a value to recompute. */
+    fillConfirmationDate(employeeData);
 
     const newEmployee = new Employee({
       ...employeeData,
