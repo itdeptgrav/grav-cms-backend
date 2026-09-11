@@ -309,9 +309,38 @@ function expectedVersionOf(body) {
  *
  * @returns {object|null} the updated document, or null when the version moved
  */
+/**
+ * Match the stated version, including on a record that has none.
+ *
+ * ── THE BUG THIS CLOSES ──────────────────────────────────────────
+ * Ninety of the ninety-six suppliers here were written before versioning and
+ * carry NO `recordVersion` field. `{ recordVersion: 0 }` does not match a
+ * missing field, so every edit of one failed the compare-and-set and answered
+ * VERSION_CONFLICT — against a version the caller had stated correctly, and
+ * which the JavaScript pre-check just above had accepted as `?? 0`. The two
+ * disagreed, so the screen said the record had changed when nothing had
+ * (11 Sep 2026).
+ *
+ * An absent version IS version zero; `$inc` then writes 1 exactly as it would
+ * have. Returned as a clause to put in `$and` so it can never collide with
+ * the tenant filter's own `$or`.
+ */
+function versionClause(expectedVersion) {
+  return expectedVersion === 0
+    ? { $or: [{ recordVersion: 0 }, { recordVersion: { $exists: false } }] }
+    : { recordVersion: expectedVersion };
+}
+
+/** `scoped()` plus a version predicate, merged without clobbering either. */
+function scopedAtVersion(req, expectedVersion, extra = {}) {
+  const filter = scoped(req, extra);
+  filter.$and = [...(filter.$and || []), versionClause(expectedVersion)];
+  return filter;
+}
+
 async function casUpdate(req, { supplierId, expectedVersion, set, extraFilter = {} }) {
   return Vendor.findOneAndUpdate(
-    scoped(req, { _id: supplierId, recordVersion: expectedVersion, ...extraFilter }),
+    scopedAtVersion(req, expectedVersion, { _id: supplierId, ...extraFilter }),
     { $set: set, $inc: { recordVersion: 1 } },
     { new: true },
   );
@@ -481,6 +510,33 @@ function normaliseCode(raw) {
   return raw.trim().toUpperCase();
 }
 
+/**
+ * A supplier code derived from the name, when the caller supplied none.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────
+ * The code is required — it identifies the supplier on orders and paperwork —
+ * but NO screen in this product has a field for it, and not one of the 94
+ * suppliers already in the database carries one. So every registration was
+ * refused SUPPLIER_CODE_REQUIRED and the Add Supplier form could not save at
+ * all (reported 11 Sep 2026).
+ *
+ * Derived rather than refused, in the same shape rawItems.js already mints a
+ * SKU from an item name: three letters per word, upper case, a random suffix
+ * for room. A code the caller DID supply is still validated and still wins —
+ * this only fills the gap, and only inside this company, where identityClash
+ * then holds it to the same uniqueness rule as a typed one.
+ */
+function deriveSupplierCode(companyName) {
+  const words = String(companyName || "").trim().split(/\s+/).filter(Boolean);
+  const nameCode = words
+    .map((w) => w.replace(/[^A-Za-z0-9]/g, "").substring(0, 3).toUpperCase())
+    .join("")
+    .substring(0, 20);
+  const stem = nameCode || "SUP";
+  const suffix = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
+  return normaliseCode("SUP-" + stem + "-" + suffix);
+}
+
 /** @returns {{ok:true,code:string}|{ok:false,code:string,message:string}} */
 function checkSupplierCode(raw) {
   if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) {
@@ -512,10 +568,17 @@ async function loadSupplier(req, res, { forWrite = false, allowArchived = false 
     refuse(res, 404, CODES.NOT_FOUND, "Supplier not found.");
     return null;
   }
-  if (forWrite && supplier.companyId == null) {
+  if (forWrite && supplier.companyId == null && !tenantContext.legacyWindowOpen()) {
     /* Legacy records are readable through the explicit contract and are never
        written: adopting one into whichever company happened to edit it is a
-       silent transfer of somebody else's supplier. */
+       silent transfer of somebody else's supplier.
+
+       Stood down while the legacy window is open (services/storePurchase/
+       tenantContext.service.js). Ninety of the ninety-four suppliers here are
+       unowned, so this refused almost every edit in the product — and with a
+       single company there is nobody to take one from. Editing does NOT adopt
+       the record: ownership is still only ever set by stamp() on something
+       newly created. */
     refuse(res, 403, CODES.LEGACY_READ_ONLY,
       "This supplier predates company ownership and cannot be edited until it is migrated.");
     return null;
@@ -977,8 +1040,29 @@ router.post("/", ...canMaintain, withIdempotency("SUPPLIER_CREATE"), async (req,
         { endpoint: "PUT /vendors/:id/bank-details" });
     }
 
-    const codeCheck = checkSupplierCode(supplierCode);
-    if (!codeCheck.ok) return refuse(res, 400, codeCheck.code, codeCheck.message);
+    /* A supplied code is validated as before; an absent one is derived and
+       retried a few times so a random-suffix collision inside this company
+       cannot fail a registration the user cannot influence. */
+    let codeCheck;
+    if (supplierCode === undefined || supplierCode === null ||
+        (typeof supplierCode === "string" && !supplierCode.trim())) {
+      let derived = null;
+      for (let attempt = 0; attempt < 5 && !derived; attempt++) {
+        const candidate = deriveSupplierCode(companyName);
+        if (!candidate || !SUPPLIER_CODE_RE.test(candidate)) continue;
+        const taken = await Vendor.findOne(scoped(req, { supplierCode: candidate }))
+          .select("_id").lean();
+        if (!taken) derived = candidate;
+      }
+      if (!derived) {
+        return refuse(res, 409, CODES.CODE_DUPLICATE,
+          "Could not allocate a supplier code. Supply one explicitly and try again.");
+      }
+      codeCheck = { ok: true, value: derived };
+    } else {
+      codeCheck = checkSupplierCode(supplierCode);
+      if (!codeCheck.ok) return refuse(res, 400, codeCheck.code, codeCheck.message);
+    }
 
     /* Company-scoped, and normalised: the old check looked at every company's
        suppliers and compared raw spellings, so it both refused a GSTIN
@@ -1299,7 +1383,7 @@ router.put("/:id", ...canMaintain, withIdempotency("SUPPLIER_UPDATE", { target: 
         set.emailNormalised = String(vendor.email || "").trim().toLowerCase();
 
         const claimed = await Vendor.findOneAndUpdate(
-          scoped(req, { _id: vendor._id, recordVersion: wanted.value }),
+          scopedAtVersion(req, wanted.value, { _id: vendor._id }),
           { $set: set, $inc: { recordVersion: 1 } },
           { new: true, ...(session ? { session } : {}) },
         );
@@ -1590,9 +1674,8 @@ LIFECYCLE.forEach(({ path, action }) => {
               claimed = await Vendor.findOneAndUpdate(
                 /* Both conditions in the filter: the state it was decided
                    against, and the version it was read at. */
-                scoped(req, {
+                scopedAtVersion(req, wanted.value, {
                   _id: supplier._id, status: from,
-                  recordVersion: wanted.value,
                 }),
                 {
                   $set: set,
