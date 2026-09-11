@@ -820,11 +820,15 @@ router.get("/", canRead, async (req, res) => {
     /* Counted inside the same company boundary as the list. These were
        system-wide totals shown to every company as its own. */
     const base = scoped(req);
-    const [allInCompany, active, blacklisted, archived] = await Promise.all([
+    const [allInCompany, active, blacklisted, archived, fabricSuppliers] = await Promise.all([
       Vendor.countDocuments(base),
       Vendor.countDocuments({ ...base, status: "Active" }),
       Vendor.countDocuments({ ...base, status: "Blacklisted" }),
       Vendor.countDocuments({ ...base, status: "Archived" }),
+      /* The register's third card. It was dropped when these counts were
+         brought inside the company boundary, and the card then rendered
+         EMPTY -- no zero, no dash, just a labelled blank (11 Sep 2026). */
+      Vendor.countDocuments({ ...base, vendorType: "Fabric Supplier" }),
     ]);
 
     res.json({
@@ -836,7 +840,7 @@ router.get("/", canRead, async (req, res) => {
         hasNextPage: page * limit < total,
         hasPrevPage: page > 1,
       },
-      stats: { total: allInCompany, active, blacklisted, archived },
+      stats: { total: allInCompany, active, blacklisted, archived, fabricSuppliers },
       legacy: Boolean(req.tenant?.legacyMode),
       filters: {
         types: VENDOR_TYPES,
@@ -1472,11 +1476,13 @@ router.put("/:id", ...canMaintain, withIdempotency("SUPPLIER_UPDATE", { target: 
  *
  * It refuses, and names the operation that does what the caller probably
  * meant. Nothing is written. */
-router.delete("/:id", ...canMaintain, async (req, res) => {
-  return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
-    "Suppliers are not deleted, because orders and item aliases refer to them. "
-    + "Deactivate the supplier to stop new procurement, or archive it to close it entirely.",
-    { operations: ["POST /vendors/:id/deactivate", "POST /vendors/:id/archive"] });
+router.delete("/:id", ...canMaintain, async (req, res, next) => {
+  /* The register's "delete" asks the operator to confirm "mark this vendor
+     as inactive", and that is exactly `deactivate`. The record is not
+     destroyed -- orders and item aliases still point at it -- and the
+     deactivation is recorded with its author, which is what the refusal
+     was protecting. See forwardToLifecycle. */
+  return forwardToLifecycle(req, res, next, "deactivate");
 });
 
 /* ── THE STATUS DROPDOWN IS GONE ────────────────────────────────────────────
@@ -1485,14 +1491,68 @@ router.delete("/:id", ...canMaintain, async (req, res) => {
  * buy from them again". Blacklisting in particular is a judgement about a
  * business relationship, and a system that cannot say who made it or why
  * cannot defend it later. */
-router.patch("/:id/status", ...canMaintain, async (req, res) => {
-  return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
-    "A supplier's state is changed through a named operation that records who "
-    + "changed it and why.",
-    { operations: [
-      "POST /vendors/:id/activate", "POST /vendors/:id/deactivate",
-      "POST /vendors/:id/blacklist", "POST /vendors/:id/archive",
-    ] });
+/**
+ * Send this request on to one of the named lifecycle operations below.
+ *
+ * -- WHY THE OLD VERBS STILL ANSWER ----------------------------------------
+ * `PATCH /:id/status` and `DELETE /:id` were replaced by four named
+ * operations that record who changed a supplier's state and why. The reason
+ * is good and the operations are kept -- but the Supplier register still
+ * calls the old two, so in the running system the status dropdown answered
+ * 405 on every change and the register's delete answered 405 as well
+ * (reported 11 Sep 2026).
+ *
+ * Rather than restore the unaccountable write, the old verb is TRANSLATED
+ * into the named operation and forwarded to it. The history line, the
+ * author, the idempotency receipt and the version check are all the named
+ * operation's, unchanged -- this only decides which one was meant.
+ *
+ * `expectedVersion` is filled from the stored record when the caller sent
+ * none. That is what the old verb meant: last-write-wins. A caller that
+ * DOES state a version still gets the concurrency check, so the protection
+ * is available to anyone who wants it and is never silently removed from
+ * anyone who asked for it.
+ *
+ * Only Active and Inactive translate. Blacklisting and archiving must say
+ * why, and no reason can be inferred from a status string -- those still
+ * refuse and name the operation to call.
+ */
+async function forwardToLifecycle(req, res, next, action) {
+  /* A DELETE carries no body at all, so `req.body` is undefined rather
+     than empty, and the fill below was skipped entirely -- the register's
+     delete then failed asking for a version it had no way to send. */
+  if (!req.body || typeof req.body !== "object") req.body = {};
+  if (req.body.expectedVersion === undefined) {
+    const current = await Vendor.findOne(scoped(req, { _id: req.params.id }))
+      .select("recordVersion").lean();
+    if (!current) {
+      return refuse(res, 404, CODES.NOT_FOUND,
+        "That supplier was not found in this company.");
+    }
+    req.body.expectedVersion = current.recordVersion ?? 0;
+  }
+  /* Re-entering the router is what runs the real operation: its capability
+     checks, its idempotency wrapper and its handler, all as written. */
+  req.method = "POST";
+  req.url = `/${req.params.id}/${action}`;
+  return router.handle(req, res, next);
+}
+
+/* Active and Inactive are the only two the register offers, and neither
+   needs a reason. See forwardToLifecycle. */
+const STATUS_TO_ACTION = { Active: "activate", Inactive: "deactivate" };
+
+router.patch("/:id/status", ...canMaintain, async (req, res, next) => {
+  const action = STATUS_TO_ACTION[String(req.body?.status || "")];
+  if (!action) {
+    return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
+      "Blacklisting or archiving a supplier has to say why, so it is done "
+      + "through its own operation.",
+      { operations: [
+        "POST /vendors/:id/blacklist", "POST /vendors/:id/archive",
+      ] });
+  }
+  return forwardToLifecycle(req, res, next, action);
 });
 
 /* ── THE TRANSITION TABLE ───────────────────────────────────────────────────
