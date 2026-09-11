@@ -52,6 +52,7 @@ const READONLY = [
   "verifyRoleResolution",      // approvers resolve; orphan grants are named
   "verifyManagerChain",        // who may be offered as a manager
   "verifyPartyLinkSafety",     // a merge never hands one party another's books
+  "verifyCustomerRegister",    // the customer register IS Sundry Debtors, and ties to it
 ];
 
 const WRITES = [

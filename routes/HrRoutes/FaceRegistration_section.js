@@ -20,6 +20,7 @@
  * mapping, touches a photo, or records attendance.
  */
 
+const crypto = require("crypto");
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -229,6 +230,74 @@ router.get("/health", async (req, res) => {
           peopleMap: faceConfig.FACE_BIOMETRIC_PEOPLE_MAP,
         }
       : { reason: h.reason, detail: h.detail, message: h.message }),
+  });
+});
+
+// ── POST /hr/face-registration/verify-token ─────────────────────────────
+//
+// Issue a short-lived token that lets THIS BROWSER call the engine's /verify
+// directly, over the public hostname.
+//
+// Why a browser talks to the engine at all: face sign-in streams several frames
+// a second while it waits for a confident match. Relaying each one through this
+// process doubles the hops and puts a video-rate stream through an Express
+// server that has an ERP to run.
+//
+// Why it is not simply given FACE_ENGINE_KEY: that key never expires and
+// authorises everything the engine can do, enrolment included. A browser that
+// holds it can register any face as any employee. What this hands out instead
+// is valid for two minutes, permits exactly one operation, and is bound to one
+// capture session.
+//
+// Authenticated deliberately. Anyone who can reach this route can spend the
+// machine's CPU on inference, so the door to the door is behind a login even
+// though the operation itself identifies someone who has not signed in yet.
+router.post("/verify-token", EmployeeAuthMiddlewear, async (req, res) => {
+  if (!faceConfig.browserTokensConfigured()) {
+    /* Fails CLOSED, and says which variable is missing rather than pretending
+       the feature is off. An engine reachable publicly with token checking
+       silently disabled would be the worst outcome available. */
+    return res.status(503).json({
+      success: false,
+      reason: "browser_tokens_not_configured",
+      message:
+        "FACE_BROWSER_TOKEN_SECRET is not set on this server, so browser access to the face engine is unavailable. " +
+        "Set the same value here and in the engine's environment.",
+    });
+  }
+
+  /* One session per capture attempt. Generated here rather than accepted from
+     the client so a caller cannot pin every token it ever gets to one id and
+     share the rate-limit budget of a session it does not own. */
+  const sessionId = crypto.randomBytes(16).toString("hex");
+
+  let minted;
+  try {
+    minted = faceConfig.mintBrowserToken({
+      sessionId,
+      /* Only when the caller already IS somebody. Face sign-in exists to work
+         out who an unknown person is, so requiring a subject would mean naming
+         the employee before the recognition meant to determine it. */
+      employeeId: req.user?.employeeId || null,
+      action: "verify",
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, reason: "mint_failed", message: "Could not issue a token." });
+  }
+  if (!minted) {
+    return res.status(503).json({ success: false, reason: "browser_tokens_not_configured" });
+  }
+
+  return res.status(200).json({
+    success: true,
+    token: minted.token,
+    sessionId: minted.sessionId,
+    expiresAt: minted.expiresAt,
+    expiresInSec: minted.expiresInSec,
+    /* The PUBLIC hostname, which is the only address a browser can use. The
+       internal loopback URL this server talks to is not sent: it would be
+       useless to the client and it describes the inside of the box. */
+    verifyUrl: process.env.FACE_PUBLIC_VERIFY_URL || null,
   });
 });
 

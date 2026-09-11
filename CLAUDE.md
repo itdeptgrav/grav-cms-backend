@@ -233,10 +233,32 @@ That map is process-local, so recording state does not survive a restart or scal
 Face biometrics adds `FACE_PYTHON`, `FACE_BIOMETRIC_ROOT`,
 `FACE_BIOMETRIC_SERVICE_URL` and `FACE_ENGINE_KEY`, all explained in
 `docs/face-biometric-deployment.md`. On GravServer the engine runs as its own
-PM2 process on the **same host**, so the service URL stays loopback and it is
-never routed through Cloudflare. The one that will bite you is
-`FACE_BIOMETRIC_ROOT`: it must point OUTSIDE any app directory, or a deployment
-that replaces the working tree takes the registration photos with it.
+PM2 process on the **same host**, so the service URL this backend uses stays
+loopback. The one that will bite you is `FACE_BIOMETRIC_ROOT`: it must point
+OUTSIDE any app directory, or a deployment that replaces the working tree takes
+the registration photos with it.
+
+**One path is now public.** `POST /verify` is reachable from the internet
+through the existing Cloudflare tunnel, on a hostname carried in
+`FACE_PUBLIC_VERIFY_URL`, so a sign-in page can stream frames straight to the
+engine instead of relaying every one through Express. That is the only path
+routed: `/health` (which lists the enrolled gallery), `/register/*`, `/reset`
+and `/reload` are refused at the edge and again by the engine.
+
+It needs two more variables, and they are not interchangeable:
+
+| Variable | Who holds it | Scope |
+|---|---|---|
+| `FACE_ENGINE_KEY` | this backend only, server to server | everything, no expiry |
+| `FACE_BROWSER_TOKEN_SECRET` | signs tokens handed to browsers | `POST /verify`, 120 s, one session |
+
+`FACE_ENGINE_KEY` must never reach a browser — not as `NEXT_PUBLIC_*`, not in
+a response body, not in a log. `GET /hr/face-registration/verify-token` mints
+the browser's token; the engine verifies it independently. `FACE_ALLOWED_ORIGINS`
+(on the engine) is the exact CORS allow-list for that path — never `*`.
+
+The engine still binds `127.0.0.1` only. The tunnel is the transport; nothing
+is exposed on the network interface.
 
 `NODE_ENV=production` flips cookies to `secure: true, sameSite: "none"` — cross-site auth silently breaks in production if it isn't set.
 
