@@ -10,6 +10,7 @@
 // Timer-SOP penalties, no C4 presence credits, no Firestore housekeeping, no
 // boot-time task repair.
 //
+
 // That distinction is the whole reason it exists. A second instance pointed at
 // the same MongoDB and the same Firebase project — a self-hosted box being
 // rehearsed while the live one still serves users — is harmless as a reader
