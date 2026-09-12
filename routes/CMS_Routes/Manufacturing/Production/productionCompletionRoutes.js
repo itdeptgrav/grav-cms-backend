@@ -33,6 +33,31 @@ const getISTMidnight = (dateStr) => {
   return new Date(istDate.getTime() - 5.5 * 60 * 60 * 1000);
 };
 
+/* Hour and day of an instant, IN IST, as plain numbers/strings.
+ *
+ * Derived from the offset rather than from the process timezone, for the same
+ * reason getISTMidnight above is: this backend runs on a host set to UTC, so
+ * `new Date(x).getHours()` would bucket a 10am shift hour as 04:30 and the
+ * "output by hour" chart would show the factory working through the night. */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const istHourOf = (instant) =>
+  new Date(new Date(instant).getTime() + IST_OFFSET_MS).getUTCHours();
+const istDayKeyOf = (instant) =>
+  new Date(new Date(instant).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+
+/* Who recorded a scan.
+ *
+ * scannedBy is free text supplied by the Production Record page, so it arrives
+ * as "", "  ", or a real name depending on what was typed. Everything unnamed
+ * collapses into ONE bucket rather than several near-identical blanks — an
+ * "Unattributed" row a supervisor can see and act on is more useful than a
+ * chart with four empty legend entries. */
+const SUPERVISOR_UNATTRIBUTED = "Unattributed";
+const supervisorNameOf = (raw) => {
+  const name = String(raw || "").trim();
+  return name || SUPERVISOR_UNATTRIBUTED;
+};
+
 // ── POST /fetch-order ────────────────────────────────────────────────────────
 // Look up WO + MO info for a single barcode (for preview / validation only)
 router.post("/fetch-order", async (req, res) => {
@@ -178,7 +203,7 @@ router.post("/preview", async (req, res) => {
 
 router.post("/mark-done", async (req, res) => {
   try {
-    const { barcodes, scannedBy } = req.body;
+    const { barcodes, scannedBy, scannedAt } = req.body;
     if (!Array.isArray(barcodes) || barcodes.length === 0) {
       return res.status(400).json({ success: false, message: "barcodes array is required" });
     }
@@ -219,10 +244,38 @@ router.post("/mark-done", async (req, res) => {
     const now = new Date();
     const dateBucket = getISTMidnight(now);
 
+    /* WHEN each garment was actually scanned, where the device knows.
+     *
+     * Every barcode in a batch used to be stamped with one `now` taken at save
+     * time, so an operator who scanned forty pieces across the afternoon and
+     * pressed Save at 18:00 produced forty scans dated 18:00. That is fine for
+     * a daily total and wrong for anything hour-shaped — and the Overview page
+     * now draws an hourly curve off this field.
+     *
+     * The record page's offline queue has carried a real per-scan `at` on the
+     * device since it was written (components/production-supervisor/scanQueue.js);
+     * it simply never left the browser. `scannedAt` is that map, barcode -> ms.
+     *
+     * Optional and per-barcode: an older page, or a barcode typed in by hand
+     * with no queue entry, still falls back to save time. Bounds-checked
+     * because this is a client-supplied timestamp — anything not inside the
+     * last 30 days, or in the future, is a clock the server should not trust.
+     */
+    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+    const timeFor = (barcode) => {
+      const raw = scannedAt && scannedAt[barcode];
+      if (!raw) return now;
+      const t = new Date(raw);
+      if (Number.isNaN(t.getTime())) return now;
+      const age = now.getTime() - t.getTime();
+      if (age < -60_000 || age > THIRTY_DAYS_MS) return now;
+      return t;
+    };
+
     if (newBarcodes.length > 0) {
       const scanEntries = newBarcodes.map((bc) => ({
         barcodeId: bc,
-        scannedAt: now,
+        scannedAt: timeFor(bc),
         scannedBy: scannedBy || "",
       }));
       await ProductionCompletionScanRecord.findOneAndUpdate(
@@ -269,22 +322,55 @@ router.get("/overview", async (req, res) => {
 
     const allScans = docs.flatMap((d) => d.scans || []);
 
-    // Group scans by WO short id, deduplicating units
-    const unitsByShortId = new Map();
+    /* Group scans by WO short id, deduplicating units — and KEEP WHO AND WHEN.
+     *
+     * This used to be a Set of unit numbers, which answered "how many" and
+     * nothing else. The timestamp and the name of the person who recorded the
+     * scan were already on every row in the database and were dropped here, one
+     * line into the handler, so the page above could not show an hourly curve
+     * or say who had booked the work (11 Sep 2026 request: "hour wise report,
+     * graph... and also the production supervisor name and all, in order to
+     * keep the record properly").
+     *
+     * EARLIEST scan wins where a unit somehow appears twice. A garment is
+     * finished once; if a duplicate ever slips past the mark-done dedup, the
+     * first sighting is the completion and the second is a mistake — counting
+     * the later one would quietly move output into the wrong hour. */
+    const unitsByShortId = new Map(); // shortId -> Map<unitNumber, {at, by}>
     for (const s of allScans) {
       const p = parseBarcode(s.barcodeId);
       if (!p.success) continue;
-      if (!unitsByShortId.has(p.woShortId)) unitsByShortId.set(p.woShortId, new Set());
-      unitsByShortId.get(p.woShortId).add(p.unitNumber);
+      if (!unitsByShortId.has(p.woShortId)) unitsByShortId.set(p.woShortId, new Map());
+      const units = unitsByShortId.get(p.woShortId);
+      const at = s.scannedAt ? new Date(s.scannedAt) : null;
+      const prior = units.get(p.unitNumber);
+      if (!prior || (at && prior.at && at < prior.at) || (at && !prior.at)) {
+        units.set(p.unitNumber, { at, by: supervisorNameOf(s.scannedBy) });
+      }
     }
 
     if (unitsByShortId.size === 0) {
+      // Same shape as the populated response, not a shorter one. A page that
+      // has to write `data.byHour ?? []` in six places eventually forgets in
+      // the seventh, and an empty day is the commonest response this endpoint
+      // gives — every morning before the first scan.
       return res.json({
         success: true,
         dateRange: { start, end: new Date(end.getTime() - 1) },
         totalScans: allScans.length,
         totalUnitsCompleted: 0,
         manufacturingOrders: [],
+        byHour: Array.from({ length: 24 }, (_, hour) => ({
+          hour,
+          label: `${String(hour).padStart(2, "0")}:00`,
+          units: 0,
+        })),
+        byDay: [],
+        bySupervisor: [],
+        rows: [],
+        peakHour: null,
+        unitsWithoutTime: 0,
+        avgUnitsPerActiveDay: 0,
       });
     }
 
@@ -300,7 +386,14 @@ router.get("/overview", async (req, res) => {
     const stockItemIdsToLoad = new Set();
     const moIdsToLoad = new Set();
 
-    for (const [shortId, unitSet] of unitsByShortId) {
+    /* Cross-cutting breakdowns, accumulated in the SAME pass that builds the
+     * MO tree so the whole range is walked once rather than three times. */
+    const byHourMap = new Map();       // 0..23 -> units
+    const byDayMap = new Map();        // YYYY-MM-DD -> units
+    const bySupervisorMap = new Map(); // name -> {units, firstAt, lastAt, orders:Set}
+    let unattributedTime = 0;          // units whose scan carried no timestamp
+
+    for (const [shortId, unitMap] of unitsByShortId) {
       const wo = woByShortId.get(shortId);
       if (!wo) continue;
 
@@ -310,11 +403,49 @@ router.get("/overview", async (req, res) => {
       if (moId !== "__no_mo__") moIdsToLoad.add(moId);
 
       if (!moAgg.has(moId)) {
-        moAgg.set(moId, { moId, products: new Map(), totalUnits: 0 });
+        moAgg.set(moId, {
+          moId,
+          products: new Map(),
+          totalUnits: 0,
+          firstAt: null,
+          lastAt: null,
+          supervisors: new Set(),
+        });
       }
 
       const entry = moAgg.get(moId);
-      entry.totalUnits += unitSet.size;
+      entry.totalUnits += unitMap.size;
+
+      // Attribution, per MO and across the whole range, from the same rows.
+      for (const [, meta] of unitMap) {
+        if (meta.at) {
+          const hr = istHourOf(meta.at);
+          byHourMap.set(hr, (byHourMap.get(hr) || 0) + 1);
+          const day = istDayKeyOf(meta.at);
+          byDayMap.set(day, (byDayMap.get(day) || 0) + 1);
+          if (!entry.firstAt || meta.at < entry.firstAt) entry.firstAt = meta.at;
+          if (!entry.lastAt || meta.at > entry.lastAt) entry.lastAt = meta.at;
+        } else {
+          unattributedTime++;
+        }
+        entry.supervisors.add(meta.by);
+        if (!bySupervisorMap.has(meta.by)) {
+          bySupervisorMap.set(meta.by, {
+            name: meta.by,
+            units: 0,
+            firstAt: null,
+            lastAt: null,
+            orders: new Set(),
+          });
+        }
+        const sup = bySupervisorMap.get(meta.by);
+        sup.units++;
+        sup.orders.add(moId);
+        if (meta.at) {
+          if (!sup.firstAt || meta.at < sup.firstAt) sup.firstAt = meta.at;
+          if (!sup.lastAt || meta.at > sup.lastAt) sup.lastAt = meta.at;
+        }
+      }
 
       const variantSig = (wo.variantAttributes || [])
         .map((v) => `${v.name}:${v.value}`)
@@ -331,8 +462,8 @@ router.get("/overview", async (req, res) => {
         });
       }
       const prodEntry = entry.products.get(productKey);
-      prodEntry.totalUnits += unitSet.size;
-      for (const u of [...unitSet].sort((a, b) => a - b))
+      prodEntry.totalUnits += unitMap.size;
+      for (const u of [...unitMap.keys()].sort((a, b) => a - b))
         prodEntry.unitBarcodes.push(`WO-${shortId}-${String(u).padStart(3, "0")}`);
     }
 
@@ -389,16 +520,90 @@ router.get("/overview", async (req, res) => {
           requestType: mo?.requestType || null,
           totalUnits: entry.totalUnits,
           products,
+          // Added 11 Sep 2026 — who booked this customer's work and when.
+          firstAt: entry.firstAt,
+          lastAt: entry.lastAt,
+          supervisors: [...entry.supervisors].sort(),
+          productCount: products.length,
         };
       })
       .sort((a, b) => b.totalUnits - a.totalUnits);
+
+    /* ── Hour of the working day ──────────────────────────────────────────
+     * All 24 emitted, not just the ones with output. A chart drawn from only
+     * the hours that produced something silently rescales its axis every
+     * refresh, and "nothing came off the line between 13:00 and 14:00" — the
+     * lunch break, or a line that stopped — is exactly the gap a supervisor is
+     * looking for. A missing bar says it; an absent hour hides it. */
+    const byHour = Array.from({ length: 24 }, (_, hour) => ({
+      hour,
+      label: `${String(hour).padStart(2, "0")}:00`,
+      units: byHourMap.get(hour) || 0,
+    }));
+
+    const byDay = [...byDayMap.entries()]
+      .map(([date, units]) => ({ date, units }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    const bySupervisor = [...bySupervisorMap.values()]
+      .map((v) => ({
+        name: v.name,
+        units: v.units,
+        orders: v.orders.size,
+        firstAt: v.firstAt,
+        lastAt: v.lastAt,
+      }))
+      .sort((a, b) => b.units - a.units);
+
+    // Flattened per-product rows, so the page can hand a spreadsheet or a PDF
+    // table straight to a file without re-walking the nested MO tree in the
+    // browser and getting the totals subtly different from these ones.
+    const rows = [];
+    for (const mo of manufacturingOrders) {
+      for (const p of mo.products) {
+        rows.push({
+          moNumber: mo.moNumber,
+          customerName: mo.customerName,
+          requestType: mo.requestType,
+          product: p.name,
+          reference: p.reference,
+          category: p.category,
+          genderCategory: p.genderCategory,
+          variant: (p.variantAttributes || []).map((v) => `${v.name}: ${v.value}`).join(", "),
+          units: p.totalUnits,
+          supervisors: mo.supervisors.join(", "),
+          firstAt: mo.firstAt,
+          lastAt: mo.lastAt,
+        });
+      }
+    }
+
+    const totalUnitsCompleted = manufacturingOrders.reduce((s, m) => s + m.totalUnits, 0);
 
     return res.json({
       success: true,
       dateRange: { start, end: new Date(end.getTime() - 1) },
       totalScans: allScans.length,
-      totalUnitsCompleted: manufacturingOrders.reduce((s, m) => s + m.totalUnits, 0),
+      totalUnitsCompleted,
       manufacturingOrders,
+
+      // ── Added 11 Sep 2026 ──────────────────────────────────────────────
+      // Additive only: everything above is byte-for-byte what this endpoint
+      // returned before, so anything already reading it is unaffected.
+      byHour,
+      byDay,
+      bySupervisor,
+      rows,
+      peakHour: byHour.reduce((best, h) => (h.units > best.units ? h : best), byHour[0]),
+      // Units whose scan row carried no timestamp — they count in the totals
+      // but cannot appear in the hourly curve. Reported so the two never look
+      // like they disagree.
+      unitsWithoutTime: unattributedTime,
+      // Averaged over the days that actually produced, not over the calendar
+      // range: a Sunday in the range is not a bad day, it is not a day.
+      avgUnitsPerActiveDay: byDay.length
+        ? Math.round((totalUnitsCompleted / byDay.length) * 10) / 10
+        : 0,
     });
   } catch (err) {
     console.error("overview error:", err);
