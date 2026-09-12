@@ -1,10 +1,10 @@
 // services/barcodeScanner/ensureIndexes.js
 //
-// Builds the indexes the four scan collections own, explicitly, at boot.
+// Builds the indexes the scan collections own, explicitly, at boot.
 //
 // connectDB() sets `autoIndex: process.env.NODE_ENV !== "production"`, which is
 // right for the CMS's own collections but means that on a production box these
-// four would never get their indexes at all. On a developer laptop they already
+// would never get their indexes at all. On a developer laptop they already
 // exist from earlier runs, so the gap does not show up here — it shows up on the
 // deployed server, which starts from an empty database.
 //
@@ -28,6 +28,14 @@ async function ensureScannerIndexes() {
     // CanvasLayout is deliberately absent: it declares no indexes of its own,
     // and the CMS floor canvas writes it too — the scanner pipeline should not
     // be the process that shapes a collection it shares.
+
+    /* ProductionTarget is not a scan collection, but it has the same problem
+       and no boot hook of its own: autoIndex is off in production, and every
+       one of its queries (a shift day's active targets, the closed-but-unsettled
+       sweep, a machine's or an operator's history) leads with an index declared
+       on the schema. It is listed here rather than given a second bootstrap
+       because this one already runs unconditionally right after connect. */
+    require("../../models/CMS_Models/Manufacturing/Production/ProductionTarget"),
   ];
 
   let built = 0;

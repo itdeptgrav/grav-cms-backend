@@ -29,6 +29,13 @@ const DeviceHeartbeat = require(`${B}/DeviceHeartbeat`);
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 
 const { shiftDateFor, currentShiftDate } = require("../../../../services/barcodeScanner/shift");
+/* Newest-heartbeat-wins. A machine can carry several DeviceHeartbeat rows — a
+   replaced scanner leaves its old one behind, a diagnostic tool pairs briefly
+   under its own id — and a plain Map keyed by machineId lets whichever row
+   Mongo happened to return LAST decide whether the machine is online. This page
+   feeds Device Health, so that coin-flip is the difference between a live
+   scanner reading "connected" and reading "offline". */
+const { latestHeartbeatByMachine } = require("../../../../services/barcodeScanner/rollupStats");
 
 // Authentication for the whole router, stated here rather than left to the
 // mount. These reads name who is on the floor right now, which machine they
@@ -94,9 +101,7 @@ const overviewHandler = async (req, res) => {
     const statsByMachine = new Map(
       dayStats.map((s) => [String(s.machineId), s])
     );
-    const hbByMachine = new Map(
-      heartbeats.filter((h) => h.machineId).map((h) => [String(h.machineId), h])
-    );
+    const hbByMachine = latestHeartbeatByMachine(heartbeats);
     const machineNames = new Map(machines.map((m) => [String(m._id), m.name]));
     const operatorNames = new Map(
       operators.map((o) => [o.operatorId, o.operatorName])
@@ -252,7 +257,13 @@ router.get("/machine/:machineId", async (req, res) => {
         status: 1,
       }).lean(),
       MachineDayStats.findOne({ shiftDate, machineId: machineObjId }).lean(),
-      DeviceHeartbeat.findOne({ machineId: machineObjId }).lean(),
+      /* Same rule as the fleet view above: with more than one device row for
+         this machine, findOne() with no sort returns an arbitrary one, so a
+         stale row could report a live machine offline on its own detail page
+         while the fleet list showed it connected. */
+      DeviceHeartbeat.findOne({ machineId: machineObjId })
+        .sort({ lastHeartbeatAt: -1 })
+        .lean(),
       ProductionEvent.find({ shiftDate, machineId: machineObjId })
         .sort({ scanTime: -1 })
         .limit(limit)

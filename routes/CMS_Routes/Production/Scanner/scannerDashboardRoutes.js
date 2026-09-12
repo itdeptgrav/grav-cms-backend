@@ -124,6 +124,9 @@ router.get("/work-orders", async (req, res) => {
           workOrderShortId: shortId,
           workOrderNumber: wo?.workOrderNumber || null,
           productName: wo?.stockItemName || null,
+        /* masterData already projects this; it just was not put on the wire, so
+           the floor search could not match a typed product code. Additive. */
+        stockItemReference: wo?.stockItemReference || null,
           customerName: wo?.customerName || null,
           orderQuantity: qty,
           unitsCompleted: done,
@@ -204,6 +207,15 @@ router.get("/operator/:operatorId", async (req, res) => {
     const woMap = masterData.workOrderMap(master);
     const nameFor = masterData.operatorNameResolver(master);
     const targets = masterData.operationTargets(master);
+    /* AP001 means nothing on a shop floor. The registry already carries the
+       real name ("UPPER LECS IRONING") and the machine type, and master data is
+       already in memory here, so naming the operation costs nothing. */
+    const opInfo = new Map(
+      (master.operations || []).map((o) => [
+        String(o.operationCode).trim(),
+        { name: o.name || "", machineType: o.machineType || "" },
+      ])
+    );
     const machineNames = new Map(
       (master.machines || []).map((m) => [String(m._id), m.name])
     );
@@ -244,8 +256,11 @@ router.get("/operator/:operatorId", async (req, res) => {
     const byOperation = [...perOperation.entries()].map(([code, st]) => {
       const avg = st.gaps > 0 ? st.gapMs / st.gaps / 1000 : null;
       const target = targets.get(code) ?? null;
+      const info = opInfo.get(code) || {};
       return {
         operationCode: code,
+        operationName: info.name || null,
+        machineType: info.machineType || null,
         pieces: st.pieces,
         avgSecondsPerPiece: avg == null ? null : Math.round(avg * 10) / 10,
         standardSeconds: target,
@@ -281,9 +296,21 @@ router.get("/operator/:operatorId", async (req, res) => {
         type: ev.type,
         barcodeId: ev.barcodeId || null,
         productName: ev.workOrderKey ? (woMap.get(ev.workOrderKey)?.stockItemName || null) : null,
+        /* masterData resolves this through displayWorkOrderNumber(), so it is
+           the WO-<short id> the printed label carries — never the blank that
+           the unbackfilled stored field gives. */
+        workOrderNumber: ev.workOrderKey ? (woMap.get(ev.workOrderKey)?.workOrderNumber || null) : null,
+        productCode: ev.workOrderKey ? (woMap.get(ev.workOrderKey)?.stockItemReference || null) : null,
+        customerName: ev.workOrderKey ? (woMap.get(ev.workOrderKey)?.customerName || null) : null,
         unitNumber: ev.unitNumber,
         machineName: machineNames.get(String(ev.machineId)) || "Unknown",
         activeOps: ev.activeOps || [],
+        /* The code (AP001) means nothing to a supervisor on the floor; the
+           operation name is what they know the job by. Codes are kept so the
+           existing consumers and the mono-spaced badge keep working. */
+        activeOpNames: (ev.activeOps || [])
+          .map((c) => opInfo.get(String(c).trim())?.name || String(c).trim())
+          .filter(Boolean),
         scanTime: ev.scanTime,
         timeRecovered: ev.timeRecovered,
       })),

@@ -780,7 +780,53 @@ app.get("/cowork/admin/bandwidth-stats", bandwidthStatsHandler);
 app.use("/cowork", transcriptModule.router);
 
 // ─── Database Connection ──────────────────────────────────────────────────────
-const connectDB = async () => {
+
+/**
+ * **A database that is not reachable yet is not a reason to kill the server.**
+ *
+ * This used to `process.exit(1)` on any connect failure, so one unreachable
+ * Atlas cluster took down everything in the process — including the Cowork
+ * side, which runs on Firestore and never touches Mongo. Meetings, tasks and
+ * chat stopped for a reason that had nothing to do with them.
+ *
+ * The case that prompted it, 12 Sep 2026: the machine's public IP had fallen
+ * off the Atlas access list. Atlas DISCARDS those packets rather than refusing
+ * them, so it surfaces as a server-selection timeout with every shard reported
+ * `Unknown` — the boot logged one line and the process was gone, and the same
+ * thing happens on any home or office connection that gets a new IP.
+ *
+ * So the first connection is RETRIED and the process stays up. That is not a
+ * licence to serve half-broken requests, and nothing here pretends the
+ * database is fine:
+ *
+ *   · `/health` already answers **503** until `readyState === 1`, which is what
+ *     a host routes on — it was written for exactly this window, where the
+ *     port is open and the connection is not ready;
+ *   · Mongoose buffers a query on a disconnected connection and then fails it,
+ *     so a Mongo-backed route errors rather than answering wrongly.
+ *
+ * `MONGO_REQUIRED=1` keeps the old exit-on-failure behaviour for anywhere that
+ * would rather the orchestrator replace the container than have it linger.
+ * Nothing was removed; the old behaviour is opt-in.
+ *
+ * Only the FIRST connection is retried here. Once Mongoose has connected once,
+ * it handles its own reconnection.
+ */
+const MONGO_RETRY_CAP_MS = 60_000;
+
+/**
+ * Resolves on the first REAL connection, never on a failed attempt.
+ *
+ * `connectDB().then(...)` below runs the access-table setup, and that has to
+ * meet a live connection. Resolving on failure would run it against a buffer
+ * that is about to time out — a confusing error on top of the real one.
+ */
+let signalFirstConnection;
+const firstConnection = new Promise((resolve) => {
+  signalFirstConnection = resolve;
+});
+
+const connectDB = async (attempt = 1) => {
   try {
     await mongoose.connect(
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
@@ -797,7 +843,11 @@ const connectDB = async () => {
         autoIndex: process.env.NODE_ENV !== "production",
       },
     );
-    console.log("✅ MongoDB connected successfully");
+    console.log(
+      attempt === 1
+        ? "✅ MongoDB connected successfully"
+        : `✅ MongoDB connected successfully (attempt ${attempt})`,
+    );
 
     // Folds the in-memory counters into hourly buckets once a minute. Started
     // here rather than at boot because the first flush would otherwise fire
@@ -813,10 +863,52 @@ const connectDB = async () => {
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     // productionSyncService.initialize();
+
+    signalFirstConnection();
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
-    process.exit(1);
+
+    if (process.env.MONGO_REQUIRED === "1") {
+      console.error("   MONGO_REQUIRED=1 — exiting so this instance is replaced.");
+      process.exit(1);
+    }
+
+    /* The guidance once, on the first failure. Repeating it every retry buries
+       the rest of the boot output, and after the first one the operator has
+       already read it. */
+    if (attempt === 1) {
+      console.error(
+        "   The server is STAYING UP. /health answers 503 until the database connects,",
+      );
+      console.error(
+        "   and Mongo-backed routes will fail rather than answer from a stale buffer.",
+      );
+      console.error(
+        "   A timeout with every shard Unknown usually means this machine's public IP",
+      );
+      console.error(
+        "   is not on the Atlas access list (Atlas discards those packets rather than",
+      );
+      console.error(
+        "   refusing them). Check Atlas → Network Access, or that the cluster is not paused.",
+      );
+      console.error("   Set MONGO_REQUIRED=1 to exit on failure instead of retrying.");
+    }
+
+    /* 5s, 10s, 20s, 40s, then every minute. Long enough not to hammer a
+       cluster that is genuinely down, short enough that fixing the access
+       list heals the server without anybody restarting it. */
+    const delay = Math.min(MONGO_RETRY_CAP_MS, 5000 * 2 ** (attempt - 1));
+    console.error(`   Retrying in ${Math.round(delay / 1000)}s (attempt ${attempt + 1}).`);
+
+    /* `unref` so the retry timer alone never holds the process open. The HTTP
+       server keeps it alive; if that is ever gone, this should not linger. */
+    setTimeout(() => connectDB(attempt + 1), delay).unref();
   }
+
+  /* Always the first-connection promise, not this attempt's outcome — see the
+     note on `firstConnection`. A failed attempt leaves it pending. */
+  return firstConnection;
 };
 
 /* ─── BOOT SEEDING ────────────────────────────────────────────────────────
@@ -1789,6 +1881,51 @@ app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/supervisorFloorRo
 app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/scannerDashboardRoutes.js`));
 app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/overviewSummaryRoutes.js`));
 app.use("/api/cms/production/scanner", require(`${S_ROUTES}/scannerAdminRoutes.js`));
+
+/* Machine intelligence — one machine in full (production, SAM, efficiency,
+   downtime, last activity) plus machine-wise efficiency for the floor. Mounted
+   on the supervisor prefix AFTER supervisorFloorRoutes, so it can only ADD
+   /machine-intelligence paths and can never shadow one of that router's. */
+app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/machineIntelligenceRoutes.js`));
+
+/* The production assistant — ask the floor a question in English.
+ *
+ * Its own narrow prefix, mounted AFTER the four routers above: a distinct
+ * segment cannot shadow one of their paths and they cannot shadow its. Not
+ * `/api/cms/production` for the reason the comment above already gives — a
+ * router carrying its own auth on a prefix that broad sits in front of every
+ * later /api/cms/production/** route in this file.
+ *
+ * No department gate on the mount. The router states
+ * `router.use(EmployeeAuthMiddleware)` itself, the same way the four above do,
+ * so moving the mount cannot quietly open it. Authentication only, because the
+ * supervisor and the project manager both read the production surfaces and
+ * hold different roles. */
+app.use(
+  "/api/cms/production/assistant",
+  require("./routes/CMS_Routes/Production/Assistant/productionAssistantRoutes.js")
+);
+
+/* Production targets — set a piece target against a machine, an operator, an
+ * operation, a group of machines or the whole floor, and compare it to what was
+ * actually scanned. The ACTUAL is always counted from ProductionEvent by
+ * services/production/targetEvaluator.js; nothing here accepts a typed-in one.
+ *
+ * Its own narrow segment, mounted AFTER the four scanner routers and the
+ * assistant, for the reason the comments above already give: a router carrying
+ * its own EmployeeAuthMiddleware on a prefix as broad as `/api/cms/production`
+ * sits in front of every later /api/cms/production/** route in this file.
+ * `/targets` can neither shadow one of their paths nor be shadowed by one.
+ *
+ * No department guard on the mount. The router states
+ * `router.use(EmployeeAuthMiddleware)` itself — the same way the scanner
+ * routers do, including the one that writes — so moving the mount cannot
+ * quietly open it. Authentication only, because the supervisor and the project
+ * manager both work the floor surfaces and hold different roles. */
+app.use(
+  "/api/cms/production/targets",
+  require("./routes/CMS_Routes/Production/Targets/productionTargetRoutes.js")
+);
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);

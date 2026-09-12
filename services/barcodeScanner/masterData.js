@@ -21,6 +21,7 @@ const Machine = require("../../models/CMS_Models/Inventory/Configurations/Machin
 const Employee = require("../../models/Employee");
 const Operation = require("../../models/CMS_Models/Inventory/Configurations/Operation");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const { displayWorkOrderNumber } = require("../manufacturing/workOrderNumber");
 
 const TTL_MS = Number(process.env.MASTER_TTL_MS || 10 * 1000);
 
@@ -55,8 +56,14 @@ async function load() {
     WorkOrder.find(
       {},
       {
+        /* Stored on NEW work orders only: the model's pre("validate") hook is
+           guarded on isNew, so all 143 pre-existing rows have it empty and the
+           backfill migration has not been run. displayWorkOrderNumber() below
+           fills the gap with the WO-<short id> form the barcodes already use,
+           and yields to the stored value if the migration is ever applied. */
         workOrderNumber: 1,
         stockItemName: 1,
+        stockItemReference: 1,
         customerName: 1,
         quantity: 1,
         status: 1,
@@ -65,7 +72,11 @@ async function load() {
     ).lean(),
   ]);
 
-  const workOrders = workOrdersRaw.map((w) => ({ ...w, shortId: shortIdOf(w) }));
+  const workOrders = workOrdersRaw.map((w) => ({
+    ...w,
+    shortId: shortIdOf(w),
+    workOrderNumber: displayWorkOrderNumber(w),
+  }));
   return { machines, operators, operations, workOrders };
 }
 

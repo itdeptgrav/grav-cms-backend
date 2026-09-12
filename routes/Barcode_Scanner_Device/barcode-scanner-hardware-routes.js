@@ -82,6 +82,27 @@ router.get('/name', async (req, res) => {
 });
 
 /**
+ * The scheme a DEVICE must use to reach us, not the one we wish it would.
+ *
+ * This was hardcoded `https://`. The backend only ever ran behind Render's TLS,
+ * so it was always right — until it moved onto the factory PC and started
+ * serving plain HTTP on the LAN. A scanner handed an https:// URL for an HTTP
+ * server fails in the TLS handshake and HTTPClient reports -1, which the screen
+ * renders as "Update Failed / HTTP -1" with a perfectly green server tick.
+ * Observed on device 8C40C86C, 12 Sep 2026.
+ *
+ * `trust proxy` is not enabled on this app, so req.protocol alone reports the
+ * raw connection and would answer "http" even behind the hosted TLS proxy —
+ * which would break api.grav.in in the opposite direction. x-forwarded-proto is
+ * what the proxy sets, so it wins when present.
+ */
+function deviceBaseUrl(req) {
+  const fwd = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const proto = fwd || req.protocol || 'http';
+  return `${proto}://${req.get('host')}`;
+}
+
+/**
  * POST /api/barcode-devices/check-update
  *
  * Called by the device on every WiFi connect and periodically thereafter.
@@ -149,7 +170,7 @@ router.post('/check-update', async (req, res) => {
 
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
-        const baseUrl   = `https://${req.get('host')}`;
+        const baseUrl   = deviceBaseUrl(req);
         firmwareInfo    = {
           version:     latestFirmware.version,
           url:         `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
@@ -288,12 +309,12 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     fs.writeFileSync(filePath, file.buffer);
     console.log('Firmware saved to:', filePath);
 
-    const baseUrl    = `https://${req.get('host')}`;
+    const baseUrl    = deviceBaseUrl(req);
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate any existing record with the same version
-    await Firmware.updateMany({ version }, { isActive: false });
-
+    /* Restored with the upsert below: the original computed this immediately
+       before building the document, and replacing that block dropped it. */
     let targetDevicesArray = ['all'];
     if (targetDevices) {
       try {
@@ -302,18 +323,38 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
         targetDevicesArray = [targetDevices];
       }
     }
+    if (!Array.isArray(targetDevicesArray) || targetDevicesArray.length === 0) {
+      targetDevicesArray = ['all'];
+    }
 
-    const firmware = new Firmware({
-      version,
-      cloudinaryUrl: firmwareUrl,
-      fileSize:      file.size,
-      description,
-      isActive:      true,
-      targetDevices: targetDevicesArray,
-      releasedAt:    new Date()
-    });
-
-    await firmware.save();
+    /* UPSERT, not deactivate-then-insert.
+     *
+     * The previous sequence deactivated every record with this version and THEN
+     * inserted a new one. `version` carries a UNIQUE index, so re-uploading a
+     * version already present failed on the insert — AFTER the deactivate had
+     * already committed. The build was left switched OFF, check-update stopped
+     * offering it, devices silently fell back to the previous version, and the
+     * page showed only "Server error".
+     *
+     * Re-uploading the same version is the ordinary thing to do when a build is
+     * corrected without bumping the number, so it has to be safe. One atomic
+     * replace makes it so.
+     */
+    const firmware = await Firmware.findOneAndUpdate(
+      { version },
+      {
+        $set: {
+          version,
+          cloudinaryUrl: firmwareUrl,
+          fileSize:      file.size,
+          description,
+          isActive:      true,
+          targetDevices: targetDevicesArray,
+          releasedAt:    new Date()
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     return res.json({
       success: true,

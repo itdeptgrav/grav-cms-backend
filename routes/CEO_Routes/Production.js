@@ -232,12 +232,17 @@ function buildOperationsBreakdown(scans, opMasterMap) {
           .filter(Boolean)
         : [];
     for (const code of ops) {
-      if (!buckets[code]) buckets[code] = [];
-      buckets[code].push(new Date(scan.timeStamp));
+      /* Buckets now carry the distinct garments as well as the timestamps.
+         scanCount alone forced the UI to display an event tally as production:
+         a piece re-scanned raised it without another garment existing. */
+      if (!buckets[code]) buckets[code] = { timestamps: [], pieces: new Set() };
+      buckets[code].timestamps.push(new Date(scan.timeStamp));
+      if (scan.barcodeId) buckets[code].pieces.add(scan.barcodeId);
     }
   }
   return Object.entries(buckets)
-    .map(([code, timestamps]) => {
+    .map(([code, bucket]) => {
+      const timestamps = bucket.timestamps;
       const master = opMasterMap.get(code);
       const sorted = timestamps.sort((a, b) => a - b);
       let avgI = null;
@@ -269,13 +274,14 @@ function buildOperationsBreakdown(scans, opMasterMap) {
         machineType: master?.machineType || null,
         samSecs,
         samMins: samSecs ? +(samSecs / 60).toFixed(1) : null,
-        scanCount: timestamps.length,
+        uniquePieces: bucket.pieces.size, // distinct garments — the production figure
+        scanCount: timestamps.length,     // diagnostics only, never displayed
         avgIntervalSecs: avgI,
         efficiencyPct: effPct,
         noTimingData: !hasTiming, // true = 0% is "no data", not real perf
       };
     })
-    .sort((a, b) => b.scanCount - a.scanCount);
+    .sort((a, b) => b.uniquePieces - a.uniquePieces);
 }
 
 /** Composite performance score 0–100 */
@@ -1163,7 +1169,8 @@ router.get("/operator-detail/:operatorId", ceoAuth, async (req, res) => {
               samMins: samSecs ? +(samSecs / 60).toFixed(1) : null,
               avgIntervalSecs: avgActual,
               efficiencyPct: effPct,
-              scanCount: ob?.scanCount || 0,
+              uniquePieces: ob?.uniquePieces || 0,
+              scanCount: ob?.scanCount || 0, // diagnostics only
             };
           });
 
