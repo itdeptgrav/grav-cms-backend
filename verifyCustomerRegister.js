@@ -170,6 +170,45 @@ const check = (n, ok, d = "") => {
     check("no row is on both sides at once",
       !crmRows.some((c) => ids.has(String(c._id))));
 
+    /* ── EVERY ROW ON THE PAGE MUST OPEN ────────────────────────────────
+       The register's row ids became LEDGER ids when it started reading Sundry
+       Debtors. The detail route's ledger fallback was gated on
+       `!ledger.linkedCustomerId` — written when it only had to serve Tally
+       parties with no CRM account — so the eighteen rows whose ledger IS
+       linked fell past it and answered "Customer not found" for parties
+       plainly listed one click earlier, balances and all.
+
+       A list that offers a link is a promise the link works, so this follows
+       every one of them. Serially: 54 rows times four endpoints at once was
+       enough concurrency to knock over the test server, which is a fact about
+       the harness rather than the route. */
+    console.log("\nevery row on the register actually opens");
+    let opened = 0;
+    const dead = [];
+    for (const r of all) {
+      const res1 = await fetch(`${base}/${r._id}?companyId=${cid}`);
+      if (res1.status !== 200) {
+        dead.push(`${r.name}: detail ${res1.status}`);
+        continue;
+      }
+      const body = await res1.json();
+      /* And it must open as ITSELF. A detail page headed with a different
+         party's name is the bug this whole change set exists to end. */
+      if (body.customer?.name !== r.name) {
+        dead.push(`${r.name}: opens as "${body.customer?.name}"`);
+        continue;
+      }
+      const res2 = await fetch(`${base}/${r._id}/accounting?companyId=${cid}`);
+      if (res2.status !== 200) {
+        dead.push(`${r.name}: accounting ${res2.status}`);
+        continue;
+      }
+      opened += 1;
+    }
+    check(`all ${all.length} rows open, under their own name`,
+      dead.length === 0, dead.slice(0, 6).join(" | "));
+    console.log(`        ${opened} opened · ${rows.length} accounting · ${crmRows.length} sales/CRM`);
+
     /* ── who is NOT on it ───────────────────────────────────────────── */
     console.log("\nwho is no longer listed as a customer");
     const names = rows.map((r) => String(r.name));
@@ -194,6 +233,23 @@ const check = (n, ok, d = "") => {
          named and valued by its own ledger. */
       if (row && crm && row.name !== l.name) borrowed.push(`${l.name} -> ${row.name}`);
     }
+    /* Nor its contact details. Reading the register from the ledger stopped a
+       bad link moving MONEY; the enrichment still borrowed the wrong party's
+       email until it was made to check. A wrong link should cost a blank
+       field, not somebody else's address. */
+    const { sameParty } = require("./services/partyLinkSafety");
+    const borrowedContact = [];
+    for (const l of linked) {
+      const c = await db
+        .collection("customers")
+        .findOne({ _id: l.linkedCustomerId }, { projection: { name: 1, email: 1 } });
+      if (!c?.email) continue;
+      if (sameParty(l.name, c.name || c.companyName)) continue;
+      const row = rows.find((r) => String(r.ledgerId) === String(l._id));
+      if (row && row.email === c.email) borrowedContact.push(`${l.name} shows ${c.name}'s email`);
+    }
+    check("nor its contact details", borrowedContact.length === 0, borrowedContact.join(" | "));
+
     check(`${linked.length} linked ledgers, none took its name from the CRM row`,
       borrowed.length === 0, borrowed.join(" | "));
   } finally {

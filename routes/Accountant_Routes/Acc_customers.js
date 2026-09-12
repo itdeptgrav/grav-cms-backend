@@ -112,6 +112,29 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
     for (const r of rows) crmById.set(String(r._id), r);
   }
 
+  /* ── A BAD LINK MUST NOT LEAK CONTACT DETAILS EITHER ──────────────────────
+     Reading the register from the ledger already stopped a mislink moving
+     MONEY between parties — the figures come from the ledger's own vouchers
+     whatever the link says. It did not stop the enrichment: a ledger pointing
+     at the wrong customer still borrowed that customer's email and phone, so
+     "MAYFAIR World Cup Village, Rourkela" was listed with the address of
+     MAYFAIR CORPORATE BBSR.
+
+     Clearing the offending row does not hold — it has come back twice in this
+     database. So the check moves into the code: enrichment is used only when
+     the ledger and the customer are plausibly the same party, by the same test
+     the merge guard uses. A wrong link now costs a blank email, which is the
+     honest answer. */
+  const { sameParty } = require("../../services/partyLinkSafety");
+  for (const [id, crm] of crmById) {
+    const ledger = ledgers.find(
+      (l) => l.linkedCustomerId && String(l.linkedCustomerId) === id,
+    );
+    if (ledger && !sameParty(ledger.name, crm.name || crm.companyName)) {
+      crmById.delete(id);
+    }
+  }
+
   const ledgerIds = ledgers.map((l) => l._id);
   const agg = await Acc_Voucher.aggregate([
     { $match: { companyId: cId, status: "posted" } },
@@ -1588,23 +1611,63 @@ router.get("/:customerId", verifyAccountantToken, async (req, res) => {
         .lean();
     } catch (_) {}
 
-    if (ledger && !ledger.linkedCustomerId && ledger.isActive !== false) {
+    /* ── A LEDGER ID IS A VALID CUSTOMER ID HERE ──────────────────────────
+       This used to require `!ledger.linkedCustomerId` — the fallback existed
+       only for Tally parties that had no CRM account at all. That held while
+       the register was built from CRM rows and merely appended the unlinked
+       ledgers.
+
+       The register is now one row per Sundry Debtor LEDGER, so every link on
+       the page carries a ledger id — including the eighteen whose ledger IS
+       linked to a CRM customer. Those fell past this condition and came back
+       "Customer not found" for parties plainly visible on the list a click
+       earlier, with real balances and real vouchers behind them.
+
+       A linked ledger is not a different kind of thing; it is the same party
+       with an email attached. So the ledger resolves either way, and the CRM
+       row is read for the contact details it alone knows. */
+    if (ledger && ledger.isActive !== false) {
       const cd = ledger.contactDetails || {};
+
+      /* Enrichment, not identity — exactly as the register does it. The
+         ledger names and values the party; the CRM row can only add ways to
+         contact them. */
+      let crm = null;
+      if (ledger.linkedCustomerId) {
+        crm = await Customer.findById(ledger.linkedCustomerId)
+          .select("name email phone gstin lastLogin createdAt profile")
+          .lean()
+          .catch(() => null);
+        /* Same rule as the register: a link to a different party contributes
+           nothing. See the note there. */
+        const { sameParty } = require("../../services/partyLinkSafety");
+        if (crm && !sameParty(ledger.name, crm.name || crm.companyName)) {
+          crm = null;
+        }
+      }
+
       const virtual = {
         _id: ledger._id,
+        /* The LEDGER's name. Taking the CRM name here is what put one party's
+           books under another party's heading in the first place. */
         name: ledger.name,
         companyName: ledger.name,
-        email: ledger.email || cd.email || "",
-        phone: ledger.phone || cd.phone || "",
-        gstin: ledger.gstin || "",
+        email: ledger.email || cd.email || crm?.email || "",
+        phone: ledger.phone || cd.phone || crm?.phone || "",
+        gstin: ledger.gstin || crm?.gstin || "",
         address: cd.address || "",
         city: cd.city || "",
         state: cd.state || "",
         pincode: cd.pincode || "",
         customerCode: customerCodeForId(ledger._id),
-        isLedgerOnly: true,
-        accountStatus: "ledger_only",
+        /* "Ledger only" means no portal account — a fact about the CRM row,
+           not about whether a link exists. */
+        isLedgerOnly: !crm,
+        accountStatus: crm ? "linked" : "ledger_only",
         ledgerId: ledger._id,
+        crmCustomerId: crm ? crm._id : null,
+        lastLogin: crm?.lastLogin || null,
+        createdAt: crm?.createdAt || null,
       };
       return res.status(200).json({ success: true, customer: virtual });
     }
@@ -1624,10 +1687,39 @@ router.get("/:customerId", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /:customerId/requests
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * The CRM customer id to query with, given whatever id the page sent.
+ *
+ * Since the register became one row per Sundry Debtor ledger, every link on
+ * that page carries a LEDGER id. The CRM-side collections — portal requests,
+ * payment submissions — are keyed on the CUSTOMER id, so querying them with a
+ * ledger id quietly returns nothing: not an error, just an empty history for a
+ * party who has one.
+ *
+ * Returns the id unchanged when it is already a customer, the linked customer
+ * when it is a ledger that has one, and null when the party genuinely has no
+ * CRM side — for which an empty list is the right answer.
+ */
+async function crmCustomerIdFor(id) {
+  if (!id) return null;
+  const asCustomer = await Customer.exists({ _id: id }).catch(() => null);
+  if (asCustomer) return id;
+  const ledger = await Acc_Ledger.findById(id)
+    .select("linkedCustomerId")
+    .lean()
+    .catch(() => null);
+  return ledger?.linkedCustomerId ? String(ledger.linkedCustomerId) : null;
+}
+
 router.get("/:customerId/requests", verifyAccountantToken, async (req, res) => {
   try {
-    const { customerId } = req.params;
-    const requests = await CustomerRequest.find({ customerId })
+    const crmId = await crmCustomerIdFor(req.params.customerId);
+    if (!crmId) {
+      /* A ledger-only party has no portal history, which is a fact rather
+         than a failure. */
+      return res.status(200).json({ success: true, requests: [], count: 0 });
+    }
+    const requests = await CustomerRequest.find({ customerId: crmId })
       .select("-__v -notes")
       .sort({ createdAt: -1 })
       .lean();
@@ -1646,8 +1738,11 @@ router.get("/:customerId/requests", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:customerId/payments", verifyAccountantToken, async (req, res) => {
   try {
-    const { customerId } = req.params;
-    const requests = await CustomerRequest.find({ customerId })
+    const crmId = await crmCustomerIdFor(req.params.customerId);
+    if (!crmId) {
+      return res.status(200).json({ success: true, payments: [], count: 0 });
+    }
+    const requests = await CustomerRequest.find({ customerId: crmId })
       .select("quotations.paymentSubmissions requestId")
       .lean();
     const allPayments = [];
