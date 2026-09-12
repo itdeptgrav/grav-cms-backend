@@ -278,7 +278,10 @@ router.get("/stats", requireCapability(CAPABILITIES.READ), async (req, res) => {
     );
     res.json({
       success: true,
-      stats: { ...base, unrecognised, corrections },
+      /* `edited` is the same count under the name the ledger screen's
+         "Edited" card reads. Without it that card rendered a dash
+         forever, never a zero (11 Sep 2026). */
+      stats: { ...base, unrecognised, corrections, edited: corrections },
       source: LEGACY_SOURCE,
     });
   } catch (e) {

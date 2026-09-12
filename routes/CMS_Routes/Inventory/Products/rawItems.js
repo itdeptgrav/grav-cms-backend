@@ -151,12 +151,19 @@ const SUPPLIER_NOT_SELECTABLE = "SUPPLIER_NOT_SELECTABLE";
 const supplierScope = (req, extra = {}) => ({
   $and: [
     tenantContext.tenantFilter(req.tenant),
-    { companyId: { $ne: null } },
+    tenantContext.ownedOnly(),
     /* A company-owned supplier part-way through migration has no code yet.
        It is visible in the Supplier Master for remediation, and must not be
        offered here: an order or alias bound to it would carry no identity
-       anybody can quote back. */
-    { supplierCode: { $gt: "" } },
+       anybody can quote back.
+
+       Stood down while the legacy window is open. NOT ONE of the 94 suppliers
+       in this database carries a code — the supplier-code scheme shipped after
+       them and the migration script deliberately never derives one — so
+       enforcing it emptied the vendor dropdown on every Raw Item form in Store
+       and Sales (reported 10 Sep 2026). It comes back with
+       STORE_PURCHASE_STRICT_TENANCY=1, by which time codes must exist. */
+    ...(tenantContext.legacyWindowOpen() ? [] : [{ supplierCode: { $gt: "" } }]),
     ...(Object.keys(extra).length ? [extra] : []),
   ],
 });
@@ -207,6 +214,47 @@ async function supplierIdentityMap(req, ids) {
     _id: { $in: wanted },
   }).select("_id companyName status supplierCode companyId").lean();
   return new Map(found.map((v) => [String(v._id), v]));
+}
+
+/**
+ * Put a name on each stored alias's supplier.
+ *
+ * -- WHY THE ALIAS ROWS CARRY AN OBJECT AGAIN --------------------------------
+ * This route deliberately stopped populating the supplier when Supplier Master
+ * gained company ownership: an id resolvable across the whole database is not
+ * an identity THIS company can vouch for. But every screen that reads an alias
+ * reads `vendorNicknames[].vendor.companyName` -- the Raw Item view groups by
+ * it, and both Raw Item forms carry it as `vendorName` -- so a bare id rendered
+ * every vendor code in the system as "Unknown Vendor" while the codes
+ * themselves were still there (reported 11 Sep 2026).
+ *
+ * Identity is resolved through `supplierIdentityMap`, which is tenant-scoped:
+ * a supplier this company cannot resolve is LEFT as a bare id and still reads
+ * as unknown, because that is the honest answer. Only one this company can
+ * actually see gets a name. Nothing is widened -- the same rows are returned,
+ * with the ones that can be attributed attributed.
+ */
+async function resolveAliasVendors(req, rawItem) {
+  const variants = Array.isArray(rawItem?.variants) ? rawItem.variants : [];
+  const ids = [];
+  for (const v of variants) {
+    for (const vn of (v?.vendorNicknames || [])) if (vn?.vendor) ids.push(vn.vendor);
+  }
+  if (!ids.length) return;
+
+  const identities = await supplierIdentityMap(req, ids);
+  for (const v of variants) {
+    for (const vn of (v?.vendorNicknames || [])) {
+      const known = vn?.vendor ? identities.get(String(vn.vendor)) : null;
+      if (!known) continue;
+      vn.vendor = {
+        _id: known._id,
+        companyName: known.companyName,
+        status: known.status,
+        supplierCode: known.supplierCode || "",
+      };
+    }
+  }
 }
 
 function sensitiveFieldsIn(body) {
@@ -391,7 +439,13 @@ const normaliseVariantNicknames = (incoming) => {
     .filter(vn => vn && vn.vendor && vn.nickname && vn.nickname.toString().trim())
     .map(vn => ({
       _id: vn._id && mongoose.Types.ObjectId.isValid(vn._id) ? vn._id : undefined,
-      vendor: vn.vendor,
+      /* A read hands back a NAMED supplier (see resolveAliasVendors), and a
+         form that round-trips an untouched row sends that object straight
+         back. Take the id out of either shape rather than relying on the
+         cast to find `_id` inside an object it was not given. */
+      vendor: vn.vendor && typeof vn.vendor === "object" && vn.vendor._id
+        ? vn.vendor._id
+        : vn.vendor,
       nickname: vn.nickname.toString().trim(),
       price: parseFloat(vn.price) || 0,
       deliveryDays: parseInt(vn.deliveryDays) || 0,
@@ -739,6 +793,9 @@ router.get("/:id", canRead, async (req, res) => {
     }
 
     applyComputedStatus(rawItem);
+    /* Alias rows are stored as references; this names the ones this company
+       can resolve, and leaves the rest as ids. See resolveAliasVendors. */
+    await resolveAliasVendors(req, rawItem);
 
     res.json({ success: true, rawItem });
 
@@ -982,11 +1039,37 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
      *
      * Refused, not ignored: an operator who typed a quantity into a form and
      * got a success message would otherwise believe the shelf had changed. */
+    /* ── PRESENT IS NOT THE SAME AS CHANGED ───────────────────────────────
+     * This refused on the mere PRESENCE of a quantity, and the edit form
+     * sends every field it loaded -- including each variant's unchanged
+     * quantity -- so EVERY raw-item edit was refused. Renaming an item or
+     * fixing its category was impossible, on both the Store and Sales forms
+     * (reported 11 Sep 2026).
+     *
+     * The rule itself is right and is kept: an edit must not move stock. So
+     * the comparison is against what is STORED. An echo of the current
+     * balance changes nothing and is allowed through (and ignored below,
+     * where no quantity is ever assigned); a DIFFERENT number is still a
+     * stock movement asked for in the wrong place, and is still refused.
+     *
+     * A row with no `_id` is new: it may arrive with 0, never with stock. */
+    const sameQty = (a, b) => Number(a || 0) === Number(b || 0);
+    const storedVariant = (row) => {
+      if (row && row._id) {
+        const byId = (rawItem.variants || []).find((sv) => String(sv._id) === String(row._id));
+        if (byId) return byId;
+      }
+      const combo = JSON.stringify(row?.combination || []);
+      return (rawItem.variants || []).find((sv) => JSON.stringify(sv.combination || []) === combo);
+    };
+
     const quantityFields = [];
-    if (quantity !== undefined) quantityFields.push("quantity");
+    if (quantity !== undefined && !sameQty(quantity, rawItem.quantity)) {
+      quantityFields.push("quantity");
+    }
     const variantQuantities = (Array.isArray(variants) ? variants : [])
-      .map((v, i) => ({ i, has: v && v.quantity !== undefined }))
-      .filter((x) => x.has);
+      .map((v, i) => ({ i, v }))
+      .filter(({ v }) => v && v.quantity !== undefined && !sameQty(v.quantity, storedVariant(v)?.quantity));
     if (variantQuantities.length) quantityFields.push("variants[].quantity");
 
     if (quantityFields.length) {

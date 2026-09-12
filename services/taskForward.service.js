@@ -3613,7 +3613,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
     const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
-    const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
+    const _reworkHistory = reworkHistoryEntry(task, approverId, approverName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     // ── Roll deadlineWindowSecs back to what it was before this proposal ──
     // proposeDeadline wrote the new proposed total into deadlineWindowSecs so
     // TL/CEO could see "X asked". On rejection that value must be reverted —

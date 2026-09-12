@@ -220,6 +220,72 @@ function bad(sev, title, detail, sample = []) {
     : bad("med", "the closing voucher type is not reported",
         "a status of 'closed' that cannot say what closed it");
 
+  /* ── 8c. customers point at their own ledger ─────────────────────── */
+  console.log("\n8c. every customer is linked to its own ledger");
+  /* A customer page reads its figures from the ledger it is linked to. Link
+     it to the wrong one and the page shows ANOTHER party's invoices,
+     receipts and balance — under this customer's name, with no sign that
+     anything is wrong. Names are compared on their distinctive words: a
+     shared word means it is plausibly the same party, none at all means
+     somebody is reading somebody else's books. */
+  const stop = new Set(["the", "and", "ltd", "pvt", "limited", "mayfair", "hotels", "resorts", "resort", "the"]);
+  const words = (t) =>
+    String(t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/)
+      .filter((w) => w.length > 2 && !stop.has(w));
+
+  const linked = await L.find({ linkedCustomerId: { $ne: null } })
+    .project({ name: 1, linkedCustomerId: 1 }).toArray();
+  const custCol = db.collection("customers");
+  const mislinked = [];
+  for (const l of linked) {
+    const c = await custCol.findOne({ _id: l.linkedCustomerId }, { projection: { name: 1, companyName: 1 } });
+    if (!c) { mislinked.push(`"${l.name}" → a customer row that no longer exists`); continue; }
+    const cn = c.name || c.companyName || "";
+    const a = new Set(words(l.name));
+    if (!words(cn).some((w) => a.has(w))) {
+      mislinked.push(`ledger "${l.name}" → customer "${cn}"`);
+    }
+  }
+  mislinked.length
+    ? bad("high", "customers linked to another party's ledger",
+        `${mislinked.length} of ${linked.length} — that customer page shows somebody else's invoices and balance`,
+        mislinked)
+    : good(`all ${linked.length} customer-to-ledger links point at the same party`);
+
+  /* The subtler half. A link can point at the right NAME and still be wrong,
+     because this database holds two ledgers for the same party: one the CRM
+     created (linked, and empty) and one Tally imported (unlinked, and holding
+     every invoice). The customer page reads the linked one, so it reports a
+     party with real trade as having done nothing. Silence here looks like a
+     quiet customer; it is actually a customer whose books are somewhere else. */
+  const partyCounts = new Map();
+  for (const r of await V.aggregate([
+    { $match: { status: "posted", partyLedgerId: { $ne: null } } },
+    { $group: { _id: "$partyLedgerId", n: { $sum: 1 } } },
+  ]).toArray()) partyCounts.set(String(r._id), r.n);
+
+  const allLedgers = await L.find({}).project({ name: 1, linkedCustomerId: 1 }).toArray();
+  const emptyLinks = [];
+  for (const l of allLedgers) {
+    if (!l.linkedCustomerId) continue;
+    if ((partyCounts.get(String(l._id)) || 0) > 0) continue;
+    const w = new Set(words(l.name));
+    const rivals = allLedgers.filter(
+      (o) => String(o._id) !== String(l._id) && !o.linkedCustomerId &&
+             (partyCounts.get(String(o._id)) || 0) > 0 &&
+             words(o.name).filter((x) => w.has(x)).length >= 2,
+    );
+    if (rivals.length) {
+      emptyLinks.push(`"${l.name}" is empty; the trade is on ` +
+        rivals.map((r) => `"${r.name}" (${partyCounts.get(String(r._id))})`).join(", "));
+    }
+  }
+  emptyLinks.length
+    ? bad("high", "customers reading an empty duplicate of their own ledger",
+        `${emptyLinks.length} — the page shows no activity while a namesake ledger holds every voucher`,
+        emptyLinks)
+    : good("no customer is linked to an empty duplicate of its own ledger");
+
   /* ── 9. PO -> bill -> payment ────────────────────────────────────── */
   console.log("\n9. purchase orders, bills and the payments against them");
   const POs = db.collection("acc_purchaseorders");

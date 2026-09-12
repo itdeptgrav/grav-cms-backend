@@ -180,10 +180,66 @@ async function voucherDerivedGst(startDate, endDate) {
       igst: Math.abs(vIgst),
       cess: Math.abs(vCess),
     };
-    if (isSalesSide && (vBaseAbs > 0 || vTaxAbs > 0)) {
-      addRate(outByRate, effRate, rateVals);
-    } else if (isPurchSide && (vBaseAbs > 0 || vTaxAbs > 0)) {
-      addRate(inByRate, effRate, rateVals);
+    /* ONE RATE PER VOUCHER IS WRONG FOR A MIXED INVOICE.
+       ------------------------------------------------------------------
+       An invoice selling taxed goods AND nil-rated goods has no single
+       rate. Folding it under one diluted effective rate files the
+       nil-rated turnover as though it were taxed — the same mistake the
+       invoice's own HSN summary was making.
+
+       So the lines are used when they can be trusted, and only then.
+       Trust is not assumed: 123 vouchers here carry real tax while every
+       one of their lines says taxRate 0 (old Tally imports that never
+       stored a per-line rate). Splitting those by line rate would file
+       ~₹49 lakh of taxed turnover at 0% — far worse than the problem being
+       fixed. The test is arithmetic, not faith: the lines are used only if
+       the tax they imply reconciles with the tax the voucher actually
+       carries. Otherwise the voucher-level effective rate stands, exactly
+       as before.
+
+       The ledger base stays authoritative — line amounts are scaled onto
+       it — so this changes how the base is DISTRIBUTED across rate rows,
+       never the total. */
+    const invLines = v.inventoryEntries || [];
+    const lineBase = invLines.reduce((s, i) => s + Math.abs(i.amount || 0), 0);
+    const lineTaxTotal = invLines.reduce(
+      (s, i) => s + (Math.abs(i.amount || 0) * Number(i.taxRate || 0)) / 100,
+      0,
+    );
+    const linesReconcile =
+      invLines.length > 0 &&
+      lineBase > 0 &&
+      vBaseAbs > 0 &&
+      Math.abs(lineTaxTotal - vTaxAbs) <= Math.max(2, vTaxAbs * 0.02);
+
+    const rateBucket = isSalesSide ? outByRate : isPurchSide ? inByRate : null;
+    if (rateBucket && (vBaseAbs > 0 || vTaxAbs > 0)) {
+      if (linesReconcile) {
+        const scale = vBaseAbs / lineBase;
+        const baseByRate = new Map();
+        for (const it of invLines) {
+          const r = Number(it.taxRate || 0);
+          baseByRate.set(
+            r,
+            (baseByRate.get(r) || 0) + Math.abs(it.amount || 0) * scale,
+          );
+        }
+        for (const [r, base] of baseByRate) {
+          /* Apportion the voucher's real tax by how much of it this rate
+             band accounts for, so the components still add up to what was
+             actually posted rather than to a recomputation. */
+          const share = vTaxAbs > 0 ? (base * r) / 100 / vTaxAbs : 0;
+          addRate(rateBucket, r, {
+            taxable: base,
+            cgst: Math.abs(vCgst) * share,
+            sgst: Math.abs(vSgst) * share,
+            igst: Math.abs(vIgst) * share,
+            cess: Math.abs(vCess) * share,
+          });
+        }
+      } else {
+        addRate(rateBucket, effRate, rateVals);
+      }
     }
 
     // HSN summary — use inventoryEntries when the (newer) import stored
@@ -194,8 +250,11 @@ async function voucherDerivedGst(startDate, endDate) {
       const h = it.hsnCode ? String(it.hsnCode).trim() : "";
       if (!h) continue;
       const base = Math.abs(it.amount || 0);
-      // Apportion this line's tax by the voucher's effective rate.
-      const lineTax = (base * effRate) / 100;
+      /* Apportion this line's tax by its OWN rate where the lines
+         reconcile with the posted tax (see the note above), and by the
+         voucher's effective rate otherwise. A nil-rated line then shows
+         under 0% instead of borrowing the invoice's average. */
+      const lineTax = (base * (linesReconcile ? Number(it.taxRate || 0) : effRate)) / 100;
       const isIgst = Math.abs(vIgst) > Math.abs(vCgst);
       if (!hsnMap[h])
         hsnMap[h] = {

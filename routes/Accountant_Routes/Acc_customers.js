@@ -73,24 +73,44 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
   if (!ids.size) return [];
   const gIds = [...ids].map((s) => new mongoose.Types.ObjectId(s));
 
-  // Only return ledgers NOT linked to any CRM customer. A ledger linked to a
-  // customer IS that customer's own accounting ledger — it shows as part of the
-  // customer's data (and on the detail page), never as a separate "ghost" row.
-  // Per the import model, every matched/created Tally party gets linked, so the
-  // real duplicates live at the CRM-customer level and are caught by the
-  // CRM-to-CRM detection in /all. This prevents a customer's own ledger from
-  // appearing as a phantom ghost of itself.
+  /* ── THE LEDGER IS THE CUSTOMER ───────────────────────────────────────────
+     This used to return only ledgers with NO linkedCustomerId, on the reasoning
+     that a linked ledger "shows as part of the customer's data". That reasoning
+     is what broke the page. It made the CRM row the identity and the ledger a
+     mere attachment, so the name, the balance and the "open full ledger" link
+     all came from whichever CRM row happened to point here — and when one
+     pointed at the wrong party, the page showed another company's books under
+     this customer's name with nothing on screen to suggest it.
+
+     The two collections answer different questions. A CRM `customers` row
+     carries `cart`, `favorites`, `orders`, `lastLogin` — it is a storefront
+     login. Sundry Debtors is who owes us money. This register asks the second
+     question, so it now reads the second source: every active Sundry Debtor
+     ledger is exactly one row, named and valued by itself.
+
+     A CRM row still contributes what only it knows — email, phone, whether
+     they can log in — but it can no longer decide who this is. A mislink stops
+     being a bug that shows wrong money and becomes a missing email. */
   const ledgers = await Acc_Ledger.find({
     companyId: cId,
     groupId: { $in: gIds },
     isActive: { $ne: false },
-    linkedCustomerId: { $in: [null, undefined] },
   })
     .select(
       "name gstin aliases groupName openingBalance openingBalanceType email phone linkedCustomerId",
     )
     .lean();
   if (!ledgers.length) return [];
+
+  /* Enrichment only — never identity. Read in one query for the whole page. */
+  const linkedIds = ledgers.map((l) => l.linkedCustomerId).filter(Boolean);
+  const crmById = new Map();
+  if (linkedIds.length) {
+    const rows = await Customer.find({ _id: { $in: linkedIds } })
+      .select("name email phone gstin createdAt lastLogin isEmailVerified isPhoneVerified")
+      .lean();
+    for (const r of rows) crmById.set(String(r._id), r);
+  }
 
   const ledgerIds = ledgers.map((l) => l._id);
   const agg = await Acc_Voucher.aggregate([
@@ -120,6 +140,10 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
         },
         orderCount: { $sum: 1 },
         lastOrderDate: { $max: "$voucherDate" },
+        /* When this party first traded. "New this month" needs the FIRST
+           transaction — keyed on the last one, every active customer counts
+           as new every month. */
+        firstOrderDate: { $min: "$voucherDate" },
       },
     },
   ]);
@@ -135,39 +159,65 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
     const closingSigned = openSigned + dr - cr;
     const stillOwed = closingSigned > 0 ? closingSigned : 0;
     const advanceFrom = closingSigned < 0 ? Math.abs(closingSigned) : 0;
-    const netMagnitude = Math.abs(closingSigned);
+    /* REVENUE IS WHAT WE BILLED THEM; PAID IS WHAT THEY SENT.
+       ------------------------------------------------------------------
+       These two used to be read off the closing BALANCE — revenue was
+       |closing| and paid was the credit balance. So a customer invoiced
+       ₹12,30,553 who had paid ₹12,30,554 showed "revenue ₹1, paid ₹1",
+       because a settled account has a balance of nearly nothing. It is the
+       same mistake as the linked path had: a balance is not a turnover.
+       Dr turnover (plus any opening debit) is what was invoiced; Cr
+       turnover is what came back. */
+    const invoiced = Math.max(0, openSigned > 0 ? openSigned : 0) + dr;
+    const received = cr;
+    const crm = l.linkedCustomerId ? crmById.get(String(l.linkedCustomerId)) : null;
     return {
       _id: l._id,
       isImported: true,
-      isLedgerOnly: true, // has a ledger but no real CRM account
-      accountStatus: "ledger_only", // for the frontend badge
+      /* "No account" means no portal login, which is now a fact about the CRM
+         row rather than about whether a ledger was ever linked. */
+      isLedgerOnly: !crm,
+      accountStatus: crm ? "linked" : "ledger_only",
       source: "tally_ledger",
-      // Give it a code derived from the ledger _id so it's identifiable and
-      // searchable just like a real customer (was null before).
+      // Derived from the LEDGER _id — the row's identity. Ledger-only rows
+      // already used this, so only the previously CRM-keyed rows shift, and
+      // those are the ones that were showing the wrong figures anyway.
       customerCode: customerCodeForId(l._id),
       vendorCode: null,
       ledgerId: l._id,
+      /* The ledger names itself. This is the whole point: the name and the
+         money now come from the same record, so they cannot disagree. */
       name: l.name,
-      email: l.email || null,
-      phone: l.phone || null,
-      gstin: l.gstin || null,
+      /* Contact details are the one thing the CRM row genuinely knows better —
+         a ledger imported from Tally rarely carries an email. */
+      email: l.email || crm?.email || null,
+      phone: l.phone || crm?.phone || null,
+      crmCustomerId: crm ? crm._id : null,
+      crmName: crm ? crm.name : null,
+      lastLogin: crm?.lastLogin || null,
+      createdAt: crm?.createdAt || null,
+      gstin: l.gstin || crm?.gstin || null,
       aliases: l.aliases || [],
       groupName: l.groupName || null,
-      totalRevenue: netMagnitude,
-      totalPaid: advanceFrom,
+      totalRevenue: invoiced,
+      totalPaid: received,
       totalOutstanding: stillOwed,
-      // Ledger-only party: figures ARE the books figures; it has no CRM side.
-      ledgerRevenue: netMagnitude,
-      ledgerPaid: advanceFrom,
+      // The books ARE the figures here; there is no CRM side to mix in.
+      ledgerRevenue: invoiced,
+      ledgerPaid: received,
       ledgerOutstanding: stillOwed,
+      /* Owed the other way — an overpayment or advance sitting on their
+         ledger. Kept apart from , which is money that actually came in. */
+      ledgerCreditBalance: advanceFrom,
       voucherCount: a.orderCount || 0,
       ledgerLastDate: a.lastOrderDate || null,
+      firstOrderDate: a.firstOrderDate || null,
       crmRevenue: 0,
       crmPaid: 0,
       crmOutstanding: 0,
       crmOrderCount: 0,
       crmLastOrderDate: null,
-      balance: netMagnitude,
+      balance: Math.abs(closingSigned),
       balanceType: closingSigned < 0 ? "Cr" : "Dr",
       outstandingType: closingSigned < 0 ? "Cr" : "Dr",
       orderCount: a.orderCount || 0,
@@ -802,13 +852,30 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
           const openSigned =
             (ll.openingBalanceType === "Cr" ? -1 : 1) *
             Math.abs(ll.openingBalance || 0);
-          // Sundry Debtor: positive closing = they owe us
+          /* Sundry Debtor: positive closing = they owe us.
+             ------------------------------------------------------------
+             "PAID" USED TO MEAN "THE LEDGER WENT INTO CREDIT", which is a
+             different fact entirely. A customer invoiced ₹12,30,553 and
+             credited ₹12,30,554.18 sits ₹1.18 in credit — and the register
+             reported that as "Paid ₹1", as though ₹1 was all they had ever
+             paid. It is the same mistake as calling a credited invoice
+             "Paid": treating "nothing is owed" as "money arrived".
+
+             So the two are separated. `paid` is what has actually been
+             credited against them — receipts and notes, the real movement.
+             A negative closing is an ADVANCE or overpayment and is reported
+             as such, never folded into `paid`. */
           const closingSigned = openSigned + (a.dr || 0) - (a.cr || 0);
           const outstanding = closingSigned > 0 ? closingSigned : 0;
-          const paid = closingSigned < 0 ? Math.abs(closingSigned) : 0;
+          const creditBalance = closingSigned < 0 ? Math.abs(closingSigned) : 0;
+          const paid = a.cr || 0;
           ledgerVoucherBalByCustomerId.set(String(ll.linkedCustomerId), {
             outstanding: parseFloat(outstanding.toFixed(2)),
             paid: parseFloat(paid.toFixed(2)),
+            /* They are in credit with us — an overpayment or an advance.
+               Kept apart from `outstanding` (which is never negative) so a
+               screen can say which way the balance runs. */
+            creditBalance: parseFloat(creditBalance.toFixed(2)),
             revenue: parseFloat(
               (Math.abs(closingSigned) + (a.cr || 0)).toFixed(2),
             ),
@@ -834,6 +901,7 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
       const ledgerBal = ledgerVoucherBalByCustomerId.get(String(c._id));
       const combinedRevenue = totalRevenue + (ledgerBal?.revenue || 0);
       const combinedPaid = totalPaid + (ledgerBal?.paid || 0);
+      const combinedCreditBalance = ledgerBal?.creditBalance || 0;
       const combinedOutstanding = Math.max(
         0,
         totalRevenue - totalPaid + (ledgerBal?.outstanding || 0),
@@ -864,6 +932,9 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
         ledgerRevenue: parseFloat((ledgerBal?.revenue || 0).toFixed(2)),
         ledgerPaid: parseFloat((ledgerBal?.paid || 0).toFixed(2)),
         ledgerOutstanding: parseFloat((ledgerBal?.outstanding || 0).toFixed(2)),
+        /* Owed the other way — an overpayment or an advance sitting on their
+           ledger. Never folded into `paid`; see the note where it is derived. */
+        ledgerCreditBalance: parseFloat(combinedCreditBalance.toFixed(2)),
         voucherCount: ledgerBal?.orderCount || 0,
         ledgerLastDate: ledgerBal?.lastOrderDate || null,
         // Legacy combined fields (kept so other callers don't break)
@@ -971,37 +1042,36 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
         groupRx: /sundry debtor/i,
         kind: "customer",
       });
+
+      /* BOTH SIDES ARE SENT; THE PAGE SHOWS THEM ON SEPARATE TABS.
+         ------------------------------------------------------------------
+         Accounting Customers reads the ledger rows below — one per active
+         Sundry Debtor, named and valued by itself, which is what stopped a
+         bad CRM link putting another party's books under this name.
+
+         Sales / CRM Customers reads the `customers` rows, with their order
+         and quotation figures. That side was never broken and is untouched:
+         the tab exists precisely to show CRM parties, so sending only
+         ledgers would empty it.
+
+         What keeps them from mixing is which collection a row came from,
+         not whether it happens to have a ledger. A CRM customer WITH a
+         ledger belongs on Sales for its orders and on Accounting as its
+         ledger — one row each, from the right source, never the same row
+         doing both jobs.
+
+         The ghost/duplicate marking is applied to CRM rows only. A ledger is
+         now an identity in its own right, so calling one a "ghost of" a CRM
+         record would be backwards. Duplicate LEDGERS — the empty CRM-created
+         copy beside the Tally one holding the trade — are a real and separate
+         problem, named by auditAccounting section 8c. */
+      imported = imported.map((c) => {
+        const { _normName, _gstinKey, _linkedCustomerId, ...rest } = c;
+        return rest;
+      });
+      allRows = [...customersWithCrmGhosts, ...imported];
+
       if (imported.length) {
-        // For imported Tally entries, match against the OLDEST keeper (same maps)
-        imported = imported.map((c) => {
-          let match = null;
-          if (c._gstinKey && crmKeeperByGstin.has(c._gstinKey))
-            match = crmKeeperByGstin.get(c._gstinKey);
-          else if (c._normName && crmKeeperByName.has(c._normName))
-            match = crmKeeperByName.get(c._normName);
-
-          // Skip if already properly linked to this exact CRM customer
-          if (
-            match &&
-            c._linkedCustomerId &&
-            String(c._linkedCustomerId) === String(match._id)
-          ) {
-            match = null;
-          }
-
-          const ghost = match
-            ? {
-                isGhost: true,
-                ghostOf: {
-                  id: match._id,
-                  name: match.name || match.companyName,
-                },
-              }
-            : {};
-          const { _normName, _gstinKey, _linkedCustomerId, ...rest } = c;
-          return { ...rest, ...ghost };
-        });
-        allRows = [...customersWithCrmGhosts, ...imported];
         impSummary.count = imported.length;
         impSummary.revenue = imported.reduce(
           (s, c) => s + (c.totalRevenue || 0),
@@ -1020,21 +1090,38 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
       console.error("[customers/all] imported merge skipped:", impErr.message);
     }
 
+    /* The summary describes the ACCOUNTING register — the ledger rows — so it
+       ties back to the Sundry Debtors group and can be checked against the
+       chart of accounts. It used to add a CRM subtotal to a ledger subtotal,
+       double-counting every party that had both, which is why these figures
+       never reconciled with anything.
+
+       The page does not read this: it recomputes a summary per tab, client
+       side, precisely so the two sides never mix. This is kept accurate for
+       any other caller, and for the harness that pins the reconciliation. */
+    const acctRows = allRows.filter((c) => c.isImported);
     res.json({
       success: true,
       customers: allRows,
       summary: {
-        totalCustomers: customers.length + impSummary.count,
+        totalCustomers: acctRows.length,
         totalRevenue: parseFloat(
-          (totalRevenue + impSummary.revenue).toFixed(2),
+          acctRows.reduce((s, c) => s + (c.totalRevenue || 0), 0).toFixed(2),
         ),
-        totalPaid: parseFloat((totalPaid + impSummary.paid).toFixed(2)),
+        totalPaid: parseFloat(
+          acctRows.reduce((s, c) => s + (c.totalPaid || 0), 0).toFixed(2),
+        ),
         totalOutstanding: parseFloat(
-          (totalOutstanding + impSummary.outstanding).toFixed(2),
+          acctRows.reduce((s, c) => s + (c.totalOutstanding || 0), 0).toFixed(2),
         ),
-        customersWithOutstanding:
-          customersWithOutstanding + impSummary.withOutstanding,
-        newThisMonth,
+        customersWithOutstanding: acctRows.filter((c) => c.totalOutstanding > 0).length,
+        /* "New" now means a party that started trading this month, which is
+           what an accounts register should count. It used to mean a CRM
+           record created this month — a portal sign-up, even one that never
+           bought anything. */
+        newThisMonth: acctRows.filter(
+          (c) => c.firstOrderDate && new Date(c.firstOrderDate) >= monthStart,
+        ).length,
       },
     });
   } catch (error) {

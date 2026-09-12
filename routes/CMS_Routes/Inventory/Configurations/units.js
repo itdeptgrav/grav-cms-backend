@@ -163,7 +163,17 @@ router.get("/", canRead, async (req, res) => {
       .populate("conversions.toUnit", "_id name") // ← MUST populate
       .sort({ createdAt: -1 });
 
-    return res.json({ success: true, units });
+    /* The Units & Packaging screen reads `stats.total` and `stats.totalActive`
+       for its counters and derives its page count from the total. Without them
+       it showed "0 units" over a full list and computed zero pages (9 Sep 2026).
+       Both are counts of what this same scoped query returned — nothing is
+       inferred. */
+    const stats = {
+      total: units.length,
+      totalActive: units.filter((u) => u.status === "Active").length,
+    };
+
+    return res.json({ success: true, units, stats });
   } catch (error) {
     console.error("Error fetching units:", error);
     return res.status(500).json({ success: false, message: "Server error" });

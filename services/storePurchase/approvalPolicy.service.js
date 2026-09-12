@@ -101,6 +101,32 @@ async function resolvePolicy({
  * WHY in history — "no policy matched" and "policy required an authority you
  * do not hold" are different facts about the same refusal.
  */
+/* ── APPROVALS ARE NOT LIVE YET ──────────────────────────────────────
+ *
+ * Purchase-order approval policy is part of the system being built for later,
+ * and it reached main ahead of the screens that would configure it: there is
+ * an SpApprovalPolicy model but no route and no page that creates one, so no
+ * company can have a policy, so `NONE_MATCHED` fails closed and NO purchase
+ * order can be issued — which also makes receiving one unreachable, because
+ * a draft cannot be received (reported 11 Sep 2026).
+ *
+ * Until the approvals feature ships with its configuration screen, an
+ * unconfigured company issues orders as it did before the policy gate
+ * existed. The gate is not deleted — an AMBIGUOUS policy still throws, a
+ * policy that names no approver still throws, and a policy that IS
+ * configured is still enforced in full. Only the "no policy at all" case
+ * stands down, and only while the feature is off.
+ *
+ * TO TURN IT ON: set STORE_PURCHASE_APPROVALS=1 once policies can be created.
+ */
+const APPROVALS_LIVE = process.env.STORE_PURCHASE_APPROVALS === "1";
+if (!APPROVALS_LIVE) {
+  console.warn(
+    "[store-purchase] Approval policy is NOT enforced for unconfigured companies " +
+    "(the approvals feature is not live). Set STORE_PURCHASE_APPROVALS=1 to enforce it.",
+  );
+}
+
 function evaluate({ resolution, ctx, level = 1 }) {
   if (resolution.outcome === OUTCOMES.AMBIGUOUS) {
     throw fail(
@@ -111,6 +137,12 @@ function evaluate({ resolution, ctx, level = 1 }) {
   }
 
   if (resolution.outcome === OUTCOMES.NONE_MATCHED) {
+    if (!APPROVALS_LIVE) {
+      /* No policy exists anywhere yet, and none can be created. Authorise,
+         and say so in the outcome so the history entry records that the
+         order was issued under no policy rather than under a matched one. */
+      return { allowed: true, policy: "NONE_MATCHED", level: 0, requiredCapability: null };
+    }
     /* FAIL CLOSED. An unconfigured company cannot issue orders. */
     throw fail(
       "POLICY_NOT_CONFIGURED",

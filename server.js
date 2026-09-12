@@ -1133,11 +1133,9 @@ app.use("/api/hr", hrProfileRoutes);
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
 
-// Face recognition for the sign-in page. Mounted AFTER deptAuth so it can
-// never shadow /api/auth/login — password sign-in stays exactly as it was.
-// Recognition only: this issues no session and records no attendance.
-const faceSigninRoutes = require("./routes/auth/faceSignin");
-app.use("/api/auth/face", faceSigninRoutes);
+// Face SIGN-IN was removed at the owner's request. Faces are still registered
+// — see /hr/face-registration and /hr/face-enroll — but a face no longer opens
+// a session. Nothing is mounted at /api/auth/face any more.
 
 // Self-service "forgot password" for the same login this replaces — request a
 // 4-digit email OTP, verify it, then set a new password. Reuses deptAuth's own
@@ -1800,6 +1798,13 @@ app.use("/hr/shift-swaps", shiftSwapRouter);
 // punch-in machine's Python engine; this process never loads a face model.
 const faceRegistrationRouter = require("./routes/HrRoutes/FaceRegistration_section");
 app.use("/hr/face-registration", faceRegistrationRouter);
+
+// Self-service face enrolment by link. HR mints a token, the employee opens it
+// on their own phone. The /session/* half is deliberately unauthenticated —
+// the token is the authorisation — so it is bounded, revocable and rate
+// limited inside the router itself. See the header of that file.
+const faceEnrollInviteRouter = require("./routes/HrRoutes/FaceEnrollInvite_section");
+app.use("/hr/face-enroll", faceEnrollInviteRouter);
 
 const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
 app.use("/api/hr/leaves", hrLeaveRoutes);

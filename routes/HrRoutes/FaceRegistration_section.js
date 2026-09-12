@@ -20,6 +20,7 @@
  * mapping, touches a photo, or records attendance.
  */
 
+const crypto = require("crypto");
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -32,6 +33,8 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 // Giving this process a second write path into that directory would mean two
 // codebases enforcing the same filename and traversal rules, and eventually
 // only one of them doing it correctly.
+const FacePhoto = require("../../models/HR_Models/FacePhoto");
+const faceDrive = require("../../services/faceGalleryDrive.service");
 const faceConfig = require("../../config/faceBiometric");
 const FACE_SERVICE_URL = faceConfig.FACE_BIOMETRIC_SERVICE_URL;
 const FACE_SERVICE_TIMEOUT_MS = Number(
@@ -53,7 +56,7 @@ async function callEngine(path, body, timeoutMs = FACE_SERVICE_TIMEOUT_MS) {
   try {
     const res = await fetch(`${FACE_SERVICE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: faceConfig.engineHeaders(),
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -97,6 +100,34 @@ async function loadSnapshot() {
   }
   const file = readSnapshotFile();
   if (file.ok) return { ...file, live: false };
+
+  /* A running-but-slow engine and a stopped one used to produce the same
+     sentence — "the face service is not running" — which sent operators to
+     restart a service that was working. Three states, three answers. */
+  if (r.error === "timeout") {
+    return {
+      ok: false,
+      reason: "face_service_timeout",
+      message:
+        `The face service at ${FACE_SERVICE_URL} did not answer in time. It ` +
+        `is running, but busy. Try again in a moment.`,
+      serviceUrl: FACE_SERVICE_URL,
+      path: file.path,
+      engineError: "timeout",
+    };
+  }
+  if (r.status === 401) {
+    return {
+      ok: false,
+      reason: "face_engine_unauthorised",
+      message:
+        `The face service refused this server's key. Set the same ` +
+        `FACE_ENGINE_KEY on the engine and on this API.`,
+      serviceUrl: FACE_SERVICE_URL,
+      path: file.path,
+      engineError: "unauthorised",
+    };
+  }
   return {
     ok: false,
     reason: "face_service_unreachable",
@@ -172,6 +203,9 @@ function shapePerson(p) {
     retakeReasons: p.retake_reasons || [],
     nearestOther: p.nearest_other || null,
     nearestOtherDist: p.nearest_other_dist ?? null,
+    /* Filenames, so the page can render the gallery straight from this. The
+       thumbnails are fetched per file, on demand. */
+    photos: p.photos || [],
   };
 }
 
@@ -199,6 +233,74 @@ router.get("/health", async (req, res) => {
   });
 });
 
+// ── POST /hr/face-registration/verify-token ─────────────────────────────
+//
+// Issue a short-lived token that lets THIS BROWSER call the engine's /verify
+// directly, over the public hostname.
+//
+// Why a browser talks to the engine at all: face sign-in streams several frames
+// a second while it waits for a confident match. Relaying each one through this
+// process doubles the hops and puts a video-rate stream through an Express
+// server that has an ERP to run.
+//
+// Why it is not simply given FACE_ENGINE_KEY: that key never expires and
+// authorises everything the engine can do, enrolment included. A browser that
+// holds it can register any face as any employee. What this hands out instead
+// is valid for two minutes, permits exactly one operation, and is bound to one
+// capture session.
+//
+// Authenticated deliberately. Anyone who can reach this route can spend the
+// machine's CPU on inference, so the door to the door is behind a login even
+// though the operation itself identifies someone who has not signed in yet.
+router.post("/verify-token", EmployeeAuthMiddlewear, async (req, res) => {
+  if (!faceConfig.browserTokensConfigured()) {
+    /* Fails CLOSED, and says which variable is missing rather than pretending
+       the feature is off. An engine reachable publicly with token checking
+       silently disabled would be the worst outcome available. */
+    return res.status(503).json({
+      success: false,
+      reason: "browser_tokens_not_configured",
+      message:
+        "FACE_BROWSER_TOKEN_SECRET is not set on this server, so browser access to the face engine is unavailable. " +
+        "Set the same value here and in the engine's environment.",
+    });
+  }
+
+  /* One session per capture attempt. Generated here rather than accepted from
+     the client so a caller cannot pin every token it ever gets to one id and
+     share the rate-limit budget of a session it does not own. */
+  const sessionId = crypto.randomBytes(16).toString("hex");
+
+  let minted;
+  try {
+    minted = faceConfig.mintBrowserToken({
+      sessionId,
+      /* Only when the caller already IS somebody. Face sign-in exists to work
+         out who an unknown person is, so requiring a subject would mean naming
+         the employee before the recognition meant to determine it. */
+      employeeId: req.user?.employeeId || null,
+      action: "verify",
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, reason: "mint_failed", message: "Could not issue a token." });
+  }
+  if (!minted) {
+    return res.status(503).json({ success: false, reason: "browser_tokens_not_configured" });
+  }
+
+  return res.status(200).json({
+    success: true,
+    token: minted.token,
+    sessionId: minted.sessionId,
+    expiresAt: minted.expiresAt,
+    expiresInSec: minted.expiresInSec,
+    /* The PUBLIC hostname, which is the only address a browser can use. The
+       internal loopback URL this server talks to is not sent: it would be
+       useless to the client and it describes the inside of the box. */
+    verifyUrl: process.env.FACE_PUBLIC_VERIFY_URL || null,
+  });
+});
+
 // ── GET /hr/face-registration/status ────────────────────────────────────
 // The whole picture: every folder, plus the ones nobody is linked to.
 router.get("/status", EmployeeAuthMiddlewear, async (req, res) => {
@@ -208,6 +310,9 @@ router.get("/status", EmployeeAuthMiddlewear, async (req, res) => {
       success: false,
       reason: r.reason,
       message: r.message || "Snapshot unavailable",
+      /* Only set when restarting is actually the fix, so the page can show
+         the command for that case and stay quiet for the others. */
+      startCommand: r.startCommand || null,
       snapshotPath: r.path,
       data: null,
     });
@@ -239,6 +344,9 @@ router.get("/status/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
       success: false,
       reason: r.reason,
       message: r.message || "Snapshot unavailable",
+      /* Only set when restarting is actually the fix, so the page can show
+         the command for that case and stay quiet for the others. */
+      startCommand: r.startCommand || null,
       snapshotPath: r.path,
       data: null,
     });
@@ -382,11 +490,36 @@ router.post("/upload/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
   });
   if (r.status === 0) return engineUnavailable(res, r.error);
   if (r.status !== 200 || !r.json || r.json.ok !== true) {
-    return res.status(r.status === 413 ? 413 : 400).json({
-      success: false,
-      reason: (r.json && r.json.error) || "upload_failed",
-    });
+    const reason = (r.json && r.json.error) || "upload_failed";
+    /* `gallery_full:<have>/<max>` from the engine, kept legible so the page
+       can tell the operator to remove one rather than just refusing. */
+    if (String(reason).startsWith("gallery_full")) {
+      const [, counts = ""] = String(reason).split(":");
+      const [have, max] = counts.split("/");
+      return res.status(409).json({
+        success: false,
+        reason: "gallery_full",
+        have: Number(have) || null,
+        maxPhotos: Number(max) || null,
+        message:
+          `This employee already has ${have || "the maximum"} of ` +
+          `${max || "the allowed"} photos. Remove one before adding another.`,
+      });
+    }
+    return res.status(r.status === 413 ? 413 : 400).json({ success: false, reason });
   }
+  /* Mirror to private Drive, after the engine has the photos. Best effort and
+     not awaited: the registration that matters is the one on the punch-in
+     machine, and a Drive outage must not fail an HR upload. */
+  backupToDrive(
+    r.json.saved || [],
+    files,
+    employee,
+    r.json.folder,
+    "hr-upload",
+    r.json.verdicts || [],
+  ).catch(() => {});
+
   return res.status(200).json({
     success: true,
     folder: r.json.folder,
@@ -451,6 +584,19 @@ router.post("/archive/:employeeId", EmployeeAuthMiddlewear, async (req, res) => 
       reason: (r.json && r.json.error) || "archive_failed",
     });
   }
+  /* Retire the Drive copy alongside the local one. Trashed rather than
+     deleted, and the row is kept with archivedAt set — the same reasoning the
+     engine uses when it moves a photo to _archive/ instead of removing it. */
+  FacePhoto.find({ biometricId: String(employee.biometricId), filename, archivedAt: null })
+    .then(async (rows) => {
+      for (const row of rows) {
+        await faceDrive.trashFacePhoto(row.driveFileId);
+        row.archivedAt = new Date();
+        await row.save();
+      }
+    })
+    .catch((err) => console.warn("[face-drive] archive mirror failed:", err.message));
+
   return res.status(200).json({
     success: true,
     archivedTo: r.json.archived_to,
@@ -467,7 +613,10 @@ router.post("/recheck", EmployeeAuthMiddlewear, async (req, res) => {
   if (!folder) {
     return res.status(400).json({ success: false, reason: "missing_folder" });
   }
-  const r = await callEngine("/register/status", { folder }, 30000);
+  /* The one call that should pay for a full re-read of the folder: this is
+     the operator explicitly asking "look again". Everything else is served
+     from the gallery the engine already holds. */
+  const r = await callEngine("/register/status", { folder, refresh: true }, 120000);
   if (r.status === 0) return engineUnavailable(res, r.error);
   if (r.status !== 200 || !r.json || r.json.ok !== true) {
     return res.status(404).json({
@@ -527,5 +676,57 @@ router.post("/photo/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
   }
   return res.status(200).json({ success: true, image: r.json.image });
 });
+
+
+/**
+ * Copy the photos that actually landed to private Drive, and record where.
+ * See services/faceGalleryDrive.service.js for why this is a mirror and not
+ * a move. Never throws — the caller does not await it.
+ */
+async function backupToDrive(saved, files, employee, folder, source, verdicts = []) {
+  try {
+    if (!faceDrive.backupEnabled() || !saved.length) return;
+    /* The engine renames on write, so pair its saved names back to the bytes
+       we were posted, in order. */
+    const pairs = saved
+      .map((s, i) => ({ filename: s.filename, data: files[i] && files[i].data }))
+      .filter((p) => p.data);
+    if (!pairs.length) return;
+
+    const name = [employee.firstName, employee.middleName, employee.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    const stored = await faceDrive.backupFacePhotos(pairs, {
+      employeeId: String(employee.biometricId),
+      employeeName: name,
+    });
+    if (!stored.length) return;
+
+    /* Keyed by filename so a partial upload cannot pair one photo's numbers
+       with another photo's row. */
+    const byName = new Map((verdicts || []).map((v) => [v.filename, v]));
+
+    await FacePhoto.insertMany(
+      stored.map((s) => {
+        const v = byName.get(s.filename);
+        return {
+          employee: employee._id,
+          biometricId: String(employee.biometricId),
+          folder: folder || "",
+          filename: s.filename,
+          driveFileId: s.driveFileId,
+          bytes: s.bytes,
+          source,
+          embedding: v && Array.isArray(v.embedding) ? v.embedding : undefined,
+          embeddingModel: (v && v.model) || "",
+        };
+      }),
+      { ordered: false },
+    );
+  } catch (err) {
+    console.warn("[face-drive] mirror failed:", err.message);
+  }
+}
 
 module.exports = router;
