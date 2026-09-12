@@ -1,0 +1,13 @@
+GRAV Scanner — ROLLBACK RELEASE
+================================
+Firmware version : 5.6.2
+Role             : Known-good production build. Keep for rollback.
+Built            : 2026-09-11 17:54 IST
+FQBN             : esp32:esp32:esp32:PartitionScheme=default
+Application BIN  : bin/GRAV-Scanner-5.6.2.bin
+Size             : 1,239,184 bytes
+Flash            : 1239028 / 1310720 bytes (94%)
+RAM (globals)    : 93688 / 327680 bytes (28%)
+
+If 5.6.3 misbehaves on the floor, upload THIS file to the CMS
+OTA page with the version label typed exactly as: 5.6.2
