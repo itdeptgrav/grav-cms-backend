@@ -4,6 +4,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+const { settlementOf } = require("../../services/poSettlement.service");
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const {
@@ -911,12 +912,15 @@ router.post("/:id/payment", async (req, res) => {
       recordedBy: req.user.id,
     });
     const newTotalPaid = totalPaid + amount;
-    purchaseOrder.paymentStatus =
-      newTotalPaid >= purchaseOrder.totalAmount
-        ? "COMPLETED"
-        : newTotalPaid > 0
-          ? "PARTIAL"
-          : "PENDING";
+    /* An exact >= against the PO total could never be satisfied: 24 of the
+       101 POs here store a sub-paisa total (₹12,006.323 — quantity × rate,
+       never rounded), and no payment can be made for a third of a paisa. So a
+       fully-settled order sat at PENDING forever. The same rounding tolerance
+       the accounts pages use decides it now. */
+    purchaseOrder.paymentStatus = settlementOf(purchaseOrder, {
+      paidAmount: newTotalPaid,
+      paymentCount: (purchaseOrder.payments || []).length,
+    }).paymentStatusComputed;
     await purchaseOrder.save();
 
     const updatedPO = await PurchaseOrder.findById(purchaseOrderId).populate(
