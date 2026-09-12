@@ -331,6 +331,13 @@ bw.attachSocketMeter(io);
 
 // Make io accessible to routes
 app.set("io", io);
+/* The scanner pipeline pushes two kinds of update through this same io: a
+   per-scan broadcast the moment a barcode lands (so a tile on the floor canvas
+   flashes within a second) and a settle-up broadcast after each 60s rollup (so
+   the counts behind the tiles reconcile to their accurate values). It creates
+   no Socket.IO server of its own — the rooms and event names are the ones
+   useProductionSocket already handles. */
+require("./services/barcodeScanner/realtime").attach(io);
 /* Meeting rooms only — see socketInstance.attachMeetingRooms for why this is
    not `init(io)`. Lets the meeting-status service reach every socket in a
    meeting, guests included, and forget a finished meeting's live recording. */
@@ -796,6 +803,13 @@ const connectDB = async () => {
     // here rather than at boot because the first flush would otherwise fire
     // against a disconnected connection and log a failure on every restart.
     bw.startFlusher(mongoose);
+
+    /* The four scan collections build their own indexes explicitly, because
+       autoIndex above is OFF in production and the unique ProductionEvent
+       .eventId is not a nicety: a scanner retries any scan it did not see a
+       200 for, and that index is the only thing that turns the retry into a
+       no-op instead of a second garment counted. Logged, never fatal. */
+    await require("./services/barcodeScanner/ensureIndexes").ensureScannerIndexes();
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     // productionSyncService.initialize();
@@ -1357,6 +1371,28 @@ app.use(
   salesDepartmentRulesRoutes,
 );
 
+/* ─── ESP32 barcode scanners: scan ingest ──────────────────────────────────
+ * MOUNTED HERE, ABOVE THE TWO LINES BELOW, AND THE ORDER IS LOAD-BEARING.
+ *
+ * `app.use("/api/cms", productOperations)` carries a router-level
+ * EmployeeAuthMiddleware, so EVERY /api/cms/** route registered after it
+ * answers 401 without a session. A scanner on the factory floor has no
+ * session and never will — it is a device on the LAN, not a logged-in user —
+ * and the path it posts to is built from the server address stored in its own
+ * NVS, so it cannot be moved off /api/cms without walking the floor with a
+ * barcode sheet and re-pointing fifty devices.
+ *
+ * Moving this mount below the next two lines takes the whole floor offline
+ * with a 401 that the devices render as a red cross.
+ *
+ * Merged in from the standalone barcode server (11 Sep 2026), which ran as its
+ * own process on port 5001 against its own MongoDB.
+ * --------------------------------------------------------------------- */
+app.use(
+  "/api/cms/production/barcode_punchings",
+  require("./routes/Barcode_Scan_Punchings/scannerIngestRoutes.js"),
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1720,6 +1756,39 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionSupervisorWrites("machine layout"), productionMachineLayout);
+
+/* ─── Barcode scanner: the read side ───────────────────────────────────────
+ * Everything the Production Supervisor portal's floor pages read, all of it
+ * derived from the productionevents the ingest router above writes.
+ *
+ * Below the `app.use("/api/cms", productOperations)` line on purpose — the
+ * mirror image of the ingest mount. These are read by a person in a browser
+ * with a session, so picking up that router's EmployeeAuthMiddleware on the
+ * way past is exactly what should happen. Each router also states its own
+ * `router.use(EmployeeAuthMiddleware)` rather than inheriting it silently,
+ * so moving a mount cannot quietly open them.
+ *
+ *   /supervisor/*              floor overview, device health, drill-down
+ *   /dashboard/work-orders     what was made today, per work order
+ *   /dashboard/operator/:id    one operator's whole shift
+ *   /dashboard/overview-summary the floor day: MOs, people, machines, SAM
+ *   /scanner/*                 QR generation, pipeline health, manual rollup
+ *
+ * The last three mount at the SAME path as productionDashboardRoutes and after
+ * it, so they can only add endpoints, never shadow one. See scannerDashboard
+ * Routes' header for why /machine-status is not among them.
+ *
+ * Note the /dashboard on the overview-summary mount. It was briefly the bare
+ * `/api/cms/production`, which works — but a router carrying its own
+ * EmployeeAuthMiddleware mounted on a prefix that broad sits in front of every
+ * later /api/cms/production/** route in this file, which is a trap to leave
+ * lying around for whoever adds the first public one.
+ * --------------------------------------------------------------------- */
+const S_ROUTES = "./routes/CMS_Routes/Production/Scanner";
+app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/supervisorFloorRoutes.js`));
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/scannerDashboardRoutes.js`));
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/overviewSummaryRoutes.js`));
+app.use("/api/cms/production/scanner", require(`${S_ROUTES}/scannerAdminRoutes.js`));
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
@@ -3131,6 +3200,13 @@ const gracefulShutdown = (signal) => {
 
   productionSyncService.stop();
 
+  /* Stop the rollup before the connection closes, so a restart cannot leave a
+     half-written MachineDayStats behind, and withdraw the mDNS record so the
+     name does not keep resolving to a server that has gone. */
+  require("./services/barcodeScanner/rollupStats").stop();
+  require("./services/barcodeScanner/announce").stop();
+  if (scannerCompatServer) scannerCompatServer.close();
+
   // Close the payslip renderer's Chromium. It is a child process, so without
   // this a restart leaves one behind every time — and on a small box a handful
   // of orphaned Chromiums is the whole machine's memory.
@@ -3164,6 +3240,49 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 const PORT = process.env.PORT || 5000;
 
+/* ─── The scanners' port ───────────────────────────────────────────────────
+ * Every ESP32 on the floor stores a server address in its own flash and posts
+ * scans to <host>:5001, because that is where the standalone barcode server
+ * listened. Firmware 5.6+ goes further: on boot it REWRITES a stored port of
+ * 5000 to 5001 on the grounds that "5000 is the CMS backend now" — so simply
+ * re-pointing a device at 5000 does not survive its next power cut.
+ *
+ * Merging that server in here would therefore have meant reflashing fifty
+ * devices. Instead the same Express app answers on both ports: nothing about
+ * the floor changes, and there is still exactly one process and one codebase.
+ * The compat listener has no routes of its own — /api/barcode-devices (OTA,
+ * machine names) and /api/cms/production/barcode_punchings (scans) are simply
+ * both reachable on either port.
+ *
+ * Set SCANNER_COMPAT_PORT=0 to switch it off once every device has been
+ * re-pointed. A bind failure is logged, never fatal — the main port is what
+ * the CMS needs, and losing the compat port must not stop the backend.
+ * --------------------------------------------------------------------- */
+const SCANNER_COMPAT_PORT = Number(
+  process.env.SCANNER_COMPAT_PORT ?? 5001,
+);
+
+let scannerCompatServer = null;
+if (SCANNER_COMPAT_PORT > 0 && SCANNER_COMPAT_PORT !== Number(PORT)) {
+  scannerCompatServer = require("http").createServer(app);
+  scannerCompatServer.on("error", (err) => {
+    console.warn(
+      `⚠️  Scanner compat port ${SCANNER_COMPAT_PORT} unavailable (${err.code}) — ` +
+        `devices still storing :${SCANNER_COMPAT_PORT} cannot reach this server. ` +
+        `Another copy of the old barcode server may still be running.`,
+    );
+    scannerCompatServer = null;
+  });
+  // 0.0.0.0, not localhost — "localhost" means the device itself to every
+  // ESP32 on the floor.
+  scannerCompatServer.listen(SCANNER_COMPAT_PORT, "0.0.0.0", () => {
+    console.log(
+      `✅ Scanner compat listener on 0.0.0.0:${SCANNER_COMPAT_PORT} ` +
+        `(same app; for devices still pointed at the old barcode server's port)`,
+    );
+  });
+}
+
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   /* The heap limit, in the deploy log, because it is the number that decides
@@ -3186,6 +3305,23 @@ server.listen(PORT, () => {
      running the schedules stops here and simply serves requests. */
   announceBackgroundJobMode();
   if (!backgroundJobsEnabled()) return;
+
+  /* ─── Barcode scanner: rollup + LAN announcement ─────────────────────────
+   * Full recompute of the three read models from productionevents, every 60s.
+   * It never patches what it wrote last time — a bug here costs one cycle and
+   * self-corrects, because the events are append-only and untouched.
+   *
+   * Inside the background-jobs gate with everything else: two processes both
+   * regenerating MachineDayStats would not corrupt anything (the writes are
+   * idempotent replaceOnes) but would double the load for no benefit.
+   *
+   * The mDNS announcement publishes this server as gravserver.local so a
+   * scanner can be pointed at a NAME instead of an IP that goes stale every
+   * time the host rejoins a network. Opt-in via MDNS_ENABLED=true — see
+   * services/barcodeScanner/announce.js for why it is off by default here and
+   * was on by default on the factory PC. */
+  require("./services/barcodeScanner/rollupStats").start();
+  require("./services/barcodeScanner/announce").start(SCANNER_COMPAT_PORT || PORT);
 
   transcriptModule.startCron();
 

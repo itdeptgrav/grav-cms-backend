@@ -38,28 +38,29 @@ const admin = require("firebase-admin");
 const db = admin.firestore();
 const Employee = require("../models/Employee");
 
+const { instantMs, istDateStr, addDaysToLabel, dowForLabel } = require("./timerSopTime");
+
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 const MAX_DAYS_PER_RUN = 60; // safety cap so a very stale watermark can't loop forever
 
+/* The three label helpers live in timerSopTime.js now — pure, and tested
+   there without Firebase or Mongo in the room. These names are kept so the
+   rest of this file reads as it did. */
+
 /** IST calendar-date string (YYYY-MM-DD) for a UTC ms timestamp. */
 function _istDateStr(utcMs) {
-    return new Date(utcMs + IST_OFFSET_MS).toISOString().split("T")[0];
+    return istDateStr(utcMs);
 }
 
-/** Add N whole calendar days to a YYYY-MM-DD label. Pure string/date-label
- *  arithmetic, anchored at UTC midnight of the label — never mixed with the
- *  "real IST instant" math above, so it can't inherit an offset bug. */
+/** Add N whole calendar days (N may be negative) to a YYYY-MM-DD label. */
 function _addDaysToLabel(dateStr, n) {
-    const anchor = Date.parse(dateStr + "T00:00:00.000Z");
-    return new Date(anchor + n * MS_PER_DAY).toISOString().split("T")[0];
+    return addDaysToLabel(dateStr, n);
 }
 
 /** Day-of-week (0=Sun) for a YYYY-MM-DD label. */
 function _dowForLabel(dateStr) {
-    const anchor = Date.parse(dateStr + "T00:00:00.000Z");
-    return new Date(anchor).getUTCDay();
+    return dowForLabel(dateStr);
 }
 
 /** Has the given IST clock time ("HH:MM") on the given date already passed? */
@@ -135,7 +136,14 @@ function _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMs, breakAllowanc
  *   credit someone based on a total they were still going to add to.
  */
 async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
-    const { forceToday = false } = opts;
+    /**
+     * `dryRun` — compute everything, save nothing: no watermark, no
+     * accumulators, no ledger entries. It is how a night's run is checked
+     * against real data before the night comes. `nowMs` sets the clock the
+     * run believes in, so tonight can be simulated this afternoon. Neither is
+     * reachable from any route; they are for scripts and tests.
+     */
+    const { forceToday = false, dryRun = false, nowMs = Date.now() } = opts;
     try {
         // ── 1. Load SOP config ──────────────────────────────────────────────
         const sopSnap = await db.collection("cowork_sop_settings").doc("task_events").get();
@@ -172,22 +180,31 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         const emp = await Employee.findOne({ biometricId: employeeId });
         if (!emp) return { ok: false, reason: "employee_not_found" };
 
-        const todayIST = _istDateStr(Date.now());
+        const todayIST = _istDateStr(nowMs);
 
         // ── 4. Work out which days are actually finalizable ────────────────
-        // A day is only ever evaluated once it's over: a past calendar day,
-        // or today itself once today's office hours have already ended.
-        // First-ever run starts the watermark at today — it never reaches
-        // back before the feature existed.
-        let cursor = emp.lastFinalizedDate ? _addDaysToLabel(emp.lastFinalizedDate, 1) : todayIST;
+        // A day is judged once it is COMPLETE, and a day is complete when it
+        // is a past day. Today is never judged before midnight: it used to
+        // count as over once the office CLOSING TIME had passed, and the
+        // Score page asks for an evaluation on every load — so opening it at
+        // 19:10 closed the day at 19:10, with the timer still running and
+        // unbanked, and the evening's work then paused into a day that had
+        // already been judged. The nightly 00:15 IST run is what closes a
+        // day now. `forceToday` (the CEO test tool) keeps its way in.
+        //
+        // Somebody never finalised starts at YESTERDAY, not today. Started at
+        // today, the nightly run — at 00:15, when today has just begun — found
+        // nothing to judge, saved no watermark, and did exactly the same the
+        // next night: 89 of 90 people were never judged once. Yesterday is the
+        // most recent complete day; the amnesty below keeps it from reaching
+        // back to before the switch-on.
+        let cursor = emp.lastFinalizedDate
+            ? _addDaysToLabel(emp.lastFinalizedDate, 1)
+            : _addDaysToLabel(todayIST, -1);
         const daysToFinalize = [];
         let guard = 0;
         while (cursor <= todayIST && guard++ < MAX_DAYS_PER_RUN) {
-            if (cursor === todayIST && !forceToday) {
-                const todayCfg = _dayCfgFor(todayIST, schedule);
-                const todayIsOver = todayCfg.isOff || _isPastClockTimeIST(todayIST, todayCfg.outTime);
-                if (!todayIsOver) break; // today isn't over yet — stop here, try again later
-            }
+            if (cursor === todayIST && !forceToday) break; // today is judged after midnight
             daysToFinalize.push(cursor);
             cursor = _addDaysToLabel(cursor, 1);
         }
@@ -195,20 +212,28 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         // ── OFF-period amnesty ──────────────────────────────────────────────
         // Days while the engine was switched OFF are never judged. The toggle
         // stamps timerSopEnabledAt every time it is turned back ON; any
-        // unfinalized day BEFORE that date belongs to the paused period —
-        // skip it and advance the watermark so it is never revisited.
-        // Calculation starts fresh from the enable date onward. Accumulators
-        // earned before the pause are kept; paused days add nothing to them.
-        if (sopCfg.timerSopEnabledAt) {
-            const enabledDateIST = _istDateStr(new Date(sopCfg.timerSopEnabledAt).getTime());
-            const skipped = daysToFinalize.filter(d => d < enabledDateIST);
+        // unfinalized day up to and INCLUDING that date belongs to the paused
+        // period — the switch-on day itself was off for part of it, and a day
+        // judged on a partial record is a cut nobody can explain — so skip it
+        // and advance the watermark so it is never revisited. Judging starts
+        // from the day after the switch-on. Accumulators earned before the
+        // pause are kept; paused days add nothing to them.
+        //
+        // `instantMs`, not `new Date(...)`: the toggle writes a Date, Firestore
+        // hands back a Timestamp, and `new Date(timestamp)` is Invalid Date.
+        // The label built from it threw RangeError for every employee on every
+        // run — the reason the engine had never moved a point.
+        const enabledMs = instantMs(sopCfg.timerSopEnabledAt);
+        if (enabledMs !== null) {
+            const enabledDateIST = _istDateStr(enabledMs);
+            const skipped = daysToFinalize.filter(d => d <= enabledDateIST);
             if (skipped.length > 0) {
-                const keep = daysToFinalize.filter(d => d >= enabledDateIST);
+                const keep = daysToFinalize.filter(d => d > enabledDateIST);
                 daysToFinalize.length = 0;
                 daysToFinalize.push(...keep);
                 emp.lastFinalizedDate = skipped[skipped.length - 1];
-                await emp.save();
-                console.log(`[timerSop] ${employeeId}: amnesty — skipped ${skipped.length} paused day(s) up to ${skipped[skipped.length - 1]}, judging resumes from ${enabledDateIST}`);
+                if (!dryRun) await emp.save();
+                console.log(`[timerSop] ${employeeId}: amnesty — skipped ${skipped.length} paused day(s) up to ${skipped[skipped.length - 1]}, judging resumes from ${_addDaysToLabel(enabledDateIST, 1)}`);
             }
         }
 
@@ -216,11 +241,12 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             return {
                 ok: true,
                 reason: "nothing_to_finalize_yet",
+                dryRun,
                 lastFinalizedDate: emp.lastFinalizedDate || null,
                 todayIST,
                 hint: forceToday
                     ? "Unexpected with forceToday set — lastFinalizedDate is already >= today."
-                    : "Today isn't over yet (per cowork_settings/office schedule) and there's no earlier unfinalized day. This is expected mid-day, not a bug.",
+                    : "Today is judged after midnight, by the 00:15 IST run, and there is no earlier unfinalised day. This is expected during the day, not a bug.",
             };
         }
 
@@ -406,14 +432,15 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         emp.timerDeficitAccumHrs = +deficitAccum.toFixed(4);
         emp.timerOvertimeAccumHrs = +overtimeAccum.toFixed(4);
         emp.lastFinalizedDate = daysToFinalize[daysToFinalize.length - 1];
-        await emp.save();
+        if (!dryRun) await emp.save();
 
         if (bleachesToAdd.length > 0) {
-            console.log(`[timerSop] ${employeeId}: ${bleachesToAdd.map(b => `${b.bleachType}=${b.points}pts (${b.sopName}, ${b.date})`).join(", ")}`);
+            console.log(`[timerSop] ${employeeId}: ${dryRun ? "DRY RUN — would apply " : ""}${bleachesToAdd.map(b => `${b.bleachType}=${b.points}pts (${b.sopName}, ${b.date})`).join(", ")}`);
         }
 
         return {
             ok: true,
+            dryRun,
             finalizedDates: daysToFinalize,
             bleachesApplied: bleachesToAdd,
             deficitAccum: { before: +deficitAccumBefore.toFixed(4), after: emp.timerDeficitAccumHrs },
@@ -552,4 +579,69 @@ async function calculateLateStayBoost(employeeId, employeeName, startDateStr, en
     return { ok: true, lateStayHrs, rate, boost, finalScore, bleach };
 }
 
-module.exports = { evaluateTimerSop, evaluateTimerSopForAllEmployees, calculateLateStayHours, calculateLateStayBoost };
+/**
+ * Finish a nightly run that did not finish.
+ *
+ * ## Why this exists
+ *
+ * The nightly sweep only fires inside a ten-minute window at 00:15 IST, and it
+ * walks 90-odd employees one at a time, each one reading two Firestore
+ * subcollections. If the process dies part-way — a restart, a closed laptop, a
+ * dropped connection — the employees it had not reached yet are simply left,
+ * and nothing tries again until the next night.
+ *
+ * That is not a theoretical risk. On 11 September 2026 the run reached 54 of 91
+ * people and stopped; the other 37 carried no judgement at all, so their scores
+ * showed nothing while their colleagues had been judged for the same day. Worse,
+ * a person with no watermark starts at YESTERDAY, so the day an interrupted run
+ * missed is not merely late — it is skipped for good once the watermark moves
+ * past it.
+ *
+ * So: a cheap sweep that asks Mongo alone "is anybody behind?" and evaluates
+ * only those. It costs one indexed query when everybody is up to date, which is
+ * the normal case, and it makes the nightly run self-healing rather than
+ * one-shot.
+ *
+ * Idempotent by construction: `evaluateTimerSop` is watermark-guarded, so
+ * running this at any hour is safe and a person already finalised is returned
+ * untouched.
+ */
+async function evaluateTimerSopStragglers() {
+    /* Yesterday in IST. Anybody whose watermark is older than this has a
+       completed day nobody has judged. Today is deliberately excluded — a day
+       is only judged once it is over. */
+    const todayIST = istDateStr(Date.now());
+    const yesterdayIST = addDaysToLabel(todayIST, -1);
+
+    const behind = await Employee.find({
+        isActive: true,
+        biometricId: { $exists: true, $nin: [null, ""] },
+        $or: [
+            { lastFinalizedDate: null },
+            { lastFinalizedDate: { $exists: false } },
+            { lastFinalizedDate: { $lt: yesterdayIST } },
+        ],
+    }).select("biometricId firstName lastName").lean();
+
+    if (!behind.length) return { employeeCount: 0, totalBleaches: 0, results: [] };
+
+    console.log(`[timerSop] catch-up: ${behind.length} employee(s) behind ${yesterdayIST}`);
+    const results = [];
+    for (const emp of behind) {
+        const name = [emp.firstName, emp.lastName].filter(Boolean).join(" ") || emp.biometricId;
+        try {
+            const result = await evaluateTimerSop(emp.biometricId, name);
+            results.push({ employeeId: emp.biometricId, ...result });
+        } catch (e) {
+            /* One employee's bad data must never strand the rest, which is the
+               whole failure this function exists to undo. */
+            console.error(`[timerSop] catch-up failed for ${emp.biometricId}:`, e.message);
+            results.push({ employeeId: emp.biometricId, ok: false, reason: "error", message: e.message });
+        }
+    }
+    const totalBleaches = results.reduce((s, r) => s + (r.bleachesApplied?.length || 0), 0);
+    console.log(`[timerSop] catch-up complete: ${behind.length} employees judged, ${totalBleaches} entries applied.`);
+    return { employeeCount: behind.length, totalBleaches, results };
+}
+
+module.exports = { evaluateTimerSop, evaluateTimerSopForAllEmployees, evaluateTimerSopStragglers, calculateLateStayHours, calculateLateStayBoost };

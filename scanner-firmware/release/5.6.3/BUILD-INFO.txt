@@ -1,0 +1,55 @@
+GRAV Scanner — PRODUCTION CANDIDATE (NOT yet fleet-approved)
+=============================================================
+Firmware version : 5.6.3
+Previous release : 5.6.2  (../5.6.2/, byte-identical to shipped, rollback)
+FQBN             : esp32:esp32:esp32:PartitionScheme=default
+
+STATUS: hardware bench tests NOT yet performed. Do not roll to the fleet
+until the procedure in the release notes has passed on one ESP32.
+
+OTA APPLICATION IMAGE
+---------------------
+  bin/GRAV-Scanner-5.6.3.bin
+  Size   : 1,243,632 bytes
+  SHA-256: 86998917d725ce5727ca513faf2526178bcb88a6ecb6cbf8b590a9a6903b6114
+  byte 0      = 0xE9
+  offset 0x20 = 0xABCD5432 (esp_app_desc_t -> APPLICATION, not a bootloader)
+  Embedded FW_VERSION : 5.6.3 (single occurrence)
+  NOT the OTA file: *.bootloader.bin / *.partitions.bin / *.merged.bin
+
+MEMORY
+------
+  Program storage : 1,243,476 / 1,310,720 bytes  (94.87%)
+  Free flash      :    67,244 bytes  (5.13%)
+  Globals (RAM)   :    93,720 /   327,680 bytes  (28.60%)
+  vs 5.6.2        : +4,448 bytes program, +32 bytes RAM
+
+NETWORK / RESPONSIVENESS CHANGES
+--------------------------------
+  1. onWiFiConnected() returns immediately (was ~25s inline)
+  2. serviceReconnectFollowUp() state machine, one phase per loop pass
+  3. queueTimesPending holds the sender until timestamps are reconstructed
+  4. handleServerUpdateBarcode() disowns in-flight OLD-server tasks
+  5. noteBackendResult() transition logging + repaint flag; rejects a success
+     landing after the link dropped
+  6. loop() repaints on a known state change, not only the 1s tick
+  7. Reconnect spacing 3s / 10s / 30s (was flat 30s)
+  8. Update availability check + machine-name fetch moved into ONE background
+     task (updchk). Neither blocks the scanning loop any more.
+  9. Result handed back core0 -> core1 through a FreeRTOS queue by pointer
+     ownership transfer, not a volatile flag over shared Strings.
+ 10. Setup portal scanner port derived from DEFAULT_SERVER_PORT
+ 11. Send and heartbeat tasks now use a URL snapshot composed on core 1 and
+     carried in their own SendJob, so no task reads serverScheme/serverHost
+     (mutable Strings) from core 0 during an SRV: re-point.
+ 12. startUpdateCheck() drains any stale result from the one-deep mailbox
+     before spawning, so a disowned task cannot cost the next run its slot.
+ 13. FW_VERSION 5.6.2 -> 5.6.3
+
+  OTA INSTALL (performOTAUpdate) is byte-identical and still blocking, by design.
+
+UPLOAD / ROLLBACK
+-----------------
+  Upload bin/GRAV-Scanner-5.6.3.bin, version field typed EXACTLY: 5.6.3
+  Rollback: ../5.6.2/bin/GRAV-Scanner-5.6.2.bin, label 5.6.2
+    sha256 646c59ac391e0ae392c91fa523b546e09b4bfc71e29bb8039989078cb108fa50

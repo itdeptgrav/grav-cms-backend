@@ -1,0 +1,12 @@
+# Arduino sketch project file.
+#
+# Pins the board so neither the IDE nor arduino-cli can be left on "Select
+# Board" — which is the whole of the "Missing FQBN (Fully Qualified Board Name)"
+# error. Committing it means a fresh clone or a second machine builds the same
+# binary without anyone remembering which menu entries to pick.
+#
+# PartitionScheme=default is NOT optional here: it is the 4MB-with-SPIFFS layout
+# that gives two ~1.3MB OTA slots plus the SPIFFS/LittleFS area the offline scan
+# queue lives in. Build this sketch under any other scheme and either the image
+# will not fit or the queue file has nowhere to go.
+default_fqbn: esp32:esp32:esp32:PartitionScheme=default

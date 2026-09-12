@@ -232,7 +232,14 @@ function assertTenantInput(req) {
  * rather than being replaced by a whole new subdocument built from defaults.
  * `hasOwnProperty` and not truthiness: `""` is a real instruction to clear.
  */
-function mergeNested($set, path, incoming, allowed) {
+/**
+ * @param {*} stored  what the record holds at `path` right now. A record
+ *   written before this subdocument existed holds `null` there, and MongoDB
+ *   CANNOT create `path.key` inside a null -- the update throws and the whole
+ *   edit answered 500. Saving the one warehouse in this database was
+ *   impossible for exactly that reason (reported 11 Sep 2026).
+ */
+function mergeNested($set, path, incoming, allowed, stored) {
   if (incoming === undefined) return;
   if (incoming === null || typeof incoming !== "object" || Array.isArray(incoming)) {
     throw fail("VALIDATION", `${path} must be an object of fields to change.`,
@@ -263,6 +270,24 @@ function mergeNested($set, path, incoming, allowed) {
     }
     $set[`${path}.${key}`] = value.trim();
   }
+
+  /* Nothing to seed unless the stored value cannot hold a key. Only then is
+     the whole subdocument written, and the keys the caller did not send are
+     written empty -- which is what they already were, since there was no
+     object there to keep anything in. */
+  const holdsKeys = stored !== null && typeof stored === "object" && !Array.isArray(stored);
+  if (holdsKeys) return;
+
+  const seeded = {};
+  for (const key of allowed) seeded[key] = "";
+  for (const key of allowed) {
+    const dotted = `${path}.${key}`;
+    if (Object.prototype.hasOwnProperty.call($set, dotted)) {
+      seeded[key] = $set[dotted];
+      delete $set[dotted];
+    }
+  }
+  $set[path] = seeded;
 }
 
 /**
@@ -684,12 +709,22 @@ async function loadWarehouse(req, id) {
 
 /** An archived or legacy master accepts no changes. */
 function assertMutable(w) {
-  if (!w.companyId) {
-    throw fail(
-      "LEGACY_ACCESS_REQUIRED",
-      "This warehouse was created before company ownership was recorded, so it is read-only until it has been migrated.",
-      { reason: "LEGACY_RECORD_READ_ONLY" },
-    );
+  /* Stood down while the legacy migration window is open. EVERY warehouse
+     in this database predates company ownership, so this refused every
+     edit, every status change and every capacity change on the only
+     warehouse there is (reported 11 Sep 2026). It comes back with
+     STORE_PURCHASE_STRICT_TENANCY=1, once companyId has been backfilled.
+     Same switch as the read-through that makes the record visible at
+     all -- a record that can be read but never written is worse than
+     one that is hidden. */
+  if (!tenantContext.legacyWindowOpen()) {
+    if (!w.companyId) {
+      throw fail(
+        "LEGACY_ACCESS_REQUIRED",
+        "This warehouse was created before company ownership was recorded, so it is read-only until it has been migrated.",
+        { reason: "LEGACY_RECORD_READ_ONLY" },
+      );
+    }
   }
   if (w.status === "Archived") {
     throw fail(
@@ -1136,9 +1171,10 @@ router.put(
          "I am not changing this"; an explicit "" is "clear this". They are
          different instructions and are now treated as such. */
       mergeNested($set, "addressDetail", req.body.addressDetail,
-        ["line1", "line2", "city", "state", "postalCode", "country"]);
+        ["line1", "line2", "city", "state", "postalCode", "country"],
+        current.addressDetail);
       mergeNested($set, "contactPerson", req.body.contactPerson,
-        ["name", "phone", "email"]);
+        ["name", "phone", "email"], current.contactPerson);
 
       if (req.body.capacityDetail !== undefined) {
         /* Validated as a whole: a value without a unit, an unsupported unit
@@ -1299,7 +1335,8 @@ router.patch(
       }
 
       const current = await loadWarehouse(req, req.params.id);
-      if (!current.companyId) {
+      /* Same legacy window as assertMutable above. */
+      if (!tenantContext.legacyWindowOpen() && !current.companyId) {
         throw fail("LEGACY_ACCESS_REQUIRED",
           "This warehouse was created before company ownership was recorded, so it is read-only until it has been migrated.",
           { reason: "LEGACY_RECORD_READ_ONLY" });

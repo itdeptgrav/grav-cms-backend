@@ -309,9 +309,38 @@ function expectedVersionOf(body) {
  *
  * @returns {object|null} the updated document, or null when the version moved
  */
+/**
+ * Match the stated version, including on a record that has none.
+ *
+ * ── THE BUG THIS CLOSES ──────────────────────────────────────────
+ * Ninety of the ninety-six suppliers here were written before versioning and
+ * carry NO `recordVersion` field. `{ recordVersion: 0 }` does not match a
+ * missing field, so every edit of one failed the compare-and-set and answered
+ * VERSION_CONFLICT — against a version the caller had stated correctly, and
+ * which the JavaScript pre-check just above had accepted as `?? 0`. The two
+ * disagreed, so the screen said the record had changed when nothing had
+ * (11 Sep 2026).
+ *
+ * An absent version IS version zero; `$inc` then writes 1 exactly as it would
+ * have. Returned as a clause to put in `$and` so it can never collide with
+ * the tenant filter's own `$or`.
+ */
+function versionClause(expectedVersion) {
+  return expectedVersion === 0
+    ? { $or: [{ recordVersion: 0 }, { recordVersion: { $exists: false } }] }
+    : { recordVersion: expectedVersion };
+}
+
+/** `scoped()` plus a version predicate, merged without clobbering either. */
+function scopedAtVersion(req, expectedVersion, extra = {}) {
+  const filter = scoped(req, extra);
+  filter.$and = [...(filter.$and || []), versionClause(expectedVersion)];
+  return filter;
+}
+
 async function casUpdate(req, { supplierId, expectedVersion, set, extraFilter = {} }) {
   return Vendor.findOneAndUpdate(
-    scoped(req, { _id: supplierId, recordVersion: expectedVersion, ...extraFilter }),
+    scopedAtVersion(req, expectedVersion, { _id: supplierId, ...extraFilter }),
     { $set: set, $inc: { recordVersion: 1 } },
     { new: true },
   );
@@ -481,6 +510,33 @@ function normaliseCode(raw) {
   return raw.trim().toUpperCase();
 }
 
+/**
+ * A supplier code derived from the name, when the caller supplied none.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────
+ * The code is required — it identifies the supplier on orders and paperwork —
+ * but NO screen in this product has a field for it, and not one of the 94
+ * suppliers already in the database carries one. So every registration was
+ * refused SUPPLIER_CODE_REQUIRED and the Add Supplier form could not save at
+ * all (reported 11 Sep 2026).
+ *
+ * Derived rather than refused, in the same shape rawItems.js already mints a
+ * SKU from an item name: three letters per word, upper case, a random suffix
+ * for room. A code the caller DID supply is still validated and still wins —
+ * this only fills the gap, and only inside this company, where identityClash
+ * then holds it to the same uniqueness rule as a typed one.
+ */
+function deriveSupplierCode(companyName) {
+  const words = String(companyName || "").trim().split(/\s+/).filter(Boolean);
+  const nameCode = words
+    .map((w) => w.replace(/[^A-Za-z0-9]/g, "").substring(0, 3).toUpperCase())
+    .join("")
+    .substring(0, 20);
+  const stem = nameCode || "SUP";
+  const suffix = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
+  return normaliseCode("SUP-" + stem + "-" + suffix);
+}
+
 /** @returns {{ok:true,code:string}|{ok:false,code:string,message:string}} */
 function checkSupplierCode(raw) {
   if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) {
@@ -512,10 +568,17 @@ async function loadSupplier(req, res, { forWrite = false, allowArchived = false 
     refuse(res, 404, CODES.NOT_FOUND, "Supplier not found.");
     return null;
   }
-  if (forWrite && supplier.companyId == null) {
+  if (forWrite && supplier.companyId == null && !tenantContext.legacyWindowOpen()) {
     /* Legacy records are readable through the explicit contract and are never
        written: adopting one into whichever company happened to edit it is a
-       silent transfer of somebody else's supplier. */
+       silent transfer of somebody else's supplier.
+
+       Stood down while the legacy window is open (services/storePurchase/
+       tenantContext.service.js). Ninety of the ninety-four suppliers here are
+       unowned, so this refused almost every edit in the product — and with a
+       single company there is nobody to take one from. Editing does NOT adopt
+       the record: ownership is still only ever set by stamp() on something
+       newly created. */
     refuse(res, 403, CODES.LEGACY_READ_ONLY,
       "This supplier predates company ownership and cannot be edited until it is migrated.");
     return null;
@@ -757,11 +820,15 @@ router.get("/", canRead, async (req, res) => {
     /* Counted inside the same company boundary as the list. These were
        system-wide totals shown to every company as its own. */
     const base = scoped(req);
-    const [allInCompany, active, blacklisted, archived] = await Promise.all([
+    const [allInCompany, active, blacklisted, archived, fabricSuppliers] = await Promise.all([
       Vendor.countDocuments(base),
       Vendor.countDocuments({ ...base, status: "Active" }),
       Vendor.countDocuments({ ...base, status: "Blacklisted" }),
       Vendor.countDocuments({ ...base, status: "Archived" }),
+      /* The register's third card. It was dropped when these counts were
+         brought inside the company boundary, and the card then rendered
+         EMPTY -- no zero, no dash, just a labelled blank (11 Sep 2026). */
+      Vendor.countDocuments({ ...base, vendorType: "Fabric Supplier" }),
     ]);
 
     res.json({
@@ -773,7 +840,7 @@ router.get("/", canRead, async (req, res) => {
         hasNextPage: page * limit < total,
         hasPrevPage: page > 1,
       },
-      stats: { total: allInCompany, active, blacklisted, archived },
+      stats: { total: allInCompany, active, blacklisted, archived, fabricSuppliers },
       legacy: Boolean(req.tenant?.legacyMode),
       filters: {
         types: VENDOR_TYPES,
@@ -977,8 +1044,29 @@ router.post("/", ...canMaintain, withIdempotency("SUPPLIER_CREATE"), async (req,
         { endpoint: "PUT /vendors/:id/bank-details" });
     }
 
-    const codeCheck = checkSupplierCode(supplierCode);
-    if (!codeCheck.ok) return refuse(res, 400, codeCheck.code, codeCheck.message);
+    /* A supplied code is validated as before; an absent one is derived and
+       retried a few times so a random-suffix collision inside this company
+       cannot fail a registration the user cannot influence. */
+    let codeCheck;
+    if (supplierCode === undefined || supplierCode === null ||
+        (typeof supplierCode === "string" && !supplierCode.trim())) {
+      let derived = null;
+      for (let attempt = 0; attempt < 5 && !derived; attempt++) {
+        const candidate = deriveSupplierCode(companyName);
+        if (!candidate || !SUPPLIER_CODE_RE.test(candidate)) continue;
+        const taken = await Vendor.findOne(scoped(req, { supplierCode: candidate }))
+          .select("_id").lean();
+        if (!taken) derived = candidate;
+      }
+      if (!derived) {
+        return refuse(res, 409, CODES.CODE_DUPLICATE,
+          "Could not allocate a supplier code. Supply one explicitly and try again.");
+      }
+      codeCheck = { ok: true, value: derived };
+    } else {
+      codeCheck = checkSupplierCode(supplierCode);
+      if (!codeCheck.ok) return refuse(res, 400, codeCheck.code, codeCheck.message);
+    }
 
     /* Company-scoped, and normalised: the old check looked at every company's
        suppliers and compared raw spellings, so it both refused a GSTIN
@@ -1299,7 +1387,7 @@ router.put("/:id", ...canMaintain, withIdempotency("SUPPLIER_UPDATE", { target: 
         set.emailNormalised = String(vendor.email || "").trim().toLowerCase();
 
         const claimed = await Vendor.findOneAndUpdate(
-          scoped(req, { _id: vendor._id, recordVersion: wanted.value }),
+          scopedAtVersion(req, wanted.value, { _id: vendor._id }),
           { $set: set, $inc: { recordVersion: 1 } },
           { new: true, ...(session ? { session } : {}) },
         );
@@ -1388,11 +1476,13 @@ router.put("/:id", ...canMaintain, withIdempotency("SUPPLIER_UPDATE", { target: 
  *
  * It refuses, and names the operation that does what the caller probably
  * meant. Nothing is written. */
-router.delete("/:id", ...canMaintain, async (req, res) => {
-  return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
-    "Suppliers are not deleted, because orders and item aliases refer to them. "
-    + "Deactivate the supplier to stop new procurement, or archive it to close it entirely.",
-    { operations: ["POST /vendors/:id/deactivate", "POST /vendors/:id/archive"] });
+router.delete("/:id", ...canMaintain, async (req, res, next) => {
+  /* The register's "delete" asks the operator to confirm "mark this vendor
+     as inactive", and that is exactly `deactivate`. The record is not
+     destroyed -- orders and item aliases still point at it -- and the
+     deactivation is recorded with its author, which is what the refusal
+     was protecting. See forwardToLifecycle. */
+  return forwardToLifecycle(req, res, next, "deactivate");
 });
 
 /* ── THE STATUS DROPDOWN IS GONE ────────────────────────────────────────────
@@ -1401,14 +1491,68 @@ router.delete("/:id", ...canMaintain, async (req, res) => {
  * buy from them again". Blacklisting in particular is a judgement about a
  * business relationship, and a system that cannot say who made it or why
  * cannot defend it later. */
-router.patch("/:id/status", ...canMaintain, async (req, res) => {
-  return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
-    "A supplier's state is changed through a named operation that records who "
-    + "changed it and why.",
-    { operations: [
-      "POST /vendors/:id/activate", "POST /vendors/:id/deactivate",
-      "POST /vendors/:id/blacklist", "POST /vendors/:id/archive",
-    ] });
+/**
+ * Send this request on to one of the named lifecycle operations below.
+ *
+ * -- WHY THE OLD VERBS STILL ANSWER ----------------------------------------
+ * `PATCH /:id/status` and `DELETE /:id` were replaced by four named
+ * operations that record who changed a supplier's state and why. The reason
+ * is good and the operations are kept -- but the Supplier register still
+ * calls the old two, so in the running system the status dropdown answered
+ * 405 on every change and the register's delete answered 405 as well
+ * (reported 11 Sep 2026).
+ *
+ * Rather than restore the unaccountable write, the old verb is TRANSLATED
+ * into the named operation and forwarded to it. The history line, the
+ * author, the idempotency receipt and the version check are all the named
+ * operation's, unchanged -- this only decides which one was meant.
+ *
+ * `expectedVersion` is filled from the stored record when the caller sent
+ * none. That is what the old verb meant: last-write-wins. A caller that
+ * DOES state a version still gets the concurrency check, so the protection
+ * is available to anyone who wants it and is never silently removed from
+ * anyone who asked for it.
+ *
+ * Only Active and Inactive translate. Blacklisting and archiving must say
+ * why, and no reason can be inferred from a status string -- those still
+ * refuse and name the operation to call.
+ */
+async function forwardToLifecycle(req, res, next, action) {
+  /* A DELETE carries no body at all, so `req.body` is undefined rather
+     than empty, and the fill below was skipped entirely -- the register's
+     delete then failed asking for a version it had no way to send. */
+  if (!req.body || typeof req.body !== "object") req.body = {};
+  if (req.body.expectedVersion === undefined) {
+    const current = await Vendor.findOne(scoped(req, { _id: req.params.id }))
+      .select("recordVersion").lean();
+    if (!current) {
+      return refuse(res, 404, CODES.NOT_FOUND,
+        "That supplier was not found in this company.");
+    }
+    req.body.expectedVersion = current.recordVersion ?? 0;
+  }
+  /* Re-entering the router is what runs the real operation: its capability
+     checks, its idempotency wrapper and its handler, all as written. */
+  req.method = "POST";
+  req.url = `/${req.params.id}/${action}`;
+  return router.handle(req, res, next);
+}
+
+/* Active and Inactive are the only two the register offers, and neither
+   needs a reason. See forwardToLifecycle. */
+const STATUS_TO_ACTION = { Active: "activate", Inactive: "deactivate" };
+
+router.patch("/:id/status", ...canMaintain, async (req, res, next) => {
+  const action = STATUS_TO_ACTION[String(req.body?.status || "")];
+  if (!action) {
+    return refuse(res, 405, CODES.DELETE_UNSUPPORTED,
+      "Blacklisting or archiving a supplier has to say why, so it is done "
+      + "through its own operation.",
+      { operations: [
+        "POST /vendors/:id/blacklist", "POST /vendors/:id/archive",
+      ] });
+  }
+  return forwardToLifecycle(req, res, next, action);
 });
 
 /* ── THE TRANSITION TABLE ───────────────────────────────────────────────────
@@ -1590,9 +1734,8 @@ LIFECYCLE.forEach(({ path, action }) => {
               claimed = await Vendor.findOneAndUpdate(
                 /* Both conditions in the filter: the state it was decided
                    against, and the version it was read at. */
-                scoped(req, {
+                scopedAtVersion(req, wanted.value, {
                   _id: supplier._id, status: from,
-                  recordVersion: wanted.value,
                 }),
                 {
                   $set: set,
