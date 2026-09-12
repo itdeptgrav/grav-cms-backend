@@ -4,6 +4,15 @@ const mongoose = require("mongoose");
 
 const purchaseOrderItemSchema = new mongoose.Schema(
   {
+    /* ── THE REQUEST LINE THIS ORDER LINE IS ────────────────────────────────
+       Carried so a supplier bill can say which budget allocation it discharges.
+       The service chain already had this (`ServiceOrder.lines[].spendLineId`);
+       goods did not, so a bill for one line of a four-line request could only
+       release the whole commitment.
+
+       Optional and additive: an order raised before this has none, and falls
+       back to the whole-document behaviour it has always had. */
+    spendLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",

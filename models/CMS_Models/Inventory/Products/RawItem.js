@@ -104,6 +104,17 @@ const stockTransactionSchema = new mongoose.Schema(
        not yet governed. */
     operationId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
 
+    /* ── WHERE IN THE WAREHOUSE THIS MOVEMENT LANDED / LEFT (Warehouse Stock V1)
+       A snapshot of the warehouse/location the paired LocationMovement records,
+       so Stock movements can show the real location without a fragile join.
+       Absent on legacy movements and on operations not yet location-aware —
+       those read as "Unassigned", never guessed onto a warehouse. */
+    warehouseId:   { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", default: null },
+    locationId:    { type: mongoose.Schema.Types.ObjectId, default: null },
+    warehouseName: { type: String, default: "" },
+    locationCode:  { type: String, default: "" },
+    locationName:  { type: String, default: "" },
+
     /* Mongoose's `timestamps` option does not run for an update written as an
        aggregation pipeline, and the stock movements are written that way so
        they can be atomic. The route sets these explicitly; declaring them here

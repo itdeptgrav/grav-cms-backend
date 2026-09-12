@@ -1,7 +1,8 @@
 # Item-wise Budget Attribution
 
 > **Status:** Chunk 1 (foundation) + Chunk 1.1 (integrity corrections) + B1
-> (service defaults) + B2 (service classification before approval) shipped.
+> (service defaults) + B2 (service classification before approval) + B3A
+> (line-wise allocation) + B3B (voucher-line mapping, partial release) shipped.
 > The mechanism is INERT — nothing in the live budget path reads it yet, by
 > design.
 >
@@ -524,6 +525,217 @@ before and after and asserts none moved.
 first job was raising the order, wrong now they have an earlier one. Widened on
 the classification READ route only; `maySeeRequest` itself is untouched, because
 changing it would open every other route on that router at once.
+
+---
+
+## Chunk B3A — line-wise allocation and multi-head commitments (shipped)
+
+One request buys fabric from Raw Materials, packaging from Packaging, freight
+from Freight and a repair from Repairs & Maintenance. A commitment could
+express one head, so finance either split the request into four or charged
+three of them somewhere they do not belong.
+
+### Schema
+
+`Acc_BudgetCommitment` gains `allocations[]` — one row per approved line —
+plus `allocationMode` (`single_head` | `line_wise`) and `headCount`.
+
+**Still one document per request.** `spendRequestId` stays unique; one
+commitment per LINE would hand back the idempotency that index exists to give.
+
+`allocations` has **no schema default**. Absence is the legacy signal, and a
+default `[]` would make every historical commitment look line-wise with nothing
+in it — contributing zero to its own head.
+
+Each row: `spendLineId`, `name`, item/service identity, `budgetId`,
+`budgetLineId`, `financialYear`, `ledgerId`, `ledgerName`, `amount`,
+`adjustment`, `status` (`committed` | `unbudgeted`), `resolutionSource`,
+`resolutionReason`, `selectedByName`/`selectedAt`, and its own `snapshot`.
+
+**No fake primary head.** On a line-wise commitment the top-level
+`ledgerId`/`ledgerName`/`budgetId`/`budgetLineId`/`snapshot` are absent — naming
+one of several would be a figure every report reads and no human chose.
+Single-head commitments keep every one of them populated.
+
+### Line amount and rounding
+
+`services/lineAllocation.service.js`, pure:
+
+1. `lineTotal` where usable — it is what Store quoted and the requester
+   confirmed, and recomputing would silently disagree with it
+2. otherwise `amount + taxAmount`
+3. explicit `0` survives; absent is refused, and a present-but-unreadable value
+   is a fault rather than a free line
+4. negative or non-finite refuses the whole allocation
+
+A header discount/freight/round-off makes the lines disagree with `grandTotal`.
+The difference is spread **proportionally over non-zero lines**, each share
+rounded to the paise, and the **remainder placed on the last eligible line** —
+computed as "everything not yet placed", so the parts equal the whole by
+construction rather than by luck. Deterministic. A 112-combination sweep asserts
+the invariant. If the difference cannot be placed honestly (every line zero, or
+a discount larger than the lines) the approval is **refused**, never rounded
+away.
+
+### Grouped availability
+
+Lines sharing a `budgetLineId` are ONE claim. `₹10,000` available against lines
+of `₹6,000` and `₹5,000` reports a **₹1,000 shortage** on the group; either
+line alone would have passed, which is the trap.
+
+Grouping feeds the **existing** over-budget vocabulary at the grouped level —
+`within_budget` / `over_budget` / `unbudgeted`. Finance is not blocked by an
+over-budget group; the request records which kind of yes it was, exactly as
+before. No second approval framework.
+
+**Blocked, by contrast:** a line nothing resolves and finance did not choose; a
+head that is not an approved budget line for this department; an override of a
+configured suggestion with no reason. An arbitrary expense ledger is not an
+approved budget head merely because it exists in the chart.
+
+`SOURCE_REQUEST_HEAD` (`request_head`) is new: a line whose own rule produces
+nothing falls back to the head the REQUEST was approved against. That was the
+only authority before B3A and is a real decision. It is a distinct value
+precisely so nobody later mistakes it for a line-level classification.
+
+### Legacy compatibility
+
+`committedByLine` reads two shapes through **mutually exclusive** queries: the
+legacy branch requires `allocations` absent/null/empty, the line-wise branch
+requires it present. A document satisfies exactly one.
+
+The trap is the **single-head** commitment, which carries the compatibility
+fields AND an `allocations[]` — that is the document counted twice without the
+exclusion, and it is the ordinary shape of almost every request. Pinned by a
+test that fails when the exclusion is removed.
+
+Unbudgeted allocations reduce nothing (null `budgetLineId`). Released
+commitments do not count. Repeated approval creates no second commitment.
+Cancellation releases the one commitment once.
+
+### Correction — mounted on both real Finance surfaces
+
+The engine and `LineAllocationReview` shipped correct and **mounted nowhere**,
+while both live finance paths kept approving through a single-head button. A
+component nobody can reach is not a feature, and a unit test of its
+presentation cannot tell you that.
+
+`LineAllocationReview` no longer imports a client. The Request Desk
+authenticates as a CMS employee and Payables as an accounting user; a component
+importing one of those could only ever mount on one surface, which is how it
+ended up on none. Callers now pass `fetchAllocation`, `submitApproval` and an
+optional `decisionFields` slot.
+
+| Surface | Change |
+|---|---|
+| `components/mrf/PurchaseOrService.js` | review mounted at `r.step === "finance"`; the direct finance Approve removed. The TL's plain Approve is untouched — a TL answers whether the department needs this, which has no heads in it. |
+| `app/accountant/payables/spend-approvals/[id]/page.js` | review mounted; direct Approve removed; note and expected-payment-date render inside its action row so there is one Approve carrying the allocation. The single-head "Budget position" panel is hidden only when several heads genuinely apply. |
+| `routes/Accountant_Routes/Acc_spendApprovals.js` | `GET /:id/line-allocations` on the accountant session, gated by the `isApprover` check the file already makes; `lineAllocations` forwarded into the shared `financeDecision.decide`; the approval message no longer names one head when there are several. |
+
+`allocationSummary` moved into `spendFinanceDecision` so both routes read one
+implementation. Rejection and the budget exception need no allocation and keep
+their own controls.
+
+### B3B — SHIPPED: voucher-line mapping and partial release
+
+The limitation below is closed. Kept for the record of what it was.
+
+**Line identity, end to end.** `SpendRequest.items[]._id` →
+`PurchaseOrder.items[].spendLineId` (new; the service chain already had it) →
+purchase-voucher `inventoryEntries[].spendLineId`. Every id is derived on the
+SERVER from the authoritative order — a client that could set one could point a
+bill at whichever allocation had the most budget left. Nothing is matched by
+item name, vendor, amount or array position.
+
+The goods provenance gap is closed with it: a PO-linked voucher now derives
+`spendRequestId` and `budgetCommitmentId` from the order, as Service Order
+billing already did.
+
+**Per-allocation release.** Each `allocations[]` row gains `releasedAmount`,
+`remainingAmount`, a `releases[]` audit trail (voucher id, number, line, amount,
+actor, time) and the states `partially_released` / `released`. The approved
+`amount` and its snapshot are never rewritten: "what was promised" and "what is
+still promised" stay two questions with two answers. The document is `released`
+only when every allocation has nothing left.
+
+**Release uses exact voucher lines.** Mapped lines group by `spendLineId`; a
+genuine voucher-level adjustment is spread proportionally with the remainder on
+the last line; each allocation releases `min(billed, remaining)`. Over-billing
+exhausts the promise and never makes remaining negative — the excess is real
+spending no commitment covered, and the screen says so. An unmapped charge line
+releases nothing and is not treated as an adjustment.
+
+**Idempotent and reversible.** A voucher already present in `releases[]`
+releases nothing more, so repeated saving or posting is safe. Cancelling
+restores only the rows THAT voucher wrote — a second still-posted bill keeps
+its discharge. Re-posting after cancellation writes exactly one set again.
+
+**`committedByLine` counts `remainingAmount`**, falling back to `amount` on
+rows written before B3B (which have released nothing), and treats
+`partially_released` as live. A commitment is still never counted through both
+the legacy and line-wise paths.
+
+**Compatibility.** A commitment with no `allocations[]` keeps whole-document
+release, unchanged. A line-wise one NEVER falls back to it — not even when
+nothing mapped: the bill posts, the commitment stays live, and a
+`reconciliationWarning` says why. Posting is never blocked by a release that
+could not be resolved; refusing a real supplier bill over an unreconciled
+promise would be the worse failure.
+
+Accounting postings are untouched. The voucher remains the actual.
+
+### B3B correction — the lifecycle conflict, and exact line identity
+
+The first B3B pass had the engine right and the wiring wrong.
+
+**One orchestrator.** The voucher's post-save hook still called the legacy
+whole-document release, and the create route called the new line-wise one.
+For a line-wise commitment the hook usually won and freed every head — the bug
+the chunk existed to fix, reintroduced by the fix. The hook is now the single
+entry point (it is the chokepoint all six posting paths share), it loads
+`inventoryEntries` (without which partial release is impossible), and it calls
+`commitmentRelease.orchestrate`, which decides legacy versus line-wise from the
+COMMITMENT. The route's three helpers are deleted rather than left dormant.
+
+**Exact line identity.** `poItemId` and `serviceOrderLineId` are new on the
+voucher line, carried by the form through prefill, edit and submit; the server
+deletes any client `spendLineId` and resolves them against the linked order.
+The raw-item fallback survives only for legacy data and only where **exactly
+one** order line matches — two PO lines naming the same fabric stay unmapped,
+because releasing the wrong allocation would look entirely correct.
+
+**Grouped audit.** A release row keeps `contributions[]` — every contributing
+bill line with its own share, scaled if the release was capped — not just the
+first id.
+
+**Unbudgeted lifecycle.** Unbudgeted allocations now carry released/remaining
+and hold the document open until billed. They remain excluded from every
+availability figure: the word `unbudgeted` is fixed, only the figures move.
+
+**Persistent reconciliation.** `GET /vouchers/:id` reconstructs it from the
+commitment's stored release rows, so reopening a voucher tomorrow shows what it
+showed today. It used to ride back only on the creation response.
+
+### Superseded — what B3A did not solve
+
+**Partial actual release is not built.** A commitment is still released
+whole-document, by `commitmentForVoucher` / `releaseForVoucher`, exactly as
+before. That means:
+
+- a supplier bill for ONE line of a four-line request releases the WHOLE
+  commitment, freeing budget on three heads nothing has been billed against;
+- there is no mapping from a voucher line to the `allocations[]` row it
+  discharges;
+- `allocations[].status` has no `released` value, because nothing can set it
+  correctly yet.
+
+B3B must map voucher lines to commitment allocations, add per-allocation
+release, and handle partial supplier bills. Until then, treat multi-head
+commitments as released all-or-nothing. This is a real limitation, not an
+oversight, and B3A does not pretend otherwise.
+
+Untouched: `Acc_VoucherModels.js`, `Acc_vouchers.js`, Service Order billing,
+voucher prefill, inventory valuation.
 
 ---
 

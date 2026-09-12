@@ -107,6 +107,25 @@ const inventoryEntrySchema = new mongoose.Schema(
     // ─── Charge line (courier, freight, packing etc.) ───────────────────────
     // A charge is a non-stock line: no quantity, posts a Cr to its own ledger
     // (NOT to Sales). isCharge:true distinguishes it from a product row.
+    /* ── WHICH ORDER LINE THIS BILL LINE IS ─────────────────────────────
+       The form carries this from the PO prefill through editing and back on
+       submit, and the server resolves it against the linked order to stamp
+       `spendLineId`. It is the only reliable key: two PO lines can name the
+       SAME raw item — two rolls of the same fabric, charged to two different
+       request lines — and nothing about the item, the amount or the position
+       tells them apart. */
+    poItemId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+    /* The Service Order line, for the service half of the same chain. */
+    serviceOrderLineId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+
+    /* ── WHICH REQUEST LINE THIS BILL LINE DISCHARGES ───────────────────
+       Server-derived from the linked Purchase Order or Service Order — never
+       from the client, which could otherwise point a bill at whichever
+       allocation had the most budget left. Absent on an ordinary voucher that
+       is not billing an approved request, and its absence is what tells the
+       release engine it has nothing to discharge. */
+    spendLineId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+
     isCharge: { type: Boolean, default: false },
     chargeLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
     chargeDescription: { type: String, trim: true },
@@ -828,33 +847,44 @@ tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
   /* Nothing to do for the overwhelming majority of vouchers, and this check
      costs nothing — the link is on the document already. */
   if (status === "posted" && !doc.spendRequestId && !doc.budgetCommitmentId &&
-      !doc.referenceNumber) return;
+      !doc.referenceNumber && !doc.purchaseOrderId && !doc.serviceOrderId) return;
 
   try {
-    const commitments = require("../../services/budgetCommitment.service");
+    /* ── ONE ORCHESTRATOR, NOT TWO COMPETING RELEASES ──────────────────────
+       This called the legacy WHOLE-DOCUMENT release directly. Once a
+       commitment could carry per-line allocations that was wrong twice over:
+       it freed every head when only one had been billed, and it raced the
+       route-level partial release that had been added beside it — whichever
+       ran first won, and the hook usually did.
+
+       Both are gone. `orchestrate` is the single entry point; it decides
+       legacy versus line-wise from the COMMITMENT, because that is a property
+       of the promise and not of the call site. */
+    const release = require("../../services/commitmentRelease.service");
     const Model = doc.constructor;
 
-    /* What is actually stored, not what this document believes. */
+    /* ── WHAT IS ACTUALLY STORED, INCLUDING THE LINES ──────────────────────
+       `inventoryEntries` was NOT selected, so the release engine saw a voucher
+       with no lines and could only ever conclude "nothing mapped". Partial
+       release is impossible without them — this projection is the difference
+       between discharging the right allocation and discharging none.
+
+       Re-read rather than trusted: two posting paths save inside a
+       transaction that can still abort, and a rolled-back save must find
+       nothing to act on. This is also what makes the release run only after
+       the posting is durably committed. */
     const fresh = await Model.findById(doc._id)
-      .select("_id status companyId voucherType voucherNumber grandTotal referenceNumber spendRequestId budgetCommitmentId updatedBy")
+      .select("_id status companyId voucherType voucherNumber grandTotal "
+        + "referenceNumber spendRequestId budgetCommitmentId updatedBy inventoryEntries")
       .lean();
     if (!fresh) return;
 
-    if (fresh.status === "posted") {
-      const commitment = await commitments.commitmentForVoucher(fresh);
-      if (commitment) {
-        await commitments.releaseForVoucher({
-          commitment,
-          voucher: fresh,
-          actor: { id: fresh.updatedBy },
-          reason: "voucher_posted",
-        });
-      }
-      return;
-    }
-
-    if (fresh.status === "cancelled") {
-      await commitments.restoreForVoucher({ voucher: fresh });
+    if (fresh.status === "posted" || fresh.status === "cancelled") {
+      await release.orchestrate({
+        voucher: fresh,
+        actor: { id: fresh.updatedBy },
+        transition: fresh.status,
+      });
     }
   } catch (e) {
     console.error("[budget commitment] voucher hook failed:", e.message);
