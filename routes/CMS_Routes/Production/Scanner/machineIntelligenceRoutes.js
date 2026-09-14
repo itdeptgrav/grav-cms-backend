@@ -61,7 +61,7 @@ const masterData = require(`${S}/masterData`);
    DeviceHeartbeat row (a replaced scanner, a diagnostic pairing), and the
    arbitrary last-one-wins Map this used to build reported live machines
    offline off a stale stub. */
-const { walkMachine, latestHeartbeatByMachine } = require(`${S}/rollupStats`);
+const { walkMachine, latestHeartbeatByMachine, pieceKeyOf } = require(`${S}/rollupStats`);
 
 // Authentication, not a department gate — the same reasoning the sibling
 // routers state: the supervisor and the project manager both read these floor
@@ -974,6 +974,74 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
       rollupAgeSeconds: stats?.updatedAt
         ? Math.round((now - new Date(stats.updatedAt).getTime()) / 1000)
         : null,
+
+      /* SCAN AUDIT — the raw truth behind the piece count.
+         ---------------------------------------------------
+         The floor kept asking the same question: "the device says 4, the
+         screen says 5". Both were right — 5 scans, 4 garments, because one
+         piece was read twice. Everything else on this screen now reports
+         DISTINCT garments, which is correct but hides the discrepancy rather
+         than explaining it.
+
+         So this block shows the working: how many times the scanner fired, how
+         many garments that actually represents, and — for every piece read more
+         than once — the exact barcode, unit, operation and the timestamp of
+         each read, with the operator who made it. A supervisor can take that
+         straight to the person and say "unit 2 was scanned at 11:39 and again
+         at 12:06". No figure here is a production number; it is the audit
+         trail underneath one. */
+      scanAudit: (() => {
+        const byPiece = new Map();
+        let unidentified = 0;
+        for (const e of scans) {
+          if (!e.barcodeId) {
+            // No ticket, so no garment identity — counted, never guessed at.
+            unidentified += 1;
+            continue;
+          }
+          const key = pieceKeyOf(e);
+          if (!byPiece.has(key)) {
+            byPiece.set(key, {
+              barcodeId: e.barcodeId,
+              unitNumber: e.unitNumber ?? null,
+              workOrderKey: e.workOrderKey || null,
+              operations: [...(e.activeOps || [])].sort(),
+              reads: [],
+            });
+          }
+          byPiece.get(key).reads.push({
+            at: e.scanTime,
+            operatorId: e.operatorId || null,
+            operatorName: e.operatorName || nameFor(e.operatorId) || null,
+            timeRecovered: Boolean(e.timeRecovered),
+          });
+        }
+
+        const repeats = [...byPiece.values()]
+          .filter((p) => p.reads.length > 1)
+          .map((p) => ({
+            ...p,
+            readCount: p.reads.length,
+            extraReads: p.reads.length - 1,
+            firstAt: p.reads[0].at,
+            lastAt: p.reads[p.reads.length - 1].at,
+            // How long between the first read and the last — a re-read seconds
+            // later is a twitchy trigger; hours later is the piece coming back.
+            spanSeconds: Math.round(
+              (new Date(p.reads[p.reads.length - 1].at) - new Date(p.reads[0].at)) / 1000
+            ),
+          }))
+          .sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt));
+
+        return {
+          scanEvents: scans.length,
+          uniqueGarments: byPiece.size,
+          repeatScans: scans.length - byPiece.size - unidentified,
+          piecesReadMoreThanOnce: repeats.length,
+          unidentifiedScans: unidentified,
+          repeats,
+        };
+      })(),
 
       production: {
         // DISTINCT GARMENTS. MachineDayStats.totalPieces is the rollup's

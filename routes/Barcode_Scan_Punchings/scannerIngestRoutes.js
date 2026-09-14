@@ -33,6 +33,7 @@ const MachineDayStats = require(`${B}/MachineDayStats`);
 const OperatorDayStats = require(`${B}/OperatorDayStats`);
 const DeviceHeartbeat = require(`${B}/DeviceHeartbeat`);
 const ProductionTracking = require("../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const rollupStats = require("../../services/barcodeScanner/rollupStats");
 const Employee = require("../../models/Employee");
 
 const {
@@ -223,6 +224,12 @@ const ingestHandler = async (req, res) => {
       }
     }
 
+    /* Anything actually committed changes what the floor should be showing.
+       Duplicates are deliberately excluded: a device re-sending work already
+       recorded has changed nothing, and re-running the rollup for it would be
+       pure load. */
+    if (inserted > 0) scheduleFloorRefresh();
+
     // Push to any connected dashboard. Deliberately AFTER the write and
     // wrapped so a socket problem can never fail an ingest — the device would
     // then retry events that are already durable.
@@ -251,6 +258,52 @@ const ingestHandler = async (req, res) => {
       .json({ success: false, message: "Server error", error: error.message });
   }
 };
+
+
+/* ─── Making the floor's numbers current ──────────────────────────────────────
+ *
+ * The scan itself is already announced: emitScans() below fires
+ * "tracking-data-updated" the moment events land, and every open floor view
+ * re-reads immediately. That part worked.
+ *
+ * What it re-read was stale. The floor's figures come from MachineDayStats,
+ * which the rollup rewrites on a 60-SECOND timer — so a scan arrived, every
+ * screen dutifully re-fetched, and got back the same numbers as before. The
+ * count only moved when the timer next ran, up to a minute later, which is
+ * exactly the "real-time update is not happening, even after refresh" the floor
+ * reported: refreshing re-read the same not-yet-recomputed rollup.
+ *
+ * So the rollup is now run right after a scan commits, and its completion is
+ * announced through realtime.emitRollup() — the same signal the timer already
+ * sends, so no client needs to learn anything new. Lag drops from up to 60s to
+ * about a second.
+ *
+ * DEBOUNCED, because a device uploads its queue in batches: ten posts in a
+ * burst must not run ten rollups over the same shift. The trailing call sees
+ * every event in the batch.
+ *
+ * Fire-and-forget on purpose. The scanner's HTTP response must not wait for a
+ * rollup, and must never fail because of one — a device that gets a 500 here
+ * re-queues work that is already committed. The 60s timer remains the backstop
+ * if this throws.
+ */
+let refreshTimer = null;
+
+function scheduleFloorRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(async () => {
+    refreshTimer = null;
+    try {
+      const result = await rollupStats.runOnce();
+      if (result && !result.skipped && !result.error) {
+        realtime.emitRollup(result);
+      }
+    } catch (err) {
+      console.error("[scanner-ingest] floor refresh failed:", err.message);
+    }
+  }, 1200);
+}
+
 
 router.post("/events", ingestHandler);
 // Same handler. Keeps v5.4.0 devices working during the rollout.
