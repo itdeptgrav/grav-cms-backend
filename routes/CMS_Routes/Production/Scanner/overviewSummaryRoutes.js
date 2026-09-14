@@ -23,6 +23,10 @@ const S = "../../../../services/barcodeScanner";
 const { shiftDateFor, currentShiftDate } = require(`${S}/shift`);
 const masterData = require(`${S}/masterData`);
 const productLookup = require(`${S}/productLookup`);
+/* The one definition of "which garment is this" — barcodeId plus the sorted
+   operations it was scanned against. Imported rather than restated so this page
+   cannot drift from the rollup, the targets and the floor views. */
+const { pieceKeyOf, countDistinctPieces } = require(`${S}/rollupStats`);
 
 // Same reasoning as supervisorFloorRoutes: authentication, no department gate.
 router.use(EmployeeAuthMiddleware);
@@ -107,6 +111,7 @@ router.get("/overview-summary", async (req, res) => {
         operators.set(id, {
           operatorId: id, signInAt: null, signOutAt: null, signedIn: false,
           pieces: 0, samMinutes: 0, piecesWithSam: 0,
+          pieceKeys: new Set(),
           machines: new Set(), operations: new Set(),
           onBreak: false, breaks: 0, breakSeconds: 0, openBreakAt: null,
           firstScanAt: null, lastScanAt: null,
@@ -123,6 +128,7 @@ router.get("/overview-summary", async (req, res) => {
           pieces: 0, samMinutes: 0, piecesWithSam: 0,
           operators: new Set(), operations: new Set(),
           workOrderKeys: new Set(), breakSeconds: 0, openBreakAt: null,
+          pieceKeys: new Set(),
           firstScanAt: null, lastScanAt: null,
         });
       }
@@ -132,6 +138,7 @@ router.get("/overview-summary", async (req, res) => {
       if (!orders.has(key))
         orders.set(key, {
           workOrderKey: key, pieces: 0, samMinutes: 0,
+          pieceKeys: new Set(),
           operators: new Set(), machines: new Set(), units: new Set(),
           firstScanAt: null, lastScanAt: null,
         });
@@ -180,10 +187,37 @@ router.get("/overview-summary", async (req, res) => {
         mr.openBreakAt = null;
       } else if (e.type === "scan") {
         const sam = samForScan(e.activeOps);
+
+        /* ONE GARMENT, COUNTED ONCE. Every scan used to increment `pieces` and
+           add its SAM again, so a re-scanned garment inflated both the output
+           and the standard minutes earned — which is how this page showed
+           "Scanned pieces today 5" beside "Units 4" for four real trousers, and
+           how efficiency reached 1300%. The `units` Set a few lines down was
+           already deduplicating, which is exactly why the two disagreed.
+
+           `first()` returns true the first time a garment is seen in a given
+           scope, so a piece worked on two machines still counts once on each —
+           that is correct, they each made it — while a repeat scan at the same
+           machine adds nothing.
+
+           A scan with no barcodeId identifies no garment and so cannot be
+           deduplicated; it is left out of the piece count entirely, matching
+           countDistinctPieces(). Its operator, operation and timestamps are
+           still recorded below, because those are facts about the scan. */
+        const pieceKey = e.barcodeId ? pieceKeyOf(e) : null;
+        const first = (rec) => {
+          if (!pieceKey) return false;
+          if (rec.pieceKeys.has(pieceKey)) return false;
+          rec.pieceKeys.add(pieceKey);
+          return true;
+        };
+
         const mr = mcRec(mid);
-        mr.pieces++;
-        mr.samMinutes += sam;
-        if (sam > 0) mr.piecesWithSam++;
+        if (first(mr)) {
+          mr.pieces++;
+          mr.samMinutes += sam;
+          if (sam > 0) mr.piecesWithSam++;
+        }
         if (oid) mr.operators.add(oid);
         (e.activeOps || []).forEach((c) => mr.operations.add(c));
         if (!mr.firstScanAt) mr.firstScanAt = e.scanTime;
@@ -191,9 +225,11 @@ router.get("/overview-summary", async (req, res) => {
 
         if (oid) {
           const r = opRec(oid);
-          r.pieces++;
-          r.samMinutes += sam;
-          if (sam > 0) r.piecesWithSam++;
+          if (first(r)) {
+            r.pieces++;
+            r.samMinutes += sam;
+            if (sam > 0) r.piecesWithSam++;
+          }
           r.machines.add(mid);
           (e.activeOps || []).forEach((c) => r.operations.add(c));
           if (!r.firstScanAt) r.firstScanAt = e.scanTime;
@@ -202,8 +238,10 @@ router.get("/overview-summary", async (req, res) => {
         if (e.workOrderKey) {
           mr.workOrderKeys.add(e.workOrderKey);
           const wr = woRec(e.workOrderKey);
-          wr.pieces++;
-          wr.samMinutes += sam;
+          if (first(wr)) {
+            wr.pieces++;
+            wr.samMinutes += sam;
+          }
           if (oid) wr.operators.add(oid);
           wr.machines.add(mid);
           if (e.unitNumber != null) wr.units.add(e.unitNumber);
@@ -272,11 +310,50 @@ router.get("/overview-summary", async (req, res) => {
     // zero standard minutes and the honest arithmetic returns 1%. That is not a
     // slow machine, it is an unmeasured operation - and publishing 1% would send
     // someone to fix a line that is running fine.
+    // A SCAN SPAN IS NOT ATTENDANCE, so it cannot be an efficiency denominator.
+    //
+    // The fallback above measures first scan -> last scan when nobody signed in.
+    // That is a reasonable stand-in for "how long was this running" and useless
+    // as "how long was this person available to work": it excludes everything
+    // before the first scan and after the last, and for two scans a minute
+    // apart it collapses to about a minute. Dividing real earned minutes by it
+    // is how this page published 1040%, then 1300%, for an operator with no
+    // sign-in recorded at all — SIGN IN and SIGN OUT both read "—" on screen
+    // while the badge beside them claimed thirteen times standard output.
+    //
+    // Fixing the SAM double-count (above) lowers that number without making it
+    // true. The denominator is the fault, and the denominator does not exist:
+    // without a sign-in there is no attendance, and the honest answer is that
+    // efficiency cannot be stated — not a smaller wrong number, and not a cap
+    // at 100% that would hide the same hole.
+    //
+    // So efficiency is reported ONLY against measured attendance. Everything
+    // else it already refused to guess at — one scan, or operations with no SAM
+    // on file — is unchanged, and each refusal now says which one applied so
+    // the floor can see that the missing sign-ins are what is in the way.
     const MIN_SAM_COVERAGE = 0.8;
-    const effPct = (sam, mins, pieces, withSam) =>
-      pieces >= 2 && sam > 0 && mins > 0 && withSam / pieces >= MIN_SAM_COVERAGE
+    const effPct = (sam, mins, pieces, withSam, basis) =>
+      basis === "attendance-less-breaks" &&
+      pieces >= 2 &&
+      sam > 0 &&
+      mins > 0 &&
+      withSam / pieces >= MIN_SAM_COVERAGE
         ? Math.round((sam / mins) * 1000) / 10
         : null;
+
+    /** Why there is no percentage, for the screen to show in its place. */
+    const effUnavailable = (sam, mins, pieces, withSam, basis) => {
+      if (basis !== "attendance-less-breaks") {
+        return "no sign-in recorded, so attended time is unknown";
+      }
+      if (pieces < 2) return "needs at least two garments to measure";
+      if (!(sam > 0)) return "no standard time on the operations run";
+      if (!(mins > 0)) return "no attended time after breaks";
+      if (withSam / pieces < MIN_SAM_COVERAGE) {
+        return "most garments here have no standard time set";
+      }
+      return null;
+    };
 
     const machineOut = [...machines.values()]
       .map((m) => {
@@ -299,7 +376,8 @@ router.get("/overview-summary", async (req, res) => {
           breakMinutes: mWork.breakMinutes,
           efficiencyBasis: mWork.basis,
           samCoveragePercent: m.pieces ? Math.round((m.piecesWithSam / m.pieces) * 100) : null,
-          efficiencyPercent: effPct(m.samMinutes, mWork.minutes, m.pieces, m.piecesWithSam),
+          efficiencyPercent: effPct(m.samMinutes, mWork.minutes, m.pieces, m.piecesWithSam, mWork.basis),
+        efficiencyUnavailableReason: effUnavailable(m.samMinutes, mWork.minutes, m.pieces, m.piecesWithSam, mWork.basis),
           operators: [...m.operators].map((id) => ({
             operatorId: id, operatorName: operatorName(id),
           })),
@@ -348,7 +426,8 @@ router.get("/overview-summary", async (req, res) => {
         breakMinutes: oWork.breakMinutes,
         efficiencyBasis: oWork.basis,
         samCoveragePercent: o.pieces ? Math.round((o.piecesWithSam / o.pieces) * 100) : null,
-        efficiencyPercent: effPct(o.samMinutes, oWork.minutes, o.pieces, o.piecesWithSam),
+        efficiencyPercent: effPct(o.samMinutes, oWork.minutes, o.pieces, o.piecesWithSam, oWork.basis),
+        efficiencyUnavailableReason: effUnavailable(o.samMinutes, oWork.minutes, o.pieces, o.piecesWithSam, oWork.basis),
         machines: [...o.machines].map((id) => {
           const m = machineById.get(id);
           return { machineId: id, machineName: (m && m.name) || "Unknown machine" };
@@ -411,7 +490,15 @@ router.get("/overview-summary", async (req, res) => {
       success: true,
       shiftDate,
       totals: {
-        pieces: scans.length,
+        /* Distinct garments across the whole floor, not scan events. This read
+           `scans.length`, which is what put "Scanned pieces today 5" above a
+           work order whose own Units set said 4.
+
+           Floor-wide, so a garment that passed two machines counts ONCE here —
+           unlike the per-machine figures, where it rightly counts on each. The
+           two therefore need not add up, and should not be expected to. */
+        pieces: countDistinctPieces(scans),
+        scanEvents: scans.length,
         events: events.length,
         operators: operatorOut.length,
         operatorsOnline: operatorOut.filter((o) => o.online).length,
