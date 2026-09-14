@@ -796,15 +796,15 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
       ProductionEvent.find({ shiftDate, machineId: machineObjId })
         .sort({ scanTime: 1 })
         .lean(),
-      /* Live targets whose window is open right now and which name THIS machine
-         — either directly, or as one of the machines a group target resolved
-         to. Cheap: this shift's active targets only, which is a handful. */
-      ProductionTarget.find({
-        shiftDate,
-        status: "active",
-        windowStart: { $lte: new Date() },
-        windowEnd: { $gt: new Date() },
-      }).lean(),
+      /* EXACTLY the query the Targets panel uses — {shiftDate, status} and
+         nothing else. It previously also filtered windowStart/windowEnd against
+         now, which is one more thing to get wrong for no benefit: the shift's
+         active targets are a handful, the evaluator already knows whether a
+         window is open, and an extra Date comparison in the query is an extra
+         way to silently return nothing. Which is what it did. */
+      ProductionTarget.find({ shiftDate, status: "active" })
+        .sort({ windowStart: 1 })
+        .lean(),
     ]);
 
     if (!machine) {
@@ -826,17 +826,34 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
         const { evaluations } = await targetEvaluator.evaluateTargets(openTargets, {
           settle: false,
         });
+        /* Everything for this machine, then choose — rather than letting the
+           query choose and having no idea why it chose nothing. */
+        const mine = [];
         for (const t of openTargets) {
           const ev = evaluations.get(String(t._id)) || null;
           const direct = t.machineId && String(t.machineId) === machineKey;
           const viaGroup = (ev?.resolvedMachineIds || []).some(
             (id) => String(id) === machineKey
           );
-          if (direct || viaGroup) {
-            activeTarget = { target: t, evaluation: ev };
-            break; // one target per machine on screen; the first open one wins
-          }
+          if (direct || viaGroup) mine.push({ target: t, evaluation: ev });
         }
+
+        /* An OPEN window is what the drawer should show — that is this
+           machine's target right now. Falling back to the most recent one
+           otherwise means a supervisor opening the drawer after the window
+           closed still sees what was asked of the machine and how it did,
+           instead of the tile claiming no target exists. The evaluation says
+           which case it is, so nothing is presented as live that is not. */
+        const nowMs = Date.now();
+        const isOpen = (r) =>
+          new Date(r.target.windowStart).getTime() <= nowMs &&
+          new Date(r.target.windowEnd).getTime() > nowMs;
+        activeTarget =
+          mine.find(isOpen) ||
+          mine.sort(
+            (a, b) => new Date(b.target.windowStart) - new Date(a.target.windowStart)
+          )[0] ||
+          null;
       } catch (err) {
         /* A target that cannot be evaluated must not take the machine drawer
            down with it — the rest of this screen is unrelated to targets. */
