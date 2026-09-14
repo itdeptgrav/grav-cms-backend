@@ -16,6 +16,23 @@ const byOperationSchema = new mongoose.Schema(
     // source is wired in, at which point it is a rollup change with no
     // migration because the fields already exist.
     smvSeconds: { type: Number, default: null },
+    /* THE WORKING BEHIND efficiencyPercent, and it has to be DECLARED to
+       survive. The rollup computes earned and available minutes and writes
+       them, but mongoose runs strict by default: a field the schema does not
+       know about is silently dropped on save. So the drawer read
+       op.earnedMinutes, got undefined, and reported "no standard time set" for
+       a machine whose operations both have a SAM on file — the number had been
+       computed correctly and thrown away between the rollup and the disk.
+
+       earnedMinutes  = garments at this operation x its standard time
+       availableMinutes = the machine's manned time less recorded breaks,
+                          identical on every row because attended time cannot be
+                          split between operations that ran at once */
+    earnedMinutes: { type: Number, default: null },
+    availableMinutes: { type: Number, default: null },
+    /* The true cycle (attended time / garments), as opposed to
+       avgSecondsPerPiece above, which is the pace with idle gaps removed. */
+    observedCycleSeconds: { type: Number, default: null },
     efficiencyPercent: { type: Number, default: null },
   },
   { _id: false }

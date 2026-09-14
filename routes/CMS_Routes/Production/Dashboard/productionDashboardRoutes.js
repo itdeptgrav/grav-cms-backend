@@ -12,6 +12,9 @@ const Employee = require("../../../../models/Employee");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const Measurement = require("../../../../models/Customer_Models/Measurement");
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
+/* One definition of "which garment is this", shared with the rollup, the
+   targets and every floor view — so these counts cannot drift from those. */
+const { pieceKeyOf } = require("../../../../services/barcodeScanner/rollupStats");
 
 // Authentication for the whole router.
 //
@@ -283,7 +286,12 @@ router.get("/current-production", async (req, res) => {
 
         // Track unique barcodes scanned on this machine
         for (const scan of scans) {
-          if (scan.barcodeId) uniqueBarcodes.add(scan.barcodeId);
+          /* The SHARED garment identity — barcode plus the sorted operation
+             set — not the barcode alone. Deduping on the barcode by itself
+             counts a piece once even when it received two different operations
+             at different stations, so this figure quietly disagreed with every
+             other piece count in the system. */
+          if (scan.barcodeId) uniqueBarcodes.add(pieceKeyOf(scan));
           const parsed = parseBarcode(scan.barcodeId);
           if (parsed.success) woShortIds.add(parsed.workOrderShortId);
         }
@@ -298,7 +306,9 @@ router.get("/current-production", async (req, res) => {
         }
 
         // Per-operator unique pieces count (for the canvas tooltip)
-        const operatorPieces = new Set(scans.map((s) => s.barcodeId).filter(Boolean));
+        const operatorPieces = new Set(
+          scans.filter((s) => s.barcodeId).map((s) => pieceKeyOf(s))
+        );
         const lastOpCodesArr = scans.length > 0
           ? (Array.isArray(scans[scans.length - 1].activeOps)
               ? scans[scans.length - 1].activeOps

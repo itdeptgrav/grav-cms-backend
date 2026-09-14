@@ -14,6 +14,23 @@ const byOperationSchema = new mongoose.Schema(
     maxSecondsPerPiece: { type: Number, default: null },
     // Reserved — see MachineDayStats. Null until SMV is introduced.
     smvSeconds: { type: Number, default: null },
+    /* THE WORKING BEHIND efficiencyPercent, and it has to be DECLARED to
+       survive. The rollup computes earned and available minutes and writes
+       them, but mongoose runs strict by default: a field the schema does not
+       know about is silently dropped on save. So the drawer read
+       op.earnedMinutes, got undefined, and reported "no standard time set" for
+       a machine whose operations both have a SAM on file — the number had been
+       computed correctly and thrown away between the rollup and the disk.
+
+       earnedMinutes  = garments at this operation x its standard time
+       availableMinutes = the machine's manned time less recorded breaks,
+                          identical on every row because attended time cannot be
+                          split between operations that ran at once */
+    earnedMinutes: { type: Number, default: null },
+    availableMinutes: { type: Number, default: null },
+    /* The true cycle (attended time / garments), as opposed to
+       avgSecondsPerPiece above, which is the pace with idle gaps removed. */
+    observedCycleSeconds: { type: Number, default: null },
     efficiencyPercent: { type: Number, default: null },
   },
   { _id: false }
@@ -46,6 +63,16 @@ const operatorDayStatsSchema = new mongoose.Schema(
 
     // Reserved. Meaningless without a target time, so left null while SMV is
     // out of scope. Pace lives in byOperation.avgSecondsPerPiece instead.
+    /* The two numbers overallEfficiencyPercent is made of, kept so a reader can
+       see WHY it is what it is — and, as with the byOperation fields above,
+       declared because mongoose strict would otherwise drop them on write.
+           overall = earnedMinutes / availableMinutes x 100
+       unratedOperations counts operations this person ran that have no SAM in
+       the registry: they earn nothing, so a high count means the figure covers
+       less of their shift than it appears to. */
+    earnedMinutes: { type: Number, default: null },
+    availableMinutes: { type: Number, default: null },
+    unratedOperations: { type: Number, default: 0 },
     overallEfficiencyPercent: { type: Number, default: null },
 
     byOperation: { type: [byOperationSchema], default: [] },

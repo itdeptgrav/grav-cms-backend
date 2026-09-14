@@ -52,6 +52,8 @@ const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/
 
 const S = "../../../../services/barcodeScanner";
 const { shiftDateFor, currentShiftDate } = require(`${S}/shift`);
+const ProductionTarget = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionTarget");
+const targetEvaluator = require("../../../../services/production/targetEvaluator");
 const masterData = require(`${S}/masterData`);
 // The sign-in / scan / break session walk, imported rather than copied. It is
 // exported for exactly this (rollupStats.js:752-757); a second copy of it here
@@ -61,7 +63,12 @@ const masterData = require(`${S}/masterData`);
    DeviceHeartbeat row (a replaced scanner, a diagnostic pairing), and the
    arbitrary last-one-wins Map this used to build reported live machines
    offline off a stale stub. */
-const { walkMachine, latestHeartbeatByMachine, pieceKeyOf } = require(`${S}/rollupStats`);
+const {
+  walkMachine,
+  latestHeartbeatByMachine,
+  pieceKeyOf,
+  countDistinctPieces,
+} = require(`${S}/rollupStats`);
 
 // Authentication, not a department gate — the same reasoning the sibling
 // routers state: the supervisor and the project manager both read these floor
@@ -619,7 +626,16 @@ const worstSeverity = (flags) =>
  * Machines that produced nothing are kept — a machine with no stats is exactly
  * what a supervisor is scanning the list for.
  */
-function buildFloorRows({ machines, statsByMachine, hbByMachine, now }) {
+function buildFloorRows({
+  machines,
+  statsByMachine,
+  hbByMachine,
+  now,
+  /* Live per-machine garment counts, built by the caller in one pass over the
+     shift's events. Passed in rather than recomputed per row. */
+  livePieces = new Map(),
+  liveHour = new Map(),
+}) {
   return machines
     .map((m) => {
       const key = String(m._id);
@@ -636,8 +652,11 @@ function buildFloorRows({ machines, statsByMachine, hbByMachine, now }) {
         type: m.type || "",
         assetStatus: m.status || null,
         status,
-        pieces: stats?.totalPieces ?? 0,
-        piecesThisHour: stats?.piecesThisHour ?? 0,
+        /* Live, from this shift's events — not the rollup's 60s-old copy. See
+           the detail route for why the two sources had to become one. */
+        pieces: livePieces.get(key) ?? 0,
+        piecesThisHour: liveHour.get(key) ?? 0,
+        rollupPieces: stats?.totalPieces ?? null,
         efficiencyPercent,
         lastScanAt: stats?.lastScanAt || null,
         currentOperatorName: stats?.currentOperatorName || null,
@@ -672,20 +691,49 @@ router.get("/machine-intelligence", async (req, res) => {
     }
 
     const now = Date.now();
-    const [master, dayStats, heartbeats] = await Promise.all([
+    const [master, dayStats, heartbeats, events] = await Promise.all([
       masterData.getMasterData(),
       MachineDayStats.find({ shiftDate }).lean(),
       DeviceHeartbeat.find({}).lean(),
+      /* The shift's scans, so this list reports the same live count the detail
+         drawer and the 3D nameplates do. One indexed read over one shift —
+         cheaper than the rollup it replaces reading, and it cannot be stale.
+         Only the four fields the count needs. */
+      ProductionEvent.find(
+        { shiftDate, type: "scan" },
+        { machineId: 1, barcodeId: 1, activeOps: 1, scanTime: 1 }
+      ).lean(),
     ]);
 
     const statsByMachine = new Map(dayStats.map((s) => [String(s.machineId), s]));
     const hbByMachine = latestHeartbeatByMachine(heartbeats);
+
+    /* Distinct garments per machine, live. Built once here rather than per row
+       so fifty machines cost one pass over the shift's events, not fifty. */
+    const scansByMachine = new Map();
+    for (const e of events) {
+      const k = String(e.machineId);
+      if (!scansByMachine.has(k)) scansByMachine.set(k, []);
+      scansByMachine.get(k).push(e);
+    }
+    const hourAgo = now - 60 * 60 * 1000;
+    const livePieces = new Map();
+    const liveHour = new Map();
+    for (const [k, rows] of scansByMachine) {
+      livePieces.set(k, countDistinctPieces(rows));
+      liveHour.set(
+        k,
+        countDistinctPieces(rows.filter((e) => new Date(e.scanTime).getTime() >= hourAgo))
+      );
+    }
 
     const rows = buildFloorRows({
       machines: master.machines || [],
       statsByMachine,
       hbByMachine,
       now,
+      livePieces,
+      liveHour,
     });
 
     const measured = rows.filter((r) => r.efficiencyPercent != null);
@@ -737,7 +785,7 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
     const machineKey = String(machineObjId);
     const now = Date.now();
 
-    const [machine, master, dayStats, heartbeats, events] = await Promise.all([
+    const [machine, master, dayStats, heartbeats, events, openTargets] = await Promise.all([
       // The asset register, read directly rather than through master data: this
       // is the only place model / lastMaintenance / nextMaintenance live, and
       // the master-data projection does not carry them.
@@ -748,6 +796,15 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
       ProductionEvent.find({ shiftDate, machineId: machineObjId })
         .sort({ scanTime: 1 })
         .lean(),
+      /* Live targets whose window is open right now and which name THIS machine
+         — either directly, or as one of the machines a group target resolved
+         to. Cheap: this shift's active targets only, which is a handful. */
+      ProductionTarget.find({
+        shiftDate,
+        status: "active",
+        windowStart: { $lte: new Date() },
+        windowEnd: { $gt: new Date() },
+      }).lean(),
     ]);
 
     if (!machine) {
@@ -757,6 +814,35 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
     const statsByMachine = new Map(dayStats.map((s) => [String(s.machineId), s]));
     const hbByMachine = latestHeartbeatByMachine(heartbeats);
     const stats = statsByMachine.get(machineKey) || null;
+
+    /* Which open target, if any, is this machine's — and what the evaluator
+       makes of it. A machine target matches outright; a group target matches
+       when this machine is in the set the evaluator resolved it to. Evaluated
+       through targetEvaluator so the figure here is the same one the Targets
+       panel shows, rather than a second opinion computed locally. */
+    let activeTarget = null;
+    if (openTargets.length) {
+      try {
+        const { evaluations } = await targetEvaluator.evaluateTargets(openTargets, {
+          settle: false,
+        });
+        for (const t of openTargets) {
+          const ev = evaluations.get(String(t._id)) || null;
+          const direct = t.machineId && String(t.machineId) === machineKey;
+          const viaGroup = (ev?.resolvedMachineIds || []).some(
+            (id) => String(id) === machineKey
+          );
+          if (direct || viaGroup) {
+            activeTarget = { target: t, evaluation: ev };
+            break; // one target per machine on screen; the first open one wins
+          }
+        }
+      } catch (err) {
+        /* A target that cannot be evaluated must not take the machine drawer
+           down with it — the rest of this screen is unrelated to targets. */
+        console.error("[machine-intelligence] target evaluation failed:", err.message);
+      }
+    }
     const hb = hbByMachine.get(machineKey) || null;
 
     const heartbeatAge = heartbeatAgeOf(hb, now);
@@ -1044,10 +1130,31 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
       })(),
 
       production: {
-        // DISTINCT GARMENTS. MachineDayStats.totalPieces is the rollup's
-        // barcodeId + sorted-activeOps key count, not a scan tally.
-        pieces: stats?.totalPieces ?? 0,
-        piecesThisHour: stats?.piecesThisHour ?? 0,
+        /* DISTINCT GARMENTS, COUNTED FROM THE EVENTS THIS REQUEST ALREADY READ.
+           ------------------------------------------------------------------
+           This used to return MachineDayStats.totalPieces — the rollup's figure,
+           rewritten on a 60-second timer. The 3D nameplate beside it counts from
+           current-production, which is live. So the same machine at the same
+           moment read "10 pcs today" on the floor and "9" in this drawer, and
+           the drawer was simply a minute behind.
+
+           The fix is not to sync two sources but to stop having two: the detail
+           route already loads every ProductionEvent for this machine and shift
+           (it needs them for the scan audit and the session walk), so the count
+           is taken from those. It cannot lag, because there is nothing between
+           the scan and the number.
+
+           countDistinctPieces is the shared definition — barcodeId plus the
+           sorted operation set — so this agrees with the rollup by construction
+           rather than by coincidence; it is just not waiting for it. */
+        pieces: countDistinctPieces(scans),
+        piecesThisHour: countDistinctPieces(
+          scans.filter((e) => now - new Date(e.scanTime).getTime() <= 60 * 60 * 1000)
+        ),
+        /* What the rollup last wrote, so a mismatch is visible rather than
+           mysterious: if these differ the rollup is mid-cycle, which is normal
+           and expected within any 60s window. */
+        rollupPieces: stats?.totalPieces ?? null,
         piecesDefinition:
           "distinct garments (barcode + operation set), counted once however many times they were scanned",
         // Diagnostics only — a device double-firing shows up as scans far above
@@ -1061,13 +1168,38 @@ router.get("/machine-intelligence/:machineId", async (req, res) => {
       // piece target, and there is no roster or shift-length record to derive
       // one from. Returned explicitly so the UI shows an em-dash rather than a
       // number somebody would plan against.
-      target: {
-        pieces: null,
-        source: null,
-        note:
-          "No machine or shift target is stored anywhere in this system. The only " +
-          "standard available is the per-operation SAM shown against each operation.",
-      },
+      /* TARGETS EXIST NOW. This block was written when they did not — its note
+         said "No machine or shift target is stored anywhere in this system",
+         which was true then and has not been true since the target system was
+         added. The result was a drawer reporting "no target is stored" for a
+         machine the Targets panel was, at that same moment, showing a target
+         for. Same database, two answers.
+
+         Only targets whose window covers NOW are offered: a target that closed
+         at noon is not this machine's target at four o'clock, and showing the
+         most recent one regardless of time would be worse than showing none.
+         The evaluation (actual, remaining, achievement, state) is deliberately
+         NOT recomputed here — it comes from the evaluator that the Targets
+         panel reads, so the two cannot drift. */
+      target: activeTarget
+        ? {
+            targetId: String(activeTarget.target._id),
+            pieces: activeTarget.target.targetPieces,
+            source: "production target",
+            windowStart: activeTarget.target.windowStart,
+            windowEnd: activeTarget.target.windowEnd,
+            scope: activeTarget.target.scope,
+            assignedByName: activeTarget.target.assignedByName || null,
+            evaluation: activeTarget.evaluation || null,
+            note: null,
+          }
+        : {
+            pieces: null,
+            source: null,
+            note:
+              "No target covers this machine right now. Set one from the Targets " +
+              "panel; the actual is counted from scans, never typed in.",
+          },
 
       efficiency,
       byOperation,
