@@ -128,6 +128,10 @@ router.get("/overview-summary", async (req, res) => {
           pieces: 0, samMinutes: 0, piecesWithSam: 0,
           operators: new Set(), operations: new Set(),
           workOrderKeys: new Set(), breakSeconds: 0, openBreakAt: null,
+          // Operator-minutes attended ON THIS MACHINE, summed across everyone
+          // who signed in at it. Two people on one machine for an hour is two
+          // attended hours, because the machine's earned minutes came from both.
+          attendedSeconds: 0,
           pieceKeys: new Set(),
           firstScanAt: null, lastScanAt: null,
         });
@@ -145,6 +149,23 @@ router.get("/overview-summary", async (req, res) => {
       return orders.get(key);
     };
 
+    /* Where each operator is currently signed in, so attended time can be
+       credited to the MACHINE and not just the person. A machine never signs
+       in itself, which is why its efficiency column was permanently blank —
+       but the operators standing at it do, and those events carry the machine.
+
+       Keyed by operator: signing in somewhere else closes the previous window
+       rather than leaving two open, which is what an operator moving down the
+       line actually does. */
+    const openSignIn = new Map(); // operatorId -> { machineId, at }
+    const closeSignIn = (oid, atIso) => {
+      const w = openSignIn.get(oid);
+      if (!w) return;
+      openSignIn.delete(oid);
+      const secs = (new Date(atIso) - new Date(w.at)) / 1000;
+      if (secs > 0) mcRec(w.machineId).attendedSeconds += secs;
+    };
+
     for (const e of events) {
       const mid = String(e.machineId);
       const oid = e.operatorId || "";
@@ -155,10 +176,13 @@ router.get("/overview-summary", async (req, res) => {
         r.signedIn = true;
         r.signOutAt = null;
         r.machines.add(mid);
+        closeSignIn(oid, e.scanTime); // moved machines without signing out
+        openSignIn.set(oid, { machineId: mid, at: e.scanTime });
       } else if (e.type === "signout" && oid) {
         const r = opRec(oid);
         r.signOutAt = e.scanTime;
         r.signedIn = false;
+        closeSignIn(oid, e.scanTime);
       } else if (e.type === "break_start") {
         // Breaks come off the denominator. They are off-standard time: the
         // operator is not expected to be producing, so counting those minutes
@@ -258,6 +282,10 @@ router.get("/overview-summary", async (req, res) => {
     // labelled "span" rather than presented as paid working time.
     const now = Date.now();
 
+    /* Still on the clock at this instant. Snapshotted before iterating because
+       closeSignIn mutates the map it is reading from. */
+    for (const [oid] of [...openSignIn]) closeSignIn(oid, new Date(now).toISOString());
+
     // ─── The efficiency denominator ──────────────────────────────────────────
     // ON-STANDARD minutes: attendance minus break time. This is the number a
     // production manager uses, and it is not the same as elapsed time.
@@ -274,6 +302,31 @@ router.get("/overview-summary", async (req, res) => {
     // Falls back to the scan span only when there is no sign-in event to
     // measure from, and the response says which basis was used so the number is
     // never read as more authoritative than it is.
+    /* A machine's attended time, from the people who stood at it.
+     *
+     * Machines showed no efficiency at all because the rule demanded a sign-in
+     * and a machine never signs in. Its operators do, and their sign-in events
+     * name the machine — so the attended minutes were always recoverable; they
+     * were simply never added up. Breaks come off exactly as they do for a
+     * person, including one nobody scanned back from.
+     *
+     * Returns basis "none-machine" rather than falling back to the scan span:
+     * first-scan-to-last-scan counts every idle gap as worked time, which is
+     * the mistake that produced 1% for healthy lines. A blank with a reason
+     * beats a number that is wrong. */
+    const machineWorked = (rec) => {
+      if (!(rec.attendedSeconds > 0)) return { minutes: null, basis: "none-machine" };
+      const gross = rec.attendedSeconds / 60;
+      const openBreak = rec.openBreakAt ? (now - new Date(rec.openBreakAt)) / 60000 : 0;
+      const net = gross - rec.breakSeconds / 60 - openBreak;
+      return {
+        minutes: net > 0 ? Math.round(net) : null,
+        grossMinutes: Math.round(gross),
+        breakMinutes: Math.round(rec.breakSeconds / 60 + openBreak),
+        basis: "operator-attendance-less-breaks",
+      };
+    };
+
     const workedMinutes = (rec) => {
       const start = rec.signInAt || rec.firstScanAt;
       if (!start) return { minutes: null, basis: "none" };
@@ -332,8 +385,14 @@ router.get("/overview-summary", async (req, res) => {
     // on file — is unchanged, and each refusal now says which one applied so
     // the floor can see that the missing sign-ins are what is in the way.
     const MIN_SAM_COVERAGE = 0.8;
+    /* Both of these are MEASURED attendance — a person's own sign-in, or the
+       sign-ins of the people at a machine. The scan span is still refused. */
+    const MEASURED_BASES = new Set([
+      "attendance-less-breaks",
+      "operator-attendance-less-breaks",
+    ]);
     const effPct = (sam, mins, pieces, withSam, basis) =>
-      basis === "attendance-less-breaks" &&
+      MEASURED_BASES.has(basis) &&
       pieces >= 2 &&
       sam > 0 &&
       mins > 0 &&
@@ -343,7 +402,10 @@ router.get("/overview-summary", async (req, res) => {
 
     /** Why there is no percentage, for the screen to show in its place. */
     const effUnavailable = (sam, mins, pieces, withSam, basis) => {
-      if (basis !== "attendance-less-breaks") {
+      if (basis === "none-machine") {
+        return "nobody signed in at this machine, so attended time is unknown";
+      }
+      if (!MEASURED_BASES.has(basis)) {
         return "no sign-in recorded, so attended time is unknown";
       }
       if (pieces < 2) return "needs at least two garments to measure";
@@ -358,7 +420,7 @@ router.get("/overview-summary", async (req, res) => {
     const machineOut = [...machines.values()]
       .map((m) => {
         const live = liveMachines.get(m.machineId) || null;
-        const mWork = workedMinutes(m);
+        const mWork = machineWorked(m);
         return {
           machineId: m.machineId,
           machineName: m.machineName,
