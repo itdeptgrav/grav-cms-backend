@@ -332,9 +332,15 @@ function filesUnder(dir) {
     ),
   );
 
-  console.log("\nevery accountant route and every service");
+  console.log("\nevery accountant route, every HR route, every service");
+  /* HR joined this list after the same class of bug turned up there: a
+     helper used in a route that nothing had imported. These trees are the
+     ones under active change; the rest of routes/ is worth adding when
+     somebody next works in it. */
   const targets = [
     ...filesUnder("routes/Accountant_Routes"),
+    ...filesUnder("routes/HrRoutes"),
+    ...filesUnder("routes/Employee_Routes"),
     ...filesUnder("services"),
   ];
   const broken = [];

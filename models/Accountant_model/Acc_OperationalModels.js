@@ -1274,6 +1274,14 @@ budgetSchema.index({ companyId: 1, status: 1, startDate: -1 });
 const journalLineSchema = new mongoose.Schema(
   {
     accountName: { type: String, required: true },
+    /* The ledger this line actually hits.
+       The journal-entries page has always sent one — it put the ledger's _id
+       in `accountCode` and said so in a comment, "so downstream pages can
+       resolve to a specific TallyLedger". Nothing downstream ever did, and
+       there was no field here to hold it, so every entry recorded a name and
+       posted to nothing. It is a real reference now; `accountCode` is left
+       alone because the existing rows carry their ledger id in it. */
+    ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
     accountCode: { type: String },
     debit: { type: Number, default: 0, min: 0 },
     credit: { type: Number, default: 0, min: 0 },
@@ -1330,9 +1338,18 @@ const journalEntrySchema = new mongoose.Schema(
     sourceReference: { type: String },
     status: {
       type: String,
-      enum: ["draft", "posted", "reversed", "void"],
+      /* "cancelled" is a draft abandoned before it ever reached the books;
+         "void" is a posted entry taken back out of them. Keeping them apart
+         matters: one never moved a balance, the other did and had to be
+         reversed, and an auditor asking "was this ever in the accounts?" needs
+         those to be different answers. */
+      enum: ["draft", "posted", "reversed", "void", "cancelled"],
       default: "draft",
     },
+    /* Who withdrew it, when, and why — for both cancel and void. */
+    cancelledAt: { type: Date },
+    cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Department" },
+    cancelReason: { type: String, trim: true },
     attachments: [
       {
         fileName: String,
@@ -1344,6 +1361,27 @@ const journalEntrySchema = new mongoose.Schema(
     postedAt: { type: Date },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Department" },
     financialYear: { type: String },
+
+    /* Which company's books this belongs in.
+       The page has always sent it; there was no field for it, so mongoose
+       dropped it and every entry belonged to nobody — which is also why the
+       list showed every company's entries to everyone. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+
+    /* THE ENTRY IN THE BOOKS.
+       A journal entry is a request to move money between ledgers; the thing
+       that actually moves it is a voucher. Reports — trial balance, ledger,
+       day book, P&L — all read Acc_Voucher, so until this link exists an
+       entry can say "posted" and change no balance anywhere, which is exactly
+       what it did. Posting creates the voucher and records it here; voiding
+       voids it. An entry marked posted with no voucherId was posted under the
+       old behaviour and has not reached the ledger. */
+    voucherId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Voucher" },
+    voucherNumber: { type: String, trim: true },
   },
   { timestamps: true, collection: "acc_journal_entries" },
 );

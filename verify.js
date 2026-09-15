@@ -74,6 +74,8 @@ const WRITES = [
   "verifyPayrollPaymentLink",  // payroll posts a journal; a linked payment marks it paid
   "verifyRegularizationRules", // a client visit is Present; a present day brings its hours
   "verifyFaceEnrollInvite",    // the self-registration link, and what it refuses
+  "verifyAttendanceRemoval",   // removed from a month stays removed — and stays on the others
+  "verifyJournalEntryPosting", // a posted journal entry actually moves the trial balance
 ];
 
 const TIERS = { pure: PURE, readonly: READONLY, writes: WRITES };
