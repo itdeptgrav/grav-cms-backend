@@ -1,4 +1,4 @@
-/**
+/*
  * scripts/verifyTimerSop.js
  *
  * Proves the timer -> deficit/overtime -> SOP points pipeline actually
@@ -10,7 +10,8 @@
  *   node scripts/verifyTimerSop.js E018
  *                                  ^^^^ the employeeId to test (required)
  *
- * WHAT IT DOES, IN ORDER:
+ * WHAT IT DOES, IN ORDER:  
+ 
  *   1. Connects to your real MongoDB (same MONGODB_URI your server uses).
  *   2. Reads that employee's CURRENT state directly from Mongo — before
  *      touching anything. Prints it.
