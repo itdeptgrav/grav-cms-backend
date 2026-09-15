@@ -146,64 +146,118 @@ router.get("/report/pace-log", async (req, res) => {
   try {
     const day = req.query.day || req.query.date;
     const operation = String(req.query.operation || "").trim();
-    if (!day || !operation) {
+    const machineId = String(req.query.machineId || "").trim();
+    if (!day || (!operation && !machineId)) {
       return res
         .status(400)
-        .json({ success: false, message: "day and operation are both required" });
+        .json({ success: false, message: "day, plus operation or machineId, are required" });
     }
 
-    const r = await reportBuilder.buildReport({ ...readOptions(req), from: day, to: day });
+    /* ASKING FOR A MACHINE NARROWS THE SCANS FIRST.
+       buildReport's machineId filter applies before pace is computed, so the
+       per-operation figures that come back are already this machine's alone.
+       That matters: computed across the floor they would mix machines, and a
+       gap between two different machines' garments is not a cycle time. */
+    const r = await reportBuilder.buildReport({
+      ...readOptions(req),
+      from: day,
+      to: day,
+      ...(machineId ? { machineId } : {}),
+    });
     const d = (r.days || []).find((x) => x.dayKey === day);
-    const op = (d?.pace?.byOperation || []).find((o) => o.operationCode === operation);
-    if (!op) {
+    let ops = (d?.pace?.byOperation || []).filter((o) => o.scansConsidered > 0);
+    if (operation) ops = ops.filter((o) => o.operationCode === operation);
+
+    if (ops.length === 0) {
+      /* An empty day is the ordinary answer for a floor that did not run, so it
+         reads as a sentence rather than an id — the caller shows it verbatim. */
+      const who = operation ? `operation ${operation}` : "this device";
       return res
         .status(404)
-        .json({ success: false, message: `no scans for ${operation} on ${day}` });
+        .json({ success: false, message: `Nothing was scanned on ${who} on ${day}` });
     }
 
-    /* The first scan opens the sequence and closes nothing, so it carries no
-       duration and no percentage — it is the reference §4 describes. It is not
-       in `rows` (which holds intervals, not scans), so it is reconstructed here
-       from the first interval's `previousAt`. */
-    const first = op.rows?.[0];
-    const scans = [];
-    if (first) {
-      scans.push({ index: 1, at: first.previousAt, reference: true });
+    const shape = (op) => {
+      /* The first scan opens the sequence and closes nothing, so it carries no
+         duration and no percentage — the reference §4 describes. It is not in
+         `rows` (which holds intervals, not scans), so it is reconstructed from
+         the first interval's `previousAt`. */
+      const scans = [];
+      const first = op.rows?.[0];
+      if (first) scans.push({ index: 1, at: first.previousAt, reference: true });
+      for (const row of op.rows || []) {
+        scans.push({
+          index: row.index,
+          at: row.at,
+          barcodeId: row.barcodeId,
+          durationSeconds: row.intervalSeconds,
+          counted: row.counted,
+          excludedBecause: row.excludedBecause,
+          /* Per-interval, for THIS ROW ONLY. Never summed anywhere: §7 forbids
+             averaging this column, and the overall below is a ratio of totals. */
+          efficiencyPercent:
+            row.counted && row.intervalSeconds > 0
+              ? Math.round((op.samSeconds / row.intervalSeconds) * 10000) / 100
+              : null,
+        });
+      }
+      return {
+        operationCode: op.operationCode,
+        operationName: op.operationName || "",
+        samSeconds: op.samSeconds,
+        scans,
+        totals: {
+          scansConsidered: op.scansConsidered,
+          intervals: op.intervals,
+          totalSamSeconds: op.totalSamSeconds,
+          totalActualSeconds: op.totalActualSeconds,
+          averageActualSeconds: op.averageActualSeconds,
+          pacePercent: op.pacePercent,
+          excluded: op.excluded,
+          caveat: op.caveat || null,
+          basis: op.basis || null,
+        },
+      };
+    };
+
+    /* THE ONE FIGURE FOR THE DEVICE. Same rule as the day total: a garment
+       interval contributes its elapsed seconds ONCE however many operations it
+       completed, and earns each of their standard times. Summing the operations
+       naively would count the same seconds twice in the denominator. */
+    const earned = new Map();
+    for (const op of ops) {
+      if (!(op.samSeconds > 0)) continue;
+      for (const row of op.rows || []) {
+        if (!row.counted) continue;
+        const k = `${new Date(row.previousAt).getTime()}|${new Date(row.at).getTime()}|${row.barcodeId}`;
+        const cur = earned.get(k);
+        if (cur) cur.sam += op.samSeconds;
+        else earned.set(k, { seconds: row.intervalSeconds, sam: op.samSeconds });
+      }
     }
-    for (const row of op.rows || []) {
-      scans.push({
-        index: row.index,
-        at: row.at,
-        barcodeId: row.barcodeId,
-        durationSeconds: row.intervalSeconds,
-        counted: row.counted,
-        excludedBecause: row.excludedBecause,
-        /* Per-interval percentage, for THIS ROW ONLY. Deliberately computed
-           here and not summed anywhere: §7 forbids averaging this column, and
-           the overall figure below is the ratio of the totals. */
-        efficiencyPercent:
-          row.counted && row.intervalSeconds > 0
-            ? Math.round((op.samSeconds / row.intervalSeconds) * 10000) / 100
-            : null,
-      });
+    let sam = 0;
+    let actual = 0;
+    for (const v of earned.values()) {
+      sam += v.sam;
+      actual += v.seconds;
     }
 
     res.json({
       success: true,
       dayKey: day,
-      operationCode: op.operationCode,
-      samSeconds: op.samSeconds,
-      scans,
-      totals: {
-        scansConsidered: op.scansConsidered,
-        intervals: op.intervals,
-        totalSamSeconds: op.totalSamSeconds,
-        totalActualSeconds: op.totalActualSeconds,
-        averageActualSeconds: op.averageActualSeconds,
-        pacePercent: op.pacePercent,
-        excluded: op.excluded,
-        caveat: op.caveat || null,
-        basis: op.basis || null,
+      machineId: machineId || null,
+      machineName:
+        (d?.machines || []).find((m) => String(m.machineId) === machineId)?.machineName || null,
+      operations: ops.map(shape),
+      overall: {
+        intervals: earned.size,
+        totalSamSeconds: sam,
+        totalActualSeconds: actual,
+        averageActualSeconds: earned.size > 0 ? actual / earned.size : null,
+        pacePercent: actual > 0 ? Math.round((sam / actual) * 1000) / 10 : null,
+        garments: Math.max(...ops.map((o) => o.scansConsidered), 0),
+        caveat: (ops.find((o) => o.caveat) || {}).caveat || null,
+        basis: (ops.find((o) => o.basis) || {}).basis || null,
       },
     });
   } catch (error) {
