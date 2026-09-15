@@ -2,6 +2,7 @@
  * The connection every Brevo call goes out on.
  *
  * ## Why this exists: IPv4, deliberately
+ 
  *
  * Brevo can restrict an account to a list of authorised IP addresses, and a
  * dual-stack machine does not have one address — it has two, and picks between
