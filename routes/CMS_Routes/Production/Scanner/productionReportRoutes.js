@@ -147,22 +147,26 @@ router.get("/report/pace-log", async (req, res) => {
     const day = req.query.day || req.query.date;
     const operation = String(req.query.operation || "").trim();
     const machineId = String(req.query.machineId || "").trim();
-    if (!day || (!operation && !machineId)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "day, plus operation or machineId, are required" });
+    const operatorId = String(req.query.operatorId || "").trim();
+    if (!day || (!operation && !machineId && !operatorId)) {
+      return res.status(400).json({
+        success: false,
+        message: "day, plus one of operation, machineId or operatorId, are required",
+      });
     }
 
-    /* ASKING FOR A MACHINE NARROWS THE SCANS FIRST.
-       buildReport's machineId filter applies before pace is computed, so the
-       per-operation figures that come back are already this machine's alone.
-       That matters: computed across the floor they would mix machines, and a
-       gap between two different machines' garments is not a cycle time. */
+    /* ASKING FOR A MACHINE OR A PERSON NARROWS THE SCANS FIRST.
+       buildReport's filters apply before pace is computed, so the per-operation
+       figures that come back already belong to that machine or that operator
+       alone. This matters: computed across the floor they would mix machines,
+       and the gap between two different people's garments is not a cycle time
+       for either of them. */
     const r = await reportBuilder.buildReport({
       ...readOptions(req),
       from: day,
       to: day,
       ...(machineId ? { machineId } : {}),
+      ...(operatorId ? { operatorId } : {}),
     });
     const d = (r.days || []).find((x) => x.dayKey === day);
     let ops = (d?.pace?.byOperation || []).filter((o) => o.scansConsidered > 0);
@@ -171,7 +175,11 @@ router.get("/report/pace-log", async (req, res) => {
     if (ops.length === 0) {
       /* An empty day is the ordinary answer for a floor that did not run, so it
          reads as a sentence rather than an id — the caller shows it verbatim. */
-      const who = operation ? `operation ${operation}` : "this device";
+      const who = operation
+        ? `operation ${operation}`
+        : operatorId
+        ? "this person"
+        : "this device";
       return res
         .status(404)
         .json({ success: false, message: `Nothing was scanned on ${who} on ${day}` });
@@ -248,6 +256,9 @@ router.get("/report/pace-log", async (req, res) => {
       machineId: machineId || null,
       machineName:
         (d?.machines || []).find((m) => String(m.machineId) === machineId)?.machineName || null,
+      operatorId: operatorId || null,
+      operatorName:
+        (d?.operators || []).find((o) => String(o.operatorId) === operatorId)?.operatorName || null,
       operations: ops.map(shape),
       overall: {
         intervals: earned.size,

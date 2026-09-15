@@ -109,7 +109,7 @@ function parseDayKey(raw) {
  * Returns `hasData: false` for a day nobody worked — the caller still writes a
  * row for it, because an empty day is information.
  */
-async function gatherDay(shiftDate, master) {
+async function gatherDay(shiftDate, master, filters = {}) {
   /* TWO BUCKETING CONVENTIONS EXIST IN THIS DATABASE, so matching shiftDate
      exactly finds only one of them:
 
@@ -239,21 +239,43 @@ async function gatherDay(shiftDate, master) {
     breaks.push({ start: openBreak, end: events[events.length - 1].scanTime });
   }
 
-  const usedCodes = {};
-  for (const e of scans) for (const c of e.activeOps || []) usedCodes[String(c).trim()] = true;
+  /* PACE IS MEASURED ON THE SCANS THE REPORT IS ABOUT, NOT THE WHOLE FLOOR.
+     applyFilters() runs AFTER this function and rebuilds the totals, the rows
+     and the operator and machine lists — but it cannot rebuild pace, because
+     pace needs the scan events and it only has the flattened display rows. It
+     therefore used to pass `pace` through untouched, so a report filtered to
+     one person showed that person's garments beside the entire floor's
+     efficiency. Measured: filtering to GR0108 (6 garments) and to GR0045 (15)
+     both returned 19 garments and 11.7%, the unfiltered day.
 
-  const paceOps = paceByOperation(scans, samByCode, { breaks, detail: true });
+     Narrowing here instead fixes it once for every surface — the on-screen
+     block, the Excel sheet, the PDF section, the CSV header and the scan log
+     all read this same object. */
+  const paceScans = scans.filter((e) => {
+    if (filters.operatorId && String(e.operatorId) !== String(filters.operatorId)) return false;
+    if (filters.machineId && String(e.machineId) !== String(filters.machineId)) return false;
+    if (filters.productName) {
+      const wo = woInfo.get(String(e.workOrderKey || "")) || {};
+      if ((wo.productName || "") !== filters.productName) return false;
+    }
+    return true;
+  });
+
+  const usedCodes = {};
+  for (const e of paceScans) for (const c of e.activeOps || []) usedCodes[String(c).trim()] = true;
+
+  const paceOps = paceByOperation(paceScans, samByCode, { breaks, detail: true });
 
   /* §9 — PER OPERATOR, PER OPERATION. "Employee A — Stitching — XX%".
      Each person's own scans form their own sequence: two operators on one
      machine interleave in the raw stream, and measuring that stream would give
      each of them the other's gaps. Splitting first is what makes the figure
      belong to the person. */
-  const paceByOperator = paceByGroup(scans, (e) => e.operatorId, samByCode, { breaks });
+  const paceByOperator = paceByGroup(paceScans, (e) => e.operatorId, samByCode, { breaks });
 
   /* §10 already falls out of paceOps above (operation across all its scans),
      and the same grouping serves a machine or table. */
-  const paceByMachine = paceByGroup(scans, (e) => String(e.machineId), samByCode, { breaks });
+  const paceByMachine = paceByGroup(paceScans, (e) => String(e.machineId), samByCode, { breaks });
   /* One figure for the day: every operation's earned standard time over the
      time actually spent. A ratio of totals, never a mean of the per-operation
      percentages — the same rule that governs one operation's intervals governs
@@ -588,7 +610,7 @@ async function buildReport(opts = {}) {
 
   const master = await masterData.getMasterData();
   const days = [];
-  for (const d of dates) days.push(applyFilters(await gatherDay(d, master), filters));
+  for (const d of dates) days.push(applyFilters(await gatherDay(d, master, filters), filters));
 
   const sum = (f) => days.reduce((n, d) => n + (f(d) || 0), 0);
   const uniq = (f) => new Set(days.flatMap(f)).size;
