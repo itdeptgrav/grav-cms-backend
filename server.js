@@ -1888,6 +1888,13 @@ app.use("/api/cms/production/scanner", require(`${S_ROUTES}/scannerAdminRoutes.j
    /machine-intelligence paths and can never shadow one of that router's. */
 app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/machineIntelligenceRoutes.js`));
 
+/* Date-wise production report as a workbook. Its own narrow segment under
+ * /dashboard, mounted with the other scanner routers and carrying its own
+ * EmployeeAuthMiddleware the same way they do, so the mount position cannot
+ * quietly open it. Read-only: it writes nothing and computes no production
+ * figure of its own — every number is the rollup's or countDistinctPieces'. */
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/productionReportRoutes.js`));
+
 /* The production assistant — ask the floor a question in English.
  *
  * Its own narrow prefix, mounted AFTER the four routers above: a distinct
