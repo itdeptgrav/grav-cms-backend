@@ -663,9 +663,29 @@ async function buildReport(opts = {}) {
 }
 
 /** Options a filter UI can offer, drawn from the register rather than guessed. */
+/**
+ * The most recent shift day that has any scan on it.
+ *
+ * The dashboard opens on today, and on a day the floor has not run yet that
+ * means every card reads zero — which looks like a broken page rather than an
+ * idle morning. Knowing the last day with production lets the page offer to go
+ * there instead of leaving the reader to guess a date.
+ *
+ * @returns {Promise<string|null>} a YYYY-MM-DD shift day, or null if there has
+ *   never been a scan.
+ */
+async function latestDayWithData() {
+  const newest = await ProductionEvent.findOne({ type: "scan" })
+    .sort({ shiftDate: -1 })
+    .select({ shiftDate: 1 })
+    .lean();
+  return newest?.shiftDate ? dayKeyOf(newest.shiftDate) : null;
+}
+
 async function filterOptions() {
   const master = await masterData.getMasterData();
   return {
+    latestDayWithData: await latestDayWithData(),
     operators: (master.operators || [])
       .map((e) => ({
         id: e.identityId || e.biometricId || "",
@@ -685,6 +705,7 @@ async function filterOptions() {
 module.exports = {
   buildReport,
   filterOptions,
+  latestDayWithData,
   periodRange,
   parseDayKey,
   dayKeyOf,
