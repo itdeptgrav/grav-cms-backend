@@ -565,6 +565,9 @@ const tallyVoucherSchema = new mongoose.Schema(
         "auto_from_payroll",
         "expense_module",
         "tally_import",
+        // A manual journal entry, posted from the Journal Entries page. The
+        // entry is the request; this voucher is what it did to the books.
+        "journal_entry",
       ],
       default: "manual",
     },

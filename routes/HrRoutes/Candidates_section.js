@@ -4,6 +4,11 @@ const JobPosting = require("../../models/HR_Models/JobPosting");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const Candidate = require("../../models/HR_Models/Candidates");
 const EmployeeTask = require("../../models/HR_Models/EmployeeTask");
+// Used to name the interviewer on a scored interview. It was referenced
+// without being required, so submitting interview scores threw
+// "HRDepartment is not defined" and returned a 500 — the same class of bug as
+// the missing billMatching import in the accountant module.
+const HRDepartment = require("../../models/HRDepartment");
 
 // Candidates share the Recruitment history with job postings - see the note in
 // JobPosting_Section.js.

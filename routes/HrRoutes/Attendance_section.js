@@ -28,6 +28,15 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 
 const mongoose = require("mongoose");
 const { recordChange } = require("../../services/changeLog");
+const AttendanceExclusion = require("../../models/HR_Models/AttendanceExclusion");
+const {
+  loadExclusionMap,
+  excludedBidsForMonth,
+  excludedForWholeRange,
+  excludedOnDate,
+  rollMembership,
+  leaveBidsInRange,
+} = require("../../services/attendanceRoster.service");
 // Push notifications — one fan-out to mobile (Expo) + web (FCM).
 // Fire-and-forget: never awaited, never able to fail an HR decision.
 const {
@@ -239,6 +248,16 @@ const extractDesignation = (e) =>
   "—";
 const extractBiometricId = (e) =>
   e?.biometricId || e?.basicInfo?.biometricId || e?.workInfo?.biometricId || "";
+
+/* Whether the employee record still says they are with the company. Both
+   spellings are checked because both are in use, and a record carrying
+   neither is treated as current.
+
+   It is weaker evidence than it looks — there is no leaving date on the
+   employee model, and people who have left are routinely left flagged active
+   — so the roster only falls back to it when there is no attendance at all
+   to judge a period by. See services/attendanceRoster.service.js. */
+const onStaff = (e) => e?.isActive !== false && e?.status !== "inactive";
 
 function holidayTypeToStatus(type) {
   switch (type) {
@@ -1012,6 +1031,19 @@ async function smartSaveDay(
   settings,
   isToday,
 ) {
+  /* Anybody HR has taken off this month's register stays off it, however
+     many times the device is asked again. This is the half of "remove from
+     month" that was missing: the removal deleted the rows that existed and
+     the next sync wrote them back, so the button appeared to do nothing.
+
+     Applied to BOTH the fresh rows and the merge below — the merge carries
+     forward any existing row the device no longer reports, which would
+     otherwise resurrect somebody removed after their rows were written. */
+  const excludedBids = await excludedBidsForMonth(String(dateStr).slice(0, 7));
+  const onRoll = (e) =>
+    !excludedBids.has(String(e.biometricId || "").toUpperCase());
+  if (excludedBids.size) freshEmployees = freshEmployees.filter(onRoll);
+
   if (!existingDoc || existingDoc.employees.length === 0) {
     await DailyAttendance.updateOne(
       { dateStr },
@@ -1044,6 +1076,7 @@ async function smartSaveDay(
   });
   const freshBids = new Set(freshEmployees.map((e) => e.biometricId));
   for (const old of existingDoc.employees) {
+    if (!onRoll(old)) continue; // removed from this month — see above
     if (!freshBids.has(old.biometricId))
       mergedEmployees.push(old.toObject ? old.toObject() : { ...old });
   }
@@ -2641,10 +2674,15 @@ async function getDailyAttendance(date, department) {
       const presentBids = new Set(
         (dayDoc.employees || []).map((e) => e.biometricId),
       );
+      /* Somebody HR removed from this month is off the register here too.
+         The sheet and the screen have to give the same answer, or the
+         removal looks like it half-worked. */
+      const excludedHere = await excludedBidsForMonth(String(date).slice(0, 7));
       const absentEntries = [];
       for (const emp of allActive) {
         const bid = String(extractBiometricId(emp) || "").toUpperCase();
         if (!bid || presentBids.has(bid)) continue;
+        if (excludedHere.has(bid)) continue;
         if (
           department &&
           department !== "all" &&
@@ -3114,10 +3152,21 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
     const settings = await AttendanceSettings.getConfig();
     const _n = new Date(Date.now() + 330 * 60 * 1000);
     const todayStr = `${_n.getUTCFullYear()}-${String(_n.getUTCMonth() + 1).padStart(2, "0")}-${String(_n.getUTCDate()).padStart(2, "0")}`;
-    const filteredActive =
+    const _summaryExclusions = await loadExclusionMap(from, to);
+    const filteredActive = (
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
-        : allActive;
+        : allActive
+    ).filter(
+      // Off the roll for every month in this window — see the export.
+      (e) =>
+        !excludedForWholeRange(
+          _summaryExclusions,
+          String(extractBiometricId(e) || "").toUpperCase(),
+          from,
+          to,
+        ),
+    );
     const days = await DailyAttendance.find({
       dateStr: { $gte: from, $lte: to },
     })
@@ -4281,22 +4330,13 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     dayDoc.markModified("employees");
     await dayDoc.save();
 
-    // Log HR action
-    try {
-      await logHRAction({
-        actionType: "hr_override",
-        performedBy: req.user?.id,
-        employeeId: emp.employeeDbId,
-        biometricId: bid,
-        dateStr,
-        oldStatus,
-        newStatus: emp.hrFinalStatus || emp.systemPrediction,
-        remarks: hrRemarks,
-        punchChanges,
-      });
-    } catch (logErr) {
-      console.error("[DAY-OVERRIDE] Log error:", logErr.message);
-    }
+    /* The HR action is logged by the recordChange() below, which records the
+       status change, the remarks and every edited punch.
+
+       A second call to a logHRAction() that is defined nowhere in the repo
+       used to sit here. It threw ReferenceError on every override, the
+       surrounding try/catch swallowed it into a console line, and the audit
+       it looked like it was writing never existed. */
 
     // ── Sync leaves (handles full-day L-CL/L-SL/L-EL AND half-day P/CL/P/SL/P/PL) ──
     // We compute a per-bucket delta between oldStatus and newStatus and apply it
@@ -4669,24 +4709,8 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
     dayDoc.markModified("employees");
     await dayDoc.save();
 
-    // Log HR action
-    try {
-      await logHRAction({
-        actionType: "punch_correction",
-        performedBy: req.user?.id,
-        employeeId: emp.employeeDbId,
-        biometricId: bid,
-        dateStr,
-        oldStatus,
-        newStatus: emp.hrFinalStatus || emp.systemPrediction,
-        remarks: hrRemarks,
-        punchChanges: [
-          { punchType, action, oldTime, newTime: punchTime || "—" },
-        ],
-      });
-    } catch (logErr) {
-      console.error("[PUNCH-CORRECTION] Log error:", logErr.message);
-    }
+    /* Logged by the recordChange() below — see the note on the same dead
+       logHRAction() call in the day-override route above. */
 
     // A punch edit moves the worked minutes, which moves overtime and pay.
     // Both the punch and whatever the status became are recorded, because a
@@ -4837,6 +4861,44 @@ router.delete(
         { yearMonth, "employees.biometricId": bid },
         { $pull: { employees: { biometricId: bid } } },
       );
+
+      /* Deleting the rows is not the removal; it is one of its consequences.
+         The other, and the load-bearing one, is this record.
+
+         Pulling alone could only ever remove what had already been written,
+         and the sync writes more afterwards — every one of the five removals
+         performed on this database on 2 Sep 2026 reported "0 day record(s)
+         deleted", because September was two days old, and all five people had
+         September rows again a week later. So the fact that they are off the
+         roll for this month is stored, and the sync, the register and the
+         sheet all honour it.
+
+         Upserted, so pressing the button a second time is not an error; the
+         original removedAt is kept because that is when the decision was
+         actually taken. */
+      const who = await Employee.findOne({ biometricId: bid })
+        .select("firstName lastName name")
+        .lean();
+      await AttendanceExclusion.updateOne(
+        { biometricId: bid, yearMonth },
+        {
+          $set: {
+            employeeName:
+              (who &&
+                (who.name ||
+                  `${who.firstName || ""} ${who.lastName || ""}`.trim())) ||
+              "",
+            daysRemovedAtTime: result.modifiedCount,
+            reason: String(req.query.reason || req.body?.reason || ""),
+          },
+          $setOnInsert: {
+            removedAt: new Date(),
+            removedBy: req.user?.id || req.user?._id || null,
+            removedByName: req.user?.name || req.user?.email || "",
+          },
+        },
+        { upsert: true },
+      );
       // Removing somebody from a month deletes attendance rows outright. It is
       // the only destructive action on this page and the one most likely to be
       // asked about, so it is logged as a delete with the day count named.
@@ -4849,16 +4911,26 @@ router.delete(
         action: "delete",
         summary:
           `Removed ${bid} from the attendance register for ${yearMonth} — ` +
-          `${result.modifiedCount} day record(s) deleted. This cannot be undone from the UI; ` +
-          `the days must be re-synced from the biometric device to come back.`,
+          `${result.modifiedCount} day record(s) deleted, and they are now held ` +
+          `off the roll for that month, so a later sync will not re-add them. ` +
+          `They stay on every other month's register. Reversible with ` +
+          `"restore to month", after which the days return on the next sync.`,
         before: { biometricId: bid, yearMonth, daysPresent: result.modifiedCount },
         after: { daysPresent: 0 },
       });
 
+      /* "Removed from 0 day(s)" read like a failure and was the normal result
+         when the month had not been synced for this person yet. It is the
+         exclusion that matters, so that is what the message reports. */
       res.json({
         success: true,
-        message: `Removed ${bid} from ${result.modifiedCount} day(s) in ${yearMonth}`,
+        message:
+          `${bid} is off the attendance register for ${yearMonth}` +
+          (result.modifiedCount
+            ? ` — ${result.modifiedCount} day record(s) deleted.`
+            : ` — no day records had been written yet; future syncs will skip them.`),
         daysModified: result.modifiedCount,
+        excluded: true,
       });
     } catch (err) {
       console.error("[REMOVE-FROM-MONTH]", err.message);
@@ -4866,6 +4938,79 @@ router.delete(
     }
   },
 );
+
+/* The way back. Removal is now durable, which makes an accidental removal
+   permanent unless there is a door out of it — and the person who pressed the
+   button by mistake is exactly the person who needs one.
+
+   This clears the hold. It does not re-create the deleted rows: those come
+   back from the device on the next sync of that month, which is the only
+   honest source for them. */
+router.post("/restore-to-month", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const biometricId = req.body?.biometricId || req.query.biometricId;
+    const yearMonth = req.body?.yearMonth || req.query.yearMonth;
+    if (!biometricId || !yearMonth)
+      return res.status(400).json({
+        success: false,
+        message: "biometricId and yearMonth required",
+      });
+    if (!/^\d{4}-\d{2}$/.test(yearMonth))
+      return res
+        .status(400)
+        .json({ success: false, message: "yearMonth must be YYYY-MM" });
+
+    const bid = String(biometricId).toUpperCase();
+    const removed = await AttendanceExclusion.findOneAndDelete({
+      biometricId: bid,
+      yearMonth,
+    }).lean();
+
+    if (!removed)
+      return res.status(404).json({
+        success: false,
+        message: `${bid} is not being held off ${yearMonth}`,
+      });
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "attendance-day",
+      entityId: `${bid}:${yearMonth}`,
+      entityLabel: `${bid} · ${yearMonth}`,
+      action: "update",
+      summary:
+        `Restored ${bid} to the attendance register for ${yearMonth}. ` +
+        `Their days return on the next sync of that month.`,
+      before: { excluded: true, removedAt: removed.removedAt },
+      after: { excluded: false },
+    });
+
+    res.json({
+      success: true,
+      message: `${bid} is back on the register for ${yearMonth}. Re-sync that month to bring the days back.`,
+    });
+  } catch (err) {
+    console.error("[RESTORE-TO-MONTH]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* Who is currently held off which month — so the UI can show it, and so a
+   person wondering why somebody is missing from a sheet has somewhere to
+   look. */
+router.get("/roster-exclusions", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { yearMonth } = req.query;
+    const q = yearMonth ? { yearMonth } : {};
+    const rows = await AttendanceExclusion.find(q)
+      .sort({ yearMonth: -1, biometricId: 1 })
+      .lean();
+    res.json({ success: true, count: rows.length, exclusions: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
   try {
@@ -4905,16 +5050,16 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         restStatus: resolveRestDayStatus(dateStr, dow, holidayMap),
       });
     }
-    const allActive = await Employee.find({
-      $or: [
-        { status: "active" },
-        { status: { $exists: false } },
-        { isActive: true },
-      ],
-    })
+    /* Everybody, narrowed to this month's roll below.
+       Filtering to active employees HERE is what kept people who left off
+       this screen entirely — a leaver who worked all of July was missing from
+       July's screen while being present on July's Excel. Who was on the roll
+       is a question about the month, not about the employee record, and it is
+       answered once, in the roster service. */
+    const allActive = await Employee.find({})
       .select(ATTENDANCE_EMPLOYEE_PROJECTION)
       .lean();
-    const filteredActive =
+    const _deptFiltered =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
@@ -4930,6 +5075,38 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       if (!b || dojByBid.has(b) || !emp.dateOfJoining) continue;
       dojByBid.set(b, new Date(emp.dateOfJoining).toISOString().split("T")[0]);
     }
+    /* The same roll this month's Excel is built from — literally the same
+       function. This screen is the sheet on screen; if the two disagreed
+       about who was there, one of them would be lying. */
+    const _musterSeen = new Set();
+    for (const d of dayDocs)
+      for (const e of d.employees || []) {
+        const b = String(e.biometricId || "").toUpperCase();
+        if (b) _musterSeen.add(b);
+      }
+    let _musterLeave = new Set();
+    let _musterLeaveUnknown = false;
+    if (_musterSeen.size) {
+      try {
+        _musterLeave = await leaveBidsInRange(getLeaveApplication(), from, to);
+      } catch {
+        _musterLeaveUnknown = true;
+      }
+    }
+    const _musterOnRoll = rollMembership({
+      from,
+      to,
+      seenInRange: _musterSeen,
+      lastRegisterDay: dayDocs.length ? dayDocs[dayDocs.length - 1].dateStr : null,
+      exclusionMap: await loadExclusionMap(from, to),
+      dojByBid,
+      onLeaveInRange: _musterLeave,
+      leaveUnknown: _musterLeaveUnknown,
+    });
+    const filteredActive = _deptFiltered.filter((e) =>
+      _musterOnRoll(extractBiometricId(e), onStaff(e)),
+    );
+
     const employees = [],
       running = new Map();
     const PAID_CODES = [
@@ -5351,10 +5528,14 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
     })
       .select(ATTENDANCE_EMPLOYEE_PROJECTION)
       .lean();
-    const filteredActive =
+    const _dayExcluded = await excludedBidsForMonth(String(date).slice(0, 7));
+    const filteredActive = (
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
-        : allActive;
+        : allActive
+    ).filter(
+      (e) => !_dayExcluded.has(String(extractBiometricId(e) || "").toUpperCase()),
+    );
     const byBio = new Map();
     if (dayDoc)
       for (const e of dayDoc.employees || []) byBio.set(e.biometricId, e);
@@ -6283,15 +6464,37 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       };
       return map[status] || "";
     }
-    const allActive = await Employee.find({
-      $or: [
-        { status: "active" },
-        { status: { $exists: false } },
-        { isActive: true },
-      ],
-    })
+    /* ── WHO BELONGS ON A MUSTER ROLL FOR *THIS* PERIOD ──────────────────
+       A muster roll records who was on the roll during a period, so the
+       roster has to be bounded at BOTH ends. Only one end was: `dojByBid`
+       below already renders days before somebody joined as "--", but nothing
+       marked the other side, and this query asked a single time-blind
+       question — "who is active right now".
+
+       That was wrong in both directions at once:
+
+         • Somebody who left in August still counted as active until HR got
+           round to deactivating them, so September's sheet listed them with
+           every day marked A — a month of absence for a person who was not
+           employed.
+         • The moment HR DID deactivate them they vanished from every sheet
+           ever written, including August, when they worked the whole month.
+           A muster roll that loses a past employee is not a record.
+
+       There is no leaving date on the employee model to bound it with, so
+       ATTENDANCE is the evidence: a daily document carries a row for every
+       person on the roll that day, absences included — 6 of the 81 rows on
+       2026-08-01 are AB with no punches. A row means "on the roll that day";
+       none across a whole range means they were not.
+
+       Everyone is fetched here and filtered below, once the range's
+       attendance has been read. */
+    const rosterCandidates = await Employee.find({})
       .select(ATTENDANCE_EMPLOYEE_PROJECTION)
       .lean();
+    /* Kept under the old name so the DOJ map and the department filter below
+       read unchanged; narrowed to the period further down. */
+    const allActive = rosterCandidates;
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
@@ -6316,6 +6519,89 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       .sort({ dateStr: 1 })
       .lean();
     const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
+
+    /* ── THE PERIOD'S ROLL, AND WHEN EACH PERSON LEFT IT ──────────────────
+       Every biometric id appearing anywhere in this range, and the LAST date
+       each appears on. Together they answer both questions the sheet needs:
+       was this person on the roll at all, and from which day were they not. */
+    const seenInRange = new Set();
+    const lastSeenInRange = new Map();
+    for (const doc of dayDocs) {
+      for (const e of doc.employees || []) {
+        const b = String(e.biometricId || "").toUpperCase();
+        if (!b) continue;
+        seenInRange.add(b);
+        lastSeenInRange.set(b, doc.dateStr); // dayDocs are sorted ascending
+      }
+    }
+
+    /* An ex-employee belongs on this sheet only if they were on the roll
+       during it. Active people are always kept: they are on the roll by
+       definition, and a sync that has not run must never delete anybody from
+       a muster roll. */
+    /* HR's own answer, where they have given one. "Remove from month" is a
+       statement that somebody was not on the roll for that month, and it
+       outranks anything inferred from rows — not least because the rows it
+       contradicts are the ones a later sync wrote back. */
+    const exclusionMap = await loadExclusionMap(from, to);
+
+    /* Somebody who was not on the roll for this period is not a row on this
+       sheet — whether they were formally removed, marked inactive, or simply
+       are not there any more. The employee record cannot answer it: there is
+       no leaving date on it, and four of the five people removed from this
+       register are still flagged active. Attendance is the evidence.
+
+       A daily document carries a row for everybody the device reported, so
+       "no row on any day of this period" is a real statement about the roll.
+       Three things must never be mistaken for it, and each is a guard below:
+       a period nothing has been written for yet, somebody who joined during
+       it, and somebody away on approved leave for the whole of it. */
+    /* The last day this period's register actually holds, which is not the
+       same as the last day of the period: for the current month it is however
+       far the sync has got. */
+    const lastRegisterDay = dayDocs.length
+      ? dayDocs[dayDocs.length - 1].dateStr
+      : null;
+
+    /* Away, but still employed. One query, and only when it can change an
+       answer. If it fails, keep everybody rather than drop somebody on the
+       strength of a query that did not run. */
+    let onLeaveInRange = new Set();
+    let leaveUnknown = false;
+    if (seenInRange.size) {
+      try {
+        onLeaveInRange = await leaveBidsInRange(getLeaveApplication(), from, to);
+      } catch {
+        leaveUnknown = true;
+      }
+    }
+
+    /* The decision itself lives in the roster service, so this sheet and the
+       muster-roll screen cannot answer it differently. */
+    const onRoll = rollMembership({
+      from,
+      to,
+      seenInRange,
+      lastRegisterDay,
+      exclusionMap,
+      dojByBid,
+      onLeaveInRange,
+      leaveUnknown,
+    });
+    const onRollThisPeriod = (emp) =>
+      onRoll(extractBiometricId(emp), onStaff(emp));
+
+    /* Nobody appears after their last day on the roll, just as nobody appears
+       before they joined. For somebody who has left, that last day is the
+       last attendance row they have; the days after it render "--" and are
+       counted in no total. */
+    const lastDayByBid = new Map();
+    for (const emp of rosterCandidates) {
+      if (emp.isActive !== false && emp.status !== "inactive") continue;
+      const bid = String(extractBiometricId(emp) || "").toUpperCase();
+      const last = bid && lastSeenInRange.get(bid);
+      if (last) lastDayByBid.set(bid, last);
+    }
 
     // ── Build promotion map: replay applyLateCountPromotion across the ──
     // range in date order so LHD/LAB/EAB show up in the export just like
@@ -6383,10 +6669,26 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         },
       };
       const dojStr = dojByBid.get(String(key).toUpperCase()) || null;
+      /* The other end of the same rule. For somebody who has left, days after
+         their last day on the roll are "--" and count towards nothing — the
+         mirror of the pre-joining case below. Without it a person who left
+         mid-month carried a fortnight of A's they were never absent for. */
+      const lastStr = lastDayByBid.get(String(key).toUpperCase()) || null;
       for (const cal of allDays) {
         // Pre-joining days: "--" in the cell, nothing counted — not WO, not
         // holidays, not absences. The person wasn't on the payroll yet.
         if (dojStr && cal.dateStr < dojStr) {
+          row.dayCodes[cal.dateStr] = "--";
+          continue;
+        }
+        if (lastStr && cal.dateStr > lastStr) {
+          row.dayCodes[cal.dateStr] = "--";
+          continue;
+        }
+        /* Removed from THIS month but not from the whole range — a quarterly
+           sheet for somebody who left in September shows August in full and
+           September as days they were not on the roll for. */
+        if (excludedOnDate(exclusionMap, key, cal.dateStr)) {
           row.dayCodes[cal.dateStr] = "--";
           continue;
         }
@@ -6570,6 +6872,10 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     }
     const processedBids = new Set();
     for (const emp of filteredActive) {
+      /* Not on the roll during this period — see onRollThisPeriod. This is
+         what keeps somebody who left in August off September's sheet, and it
+         is also what keeps them ON August's. */
+      if (!onRollThisPeriod(emp)) continue;
       const bid = extractBiometricId(emp);
       if (!bid) continue;
       const key = String(bid).toUpperCase();
@@ -8856,3 +9162,7 @@ module.exports.computeDay = computeDay;
 // Exported so the read-only Daily Attendance AI assistant builds its context
 // from the SAME computation the HR daily page uses, rather than a second copy.
 module.exports.getDailyAttendance = getDailyAttendance;
+// Exported so the removal check can drive a sync write without calling the
+// biometric device. This is the function the "remove from month" fix turns
+// on: it is what used to write a removed employee's rows straight back.
+module.exports.smartSaveDay = smartSaveDay;
