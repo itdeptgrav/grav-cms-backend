@@ -434,6 +434,26 @@ router.get("/overview-summary", async (req, res) => {
         }),
         operations: [...o.operations],
         opsWithoutSam: [...o.operations].filter((c) => !samByCode.has(String(c).trim())),
+
+        // Each operation this person ran, with its own standard time. The
+        // percentage on its own invites the question "which operations is that
+        // counting?", and until now the answer lived only in the operation
+        // registry. Sending it with the row lets the screen answer it.
+        operationDetail: [...o.operations].map((c) => {
+          const code = String(c).trim();
+          const m = samByCode.get(code);
+          return { code, samMinutes: m ? Math.round(m * 100) / 100 : null };
+        }),
+
+        // The REALISED average — samMinutes as actually recorded, over the
+        // pieces that carried a standard. Not the sum of the operation list:
+        // those diverge the moment the assigned set changes mid-shift, and this
+        // is the one the percentage was computed from, so it is the one that
+        // can be checked against it.
+        avgSamPerPiece: o.piecesWithSam
+          ? Math.round((o.samMinutes / o.piecesWithSam) * 100) / 100
+          : null,
+        piecesWithSam: o.piecesWithSam,
         firstScanAt: o.firstScanAt,
         lastScanAt: o.lastScanAt,
         });
