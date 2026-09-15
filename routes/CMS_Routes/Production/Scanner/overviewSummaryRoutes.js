@@ -438,6 +438,12 @@ router.get("/overview-summary", async (req, res) => {
           breakMinutes: mWork.breakMinutes,
           efficiencyBasis: mWork.basis,
           samCoveragePercent: m.pieces ? Math.round((m.piecesWithSam / m.pieces) * 100) : null,
+          // Same realised average the operator rows carry, so "should take" is
+          // one definition across the whole page.
+          avgSamPerPiece: m.piecesWithSam
+            ? Math.round((m.samMinutes / m.piecesWithSam) * 100) / 100
+            : null,
+          piecesWithSam: m.piecesWithSam,
           efficiencyPercent: effPct(m.samMinutes, mWork.minutes, m.pieces, m.piecesWithSam, mWork.basis),
         efficiencyUnavailableReason: effUnavailable(m.samMinutes, mWork.minutes, m.pieces, m.piecesWithSam, mWork.basis),
           operators: [...m.operators].map((id) => ({
