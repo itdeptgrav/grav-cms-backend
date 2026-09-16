@@ -421,8 +421,25 @@ router.post(
     /* ── MANUFACTURING SNAPSHOTS ARE NOT TRUSTED ──────────────────────────
        There is no way to prove a manufacturing order belongs to this company,
        so a client-supplied MO id, number or customer name cannot be recorded
-       as fact. It is refused rather than stored unverified. */
-    if (objectId(manufacturingOrderId) || String(moNumber ?? "").trim() || String(customerName ?? "").trim()) {
+       as fact. It is refused rather than stored unverified.
+
+       ── STOOD DOWN WHILE THE LEGACY WINDOW IS OPEN ──────────────────────
+       The refusal exists to stop ONE company's adjustment citing ANOTHER
+       company's manufacturing order. While the migration window is open
+       there is a single company in this database and nothing to cross:
+       the same switch already lets every other Store screen read and write
+       unowned records.
+
+       What it cost, closed: the Issue/Return drawer on an order request
+       always sends the order it was opened from, so EVERY submit from that
+       screen answered 503 and no material could be issued against an order
+       at all (reported 16 Sep 2026).
+
+       It comes back with STORE_PURCHASE_STRICT_TENANCY=1, by which time
+       CustomerRequest and StockItem must carry company ownership -- the
+       cross-domain change this note has always named. */
+    if (!tenantContext.legacyWindowOpen() &&
+        (objectId(manufacturingOrderId) || String(moNumber ?? "").trim() || String(customerName ?? "").trim())) {
       return res.status(503).json({
         success: false, unavailable: MANUFACTURING_UNAVAILABLE,
         error: {
