@@ -34,12 +34,13 @@ const OperatorDayStats = require(`${B}/OperatorDayStats`);
 const S = "../barcodeScanner";
 const { shiftDateFor, currentShiftDate } = require(`${S}/shift`);
 const masterData = require(`${S}/masterData`);
+const productLookup = require(`${S}/productLookup`);
 const { countDistinctPieces, pieceKeyOf } = require(`${S}/rollupStats`);
 /* Pace against standard time, from scan-to-scan intervals. A separate question
    from the rollup's efficiency (earned minutes over attended time) and kept as a
    separate number — see paceCalculator's header for why neither substitutes for
    the other. */
-const { calculatePace, paceByOperation, paceByGroup } = require("./paceCalculator");
+const { calculatePace, paceByOperation, paceByGroup, rollupPace } = require("./paceCalculator");
 
 /** Widest range a single request may ask for. */
 const MAX_DAYS = 92;
@@ -226,17 +227,57 @@ async function gatherDay(shiftDate, master, filters = {}) {
     }
   }
 
+  /* ── When the operator was AWAY ────────────────────────────────────────
+   *
+   * Two things take somebody off the machine and both have to count the same
+   * way: a break card, and signing out altogether. Only breaks were collected
+   * here, so a sign-out was invisible to pace — an operator who signed out at
+   * 11:39:30 and back in at 11:43:06 had those 216 seconds charged to the next
+   * garment, which is a cycle time that includes time they were not at work.
+   *
+   * Filtered to the person the report is about when there is one. Another
+   * operator's lunch is not a gap in this operator's sequence, and the day's
+   * events contain everybody.
+   */
+  const awayOf = (e) =>
+    !filters.operatorId || String(e.operatorId || "") === String(filters.operatorId);
+
   const breaks = [];
   let openBreak = null;
   for (const e of events) {
+    if (!awayOf(e)) continue;
     if (e.type === "break_start") openBreak = e.scanTime;
     else if (e.type === "break_end" && openBreak) {
-      breaks.push({ start: openBreak, end: e.scanTime });
+      breaks.push({ start: openBreak, end: e.scanTime, kind: "break" });
       openBreak = null;
     }
   }
   if (openBreak && events.length) {
-    breaks.push({ start: openBreak, end: events[events.length - 1].scanTime });
+    breaks.push({
+      start: openBreak,
+      end: events[events.length - 1].scanTime,
+      kind: "break",
+    });
+  }
+
+  /* A signout opens an away span; the next signin closes it. A signout with no
+     signin after it runs to the last event of the day — the operator did not
+     come back, so nothing after it is theirs either. */
+  let openSignOut = null;
+  for (const e of events) {
+    if (!awayOf(e)) continue;
+    if (e.type === "signout") openSignOut = e.scanTime;
+    else if (e.type === "signin" && openSignOut) {
+      breaks.push({ start: openSignOut, end: e.scanTime, kind: "signed out" });
+      openSignOut = null;
+    }
+  }
+  if (openSignOut && events.length) {
+    breaks.push({
+      start: openSignOut,
+      end: events[events.length - 1].scanTime,
+      kind: "signed out",
+    });
   }
 
   /* PACE IS MEASURED ON THE SCANS THE REPORT IS ABOUT, NOT THE WHOLE FLOOR.
@@ -264,18 +305,39 @@ async function gatherDay(shiftDate, master, filters = {}) {
   const usedCodes = {};
   for (const e of paceScans) for (const c of e.activeOps || []) usedCodes[String(c).trim()] = true;
 
-  const paceOps = paceByOperation(paceScans, samByCode, { breaks, detail: true });
+  /* When the operator RESUMED work: the ID-card sign-in, and the end of a
+     break. The garment scanned after one is timed from it. Same operator filter
+     as the away spans — somebody else's sign-in does not start this clock. */
+  const anchors = [];
+  for (const e of events) {
+    if (!awayOf(e)) continue;
+    if (e.type === "signin") anchors.push({ at: e.scanTime, kind: "sign-in" });
+    else if (e.type === "break_end") anchors.push({ at: e.scanTime, kind: "break end" });
+  }
+
+  const paceOps = paceByOperation(paceScans, samByCode, {
+    boundaries: breaks,
+    anchors,
+    detail: true,
+  });
 
   /* §9 — PER OPERATOR, PER OPERATION. "Employee A — Stitching — XX%".
      Each person's own scans form their own sequence: two operators on one
      machine interleave in the raw stream, and measuring that stream would give
      each of them the other's gaps. Splitting first is what makes the figure
      belong to the person. */
-  const paceByOperator = paceByGroup(paceScans, (e) => e.operatorId, samByCode, { breaks });
+  /* THE SAME OPTIONS AS THE FLOOR FIGURE ABOVE. Dropping `anchors` here meant a
+     group's first garment after a sign-in or a break end was not timed from it,
+     so the group lost intervals the floor figure counted: on 2026-09-16 the one
+     operator on the floor came out at 22.1% against the floor's 42.4%, from the
+     same scans. A per-person number that cannot reproduce the floor number it
+     is a part of is not a measurement of that person. */
+  const paceGroupOpts = { boundaries: breaks, anchors };
+  const paceByOperator = paceByGroup(paceScans, (e) => e.operatorId, samByCode, paceGroupOpts);
 
   /* §10 already falls out of paceOps above (operation across all its scans),
      and the same grouping serves a machine or table. */
-  const paceByMachine = paceByGroup(paceScans, (e) => String(e.machineId), samByCode, { breaks });
+  const paceByMachine = paceByGroup(paceScans, (e) => String(e.machineId), samByCode, paceGroupOpts);
   /* One figure for the day: every operation's earned standard time over the
      time actually spent. A ratio of totals, never a mean of the per-operation
      percentages — the same rule that governs one operation's intervals governs
@@ -293,25 +355,43 @@ async function gatherDay(shiftDate, master, filters = {}) {
      that one interval.
 
      So: a garment-interval contributes its elapsed seconds ONCE, and earns the
-     SAM of every operation it completed. */
-  const earnedByInterval = new Map(); // prevAt|at|barcode -> {seconds, sam}
-  for (const o of paceOps) {
-    if (!(o.samSeconds > 0)) continue;
-    for (const row of o.rows || []) {
-      if (!row.counted) continue;
-      const k = `${new Date(row.previousAt).getTime()}|${new Date(row.at).getTime()}|${row.barcodeId}`;
-      const cur = earnedByInterval.get(k);
-      if (cur) cur.sam += o.samSeconds;
-      else earnedByInterval.set(k, { seconds: row.intervalSeconds, sam: o.samSeconds });
+     SAM of every operation it completed.
+
+     The rule now lives in rollupPace(), which paceByGroup() applies to every
+     operator and every machine — so a person's figure and the floor figure they
+     are part of are produced by one piece of code, not two that agree today.
+
+     THE FLOOR FIGURE IS THE SUM OF THE STATIONS, NOT ONE SEQUENCE OVER ALL OF
+     THEM. rollupPace(paceOps) measures a single sequence built from every scan
+     on the floor, so with more than one station running the same operation the
+     sequence interleaves and a "gap" becomes the time between a garment on one
+     machine and a garment on another. That gap is nobody's cycle time, and it
+     shrinks as the floor gets busier while each interval still earns a full
+     SAM — so the percentage climbs with machine count.
+
+     Measured: two machines each finishing one garment per 100s against a 100s
+     standard is exactly 100%. Read as one sequence it comes out at 200%, because
+     the interleaved gaps are 50s. On this floor's 54 machines the error scales
+     with however many stations run at once.
+
+     A machine is the unit because garments physically flow through it one at a
+     time, and every scan carries a machineId. Intervals within a machine are
+     already deduped by rollupPace; intervals in different machines are disjoint,
+     so summing across machines double-counts nothing. */
+  const paceTotals = (() => {
+    let sam = 0;
+    let actual = 0;
+    let intervals = 0;
+    for (const g of paceByMachine) {
+      sam += g.totalSamSeconds || 0;
+      actual += g.totalActualSeconds || 0;
+      intervals += g.intervals || 0;
     }
-  }
-  let paceSam = 0;
-  let paceActual = 0;
-  for (const v of earnedByInterval.values()) {
-    paceSam += v.sam;
-    paceActual += v.seconds;
-  }
-  const paceIntervalCount = earnedByInterval.size;
+    return { totalSamSeconds: sam, totalActualSeconds: actual, intervals };
+  })();
+  const paceSam = paceTotals.totalSamSeconds;
+  const paceActual = paceTotals.totalActualSeconds;
+  const paceIntervalCount = paceTotals.intervals;
 
   /* GARMENTS PER MACHINE AND PER OPERATOR, COUNTED HERE.
      The rollup's stored totalPieces is authoritative only for shifts it has
@@ -341,6 +421,174 @@ async function gatherDay(shiftDate, master, filters = {}) {
     machineScans.set(mk, (machineScans.get(mk) || 0) + 1);
   }
 
+  /* WHAT ONE OPERATOR'S DAY ACTUALLY LOOKED LIKE.
+     A piece count alone hides most of it. On 2026-08-29 one operator made 63
+     barcode reads that resolved to 26 garments — the other 37 were re-reads of
+     tickets already counted, and a report that prints only "26" gives a manager
+     no way to see that the scanner was being used twice per garment. The same
+     operator signed in six separate times; on 2026-09-16 another signed in ten
+     times. Sessions and machines are how "this person moved around today" is
+     said in a report.
+
+     Scans and repeats are aggregated FROM scanRows rather than recounted, so
+     they cannot disagree with the scan sheet: countsAsProduction is the single
+     decision about whether a read was a repeat, made once, above. */
+  const operatorDetail = new Map();
+  const detailFor = (id) => {
+    const k = String(id || "");
+    let d = operatorDetail.get(k);
+    if (!d) {
+      d = {
+        scans: 0,
+        repeatScans: 0,
+        pieces: 0,
+        firstScanAt: null,
+        lastScanAt: null,
+        machines: new Map(),
+        sessions: [],
+      };
+      operatorDetail.set(k, d);
+    }
+    return d;
+  };
+
+  /* REPEATS ARE COUNTED PER OPERATOR HERE, NOT ACROSS THE FLOOR.
+     scanRows marks a read as a repeat if that garment was seen ANYWHERE earlier
+     in the day, which is the right rule for the floor total — a garment is one
+     garment however many people touched it. It is the wrong rule inside one
+     person's row: on 2026-09-12 two garments were scanned by both operators, so
+     the second operator's machine lines summed to 13 against their own total of
+     15, and a manager reading a row whose parts do not add up stops trusting
+     the page. Within a row the question is "how many did THIS person handle",
+     so the dedupe is per operator, which is also exactly how `garments` above
+     is counted — the row and its total are then the same arithmetic.
+     The floor total and the sum of the operator rows can therefore differ, and
+     the report says so where both appear. */
+  const seenByOperator = new Map();
+  const seenByOperatorMachine = new Map();
+  for (const e of scans) {
+    if (!e.barcodeId || !e.operatorId) continue;
+    const ok = String(e.operatorId);
+    const mk = String(e.machineId);
+    const piece = pieceKeyOf(e);
+    const d = detailFor(ok);
+
+    let seen = seenByOperator.get(ok);
+    if (!seen) {
+      seen = new Set();
+      seenByOperator.set(ok, seen);
+    }
+    const firstForOperator = !seen.has(piece);
+    seen.add(piece);
+
+    d.scans += 1;
+    if (firstForOperator) d.pieces += 1;
+    else d.repeatScans += 1;
+    if (!d.firstScanAt || e.scanTime < d.firstScanAt) d.firstScanAt = e.scanTime;
+    if (!d.lastScanAt || e.scanTime > d.lastScanAt) d.lastScanAt = e.scanTime;
+
+    let m = d.machines.get(mk);
+    if (!m) {
+      m = {
+        machineId: mk,
+        machineName: machineName.get(mk) || "Unknown machine",
+        scans: 0,
+        pieces: 0,
+        repeatScans: 0,
+      };
+      d.machines.set(mk, m);
+    }
+    const omKey = `${ok}|${mk}`;
+    let seenM = seenByOperatorMachine.get(omKey);
+    if (!seenM) {
+      seenM = new Set();
+      seenByOperatorMachine.set(omKey, seenM);
+    }
+    const firstForMachine = !seenM.has(piece);
+    seenM.add(piece);
+
+    m.scans += 1;
+    if (firstForMachine) m.pieces += 1;
+    else m.repeatScans += 1;
+  }
+
+  /* Sessions: each sign-in paired with the sign-out that closed it. One left
+     open at the end of the shift is reported open rather than dropped — a
+     person still on the floor is not a missing session. */
+  const openSession = new Map();
+  for (const e of events) {
+    const k = String(e.operatorId || "");
+    if (!k) continue;
+    if (e.type === "signin") {
+      const prev = openSession.get(k);
+      if (prev) {
+        /* A sign-in while one was already open. The card was read again without
+           a sign-out between — worth printing, because it is how a session ends
+           up spanning a break the operator thought they had booked. */
+        prev.endedAt = e.scanTime;
+        prev.closedBy = "next sign-in";
+        detailFor(k).sessions.push(prev);
+      }
+      openSession.set(k, {
+        startedAt: e.scanTime,
+        endedAt: null,
+        closedBy: "still open",
+        machineId: String(e.machineId || ""),
+        machineName: machineName.get(String(e.machineId)) || "",
+        scans: 0,
+        pieces: 0,
+      });
+    } else if (e.type === "signout") {
+      const s = openSession.get(k);
+      if (s) {
+        s.endedAt = e.scanTime;
+        s.closedBy = "signout";
+        detailFor(k).sessions.push(s);
+        openSession.delete(k);
+      }
+    }
+  }
+  for (const [k, s] of openSession) detailFor(k).sessions.push(s);
+  for (const d of operatorDetail.values()) {
+    d.sessions.sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+  }
+
+  /* Attribute each read to the session that was open when it happened, so a
+     session row can say what came off the machine during it. */
+  const seenBySession = new Map();
+  for (const e of scans) {
+    if (!e.barcodeId || !e.operatorId) continue;
+    const d = operatorDetail.get(String(e.operatorId));
+    if (!d) continue;
+    const t = new Date(e.scanTime).getTime();
+    const idx = d.sessions.findIndex(
+      (x) =>
+        new Date(x.startedAt).getTime() <= t &&
+        (!x.endedAt || new Date(x.endedAt).getTime() >= t)
+    );
+    if (idx < 0) {
+      /* A read with no sign-in open around it. Real: on 2026-09-12 an operator
+         has seven reads and no signin event at all. Counted so the session
+         lines and the row total can be reconciled instead of silently differing. */
+      d.scansOutsideSession = (d.scansOutsideSession || 0) + 1;
+      continue;
+    }
+    const s = d.sessions[idx];
+    const key = `${e.operatorId}|${idx}`;
+    let seen = seenBySession.get(key);
+    if (!seen) {
+      seen = new Set();
+      seenBySession.set(key, seen);
+    }
+    const piece = pieceKeyOf(e);
+    s.scans += 1;
+    if (!seen.has(piece)) s.pieces += 1;
+    seen.add(piece);
+  }
+
+  const paceOfOperator = new Map(paceByOperator.map((g) => [String(g.key), g]));
+  const paceOfMachine = new Map(paceByMachine.map((g) => [String(g.key), g]));
+
   // Per product, from the work order each scan belongs to.
   const productMap = new Map();
   for (const e of scans) {
@@ -363,6 +611,82 @@ async function gatherDay(shiftDate, master, filters = {}) {
     if (e.workOrderKey) row.workOrders.add(e.workOrderKey);
   }
 
+  /* ORDER PROGRESS — WHAT IS FINISHED AND WHAT IS STILL OWED.
+     A production report that says "9 garments" without saying "of 80" tells a
+     manager how busy the floor was and nothing about whether the order will
+     ship. The ordered quantity, the manufacturing-order number and the work
+     order's own status live on the work order, not on the scan, so they are
+     resolved here rather than counted.
+     `done` is this period's garments for that work order. It is NOT the order's
+     lifetime progress: a one-day report counts one day. The remaining figure is
+     therefore "still to do at the end of this period" only when the report
+     covers the order from its start, and the PDF says so rather than implying
+     a running total it cannot see. */
+  const woKeys = [...new Set(scans.map((e) => String(e.workOrderKey || "")).filter(Boolean))];
+  let woDetail = new Map();
+  if (woKeys.length) {
+    try {
+      woDetail = await productLookup.resolve(woKeys);
+    } catch {
+      /* Order progress is an enrichment. Losing it must not lose the report. */
+    }
+  }
+  const woPieces = new Map();
+  const woScans = new Map();
+  const woOperators = new Map();
+  const woMachines = new Map();
+  const woFirst = new Map();
+  const woLast = new Map();
+  for (const e of scans) {
+    const k = String(e.workOrderKey || "");
+    if (!k || !e.barcodeId) continue;
+    if (!woPieces.has(k)) {
+      woPieces.set(k, new Set());
+      woOperators.set(k, new Set());
+      woMachines.set(k, new Set());
+    }
+    woPieces.get(k).add(pieceKeyOf(e));
+    woScans.set(k, (woScans.get(k) || 0) + 1);
+    if (e.operatorId) woOperators.get(k).add(e.operatorName || nameFor(e.operatorId) || String(e.operatorId));
+    woMachines.get(k).add(machineName.get(String(e.machineId)) || "Unknown machine");
+    if (!woFirst.has(k) || e.scanTime < woFirst.get(k)) woFirst.set(k, e.scanTime);
+    if (!woLast.has(k) || e.scanTime > woLast.get(k)) woLast.set(k, e.scanTime);
+  }
+  const workOrders = woKeys
+    .map((k) => {
+      const d = woDetail.get(k) || {};
+      const done = woPieces.get(k)?.size ?? 0;
+      const ordered = d.orderQuantity != null ? d.orderQuantity : null;
+      return {
+        workOrderKey: k,
+        /* The garment keys, kept only long enough for buildReport to union them
+           across the period. A garment scanned on Monday and again on Friday is
+           one garment; summing two days' distinct counts made it two, and an
+           order of 20 reported 32 made. Stripped before the day is returned, so
+           no response carries them. */
+        _pieceKeys: [...(woPieces.get(k) || [])],
+        productName: d.productName || woInfo.get(k)?.productName || "(work order not in register)",
+        productCode: woInfo.get(k)?.productCode || "",
+        productCategory: d.productCategory || "",
+        productImage: d.productImage || null,
+        variant: d.variant || "",
+        customerName: d.customerName || woInfo.get(k)?.customerName || "",
+        moNumber: d.moNumber || null,
+        moStatus: d.moStatus || null,
+        workOrderStatus: d.workOrderStatus || "",
+        orderQuantity: ordered,
+        done,
+        remaining: ordered != null ? Math.max(0, ordered - done) : null,
+        percentDone: ordered > 0 ? Math.round((done / ordered) * 1000) / 10 : null,
+        scans: woScans.get(k) || 0,
+        operators: [...(woOperators.get(k) || [])].join(", "),
+        machines: [...(woMachines.get(k) || [])].join(", "),
+        firstScanAt: woFirst.get(k) || null,
+        lastScanAt: woLast.get(k) || null,
+      };
+    })
+    .sort((a, b) => b.done - a.done);
+
   const workedMinutes = operatorStats.reduce(
     (n, o) => n + (o.minutesLoggedIn || 0),
     0
@@ -379,6 +703,9 @@ async function gatherDay(shiftDate, master, filters = {}) {
       scanEvents: scans.length,
       repeatScans: Math.max(0, scans.length - pieces),
       allEvents: events.length,
+      /* Badge-ins at a machine. One person can have many in a day — ten on
+         2026-09-16 — and a report that shows only a piece count hides that. */
+      signIns: [...operatorDetail.values()].reduce((n, d) => n + d.sessions.length, 0),
       operators: new Set(scans.map((e) => e.operatorId).filter(Boolean)).size,
       machines: new Set(scans.map((e) => String(e.machineId))).size,
       orders: new Set(scans.map((e) => e.workOrderKey).filter(Boolean)).size,
@@ -410,6 +737,32 @@ async function gatherDay(shiftDate, master, filters = {}) {
       samConflicts: samConflicts.filter((c) => Object.prototype.hasOwnProperty.call(usedCodes, c.code)),
       pacePercent: paceActual > 0 ? Math.round((paceSam / paceActual) * 1000) / 10 : null,
     },
+    /* OUTPUT THROUGH THE DAY, in IST hours. A shift total says how much; this
+       says when, which is how a supervisor spots the hour the line stalled.
+       Garments are deduped inside the hour they were first scanned, so the
+       buckets add up to the day's piece count and a repeat read cannot invent
+       an extra garment in a later hour. */
+    hourly: (() => {
+      const buckets = new Map();
+      const counted = new Set();
+      for (const e of scans) {
+        if (!e.barcodeId) continue;
+        const h = new Date(new Date(e.scanTime).getTime() + IST_OFFSET_MIN * 60000).getUTCHours();
+        let b = buckets.get(h);
+        if (!b) {
+          b = { hour: h, pieces: 0, scans: 0 };
+          buckets.set(h, b);
+        }
+        b.scans += 1;
+        const k = pieceKeyOf(e);
+        if (!counted.has(k)) {
+          counted.add(k);
+          b.pieces += 1;
+        }
+      }
+      return [...buckets.values()].sort((a, b) => a.hour - b.hour);
+    })(),
+    workOrders,
     products: [...productMap.values()]
       .map((p) => ({
         productName: p.productName,
@@ -425,6 +778,20 @@ async function gatherDay(shiftDate, master, filters = {}) {
         operatorId: o.operatorId,
         operatorName: o.operatorName || nameFor(o.operatorId),
         garments: operatorPieces.get(String(o.operatorId))?.size ?? 0,
+        /* The day as it happened, not just its total. See operatorDetail above. */
+        scans: operatorDetail.get(String(o.operatorId))?.scans ?? 0,
+        repeatScans: operatorDetail.get(String(o.operatorId))?.repeatScans ?? 0,
+        firstScanAt: operatorDetail.get(String(o.operatorId))?.firstScanAt ?? null,
+        lastScanAt: operatorDetail.get(String(o.operatorId))?.lastScanAt ?? null,
+        machinesDetail: [...(operatorDetail.get(String(o.operatorId))?.machines?.values() ?? [])]
+          .sort((a, b) => b.pieces - a.pieces),
+        sessions: operatorDetail.get(String(o.operatorId))?.sessions ?? [],
+        scansOutsideSession: operatorDetail.get(String(o.operatorId))?.scansOutsideSession ?? 0,
+        /* The adopted efficiency, on the row it belongs to. */
+        pacePercent: paceOfOperator.get(String(o.operatorId))?.pacePercent ?? null,
+        paceSamSeconds: paceOfOperator.get(String(o.operatorId))?.totalSamSeconds ?? null,
+        paceActualSeconds: paceOfOperator.get(String(o.operatorId))?.totalActualSeconds ?? null,
+        paceIntervals: paceOfOperator.get(String(o.operatorId))?.intervals ?? 0,
         rollupGarments: o.totalPieces ?? null,
         minutesLoggedIn: o.minutesLoggedIn ?? null,
         productiveMinutes: o.productiveMinutes ?? null,
@@ -438,6 +805,30 @@ async function gatherDay(shiftDate, master, filters = {}) {
           .filter(Boolean)
           .join(", "),
         operations: (o.byOperation || []).map((b) => b.operationCode).join(", "),
+        /* Codes mean nothing to the person being measured. "AP002 Attach Pocket"
+           is readable on a printed sheet; "AP002" alone needs a lookup table
+           the operator does not have. */
+        operationNames: (o.byOperation || [])
+          .map((b) => {
+            const code = String(b.operationCode).trim();
+            const name = opName.get(code) || "";
+            return name ? `${code} ${name}` : code;
+          })
+          .join(", "),
+        /* THE TWO NUMBERS A SUPERVISOR ACTUALLY COMPARES, per garment.
+             should = the standard time for the work this person really did
+             took   = the attended time they really spent
+           Both divided by the same garment count, so should ÷ took is exactly
+           the efficiency in the column beside them — the arithmetic can be
+           checked by eye, which is the point of printing them. */
+        shouldSecPerPiece:
+          o.earnedMinutes > 0 && (operatorPieces.get(String(o.operatorId))?.size ?? 0) > 0
+            ? (o.earnedMinutes * 60) / operatorPieces.get(String(o.operatorId)).size
+            : null,
+        tookSecPerPiece:
+          o.availableMinutes > 0 && (operatorPieces.get(String(o.operatorId))?.size ?? 0) > 0
+            ? (o.availableMinutes * 60) / operatorPieces.get(String(o.operatorId)).size
+            : null,
       }))
       .sort((a, b) => (b.garments || 0) - (a.garments || 0)),
     machines: machineStats
@@ -450,6 +841,10 @@ async function gatherDay(shiftDate, master, filters = {}) {
         rollupGarments: m.totalPieces ?? null,
         scanEvents: machineScans.get(String(m.machineId)) ?? 0,
         suppressedRescans: m.suppressedRescans ?? null,
+        pacePercent: paceOfMachine.get(String(m.machineId))?.pacePercent ?? null,
+        paceSamSeconds: paceOfMachine.get(String(m.machineId))?.totalSamSeconds ?? null,
+        paceActualSeconds: paceOfMachine.get(String(m.machineId))?.totalActualSeconds ?? null,
+        paceIntervals: paceOfMachine.get(String(m.machineId))?.intervals ?? 0,
         operations: (m.byOperation || []).map((b) => b.operationCode).join(", "),
         operators: (m.operatorSpans || [])
           .map((s) => s.operatorName || nameFor(s.operatorId))
@@ -520,6 +915,12 @@ function applyFilters(day, filters) {
       workedMinutes: wantOperator ? day.totals.workedMinutes : null,
       breakMinutes: wantOperator ? day.totals.breakMinutes : null,
       idleMinutes: wantOperator ? day.totals.idleMinutes : null,
+      /* Sign-ins belong to the people in the filtered set, not to the floor —
+         spreading the day's figure through would have reported the whole
+         floor's badge-ins on a one-operator report. */
+      signIns: day.operators
+        .filter((o) => !wantOperator || String(o.operatorId) === wantOperator)
+        .reduce((n, o) => n + (o.sessions?.length || 0), 0),
     },
     products: day.products.filter((p) => !wantProduct || p.productName === wantProduct),
     operators: day.operators.filter(
@@ -646,6 +1047,7 @@ async function buildReport(opts = {}) {
       scanEvents: sum((d) => d.totals.scanEvents),
       repeatScans: sum((d) => d.totals.repeatScans),
       allEvents: sum((d) => d.totals.allEvents),
+      signIns: sum((d) => d.totals.signIns),
       workedMinutes: round1(sum((d) => d.totals.workedMinutes)),
       breakMinutes: round1(sum((d) => d.totals.breakMinutes)),
       idleMinutes: round1(sum((d) => d.totals.idleMinutes)),
@@ -680,7 +1082,72 @@ async function buildReport(opts = {}) {
       })(),
       scanRows: sum((d) => d.scanRows.length),
     },
-    days,
+    /* ORDER PROGRESS FOR THE WHOLE PERIOD, deduplicated across days.
+       Every other period figure can be summed from the days because a garment
+       belongs to one day. An ORDER does not: it runs across days, and the same
+       garment can be scanned on two of them. Summed, work order 359e717d
+       reported 32 garments made against 29 real ones — and against an order of
+       20, which is how it was noticed. Unioning the garment keys is the only
+       count that survives a range. */
+    workOrders: (() => {
+      const merged = new Map();
+      for (const d of days) {
+        for (const w of d.workOrders || []) {
+          let a = merged.get(w.workOrderKey);
+          if (!a) {
+            a = {
+              ...w,
+              keys: new Set(),
+              scans: 0,
+              operators: new Set(),
+              machines: new Set(),
+              firstScanAt: null,
+              lastScanAt: null,
+            };
+            delete a._pieceKeys;
+            merged.set(w.workOrderKey, a);
+          }
+          for (const k of w._pieceKeys || []) a.keys.add(k);
+          a.scans += w.scans || 0;
+          a.orderQuantity = a.orderQuantity ?? w.orderQuantity;
+          a.moNumber = a.moNumber || w.moNumber;
+          a.workOrderStatus = a.workOrderStatus || w.workOrderStatus;
+          for (const n of String(w.operators || "").split(",")) {
+            const v = n.trim();
+            if (v) a.operators.add(v);
+          }
+          for (const n of String(w.machines || "").split(",")) {
+            const v = n.trim();
+            if (v) a.machines.add(v);
+          }
+          if (w.firstScanAt && (!a.firstScanAt || w.firstScanAt < a.firstScanAt)) {
+            a.firstScanAt = w.firstScanAt;
+          }
+          if (w.lastScanAt && (!a.lastScanAt || w.lastScanAt > a.lastScanAt)) {
+            a.lastScanAt = w.lastScanAt;
+          }
+        }
+      }
+      return [...merged.values()]
+        .map((a) => {
+          const done = a.keys.size;
+          const ordered = a.orderQuantity != null ? a.orderQuantity : null;
+          return {
+            ...a,
+            keys: undefined,
+            done,
+            remaining: ordered != null ? Math.max(0, ordered - done) : null,
+            percentDone: ordered > 0 ? Math.round((done / ordered) * 1000) / 10 : null,
+            operators: [...a.operators].join(", "),
+            machines: [...a.machines].join(", "),
+          };
+        })
+        .sort((x, y) => y.done - x.done);
+    })(),
+    days: days.map((d) => ({
+      ...d,
+      workOrders: (d.workOrders || []).map(({ _pieceKeys, ...w }) => w),
+    })),
   };
 }
 

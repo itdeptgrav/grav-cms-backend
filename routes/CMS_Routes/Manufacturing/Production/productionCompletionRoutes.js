@@ -11,6 +11,9 @@ const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Ma
    the Project Manager's production tab did. See
    services/manufacturing/workOrderNumber.js. */
 const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
+/* Short-id -> work order, with an indexed aggregation and a cache. Reused here
+   so the preview and the barcode scanners resolve a work order the same way. */
+const productLookup = require("../../../../services/barcodeScanner/productLookup");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const parseBarcode = (barcodeId) => {
@@ -122,7 +125,29 @@ router.post("/fetch-order", async (req, res) => {
 // happen at packaging time (authoritative completion point).
 // ── DRY-RUN preview — checks without saving ─────────────────────────────────
 // Returns breakdown: total / valid / invalid / alreadyRecorded today / newToSave
-// ── DRY-RUN preview — checks format + WO existence + today's duplicates ──────
+// ── DRY-RUN preview — what "Save" will actually do, before it does it ────────
+//
+// THE PREVIEW AND THE SAVE MUST AGREE. They did not. /mark-done rejects a
+// barcode recorded on ANY previous day, and this preview only looked in today's
+// record — so every one of the 2,985 barcodes already saved on an earlier day
+// was reported "New to save", the dialog offered to save them, and the server
+// then refused. The dialog's own header promises "Barcodes already recorded
+// earlier are skipped by the server, never counted twice"; the check now looks
+// where the save looks, so the promise and the number are the same fact.
+//
+// EVERY BARCODE LANDS IN EXACTLY ONE BUCKET, and the buckets add up to the
+// total. The old shape had "valid" meaning "passed format AND order", printed
+// under a label reading "Valid format", beside an "Already recorded" and a
+// "New to save" that were subdivisions of it — six numbers where some summed to
+// the total and others summed to each other, with nothing saying which.
+//
+//   total = invalidFormat + notInOrder + beyondQuantity + alreadyRecorded + newToSave
+//
+// "NOT IN ANY ORDER" MEANS WHAT IT SAYS. It used to also count a barcode whose
+// unit number was higher than the quantity ordered — a garment that IS in an
+// order, on a work order that exists, just numbered beyond it. That is a
+// different problem with a different fix (check the order quantity, not the
+// barcode), so it is its own bucket.
 router.post("/preview", async (req, res) => {
   try {
     const { barcodes } = req.body;
@@ -131,69 +156,108 @@ router.post("/preview", async (req, res) => {
     }
     const uniqueBarcodes = [...new Set(barcodes.map((b) => b?.trim()).filter(Boolean))];
 
-    // ── Step 1: format check ──────────────────────────────────────────────────
-    const invalidFormat   = [];
-    const formatPassed    = []; // { bc, woShortId, unitNumber }
+    // ── Step 1: format ───────────────────────────────────────────────────────
+    const invalidFormat = [];
+    const formatPassed = []; // { bc, woShortId, unitNumber }
     for (const bc of uniqueBarcodes) {
       const parsed = parseBarcode(bc);
       if (!parsed.success) invalidFormat.push(bc);
       else formatPassed.push({ bc, woShortId: parsed.woShortId, unitNumber: parsed.unitNumber });
     }
 
-    // ── Step 2: WO existence check (batch) ───────────────────────────────────
-    // woShortId = last 8 chars of WO _id — fetch all WOs once and build a map
-    const uniqueShortIds = [...new Set(formatPassed.map((f) => f.woShortId))];
-    const allWOs = uniqueShortIds.length
-      ? await WorkOrder.find({}).select("_id workOrderNumber quantity").lean()
-      : [];
-    const woByShortId = new Map(allWOs.map((w) => [w._id.toString().slice(-8), w]));
+    // ── Step 2: does the work order exist, and does the unit fit it? ─────────
+    /* productLookup resolves a short id with one indexed aggregation and caches
+       the answer. The previous code read EVERY work order in the collection on
+       every keystroke-sized preview to build the same map by hand. */
+    const shortIds = [...new Set(formatPassed.map((f) => f.woShortId))];
+    let woByShortId = new Map();
+    if (shortIds.length) {
+      try {
+        woByShortId = await productLookup.resolve(shortIds);
+      } catch (err) {
+        console.error("preview: work order lookup failed:", err.message);
+      }
+    }
 
-    const invalidOrder   = []; // valid format but WO not found or unit exceeds qty
-    const invalidOrderDetails = []; // { bc, reason }
-    const orderPassed    = []; // barcodes that passed both checks
+    const notInOrder = [];      // no such work order
+    const beyondQuantity = [];  // work order exists, unit number past what was ordered
+    const invalidDetails = [];  // { bc, reason }
+    const passed = [];          // real garments on real orders
 
     for (const { bc, woShortId, unitNumber } of formatPassed) {
       const wo = woByShortId.get(woShortId);
       if (!wo) {
-        invalidOrder.push(bc);
-        invalidOrderDetails.push({ bc, reason: "Work order not found" });
+        notInOrder.push(bc);
+        invalidDetails.push({ bc, reason: `No work order ending ${woShortId}` });
         continue;
       }
-      if (unitNumber > wo.quantity) {
-        invalidOrder.push(bc);
-        invalidOrderDetails.push({ bc, reason: `Unit ${unitNumber} exceeds WO quantity (${wo.quantity})` });
+      /* A work order with no quantity on file cannot say a unit is beyond it.
+         Treating "unknown" as "exceeded" would reject good garments. */
+      if (wo.orderQuantity != null && unitNumber > wo.orderQuantity) {
+        beyondQuantity.push(bc);
+        invalidDetails.push({
+          bc,
+          reason: `Piece ${unitNumber} is past the ${wo.orderQuantity} ordered`,
+        });
         continue;
       }
-      orderPassed.push(bc);
+      passed.push(bc);
     }
 
-    // ── Step 3: already-recorded-today check ─────────────────────────────────
-    const dateBucket  = getISTMidnight(new Date());
-    const todayRecord = await ProductionCompletionScanRecord.findOne({ date: dateBucket })
-      .select("scans.barcodeId").lean();
-    const todaySet = new Set((todayRecord?.scans || []).map((s) => s.barcodeId));
+    // ── Step 3: recorded before? THE SAME QUESTION /mark-done ASKS ───────────
+    const alreadyRecorded = [];
+    const newToSave = [];
+    if (passed.length) {
+      const passedSet = new Set(passed);
+      const dupDocs = await ProductionCompletionScanRecord.find({
+        "scans.barcodeId": { $in: passed },
+      })
+        .select("date scans.barcodeId")
+        .lean();
+      const seenOn = new Map(); // barcode -> the date it was first recorded
+      for (const d of dupDocs) {
+        for (const s of d.scans || []) {
+          if (!passedSet.has(s.barcodeId)) continue;
+          const prev = seenOn.get(s.barcodeId);
+          if (!prev || d.date < prev) seenOn.set(s.barcodeId, d.date);
+        }
+      }
+      for (const bc of passed) {
+        if (seenOn.has(bc)) alreadyRecorded.push(bc);
+        else newToSave.push(bc);
+      }
+      /* Saying WHEN turns "already recorded" from a refusal into an answer —
+         the operator can tell a genuine duplicate from a re-scan of their own
+         work five minutes ago. */
+      var alreadyRecordedDetails = alreadyRecorded.map((bc) => ({
+        bc,
+        on: seenOn.get(bc) || null,
+      }));
+    }
 
-    const alreadyRecordedBarcodes = orderPassed.filter((bc) =>  todaySet.has(bc));
-    const newToSaveBarcodes       = orderPassed.filter((bc) => !todaySet.has(bc));
-
-    // Combined invalid list for the frontend
-    const allInvalidBarcodes = [
-      ...invalidFormat.map((bc) => ({ bc, reason: "Invalid barcode format" })),
-      ...invalidOrderDetails,
-    ];
+    const allInvalidBarcodes = invalidDetails;
 
     return res.json({
-      success:               true,
-      total:                 uniqueBarcodes.length,
-      validCount:            orderPassed.length,
-      invalidCount:          allInvalidBarcodes.length,
-      invalidBarcodes:       allInvalidBarcodes,   // [{bc, reason}]
-      invalidFormatCount:    invalidFormat.length,
-      invalidOrderCount:     invalidOrder.length,
-      alreadyRecordedCount:  alreadyRecordedBarcodes.length,
-      alreadyRecordedBarcodes,
-      newToSaveCount:        newToSaveBarcodes.length,
-      newToSaveBarcodes,
+      success: true,
+      total: uniqueBarcodes.length,
+
+      /* The five buckets. They are disjoint and they sum to `total`. */
+      invalidFormatCount: invalidFormat.length,
+      notInOrderCount: notInOrder.length,
+      beyondQuantityCount: beyondQuantity.length,
+      alreadyRecordedCount: alreadyRecorded.length,
+      newToSaveCount: newToSave.length,
+
+      invalidBarcodes: allInvalidBarcodes, // [{bc, reason}]
+      alreadyRecordedBarcodes: alreadyRecorded,
+      alreadyRecordedDetails: alreadyRecordedDetails || [],
+      newToSaveBarcodes: newToSave,
+
+      /* Kept for anything still reading the old names. `validCount` has always
+         meant "passed format and order", never "valid format". */
+      validCount: passed.length,
+      invalidCount: allInvalidBarcodes.length,
+      invalidOrderCount: notInOrder.length + beyondQuantity.length,
     });
   } catch (err) {
     console.error("preview error:", err);
@@ -375,7 +439,7 @@ router.get("/overview", async (req, res) => {
     }
 
     const allWOs = await WorkOrder.find({})
-      .select("_id workOrderNumber customerRequestId stockItemId stockItemName variantAttributes")
+      .select("_id workOrderNumber customerRequestId stockItemId stockItemName variantAttributes quantity")
       .lean();
     const woByShortId = new Map();
     for (const wo of allWOs) {
@@ -392,6 +456,7 @@ router.get("/overview", async (req, res) => {
     const byDayMap = new Map();        // YYYY-MM-DD -> units
     const bySupervisorMap = new Map(); // name -> {units, firstAt, lastAt, orders:Set}
     let unattributedTime = 0;          // units whose scan carried no timestamp
+    let totalBeyondOrder = 0;          // units numbered past what the order asked for
 
     for (const [shortId, unitMap] of unitsByShortId) {
       const wo = woByShortId.get(shortId);
@@ -413,11 +478,31 @@ router.get("/overview", async (req, res) => {
         });
       }
 
+      /* A UNIT NUMBER ABOVE THE ORDERED QUANTITY IS NOT PROGRESS.
+         The order page has always applied this — computeWorkOrderProduction()
+         does `if (unit > total) { extra++; continue; }` — and this page did not,
+         so the same garments were counted two different ways. Work order
+         a6b17029 (Black Pant, 3 ordered) read 4 here and "3 / 3 (100%), 1 scan
+         carried a unit number above the ordered 3" there, with nothing on this
+         page to explain the difference.
+         The over-quantity units are counted and reported, never silently
+         dropped: somebody made them, and a piece numbered 4 against an order
+         for 3 is a question for the floor, not a rounding error. */
+      const ordered = wo.quantity || 0;
+      const inOrder = new Map();
+      let beyondOrder = 0;
+      for (const [unit, meta] of unitMap) {
+        if (ordered > 0 && unit > ordered) beyondOrder++;
+        else inOrder.set(unit, meta);
+      }
+
       const entry = moAgg.get(moId);
-      entry.totalUnits += unitMap.size;
+      entry.totalUnits += inOrder.size;
+      entry.beyondOrder = (entry.beyondOrder || 0) + beyondOrder;
+      totalBeyondOrder += beyondOrder;
 
       // Attribution, per MO and across the whole range, from the same rows.
-      for (const [, meta] of unitMap) {
+      for (const [, meta] of inOrder) {
         if (meta.at) {
           const hr = istHourOf(meta.at);
           byHourMap.set(hr, (byHourMap.get(hr) || 0) + 1);
@@ -462,8 +547,9 @@ router.get("/overview", async (req, res) => {
         });
       }
       const prodEntry = entry.products.get(productKey);
-      prodEntry.totalUnits += unitMap.size;
-      for (const u of [...unitMap.keys()].sort((a, b) => a - b))
+      prodEntry.totalUnits += inOrder.size;
+      prodEntry.beyondOrder = (prodEntry.beyondOrder || 0) + beyondOrder;
+      for (const u of [...inOrder.keys()].sort((a, b) => a - b))
         prodEntry.unitBarcodes.push(`WO-${shortId}-${String(u).padStart(3, "0")}`);
     }
 
@@ -508,6 +594,7 @@ router.get("/overview", async (req, res) => {
               image,
               variantAttributes: p.variantAttributes,
               totalUnits: p.totalUnits,
+              beyondOrder: p.beyondOrder || 0,
               unitBarcodes: p.unitBarcodes || [],
             };
           })
@@ -519,6 +606,7 @@ router.get("/overview", async (req, res) => {
           customerName: mo?.customerInfo?.name || "—",
           requestType: mo?.requestType || null,
           totalUnits: entry.totalUnits,
+          beyondOrder: entry.beyondOrder || 0,
           products,
           // Added 11 Sep 2026 — who booked this customer's work and when.
           firstAt: entry.firstAt,
@@ -585,6 +673,10 @@ router.get("/overview", async (req, res) => {
       dateRange: { start, end: new Date(end.getTime() - 1) },
       totalScans: allScans.length,
       totalUnitsCompleted,
+      /* Units numbered past what their order asked for. Counted, never hidden —
+         and excluded from totalUnitsCompleted so this page and the order page
+         report the same progress. */
+      totalBeyondOrder,
       manufacturingOrders,
 
       // ── Added 11 Sep 2026 ──────────────────────────────────────────────

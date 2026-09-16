@@ -109,7 +109,17 @@ router.get("/overview-summary", async (req, res) => {
     const opRec = (id) => {
       if (!operators.has(id))
         operators.set(id, {
-          operatorId: id, signInAt: null, signOutAt: null, signedIn: false,
+          operatorId: id,
+          /* signInAt is the CURRENT session's start, not the day's first.
+             Keeping the first meant somebody on their sixth session still read
+             "signed in 10:18, still working" — which says they have been at the
+             machine for two and a half hours when five of those were spent
+             signed out. firstSignInAt keeps the day's start for anyone who
+             wants it. */
+          signInAt: null, firstSignInAt: null, sessions: 0,
+          /* Summed per session, so signed-out gaps never become worked time. */
+          attendedSeconds: 0,
+          signOutAt: null, signedIn: false,
           pieces: 0, samMinutes: 0, piecesWithSam: 0,
           pieceKeys: new Set(),
           machines: new Set(), operations: new Set(),
@@ -163,7 +173,12 @@ router.get("/overview-summary", async (req, res) => {
       if (!w) return;
       openSignIn.delete(oid);
       const secs = (new Date(atIso) - new Date(w.at)) / 1000;
-      if (secs > 0) mcRec(w.machineId).attendedSeconds += secs;
+      if (secs > 0) {
+        mcRec(w.machineId).attendedSeconds += secs;
+        /* The same session is this person's attendance too. Walking it once
+           keeps the two from ever disagreeing about how long they were here. */
+        opRec(oid).attendedSeconds += secs;
+      }
     };
 
     for (const e of events) {
@@ -172,7 +187,9 @@ router.get("/overview-summary", async (req, res) => {
 
       if (e.type === "signin" && oid) {
         const r = opRec(oid);
-        if (!r.signInAt) r.signInAt = e.scanTime;
+        if (!r.firstSignInAt) r.firstSignInAt = e.scanTime;
+        r.signInAt = e.scanTime; // this session, not the day's first
+        r.sessions += 1;
         r.signedIn = true;
         r.signOutAt = null;
         r.machines.add(mid);
@@ -328,6 +345,26 @@ router.get("/overview-summary", async (req, res) => {
     };
 
     const workedMinutes = (rec) => {
+      /* SESSIONS, not first-sign-in-to-now.
+       *
+       * Measuring from the first sign-in charges somebody for every minute they
+       * were signed OUT. On this floor that is not a rounding error: six
+       * sessions across a morning meant five absences counted as work. Summing
+       * the sessions is the only reading that matches what the clock cards say.
+       *
+       * Falls back to the scan span only when there is no sign-in at all. */
+      if (rec.attendedSeconds > 0) {
+        const gross = rec.attendedSeconds / 60;
+        const openBreak = rec.openBreakAt ? (now - new Date(rec.openBreakAt)) / 60000 : 0;
+        const net = gross - rec.breakSeconds / 60 - openBreak;
+        return {
+          minutes: net > 0 ? Math.round(net) : null,
+          grossMinutes: Math.round(gross),
+          breakMinutes: Math.round(rec.breakSeconds / 60 + openBreak),
+          basis: "attendance-less-breaks",
+        };
+      }
+
       const start = rec.signInAt || rec.firstScanAt;
       if (!start) return { minutes: null, basis: "none" };
 
@@ -483,6 +520,8 @@ router.get("/overview-summary", async (req, res) => {
           return live && live.online && live.currentOperatorId === o.operatorId;
         }),
         signInAt: o.signInAt,
+        firstSignInAt: o.firstSignInAt,
+        sessions: o.sessions,
         signOutAt: o.signOutAt,
         stillSignedIn: o.signedIn,
         onBreak: o.onBreak,

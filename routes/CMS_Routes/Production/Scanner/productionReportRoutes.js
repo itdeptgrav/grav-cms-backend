@@ -25,6 +25,9 @@ const router = express.Router();
 
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const reportBuilder = require("../../../../services/production/reportBuilder");
+/* For the shift-date helper and to re-run the rollup after a delete, so the
+   derived day stats cannot outlive the events they were built from. */
+const rollupStats = require("../../../../services/barcodeScanner/rollupStats");
 
 /* Same auth as every other production surface. Carried by the router itself,
    the way the scanner routers do it, so moving the mount cannot open it. */
@@ -78,13 +81,29 @@ const clock = (sec) => {
   return `${mm}:${ss}`;
 };
 
+/* The same duration in words, for the operator section only. "5:42" is read as
+   five forty-two by anybody who has not been told the column is minutes and
+   seconds, and the operator section is the one part of this report written to
+   be handed to the person it measures. Everywhere else keeps clock(), which is
+   compact and shared with the CSV and the workbook. */
+const durationWords = (sec) => {
+  if (sec == null || !Number.isFinite(sec)) return "—";
+  const s = Math.round(sec);
+  if (s < 60) return `${s} sec`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor(s / 60) % 60;
+  const r = s % 60;
+  if (h > 0) return m ? `${h} hr ${m} min` : `${h} hr`;
+  return r ? `${m} min ${r} sec` : `${m} min`;
+};
+
 /* One sentence, shared by every format, saying what the denominator contains.
    It stopped being "time spent working" on 2026-09-15 when the idle-gap
    threshold was removed, and a percentage that does not say so invites exactly
    the misreading the change was meant to avoid. */
 const BASIS_TEXT =
-  "Elapsed time between garments, including waiting, thread breaks and unrecorded absence. " +
-  "This is output per hour present, not working speed.";
+  "Time between garments, including waiting, thread breaks and time away from the machine. " +
+  "This is work done per hour, not how fast the operator sews.";
 
 /* Duplicate operation codes in the master are resolved by keeping the first,
    but resolving is not the same as being right — only the IE study knows which
@@ -106,16 +125,16 @@ const samConflictLine = (r) => {
 const paceSummaryRows = (o) => [
   ["Operation", o.operationCode],
   ["SAM", clock(o.samSeconds)],
-  ["Total scans", o.scansConsidered],
-  ["Valid intervals", o.intervals],
-  ["Total SAM time", clock(o.totalSamSeconds)],
-  ["Total actual time", clock(o.totalActualSeconds)],
-  ["Average actual time", clock(o.averageActualSeconds)],
-  ["Overall efficiency", o.pacePercent == null ? `N/A — ${o.reason || "insufficient data"}` : `${o.pacePercent}%`],
+  ["Scans", o.scansConsidered],
+  ["Gaps counted", o.intervals],
+  ["SAM time", clock(o.totalSamSeconds)],
+  ["Time taken", clock(o.totalActualSeconds)],
+  ["Time per garment", clock(o.averageActualSeconds)],
+  ["Efficiency", o.pacePercent == null ? `N/A — ${o.reason || "insufficient data"}` : `${o.pacePercent}%`],
   /* Since 2026-09-15 no gap is discarded as a stop, so the denominator is
      wall-clock time. Saying so next to the number is the whole reason the
      number is safe to publish. */
-  ...(o.basis ? [["Basis", o.basis]] : []),
+  ...(o.basis ? [["What the time includes", o.basis]] : []),
 ];
 
 // ─── Filters ──────────────────────────────────────────────────────────────────
@@ -141,6 +160,86 @@ router.get("/report/filters", async (req, res) => {
 //
 // It goes through buildReport like every other surface, so the log cannot
 // disagree with the total it sits under.
+
+/**
+ * DELETE /report/scans?day=&operatorId=&machineId=
+ *
+ * Removes the scan events behind one log — the drawer the operator is looking
+ * at, not the database. Built for clearing a test run without hand-editing
+ * Mongo.
+ *
+ * THE SCOPE RAIL IS THE POINT. `day` plus at least one of operatorId or
+ * machineId is REQUIRED, so there is no URL that empties a shift, and none at
+ * all that empties the collection. A delete button one misclick from Refresh
+ * needs a floor under it that a crafted query cannot remove.
+ *
+ * Only `type: "scan"` goes. Sign-ins, sign-outs and breaks stay, because they
+ * are the attendance record — deleting those would rewrite how long somebody
+ * was at work, which is a payroll fact and not this button's business.
+ *
+ * The rollup is re-run afterwards. MachineDayStats and OperatorDayStats are
+ * derived from these events, so leaving them would show garments that no longer
+ * exist on the very page the drawer opened from.
+ */
+router.delete("/report/scans", async (req, res) => {
+  try {
+    const day = req.query.day || req.query.date;
+    const operatorId = String(req.query.operatorId || "").trim();
+    const machineId = String(req.query.machineId || "").trim();
+
+    if (!day) {
+      return res.status(400).json({ success: false, message: "day is required" });
+    }
+    if (!operatorId && !machineId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Refusing an unscoped delete. Pass operatorId or machineId — this endpoint " +
+          "cannot clear a whole shift.",
+      });
+    }
+
+    const parsed = new Date(day);
+    if (Number.isNaN(parsed.getTime())) {
+      return res.status(400).json({ success: false, message: `Not a date: ${day}` });
+    }
+    const shiftDate = rollupStats.shiftDateFor(parsed);
+
+    const filter = { shiftDate, type: "scan" };
+    if (operatorId) filter.operatorId = operatorId;
+    if (machineId) filter.machineId = machineId;
+
+    /* One model registry for both steps. This file does not import the models
+       itself, and reaching for a bare `ProductionEvent` here is what made the
+       first version answer 500 — getLocalModels() is the same set the rollup
+       runs against, so the delete and the recount cannot disagree about which
+       collection they mean. */
+    const models = rollupStats.getLocalModels();
+    const result = await models.ProductionEvent.deleteMany(filter);
+
+    /* Best effort: a failed rollup must not report the delete as failed, since
+       the events really are gone. The 60s cycle picks it up regardless. */
+    let rollup = "queued";
+    try {
+      await rollupStats.runOnce(models, shiftDate);
+      rollup = "done";
+    } catch (err) {
+      rollup = `deferred (${err.message})`;
+    }
+
+    return res.json({
+      success: true,
+      deleted: result.deletedCount || 0,
+      scope: { day, operatorId: operatorId || null, machineId: machineId || null },
+      rollup,
+      message:
+        `${result.deletedCount || 0} scan${result.deletedCount === 1 ? "" : "s"} deleted. ` +
+        `Sign-ins, sign-outs and breaks were kept.`,
+    });
+  } catch (error) {
+    fail(res, error, "delete-scans");
+  }
+});
 
 router.get("/report/pace-log", async (req, res) => {
   try {
@@ -190,17 +289,56 @@ router.get("/report/pace-log", async (req, res) => {
          duration and no percentage — the reference §4 describes. It is not in
          `rows` (which holds intervals, not scans), so it is reconstructed from
          the first interval's `previousAt`. */
+      /* THE START POINT IS THE ID CARD.
+       *
+       * This used to prepend a synthetic "scan 1" built from the first row's
+       * previousAt — a row with no barcode, so a garment that really was
+       * scanned showed as "—" and was then discarded as unmeasurable. Now each
+       * session opens with the sign-in that started it, and every garment
+       * after it is timed and named. Indices are assigned here so the sequence
+       * reads 1,2,3 down the page including those markers. */
       const scans = [];
-      const first = op.rows?.[0];
-      if (first) scans.push({ index: 1, at: first.previousAt, reference: true });
-      for (const row of op.rows || []) {
+      let lastAnchorAt = null;
+      let n = 0;
+      const rows = op.rows || [];
+      if (rows.length && !rows[0].anchoredTo && rows[0].previousAt) {
+        /* No sign-in before the first garment: keep the old reference row so
+           the sequence still starts somewhere. */
+        scans.push({ index: ++n, at: rows[0].previousAt, reference: true });
+      }
+      for (const row of rows) {
+        if (row.anchoredTo && row.anchoredTo.at !== lastAnchorAt) {
+          lastAnchorAt = row.anchoredTo.at;
+          /* In the order it happened: the absence, then the sign-in that ended
+             it, then the garments. Hanging the absence off the garment instead
+             is what put an 11:39 sign-out next to a 13:05 scan. */
+          /* The absence rides ON the sign-in row rather than getting one of its
+             own. As a separate row it was either orphaned at the top of the
+             table, explaining a period no work in this log belongs to, or —
+             once that was suppressed — missing entirely, so nothing said the
+             operator had been away. Attached here it is always present and
+             always attached to the thing it explains: why this session
+             started. */
+          scans.push({
+            index: ++n,
+            at: row.anchoredTo.at,
+            anchorKind: row.anchoredTo.kind,
+            awayBefore: row.anchoredTo.after || null,
+            reference: true,
+          });
+        }
         scans.push({
-          index: row.index,
+          index: ++n,
           at: row.at,
           barcodeId: row.barcodeId,
           durationSeconds: row.intervalSeconds,
           counted: row.counted,
+          anchoredTo: row.anchoredTo || null,
           excludedBecause: row.excludedBecause,
+          /* The away span this interval ran across, so the log can show
+             "signed out 216s" as its own line and treat the scan after it as a
+             fresh start point rather than silently dropping a row. */
+          boundary: row.boundary || null,
           /* Per-interval, for THIS ROW ONLY. Never summed anywhere: §7 forbids
              averaging this column, and the overall below is a ratio of totals. */
           efficiencyPercent:
@@ -209,6 +347,12 @@ router.get("/report/pace-log", async (req, res) => {
               : null,
         });
       }
+      /* The shift ended. Emitted after the last garment, in the position it
+         happened, so a finished session reads as finished. */
+      if (op.closedBy) {
+        scans.push({ closedBy: op.closedBy });
+      }
+
       return {
         operationCode: op.operationCode,
         operationName: op.operationName || "",
@@ -260,6 +404,40 @@ router.get("/report/pace-log", async (req, res) => {
       operatorName:
         (d?.operators || []).find((o) => String(o.operatorId) === operatorId)?.operatorName || null,
       operations: ops.map(shape),
+      /* THE EFFICIENCY FIGURE, which is not the pace figure.
+       *
+       * pacePercent below divides standard time by the gaps BETWEEN scans, so
+       * it answers "while they were going, how fast" — and it can exceed 100%
+       * honestly, because two garments scanned 80 seconds apart really were 80
+       * seconds apart. What it cannot do is describe a shift: the time before
+       * the first scan, after the last, and every excluded stoppage are all
+       * outside its denominator.
+       *
+       * Standard garment-industry efficiency divides earned standard minutes by
+       * ATTENDED minutes less breaks. The rollup already computes exactly that
+       * (rollupStats overallEfficiencyPercent), so this reports it rather than
+       * deriving a second version that could disagree with the rest of the CMS.
+       *
+       * Sent alongside its own components so the screen can show the working
+       * instead of asking anyone to trust a bare percentage.
+       */
+      efficiency: (() => {
+        if (!operatorId) return null; // machines have no attendance of their own here
+        const o = (d?.operators || []).find((x) => String(x.operatorId) === operatorId);
+        if (!o) return null;
+        const attendance = o.minutesLoggedIn;
+        const breaks = o.breakMinutes || 0;
+        const worked = attendance != null ? Math.max(0, attendance - breaks) : null;
+        return {
+          percent: o.efficiencyPercent ?? null,
+          earnedMinutes: o.earnedMinutes ?? null,
+          attendanceMinutes: attendance,
+          breakMinutes: breaks,
+          workedMinutes: worked == null ? null : Math.round(worked * 10) / 10,
+          basis: "earned standard minutes ÷ attended minutes less breaks",
+        };
+      })(),
+
       overall: {
         intervals: earned.size,
         totalSamSeconds: sam,
@@ -300,6 +478,7 @@ router.get("/report/preview", async (req, res) => {
         operators: d.operators,
         machines: d.machines,
         scanRowCount: d.scanRows.length,
+        hourly: d.hourly,
         /* §11 — the figures a report must show: scans, valid intervals, SAM,
            total SAM time, total actual, average actual, overall efficiency.
            The per-interval rows are left out of the preview and kept for the
@@ -471,18 +650,21 @@ router.get("/report/xlsx", async (req, res) => {
       },
       {
         name: "Operator Details",
-        widths: [13, 14, 26, 11, 14, 15, 11, 11, 13, 14, 12, 30, 22],
+        widths: [13, 14, 26, 34, 9, 15, 12, 12, 14, 15, 11, 11, 13, 14, 30],
         headers: [
-          "Date", "Operator ID", "Operator", "Garments", "Logged in (min)",
-          "Productive (min)", "Idle (min)", "Break (min)", "Earned (min)",
-          "Available (min)", "Efficiency %", "Machines", "Operations",
+          "Date", "Operator ID", "Operator", "Work done (operation)", "Pieces",
+          "Should take /pc", "Took /pc", "Efficiency %",
+          "Logged in (min)", "Productive (min)", "Idle (min)", "Break (min)",
+          "Earned (min)", "Available (min)", "Machines",
         ],
         rows: (d) =>
           d.operators.map((o) => [
-            d.dayKey, o.operatorId, o.operatorName, mins(o.garments), mins(o.minutesLoggedIn),
-            mins(o.productiveMinutes), mins(o.idleMinutes), mins(o.breakMinutes),
-            mins(o.earnedMinutes), mins(o.availableMinutes), mins(o.efficiencyPercent),
-            o.machines, o.operations,
+            d.dayKey, o.operatorId, o.operatorName,
+            o.operationNames || o.operations, mins(o.garments),
+            clock(o.shouldSecPerPiece), clock(o.tookSecPerPiece), mins(o.efficiencyPercent),
+            mins(o.minutesLoggedIn), mins(o.productiveMinutes), mins(o.idleMinutes),
+            mins(o.breakMinutes), mins(o.earnedMinutes), mins(o.availableMinutes),
+            o.machines,
           ]),
       },
       {
@@ -565,7 +747,7 @@ router.get("/report/xlsx", async (req, res) => {
     writeSheetHead(
       pace,
       "Efficiency against standard time",
-      `SAM x intervals / total elapsed time between garments (waiting included) · ${words}`,
+      `SAM time / time taken between garments (waiting included) · ${words}`,
       meta,
       filt
     );
@@ -596,8 +778,8 @@ router.get("/report/xlsx", async (req, res) => {
         // §15 — every interval behind that figure.
         pr += 1;
         writeHeaderRow(pace, pr, [
-          "Scan #", "Operation", "Scan time", "Previous scan",
-          "Interval", "Counted", "Excluded because", "Barcode",
+              "Scan #", "Operation", "Scan time", "Previous scan",
+          "Time taken", "Counted", "Left out because", "Barcode",
         ]);
         pr += 1;
         for (const row of o.rows || []) {
@@ -716,6 +898,39 @@ router.get("/report/csv", async (req, res) => {
 
 const PDF_MARGIN = 40;
 
+/* ── PDF ──────────────────────────────────────────────────────────────────────
+ *
+ * THE DOCUMENT AN IE HANDS TO A PRODUCTION MANAGER.
+ *
+ * Page 1 decides, the rest proves. The manager reads the verdict and the
+ * figures; the IE keeps the tables behind them to defend every number when
+ * challenged. Nothing is on page 1 that cannot be traced to a table later, and
+ * nothing is in a later table that page 1 cannot reach.
+ *
+ * WHAT THIS REPORT IS NOT. It is a summary, not a log. It says what each person
+ * and each machine did and how that compares with standard time. It does not
+ * print one line per badge-in or one line per scan: that detail lives in the
+ * scan log on the dashboard, where it can be opened for the one person being
+ * questioned rather than printed for everybody.
+ *
+ * ONE EFFICIENCY. Standard time (SAM) earned ÷ real time between finished
+ * garments × 100. Floor, operator, machine and operation are the same
+ * arithmetic at different scopes, so a row can be checked against its total by
+ * eye. It is defined once, on page 1, and every table afterwards just says
+ * "Efficiency".
+ *
+ * THE OLD MEASURE IS GONE, NOT HIDDEN. earned ÷ signed-in minutes, and the
+ * columns built from it — "Should take /pc", "Took /pc" and the Worked / Break
+ * / Idle minute cards — are removed. The attendance minutes went with them, so
+ * that nobody can rebuild the banned ratio by hand out of columns this report
+ * printed.
+ *
+ * WHY SCANS, REPEATS AND SIGN-INS ARE COLUMNS. The floor asked for it: one
+ * operator works several machines and badges in many times a day, and printing
+ * only the deduplicated garment count hid all of it. On 2026-08-29 one operator
+ * made 63 reads that resolved to 26 garments across 6 sign-ins; the old report
+ * said "26" and nothing else.
+ */
 router.get("/report/pdf", async (req, res) => {
   try {
     const PDFDocument = require("pdfkit");
@@ -730,10 +945,6 @@ router.get("/report/pdf", async (req, res) => {
     const W = doc.page.width - PDF_MARGIN * 2;
     const BOTTOM = doc.page.height - PDF_MARGIN - 24;
 
-    /* Every table draws through this, so a long report breaks across pages
-       instead of running off the bottom — the failure a raw table dump always
-       has. The header is re-printed on each new page, because a column of
-       numbers with no heading is unreadable two pages in. */
     const ensureRoom = (need, repeatHeader) => {
       if (doc.y + need <= BOTTOM) return;
       doc.addPage();
@@ -741,240 +952,592 @@ router.get("/report/pdf", async (req, res) => {
     };
 
     const heading = (text, size = 12) => {
-      ensureRoom(34);
+      /* A heading must not be the last thing on a page. 40pt was enough for the
+         heading itself and nothing else, so "Styles made" printed at the foot of
+         a page with its column header, and the first data row — and a repeat of
+         the header — began the next one. Reserve the heading, an explanatory
+         line, the column header AND one row, so a section always starts with
+         something to read under it. */
+      ensureRoom(78);
       doc.moveDown(0.6);
-      doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(size).text(text);
+      doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(size)
+        .text(text, PDF_MARGIN, doc.y, { width: W });
       doc.moveDown(0.25);
+    };
+
+    const prose = (text, opts = {}) => {
+      if (!text) return;
+      doc.font(opts.font || "Helvetica").fontSize(opts.size || 7.5)
+        .fillColor(opts.color || "#64748b")
+        .text(text, PDF_MARGIN + (opts.indent || 0), doc.y, {
+          width: W - (opts.indent || 0),
+        });
+      doc.moveDown(opts.gap == null ? 0.25 : opts.gap);
     };
 
     const tableRow = (cells, widths, opts = {}) => {
       const size = opts.size || 8.5;
-      doc.font(opts.bold ? "Helvetica-Bold" : "Helvetica").fontSize(size)
-        .fillColor(opts.color || "#0f172a");
+      const font = opts.bold ? "Helvetica-Bold" : "Helvetica";
+      const wrap = opts.wrap !== false;
+
+      doc.font(font).fontSize(size);
+      let tallest = size;
+      if (wrap) {
+        cells.forEach((c, i) => {
+          const h = doc.heightOfString(String(c == null ? "" : c), { width: widths[i] - 4 });
+          if (h > tallest) tallest = h;
+        });
+      }
+      if (opts.repeatHeader) ensureRoom(tallest + 6, opts.repeatHeader);
+
+      doc.font(font).fontSize(size).fillColor(opts.color || "#0f172a");
       const y = doc.y;
       let x = PDF_MARGIN;
       cells.forEach((c, i) => {
         doc.text(String(c == null ? "" : c), x + 2, y, {
           width: widths[i] - 4,
           align: opts.align && opts.align[i] ? opts.align[i] : "left",
-          lineBreak: false,
-          ellipsis: true,
+          lineBreak: wrap,
+          ellipsis: !wrap,
         });
         x += widths[i];
       });
-      doc.y = y + size + 4;
+      doc.x = PDF_MARGIN;
+      doc.y = y + tallest + 4;
       if (opts.rule) {
-        doc.moveTo(PDF_MARGIN, doc.y - 2)
-          .lineTo(PDF_MARGIN + W, doc.y - 2)
-          .lineWidth(0.5)
-          .strokeColor("#cbd5e1")
-          .stroke();
+        doc.moveTo(PDF_MARGIN, doc.y - 2).lineTo(PDF_MARGIN + W, doc.y - 2)
+          .lineWidth(0.5).strokeColor("#cbd5e1").stroke();
       }
     };
 
-    // ── Cover block ──────────────────────────────────────────────────────────
-    doc.rect(PDF_MARGIN, PDF_MARGIN, W, 54).fill("#1f2937");
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17)
-      .text("GRAV Production Report", PDF_MARGIN + 12, PDF_MARGIN + 12);
-    doc.font("Helvetica").fontSize(9.5).fillColor("#cbd5e1")
-      .text(rangeWords(r), PDF_MARGIN + 12, PDF_MARGIN + 34);
-    doc.y = PDF_MARGIN + 66;
-    doc.fillColor("#475569").font("Helvetica").fontSize(9);
-    doc.text(filterWords(r), PDF_MARGIN, doc.y);
-    doc.text(metaLine(r), PDF_MARGIN, doc.y);
+    /* Every clock time in this document is IST: the shift day is an IST day, and
+       a report whose dates and times disagreed about the timezone would be
+       indefensible the first time it was checked against a machine. */
+    const IST = 330 * 60000;
+    const two = (n) => String(n).padStart(2, "0");
+    const istTime = (d) => {
+      if (!d) return "—";
+      const t = new Date(new Date(d).getTime() + IST);
+      return `${two(t.getUTCHours())}:${two(t.getUTCMinutes())}`;
+    };
+    const istStamp = (d) => {
+      if (!d) return "—";
+      const t = new Date(new Date(d).getTime() + IST);
+      return `${t.toISOString().slice(0, 10)} ${two(t.getUTCHours())}:${two(t.getUTCMinutes())} IST`;
+    };
+    /* The print time is part of the number on purpose: a shift re-run after a
+       correction is a different report, and a manager must be able to tell which
+       copy is on the desk. */
+    const reportNo = (() => {
+      const t = new Date(new Date(r.generatedAt).getTime() + IST);
+      const hm = `${two(t.getUTCHours())}${two(t.getUTCMinutes())}`;
+      return r.range.days === 1
+        ? `IE/DPR/${r.range.from.replace(/-/g, "")}-${hm}`
+        : `IE/PR/${r.range.from.replace(/-/g, "")}-${r.range.to.replace(/-/g, "")}-${hm}`;
+    })();
 
-    // ── KPIs ─────────────────────────────────────────────────────────────────
-    heading("Overview");
-    const kpis = [
-      ["Garments", r.totals.pieces],
-      ["Scans", r.totals.scanEvents],
-      ["Repeat scans", r.totals.repeatScans],
-      ["Operators", r.totals.operators],
-      ["Machines", r.totals.machines],
-      ["Products", r.totals.products],
-      ["Worked (min)", r.totals.workedMinutes == null ? "—" : r.totals.workedMinutes],
-      ["Break (min)", r.totals.breakMinutes == null ? "—" : r.totals.breakMinutes],
-      ["Idle (min)", r.totals.idleMinutes == null ? "—" : r.totals.idleMinutes],
-      ["Days with data", `${r.totals.datesWithData}/${r.range.days}`],
-    ];
-    const cardW = W / 5;
-    let cx = PDF_MARGIN;
-    let cy = doc.y;
-    kpis.forEach((k, i) => {
-      if (i === 5) {
-        cy += 44;
-        cx = PDF_MARGIN;
-      }
-      doc.roundedRect(cx + 2, cy, cardW - 6, 38, 3)
-        .lineWidth(0.5).strokeColor("#e2e8f0").stroke();
-      doc.font("Helvetica").fontSize(6.5).fillColor("#64748b")
-        .text(String(k[0]).toUpperCase(), cx + 7, cy + 6, {
-          width: cardW - 16, lineBreak: false, ellipsis: true,
-        });
-      doc.font("Helvetica-Bold").fontSize(13).fillColor("#0f172a")
-        .text(String(k[1]), cx + 7, cy + 17, { width: cardW - 16, lineBreak: false });
-      cx += cardW;
-    });
-    doc.y = cy + 52;
+    const pctText = (sam, actual) =>
+      actual > 0 ? `${Math.round((sam / actual) * 1000) / 10}%` : "Not measured";
 
-    // ── Date-wise breakdown ──────────────────────────────────────────────────
-    const dayW = [64, 58, 48, 52, 58, 56, 58, 50];
-    const dayHead = () =>
-      tableRow(
-        ["Date", "Garments", "Scans", "Repeats", "Operators", "Machines", "Worked", "Break"],
-        dayW,
-        { bold: true, size: 8, color: "#334155", rule: true }
-      );
-    heading("Date-wise breakdown");
-    dayHead();
+    /* Codes mean nothing to the person being measured. The only name source on
+       this payload is the pre-joined "CODE Name, CODE Name" string on operator
+       rows, so it is unpacked once here. */
+    const opNames = new Map();
     for (const d of r.days) {
-      ensureRoom(16, dayHead);
-      tableRow(
-        [
-          d.dayKey,
-          d.hasData ? d.totals.pieces : "—",
-          d.hasData ? d.totals.scanEvents : "—",
-          d.hasData ? d.totals.repeatScans : "—",
-          d.hasData ? d.totals.operators : "—",
-          d.hasData ? d.totals.machines : "—",
-          d.totals.workedMinutes == null ? "—" : d.totals.workedMinutes,
-          d.totals.breakMinutes == null ? "—" : d.totals.breakMinutes,
-        ],
-        dayW,
-        { color: d.hasData ? "#0f172a" : "#94a3b8" }
-      );
+      for (const o of d.operators || []) {
+        for (const part of String(o.operationNames || "").split(",")) {
+          const v = part.trim();
+          const sp = v.indexOf(" ");
+          if (sp > 0) opNames.set(v.slice(0, sp), v.slice(sp + 1));
+        }
+      }
     }
-    ensureRoom(18, dayHead);
-    tableRow(
-      [
-        "TOTAL", r.totals.pieces, r.totals.scanEvents, r.totals.repeatScans,
-        r.totals.operators, r.totals.machines,
-        r.totals.workedMinutes == null ? "—" : r.totals.workedMinutes,
-        r.totals.breakMinutes == null ? "—" : r.totals.breakMinutes,
-      ],
-      dayW,
-      { bold: true, rule: true }
-    );
+    const opLabel = (code) => {
+      const n = opNames.get(String(code).trim());
+      return n ? `${code} ${n}` : String(code);
+    };
 
-    // ── Products, operators, machines — aggregated over the whole period ─────
-    const agg = (rowsOf, keyOf) => {
+    /** Merge the same entity across every day in the period. */
+    const mergeDays = (pick, keyOf, seed, add) => {
       const m = new Map();
       for (const d of r.days) {
-        for (const row of rowsOf(d)) {
-          const k = keyOf(row);
+        for (const row of pick(d) || []) {
+          const k = String(keyOf(row));
           if (!k) continue;
-          if (!m.has(k)) m.set(k, { label: k, garments: 0, extra: row });
-          m.get(k).garments += row.garments || 0;
+          if (!m.has(k)) m.set(k, seed(row));
+          add(m.get(k), row);
         }
       }
-      return [...m.values()].sort((a, b) => b.garments - a.garments);
+      return [...m.values()];
     };
 
-    const sections = [
-      {
-        title: "Products",
-        rows: agg((d) => d.products, (p) => p.productName),
-        cols: ["Product", "Garments", "Product code", "Customer"],
-        widths: [190, 60, 130, 135],
-        cell: (v) => [v.label, v.garments, v.extra.productCode || "", v.extra.customerName || ""],
-      },
-      {
-        title: "Operators",
-        rows: agg((d) => d.operators, (o) => o.operatorName || o.operatorId),
-        cols: ["Operator", "Garments", "Operator ID", "Machines"],
-        widths: [170, 60, 90, 195],
-        cell: (v) => [v.label, v.garments, v.extra.operatorId || "", v.extra.machines || ""],
-      },
-      {
-        title: "Machines",
-        rows: agg((d) => d.machines, (m) => m.machineName),
-        cols: ["Machine", "Garments", "Type", "Operators"],
-        widths: [160, 60, 90, 205],
-        cell: (v) => [v.label, v.garments, v.extra.machineType || "", v.extra.operators || ""],
-      },
-    ];
+    // ── 1 · Identification ───────────────────────────────────────────────────
+    doc.rect(PDF_MARGIN, PDF_MARGIN, W, 52).fill("#1f2937");
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(16)
+      .text(r.range.days === 1 ? "GRAV — Daily Production Report" : "GRAV — Production Report",
+        PDF_MARGIN + 12, PDF_MARGIN + 10, { lineBreak: false });
+    doc.font("Helvetica").fontSize(8.5).fillColor("#cbd5e1")
+      .text("Industrial Engineering", PDF_MARGIN + 275, PDF_MARGIN + 13,
+        { width: 228, align: "right", lineBreak: false });
+    doc.font("Helvetica").fontSize(9.5).fillColor("#cbd5e1")
+      .text(`Sewing floor · ${rangeWords(r)}`, PDF_MARGIN + 12, PDF_MARGIN + 32, { lineBreak: false });
 
-    for (const s of sections) {
-      const head = () =>
-        tableRow(s.cols, s.widths, { bold: true, size: 8, color: "#334155", rule: true });
-      heading(s.title);
-      head();
-      if (s.rows.length === 0) {
-        tableRow(["No data available for this period", "", "", ""], s.widths, {
-          color: "#94a3b8",
-        });
-        continue;
+    const gridY = PDF_MARGIN + 60;
+    doc.rect(PDF_MARGIN, gridY, W, 60).lineWidth(0.5).strokeColor("#cbd5e1").stroke();
+    doc.moveTo(PDF_MARGIN, gridY + 30).lineTo(PDF_MARGIN + W, gridY + 30)
+      .lineWidth(0.5).strokeColor("#e2e8f0").stroke();
+    const cw = [129, 129, 129, 128];
+    [
+      ["SHIFT DATE", rangeWords(r)],
+      ["SHIFT DAY", "00:00 to 24:00 IST"],
+      ["SECTION", r.filterLabels.machine === "All" ? "Sewing — all machines" : r.filterLabels.machine],
+      ["REPORT NO.", reportNo],
+      ["OPERATORS INCLUDED", r.filterLabels.operator],
+      ["STYLE INCLUDED", r.filterLabels.product],
+      ["DAYS WITH PRODUCTION", `${r.totals.datesWithData} of ${r.range.days}`],
+      ["PRINTED", istStamp(r.generatedAt)],
+    ].forEach(([label, value], i) => {
+      const col = i % 4;
+      const row = Math.floor(i / 4);
+      const cx = PDF_MARGIN + cw.slice(0, col).reduce((a, b) => a + b, 0);
+      const cy = gridY + row * 30;
+      if (row === 0 && col > 0) {
+        doc.moveTo(cx, gridY).lineTo(cx, gridY + 60).lineWidth(0.5).strokeColor("#e2e8f0").stroke();
       }
-      for (const v of s.rows) {
-        ensureRoom(16, head);
-        tableRow(s.cell(v), s.widths);
+      doc.font("Helvetica").fontSize(6.5).fillColor("#64748b")
+        .text(label, cx + 6, cy + 5, { width: cw[col] - 12, lineBreak: false, ellipsis: true });
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#0f172a")
+        .text(String(value), cx + 6, cy + 16, { width: cw[col] - 12, lineBreak: false, ellipsis: true });
+    });
+    doc.y = gridY + 66;
+    prose("From the machines on the floor. Times are IST.", { gap: 0.4 });
+
+    // ── 2 · What this report says ────────────────────────────────────────────
+    const T = r.totals;
+    const eff = T.pacePercent;
+    heading("What this report says", 12);
+
+    const verdict = [];
+    if (T.pieces === 0) {
+      verdict.push("No production was recorded in this period.");
+    } else {
+      verdict.push(
+        eff == null
+          ? `${T.pieces} garments were finished. Efficiency could not be measured: no operation has a standard time against this work, so there is nothing to compare it with.`
+          : `${T.pieces} garments at ${eff}% efficiency — ${durationWords(T.paceSamSeconds)} of standard time in ${durationWords(T.paceActualSeconds)}.`
+      );
+      if (T.paceBatchScanning) {
+        verdict.push("Tickets were entered in batches, so these times show when they were entered.");
       }
     }
-
-    // ── Efficiency against standard time (§14) ───────────────────────────────
-    const effW = [70, 52, 58, 68, 70, 74, 62, 60];
-    const effHead = () =>
-      tableRow(
-        ["Operation", "SAM", "Scans", "Intervals", "Total SAM", "Total actual", "Average", "Efficiency"],
-        effW,
-        { bold: true, size: 8, color: "#334155", rule: true }
-      );
-    heading("Work produced against standard time");
-    doc.font("Helvetica").fontSize(8).fillColor("#64748b")
-      .text(
-        "SAM x intervals / total elapsed time between garments. The first scan of a sequence is a " +
-          "reference only and contributes no interval. " + BASIS_TEXT,
-        { width: W }
-      );
+    verdict.forEach((v) => prose(v, { font: "Helvetica-Bold", size: 9.5, color: "#0f172a", gap: 0.15 }));
     doc.moveDown(0.3);
-    const pdfConflict = samConflictLine(r);
-    if (pdfConflict) {
-      doc.font("Helvetica-Oblique").fontSize(7.5).fillColor("#b45309")
-        .text(pdfConflict, { width: W });
-      doc.moveDown(0.3);
+
+    /* FOUR FIGURES, THE SAME FOUR THE DASHBOARD LEADS WITH.
+       Repeat scans, sign-ins and standard time had a card each. Repeats and
+       standard time are already said elsewhere — repeats under Garments, where
+       they explain the difference between it and the scan count, and standard
+       time in the formula line two inches below, where it is one of the two
+       operands. Sign-ins is a floor-discipline figure, not a production one,
+       and it stays on the operator table where it belongs to a person. */
+    const tiles = [
+      ["GARMENTS", String(T.pieces), "finished pieces"],
+      ["OPERATORS", String(T.operators), "people who worked"],
+      ["MACHINES USED", String(T.machines), "machines that finished a garment"],
+      [
+        "EFFICIENCY",
+        eff == null ? "Not measured" : `${eff}%`,
+        "whole floor, everyone together",
+      ],
+    ];
+    let cx = PDF_MARGIN;
+    let cy = doc.y;
+    tiles.forEach((t, i) => {
+      doc.roundedRect(cx + 2, cy, 124, 44, 3).lineWidth(0.5).strokeColor("#e2e8f0").stroke();
+      doc.font("Helvetica").fontSize(6.5).fillColor("#64748b")
+        .text(t[0], cx + 8, cy + 5, { width: 114, lineBreak: false, ellipsis: true });
+      doc.font("Helvetica-Bold").fontSize(13).fillColor("#0f172a")
+        .text(t[1], cx + 8, cy + 15, { width: 114, lineBreak: false, ellipsis: true });
+      doc.font("Helvetica").fontSize(6.5).fillColor("#64748b")
+        .text(t[2], cx + 8, cy + 33, { width: 114, lineBreak: false, ellipsis: true });
+      cx += 128.75;
+    });
+    doc.x = PDF_MARGIN;
+    doc.y = cy + 56;
+
+    /* ONE LINE, NOT FOUR. The formula, this report's own numbers, and what the
+       result means. Everything else was a lecture a manager skips. */
+    prose(
+      "Efficiency = standard time (SAM) ÷ time between finished garments × 100" +
+      (eff == null
+        ? ". 100% = took exactly the standard time."
+        : `. Here ${Math.round(T.paceSamSeconds)}s ÷ ${Math.round(T.paceActualSeconds)}s = ${eff}%. 100% = took exactly the standard time.`),
+      { size: 7.5, gap: 0.4 }
+    );
+
+    // ── 3 · Day by day (period reports only) ─────────────────────────────────
+    if (r.range.days > 1) {
+      heading("Day by day", 12);
+      const dayW = [85, 80, 115, 115, 120];
+      const dayHead = () =>
+        tableRow(["Date", "Garments", "Standard", "Took", "Efficiency"],
+          dayW, { bold: true, size: 8, color: "#334155", rule: true });
+      dayHead();
+      const al = ["left", "right", "right", "right", "right"];
+      for (const d of r.days) {
+        tableRow([
+          d.dayKey,
+          d.totals.pieces,
+          d.pace?.totalActualSeconds > 0 ? durationWords(d.pace.totalSamSeconds) : "—",
+          d.pace?.totalActualSeconds > 0 ? durationWords(d.pace.totalActualSeconds) : "—",
+          d.pace?.pacePercent == null ? "Not measured" : `${d.pace.pacePercent}%`,
+        ], dayW, { align: al, repeatHeader: dayHead });
+      }
+      tableRow([
+        "TOTAL", T.pieces,
+        T.paceIntervals > 0 ? durationWords(T.paceSamSeconds) : "—",
+        T.paceIntervals > 0 ? durationWords(T.paceActualSeconds) : "—",
+        eff == null ? "Not measured" : `${eff}%`,
+      ], dayW, { bold: true, align: al, rule: true });
     }
-    effHead();
-    let anyPace = false;
+
+    // ── 4 · Operator by operator ─────────────────────────────────────────────
+    /* The spine of the answer to the complaint: scans, repeats, garments,
+       machines and sign-ins on one line for every person, with the machines
+       named underneath. */
+    heading("Operator by operator", 12);
+
+
+    const ops = mergeDays(
+      (d) => d.operators,
+      (o) => o.operatorId,
+      (o) => ({
+        operatorId: o.operatorId, operatorName: o.operatorName,
+        scans: 0, repeatScans: 0, garments: 0, sessions: 0, outside: 0,
+        sam: 0, actual: 0, machines: new Map(),
+      }),
+      (a, o) => {
+        a.operatorName = a.operatorName || o.operatorName;
+        a.scans += o.scans || 0;
+        a.repeatScans += o.repeatScans || 0;
+        a.garments += o.garments || 0;
+        a.sessions += (o.sessions || []).length;
+        a.outside += o.scansOutsideSession || 0;
+        a.sam += o.paceSamSeconds || 0;
+        a.actual += o.paceActualSeconds || 0;
+        for (const m of o.machinesDetail || []) {
+          const cur = a.machines.get(m.machineId) || { machineName: m.machineName, scans: 0, pieces: 0 };
+          cur.scans += m.scans;
+          cur.pieces += m.pieces;
+          a.machines.set(m.machineId, cur);
+        }
+      }
+    ).sort((a, b) => b.garments - a.garments);
+
+    /* No "Machines" count column: the machines are named in full on the line
+       directly below each row, and the count was costing the two time columns
+       the width they need to print "53 min 37 sec" without wrapping. */
+    const opW = [130, 60, 60, 85, 85, 95];
+    const opAl = ["left", "left", "right", "right", "right", "right"];
+    const opHead = () =>
+      tableRow(["Operator", "ID card", "Garments", "Standard", "Took", "Efficiency"], opW,
+        { bold: true, size: 8, color: "#334155", rule: true });
+    opHead();
+    if (!ops.length) {
+      tableRow(["No operator worked in this period", "", "", "", "", ""], opW, { color: "#94a3b8" });
+    }
+    for (const o of ops) {
+      tableRow([
+        o.operatorName || o.operatorId, o.operatorId, o.garments,
+        o.actual > 0 ? durationWords(o.sam) : "—",
+        o.actual > 0 ? durationWords(o.actual) : "—",
+        pctText(o.sam, o.actual),
+      ], opW, { align: opAl, repeatHeader: opHead });
+
+      const mline = [...o.machines.values()]
+        .sort((a, b) => b.pieces - a.pieces)
+        .map((m) => `${m.machineName} — ${m.pieces} garment${m.pieces === 1 ? "" : "s"}`)
+        .join(" · ");
+      prose(`Machines: ${mline || "none recorded"}`, { size: 7, indent: 8, gap: 0.15 });
+
+      if (o.sessions === 0 && o.garments > 0) {
+        prose("never badged in", { font: "Helvetica-Oblique", size: 7, color: "#b45309", indent: 8, gap: 0.2 });
+      }
+    }
+
+
+    // ── 5 · Machine by machine ───────────────────────────────────────────────
+    heading("Machine by machine", 12);
+    prose("Worst efficiency first — this is the walking order for the floor.", { size: 7.5, gap: 0.3 });
+
+    const opsByMachine = new Map();
     for (const d of r.days) {
-      for (const o of d.pace?.byOperation || []) {
-        if (!o.scansConsidered) continue;
-        anyPace = true;
-        ensureRoom(16, effHead);
-        tableRow(
-          [
-            `${d.dayKey.slice(5)} ${o.operationCode}`,
-            clock(o.samSeconds),
-            o.scansConsidered,
-            o.intervals,
-            clock(o.totalSamSeconds),
-            clock(o.totalActualSeconds),
-            clock(o.averageActualSeconds),
-            o.pacePercent == null ? "N/A" : `${o.pacePercent}%`,
-          ],
-          effW,
-          { color: o.pacePercent == null ? "#94a3b8" : "#0f172a" }
-        );
-        if (o.caveat) {
-          ensureRoom(22, effHead);
-          doc.font("Helvetica-Oblique").fontSize(7).fillColor("#b45309")
-            .text(o.caveat, PDF_MARGIN + 8, doc.y, { width: W - 16 });
-          doc.moveDown(0.2);
+      for (const o of d.operators || []) {
+        for (const md of o.machinesDetail || []) {
+          const k = String(md.machineId);
+          if (!opsByMachine.has(k)) opsByMachine.set(k, new Set());
+          opsByMachine.get(k).add(o.operatorName || o.operatorId);
         }
       }
     }
-    if (!anyPace) {
-      tableRow(["No scans to measure against SAM in this period", "", "", "", "", "", "", ""], effW, {
-        color: "#94a3b8",
-      });
+
+    const macs = mergeDays(
+      (d) => d.machines,
+      (m) => m.machineId,
+      (m) => ({
+        machineName: m.machineName, machineType: m.machineType,
+        garments: 0, scanEvents: 0, sam: 0, actual: 0, intervals: 0, operators: new Set(),
+      }),
+      (a, m) => {
+        a.garments += m.garments || 0;
+        a.scanEvents += m.scanEvents || 0;
+        a.sam += m.paceSamSeconds || 0;
+        a.actual += m.paceActualSeconds || 0;
+        a.intervals += m.paceIntervals || 0;
+        for (const n of String(m.operators || "").split(",")) {
+          const v = n.trim();
+          if (v) a.operators.add(v);
+        }
+        /* machines[].operators comes from the rollup's operatorSpans, which is
+           empty for shifts written before that field existed. The operator rows
+           always know which machines they touched, so they are the fallback. */
+        for (const o of opsByMachine.get(String(m.machineId)) || []) a.operators.add(o);
+      }
+    ).sort((a, b) => {
+      const am = a.actual > 0, bm = b.actual > 0;
+      if (am !== bm) return am ? -1 : 1;
+      if (am) return a.sam / a.actual - b.sam / b.actual;
+      return b.garments - a.garments;
+    });
+
+    const mW = [115, 60, 55, 80, 80, 60, 65];
+    const mAl = ["left", "left", "right", "right", "right", "right", "right"];
+    const mHead = () =>
+      tableRow(["Machine", "Type", "Garments", "Standard time", "Time taken", "Per garment", "Efficiency"],
+        mW, { bold: true, size: 8, color: "#334155", rule: true });
+    mHead();
+    if (!macs.length) {
+      tableRow(["No machine worked in this period", "", "", "", "", "", ""], mW, { color: "#94a3b8" });
+    }
+    for (const m of macs) {
+      tableRow([
+        m.machineName, m.machineType || "—", m.garments,
+        m.actual > 0 ? durationWords(m.sam) : "—",
+        m.actual > 0 ? durationWords(m.actual) : "—",
+        m.intervals > 0 ? durationWords(m.actual / m.intervals) : "—",
+        pctText(m.sam, m.actual),
+      ], mW, { align: mAl, repeatHeader: mHead });
+      prose(`Operators: ${[...m.operators].join(", ") || "none recorded"}`,
+        { size: 7, indent: 8, gap: 0.15 });
+    }
+    if (macs.length) {
+      tableRow([
+        "Floor total", "", T.pieces,
+        T.paceIntervals > 0 ? durationWords(T.paceSamSeconds) : "—",
+        T.paceIntervals > 0 ? durationWords(T.paceActualSeconds) : "—",
+        T.paceIntervals > 0 ? durationWords(T.paceActualSeconds / T.paceIntervals) : "—",
+        eff == null ? "Not measured" : `${eff}%`,
+      ], mW, { bold: true, align: mAl, rule: true });
+
     }
 
-    /* Page numbers last, once the count is known — the reason the document was
-       opened with bufferPages. */
+    const allOps = mergeDays(
+      (d) => d.pace?.byOperation,
+      (o) => o.operationCode,
+      (o) => ({
+        operationCode: o.operationCode, samSeconds: o.samSeconds, scansConsidered: 0,
+        intervals: 0, sam: 0, actual: 0, measurable: o.measurable, reason: o.reason, caveat: o.caveat,
+      }),
+      (a, o) => {
+        a.scansConsidered += o.scansConsidered || 0;
+        a.intervals += o.intervals || 0;
+        a.sam += o.totalSamSeconds || 0;
+        a.actual += o.totalActualSeconds || 0;
+        if (o.measurable === false) a.reason = a.reason || o.reason;
+        a.caveat = a.caveat || o.caveat;
+      }
+    );
+
+    // ── 6 · Operation against standard time ──────────────────────────────────
+    heading("Operation against standard time", 12);
+    prose("Where the standard minutes were lost. Worst first.", { size: 7.5, gap: 0.3 });
+
+    const oW = [160, 60, 80, 80, 70, 65];
+    const oAl = ["left", "right", "right", "right", "right", "right"];
+    const oHead = () =>
+      tableRow(["Operation", "SAM each", "Standard time", "Time taken", "Per garment", "Efficiency"],
+        oW, { bold: true, size: 8, color: "#334155", rule: true });
+    oHead();
+    const shown = allOps.filter((o) => o.scansConsidered > 0).sort((a, b) => {
+      const am = a.actual > 0, bm = b.actual > 0;
+      if (am !== bm) return am ? -1 : 1;
+      if (am) return a.sam / a.actual - b.sam / b.actual;
+      return 0;
+    });
+    if (!shown.length) {
+      tableRow(["Nothing could be measured against standard time in this period", "", "", "", "", ""],
+        oW, { color: "#94a3b8" });
+    }
+    for (const o of shown) {
+      tableRow([
+        opLabel(o.operationCode), durationWords(o.samSeconds),
+        o.actual > 0 ? durationWords(o.sam) : "—",
+        o.actual > 0 ? durationWords(o.actual) : "—",
+        o.intervals > 0 ? durationWords(o.actual / o.intervals) : "—",
+        pctText(o.sam, o.actual),
+      ], oW, { align: oAl, color: o.actual > 0 ? "#0f172a" : "#94a3b8", repeatHeader: oHead });
+      /* Only the reason an operation could not be measured. The batch-scanning
+         caveat is the same finding as the sentence at the top of page 1, in
+         three times the words, and it is the one place the report still spoke
+         of gaps and scans. Said once, up there. */
+      if (o.reason) {
+        prose(o.reason, { font: "Helvetica-Oblique", size: 7, color: "#b45309", indent: 8, gap: 0.2 });
+      }
+    }
+    prose("A garment can finish two operations at once, so these add up to more than the floor total.",
+      { size: 7, gap: 0.3 });
+
+    // ── 7 · Orders: what is made and what is still owed ─────────────────────
+    /* THE QUESTION A MANAGER ASKS THAT A PIECE COUNT CANNOT ANSWER.
+       "9 garments" says how busy the floor was. "9 of 80, 71 still to make"
+       says whether the order ships. The ordered quantity and the order's own
+       status come off the work order; the done figure is counted from this
+       period's scans, so it is THIS PERIOD's output against the whole order —
+       stated in the note below rather than left to be assumed. */
+    heading("Orders — made and still to make", 12);
+    prose("Made = finished in these dates. Still to make = ordered less everything done so far.",
+      { size: 7.5, gap: 0.3 });
+
+    /* buildReport already merged these across the period, deduplicating the
+       garments — summing the days here would count a garment scanned on two of
+       them twice. See the workOrders rollup in reportBuilder. */
+    const orders = r.workOrders || [];
+
+    /* THE GARMENT, NOT JUST ITS NAME. A supervisor recognises the trouser
+       before they read the order number, and the dashboard already shows it.
+       Fetched at render time because the image lives on Cloudinary, so:
+       - asked for at 120px wide and as JPEG via a Cloudinary transform, which
+         is what pdfkit embeds directly and keeps the file small;
+       - all of them in parallel, behind one 4s budget;
+       - a failure is a missing picture, never a missing report. */
+    const thumbs = new Map();
+    {
+      const wanted = orders.filter((o) => o.productImage).slice(0, 40);
+      if (wanted.length) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 4000);
+        await Promise.all(
+          wanted.map(async (o) => {
+            try {
+              const url = String(o.productImage).replace(
+                "/image/upload/",
+                "/image/upload/w_120,c_limit,f_jpg,q_auto/"
+              );
+              const resp = await fetch(url, { signal: ctrl.signal });
+              if (!resp.ok) return;
+              const buf = Buffer.from(await resp.arrayBuffer());
+              /* pdfkit accepts JPEG and PNG only, and throws on anything else —
+                 which would abort the whole document for a thumbnail. */
+              const jpeg = buf[0] === 0xff && buf[1] === 0xd8;
+              const png = buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+              if (jpeg || png) thumbs.set(o.workOrderKey, buf);
+            } catch {
+              /* no picture for this one */
+            }
+          })
+        );
+        clearTimeout(timer);
+      }
+    }
+
+    const ordW = [78, 140, 88, 46, 40, 58, 65];
+    const ordAl = ["left", "left", "left", "right", "right", "right", "left"];
+    const ordHead = () =>
+      tableRow(["Order", "Garment", "Customer", "Ordered", "Made", "Still to make", "Status"],
+        ordW, { bold: true, size: 8, color: "#334155", rule: true });
+    ordHead();
+    if (!orders.length) {
+      tableRow(["No order was worked on in this period", "", "", "", "", "", ""], ordW, { color: "#94a3b8" });
+    }
+    let totalOrdered = 0;
+    let totalDone = 0;
+    let totalLeft = 0;
+    for (const o of orders) {
+      const left = o.orderQuantity != null ? Math.max(0, o.orderQuantity - o.done) : null;
+      const over = o.orderQuantity != null ? Math.max(0, o.done - o.orderQuantity) : 0;
+      if (o.orderQuantity != null) totalOrdered += o.orderQuantity;
+      totalDone += o.done;
+      if (left != null) totalLeft += left;
+      tableRow([
+        o.moNumber || "No order number",
+        [o.productName, o.variant].filter(Boolean).join(" · "),
+        o.customerName || "—",
+        o.orderQuantity ?? "not on file",
+        o.done,
+        left == null ? "—" : left,
+        /* MORE MADE THAN ORDERED IS A FINDING, NOT A ROUNDING ERROR. `remaining`
+           floors at zero so a manager is never told to make a negative number,
+           and that floor would quietly hide the overrun — so the overrun is
+           named here instead. 29 garments against an order of 20 is rework,
+           double-scanning, or an order quantity nobody updated; all three are
+           worth a question. */
+        over > 0 ? `Over by ${over}` : left === 0 ? "Complete" : o.workOrderStatus || "—",
+      ], ordW, {
+        align: ordAl,
+        color: over > 0 ? "#b45309" : left === 0 ? "#166534" : "#0f172a",
+        repeatHeader: ordHead,
+      });
+      const madeOn =
+        `${o.done} garment${o.done === 1 ? "" : "s"}` +
+        (o.machines ? ` on ${o.machines}` : "") +
+        (o.operators ? ` by ${o.operators}` : "");
+      const thumb = thumbs.get(o.workOrderKey);
+      if (thumb) {
+        /* Reserve the row before drawing: an image is placed at an absolute
+           position and does not move doc.y, so without this it can straddle a
+           page break with its caption on the other side. */
+        ensureRoom(30, ordHead);
+        const ty = doc.y;
+        try {
+          doc.image(thumb, PDF_MARGIN + 8, ty, { fit: [26, 26] });
+        } catch {
+          /* a corrupt image is not a reason to lose the order row */
+        }
+        doc.y = ty + 2;
+        prose(madeOn, { size: 7, indent: 40, gap: 0.15 });
+        if (doc.y < ty + 28) doc.y = ty + 28;
+      } else {
+        prose(madeOn, { size: 7, indent: 8, gap: 0.15 });
+      }
+    }
+    if (orders.length > 1) {
+      tableRow(
+        ["TOTAL", "", "", totalOrdered || "—", totalDone, totalLeft || "—", ""],
+        ordW,
+        { bold: true, align: ordAl, rule: true }
+      );
+    }
+
+    // ── 8 · Sign-off ────────────────────────────────────────────────────────
+    ensureRoom(70);
+    doc.moveDown(1);
+    const sy = doc.y;
+    const sw = [171, 172, 172];
+    ["Prepared by (IE)", "Checked by (Production Manager)", "Date"].forEach((label, i) => {
+      const x = PDF_MARGIN + sw.slice(0, i).reduce((a, b) => a + b, 0);
+      doc.moveTo(x + 4, sy + 26).lineTo(x + sw[i] - 12, sy + 26)
+        .lineWidth(0.5).strokeColor("#94a3b8").stroke();
+      doc.font("Helvetica").fontSize(7).fillColor("#64748b")
+        .text(label, x + 4, sy + 30, { width: sw[i] - 16, lineBreak: false });
+    });
+    doc.y = sy + 44;
+
+    // ── Page numbers, once the count is known ────────────────────────────────
     const pages = doc.bufferedPageRange();
     for (let i = 0; i < pages.count; i++) {
       doc.switchToPage(pages.start + i);
-      doc.font("Helvetica").fontSize(7.5).fillColor("#94a3b8").text(
-        `GRAV Production Report · ${rangeWords(r)} · page ${i + 1} of ${pages.count}`,
+      doc.font("Helvetica").fontSize(7).fillColor("#94a3b8").text(
+        `${reportNo} · GRAV Production Report · ${rangeWords(r)} · page ${i + 1} of ${pages.count}`,
         PDF_MARGIN,
         doc.page.height - PDF_MARGIN + 6,
         { width: W, align: "center", lineBreak: false }
