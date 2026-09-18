@@ -192,6 +192,72 @@ const overviewHandler = async (req, res) => {
       timeRecovered: ev.timeRecovered,
     }));
 
+
+    /* ── EVERY SCANNER THAT REPORTS, NOT ONLY THE ONES ON A MACHINE ─────────
+       rows[] above is machine-shaped: it walks machines and hangs a heartbeat
+       off each one. Two kinds of live scanner can never appear in it —
+
+         · one with no machineId, which latestHeartbeatByMachine() skips
+           outright ("if (!h?.machineId) continue"), and
+         · the older of two scanners mapped to the SAME machine, because that
+           helper keeps newest-wins and discards the rest.
+
+       Both are reaching the server perfectly well. Counting the floor board and
+       concluding "only 2 scanners are online" when six are posting heartbeats
+       is exactly the wrong conclusion, and it is the board's shape that causes
+       it, not the data. This array is device-shaped so that question has a
+       direct answer, and each row carries WHY it is or is not on the board. */
+    const knownMachineIds = new Set(machines.map((m) => String(m._id)));
+    const devices = heartbeats
+      .map((hb) => {
+        const age = hb.lastHeartbeatAt
+          ? now - new Date(hb.lastHeartbeatAt).getTime()
+          : null;
+        const key = hb.machineId ? String(hb.machineId) : null;
+        const assigned = !!key;
+        const machineKnown = assigned && knownMachineIds.has(key);
+        // Newest-wins already picked one scanner per machine; anything else
+        // mapped to that machine is live but invisible on the board.
+        const isBoardDevice =
+          machineKnown && hbByMachine.get(key)?.deviceId === hb.deviceId;
+
+        return {
+          deviceId: hb.deviceId,
+          firmwareVersion: hb.firmwareVersion,
+          ipAddress: hb.ipAddress,
+          wifiSSID: hb.wifiSSID,
+          rssi: hb.rssi,
+          wifiChannel: hb.wifiChannel,
+          queueDepth: hb.queueDepth,
+          queueHighWater: hb.queueHighWater,
+          onBreak: hb.onBreak,
+          bootCount: hb.bootCount,
+          uptimeSec: hb.uptimeSec,
+          lastHeartbeatAt: hb.lastHeartbeatAt,
+          heartbeatAgeSec: age == null ? null : Math.round(age / 1000),
+          online: age == null ? null : age <= HEARTBEAT_STALE_MS,
+
+          machineId: hb.machineId || null,
+          machineName: machineKnown ? machineNames.get(key) : null,
+          // Why this scanner is, or is not, a tile on the floor board.
+          assigned,
+          machineKnown,
+          onBoard: isBoardDevice,
+          hiddenReason: isBoardDevice
+            ? null
+            : !assigned
+            ? "not_assigned"
+            : !machineKnown
+            ? "machine_missing"
+            : "duplicate_machine",
+        };
+      })
+      .sort(
+        (a, z) =>
+          Number(z.online === true) - Number(a.online === true) ||
+          String(a.deviceId).localeCompare(String(z.deviceId))
+      );
+
     const summary = {
       totalMachines: rows.length,
       producing: rows.filter((r) => r.status === "producing").length,
@@ -207,6 +273,16 @@ const overviewHandler = async (req, res) => {
         (sum, r) => sum + (r.device?.queueDepth || 0),
         0
       ),
+
+      /* Counted over devices, not over machines, so it answers "how many
+         scanners are reaching this server" rather than "how many machines have
+         a scanner that is reaching it" — which are different numbers whenever a
+         scanner is unassigned or shares a machine. */
+      devicesTotal: devices.length,
+      devicesOnline: devices.filter((d) => d.online === true).length,
+      devicesOffline: devices.filter((d) => d.online === false).length,
+      devicesNeverReported: devices.filter((d) => d.online == null).length,
+      devicesNotOnBoard: devices.filter((d) => !d.onBoard).length,
     };
 
     /* ?fields=summary — THE TEN COUNTS, WITHOUT THE THREE ARRAYS.
@@ -225,6 +301,7 @@ const overviewHandler = async (req, res) => {
       generatedAt: new Date(),
       summary,
       machines: rows,
+      devices,
       operators,
       recentScans,
     });
