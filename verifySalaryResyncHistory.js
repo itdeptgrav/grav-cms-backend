@@ -100,6 +100,7 @@ async function restore() {
       typeof f.from === "number" && typeof f.to === "number" && f.from !== f.to,
       `${f.from} -> ${f.to}`);
   }
+  
 
   console.log("\nunchanged employees are not recorded");
   /* Running it a SECOND time must change nothing and write nothing — the
