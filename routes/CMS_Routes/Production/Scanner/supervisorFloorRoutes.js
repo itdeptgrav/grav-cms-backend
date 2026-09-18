@@ -209,6 +209,16 @@ const overviewHandler = async (req, res) => {
       ),
     };
 
+    /* ?fields=summary — THE TEN COUNTS, WITHOUT THE THREE ARRAYS.
+       floor-summary and device-health poll this endpoint and read only
+       `summary`: at 54 machines the full body is ~165 KB (machines[] 84 KB,
+       operators[] 58 KB, recentScans[] 23 KB) to deliver about 170 bytes the
+       caller actually looks at.
+       Opt-in, so every existing caller keeps the full body byte for byte. */
+    if (String(req.query.fields || "") === "summary") {
+      return res.json({ success: true, shiftDate, generatedAt: new Date(), summary });
+    }
+
     return res.json({
       success: true,
       shiftDate,

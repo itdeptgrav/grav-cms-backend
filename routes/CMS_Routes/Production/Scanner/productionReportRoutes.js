@@ -462,7 +462,8 @@ router.get("/report/pace-log", async (req, res) => {
 
 router.get("/report/preview", async (req, res) => {
   try {
-    const r = await reportBuilder.buildReport(readOptions(req));
+    /* scanRows: false — the preview sends scanRowCount, never the rows. */
+    const r = await reportBuilder.buildReport({ ...readOptions(req), scanRows: false });
     res.json({
       success: true,
       generatedAt: r.generatedAt,
@@ -477,7 +478,10 @@ router.get("/report/preview", async (req, res) => {
         products: d.products,
         operators: d.operators,
         machines: d.machines,
-        scanRowCount: d.scanRows.length,
+        /* buildReport's own count, not the array's length — the array is empty
+           here because this route asks for scanRows: false, and reading its
+           length reported 0 scans on a day that had 13. */
+        scanRowCount: d.scanRowCount,
         hourly: d.hourly,
         /* §11 — the figures a report must show: scans, valid intervals, SAM,
            total SAM time, total actual, average actual, overall efficiency.
@@ -934,7 +938,8 @@ const PDF_MARGIN = 40;
 router.get("/report/pdf", async (req, res) => {
   try {
     const PDFDocument = require("pdfkit");
-    const r = await reportBuilder.buildReport(readOptions(req));
+    /* scanRows: false — the PDF has no scan list section. */
+    const r = await reportBuilder.buildReport({ ...readOptions(req), scanRows: false });
 
     const doc = new PDFDocument({ size: "A4", margin: PDF_MARGIN, bufferPages: true });
     const file = r.range.from === r.range.to ? r.range.from : `${r.range.from}_to_${r.range.to}`;
@@ -975,6 +980,26 @@ router.get("/report/pdf", async (req, res) => {
       doc.moveDown(opts.gap == null ? 0.25 : opts.gap);
     };
 
+    /* A HEADER IS ALIGNED LIKE THE COLUMN IT NAMES.
+       No header row passed `align`, so every one printed flush left while its
+       numbers printed flush right: "Garments" sat at the left edge of its
+       column and the 5 beneath it sat at the right edge, an inch away. The
+       header and its value have to sit in the same place to read as a column,
+       and no amount of closing the vertical gap fixes a horizontal one.
+
+       SPACE BELOW A ROW'S TEXT, IN POINTS.
+       heightOfString already returns the glyph height plus pdfkit's own line
+       gap — 9.52pt for an 8pt header, 9.83pt for an 8.5pt cell — so this is
+       padding on top of that, not leading. At 4 a header and the figure under
+       it sat 13.5pt apart, about 1.7x the font size, which reads as a gap
+       rather than as a table. At 1 the row pitch is ~1.27x — measured from the
+       PDF's own content stream, a header baseline and the figure under it sit
+       10.9pt apart, of which only ~1.4pt is white space; the rest is the
+       descender room inside each line box, which cannot be removed without
+       clipping glyphs. Nothing else changes: the same text, the same widths,
+       the same wrap heights. */
+    const ROW_PAD = 1;
+
     const tableRow = (cells, widths, opts = {}) => {
       const size = opts.size || 8.5;
       const font = opts.bold ? "Helvetica-Bold" : "Helvetica";
@@ -988,7 +1013,7 @@ router.get("/report/pdf", async (req, res) => {
           if (h > tallest) tallest = h;
         });
       }
-      if (opts.repeatHeader) ensureRoom(tallest + 6, opts.repeatHeader);
+      if (opts.repeatHeader) ensureRoom(tallest + ROW_PAD + 4, opts.repeatHeader);
 
       doc.font(font).fontSize(size).fillColor(opts.color || "#0f172a");
       const y = doc.y;
@@ -1003,9 +1028,12 @@ router.get("/report/pdf", async (req, res) => {
         x += widths[i];
       });
       doc.x = PDF_MARGIN;
-      doc.y = y + tallest + 4;
+      doc.y = y + tallest + ROW_PAD;
       if (opts.rule) {
-        doc.moveTo(PDF_MARGIN, doc.y - 2).lineTo(PDF_MARGIN + W, doc.y - 2)
+        /* Centred in the padding, so the rule does not sit hard against the
+           header text nor against the row below it. */
+        const ruleY = doc.y - ROW_PAD / 2;
+        doc.moveTo(PDF_MARGIN, ruleY).lineTo(PDF_MARGIN + W, ruleY)
           .lineWidth(0.5).strokeColor("#cbd5e1").stroke();
       }
     };
@@ -1179,11 +1207,11 @@ router.get("/report/pdf", async (req, res) => {
     if (r.range.days > 1) {
       heading("Day by day", 12);
       const dayW = [85, 80, 115, 115, 120];
+      const al = ["left", "right", "right", "right", "right"];
       const dayHead = () =>
         tableRow(["Date", "Garments", "Standard", "Took", "Efficiency"],
-          dayW, { bold: true, size: 8, color: "#334155", rule: true });
+          dayW, { bold: true, size: 8, color: "#334155", rule: true, align: al });
       dayHead();
-      const al = ["left", "right", "right", "right", "right"];
       for (const d of r.days) {
         tableRow([
           d.dayKey,
@@ -1241,7 +1269,7 @@ router.get("/report/pdf", async (req, res) => {
     const opAl = ["left", "left", "right", "right", "right", "right"];
     const opHead = () =>
       tableRow(["Operator", "ID card", "Garments", "Standard", "Took", "Efficiency"], opW,
-        { bold: true, size: 8, color: "#334155", rule: true });
+        { bold: true, size: 8, color: "#334155", rule: true, align: opAl });
     opHead();
     if (!ops.length) {
       tableRow(["No operator worked in this period", "", "", "", "", ""], opW, { color: "#94a3b8" });
@@ -1314,7 +1342,7 @@ router.get("/report/pdf", async (req, res) => {
     const mAl = ["left", "left", "right", "right", "right", "right", "right"];
     const mHead = () =>
       tableRow(["Machine", "Type", "Garments", "Standard time", "Time taken", "Per garment", "Efficiency"],
-        mW, { bold: true, size: 8, color: "#334155", rule: true });
+        mW, { bold: true, size: 8, color: "#334155", rule: true, align: mAl });
     mHead();
     if (!macs.length) {
       tableRow(["No machine worked in this period", "", "", "", "", "", ""], mW, { color: "#94a3b8" });
@@ -1366,7 +1394,7 @@ router.get("/report/pdf", async (req, res) => {
     const oAl = ["left", "right", "right", "right", "right", "right"];
     const oHead = () =>
       tableRow(["Operation", "SAM each", "Standard time", "Time taken", "Per garment", "Efficiency"],
-        oW, { bold: true, size: 8, color: "#334155", rule: true });
+        oW, { bold: true, size: 8, color: "#334155", rule: true, align: oAl });
     oHead();
     const shown = allOps.filter((o) => o.scansConsidered > 0).sort((a, b) => {
       const am = a.actual > 0, bm = b.actual > 0;
@@ -1454,7 +1482,7 @@ router.get("/report/pdf", async (req, res) => {
     const ordAl = ["left", "left", "left", "right", "right", "right", "left"];
     const ordHead = () =>
       tableRow(["Order", "Garment", "Customer", "Ordered", "Made", "Still to make", "Status"],
-        ordW, { bold: true, size: 8, color: "#334155", rule: true });
+        ordW, { bold: true, size: 8, color: "#334155", rule: true, align: ordAl });
     ordHead();
     if (!orders.length) {
       tableRow(["No order was worked on in this period", "", "", "", "", "", ""], ordW, { color: "#94a3b8" });

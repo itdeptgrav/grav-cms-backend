@@ -1144,10 +1144,21 @@ async function buildReport(opts = {}) {
         })
         .sort((x, y) => y.done - x.done);
     })(),
-    days: days.map((d) => ({
-      ...d,
-      workOrders: (d.workOrders || []).map(({ _pieceKeys, ...w }) => w),
-    })),
+    /* DROP THE SCAN ROWS UNLESS A CALLER ASKED FOR THEM.
+       Every day's rows are built (filtering needs them) and then retained on
+       the returned object, so a 92-day range held every scan of every day in
+       heap at once. Only the workbook and the CSV ever read them; the preview
+       and the PDF read `.length`, which is kept as scanRowCount.
+       Opt-out, so any caller that does not pass the flag keeps the rows. */
+    days: days.map((d) => {
+      const day = {
+        ...d,
+        scanRowCount: d.scanRows.length,
+        workOrders: (d.workOrders || []).map(({ _pieceKeys, ...w }) => w),
+      };
+      if (opts.scanRows === false) day.scanRows = [];
+      return day;
+    }),
   };
 }
 

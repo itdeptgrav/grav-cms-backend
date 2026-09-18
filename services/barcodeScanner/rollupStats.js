@@ -470,6 +470,11 @@ function resolveStatus({ heartbeat, currentSession, lastScanAt, now }) {
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
+/* shiftDate ISO -> the event count at the last SUCCESSFUL rollup. Only written
+   once a pass completes, so a crashed or throwing run always rebuilds. One
+   small entry per day this process has rolled up. */
+const lastRolledCount = new Map();
+
 async function rollupForDate(shiftDate, models) {
   const {
     ProductionEvent,
@@ -482,14 +487,37 @@ async function rollupForDate(shiftDate, models) {
     Operation,
   } = models;
 
+  /* DO NOT REBUILD A DAY THAT HAS NOT CHANGED.
+     This ran every 60s in two processes and on a ~1.2s debounce during
+     ingest, and each pass pulled the WHOLE shift into Node's heap —
+     ~38,900 documents, ~26 MB, by the end of a 54-machine shift — before
+     the "no events" check below could do anything about it. The heaviest
+     case was overnight, when the day is finished and every pass rebuilt an
+     identical answer from identical data until IST midnight.
+
+     countDocuments is served by the { shiftDate, machineId, scanTime }
+     index without materialising a single document, so the unchanged case
+     now costs one index count instead of a full-day read.
+
+     COUNT IS A SUFFICIENT SIGNAL HERE. Events are insert-only in normal
+     operation; the one path that deletes them
+     (productionReportRoutes DELETE /report/scans) re-runs this rollup
+     itself straight afterwards, so an insert-and-delete pair between two
+     ticks cannot leave a stale figure standing. */
+  const countKey = new Date(shiftDate).toISOString();
+  const liveCount = await ProductionEvent.countDocuments({ shiftDate });
+
+  if (liveCount === 0) {
+    lastRolledCount.delete(countKey);
+    return { shiftDate, skipped: true, reason: "no events" };
+  }
+  if (lastRolledCount.get(countKey) === liveCount) {
+    return { shiftDate, skipped: true, reason: "unchanged" };
+  }
+
   const events = await ProductionEvent.find({ shiftDate })
     .sort({ machineId: 1, scanTime: 1 })
     .lean();
-
-  // The guard that makes this job safe to run against any date.
-  if (events.length === 0) {
-    return { shiftDate, skipped: true, reason: "no events" };
-  }
 
   const now = Date.now();
   const opTargets = await loadOperationTargets(Operation);
@@ -795,6 +823,10 @@ async function rollupForDate(shiftDate, models) {
       { upsert: true }
     ),
   ]);
+
+  /* Recorded only now, after every write above has resolved — a pass that
+     threw leaves the old count in place and rebuilds next tick. */
+  lastRolledCount.set(countKey, liveCount);
 
   return {
     shiftDate,
