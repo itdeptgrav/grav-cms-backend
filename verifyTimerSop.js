@@ -123,6 +123,7 @@ async function main() {
     console.log("\nDone.\n");
 }
 
+
 main().catch(e => {
     console.error("\nSCRIPT ERROR:", e);
     process.exit(1);
