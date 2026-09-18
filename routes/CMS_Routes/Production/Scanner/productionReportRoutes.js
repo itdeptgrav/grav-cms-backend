@@ -471,6 +471,11 @@ router.get("/report/preview", async (req, res) => {
       filters: r.filters,
       filterLabels: r.filterLabels,
       totals: r.totals,
+      /* Order progress for the period, garments deduplicated across days. The
+         Scan Records page shows "3 of 80 done" from this rather than from the
+         old work-orders endpoint, so the two pages cannot disagree about how
+         much of an order is finished. */
+      workOrders: r.workOrders,
       days: r.days.map((d) => ({
         dayKey: d.dayKey,
         hasData: d.hasData,
