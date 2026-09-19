@@ -34,8 +34,22 @@
  * Pure functions, no database, no sockets — so the rule can be tested directly.
  */
 
-/** A per-person delivery room. Matches `socket.join(String(employeeId))`. */
-const person = (id) => String(id);
+const { userRoom } = require("./socketIdentity");
+
+/**
+ * A per-person delivery room — the AUTHENTICATED one.
+ *
+ * `userRoom` yields `user:<employeeId>`, a room only `socketIdentity` joins and
+ * only for the employee a verified Firebase token resolved to. It is not the
+ * bare `<employeeId>` room `join_cowork` hands out on request.
+ *
+ * That distinction is the entire security model here and it is one character
+ * away from being lost: addressing `String(id)` instead would deliver every
+ * task and message to whoever asked for that room by name. The legacy room
+ * keeps carrying exactly what it carries today; nothing from this migration
+ * goes near it.
+ */
+const person = (id) => userRoom(id);
 
 /** Everyone named on a task, by the same rule that decides who may open it. */
 function taskAudience(doc) {

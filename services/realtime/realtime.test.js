@@ -2,6 +2,10 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 const { audienceFor, isWatched, taskAudience } = require("./rooms");
+const { isAuthenticatedRoom, userRoom } = require("./socketIdentity");
+
+/** Every room the broker addresses is one the SERVER granted, not one claimed. */
+const u = (...ids) => ids.map(userRoom);
 const { ChangeStreamBroker, STATE_ID, toEvent } = require("./changeStreamBroker");
 
 /**
@@ -85,28 +89,26 @@ test("a task reaches everyone the document names, and nobody else", () => {
     departmentApprovals: [{ approverId: "E7" }],
     visibleTo: ["E8"],
   });
-  assert.deepEqual(rooms.sort(), ["E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8"]);
+  assert.deepEqual(rooms.sort(), u("E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8").sort());
 });
 
 test("a stranger is not on the list however they joined", () => {
   /* The point of the whole design: the audience comes from the document, so a
      socket that guessed `socket.join("E999")` is simply never addressed. */
   const rooms = taskAudience({ assigneeIds: ["E1"], assignedBy: "E2" });
+  assert.ok(!rooms.includes(userRoom("E999")));
   assert.ok(!rooms.includes("E999"));
 });
 
 test("a notification is for its owner alone", () => {
   /* Not their manager, not a CEO. */
-  assert.deepEqual(audienceFor("cowork_notifications", { employeeId: "E1" }), ["E1"]);
+  assert.deepEqual(audienceFor("cowork_notifications", { employeeId: "E1" }), u("E1"));
 });
 
 test("a DM is addressed to the two people its id is made of", () => {
   /* `chatId` is `[a,b].sort().join("_")`, so the participants are derivable
      without trusting a client to say who it is. */
-  assert.deepEqual(audienceFor("cowork_direct_messages", { chatId: "E1_E2" }), [
-    "E1",
-    "E2",
-  ]);
+  assert.deepEqual(audienceFor("cowork_direct_messages", { chatId: "E1_E2" }), u("E1", "E2"));
 });
 
 test("a malformed chat id addresses nobody rather than everybody", () => {
@@ -151,7 +153,7 @@ test("a change is emitted to the document's audience", async () => {
   const broker = new ChangeStreamBroker({ db: fakeDb(), io, log: quiet });
   await broker.deliver(change());
   assert.equal(io.sent.length, 1);
-  assert.deepEqual(io.sent[0].rooms.sort(), ["E1", "E2"]);
+  assert.deepEqual(io.sent[0].rooms.sort(), u("E1", "E2").sort());
   assert.equal(io.sent[0].event, "realtime:change");
   assert.deepEqual(io.sent[0].payload.collection, "cowork_tasks");
   assert.equal(io.sent[0].payload.id, "T1");
@@ -263,4 +265,112 @@ test("stopping keeps it stopped", async () => {
   await broker.stop();
   await broker.recover(new Error("closed"));
   assert.equal(opened, 0);
+});
+
+/* ── The room namespace itself ────────────────────────────────────────────── */
+
+test("nothing is ever addressed to a room a client can simply claim", () => {
+  /* `join_cowork` in server.js joins whatever employeeId the client sends, with
+     no check. While Firestore enforced reads that was survivable; it is not once
+     documents travel through rooms. Every room the broker addresses must be one
+     `socketIdentity` granted after verifying a token — the `user:` namespace —
+     and NEVER the bare id. The two are one character apart in the source. */
+  const docs = [
+    ["cowork_tasks", { assigneeIds: ["E1"], assignedBy: "E2", visibleTo: ["E3"] }],
+    ["cowork_notifications", { employeeId: "E1" }],
+    ["cowork_direct_messages", { chatId: "E1_E2" }],
+    ["cowork_groups", { memberIds: ["E1", "E2"] }],
+    ["cowork_duty_status", { employeeId: "E1" }],
+    ["cowork_task_timers", { employeeId: "E1" }],
+  ];
+  for (const [collection, doc] of docs) {
+    const rooms = audienceFor(collection, doc);
+    assert.ok(rooms.length > 0, `${collection} addressed nobody`);
+    for (const room of rooms)
+      assert.ok(
+        isAuthenticatedRoom(room),
+        `${collection} addressed "${room}", which any client could join`,
+      );
+  }
+});
+
+test("an unauthenticated socket is not refused, it is just not addressed", async () => {
+  /* Refusing would disconnect every client that has not been updated — presence,
+     typing, meetings and MRF chat all ride this socket and none of them are
+     changing. No token means no `user:` room, which means none of the migrated
+     data. Degraded, not broken. */
+  const { socketIdentity } = require("./socketIdentity");
+  const identify = socketIdentity({
+    verifyIdToken: async () => {
+      throw new Error("should not be called");
+    },
+    resolveEmployee: async () => null,
+  });
+  const joined = [];
+  const socket = { handshake: { auth: {}, query: {} }, data: {}, join: (r) => joined.push(r) };
+  let called = false;
+  await identify(socket, () => {
+    called = true;
+  });
+  assert.equal(called, true, "the connection was refused");
+  assert.equal(socket.data.employeeId, null);
+  assert.deepEqual(joined, [], "an anonymous socket was given a room");
+});
+
+test("a verified token joins exactly one room, its own", async () => {
+  const { socketIdentity } = require("./socketIdentity");
+  const identify = socketIdentity({
+    verifyIdToken: async (t) => {
+      assert.equal(t, "good-token");
+      return { uid: "uid-1" };
+    },
+    resolveEmployee: async (uid) => (uid === "uid-1" ? { employeeId: "E1" } : null),
+  });
+  const joined = [];
+  const socket = {
+    handshake: { auth: { token: "good-token" }, query: {} },
+    data: {},
+    join: (r) => joined.push(r),
+  };
+  await identify(socket, () => {});
+  assert.deepEqual(joined, [userRoom("E1")]);
+  assert.equal(socket.data.employeeId, "E1");
+});
+
+test("an expired token costs the room, not the connection", async () => {
+  /* Tokens expire on the SDK's schedule and a tab waking from sleep reconnects
+     with a stale one. Dropping the socket would take the meeting with it. */
+  const { socketIdentity } = require("./socketIdentity");
+  const identify = socketIdentity({
+    verifyIdToken: async () => {
+      throw Object.assign(new Error("expired"), { code: "auth/id-token-expired" });
+    },
+    resolveEmployee: async () => null,
+  });
+  const joined = [];
+  const socket = {
+    handshake: { auth: { token: "stale" }, query: {} },
+    data: {},
+    join: (r) => joined.push(r),
+  };
+  let called = false;
+  await identify(socket, () => {
+    called = true;
+  });
+  assert.equal(called, true, "an expired token disconnected the socket");
+  assert.deepEqual(joined, []);
+  assert.equal(socket.data.employeeId, null);
+});
+
+test("a Firebase user with no workspace record gets no room", async () => {
+  const { socketIdentity } = require("./socketIdentity");
+  const identify = socketIdentity({
+    verifyIdToken: async () => ({ uid: "uid-x" }),
+    resolveEmployee: async () => null,
+  });
+  const joined = [];
+  const socket = { handshake: { auth: { token: "t" }, query: {} }, data: {}, join: (r) => joined.push(r) };
+  await identify(socket, () => {});
+  assert.deepEqual(joined, []);
+  assert.equal(socket.data.employeeId, null);
 });
