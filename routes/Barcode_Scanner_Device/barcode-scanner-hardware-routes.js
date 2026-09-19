@@ -131,6 +131,11 @@ function firmwareImageProblem(buf) {
   return null;
 }
 
+/** Where a given version's binary lives on this server's disk. */
+function firmwarePathFor(version) {
+  return path.join(__dirname, '../../firmware', `firmware_v${version}.bin`);
+}
+
 function deviceBaseUrl(req) {
   const fwd = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
   const proto = fwd || req.protocol || 'http';
@@ -161,6 +166,81 @@ function deviceBaseUrl(req) {
  * Unset, this changes nothing: every caller gets exactly today's behaviour.
  * Example: OTA_DOWNLOAD_BASE_URL=http://192.168.1.80:5000
  */
+/* THE DOWNLOAD URL, BUILT TO SURVIVE A TUNNEL.
+ *
+ * api.grav.in is a Cloudflare Tunnel. cloudflared re-streams a response on
+ * its way to the edge, and a re-streamed response loses its Content-Length
+ * and arrives chunked. The scanner needs that length UP FRONT to size the
+ * flash write, so every OTA through the tunnel fails with "No size sent".
+ *
+ * A CACHED response does not have that problem: once Cloudflare holds the
+ * object it knows the size and serves it with a real Content-Length, without
+ * going near the tunnel at all. So the job is to make this response
+ * cacheable, which takes three things:
+ *
+ *   1. a .bin path, so it looks like a static file rather than an API call
+ *   2. Cache-Control that permits caching (it said no-cache before, which is
+ *      exactly what forced cf-cache-status: DYNAMIC)
+ *   3. a URL that CHANGES whenever the bytes change
+ *
+ * (3) is what makes (2) safe. Version numbers get reused here - the same
+ * 5.6.4 has been uploaded more than once - so caching on version alone would
+ * hand scanners a stale binary for as long as the TTL lasted. The fingerprint
+ * is taken from the file's own size and mtime, so re-uploading anything at
+ * all produces a different URL, a different cache key, and a guaranteed miss.
+ * The old object simply ages out, unreachable.
+ */
+function firmwareFingerprint(filePath) {
+  try {
+    const st = fs.statSync(filePath);
+    return `${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}`;
+  } catch {
+    return '';
+  }
+}
+
+/** The full URL a scanner should fetch a given version from. */
+function firmwareDownloadUrl(req, version) {
+  const fp = firmwareFingerprint(firmwarePathFor(version));
+  const base = `${otaDownloadBase(req)}/api/barcode-devices/firmware/download/` +
+    `${encodeURIComponent(version)}.bin`;
+  return fp ? `${base}?v=${fp}` : base;
+}
+
+/* PULL THE NEW BINARY THROUGH CLOUDFLARE ONCE, SO NO SCANNER IS THE FIRST.
+ *
+ * Caching only helps on a HIT. On a MISS Cloudflare goes to the tunnel, and
+ * the tunnel is exactly what loses the Content-Length - so whichever device
+ * asked first would still fail, and worse, it would mark that version failed
+ * and not retry until it was power-cycled.
+ *
+ * So the server fetches its own public URL once, immediately after the
+ * upload, and wears that miss itself. By the time any scanner checks in, the
+ * object is in the edge cache with a known length.
+ *
+ * Deliberately fire-and-forget: the upload has already succeeded and been
+ * recorded by this point, and whether a CDN warmed up is not something the
+ * person uploading should wait on or see fail. It logs either way.
+ */
+function warmFirmwareCache(url) {
+  if (!url || !/^https:\/\//i.test(url)) return; // only meaningful via the CDN
+  setImmediate(async () => {
+    try {
+      const r = await fetch(url);
+      // Read it fully - a partial read may not populate the cache.
+      const buf = await r.arrayBuffer();
+      console.log(
+        `Firmware cache warm: HTTP ${r.status} ` +
+        `cf-cache-status=${r.headers.get('cf-cache-status') || 'n/a'} ` +
+        `content-length=${r.headers.get('content-length') || 'ABSENT'} ` +
+        `${buf.byteLength} bytes  ${url}`
+      );
+    } catch (err) {
+      console.warn('Firmware cache warm failed (harmless):', err.message);
+    }
+  });
+}
+
 function otaDownloadBase(req) {
   const override = String(process.env.OTA_DOWNLOAD_BASE_URL || '')
     .trim()
@@ -236,10 +316,9 @@ router.post('/check-update', async (req, res) => {
 
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
-        const baseUrl   = otaDownloadBase(req);
         firmwareInfo    = {
           version:     latestFirmware.version,
-          url:         `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
+          url:         firmwareDownloadUrl(req, latestFirmware.version),
           fileSize:    latestFirmware.fileSize,
           description: latestFirmware.description
         };
@@ -276,8 +355,11 @@ router.post('/check-update', async (req, res) => {
  */
 router.get('/firmware/download/:version', (req, res) => {
   try {
-    const { version }    = req.params;
-    const firmwarePath   = path.join(__dirname, '../../firmware', `firmware_v${version}.bin`);
+    /* The URL now ends in .bin so Cloudflare treats it as a static file.
+       Stripped here, so both the new `5.6.5.bin` form and the bare `5.6.5`
+       every already-deployed scanner still has keep working. */
+    const version        = String(req.params.version).replace(/\.bin$/i, '');
+    const firmwarePath   = firmwarePathFor(version);
 
     console.log('Firmware download requested:', firmwarePath);
 
@@ -308,7 +390,20 @@ router.get('/firmware/download/:version', (req, res) => {
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
     res.setHeader('Content-Length', stats.size);
-    res.setHeader('Cache-Control', 'no-cache');
+    /* CACHEABLE, AND THAT IS THE WHOLE FIX.
+       `no-cache` is what pinned this at cf-cache-status: DYNAMIC, which means
+       Cloudflare streamed it straight from the tunnel and the Content-Length
+       never survived. Cached, Cloudflare knows the object's size and sends it.
+       Safe to cache hard because the URL carries a fingerprint of the bytes:
+       different bytes, different URL. A request without one is treated as
+       uncacheable, so an old scanner asking the bare URL cannot be pinned to a
+       stale copy either. */
+    res.setHeader(
+      'Cache-Control',
+      req.query.v
+        ? 'public, max-age=31536000, immutable'
+        : 'no-cache'
+    );
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     const fileStream = fs.createReadStream(firmwarePath);
@@ -407,8 +502,11 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     fs.writeFileSync(filePath, file.buffer);
     console.log('Firmware saved to:', filePath);
 
-    const baseUrl    = otaDownloadBase(req);
-    const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
+    const firmwareUrl = firmwareDownloadUrl(req, version);
+
+    // Take the cache miss here, on the server, rather than leaving it for
+    // whichever scanner happens to check in first.
+    warmFirmwareCache(firmwareUrl);
 
     // Deactivate any existing record with the same version
     /* Restored with the upsert below: the original computed this immediately
