@@ -402,11 +402,31 @@ class DocumentReference {
    * nobody else's either. It simply vanished. `add()` happened to work, which
    * is what made it look like subcollections worked at all.
    */
-  constructor(store, collection, id, parentId = null) {
+  constructor(store, collection, id, parentId = null, session = null) {
     this._store = store;
     this._collection = collection;
     this._parentId = parentId;
+    this._session = session;
     this.id = id;
+  }
+
+  /**
+   * The same reference, enrolled in a transaction.
+   *
+   * A reference created outside `runTransaction` and used inside it would read
+   * and write outside the transaction — succeeding, and committing nothing.
+   * The transaction object below binds every reference it is handed through
+   * here, so a caller can go on building refs from `db.collection(...)` exactly
+   * as it does with Firestore.
+   */
+  withSession(session) {
+    return new DocumentReference(
+      this._store,
+      this._collection,
+      this.id,
+      this._parentId,
+      session,
+    );
   }
 
   /** The owner stamp, on every write this reference makes. */
@@ -425,7 +445,11 @@ class DocumentReference {
 
 
   async get() {
-    const doc = await this._store.findOne(this._collection, { _id: this.id });
+    const doc = await this._store.findOne(
+      this._collection,
+      { _id: this.id },
+      { session: this._session },
+    );
     return new DocumentSnapshot(this.id, doc, this);
   }
 
@@ -435,7 +459,7 @@ class DocumentReference {
         this._collection,
         this.id,
         toUpdate(this._own(data)),
-        { upsert: true },
+        { upsert: true, session: this._session },
       );
       return this;
     }
@@ -443,6 +467,7 @@ class DocumentReference {
       this._collection,
       this.id,
       this._own(toDocument(data)),
+      { session: this._session },
     );
     return this;
   }
@@ -456,7 +481,7 @@ class DocumentReference {
       this._collection,
       this.id,
       toUpdate(patch),
-      { upsert: false },
+      { upsert: false, session: this._session },
     );
     if (!result.matched) {
       const e = new Error(
@@ -469,7 +494,7 @@ class DocumentReference {
   }
 
   async delete() {
-    await this._store.delete(this._collection, this.id);
+    await this._store.delete(this._collection, this.id, { session: this._session });
     return this;
   }
 }
@@ -527,14 +552,22 @@ class WriteBatch {
     this._ops.push({ kind: "delete", ref });
     return this;
   }
+  /**
+   * Firestore resolves a batch to one `WriteResult` per operation. Returning a
+   * count, or a `{atomic, value}` wrapper, is a different shape from the one
+   * every caller was written against.
+   */
   async commit() {
-    return this._store.transaction(async () => {
+    return this._store.transaction(async (session) => {
+      const results = [];
       for (const op of this._ops) {
-        if (op.kind === "set") await op.ref.set(op.data, op.options);
-        else if (op.kind === "update") await op.ref.update(op.patch);
-        else await op.ref.delete();
+        const ref = session ? op.ref.withSession(session) : op.ref;
+        if (op.kind === "set") await ref.set(op.data, op.options);
+        else if (op.kind === "update") await ref.update(op.patch);
+        else await ref.delete();
+        results.push({ writeTime: new Date() });
       }
-      return this._ops.length;
+      return results;
     });
   }
 }
@@ -549,15 +582,35 @@ function createFirestoreCompat(store) {
   return {
     collection: (name) => new CollectionReference(store, name),
     batch: () => new WriteBatch(store),
+    /**
+     * Resolves to what the callback returned — not a wrapper.
+     *
+     * Ten call sites use the value directly: a generated document id, an HTTP
+     * status, the claimed/not-claimed answer to a race. A `{atomic, value}`
+     * wrapper broke all of them silently, because an object is truthy.
+     *
+     * Every reference the callback touches is rebound to the session first, so
+     * a ref built with the ordinary `db.collection(...).doc(...)` — which is
+     * how all ten are written — actually takes part in the transaction rather
+     * than running beside it.
+     */
     runTransaction: (fn) =>
-      store.transaction(() =>
-        fn({
-          get: (ref) => ref.get(),
-          set: (ref, data, options) => ref.set(data, options),
-          update: (ref, patch) => ref.update(patch),
-          delete: (ref) => ref.delete(),
-        }),
-      ),
+      store.transaction((session) => {
+        const bind = (ref) => (session ? ref.withSession(session) : ref);
+        return fn({
+          get: (ref) => bind(ref).get(),
+          /**
+           * Several documents in one read, which `taskForward.js` uses to
+           * verify a whole queue belongs to one person before renumbering it.
+           * Firestore reads them at a single consistent point; the loop here is
+           * inside the transaction, so it sees one snapshot too.
+           */
+          getAll: (...refs) => Promise.all(refs.flat().map((r) => bind(r).get())),
+          set: (ref, data, options) => bind(ref).set(data, options),
+          update: (ref, patch) => bind(ref).update(patch),
+          delete: (ref) => bind(ref).delete(),
+        });
+      }),
     /* Deliberate refusals. Both are absent from this backend — measured, not
        assumed — and a silent approximation of either would be worse than a
        clear failure the day somebody reaches for one. */

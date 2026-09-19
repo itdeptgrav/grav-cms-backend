@@ -38,7 +38,12 @@
  * the whole security model now that Firestore's rules are gone.
  */
 
-const { audienceFor, isWatched, watchedCollections } = require("./rooms");
+const {
+  audienceFor,
+  isWatched,
+  parentOf,
+  watchedCollections,
+} = require("./rooms");
 
 /** Where the oplog position is kept between restarts. */
 const STATE_COLLECTION = "cowork_realtime_state";
@@ -47,6 +52,10 @@ const STATE_ID = "changeStreamResumeToken";
 /** How long to wait before reopening a stream that failed, and the ceiling. */
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
+
+/** How long a resolved parent may be reused, and how many are kept. */
+const PARENT_CACHE_MS = 5_000;
+const PARENT_CACHE_MAX = 500;
 
 /**
  * The event a client receives. One shape for every collection, because the
@@ -89,6 +98,8 @@ class ChangeStreamBroker {
     /* Counters, so `/cowork/admin/realtime-stats` can answer "is it actually
        delivering?" without anyone reading logs. */
     this.stats = { events: 0, delivered: 0, dropped: 0, resyncs: 0, since: null };
+    /** Recently-resolved subcollection parents — see `audienceOf`. */
+    this.parents = new Map();
   }
 
   /* ── Resume position ──────────────────────────────────────────────────── */
@@ -135,7 +146,21 @@ class ChangeStreamBroker {
     return [
       {
         $match: {
-          "ns.coll": { $in: watchedCollections(), $ne: STATE_COLLECTION },
+          /* Watched collections AND their flattened subcollections. A chat
+             message lives in `cowork_tasks__chat`, which is not in the audience
+             table — its readers are decided by the TASK it hangs off, resolved
+             in `deliver` below. Matching only `$in: watchedCollections()`
+             silently dropped every message, every daily report and every timer
+             session: the busiest realtime traffic in the product. */
+          $or: [
+            { "ns.coll": { $in: watchedCollections() } },
+            {
+              "ns.coll": {
+                $in: watchedCollections().map((c) => new RegExp(`^${c}__`)),
+              },
+            },
+          ],
+          "ns.coll": { $ne: STATE_COLLECTION },
           operationType: { $in: ["insert", "update", "replace", "delete"] },
         },
       },
@@ -195,7 +220,7 @@ class ChangeStreamBroker {
 
     if (change.operationType === "delete") return this.deliverDelete(change, event);
 
-    const audience = audienceFor(event.collection, change.fullDocument);
+    const audience = await this.audienceOf(event.collection, change.fullDocument, event.id);
     if (audience.length === 0) {
       /* Nobody to tell. Counted rather than ignored: a collection quietly
          addressing nobody is a rule that needs looking at, and the number is
@@ -207,6 +232,46 @@ class ChangeStreamBroker {
     }
 
     await this.writeResumeToken(change._id);
+  }
+
+  /**
+   * The audience, resolving a subcollection through its parent.
+   *
+   * A chat message names nobody: who may read it is whoever may read the task.
+   * That needs a second read, which is why this is async and the rule in
+   * `rooms.js` is not. The parent is cached for a few seconds — a burst of
+   * messages on one task is the common case, and re-reading the task per
+   * message would turn a chat into a read amplifier.
+   */
+  async audienceOf(collection, doc, id) {
+    const direct = audienceFor(collection, doc, id);
+    if (direct.length > 0) return direct;
+
+    const sub = parentOf(collection);
+    if (!sub) return [];
+    const parentId = doc?._parentId;
+    if (!parentId) return [];
+
+    const key = `${sub.parent}/${parentId}`;
+    const cached = this.parents.get(key);
+    if (cached && Date.now() - cached.at < PARENT_CACHE_MS) {
+      return audienceFor(sub.parent, cached.doc, String(parentId));
+    }
+    try {
+      const parent = await this.db
+        .collection(sub.parent)
+        .findOne({ _id: String(parentId) });
+      this.parents.set(key, { doc: parent, at: Date.now() });
+      /* Bounded, so a long-running process cannot grow this without limit. */
+      if (this.parents.size > PARENT_CACHE_MAX)
+        this.parents.delete(this.parents.keys().next().value);
+      return audienceFor(sub.parent, parent, String(parentId));
+    } catch (e) {
+      /* A parent that cannot be read means an audience that cannot be
+         computed. Telling nobody is the only safe answer. */
+      this.log("could not resolve a subcollection parent", e?.message);
+      return [];
+    }
   }
 
   /**

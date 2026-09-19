@@ -265,11 +265,122 @@ test("a batch applies every operation", async () => {
   assert.equal((await db.collection("t").doc("c").get()).exists, false);
 });
 
-test("a batch reports whether it was actually atomic", async () => {
-  /* Atomicity needs a replica set. Saying so beats letting a caller believe in
-     a guarantee the deployment is not giving. */
-  const r = await fresh({}).batch().commit();
-  assert.equal(r.atomic, false);
+test("a batch resolves to one WriteResult per operation, as Firestore does", async () => {
+  /* Not a count, and not a `{atomic, value}` wrapper. Callers were written
+     against Firestore's shape. */
+  const db = fresh({ t: [{ _id: "b", n: 1 }] });
+  const batch = db.batch();
+  batch.set(db.collection("t").doc("a"), { n: 1 });
+  batch.update(db.collection("t").doc("b"), { n: 2 });
+  const results = await batch.commit();
+  assert.ok(Array.isArray(results));
+  assert.equal(results.length, 2);
+  assert.ok(results[0].writeTime instanceof Date);
+});
+
+test("runTransaction resolves to what the callback returned", async () => {
+  /**
+   * The bug this pins. Ten call sites do `const x = await db.runTransaction(...)`
+   * and use `x` directly — as a document id, an HTTP status, the claimed /
+   * not-claimed answer to a race. Returning `{atomic, value}` broke every one
+   * of them SILENTLY, because an object is truthy: `if (claimed)` stayed true
+   * whatever the transaction decided.
+   */
+  const db = fresh({});
+  const out = await db.runTransaction(async () => "T-1234");
+  assert.equal(out, "T-1234", "the callback's value was wrapped");
+
+  assert.equal(await db.runTransaction(async () => null), null);
+  assert.equal(await db.runTransaction(async () => false), false);
+});
+
+test("a transaction reads several documents at once", async () => {
+  /* `taskForward.js:557` verifies a whole queue belongs to one person before
+     renumbering it, and does it with `tx.getAll(...refs)` — which did not exist
+     on the facade at all. */
+  const db = fresh({ t: [{ _id: "1", n: 1 }, { _id: "2", n: 2 }] });
+  const got = await db.runTransaction(async (tx) => {
+    const refs = ["1", "2", "missing"].map((id) => db.collection("t").doc(id));
+    const snaps = await tx.getAll(...refs);
+    return snaps.map((s) => (s.exists ? s.data().n : null));
+  });
+  assert.deepEqual(got, [1, 2, null]);
+});
+
+test("every operation inside a transaction is enrolled in it", async () => {
+  /**
+   * The silent one. The driver only counts an operation as part of a
+   * transaction if it is handed the session — otherwise the reads and writes
+   * succeed OUTSIDE it and `withTransaction` commits an empty transaction. No
+   * rollback, no read-conflict detection, and every compare-and-set in Cowork
+   * quietly becomes a plain race. It is correct-looking under test and wrong
+   * only under concurrency, which is the worst shape a bug can have.
+   */
+  const seen = [];
+  const store = {
+    async findOne(_c, _f, o) {
+      seen.push(["findOne", o?.session]);
+      return { _id: "a", n: 1 };
+    },
+    async find() {
+      return [];
+    },
+    async replace(_c, _i, _d, o) {
+      seen.push(["replace", o?.session]);
+    },
+    async update(_c, _i, _u, o) {
+      seen.push(["update", o?.session]);
+      return { matched: true };
+    },
+    async delete(_c, _i, o) {
+      seen.push(["delete", o?.session]);
+    },
+    async transaction(fn) {
+      return fn("SESSION");
+    },
+  };
+  const db = createFirestoreCompat(store);
+  await db.runTransaction(async (tx) => {
+    const ref = db.collection("t").doc("a");
+    await tx.get(ref);
+    await tx.set(ref, { n: 2 });
+    await tx.update(ref, { n: 3 });
+    await tx.delete(ref);
+  });
+  assert.ok(seen.length >= 4, `only ${seen.length} operations reached the store`);
+  for (const [op, session] of seen)
+    assert.equal(session, "SESSION", `${op} ran outside the transaction`);
+});
+
+test("a batch is enrolled in its transaction too", async () => {
+  const seen = [];
+  const store = {
+    async findOne() {
+      return null;
+    },
+    async find() {
+      return [];
+    },
+    async replace(_c, _i, _d, o) {
+      seen.push(o?.session);
+    },
+    async update(_c, _i, _u, o) {
+      seen.push(o?.session);
+      return { matched: true };
+    },
+    async delete(_c, _i, o) {
+      seen.push(o?.session);
+    },
+    async transaction(fn) {
+      return fn("SESSION");
+    },
+  };
+  const db = createFirestoreCompat(store);
+  const batch = db.batch();
+  batch.set(db.collection("t").doc("a"), { n: 1 });
+  batch.delete(db.collection("t").doc("b"));
+  await batch.commit();
+  assert.deepEqual(seen, ["SESSION", "SESSION"]);
 });
 
 test("a transaction reads and writes through the same references", async () => {

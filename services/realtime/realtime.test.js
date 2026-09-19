@@ -224,7 +224,121 @@ test("the broker's own bookkeeping cannot feed itself", async () => {
   const broker = new ChangeStreamBroker({ db: fakeDb(), io: fakeIo(), log: quiet });
   const [stage] = broker.pipeline();
   assert.equal(stage.$match["ns.coll"].$ne, "cowork_realtime_state");
-  assert.ok(Array.isArray(stage.$match["ns.coll"].$in));
+});
+
+test("the filter also catches flattened subcollections", () => {
+  /**
+   * The busiest realtime traffic in the product lives in subcollections —
+   * `cowork_tasks__chat`, `cowork_conversations__messages`,
+   * `cowork_task_timers__sessions`. None of those names is in the audience
+   * table, so matching only the watched collections dropped every chat message,
+   * every daily report and every timer session. Silently: the stream was
+   * healthy, it just never mentioned them.
+   */
+  const broker = new ChangeStreamBroker({ db: fakeDb(), io: fakeIo(), log: quiet });
+  const [stage] = broker.pipeline();
+  const clauses = stage.$match.$or;
+  assert.ok(Array.isArray(clauses) && clauses.length === 2);
+
+  const exact = clauses[0]["ns.coll"].$in;
+  assert.ok(exact.includes("cowork_tasks"));
+
+  const patterns = clauses[1]["ns.coll"].$in;
+  assert.ok(patterns.every((p) => p instanceof RegExp));
+  assert.ok(
+    patterns.some((p) => p.test("cowork_tasks__chat")),
+    "a chat message would not match the filter",
+  );
+  assert.ok(
+    !patterns.some((p) => p.test("cowork_payroll__secrets")),
+    "an unwatched parent's subcollection matched",
+  );
+});
+
+test("a subcollection change is addressed to its PARENT's audience", async () => {
+  /* A chat message names nobody. Who may read it is whoever may read the task
+     it hangs off, which needs a second read — so this is the one place the
+     audience is not computed purely. */
+  const io = fakeIo();
+  const db = fakeDb();
+  db.collection = (name) => ({
+    findOne: async ({ _id }) =>
+      name === "cowork_tasks" && _id === "T1"
+        ? { _id: "T1", assigneeIds: ["E1"], assignedBy: "E2" }
+        : null,
+    updateOne: async () => {},
+    deleteOne: async () => {},
+  });
+  const broker = new ChangeStreamBroker({ db, io, log: quiet });
+  await broker.deliver({
+    _id: { _data: "T" },
+    operationType: "insert",
+    ns: { coll: "cowork_tasks__chat" },
+    documentKey: { _id: "m1" },
+    fullDocument: { _id: "m1", _parentId: "T1", text: "hello" },
+  });
+  assert.equal(io.sent.length, 1, "the message reached nobody");
+  assert.deepEqual(io.sent[0].rooms.sort(), u("E1", "E2").sort());
+});
+
+test("a subcollection whose parent cannot be read tells nobody", async () => {
+  const io = fakeIo();
+  const db = fakeDb();
+  db.collection = (name) => ({
+    findOne: async () => {
+      if (name === "cowork_tasks") throw new Error("gone");
+      return null;
+    },
+    updateOne: async () => {},
+    deleteOne: async () => {},
+  });
+  const broker = new ChangeStreamBroker({ db, io, log: quiet });
+  await broker.deliver({
+    _id: { _data: "T" },
+    operationType: "insert",
+    ns: { coll: "cowork_tasks__chat" },
+    documentKey: { _id: "m1" },
+    fullDocument: { _id: "m1", _parentId: "T1" },
+  });
+  assert.equal(io.sent.length, 0);
+});
+
+/* ── The field names, checked against the writers ─────────────────────────── */
+
+test("a notification is addressed by recipientEmployeeId", () => {
+  /**
+   * `services/cowork.service.js:1346` writes `recipientEmployeeId`. Reading
+   * `employeeId` instead yields undefined, which yields an empty audience,
+   * which is a LEGAL answer — so the bell would simply have stopped, with no
+   * error anywhere.
+   */
+  assert.deepEqual(
+    audienceFor("cowork_notifications", { recipientEmployeeId: "E1" }),
+    u("E1"),
+  );
+  /* Older rows and other writers use the shorter name. */
+  assert.deepEqual(audienceFor("cowork_notifications", { employeeId: "E2" }), u("E2"));
+});
+
+test("duty status and timers are addressed by DOCUMENT ID", () => {
+  /* Both are written `.doc(String(employeeId))`. Duty carries an `employeeId`
+     field on some write paths and not others, which is exactly what makes a
+     field-only rule look correct in testing and fail in production. */
+  assert.deepEqual(audienceFor("cowork_duty_status", {}, "E1"), u("E1"));
+  assert.deepEqual(audienceFor("cowork_task_timers", {}, "E1"), u("E1"));
+  assert.deepEqual(
+    audienceFor("cowork_duty_status", { employeeId: "E1" }, "E1"),
+    u("E1"),
+    "the id and the field disagreed",
+  );
+});
+
+test("a conversation falls back to the ids in its own name", () => {
+  assert.deepEqual(
+    audienceFor("cowork_conversations", { participantIds: ["E1", "E2"] }),
+    u("E1", "E2"),
+  );
+  assert.deepEqual(audienceFor("cowork_conversations", {}, "E1_E2"), u("E1", "E2"));
 });
 
 test("a lost oplog resyncs everyone rather than pretending", async () => {

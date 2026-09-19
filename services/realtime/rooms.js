@@ -8,129 +8,157 @@
  * with it — every realtime update now leaves THIS process, and whatever this
  * file says is who gets it.
  *
- * The existing socket rooms cannot be trusted for that job. `join_cowork` takes
- * an `employeeId` straight from the client and joins it (`server.js`), and
- * `join_group` / `join_dm` / `join_mrf` do the same with their ids — nobody
- * checks whether the caller is that person or belongs to that thread. That was
- * survivable while rooms only carried notifications and typing flags. It is not
- * survivable once task and message documents travel through them.
- *
  * So the rule here is absolute:
  *
  *   **The audience is computed from the DOCUMENT, never from what a client
  *   asked to join.**
  *
- * A socket that joined `E123` by guessing still receives nothing it is not in
- * the document for, because the emit is addressed to the ids the document
- * itself names. Room membership becomes a delivery address, not a permission.
+ * `join_cowork` in `server.js` joins whatever `employeeId` a client sends, with
+ * no check; `join_group`, `join_dm` and `join_mrf` do the same. Those rooms are
+ * addresses anyone can claim. Everything here is addressed to `user:<id>`,
+ * which only `socketIdentity` grants and only after verifying a Firebase ID
+ * token — see `socketIdentity.js`. The difference is one function call wide and
+ * it is the whole model.
  *
- * ## One rule, not two
+ * ## The field names are checked against the writers, not assumed
  *
- * `taskAudience` is the same set `mayViewTask` uses in
- * `routes/task_routes/coworkAttachments.js`, and deliberately so. A parallel
- * visibility model would drift, and the first symptom of the drift would be a
- * task update reaching somebody who cannot open the task.
+ * Three of these were wrong on the first attempt and would have failed
+ * silently, which is the failure mode this file exists to avoid:
  *
- * Pure functions, no database, no sockets — so the rule can be tested directly.
+ * · **Notifications are keyed `recipientEmployeeId`**, not `employeeId`
+ *   (`services/cowork.service.js:1346`). Reading the wrong field yields
+ *   `undefined`, which yields an empty audience, which is a legal answer — so
+ *   the bell would simply have stopped, with no error anywhere.
+ * · **Duty status and timers are keyed by DOCUMENT ID.** Both are written as
+ *   `.doc(String(employeeId))`, so the owner is the id, not a field. Duty also
+ *   carries an `employeeId` field on some write paths and not others, which is
+ *   exactly the sort of thing that makes a field-only rule look correct in
+ *   testing.
+ *
+ * Every rule therefore receives `(doc, id)` and is free to use either.
+ *
+ * ## Subcollections
+ *
+ * `cowork_tasks__chat` and friends hold no audience of their own — who may read
+ * a chat message is decided by the TASK it hangs off. A rule here cannot answer
+ * that, because answering needs a second read. `parentOf()` names the parent so
+ * the broker can do that read and apply the parent's rule; see
+ * `changeStreamBroker.deliver`.
  */
 
 const { userRoom } = require("./socketIdentity");
 
+/** The separator `firestoreCompat` uses when it flattens a subcollection. */
+const SUBCOLLECTION_SEPARATOR = "__";
+
 /**
  * A per-person delivery room — the AUTHENTICATED one.
  *
- * `userRoom` yields `user:<employeeId>`, a room only `socketIdentity` joins and
- * only for the employee a verified Firebase token resolved to. It is not the
- * bare `<employeeId>` room `join_cowork` hands out on request.
- *
- * That distinction is the entire security model here and it is one character
- * away from being lost: addressing `String(id)` instead would deliver every
- * task and message to whoever asked for that room by name. The legacy room
- * keeps carrying exactly what it carries today; nothing from this migration
- * goes near it.
+ * `user:<employeeId>`, joined only by `socketIdentity` and only for the
+ * employee a verified token resolved to. Addressing `String(id)` instead would
+ * deliver every task and message to whoever asked for that room by name.
  */
 const person = (id) => userRoom(id);
+
+/** Collect ids, ignoring blanks, and turn them into rooms. */
+function roomsFor(...ids) {
+  const out = new Set();
+  for (const id of ids.flat()) {
+    const s = String(id ?? "").trim();
+    if (s) out.add(person(s));
+  }
+  return [...out];
+}
 
 /** Everyone named on a task, by the same rule that decides who may open it. */
 function taskAudience(doc) {
   if (!doc || typeof doc !== "object") return [];
-  const out = new Set();
-  const add = (v) => {
-    const s = String(v ?? "").trim();
-    if (s) out.add(person(s));
-  };
-
-  for (const id of doc.assigneeIds || []) add(id);
-  add(doc.pendingAssigneeId);
-  add(doc.assignedBy);
-  add(doc.originalAssignedBy);
-  add(doc.approverId);
-  for (const a of doc.departmentApprovals || []) add(a?.approverId);
-  for (const id of doc.visibleTo || []) add(id);
-
-  return [...out];
+  return roomsFor(
+    doc.assigneeIds || [],
+    doc.pendingAssigneeId,
+    doc.assignedBy,
+    doc.originalAssignedBy,
+    doc.approverId,
+    (doc.departmentApprovals || []).map((a) => a && a.approverId),
+    doc.visibleTo || [],
+  );
 }
 
 /**
  * The rooms a change to each collection should reach.
  *
- * A collection with no entry here is NOT broadcast. That default is deliberate:
- * a new collection appearing in the database must be silent until somebody has
- * decided who is allowed to see it, rather than reaching everyone because
- * nobody wrote a rule yet.
+ * Each rule takes `(doc, id)`. A collection with no entry is NOT broadcast —
+ * deliberately, so a new collection is silent until somebody decides who may
+ * see it, rather than reaching everyone because nobody wrote a rule yet.
  */
 const AUDIENCE = {
-  /* The task itself, and everything the domain hangs off a task id. */
   cowork_tasks: (doc) => taskAudience(doc),
 
-  /* One person's notification. Nobody else, ever — not their manager, not a
-     CEO. The document names its owner and that is the whole audience. */
+  /* One person's notification, and nobody else's — not their manager, not a
+     CEO. `recipientEmployeeId` is the field the writer uses; `employeeId` is
+     accepted too because older rows and other writers use that name. */
   cowork_notifications: (doc) =>
-    doc?.employeeId ? [person(doc.employeeId)] : [],
+    roomsFor(doc?.recipientEmployeeId, doc?.employeeId),
 
-  /* A DM thread. `chatId` is `[a,b].sort().join("_")`, the same shape
-     `join_dm` uses, so both participants are addressable without trusting
-     either of them to say who they are. */
-  cowork_direct_messages: (doc) => {
-    const chatId = String(doc?.chatId ?? "").trim();
-    if (!chatId) return [];
-    /* Addressed to the two people the id is MADE of, not to the room — so a
-       socket that joined `dm_x_y` uninvited receives nothing. */
+  /* A DM thread. `chatId` is `[a,b].sort().join("_")`, so both participants are
+     derivable without trusting either of them to say who they are. */
+  cowork_direct_messages: (doc, id) => {
+    const chatId = String(doc?.chatId ?? id ?? "").trim();
     const parts = chatId.split("_").filter(Boolean);
-    return parts.length === 2 ? parts.map(person) : [];
+    return parts.length === 2 ? roomsFor(parts) : [];
   },
 
-  /* A group thread reaches its members, from the group document's own list. */
-  cowork_groups: (doc) => (doc?.memberIds || []).map(person),
+  /* A group reaches its members, from the group's own list. */
+  cowork_groups: (doc) => roomsFor(doc?.memberIds || [], doc?.members || []),
 
-  /* Duty status is a presence fact. It is already broadcast to the workspace
-     today (`workspace-member-status`), so this changes nothing about who can
-     see it — it is listed so the default-silent rule above stays true. */
-  cowork_duty_status: (doc) =>
-    doc?.employeeId ? [person(doc.employeeId)] : [],
+  /* A conversation's participants, however the row spells them. */
+  cowork_conversations: (doc, id) => {
+    const listed = roomsFor(doc?.participantIds || [], doc?.memberIds || []);
+    if (listed.length) return listed;
+    const parts = String(id ?? "").split("_").filter(Boolean);
+    return parts.length === 2 ? roomsFor(parts) : [];
+  },
 
-  /* A running timer belongs to one person. */
-  cowork_task_timers: (doc) =>
-    doc?.employeeId ? [person(doc.employeeId)] : [],
+  /* Keyed by DOCUMENT ID — written as `.doc(String(employeeId))`. The field is
+     present on some write paths and absent on others, so the id leads. */
+  cowork_duty_status: (doc, id) => roomsFor(id, doc?.employeeId),
+  cowork_task_timers: (doc, id) => roomsFor(id, doc?.employeeId),
 };
 
-/** Whether this collection is broadcast at all. */
+/**
+ * The parent of a flattened subcollection, or null.
+ *
+ * `cowork_tasks__chat` -> `{ parent: "cowork_tasks", child: "chat" }`. Split at
+ * the FIRST separator, matching how `firestoreCompat` builds the name.
+ */
+function parentOf(collection) {
+  const at = String(collection).indexOf(SUBCOLLECTION_SEPARATOR);
+  if (at <= 0) return null;
+  return {
+    parent: collection.slice(0, at),
+    child: collection.slice(at + SUBCOLLECTION_SEPARATOR.length),
+  };
+}
+
+/** Whether this collection is broadcast at all, directly or through a parent. */
 function isWatched(collection) {
-  return Object.prototype.hasOwnProperty.call(AUDIENCE, collection);
+  if (Object.prototype.hasOwnProperty.call(AUDIENCE, collection)) return true;
+  const p = parentOf(collection);
+  return Boolean(p && Object.prototype.hasOwnProperty.call(AUDIENCE, p.parent));
 }
 
 /**
  * The delivery rooms for one change.
  *
- * Returns `[]` — meaning "tell nobody" — for an unknown collection, a missing
- * document, or a document that names no one. An empty audience is a correct
- * answer and must never be widened into a broadcast.
+ * Returns `[]` — tell nobody — for an unknown collection, a missing document,
+ * or a document that names no one. An empty audience is a correct answer and
+ * must never be widened into a broadcast.
  */
-function audienceFor(collection, doc) {
+function audienceFor(collection, doc, id = null) {
   const rule = AUDIENCE[collection];
   if (!rule) return [];
   try {
-    return rule(doc) || [];
+    return rule(doc, id) || [];
   } catch {
     /* A malformed document must not take the broker down, and must not be
        answered with "everyone" either. */
@@ -140,8 +168,11 @@ function audienceFor(collection, doc) {
 
 module.exports = {
   AUDIENCE,
+  SUBCOLLECTION_SEPARATOR,
   audienceFor,
   isWatched,
+  parentOf,
+  roomsFor,
   taskAudience,
   watchedCollections: () => Object.keys(AUDIENCE),
 };

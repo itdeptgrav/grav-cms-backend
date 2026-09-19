@@ -20,22 +20,35 @@ const clone = (v) => (v === undefined ? undefined : structuredClone(v));
 /* ── The real store ───────────────────────────────────────────────────────── */
 
 function mongoStore(db, { client = null } = {}) {
+  /**
+   * The driver only counts an operation as part of a transaction if it is
+   * handed the session. Every method below therefore takes one and passes it
+   * through.
+   *
+   * Leaving it out is not a loud failure — the reads and writes still succeed,
+   * outside the transaction, and `withTransaction` commits an empty one. So
+   * there is no rollback, no read-conflict detection, and every compare-and-set
+   * in Cowork silently becomes a plain race. That is the worst shape a bug can
+   * have: correct-looking under test, wrong only under concurrency.
+   */
+  const opts = (session, extra = {}) => (session ? { ...extra, session } : extra);
+
   return {
-    async findOne(collection, filter) {
-      return db.collection(collection).findOne(filter);
+    async findOne(collection, filter, { session = null } = {}) {
+      return db.collection(collection).findOne(filter, opts(session));
     },
 
-    async find(collection, filter, { sort = null, limit = null } = {}) {
-      let cursor = db.collection(collection).find(filter);
+    async find(collection, filter, { sort = null, limit = null, session = null } = {}) {
+      let cursor = db.collection(collection).find(filter, opts(session));
       if (sort) cursor = cursor.sort(sort);
       if (limit != null) cursor = cursor.limit(limit);
       return cursor.toArray();
     },
 
-    async replace(collection, id, doc) {
+    async replace(collection, id, doc, { session = null } = {}) {
       await db
         .collection(collection)
-        .replaceOne({ _id: id }, { ...doc, _id: id }, { upsert: true });
+        .replaceOne({ _id: id }, { ...doc, _id: id }, opts(session, { upsert: true }));
     },
 
     /**
@@ -44,38 +57,41 @@ function mongoStore(db, { client = null } = {}) {
      * `set({merge:true})` is defined to create, and only `update()` passes
      * `upsert: false`.
      */
-    async update(collection, id, update, { upsert = false } = {}) {
+    async update(collection, id, update, { upsert = false, session = null } = {}) {
       if (Object.keys(update).length === 0) return { matched: true };
       const r = await db
         .collection(collection)
-        .updateOne({ _id: id }, update, { upsert });
+        .updateOne({ _id: id }, update, opts(session, { upsert }));
       return { matched: r.matchedCount > 0 || r.upsertedCount > 0 };
     },
 
-    async delete(collection, id) {
-      await db.collection(collection).deleteOne({ _id: id });
+    async delete(collection, id, { session = null } = {}) {
+      await db.collection(collection).deleteOne({ _id: id }, opts(session));
     },
 
     /**
-     * All-or-nothing where the deployment can give it, in order where it
-     * cannot.
+     * All-or-nothing, returning what the callback returned.
      *
-     * Multi-document transactions need a replica set — the same requirement
-     * change streams carry, so on a correctly configured deployment this is
-     * always the atomic path. Without a client (or on a standalone server) the
-     * operations still run, in order, stopping at the first failure. The
-     * difference is real and is why this does not pretend: a caller that needs
-     * the guarantee can check `atomic` on the result.
+     * **Returns the value itself, not a wrapper.** Firestore's `runTransaction`
+     * resolves to whatever the callback returned, and ten call sites in this
+     * backend use it directly — as a document id, as an HTTP status, as the
+     * claimed/not-claimed answer to a race. Wrapping it in `{atomic, value}`
+     * broke every one of them, quietly, since `{...}` is truthy.
+     *
+     * The session is passed to the callback so every operation inside can be
+     * enrolled in the transaction. Atomicity is no longer reported as a
+     * maybe: `coworkDbChoice` refuses to boot against anything that is not a
+     * replica set, so by the time this runs the guarantee is already there.
      */
     async transaction(fn) {
-      if (!client) return { atomic: false, value: await fn() };
+      if (!client) return fn(null);
       const session = client.startSession();
       try {
         let value;
         await session.withTransaction(async () => {
           value = await fn(session);
         });
-        return { atomic: true, value };
+        return value;
       } finally {
         await session.endSession();
       }
@@ -217,10 +233,12 @@ function memoryStore(seed = {}) {
     },
 
     async transaction(fn) {
-      /* No rollback in memory. Tests that need to observe a partial failure
-         assert on what landed, which is the honest thing for a store that
-         cannot undo. */
-      return { atomic: false, value: await fn() };
+      /* No rollback in memory, and no session to hand out. Tests that need to
+         observe a partial failure assert on what landed, which is the honest
+         thing for a store that cannot undo. The RETURN SHAPE matches the real
+         store — the callback's value — because that is what ten call sites
+         depend on. */
+      return fn(null);
     },
   };
 }
