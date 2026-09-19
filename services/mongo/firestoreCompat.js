@@ -90,8 +90,57 @@ const FieldValue = {
   delete: () => ({ [SENTINEL]: "delete" }),
 };
 
-const isSentinel = (v) =>
+const isOwnSentinel = (v) =>
   v !== null && typeof v === "object" && SENTINEL in v;
+
+/**
+ * The admin SDK's OWN sentinels, which this has to understand too.
+ *
+ * 239 write sites in this backend call `admin.firestore.FieldValue.serverTimestamp()`
+ * rather than the `FieldValue` exported above — they were written against
+ * Firestore and there was no reason for them to import anything else. Those
+ * objects carry no symbol of ours, so without this they would fall through as
+ * ordinary values and be stored verbatim: `serverTimestamp()` would persist as
+ * `{}`, `increment(3)` as `{operand: 3}`, and every one of them would look like
+ * a successful write.
+ *
+ * Recognised by constructor name and shape rather than `instanceof`, so this
+ * module does not have to import firebase-admin. A facade that pulled in the
+ * SDK it replaces would keep the dependency alive for ever and would break the
+ * day Firebase is finally removed from the deployment.
+ *
+ * The five names are stable across firebase-admin v11-v13 and are verified
+ * against the installed SDK by `adminSentinels.test.js` — if a future version
+ * renames one, that test fails rather than the data going quietly wrong.
+ */
+function adminSentinel(v) {
+  if (v === null || typeof v !== "object") return null;
+  switch (v.constructor && v.constructor.name) {
+    case "ServerTimestampTransform":
+      return { kind: "serverTimestamp" };
+    case "DeleteTransform":
+      return { kind: "delete" };
+    case "NumericIncrementTransform":
+      return { kind: "increment", by: v.operand };
+    case "ArrayUnionTransform":
+      return { kind: "arrayUnion", values: v.elements };
+    case "ArrayRemoveTransform":
+      return { kind: "arrayRemove", values: v.elements };
+    default:
+      return null;
+  }
+}
+
+/** One reading of a value, whichever FieldValue it came from. */
+function readSentinel(v) {
+  if (isOwnSentinel(v)) {
+    const kind = v[SENTINEL];
+    return { kind, by: v.by, values: v.values };
+  }
+  return adminSentinel(v);
+}
+
+const isSentinel = (v) => readSentinel(v) !== null;
 
 /**
  * Turn a Firestore-shaped patch into a Mongo update document.
@@ -108,7 +157,8 @@ function toUpdate(patch, { now = new Date() } = {}) {
   const $pull = {};
 
   for (const [key, value] of Object.entries(patch ?? {})) {
-    if (!isSentinel(value)) {
+    const sentinel = readSentinel(value);
+    if (!sentinel) {
       /* Converted, not passed through. A caller can hand back a value it just
          READ — a Timestamp, most often — and storing that object literally
          would put `{seconds, nanoseconds}` in the database where a real date
@@ -117,7 +167,7 @@ function toUpdate(patch, { now = new Date() } = {}) {
       $set[key] = convertValue(value);
       continue;
     }
-    switch (value[SENTINEL]) {
+    switch (sentinel.kind) {
       case "serverTimestamp":
         $set[key] = now;
         break;
@@ -125,16 +175,16 @@ function toUpdate(patch, { now = new Date() } = {}) {
         $unset[key] = "";
         break;
       case "increment":
-        $inc[key] = value.by;
+        $inc[key] = sentinel.by;
         break;
       case "arrayUnion":
-        $addToSet[key] = { $each: value.values };
+        $addToSet[key] = { $each: sentinel.values };
         break;
       case "arrayRemove":
-        $pull[key] = { $in: value.values };
+        $pull[key] = { $in: sentinel.values };
         break;
       default:
-        throw new Error(`Unknown field sentinel: ${String(value[SENTINEL])}`);
+        throw new Error(`Unknown field sentinel: ${String(sentinel.kind)}`);
     }
   }
 
@@ -156,27 +206,28 @@ function toUpdate(patch, { now = new Date() } = {}) {
 function toDocument(data, { now = new Date() } = {}) {
   const out = {};
   for (const [key, value] of Object.entries(data ?? {})) {
-    if (!isSentinel(value)) {
+    const sentinel = readSentinel(value);
+    if (!sentinel) {
       out[key] = convertValue(value);
       continue;
     }
-    switch (value[SENTINEL]) {
+    switch (sentinel.kind) {
       case "serverTimestamp":
         out[key] = now;
         break;
       case "delete":
         break; // absent, which is what deleting a field means on a fresh write
       case "increment":
-        out[key] = value.by;
+        out[key] = sentinel.by;
         break;
       case "arrayUnion":
-        out[key] = value.values;
+        out[key] = sentinel.values;
         break;
       case "arrayRemove":
         out[key] = [];
         break;
       default:
-        throw new Error(`Unknown field sentinel: ${String(value[SENTINEL])}`);
+        throw new Error(`Unknown field sentinel: ${String(sentinel.kind)}`);
     }
   }
   return out;
@@ -520,6 +571,8 @@ function createFirestoreCompat(store) {
 
 module.exports = {
   CompatTimestamp: require("./timestamp").CompatTimestamp,
+  adminSentinel,
+  readSentinel,
   FieldValue,
   CollectionReference,
   DocumentReference,
