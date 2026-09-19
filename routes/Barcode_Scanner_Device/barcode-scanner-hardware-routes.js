@@ -27,7 +27,27 @@ const upload = multer({
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Validate 8-char hex device ID (generated from ESP32 MAC). */
-const isValidDeviceId = (id) => /^[0-9a-fA-F]{8}$/.test(id);
+/* DEVICE IDS COME IN TWO LENGTHS, AND BOTH MUST BE ACCEPTED.
+ *
+ * 8 hex characters is the OLD form, and it was never unique. The firmware
+ * built it as `String((uint32_t)ESP.getEfuseMac(), HEX)` - and getEfuseMac()
+ * returns the 48-bit MAC byte-reversed, so the low 32 bits are the first four
+ * MAC bytes, of which the first three are the Espressif OUI that every one of
+ * these chips shares. Exactly one byte varied. That is 256 possible ids for
+ * the whole fleet, and it collided in production: two scanners, one on SNLS13
+ * and one on OVERLOCK-4T-03, both calling themselves 8B40C86C, overwriting
+ * each other's heartbeat every thirty seconds. Note the shared tail on the
+ * ids that exist - 8A40C86C, 8B40C86C, 8C40C86C.
+ *
+ * 12 hex characters is the fixed form: the full MAC, genuinely unique.
+ *
+ * Both are allowed because they have to overlap. This validator has to accept
+ * the long form BEFORE any device starts sending it, and has to keep accepting
+ * the short form until the last scanner has taken the update - a device that
+ * gets a 400 here cannot check for updates, so rejecting the old form would
+ * strand exactly the devices that still need to be fixed.
+ */
+const isValidDeviceId = (id) => /^[0-9a-fA-F]{8}$|^[0-9a-fA-F]{12}$/.test(id);
 
 /**
  * Look up Machine.name by its _id.
