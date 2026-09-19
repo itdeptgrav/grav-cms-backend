@@ -52,6 +52,9 @@
  * indexes exactly as a nested collection would have.
  */
 
+const { convertValue } = require("./convert");
+const { reviveTimestamps } = require("./timestamp");
+
 const OPERATORS = {
   "==": (v) => ({ $eq: v }),
   "!=": (v) => ({ $ne: v }),
@@ -106,7 +109,12 @@ function toUpdate(patch, { now = new Date() } = {}) {
 
   for (const [key, value] of Object.entries(patch ?? {})) {
     if (!isSentinel(value)) {
-      $set[key] = value;
+      /* Converted, not passed through. A caller can hand back a value it just
+         READ — a Timestamp, most often — and storing that object literally
+         would put `{seconds, nanoseconds}` in the database where a real date
+         belongs, making it unqueryable and unsortable. `convertValue` turns it
+         back into the BSON Date it came from. */
+      $set[key] = convertValue(value);
       continue;
     }
     switch (value[SENTINEL]) {
@@ -149,7 +157,7 @@ function toDocument(data, { now = new Date() } = {}) {
   const out = {};
   for (const [key, value] of Object.entries(data ?? {})) {
     if (!isSentinel(value)) {
-      out[key] = value;
+      out[key] = convertValue(value);
       continue;
     }
     switch (value[SENTINEL]) {
@@ -189,11 +197,18 @@ function autoId(random = Math.random) {
 
 /* ── Snapshots ────────────────────────────────────────────────────────────── */
 
-/** `_id`, `_parentId` and the rest are storage, not the document people wrote. */
+/**
+ * The document as its author wrote it.
+ *
+ * `_id` and `_parentId` are storage and are removed. Every BSON `Date` becomes
+ * a `CompatTimestamp`, because that is what Firestore returned and what ~12
+ * call sites call `.toDate()` on — and what the browser reads as
+ * `{_seconds, _nanoseconds}`. See `timestamp.js`.
+ */
 function strip(doc) {
   if (!doc) return undefined;
   const { _id, _parentId, ...rest } = doc;
-  return rest;
+  return reviveTimestamps(rest);
 }
 
 class DocumentSnapshot {
@@ -504,6 +519,7 @@ function createFirestoreCompat(store) {
 }
 
 module.exports = {
+  CompatTimestamp: require("./timestamp").CompatTimestamp,
   FieldValue,
   CollectionReference,
   DocumentReference,
