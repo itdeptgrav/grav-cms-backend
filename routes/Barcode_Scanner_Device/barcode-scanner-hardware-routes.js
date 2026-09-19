@@ -6,6 +6,7 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const BarcodeDevice = require('../../models/Barcode_Scanner_Device/BarcodeDevice');
 const Firmware = require('../../models/Barcode_Scanner_Device/Firmware');
+const { uploadFirmware } = require('../../services/firmwareStorage');
 const Machine = require('../../models/CMS_Models/Inventory/Configurations/Machine');
 
 // ─── Multer (memory storage → written to disk after validation) ───────────────
@@ -318,7 +319,13 @@ router.post('/check-update', async (req, res) => {
         updateAvailable = true;
         firmwareInfo    = {
           version:     latestFirmware.version,
-          url:         firmwareDownloadUrl(req, latestFirmware.version),
+          /* Object storage first. It is reachable from anywhere, it is the
+             same answer whichever server the device checked in with, and it
+             is the only one of the two that survives the tunnel. Falls back
+             to serving it ourselves for builds uploaded before storage was
+             wired up. */
+          url:         latestFirmware.storageUrl ||
+                       firmwareDownloadUrl(req, latestFirmware.version),
           fileSize:    latestFirmware.fileSize,
           description: latestFirmware.description
         };
@@ -504,9 +511,22 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
 
     const firmwareUrl = firmwareDownloadUrl(req, version);
 
-    // Take the cache miss here, on the server, rather than leaving it for
-    // whichever scanner happens to check in first.
-    warmFirmwareCache(firmwareUrl);
+    /* PUT IT WHERE THE SCANNERS CAN ACTUALLY READ IT.
+       Object storage answers a plain GET with 200 and a real Content-Length,
+       which is the one thing the tunnel cannot do and the one thing the
+       scanner requires. Awaited rather than fired off, because the URL it
+       returns is recorded on the build below - but a failure only means we
+       fall back to serving it ourselves, never that the upload fails. */
+    const storageUrl = await uploadFirmware(version, file.buffer);
+    if (!storageUrl) {
+      console.warn(
+        'Firmware stored locally only - object storage was unavailable. ' +
+        'Devices behind a proxy that strips Content-Length will not be able ' +
+        'to install this build.'
+      );
+      // Only worth warming the CDN copy when it is the one being handed out.
+      warmFirmwareCache(firmwareUrl);
+    }
 
     // Deactivate any existing record with the same version
     /* Restored with the upsert below: the original computed this immediately
@@ -542,6 +562,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
         $set: {
           version,
           cloudinaryUrl: firmwareUrl,
+          storageUrl,
           fileSize:      file.size,
           description,
           isActive:      true,
