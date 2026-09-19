@@ -46,7 +46,7 @@
  * `changeStreamBroker.deliver`.
  */
 
-const { userRoom } = require("./socketIdentity");
+const { PRESENCE_ROOM, userRoom } = require("./socketIdentity");
 
 /** The separator `firestoreCompat` uses when it flattens a subcollection. */
 const SUBCOLLECTION_SEPARATOR = "__";
@@ -119,10 +119,24 @@ const AUDIENCE = {
     return parts.length === 2 ? roomsFor(parts) : [];
   },
 
-  /* Keyed by DOCUMENT ID — written as `.doc(String(employeeId))`. The field is
-     present on some write paths and absent on others, so the id leads. */
-  cowork_duty_status: (doc, id) => roomsFor(id, doc?.employeeId),
+  /**
+   * Presence goes to the whole workspace, which is what it already does.
+   *
+   * Keyed by DOCUMENT ID — written `.doc(String(employeeId))` — and the
+   * `employeeId` FIELD is present on some write paths and absent on others, so
+   * the id leads. But the owner is not the audience: `watchDutyModes`,
+   * `watchDutyRoster` and `watchPresence` all exist so somebody can see OTHER
+   * people's status, and `server.js` already broadcasts exactly this to
+   * everyone. Owner-only delivery would have deleted the feature silently.
+   */
+  cowork_duty_status: () => [PRESENCE_ROOM],
+
+  /* A running timer belongs to one person, and is keyed by document id. */
   cowork_task_timers: (doc, id) => roomsFor(id, doc?.employeeId),
+
+  /* A mail thread reaches its participants — the same `participantIds` the
+     read and the listener filter on (`watchMail`, legacy/index.ts:16229). */
+  cowork_mails: (doc) => roomsFor(doc?.participantIds || []),
 };
 
 /**

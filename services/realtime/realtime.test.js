@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 const { audienceFor, isWatched, taskAudience } = require("./rooms");
-const { isAuthenticatedRoom, userRoom } = require("./socketIdentity");
+const { PRESENCE_ROOM, isAuthenticatedRoom, userRoom } = require("./socketIdentity");
 
 /** Every room the broker addresses is one the SERVER granted, not one claimed. */
 const u = (...ids) => ids.map(userRoom);
@@ -320,17 +320,36 @@ test("a notification is addressed by recipientEmployeeId", () => {
   assert.deepEqual(audienceFor("cowork_notifications", { employeeId: "E2" }), u("E2"));
 });
 
-test("duty status and timers are addressed by DOCUMENT ID", () => {
-  /* Both are written `.doc(String(employeeId))`. Duty carries an `employeeId`
-     field on some write paths and not others, which is exactly what makes a
-     field-only rule look correct in testing and fail in production. */
-  assert.deepEqual(audienceFor("cowork_duty_status", {}, "E1"), u("E1"));
+test("a timer is addressed by DOCUMENT ID, since the field is not always written", () => {
   assert.deepEqual(audienceFor("cowork_task_timers", {}, "E1"), u("E1"));
+  assert.deepEqual(audienceFor("cowork_task_timers", { employeeId: "E1" }, "E1"), u("E1"));
+});
+
+test("presence reaches the workspace, because that is what presence IS", () => {
+  /**
+   * `watchDutyModes`, `watchDutyRoster` and `watchPresence` all exist so
+   * somebody can see OTHER people's status — a manager watching a team is the
+   * whole point. `server.js` already broadcasts exactly this to everyone via
+   * `workspace-member-status`, so owner-only delivery would not have been
+   * "more secure", it would have silently deleted the feature.
+   */
+  assert.deepEqual(audienceFor("cowork_duty_status", {}, "E1"), [PRESENCE_ROOM]);
   assert.deepEqual(
-    audienceFor("cowork_duty_status", { employeeId: "E1" }, "E1"),
-    u("E1"),
-    "the id and the field disagreed",
+    audienceFor("cowork_duty_status", { employeeId: "E9" }, "E1"),
+    [PRESENCE_ROOM],
+    "presence became owner-only again",
   );
+  assert.ok(isAuthenticatedRoom(PRESENCE_ROOM), "presence is not a granted room");
+});
+
+test("mail reaches its participants, the same list the read filters on", () => {
+  /* `watchMail` queries `participantIds array-contains me`. Without a rule the
+     mailbox had no live channel at all. */
+  assert.deepEqual(
+    audienceFor("cowork_mails", { participantIds: ["E1", "E2"] }),
+    u("E1", "E2"),
+  );
+  assert.deepEqual(audienceFor("cowork_mails", {}), []);
 });
 
 test("a conversation falls back to the ids in its own name", () => {
@@ -431,7 +450,7 @@ test("an unauthenticated socket is not refused, it is just not addressed", async
   assert.deepEqual(joined, [], "an anonymous socket was given a room");
 });
 
-test("a verified token joins exactly one room, its own", async () => {
+test("a verified token joins its own room and presence, and nothing else", async () => {
   const { socketIdentity } = require("./socketIdentity");
   const identify = socketIdentity({
     verifyIdToken: async (t) => {
@@ -447,7 +466,7 @@ test("a verified token joins exactly one room, its own", async () => {
     join: (r) => joined.push(r),
   };
   await identify(socket, () => {});
-  assert.deepEqual(joined, [userRoom("E1")]);
+  assert.deepEqual(joined.sort(), [PRESENCE_ROOM, userRoom("E1")].sort());
   assert.equal(socket.data.employeeId, "E1");
 });
 

@@ -45,6 +45,21 @@
 /** The only room prefix the change broker may address. */
 const USER_ROOM = "user:";
 
+/**
+ * Presence, which is workspace-wide by design and already is today.
+ *
+ * `server.js` does `socket.broadcast.emit("workspace-member-status", …)` on
+ * every duty change, to everyone. Presence is not private in this product —
+ * the point of it is that colleagues can see who is online, and a manager
+ * watching a team reads it about other people. Delivering duty changes only to
+ * their owner would not be "more secure", it would silently delete the feature.
+ *
+ * So it gets a room of its own rather than travelling to `user:` rooms. Still
+ * granted by the server and only to an authenticated socket — an anonymous one
+ * gets neither.
+ */
+const PRESENCE_ROOM = "presence";
+
 /** The room for one employee, once the server has verified they are that person. */
 function userRoom(employeeId) {
   return `${USER_ROOM}${String(employeeId)}`;
@@ -52,7 +67,10 @@ function userRoom(employeeId) {
 
 /** Whether a room name is one this module grants, rather than one a client claimed. */
 function isAuthenticatedRoom(room) {
-  return typeof room === "string" && room.startsWith(USER_ROOM);
+  return (
+    typeof room === "string" &&
+    (room.startsWith(USER_ROOM) || room === PRESENCE_ROOM)
+  );
 }
 
 /**
@@ -103,6 +121,7 @@ function socketIdentity({ verifyIdToken, resolveEmployee, log = () => {} }) {
       socket.data.employeeId = String(employee.employeeId);
       socket.data.authUid = decoded.uid;
       socket.join(userRoom(employee.employeeId));
+      socket.join(PRESENCE_ROOM);
       return next();
     } catch (error) {
       /**
@@ -122,6 +141,7 @@ function socketIdentity({ verifyIdToken, resolveEmployee, log = () => {} }) {
 }
 
 module.exports = {
+  PRESENCE_ROOM,
   USER_ROOM,
   isAuthenticatedRoom,
   socketIdentity,
