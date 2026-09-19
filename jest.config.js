@@ -12,3 +12,4 @@ module.exports = {
   // The legacy root-level scripts are not jest tests.
   testPathIgnorePatterns: ["/node_modules/"],
 };
+
