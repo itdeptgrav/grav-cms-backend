@@ -556,14 +556,9 @@ router.get("/find-piece", async (req, res) => {
               ? scan.activeOps
               : (scan.activeOps || "").split(",").map((s) => s.trim()).filter(Boolean);
 
-            const resolvedOps = codes.map((code) => {
-              const op = (workOrder.operations || []).find(
-                (o) => (o.operationCode || "").trim().toLowerCase() === code.trim().toLowerCase()
-              );
-              return op
-                ? { code, name: op.operationType, plannedTimeSeconds: op.plannedTimeSeconds || 0 }
-                : { code, name: "", plannedTimeSeconds: 0 };
-            });
+            // Carried as codes here and named in one pass below, so the
+            // master lookup is a single query rather than one per scan.
+            const resolvedOps = codes.map((code) => ({ code, name: "", plannedTimeSeconds: 0 }));
 
             operationLog.push({
               timestamp:     scan.timeStamp,
@@ -583,6 +578,61 @@ router.get("/find-piece", async (req, res) => {
       }
     }
     operationLog.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    /* NAME THE OPERATIONS: THE WORK ORDER FIRST, THE MASTER SECOND.
+
+       This used to look only at workOrder.operations, and fell back to an
+       empty string. A scanner can be assigned any operation in the master
+       list, not only the ones costed onto this particular work order, so the
+       common case - a machine set to an operation the WO never listed - came
+       back nameless and the piece history showed bare codes like KUT004 and
+       CT007. Unreadable unless you happen to know the code book.
+
+       The work order still wins where it has the operation, because that is
+       the name the order was costed and quoted under and it can legitimately
+       differ from the master. The master is the fallback, not the override.
+
+       plannedTimeSeconds is deliberately NOT taken from the master: the
+       master's time is a standard, the work order's is what was planned for
+       this order, and quietly substituting one for the other would put a
+       number on screen that no one planned. Absent stays absent. */
+    const woByCode = new Map(
+      (workOrder.operations || [])
+        .filter((o) => o.operationCode)
+        .map((o) => [String(o.operationCode).trim().toUpperCase(), o])
+    );
+
+    const unnamed = [
+      ...new Set(
+        operationLog
+          .flatMap((e) => e.operations.map((o) => o.code))
+          .filter((c) => c && !woByCode.has(String(c).trim().toUpperCase()))
+      ),
+    ];
+
+    const masterByCode = new Map();
+    if (unnamed.length) {
+      const masters = await Operation.find({ operationCode: { $in: unnamed } })
+        .select("name operationCode")
+        .lean();
+      for (const m of masters) {
+        if (m.operationCode) {
+          masterByCode.set(String(m.operationCode).trim().toUpperCase(), m.name || "");
+        }
+      }
+    }
+
+    for (const entry of operationLog) {
+      entry.operations = entry.operations.map(({ code }) => {
+        const key = String(code).trim().toUpperCase();
+        const wo = woByCode.get(key);
+        return {
+          code,
+          name: wo ? wo.operationType || "" : masterByCode.get(key) || "",
+          plannedTimeSeconds: wo ? wo.plannedTimeSeconds || 0 : 0,
+        };
+      });
+    }
 
     return res.json({
       success: true,
