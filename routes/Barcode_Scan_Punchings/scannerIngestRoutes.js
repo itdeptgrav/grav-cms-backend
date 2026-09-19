@@ -437,6 +437,94 @@ const operatorStatsHandler = async (req, res) => {
 router.get("/stats/operators", operatorStatsHandler);
 router.get("/stats/operators/:date", operatorStatsHandler);
 
+// ─── GET /operator-count ──────────────────────────────────────────────────────
+//
+// THE NUMBER ON THE SCANNER'S SCREEN, ANSWERED BY THE SERVER.
+//
+// The device keeps its own tally in RAM and only flushes it to flash on a
+// timer, so a power cut between flushes leaves the screen one or two behind for
+// the rest of the shift. The events themselves are never lost — they upload as
+// they are scanned — but the operator ends up looking at a number the report
+// disagrees with, which is how this was found: a screen reading 3 against a
+// report reading 4.
+//
+// This lets the device stop guessing. On boot, on sign-in and on reconnect it
+// asks here and takes the answer; its local tally stays as the offline
+// fallback, used only when this call cannot be reached.
+//
+// Counted with countDistinctPieces() — the SAME function the reports use — so
+// the screen and the report cannot drift apart by definition. Restating the
+// rule here instead would recreate exactly the disagreement this fixes.
+//
+//   GET /operator-count?operatorId=GR0013&machineId=<id>[&date=YYYY-MM-DD]
+//
+// machineId is optional and scopes the count to work done AT that machine,
+// which is what the device's own tally means — it only ever counted its own
+// scans. Both the scoped and the whole-day figure are returned, so a caller
+// that wants the operator across every machine does not need a second request.
+const operatorCountHandler = async (req, res) => {
+  try {
+    const operatorId = String(
+      req.query.operatorId || req.params.operatorId || ""
+    ).trim();
+    if (!operatorId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "operatorId is required" });
+    }
+
+    const shiftDate = req.query.date
+      ? shiftDateFor(new Date(req.query.date))
+      : currentShiftDate();
+    if (!shiftDate) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid date format" });
+    }
+
+    /* A malformed machineId must not silently widen the answer to every
+       machine — the device would then show a number bigger than its own work
+       and look broken in the other direction. */
+    const wantsMachine = Boolean(req.query.machineId);
+    const machineObjId = wantsMachine ? toObjectId(req.query.machineId) : null;
+    if (wantsMachine && !machineObjId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid machineId" });
+    }
+
+    const scans = await ProductionEvent.find({
+      shiftDate,
+      type: "scan",
+      operatorId,
+    })
+      .select({ barcodeId: 1, activeOps: 1, machineId: 1 })
+      .lean();
+
+    const atMachine = machineObjId
+      ? scans.filter((s) => String(s.machineId) === String(machineObjId))
+      : scans;
+
+    return res.json({
+      success: true,
+      shiftDate,
+      operatorId,
+      machineId: wantsMachine ? String(req.query.machineId) : null,
+      // What the scanner should display: its own machine, when it names one.
+      count: rollupStats.countDistinctPieces(atMachine),
+      // The operator across the whole floor, for anything that wants it.
+      countAllMachines: rollupStats.countDistinctPieces(scans),
+    });
+  } catch (error) {
+    console.error("[Operator-count] error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Server error", error: error.message });
+  }
+};
+router.get("/operator-count", operatorCountHandler);
+router.get("/operator-count/:operatorId", operatorCountHandler);
+
 // ─── GET /events[/:date] ──────────────────────────────────────────────────────
 // Raw event access, for auditing a number a dashboard disagrees with.
 const eventsHandler = async (req, res) => {

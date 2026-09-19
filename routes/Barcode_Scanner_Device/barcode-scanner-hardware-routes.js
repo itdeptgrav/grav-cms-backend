@@ -96,10 +96,76 @@ router.get('/name', async (req, res) => {
  * which would break api.grav.in in the opposite direction. x-forwarded-proto is
  * what the proxy sets, so it wins when present.
  */
+/* WHAT A REAL SCANNER IMAGE LOOKS LIKE.
+ *
+ * The scanner refuses anything under MIN_FIRMWARE_BYTES (200000) and shows
+ * "Wrong file". That guard works, but it fires at the machine, hours later,
+ * on a device that has already given up on the version. The same test costs
+ * nothing at upload time, where whoever uploaded it is still sitting there and
+ * can pick the right file.
+ *
+ * Two checks, both cheap:
+ *   size   - boot_app0.bin (8KB), partitions.bin (3KB) and bootloader.bin
+ *            (25KB) all sit in the same build folder and are easy to pick by
+ *            mistake. A real application image is over a megabyte.
+ *   byte 0 - every ESP application image starts 0xE9. merged.bin, the 4MB
+ *            full-flash image, starts 0xFF - it is the right size and still
+ *            completely wrong, so size alone does not catch it.
+ */
+const MIN_FIRMWARE_BYTES = 200000;
+const ESP_IMAGE_MAGIC = 0xe9;
+
+/** null when the buffer looks like a scanner image, otherwise why it does not. */
+function firmwareImageProblem(buf) {
+  if (!buf || buf.length === 0) return 'the file is empty (0 bytes)';
+  if (buf.length < MIN_FIRMWARE_BYTES) {
+    return `only ${buf.length.toLocaleString()} bytes - that is not the application ` +
+      `image. Upload GRAV_Scanner_v5_5_0.ino.bin, not bootloader.bin, ` +
+      `partitions.bin or boot_app0.bin.`;
+  }
+  if (buf[0] !== ESP_IMAGE_MAGIC) {
+    return `starts with 0x${buf[0].toString(16).padStart(2, '0').toUpperCase()}, ` +
+      `not 0xE9 - this is not an ESP application image. merged.bin is the ` +
+      `full-flash image and cannot be installed over the air.`;
+  }
+  return null;
+}
+
 function deviceBaseUrl(req) {
   const fwd = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
   const proto = fwd || req.protocol || 'http';
   return `${proto}://${req.get('host')}`;
+}
+
+/* WHERE THE BINARY IS FETCHED FROM - WHICH NEED NOT BE WHERE THE DEVICE ASKED.
+ *
+ * deviceBaseUrl() echoes back the host the scanner just talked to, which is
+ * almost always right. It is wrong in one specific deployment: when the API
+ * sits behind a proxy or tunnel that re-streams large responses as
+ * `Transfer-Encoding: chunked`, dropping Content-Length on the way.
+ *
+ * Chunked is harmless for every OTHER call the scanner makes - heartbeats,
+ * scan uploads and the update check are read with HTTPClient::getString(),
+ * which de-chunks correctly and never needs the size in advance. It is fatal
+ * for exactly this one, because the OTA path needs the length UP FRONT to size
+ * the flash write, and then reads the raw socket - which on a chunked response
+ * still carries the chunk framing. The scanner's own guard catches it and
+ * reports "Wrong file / No size sent"; correct, but it means no device behind
+ * that proxy can ever update.
+ *
+ * So the DOWNLOAD alone can be pointed somewhere unproxied - typically the
+ * server's own LAN address, where the file already is, since this is the
+ * process that wrote it - while everything else carries on through the public
+ * hostname with whatever protection sits in front of it.
+ *
+ * Unset, this changes nothing: every caller gets exactly today's behaviour.
+ * Example: OTA_DOWNLOAD_BASE_URL=http://192.168.1.80:5000
+ */
+function otaDownloadBase(req) {
+  const override = String(process.env.OTA_DOWNLOAD_BASE_URL || '')
+    .trim()
+    .replace(/\/+$/, '');
+  return override || deviceBaseUrl(req);
 }
 
 /**
@@ -170,7 +236,7 @@ router.post('/check-update', async (req, res) => {
 
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
-        const baseUrl   = deviceBaseUrl(req);
+        const baseUrl   = otaDownloadBase(req);
         firmwareInfo    = {
           version:     latestFirmware.version,
           url:         `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
@@ -221,6 +287,24 @@ router.get('/firmware/download/:version', (req, res) => {
     }
 
     const stats = fs.statSync(firmwarePath);
+
+    /* A 0-BYTE FILE MUST NOT BE SERVED AS A 200.
+       Content-Length comes from this stat, so a zero-length file on disk sends
+       `Content-Length: 0` with a 200, and the scanner reports "Wrong file / No
+       size sent" - which reads like a bad upload when it is really a bad file
+       on THIS disk. A 500 says plainly that the server is at fault, and the
+       reason lands in the log next to it. */
+    if (stats.size < MIN_FIRMWARE_BYTES) {
+      console.error(
+        `Firmware file is unusable: ${firmwarePath} is ${stats.size} bytes ` +
+        `(expected at least ${MIN_FIRMWARE_BYTES}). Re-upload the .bin on THIS server.`
+      );
+      return res.status(500).json({
+        success: false,
+        message: `The stored file for ${version} is ${stats.size} bytes and cannot be installed. Re-upload it on this server.`,
+      });
+    }
+
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
     res.setHeader('Content-Length', stats.size);
@@ -300,6 +384,20 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
       return res.status(400).json({ success: false, message: 'Firmware file is required' });
     }
 
+    /* REFUSE IT HERE, RATHER THAN STORING IT AND LETTING FIFTY SCANNERS FIND OUT.
+       Writing a truncated or wrong file to disk creates a record that looks
+       perfect in the build list and fails at every machine that tries it - and
+       each device marks the version failed, so it will not retry even once the
+       file is fixed. Cheaper to say no now. */
+    const problem = firmwareImageProblem(file.buffer);
+    if (problem) {
+      console.error('Firmware upload REJECTED - ' + problem);
+      return res.status(400).json({
+        success: false,
+        message: `That file was not accepted: ${problem}`,
+      });
+    }
+
     // Persist .bin to disk
     const firmwareDir = path.join(__dirname, '../../firmware');
     if (!fs.existsSync(firmwareDir)) fs.mkdirSync(firmwareDir, { recursive: true });
@@ -309,7 +407,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     fs.writeFileSync(filePath, file.buffer);
     console.log('Firmware saved to:', filePath);
 
-    const baseUrl    = deviceBaseUrl(req);
+    const baseUrl    = otaDownloadBase(req);
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate any existing record with the same version
