@@ -35,6 +35,42 @@ const mongoose = require("mongoose");
 
 const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
 
+/**
+ * Run an identity query, or refuse — never quietly return "nothing".
+ *
+ * ── WHY EVERY `.catch(() => [])` HERE WAS A HOLE ────────────────────────────
+ * "The query returned no rows" and "the query failed" are different facts, and
+ * this file's whole job is to turn facts about identity into an access
+ * decision. Collapsing them:
+ *
+ *   · told a user with a perfectly good membership that their account is not
+ *     linked to a company, sending them to an administrator to fix nothing;
+ *   · and — the serious one — made the single-company fallback's premise
+ *     ("nobody has a membership row") reachable by BREAKING the query that
+ *     tests it. A fail-closed rule that can be opened by causing an error is
+ *     not fail-closed.
+ *
+ * So a failure becomes a stable 503 that no caller can mistake for an
+ * authorisation answer, and the cause is logged for an operator rather than
+ * described to the client.
+ */
+async function unavailableOnFailure(fail, what, runQuery) {
+  try {
+    /* A THUNK, not an already-built query: a mongoose call can throw
+       synchronously (a bad cast, a model in a broken state), and passing the
+       query in as a value would let that throw escape the very handler written
+       to catch it — surfacing as a 500 rather than the stable 503. */
+    return await runQuery();
+  } catch (err) {
+    console.error(`[companyContext] ${what} failed:`, err?.message || err);
+    throw fail(
+      "COMPANY_CONTEXT_UNAVAILABLE",
+      "Your company access could not be checked just now. Try again in a moment.",
+      { stage: what },
+    );
+  }
+}
+
 const MEMBERSHIP_SOURCES = Object.freeze({
   MEMBERSHIP_RECORD: "MEMBERSHIP_RECORD",
   SINGLE_COMPANY_DEPLOYMENT: "SINGLE_COMPANY_DEPLOYMENT",
@@ -84,11 +120,11 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
 
   let memberships = [];
   if (or.length) {
-    memberships = await SpCompanyMembership.find({ isActive: true, $or: or })
-      .select("companyId siteIds personName email employeeRef")
-      .sort({ companyId: 1 }) // stable order, so any diagnostic reads the same twice
-      .lean()
-      .catch(() => []);
+    memberships = await unavailableOnFailure(fail, "membership lookup", () =>
+      SpCompanyMembership.find({ isActive: true, $or: or })
+        .select("companyId siteIds personName email employeeRef")
+        .sort({ companyId: 1 }) // stable order, so any diagnostic reads the same twice
+        .lean());
   }
 
   /* Two rows naming the SAME company (one matched by email, one by
@@ -144,8 +180,16 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
    * The moment a second company exists, or anybody is given an explicit
    * membership, it stops applying — for everybody, at once. */
   const Acc_Company = companyModel();
-  const anyMembershipExists = await SpCompanyMembership.exists({ isActive: true }).catch(() => null);
-  const companies = await Acc_Company.find({}).select("_id").limit(2).lean().catch(() => []);
+  /* ── BOTH QUERIES MUST SUCCEED BEFORE THE FALLBACK IS EVEN CONSIDERED ────
+   * The fallback's premise is "no membership row exists for ANYBODY and there
+   * is exactly one company". A failed query cannot establish either half, and
+   * treating a failure as an empty result would let the premise be
+   * MANUFACTURED by breaking the database — which is the one way a
+   * fail-closed rule turns into a fail-open one. */
+  const anyMembershipExists = await unavailableOnFailure(fail, "membership existence check", () =>
+    SpCompanyMembership.exists({ isActive: true }));
+  const companies = await unavailableOnFailure(fail, "company lookup", () =>
+    Acc_Company.find({}).select("_id").limit(2).lean());
 
   if (!anyMembershipExists && companies.length === 1) {
     return {
@@ -166,4 +210,49 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
   );
 }
 
-module.exports = { MEMBERSHIP_SOURCES, resolveCompanyForActor };
+/**
+ * THE COMPANIES THIS ACTOR IS A MEMBER OF, WITH THEIR NAMES.
+ *
+ * The smallest projection a company selector needs, and membership-bound: it
+ * reads the actor's own `SpCompanyMembership` rows and looks up only those
+ * ids. Nobody browses the company master through it, and a person with no
+ * membership gets an empty list rather than everybody's companies.
+ *
+ * ── WHY IT LIVES HERE ───────────────────────────────────────────────────────
+ * It was written inside `services/merchandising/execution.service.js` because
+ * that is the chunk that needed a selector first. A second department needing
+ * the same answer had two bad options — import a Merchandising service into
+ * Industrial Engineering, or keep a second copy that drifts — so the rule moved
+ * to the module that already owns "which company is this person in". Both
+ * callers read it here; neither owns it.
+ *
+ * @returns {Promise<{companies: Array<{companyId: string, displayName: string}>}>}
+ */
+async function listMembershipCompanies(user) {
+  const str = (v) => String(v ?? "").trim();
+  const email = str(user?.email).toLowerCase();
+  const or = [];
+  if (email) or.push({ email });
+  if (mongoose.Types.ObjectId.isValid(str(user?.id))) {
+    or.push({ employeeRef: new mongoose.Types.ObjectId(str(user.id)) });
+  }
+  if (!or.length) return { companies: [] };
+
+  const memberships = await SpCompanyMembership.find({ isActive: true, $or: or })
+    .select("companyId").lean();
+  const ids = [...new Set(memberships.map((m) => str(m.companyId)))].filter(Boolean);
+  if (!ids.length) return { companies: [] };
+
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  const companies = await Acc_Company.find({ _id: { $in: ids } })
+    .select("companyName").lean();
+  return {
+    /* Sorted by name so two identical requests return the same order and a
+       selector does not reshuffle itself between renders. */
+    companies: companies
+      .map((c) => ({ companyId: str(c._id), displayName: str(c.companyName) }))
+      .sort((a, b) => a.displayName.localeCompare(b.displayName)),
+  };
+}
+
+module.exports = { MEMBERSHIP_SOURCES, resolveCompanyForActor, listMembershipCompanies };

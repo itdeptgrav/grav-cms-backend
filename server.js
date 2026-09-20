@@ -1462,6 +1462,19 @@ app.use(
 // then a costing capability. Authentication alone reaches nothing.
 app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
 
+/* ── INDUSTRIAL ENGINEERING'S READ BOUNDARY ──────────────────────────────
+   ADR-003 makes IE a department application of its own, separate from PPC and
+   from Production. Chunk 1A is its first door and it only READS: a
+   company-scoped, allowlisted projection of the styles IE must engineer, the
+   two legacy route sources that disagree about them, and the operation master
+   — with no write verb anywhere on the router.
+
+   Mounted ONCE, at its own top-level URL, and gated on the `ie` grant rather
+   than on Production's. Adding these reads to the style-route door would have
+   given the two departments one grant, which is exactly the ownership
+   ambiguity Chunk 0 was written to stop. */
+app.use("/api/cms/ie", require("./routes/CMS_Routes/IndustrialEngineering/ieRoutes"));
+
 
 /* ── MERCHANDISING'S OWN READ DOOR ───────────────────────────────────────
    Mounted ONCE, at its own top-level URL, and gated on the `merchandiser`
@@ -1505,6 +1518,13 @@ app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/han
    Merchandising grant of any level opens nothing here — which is the whole
    point: Merchandising hands off, and the receiving decision stays PPC's. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
+
+/* ── AND THE SECOND INBOUND QUEUE: ISSUED IE RELEASES ────────────────────
+   Same mount, same live `ppc` grant, PPC's own receipt collection. Industrial
+   Engineering issues into `ie_releases` and writes nothing here; PPC answers
+   here and writes nothing into `ie_releases`. There is no outbox between them
+   because the queue reads IE's immutable record directly. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/ieReleasesRoute"));
 
 /* Change control and the enterprise operations — the M7 surface: Sales-
    authorised change intake, impact coordination, acknowledgements, bulk tools,

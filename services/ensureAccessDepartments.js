@@ -61,6 +61,24 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: "merchandiserdepartments",
     legacyUserType: "merchandiser", dashboardPath: "/merchandiser/dashboard",
     description: "Style execution, component selection and development coordination." },
+  /* ── INDUSTRIAL ENGINEERING ──────────────────────────────────────────
+     A department application in its own right (ADR-003), not a designation:
+     Production Manager and Production Supervisor stay ROLES inside Production
+     rather than becoming a second name for this.
+
+     No legacy collection — nobody ever signed in to an "industrial
+     engineering" module — so like Merchandising and Developer it only
+     registers the department, which is what makes it appear in
+     CEO → Access Control and therefore GRANTABLE from there. That grant is the
+     whole access model: every /api/cms/ie endpoint checks
+     DepartmentRole("ie"), and the frontend shell is gated on the same slug.
+
+     Sorted at 47, between Merchandising (45) and Accounting (50): IE sits with
+     the make-side departments rather than at the end of the list. */
+  { key: "ie", slug: "ie", name: "Industrial Engineering", sortOrder: 47,
+    legacyModel: null, legacyCollection: "iedepartments",
+    legacyUserType: "ie", dashboardPath: "/industrial-engineering/orders",
+    description: "Operation standards, style bulletins, SAM, line balance and capacity standards." },
   { key: "accountant", slug: "accountant", name: "Accounting", sortOrder: 50,
     legacyModel: "Acc_Department", legacyCollection: "acc_departments",
     legacyUserType: "accountant", dashboardPath: "/accountant/",
