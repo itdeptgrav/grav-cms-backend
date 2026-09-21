@@ -200,7 +200,7 @@ function transcriptHtml(record, result, mode, meetId, summary, needsActionGroups
     const heading =
         mode === "translate"
             ? "Translated to English — translated lines are marked"
-            : "Verbatim — the exact words, in the language they were spoken";
+            : "Verbatim — the exact words, in the language they were spoken, written in Roman letters";
 
     const rows = utterances
         .map(

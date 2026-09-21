@@ -1598,9 +1598,45 @@ Render every line in ENGLISH. Where a line was originally spoken in another lang
 [0:05-0:09] Pramod Biswal: It will be done by tomorrow. <<T>>`;
   }
 
+  /**
+   * **Roman letters, not Devanagari.** Asked for 21 September 2026, looking at
+   * a transcript where one speaker's Hindi came back as Devanagari and the
+   * next speaker's came back as Hinglish — the same meeting, two scripts, and
+   * half of it unreadable to anybody who does not read the script.
+   *
+   * The ask is precise and worth restating, because the obvious reading of it
+   * is wrong: this is NOT a translation. The words and their meaning stay
+   * exactly as spoken. Only the letters change. "Verbatim" still means
+   * verbatim — the Translated tab is what renders speech into English, and it
+   * is unchanged.
+   *
+   * Why the model needed telling: nothing in the prompt ever named a script,
+   * so it picked one per request, and for Hindi it picks Devanagari about as
+   * often as Roman. Stating it removes the coin toss.
+   *
+   * The examples do the work that the instruction cannot. A model told to
+   * "use Roman letters" will happily transliterate one letter at a time and
+   * produce "sakate hain" and "aura" — correct character by character and not
+   * how a single person types Hindi. So the prompt shows the natural spelling
+   * beside the mechanical one, and shows the translated version as a third
+   * wrong answer so it cannot mistake romanising for translating.
+   */
   return `${common}
 
-Transcribe VERBATIM, in the language each line was actually spoken in. Do not translate. Do not tidy grammar, remove filler words, or turn speech into prose — if somebody says "um, so, yeah, we can, we can do that", write that.`;
+Transcribe VERBATIM, in the language each line was actually spoken in. Do not translate. Do not tidy grammar, remove filler words, or turn speech into prose — if somebody says "um, so, yeah, we can, we can do that", write that.
+
+Write every line in the LATIN ALPHABET (a-z), whatever language it was spoken in. Hindi, Odia, Bengali, Assamese and the rest go in Roman letters — the way people type them to each other in chat — never in Devanagari or any other script. This is NOT a translation: the words and the meaning stay exactly as spoken, and only the letters change.
+
+One Hindi sentence, and the three ways it could come back:
+  WRONG, right words but the wrong script: और आपका जो मेल है, अभी भी आप मेल खोल सकते हैं?
+  WRONG, translated into English:          And your mail, can you still open it?
+  RIGHT:                                   Aur aapka jo mail hai, abhi bhi aap mail khol sakte hain?
+
+Spell each word the way somebody would actually type it, not one letter at a time: "sakte hain" rather than "sakate hain", "khol" rather than "khola", "aur" rather than "aura", "kiya" rather than "kiyaa". Proper nouns keep their usual English spelling.
+
+A line that mixed Hindi and English stays mixed, with the English words spelled in English:
+
+[0:21-0:30] Rakesh Biswal: Sir kal call kiya tha, aaj mujhe details batayenge, wo bole 28 taareek tak fabric hamare paas pahunch jayega.`;
 }
 
 /**
@@ -2167,7 +2203,7 @@ router.get(
 async function renderTranscriptDocx(transcript, result, mode, meetId, summary) {
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-    WidthType, ShadingType, VerticalAlign, AlignmentType,
+    WidthType, ShadingType, VerticalAlign, AlignmentType, TableLayoutType,
   } = require("docx");
 
   const CONTENT_W = 9746;
@@ -2207,7 +2243,7 @@ async function renderTranscriptDocx(transcript, result, mode, meetId, summary) {
           text:
             mode === "translate"
               ? "Translated to English — lines marked [translated] were spoken in another language"
-              : "Verbatim — the exact words, in the language they were spoken",
+              : "Verbatim — the exact words, in the language they were spoken, written in Roman letters",
           size: 18,
           color: "5F6368",
         }),
@@ -2331,6 +2367,8 @@ async function renderTranscriptDocx(transcript, result, mode, meetId, summary) {
       new Table({
         width: { size: CONTENT_W, type: WidthType.DXA },
         columnWidths: [W_TASK, W_WHO, W_DUE],
+        /* Same reason as the transcript table below — see its note. */
+        layout: TableLayoutType.FIXED,
         rows: [
           new TableRow({
             tableHeader: true,
@@ -2412,7 +2450,30 @@ async function renderTranscriptDocx(transcript, result, mode, meetId, summary) {
   ];
 
   const body = utterances.length
-    ? new Table({ width: { size: CONTENT_W, type: WidthType.DXA }, rows })
+    ? new Table({
+        width: { size: CONTENT_W, type: WidthType.DXA },
+        /**
+         * **The grid, and a fixed layout.**
+         *
+         * Reported 21 September 2026 with this document open in Google Docs:
+         * the three columns had collapsed to one character wide, so the
+         * header read T-i-m-e down the page and every line of speech was a
+         * vertical ribbon.
+         *
+         * The table declared its own width and never declared its COLUMNS.
+         * Word infers a grid from the cell widths and looks right; Google
+         * Docs does not, and auto-fits to something unreadable. The other
+         * tables in this codebase all carry `columnWidths` — this one was
+         * the exception, which is why only this document was wrong.
+         *
+         * `TableLayoutType.FIXED` is the second half: it tells a reader to use the grid as
+         * given rather than re-fitting it to the content, which is what
+         * keeps a 400-row transcript from re-flowing per page.
+         */
+        columnWidths: [W_TIME, W_WHO, W_TEXT],
+        layout: TableLayoutType.FIXED,
+        rows,
+      })
     : new Paragraph({
         alignment: AlignmentType.LEFT,
         children: [
