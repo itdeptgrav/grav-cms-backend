@@ -355,18 +355,34 @@ class Query {
    * approximation that quietly pages wrongly, the unsupported shapes throw.
    */
   startAfter(cursor) {
+    return this._cursor(cursor, false, "startAfter");
+  }
+
+  /** Inclusive: the row equal to the cursor is the first row returned. */
+  startAt(cursor) {
+    return this._cursor(cursor, true, "startAt");
+  }
+
+  _cursor(cursor, inclusive, name) {
     if (!this._sort || Object.keys(this._sort).length !== 1)
-      throw new Error("startAfter() needs exactly one orderBy()");
+      throw new Error(`${name}() needs exactly one orderBy()`);
     const [field] = Object.keys(this._sort);
     const value =
-      cursor instanceof DocumentSnapshot ? cursor.get(field) : cursor;
-    return this._next({ after: { field, value, dir: this._sort[field] } });
+      cursor instanceof DocumentSnapshot
+        ? field === "_id"
+          ? cursor.id
+          : cursor.get(field)
+        : cursor;
+    return this._next({ after: { field, value, dir: this._sort[field], inclusive } });
   }
 
   async get() {
     const filter = { ...this._filter };
     if (this._after) {
-      const op = this._after.dir === -1 ? "$lt" : "$gt";
+      const desc = this._after.dir === -1;
+      const op = this._after.inclusive
+        ? desc ? "$lte" : "$gte"
+        : desc ? "$lt" : "$gt";
       filter[this._after.field] = {
         ...(filter[this._after.field] ?? {}),
         [op]: this._after.value,

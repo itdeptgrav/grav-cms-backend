@@ -62,7 +62,8 @@ async function sendIOSWebPush(subscriptionJSON, title, body, data = {}) {
 async function sendPushToEmployees(recipientIds, title, body, data = {}) {
 
     if (!recipientIds?.length) return;
-    const db = admin.firestore();
+    /* Through the config, not `admin.firestore()` — see timerSop.service.js. */
+    const { db } = require("../config/firebaseAdmin");
 
     console.log(`[FCM] ── Sending "${title}" to ${recipientIds.length} recipient(s): [${recipientIds.join(", ")}]`);
 

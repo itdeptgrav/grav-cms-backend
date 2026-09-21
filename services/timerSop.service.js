@@ -35,7 +35,10 @@
  */
 
 const admin = require("firebase-admin");
-const db = admin.firestore();
+/* Through the config, not `admin.firestore()` directly: that call reaches past
+   the `COWORK_DB` switch and would keep this service on Firestore after
+   everything else had moved. `admin` is still needed for FieldValue. */
+const { db } = require("../config/firebaseAdmin");
 const Employee = require("../models/Employee");
 
 const { instantMs, istDateStr, addDaysToLabel, dowForLabel } = require("./timerSopTime");

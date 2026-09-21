@@ -1,8 +1,9 @@
 # Cowork: Firestore → MongoDB
 
-**Status:** foundation implemented and tested. **Nothing is wired in.** The
-running server is byte-for-byte unaffected — the only change to the repository
-is two new directories under `services/`.
+**Status (21 Sep 2026): the code path is complete end to end and behind one
+switch. It has not yet run against a MongoDB replica set, because none exists
+on the machines this was built on.** Until it has, this is "built and tested",
+not "migrated".
 
 **Scope conflict, recorded rather than resolved:** `docs/tasks/current-task.md`
 names Store & Purchase professionalisation as the active scope. This work was
@@ -11,135 +12,120 @@ instead of the task file being rewritten unilaterally.
 
 ---
 
-## Why this shape
+## The switch
 
-The Cowork backend reaches Firestore from **504 call sites across 87 files**
-(services 259, routes 236, middleware 7, server.js 2; a further ~105 sites live
-in root-level one-off scripts and are not on the critical path).
+`COWORK_DB=mongo` in the backend's environment. Anything else — including unset
+— is Firestore, unchanged. Reversible by an environment variable and a restart,
+never a deploy.
 
-Rewriting 504 sites by hand is weeks of mechanical edits through code that
-decides who approves work and what somebody is scored on, and each edit is a
-chance at a silent inversion.
+The URI must name a **replica set** (`?replicaSet=rs0`, or Atlas `mongodb+srv`).
+`services/mongo/coworkDbChoice.js` refuses a standalone URI at boot, because a
+standalone `mongod` serves every read and write and fails only at the first
+`watch()` — by which time realtime is silently dead.
 
-So the surface those sites use was **measured**:
+## The shape
 
-| Used | Count |
-|---|---|
-| `.get()` | 1492 |
-| `.doc(` | 461 |
-| `.set(` | 336 |
-| `.exists` | 320 |
-| `FieldValue.serverTimestamp` | 239 |
-| `.update(` | 218 |
-| `.size` / `.docs` / `.empty` | 150 / 124 / 34 |
-| `.delete()` | 138 |
-| `.add(` | 131 |
-| `.where(` | 116 |
-| `.limit(` / `.orderBy(` | 73 / 27 |
-| `FieldValue.arrayUnion` / `increment` / `arrayRemove` / `delete` | 28 / 18 / 3 / 4 |
-| `.batch()` / `runTransaction` | 23 / 12 |
-| `.startAfter(` | 1 |
+Two facades, one on each side, so that **none of the ~650 call sites changed**:
 
-and — decisively — what is **not** used: no `collectionGroup`, no `onSnapshot`
-on the backend, no `count()`, no `offset`, no `FieldPath`. Eight query
-operators in total (`==`, `array-contains`, `in`, `not-in`, `>=`, `<=`, `<`,
-`!=`). Nine subcollections (`chat`, `draft_chat`, `messages`, `dailyReports`,
-`sessions`, `logs`, `reports`, `lines`, `events`) across 40 usages.
+| | where | what it answers |
+|---|---|---|
+| server | `services/mongo/firestoreCompat.js` | the Firestore *admin* API — `db.collection().doc().get()`, `FieldValue`, snapshots — over the MongoDB driver |
+| browser | `Cowork/lib/legacy/firestoreClient.ts` | the Firestore *client* API — `collection`, `doc`, `getDoc`, `getDocs`, `query`, `where`, `onSnapshot`, `writeBatch`, `Timestamp` … — over `POST /cowork/db` |
 
-That is a bounded, emulatable surface. A facade is therefore the lower-risk
-path than 504 rewrites.
+The browser no longer holds any database connection. Every read and write it
+used to make directly against Firestore (147 import sites in 10 files, all
+re-pointed by one specifier swap) now goes to the server, authenticated by the
+same Firebase ID token as every other request.
 
-## What exists
+**Firebase Auth stays.** Only the database moved. `config/firebaseAdmin.js`
+still exports `auth`, `messaging`, `rtdb`; only `db` is switched.
 
-### `services/mongo/firestoreCompat.js`
+## What stands where Firestore's rules stood
 
-The Firestore admin API, implemented over MongoDB. Call sites keep their code;
-one import changes.
+The rules were never in this repository — only in the Firebase console — so
+`services/mongo/dataAccess.js` is the only written statement of who may read
+and write what from the browser. **Deny by default**: a collection with no entry
+is refused, and the refusal names the collection. Reads are `employee` (any
+authenticated workspace member — the directory, settings), `audience` (the same
+people `rooms.js` would send the realtime change to, so nobody can be told
+about a change to a record they could not read), or `owner`. A subcollection is
+judged by its parent. Query results are filtered server-side per document.
 
-Semantics deliberately preserved rather than approximated:
+## Realtime
 
-- **`snapshot.exists` is a getter**, not a method. This codebase has been bitten
-  by that difference before.
-- **`update()` on a missing document throws** (`code: 5`, NOT_FOUND). Mongo's
-  `updateOne` matches nothing and reports success; 218 call sites were written
-  against the throw.
-- **`set()` replaces; `set(data, {merge:true})` merges.**
-- **Ids stay strings** — `_id` is the Firestore id verbatim, so every id already
-  stored in another document, a URL, or the Mongo side still resolves.
-- **Subcollections flatten** to `<parent>__<child>` with `_parentId` on each
-  document; a subcollection reference scopes every read and write by it.
-- **`collectionGroup()` throws** rather than being approximated. It is unused,
-  and a wrong answer would be silent.
+`onSnapshot` in the browser is now: fetch, then refetch whenever the server's
+`realtime:change` names the collection being watched. The server side is one
+`db.watch()` change stream (`services/realtime/changeStreamBroker.js`) over the
+whole database, resume token persisted, `realtime:resync` when the oplog has
+moved past it. The audience for every change is computed **from the document**
+(`rooms.js`), never from a room a client asked to join, and delivered only to
+`user:<employeeId>` / `presence` — rooms `server.js`'s existing handshake
+middleware grants after verifying the token. The legacy `join_cowork` rooms are
+untouched and carry nothing new.
 
-### `services/mongo/mongoStore.js`
+A subcollection change (`cowork_tasks__chat`) is delivered to its **parent's**
+audience, resolved with a 5-second bounded cache.
 
-The driver half, split out so every rule above is testable with no database.
-`mongoStore(db, {client})` for production, `memoryStore()` for tests. The memory
-store implements only the operators the facade emits and throws on anything
-else, so a new operator fails loudly rather than passing an untested path.
+## Semantics that would otherwise have failed silently
 
-`transaction()` reports `atomic: true/false`. Multi-document atomicity needs a
-replica set; without one the batch applies in order and stops at the first
-failure. It says which rather than implying a guarantee it is not giving.
+Each of these was found by a test or a survey before anything ran; each would
+have produced no error, only wrong data:
 
-### `services/realtime/rooms.js`
+- `snapshot.exists` — a **property** on the admin SDK, a **method** on the
+  client SDK. Both facades match their own side.
+- `update()` on a missing document throws NOT_FOUND on Firestore and succeeds
+  on Mongo. The server facade turns the miss back into the throw.
+- Timestamps: MongoDB stores a BSON `Date`; the server facade revives it into a
+  `CompatTimestamp` (`toDate()`, `_seconds/_nanoseconds` on the wire), and the
+  client facade revives that into a `Timestamp`. Writing a timestamp back stores
+  a real `Date` again, so the field stays queryable and sortable.
+- `admin.firestore.FieldValue` sentinels (308 sites) are recognised by
+  constructor name; `serverTimestamp()` would otherwise have stored `{}`.
+- `runTransaction` resolves to the callback's value (10 sites use it directly),
+  and every operation inside is enrolled in the session — previously none was.
+- Notifications are keyed `recipientEmployeeId`; duty and timers by document id.
+- Presence is workspace-wide, as `workspace-member-status` already is.
 
-**The security boundary.** Firestore's rules were enforced by Google; they are
-gone. The audience for every change is computed **from the document**, never
-from a room a client asked to join — which matters because `join_cowork`,
-`join_group`, `join_dm` and `join_mrf` in `server.js` take their ids straight
-from the client with no check. Default is silent: a collection with no rule
-reaches nobody. `taskAudience` mirrors `mayViewTask` in
-`routes/task_routes/coworkAttachments.js` — one rule, not two.
+## Data and indexes
 
-### `services/realtime/changeStreamBroker.js`
+`scripts/migrateCoworkToMongo.js` — `--dry-run`, `--only`, `--verify`.
+Re-runnable upserts, ids preserved as strings, never writes to Firestore,
+reports (never renames) field names MongoDB cannot store. Covers the
+`cowork_*`, `meeting_*` and `bandconfigs` roots and the nine real
+subcollections.
 
-One `db.watch()` over the whole database (not 41 cursors), `updateLookup` so the
-audience can be computed, resume token persisted in `cowork_realtime_state`
-(excluded from its own pipeline or it feeds itself for ever). On
-`ChangeStreamHistoryLost` it emits `realtime:resync` and starts clean rather
-than pretending; ordinary failures retry with backoff capped at 30s.
+`services/mongo/indexes.js` — 50 indexes derived from the query shapes in the
+code, ensured on every boot and by `scripts/ensureCoworkIndexes.js`. Without
+them every query is a collection scan, including the `authUid` lookup on every
+authenticated request.
 
-### Client half — `Cowork/lib/realtime/changeFeed.ts`
+## Cutover, in order
 
-Turns `realtime:change` into the invalidation Cowork already runs on
-(`notifyRepositoryChanged`). Coalesces a burst into one refetch. Carries no
-document data: the client refetches, so there is never a second copy of the
-truth in the browser, and an audience mistake leaks *that* something changed
-rather than *what*.
+1. Start `mongod --replSet rs0`, run `rs.initiate()` once.
+2. `COWORK_MONGODB_URI=mongodb://127.0.0.1:27017/cowork?replicaSet=rs0`
+3. `node -r dotenv/config scripts/migrateCoworkToMongo.js --dry-run`, then
+   without `--dry-run`, then `--verify` until every collection reads `ok`.
+4. `node -r dotenv/config scripts/ensureCoworkIndexes.js`
+5. `COWORK_DB=mongo`, restart. Watch `GET /cowork/admin/realtime-stats`.
+6. Deploy the Cowork frontend from `MONGODB_DATA_BRANCH` — its `/cowork/db`
+   calls need this backend.
+7. Re-run the migration once more for the delta, then verify again.
+8. To go back: unset `COWORK_DB`, restart. Nothing else.
 
 ## Tests
 
-`npm test` (backend): **43 new tests, all passing.** Suite total 1717, with 4
-pre-existing failures in `blockedDeadline.test.js`, `openItems.test.js` and
-`salesJourneyOutcome.test.js` — untouched by this work.
+Backend `npm test`: 1814, of which the migration suites are 140 and all pass;
+4 pre-existing failures in `blockedDeadline`, `openItems`,
+`salesJourneyOutcome`. Cowork `npm test`: see the commit for the count; the
+only failures are the two pre-existing environment-dependent ones.
 
-`npm test` (Cowork): 12 new tests for the client feed; suite unaffected.
+## Known limits, stated rather than hidden
 
-Two real bugs were caught by these tests before any of it ran:
-
-1. `toEvent` read `change.ns.collection`; MongoDB change events use `ns.coll`.
-   Every change would have looked like an unwatched collection and **nothing
-   would ever have been delivered**.
-2. `doc().set()` on a subcollection did not stamp `_parentId`, so the document
-   landed with no owner and was invisible to its own scoped read. `add()`
-   happened to work, which is what made subcollections look functional.
-
-## Deployment prerequisites — not optional
-
-1. **MongoDB must run as a replica set.** A standalone `mongod` has no change
-   streams and no multi-document transactions. Single node is fine:
-   `mongod --replSet rs0` then `rs.initiate()`; URI
-   `mongodb://127.0.0.1:27017/cowork?replicaSet=rs0`.
-2. **A backup plan for that host.** One self-hosted node has no redundancy;
-   Firestore was replicated by Google.
-
-## Next
-
-1. Migration script: Firestore → Mongo, per collection, ids preserved, re-runnable.
-2. Wire the broker into `server.js` (owner's word needed — it opens a live
-   change stream).
-3. Socket authentication, so room membership is earned rather than claimed.
-4. Cut over per collection behind a flag, starting with `cowork_notifications`;
-   dual-write and shadow-read to prove equivalence on real traffic.
-   `cowork_tasks`, approvals and scoring go last.
+- Never run against a real MongoDB. Every semantic above is proven against an
+  in-memory store that mirrors the driver on the points the facades depend on.
+- The client-side `runTransaction` (one caller) commits its writes as one batch
+  but does not re-run on a conflicting concurrent write as the SDK does.
+- Both bandwidth meters patch admin-SDK prototypes the facade never
+  instantiates; on MongoDB the Firestore document counts read zero.
+- Firebase Realtime Database (`rtdb`, 8 call sites in `cowork.service.js`) is a
+  different product and was not moved.

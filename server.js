@@ -274,6 +274,24 @@ io.use(async (socket, next) => {
 });
 
 /**
+ * The rooms that carry Cowork DATA, granted only to a socket the middleware
+ * above has named.
+ *
+ * `join_cowork` below joins whatever employee id a client sends, unchecked; it
+ * is a delivery address anyone can claim. The change broker
+ * (`services/realtime/changeStreamBroker.js`) therefore never emits into it —
+ * it addresses `user:<employeeId>` and `presence`, which exist only through
+ * this call, only after a verified token. See `services/realtime/rooms.js` for
+ * why that one distinction is the whole security model now that Firestore's
+ * rules are gone.
+ */
+const { grantRooms } = require("./services/realtime/socketIdentity");
+io.use((socket, next) => {
+  if (socket.cowork?.employeeId) grantRooms(socket, socket.cowork.employeeId);
+  next();
+});
+
+/**
  * Whether this socket may control the given meeting's recording.
  *
  * The organiser (`createdBy`) runs their own meeting; a CEO or TL may act on
@@ -776,6 +794,10 @@ io.on("connection", (socket) => {
 
 app.use(bandwidthMiddleware);
 app.get("/cowork/admin/bandwidth-stats", bandwidthStatsHandler);
+app.get("/cowork/admin/realtime-stats", (req, res) => {
+  const broker = app.get("realtimeBroker");
+  res.json(broker ? { running: broker.stream !== null, ...broker.stats } : { running: false, reason: "COWORK_DB is not mongo" });
+});
 
 app.use("/cowork", transcriptModule.router);
 
@@ -2408,6 +2430,9 @@ app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
 
 // Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
 app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
+/* `POST /cowork/db` — every read and write the browser used to make against
+   Firestore directly. Policy in services/mongo/dataAccess.js. */
+app.use("/cowork", require("./routes/task_routes/coworkData.routes.js"));
 
 // Mindmaps: /cowork/mindmaps. A route rather than a browser-direct write —
 // unlike a document body, a card tree can be malformed in ways that stop it
@@ -3429,6 +3454,34 @@ if (SCANNER_COMPAT_PORT > 0 && SCANNER_COMPAT_PORT !== Number(PORT)) {
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+
+  /**
+   * Cowork on MongoDB: indexes, then realtime.
+   *
+   * Only when `COWORK_DB=mongo`. On Firestore neither applies — Firestore
+   * indexes itself and the browser still listens directly — so this block is
+   * inert on today's deployment and becomes the realtime layer on tomorrow's.
+   *
+   * Indexes first, on every boot: `createIndex` is a no-op when the index
+   * exists, and a collection that appears with no index must never sit
+   * unindexed until somebody remembers. Then the broker, which is what
+   * replaces every `onSnapshot` the browser used to hold.
+   */
+  const { useMongo } = require("./config/firebaseAdmin");
+  if (useMongo && db.__mongo) {
+    const { ensureIndexes } = require("./services/mongo/indexes");
+    const { ChangeStreamBroker } = require("./services/realtime/changeStreamBroker");
+    const broker = new ChangeStreamBroker({
+      db: db.__mongo.mongo,
+      io,
+      log: (m, e) => console.log(`[realtime] ${m}`, e ?? ""),
+    });
+    app.set("realtimeBroker", broker);
+    ensureIndexes(db.__mongo.mongo, { log: (m) => console.log(`[mongo] ${m}`) })
+      .catch((e) => console.error("[mongo] ensureIndexes failed:", e.message))
+      .then(() => broker.start())
+      .catch((e) => console.error("[realtime] broker did not start:", e.message));
+  }
   /* The heap limit, in the deploy log, because it is the number that decides
      whether this process survives a busy afternoon. Node sizes it from the
      container's memory — ~256 MB on a 512 MB instance — and that is what

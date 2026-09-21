@@ -60,13 +60,23 @@ function loadFirebase() {
  * day that stops being true.
  */
 const SUBCOLLECTIONS = {
-  cowork_tasks: ["chat", "draft_chat", "dailyReports", "reports", "events", "logs"],
+  /* From `grep 'collection("X").doc(...).collection("Y")'` over routes/ and
+     services/, plus the two the BROWSER writes (timer sessions, conversation
+     messages) that the backend only reads. An earlier version of this map
+     listed children that do not exist and missed five that do — a survey caught
+     it. Do not edit this without re-running that grep. */
+  cowork_tasks: ["chat", "draft_chat", "dailyReports", "reports"],
   cowork_groups: ["messages"],
   cowork_direct_messages: ["messages"],
   cowork_conversations: ["messages"],
-  cowork_scheduled_meets: ["sessions", "logs"],
-  cowork_workbooks: ["lines"],
+  cowork_work_commits: ["logs"],
+  cowork_timer_events: ["logs"],
+  cowork_task_timers: ["sessions"],
+  cowork_scheduled_meets: ["events"],
 };
+
+/** Every root that holds Cowork data — not only the `cowork_` prefix. */
+const ROOT_PREFIXES = ["cowork_", "meeting_", "bandconfigs"];
 
 /** Collections that exist but must NOT be copied. */
 const SKIP = new Set([
@@ -105,7 +115,10 @@ async function topLevelCollections(firestore) {
   const refs = await firestore.listCollections();
   return refs
     .map((r) => r.id)
-    .filter((id) => id.startsWith("cowork_") && !SKIP.has(id))
+    .filter(
+      (id) =>
+        ROOT_PREFIXES.some((p) => id === p || id.startsWith(p)) && !SKIP.has(id),
+    )
     .sort();
 }
 
@@ -308,4 +321,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { SKIP, SUBCOLLECTIONS, parseArgs };
+module.exports = { ROOT_PREFIXES, SKIP, SUBCOLLECTIONS, parseArgs };

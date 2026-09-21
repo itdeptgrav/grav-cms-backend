@@ -74,6 +74,19 @@ function isAuthenticatedRoom(room) {
 }
 
 /**
+ * Join the rooms a verified employee is entitled to — and only those.
+ *
+ * Exported on its own because `server.js` already has a handshake middleware
+ * that verifies the token and attaches `socket.cowork`; verifying a second time
+ * would be two round trips to Firebase per connection for one answer. That
+ * middleware calls this, so the room NAMES have exactly one definition.
+ */
+function grantRooms(socket, employeeId) {
+  socket.join(userRoom(employeeId));
+  socket.join(PRESENCE_ROOM);
+}
+
+/**
  * Build the Socket.IO middleware.
  *
  * `verify` and `resolveEmployee` are injected rather than imported so this can
@@ -120,8 +133,7 @@ function socketIdentity({ verifyIdToken, resolveEmployee, log = () => {} }) {
       }
       socket.data.employeeId = String(employee.employeeId);
       socket.data.authUid = decoded.uid;
-      socket.join(userRoom(employee.employeeId));
-      socket.join(PRESENCE_ROOM);
+      grantRooms(socket, employee.employeeId);
       return next();
     } catch (error) {
       /**
@@ -143,6 +155,7 @@ function socketIdentity({ verifyIdToken, resolveEmployee, log = () => {} }) {
 module.exports = {
   PRESENCE_ROOM,
   USER_ROOM,
+  grantRooms,
   isAuthenticatedRoom,
   socketIdentity,
   userRoom,
