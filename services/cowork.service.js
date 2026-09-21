@@ -618,29 +618,46 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
   return data;
 }
 
+/**
+ * **Your meetings. Membership decides it, and the role does not.**
+ * OWNER DECISION, 21 September 2026.
+ *
+ * This branched three ways on the caller's role, and the first branch was the
+ * problem: `role === "ceo"` read the WHOLE collection with no membership check
+ * at all, so that account was handed every meeting in the company — including
+ * private ones it was not on. Reported with the meetings page as evidence: a
+ * meeting whose invitation held one person showed up on somebody else's list,
+ * and opening it answered "You are not on this meeting's invitation".
+ *
+ * The frontend also narrowed `canView` to membership in the same change. Both
+ * ends are fixed rather than just the screen, deliberately: a list filtered only
+ * in the browser still SENDS every meeting in the organisation — titles,
+ * agendas and participants — to a client that then hides them. Filtering here
+ * means it is never sent.
+ *
+ * The remaining query is what the TL branch already did, now for everybody:
+ * meetings you created, plus meetings you are on. Both halves are needed.
+ * `createdBy` alone misses the ones you were invited to, and `participants`
+ * alone misses meetings created before the organiser was added to that array —
+ * see `allParticipants` in the create path, which has deduped the organiser
+ * into it only since that was fixed.
+ *
+ * Cancelled meetings are still returned, as before: participants need to see
+ * the cancelled state on their own page, and the frontend decides how to show
+ * it.
+ *
+ * NOT a CEO-visibility feature in disguise. If organisation-wide meeting
+ * oversight is wanted later it should be an explicit, audited surface — not a
+ * role check inside the list everybody reads.
+ */
 async function listCoworkMeets(employeeId, role) {
-  // NOTE: We now return cancelled meetings too — participants need to see the
-  // "Cancelled" blurred state on their meetings page. The frontend handles display.
-  if (role === "ceo") {
-    // CEO sees all meetings (active + cancelled)
-    const snap = await db.collection("cowork_scheduled_meets").get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  }
-
-  if (role === "tl") {
-    // TL sees meetings they CREATED + meetings they are a PARTICIPANT in (active + cancelled)
-    const [createdSnap, participantSnap] = await Promise.all([
-      db.collection("cowork_scheduled_meets").where("createdBy", "==", employeeId).get(),
-      db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).get(),
-    ]);
-    const map = new Map();
-    [...createdSnap.docs, ...participantSnap.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
-    return Array.from(map.values());
-  }
-
-  // Employee — only meetings they are a participant in (active + cancelled so they see the blur)
-  const snap = await db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const [createdSnap, participantSnap] = await Promise.all([
+    db.collection("cowork_scheduled_meets").where("createdBy", "==", employeeId).get(),
+    db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).get(),
+  ]);
+  const map = new Map();
+  [...createdSnap.docs, ...participantSnap.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+  return Array.from(map.values());
 }
 
 async function getCoworkMeet(meetId) {

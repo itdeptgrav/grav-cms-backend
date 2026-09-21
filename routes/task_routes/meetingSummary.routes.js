@@ -23,7 +23,34 @@
 const express = require("express");
 const router = express.Router();
 const { google } = require("googleapis");
-const { generateSummaryDocx } = require("./generateSummaryDocx");
+const { generateSummaryDocx, needsActionGroups } = require("./generateSummaryDocx");
+
+/**
+ * **The same two documents, as PDF.**
+ *
+ * Asked for 21 September 2026: a PDF beside each Download .docx. Both routes
+ * below branch on `?format=pdf` rather than gaining a path of their own —
+ * one document, one URL, one permission check, and the only thing that differs
+ * is how it is rendered.
+ *
+ * Chromium is shared and kept warm by `pdfRender.service`. When it cannot run
+ * at all the caller is told so in those words rather than being handed a 500
+ * that looks like the summary failed: the .docx is still there, and that is
+ * the useful thing to say.
+ */
+const { summaryHtml, transcriptHtml } = require("./meetingPdf");
+const {
+  htmlToPdf,
+  RendererUnavailableError,
+} = require("../../services/pdfRender.service");
+
+function pdfUnavailable(res, e) {
+  console.error("[MeetingPdf] renderer unavailable:", e.message);
+  return res.status(503).json({
+    error:
+      "The PDF renderer is not available on this server. The .docx download still works.",
+  });
+}
 const { db, admin } = require("../../config/firebaseAdmin");
 const {
   verifyCoworkToken,
@@ -676,6 +703,93 @@ Rules:
 - Keep quotes natural — paraphrase if exact words unclear`;
 }
 
+/**
+ * **The summary, made from the transcript, in the same run.**
+ *
+ * Reported 21 September 2026: downloading a transcript gave a Summary box
+ * reading "No summary has been generated for this meeting yet", because the
+ * summary was a SEPARATE button that had never been pressed. The answer asked
+ * for was not a better message — it was that there should be nothing to press:
+ * "generate the Summary and Transcription at the same time from the same
+ * meeting communication."
+ *
+ * So this runs at the end of the transcript route, and it reads the transcript
+ * rather than the audio. That matters for three reasons:
+ *
+ *   · it is the same meeting communication, by construction — the summary
+ *     cannot describe a different call from the one printed underneath it;
+ *   · the audio is already uploaded, transcribed and deleted by then, and
+ *     sending fifty minutes of it through the model a second time would double
+ *     the slowest part of the job for nothing;
+ *   · text is small, so this costs one quick call on top of a job that already
+ *     took several minutes.
+ *
+ * The existing audio-based `/audio/summary` route is untouched and still works.
+ * This does not replace it; it means nobody has to use it before a transcript
+ * document is worth reading.
+ *
+ * The section headers are the ones `parseResponse` already reads, so the result
+ * is the exact shape `meeting_summaries` holds and every reader of it — the
+ * panel, the summary document, the transcript's own Summary box — keeps
+ * working with no change.
+ */
+async function summariseFromTranscript(apiKey, utterances, participantNames, meetTitle) {
+  const lines = (utterances || [])
+    .map((u) => {
+      const t = Number(u?.start) || 0;
+      const clock = `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+      return `[${clock}] ${u?.speaker ?? "Unknown"}: ${u?.text ?? ""}`;
+    })
+    .join("\n");
+
+  if (!lines.trim()) return null;
+
+  const who = (participantNames || []).length
+    ? `The people in this meeting were: ${participantNames.join(", ")}.`
+    : "";
+
+  const prompt = `Below is the full transcript of a meeting${
+    meetTitle ? ` titled "${meetTitle}"` : ""
+  }. ${who}
+
+Read ALL of it and write a summary for somebody who was not there and will not read the transcript.
+
+Respond in this EXACT format (do not change the section headers, and write nothing outside them):
+
+## MEETING SUMMARY
+[10 to 15 lines. Not five, not thirty. Cover, in this order and in plain sentences:
+ - what the meeting was about and what was actually discussed;
+ - the decisions taken and what was agreed;
+ - any updates, numbers, dates or names that matter (order numbers, quantities, suppliers, systems);
+ - anything left unresolved or waiting on somebody.
+Write about what was really said. Do not invent anything that is not in the transcript, and do not pad it out with sentences that say nothing.]
+
+## TASKS ASSIGNED
+[One per line, exactly:
+- {Name}: {what they have to do} [Deadline: {the deadline, or "Not specified"}]
+{Name} must be the person who has to DO it, not the person who asked. Include every task anybody was asked to do or agreed to do.
+If genuinely nobody was given anything to do, write: No tasks were assigned]
+
+## DEADLINES MENTIONED
+[One per line, exactly:
+- {Person}: {what} by {date or time as it was said}
+Only dates that were actually spoken. If none, write: No specific deadlines mentioned]
+
+## ACTION ITEMS
+[One per line, the next steps the meeting decided that are not already a named person's task above.
+If none, write: No action items]
+
+TRANSCRIPT:
+${lines}`;
+
+  /* No file parts — `callGemini` sends the prompt alone, which is what makes
+     this the cheap call rather than a second pass over the audio. */
+  const text = await callGemini(apiKey, [], prompt);
+  const parsed = parseResponse(text);
+  if (!parsed.summary && !parsed.tasksAssigned.length) return null;
+  return parsed;
+}
+
 // ── Parse Gemini response into structured sections ────────────────────────────
 function parseResponse(text) {
   const get = (header, stops) => {
@@ -1310,7 +1424,37 @@ router.get(
         .replace(/[^a-zA-Z0-9_\- ]/g, "")
         .trim()
         .replace(/\s+/g, "_");
-      const fileName = `Meeting_Summary_${safeName}_${meetId}.docx`;
+      const wantsPdf = String(req.query.format || "").toLowerCase() === "pdf";
+      const fileName = `Meeting_Summary_${safeName}_${meetId}.${wantsPdf ? "pdf" : "docx"}`;
+
+      if (wantsPdf) {
+        console.log(`[SummaryPdf] Rendering pdf for ${meetId} — "${meetTitle}"`);
+        let pdf;
+        try {
+          pdf = await htmlToPdf(
+            summaryHtml(
+              summaryWithMeta,
+              meetId,
+              /* The docx builder's own reading, so the two documents cannot
+                 disagree about what somebody has to do. */
+              needsActionGroups(
+                summaryWithMeta.tasksAssigned,
+                summaryWithMeta.deadlines,
+                summaryWithMeta.actionItems,
+              ),
+            ),
+          );
+        } catch (e) {
+          if (e instanceof RendererUnavailableError || e?.rendererUnavailable) {
+            return pdfUnavailable(res, e);
+          }
+          throw e;
+        }
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+        res.setHeader("Content-Length", pdf.length);
+        return res.send(pdf);
+      }
 
       console.log(
         `[SummaryDocx] Generating docx for ${meetId} — "${meetTitle}"`,
@@ -1360,29 +1504,88 @@ const TRANSCRIPT_COLLECTION = "meeting_transcripts_gemini";
  * plausible sentence is worse than one with a gap in it: the gap can be checked
  * against the recording, the invention cannot be told from the truth.
  */
-function buildTranscriptPrompt(mode, participantNames, timeline) {
-  const who = participantNames.length
-    ? `The speakers are: ${participantNames.join(", ")}.`
-    : "Speaker names are not known; label them Speaker 1, Speaker 2, and so on.";
+/** Seconds as M:SS, or H:MM:SS past an hour — for the prompt's own copy. */
+function clockOf(totalSecs) {
+  const s = Math.max(0, Math.round(totalSecs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
 
-  const order = timeline.length
-    ? `\n\nSpeaking order, taken from each participant's own microphone (seconds from the start of the meeting):\n${timeline
-        .map((t) => `  ${t.start}-${t.end}s ${t.name}`)
-        .join("\n")}\nUse this to attribute lines. Where it disagrees with what you hear, trust what you hear.`
+/**
+ * **One speaker's own microphone, transcribed on its own.**
+ *
+ * This used to hand all three files to one call and ask for a merged,
+ * time-ordered transcript with the speakers worked out. On M084 that produced
+ * 48 lines in which TRINAYAN DOLEY appeared **not once** — three people were
+ * recorded and two made it to the page.
+ *
+ * It was the wrong job to give a model. Merging N streams, aligning them on a
+ * shared clock and attributing every line is hard, and it was being asked
+ * blind: `speechIntervals` is empty on every recording this product has
+ * written, so the "speaking order" block that was supposed to carry the
+ * attribution was never in the prompt at all.
+ *
+ * Per file, none of that arises. The file IS the speaker — `gatherMeetingAudio`
+ * pushes the name and the upload together — so attribution stops being a guess
+ * and becomes a fact, and each call has one voice and one timeline to follow.
+ * The route merges the results on the timestamps afterwards, where merging is
+ * arithmetic rather than judgement.
+ *
+ * `fromSecs` is the other half. A model given fifty minutes of audio returns an
+ * opening and stops, so the caller asks again from where the last answer
+ * reached — see `transcribeSpeaker`.
+ */
+function buildTranscriptPrompt(mode, speakerName, durationSecs, fromSecs) {
+  const who = `This audio is ONE person's own microphone: ${speakerName}.
+
+Transcribe ONLY what ${speakerName} says. Other people were in the same call and are faintly audible in the background of this recording — ignore them completely. Every line you write is ${speakerName} speaking, and the speaker name on every line is ${speakerName}.`;
+
+  const order = "";
+
+  /**
+   * **How long it is, and that it must all be transcribed.**
+   *
+   * Reported 21 September 2026 with M084, a 50-minute meeting: the translated
+   * transcript came back perfectly formatted, nothing for the parser to
+   * reject — and it stopped at 2:18. The model had no idea how long the
+   * recording was and nothing told it to reach the end, so it did what a model
+   * does with a long input and a short example: produced an opening.
+   *
+   * So the length is stated, and finishing is stated. Both in terms of the
+   * audio rather than a line count — asking for "at least N lines" invites
+   * padding, and a quiet meeting genuinely has fewer.
+   */
+  const hasLength = Number.isFinite(durationSecs) && durationSecs > 0;
+  const from = Number.isFinite(fromSecs) && fromSecs > 0 ? fromSecs : 0;
+
+  const howLong = hasLength
+    ? `\n\nThis recording is about ${Math.round(durationSecs / 60)} minutes long (${clockOf(durationSecs)}). Transcribe ALL of it, to the very end. Do not stop part-way, do not summarise, and do not give only the opening — the last line you write should be near ${clockOf(durationSecs)}. If a long stretch is silence, or ${speakerName} simply is not speaking, skip it and carry on with the next thing they say rather than stopping there.`
     : "";
 
-  const common = `${who}${order}
+  /* The resume. Stated as a hard boundary rather than a hint, because a model
+     asked to "continue" will otherwise restate what it already gave and the
+     caller cannot tell a repeat from a new line at the same second. */
+  const resume = from > 0
+    ? `\n\nYou have already transcribed everything before ${clockOf(from)}. Begin at ${clockOf(from)} and carry on from there to the end. Do NOT repeat anything earlier than ${clockOf(from)} — your first line must start at or after ${clockOf(from)}.`
+    : "";
 
-Each audio file is ONE participant's own microphone for the whole meeting, so the same moment appears in several files. Produce ONE combined transcript in time order, not one per file.
+  const common = `${who}${howLong}${resume}
 
 Return ONLY lines in exactly this format, one utterance per line, and nothing else — no preamble, no headings, no markdown, no code fences:
 
 [start-end] Speaker Name: text
 
-start and end are whole seconds from the beginning of the meeting. For example:
+start and end are times from the beginning of the meeting, written as M:SS — or H:MM:SS once past an hour. For example:
 
-[0-4] Rakesh Biswal: Good morning, shall we start?
-[5-9] Pramod Biswal: Yes, I have the numbers ready.
+[0:00-0:04] Rakesh Biswal: Good morning, shall we start?
+[0:05-0:09] Pramod Biswal: Yes, I have the numbers ready.
+[12:41-12:48] Rakesh Biswal: Right, and where did the fabric order get to?
+[1:04:20-1:04:26] Pramod Biswal: It ships on the twenty-eighth.
+
+Keep using that format for the whole recording, however far in you are.
 
 Where you cannot make out what was said, write [unclear] in place of those words. Never guess at words you cannot hear, and never drop a line because it is hard.`;
 
@@ -1391,8 +1594,8 @@ Where you cannot make out what was said, write [unclear] in place of those words
 
 Render every line in ENGLISH. Where a line was originally spoken in another language, translate it and append the marker <<T>> at the very end of that line. Lines already in English get no marker. Do not silently blend the two — the marker is the point: a reader must be able to tell which words are the speaker's own and which are yours.
 
-[0-4] Rakesh Biswal: Good morning, shall we start?
-[5-9] Pramod Biswal: It will be done by tomorrow. <<T>>`;
+[0:00-0:04] Rakesh Biswal: Good morning, shall we start?
+[0:05-0:09] Pramod Biswal: It will be done by tomorrow. <<T>>`;
   }
 
   return `${common}
@@ -1407,6 +1610,100 @@ Transcribe VERBATIM, in the language each line was actually spoken in. Do not tr
  * that lost a third of its lines to a formatting wobble should say so on
  * screen, not merely look short.
  */
+/**
+ * A timestamp from the model, in seconds.
+ *
+ * Accepts what models actually write for a long recording: `58` (seconds),
+ * `1:02` (minutes and seconds), `1:02:03` (hours too). Anything else reads as
+ * NaN and the caller falls back, so a malformed stamp costs the line its time
+ * rather than costing the whole line.
+ */
+function stampToSeconds(raw) {
+  const parts = String(raw).split(":").map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n))) return NaN;
+  /* Right to left, so 1:02 is a minute and two seconds whether or not an hour
+     was written. */
+  return parts.reduce((total, n) => total * 60 + n, 0);
+}
+
+/**
+ * How many times we will ask one file to carry on.
+ *
+ * A bound, not a target: the loop stops as soon as a pass reaches the end of
+ * the recording or stops making progress. It exists so a model that answers
+ * with the same opening every time cannot spin.
+ */
+const TRANSCRIBE_MAX_PASSES = 20;
+
+/** Stop asking once we are within this of the end — the tail is usually goodbyes. */
+const TRANSCRIBE_TAIL_SLACK_SECS = 45;
+
+/**
+ * Everything one participant said, from their own microphone.
+ *
+ * Asks repeatedly, each time from where the previous answer reached, because a
+ * model handed fifty minutes of audio returns an opening and stops. Reported on
+ * M084: a perfectly formatted transcript that ended at 2:18 of a 55-minute
+ * meeting, and a second run that ended at 6:21.
+ *
+ * Every line is stamped with the file's owner rather than whatever name the
+ * model wrote — the file is one person's microphone, so the speaker is known
+ * and there is nothing to infer. That is what puts a participant back who was
+ * missing from the page entirely.
+ */
+async function transcribeSpeaker(apiKey, file, speakerName, mode, durationSecs) {
+  const utterances = [];
+  let unparsedLineCount = 0;
+  let reached = 0;
+
+  /**
+   * Enough passes to actually reach the end, bounded.
+   *
+   * A flat eight was not enough: a model answers roughly six minutes at a
+   * time, so eight passes cover about forty-eight — and a 55-minute meeting
+   * stopped seven minutes short with no sign that it had. The budget is now
+   * the length of the recording, plus two for the passes that overlap, with a
+   * hard ceiling so nothing can spin.
+   */
+  const passBudget = Math.min(
+    TRANSCRIBE_MAX_PASSES,
+    Math.max(4, Math.ceil((durationSecs > 0 ? durationSecs : 0) / 300) + 2),
+  );
+
+  for (let pass = 1; pass <= passBudget; pass++) {
+    const text = await callGemini(
+      apiKey,
+      [file],
+      buildTranscriptPrompt(mode, speakerName, durationSecs, reached),
+    );
+    const parsed = parseTranscript(text, mode);
+    unparsedLineCount += parsed.unparsedLineCount;
+
+    /* Only what is genuinely new. A resumed pass that restates an earlier line
+       must not double it, and comparing on the END keeps a line that merely
+       straddles the boundary. */
+    const fresh = parsed.utterances.filter((u) => u.end > reached);
+    for (const u of fresh) utterances.push({ ...u, speaker: speakerName });
+
+    console.log(
+      `[Transcript] ${speakerName} pass ${pass}: +${fresh.length} line(s), reached ${clockOf(
+        fresh.length ? Math.max(...fresh.map((u) => u.end)) : reached,
+      )}`,
+    );
+
+    if (!fresh.length) break;
+    const now = Math.max(...fresh.map((u) => u.end));
+    /* No length to aim at means one pass is all we can justify: without it
+       there is no way to tell "finished" from "stopped early". */
+    if (!Number.isFinite(durationSecs) || durationSecs <= 0) break;
+    if (now >= durationSecs - TRANSCRIBE_TAIL_SLACK_SECS) break;
+    if (now <= reached) break;
+    reached = now;
+  }
+
+  return { utterances, unparsedLineCount };
+}
+
 function parseTranscript(text, mode) {
   const lines = String(text || "")
     .replace(/```[a-z]*\n?/gi, "")
@@ -1417,11 +1714,39 @@ function parseTranscript(text, mode) {
   const utterances = [];
   let unparsedLineCount = 0;
 
-  for (const line of lines) {
-    /* [12-18] Name: words — the seconds, the speaker, the rest. */
-    const m = /^\[\s*(\d+)\s*[-–]\s*(\d+)\s*\]\s*([^:]{1,60}?)\s*:\s*(.*)$/.exec(
-      line,
-    );
+  for (const rawLine of lines) {
+    /* A leading bullet is the commonest wrapper a model adds around lines it
+       was asked to emit bare. Stripping it costs nothing and saves the line. */
+    const line = rawLine.replace(/^[-*•]\s+/, "");
+
+    /* `[12-18] Name: words` — a stamp, a speaker, the rest.
+     *
+     * **The stamp is read as a clock, not as an integer.** This was
+     * `(\d+)\s*[-–]\s*(\d+)\s*`, which matches only whole seconds, and it is
+     * what made a 50-minute meeting produce a one-minute transcript.
+     *
+     * Reported 21 September 2026 with M084: 9 lines parsed, **55 unparsed**,
+     * and every surviving line ended at or before 0:58. Past the first minute
+     * the model writes `[1:02-1:08]` — which is what anybody would write, and
+     * what the prompt's own examples (all under ten seconds) never showed it
+     * not to do. Every one of those lines was counted as unparseable and
+     * dropped, so the transcript stopped dead at the end of minute one.
+     *
+     * Seconds still parse, so nothing already working changes. `to` and an `s`
+     * suffix are accepted for the same reason: the cost of tolerating a
+     * spelling is one alternation, and the cost of rejecting it is an hour of
+     * somebody's meeting. */
+    const m =
+      /^\[\s*([\d:]+)\s*s?\s*(?:[-–—]|to)\s*([\d:]+)\s*s?\s*\]\s*([^:]{1,60}?)\s*:\s*(.*)$/.exec(
+        line,
+      ) ??
+      /* A single stamp with no end. Worth keeping: a line with a time and words
+         is a line, and guessing its end as its start loses nothing. */
+      (() => {
+        const one =
+          /^\[\s*([\d:]+)\s*s?\s*\]\s*([^:]{1,60}?)\s*:\s*(.*)$/.exec(line);
+        return one ? [one[0], one[1], one[1], one[2], one[3]] : null;
+      })();
     if (!m) {
       unparsedLineCount++;
       continue;
@@ -1433,8 +1758,8 @@ function parseTranscript(text, mode) {
       unparsedLineCount++;
       continue;
     }
-    const start = Number(m[1]);
-    const end = Number(m[2]);
+    const start = stampToSeconds(m[1]);
+    const end = stampToSeconds(m[2]);
     utterances.push({
       start: Number.isFinite(start) ? start : 0,
       end: Number.isFinite(end) ? Math.max(end, start) : start,
@@ -1541,12 +1866,88 @@ router.post(
       }
       timeline.sort((a, b) => a.start - b.start);
 
-      const text = await callGemini(
-        apiKey,
-        uploadedGeminiFiles,
-        buildTranscriptPrompt(mode, participantNames, timeline),
+      /**
+       * How long the recording runs, for the prompt.
+       *
+       * The speech timeline first — but it is EMPTY on every recording this
+       * product has written, which is how the first attempt at this shipped
+       * doing nothing: `durationSecs` came out 0, so the "transcribe all of it"
+       * paragraph was never added and the model went on stopping early.
+       *
+       * So the meeting's own clock is the real source. `startedAt` where the
+       * organiser pressed start, the scheduled time otherwise; `endedAt` where
+       * the room closed. It can run slightly long — somebody who joined late
+       * recorded less than the meeting lasted — which is harmless: the model is
+       * told to transcribe to the end of the audio, and the loop stops when a
+       * pass stops making progress.
+       */
+      const fromTimeline = timeline.reduce(
+        (latest, t) => Math.max(latest, t.end || 0),
+        0,
       );
-      const result = parseTranscript(text, mode);
+      let durationSecs = fromTimeline;
+      if (!(durationSecs > 0)) {
+        try {
+          const meetDoc = await db
+            .collection("cowork_scheduled_meets")
+            .doc(meetId)
+            .get();
+          const meet = meetDoc.exists ? meetDoc.data() : null;
+          const startMs = Date.parse(meet?.startedAt || meet?.dateTime || "");
+          const endMs = Date.parse(meet?.endedAt || "") || Date.now();
+          if (Number.isFinite(startMs) && endMs > startMs) {
+            durationSecs = Math.round((endMs - startMs) / 1000);
+          }
+        } catch (e) {
+          /* A length we could not read is not a reason to refuse a transcript.
+             Without it each file gets a single pass, which is what this did
+             before — less, never nothing. */
+          console.warn("[Transcript] could not read meeting length:", e.message);
+        }
+      }
+      console.log(
+        `[Transcript] ${meetId} ${mode}: ${uploadedGeminiFiles.length} speaker file(s), length ${clockOf(durationSecs)}`,
+      );
+
+      /**
+       * **One call per speaker, run together, merged on the clock.**
+       *
+       * In parallel because they are independent and a 55-minute meeting is
+       * several passes each — run one after another it is the difference
+       * between minutes and a quarter of an hour. `callGemini` already backs
+       * off and retries on a quota error, which is what makes three at once
+       * safe.
+       */
+      const perSpeaker = await Promise.all(
+        uploadedGeminiFiles.map((file, i) =>
+          transcribeSpeaker(
+            apiKey,
+            file,
+            participantNames[i] || `Speaker ${i + 1}`,
+            mode,
+            durationSecs,
+          ).catch((e) => {
+            /* One participant's file failing must not cost the other two their
+               transcript — the same reason `gatherMeetingAudio` skips a file it
+               cannot upload rather than throwing. */
+            console.error(
+              `[Transcript] ${participantNames[i]} failed: ${e.message}`,
+            );
+            return { utterances: [], unparsedLineCount: 0 };
+          }),
+        ),
+      );
+
+      const result = {
+        utterances: perSpeaker
+          .flatMap((r) => r.utterances)
+          .sort((a, b) => a.start - b.start || a.end - b.end),
+        unparsedLineCount: perSpeaker.reduce(
+          (n, r) => n + r.unparsedLineCount,
+          0,
+        ),
+        createdAtMs: Date.now(),
+      };
 
       /* Merged, never overwritten: generating the translation must not delete
          the verbatim transcript somebody may be reading. */
@@ -1565,6 +1966,51 @@ router.post(
       console.log(
         `[Transcript] ${meetId} ${mode}: ${result.utterances.length} line(s), ${result.unparsedLineCount} unparsed`,
       );
+
+      /**
+       * **And the summary, from the transcript we just made.**
+       *
+       * Non-fatal on purpose: a transcript that exists is worth answering with
+       * even if the summary step failed, and the next run will try again. The
+       * write MERGES, so a richer summary made from the audio is not thrown
+       * away — only the fields this produced are set.
+       */
+      try {
+        const made = await summariseFromTranscript(
+          apiKey,
+          result.utterances,
+          participantNames,
+          undefined,
+        );
+        if (made) {
+          const summaryRef = db.collection("meeting_summaries").doc(meetId);
+          const already = await summaryRef.get();
+          const payload = {
+            meetId,
+            participants: participantNames,
+            summary: made.summary,
+            tasksAssigned: made.tasksAssigned,
+            deadlines: made.deadlines,
+            actionItems: made.actionItems,
+            audioFilesCount: uploadedGeminiFiles.length,
+            createdAtMs: Date.now(),
+            source: "transcript",
+          };
+          /* Only where the audio pass left nothing: its dialogue is richer than
+             anything derivable here, and overwriting it with an empty list
+             would cost the summary page its Conversation section. */
+          if (!already.exists || !(already.data().conversationFlow || []).length) {
+            payload.dialogue = made.dialogue;
+            payload.conversationFlow = made.conversationFlow;
+          }
+          await summaryRef.set(payload, { merge: true });
+          console.log(
+            `[Transcript] ${meetId}: summary written — ${made.tasksAssigned.length} task(s)`,
+          );
+        }
+      } catch (e) {
+        console.error("[Transcript] summary step failed:", e.message);
+      }
 
       const saved = await ref.get();
       return res.json({
@@ -1622,9 +2068,59 @@ router.get(
       }
 
       const t = snap.data();
-      const buffer = await renderTranscriptDocx(t, result, mode, meetId);
-
       const suffix = mode === "translate" ? "Translated" : "Verbatim";
+
+      /* For the Summary box at the front of both documents. Non-fatal: a
+         transcript is worth having without one, and the box says so. */
+      let summaryForBox = null;
+      try {
+        const sdoc = await db.collection("meeting_summaries").doc(meetId).get();
+        if (sdoc.exists) summaryForBox = sdoc.data();
+      } catch (e) {
+        console.warn("[Transcript] summary read failed:", e.message);
+      }
+
+      if (String(req.query.format || "").toLowerCase() === "pdf") {
+        let pdf;
+        try {
+          pdf = await htmlToPdf(
+            transcriptHtml(
+              t,
+              result,
+              mode,
+              meetId,
+              summaryForBox,
+              summaryForBox
+                ? needsActionGroups(
+                    summaryForBox.tasksAssigned,
+                    summaryForBox.deadlines,
+                    summaryForBox.actionItems,
+                  )
+                : [],
+            ),
+          );
+        } catch (e) {
+          if (e instanceof RendererUnavailableError || e?.rendererUnavailable) {
+            return pdfUnavailable(res, e);
+          }
+          throw e;
+        }
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="Meeting_Transcript_${suffix}_${meetId}.pdf"`,
+        );
+        res.setHeader("Content-Length", pdf.length);
+        return res.send(pdf);
+      }
+
+      const buffer = await renderTranscriptDocx(
+        t,
+        result,
+        mode,
+        meetId,
+        summaryForBox,
+      );
       res.setHeader(
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1651,7 +2147,24 @@ router.get(
  * that leaves the building, a reader has neither, and a translated line that
  * does not say so reads as the speaker's own words.
  */
-async function renderTranscriptDocx(transcript, result, mode, meetId) {
+/**
+ * **A Summary box, before the transcript itself.**
+ *
+ * Asked for 21 September 2026: the transcript document opened straight onto
+ * four hundred rows of dialogue. Somebody handed that file has to read the
+ * whole meeting to find out what it was about, and a transcript is a record
+ * rather than a briefing.
+ *
+ * So the summary goes in front of it: what was discussed, and what anybody was
+ * asked to do. `summary` is read by the route and passed in — null where none
+ * has been generated yet, which the box says plainly rather than leaving a gap
+ * somebody has to interpret.
+ *
+ * The tasks are read through the SAME `needsActionGroups` the summary document
+ * and the panel use. Three places now print what somebody has to do, and all
+ * three read it once.
+ */
+async function renderTranscriptDocx(transcript, result, mode, meetId, summary) {
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
     WidthType, ShadingType, VerticalAlign, AlignmentType,
@@ -1723,6 +2236,154 @@ async function renderTranscriptDocx(transcript, result, mode, meetId) {
       ],
     }),
   ];
+
+  /* ── Meeting Summary, then the tasks, then the transcript ─────────────
+   *
+   * The order asked for on 21 September 2026, and the reason for it: somebody
+   * handed this file should be able to close it after the first page knowing
+   * what happened, who owes what and by when. The transcript is underneath for
+   * when they need the exact words.
+   */
+  head.push(
+    new Paragraph({
+      spacing: { before: 80, after: 100 },
+      border: { bottom: { style: "single", size: 6, color: "0D47A1", space: 4 } },
+      children: [
+        new TextRun({ text: "Meeting Summary", bold: true, size: 26, color: "0D47A1" }),
+      ],
+    }),
+  );
+
+  const summaryText = String(summary?.summary || "").trim();
+  if (summaryText) {
+    /* One paragraph per line the model wrote. It was asked for 10–15 lines, and
+       collapsing them into a wall loses the shape it wrote them in. */
+    const paras = summaryText.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    paras.forEach((line, i) =>
+      head.push(
+        new Paragraph({
+          spacing: { before: i === 0 ? 40 : 20, after: 20 },
+          shading: { type: ShadingType.CLEAR, fill: "F8FAFF" },
+          children: [new TextRun({ text: line, size: 19, color: "202124" })],
+        }),
+      ),
+    );
+    head.push(new Paragraph({ spacing: { after: 140 }, children: [] }));
+  } else {
+    head.push(
+      new Paragraph({
+        spacing: { after: 200 },
+        children: [
+          new TextRun({
+            text: "A summary is written whenever a transcript is generated. This transcript predates that, so generating it again will produce one.",
+            italics: true,
+            size: 19,
+            color: "9AA0A6",
+          }),
+        ],
+      }),
+    );
+  }
+
+  /* ── Tasks and action items ───────────────────────────────────────────── */
+  const naGroups = summary
+    ? needsActionGroups(
+        summary.tasksAssigned,
+        summary.deadlines,
+        summary.actionItems,
+      )
+    : [];
+  const naRows = naGroups.flatMap((g) =>
+    g.items.map((i) => ({ what: i.what, who: g.owner || "Everyone", due: i.due })),
+  );
+
+  head.push(
+    new Paragraph({
+      spacing: { before: 120, after: 100 },
+      border: { bottom: { style: "single", size: 6, color: "F29900", space: 4 } },
+      children: [
+        new TextRun({ text: "Tasks & Action Items", bold: true, size: 26, color: "F29900" }),
+      ],
+    }),
+  );
+
+  if (naRows.length === 0) {
+    head.push(
+      new Paragraph({
+        spacing: { after: 200 },
+        children: [
+          new TextRun({
+            text: "Nothing was assigned in this meeting.",
+            italics: true,
+            size: 19,
+            color: "9AA0A6",
+          }),
+        ],
+      }),
+    );
+  } else {
+    /* A table, because three facts about one task belong on one line and a
+       reader scans DOWN the column they care about — usually their own name. */
+    const W_TASK = 5200;
+    const W_WHO = 2500;
+    const W_DUE = CONTENT_W - W_TASK - W_WHO;
+    head.push(
+      new Table({
+        width: { size: CONTENT_W, type: WidthType.DXA },
+        columnWidths: [W_TASK, W_WHO, W_DUE],
+        rows: [
+          new TableRow({
+            tableHeader: true,
+            children: [
+              cell([new Paragraph({ children: [new TextRun({ text: "Task", bold: true, size: 18, color: "FFFFFF" })] })], W_TASK, "F29900"),
+              cell([new Paragraph({ children: [new TextRun({ text: "Assigned To", bold: true, size: 18, color: "FFFFFF" })] })], W_WHO, "F29900"),
+              cell([new Paragraph({ children: [new TextRun({ text: "Deadline", bold: true, size: 18, color: "FFFFFF" })] })], W_DUE, "F29900"),
+            ],
+          }),
+          ...naRows.map((r, i) => {
+            const zebra = i % 2 === 1 ? "FFF8EC" : undefined;
+            return new TableRow({
+              children: [
+                cell([new Paragraph({ children: [new TextRun({ text: r.what, size: 19, color: "202124" })] })], W_TASK, zebra),
+                cell([new Paragraph({ children: [new TextRun({ text: r.who, bold: true, size: 19, color: "0D47A1" })] })], W_WHO, zebra),
+                cell(
+                  [
+                    new Paragraph({
+                      children: [
+                        new TextRun({
+                          /* The words the meeting used, never a date nobody
+                             said. An em dash where none was given, so the
+                             column is never ambiguous about which it is. */
+                          text: r.due || "—",
+                          bold: Boolean(r.due),
+                          size: 19,
+                          color: r.due ? "F29900" : "9AA0A6",
+                        }),
+                      ],
+                    }),
+                  ],
+                  W_DUE,
+                  zebra,
+                ),
+              ],
+            });
+          }),
+        ],
+      }),
+    );
+    head.push(new Paragraph({ spacing: { after: 240 }, children: [] }));
+  }
+
+  /* ── The transcript itself ────────────────────────────────────────────── */
+  head.push(
+    new Paragraph({
+      spacing: { before: 80, after: 100 },
+      border: { bottom: { style: "single", size: 6, color: "0D47A1", space: 4 } },
+      children: [
+        new TextRun({ text: "Transcript", bold: true, size: 26, color: "0D47A1" }),
+      ],
+    }),
+  );
 
   const rows = [
     new TableRow({

@@ -67,6 +67,112 @@ function sectionHeading(text, accentColor = C.BRAND_DARK) {
     });
 }
 
+// ── Needs Action ─────────────────────────────────────────────────────────────
+//
+// **What somebody has to do, pulled out of the three lists that hold it.**
+//
+// Asked for on 21 September 2026 along with the screen: the document listed
+// Tasks Assigned, Deadlines Mentioned and Action Items as three separate
+// numbered sections, so "what do I have to do" meant reading all three and
+// working out which lines carried your name.
+//
+// Read back from the formats the engine's own prompt specifies:
+//
+//   TASKS ASSIGNED      - {Name}: {task} [Deadline: {when or "Not specified"}]
+//   DEADLINES MENTIONED - {Person}: {task} by {date/time}
+//   ACTION ITEMS        - {action item}
+//
+// The three numbered sections are LEFT WHERE THEY ARE. The document is a record
+// and somebody may be reading it for the deadlines alone; this is a front page
+// for it, not a replacement. The screen made the opposite choice deliberately —
+// see MeetingSummaryPanel — because a page you scroll is not a file you keep.
+//
+// This mirrors lib/rules/meetings/needsAction.ts in the Cowork repository. Kept
+// as a copy rather than shared because the two runtimes do not import from each
+// other; the formats above are the contract both read.
+
+const NA_NOTHING =
+    /^(no\b.*(task|deadline|action|item)|none\b|n\/?a\b|not applicable\b|nothing\b)/i;
+const NA_NO_DATE = /^(not specified|none|n\/?a|tbd|not given|unspecified)\.?$/i;
+
+function naClean(line) {
+    return String(line || "")
+        .replace(/^\s*(?:[-*•–—]|\d+[.)])\s*/, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+/* An owner is a short prefix before a colon that is not a sentence — without
+   the punctuation guard, "We agreed, finally: ship it" files a clause as a
+   person. */
+function naSplitOwner(text) {
+    const at = text.indexOf(":");
+    if (at < 1 || at > 60) return { owner: null, rest: text };
+    const owner = text.slice(0, at).trim();
+    if (!owner || /[.!?,;]/.test(owner)) return { owner: null, rest: text };
+    return { owner, rest: text.slice(at + 1).trim() };
+}
+
+function needsActionGroups(tasks, deadlines, actions) {
+    const items = [];
+
+    for (const line of tasks || []) {
+        const source = naClean(line);
+        if (!source || NA_NOTHING.test(source)) continue;
+        let body = source;
+        let due = null;
+        const bracket = /\[\s*deadline\s*:\s*([^\]]*)\]\s*$/i.exec(body);
+        if (bracket) {
+            const said = bracket[1].trim();
+            due = said && !NA_NO_DATE.test(said) ? said : null;
+            body = body.slice(0, bracket.index).trim();
+        }
+        const { owner, rest } = naSplitOwner(body);
+        if (rest) items.push({ owner, what: rest, due });
+    }
+
+    for (const line of deadlines || []) {
+        const source = naClean(line);
+        if (!source || NA_NOTHING.test(source)) continue;
+        const { owner, rest } = naSplitOwner(source);
+        /* The LAST "by", so "the by-product by Friday" keeps its words. */
+        const at = rest.toLowerCase().lastIndexOf(" by ");
+        if (at < 0) items.push({ owner, what: rest, due: null });
+        else {
+            const what = rest.slice(0, at).trim();
+            items.push({ owner, what: what || rest, due: what ? rest.slice(at + 4).trim() : null });
+        }
+    }
+
+    for (const line of actions || []) {
+        const source = naClean(line);
+        if (!source || NA_NOTHING.test(source)) continue;
+        const { owner, rest } = naSplitOwner(source);
+        items.push({ owner, what: rest || source, due: null });
+    }
+
+    /* The engine asks for a task WITH its deadline and then for the deadlines
+       again, so the same commitment arrives twice. Once, with the date. */
+    const byKey = new Map();
+    for (const item of items) {
+        const key = `${(item.owner || "").toLowerCase()}|${item.what.toLowerCase()}`;
+        const held = byKey.get(key);
+        if (!held) byKey.set(key, item);
+        else if (!held.due && item.due) held.due = item.due;
+    }
+
+    const groups = new Map();
+    for (const item of byKey.values()) {
+        const key = item.owner || "\u0000everyone";
+        if (groups.has(key)) groups.get(key).items.push(item);
+        else groups.set(key, { owner: item.owner, items: [item] });
+    }
+    /* People in the order they appear; the room's own list last. */
+    return [...groups.values()].sort((a, b) =>
+        a.owner === null ? 1 : b.owner === null ? -1 : 0,
+    );
+}
+
 // ── Helper: normal body paragraph ────────────────────────────────────────────
 function bodyPara(text, opts = {}) {
     return new Paragraph({
@@ -210,6 +316,53 @@ async function generateSummaryDocx(summary, meetId) {
         }),
         spacer(240),
     );
+
+    // ── NEEDS ACTION ──────────────────────────────────────────────────────────
+    //
+    // Ahead of the numbered sections and deliberately unnumbered: it is a front
+    // page for the record rather than a part of it, and everything in it also
+    // appears below in the section it came from.
+    const naGroups = needsActionGroups(tasks, deadlines, actions);
+    if (naGroups.length > 0) {
+        children.push(sectionHeading("Needs Action", C.ORANGE));
+        for (const group of naGroups) {
+            children.push(
+                new Paragraph({
+                    spacing: { before: 120, after: 40 },
+                    children: [
+                        new TextRun({
+                            /* Null is the room's own list — agreed without
+                               anybody being named to do it. */
+                            text: group.owner || "Everyone",
+                            bold: true,
+                            size: 22,
+                            color: C.BLACK,
+                            font: "Arial",
+                        }),
+                    ],
+                }),
+            );
+            for (const item of group.items) {
+                children.push(
+                    new Paragraph({
+                        spacing: { before: 20, after: 40 },
+                        indent: { left: 340, hanging: 180 },
+                        children: [
+                            new TextRun({ text: "☐  ", size: 22, color: C.LIGHT_GREY, font: "Arial" }),
+                            new TextRun({ text: item.what, size: 22, color: C.GREY, font: "Arial" }),
+                            /* The date in the words the meeting used — "28th",
+                               "next Tuesday" — never reformatted into a date
+                               nobody said. */
+                            ...(item.due
+                                ? [new TextRun({ text: `   ${item.due}`, size: 20, bold: true, color: C.ORANGE, font: "Arial" })]
+                                : []),
+                        ],
+                    }),
+                );
+            }
+        }
+        children.push(spacer(200));
+    }
 
     // ── 3. MEETING OVERVIEW ───────────────────────────────────────────────────
     children.push(sectionHeading("1.  Meeting Overview", C.BRAND_DARK));
@@ -424,4 +577,7 @@ async function generateSummaryDocx(summary, meetId) {
     return Packer.toBuffer(doc);
 }
 
-module.exports = { generateSummaryDocx };
+/* `needsActionGroups` is exported so the PDF uses the SAME reading of the
+   three lists. Two documents disagreeing about what somebody has to do would
+   be worse than one of them not existing. */
+module.exports = { generateSummaryDocx, needsActionGroups };
