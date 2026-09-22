@@ -139,6 +139,36 @@ function rupeesToWords(n) {
 
 // Recompute every line's tax + the document totals from scratch. Called on
 // create AND on update so the stored numbers can't drift from the inputs.
+/* A line the user typed by hand has no stock item behind it, and the form
+   sends that as `stockItemId: ""`.
+
+   Mongoose casts an empty string to ObjectId and throws, so the whole save
+   died with:
+
+     Acc_ProformaInvoice validation failed: items.1.stockItemId:
+     Cast to ObjectId failed for value "" (type string)
+
+   — a quotation with one free-text line could not be saved at all, and the
+   message named a field the user has never heard of. An absent reference is
+   `undefined`, not "", so that is what is stored. Done here rather than only
+   in the browser because the same empty string arrives from the edit form,
+   from a copied PI, and from anything else that posts to this route. */
+const OPTIONAL_OBJECT_ID_FIELDS = ["stockItemId"];
+
+function sanitiseItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((line) => {
+    const out = { ...line };
+    for (const f of OPTIONAL_OBJECT_ID_FIELDS) {
+      const v = out[f];
+      if (v === "" || v === null || v === "undefined" || v === "null") {
+        delete out[f];
+      }
+    }
+    return out;
+  });
+}
+
 function recomputeTotals(items, isInterState) {
   let subtotal = 0;
   let totalDiscount = 0;
@@ -285,6 +315,33 @@ router.get("/", async (req, res) => {
 // -----------------------------------------------------------------------------
 // GET /:id — single PI with seller + bank info for the detail page / PDF
 // -----------------------------------------------------------------------------
+/* GET /next-number — what the next PI will be called.
+ *
+ * The number was only ever allocated inside the save, so the form had nothing
+ * to show and the user could not set one either. This previews it; the save
+ * still allocates authoritatively, so two people drafting at once do not both
+ * get PI/2627/00042 written to the database.
+ *
+ * MUST stay above the "/:id" route below, or Express matches this path as an
+ * id and looks for a proforma invoice called "next-number".
+ */
+router.get("/next-number", async (req, res) => {
+  try {
+    const { companyId, date } = req.query;
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    const when = date ? new Date(date) : new Date();
+    const fyString = computeFY(isNaN(when) ? new Date() : when);
+    const voucherNumber = await nextPINumber(companyId, fyString);
+    res.json({ success: true, voucherNumber, financialYear: fyString });
+  } catch (e) {
+    console.error("[proforma next-number]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id).lean();
@@ -370,7 +427,28 @@ router.post("/", async (req, res) => {
       ? new Date(body.voucherDate)
       : new Date();
     const fyString = computeFY(voucherDate);
-    const voucherNumber = await nextPINumber(body.companyId, fyString);
+    /* The form shows the next number and lets it be edited, so a number typed
+       there is honoured; anything else falls back to the allocator. Checked
+       against live PIs first — the unique index would otherwise surface a
+       duplicate as a 500 with a raw mongo error. */
+    let voucherNumber = String(body.voucherNumber || "").trim();
+    if (voucherNumber) {
+      const clash = await Acc_ProformaInvoice.findOne({
+        companyId: body.companyId,
+        financialYear: fyString,
+        voucherNumber,
+      })
+        .select("_id")
+        .lean();
+      if (clash) {
+        return res.status(409).json({
+          success: false,
+          message: `Proforma invoice "${voucherNumber}" already exists for ${fyString}. Pick a different number.`,
+        });
+      }
+    } else {
+      voucherNumber = await nextPINumber(body.companyId, fyString);
+    }
 
     // Inter-state detection. If either side is missing stateCode, fall
     // back to intra-state (CGST+SGST) — conservative since IGST when
@@ -386,7 +464,7 @@ router.post("/", async (req, res) => {
       sellerStateCode && buyerStateCode && sellerStateCode !== buyerStateCode,
     );
 
-    const totals = recomputeTotals(body.items, isInterState);
+    const totals = recomputeTotals(sanitiseItems(body.items), isInterState);
 
     // Consignee defaults to a clone of buyer when omitted — most PIs go
     // to the same place that gets billed.
@@ -481,7 +559,7 @@ router.put("/:id", async (req, res) => {
       );
       pi.isInterState = isInterState;
 
-      const totals = recomputeTotals(body.items, isInterState);
+      const totals = recomputeTotals(sanitiseItems(body.items), isInterState);
       Object.assign(pi, totals);
     }
 
