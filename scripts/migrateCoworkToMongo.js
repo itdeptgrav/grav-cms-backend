@@ -159,9 +159,10 @@ async function writeBatch(target, docs, { dryRun }) {
 
 async function copyCollection(ref, mongo, name, { dryRun, parentId = null, admin }) {
   const target = mongo.collection(name);
-  const report = { name, read: 0, written: 0, skipped: [] };
+  const report = { name, read: 0, written: 0, skipped: [], error: null };
 
   for await (const docs of pagesOf(ref, admin)) {
+    if (report.error) break;
     const batch = [];
     for (const snap of docs) {
       report.read += 1;
@@ -175,7 +176,19 @@ async function copyCollection(ref, mongo, name, { dryRun, parentId = null, admin
       }
       batch.push(toMongoDocument(snap.id, data, { parentId }));
     }
-    report.written += await writeBatch(target, batch, { dryRun });
+    /**
+     * One collection's failure is that collection's line in the report — not
+     * a stack trace that ends the run with every later collection untried.
+     * The first real run against Atlas died this way on a 500-collection cap,
+     * after 16,000 documents had already landed, and the only evidence was
+     * `insertedCount: 0` for the one batch that failed. Re-runnable upserts
+     * make a partial run harmless; an unreadable one is not.
+     */
+    try {
+      report.written += await writeBatch(target, batch, { dryRun });
+    } catch (e) {
+      report.error = e.message;
+    }
   }
   return report;
 }
@@ -293,12 +306,20 @@ async function main() {
 
     console.log("");
     let skipped = 0;
+    let failed = 0;
     for (const r of all) {
       skipped += r.skipped.length;
+      if (r.error) failed += 1;
       console.log(
         `  ${r.name.padEnd(42)} read ${String(r.read).padStart(7)}   written ${String(r.written).padStart(7)}` +
-          (r.skipped.length ? `   SKIPPED ${r.skipped.length}` : ""),
+          (r.skipped.length ? `   SKIPPED ${r.skipped.length}` : "") +
+          (r.error ? `   FAILED: ${r.error}` : ""),
       );
+    }
+    if (failed) {
+      console.log(`
+${failed} collection(s) FAILED to write. Fix the cause and re-run — every write is an upsert, so what landed stays and what did not is retried.`);
+      process.exitCode = 1;
     }
     if (skipped) {
       console.log(`\n${skipped} document(s) skipped for field names MongoDB cannot store:`);

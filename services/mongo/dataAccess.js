@@ -103,6 +103,10 @@ const ACCESS = {
 
   /* Meetings. */
   cowork_scheduled_meets: { read: "employee", write: "employee" },
+  /* The browser reads this one too (found by grepping the frontend for every
+     collection the dry run listed); without an entry every task's Meetings tab
+     would 403. */
+  cowork_task_meetings: { read: "employee", write: "employee" },
   cowork_meeting_participants: { read: "employee", write: "employee" },
   meeting_sessions: { read: "employee", write: "deny" },
   meeting_summaries: { read: "employee", write: "deny" },
