@@ -99,6 +99,24 @@ code, ensured on every boot and by `scripts/ensureCoworkIndexes.js`. Without
 them every query is a collection scan, including the `authUid` lookup on every
 authenticated request.
 
+## First real run — 22 Sep 2026, against the Atlas cluster
+
+The copy landed **16,123 documents in 47 collections** (database `cowork`),
+then Atlas refused the next collection: `already using 500 collections of
+500`. The cluster is shared by nine databases; a database named `test` holds
+409 of the 500. `--verify` afterwards: 39 of 45 top-level collections exact,
+five differences that are live drift (Firebase kept changing during the copy —
+a second pass fixes them), one real miss (`meeting_verbatim_transcripts`,
+refused by the cap). Every flattened subcollection matches.
+
+**Do not set `COWORK_DB=mongo` on a cluster at its collection cap.** Any
+collection the app creates at runtime — `cowork_realtime_state` for the
+broker's resume position, `cowork_task_timers__sessions` on the first timer
+start, the `*__logs` children — would be refused, and the failure would look
+like an application bug. Free the cap first (drop `test` if it is disposable,
+upgrade the tier, or point `COWORK_MONGODB_URI` at the self-hosted replica set
+the migration was planned for), then re-run the copy and verify.
+
 ## Cutover, in order
 
 1. Start `mongod --replSet rs0`, run `rs.initiate()` once.
