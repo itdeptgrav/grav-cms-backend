@@ -276,6 +276,27 @@ const fieldName = (f) => (f === "__name__" ? "_id" : String(f));
 
 /* ── Operations ───────────────────────────────────────────────────────────── */
 
+/**
+ * Drop the fields the caller did not ask for.
+ *
+ * Applied LAST, after `mayRead` has judged the whole document. A projection
+ * pushed down into the query would decide access on a partial record, and a
+ * rule that cannot see `participantIds` cannot tell whose record it is. So
+ * this saves the wire, never the check.
+ *
+ * Anything but a non-empty array of field names is ignored, which keeps an
+ * odd request answering in full rather than answering with nothing.
+ */
+function project(doc, fields) {
+  if (!Array.isArray(fields) || fields.length === 0) return doc;
+  if (!doc || !doc.data) return doc;
+  const kept = {};
+  for (const f of fields)
+    if (typeof f === "string" && Object.prototype.hasOwnProperty.call(doc.data, f))
+      kept[f] = doc.data[f];
+  return { ...doc, data: kept };
+}
+
 async function readParent(db, path) {
   const pp = parentPathOf(path);
   if (!pp) return null;
@@ -374,7 +395,8 @@ async function execute(db, caller, op) {
          the caller could not have fetched by id. */
       const docs = snap.docs
         .filter((d) => mayRead([...path, d.id], d.data(), caller, parent))
-        .map(encodeSnap);
+        .map(encodeSnap)
+        .map((d) => project(d, op.select));
       return { docs };
     }
 

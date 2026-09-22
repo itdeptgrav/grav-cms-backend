@@ -319,3 +319,51 @@ test("multi is bounded and cannot nest", async () => {
     400,
   );
 });
+
+/* ── Asking for fewer fields ──────────────────────────────────────────────── */
+
+test("select trims what comes back, and never what is checked", async () => {
+  /* The access rule reads the WHOLE document; the projection is applied after,
+     to the wire only. A rule judging a partial record is a rule that cannot see
+     whose record it is. */
+  const db = fresh({
+    cowork_direct_messages: [{ _id: "E1_E9", participantIds: ["E1", "E9"] }],
+    cowork_direct_messages__messages: [
+      { _id: "m1", _parentId: "E1_E9", senderId: "E9", text: "a long message body", readBy: ["E9"] },
+    ],
+  });
+  const { docs } = await execute(db, EMP, {
+    op: "query",
+    path: ["cowork_direct_messages", "E1_E9", "messages"],
+    select: ["readBy"],
+  });
+  assert.equal(docs.length, 1, "the row itself was lost");
+  assert.deepEqual(docs[0].data, { readBy: ["E9"] });
+  assert.equal(docs[0].id, "m1", "the id must survive a projection");
+});
+
+test("a projection cannot widen what a caller may read", async () => {
+  const db = fresh({
+    cowork_direct_messages: [{ _id: "E7_E9", participantIds: ["E7", "E9"] }],
+    cowork_direct_messages__messages: [
+      { _id: "m1", _parentId: "E7_E9", senderId: "E9", text: "private", readBy: [] },
+    ],
+  });
+  /* A query is filtered per document rather than refused whole, so the answer
+     is an empty result -- and, crucially, not a row with only the projected
+     fields on it. */
+  const { docs } = await execute(db, EMP, {
+    op: "query",
+    path: ["cowork_direct_messages", "E7_E9", "messages"],
+    select: ["readBy"],
+  });
+  assert.deepEqual(docs, [], "a projected query returned somebody else’s message");
+});
+
+test("an empty or malformed select answers in full rather than with nothing", async () => {
+  const db = fresh({ cowork_employees: [{ _id: "E1", name: "One", title: "Two" }] });
+  for (const select of [undefined, [], "readBy", 7]) {
+    const { docs } = await execute(db, EMP, { op: "query", path: ["cowork_employees"], select });
+    assert.equal(docs[0].data.name, "One", `select ${JSON.stringify(select)} dropped everything`);
+  }
+});
