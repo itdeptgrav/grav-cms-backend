@@ -301,6 +301,45 @@ async function execute(db, caller, op) {
   const path = op.path;
 
   switch (op.op) {
+    /**
+     * Several INDEPENDENT operations in one request.
+     *
+     * Not a batch: nothing here is atomic, and one failure does not touch the
+     * others. This exists because of how the browser reaches a database now.
+     * Firestore multiplexed every read over a single connection; a request per
+     * read is limited by the browser to six at a time to one origin, so the
+     * fourteen unread counts one conversation list asks for arrive in three
+     * waves instead of one. That queueing is what a reader feels as lag.
+     *
+     * Each operation still goes through `execute` on its own, with the same
+     * caller and the same policy, so nothing here can be read or written that
+     * could not be one request at a time. A failure is reported in that
+     * operation's own slot and the rest still answer.
+     */
+    case "multi": {
+      const many = Array.isArray(op.ops) ? op.ops : [];
+      if (many.length === 0) return { results: [] };
+      if (many.length > 50)
+        throw new AccessError(400, "A multi request may hold at most 50 operations.");
+      if (many.some((o) => o && o.op === "multi"))
+        throw new AccessError(400, "A multi request cannot contain another.");
+      const results = await Promise.all(
+        many.map(async (one) => {
+          try {
+            return { ok: true, data: await execute(db, caller, one) };
+          } catch (e) {
+            if (e instanceof AccessError)
+              return { ok: false, status: e.status, error: e.message };
+            if (e && e.code === 5) return { ok: false, status: 404, error: e.message };
+            /* An unexpected failure is reported as one, without leaking its
+               internals — the same thing the route does for a single op. */
+            return { ok: false, status: 500, error: "The request could not be completed." };
+          }
+        }),
+      );
+      return { results };
+    }
+
     case "get": {
       if (!isDocPath(path)) throw new AccessError(400, "get needs a document path.");
       const parent = path.length > 2 ? await readParent(db, path) : null;
@@ -379,15 +418,51 @@ async function execute(db, caller, op) {
       if (ops.length > 500) throw new AccessError(400, "A batch may hold at most 500 writes.");
       /* Every permission is checked BEFORE anything is written, so a batch is
          refused whole rather than half-applied. */
-      const checked = [];
-      for (const w of ops) {
+      /**
+       * The permission reads happen ALL AT ONCE, and each parent is read once.
+       *
+       * This loop used to be sequential and to re-read the parent for every
+       * write: two round trips per operation, one after the other. Marking a
+       * conversation read is one write per unread message, so opening a thread
+       * with forty unread messages spent about eighty round trips — measured at
+       * 3.9 seconds — before a single tick turned blue. Every one of those
+       * reads is independent of the others, and a chat batch shares ONE parent
+       * between all of its writes.
+       *
+       * Order is still preserved where it is observable: paths are validated
+       * in order first, and the permission decisions are taken in order after
+       * the reads land, so the same batch is refused with the same message as
+       * before. Only the waiting is gone.
+       */
+      for (const w of ops)
         if (!isDocPath(w.path)) throw new AccessError(400, "Batch writes need document paths.");
-        const ref = refFromPath(db, w.path);
-        const parent = w.path.length > 2 ? await readParent(db, w.path) : null;
-        const existing = await ref.get();
-        if (!mayWrite(w.path, existing.exists ? existing.data() : null, caller, parent))
+
+      const refs = ops.map((w) => refFromPath(db, w.path));
+
+      const parentPaths = new Map();
+      for (const w of ops) {
+        const pp = parentPathOf(w.path);
+        if (pp) parentPaths.set(pp.join("/"), pp);
+      }
+      const parents = new Map(
+        await Promise.all(
+          [...parentPaths].map(async ([key, pp]) => {
+            const snap = await refFromPath(db, pp).get();
+            return [key, snap.exists ? snap.data() : null];
+          }),
+        ),
+      );
+
+      const existing = await Promise.all(refs.map((ref) => ref.get()));
+
+      const checked = [];
+      for (let i = 0; i < ops.length; i += 1) {
+        const w = ops[i];
+        const pp = parentPathOf(w.path);
+        const parent = pp ? parents.get(pp.join("/")) ?? null : null;
+        if (!mayWrite(w.path, existing[i].exists ? existing[i].data() : null, caller, parent))
           throw new AccessError(403, `You do not have access to change ${w.path.join("/")}.`);
-        checked.push({ ref, w });
+        checked.push({ ref: refs[i], w });
       }
       const batch = db.batch();
       for (const { ref, w } of checked) {

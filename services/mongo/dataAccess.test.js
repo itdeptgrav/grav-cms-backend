@@ -252,3 +252,70 @@ test("a batch that is allowed applies every write", async () => {
 test("an unknown operation is a 400, not a 500", async () => {
   await refused(execute(fresh({}), EMP, { op: "drop", path: ["cowork_tasks"] }), 400);
 });
+
+/* ── Several operations in one request ────────────────────────────────────── */
+
+/**
+ * `multi` is a transport convenience, never a way round the policy. A browser
+ * gets six connections to one origin, so a conversation list asking fourteen
+ * unread counts waits through three waves of requests. These pin that grouping
+ * them changes the waiting and NOTHING else.
+ */
+
+test("multi answers each operation in its own slot, in order", async () => {
+  const db = fresh({
+    cowork_employees: [{ _id: "E1", name: "One" }, { _id: "E9", name: "Nine" }],
+  });
+  const { results } = await execute(db, EMP, {
+    op: "multi",
+    ops: [
+      { op: "get", path: ["cowork_employees", "E1"] },
+      { op: "get", path: ["cowork_employees", "E9"] },
+    ],
+  });
+  assert.equal(results.length, 2);
+  assert.equal(results[0].data.doc.data.name, "One");
+  assert.equal(results[1].data.doc.data.name, "Nine");
+});
+
+test("a refusal inside multi refuses only that operation", async () => {
+  /* One failure taking the whole request down would turn a single forbidden
+     read into a blank screen for everything that travelled with it. */
+  const db = fresh({
+    cowork_employees: [{ _id: "E1", name: "One" }],
+    employees: [{ _id: "x", salary: 1 }],
+  });
+  const { results } = await execute(db, EMP, {
+    op: "multi",
+    ops: [
+      { op: "get", path: ["cowork_employees", "E1"] },
+      { op: "get", path: ["employees", "x"] },
+    ],
+  });
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].ok, false);
+  assert.equal(results[1].status, 403);
+  assert.ok(!JSON.stringify(results[1]).includes("salary"), "a refusal leaked the record");
+});
+
+test("multi cannot be used to reach something a single request could not", async () => {
+  const db = fresh({ cowork_notifications: [{ _id: "n1", recipientEmployeeId: "E9" }] });
+  const { results } = await execute(db, EMP, {
+    op: "multi",
+    ops: [{ op: "get", path: ["cowork_notifications", "n1"] }],
+  });
+  assert.equal(results[0].ok, false, "another person's notification was readable inside multi");
+  assert.equal(results[0].status, 403);
+});
+
+test("multi is bounded and cannot nest", async () => {
+  const db = fresh();
+  await refused(
+    execute(db, EMP, { op: "multi", ops: new Array(51).fill({ op: "get", path: ["cowork_employees", "E1"] }) }),
+    400,
+  );
+  await refused(
+    execute(db, EMP, { op: "multi", ops: [{ op: "multi", ops: [] }] }),
+    400,
+  );
+});

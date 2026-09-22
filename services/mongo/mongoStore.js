@@ -70,6 +70,26 @@ function mongoStore(db, { client = null } = {}) {
     },
 
     /**
+     * Several writes to ONE collection as a single command.
+     *
+     * A batch used to be sent one operation at a time, each waiting for the
+     * last, because that is the only shape a Firestore `WriteBatch` has. Over
+     * a network that is a round trip per write: forty read receipts on one
+     * conversation cost forty of them. `bulkWrite` is one command carrying the
+     * same forty operations, and inside a session it is still all-or-nothing.
+     *
+     * Returns how many documents the update operations MATCHED, which is what
+     * `firestoreCompat` turns back into Firestore's NOT_FOUND.
+     */
+    async bulk(collection, operations, { session = null } = {}) {
+      if (operations.length === 0) return { matched: 0 };
+      const r = await db
+        .collection(collection)
+        .bulkWrite(operations, opts(session, { ordered: true }));
+      return { matched: (r.matchedCount || 0) + (r.upsertedCount || 0) };
+    },
+
+    /**
      * All-or-nothing, returning what the callback returned.
      *
      * **Returns the value itself, not a wrapper.** Firestore's `runTransaction`
@@ -230,6 +250,31 @@ function memoryStore(seed = {}) {
 
     async delete(collection, id) {
       col(collection).delete(String(id));
+    },
+
+    /**
+     * The same contract as the real store, applied one at a time.
+     *
+     * There is nothing to batch in memory; what matters is that a test
+     * exercising the fast path sees the same RESULT as the driver would
+     * return, or the path that only runs in production is the untested one.
+     */
+    async bulk(collection, operations, _options = {}) {
+      let matched = 0;
+      for (const o of operations) {
+        if (o.updateOne) {
+          const r = await this.update(collection, o.updateOne.filter._id, o.updateOne.update, {
+            upsert: o.updateOne.upsert === true,
+          });
+          if (r.matched) matched += 1;
+        } else if (o.replaceOne) {
+          await this.replace(collection, o.replaceOne.filter._id, o.replaceOne.replacement);
+          matched += 1;
+        } else if (o.deleteOne) {
+          await this.delete(collection, o.deleteOne.filter._id);
+        }
+      }
+      return { matched };
     },
 
     async transaction(fn) {

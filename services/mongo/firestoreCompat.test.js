@@ -392,3 +392,86 @@ test("a transaction reads and writes through the same references", async () => {
   });
   assert.equal((await db.collection("t").doc("a").get()).data().n, 2);
 });
+
+/* ── One command instead of one round trip per write ──────────────────────── */
+
+/**
+ * Marking a conversation read is one write per unread message. Sent one at a
+ * time over a network that cost about 96ms each — forty unread messages took
+ * almost four seconds before a tick turned blue. These pin the batch that goes
+ * as a single command, and, more importantly, pin that it still behaves like
+ * the one that did not.
+ */
+
+test("a same-collection batch of updates is sent as one command", async () => {
+  const store = memoryStore({ t: [{ _id: "a", n: 1 }, { _id: "b", n: 1 }, { _id: "c", n: 1 }] });
+  const sent = [];
+  const bulk = store.bulk.bind(store);
+  store.bulk = (collection, operations, options) => {
+    sent.push({ collection, count: operations.length });
+    return bulk(collection, operations, options);
+  };
+  const db = createFirestoreCompat(store);
+  const batch = db.batch();
+  for (const id of ["a", "b", "c"])
+    batch.update(db.collection("t").doc(id), { n: FieldValue.increment(1) });
+  const results = await batch.commit();
+
+  assert.deepEqual(sent, [{ collection: "t", count: 3 }], "not sent as one command");
+  assert.equal(results.length, 3, "still one WriteResult per operation");
+  for (const id of ["a", "b", "c"])
+    assert.equal((await db.collection("t").doc(id).get()).data().n, 2, `${id} was not written`);
+});
+
+test("the one-command batch still fails on a document that is not there", async () => {
+  /* The whole reason the fast path is restricted to a single kind: bulkWrite
+     reports one matched count for the command, so a batch of updates is the
+     only shape where "all of them had to match" is unambiguous. */
+  const db = createFirestoreCompat(memoryStore({ t: [{ _id: "a", n: 1 }] }));
+  const batch = db.batch();
+  batch.update(db.collection("t").doc("a"), { n: 2 });
+  batch.update(db.collection("t").doc("gone"), { n: 2 });
+  await assert.rejects(
+    () => batch.commit(),
+    (e) => e.code === 5 && /t\/gone/.test(e.message),
+    "a missing document in a batched update no longer raises NOT_FOUND",
+  );
+});
+
+test("a mixed or multi-collection batch takes the original path", async () => {
+  const store = memoryStore({ t: [{ _id: "a", n: 1 }], u: [{ _id: "b", n: 1 }] });
+  let used = 0;
+  const bulk = store.bulk.bind(store);
+  store.bulk = (...args) => { used += 1; return bulk(...args); };
+  const db = createFirestoreCompat(store);
+
+  /* Two collections. */
+  const across = db.batch();
+  across.update(db.collection("t").doc("a"), { n: 2 });
+  across.update(db.collection("u").doc("b"), { n: 2 });
+  await across.commit();
+
+  /* One collection, but an upserting set beside an update. */
+  const mixed = db.batch();
+  mixed.set(db.collection("t").doc("new"), { n: 9 }, { merge: true });
+  mixed.update(db.collection("t").doc("a"), { n: 3 });
+  await mixed.commit();
+
+  assert.equal(used, 0, "a batch that cannot be expressed as one command was sent as one anyway");
+  assert.equal((await db.collection("t").doc("a").get()).data().n, 3);
+  assert.equal((await db.collection("u").doc("b").get()).data().n, 2);
+  assert.equal((await db.collection("t").doc("new").get()).data().n, 9);
+});
+
+test("a batched set carries the subcollection parent, as a single set does", async () => {
+  /* `_parentId` is what scopes a flattened subcollection. A fast path that
+     dropped it would file every batched chat message under no conversation. */
+  const db = createFirestoreCompat(memoryStore());
+  const chat = db.collection("cowork_tasks").doc("T1").collection("chat");
+  const batch = db.batch();
+  batch.set(chat.doc("m1"), { text: "one" });
+  batch.set(chat.doc("m2"), { text: "two" });
+  await batch.commit();
+  const snap = await chat.get();
+  assert.equal(snap.size, 2, "the batched messages are not under their task");
+});

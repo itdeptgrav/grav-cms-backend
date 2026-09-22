@@ -573,8 +573,85 @@ class WriteBatch {
    * count, or a `{atomic, value}` wrapper, is a different shape from the one
    * every caller was written against.
    */
+  /**
+   * Can this whole batch be sent as ONE command?
+   *
+   * Only when every write lands in the same collection, and only when the
+   * batch is either all `update` or has no `update` at all. That second rule
+   * is about one thing: `update()` must still fail on a missing document, and
+   * `bulkWrite` reports one matched count for the whole command, not one per
+   * operation. With nothing but updates the count is unambiguous — every one
+   * of them had to match. Mix an upserting `set` into the same command and it
+   * no longer is, so that batch takes the original path instead of guessing.
+   *
+   * Everything else — several collections, a mixture of kinds — is unchanged.
+   */
+  _bulkPlan() {
+    if (this._ops.length < 2) return null;
+    const collection = this._ops[0].ref._collection;
+    if (!this._ops.every((o) => o.ref._collection === collection)) return null;
+    const updates = this._ops.filter((o) => o.kind === "update").length;
+    if (updates !== 0 && updates !== this._ops.length) return null;
+
+    const operations = [];
+    const mustMatch = [];
+    for (const op of this._ops) {
+      const ref = op.ref;
+      if (op.kind === "delete") {
+        operations.push({ deleteOne: { filter: { _id: ref.id } } });
+      } else if (op.kind === "update") {
+        const update = toUpdate(op.patch);
+        /* An empty patch touches nothing and cannot fail — the store already
+           treats it as matched, and bulkWrite would refuse it outright. */
+        if (Object.keys(update).length === 0) continue;
+        operations.push({ updateOne: { filter: { _id: ref.id }, update, upsert: false } });
+        mustMatch.push(ref.id);
+      } else if (op.options && op.options.merge) {
+        const update = toUpdate(ref._own(op.data));
+        if (Object.keys(update).length === 0) continue;
+        operations.push({ updateOne: { filter: { _id: ref.id }, update, upsert: true } });
+      } else {
+        const doc = ref._own(toDocument(op.data));
+        operations.push({
+          replaceOne: { filter: { _id: ref.id }, replacement: { ...doc, _id: ref.id }, upsert: true },
+        });
+      }
+    }
+    return { collection, operations, mustMatch };
+  }
+
+  /**
+   * Firestore resolves a batch to one `WriteResult` per operation. Returning a
+   * count, or a `{atomic, value}` wrapper, is a different shape from the one
+   * every caller was written against.
+   */
   async commit() {
     return this._store.transaction(async (session) => {
+      const plan = typeof this._store.bulk === "function" ? this._bulkPlan() : null;
+      if (plan) {
+        const { matched } = await this._store.bulk(plan.collection, plan.operations, { session });
+        if (plan.mustMatch.length > 0 && matched < plan.mustMatch.length) {
+          /* One of the updates had nothing to update. Which one costs a single
+             extra read, and only on this path — the batch is inside the
+             session, so throwing here rolls all of it back, exactly as a
+             mid-batch NOT_FOUND did before. */
+          const found = new Set(
+            (
+              await this._store.find(
+                plan.collection,
+                { _id: { $in: plan.mustMatch } },
+                { session },
+              )
+            ).map((d) => d._id),
+          );
+          const missing = plan.mustMatch.find((id) => !found.has(id));
+          const e = new Error(`No document to update: ${plan.collection}/${missing}`);
+          e.code = 5; // NOT_FOUND, the code the admin SDK uses
+          throw e;
+        }
+        return this._ops.map(() => ({ writeTime: new Date() }));
+      }
+
       const results = [];
       for (const op of this._ops) {
         const ref = session ? op.ref.withSession(session) : op.ref;
