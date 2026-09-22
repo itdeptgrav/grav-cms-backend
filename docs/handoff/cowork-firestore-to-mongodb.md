@@ -137,6 +137,50 @@ Backend `npm test`: 1814, of which the migration suites are 140 and all pass;
 `salesJourneyOutcome`. Cowork `npm test`: see the commit for the count; the
 only failures are the two pre-existing environment-dependent ones.
 
+## Chat felt slower than Firestore — 22 Sep 2026
+
+Reported as seen-ticks, sending and live conversation "not happening
+properly/smoothly". Measured against the running server rather than guessed
+at. Delivery was never broken: a message reached the other person's socket in
+139ms, and every one of the 103 DM threads and 14 groups resolves to a real
+audience. What was wrong was the cost of everything around it, and all three
+causes were in the transport, not in any product rule.
+
+| | before | after |
+|---|---|---|
+| 40 read receipts (opening a thread with 40 unread) | 3851ms | ~800ms |
+| 14 unread counts (the conversation list) | 221ms | 172ms |
+| message sent → recipient's socket told | 139ms | 150ms |
+| read receipt → sender's socket told | not measured | 163ms |
+
+**A batch checked permissions one write at a time, and re-read the parent for
+each.** Marking a conversation read is one write per unread message, so forty
+unread messages meant about eighty sequential round trips before a tick turned
+blue. The reads now run together and each parent is read once. Paths are still
+validated in order and the decisions still taken in order, so the same batch is
+refused with the same message.
+
+**The batch was then applied one operation at a time**, because that is the
+only shape a Firestore `WriteBatch` has. Where every write lands in one
+collection and the batch is all updates or has no updates, it now goes as a
+single `bulkWrite` in the same session. The restriction is the point:
+`bulkWrite` reports one matched count for the whole command, and a batch of
+nothing but updates is the only shape where "every one had to match" is
+unambiguous — so `update()` still raises NOT_FOUND naming the missing document
+and the batch still rolls back whole. Anything else takes the original path.
+
+**Every read was its own HTTP request.** Firestore multiplexed them over one
+connection; a browser opens six to an origin and queues the rest, so fourteen
+unread counts arrive in three waves and every incoming message re-runs them.
+`multi` carries independent operations in one request. Each is still executed
+on its own against the same policy and answers for itself — a refusal in one
+slot does not disturb the others, and nothing is reachable that a single
+request could not reach.
+
+What is still true, and is not a bug: a notice is a notice, so the client reads
+after it. Firestore pushed the document itself. That one read is the price of
+the browser no longer holding a database connection.
+
 ## Known limits, stated rather than hidden
 
 - Never run against a real MongoDB. Every semantic above is proven against an
