@@ -45,7 +45,12 @@ const { illegalKeys, toMongoDocument } = require("../services/mongo/convert");
  * without production credentials, and made `parseArgs` untestable.
  */
 function loadFirebase() {
-  return require("../config/firebaseAdmin");
+  const { admin } = require("../config/firebaseAdmin");
+  /* Always the real Firestore. `config/firebaseAdmin` exports `db` as the
+     MongoDB facade once `COWORK_DB=mongo` is set — which is exactly when this
+     script is run for the delta pass — and reading the copy to make the copy
+     would report every collection as already matching. */
+  return { admin, db: admin.firestore() };
 }
 
 /* ── What to copy ─────────────────────────────────────────────────────────── */
