@@ -1238,6 +1238,9 @@ app.use("/api/hr", hrProfileRoutes);
  * --------------------------------------------------------------------- */
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
+/* Grav CAD desktop: shared-key handshake, no session. Must sit above the
+   /api/cms auth gate (see the scanner note further down). */
+app.use("/api/cutting-desk", require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingDeskHandshake"));
 
 // Face SIGN-IN was removed at the owner's request. Faces are still registered
 // — see /hr/face-registration and /hr/face-enroll — but a face no longer opens
@@ -2375,6 +2378,9 @@ app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
 const patternGradingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/patternGradingRoutes");
 app.use("/api/cms/manufacturing/cutting-master", patternGradingRoutes);
+// Offline cutting desktop: send-to-cutting, outbox bundles, cut-done inbox.
+const cuttingSyncRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingSyncRoutes");
+app.use("/api/cms/manufacturing/cutting-master", cuttingSyncRoutes);
 
 // Import measurement routes
 const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");

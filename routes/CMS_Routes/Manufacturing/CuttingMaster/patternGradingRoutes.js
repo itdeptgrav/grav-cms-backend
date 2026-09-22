@@ -109,7 +109,12 @@ function normaliseGroup(g) {
     targetFullInches: Number(g.targetFullInches) || 0,
     baseFullInches: Number(g.baseFullInches) || 0,
     measurementOffset: Number(g.measurementOffset) || 0,
-    gradingMode: g.gradingMode || (g.ruleProfile?.enabled ? "rule" : "keyframe"),
+    gradingMode:
+      g.gradingMode
+      || (g.ruleProfile?.enabled
+        ? "rule"
+        /* Unset means parametric: grade from the pattern, do not demand recordings. */
+        : (g.keyframes?.length ? "keyframe" : "parametric")),
     measureMode: ["auto", "curve", "straight"].includes(g.measureMode)
       ? g.measureMode
       : "auto",
@@ -123,6 +128,85 @@ function normaliseGroup(g) {
     nestedConditions: (g.nestedConditions || []).map(normaliseCondition),
     keyframes: (g.keyframes || []).map(normaliseKeyframe),
   };
+}
+
+/*
+ * A STALE EDITOR CANNOT UNDO A TUNED VALUE.
+ *
+ * The editor saves every group it holds, as it loaded them. When a multiplier,
+ * offset or part key has been corrected in the database after that load (the
+ * group carries `tuned`), a save from that tab hands back the OLD value and
+ * silently reverts the correction - it happened three times on 2026-09-18.
+ *
+ * `tuned.replaced` records what each corrected field used to be. If the
+ * incoming value is exactly that old value, the tab is stale and the tuned
+ * value is kept (with the baseFullInches that goes with it). Any other
+ * incoming value is a deliberate change by the designer and is accepted.
+ * Applied wherever an existing group is overwritten from the client.
+ */
+function keepTuned(stored, normalised) {
+  const tuned = stored?.tuned;
+  if (!tuned || !tuned.replaced || typeof tuned.replaced !== "object") return normalised;
+  const near = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
+  for (const field of ["multiplier", "measurementOffset", "partKey"]) {
+    if (!(field in tuned.replaced)) continue;
+    const old = tuned.replaced[field];
+    const incoming = normalised[field];
+    const stale = field === "partKey" ? String(incoming) === String(old) : near(incoming, old);
+    if (stale) {
+      normalised[field] = stored[field];
+      if (field !== "partKey") normalised.baseFullInches = stored.baseFullInches;
+      console.log(`[groups] ${normalised.groupName}: kept tuned ${field}=${stored[field]} (stale editor sent ${old})`);
+    }
+  }
+  normalised.tuned = tuned;
+  return normalised;
+}
+
+/*
+ * A CONNECTOR A MEASUREMENT DEPENDS ON CANNOT VANISH BY ACCIDENT.
+ *
+ * Two refs on one closed path are measured along the outline UNLESS a
+ * connector links exactly those two nodes, in which case they are measured
+ * straight across. So the chest line's connector is not decoration: without
+ * it "BackChest" is silently measured the short way round the back and the
+ * grade goes wrong everywhere. On 2026-09-18 an editor save arrived with the
+ * three most recently drawn connectors missing (a stale client state) and
+ * did exactly that.
+ *
+ * So when a save drops a connector that still has a group measuring across
+ * it, and the two nodes it linked still exist at the same indices, the
+ * connector is put back with its ends on the live node positions.
+ */
+function keepDependedOnConnectors(storedPaths, incomingPaths, groups) {
+  const refsOf = (g) => [g?.ref1, g?.ref2];
+  const linked = (p, a, b) => p?.isConnector && p.connectorFrom && p.connectorTo
+    && ((p.connectorFrom.pi === a.pathIdx && p.connectorFrom.si === a.segIdx
+      && p.connectorTo.pi === b.pathIdx && p.connectorTo.si === b.segIdx)
+      || (p.connectorFrom.pi === b.pathIdx && p.connectorFrom.si === b.segIdx
+        && p.connectorTo.pi === a.pathIdx && p.connectorTo.si === a.segIdx));
+  const out = [...incomingPaths];
+  let restored = 0;
+  for (const g of groups || []) {
+    const [a, b] = refsOf(g);
+    if (!a || !b || a.pathIdx !== b.pathIdx) continue;             // only same-path pairs need one
+    if (out.some((p) => linked(p, a, b))) continue;                 // still there
+    const had = (storedPaths || []).find((p) => linked(p, a, b));
+    if (!had) continue;                                             // never had one
+    const n1 = out[a.pathIdx]?.segs?.[a.segIdx];
+    const n2 = out[b.pathIdx]?.segs?.[b.segIdx];
+    if (!n1 || !n2 || !Number.isFinite(n1.x) || !Number.isFinite(n2.x)) continue;
+    const pt = (n) => ({ x: n.x, y: n.y, c1: { x: n.x, y: n.y }, c2: { x: n.x, y: n.y } });
+    out.push({
+      ...had,
+      id: had.id || `conn-kept-${Date.now()}-${restored}`,
+      segs: [{ t: "M", ...pt(n1) }, { t: "L", ...pt(n2) }],
+      distance: Math.hypot(n2.x - n1.x, n2.y - n1.y),
+    });
+    restored += 1;
+    console.log(`[editor-state] kept connector for ${g.groupName || g.name}: a save without it would measure that group round the outline`);
+  }
+  return out;
 }
 
 function normaliseKeyframe(kf) {
@@ -309,13 +393,39 @@ router.get("/pattern-grading/stock-item/:stockItemId/setup-status", async (req, 
 router.post("/pattern-grading/stock-item/:stockItemId/setup-complete", async (req, res) => {
   try {
     const { stockItemId } = req.params;
-    const { designatedGroup } = req.body;
+    const { designatedGroup, yokeGradeProfile } = req.body;
+    const set = { setupCompleted: true, designatedGroup: designatedGroup || "chest" };
+    /*
+     * The yoke rule is a pattern-master decision the engine cannot derive, so it is stored with the product rather
+     * than lived in code. It is only written when it is actually sent: an older client that does not know about it
+     * must not silently erase an answer somebody has already given.
+     */
+    if (yokeGradeProfile && typeof yokeGradeProfile === "object") {
+      const mode = ["UNCONFIRMED", "PER_SIZE", "STEP_RULE", "CONSTANT"].includes(yokeGradeProfile.mode)
+        ? yokeGradeProfile.mode : "UNCONFIRMED";
+      const depthBySize = {};
+      for (const [k, v] of Object.entries(yokeGradeProfile.depthBySize || {})) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0.5 && n <= 12) depthBySize[k] = n;
+      }
+      const step = Number(yokeGradeProfile.depthStep);
+      set.yokeGradeProfile = {
+        mode,
+        anchorSize: yokeGradeProfile.anchorSize || "M",
+        depthBySize,
+        depthStep: Number.isFinite(step) ? step : null,
+        armholeRule: yokeGradeProfile.armholeRule || null,
+        confirmedBy: mode === "UNCONFIRMED" ? null : (yokeGradeProfile.confirmedBy || req.user?.name || "pattern master"),
+        confirmedAt: mode === "UNCONFIRMED" ? null : new Date(),
+        notes: yokeGradeProfile.notes || "",
+      };
+    }
     const config = await PatternGradingConfig.findOneAndUpdate(
       { stockItemId, isActive: true },
-      { $set: { setupCompleted: true, designatedGroup: designatedGroup || "chest" } },
+      { $set: set },
       { new: true, upsert: true }
     );
-    res.json({ success: true, message: "Setup marked as completed", designatedGroup: config.designatedGroup });
+    res.json({ success: true, message: "Setup marked as completed", designatedGroup: config.designatedGroup, yokeGradeProfile: config.yokeGradeProfile });
   } catch (error) {
     console.error("Error marking setup complete:", error);
     res.status(500).json({ success: false, message: error.message });
@@ -459,6 +569,16 @@ router.get("/pattern-grading/stock-item/:stockItemId/size-patterns-with-groups",
       sizePatterns: sizePatternsWithGroups,
       designatedGroup: config.designatedGroup || "chest",
       setupCompleted: config.setupCompleted || false,
+      /*
+       * WHICH SIZE IS AUTHORED.
+       *
+       * V3 authors one size and generates the rest, so "which size do I open" is a stored fact about the product, not
+       * something to work out from the chart. It was not being sent, so the Designer fell back to the first size in
+       * order — 3XS — and presented it as though it were a source pattern of its own.
+       */
+      basePatternSize: config.basePatternSize || null,
+      patternEngineVersion: config.patternEngineVersion || null,
+      garmentType: config.garmentType || null,
     });
   } catch (error) {
     console.error("Error fetching size patterns with groups:", error);
@@ -484,17 +604,70 @@ router.get("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName", as
 });
 
 // PUT: Update base measurements for a size pattern
+/*
+ * THE PRODUCT'S V3 FACTS: which garment it is, which engine authors it, and which size is authored.
+ *
+ * These belong to the product, not to any one of its sizes, and they are what stops the Designer guessing. They were
+ * previously only settable through a route named after saving an SVG URL, which is not a thing anybody would find.
+ * The configuration is created if the product has none, so a product can be set up before any drawing exists.
+ */
+router.put("/pattern-grading/stock-item/:stockItemId/v3-config", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const { basePatternSize, garmentType, patternEngineVersion } = req.body || {};
+
+    let doc = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
+    if (!doc) doc = await PatternGradingConfig.create({ stockItemId, isActive: true, sizePatterns: [] });
+
+    doc = await saveWithRetry(
+      () => PatternGradingConfig.findOne({ stockItemId, isActive: true }),
+      (config) => {
+        if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
+        if (garmentType !== undefined) config.garmentType = garmentType;
+        if (patternEngineVersion !== undefined) config.patternEngineVersion = patternEngineVersion;
+      },
+      5,
+    );
+    res.json({
+      success: true,
+      basePatternSize: doc.basePatternSize || null,
+      garmentType: doc.garmentType || null,
+      patternEngineVersion: doc.patternEngineVersion || null,
+    });
+  } catch (error) {
+    console.error("Error saving V3 config:", error);
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+});
+
 router.put("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName", async (req, res) => {
   try {
     const { stockItemId, sizeName } = req.params;
     const { baseMeasurements } = req.body;
 
-    const doc = await saveWithRetry(
+    /*
+     * THE CHART IS STORABLE BEFORE ANY DRAWING EXISTS.
+     *
+     * This used to refuse with 404 whenever the size had no uploaded SVG — and, before that, whenever the product
+     * had no pattern configuration at all. Under V3 that is the ordinary state of eight sizes out of nine: one
+     * master is drawn and every other size is a row on the chart it is graded to. So a missing configuration is
+     * created and a missing size becomes a chart-only row, rather than the number being thrown away.
+     *
+     * Only this product's document is touched, and only the named size within it.
+     */
+    let doc = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
+    if (!doc) {
+      doc = await PatternGradingConfig.create({ stockItemId, isActive: true, sizePatterns: [] });
+    }
+    doc = await saveWithRetry(
       () => PatternGradingConfig.findOne({ stockItemId, isActive: true }),
       (config) => {
         if (!config) throw Object.assign(new Error("Pattern config not found"), { statusCode: 404 });
-        const sizePattern = config.sizePatterns.find((p) => p.sizeName === sizeName);
-        if (!sizePattern) throw Object.assign(new Error("Size pattern not found"), { statusCode: 404 });
+        let sizePattern = config.sizePatterns.find((p) => p.sizeName === sizeName);
+        if (!sizePattern) {
+          config.sizePatterns.push({ sizeName, baseMeasurements: {} });
+          sizePattern = config.sizePatterns[config.sizePatterns.length - 1];
+        }
         sizePattern.baseMeasurements = baseMeasurements || {};
         config.markModified("sizePatterns");
       },
@@ -554,7 +727,9 @@ router.post("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName/gro
         if (!normalised.keyframes?.length && existing.keyframes?.length) {
           normalised.keyframes = existing.keyframes;
         }
-        sizePattern.keyframeGroups[existingIdx] = { ...existing.toObject?.() || existing, ...normalised };
+        const stored = existing.toObject?.() || existing;
+        keepTuned(stored, normalised);
+        sizePattern.keyframeGroups[existingIdx] = { ...stored, ...normalised };
       }
     }
 
@@ -618,7 +793,7 @@ router.post(
           g.baseFullInches = Number(baseFullInches) || g.baseFullInches || 0;
           g.targetFullInches = Number(targetFullInches) || g.targetFullInches || 0;
           g.measurementOffset = Number(measurementOffset) || g.measurementOffset || 0;
-          g.gradingMode = gradingMode || g.gradingMode || "keyframe";
+          g.gradingMode = gradingMode || g.gradingMode || "parametric";
           g.measureMode = measureMode || g.measureMode || "auto";
           g.loosingEnabled = Boolean(loosingEnabled);
           g.loosingValueInches = Number(loosingValueInches) || 0;
@@ -793,7 +968,13 @@ router.post(
         Array.isArray(basePaths) && basePaths.length ? basePaths
           : Array.isArray(currentPaths) && currentPaths.length ? currentPaths
             : null;
-      if (pathsToSave) sizePattern.basePaths = pathsToSave;
+      if (pathsToSave) {
+        const groupsAfterSave = Array.isArray(measureGroups) && measureGroups.length
+          ? measureGroups : (sizePattern.keyframeGroups || []);
+        sizePattern.basePaths = keepDependedOnConnectors(
+          (sizePattern.basePaths || []).map((p) => p.toObject?.() || p), pathsToSave, groupsAfterSave,
+        );
+      }
 
       if (unitsPerInch != null) {
         const n = Number(unitsPerInch);
@@ -859,6 +1040,10 @@ router.post(
           if (!gid) return null;
           const groupKFs = kfByGid.get(gid) || [];
           const merged = normaliseGroup({ ...mg, groupId: gid, assignedSize: sizeName });
+          {
+            const prior = sizePattern.keyframeGroups.find((g) => (g.groupId || g.clientId) === gid);
+            if (prior) keepTuned(prior.toObject?.() || prior, merged);
+          }
           // Frontend keyframes are ALWAYS authoritative when the keyframes field exists in the request.
           // Empty array = all keyframes deleted. We must NOT fall back to server data.
           if (keyframes !== undefined) {
@@ -1435,6 +1620,20 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
             explicitGradingMode === "rule" ||
             (explicitGradingMode !== "keyframe" && !!group.ruleProfile?.enabled && !hasKeyframes);
 
+          /*
+           * PARAMETRIC GROUPS HAVE NO RECORDED RANGE, AND DO NOT NEED ONE.
+           *
+           * Mirrors resolveGradingModeV2() in grav-cms's
+           * lib/parametricGradingEngine.js. A parametric group grades from the
+           * pattern itself, so neither of the two refusals below applies to it:
+           * there are no keyframes to be missing, and no recorded range to be
+           * outside of. Those refusals are exactly what made a freshly set-up
+           * pattern unusable until somebody recorded it size by size.
+           */
+          const isParametricMode =
+            explicitGradingMode === "parametric"
+            || (!isRuleMode && !hasKeyframes && explicitGradingMode !== "keyframe");
+
           // The grading range is from baseFullInches through all keyframe targets
           let gradingMin = baseVal;
           let gradingMax = baseVal;
@@ -1448,7 +1647,9 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           let gradingApplicable = true;
           let gradingWarning = null;
 
-          if (isRuleMode) {
+          if (isParametricMode) {
+            // Solved from the geometry at whatever size is asked for. Nothing to record.
+          } else if (isRuleMode) {
             // Rule mode grades from the ruleProfile directly — no keyframe range to fall outside of.
           } else if (effectiveEmpVal !== null && hasKeyframes) {
             if (effectiveEmpVal < gradingMin || effectiveEmpVal > gradingMax) {
@@ -1472,10 +1673,21 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
             employeeValue: effectiveEmpVal,
             usedFallback: empVal === null && fallbackVal !== null,
             fallbackSource: empVal === null && fallbackVal !== null ? `Size ${selectedSizePattern.sizeName} default` : null,
+            /*
+             * The group's own ease, so the cutting master can see WHY what gets
+             * cut differs from what was measured. A 17" shoulder is drafted at
+             * 17.48"; an 18" neck opening dresses a 15.5" collar. Sent through
+             * because without it those two numbers look like a failed grade.
+             */
+            measurementOffset: Number(group.measurementOffset) || 0,
             // New fields for grading status
             hasKeyframes,
             keyframeCount: kfValues.length,
-            gradingMode: isRuleMode ? "rule" : "keyframe",
+            gradingMode: isParametricMode
+              ? "parametric"
+              : isRuleMode
+                ? "rule"
+                : "keyframe",
             gradingMin,
             gradingMax,
             gradingApplicable,
@@ -1500,6 +1712,7 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           targetFullInches: empVal !== null ? empVal : group.baseFullInches,
           hasEmployeeData: empVal !== null,
           employeeValue: empVal,
+          measurementOffset: Number(group.measurementOffset) || 0,
         };
       });
 

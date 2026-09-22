@@ -141,10 +141,30 @@ const measureGroupSchema = new mongoose.Schema(
     targetFullInches: { type: Number, default: 0 },
     baseFullInches: { type: Number, default: 0 },
     measurementOffset: { type: Number, default: 0 },
+    /*
+     * A CORRECTION WRITTEN BY SCRIPT, AND WHAT IT REPLACED.
+     *
+     * `{ at, by, replaced: { multiplier?, measurementOffset?, partKey? } }`.
+     * The groups-save route uses `replaced` to recognise a stale editor tab
+     * handing back the pre-correction value, and keeps the correction. Without
+     * a schema entry this field would be stripped on the very save it guards.
+     */
+    tuned: { type: mongoose.Schema.Types.Mixed, default: null },
+    /*
+     * HOW THIS GROUP GRADES.
+     *
+     * "parametric" is the default now. It grades from the pattern itself - the
+     * group's own ref1->ref2 axis, the fold, and every other group read as a
+     * station on the same piece - so nothing has to be recorded size by size,
+     * and a size nobody recorded is solved rather than extrapolated.
+     *
+     * "keyframe" is kept so every already-configured pattern goes on behaving
+     * exactly as it did. Nothing in the database changes meaning.
+     */
     gradingMode: {
       type: String,
-      enum: ["keyframe", "rule"],
-      default: "keyframe",
+      enum: ["parametric", "keyframe", "rule"],
+      default: "parametric",
     },
     // How this group's distance is measured/drawn between its two ref nodes.
     // "auto" keeps the engine's own geometry-based choice; "curve" always
@@ -156,6 +176,53 @@ const measureGroupSchema = new mongoose.Schema(
       enum: ["auto", "curve", "straight"],
       default: "auto",
     },
+    // WHAT THIS MEASUREMENT IS BOUND TO — the authoritative answer, where
+    // measureMode's "auto" was only a hint.
+    //
+    // Between two points on a closed outline there are three possible answers:
+    // the chord and the two arcs. "auto" picked between them from whatever else
+    // happened to be drawn — a guide across the same two nodes meant the chord.
+    // That makes a measurement's value depend on drawings made after it, which
+    // is how a sleeve cap collapsed onto the sleeve width: the two share both
+    // endpoints on purpose, and the cap had no way to say it meant the cap.
+    //
+    // STRAIGHT_SPAN   the chord; needs no guide drawn to exist.
+    // BOUNDARY_CURVE  a named run along the piece's own outline, walked in
+    //                 `boundaryTraversal` from ref1 to ref2.
+    //
+    // Left unset on a group that has not been classified yet; both the desktop
+    // and the web then derive it from the group's own recorded value on load.
+    measurementType: {
+      type: String,
+      enum: ["STRAIGHT_SPAN", "BOUNDARY_CURVE"],
+      default: undefined,
+    },
+    boundaryTraversal: {
+      type: String,
+      enum: ["forward", "backward"],
+      default: undefined,
+    },
+    // Which named run along the outline this measurement follows, once runs have stable ids. Until then the pair
+    // (ref1, ref2, boundaryTraversal) names it; this field is what makes the reference survive re-ordered geometry.
+    boundaryRunId: { type: String, default: undefined },
+
+    // ── PROVENANCE OF THE BINDING ───────────────────────────────────────────
+    // A measurement's meaning must be auditable: which migration wrote it, what it measured before, and whether a
+    // human still needs to look at it. Without these a binding is just an assertion nobody can check.
+    bindingVersion: { type: Number, default: undefined },
+    bindingBefore: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    needsReview: { type: Boolean, default: undefined },
+
+    // Which catalogue definition this group is an instance of, so the same measurement can be recognised across
+    // sizes and products rather than matched by name.
+    catalogId: { type: String, default: undefined },
+
+    // ── CANONICAL VALUES ────────────────────────────────────────────────────
+    // What the AUTHORING application measured. The website renders these and may recompute independently as a
+    // check, but must not silently replace them: a disagreement is a contract mismatch to report, not to paper over.
+    rawValue: { type: Number, default: undefined },
+    garmentValue: { type: Number, default: undefined },
+    contractVersion: { type: Number, default: undefined },
     ruleProfile: ruleProfileSchema,
     nestedConditions: { type: [nestedConditionSchema], default: [] },
     loosingEnabled: { type: Boolean, default: false },
@@ -257,8 +324,18 @@ const foldAxisSchema = new mongoose.Schema(
 const sizePatternSchema = new mongoose.Schema(
   {
     sizeName: { type: String, required: true },   // "S", "M", "L", "XL" …
-    sizeValue: { type: Number, required: true },   // numeric chest/waist inch value
-    svgFileUrl: { type: String, required: true },
+    /*
+     * A SIZE CAN EXIST WITHOUT A DRAWING.
+     *
+     * Under the per-size architecture every size had its own SVG, so requiring one here cost nothing. V3 grades every
+     * size from ONE master, so eight of the nine sizes will never have a drawing — but they all still need their row
+     * on the size chart, because that chart is what the master is graded TO. With these required, saving a chart
+     * value for a size with no SVG was refused outright, which on screen looked like the field clearing itself.
+     *
+     * A row with no svgFileUrl is a chart-only size. It is not a broken pattern; it is the normal case now.
+     */
+    sizeValue: { type: Number },                   // numeric chest/waist inch value
+    svgFileUrl: { type: String },
     svgPublicId: { type: String },
     originalFilename: { type: String },
     bytes: { type: Number },
@@ -272,6 +349,21 @@ const sizePatternSchema = new mongoose.Schema(
     seamEdges: { type: [seamEdgeSchema], default: [] },
     foldAxes: { type: [foldAxisSchema], default: [] },
     groupsSetupCompleted: { type: Boolean, default: false },
+
+    // ── WHICH DRAWING THIS IS ───────────────────────────────────────────────
+    // Everything derived from a size — parsed geometry, resolved paths, measurement caches, 3D input — is only
+    // valid for the drawing it came from. Without a revision and a checksum there is no way to tell new geometry
+    // from old, so a replaced SVG can be combined with the previous size's cached derivatives and nobody notices.
+    svgRevision: { type: Number, default: undefined },
+    svgChecksum: { type: String, default: undefined },
+
+    // Which version of the pattern contract this size was written under, so a consumer can refuse data it does not
+    // understand instead of guessing at it.
+    contractVersion: { type: Number, default: undefined },
+
+    // Groups whose binding could not be established with confidence during migration. Named here so they can be
+    // listed and resolved deliberately rather than silently assumed correct.
+    groupsNeedReview: { type: [String], default: undefined },
   },
   { _id: false }
 );
@@ -295,6 +387,31 @@ const patternGradingConfigSchema = new mongoose.Schema(
     // on the cutting master side.
     designatedGroup: { type: String, default: "chest" },
 
+    /*
+     * HOW THE YOKE GRADES — a decision the pattern master makes, not one the engine can derive.
+     *
+     * There is no yoke in the size chart and nothing in the body implies one, so grading from a single base leaves
+     * the depth frozen across the whole range. Until a real rule is recorded here the grade is marked
+     * REVIEW REQUIRED rather than production-ready. See packages/pattern-core/yokeProfile.js.
+     *
+     *   UNCONFIRMED  nobody has been asked yet; the drawn depth is held
+     *   PER_SIZE     a depth for each size, interpolated only BETWEEN sizes that were given
+     *   STEP_RULE    one increment per size step, from an anchor size
+     *   CONSTANT     the pattern master has confirmed one depth is intended for every size
+     */
+    yokeGradeProfile: {
+      mode: { type: String, enum: ["UNCONFIRMED", "PER_SIZE", "STEP_RULE", "CONSTANT"], default: "UNCONFIRMED" },
+      anchorSize: { type: String, default: "M" },
+      /* inches, by size name */
+      depthBySize: { type: Map, of: Number, default: undefined },
+      /* inches added per size step, in STEP_RULE */
+      depthStep: { type: Number, default: null },
+      armholeRule: { type: String, default: null },
+      confirmedBy: { type: String, default: null },
+      confirmedAt: { type: Date, default: null },
+      notes: { type: String, default: "" },
+    },
+
     // ════ LEGACY fields (kept so old DB documents still work) ═
     svgFileUrl: { type: String, trim: true, default: null },
     svgPublicId: { type: String, trim: true, default: null },
@@ -311,7 +428,16 @@ const patternGradingConfigSchema = new mongoose.Schema(
     seamEdges: { type: [seamEdgeSchema], default: [] },
     foldAxes: { type: [foldAxisSchema], default: [] },
 
+    /*
+     * THE ONE SIZE THAT IS AUTHORED, AND WHAT KIND OF GARMENT IT IS.
+     *
+     * `basePatternSize` already existed and already meant this; V3 makes it load-bearing, because it is the size the
+     * Designer opens and the size every other size is generated from. The default stays "M" for products that never
+     * said, but a product that sets it must have that honoured — a future product may be drawn at S, L or 34.
+     */
     basePatternSize: { type: String, default: "M" },
+    garmentType: { type: String, default: null },            // SHIRT | TROUSER | … declared, never inferred
+    patternEngineVersion: { type: String, default: null },   // LEGACY | V3
     isActive: { type: Boolean, default: true },
     version: { type: Number, default: 1 },
 

@@ -502,7 +502,7 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
     })
       .select(
         "workOrderNumber stockItemName stockItemId quantity variantAttributes " +
-          "cuttingStatus cuttingProgress status createdAt _id",
+          "cuttingStatus cuttingProgress status createdAt _id sentToCutting sentToCuttingAt",
       )
       .sort({ createdAt: -1 })
       .lean();

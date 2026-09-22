@@ -46,6 +46,12 @@ const employeeProductionProgressSchema = new mongoose.Schema(
 
     lastSyncedAt: { type: Date, default: null },
 
+    /* "This employee's cutting is done" - the one fact the offline cutting
+       desktop sends back (cuttingSyncRoutes.js inbox). Written once. */
+    cutDone: { type: Boolean, default: false },
+    cutDoneAt: { type: Date, default: null },
+    cutDoneBy: { type: String, default: "" },
+
 
     packagedUnits: { type: Number, default: 0 },
     isFullyPackaged: { type: Boolean, default: false },

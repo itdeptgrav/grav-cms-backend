@@ -363,6 +363,10 @@ const workOrderSchema = new mongoose.Schema(
       ],
     },
 
+    /* Marked by the web's "Send to cutting"; the offline cutting desktop pulls
+       every work order with this set (see cuttingSyncRoutes.js). */
+    sentToCutting: { type: Boolean, default: false },
+    sentToCuttingAt: { type: Date, default: null },
     cuttingStatus: {
       type: String,
       enum: ["pending", "in_progress", "completed"],
