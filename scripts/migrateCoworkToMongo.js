@@ -236,6 +236,25 @@ async function copySubcollections(parentRef, mongo, parentName, children, opts) 
 async function verify(mongo, names, firestore) {
   const rows = [];
   for (const name of names) {
+    /**
+     * The subcollections first, because that is where chat and messages live
+     * and a verify that skipped them once reported "39 of 45 ok" while saying
+     * nothing about 2,000 messages. Each parent's children are counted on the
+     * Firestore side (`select()` fetches ids only, so a parent costs one small
+     * read) and summed against the flattened collection's count on the Mongo
+     * side.
+     */
+    for (const child of SUBCOLLECTIONS[name] ?? []) {
+      const flat = `${name}__${child}`;
+      let fsCount = 0;
+      const parents = await firestore.collection(name).select().get();
+      for (const parent of parents.docs) {
+        const c = await parent.ref.collection(child).count().get();
+        fsCount += c.data().count;
+      }
+      const moCount = await mongo.collection(flat).countDocuments();
+      rows.push({ name: flat, firestore: fsCount, mongo: moCount, mismatches: [] });
+    }
     const fsCount = (await firestore.collection(name).count().get()).data().count;
     const moCount = await mongo.collection(name).countDocuments();
     const sample = await firestore.collection(name).limit(3).get();
