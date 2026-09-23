@@ -100,55 +100,211 @@ const QUALIFICATION_READY_FIELDS = {
 
 /* ══════════════════════ 1. Controlled Lead status ═══════════════════════ */
 
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Account, Lead and Contact creation now refuses unless the actor's company is
+ * provable. These suites are not about tenancy, so they seed the simplest
+ * thing that makes ownership provable: a single company, which is the
+ * documented deployment fallback. Without it every creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
+
+/* ══ THE LEAD LIFECYCLE IS ABOUT THE REQUIREMENT ═══════════════════════════
+ * Three tests here used to prove the contact funnel: that Contacting needed a
+ * logged outreach attempt, that Contacted needed a successful two-way outcome,
+ * and that neither could be reached without a contact route.
+ *
+ * Every one of those facts is now established BEFORE the record is a Lead. A
+ * Prospect converts only on a successful interaction with a confirmed interest
+ * signal, so re-asking made a salesperson prove the same thing twice — and
+ * told them nothing about the only open question at this stage: what does this
+ * customer actually want?
+ *
+ * The two states are kept so old records stay readable (see lead.test.js for
+ * the graph), but nothing targets them, so those tests are replaced by the
+ * rules that took their place rather than deleted quietly.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
 describe("1. Controlled Lead status — per-transition prerequisites", () => {
-  test("Contacting/Engaged are rejected when the Lead has no phone, WhatsApp or email at all", async () => {
-    // A Lead with NO way to reach them cannot be marked contacted, even with a
-    // logged activity — you can't have contacted someone you can't reach.
-    const lead = await createLead({ phone: "", email: "", whatsapp: "" });
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Claim I called", status: "completed", outcome: "replied_connected" });
+  const setState = (id, body) => call(`/${id}/qualification-state`, { method: "PATCH", body });
 
-    const attempted = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(attempted.status).toBe(400);
-    expect(attempted.body.message).toMatch(/no contact details|phone number, WhatsApp or email/i);
-
-    const contacted = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    expect(contacted.status).toBe(400);
-    expect(contacted.body.message).toMatch(/no contact details|phone number, WhatsApp or email/i);
-
-    // Add an email → the same moves are now allowed (activity already logged).
-    await call(`/${lead._id}`, { method: "PATCH", body: { email: "buyer@testco.example" } });
-    const ok = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    expect(ok.status).toBe(200);
+  test("a converted Prospect starts at Interest Confirmed, not at New-and-uncontacted", async () => {
+    const lead = await createLead();
+    expect(lead.qualificationState).toBe("new");
+    const { LEAD_QUALIFICATION_STATES } = require("../../constants/crm");
+    const label = Object.fromEntries(LEAD_QUALIFICATION_STATES.map((x) => [x.code, x.label]));
+    expect(label.new).toBe("Interest Confirmed");
   });
 
-  test("Contact Attempted is rejected with no logged outreach attempt, and accepted once one exists", async () => {
+  test("no new work can be moved to Contacting or Contacted", async () => {
     const lead = await createLead();
-    const rejected = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(rejected.status).toBe(400);
-    expect(rejected.body.message).toMatch(/logged outreach attempt/i);
-
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Tried calling", status: "completed", outcome: "no_answer" });
-    const accepted = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(accepted.status).toBe(200);
-  });
-
-  test("a task/follow_up (not yet acted on) does not count as an outreach attempt", async () => {
-    const lead = await createLead();
-    await Activity.create({ leadId: lead._id, activityType: "follow_up", subject: "Plan to call", status: "planned", dueDate: new Date() });
-    const { status } = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(status).toBe(400);
-  });
-
-  test("Contacted is rejected with only a No Answer logged, accepted once a successful outcome exists", async () => {
-    const lead = await createLead();
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Tried calling", status: "completed", outcome: "no_answer" });
-    const rejected = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    expect(rejected.status).toBe(400);
-    expect(rejected.body.message).toMatch(/successful two-way contact/i);
-
     await Activity.create({ leadId: lead._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    const accepted = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    expect(accepted.status).toBe(200);
+    for (const target of ["contactAttempted", "contacted"]) {
+      const r = await setState(lead._id, { qualificationState: target });
+      expect(r.status).toBe(400);
+      expect(r.body.message).toMatch(/legacy/i);
+    }
+    // even with everything the old gates asked for, and from nurture too
+    await setState(lead._id, { qualificationState: "nurture", reason: "Busy", nextAction: { subject: "Check back", dueDate: "2026-11-01T09:00:00.000Z" } });
+    expect((await setState(lead._id, { qualificationState: "contacted" })).status).toBe(400);
+  });
+
+  test("an existing Contacting/Contacted record stays readable and can still advance", async () => {
+    /* Compatibility, not migration: the stored value is untouched and the
+       record moves straight to Requirement Captured. */
+    for (const legacy of ["contactAttempted", "contacted"]) {
+      const lead = await createLead(QUALIFICATION_READY_FIELDS);
+      await Lead.updateOne({ _id: lead._id }, { $set: { qualificationState: legacy } });
+
+      const read = await call(`/${lead._id}`);
+      expect(read.status).toBe(200);
+      expect(read.body.lead.qualificationState).toBe(legacy);
+
+      const r = await setState(lead._id, { qualificationState: "qualified" });
+      expect(r.status).toBe(200);
+      expect(r.body.lead.qualificationState).toBe("qualified");
+    }
+  });
+
+  test("a legacy record keeps its history when it advances", async () => {
+    const lead = await createLead(QUALIFICATION_READY_FIELDS);
+    await Lead.updateOne({ _id: lead._id }, { $set: { qualificationState: "contacted" } });
+    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Old call", status: "completed", outcome: "replied_connected" });
+
+    await setState(lead._id, { qualificationState: "qualified" });
+    const acts = await Activity.find({ leadId: lead._id }).lean();
+    expect(acts.some((a) => a.subject === "Old call")).toBe(true);
+  });
+
+  /* ── REQUIREMENT IDENTIFIED ─────────────────────────────────────────────
+     "We know what requirement we are investigating" — not "everything is
+     confirmed". */
+
+  test("Requirement Captured refuses a missing product, quantity or certainty", async () => {
+    const base = { requirementItems: [{ product: "Housekeeping shirts", quantity: 500 }], requirementCertainty: "suspected" };
+
+    const noProduct = await createLead({ requirementCertainty: "suspected", estimatedQuantity: 500 });
+    const r1 = await setState(noProduct._id, { qualificationState: "qualified" });
+    expect(r1.status).toBe(400);
+    expect(r1.body.message).toMatch(/product/i);
+
+    const noQty = await createLead({ requirementItems: [{ product: "Shirts" }], requirementCertainty: "suspected" });
+    const r2 = await setState(noQty._id, { qualificationState: "qualified" });
+    expect(r2.status).toBe(400);
+    expect(r2.body.message).toMatch(/quantity/i);
+
+    // zero is not a quantity
+    const zeroQty = await createLead({ requirementItems: [{ product: "Shirts", quantity: 0 }], requirementCertainty: "suspected" });
+    expect((await setState(zeroQty._id, { qualificationState: "qualified" })).status).toBe(400);
+
+    const unknown = await createLead(base);
+    await call(`/${unknown._id}`, { method: "PATCH", body: { requirementCertainty: "unknown" } });
+    const r3 = await setState(unknown._id, { qualificationState: "qualified" });
+    expect(r3.status).toBe(400);
+    expect(r3.body.message).toMatch(/unknown/i);
+  });
+
+  test("a SUSPECTED requirement is enough to identify it", async () => {
+    /* The stage means we know what we are investigating. Demanding confirmation
+       here would leave nothing for Enquiry Ready to ask. */
+    const lead = await createLead({
+      requirementItems: [{ product: "Housekeeping shirts", quantity: 500 }],
+      requirementCertainty: "suspected",
+    });
+    const r = await setState(lead._id, { qualificationState: "qualified" });
+    expect(r.status).toBe(200);
+    expect(r.body.lead.qualificationState).toBe("qualified");
+  });
+
+  test("Requirement Captured does NOT ask for annual figures, budget or a delivery date", async () => {
+    const lead = await createLead({
+      requirementItems: [{ product: "Housekeeping shirts", quantity: 500 }],
+      requirementCertainty: "suspected",
+      // deliberately: no estimatedAnnualQuantity/Revenue, no budget, no requirementDate,
+      // no decision-maker, no email — none of it is this stage's business
+    });
+    expect((await setState(lead._id, { qualificationState: "qualified" })).status).toBe(200);
+  });
+
+  /* ── READY FOR ENQUIRY ──────────────────────────────────────────────────
+     Everything above, plus what an Enquiry cannot be raised without. */
+
+  const identified = async (over = {}) => {
+    const lead = await createLead({ ...QUALIFICATION_READY_FIELDS, ...over });
+    await setState(lead._id, { qualificationState: "qualified" });
+    return lead;
+  };
+
+  test("Enquiry Ready refuses a merely SUSPECTED requirement", async () => {
+    const lead = await identified({ requirementCertainty: "suspected" });
+    const r = await setState(lead._id, { qualificationState: "readyToConvert" });
+    expect(r.status).toBe(400);
+    expect(r.body.message).toMatch(/confirmed by the customer or a document/i);
+
+    await call(`/${lead._id}`, { method: "PATCH", body: { requirementCertainty: "prospect_confirmed" } });
+    expect((await setState(lead._id, { qualificationState: "readyToConvert" })).status).toBe(200);
+  });
+
+  test("Enquiry Ready requires a decision-maker and a contact route", async () => {
+    const noDM = await identified();
+    await call(`/${noDM._id}`, { method: "PATCH", body: { decisionMakerName: "" } });
+    const r1 = await setState(noDM._id, { qualificationState: "readyToConvert" });
+    expect(r1.status).toBe(400);
+    expect(r1.body.message).toMatch(/decision-maker/i);
+
+    const noContact = await identified();
+    await call(`/${noContact._id}`, { method: "PATCH", body: { phone: "", email: "", whatsapp: "" } });
+    const r2 = await setState(noContact._id, { qualificationState: "readyToConvert" });
+    expect(r2.status).toBe(400);
+    expect(r2.body.message).toMatch(/contact route/i);
+  });
+
+  test("Enquiry Ready still needs the requirement itself", async () => {
+    const lead = await identified();
+    await call(`/${lead._id}`, { method: "PATCH", body: { productInterest: [], requirementItems: [] } });
+    const r = await setState(lead._id, { qualificationState: "readyToConvert" });
+    expect(r.status).toBe(400);
+    expect(r.body.message).toMatch(/named product|product/i);
+  });
+
+  test("optional commercial estimates are not required at any stage", async () => {
+    /* A Lead that must forecast a year of business before it can raise an
+       Enquiry is a Lead nobody moves. */
+    const lead = await identified();
+    const before = await Lead.findById(lead._id).lean();
+    expect(before.estimatedAnnualQuantity).toBeUndefined();
+    expect(before.estimatedAnnualRevenue).toBeUndefined();
+    expect((await setState(lead._id, { qualificationState: "readyToConvert" })).status).toBe(200);
+  });
+
+  test("but an estimate PRESENTED as researched must carry its own source", async () => {
+    /* An unevidenced "researched" figure is indistinguishable from a guess,
+       which is the entire problem. */
+    const lead = await identified();
+    await call(`/${lead._id}`, { method: "PATCH", body: {
+      estimatedAnnualQuantity: 12000,
+      estimatedAnnualQuantityConfidence: "researched",
+    } });
+    const r = await setState(lead._id, { qualificationState: "readyToConvert" });
+    expect(r.status).toBe(400);
+    expect(r.body.message).toMatch(/source/i);
+
+    await call(`/${lead._id}`, { method: "PATCH", body: { estimatedAnnualQuantitySource: "Their 2025 tender document" } });
+    expect((await setState(lead._id, { qualificationState: "readyToConvert" })).status).toBe(200);
+  });
+
+  test("an ASSUMED estimate needs nothing", async () => {
+    const lead = await identified();
+    await call(`/${lead._id}`, { method: "PATCH", body: {
+      estimatedAnnualRevenue: 900000,
+      estimatedAnnualRevenueConfidence: "assumed",
+    } });
+    expect((await setState(lead._id, { qualificationState: "readyToConvert" })).status).toBe(200);
   });
 
   test("Nurture is rejected without reason, next action or follow-up date; accepted with all three", async () => {
@@ -186,57 +342,8 @@ describe("1. Controlled Lead status — per-transition prerequisites", () => {
     expect(stored.subject).toBe("Check back");
   });
 
-  test("Qualified is disabled (rejected) until the checklist is genuinely complete, listing what's missing", async () => {
-    const lead = await createLead();
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
 
-    const incomplete = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
-    expect(incomplete.status).toBe(400);
-    expect(incomplete.body.message).toMatch(/isn't ready/i);
-    // The fixture has a phone (contact route met) but no confirmed requirement
-    // or decision-maker — those are what the checklist should still name.
-    expect(incomplete.body.message).toMatch(/decision-maker/i);
 
-    // Fill the checklist directly and retry.
-    await call(`/${lead._id}`, { method: "PATCH", body: QUALIFICATION_READY_FIELDS });
-    const complete = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
-    expect(complete.status).toBe(200);
-  });
-
-  test("Ready to Convert shares the same checklist bar as Qualified", async () => {
-    const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
-    // Blank the decision-maker (checklist regresses) and confirm readyToConvert is refused too.
-    await call(`/${lead._id}`, { method: "PATCH", body: { decisionMakerName: "" } });
-    const { status } = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "readyToConvert" } });
-    expect(status).toBe(400);
-  });
-
-  test("Ready for Journey needs a credible requirement (product + indicative quantity), NOT a confirmed certainty", async () => {
-    const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
-
-    // Certainty is NO LONGER a gate — confirming/finalising quantities is the
-    // journey's job (Enquiry → PO), so downgrading it must not block conversion.
-    await call(`/${lead._id}`, { method: "PATCH", body: { requirementCertainty: "unknown" } });
-    const stillOk = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "readyToConvert" } });
-    expect(stillOk.status).toBe(200);
-
-    // But an actually-missing requirement (no product) still blocks it: a Sales
-    // Journey is started against a specific, credible requirement.
-    const lead2 = await createLead(QUALIFICATION_READY_FIELDS);
-    await Activity.create({ leadId: lead2._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    await call(`/${lead2._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
-    await call(`/${lead2._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
-    await call(`/${lead2._id}`, { method: "PATCH", body: { productInterest: [] } });
-    const blocked = await call(`/${lead2._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "readyToConvert" } });
-    expect(blocked.status).toBe(400);
-  });
 
   test("Nurture requires a FUTURE revisit date, not a past one", async () => {
     const lead = await createLead();
@@ -361,19 +468,24 @@ describe("3. Lead information", () => {
     expect(patched.lead.estimatedAnnualQuantity).toBe(10000);
   });
 
-  test("a researched estimate is enforced at QUALIFICATION time: Qualified is refused until the figure carries its own inline source", async () => {
+  test("a researched estimate is enforced at the ENQUIRY gate, not while identifying the requirement", async () => {
+    /* This used to fire at Qualified. Identifying what a customer is asking
+       about must not depend on evidencing a year's forecast — the evidence
+       rule belongs where the estimate is actually relied on. */
     const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await Activity.create({ leadId: lead._id, activityType: "call", subject: "Reached them", status: "completed", outcome: "replied_connected" });
-    await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
     await call(`/${lead._id}`, { method: "PATCH", body: { estimatedAnnualQuantity: 10000, estimatedAnnualQuantityConfidence: "researched" } });
 
-    const refused = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
+    // Requirement Captured is unaffected by the unevidenced figure.
+    const identified = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
+    expect(identified.status).toBe(200);
+
+    const refused = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "readyToConvert" } });
     expect(refused.status).toBe(400);
-    expect(refused.body.message).toMatch(/evidence/i);
+    expect(refused.body.message).toMatch(/source/i);
 
     // The source is attached INLINE to the number — no separate evidence record.
     await call(`/${lead._id}`, { method: "PATCH", body: { estimatedAnnualQuantitySource: "https://example.com/report" } });
-    const ok = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
+    const ok = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "readyToConvert" } });
     expect(ok.status).toBe(200);
   });
 });

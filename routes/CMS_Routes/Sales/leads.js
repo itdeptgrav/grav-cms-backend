@@ -40,6 +40,66 @@
 // a side effect anywhere in this file. The Sales Journey model/API/UI are not
 // touched.
 const express = require("express");
+const { scopeFor: dupScopeFor } = require("../../../services/companyContext/salesScope.service");
+const { createServiceContext: dupServiceContext } = require("../../../services/companyContext/serviceScope.service");
+
+/* The service context a duplicate check runs under: this request's already
+   resolved company, so "is this a duplicate?" is answered from our own
+   customers and never from somebody else's. */
+const dupCtx = async (req) => {
+  const scope = await dupScopeFor(req);
+  /* `legacyAware`, because duplicate detection has to see the records that
+     predate company ownership — and the factory grants that only where the
+     company master proves exactly one company, never on this caller's say-so. */
+  return dupServiceContext({
+    companyId: scope.companyId,
+    reason: "duplicate detection",
+    legacyAware: true,
+  });
+};
+/* The same scope, for matching a Lead against real call and WhatsApp evidence.
+   `identityFor` takes a service context and THROWS without one; the callers
+   here passed none, so every lookup threw into their own catch and returned
+   "no evidence found". Auto-sync therefore logged nothing for ANY lead —
+   silently, because a swallowed throw and an empty result look identical.
+   `legacyAware` for the same reason duplicate detection needs it: a call
+   placed before company ownership existed still belongs to this customer. */
+const evidenceCtx = async (req) => {
+  const scope = await dupScopeFor(req);
+  return dupServiceContext({
+    companyId: scope.companyId,
+    reason: "call and message evidence matching",
+    legacyAware: true,
+  });
+};
+const {
+  scopedFilter: scoped, scopeFor: salesScopeFor, scopeAndOwnership,
+} = require("../../../services/companyContext/salesScope.service");
+const { stripCompanyOwnershipInput } = require("../../../models/CMS_Models/Sales/companyOwnership");
+
+/* ── A LEAD'S ACCOUNT IS CHECKED, NOT ASSUMED ───────────────────────────────
+ * `accountId` is an ordinary editable field, so it arrives in the PATCH body
+ * like any other — and pointing it at another company's account is how a Lead
+ * that is mine by ownership becomes theirs by relationship. Resolved through
+ * this request's own company clause, before anything is saved, with the same
+ * answer for foreign and missing. Clearing the link stays allowed. */
+async function assertLeadAccountInScope(accountId, scope) {
+  if (!accountId) return;
+  const account = await Account.findOne({ $and: [scope.clause, { _id: accountId }] })
+    .select("_id").lean();
+  if (!account) {
+    const err = new Error("That account was not found.");
+    err.status = 404;
+    throw err;
+  }
+}
+
+/** A tenant refusal keeps its own status rather than becoming a generic 500. */
+function answeredTenantRefusal(res, err) {
+  if (err?.name !== "StorePurchaseError") return false;
+  res.status(err.status).json(err.toResponse());
+  return true;
+}
 const router = express.Router();
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Account = require("../../../models/CMS_Models/Sales/Account");
@@ -55,9 +115,96 @@ const {
   applyLegacyStageChange,
   resolveInitialQualification,
 } = require("../../../services/leadQualification");
-const { findLeadDuplicates, findAccountDuplicates } = require("../../../services/crmDuplicates");
+const { findLeadDuplicates, findAccountDuplicates, findProspectDuplicates } = require("../../../services/crmDuplicates");
+const { promoteLeadContacts, ContactPromotionError } = require("../../../services/leadContactPromotion");
+const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const { isSalesManager } = require("../../../services/salesAccess");
-const { computeSubmissionReadiness, computeQualificationReadiness } = require("../../../services/leadReadiness");
+const {
+  computeSubmissionReadiness,
+  computeRequirementIdentifiedReadiness,
+  computeEnquiryReadiness,
+} = require("../../../services/leadReadiness");
+const prospectWork = require("../../../services/prospectWorkState");
+
+/**
+ * The derived work state for a page of Prospects, in ONE extra query.
+ *
+ * Attached to each Draft on the way out so the card and the detail header read
+ * the same computation rather than each doing their own — two screens deriving
+ * "where has this got to" separately is two screens that will eventually
+ * disagree, and the one people believe is whichever they looked at last.
+ *
+ * Active Leads are left alone: this is a Prospect concept and does not apply
+ * once the record has stages of its own.
+ */
+async function attachProspectWorkState(leads = []) {
+  const drafts = leads.filter((l) => l.captureStatus === "draft");
+  if (!drafts.length) return leads;
+
+  /* One aggregate for every id on the page — see outreachFactsFor's own note
+     on why this is not a per-card query. */
+  const facts = await prospectWork.outreachFactsFor(Activity, drafts.map((l) => l._id));
+
+  for (const lead of drafts) {
+    const f = facts.get(String(lead._id)) || prospectWork.NO_FACTS;
+    const { readyToConfirm } = computeSubmissionReadiness(lead, {
+      /* The SAME fact the conversion route checks (hasSuccessfulInteraction),
+         so a card that says "Ready to convert" is one that actually converts.
+         Passing the weaker attempt fact here is what made the ladder
+         self-contradictory: a run of no_answer calls sat below Follow-up on
+         outcome but above it on readiness, and Ready takes precedence, so a
+         Prospect nobody had spoken to presented as ready to become a Lead. */
+      hasSuccessfulInteraction: f.hasSuccessfulInteraction,
+    });
+    lead.workState = {
+      ...prospectWork.workStateFrom({ ...f, readyToConfirm }),
+      lastContactAt: f.lastContactAt || null,
+      /* ── ONE RULE FOR WHAT THE SCREEN SHOWS ────────────────────────────
+         A legacy record mid-review is genuinely in review, and that is what
+         both the card and the detail header must say. Deciding this here,
+         once, is what stops the two disagreeing — the card used to prefer the
+         derived state while the header preferred the review status, so the
+         same Prospect read "Contacting" in the queue and "In Review" when
+         opened. `legacy` also tells the list which records do not belong in
+         the working filters at all. */
+      legacy: ["submitted", "returned", "rejected"].includes(lead.reviewStatus)
+        ? lead.reviewStatus
+        : null,
+    };
+  }
+  return leads;
+}
+
+/**
+ * Has the customer actually ENGAGED with this Prospect — not just been dialled?
+ *
+ * The one readiness fact that needs the database, kept out of the pure
+ * checklist and asked here instead. Two things deliberately fail it:
+ *
+ *   · a PLANNED follow-up, because an intention to ring somebody is not
+ *     evidence that anybody rang them; and
+ *   · a completed attempt with no successful outcome — a call that rang out, an
+ *     outgoing email or WhatsApp nobody replied to, a blank outcome. The
+ *     product rule is that a Prospect becomes a Lead only once the customer has
+ *     genuinely engaged, so "we tried" is not the bar.
+ *
+ * `SUCCESSFUL_CONTACT_OUTCOMES` is the CRM's own definition of that engagement,
+ * already used by the qualification gate, so this is one rule and not two. The
+ * UI records it without anybody having to think about it: Quick Call stamps
+ * replied_connected or no_answer, incoming email and WhatsApp stamp
+ * replied_connected, and the manual composer exposes the same selector.
+ */
+async function hasSuccessfulInteraction(leadId) {
+  return Boolean(
+    await Activity.exists({
+      leadId,
+      isActive: true,
+      status: "completed",
+      activityType: { $in: OUTREACH_ATTEMPT_ACTIVITY_TYPES },
+      outcome: { $in: [...SUCCESSFUL_CONTACT_OUTCOMES] },
+    }),
+  );
+}
 const {
   LeadReviewError,
   applySubmit,
@@ -144,6 +291,10 @@ const LEAD_EDITABLE_FIELDS = [
   "source", "priority", "estimatedValue", "probability", "expectedCloseDate",
   "requirementItems", "productInterest", "estimatedQuantity", "deliveryTimeline", "requirementDate", "budget", "requirements",
   "requirementCertainty",
+  /* Lead form redesign chunk 1. `requirementUseCase` is the programme a
+     requirement belongs to; `budgetStatus` and `keyObjection` are the Buying
+     Process facts that had nowhere to go. All optional, none gating. */
+  "requirementUseCase", "budgetStatus", "keyObjection",
   "assignedTo", "sourcedBy",
   "city", "state", "country",
   "nextFollowUpAt", "notes", "tags",
@@ -165,6 +316,37 @@ const LEAD_EDITABLE_FIELDS = [
   "contacts",
   "researchNotes", "evidenceLinks", "evidence",
   "pendingFirstAction",
+  /* ── THE INTEREST, BUT NOT ITS ATTESTATION ────────────────────────────────
+     `interestSignal` and `interestNote` are the salesperson's own observation
+     and are theirs to set or correct at any time — including through the HOD
+     review path, which reaches readiness through PATCH rather than through the
+     conversion dialog.
+
+     `interestConfirmedBy` and `interestConfirmedAt` are deliberately ABSENT
+     and stay server-set. Who vouched for this, and when, is the one part a
+     client must never be able to write: a self-declared confirmation is not a
+     confirmation, and this is exactly the field somebody gets asked about
+     later. */
+  "interestSignal",
+  "interestNote",
+  /* Source specifics and the early "what might they need" observation. Plain
+     optional strings; none of them gates anything. `assignedTo` is NOT added
+     here — ownership stays server-derived, and `assignedToName` is already
+     excluded above for the same reason. */
+  "sourceDetails",
+  "referredBy",
+  "campaignOrEvent",
+  "possibleNeed",
+  /* The factual Prospect context (see the Lead model's own note): what kind of
+     buyer, how and when to reach them, and a broad guess at what they might
+     want. All optional, none of them a gate, and all editable later on the
+     Lead — this is the same record, so there is nothing to carry across. */
+  "businessType",
+  "preferredContactMethod",
+  "bestContactTime",
+  "contactTimeNote",
+  "preferredLanguage",
+  "productInterests",
 ];
 
 /**
@@ -176,18 +358,263 @@ const LEAD_EDITABLE_FIELDS = [
  * model doesn't need it) — Mongoose assigns fresh ids and the client re-reads
  * them after the save.
  */
-function sanitizeContacts(value) {
-  if (!Array.isArray(value)) return [];
-  return value
-    .filter((c) => c && typeof c === "object" && String(c.name || "").trim())
-    .slice(0, 25)
-    .map((c) => ({
+/* ── THE PEOPLE ON A PROSPECT, AS THE SERVER WILL ACCEPT THEM ───────────────
+   Two jobs, and the second is the one that was missing.
+
+   1. AN ALLOWLIST. A client cannot post `normalizedEmail`, `normalizedPhone`,
+      `normalizedWhatsapp` or `promotedContactId`. Those are derived (the Lead
+      model's hook) or server-set at Account promotion; a client-supplied
+      normalised value is a client-supplied duplicate-match result.
+
+   2. STABLE IDENTITY. The first version dropped every `_id` and handed
+      Mongoose a fresh array, so each save minted new ids for the same people.
+      That breaks everything the design depends on: a future
+      `Activity.leadContactId` would dangle, a `promotedContactId` would detach
+      from its person, and per-contact history would reset on every edit — an
+      ordinary rename made all four contacts look newly created.
+
+      So an existing `_id` is RESOLVED against this Lead's current contacts,
+      never trusted. One that belongs to another Lead, or to nobody, is
+      refused rather than quietly replaced — a client sending it has a bug, and
+      silently minting a new id hides it. A resolved row keeps its id and its
+      server-controlled `promotedContactId`.
+
+   Malformed input is refused, never absorbed. A non-array used to become `[]`,
+   which deleted every contact and returned 200; an oversized list was sliced;
+   a row with no name vanished. Same principle as `productInterests`: silent
+   data loss with a success response is the worst of both.
+
+   Enum codes pass through VERBATIM so Mongoose refuses an invalid one with a
+   visible 400. Empty strings become undefined so "not chosen" clears. */
+const MAX_CONTACTS = 25;
+const contactEnum = (v) => (String(v ?? "").trim() || undefined);
+const contactText = (v) => (String(v ?? "").trim() || undefined);
+const badContacts = (message) => Object.assign(new Error(message), { status: 400 });
+
+/* ── ATTRIBUTION, AS PURE FUNCTIONS ─────────────────────────────────────────
+   Auto-sync's matching lived inside the route closure, where the only way to
+   test it was to stand up Gmail, a CallEvent log and a WhatsApp conversation.
+   Two real bugs hid there for exactly that reason: a "unique" email match that
+   returned the first address hitting anybody, and a message body read from a
+   field nobody had selected.
+
+   Lifted here and exported at the bottom of this file so each rule can be
+   exercised on its own. Nothing about the behaviour changed in the move. */
+
+/** `Name <a@b.com>, c@d.com` → ["a@b.com", "c@d.com"]. That header shape is
+ *  ordinary, and comparing it whole never matches. */
+function parseEmailAddresses(header) {
+  return String(header || "")
+    .split(",")
+    .map((part) => {
+      const angled = part.match(/<([^>]+)>/);
+      return String(angled ? angled[1] : part).trim().toLowerCase();
+    })
+    .filter((a) => a.includes("@"));
+}
+
+const phoneTail = (v) => { const d = String(v ?? "").replace(/\D+/g, ""); return d.length > 10 ? d.slice(-10) : d; };
+
+/**
+ * The one contact an identity belongs to — or nothing.
+ *
+ * `hits.length === 1` is the whole rule. Two people on a shared desk line or a
+ * purchasing@ mailbox is not a near-miss to be broken by picking the first; it
+ * is a genuine "we cannot tell", and the Activity stays at Lead level where it
+ * is still true.
+ */
+function matchContacts(contacts = [], { phone, email } = {}) {
+  if (!contacts.length) return [];
+  const tail = phoneTail(phone);
+  if (tail) {
+    const byPhone = contacts.filter((c) => [c.normalizedPhone, c.normalizedWhatsapp, c.phone, c.whatsapp]
+      .some((v) => v && phoneTail(v) === tail));
+    if (byPhone.length) return byPhone;
+  }
+  const mail = String(email || "").trim().toLowerCase();
+  if (mail) {
+    return contacts.filter((c) => String(c.normalizedEmail || c.email || "").toLowerCase() === mail);
+  }
+  return [];
+}
+
+function contactByIdentity(contacts = [], identity = {}) {
+  const hits = matchContacts(contacts, identity);
+  return hits.length === 1 ? { leadContactId: hits[0]._id, contactName: hits[0].name } : {};
+}
+
+/**
+ * The one contact an email belongs to, across EVERY relevant address.
+ *
+ * This returned the first address that matched anybody, so a mail addressed to
+ * the merchandiser AND the purchase manager was filed under whichever appeared
+ * first in the header — a guess wearing a uniqueness check. Distinct contacts
+ * are collected across all of them and attribution happens only when there is
+ * exactly one. The salesperson's own connected address is excluded, or every
+ * outbound mail would be filed under the sender.
+ */
+function contactByEmailAddresses(contacts = [], addresses = [], excludeEmail = null) {
+  const mine = String(excludeEmail || "").trim().toLowerCase();
+  const found = new Map();
+  for (const addr of addresses) {
+    if (!addr || addr === mine) continue;
+    const hit = contactByIdentity(contacts, { email: addr });
+    if (hit.leadContactId) found.set(String(hit.leadContactId), hit);
+  }
+  return found.size === 1 ? [...found.values()][0] : {};
+}
+
+/** A WhatsApp message's readable content: its text, a media caption, or — for
+ *  a photo or document with neither — what it was. */
+function whatsappBody(m) {
+  return String(m?.text || m?.media?.caption || "").trim()
+    || (m?.type && m.type !== "text" ? `[${m.type}]` : "");
+}
+
+/**
+ * Resolve `leadContactId` against a Lead's own people.
+ *
+ * The id names a person INSIDE this Lead. One from another Lead would attach
+ * somebody else's identity to this history, and one from nowhere would leave a
+ * dangling reference that reads as a real person until you follow it — so both
+ * are refused rather than dropped.
+ *
+ * `contactName` is derived here, never taken from the client. It is a snapshot
+ * of what the person was called at the time, and a client that sends a name
+ * contradicting the id it also sent is either stale or wrong; either way the
+ * server's copy of the record is the one to believe.
+ *
+ * @returns {{leadContactId, contactName}} — empty when no id was supplied,
+ *          which is legitimate: legacy history has none, and a general note is
+ *          about the record rather than a person.
+ */
+function resolveLeadContact(lead, rawId, fallbackName) {
+  if (rawId === undefined || rawId === null || rawId === "") {
+    return { contactName: fallbackName };
+  }
+  const match = (lead.contacts || []).find((c) => String(c._id) === String(rawId));
+  if (!match) {
+    throw Object.assign(new Error("That contact is not on this Lead."), { status: 400 });
+  }
+  return { leadContactId: match._id, contactName: match.name };
+}
+
+async function resolveContacts(value, existing = [], prospectType = "company", lead = null) {
+  if (!Array.isArray(value)) {
+    throw badContacts("Contacts must be a list. Send an empty list to remove them all.");
+  }
+  if (value.length > MAX_CONTACTS) {
+    throw badContacts(`A Prospect can hold at most ${MAX_CONTACTS} contacts — this request had ${value.length}.`);
+  }
+
+  const byId = new Map((existing || []).map((c) => [String(c._id), c]));
+  const seen = new Set();
+
+  const rows = value.map((c, i) => {
+    if (!c || typeof c !== "object" || Array.isArray(c)) {
+      throw badContacts(`Contact ${i + 1} is not a contact.`);
+    }
+    if (!String(c.name || "").trim()) {
+      throw badContacts(`Contact ${i + 1} needs a name.`);
+    }
+
+    /* An id is a claim about which person this row IS. Resolved, not trusted:
+       one from another Lead would import a stranger's identity into this
+       record, and one from nowhere is a client bug worth surfacing. */
+    let kept = null;
+    if (c._id !== undefined && c._id !== null && c._id !== "") {
+      kept = byId.get(String(c._id));
+      if (!kept) throw badContacts(`Contact ${i + 1} refers to a person who is not on this Prospect.`);
+      if (seen.has(String(c._id))) throw badContacts(`Contact ${i + 1} is listed twice.`);
+      seen.add(String(c._id));
+    }
+
+    return {
+      ...(kept ? { _id: kept._id } : {}),
       name: String(c.name).trim(),
-      role: String(c.role || "").trim() || undefined,
-      email: String(c.email || "").trim().toLowerCase() || undefined,
-      phone: String(c.phone || "").trim() || undefined,
+      jobTitle: contactText(c.jobTitle),
+      department: contactText(c.department),
+      roleCode: contactEnum(c.roleCode),
+      /* LEGACY, retained verbatim: free-text role and the decision-maker flag
+         the readiness gate already reads. Never reinterpreted as `roleCode`. */
+      role: contactText(c.role),
       isDecisionMaker: Boolean(c.isDecisionMaker),
-    }));
+      email: String(c.email || "").trim().toLowerCase() || undefined,
+      phone: contactText(c.phone),
+      whatsapp: contactText(c.whatsapp),
+      preferredChannel: contactEnum(c.preferredChannel),
+      bestContactTime: contactEnum(c.bestContactTime),
+      contactTimeNote: contactText(c.contactTimeNote),
+      preferredLanguage: contactText(c.preferredLanguage),
+      isPrimary: Boolean(c.isPrimary),
+      status: contactEnum(c.status) || "active",
+      notes: contactText(c.notes),
+      /* Server-controlled, carried across an edit rather than re-sent. */
+      ...(kept?.promotedContactId ? { promotedContactId: kept.promotedContactId } : {}),
+    };
+  });
+
+  /* ── LOSING A PRIMARY IS A DECISION, NOT A SIDE EFFECT ─────────────────
+     The model settles the one unambiguous case (a single active contact with
+     nothing marked). Everything else it refuses. This adds the rule the model
+     cannot see, because it needs the PREVIOUS state: once a Prospect has an
+     active primary, every later save must say who the primary is. Removing or
+     deactivating that person without naming a replacement is refused, rather
+     than promoting whoever happens to sit first in the array. */
+  /* Checked BEFORE the primary rules so the message names the real blocker.
+     An Individual handed several people has a type problem, not a primary
+     problem, and being told to "mark which contact is primary" would send
+     somebody looking for the wrong fix. The model asserts this too — this is
+     here for the wording, not the safety. */
+  if (prospectType === "individual" && rows.length > 1) {
+    throw badContacts(
+      "An Individual Prospect can have only one contact — that person IS the prospect. Change its type to Organisation to record several people.",
+    );
+  }
+
+  const priorPrimary = (existing || []).find((c) => c.isPrimary && c.status === "active");
+  const marked = rows.filter((r) => r.isPrimary && r.status === "active");
+  const active = rows.filter((r) => r.status === "active");
+  if (priorPrimary && marked.length === 0 && active.length > 0) {
+    /* Only when that person has actually GONE — removed from the list, or
+       deactivated. A primary who is still present and active simply stays
+       primary; the model settles that, and refuses if it is ambiguous. */
+    const stillActive = rows.some((r) => String(r._id || "") === String(priorPrimary._id) && r.status === "active");
+    if (!stillActive) {
+      throw badContacts("Mark which contact is now the primary — this Prospect's primary contact was removed or deactivated.");
+    }
+  }
+
+  /* ── HISTORY OUTLIVES THE PERSON ──────────────────────────────────────
+     Once an Activity or the current next action can name an embedded contact,
+     deleting that contact leaves a reference to nobody — a call in the
+     timeline whose "who" resolves to nothing, and a planned follow-up aimed at
+     a person the record no longer has.
+
+     Somebody who has left, or asked not to be contacted, is a fact about the
+     relationship, not a row to tidy away. So a referenced contact is kept and
+     the status is the way to retire them; only somebody with no history at all
+     can be removed outright. Scoped by leadId, so this asks about THIS Lead's
+     history and no one else's. */
+  if (lead) {
+    const kept = new Set(rows.map((r) => String(r._id || "")));
+    const dropped = (existing || []).filter((c) => !kept.has(String(c._id)));
+    for (const gone of dropped) {
+      /* Deliberately NOT filtered to `isActive` — a soft-deleted Activity
+         still holds this contact's id, and removing the person would leave
+         that reference pointing at nobody. An inactive Activity is hidden
+         history, not disposable history. */
+      const referenced = await Activity.exists({ leadId: lead._id, leadContactId: gone._id });
+      const isTarget = String(lead.pendingFirstAction?.leadContactId || "") === String(gone._id);
+      if (referenced || isTarget) {
+        throw badContacts(
+          `"${gone.name}" has history on this record${isTarget ? " and is the target of the current next action" : ""}. Mark them "Left organisation" or "Do not contact" instead of removing them.`,
+        );
+      }
+    }
+  }
+
+  return rows;
 }
 // `reviewStatus`, `pursuitJustification` aside, and all the review audit
 // fields (submittedAt/By, reviewedAt/By, reviewReason) are NOT editable via a
@@ -203,8 +630,37 @@ function sanitizeContacts(value) {
 // save, so the value is genuinely gone and the check flips back to unmet.
 const CLEARABLE_ENUM_FIELDS = [
   "source", "industry", "companySize", "customerPotential", "requirementCertainty",
+  /* Same reason as `priority` below: "No preference" / "Not sure yet" must
+     genuinely unset the field, not be refused by the enum. */
+  "businessType", "preferredContactMethod", "bestContactTime",
   "estimatedAnnualQuantityConfidence", "estimatedAnnualRevenueConfidence",
   "estimatedUnitPriceConfidence",
+  /* "Not discussed yet" must genuinely unset the field rather than be refused
+     by the enum — the same rule every other optional select here follows. */
+  "budgetStatus",
+  /* So "Not set" in the Prospect form actually unsets it. Without this the
+     empty string reached the enum and was refused, which made the only way to
+     leave a priority blank never to have touched the control. */
+  "priority",
+];
+
+/* ── HOW A NUMBER OR A DATE IS CLEARED ──────────────────────────────────────
+   `crmApi` serialises with JSON.stringify, which DROPS a property whose value
+   is `undefined`. Several form handlers used `undefined` to mean "clear this",
+   so the field never reached the server, the PATCH said nothing about it, and
+   the old value survived — a delete that reported success and changed nothing.
+
+   `null` survives serialisation, so that is what "clear" is on the wire. Here
+   it becomes `undefined` on the document, which is what actually unsets the
+   path in Mongoose. Restricted to a named list: `null` on a field not listed
+   below keeps its literal meaning rather than being silently reinterpreted. */
+const CLEARABLE_VALUE_FIELDS = [
+  "estimatedQuantity", "requirementDate", "expectedCloseDate", "requirementReceivedAt",
+  "nextFollowUpAt",
+  "estimatedAnnualQuantity", "estimatedAnnualRevenue", "estimatedUnitPrice",
+  "estimatedAnnualQuantitySource", "estimatedAnnualRevenueSource", "estimatedUnitPriceSource",
+  "estimatedValue", "probability", "budget",
+  "keyObjection", "requirementUseCase",
 ];
 
 function pickEditable(body = {}) {
@@ -215,8 +671,49 @@ function pickEditable(body = {}) {
   for (const key of CLEARABLE_ENUM_FIELDS) {
     if (out[key] === "") out[key] = undefined;
   }
-  if (Object.prototype.hasOwnProperty.call(out, "contacts")) {
-    out.contacts = sanitizeContacts(out.contacts);
+  for (const key of CLEARABLE_VALUE_FIELDS) {
+    if (out[key] === null || out[key] === "") out[key] = undefined;
+  }
+  /* `contacts` is NOT sanitised here: resolving an `_id` needs the Lead's
+     current contacts, which this pure function does not have. Both call sites
+     handle it against the record they already loaded. */
+  /* ── A MULTI-SELECT MUST NOT BE ABLE TO DELETE WHAT IT CANNOT READ ──────
+     This turned anything that was not an array into `[]` and returned 200, so
+     a malformed request — a client sending a bare string, a serialisation bug
+     — silently wiped a saved list and reported success. Silent data loss with
+     a success response is the worst of both: nothing to notice, nothing to
+     retry. A malformed value is now refused, and the stored value is left
+     exactly as it was.
+
+     An explicit `[]` remains the way to clear the field: saying "none" and
+     failing to say anything intelligible are different acts.
+
+     Entries are trimmed, de-duplicated and capped so a client cannot post a
+     thousand of them. Unknown CODES are left for the schema enum to refuse
+     rather than silently dropped — a rejected save is visible, a silently
+     discarded value is not. */
+  if (Object.prototype.hasOwnProperty.call(out, "productInterests")) {
+    if (!Array.isArray(out.productInterests)) {
+      throw Object.assign(new Error("Product interests must be a list."), { status: 400 });
+    }
+    const list = [...new Set(
+      out.productInterests.filter((v) => typeof v === "string").map((v) => v.trim()).filter(Boolean),
+    )].slice(0, 20);
+    /* ── "NOT KNOWN YET" IS AN ANSWER, NOT AN EXTRA OPTION ────────────────
+       `["not_known", "uniforms"]` says both "we have no idea" and "we think
+       it's uniforms". The UI makes the choice exclusive; this is the same rule
+       enforced against every other client, because an invariant the server
+       does not hold is a convention, not an invariant. */
+    if (list.includes("not_known") && list.length > 1) {
+      throw Object.assign(
+        new Error('"Not known yet" cannot be combined with a specific product interest.'),
+        { status: 400 },
+      );
+    }
+    out.productInterests = list;
+  }
+  for (const key of ["contactTimeNote", "preferredLanguage"]) {
+    if (typeof out[key] === "string") out[key] = out[key].trim();
   }
   return out;
 }
@@ -292,10 +789,16 @@ async function authorizeOwnerSourceChange(req, data) {
  * is a stage advanced on someone else's contact record — which is the exact
  * bug being fixed here.
  */
-async function ambiguousContactChannels(lead) {
+/* `req` is a REQUIRED argument, not an optional one: without it `dupCtx`
+   cannot resolve the company scope, the resulting throw is swallowed by the
+   catch below, and every channel comes back ambiguous — which silently
+   disables auto-sync instead of failing loudly. It was referenced in the body
+   without ever being a parameter until 5 Sep 2026, so the catch was the only
+   branch that ever ran. */
+async function ambiguousContactChannels(lead, req) {
   try {
     const matches = await findLeadDuplicates(
-      Lead,
+      Lead, await dupCtx(req),
       { company: lead.company, email: lead.email, phone: lead.phone, website: lead.website },
       lead._id,
     );
@@ -309,17 +812,116 @@ async function ambiguousContactChannels(lead) {
   }
 }
 
+/**
+ * Which IDENTITIES on this Lead also belong to some other Lead in the company.
+ *
+ * ── AN IDENTITY, NOT A PERSON ──────────────────────────────────────────────
+ * The first version returned contact IDS, which is too coarse to be correct. A
+ * purchase manager with a generic `purchasing@acme.com` on file and their own
+ * direct line would have the whole CONTACT marked shared — and their unique
+ * phone calls silently skipped along with the shared mailbox. One duplicated
+ * address should cost you that address, not the person.
+ *
+ * So the unit is the normalised identity string: a phone tail, or an email.
+ * A shared email cannot suppress a unique phone call to the same human, and a
+ * shared phone cannot suppress their unique email.
+ *
+ * Returns a Set of those identity strings. Skipping is per event, decided by
+ * whichever identity that event actually arrived on.
+ *
+ * Company-scoped like every other lookup here. The check reads both the
+ * derived `normalized*` fields and the RAW ones, because a record that has not
+ * been saved since `normalizedWhatsapp` was added has no derived value yet —
+ * and a safety check that only protects records somebody has edited protects
+ * nothing.
+ *
+ * This is the safety check auto-sync needs. The full cross-record duplicate
+ * story is its own chunk; nothing here resolves or merges anything.
+ */
+const identityKey = (kind, value) => `${kind}:${value}`;
+
+async function ambiguousContactIdentities(lead, req) {
+  const shared = new Set();
+  const list = (lead.contacts || []).filter((c) => c._id);
+  if (!list.length) return shared;
+
+  /* Every distinct identity this Lead's people carry, with the contacts that
+     hold it — one lookup per identity, not per contact. */
+  const identities = new Map();
+  const add = (kind, raw) => {
+    const value = kind === "email"
+      ? String(raw || "").trim().toLowerCase()
+      : phoneTail(raw);
+    if (!value || (kind !== "email" && value.length !== 10)) return;
+    identities.set(identityKey(kind, value), { kind, value });
+  };
+  for (const c of list) {
+    add("phone", c.normalizedPhone || c.phone);
+    add("phone", c.normalizedWhatsapp || c.whatsapp);
+    add("email", c.normalizedEmail || c.email);
+  }
+  if (!identities.size) return shared;
+
+  try {
+    const scope = await scoped(req, {});
+    for (const [key, { kind, value }] of identities) {
+      let or;
+      if (kind === "email") {
+        or = [{ email: value }, { "contacts.normalizedEmail": value }, { "contacts.email": value }];
+      } else {
+        const re = new RegExp(`${value}$`);
+        /* ── THE RAW FIELDS HOLD REAL PHONE NUMBERS ──────────────────────
+           Derived AND raw, on both the record and its contacts. `whatsapp` has
+           only just gained a normalised form, so an existing row is reachable
+           only through the raw value — and a safety check that protects only
+           records somebody has since edited protects nothing.
+
+           The raw pattern has to tolerate separators: "+91 98000 00000" does
+           not end with "9800000000". Digits interleaved with `\D*` matches the
+           number however it was typed. Unindexed and deliberately narrow — one
+           company scope, during auto-sync, per distinct identity — with the
+           derived fields carrying the indexed load wherever they exist. */
+        const loose = new RegExp(`${value.split("").join("\\D*")}$`);
+        or = [
+          { normalizedPhone: re }, { normalizedWhatsapp: re },
+          { phone: loose }, { whatsapp: loose },
+          { "contacts.normalizedPhone": re }, { "contacts.normalizedWhatsapp": re },
+          { "contacts.phone": loose }, { "contacts.whatsapp": loose },
+        ];
+      }
+      const other = await Lead.exists({ $and: [scope, { _id: { $ne: lead._id }, isActive: true, $or: or }] });
+      if (other) shared.add(key);
+    }
+  } catch (e) {
+    /* Unable to prove uniqueness is not the same as proving it — fail closed
+       and skip attribution rather than guess. */
+    console.error("[leads] contact ambiguity check failed:", e.message);
+    return new Set(identities.keys());
+  }
+  return shared;
+}
+
 /** Every CallEvent that matches this lead's numbers/names. */
-async function matchedCallEvents(lead) {
+async function matchedCallEvents(lead, req) {
   try {
     const { identityFor } = require("../../../services/customerIdentityLookup.service");
     const { buildRecordingFilter } = require("../../../services/callRecordingMatch.service");
     const CallEvent = require("../../../models/CallEvent");
-    const identity = await identityFor({ leadId: lead._id });
+    const identity = await identityFor({ leadId: lead._id }, await evidenceCtx(req));
     if (!identity) return [];
     const filter = buildRecordingFilter(identity);
     if (!filter) return [];
-    return await CallEvent.find(filter).select("received rejected startTime durationSec driveFileId direction").lean();
+    /* ── SELECT WHAT THE CALLER ACTUALLY READS ──────────────────────────
+       Auto-sync reads `phoneNumber` (to attribute the call to a person) and
+       `contactName`; neither was selected, so per-contact attribution could
+       never match and the device's own label was always lost.
+
+       `hasRecording` is a VIRTUAL, and `.lean()` strips virtuals — so the
+       recording branch of the description was dead. `driveFileId` is the field
+       the virtual reads; the caller derives it from that. */
+    return await CallEvent.find(filter)
+      .select("received rejected startTime durationSec driveFileId direction phoneNumber contactName")
+      .lean();
   } catch (e) {
     console.error("[leads] call evidence lookup failed:", e.message);
     return [];
@@ -327,81 +929,63 @@ async function matchedCallEvents(lead) {
 }
 
 /** The WhatsApp conversation for this lead's number, if there is one. */
-async function matchedWhatsAppMessages(lead) {
+async function matchedWhatsAppMessages(lead, req) {
   try {
     const WhatsAppConversation = require("../../../models/CMS_Models/Sales/WhatsAppConversation");
     const { WhatsAppMessage } = require("../../../models/CMS_Models/Sales/WhatsAppMessage");
-    const tails = [lead.phone, lead.whatsapp, ...((lead.contacts || []).map((c) => c.phone))]
+    /* A contact's WhatsApp number counts too — it is the number messages
+       actually arrive on, and reading only `c.phone` missed anybody whose
+       WhatsApp differs from their phone. */
+    const tails = [lead.phone, lead.whatsapp, ...((lead.contacts || []).flatMap((c) => [c.phone, c.whatsapp]))]
       .map((p) => String(p || "").replace(/\D/g, "").slice(-10))
       .filter((t) => t.length === 10);
     if (!tails.length) return [];
-    const conv = await WhatsAppConversation.findOne({
+    /* ── EVERY MATCHING CONVERSATION, NOT THE FIRST ─────────────────────
+       `findOne` returned one thread, so a Prospect whose merchandiser and
+       purchase manager each have their own WhatsApp showed only one of them —
+       and which one depended on insertion order. `find` returns them all, and
+       ONE message query covers the lot rather than one per contact. */
+    const convs = await WhatsAppConversation.find({
       waId: { $in: [...new Set(tails)].map((t) => new RegExp(`${t}$`)) },
-    }).select("_id").lean();
-    if (!conv) return [];
-    return await WhatsAppMessage.find({ conversationId: conv._id }).select("direction timestamp").lean();
+    }).select("_id waId").lean();
+    if (!convs.length) return [];
+    const waById = new Map(convs.map((c) => [String(c._id), c.waId]));
+    const rows = await WhatsAppMessage.find({ conversationId: { $in: convs.map((c) => c._id) } })
+      /* `text` is read by the auto-sync description and was not selected, so
+         every auto-logged WhatsApp lost its message body — the third time in
+         this chunk that a field was read but never fetched. `type` and
+         `media.caption` keep the context for a photo or document, which a bare
+         "WhatsApp message" line would throw away. */
+      .select("direction timestamp conversationId text type media.caption").lean();
+    /* The number lives on the CONVERSATION, not on each message — carried here
+       rather than looked for on a field the message does not have. Without it
+       per-contact attribution silently never matches. */
+    return rows.map((m) => ({ ...m, waId: waById.get(String(m.conversationId)) }));
   } catch (e) {
     console.error("[leads] whatsapp evidence lookup failed:", e.message);
     return [];
   }
 }
 
-/** Did anyone actually try to reach this lead? Any call, or any message we sent. */
-async function hasRealOutreachEvidence(lead) {
-  const [calls, msgs, ambiguous] = await Promise.all([
-    matchedCallEvents(lead), matchedWhatsAppMessages(lead), ambiguousContactChannels(lead),
-  ]);
-  // Both channels are matched by phone, so both are withheld together when the
-  // phone itself is ambiguous — see ambiguousContactChannels's own comment.
-  if (ambiguous.phone) return false;
-  // A call that rang counts as an attempt whether or not it connected — that is
-  // exactly what "attempted" means.
-  return calls.length > 0 || msgs.some((m) => m.direction === "outgoing");
-}
-
-/** Did the customer actually respond? A connected call, or a message FROM them. */
-async function hasRealTwoWayEvidence(lead) {
-  const [calls, msgs, ambiguous] = await Promise.all([
-    matchedCallEvents(lead), matchedWhatsAppMessages(lead), ambiguousContactChannels(lead),
-  ]);
-  if (ambiguous.phone) return false;
-  // `received` is the device's own call-log truth, not a duration guess.
-  return calls.some((c) => c.received === true) || msgs.some((m) => m.direction === "incoming");
-}
-
 // Lead correction chunk — the per-target facts services/leadQualification.js
 // needs but cannot look up itself (it stays pure/DB-free by design). Only
 // queries what the specific target actually requires.
-async function computeTransitionContext(lead, targetState, body = {}) {
+async function computeTransitionContext(lead, targetState, body = {}, req) {
   const context = {};
-  if (targetState === "contactAttempted") {
-    const logged = Boolean(
-      await Activity.exists({
-        leadId: lead._id,
-        isActive: true,
-        status: "completed",
-        activityType: { $in: OUTREACH_ATTEMPT_ACTIVITY_TYPES },
-      }),
-    );
-    // A LOGGED activity is a salesperson's own claim. Real device/channel
-    // evidence is not. Either satisfies the gate (27 Aug 2026, explicit
-    // request that these stages "are needed to make it genuine upon fetching
-    // the call event schema... so accordingly enable that button"), so a
-    // salesperson who actually rang the customer is not blocked merely for
-    // not having typed it in afterwards.
-    context.hasOutreachAttempt = logged || (await hasRealOutreachEvidence(lead));
-  }
-  if (targetState === "contacted") {
-    const logged = Boolean(
-      await Activity.exists({
-        leadId: lead._id,
-        isActive: true,
-        status: "completed",
-        outcome: { $in: Array.from(SUCCESSFUL_CONTACT_OUTCOMES) },
-      }),
-    );
-    context.hasSuccessfulContact = logged || (await hasRealTwoWayEvidence(lead));
-  }
+  /* ── THE CONTACT GATES ARE NOT ASKED ANY MORE ──────────────────────────
+     Two blocks here resolved "was an outreach attempt logged?" and "was there
+     a successful two-way contact?" for the Contacting and Engaged moves. Both
+     states are legacy-only now: nothing in the transition graph targets them,
+     so these queries ran only for requests the service was about to refuse.
+
+     The proof itself has not been dropped — it moved earlier. A Prospect only
+     becomes a Lead on a successful interaction with a confirmed interest
+     signal, so by the time a record is here that question is answered. The
+     Their two evidence helpers went with them — they had no other caller, and
+     an unused helper that reads like a live rule is how the next person
+     re-derives a rule nobody enforces. `matchedCallEvents`,
+     `matchedWhatsAppMessages` and `ambiguousContactChannels` stay: Prospect
+     outreach reads all three. */
   if (targetState === "duplicate" && body.duplicateOf?.id) {
     const type = body.duplicateOf.type === "account" ? "account" : "lead";
     const Model = type === "account" ? Account : Lead;
@@ -589,7 +1173,8 @@ router.get("/", salesAuth, async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === "asc" ? 1 : -1;
 
-    let leadsQuery = Lead.find(filter)
+    const scopedList = await scoped(req, filter);
+    let leadsQuery = Lead.find(scopedList)
       .sort(sort)
       .skip((page - 1) * limit)
       .limit(parseInt(limit))
@@ -602,7 +1187,7 @@ router.get("/", salesAuth, async (req, res) => {
     // list load paid both latencies end to end for no reason — neither depends
     // on the other.
     const [total, leads] = await Promise.all([
-      Lead.countDocuments(filter),
+      Lead.countDocuments(scopedList),
       leadsQuery.lean(),
     ]);
 
@@ -611,7 +1196,7 @@ router.get("/", salesAuth, async (req, res) => {
     // prospects, leads, pipeline, order book").
     //
     // This used to run unconditionally on every single list load: an unbounded
-    // `Lead.find({...}).lean()` over the WHOLE collection, pulling every active
+    // `Lead.find(await scoped(req, {...})).lean()` over the WHOLE collection, pulling every active
     // lead into Node just to tally it in a forEach. Nothing in the frontend has
     // ever read the `pipelineStats` key (grepped across grav-clothing: zero
     // hits) — Prospects and Leads both throw it away — so the most expensive
@@ -628,7 +1213,10 @@ router.get("/", salesAuth, async (req, res) => {
       // affect existing pipeline statistics", extended to exclude archived
       // too). `$nin` still matches a pre-chunk record with no captureStatus at
       // all, so legacy Leads keep counting as active.
-      const grouped = await Lead.aggregate([
+      /* The company clause belongs in the INITIAL $match — a funnel built
+       from a global aggregate has already counted other companies' leads. */
+    const grouped = await Lead.aggregate([
+      { $match: await scoped(req, {}) },
         { $match: { isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } } },
         {
           $group: {
@@ -669,6 +1257,9 @@ router.get("/", salesAuth, async (req, res) => {
           : 0;
     }
 
+    /* Derived, not stored — see services/prospectWorkState.js. */
+    await attachProspectWorkState(leads);
+
     res.json({
       success: true,
       leads,
@@ -694,22 +1285,16 @@ router.get("/", salesAuth, async (req, res) => {
 // is no actual path collision (no generic POST /:id handler exists here).
 router.post("/duplicate-check", salesAuth, async (req, res) => {
   try {
-    const { company, email, phone, website, excludeId } = req.body || {};
-    const candidate = { company, email, phone, website };
-    const [leadMatches, accountMatches] = await Promise.all([
-      findLeadDuplicates(Lead, candidate, excludeId || null),
-      findAccountDuplicates(
-        Account,
-        { companyName: company, website, primaryEmail: email, primaryPhone: phone },
-        null,
-      ),
-    ]);
-    res.json({
-      success: true,
-      leadMatches,
-      accountMatches,
-      hasMatches: leadMatches.length > 0 || accountMatches.length > 0,
-    });
+    const { company, email, phone, website, excludeId, contacts } = req.body || {};
+    /* `contacts` is optional and may hold UNSAVED rows — Quick Capture calls
+       this before anything is written, which is the moment a warning is worth
+       most. Each row is matched on its own identities and reported by name. */
+    const { matches, hasMatches, leadMatches, accountMatches } = await findProspectDuplicates(
+      { Lead, Contact, Account },
+      await dupCtx(req),
+      { company, email, phone, website, contacts: Array.isArray(contacts) ? contacts : [], _id: excludeId || null },
+    );
+    res.json({ success: true, matches, hasMatches, leadMatches, accountMatches });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -780,6 +1365,11 @@ router.post("/", salesAuth, async (req, res) => {
     }
 
     const data = pickEditable(req.body);
+    /* A new Lead has no contacts to resolve an `_id` against — every row is
+       new, and a client-supplied id can only be a mistake. */
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "contacts")) {
+      data.contacts = await resolveContacts(req.body.contacts, [], req.body.prospectType);
+    }
 
     // Permissions correction: only a Sales manager may direct a NEW Lead's
     // owner/source at anyone other than themselves — checked against exactly
@@ -845,7 +1435,15 @@ router.post("/", salesAuth, async (req, res) => {
       }
     }
 
-    const lead = await createWithRef(Lead, data);
+    /* One company decision: the account check below and the ownership stamp
+       are the same company, resolved once for this request. */
+    const { scope: createScope, ownership } = await scopeAndOwnership(req);
+    /* An account from another company is not an account. Checked before the
+       create, so an invalid link writes no Lead at all. */
+    await assertLeadAccountInScope(data.accountId, createScope);
+    /* Ownership from the actor's own membership — proven, or nothing is
+       created. Never from `data`, which is the request. */
+    const lead = await createWithRef(Lead, { ...stripCompanyOwnershipInput(data), ...ownership });
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "lead",
@@ -893,14 +1491,14 @@ router.post("/", salesAuth, async (req, res) => {
     res.status(201).json({ success: true, lead, activity });
   } catch (err) {
     console.error("[leads] POST /", err);
-    res.status(400).json({ success: false, message: err.message });
+    res.status(err.status || 400).json({ success: false, message: err.message });
   }
 });
 
 // GET /api/cms/crm/leads/:id
 router.get("/:id", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id)
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
       .populate("assignedTo", "name email")
       // Populated only here, not on the list — a Converted Lead's own page
       // needs the human Journey reference + name to link to it; the list
@@ -914,6 +1512,11 @@ router.get("/:id", salesAuth, async (req, res) => {
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
+    /* The SAME computation the list runs, through the same helper. The card
+       and this page must not be able to disagree about where a Prospect has
+       got to — two derivations of one idea is two answers, and the believed
+       one is whichever was looked at last. */
+    await attachProspectWorkState([lead]);
     res.json({ success: true, lead });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -929,7 +1532,7 @@ router.get("/:id", salesAuth, async (req, res) => {
 // matter which endpoint the client used.
 router.patch("/:id", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead)
       return res
         .status(404)
@@ -940,9 +1543,21 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if (refuseIfLocked(res, lead)) return;
     const before = lead.toObject();
 
-    const patchData = pickEditable(req.body);
+    const patchData = stripCompanyOwnershipInput(pickEditable(req.body));
+    /* Resolved against THIS Lead's current people, so an existing contact keeps
+       its `_id` and its server-set `promotedContactId` across an edit. */
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "contacts")) {
+      /* The type as it will be AFTER this request — a single PATCH may set
+         the type and the contacts together. */
+      patchData.contacts = await resolveContacts(req.body.contacts, lead.contacts || [], patchData.prospectType || lead.prospectType, lead);
+    }
     if (!(await authorizeOwnerSourceChange(req, patchData))) {
       return res.status(403).json({ success: false, message: "Only a Sales manager can reassign a Lead's owner or source." });
+    }
+    /* Validated before ANY field is assigned: a bad account must not be the
+       reason half a PATCH lands. `lead` was read under the same scope. */
+    if (Object.prototype.hasOwnProperty.call(patchData, "accountId")) {
+      await assertLeadAccountInScope(patchData.accountId, await salesScopeFor(req));
     }
     Object.assign(lead, patchData);
     // `assignedToName`/`sourcedByName` are never taken from the client —
@@ -957,7 +1572,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body, "stage")) {
       try {
         const targetState = LEGACY_LEAD_STAGE_TO_QUALIFICATION[req.body.stage];
-        const context = targetState ? await computeTransitionContext(lead, targetState, req.body) : {};
+        const context = targetState ? await computeTransitionContext(lead, targetState, req.body, req) : {};
         applyLegacyStageChange(lead, {
           stage: req.body.stage,
           reason: req.body.reason,
@@ -983,7 +1598,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
     });
     res.json({ success: true, lead });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(err.status || 400).json({ success: false, message: err.message });
   }
 });
 
@@ -998,7 +1613,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
 router.patch("/:id/stage", salesAuth, async (req, res) => {
   try {
     const { stage, lostReason, reason } = req.body || {};
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead)
       return res
         .status(404)
@@ -1013,7 +1628,7 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     let applied;
     try {
       const targetState = LEGACY_LEAD_STAGE_TO_QUALIFICATION[stage];
-      const context = targetState ? await computeTransitionContext(lead, targetState, req.body) : {};
+      const context = targetState ? await computeTransitionContext(lead, targetState, req.body, req) : {};
       applied = applyLegacyStageChange(lead, { stage, reason, lostReason, actor: actor(req), context });
     } catch (err) {
       return sendTransitionError(res, err);
@@ -1045,7 +1660,7 @@ router.patch("/:id/qualification-state", salesAuth, async (req, res) => {
   try {
     const { qualificationState, reason, nextAction, duplicateOf } = req.body || {};
 
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead)
       return res
         .status(404)
@@ -1063,7 +1678,7 @@ router.patch("/:id/qualification-state", salesAuth, async (req, res) => {
     const before = lead.toObject();
     const prevState = lead.qualificationState;
 
-    const context = await computeTransitionContext(lead, qualificationState, { duplicateOf });
+    const context = await computeTransitionContext(lead, qualificationState, { duplicateOf }, req);
     try {
       applyQualificationTransition(lead, { qualificationState, reason, actor: actor(req), nextAction, context });
     } catch (err) {
@@ -1131,18 +1746,18 @@ router.patch("/:id/qualification-state", salesAuth, async (req, res) => {
  *  GET /:id/readiness so the workspace can WARN about a likely duplicate
  *  (informational only — never a gate). Returns the raw matches plus a
  *  convenience boolean. */
-async function checkStrongDuplicates(lead) {
-  const candidate = { company: lead.company, email: lead.email, phone: lead.phone, website: lead.website };
-  const [leadMatches, accountMatches] = await Promise.all([
-    findLeadDuplicates(Lead, candidate, lead._id),
-    findAccountDuplicates(
-      Account,
-      { companyName: lead.company, website: lead.website, primaryEmail: lead.email, primaryPhone: lead.phone },
-      null,
-    ),
-  ]);
-  const hasStrong = leadMatches.some((m) => m.confidence === "high") || accountMatches.some((m) => m.confidence === "high");
-  return { leadMatches, accountMatches, hasUnreviewedStrongDuplicates: hasStrong && !lead.duplicateReviewedAt };
+/* Takes the request so the duplicate context is THIS caller's company — the
+   helper cannot resolve one of its own without reaching for a global read. */
+async function checkStrongDuplicates(lead, req) {
+  const { matches, leadMatches, accountMatches, hasStrong } = await findProspectDuplicates(
+    { Lead, Contact, Account }, await dupCtx(req), lead,
+  );
+  return {
+    duplicateMatches: matches,
+    leadMatches,
+    accountMatches,
+    hasUnreviewedStrongDuplicates: hasStrong && !lead.duplicateReviewedAt,
+  };
 }
 
 // GET /api/cms/crm/leads/:id/readiness — the live checklist for whatever the
@@ -1172,7 +1787,7 @@ async function checkStrongDuplicates(lead) {
 // At conversion the Journey links this same account rather than making a new one.
 router.post("/:id/account", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
@@ -1181,10 +1796,64 @@ router.post("/:id/account", salesAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "Set up the customer once the Prospect is an Active Lead." });
     }
 
+    const { scope, ownership } = await scopeAndOwnership(req);
+    const promoteArgs = { lead, scopeClause: scope.clause, ownership, actor: actor(req) };
+
+    /* A promotion refusal is a FAILURE, not a footnote on a success. It used
+       to come back as `success: true` with a conflict count, so the screen
+       linked the customer and showed a mild note — while the people it was
+       about had not been promoted and there is no screen anywhere for doing it
+       by hand. 409: the customer was not set up, and here is exactly why. */
+    const refuseConflicts = (e) => res.status(409).json({
+      success: false,
+      message: e.message,
+      code: "contact_promotion_conflict",
+      conflicts: e.conflicts,
+    });
+
+    /* ── PROMOTION IS A RECONCILIATION, NOT A ONE-SHOT ──────────────────────
+       Run for a brand-new Account and for one that already exists. A Lead
+       gains people after the customer is set up — the site coordinator turns
+       up on the second call — and returning early because `accountId` was
+       already set is exactly how those people stayed trapped on the Lead.
+       Anybody already promoted resolves through their own
+       `promotedContactId`, so a repeat run creates nothing. */
+
     // Already linked — hand back the same account, never a second one.
     if (lead.accountId) {
-      const existing = await Account.findById(lead.accountId).lean();
-      if (existing) return res.json({ success: true, accountId: String(existing._id), account: existing, created: false });
+      const existing = await Account.findOne(await scoped(req, { _id: lead.accountId })).lean();
+      if (existing) {
+        let promoted;
+        try {
+          promoted = await promoteLeadContacts({ Contact, Lead }, { ...promoteArgs, account: existing });
+        } catch (e) {
+          /* Refused during preflight, so nothing was written: the Account
+             stands, and not one contact or `promotedContactId` moved. */
+          if (e instanceof ContactPromotionError) return refuseConflicts(e);
+          throw e;
+        }
+        try {
+          /* The primary belongs ON the Account, in this path too — it was only
+             ever persisted for a freshly created one, so an Account that
+             gained its first real contact through reconciliation kept pointing
+             at nobody. Never overwrites a primary the Account already has:
+             the service returns the incumbent's id unchanged in that case. */
+          if (promoted.summary.primaryContactId) {
+            await Account.updateOne(
+              { _id: existing._id },
+              { $set: { primaryContact: promoted.summary.primaryContactId } },
+            );
+          }
+        } catch (e) {
+          await promoted.undo();
+          throw e;
+        }
+        const refreshed = await Account.findById(existing._id).lean();
+        return res.json({
+          success: true, accountId: String(existing._id), account: refreshed,
+          created: false, contacts: promoted.summary,
+        });
+      }
       // Dangling link (account was deleted) — fall through and re-create.
     }
 
@@ -1192,7 +1861,11 @@ router.post("/:id/account", salesAuth, async (req, res) => {
       String(lead.company || "").trim() ||
       [lead.firstName, lead.lastName].filter(Boolean).join(" ").trim() ||
       "New customer";
+    /* A converted Lead becomes an Account in the SAME company the lead was
+       proved to belong to — not re-resolved, which could differ. */
     const account = await Account.create({
+      companyId: lead.companyId,
+      companyOwnership: lead.companyOwnership,
       companyName,
       displayName: companyName,
       assignedTo: lead.assignedTo || req.user?.id,
@@ -1201,20 +1874,57 @@ router.post("/:id/account", salesAuth, async (req, res) => {
       updatedBy: actor(req),
     });
 
-    lead.accountId = account._id;
-    await lead.save();
+    /* ── A HALF-SET-UP CUSTOMER IS WORSE THAN NONE ──────────────────────────
+       The Account and the Lead's link to it were written BEFORE promotion, so
+       any failure afterwards left a customer record on the Lead whose people
+       had never arrived — and the salesperson had no way back, because the
+       button only offers to create a customer that now appears to exist.
+       Everything from here rolls back together. */
+    const previousAccountId = lead.accountId || null;
+    let promoted = null;
+    let contacts;
+    try {
+      lead.accountId = account._id;
+      await lead.save();
 
-    await recordChange(req, {
-      departmentSlug: "sales",
-      entity: "crm-account",
-      entityId: account._id,
-      entityLabel: account.companyName,
-      action: "create",
-      summary: `Created account ${account.accountId} — ${account.companyName} (customer setup on Lead ${lead.leadId || lead._id})`,
-      after: account.toObject(),
-    });
+      promoted = await promoteLeadContacts({ Contact, Lead }, { ...promoteArgs, account });
+      contacts = promoted.summary;
 
-    res.status(201).json({ success: true, accountId: String(account._id), account: account.toObject(), created: true });
+      if (contacts.primaryContactId) {
+        await Account.updateOne({ _id: account._id }, { $set: { primaryContact: contacts.primaryContactId } });
+      }
+
+      await recordChange(req, {
+        departmentSlug: "sales",
+        entity: "crm-account",
+        entityId: account._id,
+        entityLabel: account.companyName,
+        action: "create",
+        summary: `Created account ${account.accountId} — ${account.companyName} (customer setup on Lead ${lead.leadId || lead._id})`,
+        after: account.toObject(),
+      });
+    } catch (e) {
+      if (promoted) await promoted.undo();
+      await Account.deleteOne({ _id: account._id }).catch(() => {});
+      /* Conditional, and not a `lead.save()`: the document in hand is from
+         before promotion and carries the whole record. Writing it back would
+         also write back anything another request changed in the meantime. The
+         filter restores the link only while it is still the one this request
+         set. */
+      await Lead.updateOne(
+        { _id: lead._id, accountId: account._id },
+        previousAccountId ? { $set: { accountId: previousAccountId } } : { $unset: { accountId: "" } },
+      ).catch(() => {});
+      lead.accountId = previousAccountId || undefined;
+      if (e instanceof ContactPromotionError) return refuseConflicts(e);
+      throw e;
+    }
+
+    /* Refreshed, because `primaryContact` was written after the document in
+       hand was built — returning the stale one told the screen the customer
+       had no primary contact moments after choosing one. */
+    const saved = await Account.findById(account._id).lean();
+    res.status(201).json({ success: true, accountId: String(account._id), account: saved, created: true, contacts });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -1222,20 +1932,58 @@ router.post("/:id/account", salesAuth, async (req, res) => {
 
 router.patch("/:id/next-action", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
     if (refuseIfLocked(res, lead)) return;
-    if (lead.captureStatus === "draft") {
-      return res.status(400).json({ success: false, message: "A Prospect sets its first action in Prospect Setup — start working the Lead first." });
-    }
-
     const subject = String(req.body?.subject || "").trim();
     if (!subject) return res.status(400).json({ success: false, message: "A next action needs a short description." });
     const due = req.body?.dueDate ? new Date(req.body.dueDate) : null;
     if (!due || Number.isNaN(due.getTime())) return res.status(400).json({ success: false, message: "A next action needs a valid due date." });
+
+    /* ── A DRAFT KEEPS ITS FIRST ACTION WHERE DRAFTS ALREADY KEEP IT ─────────
+       A Prospect can now plan a follow-up, which it could not before. It does
+       so through `pendingFirstAction` — the field the record already has —
+       rather than through a live follow-up Activity.
+
+       That is not a lesser path, it is the correct one. Approval turns
+       `pendingFirstAction` into the Lead's first follow-up Activity, so the
+       action a salesperson planned while prospecting becomes the same Activity
+       afterwards: one continuous history, no duplicate, and no edit to the
+       conversion path to prevent one. Writing a live Activity here instead
+       would leave approval creating a SECOND follow-up from a field that was
+       still set.
+
+       `nextFollowUpAt` is stamped either way so the work queue sorts a
+       Prospect alongside everything else. */
+    /* Validated against this Lead before anything is written, so a bad id
+       refuses the whole request rather than storing a pointer to nobody. */
+    const target = resolveLeadContact(lead, req.body?.leadContactId);
+
+    if (lead.captureStatus === "draft") {
+      lead.pendingFirstAction = {
+        subject,
+        dueDate: due,
+        notes: req.body?.description ? String(req.body.description).trim() : undefined,
+        leadContactId: target.leadContactId,
+      };
+      lead.nextFollowUpAt = due;
+      lead.updatedBy = actor(req);
+      await lead.save();
+      await recordChange(req, {
+        departmentSlug: "sales", entity: "lead", entityId: lead._id, entityLabel: displayName(lead),
+        action: "update", summary: `Next action set: ${subject} (${lead.leadId})`, after: lead.toObject(),
+      });
+      /* Same envelope as the Active path, so one frontend handles both. The
+         planned action is echoed as `activity` in the shape the UI reads. */
+      return res.json({
+        success: true,
+        lead,
+        activity: { subject, dueDate: due, status: "planned", activityType: "follow_up", pending: true },
+      });
+    }
 
     // CANONICAL next action = the earliest-due open planned follow-up (tie-broken
     // by createdAt) — the SAME one the frontend picks. Any other open follow-up
@@ -1266,11 +2014,17 @@ router.patch("/:id/next-action", salesAuth, async (req, res) => {
     try {
       if (canonical) {
         canonical.subject = subject; canonical.dueDate = due; canonical.status = "planned"; canonical.updatedBy = actor(req);
+        /* Same person the request named — an Active Lead's next action is a
+           real Activity, so the target lives on it rather than on
+           `pendingFirstAction`. */
+        canonical.leadContactId = target.leadContactId;
+        if (target.contactName) canonical.contactName = target.contactName;
         await canonical.save();
         activity = canonical;
       } else {
         activity = await Activity.create({
           leadId: lead._id, activityType: "follow_up", subject, dueDate: due, status: "planned",
+          ...target,
           ownerId: lead.assignedTo || req.user?.id, ownerName: lead.assignedToName || req.user?.name,
           createdBy: actor(req), updatedBy: actor(req),
         });
@@ -1291,7 +2045,7 @@ router.patch("/:id/next-action", salesAuth, async (req, res) => {
       try {
         if (createdId) await Activity.deleteOne({ _id: createdId });
         else if (canonical && canonPrev) { await Activity.updateOne({ _id: canonical._id }, { $set: { subject: canonPrev.subject, dueDate: canonPrev.dueDate, status: canonPrev.status } }); }
-        await Lead.updateOne({ _id: lead._id }, leadPrevNext ? { $set: { nextFollowUpAt: leadPrevNext } } : { $unset: { nextFollowUpAt: "" } });
+        await Lead.updateOne(await scoped(req, { _id: lead._id }), leadPrevNext ? { $set: { nextFollowUpAt: leadPrevNext } } : { $unset: { nextFollowUpAt: "" } });
       } catch { /* leave the thrown error as the reported cause */ }
       return res.status(400).json({ success: false, message: err.message || "Could not set the next action." });
     }
@@ -1308,16 +2062,42 @@ router.patch("/:id/next-action", salesAuth, async (req, res) => {
 
 router.get("/:id/readiness", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id).lean();
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
-    const { leadMatches, accountMatches } = await checkStrongDuplicates(lead);
+    const { leadMatches, accountMatches, duplicateMatches } = await checkStrongDuplicates(lead, req);
     const isDraft = lead.captureStatus === "draft";
-    const { checks, ready } = isDraft ? computeSubmissionReadiness(lead) : { checks: [], ready: false };
-    const qualification = isDraft ? null : computeQualificationReadiness(lead);
-    res.json({ success: true, checks, ready, leadMatches, accountMatches, qualification });
+    /* `readyToConfirm` and `preConfirmChecks` travel too: the screen gates its
+       Convert button on the first and lists the second, so that the interest
+       signal and note — which are typed into the dialog that button opens —
+       are never presented as blockers before the dialog can open. `ready`
+       still means the whole bar and is what conversion enforces. */
+    const { checks, ready, readyToConfirm, preConfirmChecks } = isDraft
+      ? computeSubmissionReadiness(lead, {
+          hasSuccessfulInteraction: await hasSuccessfulInteraction(lead._id),
+        })
+      : { checks: [], ready: false, readyToConfirm: false, preConfirmChecks: [] };
+    /* ── TWO GATES, REPORTED SEPARATELY ────────────────────────────────
+       The Lead lifecycle has two forward steps and they ask for different
+       things: Requirement Captured wants the requirement, Enquiry Ready
+       wants everything an Enquiry cannot be raised without. Reporting one
+       merged list would make the workspace show a salesperson the Enquiry bar
+       while they are still trying to write down what the customer asked for.
+
+       `qualification` keeps its old shape and meaning (the Enquiry bar) so
+       nothing reading it breaks; the two named keys are what the stage
+       checklists render. The server is the enforcer either way — this is the
+       mirror, not the rule. */
+    const qualification = isDraft ? null : computeEnquiryReadiness(lead);
+    res.json({
+      success: true,
+      checks, ready, readyToConfirm, preConfirmChecks,
+      leadMatches, accountMatches, duplicateMatches, qualification,
+      requirementIdentified: isDraft ? null : computeRequirementIdentifiedReadiness(lead),
+      enquiryReady: qualification,
+    });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -1330,7 +2110,7 @@ router.get("/:id/readiness", salesAuth, async (req, res) => {
 // this can never certify a review of data that no longer exists.
 router.post("/:id/review-duplicates", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
@@ -1352,7 +2132,7 @@ router.post("/:id/review-duplicates", salesAuth, async (req, res) => {
 // action's archivedAt/archivedBy (see the Lead model's own comment).
 router.patch("/:id/archive-draft", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (lead.captureStatus !== "draft") {
       // Covers "already archived" too — an archived draft can't be re-archived
@@ -1398,18 +2178,32 @@ router.patch("/:id/archive-draft", salesAuth, async (req, res) => {
 // Account/Contact/Sales Journey, a later chunk) — it's an internal review
 // gate; the language throughout is "Approve as Active Lead", never "convert".
 
-// POST /api/cms/crm/leads/:id/convert-to-active — the direct path (20 Aug
-// 2026, explicit request): the salesperson converts a ready Prospect
-// straight to an Active Lead, no HOD review in between. Same readiness gate
-// /submit enforced, same create-Activity-then-flip-then-rollback reliability
-// pattern /approve uses — just one call instead of submit-then-approve, and
-// reviewStatus never passes through "submitted" (so the Prospect is never
-// locked read-only waiting on anyone). /submit, /approve, /return-for-info
-// and /reject below are left in place — nothing forces their use anymore,
-// but removing working, reachable routes wasn't asked for.
+// POST /api/cms/crm/leads/:id/convert-to-active — THE conversion route, and
+// the only one. The salesperson converts a ready Prospect straight to an
+// Active Lead, no HOD review in between (20 Aug 2026, explicit request).
+//
+// A second `router.post("/:id/convert-to-active")` used to sit ~190 lines
+// below this one. Express matches the first registration and never reaches the
+// second, so that handler was unreachable code that read like live code — two
+// implementations of one rule, free to drift apart, with the drift invisible
+// because only one of them ever ran. This is the one that ran; the dead one is
+// deleted, and the conversion suite now asserts the route is registered
+// exactly once so it cannot come back.
+//
+// What was worth keeping from the dead copy is folded in below: an explicit
+// check that the first action really is there before it is dereferenced.
+// Everything else it did, this already did — and it stamped the review side by
+// hand, where this delegates to services/leadReview.js's applyDirectConvert,
+// the single writer of `reviewStatus` and the reason the state machine cannot
+// be bypassed.
+//
+// Same readiness gate /submit enforces, same create-Activity-then-flip-then-
+// rollback reliability pattern /approve uses. /submit, /approve,
+// /return-for-info and /reject are left in place — nothing forces their use
+// anymore, but removing working, reachable routes wasn't asked for.
 router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
@@ -1421,12 +2215,42 @@ router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
     } catch (err) {
       return sendReviewError(res, err);
     }
-    const { checks, ready } = computeSubmissionReadiness(lead);
+    /* ── THE INTEREST THAT JUSTIFIES THE CONVERSION ────────────────────────
+       Recorded on the record itself, before the readiness gate runs, so the
+       gate's own interestSignal/interestNote checks judge what was just sent
+       rather than what was there beforehand.
+
+       The signal and the note come from the salesperson. WHO confirmed it and
+       WHEN are set here from the authenticated request and are never read from
+       the body: a client-supplied "confirmed by" is not a confirmation, it is
+       an assertion, and this field exists precisely so somebody can be asked
+       about it later. */
+    if (req.body?.interestSignal !== undefined) lead.interestSignal = req.body.interestSignal;
+    if (req.body?.interestNote !== undefined) lead.interestNote = String(req.body.interestNote || "").trim();
+    if (lead.interestSignal || lead.interestNote) {
+      lead.interestConfirmedAt = new Date();
+      lead.interestConfirmedBy = actor(req);
+    }
+
+    const { checks, ready } = computeSubmissionReadiness(lead, {
+      hasSuccessfulInteraction: await hasSuccessfulInteraction(lead._id),
+    });
     if (!ready) {
       return res.status(400).json({
         success: false,
         message: "This Prospect isn't ready to convert yet.",
         checks,
+      });
+    }
+
+    /* Belt and braces: readiness already requires the first action and its
+       date, but this route dereferences both below and a 500 would be a poor
+       way to say "you forgot the follow-up". */
+    const first = lead.pendingFirstAction || {};
+    if (!String(first.subject || "").trim() || !first.dueDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Set the first follow-up — an Active Lead starts with something scheduled.",
       });
     }
 
@@ -1442,9 +2266,15 @@ router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
     const activity = await Activity.create({
       leadId: lead._id,
       activityType: "follow_up",
-      subject: String(lead.pendingFirstAction.subject).trim(),
-      description: lead.pendingFirstAction.notes ? String(lead.pendingFirstAction.notes).trim() : undefined,
-      dueDate: lead.pendingFirstAction.dueDate,
+      subject: String(first.subject).trim(),
+      description: first.notes ? String(first.notes).trim() : undefined,
+      dueDate: first.dueDate,
+      /* The person the planned action was aimed at, carried onto the Activity
+         it becomes. Re-resolved rather than copied: a contact removed between
+         planning and converting must not leave a pointer to nobody, and this
+         is inside the existing create-then-flip-then-rollback order, so a
+         refusal here still leaves no half-converted record. */
+      ...resolveLeadContact(lead, first.leadContactId),
       status: "planned",
       ownerId: lead.assignedTo || req.user?.id,
       ownerName: lead.assignedToName || req.user?.name,
@@ -1454,7 +2284,7 @@ router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
 
     try {
       lead.captureStatus = "active";
-      lead.nextFollowUpAt = lead.pendingFirstAction.dueDate;
+      lead.nextFollowUpAt = first.dueDate;
       lead.updatedBy = actor(req);
       await lead.save();
     } catch (err) {
@@ -1494,7 +2324,7 @@ router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
 // (refuseIfLocked) until a HOD reviews it.
 router.post("/:id/submit", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     // A Prospect is restricted-visible; its owner/creator (or a manager) may
     // submit it. Same access rule as every other Prospect mutation.
@@ -1515,7 +2345,26 @@ router.post("/:id/submit", salesAuth, async (req, res) => {
     // applySubmit set reviewStatus="submitted" in memory; only persist it if
     // the submission is actually READY (checked against the pre-submit data —
     // reviewStatus isn't part of the checklist, so reading `lead` is fine).
-    const { checks, ready } = computeSubmissionReadiness(lead);
+    /* ── THE INTEREST THAT JUSTIFIES THE CONVERSION ────────────────────────
+       Recorded on the record itself, before the readiness gate runs, so the
+       gate's own interestSignal/interestNote checks judge what was just sent
+       rather than what was there beforehand.
+
+       The signal and the note come from the salesperson. WHO confirmed it and
+       WHEN are set here from the authenticated request and are never read from
+       the body: a client-supplied "confirmed by" is not a confirmation, it is
+       an assertion, and this field exists precisely so somebody can be asked
+       about it later. */
+    if (req.body?.interestSignal !== undefined) lead.interestSignal = req.body.interestSignal;
+    if (req.body?.interestNote !== undefined) lead.interestNote = String(req.body.interestNote || "").trim();
+    if (lead.interestSignal || lead.interestNote) {
+      lead.interestConfirmedAt = new Date();
+      lead.interestConfirmedBy = actor(req);
+    }
+
+    const { checks, ready } = computeSubmissionReadiness(lead, {
+      hasSuccessfulInteraction: await hasSuccessfulInteraction(lead._id),
+    });
     if (!ready) {
       return res.status(400).json({
         success: false,
@@ -1540,122 +2389,6 @@ router.post("/:id/submit", salesAuth, async (req, res) => {
   }
 });
 
-// POST /api/cms/crm/leads/:id/convert-to-active — the DIRECT path.
-//
-// Prospect Setup's own button (DraftWorkspace.js) has called this since the
-// review hop was dropped on 20 Aug 2026 — "Send to HOD and then HOD approval…
-// these are not needed" — but the route was never written, so the button has
-// been posting into a 404 and no Prospect could reach Active Leads through the
-// UI at all. Written 22 Aug 2026.
-//
-// It is /approve minus the review state machine, and nothing else:
-//
-//   • No applyApprove — that asserts the Prospect is AWAITING REVIEW, which is
-//     exactly the hop this path removes. `reviewStatus` is still stamped
-//     "approved" so the record reads consistently to everything that displays
-//     it (leadReview.js, the Prospects filters, the workspace chip).
-//   • The readiness CHECKLIST still gates it. The review hop was removed; the
-//     bar was not. The UI disables the button on the same computation, so this
-//     is the server refusing what the client already refuses — not a new rule.
-//   • Same create-Activity-then-flip-then-rollback order as /approve, for the
-//     same reason: an Active Lead must never exist without its first follow-up,
-//     and a failed flip must not strand an Activity.
-//
-// /approve stays exactly as it is. Nothing is torn out — a workflow that does
-// route Prospects through a reviewer still works.
-router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
-  try {
-    const lead = await Lead.findById(req.params.id);
-    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
-    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
-      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
-    }
-    if (lead.captureStatus !== "draft") {
-      return res.status(400).json({
-        success: false,
-        message: lead.captureStatus === "active"
-          ? "This is already an Active Lead."
-          : "Only a Prospect can be converted to an Active Lead.",
-      });
-    }
-
-    const { checks, ready } = computeSubmissionReadiness(lead);
-    if (!ready) {
-      return res.status(400).json({
-        success: false,
-        message: "This Prospect isn't ready to become an Active Lead yet.",
-        checks,
-      });
-    }
-
-    // Belt and braces: readiness covers the first action, but this route
-    // dereferences it below and a 500 would be a poor way to say so.
-    const first = lead.pendingFirstAction || {};
-    if (!String(first.subject || "").trim() || !first.dueDate) {
-      return res.status(400).json({
-        success: false,
-        message: "Set the first follow-up — an Active Lead starts with something scheduled.",
-      });
-    }
-
-    const before = lead.toObject();
-
-    // Activity FIRST, flip second, roll the Activity back if the flip fails.
-    const activity = await Activity.create({
-      leadId: lead._id,
-      activityType: "follow_up",
-      subject: String(first.subject).trim(),
-      description: first.notes ? String(first.notes).trim() : undefined,
-      dueDate: first.dueDate,
-      status: "planned",
-      ownerId: lead.assignedTo || req.user?.id,
-      ownerName: lead.assignedToName || req.user?.name,
-      createdBy: actor(req),
-      updatedBy: actor(req),
-    });
-
-    try {
-      lead.captureStatus = "active";
-      // qualificationState is untouched — it stays "new". Converting says this
-      // is worth working, not that it has been qualified.
-      lead.reviewStatus = "approved";
-      lead.reviewedAt = new Date();
-      lead.reviewedBy = actor(req);
-      lead.reviewReason = undefined;
-      lead.nextFollowUpAt = first.dueDate;
-      lead.updatedBy = actor(req);
-      await lead.save();
-    } catch (err) {
-      await Activity.deleteOne({ _id: activity._id });
-      throw err;
-    }
-
-    await recordChange(req, {
-      departmentSlug: "sales",
-      entity: "lead",
-      entityId: lead._id,
-      entityLabel: displayName(lead),
-      action: "update",
-      summary: `Prospect converted to Active Lead: ${lead.leadId}`,
-      before,
-      after: lead.toObject(),
-    });
-    await recordChange(req, {
-      departmentSlug: "sales",
-      entity: "crm-activity",
-      entityId: activity._id,
-      entityLabel: activity.subject,
-      action: "create",
-      summary: `follow_up: ${activity.subject} (Lead ${displayName(lead)}, created on conversion)`,
-      after: activity.toObject(),
-    });
-
-    res.json({ success: true, lead, activity });
-  } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
-  }
-});
-
 // POST /api/cms/crm/leads/:id/approve — approves a submitted Prospect AS an
 // Active Lead. The ONLY path from Prospect to Active Lead.
 // Optional `assignedTo` lets the approver assign a different owner IN the
@@ -1670,7 +2403,7 @@ router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
 // `salesAuth` above) may approve. reject/return-for-info below are untouched.
 router.post("/:id/approve", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
 
     const before = lead.toObject();
@@ -1695,6 +2428,13 @@ router.post("/:id/approve", salesAuth, async (req, res) => {
       subject: String(lead.pendingFirstAction.subject).trim(),
       description: lead.pendingFirstAction.notes ? String(lead.pendingFirstAction.notes).trim() : undefined,
       dueDate: lead.pendingFirstAction.dueDate,
+      /* The same carry-over the direct conversion does. This path is retained
+         rather than used by the current UI, but a Prospect approved through it
+         must not silently lose the person its first follow-up was aimed at.
+         Re-resolved, so a contact removed since planning refuses here rather
+         than leaving a pointer to nobody — inside the existing
+         create-then-flip-then-rollback order. */
+      ...resolveLeadContact(lead, lead.pendingFirstAction.leadContactId),
       status: "planned",
       ownerId: lead.assignedTo || req.user?.id,
       ownerName: lead.assignedToName || req.user?.name,
@@ -1746,7 +2486,7 @@ router.post("/:id/approve", salesAuth, async (req, res) => {
 // Stays a Prospect and becomes editable / re-submittable again.
 router.post("/:id/return-for-info", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (!(await isSalesManager(req.user))) {
       return res.status(403).json({ success: false, message: "Only a HOD or admin can return a Prospect for more information." });
@@ -1779,7 +2519,7 @@ router.post("/:id/return-for-info", salesAuth, async (req, res) => {
 // reviewStatus → "rejected" (services/leadReview.js applyReject sets both).
 router.post("/:id/reject", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (!(await isSalesManager(req.user))) {
       return res.status(403).json({ success: false, message: "Only a HOD or admin can reject a Prospect." });
@@ -1814,21 +2554,37 @@ router.post("/:id/reject", salesAuth, async (req, res) => {
 // at all — a valid leadId returned that Lead's activities to any
 // authenticated Sales caller, restricted or not. Now fetches the Lead first
 // (like every other :id route in this file) and applies the same
-// isRestricted/canSeeRestricted rule, plus refuses entirely for a still-Draft
-// Lead — a Draft has no operational Activities to expose (see
-// pendingFirstAction instead).
+// isRestricted/canSeeRestricted rule.
+//
+// It ALSO used to refuse a still-Draft Lead outright, on the reasoning that a
+// Draft had no operational Activities to expose. That is no longer true and
+// was never quite right: a Prospect is the record being rung and mailed, so
+// its activities are the first ones there are. Drafts are served here like any
+// other record — ownership, not capture status, is what gates this route.
 router.get("/:id/activities", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id)
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
       .select("_id captureStatus createdBy assignedTo")
       .lean();
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
-    if (lead.captureStatus === "draft") {
-      return res.status(400).json({ success: false, message: "Prospects don't have Activities yet — start working the Lead first." });
-    }
+    /* ── A PROSPECT IS WORKED BEFORE IT IS QUALIFIED ─────────────────────
+       This refused a Draft outright: "Prospects don't have Activities yet —
+       start working the Lead first." That inverted the actual job. A Prospect
+       IS the record you ring, mail and message to discover whether interest
+       exists; requiring conversion first meant either working the customer
+       with no record of it, or converting on hope to unlock the buttons.
+
+       Removed, not relaxed — everything that made this route safe is above
+       and untouched: the company scope on the lookup, isRestricted /
+       canSeeRestricted for ownership, and refuseIfLocked for archived and
+       submitted records. A Draft was never a permission question.
+
+       Qualification is unaffected. Logging outreach writes an Activity and
+       nothing else — captureStatus stays "draft", qualificationState is not
+       read or written here, and /qualification-state still refuses Drafts. */
 
     const { type, status, page = 1, limit = 50 } = req.query;
     const filter = { isActive: true, leadId: req.params.id };
@@ -1876,7 +2632,7 @@ router.get("/:id/activities", salesAuth, async (req, res) => {
 // recomputed alongside it.
 router.patch("/:id/activities/:activityId", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
@@ -1906,6 +2662,26 @@ router.patch("/:id/activities/:activityId", salesAuth, async (req, res) => {
     // reminder... set modify there status/progress"). Reuses the same
     // ACTIVITY_STATUS_CODES/ACTIVITY_PRIORITY_CODES every other Activity
     // write in this file already validates against.
+    /* ── A REMINDER CAN BE RE-AIMED ───────────────────────────────────────
+       `NextActionForm` was already sending `leadContactId` while editing a
+       reminder, and this route ignored it — so the shared contact selector was
+       visible, the field travelled, and nothing happened. Either the field
+       stops being sent or the route honours it; honouring it is the useful
+       half, because the person a follow-up is for genuinely changes.
+
+       `null` clears the target, and clears the derived name with it: leaving a
+       `contactName` behind would show a reminder still labelled with somebody
+       it is no longer aimed at. */
+    if (req.body?.leadContactId !== undefined) {
+      if (req.body.leadContactId === null || req.body.leadContactId === "") {
+        activity.leadContactId = undefined;
+        activity.contactName = undefined;
+      } else {
+        const target = resolveLeadContact(lead, req.body.leadContactId);
+        activity.leadContactId = target.leadContactId;
+        activity.contactName = target.contactName;
+      }
+    }
     if (req.body?.priority !== undefined) {
       if (!ACTIVITY_PRIORITY_CODES.includes(req.body.priority)) {
         return res.status(400).json({ success: false, message: `priority must be one of: ${ACTIVITY_PRIORITY_CODES.join(", ")}` });
@@ -2009,9 +2785,17 @@ router.patch("/:id/activities/:activityId", salesAuth, async (req, res) => {
  * loop below catches it per-item and keeps going).
  */
 async function createLeadActivity(req, lead, body = {}) {
-  if (lead.captureStatus === "draft") {
-    throw { status: 400, message: "Prospects don't have Activities yet — start working the Lead first." };
-  }
+  /* ── A DRAFT IS A RECORD YOU WORK, NOT ONE YOU WAIT ON ────────────────────
+     This threw for any Draft, which is why the canonical POST /:id/activities
+     appeared to accept a Prospect and then refused it one level down. A
+     Prospect is precisely the record being rung and mailed to discover whether
+     interest exists; the outreach has to be loggable while it is still a
+     Prospect or it is not logged at all.
+
+     Nothing that made this safe was in this check. Callers have already proved
+     company scope, ownership (isRestricted/canSeeRestricted) and that the
+     record is not archived or submitted. Writing an Activity touches neither
+     captureStatus nor qualificationState, so a Prospect stays a Prospect. */
   const { activityType, subject } = body;
   if (!activityType || !subject) {
     throw { status: 400, message: "activityType and subject are required." };
@@ -2036,7 +2820,10 @@ async function createLeadActivity(req, lead, body = {}) {
     dueDate: body.dueDate,
     priority: body.priority,
     contactId: body.contactId,
-    contactName: body.contactName,
+    /* Which person, and what they were called at the time. `leadContactId` is
+       resolved against this Lead's own contacts; the name is derived from the
+       match rather than trusted from the request. */
+    ...resolveLeadContact(lead, body.leadContactId, body.contactName),
     channel: body.channel,
     direction: body.direction,
     visibility: body.visibility,
@@ -2069,20 +2856,14 @@ async function createLeadActivity(req, lead, body = {}) {
   });
 
   if (!isTask && SUCCESSFUL_CONTACT_OUTCOMES.has(data.outcome)) {
-    await Lead.updateOne(
-      { _id: lead._id },
-      { $set: { lastContactedAt: data.activityDate || new Date(), updatedBy: actor(req) } },
-    );
+    await Lead.updateOne(await scoped(req, { _id: lead._id }), { $set: { lastContactedAt: data.activityDate || new Date(), updatedBy: actor(req) } },);
   }
 
   if (isTask && data.activityType === "follow_up") {
     const openNow = await Activity.find({
       leadId: lead._id, isActive: true, activityType: "follow_up", status: "planned",
     }).lean();
-    await Lead.updateOne(
-      { _id: lead._id },
-      { $set: { nextFollowUpAt: nextFollowUpAt(openNow), updatedBy: actor(req) } },
-    );
+    await Lead.updateOne(await scoped(req, { _id: lead._id }), { $set: { nextFollowUpAt: nextFollowUpAt(openNow), updatedBy: actor(req) } },);
   }
 
   return activity;
@@ -2090,8 +2871,12 @@ async function createLeadActivity(req, lead, body = {}) {
 
 router.post("/:id/activities", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id)
-      .select("_id firstName lastName captureStatus createdBy assignedTo assignedToName")
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
+      /* `contacts` is here because an Activity may name one of them, and
+         `resolveLeadContact` resolves that id against this Lead's own people
+         rather than trusting it. Narrowing it out made every contact-targeted
+         log look like a foreign id. */
+      .select("_id firstName lastName captureStatus createdBy assignedTo assignedToName contacts")
       .lean();
     if (!lead)
       return res
@@ -2144,56 +2929,208 @@ router.post("/:id/activities", salesAuth, async (req, res) => {
  */
 router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id)
-      .select("_id firstName lastName company phone whatsapp email contacts captureStatus")
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
+      /* `createdBy` and `assignedTo` are what `canSeeRestricted` reads. Without
+         them the ownership test could not pass and this route answered 403 to
+         the owner of any restricted record — invisible until Prospects began
+         reaching it, because the Draft early-return used to sit just below. */
+      .select("_id firstName lastName company phone whatsapp email contacts captureStatus createdBy assignedTo")
       .lean();
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
     if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
-    if (lead.captureStatus === "draft") {
-      return res.json({ success: true, logged: { calls: 0, messages: 0, emails: 0 }, skippedAmbiguous: { phone: false, email: false } });
-    }
+    /* Auto-sync used to return an empty result for a Draft. A Prospect is the
+       record most likely to have real call and message evidence and no typed
+       activity yet, so it was switched off exactly where it was most useful.
+       The ambiguity guard below is unchanged and still refuses to attribute a
+       call or message whose number or address matches more than one record. */
 
     const TEN_MIN = 10 * 60 * 1000;
     const leadName = displayName(lead);
     const existing = await Activity.find({
       leadId: lead._id, isActive: true, activityType: { $in: ["call", "message", "email_log"] },
-    }).select("activityType activityDate").lean();
-    const loggedTimesOf = (type) => existing
-      .filter((a) => a.activityType === type)
-      .map((a) => new Date(a.activityDate || 0).getTime())
-      .filter(Boolean);
-    const loggedCall = loggedTimesOf("call");
-    const loggedMsg = loggedTimesOf("message");
-    const loggedMail = loggedTimesOf("email_log");
-    const isNew = (t, list) => !list.some((lt) => Math.abs(lt - t) < TEN_MIN);
+    }).select("activityType activityDate leadContactId").lean();
 
-    const ambiguous = await ambiguousContactChannels(lead);
+    /* ── TWO PEOPLE AT ONCE ARE NOT ONE EVENT ───────────────────────────
+       The window used to be per CHANNEL: any call already logged within ten
+       minutes suppressed the next one. Ring the merchandiser and then the
+       purchase manager about the same order — as anybody would — and the
+       second call silently never appeared.
+
+       Partitioned by contact now. An Activity with no contact (legacy history,
+       or evidence too ambiguous to attribute) stays in a shared bucket that
+       ALSO suppresses re-importing that same source event, so an old
+       unassigned row still stops a duplicate of itself. The ten-minute
+       tolerance inside one contact/source identity is unchanged. */
+    const key = (type, contactId) => `${type}::${contactId ? String(contactId) : "-"}`;
+    const loggedTimes = new Map();
+    for (const a of existing) {
+      const t = new Date(a.activityDate || 0).getTime();
+      if (!t) continue;
+      const k = key(a.activityType, a.leadContactId);
+      if (!loggedTimes.has(k)) loggedTimes.set(k, []);
+      loggedTimes.get(k).push(t);
+    }
+    /* ── THE BUCKETS DO NOT MIX ─────────────────────────────────────────
+       This used to fold every unattributed Activity into each contact's
+       times, on the reasoning that an event logged before it could be
+       attributed is still the same event. That needs a way to RECOGNISE the
+       event, and there is none — `Activity` stores no source identity, so the
+       only thing compared is a timestamp, which cannot tell "the same call,
+       now attributed" from "a different call to a different person three
+       minutes later".
+
+       The cost of mixing was the exact defect this window was meant to fix:
+       one unassigned call at 10:00 suppressed every contact's 10:03 call. Each
+       bucket now deduplicates against itself alone. */
+    const timesFor = (type, contactId) => loggedTimes.get(key(type, contactId)) || [];
+    const isNew = (t, list) => !list.some((lt) => Math.abs(lt - t) < TEN_MIN);
+    const remember = (type, contactId, t) => {
+      const k = key(type, contactId);
+      if (!loggedTimes.has(k)) loggedTimes.set(k, []);
+      loggedTimes.get(k).push(t);
+    };
+
+    /* ── WHICH PERSON DID THIS BELONG TO? ────────────────────────────────
+       Evidence arrives with a number or an address, not a name. When exactly
+       ONE of this Lead's contacts owns that identity, the Activity can say who
+       it was with. When two of them share it — a shared desk line, a generic
+       purchasing@ mailbox — there is no way to tell, and guessing would put a
+       call in the wrong person's history where nobody would ever check it.
+
+       So this returns a contact or nothing, and nothing is a perfectly good
+       answer: the Activity is still logged, still truthful, and stays at the
+       Lead level with the external name the device reported. That mirrors the
+       existing ambiguity policy one level down — that one refuses to attribute
+       across RECORDS, this one across PEOPLE within a record.
+
+       Normalisation matches what the Lead model stores (see its contact hook),
+       so a "+91 98765 00011" in the call log finds a contact saved as
+       "9876500011". */
+    /* ── RESOLVING ONE EVENT, NOT A WHOLE CHANNEL ───────────────────────
+       The previous version turned a shared identity into `{}` — no contact —
+       and then logged the evidence at Lead level anyway. That is the safety
+       rule inverted: an identity belonging to two Leads means the event might
+       be the OTHER customer's, and copying it here duplicates potentially
+       private correspondence onto a record it may have nothing to do with.
+       Dropping the attribution does not make that safe; skipping does.
+
+       Four outcomes, because they genuinely differ:
+         unique + not shared  → log it, and say who it was with
+         shared across Leads  → skip the event entirely
+         ambiguous inside     → log at Lead level; both people are ours
+         no contact match     → the legacy channel guard decides
+
+       And the guard is per EVENT now, not per channel: a duplicated top-level
+       phone no longer silences a call that uniquely belongs to one of this
+       record's own contacts. */
+    const hasContacts = (lead.contacts || []).length > 0;
+
+    /* Is THIS identity one that also exists on another Lead? Asked of the
+       identity the event arrived on, not of the person — a contact with a
+       shared mailbox and a private mobile is ambiguous on one and unique on
+       the other. */
+    const identityShared = (kind, raw) => {
+      const value = kind === "email" ? String(raw || "").trim().toLowerCase() : phoneTail(raw);
+      if (!value) return false;
+      return sharedIdentities.has(`${kind}:${value}`);
+    };
+
+    /* ── RESOLVING ONE EVENT ────────────────────────────────────────────
+       Four outcomes, because they genuinely differ:
+         unique + not shared  → log it, and say who it was with
+         shared across Leads  → skip the event entirely
+         several of OUR people, none shared → Lead level; it is still ours
+         several of ours, one shared        → skip; it may be the other
+                                              customer's correspondence
+         no contact match     → the legacy channel guard decides
+
+       Dropping only the attribution was never enough: an identity belonging to
+       two Leads means the event might be the OTHER customer's, and copying it
+       here duplicates potentially private correspondence onto a record it may
+       have nothing to do with. */
+    const resolveEvidence = (identity, channelAmbiguous) => {
+      const kind = identity.email ? "email" : "phone";
+      const raw = identity.email || identity.phone;
+      if (!hasContacts) {
+        return channelAmbiguous ? { skip: true } : { attribution: {} };
+      }
+      if (identityShared(kind, raw)) return { skip: true };
+      const hits = matchContacts(lead.contacts, identity);
+      if (hits.length === 1) {
+        return { attribution: { leadContactId: hits[0]._id, contactName: hits[0].name } };
+      }
+      /* Two of OUR people on one number, and that number is not on anybody
+         else's record — unattributable, but still this Lead's. */
+      if (hits.length > 1) return { attribution: {} };
+      return channelAmbiguous ? { skip: true } : { attribution: {} };
+    };
+
+    const resolveEmailEvidence = (addresses, exclude, channelAmbiguous) => {
+      if (!hasContacts) {
+        return channelAmbiguous ? { skip: true } : { attribution: {} };
+      }
+      const mine = String(exclude || "").trim().toLowerCase();
+      const relevant = addresses.filter((a) => a && a !== mine);
+      /* Any address on this message that is shared with another Lead takes the
+         whole message out — we cannot tell whose thread it is. */
+      if (relevant.some((a) => identityShared("email", a))) return { skip: true };
+
+      const found = new Map();
+      for (const addr of relevant) {
+        for (const c of matchContacts(lead.contacts, { email: addr })) found.set(String(c._id), c);
+      }
+      if (found.size === 1) {
+        const c = [...found.values()][0];
+        return { attribution: { leadContactId: c._id, contactName: c.name } };
+      }
+      if (found.size > 1) return { attribution: {} };
+      return channelAmbiguous ? { skip: true } : { attribution: {} };
+    };
+
+    const parseAddresses = parseEmailAddresses;
+    const waBody = whatsappBody;
+
+    const ambiguous = await ambiguousContactChannels(lead, req);
+    /* Per-contact cross-record uniqueness — the top-level check above cannot
+       see a secondary contact's identity. */
+    const sharedIdentities = await ambiguousContactIdentities(lead, req);
     const logged = { calls: 0, messages: 0, emails: 0 };
     const skippedCounts = { calls: 0, messages: 0, emails: 0 };
 
     // ── Calls ──────────────────────────────────────────────────────────────
-    const calls = await matchedCallEvents(lead);
-    if (ambiguous.phone) {
-      skippedCounts.calls = calls.length;
-    } else {
+    const calls = await matchedCallEvents(lead, req);
+    {
       for (const c of calls) {
         if (!c.startTime) continue;
         const t = new Date(c.startTime).getTime();
-        if (!isNew(t, loggedCall)) continue;
+        /* Per event: a duplicated top-level phone no longer silences a call
+           that uniquely belongs to one of this record's own contacts, and a
+           number shared with another Lead is skipped rather than downgraded. */
+        const res = resolveEvidence({ phone: c.phoneNumber }, ambiguous.phone);
+        if (res.skip) { skippedCounts.calls++; continue; }
+        const who = res.attribution;
+        if (!isNew(t, timesFor("call", who.leadContactId))) continue;
         const connected = c.received === true;
         try {
           await createLeadActivity(req, lead, {
             activityType: "call",
             subject: connected ? "Call (from call log)" : c.rejected ? "Call rejected (from call log)" : "Call attempted (from call log)",
             direction: c.direction === "INCOMING" ? "inbound" : "outbound",
+            /* A unique contact match names the person; otherwise the device's
+               own label, or the record. `contactName` is only used when no
+               contact was resolved — createLeadActivity derives it from the id
+               whenever one is present. */
             contactName: c.contactName || leadName,
+            ...who,
             activityDate: new Date(c.startTime).toISOString(),
             outcome: connected ? "replied_connected" : "no_answer",
-            description: c.hasRecording ? "Auto-logged from a synced call recording, not typed in by hand." : "Auto-logged from the phone's call log, not typed in by hand.",
+            /* `hasRecording` is a virtual and `.lean()` strips it, so this
+               branch never fired. `driveFileId` is what the virtual reads. */
+            description: c.driveFileId ? "Auto-logged from a synced call recording, not typed in by hand." : "Auto-logged from the phone's call log, not typed in by hand.",
           });
-          loggedCall.push(t);
+          remember("call", who.leadContactId, t);
           logged.calls++;
         } catch (e) {
           console.error(`[leads] auto-sync call failed for ${lead._id}:`, e.message || e);
@@ -2202,14 +3139,15 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     }
 
     // ── WhatsApp ───────────────────────────────────────────────────────────
-    const msgs = await matchedWhatsAppMessages(lead);
-    if (ambiguous.phone) {
-      skippedCounts.messages = msgs.length;
-    } else {
+    const msgs = await matchedWhatsAppMessages(lead, req);
+    {
       for (const m of msgs) {
         if (!m.timestamp) continue;
         const t = new Date(m.timestamp).getTime();
-        if (!isNew(t, loggedMsg)) continue;
+        const res = resolveEvidence({ phone: m.waId }, ambiguous.phone);
+        if (res.skip) { skippedCounts.messages++; continue; }
+        const who = res.attribution;
+        if (!isNew(t, timesFor("message", who.leadContactId))) continue;
         const incoming = m.direction === "incoming";
         try {
           await createLeadActivity(req, lead, {
@@ -2218,11 +3156,12 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
             subject: incoming ? "WhatsApp reply (from chat log)" : "WhatsApp message (from chat log)",
             direction: incoming ? "inbound" : "outbound",
             contactName: leadName,
+            ...who,
             activityDate: new Date(m.timestamp).toISOString(),
             outcome: incoming ? "replied_connected" : undefined,
-            description: `Auto-logged from the synced WhatsApp chat, not typed in by hand.${m.text ? ` "${m.text}"` : ""}`,
+            description: `Auto-logged from the synced WhatsApp chat, not typed in by hand.${waBody(m) ? ` "${waBody(m)}"` : ""}`,
           });
-          loggedMsg.push(t);
+          remember("message", who.leadContactId, t);
           logged.messages++;
         } catch (e) {
           console.error(`[leads] auto-sync message failed for ${lead._id}:`, e.message || e);
@@ -2231,7 +3170,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     }
 
     // ── Email — only inside the caller's own authenticated request ────────
-    if (!ambiguous.email && req.user?.employeeId) {
+    if (req.user?.employeeId) {
       try {
         const { emailsForLead } = require("../../../services/gmailLeadMatch.service");
         const out = await emailsForLead({ employeeId: req.user.employeeId, leadId: lead._id });
@@ -2239,19 +3178,31 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
           for (const m of out.messages || []) {
             if (!m.sentAt) continue;
             const t = new Date(m.sentAt).getTime();
-            if (!isNew(t, loggedMail)) continue;
             const inbound = m.direction === "inbound";
+            /* The customer's side of the exchange, never the connected
+               mailbox. A shared address that two contacts both carry resolves
+               to nothing — `contactFor` returns a match only when exactly one
+               person owns it — and the email stays truthfully at Lead level. */
+            const res = resolveEmailEvidence(
+              inbound ? parseAddresses(m.fromAddress) : parseAddresses(m.to),
+              out.connectedEmail,
+              ambiguous.email,
+            );
+            if (res.skip) { skippedCounts.emails++; continue; }
+            const who = res.attribution;
+            if (!isNew(t, timesFor("email_log", who.leadContactId))) continue;
             try {
               await createLeadActivity(req, lead, {
                 activityType: "email_log",
                 subject: m.subject || (inbound ? "Email received" : "Email sent"),
                 direction: inbound ? "inbound" : "outbound",
                 contactName: leadName,
+                ...who,
                 activityDate: new Date(m.sentAt).toISOString(),
                 outcome: inbound ? "replied_connected" : undefined,
                 description: `Auto-logged from your connected Gmail, not typed in by hand.${m.snippet ? ` "${m.snippet}"` : ""}`,
               });
-              loggedMail.push(t);
+              remember("email_log", who.leadContactId, t);
               logged.emails++;
             } catch (e) {
               console.error(`[leads] auto-sync email failed for ${lead._id}:`, e.message || e);
@@ -2295,7 +3246,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
 // alongside it, additive only.
 router.post("/:id/activity", salesAuth, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }));
     if (!lead)
       return res
         .status(404)
@@ -2304,11 +3255,9 @@ router.post("/:id/activity", salesAuth, async (req, res) => {
       return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
     }
     if (refuseIfLocked(res, lead)) return;
-    // Lead correction chunk: same rule as the canonical endpoint above — a
-    // Draft has no operational Activities yet.
-    if (lead.captureStatus === "draft") {
-      return res.status(400).json({ success: false, message: "Prospects don't have Activities yet — start working the Lead first." });
-    }
+    /* Kept in step with the canonical POST /:id/activities, which accepts a
+       Draft. Leaving this one refusing would mean the same act succeeding or
+       failing depending on which route the caller happened to reach. */
 
     const { type, title, description, scheduledAt, outcome } = req.body || {};
     // Structured outcome vocabulary (Lead correction chunk) — same rule as
@@ -2373,17 +3322,14 @@ router.post("/:id/activity", salesAuth, async (req, res) => {
 // DELETE /api/cms/crm/leads/:id — soft delete/archive.
 router.delete("/:id", salesAuth, async (req, res) => {
   try {
-    const before = await Lead.findById(req.params.id).lean();
+    const before = await Lead.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!before)
       return res
         .status(404)
         .json({ success: false, message: "Lead not found" });
 
-    const lead = await Lead.findByIdAndUpdate(
-      req.params.id,
-      { isActive: false, archivedAt: new Date(), archivedBy: actor(req) },
-      { new: true },
-    );
+    const lead = await Lead.findOneAndUpdate(await scoped(req, { _id: req.params.id }), { isActive: false, archivedAt: new Date(), archivedBy: actor(req) },
+      { new: true },);
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "lead",
@@ -2404,3 +3350,10 @@ router.delete("/:id", salesAuth, async (req, res) => {
 });
 
 module.exports = router;
+
+/* Exported for tests: the attribution rules, exercised directly rather than
+   through a Gmail account, a call log and a WhatsApp conversation. */
+module.exports.__attribution = {
+  parseEmailAddresses, matchContacts, contactByIdentity, contactByEmailAddresses, whatsappBody,
+  ambiguousContactIdentities,
+};

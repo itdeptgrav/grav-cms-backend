@@ -128,6 +128,29 @@ const salesHandoverVersionSchema = new mongoose.Schema(
   { timestamps: true, collection: "saleshandoverversions" },
 );
 
+/* ── THE BUYER'S PROCESS DECISION IS FROZEN AFTER ISSUE ─────────────────────
+   Sales' stated embroidery / printing / washing requirement, and the buyer
+   approval each answer rests on, are compared value for value against what
+   was loaded: a saved version may not change them in place — a change is a
+   new version. Narrow on purpose: a save that re-casts the stored projection
+   (strict mode stripping a field nobody agreed) leaves the decision equal and
+   still passes, as the contract-integrity suite relies on. */
+const processDecision = (doc) => JSON.stringify(doc.executionProjection?.processRequirements ?? null);
+salesHandoverVersionSchema.post("init", function rememberProcessDecision() {
+  this.$locals.loadedProcessDecision = processDecision(this);
+});
+salesHandoverVersionSchema.pre("save", function freezeProcessDecision(next) {
+  if (this.isNew || this.$locals.loadedProcessDecision === undefined) return next();
+  if (processDecision(this) !== this.$locals.loadedProcessDecision) {
+    const err = new Error(
+      "An issued handover version's buyer-approved processes cannot change — issue a new version instead.",
+    );
+    err.name = "SalesHandoverVersionImmutable";
+    return next(err);
+  }
+  return next();
+});
+
 /* One version number exists once per line, per company — enforced by the
    database, not by check-then-create. */
 salesHandoverVersionSchema.index(

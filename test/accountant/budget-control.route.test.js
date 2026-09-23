@@ -21,6 +21,13 @@ const mongoose = require("mongoose");
  * directly, which would prove the function works and not that the route
  * reaches it. */
 jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  /* Lane A Chunk 3A added the canonical company-scope guard, which the routers
+     under test now mount. Pass-through doubles here on purpose: these suites
+     are about budget and ledger behaviour, and company isolation has its own
+     suite (company-isolation.route.test.js) that exercises the real guard. A
+     mock has to offer what the module offers, or the router fails to load. */
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
   orgAuth: (req, res, next) => {
     const raw = req.headers["x-test-user"];
     if (!raw) return res.status(401).json({ error: "Authentication required." });

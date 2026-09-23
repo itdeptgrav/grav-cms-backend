@@ -141,14 +141,7 @@ function publishRow(row) {
     note: row.note || "",
     /* The frozen required-machine evidence, or an explicit statement that this
        row has none — never an empty list standing in for "we do not know". */
-    requirementSnapshot: snapshot ? {
-      capturedAt: new Date(snapshot.capturedAt).toISOString(),
-      ieOperationRevision: snapshot.ieOperationRevision,
-      requirementsConfigured: Boolean(snapshot.requirementsConfigured),
-      machineTypes: (snapshot.machineTypes || []).map((m) => ({
-        machineType: m.machineType, quantity: m.quantity,
-      })),
-    } : null,
+    requirementSnapshot: publishRequirementSnapshot(snapshot),
     requirementEvidence: snapshot
       ? (snapshot.requirementsConfigured ? "FROZEN" : "FROZEN_NOT_CONFIGURED")
       : "NOT_PROVABLE",
@@ -202,6 +195,9 @@ function publishFile(doc, { readiness }) {
       rows,
       rowCount: rows.length,
       ...samTotals(rows),
+      /* The DRAFT process route: `routeState: "UNKNOWN"` with `stages: null`
+         until somebody declares one. Approved only when frozen into a version. */
+      processRoute: require("./ieProcessRoute.service").publishRoute(doc.bulletin?.processRoute),
     },
     /* ── THE BULLETIN VERSION POINTERS (Chunk 7C1) ───────────────────────
        On every file envelope, so a client renders "frozen, under review as v3"
@@ -748,10 +744,109 @@ function requirementSnapshotOf(op) {
     capturedAt: new Date(),
     ieOperationRevision: op.revision,
     requirementsConfigured: Boolean(requirements.configured),
+    /* The original machine shape, unchanged. Chunk 6B compatibility, the line
+       layout and every stored digest read this exact field, and widening it
+       would restate evidence that has already been approved against. */
     machineTypes: (requirements.machine || []).map((m) => ({
       machineType: m.machineType,
       quantity: m.quantity,
     })),
+
+    /* ── CHUNK 8A-iii: ALL THREE DIMENSIONS, FROZEN ────────────────────────
+       Chunk 5A has modelled attachment and labour requirements since it
+       landed; nothing ever froze them onto a bulletin row, so a release could
+       not say whether they had moved. They are captured here, at the same
+       moment and from the same profile as the machine half.
+
+       `dimensionsCaptured` is the marker that makes an EMPTY list meaningful:
+       without it, an operation that genuinely needs no attachment is
+       indistinguishable from a row frozen before anybody captured attachments
+       at all. Rows written before this exist without it and read as
+       NOT_CAPTURED for ever — nothing is backfilled and no historical version
+       is restated. */
+    dimensionsCaptured: [...REQUIREMENT_DIMENSIONS],
+    machines: (requirements.machine || []).map((m) => ({
+      requirementId: m.requirementId,
+      sequence: m.sequence,
+      machineType: m.machineType,
+      quantity: m.quantity,
+    })),
+    attachments: (requirements.attachment || []).map((a) => ({
+      requirementId: a.requirementId,
+      sequence: a.sequence,
+      code: a.code,
+      name: a.name,
+      quantity: a.quantity,
+      note: a.note || "",
+    })),
+    labour: (requirements.labour || []).map((l) => ({
+      requirementId: l.requirementId,
+      sequence: l.sequence,
+      workerType: l.workerType,
+      quantity: l.quantity,
+      skillCode: l.skillCode || "",
+      skillName: l.skillName || "",
+      grade: l.grade || "",
+      note: l.note || "",
+    })),
+  };
+}
+
+/** The three dimensions a snapshot taken from now on covers. */
+const REQUIREMENT_DIMENSIONS = Object.freeze(["MACHINE", "ATTACHMENT", "LABOUR"]);
+
+/**
+ * The published form of a frozen requirement snapshot.
+ *
+ * One projection, used by the draft bulletin, the bulletin version and the
+ * release-impact comparison, so the three cannot drift into three spellings of
+ * the same evidence. A snapshot taken before Chunk 8A-iii carries no
+ * `dimensionsCaptured`, and its attachment and labour arrays are published as
+ * `null` — a stated absence, never an empty list that would read as "this
+ * operation needs none".
+ */
+function publishRequirementSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const captured = Array.isArray(snapshot.dimensionsCaptured) ? snapshot.dimensionsCaptured : [];
+  const has = (d) => captured.includes(d);
+  return {
+    capturedAt: snapshot.capturedAt ? new Date(snapshot.capturedAt).toISOString() : null,
+    ieOperationRevision: snapshot.ieOperationRevision ?? null,
+    requirementsConfigured: Boolean(snapshot.requirementsConfigured),
+    dimensionsCaptured: [...captured],
+    machineTypes: (snapshot.machineTypes || []).map((m) => ({
+      machineType: m.machineType, quantity: m.quantity,
+    })),
+    machines: has("MACHINE")
+      ? (snapshot.machines || []).map((m) => ({
+        requirementId: m.requirementId || null,
+        sequence: m.sequence ?? null,
+        machineType: m.machineType || "",
+        quantity: m.quantity ?? null,
+      }))
+      : null,
+    attachments: has("ATTACHMENT")
+      ? (snapshot.attachments || []).map((a) => ({
+        requirementId: a.requirementId || null,
+        sequence: a.sequence ?? null,
+        code: a.code || "",
+        name: a.name || "",
+        quantity: a.quantity ?? null,
+        note: a.note || "",
+      }))
+      : null,
+    labour: has("LABOUR")
+      ? (snapshot.labour || []).map((l) => ({
+        requirementId: l.requirementId || null,
+        sequence: l.sequence ?? null,
+        workerType: l.workerType || "",
+        quantity: l.quantity ?? null,
+        skillCode: l.skillCode || "",
+        skillName: l.skillName || "",
+        grade: l.grade || "",
+        note: l.note || "",
+      }))
+      : null,
   };
 }
 
@@ -969,6 +1064,9 @@ module.exports = {
   GAP, GAP_OWNER, ROW_FIELDS, PATCH_FIELDS, ROW_REFUSED,
   readPublished, currentApprovedRevisionOf, draftUnderReview,
   samTotals, sameBulletin, publishFile, publishRow, publishEvent, readinessFor,
+  /* Shared so the bulletin version and the release-impact comparison publish
+     frozen requirement evidence in ONE spelling rather than three. */
+  REQUIREMENT_DIMENSIONS, requirementSnapshotOf, publishRequirementSnapshot,
   resolveOrderStyle, approvedSourceOf,
   createFile, readFileForStyle, readHistory, updateBulletin,
 };

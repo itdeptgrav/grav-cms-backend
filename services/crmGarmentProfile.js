@@ -9,6 +9,7 @@
 // how services/crmHierarchy.js guards parent/child cycles.
 
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 
 class GarmentProfileError extends Error {
   constructor(message) {
@@ -35,7 +36,12 @@ const LIST_REF_FIELDS = [
  * payload points at an existing, active account.
  * @throws {GarmentProfileError}
  */
-async function assertValidGarmentProfileRefs(Account, profile) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function assertValidGarmentProfileRefs(Account, profile, ctx) {
   if (!profile || typeof profile !== "object") return;
 
   const ids = new Set();
@@ -49,7 +55,7 @@ async function assertValidGarmentProfileRefs(Account, profile) {
   }
   if (ids.size === 0) return;
 
-  const found = await Account.find({ _id: { $in: [...ids] } })
+  const found = await Account.find(serviceFilter(ctx, { _id: { $in: [...ids] } }))
     .select("_id isActive")
     .lean();
   const byId = new Map(found.map((a) => [String(a._id), a]));

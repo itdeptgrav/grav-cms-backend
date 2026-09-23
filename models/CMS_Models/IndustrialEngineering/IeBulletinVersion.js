@@ -34,6 +34,7 @@
 "use strict";
 
 const mongoose = require("mongoose");
+const { processRouteSchema } = require("./processRoute.schema");
 
 /* ── THE FOUR STATES, AND WHAT THEY MEAN ────────────────────────────────────
    IN_REVIEW   submitted, freezing the draft, awaiting a decision
@@ -108,6 +109,51 @@ const frozenRowSchema = new mongoose.Schema(
           }, { _id: false })],
           default: () => [],
         },
+        /* ── CHUNK 8A-iii: THE OTHER TWO DIMENSIONS, ADDED ADDITIVELY ──
+           Chunk 5A models three requirement dimensions on an operation —
+           machine, attachment and labour — but only the machine half was ever
+           frozen here. A comparison that silently reported the other two as
+           "unchanged" would be a reassurance nobody had evidence for.
+
+           These fields are OPTIONAL and there is no backfill. A row frozen
+           before this existed simply has no `dimensionsCaptured`, which is what
+           makes "never captured" distinguishable from "captured, and genuinely
+           empty" — without that marker an operation needing no attachment would
+           be indistinguishable from a snapshot taken before anybody looked. */
+        dimensionsCaptured: { type: [String], default: undefined },
+        machines: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            machineType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+          }, { _id: false })],
+          default: undefined,
+        },
+        attachments: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            code: { type: String, required: true, trim: true },
+            name: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
+        labour: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            workerType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            skillCode: { type: String, trim: true, default: "" },
+            skillName: { type: String, trim: true, default: "" },
+            grade: { type: String, trim: true, default: "" },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
       }, { _id: false }),
       default: null,
     },
@@ -164,6 +210,13 @@ const ieBulletinVersionSchema = new mongoose.Schema(
     fileRevisionAtSubmit: { type: Number, required: true, min: 1, immutable: true },
 
     rows: { type: [frozenRowSchema], default: () => [] },
+
+    /* ── THE PROCESS ROUTE, FROZEN WITH THE ROWS ─────────────────────────
+       Copied from the file's draft route at submission, approved with the
+       version and never edited after. Absent on a version submitted before the
+       route existed, or from a draft that declared none — and a reader must
+       treat that as "route unknown", never as "no stages". */
+    processRoute: { type: processRouteSchema, default: undefined },
 
     totals: {
       garmentSamMinutes: { type: Number, default: 0, min: 0 },

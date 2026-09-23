@@ -31,17 +31,38 @@
 // stays resolvable even when the Account underneath it is gone.
 
 const Account = require("../models/CMS_Models/Sales/Account");
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 const StockItem = require("../models/CMS_Models/Inventory/Products/StockItem");
 const Enquiry = require("../models/CMS_Models/Sales/Enquiry");
 const SalesJourney = require("../models/CMS_Models/Sales/SalesJourney");
 const { APP_URL: DEPT_NOTIFY_APP_URL, imageUrlFor, escapeHtml } = require("./departmentNotify.service");
 
 /** Every reference photo for a style, newest source first. */
-async function styleImages(style) {
+async function styleImages(style, ctx) {
   const own = style?.brief?.images || [];
   if (own.length) return own;
   if (!style?.enquiryId) return [];
-  const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
+
+  /* ── AUTHORISATION IS NOT `style.enquiryId` ───────────────────────────────
+     This read used to be `Enquiry.findOne(serviceFilter(ctx, { _id: style.enquiryId }))` — the style told
+     it which enquiry to open, and it opened it. A style carrying a foreign
+     enquiry id (a copy, a migration, an id typed in) therefore pulled that
+     company's product images into an email.
+
+     The company comes from the caller's already-authorised context. Absent
+     context is a refusal rather than a global read: an email helper that
+     quietly falls back to "any enquiry" is exactly the shape of the bug. */
+  /* ── NO PROVEN COMPANY, NO ENQUIRY READ ──────────────────────────────
+     The public BOM-approval flow reaches this through an opaque token, which
+     proves access to ONE style and says nothing about a company. Rather than
+     read the enquiry globally for it, the enquiry-derived images are simply
+     not offered: the style's own images still are. A smaller email is a better
+     outcome than one company's product photographs in another's. */
+  if (!ctx?.companyId) return [];
+
+  assertServiceContext(ctx, "sample style images");
+  const enq = await Enquiry.findOne(serviceFilter(ctx, { _id: style.enquiryId }))
+    .select("products").lean();
   return enq?.products?.find((p) => p.product === style.productName)?.images || [];
 }
 
@@ -113,12 +134,12 @@ function stockItemBom(stockItem) {
  * Empty fields drop out on their own — departmentNotify's `_row` (and this
  * module's own detailRowsHtml, for the decision page) skip them.
  */
-async function styleEmailContext(style) {
+async function styleEmailContext(style, ctx) {
   const [account, images] = await Promise.all([
     style.accountId
-      ? Account.findById(style.accountId).select("displayName companyName primaryEmail primaryPhone city state").lean()
+      ? Account.findOne(serviceFilter(ctx, { _id: style.accountId })).select("displayName companyName primaryEmail primaryPhone city state").lean()
       : null,
-    styleImages(style),
+    styleImages(style, ctx),
   ]);
   const stockItemId = linkedStockItemId(style);
   const stockItem = stockItemId
@@ -143,7 +164,7 @@ async function styleEmailContext(style) {
       // created). A bare "—" here IS the "customer information skipped" bug;
       // the Journey's own name is still resolvable and is a real identifier a
       // reader can act on, even when the Account underneath it no longer is.
-      const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
+      const journey = await SalesJourney.findOne(serviceFilter(ctx, { _id: style.journeyId })).select("name").lean();
       customerName = journey?.name || "—";
     }
   }

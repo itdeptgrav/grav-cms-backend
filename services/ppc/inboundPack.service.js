@@ -40,9 +40,8 @@ const { ExecutionPack, PACK_STATE } = require("../../models/CMS_Models/Merchandi
 const {
   DownstreamHandoverReceipt, RECEIPT_STATE, CLARIFICATION_CATEGORY, MIN_REASON,
 } = require("../../models/CMS_Models/PPC/DownstreamHandoverReceipt");
-const {
-  MerchandisingAuditEvent, MerchandisingCommandLedger,
-} = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
+const { MerchandisingAuditEvent } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
+const { once } = require("./commandOnce");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
@@ -70,37 +69,12 @@ async function withTxn(fn) {
   } finally { session.endSession(); }
 }
 
-const hashRequest = (req) => crypto.createHash("sha256")
-  .update(JSON.stringify(req ?? null)).digest("hex");
-
-async function once(ctx, { scope, idempotencyKey, request }, run) {
-  const key = str(idempotencyKey);
-  if (!key) {
-    throw fail("IDEMPOTENCY_KEY_REQUIRED",
-      "Send an idempotency key with this decision, so a retry cannot take it twice.",
-      { field: "idempotencyKey" });
-  }
-  const requestHash = hashRequest(request);
-  const held = await MerchandisingCommandLedger.findOne({
-    companyId: ctx.companyId, scope, idempotencyKey: key,
-  }).lean();
-  if (held) {
-    if (held.requestHash !== requestHash) {
-      throw fail("IDEMPOTENCY_KEY_REUSED",
-        "That idempotency key was already used for a different request.", { field: "idempotencyKey" });
-    }
-    return { replayed: true, ...held.result };
-  }
-  const result = await run();
-  try {
-    await MerchandisingCommandLedger.create([{
-      companyId: ctx.companyId, scope, idempotencyKey: key, requestHash,
-      result: { revisionNo: result?.packVersionNo ?? null, state: str(result?.state), note: str(result?.note) },
-      at: new Date(),
-    }]);
-  } catch (err) { if (err?.code !== 11000) throw err; }
-  return { replayed: false, ...result };
-}
+/* ── THE IDEMPOTENCY PROTOCOL, NOW SHARED ────────────────────────────────
+   `once()` moved to `./commandOnce.js` verbatim so PPC's second inbound queue
+   — issued IE releases — runs the SAME protocol rather than a second,
+   incompatible ledger. Nothing about this caller changed: it passes no
+   `project` or `rebuild`, so the stored ledger row and the replayed envelope
+   are byte-for-byte what they were. */
 
 /* ═══ THE QUEUE ════════════════════════════════════════════════════════════ */
 

@@ -429,21 +429,33 @@ describe("an unmapped bill", () => {
     const at = model.indexOf("afterVoucherSaved");
     expect(at).toBeGreaterThan(-1);
     const hook = model.slice(at, model.indexOf("\n});", at));
-    expect(hook).toMatch(/release\.orchestrate\(/);
+    /* The one shared operation, and no legacy call of its own. */
+    expect(hook).toMatch(/release\.reconcileVoucher\(/);
     expect(hook).not.toMatch(/releaseForVoucher/);
     expect(hook).not.toMatch(/restoreForVoucher/);
-    /* And it loads the lines, without which partial release is impossible. */
-    expect(hook).toMatch(/inventoryEntries/);
+    /* ── AND IT STANDS ASIDE FOR A TRANSACTION ──────────────────────────
+       A `post("save")` hook is not an after-commit hook: for a save carrying
+       a session it fires with the transaction still open, and any read it
+       makes sees the PRE-transaction document. */
+    expect(hook).toMatch(/doc\.\$session\(\)\) return/);
+    /* The false claim that an outside-session reread proved durable commit
+       must not come back. */
+    expect(model).not.toMatch(/durably committed/);
 
     /* The orchestrator hands a line-wise commitment to the line-wise engine
        and calls the whole-document release only when there are NO
        allocations — never as a fallback when nothing mapped. */
     const svc = fs.readFileSync(path.join(root, "services/commitmentRelease.service.js"), "utf8");
-    const o = svc.indexOf("async function orchestrate");
-    const body = svc.slice(o, svc.indexOf("\nmodule.exports", o));
-    expect(body).toMatch(/if \(!hasAllocations\) \{[\s\S]{0,300}?releaseForVoucher/);
+    const o = svc.indexOf("async function reconcileVoucher");
+    expect(o).toBeGreaterThan(-1);
+    const body = svc.slice(o, svc.indexOf("\nasync function orchestrate", o));
+    /* The whole-document release is reachable only where there are NO
+       allocations — never as a fallback when nothing mapped. */
+    expect(body).toMatch(/if \(!hasAllocations\) \{[\s\S]{0,400}?releaseForVoucher/);
     expect((body.match(/releaseForVoucher/g) || []).length).toBe(1);
-    expect(body).toMatch(/return applyRelease\(/);
+    /* An edited posted voucher is reversed and reapplied, so the stored
+       distribution matches its NEW lines rather than its old ones. */
+    expect(body).toMatch(/await restoreVoucher\([\s\S]{0,120}?await applyRelease\(/);
   });
 
   test("a legacy commitment still releases whole-document", async () => {

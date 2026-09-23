@@ -25,6 +25,20 @@ const parseBarcode = (barcodeId) => {
   return { success: false };
 };
 
+// Current labels carry the full Mongo id (`WO-<24 hex>-001`), while older
+// labels carry only its last eight characters. Index both identities so every
+// consumer in this route can read labels produced by either generator.
+const indexWorkOrdersByBarcodeIdentity = (workOrders = []) => {
+  const index = new Map();
+  for (const workOrder of workOrders) {
+    const id = workOrder?._id?.toString();
+    if (!id) continue;
+    index.set(id, workOrder);
+    index.set(id.slice(-8), workOrder);
+  }
+  return index;
+};
+
 const getISTMidnight = (dateStr) => {
   const d = dateStr ? new Date(dateStr) : new Date();
   const istMs = d.getTime() + 5.5 * 60 * 60 * 1000;
@@ -48,7 +62,7 @@ router.post("/fetch-order", async (req, res) => {
     }
 
     const allWOs = await WorkOrder.find({}).lean();
-    const wo = allWOs.find((w) => w._id.toString().slice(-8) === parsed.woShortId);
+    const wo = indexWorkOrdersByBarcodeIdentity(allWOs).get(parsed.woShortId);
 
     if (!wo) {
       return res.status(404).json({ success: false, message: "Work order not found" });
@@ -119,9 +133,11 @@ router.post("/preview", async (req, res) => {
     // woShortId = last 8 chars of WO _id — fetch all WOs once and build a map
     const uniqueShortIds = [...new Set(formatPassed.map((f) => f.woShortId))];
     const allWOs = uniqueShortIds.length
-      ? await WorkOrder.find({}).select("_id workOrderNumber quantity").lean()
+      /* `operations` comes back too: a work order's route is what a production
+         scan advances, and an order without one has nothing to advance. */
+      ? await WorkOrder.find({}).select("_id workOrderNumber quantity operations").lean()
       : [];
-    const woByShortId = new Map(allWOs.map((w) => [w._id.toString().slice(-8), w]));
+    const woByShortId = indexWorkOrdersByBarcodeIdentity(allWOs);
 
     const invalidOrder   = []; // valid format but WO not found or unit exceeds qty
     const invalidOrderDetails = []; // { bc, reason }
@@ -137,6 +153,23 @@ router.post("/preview", async (req, res) => {
       if (unitNumber > wo.quantity) {
         invalidOrder.push(bc);
         invalidOrderDetails.push({ bc, reason: `Unit ${unitNumber} exceeds WO quantity (${wo.quantity})` });
+        continue;
+      }
+      /* ── A SCAN AGAINST NO ROUTE IS AN ORPHAN LOG ───────────────────
+         A work order with no operations has nothing for a completion scan to
+         complete. Accepting one wrote a production log that could never move
+         the order off 0%, and reported "scans saved" while the order stayed
+         at 0/6 — a record that looks like progress and is not.
+
+         Refused here, in the preview, so the person sees it before saving,
+         and again in mark-done so a direct call cannot get past it. */
+      if (!(wo.operations || []).length) {
+        invalidOrder.push(bc);
+        invalidOrderDetails.push({
+          bc,
+          reason: `${wo.workOrderNumber || "This work order"} has no operation route, so a production scan has nothing to record against. Record the product's operations in R&D, then re-plan this order.`,
+          code: "WORK_ORDER_NOT_ROUTED",
+        });
         continue;
       }
       orderPassed.push(bc);
@@ -199,6 +232,37 @@ router.post("/mark-done", async (req, res) => {
         success: false,
         message: "No valid barcodes in request",
         invalidBarcodes,
+      });
+    }
+
+    /* ── AND NOT ONE OF THEM MAY BELONG TO AN UNROUTED ORDER ───────────
+       Checked again here, not only in the preview: a preview is a courtesy
+       and this is the write. A work order with no operations has nothing for
+       a completion scan to complete, and accepting one writes a log that can
+       never move the order off 0% — which is what the walkthrough produced.
+
+       Refused for the WHOLE request rather than filtered out of it: a
+       partial save on a screen that showed six barcodes is worse than a
+       refusal that names the order and what to fix. */
+    const unroutedBarcodes = [];
+    const scannedShortIds = [...new Set(validBarcodes.map((bc) => parseBarcode(bc).woShortId))];
+    if (scannedShortIds.length) {
+      const orders = await WorkOrder.find({}).select("_id workOrderNumber operations").lean();
+      const byShortId = indexWorkOrdersByBarcodeIdentity(orders);
+      for (const bc of validBarcodes) {
+        const wo = byShortId.get(parseBarcode(bc).woShortId);
+        if (wo && !(wo.operations || []).length) {
+          unroutedBarcodes.push({ barcode: bc, workOrderNumber: wo.workOrderNumber || "" });
+        }
+      }
+    }
+    if (unroutedBarcodes.length) {
+      return res.status(409).json({
+        success: false,
+        code: "WORK_ORDER_NOT_ROUTED",
+        message: `${unroutedBarcodes[0].workOrderNumber || "That work order"} has no operation route, so these scans have nothing to record against. Nothing was saved. Record the product's operations in R&D, then re-plan the order.`,
+        unroutedBarcodes,
+        remedy: "RECORD_OPERATIONS_IN_RND",
       });
     }
 
@@ -291,10 +355,7 @@ router.get("/overview", async (req, res) => {
     const allWOs = await WorkOrder.find({})
       .select("_id workOrderNumber customerRequestId stockItemId stockItemName variantAttributes")
       .lean();
-    const woByShortId = new Map();
-    for (const wo of allWOs) {
-      woByShortId.set(wo._id.toString().slice(-8), wo);
-    }
+    const woByShortId = indexWorkOrdersByBarcodeIdentity(allWOs);
 
     const moAgg = new Map();
     const stockItemIdsToLoad = new Set();
@@ -456,7 +517,7 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
       });
     }
 
-    const shortIdToWo = new Map(workOrders.map((wo) => [wo._id.toString().slice(-8), wo]));
+    const shortIdToWo = indexWorkOrdersByBarcodeIdentity(workOrders);
 
     const cutoff = getISTMidnight(new Date());
     cutoff.setDate(cutoff.getDate() - (days - 1));

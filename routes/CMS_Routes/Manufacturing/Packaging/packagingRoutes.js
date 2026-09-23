@@ -23,9 +23,26 @@ const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequ
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const access = require("./packagingAccess");
 
 
 router.use(EmployeeAuthMiddleware);
+
+/* ── WHO, AND WHOSE WORK ─────────────────────────────────────────────────────
+   Reads are for Packaging and the two departments whose own screens already
+   show these numbers (Production planning, the executive office). RECORDING
+   packing is Packaging's editor alone — watching the floor is not being on it.
+
+   Every query below is narrowed to the acting company through
+   `WorkOrder.salesLineLink.companyId`, the link the Sales-line ↔ WorkOrder
+   bridge stamps at creation. A WorkOrder with no link belongs to nobody: it is
+   in no list and unaddressable by id, and is never given a company from its
+   order, buyer, style, product, barcode text or the last characters of its id. */
+const canRead = [access.packagingReader(), access.packagingCompany];
+const canRecord = [access.packagingDepartment("editor"), access.packagingCompany];
+
+/** The acting company, resolved server-side. Never from the client. */
+const companyOf = (req) => req.packaging.companyId;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -263,10 +280,12 @@ function markUnitsAsFullyCompleted(wo, unitNumbers, now) {
 // Measurement path — push packaging record FIRST, then mark complete
 // ─────────────────────────────────────────────────────────────────────────────
 async function updateWorkOrderOnPackaging({
-  workOrderId, packagedAdded, newlyPackagedUnits, packagedBy,
+  companyId, workOrderId, packagedAdded, newlyPackagedUnits, packagedBy,
   packagingType, employeeIds = [], employeeNames = [], notes, now,
 }) {
-  const wo = await WorkOrder.findById(workOrderId);
+  /* Company-scoped, like every other WorkOrder read in this file: an id alone
+     is not permission to write to the record it names. */
+  const wo = await WorkOrder.findOne(access.scoped(companyId, { _id: workOrderId }));
   if (!wo) return { unitsMarkedComplete: 0 };
 
   const currentPackaged = wo.packagedQuantity || 0;
@@ -295,8 +314,8 @@ async function updateWorkOrderOnPackaging({
 // ─────────────────────────────────────────────────────────────────────────────
 // Bulk path — dedupe units against previous packagingRecords, then commit
 // ─────────────────────────────────────────────────────────────────────────────
-async function commitBulkPackaging({ workOrderId, scannedUnits, packagedBy, notes, now }) {
-  const wo = await WorkOrder.findById(workOrderId);
+async function commitBulkPackaging({ companyId, workOrderId, scannedUnits, packagedBy, notes, now }) {
+  const wo = await WorkOrder.findOne(access.scoped(companyId, { _id: workOrderId }));
   if (!wo) return { unitsAdded: 0, unitsMarkedComplete: 0 };
 
   const previouslyPackagedUnits = new Set(
@@ -361,7 +380,7 @@ async function commitBulkPackaging({ workOrderId, scannedUnits, packagedBy, note
 //
 // Persons whose packaging is fully done are skipped.
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/pending-pieces", async (req, res) => {
+router.get("/pending-pieces", ...canRead, async (req, res) => {
   try {
     // ── 1. Date window: last 5 days ──────────────────────────────────────
     const now = new Date();
@@ -418,17 +437,25 @@ router.get("/pending-pieces", async (req, res) => {
       });
     }
  
-    // ── 5. Resolve WOs that have scans (for short-id lookup) ─────────────
-    const allWOs = await WorkOrder.find({})
-      .select(
-        "_id workOrderNumber stockItemName stockItemReference quantity " +
-          "customerRequestId packagingRecords variantAttributes variantId stockItemId status"
-      )
-      .lean();
- 
+    /* ── 5. Resolve WOs that have scans (for short-id lookup) ────────────
+       This company's work orders, never the whole collection: a scan's short
+       id is the last 8 characters of an id, which is not unique and is not
+       proof of anything. A short id shared by two of this company's orders
+       is left unresolved rather than answered with whichever was read first,
+       and nothing outside this company is ever a candidate. */
+    const allWOs = await access.findWorkOrders(companyOf(req), {},
+      "_id workOrderNumber stockItemName stockItemReference quantity "
+        + "customerRequestId packagingRecords variantAttributes variantId stockItemId status").lean();
+
+    const byShortId = new Map();
+    for (const wo of allWOs) {
+      const shortId = wo._id.toString().slice(-8);
+      if (byShortId.has(shortId)) byShortId.set(shortId, null);
+      else byShortId.set(shortId, wo);
+    }
     const woByShortId = new Map();
     for (const shortId of scansByWO.keys()) {
-      const wo = allWOs.find((w) => w._id.toString().slice(-8) === shortId);
+      const wo = byShortId.get(shortId);
       if (wo) woByShortId.set(shortId, wo);
     }
  
@@ -822,7 +849,7 @@ function emptyStats(fromDate, now) {
 }
 
 
-router.get("/logs-by-mo", async (req, res) => {
+router.get("/logs-by-mo", ...canRead, async (req, res) => {
   try {
     const { from, to, type = "all", page = 1, limit = 25 } = req.query;
 
@@ -845,9 +872,8 @@ router.get("/logs-by-mo", async (req, res) => {
     };
 
     // Find all WOs with packagingRecords
-    const allWOs = await WorkOrder.find({ "packagingRecords.0": { $exists: true } })
-      .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity customerRequestId packagingRecords packagedQuantity")
-      .lean();
+    const allWOs = await access.findWorkOrders(companyOf(req), { "packagingRecords.0": { $exists: true } },
+      "workOrderNumber stockItemName stockItemReference variantAttributes quantity customerRequestId packagingRecords packagedQuantity").lean();
 
     // Group by MO
     const moMap = new Map(); // moId -> { wos: [], totalEvents, totalUnits, ... }
@@ -1095,7 +1121,7 @@ router.get("/logs-by-mo", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /fetch-order
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/fetch-order", async (req, res) => {
+router.post("/fetch-order", ...canRead, async (req, res) => {
   try {
     const { barcodes } = req.body;
     if (!Array.isArray(barcodes) || !barcodes.length) {
@@ -1128,11 +1154,20 @@ router.post("/fetch-order", async (req, res) => {
       byWO.get(p.workOrderShortId).push(p);
     }
 
+    /* Only this company's work orders are candidates, and a short id two of
+       them share resolves to neither: the last 8 characters of an id are not
+       unique and are not proof of whose work this is. */
     const workOrderShortIds = [...byWO.keys()];
-    const allWOs = await WorkOrder.find({}).lean();
+    const allWOs = await access.findWorkOrders(companyOf(req), {}).lean();
+    const byShortId = new Map();
+    for (const wo of allWOs) {
+      const shortId = wo._id.toString().slice(-8);
+      if (byShortId.has(shortId)) byShortId.set(shortId, null);
+      else byShortId.set(shortId, wo);
+    }
     const woMap = new Map();
     for (const shortId of workOrderShortIds) {
-      const wo = allWOs.find((w) => w._id.toString().slice(-8) === shortId);
+      const wo = byShortId.get(shortId);
       if (wo) woMap.set(shortId, wo);
     }
 
@@ -1291,11 +1326,19 @@ router.post("/fetch-order", async (req, res) => {
 // Lists measurement-conversion MOs that still have unpackaged employee units.
 // Used by the UIN-based packaging flow (alternative to barcode scanning).
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/active-mos", async (req, res) => {
+router.get("/active-mos", ...canRead, async (req, res) => {
   try {
     const { search = "" } = req.query;
 
+    /* Which orders exist, for this company: from the WORK linked to them,
+       never from the order's own status. An order with no work order of this
+       company simply is not in the list. */
+    const ownMoIds = [...new Set((await access.findWorkOrders(companyOf(req), {}, "customerRequestId").lean())
+      .map((w) => String(w.customerRequestId || "")).filter(Boolean))];
+    if (!ownMoIds.length) return res.json({ success: true, manufacturingOrders: [] });
+
     const moQuery = {
+      _id: { $in: ownMoIds.map(access.oid) },
       requestType: "measurement_conversion",
       status: "quotation_sales_approved",
     };
@@ -1355,7 +1398,7 @@ router.get("/active-mos", async (req, res) => {
 // Returns the same { groups, invalid, ... } shape as /fetch-order, so the
 // existing FetchResultView and /done flow work unchanged.
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/fetch-by-uins", async (req, res) => {
+router.post("/fetch-by-uins", ...canRead, async (req, res) => {
   try {
     const { moId, uins } = req.body;
 
@@ -1371,13 +1414,18 @@ router.post("/fetch-by-uins", async (req, res) => {
       return res.status(400).json({ success: false, message: "No valid UINs" });
     }
 
+    /* This company's work orders on that order. No visible work, no order. */
+    const { visible, objectIds } = await access.moScope(companyOf(req), moId);
+    if (!visible) return access.notFound(res, "manufacturing order");
+
     const mo = await CustomerRequest.findById(moId)
       .select("requestId requestType customerInfo")
       .lean();
-    if (!mo) return res.status(404).json({ success: false, message: "MO not found" });
+    if (!mo) return access.notFound(res, "manufacturing order");
 
     const docs = await EmployeeProductionProgress.find({
       manufacturingOrderId: moId,
+      workOrderId: { $in: objectIds },
       employeeUIN: { $in: cleanUins },
     }).lean();
 
@@ -1403,7 +1451,7 @@ router.post("/fetch-by-uins", async (req, res) => {
     }
 
     const woIds = [...woGroups.keys()];
-    const wos = await WorkOrder.find({ _id: { $in: woIds } }).lean();
+    const wos = await access.findWorkOrders(companyOf(req), { _id: { $in: woIds } }).lean();
     const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
 
     // Resolve MPC enrichment for ALL employees once (shared across WOs)
@@ -1513,13 +1561,47 @@ router.post("/fetch-by-uins", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /done
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/done", async (req, res) => {
+router.post("/done", ...canRecord, async (req, res) => {
   try {
     const { groups, notes = "" } = req.body;
     const packagedBy = req.user?.name || req.user?.employeeId || "Packaging Dept";
 
     if (!Array.isArray(groups) || !groups.length) {
       return res.status(400).json({ success: false, message: "No groups provided" });
+    }
+
+    /* ── PROVED WHOLE, BEFORE ANYTHING IS WRITTEN ──────────────────────
+       Packing is the authoritative "this unit is done" signal: it moves
+       packagedQuantity, the completion figures and the work order's own
+       status. So every work order and every progress document this request
+       names is proved to be this company's FIRST, and one that is another
+       company's, unlinked, unknown or malformed refuses the whole batch.
+       Nothing is written on a refusal — a half-applied batch would leave
+       units recorded as packed with no way to tell which. */
+    const askedWorkOrders = groups.map((g) => access.str(g?.workOrderId));
+    const provenWorkOrders = askedWorkOrders.filter(access.isId).length
+      ? await access.findWorkOrders(companyOf(req),
+        { _id: { $in: askedWorkOrders.filter(access.isId).map(access.oid) } }, "_id").lean()
+      : [];
+    const ownWorkOrderIds = new Set(provenWorkOrders.map((w) => String(w._id)));
+    if (askedWorkOrders.some((id) => !ownWorkOrderIds.has(id))) {
+      return access.notFound(res, "work order");
+    }
+
+    /* Each named progress document must belong to a work order of this
+       company too — and to the work order its own group names, so a batch
+       cannot quietly attribute one person's units to another order. */
+    const askedProgress = groups.flatMap((g) => (Array.isArray(g?.employees) ? g.employees : [])
+      .map((e) => access.str(e?.progressDocId)));
+    const progress = await access.resolveProgressDocs(companyOf(req), askedProgress);
+    if (progress.unproven.length) return access.notFound(res, "packable work");
+    for (const g of groups) {
+      for (const emp of (Array.isArray(g?.employees) ? g.employees : [])) {
+        const doc = progress.byId.get(access.str(emp?.progressDocId));
+        if (!doc || String(doc.workOrderId) !== access.str(g?.workOrderId)) {
+          return access.notFound(res, "packable work");
+        }
+      }
     }
 
     const now = new Date();
@@ -1532,7 +1614,7 @@ router.post("/done", async (req, res) => {
     };
 
     for (const g of groups) {
-      if (!mongoose.Types.ObjectId.isValid(g.workOrderId)) continue;
+      /* Proved above — this loop writes only work this company owns. */
 
       // ── MEASUREMENT-TO-PO PATH ───────────────────────────────────────
       if (g.isMeasurement && Array.isArray(g.employees) && g.employees.length) {
@@ -1542,10 +1624,9 @@ router.post("/done", async (req, res) => {
         const empNames = [];
 
         for (const emp of g.employees) {
-          if (!mongoose.Types.ObjectId.isValid(emp.progressDocId)) continue;
-
-          const doc = await EmployeeProductionProgress.findById(emp.progressDocId);
-          if (!doc) continue;
+          /* Proved above, and read once: this document is this company's and
+             belongs to the work order this group names. */
+          const doc = progress.byId.get(access.str(emp.progressDocId));
 
           const scannedUnitsForThisEmp = Array.isArray(emp.scannedUnits) ? emp.scannedUnits : [];
           if (!scannedUnitsForThisEmp.length) continue;
@@ -1606,6 +1687,7 @@ router.post("/done", async (req, res) => {
 
         if (woUnitsPackagedThisBatch > 0) {
           const { unitsMarkedComplete } = await updateWorkOrderOnPackaging({
+            companyId: companyOf(req),
             workOrderId: g.workOrderId,
             packagedAdded: woUnitsPackagedThisBatch,
             newlyPackagedUnits: allUnitsNewlyPackaged,
@@ -1627,6 +1709,7 @@ router.post("/done", async (req, res) => {
         if (!scannedUnits.length) continue;
 
         const result = await commitBulkPackaging({
+          companyId: companyOf(req),
           workOrderId: g.workOrderId,
           scannedUnits,
           packagedBy,
@@ -1653,7 +1736,10 @@ router.post("/done", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /logs
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/logs", async (req, res) => {
+/* No screen calls this today (the dashboards use /logs-by-mo). It is left in
+   place, guarded and company-scoped like everything else here rather than
+   rewritten: an unused door that is open is still a door. */
+router.get("/logs", ...canRead, async (req, res) => {
   try {
     const { from, to, moId, type = "all", page = 1, limit = 50 } = req.query;
 
@@ -1669,7 +1755,7 @@ router.get("/logs", async (req, res) => {
       dateFilter.$lte = toDate;
     }
 
-    const woFilter = {};
+    const woFilter = access.workOrderScope(companyOf(req));
     if (moId && mongoose.Types.ObjectId.isValid(moId)) {
       woFilter.customerRequestId = new mongoose.Types.ObjectId(moId);
     }
@@ -1748,16 +1834,17 @@ router.get("/logs", async (req, res) => {
 
 
 // GET /api/cms/manufacturing/packaging/mo-employees/:moId
-router.get("/mo-employees/:moId", async (req, res) => {
+router.get("/mo-employees/:moId", ...canRead, async (req, res) => {
   try {
     const { moId } = req.params;
 
-    if (!mongoose.Types.ObjectId.isValid(moId)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    /* This company's work orders on that order prove whose people these are. */
+    const { visible, objectIds } = await access.moScope(companyOf(req), moId);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
     const records = await EmployeeProductionProgress.find({
       manufacturingOrderId: moId,
+      workOrderId: { $in: objectIds },
     })
       .select("employeeUIN employeeName gender employeeId")
       .lean();
@@ -1792,11 +1879,11 @@ router.get("/mo-employees/:moId", async (req, res) => {
 });
 
 
-router.get("/remaining-units/:woId", async (req, res) => {
+router.get("/remaining-units/:woId", ...canRead, async (req, res) => {
   try {
-    const wo = await WorkOrder.findById(req.params.woId)
-      .select("quantity packagingRecords workOrderNumber").lean();
-    if (!wo) return res.status(404).json({ success: false, message: "WO not found" });
+    const wo = await access.findWorkOrder(companyOf(req), req.params.woId,
+      "quantity packagingRecords workOrderNumber");
+    if (!wo) return access.notFound(res, "work order");
     const packaged = new Set((wo.packagingRecords || []).flatMap(r => r.unitNumbers || []));
     const remaining = Array.from({ length: wo.quantity }, (_, i) => i + 1).filter(u => !packaged.has(u));
     res.json({ success: true, remaining, packedCount: packaged.size, totalCount: wo.quantity });

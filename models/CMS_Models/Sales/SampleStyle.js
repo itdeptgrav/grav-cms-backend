@@ -965,6 +965,21 @@ const sampleStyleSchema = new mongoose.Schema(
         {
           type: { type: String, trim: true },
           operationCode: { type: String, trim: true, default: "" },
+          /* WHICH REGISTERED OPERATION THIS IS, BY IDENTITY.
+             Additive and optional — every row written before this has none
+             and still resolves by code. It exists because the register holds
+             duplicate codes, and a stored id is the one match a duplicate
+             cannot confuse. Stamped by services/operationCosting.js the first
+             time a row resolves. */
+          operationId: { type: mongoose.Schema.Types.ObjectId, ref: "Operation" },
+          /* THE CODE THAT NAMED MORE THAN ONE REGISTERED OPERATION.
+             Empty on every ordinary row. Set by services/operationCosting.js
+             when a row's code matched several records and therefore resolved
+             to none, so the costing preview can refuse BY CODE — "reconcile
+             the duplicate" is unactionable without knowing which one. It is
+             rewritten (and cleared) every time the operations are re-costed,
+             so a reconciled duplicate stops blocking. */
+          ambiguousOperationCode: { type: String, trim: true, default: "" },
           machine: { type: String, trim: true },
           machineType: { type: String, trim: true },
           minutes: { type: Number, min: 0, default: 0 },
@@ -1062,7 +1077,19 @@ const sampleStyleSchema = new mongoose.Schema(
       // created" — exactly what the pipeline actually did, in order.
       log: [
         new mongoose.Schema(
-          { kind: { type: String, trim: true }, note: { type: String, trim: true }, at: { type: Date, default: Date.now }, by: actorRef() },
+          {
+            kind: { type: String, trim: true }, note: { type: String, trim: true },
+            at: { type: Date, default: Date.now }, by: actorRef(),
+            /* WHICH WORK ORDER THIS ENTRY IS ABOUT, WHERE ONE APPLIES.
+               Additive and optional — every existing entry has none and reads
+               back exactly as before. It exists so an entry can be recognised
+               as ALREADY WRITTEN: a cancellation that is replayed (the same
+               call made twice, or a repair run over a historical record)
+               must reconcile the style without appending a second account of
+               the same event. Matching on the note's prose would work until
+               somebody reworded it. */
+            workOrderId: { type: mongoose.Schema.Types.ObjectId },
+          },
           { _id: false },
         ),
       ],

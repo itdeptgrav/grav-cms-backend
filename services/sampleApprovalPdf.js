@@ -14,6 +14,7 @@
 // PDF" button keeps using the React version; this is not a replacement for
 // it, just the same document available where there's no browser.
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 
 const PDFDocument = require("pdfkit");
 const StockItem = require("../models/CMS_Models/Inventory/Products/StockItem");
@@ -74,10 +75,15 @@ async function fetchImageBuffer(img) {
 }
 
 /** The customer's company + contact details, live off the CRM account. */
-async function loadAccountDetails(accountId) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function loadAccountDetails(accountId, ctx) {
   if (!accountId) return null;
   try {
-    return await Account.findById(accountId)
+    return await Account.findOne(serviceFilter(ctx, { _id: accountId }))
       .select("companyName gstNumber address city state primaryPhone primaryEmail")
       .populate("primaryContact", "firstName lastName phone email designation")
       .lean();

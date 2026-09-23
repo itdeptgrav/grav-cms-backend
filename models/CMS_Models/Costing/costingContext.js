@@ -46,6 +46,29 @@ const CONTEXT_TYPES = Object.freeze([
   "ADHOC",
 ]);
 
+/**
+ * The context types the HTTP API accepts today.
+ *
+ * ── WHY THE OTHERS ARE DECLARED BUT NOT ENABLED ─────────────────────────────
+ * `CONTEXT_TYPES` is the vocabulary — what the stored enum permits, so a later
+ * chunk can enable one without a data migration. `ENABLED_CONTEXT_TYPES` is
+ * what the API will accept, and it is deliberately shorter.
+ *
+ * A context type is only safe to enable once the server can RESOLVE it: prove
+ * the referenced document exists, prove it is not another company's, and build
+ * the display snapshot itself instead of trusting the client's. Only
+ * `ENQUIRY_STYLE` has that resolution today (see
+ * `services/centralCosting/contextResolver.service.js`), and `ADHOC`
+ * references nothing at all so there is nothing to resolve.
+ *
+ * `STYLE`, `ORDER` and `SAMPLE_STYLE` would each need a resolver against a
+ * master that has no company scope yet. Writing one that could not check
+ * ownership — and calling the result validated — is exactly the unsafe adapter
+ * this chunk refuses to build, so they are refused with a stable
+ * `CONTEXT_NOT_SUPPORTED_YET` until their masters can answer the question.
+ */
+const ENABLED_CONTEXT_TYPES = Object.freeze(["ADHOC", "ENQUIRY_STYLE"]);
+
 /** Which context types must name a primary id, and which must name a key. */
 const CONTEXT_RULES = Object.freeze({
   STYLE:         { primaryId: true,  externalKey: false },
@@ -97,6 +120,6 @@ const contextSnapshotSchema = new mongoose.Schema(
 );
 
 module.exports = {
-  CONTEXT_TYPES, CONTEXT_RULES,
+  CONTEXT_TYPES, ENABLED_CONTEXT_TYPES, CONTEXT_RULES,
   contextRefSchema, contextSnapshotSchema, snapshotFactSchema,
 };

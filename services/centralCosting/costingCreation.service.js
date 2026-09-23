@@ -27,6 +27,14 @@
 //
 // The mode is returned so the response can state it rather than imply an
 // atomicity the deployment does not provide.
+//
+// ── AND ONE USER ACTION NEVER PRODUCES TWO COSTINGS ─────────────────────────
+// Atomicity says the pair is created together. It says nothing about the pair
+// being created TWICE, which is what a retry after a lost response does. That
+// is defended by the creation claim the costing carries and the unique index
+// over it (see Costing.js), NOT by the idempotency effect marker — the marker
+// is a second write, and a second write can fail. The claim is written in the
+// same insert as the costing, so there is no window in which it is missing.
 "use strict";
 
 const mongoose = require("mongoose");
@@ -55,6 +63,20 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
     /* Defence in depth: the route resolves context before this is reachable,
        and an unscoped write would be the one bug this whole chunk is about. */
     throw fail("TENANT_MEMBERSHIP_UNPROVEN", "A costing cannot be created without a proven company.");
+  }
+
+  /* ── VERIFIED PROVENANCE IS NOT SOMETHING A REQUEST CAN ASK FOR ──────────
+   * The parser already refuses a client-supplied `VERIFIED`. This is the
+   * second lock, on the far side of the parser: whatever produced this input,
+   * a verified source can only be written by an internal service context —
+   * one built by `companyContext.forService({companyId, reason})`, which no
+   * request can construct because nothing reads a body to build it. */
+  const verified = (input.sourceReferences || []).filter((s) => s.confidence === "VERIFIED");
+  if (verified.length && ctx.actorType !== "service") {
+    throw fail("FORBIDDEN", "A verified source can only be recorded by an internal import.", {
+      reason: "VERIFIED_SOURCE_REQUIRES_TRUSTED_CONTEXT",
+      sources: verified.map((s) => s.sourceKey || String(s.sourceId || "")),
+    });
   }
 
   /* Ids and the event time are fixed BEFORE either write, so the parent can
@@ -100,7 +122,19 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
     currentVersionNumber: 1,
     createdByActorId: ctx.actorId,
     createdByActorName: ctx.actorName || "",
+    /* Written WITH the costing, in the same insert. There is no moment at
+       which the costing exists without the identity of the action that made
+       it, which is exactly the window the effect marker could not close. */
+    ...(meta.claim?.claimId
+      ? { creationClaimId: meta.claim.claimId, creationRequestHash: meta.claim.requestHash || "" }
+      : {}),
   };
+
+  /* The unique index IS the guarantee. On a fresh deployment mongoose builds
+     it in the background, and until it exists every "duplicate" insert
+     succeeds — so the first create of the process waits for it rather than
+     racing it. Cached no-op afterwards. */
+  if (meta.claim?.claimId) await Costing.init();
 
   if (await transactionsAvailable()) {
     const session = await mongoose.startSession();
@@ -113,6 +147,8 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
         out = { costing, version };
       });
       return { ...out, mode: "TRANSACTIONAL" };
+    } catch (err) {
+      throw asClaimConflict(err);
     } finally {
       await session.endSession().catch(() => {});
     }
@@ -127,8 +163,18 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
   try {
     [costing] = await Costing.create([costingDoc]);
   } catch (err) {
+    /* Including a lost race on the creation claim: another attempt with the
+       same key got there first. The compensating delete below runs for that
+       exactly as it does for any other parent failure, so version 1 is never
+       left behind — and the caller is told to recover rather than retry. */
     try {
-      await CostingVersion.deleteOne({ _id: versionId, companyId: ctx.companyId });
+      /* ── THE ONE SANCTIONED REMOVAL ────────────────────────────────────
+         Not `deleteOne`: a persisted version is audit history and the model
+         refuses every ordinary deletion path. `deleteOrphanVersion` proves for
+         itself that this version's parent costing does not exist — which is
+         exactly the state a failed parent insert leaves — and refuses if it
+         does. There is no flag to pass and nothing a request could set. */
+      await CostingVersion.deleteOrphanVersion({ _id: versionId, companyId: ctx.companyId });
     } catch (cleanupErr) {
       /* Loud, because it is the one case that leaves a row behind — and
          quiet in effect, because nothing can read it. */
@@ -138,7 +184,7 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
         cleanupErr?.message || cleanupErr,
       );
     }
-    throw err;
+    throw asClaimConflict(err);
   }
 
   /* IMMEDIATELY after both documents are durable and before anything that
@@ -149,4 +195,32 @@ async function createCostingWithFirstVersion(ctx, input, meta = {}) {
   return { costing, version, mode: "COMPENSATED" };
 }
 
-module.exports = { createCostingWithFirstVersion };
+/**
+ * Was this a lost race on the creation claim, rather than an ordinary failure?
+ *
+ * Renamed rather than swallowed: the caller must be able to tell "somebody
+ * else already created this costing for the same user action" from "the write
+ * broke", because the first is recovered and the second is reported.
+ */
+function asClaimConflict(err) {
+  if (err?.code !== 11000) return err;
+  const keys = Object.keys(err.keyPattern || err.keyValue || {});
+  if (!keys.includes("creationClaimId")) return err;
+  const conflict = new Error("This costing was already created by the same request.");
+  conflict.name = "CostingClaimAlreadyUsed";
+  return conflict;
+}
+
+/**
+ * The costing a previous attempt at this same user action already created.
+ *
+ * Company-scoped, like every other read in this domain: a claim is only ever
+ * meaningful within one company, and looking one up across companies would
+ * make the claim id itself an oracle.
+ */
+function findByCreationClaim(ctx, claimId) {
+  if (!ctx?.companyId || !claimId) return Promise.resolve(null);
+  return Costing.findOne({ companyId: ctx.companyId, creationClaimId: String(claimId) });
+}
+
+module.exports = { createCostingWithFirstVersion, findByCreationClaim, asClaimConflict };

@@ -21,6 +21,7 @@ const express = require("express");
 const router = express.Router();
 const Request = require("../../models/Customer_Models/CustomerRequest");
 const { nextRequestId } = require("../../services/requestId");
+const { carryLineIdentities } = require("../../models/Customer_Models/customerRequestLineIdentity");
 const CustomerRequest = Request; // alias used by edit-request handlers below
 const Customer = require("../../models/Customer_Models/Customer");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
@@ -772,7 +773,17 @@ router.put("/:requestId", verifyCustomerToken, async (req, res) => {
         });
       }
 
-      if (validatedItems.length > 0) request.items = validatedItems;
+      /* Rebuilding every line from the stock-item record is deliberate — a
+         client cannot restate a name or a price that way. But a rebuilt line
+         is still the SAME commercial line, so its permanent reference is
+         carried across before the array is replaced; without this, editing
+         one quantity would retire every line on the order and open
+         replacements, and anything pointing at them (a Merchandising
+         handover above all) would be pointing at lines that no longer
+         exist. */
+      if (validatedItems.length > 0) {
+        request.items = carryLineIdentities(request.items, validatedItems);
+      }
     }
 
     request.updatedAt = new Date();

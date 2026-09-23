@@ -451,7 +451,12 @@ async function planLineAllocations({ request, body = null, actor = null } = {}) 
   const itemIds = (request.items || []).map((l) => l.rawItem).filter(Boolean);
   const items = itemIds.length
     ? new Map((await RawItem.find({ _id: { $in: itemIds } })
-      .select("_id name sku category budgetLedgerId budgetLedgerName").lean())
+      /* `customCategory` is selected because `headForItem` reads it: an item
+         whose category was typed rather than picked stores it there. Without
+         it this screen — the one where the budget decision is actually made
+         — suggested nothing for every such item, while the Store form beside
+         it showed a mapped head. */
+      .select("_id name sku category customCategory budgetLedgerId budgetLedgerName").lean())
       .map((i) => [String(i._id), i]))
     : new Map();
 

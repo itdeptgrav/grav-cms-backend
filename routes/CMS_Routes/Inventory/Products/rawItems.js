@@ -56,6 +56,13 @@ router.use(EmployeeAuthMiddleware);
 router.use(requireTenant);
 
 const canRead = requireCapability(CAPABILITIES.READ);
+/* ── HOW CUSTOMS CLASSIFIES THESE GOODS ─────────────────────────────────────
+   Uppercased and stripped of spaces and dots, because a tariff heading is
+   written "5208.52.00", "52085200" and "5208 52 00" for the same goods and a
+   duty table keyed on one of those would miss the other two. Empty stays
+   empty: an unclassified item is never read as duty-free. */
+const tariffCode = (v) => String(v ?? "").trim().toUpperCase().replace(/[\s.]/g, "").slice(0, 20);
+
 /* Item identity: name, code, category, unit, attributes, variants, thresholds. */
 const canMaintain = [requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite];
 /* Supplier aliases and their pricing are procurement facts about a commercial
@@ -628,6 +635,166 @@ router.get("/data/categories", canRead, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /data/budget-classification — which budget head an item is expected to
+// come out of, for the Store screens that must SHOW it.
+//
+// ── WHY THIS EXISTS AT ALL ──────────────────────────────────────────────────
+// The resolver, the category mappings, the item overrides and the whole
+// commitment lifecycle have existed for several chunks, and the person adding
+// the item could not see any of it. They filled in a category with no idea
+// that the choice decides which budget the purchase is later checked against,
+// and found out at Finance approval.
+//
+// ── WHY IT IS NOT THE FINANCE ROUTE ─────────────────────────────────────────
+// Everything on `Acc_chartOfAccounts` sits behind `accountantAuth` AND
+// `financeOnly` — owner, approver, admin or accountant. A storekeeper holds
+// none of those, and should not: mapping is Finance's decision. So this is a
+// READ, and a deliberately narrow one.
+//
+// ── WHAT IT DELIBERATELY DOES NOT RETURN ────────────────────────────────────
+// No ledger balances. No budget allocations, consumption or remaining figures.
+// No chart of accounts — a Store caller cannot enumerate heads through this,
+// only see the ONE their own item resolves to. No `setBy`/`setAt`: who made a
+// classification decision is Finance's record, and the Store screen has no
+// question it answers. And nothing here writes.
+//
+// Query: itemIds=a,b,c (capped) and/or category=Fabric
+// ─────────────────────────────────────────────────────────────────────────────
+const BUDGET_CLASSIFICATION_CAP = 100;
+
+/* ── CAN THIS PERSON ACTUALLY OPEN THE FINANCE SCREEN? ──────────────────────
+ * The form offers "Manage in Finance" only to someone who can reach it, and
+ * shows "Ask Finance to map this category" to everyone else. Guessing from
+ * the EMPLOYEE role would be wrong in both directions — the Finance surface
+ * is a separate session with its own roles, and a storekeeper who happens to
+ * be called "admin" in the employee directory still cannot open it.
+ *
+ * So the question is asked of the thing that actually decides: the accountant
+ * token, if this browser carries one, tested against the SAME role list
+ * `financeOnly` uses. No token, an expired one, or a role that is not on that
+ * list all answer `false` — and answering false only ever removes a link.
+ * Never throws: a malformed cookie is "not reachable", not a 500. */
+function financeSurfaceReachable(req) {
+  try {
+    const jwt = require("jsonwebtoken");
+    const raw = req.cookies?.accountant_token
+      || (String(req.headers.cookie || "").match(/accountant_token=([^;]+)/) || [])[1];
+    if (!raw) return false;
+    const decoded = jwt.verify(
+      decodeURIComponent(raw),
+      process.env.JWT_SECRET || "grav_clothing_secret_key",
+    );
+    const role = String(decoded?.role || "");
+    /* The same four roles `financeOnly` accepts, plus the same permission
+       escape hatch. Kept identical on purpose: a link that appears for
+       someone the Finance route then refuses is worse than no link. */
+    return ["owner", "approver", "admin", "accountant"].includes(role)
+      || Boolean(decoded?.permissions?.canApprove);
+  } catch (_) {
+    return false;
+  }
+}
+
+router.get("/data/budget-classification", canRead, async (req, res) => {
+  try {
+    const itemBudgetHead = require("../../../../services/itemBudgetHead.service");
+    const companyId = req.tenant?.companyId || null;
+
+    const askedIds = String(req.query.itemIds || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const ids = [...new Set(askedIds)].slice(0, BUDGET_CLASSIFICATION_CAP);
+    const category = String(req.query.category || "").trim();
+
+    /* ── SCOPED HERE, NOT IN THE SERVICE ──────────────────────────────────
+       `resolveItemIds` is the FINANCE inspection path and reads the item
+       master unscoped, which it says so in its own comment. A Store caller
+       must not reach another company's item through an id-shaped parameter,
+       so the items are loaded through this router's own tenant filter and
+       only then handed to the resolver. Nothing is re-implemented: the
+       answer still comes from `headForItem`. */
+    let items = [];
+    if (ids.length) {
+      const queryable = ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+      const found = queryable.length
+        ? await RawItem.find(scoped(req, { _id: { $in: queryable } }))
+          .select("_id name category customCategory budgetLedgerId budgetLedgerName")
+          .lean()
+        : [];
+      const byId = new Map(found.map((i) => [String(i._id), i]));
+      const map = await itemBudgetHead.categoryMap(companyId);
+
+      /* One row per REQUESTED id, including ids this company holds no item
+         for — a caller that asked about 20 and receives 18 would read the
+         answer as complete. An id belonging to another company comes back
+         in exactly the same shape as one that does not exist; separating
+         them would confirm the other company holds it. */
+      items = ids.map((id) => {
+        const item = byId.get(id);
+        if (!item) {
+          return {
+            itemId: id,
+            found: false,
+            budgetLedgerId: null,
+            budgetLedgerName: null,
+            source: itemBudgetHead.SOURCE_NONE,
+            category: null,
+            message: "No item with this id.",
+          };
+        }
+        /* `customCategory` is in the projection above because the resolver
+           reads it: an item whose category was typed rather than picked
+           stores it there, and it inherits its mapping exactly like any
+           other. This comment previously claimed the opposite, and the claim
+           was the defect — the form previewed the typed value as a mapped
+           category and the saved item then resolved to nothing. */
+        const resolution = itemBudgetHead.headForItem(item, map);
+        return {
+          itemId: id,
+          found: true,
+          ...resolution,
+          budgetLedgerId: resolution.budgetLedgerId ? String(resolution.budgetLedgerId) : null,
+        };
+      });
+    }
+
+    /* The preview behind the Add-item form: what a NEW item in this category
+       would inherit. Resolved with no item override in hand, which is exactly
+       what "the category default" means — not a saved fact about any item. */
+    let categoryDefault = null;
+    if (category) {
+      const map = await itemBudgetHead.categoryMap(companyId);
+      /* Handed in as `customCategory`, because that is what an unsaved custom
+         category IS — and `customCategory || category` then makes the preview
+         and the saved item resolve through the identical path. A standard
+         category is the same string either way, so this is one code path for
+         both rather than a branch the two screens could drift across. */
+      const resolution = itemBudgetHead.headForItem({ customCategory: category }, map);
+      categoryDefault = {
+        ...resolution,
+        budgetLedgerId: resolution.budgetLedgerId ? String(resolution.budgetLedgerId) : null,
+      };
+    }
+
+    res.json({
+      success: true,
+      items,
+      categoryDefault,
+      /* Said rather than left to be inferred from a round number. */
+      capped: askedIds.length > BUDGET_CLASSIFICATION_CAP,
+      financeSurface: {
+        reachable: financeSurfaceReachable(req),
+        path: "/accountant/budgets/item-categories",
+      },
+    });
+  } catch (error) {
+    console.error("[raw-items] budget-classification:", error);
+    res.status(500).json({ success: false, message: "Budget classification could not be read." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /accountability — every stock movement across every raw item, for a date
 // range, with the totals and series the charts render.
 //
@@ -757,6 +924,7 @@ router.post("/", ...canMaintain, payloadAuthority, async (req, res) => {
       name,
       category,
       customCategory,
+      customsTariffCode,
       unit,
       customUnit,
       minStock,
@@ -880,6 +1048,9 @@ router.post("/", ...canMaintain, payloadAuthority, async (req, res) => {
       sku: sku.toUpperCase(),
       category: customCategory ? "" : (category || ""),
       customCategory: customCategory || "",
+      /* A property of the GOODS, recorded once here rather than on every
+         quotation. Distinct from the supplier's GST HSN — see the model. */
+      customsTariffCode: tariffCode(customsTariffCode),
       unit: customUnit ? "" : (unit || ""),
       customUnit: customUnit || "",
       quantity: 0,
@@ -944,6 +1115,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       name,
       category,
       customCategory,
+      customsTariffCode,
       unit,
       customUnit,
       quantity,
@@ -1239,6 +1411,10 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
 
     if (description !== undefined) rawItem.description = description ? description.trim() : "";
     if (notes !== undefined) rawItem.notes = notes ? notes.trim() : "";
+    /* Only when the body says something about it. An absent key is "not part
+       of this edit"; an empty string is somebody clearing the classification,
+       and the two are different intentions. */
+    if (customsTariffCode !== undefined) rawItem.customsTariffCode = tariffCode(customsTariffCode);
 
     rawItem.updatedBy = req.user.id;
     await rawItem.save();

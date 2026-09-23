@@ -25,9 +25,11 @@ const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
 const {
-  CAPABILITY, merchandisingCapability,
+  CAPABILITY, merchandisingCapability, liveMerchandisingRole,
 } = require("../../../services/merchandising/access.service");
 const execution = require("../../../services/merchandising/execution.service");
+const orderDemandRelease = require("../../../services/merchandising/orderDemandRelease.service");
+const fileDemandRelease = require("../../../services/merchandising/fileDemandRelease.service");
 const selection = require("../../../services/merchandising/selection.service");
 /* ── M5 ────────────────────────────────────────────────────────────────────
    An approval closes whatever Time & Action milestone was waiting for it.
@@ -61,6 +63,9 @@ const canMoveLifecycle = merchandisingCapability(CAPABILITY.FILE_LIFECYCLE);
    an exception to that. */
 const canWriteSelection = merchandisingCapability(CAPABILITY.SELECTION_WRITE);
 const canApproveSelection = merchandisingCapability(CAPABILITY.SELECTION_APPROVE);
+/* Releasing demand is a commitment to spend, so it sits at `approver` — see
+   the capability's own note in `access.service.js`. */
+const canReleaseDemand = merchandisingCapability(CAPABILITY.PROCUREMENT_RELEASE);
 
 const actor = (req) => (req.user?.id
   ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" }
@@ -81,6 +86,78 @@ router.get("/companies", canRead, handle(async (req, res) => {
   return res.json({ success: true, ...out });
 }));
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   RELEASING APPROVED DEMAND INTO PROCUREMENT
+   ═══════════════════════════════════════════════════════════════════════════
+   An explicit command, deliberately: accepting a handover does not release
+   demand, approving a costing does not, and a customer approving a quotation
+   does not. Merchandising decides when its approved requirement becomes
+   something Store may go and buy.
+
+   It produces DRAFT spend requests and nothing else — no purchase order, no
+   supplier, no reservation. Every quantity is regenerated server-side from the
+   frozen approved costing; nothing in the request body describes one.
+════════════════════════════════════════════════════════════════════════════ */
+
+/** The context the release service reads: company, actor, and the live role. */
+const releaseCtx = async (req) => ({
+  companyId: req.merchandising.companyId,
+  role: await liveMerchandisingRole(req),
+});
+
+router.get("/demand-release", requireCompany, canRead, handle(async (req, res) => {
+  const out = await orderDemandRelease.stateFor(await releaseCtx(req), {
+    orderId: String(req.query.orderId || "").trim(),
+    lineRef: String(req.query.lineRef || "").trim(),
+    costingVersionId: String(req.query.costingVersionId || "").trim(),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+router.post("/demand-release", requireCompany, canReleaseDemand, handle(async (req, res) => {
+  const body = req.body || {};
+  const out = await orderDemandRelease.release(await releaseCtx(req), {
+    /* The three identities the command must name. A release that guessed any
+       of them would commit money against a record nobody chose. */
+    orderId: String(body.orderId || "").trim(),
+    lineRef: String(body.lineRef || "").trim(),
+    costingVersionId: String(body.costingVersionId || "").trim(),
+    actor: actor(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/* ── THE SAME COMMAND, ADDRESSED BY THE FILE SOMEBODY IS LOOKING AT ───────
+   The pair above is the identity-addressed contract, kept working and not
+   removed. It is not, however, something a screen can call: the Execution
+   File has a file id, a handover reference and a Sales version, and the only
+   ways a browser could produce an order id and an exact costing version would
+   be to guess, to search, or to have a person type an internal identity in.
+
+   These two resolve all of that server-side, from records the file already
+   points at, and hand the SAME authority the same three identities. The GET
+   returns an opaque handle for the resolution it read; the POST must echo it,
+   so a line repriced onto another approved costing is a conflict the person
+   sees rather than a substitution nobody notices. */
+
+router.get("/files/:fileId/demand-release", requireCompany, canRead, handle(async (req, res) => {
+  const out = await fileDemandRelease.stateForFile(await releaseCtx(req), {
+    fileId: String(req.params.fileId || "").trim(),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+router.post("/files/:fileId/demand-release", requireCompany, canReleaseDemand,
+  handle(async (req, res) => {
+    const out = await fileDemandRelease.releaseFromFile(await releaseCtx(req), {
+      fileId: String(req.params.fileId || "").trim(),
+      /* The handle the GET produced. Nothing else about the command is
+         body-authored — no order, no line, no version, no quantity. */
+      expectedVersion: String(req.body?.expectedVersion || "").trim(),
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
 
 /* ── THE INBOX ─────────────────────────────────────────────────────────── */
 

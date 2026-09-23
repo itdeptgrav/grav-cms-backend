@@ -32,6 +32,10 @@ const {
   ENQUIRY_PRIORITY_CODES,
   CUSTOMER_SERIOUSNESS_CODES,
   ENQUIRY_REFERENCE_TYPE_CODES,
+  /* The same four codes the Account carries. One vocabulary, so an enquiry's
+     answer and the customer's standing term are comparable. */
+  FREIGHT_ARRANGEMENT_CODES,
+  PAYMENT_DUE_FROM,
 } = require("../../../constants/crm");
 
 const actorRef = () => ({
@@ -120,6 +124,113 @@ const enquirySchema = new mongoose.Schema(
     // Free-text summary of what the customer is asking for — the plain-language
     // brief that complements the structured products below.
     summary: { type: String, trim: true },
+
+    /* ── HOW THIS ORDER IS DELIVERED, AND WHO PAYS ──────────────────────
+       The Account already carries a standing `freightArrangement`, and that
+       is the right default and the wrong authority: a customer who normally
+       collects may ask for one order delivered, and costing the whole
+       enquiry at the standing term would put a freight cost on a garment
+       nobody is shipping — or leave one off a garment we are.
+
+       So the arrangement is answerable HERE, per enquiry, and the account's
+       value is the fallback. The costing freezes which of the two it used,
+       because "the customer's standing term" and "what was agreed for this
+       order" are different claims and only one of them was made about this
+       order.
+
+       Every field is optional: an enquiry may legitimately be raised before
+       anybody has asked. What is not optional is the costing being honest
+       about the absence — a `delivered` order with no destination blocks and
+       names Sales rather than being costed to nowhere. */
+    /* ══ WHEN THIS ORDER GETS PAID ═══════════════════════════════════════
+       Financing is the cost of money tied up in an order. The company rate
+       says what money costs; this says how long it is out, and without it a
+       financing figure is a percentage of a subtotal wearing the name of a
+       cost of capital.
+
+       ── COPIED, NEVER READ THROUGH ────────────────────────────────────
+       The Account carries the customer's standing terms and is the DEFAULT.
+       It is copied here when Sales confirms, not read live: a customer
+       renegotiating in November must not silently restate what an order
+       costed in March was quoted on. That is the same reason
+       `contextSnapshot` exists on a costing, applied one record earlier.
+
+       ── AND UNANSWERED IS NOT CASH ────────────────────────────────────
+       An absent block means nobody has agreed the terms. It is never read as
+       "paid up front, therefore no financing" — that is a real commercial
+       position somebody states with `advancePercent: 100`, and it is a
+       different fact from silence. */
+    paymentTerms: {
+      /* % of the order value received before production. Reuses the
+         Account's own structured field and its convention exactly: unset is
+         "nobody said", 0 is "no advance agreed", and the two are different
+         answers. `SalesJourney.po.paymentTerms.advancePercent` gates
+         production from the same number, later. */
+      advancePercent: { type: Number, min: 0, max: 100 },
+      /* How long the BALANCE is outstanding. 0 is "due immediately", which
+         is an answer; absent is not. */
+      creditDays: { type: Number, min: 0 },
+      /* Thirty days from what. See PAYMENT_DUE_FROM — a duration with no
+         anchor cannot be turned into a financing cost. */
+      creditDaysFrom: { type: String, enum: PAYMENT_DUE_FROM.map((p) => p.code) },
+
+      /* ── WHERE THESE NUMBERS CAME FROM ──────────────────────────────
+         `ACCOUNT` — copied from the customer's standing terms unchanged.
+         `ENQUIRY` — Sales agreed something different for this order.
+         Stored rather than derived, because the Account may since have
+         moved and the claim being made is about what was agreed THEN. */
+      source: { type: String, enum: ["ACCOUNT", "ENQUIRY"] },
+      /* What the Account said at the moment of confirmation. An override is
+         then auditable as a difference rather than as an assertion — and it
+         stays auditable after the Account changes again. */
+      accountDefaultAtConfirmation: {
+        advancePercent: { type: Number, min: 0, max: 100 },
+        creditDays: { type: Number, min: 0 },
+      },
+
+      /* ── FINANCING GENUINELY NOT APPLICABLE ─────────────────────────
+         A real commercial condition — a sample order billed at cost, an
+         intercompany transfer. A stated reason, never an empty field read
+         as nil. */
+      notApplicable: { type: Boolean, default: false },
+      notApplicableReason: { type: String, trim: true, maxlength: 500 },
+
+      /* Terms are not in force until somebody says so. This is what turns
+         a draft into the fact a costing may read. */
+      confirmedAt: { type: Date },
+      confirmedBy: actorRef(),
+      /* The wording they were agreed in, for anything the three fields
+         above cannot hold. Read by people, never by the engine. */
+      note: { type: String, trim: true, maxlength: 1000 },
+    },
+
+    freight: {
+      /* `prepaid | to_pay | ex_works | delivered`, the codes already in
+         `constants/crm.js`. Absent means "ask the account". */
+      arrangement: { type: String, enum: FREIGHT_ARRANGEMENT_CODES },
+      /* How it travels. There was nowhere to record this before, and a
+         quotation is quoted for a mode — road and air on one lane are
+         different rates and different transporters. */
+      mode: { type: String, enum: ["ROAD", "RAIL", "AIR", "SEA", "COURIER"] },
+      /* ── THE SHIPPING ADDRESS, CHOSEN, NEVER ASSUMED ────────────────
+         A `CRMAddress` of this account. Billing and shipping are already
+         separate records precisely because they differ, so nothing here
+         falls back to the billing address: an unanswered destination is a
+         gap owned by Sales, not an invitation to guess. */
+      shippingAddressId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMAddress" },
+      /* Which of this company's warehouses the order dispatches from. */
+      originWarehouseId: { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse" },
+      /* ── SPLIT DELIVERIES, RECORDED AS A FACT, NOT CALCULATED ───────
+         Nothing in this system schedules deliveries, so a consignment count
+         cannot be derived. Recorded here when somebody knows it; a value
+         above 1 against a per-consignment quotation is a decision for
+         Sales/Logistics rather than a multiplication this makes up. */
+      deliveryCount: { type: Number, min: 1 },
+      /* Answering the one thing the arrangement codes cannot: whether
+         freight the company prepays is inside the price or billed on. */
+      prepaidTreatment: { type: String, enum: ["IN_PRICE", "RECOVERED_SEPARATELY"] },
+      notes: { type: String, trim: true, maxlength: 1000 },
+    },
 
     // ── Products (Chunk 2) + per-product garment spec (Chunk 3) ─────────────
     // The product-wise requirement. Quantities are APPROXIMATE at enquiry stage
@@ -290,6 +401,19 @@ const enquirySchema = new mongoose.Schema(
       new mongoose.Schema(
         {
           productName: { type: String, trim: true, required: true },
+          /* ── AND THE LINE IT IS ACTUALLY ABOUT ────────────────────────
+             `productName` is not a key. One enquiry legitimately carries the
+             same garment twice in two colourways, and those two rows have
+             their own confirmed quantities, their own floors and their own
+             selling prices — so keying a price by name made them share one.
+
+             The permanent reference and the style are the same pair the
+             commercial line is keyed by. Optional, because rows written
+             before this existed have neither and are still readable; a row
+             WITH them is addressed by them, and a row without is addressed
+             the old way. */
+          productLineRef: { type: String, trim: true },
+          sampleStyleId: { type: String, trim: true },
           /** Unit cost, as read off the costing workbook's Master tab. */
           cost: { type: Number, min: 0 },
           /** Unit price being quoted. Margin is derived, never stored. */
@@ -299,6 +423,223 @@ const enquirySchema = new mongoose.Schema(
             name: { type: String, trim: true },
           },
           updatedAt: { type: Date },
+        },
+        { _id: false },
+      ),
+    ],
+
+    /* ══ THE COMMERCIAL LINE — WHAT SALES HAS COMMITTED TO QUOTE ═════════
+     *
+     * ── WHY THIS EXISTS AT ALL ──────────────────────────────────────────
+     * The quantity a garment is priced FOR is a commercial decision, and it
+     * had no home. `costLedger` carries a cost and a price per product but no
+     * quantity, and it is keyed by `productName` — a key this file already
+     * warns "breaks on a rename and on two spellings of one garment". The
+     * enquiry's own `products[].quantity` is what the buyer ASKED for, which
+     * is not the same fact as what Sales has settled on quoting.
+     *
+     * So the number the floor price is calculated against was being read from
+     * whichever of those a screen happened to reach for. This is the one
+     * place it lives.
+     *
+     * ── KEYED BY WHAT CANNOT MOVE ───────────────────────────────────────
+     * `productLineRef` is server-minted, unique within the enquiry and never
+     * reissued; `sampleStyleId` is the style's own identity. Both, together,
+     * because a line names a product row AND the approved style being quoted.
+     * Never the product name.
+     *
+     * ── NO CUSTOMER, NO PRICE, NOT YET ──────────────────────────────────
+     * A prospect is still a prospect while this is being priced. Linking a
+     * portal customer is required to ISSUE a proforma invoice and at no
+     * earlier moment, and a selling price is something Sales decides AFTER
+     * seeing the floor — copying the floor into it would make the company's
+     * own minimum look like a quote nobody chose.
+     *
+     * ── AND EVERY QUANTITY IT HAS EVER CARRIED ──────────────────────────
+     * `revisions` is append-only. A quotation or proforma already issued was
+     * priced on a costing frozen for one of these numbers, and that pairing
+     * has to stay legible after somebody revises upward.
+     */
+    commercialLines: [
+      new mongoose.Schema(
+        {
+          productLineRef: { type: String, trim: true, required: true, index: true },
+          sampleStyleId: {
+            type: mongoose.Schema.Types.ObjectId, ref: "SampleStyle", required: true, index: true,
+          },
+          /** A display snapshot. Never joined on — see the note above. */
+          productName: { type: String, trim: true, default: "" },
+
+          /** The quantity in force, and the unit it is counted in. */
+          quantity: { type: Number, min: 1, required: true },
+          quantityUom: { type: String, trim: true, default: "Pieces" },
+
+          /** Bumped on every confirmed change. Starts at 1. */
+          revision: { type: Number, default: 1, min: 1 },
+
+          confirmedAt: { type: Date },
+          confirmedBy: {
+            id: { type: String, trim: true },
+            name: { type: String, trim: true },
+          },
+
+          /* Append-only. Oldest first. */
+          revisions: [
+            new mongoose.Schema(
+              {
+                revision: { type: Number, required: true, min: 1 },
+                quantity: { type: Number, required: true, min: 1 },
+                quantityUom: { type: String, trim: true, default: "Pieces" },
+                reason: { type: String, trim: true, default: "" },
+                at: { type: Date, required: true },
+                byName: { type: String, trim: true, default: "" },
+              },
+              { _id: false },
+            ),
+          ],
+        },
+        { _id: false },
+      ),
+    ],
+
+    /* ══ THE SALES COSTING BRIEF — WHAT SALES ASKS TO BE COSTED ══════════
+     *
+     * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────
+     * Which approved style is being quoted, what quantities the customer
+     * wants priced, in what unit, at what proposed selling price, and why —
+     * every one of those is a COMMERCIAL fact, and every one of them was
+     * being typed inside Central Costing by whoever opened the workspace.
+     * Costing is a calculation, validation and versioning engine; it has no
+     * customer, no negotiation and no order in front of it. The person who
+     * does is in Sales, and none of these facts survived anywhere they could
+     * read them back.
+     *
+     * ── KEYED BY THE STYLE, AND ONLY BY THE STYLE ───────────────────────
+     * `SampleStyle._id`, which is stable for ever.
+     *
+     * NOT the product row's `_id`: `sanitizeProducts()` rebuilds the whole
+     * `products[]` array on every requirement save and reassigns each row a
+     * fresh id, so anything keyed by one is orphaned the next time somebody
+     * edits a quantity. NOT the product NAME either — that is what
+     * `costLedger` and `costingSheets` had to fall back on, and it breaks on
+     * a rename and on two spellings of one garment. The name is kept here as
+     * a DISPLAY SNAPSHOT and is never joined on.
+     *
+     * Top-level for the same reason those two are: a row on `products[]`
+     * would not survive the next requirement save.
+     *
+     * ── AND SILENCE IS NOT AN ANSWER ────────────────────────────────────
+     * No brief, or a brief nobody confirmed, means Sales has not asked for
+     * anything to be costed. Central Costing blocks and names them. It never
+     * invents a quantity, a unit or a price, and it never picks a style. */
+    costingBriefs: [
+      new mongoose.Schema(
+        {
+          /* Server-minted and stable, so a supersession can name its
+             successor without pointing at a subdocument id. */
+          briefId: { type: String, trim: true, required: true },
+
+          /* ── THE ONE JOIN KEY ────────────────────────────────────────
+             The approved style Sales chose. Required: a brief that names no
+             style is a request to cost nothing in particular. */
+          sampleStyleId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "SampleStyle",
+            required: true,
+            index: true,
+          },
+
+          /* ── SNAPSHOTS, FOR READING ONLY ─────────────────────────────
+             So a brief stays legible when a style is renamed, and so a list
+             can be rendered without resolving every style. Nothing joins on
+             any of them. */
+          styleCode: { type: String, trim: true, default: "" },
+          styleReference: { type: String, trim: true, default: "" },
+          variantLabel: { type: String, trim: true, default: "" },
+          /* Which product on the enquiry this style is for — a snapshot, and
+             the reason two confirmed briefs for one product are refused. */
+          productName: { type: String, trim: true, default: "" },
+
+          /* ── WHAT THE CUSTOMER WANTS PRICED ──────────────────────────
+             One or more run sizes. These are QUOTATION break points, not
+             order quantities: several are normal, they are hypothetical, and
+             the committed figure is the work order's. Merging the two would
+             make a quote look like a commitment. */
+          quantities: [
+            new mongoose.Schema(
+              {
+                key: { type: String, trim: true, required: true, maxlength: 64 },
+                label: { type: String, trim: true, default: "", maxlength: 200 },
+                /* A string, in the exact-decimal convention the costing
+                   engine uses. A float here is a quantity nobody typed. */
+                quantity: { type: String, trim: true, required: true },
+                /* Exactly one, enforced on write. The primary is what the
+                   coverage assessment is made against. */
+                isPrimary: { type: Boolean, default: false },
+                /* ── A COMMERCIAL PROPOSAL, NOT A COST ────────────────
+                   What Sales proposes to sell at, per run size, excluding
+                   tax. It never reaches the engine — changing it cannot move
+                   a cost figure — and it is optional, because a costing is
+                   routinely raised before anybody has proposed a price. */
+                proposedSellingPriceExclTax: { type: String, trim: true, default: undefined },
+              },
+              { _id: false },
+            ),
+          ],
+
+          /* ── THE COMMERCIAL UNIT, SAID ONCE ──────────────────────────
+             One unit for the whole brief. It used to be per scenario, which
+             allowed one costing to quote 500 pieces beside 500 metres. */
+          quantityUom: { type: String, trim: true, default: "", maxlength: 32 },
+          /* What the proposed prices are IN. A price with no currency is a
+             number. */
+          currency: { type: String, trim: true, uppercase: true, default: "INR", maxlength: 8 },
+
+          /* Why this is being costed, in Sales' own words — the context a
+             reader needs six months later and no field can hold. */
+          note: { type: String, trim: true, default: "", maxlength: 1000 },
+          /* When Sales needs the estimate ready for review. A target they
+             state, not a gate: nothing is refused for missing it. */
+          requiredBy: { type: Date },
+
+          /* ── DRAFT, CONFIRMED, OR REPLACED ───────────────────────────
+             A costing reads a CONFIRMED brief and nothing else. `DRAFT` is
+             Sales still deciding; `SUPERSEDED` is a decision that was made
+             and then changed, kept because "we quoted style A and moved to
+             B" is a fact somebody may have to explain. */
+          state: {
+            type: String,
+            enum: ["DRAFT", "CONFIRMED", "SUPERSEDED"],
+            default: "DRAFT",
+            index: true,
+          },
+          /* Not in force until somebody says so — the same rule
+             `paymentTerms` uses, and for the same reason. */
+          confirmedAt: { type: Date },
+          confirmedBy: actorRef(),
+          /* ── SUPERSESSION IS EXPLICIT, NEVER A RETARGET ──────────────
+             Choosing a different style does not edit this brief to point at
+             the new one: that would rewrite history and leave every frozen
+             costing version citing a brief that now describes a different
+             garment. The old brief is closed, names its successor, and says
+             why. */
+          supersededAt: { type: Date },
+          supersededBy: actorRef(),
+          supersededByBriefId: { type: String, trim: true, default: "" },
+          supersessionReason: { type: String, trim: true, default: "", maxlength: 500 },
+
+          /* ── PROVENANCE AND IDEMPOTENCY ──────────────────────────────
+             Bumped on every save. A costing freezes the brief's id AND its
+             revision, so a frozen version says exactly which wording of the
+             request it was calculated from — and a caller can send the
+             revision it read to be refused if somebody else has since
+             changed it. */
+          revision: { type: Number, default: 0, min: 0 },
+
+          createdAt: { type: Date, default: Date.now },
+          createdBy: actorRef(),
+          updatedAt: { type: Date, default: Date.now },
+          updatedBy: actorRef(),
         },
         { _id: false },
       ),
@@ -637,6 +978,35 @@ const enquirySchema = new mongoose.Schema(
     // opened, and back-filled by the production route when it has to resolve
     // one itself, so the guess happens at most once per enquiry.
     customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null, index: true },
+
+    // ── HOW THE LINK ABOVE WAS PROVED (G02) ─────────────────────────────────
+    //
+    // `customerRequestId` alone cannot say whether it is proof or a guess: it
+    // has been written by a newest-request-for-this-customer lookup at PO time,
+    // by the quotation screen opening whatever request a name search listed
+    // first, and by the production route's name match. This records the two
+    // ways a link is PROVED, so services/orderBookLink.js can tell them apart
+    // from everything else:
+    //
+    //   sales_origin — the request was raised from this enquiry through Cost &
+    //                  Invoicing (`salesOrigin.enquiryId` names this enquiry);
+    //   manual       — an authorised salesperson chose it from this company's
+    //                  own candidates, with a reason when it replaced another.
+    //
+    // It describes the link only while `customerRequestId` equals the id held
+    // here. Absent on every enquiry linked before G02, which the resolver
+    // reports as unverified rather than trusting.
+    orderLink: {
+      customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: undefined },
+      method: { type: String, enum: ["sales_origin", "manual"], default: undefined },
+      confirmedAt: { type: Date, default: undefined },
+      confirmedBy: {
+        id: { type: String, default: undefined },
+        name: { type: String, default: undefined },
+      },
+      reason: { type: String, trim: true, default: undefined },
+      replacedCustomerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: undefined },
+    },
 
 
     // ── Off-schedule dispatch asks (17 Aug 2026) ────────────────────────────

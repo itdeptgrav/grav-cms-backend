@@ -111,6 +111,21 @@ const CAPABILITY = Object.freeze({
   CHANGE_COORDINATE: "merchandising.change.coordinate",
   CONFIGURATION_MANAGE: "merchandising.configuration.manage",
   EXPORT: "merchandising.export",
+
+  /* ── RELEASING APPROVED DEMAND INTO PROCUREMENT ──────────────────────
+     Merchandising receives the confirmed handover, so Merchandising decides
+     when its approved material requirement becomes demand Store may act on.
+
+     Named outside the `merchandising.*` family on purpose: what it authorises
+     happens in PROCUREMENT, and a reader auditing who can create purchasing
+     demand should find it by that name rather than by knowing which
+     department currently presses the button. It stays a Merchandising grant
+     because that is who owns the decision.
+
+     It is emphatically NOT held by Sales at any rank. Sales confirms the
+     order and may take the commercial decision on its price; committing the
+     company to buy against it is a different act with a different owner. */
+  PROCUREMENT_RELEASE: "procurement.demand.release",
 });
 
 /** What each rung of the ladder may do. Cumulative, weakest first. */
@@ -123,6 +138,10 @@ const ROLE_CAPABILITIES = (() => {
   const approver = [...editor,
     CAPABILITY.BRIEF_REVIEW, CAPABILITY.SELECTION_APPROVE, CAPABILITY.TNA_MANAGE,
     CAPABILITY.FILE_LIFECYCLE, CAPABILITY.HANDOVER_SUBMIT,
+    /* A commitment to spend, so it sits with the rung that already decides
+       rather than the one that drafts. `editor` states requirements; it does
+       not release them. */
+    CAPABILITY.PROCUREMENT_RELEASE,
   ];
   const owner = [...approver,
     CAPABILITY.FILE_ASSIGN, CAPABILITY.CONFIGURATION_MANAGE, CAPABILITY.EXPORT,

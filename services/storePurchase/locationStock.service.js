@@ -102,10 +102,22 @@ function usableLocationError(warehouse, location, companyId) {
 
 const isReceiving = (location) => location && location.type === "RECEIVING";
 
+// Derive a per-MOVEMENT idempotency key for one line of a multi-line
+// operation. Deterministic: the operation key + a stable line identity (a PO
+// line _id, an MRF issue line _id, …) + a discriminator (e.g. "receipt" vs
+// "surplus", "issue", "return"). A replay of the same operation reproduces the
+// SAME key, so the deployed unique index dedupes it; two distinct lines produce
+// distinct keys, so both persist. Returns "" when there is no operation key —
+// then the movement stays out of the partial unique index, exactly as before.
+function movementLineKey(operationKey, lineIdentity, discriminator) {
+  if (!operationKey) return "";
+  return `${operationKey}::${lineIdentity == null ? "" : lineIdentity}::${discriminator || ""}`;
+}
+
 // A movement document (plain object) ready for LocationMovement.create.
 function buildMovement({
   companyId, siteId, item, variantId, warehouse, location,
-  direction, quantity, type, source, transferId, actor, note, idempotencyKey,
+  direction, quantity, type, source, transferId, actor, note, idempotencyKey, operationKey,
 }) {
   return {
     companyId,
@@ -128,6 +140,7 @@ function buildMovement({
     actorName: actor?.name || "",
     note: note || "",
     idempotencyKey: idempotencyKey || "",
+    operationKey: operationKey || "",
     applied: true,
   };
 }
@@ -169,13 +182,44 @@ async function decLocationGuarded(session, companyId, itemId, variantId, warehou
   return (res.matchedCount || res.n || 0) > 0;
 }
 
+// Same guarded decrement, but returns the balance the atomic update ACTUALLY
+// produced (`{ new: true }`), so a caller can report an honest committed
+// after-balance — never a second, unprotected read. Two concurrent decrements
+// on the same balance are serialised by the single-document update, so each
+// caller gets a distinct `after` (10→8, then 8→6), and `before = after + qty`.
+async function decLocationGuardedReturning(session, companyId, itemId, variantId, warehouseId, locationId, qty) {
+  const doc = await LocationBalance.findOneAndUpdate(
+    { ...locFilter(companyId, itemId, variantId, warehouseId, locationId), onHand: { $gte: round4(qty) - QTY_TOL } },
+    { $inc: { onHand: -round4(qty) } },
+    { new: true, session },
+  );
+  if (!doc) return { ok: false, after: null };
+  return { ok: true, after: round4(doc.onHand) };
+}
+
+// Same as incLocation, but returns the committed after-balance the atomic
+// upsert produced. `before = after - delta`.
+async function incLocationReturning(session, companyId, itemId, variantId, warehouseId, locationId, delta) {
+  const doc = await LocationBalance.findOneAndUpdate(
+    locFilter(companyId, itemId, variantId, warehouseId, locationId),
+    { $inc: { onHand: round4(delta) } },
+    { upsert: true, new: true, session },
+  );
+  return { after: round4(doc.onHand) };
+}
+
 // Move the assigned-total sentinel. `guardMax` (company on-hand) refuses a
 // placement that would put more into locations than the company holds — the
 // atomic guard two concurrent assignments race on.
 async function incAssignedTotal(session, companyId, itemId, variantId, delta, guardMax) {
   const filter = sentinelFilter(companyId, itemId, variantId);
   if (delta > 0 && guardMax != null) {
-    await LocationBalance.updateOne(filter, { $setOnInsert: { onHand: 0 } }, { upsert: true, session });
+    // Ensure the sentinel exists; tolerate the concurrent-insert race (the
+    // unique index lets exactly one insert win — the loser's E11000 just means
+    // the row is already there).
+    try {
+      await LocationBalance.updateOne(filter, { $setOnInsert: { onHand: 0 } }, { upsert: true, session });
+    } catch (e) { if (!(e && e.code === 11000)) throw e; }
     const res = await LocationBalance.updateOne(
       { ...filter, onHand: { $lte: round4(guardMax - delta) + QTY_TOL } },
       { $inc: { onHand: round4(delta) } },
@@ -190,6 +234,29 @@ async function incAssignedTotal(session, companyId, itemId, variantId, delta, gu
 async function writeMovement(session, doc) {
   const [mv] = await LocationMovement.create([doc], { session });
   return mv;
+}
+
+// The projected on-hand of one (item[, variant]) at one location — a plain read
+// used to refuse an over-issue BEFORE any effect marker or stock change.
+async function locationOnHand(session, companyId, itemId, variantId, warehouseId, locationId) {
+  const row = await LocationBalance
+    .findOne(locFilter(companyId, itemId, variantId, warehouseId, locationId))
+    .session(session || null)
+    .lean();
+  return row && typeof row.onHand === "number" ? round4(row.onHand) : 0;
+}
+
+// Whether a SCOPE participates in Warehouse Stock — i.e. it has at least one
+// location movement in its HISTORY (truthful: not inferred from a positive
+// current balance). Pass a variantId to scope it to that variant; pass null for
+// the non-variant scope; omit it entirely to ask about the item as a whole
+// (any variant). When true, a source/destination location is REQUIRED (never
+// guess Unassigned); when false the scope is purely company-level/legacy and
+// issues/returns stay at company scope, unchanged.
+async function isLocationTracked(companyId, itemId, variantId = undefined) {
+  const query = { companyId: oid(companyId), itemId: oid(itemId) };
+  if (variantId !== undefined) query.variantId = variantId ? oid(variantId) : null;
+  return !!(await LocationMovement.exists(query));
 }
 
 // ── HIGH-LEVEL: what a canonical operation calls inside its own mutate ────────
@@ -263,13 +330,18 @@ module.exports = {
   usableLocationError,
   isReceiving,
   buildMovement,
+  movementLineKey,
   QTY_TOL,
   round4,
   // projection guards
   incLocation,
   decLocationGuarded,
+  decLocationGuardedReturning,
+  incLocationReturning,
   incAssignedTotal,
   writeMovement,
+  locationOnHand,
+  isLocationTracked,
   rebuildProjection,
   sentinelFilter,
   locFilter,

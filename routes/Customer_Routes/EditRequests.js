@@ -1,5 +1,6 @@
 // routes/Customer_Routes/EditRequests.js
 const express = require('express');
+const { carryLineIdentities, stripLineIdentities } = require("../../models/Customer_Models/customerRequestLineIdentity");
 const router = express.Router();
 const mongoose = require('mongoose');
 
@@ -165,8 +166,18 @@ router.post('/:editRequestId/approve', async (req, res) => {
         }
         
         // Apply items changes
+        //
+        // An edit proposal is a PAYLOAD, so it carries no authority to name a
+        // line: any reference on it is dropped, and each proposed line is
+        // rejoined to the line it is editing (or minted a fresh identity if
+        // it is genuinely new). Without this, adopting the proposal wholesale
+        // would let a client author the permanent reference that the
+        // Merchandising handover points at.
         if (editRequest.items && editRequest.items.length > 0) {
-            customerRequest.items = editRequest.items;
+            const proposed = editRequest.items.map((i) => (i.toObject ? i.toObject() : { ...i }));
+            customerRequest.items = carryLineIdentities(
+                customerRequest.items, stripLineIdentities(proposed),
+            );
         }
 
         // Add a note to the customer request

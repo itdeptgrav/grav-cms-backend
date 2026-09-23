@@ -11,20 +11,24 @@ const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
+/* Cutting only, this company's work only — see cuttingAccess.js. Reading needs
+   viewer, recording needs editor (once Cutting grants exist). */
+const cutting = require("./cuttingAccess");
+const canRead = [cutting.cuttingDepartment("viewer"), cutting.cuttingCompany];
+const canRecord = [cutting.cuttingDepartment("editor"), cutting.cuttingCompany];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET work order details for bulk cutting
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/work-orders/:woId/bulk-cutting", async (req, res) => {
+router.get("/work-orders/:woId/bulk-cutting", ...canRead, async (req, res) => {
   try {
     const { woId } = req.params;
 
-    const workOrder = await WorkOrder.findById(woId)
-      .select("workOrderNumber stockItemName stockItemReference quantity variantAttributes cuttingStatus cuttingProgress stockItemId")
-      .lean();
-
-    if (!workOrder) {
-      return res.status(404).json({ success: false, message: "Work order not found" });
-    }
+    const workOrder = await cutting.loadScopedWorkOrder(req, res, woId, (q) => q
+      .select("workOrderNumber stockItemName stockItemReference quantity variantAttributes cuttingStatus cuttingProgress stockItemId salesLineLink")
+      .lean());
+    if (!workOrder) return undefined;
+    delete workOrder.salesLineLink;
 
     let panelCount = 1;
     if (workOrder.stockItemId) {
@@ -41,6 +45,8 @@ router.get("/work-orders/:woId/bulk-cutting", async (req, res) => {
       workOrder: {
         ...workOrder,
         panelCount,
+        /* "linked" to this company's Sales line, or "unlinked" (historical). */
+        companyProof: req.cutting.proof,
         cuttingProgress: workOrder.cuttingProgress || { completed: 0, remaining: workOrder.quantity || 0 }
       }
     });
@@ -53,15 +59,13 @@ router.get("/work-orders/:woId/bulk-cutting", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST: Update cutting progress
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/work-orders/:woId/update-cutting", async (req, res) => {
+router.post("/work-orders/:woId/update-cutting", ...canRecord, async (req, res) => {
   try {
     const { woId } = req.params;
     const { quantityCut, action = "add" } = req.body;
 
-    const workOrder = await WorkOrder.findById(woId);
-    if (!workOrder) {
-      return res.status(404).json({ success: false, message: "Work order not found" });
-    }
+    const workOrder = await cutting.loadScopedWorkOrder(req, res, woId);
+    if (!workOrder) return undefined;
 
     if (!workOrder.cuttingProgress) {
       workOrder.cuttingProgress = { completed: 0, remaining: workOrder.quantity || 0 };
@@ -110,15 +114,14 @@ router.post("/work-orders/:woId/update-cutting", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST: Generate barcodes for bulk cutting
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/work-orders/:woId/generate-bulk-barcodes", async (req, res) => {
+router.post("/work-orders/:woId/generate-bulk-barcodes", ...canRecord, async (req, res) => {
   try {
     const { woId } = req.params;
     const { quantityToGenerate } = req.body;
 
-    const workOrder = await WorkOrder.findById(woId).populate("stockItemId", "numberOfPanels").lean();
-    if (!workOrder) {
-      return res.status(404).json({ success: false, message: "Work order not found" });
-    }
+    const workOrder = await cutting.loadScopedWorkOrder(req, res, woId,
+      (q) => q.populate("stockItemId", "numberOfPanels").lean());
+    if (!workOrder) return undefined;
 
     const panelCount = workOrder.stockItemId?.numberOfPanels || 1;
     const completed = workOrder.cuttingProgress?.completed || 0;
@@ -164,7 +167,7 @@ router.post("/work-orders/:woId/generate-bulk-barcodes", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET: Search employees (for cutting master selection)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/employees/search", async (req, res) => {
+router.get("/employees/search", cutting.cuttingDepartment("viewer"), async (req, res) => {
   try {
     const { q = "" } = req.query;
     if (!q.trim()) return res.json({ success: true, employees: [] });
@@ -202,55 +205,86 @@ router.get("/employees/search", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST: Save cutting master daily record (upsert per employee per day)
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/cutting-master-records", async (req, res) => {
+/*
+ * "Who cut these units?" — the cutting station names the worker, and the
+ * record is built from records, not from the body:
+ *   · the worker is an existing, active employee, and their name, biometric
+ *     id, department and designation are read from THEIR employee record —
+ *     a name typed into the body is never stored;
+ *   · the WorkOrder is one this company's Cutting may work on, and its number,
+ *     item and size are read from it;
+ *   · the person who recorded it is the signed-in session.
+ * The body may carry only the worker's id, the WorkOrder id, and the cut:
+ * quantity and unit range. Anything else it sends is ignored, as before.
+ */
+router.post("/cutting-master-records", ...canRecord, async (req, res) => {
   try {
-    const {
-      employeeId, employeeName, biometricId, department, designation,
-      woId, woNumber, stockItemName, variants,
-      quantityCut, startUnit, endUnit
-    } = req.body;
+    const { employeeId, woId, quantityCut, startUnit, endUnit } = req.body || {};
 
-    if (!employeeId || !employeeName) {
-      return res.status(400).json({ success: false, message: "Employee info is required" });
+    if (!cutting.isId(employeeId)) {
+      return res.status(400).json({ success: false, message: "Choose who cut these units." });
     }
+    if (!cutting.isId(woId)) {
+      return res.status(400).json({ success: false, message: "A cutting record needs the work order it was cut for." });
+    }
+    const worker = await Employee.findOne({ _id: employeeId, isActive: { $ne: false } })
+      .select("firstName middleName lastName biometricId department designation")
+      .lean();
+    if (!worker) {
+      return res.status(400).json({ success: false, message: "That employee is not an active employee." });
+    }
+    const workOrder = await cutting.loadScopedWorkOrder(req, res, woId,
+      (q) => q.select("workOrderNumber stockItemName variantAttributes salesLineLink").lean());
+    if (!workOrder) return undefined;
 
+    const workerName = [worker.firstName, worker.middleName, worker.lastName].filter(Boolean).join(" ").trim();
     const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const qty = Number(quantityCut) || 0;
 
     const entry = {
-      woId:          woId || null,
-      woNumber:      woNumber || "",
-      stockItemName: stockItemName || "",
-      variants:      variants || "",
-      quantityCut:   quantityCut || 0,
-      startUnit:     startUnit || 0,
-      endUnit:       endUnit || 0,
-      timestamp:     new Date()
+      woId:          workOrder._id,
+      woNumber:      workOrder.workOrderNumber || "",
+      stockItemName: workOrder.stockItemName || "",
+      variants:      (workOrder.variantAttributes || []).map((a) => a.value).filter(Boolean).join(" · "),
+      quantityCut:   qty,
+      startUnit:     Number(startUnit) || 0,
+      endUnit:       Number(endUnit) || 0,
+      timestamp:     new Date(),
+      recordedBy:    { id: req.user.id, name: req.user.name || "" },
+      companyProof:  req.cutting.proof,
     };
 
-    // Find existing doc for this employee + today
-    let record = await CuttingMasterRecord.findOne({ employeeId, date: today });
+    const snapshot = {
+      employeeName: workerName,
+      biometricId:  worker.biometricId || "",
+      department:   worker.department || "",
+      designation:  worker.designation || "",
+    };
 
-    if (!record) {
-      // First cut of the day for this employee
-      record = new CuttingMasterRecord({
-        employeeId,
-        employeeName: employeeName.trim(),
-        biometricId:  biometricId || "",
-        department:   department  || "",
-        designation:  designation || "",
-        date:         today,
-        entries:      [],
-        totalUnitsCut: 0
-      });
+    const append = async () => {
+      let record = await CuttingMasterRecord.findOne({ employeeId: worker._id, date: today });
+      if (!record) {
+        // First cut of the day for this employee
+        record = new CuttingMasterRecord({ employeeId: worker._id, ...snapshot, date: today, entries: [], totalUnitsCut: 0 });
+      }
+      record.entries.push(entry);
+      record.totalUnitsCut += qty;
+      await record.save();
+      return record;
+    };
+
+    let record;
+    try {
+      record = await append();
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      // Duplicate key — another save made today's record first; add to it.
+      record = await append();
     }
-
-    record.entries.push(entry);
-    record.totalUnitsCut += (quantityCut || 0);
-    await record.save();
 
     res.status(201).json({
       success: true,
-      message: `Cutting record saved for ${employeeName}`,
+      message: `Cutting record saved for ${record.employeeName}`,
       record: {
         _id:          record._id,
         employeeName: record.employeeName,
@@ -261,22 +295,6 @@ router.post("/cutting-master-records", async (req, res) => {
     });
   } catch (error) {
     console.error("Error saving cutting master record:", error);
-    if (error.code === 11000) {
-      // Duplicate key — race condition, retry with findOne + push
-      try {
-        const today = new Date().toISOString().slice(0, 10);
-        const { employeeId, employeeName, woId, woNumber, stockItemName, variants, quantityCut, startUnit, endUnit } = req.body;
-        const record = await CuttingMasterRecord.findOne({ employeeId, date: today });
-        if (record) {
-          record.entries.push({ woId, woNumber: woNumber || "", stockItemName: stockItemName || "", variants: variants || "", quantityCut: quantityCut || 0, startUnit: startUnit || 0, endUnit: endUnit || 0, timestamp: new Date() });
-          record.totalUnitsCut += (quantityCut || 0);
-          await record.save();
-          return res.status(201).json({ success: true, message: "Cutting record saved (retry)", record });
-        }
-      } catch (retryErr) {
-        console.error("Retry failed:", retryErr);
-      }
-    }
     res.status(500).json({ success: false, message: "Server error while saving cutting record" });
   }
 });

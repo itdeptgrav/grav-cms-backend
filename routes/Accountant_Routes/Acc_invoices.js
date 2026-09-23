@@ -31,6 +31,20 @@ const {
 } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 /* ================================================================== */
@@ -226,7 +240,7 @@ async function _resolveOrCreateByName(name, companyId, createdBy, session) {
 /* NEW ROUTE 1: GET /next-number                                       */
 /* ================================================================== */
 // MUST be before /:id routes so "next-number" isn't treated as an id.
-router.get("/next-number", async (req, res) => {
+router.get("/next-number", companyScope, async (req, res) => {
   try {
     const { companyId, date } = req.query;
     if (!companyId)
@@ -351,7 +365,7 @@ async function enrichInvoices(invoices, companyId) {
 /* ------------------------------------------------------------------ */
 /* GET / — list invoices                                               */
 /* ------------------------------------------------------------------ */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -432,7 +446,7 @@ router.get("/", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /summary                                                        */
 /* ------------------------------------------------------------------ */
-router.get("/summary", async (req, res) => {
+router.get("/summary", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -499,7 +513,7 @@ router.get("/summary", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /all                                                            */
 /* ------------------------------------------------------------------ */
-router.get("/all", async (req, res) => {
+router.get("/all", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -565,7 +579,7 @@ router.get("/all", async (req, res) => {
 /* GET /:id/download-pdf — Tally-format Tax Invoice PDF                */
 /* ------------------------------------------------------------------ */
 /* MUST be before /:id so Express doesn't treat "download-pdf" as an id */
-router.get("/:id/download-pdf", async (req, res) => {
+router.get("/:id/download-pdf", companyScope, async (req, res) => {
   try {
     const PDFDocument = require("pdfkit");
 
@@ -1324,7 +1338,7 @@ router.get("/:id/download-pdf", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /:id — single invoice with full bill trail                      */
 /* ------------------------------------------------------------------ */
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     const inv = await Acc_Voucher.findOne({
       _id: req.params.id,
@@ -1437,7 +1451,7 @@ router.get("/:id", async (req, res) => {
 /* ================================================================== */
 /* NEW ROUTE 2: PUT /:id — edit a draft or posted invoice             */
 /* ================================================================== */
-router.put("/:id", async (req, res) => {
+router.put("/:id", companyScope, async (req, res) => {
   // ── Approval gate ─────────────────────────────────────────────────────────
   // An editor (no direct-post privilege) editing a POSTED invoice must NOT
   // change the ledger in place. Hold the edit as an approval request — the SAME

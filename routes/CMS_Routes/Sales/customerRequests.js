@@ -1,8 +1,50 @@
 // routes/CMS_Routes/Sales/customerRequests.js
 
 const express = require("express");
+const { carryLineIdentities, stripLineIdentities } = require("../../../models/Customer_Models/customerRequestLineIdentity");
+const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
+const { isContextOutage } = require("../../../services/companyContext/serviceScope.service");
+
+/* ── THE ENQUIRY BEHIND AN ORDER, ONLY WHEN IT IS PROVED (G02) ──────────────
+   Two reads below go from an order back to "its" enquiry by
+   `Enquiry.customerRequestId`. That field was written by guesses — the newest
+   order for a customer, a customer-name match — so the enquiry found that way
+   could be another deal's, and its early-dispatch asks, costing estimate and
+   journey were shown on this order. services/orderBookLink.js now answers
+   only when exactly one of the caller's company's enquiries links this order
+   AND that link passes the full proof (raised from that enquiry, or confirmed
+   for it by a salesperson). */
+async function provedEnquiryFor(req, requestId) {
+    const { scopeFor } = require("../../../services/companyContext/salesScope.service");
+    const { createServiceContext } = require("../../../services/companyContext/serviceScope.service");
+    const { provedEnquiryForOrder } = require("../../../services/orderBookLink");
+    const scope = await scopeFor(req);
+    const ctx = await createServiceContext({ companyId: scope.companyId, reason: "order book enquiry", legacyAware: true });
+    return provedEnquiryForOrder(ctx, requestId);
+}
 const router = express.Router();
+
+/* ── EVERY ORDER IS PROVED TO BE THE CALLER'S COMPANY'S (G02) ───────────────
+   A CustomerRequest has no company of its own, and every route below used to
+   read or change one by `_id` alone — any signed-in employee could open, edit,
+   reassign or re-status any company's order, and the list, export and
+   dashboard showed every company's orders. services/sales/orderOwnership
+   proves ownership from the order's Sales origin, its styles, or a portal
+   customer only this company links (or a sole-company deployment), and the
+   list routes apply the same rule as a filter. An order that cannot be
+   proved is "Order not found." — never attributed by name or recency. */
+const { proveOrderOwned, withOwnedOrders } = require("../../../services/sales/orderOwnership.service");
+
+/** A tenant or ownership refusal keeps its own status and says nothing more. */
+function refused(res, err) {
+    if (err?.name !== "StorePurchaseError") return false;
+    res.status(err.status).json(err.toResponse());
+    return true;
+}
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
+/* Used by GET /:id/persons, which called it without ever importing it — the
+   route answered 500 for every order. */
+const { personsOnOrder } = require("../../../services/personRoster");
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../../models/Customer_Models/Customer");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem")
@@ -31,10 +73,9 @@ router.use(EmployeeAuthMiddleware);
 // rather than inferring one from sizes and being confidently wrong.
 router.get("/:id/persons", async (req, res) => {
   try {
-    const request = await CustomerRequest.findById(req.params.id)
-      .select("requestId requestType measurementId measurementName items status")
-      .lean();
-    if (!request) return res.status(404).json({ success: false, message: "Order not found" });
+    const { request } = await proveOrderOwned(req, req.params.id, {
+      select: "requestId requestType measurementId measurementName items status",
+    });
 
     let persons = personsOnOrder(request.items);
     const uin = String(req.query.uin || "").trim();
@@ -61,6 +102,7 @@ router.get("/:id/persons", async (req, res) => {
       persons,
     });
   } catch (err) {
+    if (refused(res, err)) return;
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -72,26 +114,33 @@ router.get("/dashboard", async (req, res) => {
         const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
         const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
 
-        const totalRequests = await CustomerRequest.countDocuments();
-        const pendingRequests = await CustomerRequest.countDocuments({ status: 'pending' });
-        const inProgressRequests = await CustomerRequest.countDocuments({ status: 'in_progress' });
-        const completedRequests = await CustomerRequest.countDocuments({ status: 'completed' });
-        const totalCustomers = await Customer.countDocuments();
+        /* Every figure below is over THIS company's orders only. */
+        const owned = (f = {}) => withOwnedOrders(req, f);
+        const ownedAll = await owned();
+        const totalRequests = await CustomerRequest.countDocuments(ownedAll);
+        const pendingRequests = await CustomerRequest.countDocuments(await owned({ status: 'pending' }));
+        const inProgressRequests = await CustomerRequest.countDocuments(await owned({ status: 'in_progress' }));
+        const completedRequests = await CustomerRequest.countDocuments(await owned({ status: 'completed' }));
+        /* In a sole-company deployment every portal customer is this company's;
+           otherwise only the customers of orders proved to be ours are counted. */
+        const totalCustomers = Object.keys(ownedAll).length
+            ? (await CustomerRequest.distinct("customerId", ownedAll)).filter(Boolean).length
+            : await Customer.countDocuments();
 
-        const requestsThisMonth = await CustomerRequest.find({
+        const requestsThisMonth = await CustomerRequest.find(await owned({
             status: 'completed',
             updatedAt: { $gte: startOfMonth }
-        });
+        }));
 
         const revenueThisMonth = requestsThisMonth.reduce((sum, request) => {
             return sum + (request.quotationAmount || request.items.reduce((itemSum, item) =>
                 itemSum + (item.totalEstimatedPrice || 0), 0));
         }, 0);
 
-        const requestsLastMonth = await CustomerRequest.find({
+        const requestsLastMonth = await CustomerRequest.find(await owned({
             status: 'completed',
             updatedAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }
-        });
+        }));
 
         const revenueLastMonth = requestsLastMonth.reduce((sum, request) => {
             return sum + (request.quotationAmount || request.items.reduce((itemSum, item) =>
@@ -102,7 +151,7 @@ router.get("/dashboard", async (req, res) => {
             ? Math.round(((revenueThisMonth - revenueLastMonth) / revenueLastMonth) * 100)
             : revenueThisMonth > 0 ? 100 : 0;
 
-        const completedRequestsCount = await CustomerRequest.countDocuments({ status: 'completed' });
+        const completedRequestsCount = await CustomerRequest.countDocuments(await owned({ status: 'completed' }));
         const averageOrderValue = completedRequestsCount > 0
             ? revenueThisMonth / completedRequestsCount
             : 0;
@@ -115,6 +164,7 @@ router.get("/dashboard", async (req, res) => {
             }
         });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching dashboard stats:", error);
         res.status(500).json({ success: false, message: "Server error while fetching dashboard statistics" });
     }
@@ -122,13 +172,14 @@ router.get("/dashboard", async (req, res) => {
 
 router.get("/dashboard/recent-requests", async (req, res) => {
     try {
-        const recentRequests = await CustomerRequest.find()
+        const recentRequests = await CustomerRequest.find(await withOwnedOrders(req))
             .sort({ createdAt: -1 })
             .limit(10)
             .populate('salesPersonAssigned', 'name email')
             .select('-__v -updatedAt');
         res.json({ success: true, requests: recentRequests });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching recent requests:", error);
         res.status(500).json({ success: false, message: "Server error while fetching recent requests" });
     }
@@ -137,7 +188,7 @@ router.get("/dashboard/recent-requests", async (req, res) => {
 router.get("/dashboard/top-customers", async (req, res) => {
     try {
         const topCustomers = await CustomerRequest.aggregate([
-            { $match: { status: 'completed' } },
+            { $match: await withOwnedOrders(req, { status: 'completed' }) },
             { $group: { _id: '$customerId', totalSpent: { $sum: '$quotationAmount' }, orderCount: { $sum: 1 } } },
             { $sort: { totalSpent: -1 } },
             { $limit: 5 },
@@ -147,6 +198,7 @@ router.get("/dashboard/top-customers", async (req, res) => {
         ]);
         res.json({ success: true, customers: topCustomers });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching top customers:", error);
         res.status(500).json({ success: false, message: "Server error while fetching top customers" });
     }
@@ -166,6 +218,7 @@ router.get("/requests/export", async (req, res) => {
         // Same stage-vs-status handling as the list route below, so an export
         // taken with a filter on screen contains the rows that were on screen.
         applyStatusFilter(filter, status);
+        filter = await withOwnedOrders(req, filter);
 
         const requests = await CustomerRequest.find(filter)
             .sort({ createdAt: -1 })
@@ -183,6 +236,7 @@ router.get("/requests/export", async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename=customer-requests-${new Date().toISOString().split('T')[0]}.csv`);
         res.send(csv);
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error exporting requests:", error);
         res.status(500).json({ success: false, message: "Server error while exporting requests" });
     }
@@ -268,6 +322,7 @@ router.get("/requests", async (req, res) => {
             }
         }
 
+        filter = await withOwnedOrders(req, filter);
         const skip = (page - 1) * limit;
         const requests = await CustomerRequest.find(filter)
             .sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit))
@@ -366,11 +421,14 @@ router.get("/requests", async (req, res) => {
         // than after it. Same numbers, one round trip.
         const [total, grouped] = await Promise.all([
             CustomerRequest.countDocuments(filter),
-            CustomerRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+            CustomerRequest.aggregate([
+                { $match: await withOwnedOrders(req) },
+                { $group: { _id: '$status', count: { $sum: 1 } } },
+            ]),
         ]);
-        // `stats` is deliberately UNFILTERED — it always described the whole
-        // order book, not the current filter, and the tabs that read it depend
-        // on that. Preserved exactly.
+        // `stats` is deliberately UNFILTERED by the screen's filters — it always
+        // described the whole order book, and the tabs that read it depend on
+        // that. "The whole order book" is now this company's.
         const byStatus = Object.fromEntries(grouped.map((g) => [g._id, g.count]));
         const stats = {
             total: grouped.reduce((n, g) => n + g.count, 0),
@@ -390,6 +448,7 @@ router.get("/requests", async (req, res) => {
             }
         });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching customer requests:", error);
         res.status(500).json({ success: false, message: "Server error while fetching customer requests" });
     }
@@ -405,15 +464,18 @@ router.get("/requests", async (req, res) => {
  *
  * Two indexed lookups, both optional, neither ever fatal.
  */
-async function upstreamOf(requestId) {
+async function upstreamOf(requestId, req) {
     try {
         const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
-        const EnquiryModel = require("../../../models/CMS_Models/Sales/Enquiry");
-        const enquiry = await EnquiryModel.findOne({ customerRequestId: requestId, isActive: true })
-            .select("enquiryId title journeyId").lean();
+        /* This used to read the enquiry with NO company, by a link that may
+           have been guessed, and then called `scoped(req, …)` with no `req`
+           in scope — so it threw, the catch swallowed it, and provenance never
+           showed at all. Scoped and proved now. */
+        const enquiry = await provedEnquiryFor(req, requestId);
         if (!enquiry) return null;
         const journey = enquiry.journeyId
-            ? await SalesJourney.findById(enquiry.journeyId).select("journeyId name currentStage").lean()
+            ? await SalesJourney.findOne(await scoped(req, { _id: enquiry.journeyId }))
+            .select("journeyId name currentStage").lean()
             : null;
         return {
             enquiryRef: enquiry.enquiryId || null,
@@ -429,7 +491,7 @@ async function upstreamOf(requestId) {
 
 router.get("/requests/:requestId", async (req, res) => {
     try {
-        const request = await CustomerRequest.findById(req.params.requestId)
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false, query: (q) => q
             .populate('salesPersonAssigned', 'name email phone')
             // `variants.images` as well as `images` (27 Aug 2026). A StockItem
             // carries photos in TWO places — a top-level `images` array and a
@@ -442,11 +504,7 @@ router.get("/requests/:requestId", async (req, res) => {
             // `variants.attributes` too, so the frontend can pick the photo for
             // the SIZE/COLOUR actually ordered rather than any variant's.
             .populate('items.stockItemId', 'name reference category images variants.images variants.attributes genderCategory')
-            .select('-__v');
-
-        if (!request) {
-            return res.status(404).json({ success: false, message: "Request not found" });
-        }
+            .select('-__v') });
 
         if (
             request.measurementId &&
@@ -497,7 +555,7 @@ router.get("/requests/:requestId", async (req, res) => {
                     return res.json({
                         success: true,
                         request: enrichedRequest,
-                        upstream: await upstreamOf(request._id),
+                        upstream: await upstreamOf(request._id, req),
                     });
                 }
             } catch (enrichError) {
@@ -505,8 +563,9 @@ router.get("/requests/:requestId", async (req, res) => {
             }
         }
 
-        res.json({ success: true, request, upstream: await upstreamOf(request._id) });
+        res.json({ success: true, request, upstream: await upstreamOf(request._id, req) });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching customer request:", error);
         res.status(500).json({
             success: false,
@@ -518,8 +577,7 @@ router.get("/requests/:requestId", async (req, res) => {
 router.patch("/requests/:requestId/status", async (req, res) => {
     try {
         const { status, notes } = req.body;
-        const request = await CustomerRequest.findById(req.params.requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false });
 
         request.status = status;
         if (notes) {
@@ -530,6 +588,7 @@ router.patch("/requests/:requestId/status", async (req, res) => {
         await request.save();
         res.json({ success: true, message: `Request status updated to ${status}`, request });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error updating request status:", error);
         res.status(500).json({ success: false, message: "Server error while updating request status" });
     }
@@ -537,13 +596,13 @@ router.patch("/requests/:requestId/status", async (req, res) => {
 
 router.patch("/requests/:requestId/assign", async (req, res) => {
     try {
-        const request = await CustomerRequest.findById(req.params.requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false });
         request.salesPersonAssigned = req.body.salesPersonId || req.user.id;
         request.updatedAt = new Date();
         await request.save();
         res.json({ success: true, message: "Request assigned successfully", request });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error assigning request:", error);
         res.status(500).json({ success: false, message: "Server error while assigning request" });
     }
@@ -551,13 +610,13 @@ router.patch("/requests/:requestId/assign", async (req, res) => {
 
 router.patch("/requests/:requestId/priority", async (req, res) => {
     try {
-        const request = await CustomerRequest.findById(req.params.requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false });
         request.priority = req.body.priority;
         request.updatedAt = new Date();
         await request.save();
         res.json({ success: true, message: `Priority updated to ${req.body.priority}`, request });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error updating request priority:", error);
         res.status(500).json({ success: false, message: "Server error while updating request priority" });
     }
@@ -567,13 +626,13 @@ router.post("/requests/:requestId/notes", async (req, res) => {
     try {
         const { text } = req.body;
         if (!text || !text.trim()) return res.status(400).json({ success: false, message: "Note text is required" });
-        const request = await CustomerRequest.findById(req.params.requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false });
         request.notes.push({ text: text.trim(), addedBy: req.user.id, addedByModel: 'SalesDepartment', createdAt: new Date() });
         request.updatedAt = new Date();
         await request.save();
         res.json({ success: true, message: "Note added successfully", note: request.notes[request.notes.length - 1] });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error adding note:", error);
         res.status(500).json({ success: false, message: "Server error while adding note" });
     }
@@ -581,10 +640,10 @@ router.post("/requests/:requestId/notes", async (req, res) => {
 
 router.get("/requests/:requestId/notes", async (req, res) => {
     try {
-        const request = await CustomerRequest.findById(req.params.requestId).select('notes');
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { select: "notes" });
         res.json({ success: true, notes: request.notes });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching notes:", error);
         res.status(500).json({ success: false, message: "Server error while fetching notes" });
     }
@@ -602,8 +661,7 @@ router.post("/:requestId/edit-request", async (req, res) => {
         if (!reason || !reason.trim()) return res.status(400).json({ success: false, message: "Reason for edit is required" });
         if (!changes || !Array.isArray(changes) || changes.length === 0) return res.status(400).json({ success: false, message: "No changes specified" });
 
-        const request = await CustomerRequest.findById(requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, requestId, { lean: false });
         if (request.status === 'completed' || request.status === 'cancelled') return res.status(400).json({ success: false, message: "Cannot edit completed or cancelled requests" });
 
         const hasPendingEdit = request.editRequests.some(edit => edit.status === 'pending_approval');
@@ -658,6 +716,7 @@ router.post("/:requestId/edit-request", async (req, res) => {
 
         res.json({ success: true, message: "Edit request sent to customer for approval", editRequest, request, emailSent: true });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error creating edit request:", error);
         res.status(500).json({ success: false, message: "Server error while creating edit request" });
     }
@@ -665,13 +724,15 @@ router.post("/:requestId/edit-request", async (req, res) => {
 
 router.get("/:requestId/edit-requests", async (req, res) => {
     try {
-        const request = await CustomerRequest.findById(req.params.requestId)
-            .select('editRequests')
-            .populate('editRequests.requestedBy', 'name email')
-            .populate('editRequests.reviewedBy', 'name email');
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, {
+            select: "editRequests", lean: false,
+            query: (q) => q
+                .populate('editRequests.requestedBy', 'name email')
+                .populate('editRequests.reviewedBy', 'name email'),
+        });
         res.json({ success: true, editRequests: request.editRequests || [] });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error fetching edit requests:", error);
         res.status(500).json({ success: false, message: "Server error while fetching edit requests" });
     }
@@ -682,8 +743,7 @@ router.post("/:requestId/approve-edit", async (req, res) => {
         const { requestId } = req.params;
         const { action } = req.body;
 
-        const request = await CustomerRequest.findById(requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, requestId, { lean: false });
         if (request.status !== 'pending_edit_approval') return res.status(400).json({ success: false, message: `Request is not in pending edit approval status. Current status: ${request.status}` });
 
         let editRequestToApprove;
@@ -709,7 +769,12 @@ router.post("/:requestId/approve-edit", async (req, res) => {
 
         if (action === 'approve_and_proceed') {
             if (editRequestToApprove.customerInfo) request.customerInfo = editRequestToApprove.customerInfo;
-            if (editRequestToApprove.items && editRequestToApprove.items.length > 0) request.items = editRequestToApprove.items;
+            /* The proposal names no lines of its own — see EditRequests.js.
+               Identity is rejoined here, never adopted from the payload. */
+            if (editRequestToApprove.items && editRequestToApprove.items.length > 0) {
+                const proposed = editRequestToApprove.items.map((i) => (i.toObject ? i.toObject() : { ...i }));
+                request.items = carryLineIdentities(request.items, stripLineIdentities(proposed));
+            }
             request.status = 'in_progress';
             request.pendingEditRequest = null;
             request.notes = request.notes || [];
@@ -720,6 +785,7 @@ router.post("/:requestId/approve-edit", async (req, res) => {
         await request.save();
         res.json({ success: true, message: "Edit request approved successfully", request });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error approving edit request:", error);
         res.status(500).json({ success: false, message: "Server error while approving edit request", error: error.message });
     }
@@ -728,8 +794,7 @@ router.post("/:requestId/approve-edit", async (req, res) => {
 router.post("/:requestId/reject-edit", async (req, res) => {
     try {
         const { reason } = req.body;
-        const request = await CustomerRequest.findById(req.params.requestId);
-        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const { request } = await proveOrderOwned(req, req.params.requestId, { lean: false });
 
         const pendingEditIndex = request.editRequests.findIndex(edit => edit.status === 'pending_approval');
         if (pendingEditIndex === -1) return res.status(400).json({ success: false, message: "No pending edit request found" });
@@ -746,6 +811,7 @@ router.post("/:requestId/reject-edit", async (req, res) => {
         await request.save();
         res.json({ success: true, message: "Edit request rejected successfully", request });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("Error rejecting edit request:", error);
         res.status(500).json({ success: false, message: "Server error while rejecting edit request" });
     }
@@ -787,10 +853,21 @@ const mongooseLib = require("mongoose");
 const isOid = (v) => mongooseLib.Types.ObjectId.isValid(v);
 
 /** The enquiry behind this order, when the two were ever linked. Never fatal. */
-async function enquiryForRequest(requestId) {
+async function enquiryForRequest(requestId, req) {
     try {
-        return await Enquiry.findOne({ customerRequestId: requestId, isActive: true }).lean();
-    } catch {
+        /* ── SCOPED, AND AN OUTAGE IS NOT "NO ENQUIRY" ────────────────────
+           This read used to have no company at all, so executing a customer
+           request could surface another company's enquiry. It now carries the
+           caller's scope.
+
+           The `catch` is kept for a genuinely absent record — this is
+           enrichment and a missing enquiry must not break the page — but a
+           company-context outage is re-thrown: returning null there would say
+           "there is no enquiry", when the truth is that nothing could be
+           checked. */
+        return await provedEnquiryFor(req, requestId);
+    } catch (err) {
+        if (isContextOutage(err) || err?.name === "StorePurchaseError") throw err;
         return null;
     }
 }
@@ -800,6 +877,9 @@ router.get("/requests/:requestId/production", async (req, res) => {
     try {
         const { requestId } = req.params;
         if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+        /* Work orders hang off the order; they are the order's only when the
+           order is proved to be ours. */
+        await proveOrderOwned(req, requestId, { select: "_id" });
 
         const workOrders = await WorkOrder.find({ customerRequestId: requestId })
             .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
@@ -821,6 +901,7 @@ router.get("/requests/:requestId/production", async (req, res) => {
 
         return res.json({ success: true, linked: true, requestId, view: buildProductionView(workOrders) });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("[customerRequests] GET /requests/:requestId/production", error);
         return res.status(500).json({ success: false, message: error.message });
     }
@@ -831,6 +912,7 @@ router.get("/requests/:requestId/shipment", async (req, res) => {
     try {
         const { requestId } = req.params;
         if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+        await proveOrderOwned(req, requestId, { select: "_id" });
 
         const [workOrders, challans, enquiry] = await Promise.all([
             WorkOrder.find({ customerRequestId: requestId })
@@ -843,7 +925,7 @@ router.get("/requests/:requestId/shipment", async (req, res) => {
                 .select("challanNumber dispatchType totalUnits totalPersons persons.employeeName persons.employeeUIN "
                       + "persons.department persons.designation persons.totalUnits dispatchedBy notes createdAt")
                 .lean(),
-            enquiryForRequest(requestId),
+            enquiryForRequest(requestId, req),
         ]);
 
         if (!workOrders.length) {
@@ -865,6 +947,7 @@ router.get("/requests/:requestId/shipment", async (req, res) => {
             view: buildShipmentView(workOrders, challans, enquiry?.earlyDispatchRequests || []),
         });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("[customerRequests] GET /requests/:requestId/shipment", error);
         return res.status(500).json({ success: false, message: error.message });
     }
@@ -875,8 +958,11 @@ router.get("/requests/:requestId/closing-report", async (req, res) => {
     try {
         const { requestId } = req.params;
         if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+        const { request } = await proveOrderOwned(req, requestId, {
+            select: "requestId customerInfo.name grandTotal paymentSchedule quotations.grandTotal",
+        });
 
-        const [workOrders, challans, request, enquiry] = await Promise.all([
+        const [workOrders, challans, enquiry] = await Promise.all([
             WorkOrder.find({ customerRequestId: requestId })
                 .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity assignedDeadline "
                       + "dispatchedQuantity estimatedCost actualCost rawMaterials.quantityIssued rawMaterials.unitCost "
@@ -887,12 +973,8 @@ router.get("/requests/:requestId/closing-report", async (req, res) => {
                 .select("challanNumber dispatchType totalUnits totalPersons createdAt "
                       + "persons.employeeName persons.department persons.totalUnits")
                 .lean(),
-            CustomerRequest.findById(requestId)
-                .select("requestId customerInfo.name grandTotal paymentSchedule quotations.grandTotal").lean(),
-            enquiryForRequest(requestId),
+            enquiryForRequest(requestId, req),
         ]);
-
-        if (!request) return res.status(404).json({ success: false, message: "Order not found." });
 
         if (!workOrders.length) {
             return res.json({
@@ -934,6 +1016,7 @@ router.get("/requests/:requestId/closing-report", async (req, res) => {
             report,
         });
     } catch (error) {
+        if (refused(res, error)) return;
         console.error("[customerRequests] GET /requests/:requestId/closing-report", error);
         return res.status(500).json({ success: false, message: error.message });
     }

@@ -906,12 +906,16 @@ describe("a line's planning history is one complete, readable chain", () => {
 /* ══ PRESERVED BOUNDARIES ═════════════════════════════════════════════════ */
 
 describe("the accepted boundaries are unchanged", () => {
-  test("no new route books, allocates or releases, and material still gates nothing", async () => {
+  test("no new route allocates a line or releases production, and material still gates nothing", async () => {
     const router = require("../../routes/CMS_Routes/PPC/orderBookRoute");
-    const segments = router.stack.filter((l) => l.route)
-      .flatMap((l) => l.route.path.split("/").filter(Boolean));
-    expect(segments.filter((s) => /^(capacity|book|bookings?|allocate|allocation|lines?|release|releases|work-orders?|production)$/i
+    const paths = router.stack.filter((l) => l.route).map((l) => l.route.path);
+    const segments = paths.flatMap((p) => p.split("/").filter(Boolean));
+    expect(segments.filter((s) => /^(capacity|bookings?|allocate|allocation|lines?|releases|work-orders?|production)$/i
       .test(s))).toEqual([]);
+    /* PPC does reserve CUTTING capacity, and that is the only thing the words
+       "book" and "release" are allowed to mean on this router. */
+    expect(paths.filter((p) => /\/(book|release|replan)$/.test(p))
+      .every((p) => /cutting-/.test(p))).toBe(true);
     const { REQUIRED_KEYS } = require("../../services/ppc/planningReadiness.contract");
     expect(REQUIRED_KEYS).not.toContain("material");
 

@@ -741,7 +741,7 @@ describe("applying a template lends no identity at all", () => {
     /* The pattern arrived. */
     expect(after.stations.map((s) => s.label)).toEqual(["Front", "Close"]);
     expect(after.stations[0].note).toBe("Two operators");
-    expect(after.stations[0].plannedMachineTypes).toEqual([{ machineType: "SNLS", quantity: 2 }]);
+    expect(after.stations[0].plannedMachineTypes).toEqual([{ machineType: "SNLS", quantity: 2, slotId: expect.stringMatching(/^slt_/), position: null }]);
     expect(after.stations.flatMap((s) => s.assignments.map((a) => a.rowId)))
       .toEqual(before.source.rows.map((r) => r.rowId));
 
@@ -1445,7 +1445,7 @@ describe("a template and the layouts made from it are independent for ever", () 
     expect(after.body.layout.revision).toBe(snapshot.revision);
     expect(after.body.layout.stations.map((s) => s.label)).toEqual(["Front", "Close"]);
     expect(after.body.layout.stations[0].plannedMachineTypes)
-      .toEqual([{ machineType: "SNLS", quantity: 2 }]);
+      .toEqual([{ machineType: "SNLS", quantity: 2, slotId: expect.stringMatching(/^slt_/), position: null }]);
     expect(after.body.layout.history).toHaveLength(snapshot.history.length);
 
     /* And retiring it does not either. */

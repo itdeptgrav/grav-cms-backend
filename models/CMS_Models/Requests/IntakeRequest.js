@@ -114,6 +114,19 @@ const lineSchema = new mongoose.Schema(
     rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemSku: { type: String, trim: true, default: "" },
 
+    /* ── CANONICAL SERVICE IDENTITY (from "Request this service") ──────────────
+       Set ONLY when the requester arrived from a Service Master record and the
+       server RESOLVED that service (active, in this company) — never from the
+       browser. It carries the master identity through the journey so Store does
+       not have to match the same service a second time, and the resulting
+       Service Order line can open the exact originating master record. A
+       free-text service line leaves these null and stays valid. `service` is
+       the id; the frozen code/name make the history readable if the master is
+       later renamed. */
+    service: { type: mongoose.Schema.Types.ObjectId, ref: "Service", default: null },
+    serviceCode: { type: String, trim: true, default: "" },
+    serviceName: { type: String, trim: true, default: "" },
+
 /* ── FUTURE ITEM-WISE BUDGET ATTRIBUTION (INERT) ────────────────────────────
    Where this line's own budget head will live once a request can charge
    several unrelated items to several approved lines.

@@ -166,6 +166,10 @@ const ieReleaseSchema = new mongoose.Schema(
       lineLayout: { type: mongoose.Schema.Types.Mixed, required: true },
       capacityStandard: { type: mongoose.Schema.Types.Mixed, required: true },
       ramp: { type: mongoose.Schema.Types.Mixed, default: null },
+      /* The approved process route, verbatim from the bulletin version. No
+         default: a release issued before routes existed, or from a version that
+         declared none, has no route — and publishes that as UNKNOWN. */
+      processRoute: { type: mongoose.Schema.Types.Mixed, default: undefined },
 
       capturedAt: { type: Date, required: true },
     },

@@ -16,6 +16,7 @@
 // POST /:id/sample/customer-decision already records when Sales enters it
 // by hand.
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 
 const Account = require("../models/CMS_Models/Sales/Account");
 const SampleStyle = require("../models/CMS_Models/Sales/SampleStyle");
@@ -64,16 +65,21 @@ const WHATSAPP_ACTOR = Object.freeze({ id: null, name: "Customer (via WhatsApp)"
  * any active Contact under it at all, then the account's own switchboard
  * number.
  */
-async function resolveCustomerPhone(style) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function resolveCustomerPhone(style, ctx) {
   if (!style.accountId) return null;
-  const account = await Account.findById(style.accountId)
+  const account = await Account.findOne(serviceFilter(ctx, { _id: style.accountId }))
     .select("primaryPhone")
     .populate("primaryContact", "phone")
     .lean();
   if (account?.primaryContact?.phone) return account.primaryContact.phone;
 
   const Contact = require("../models/CMS_Models/Sales/Contact");
-  const contacts = await Contact.find({ accountId: style.accountId, isActive: true })
+  const contacts = await Contact.find(serviceFilter(ctx, { accountId: style.accountId, isActive: true }))
     .select("phone isPrimary")
     .sort({ isPrimary: -1 })
     .limit(1)

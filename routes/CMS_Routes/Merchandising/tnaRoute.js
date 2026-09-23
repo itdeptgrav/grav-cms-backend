@@ -72,10 +72,22 @@ router.get("/tna/portfolio", requireCompany, canRead, handle(async (req, res) =>
   const out = await portfolio.portfolio(ctx(req), {
     view: req.query.view, q: req.query.q, owner: req.query.owner,
     assignedTo: req.query.assignedTo, buyer: req.query.buyer, factory: req.query.factory,
-    from: req.query.from, to: req.query.to,
+    from: req.query.from, to: req.query.to, undated: req.query.undated,
     cursor: req.query.cursor, limit: req.query.limit,
   });
   return res.json({ success: true, ...out, views: Object.keys(portfolio.PORTFOLIO_VIEWS) });
+}));
+
+/* How many milestones fall on each day of a range, counted in the database
+   with the list's own filter — so a calendar day's number is every record,
+   not the first page of them. Read-only. */
+router.get("/tna/portfolio/days", requireCompany, canRead, handle(async (req, res) => {
+  const out = await portfolio.portfolioDays(ctx(req), {
+    view: req.query.view, q: req.query.q, owner: req.query.owner,
+    assignedTo: req.query.assignedTo, buyer: req.query.buyer, factory: req.query.factory,
+    from: req.query.from, to: req.query.to,
+  });
+  return res.json({ success: true, ...out });
 }));
 
 router.get("/tna/portfolio/counts", requireCompany, canRead, handle(async (req, res) => {

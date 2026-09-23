@@ -1227,14 +1227,27 @@ describe("no capacity, no line, no Production and no Store write", () => {
     }
   });
 
-  test("the router carries no capacity, allocation or release verb", () => {
+  test("the router allocates no line and releases nothing to Production", () => {
     const router = require("../../routes/CMS_Routes/PPC/orderBookRoute");
     const paths = router.stack.filter((l) => l.route).map((l) => l.route.path);
-    /* `order-book` legitimately contains "book"; a BOOKING verb would be its
-       own path segment, which is what this matches. */
     const segments = paths.flatMap((p) => p.split("/").filter(Boolean));
-    expect(segments.filter((s) => /^(capacity|book|bookings?|allocate|allocation|line-plan|lines?|release|releases|work-orders?|production)$/i
+    /* Allocating a sewing line, releasing work to Production and reaching a
+       WorkOrder are still not PPC's, and none of them has a verb here. */
+    expect(segments.filter((s) => /^(allocate|allocation|line-plan|lines?|releases|work-orders?|production)$/i
       .test(s))).toEqual([]);
+
+    /* RESERVING CUTTING CAPACITY IS. It is PPC's own decision — which table,
+       which days — and it is the only thing `book` and `release` may mean
+       here, so every one of them is checked to be a cutting-capacity path
+       rather than a Production verb that slipped in under the same word. */
+    const verbs = paths.filter((p) => /\/(book|release|replan)$/.test(p));
+    expect(verbs.sort()).toEqual([
+      "/cutting-bookings/:bookingId/release",
+      "/cutting-bookings/:bookingId/replan",
+      "/planning-files/:planningFileId/cutting-capacity/book",
+    ]);
+    /* And nothing releases a quantity, only a reservation. */
+    expect(segments.filter((s) => /^(capacity|bookings?)$/i.test(s))).toEqual([]);
   });
 
   test("PPC writes nothing back into Merchandising or IE from this slice", () => {

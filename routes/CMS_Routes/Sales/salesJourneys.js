@@ -37,10 +37,38 @@
 //      All are assigned by the server.
 
 const express = require("express");
+const { ownershipFieldsFor } = require("../../../services/companyContext/ownershipStamp.service");
+const { scopeAndOwnership } = require("../../../services/companyContext/salesScope.service");
+/* ── EVERY JOURNEY QUERY CARRIES THE ACTOR'S COMPANY ────────────────────────
+ * An ownership field is not a boundary until every read and write uses it.
+ * `companyId` was added to SalesJourney and then consulted nowhere in this
+ * router: a foreign journey could still be listed, read, updated and advanced.
+ * The shared scope is folded into the same query as the selector — including
+ * the initial `$match` of the aggregation, because aggregating globally and
+ * filtering afterwards has already read the rows. */
+const {
+  scopedFilter: salesScopedFilter, scopeFor: salesScopeFor,
+} = require("../../../services/companyContext/salesScope.service");
+const { createServiceContext, serviceFilter } = require("../../../services/companyContext/serviceScope.service");
+
+/** A selector with this actor's company clause folded in. */
+const scoped = (req, selector = {}) => salesScopedFilter(req, selector);
+
+/**
+ * A tenant refusal keeps its own status rather than becoming a generic 500.
+ * "Choose which company you are working in" (409), "not linked to a company"
+ * (403) and "could not check just now" (503) are all actionable; 500 is not.
+ */
+function answeredTenantRefusal(res, err) {
+  if (err?.name !== "StorePurchaseError") return false;
+  res.status(err.status).json(err.toResponse());
+  return true;
+}
 const router = express.Router();
 
 const mongoose = require("mongoose");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
+const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
 const { resolvePaymentTerms, advanceGate } = require("../../../services/paymentTerms");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
@@ -51,10 +79,14 @@ const { recordChange } = require("../../../services/changeLog");
 const { createWithRef } = require("../../../services/salesJourneyRef");
 const { closingVerdictForJourney } = require("../../../services/closingVerdict");
 const { assertLeadConvertible, deriveLegacyStage } = require("../../../services/leadQualification");
+const { promoteLeadContacts } = require("../../../services/leadContactPromotion");
 const { planStageTransition, JourneyTransitionError } = require("../../../services/salesJourneyProgress");
 const { isSalesManager } = require("../../../services/salesAccess");
 const { journeyAttention } = require("../../../services/journeyAttention");
-const { ensureOrderLink } = require("../../../services/orderBookLink");
+const {
+  ensureOrderLink, resolveOrderLink, listOrderCandidates, chooseOrderLink, provedOrderFor, OrderLinkError,
+  STATUS: ORDER_LINK,
+} = require("../../../services/orderBookLink");
 const {
   canViewCredit,
   stripJourneyCommercial,
@@ -75,70 +107,26 @@ const INACTIVE_ACCOUNT_STATUSES = new Set(["archived", "inactive", "blocked"]);
 
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Split a single "Full Name" string into { firstName, lastName } — the Contact
-// model wants the two apart, a Lead often only has the whole thing (a
-// decisionMakerName, or a lead.contacts[] entry's `name`).
-function splitName(full) {
-  const parts = String(full || "").trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return { firstName: "", lastName: "" };
-  return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
-}
+/* `splitName` and `deriveAccountContactFromLead` lived here and picked ONE
+   person off a Lead — "decision-maker, else the first one". That rule is gone:
+   promotion moved to services/leadContactPromotion.js, which promotes every
+   contact the Lead holds and is shared with POST /leads/:id/account so both
+   paths produce the same people. */
 
-// Derive the Account primary Contact a converting Lead should seed, or null if
-// the Lead carries no usable person. The Lead model's own comment says its
-// contacts "belong to an Account, created at conversion" — this is that
-// promotion, which never actually happened before: a Lead that qualified on a
-// contact route + a decision-maker would still land on an Account with zero
-// contacts, forcing the salesperson to re-enter someone they already had.
-//
-// Preference order: a lead.contacts[] entry flagged decision-maker → the first
-// lead.contacts[] entry → the Lead's own top-level person fields (with the
-// canonical decisionMakerName as the name when the Lead itself is company-only).
-function deriveAccountContactFromLead(lead = {}) {
-  const list = Array.isArray(lead.contacts) ? lead.contacts : [];
-  const chosen = list.find((c) => c.isDecisionMaker && String(c.name || "").trim()) || list.find((c) => String(c.name || "").trim());
+/* Present is not usable. `isActive: false` is ARCHIVED (the contacts delete
+   route sets it alongside `status: "archived"`), and a status like
+   `left_organization` or `blocked` describes somebody real whom nobody should
+   be pointed at.
 
-  if (chosen) {
-    const { firstName, lastName } = splitName(chosen.name);
-    return {
-      firstName,
-      lastName,
-      email: chosen.email || undefined,
-      phone: chosen.phone || undefined,
-      jobTitle: chosen.role || undefined,
-      roles: chosen.isDecisionMaker ? ["decision_maker"] : [],
-    };
-  }
-
-  // Fall back to the Lead's top-level person. A pre-Account Lead that qualified
-  // has at least a phone/email and a decision-maker name (see
-  // services/leadReadiness.js), so there is normally something here.
-  const hasOwnPerson = String(lead.firstName || "").trim() || String(lead.lastName || "").trim();
-  if (hasOwnPerson) {
-    return {
-      firstName: lead.firstName || "",
-      lastName: lead.lastName || "",
-      email: lead.email || undefined,
-      phone: lead.phone || undefined,
-      mobile: lead.whatsapp || undefined,
-      jobTitle: lead.designation || undefined,
-      roles: [],
-    };
-  }
-  if (String(lead.decisionMakerName || "").trim()) {
-    const { firstName, lastName } = splitName(lead.decisionMakerName);
-    return {
-      firstName,
-      lastName,
-      email: lead.email || undefined,
-      phone: lead.phone || undefined,
-      mobile: lead.whatsapp || undefined,
-      jobTitle: lead.decisionMakerRole || undefined,
-      roles: ["decision_maker"],
-    };
-  }
-  return null;
-}
+   `doNotContact` is a SEPARATE boolean on CRMContact, not a status value — a
+   contact can be `status: "active"`, `isActive: true` and still be suppressed.
+   Checking status alone let those through while looking as though the question
+   had been asked. Only an active, contactable, unsuppressed person may be a
+   Journey's primary — named in the request or inherited from the Account. */
+const isUsableContact = (c) => Boolean(c)
+  && c.isActive !== false
+  && (!c.status || c.status === "active")
+  && c.doNotContact !== true;
 
 /** A bad request the caller can act on, as opposed to a 500. */
 class ValidationError extends Error {
@@ -309,10 +297,26 @@ const POPULATE_DETAIL = [
 
 const isObjectId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 
-/** Resolve an Account reference, asserting it exists and may trade. */
-async function assertUsableAccount(id, label) {
+/**
+ * Resolve an Account reference, asserting it exists, may trade, AND is ours.
+ *
+ * ── THE CLAIM PATH THIS CLOSES ──────────────────────────────────────────────
+ * This used to be `Account.findById(id)` with no company at all. A Journey was
+ * then created, correctly stamped with the ACTOR's company, from a customer
+ * belonging to somebody else — Company A's journey against Company B's buyer,
+ * and every enquiry, costing and (from Chunk 3) supplier quotation hanging off
+ * it. The journey's own ownership being right is what made it hard to see.
+ *
+ * `scope` is the company clause resolved ONCE for this request and passed in.
+ * It is not re-resolved here: one request must use one company decision, or
+ * two lookups can disagree halfway through an operation.
+ *
+ * A foreign account is reported exactly as a missing one.
+ */
+async function assertUsableAccount(id, label, scope) {
   if (!isObjectId(id)) throw new ValidationError(`${label} is not a valid account reference.`);
-  const acc = await Account.findById(id).select("accountId companyName status isActive").lean();
+  const acc = await Account.findOne({ $and: [scope, { _id: id }] })
+    .select("accountId companyName status isActive").lean();
   if (!acc) throw new ValidationError(`${label} was not found.`);
   if (acc.isActive === false || INACTIVE_ACCOUNT_STATUSES.has(acc.status)) {
     throw new ValidationError(`${label} (${acc.accountId || acc.companyName}) is not active.`);
@@ -434,7 +438,7 @@ router.get("/", salesAuth, async (req, res) => {
     // "Northstar" finds journeys even though the name lives on the Account.
     if (search) {
       const re = new RegExp(escapeRegex(search), "i");
-      const matchedAccounts = await Account.find({ $or: [{ companyName: re }, { accountId: re }, { displayName: re }] })
+      const matchedAccounts = await Account.find(await scoped(req, { $or: [{ companyName: re }, { accountId: re }, { displayName: re }] }))
         .select("_id")
         .limit(200)
         .lean();
@@ -450,14 +454,15 @@ router.get("/", salesAuth, async (req, res) => {
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const perPage = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
 
+    const scopedList = await scoped(req, filter);
     const [rows, total] = await Promise.all([
-      SalesJourney.find(filter)
+      SalesJourney.find(scopedList)
         .populate(POPULATE_SUMMARY)
         .sort({ updatedAt: -1 })
         .skip((pageNum - 1) * perPage)
         .limit(perPage)
         .lean({ virtuals: false }),
-      SalesJourney.countDocuments(filter),
+      SalesJourney.countDocuments(scopedList),
     ]);
 
     res.json({
@@ -466,6 +471,7 @@ router.get("/", salesAuth, async (req, res) => {
       pagination: { page: pageNum, limit: perPage, total, pages: Math.ceil(total / perPage) },
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     const status = err instanceof ValidationError ? 400 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -492,8 +498,11 @@ router.get("/owners", salesAuth, async (req, res) => {
     if (req.query.scope === "mine" && req.user?.id) {
       match.ownerId = new mongoose.Types.ObjectId(String(req.user.id));
     }
+    /* The company clause goes in the INITIAL $match. Aggregating globally and
+       filtering afterwards has already read every company's rows — and this
+       one groups owner names, so it would have listed other companies' staff. */
     const rows = await SalesJourney.aggregate([
-      { $match: match },
+      { $match: await scoped(req, match) },
       // $last, not $first: if a person's display name was corrected at some
       // point, the most recent journey carries the corrected spelling.
       { $group: { _id: "$ownerId", name: { $last: "$ownerName" } } },
@@ -504,6 +513,7 @@ router.get("/owners", salesAuth, async (req, res) => {
       owners: rows.map((r) => ({ id: String(r._id), name: r.name || String(r._id) })),
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -514,7 +524,7 @@ router.get("/owners", salesAuth, async (req, res) => {
 
 router.get("/:journeyId", salesAuth, async (req, res) => {
   try {
-    const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true })
+    const journey = await SalesJourney.findOne(await scoped(req, { journeyId: req.params.journeyId, isActive: true }))
       .populate(POPULATE_DETAIL)
       .lean({ virtuals: false });
 
@@ -526,7 +536,7 @@ router.get("/:journeyId", salesAuth, async (req, res) => {
     // the stage POST, which meant the first anyone heard of an unpaid advance
     // was an error on "Release to Production" — after the work of the stage was
     // already done.
-    const gate = await advanceStatus(journey);
+    const gate = await advanceStatus(journey, req);
     const dto = stripJourneyCommercial(detailDto(journey), req.user);
 
     // The VERDICT is operational — anyone working this journey needs to know
@@ -547,6 +557,7 @@ router.get("/:journeyId", salesAuth, async (req, res) => {
 
     res.json({ success: true, journey: dto });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -554,12 +565,45 @@ router.get("/:journeyId", salesAuth, async (req, res) => {
 /* ── POST /api/cms/crm/sales-journeys ───────────────────────────────────────── */
 
 router.post("/", salesAuth, async (req, res) => {
+  /* Outside the try on purpose: promotion happens deep inside it, and the
+     catch below has to be able to put it back. */
+  let undoPromotion = async () => {};
+  /* ── THE COMMIT BOUNDARY ─────────────────────────────────────────────────
+     The core operation is: the promoted contacts, the Journey, its optional
+     first Activity, and the Lead's conversion. It COMMITS the moment the
+     conditional Lead flip succeeds — or, when there is no source Lead, once
+     the Journey and its audit entry are written.
+
+     Before that point, any failure undoes ALL of it. Partial rollback was the
+     bug: the outer catch undid the contact promotion and left the Journey and
+     a converted Lead pointing at contacts that no longer existed.
+
+     After that point nothing is reversed. The remaining work is the Lead's
+     audit entry and the reload for the response — reporting problems, not
+     creating them — so a failure there becomes a warning on a successful
+     Journey, the same policy this route already applies to the optional first
+     action. */
+  let committed = false;
+  let compensate = async () => {};
   try {
     const b = req.body || {};
 
-    // ── Account: required, must exist, must be tradeable ──────────────────
+    /* ── ONE COMPANY DECISION, MADE FIRST, USED BY EVERYTHING BELOW ───────
+       Resolved before any source record is loaded, so every load below —
+       account, lead, contact, commercial parties — is scoped by the same
+       answer. Re-resolving midway would let one request act on two companies. */
+    /* ── ONE RESOLUTION, USED FOR EVERYTHING ─────────────────────────────
+       The scope AND the ownership stamp come from a single call. They used to
+       be two — `scopeFor` for the source lookups and `ownershipFieldsFor` for
+       the stamp — and two resolutions in one request are two chances to
+       disagree: a membership changed in between and the journey is created
+       owned by a company whose sources were never checked. */
+    const { scope: journeyScope, ownership: journeyOwnership } = await scopeAndOwnership(req);
+    const sourceScope = journeyScope.clause;
+
+    // ── Account: required, must exist, must be tradeable, must be OURS ────
     if (!b.accountId) throw new ValidationError("Select a customer Account for this Journey.");
-    const account = await assertUsableAccount(b.accountId, "Customer account");
+    const account = await assertUsableAccount(b.accountId, "Customer account", sourceScope);
 
     // ── Lead → Journey bridge: resolved and validated FIRST, before anything
     //    is written, so a Lead that cannot convert never leaves an orphaned
@@ -569,7 +613,9 @@ router.post("/", salesAuth, async (req, res) => {
     let sourceLead = null;
     if (b.sourceLeadId) {
       if (!isObjectId(b.sourceLeadId)) throw new ValidationError("Source lead is not a valid reference.");
-      sourceLead = await Lead.findById(b.sourceLeadId);
+      /* Scoped: converting another company's lead would carry their
+         qualification, their contact and their requirement into our journey. */
+      sourceLead = await Lead.findOne(await scoped(req, { $and: [sourceScope, { _id: b.sourceLeadId }] }));
       if (!sourceLead) throw new ValidationError("The source Lead was not found.");
       assertLeadConvertible(sourceLead);
     }
@@ -585,39 +631,71 @@ router.post("/", salesAuth, async (req, res) => {
     let primaryContactId;
     if (b.primaryContactId) {
       if (!isObjectId(b.primaryContactId)) throw new ValidationError("Primary contact is not a valid reference.");
-      const contact = await Contact.findById(b.primaryContactId).select("accountId isActive").lean();
+      /* Two conditions, and both matter: the contact must be OURS, and it
+         must belong to the account we just proved is ours. The company check
+         is in the query; the account agreement is checked after, because a
+         contact whose company is right and whose account is wrong is a
+         different mistake and deserves a different message. */
+      const contact = await Contact.findOne(await scoped(req, { $and: [sourceScope, { _id: b.primaryContactId }] }))
+        .select("accountId isActive status doNotContact").lean();
       if (!contact) throw new ValidationError("Primary contact was not found.");
       if (String(contact.accountId) !== String(account._id)) {
         throw new ValidationError("The primary contact does not belong to the selected account.");
       }
+      /* Present is not the same as usable. `isActive: false` means archived
+         (see the contacts delete route), and a status like `left_organization`
+         or `do_not_contact` means the person is real but must not be the face
+         of this Journey. Naming an unreachable primary is how a Journey ends
+         up with nobody to call. */
+      if (!isUsableContact(contact)) {
+        throw new ValidationError("That contact is archived, marked do-not-contact, or otherwise not contactable — pick an active contact.");
+      }
       primaryContactId = b.primaryContactId;
     }
 
-    // ── Carry the Lead's person across to the Account, if it has none ──────
-    // A converting Lead qualified on a contact route + a decision-maker, but
-    // that person lived only on the Lead. Promote it to a real Account Contact
-    // here (the Lead model's own comment: contacts "belong to an Account,
-    // created at conversion") so the Journey doesn't land on a contactless
-    // Account. Only when: converting, the caller didn't pass one, and the
-    // Account genuinely has no contact yet. Tracked for rollback below.
-    let createdContactId = null;
-    if (sourceLead && !primaryContactId) {
-      const existing = await Contact.countDocuments({ accountId: account._id, isActive: true });
-      if (existing === 0) {
-        const seed = deriveAccountContactFromLead(sourceLead);
-        if (seed && (seed.firstName || seed.lastName)) {
-          const contact = await Contact.create({
-            ...seed,
-            accountId: account._id,
-            isPrimary: true,
-            isActive: true,
-            createdBy: actor(req),
-            updatedBy: actor(req),
-          });
-          primaryContactId = contact._id;
-          createdContactId = contact._id;
-        }
+    // ── Carry the Lead's PEOPLE across to the Account ─────────────────────
+    /* This used to seed exactly ONE contact — "decision-maker, else the first
+       one" — and only when the Account had none at all. A Lead that had
+       collected a merchandiser, a purchase manager and an admin head arrived
+       with one of them, and the salesperson re-typed the other two.
+       `promoteLeadContacts` promotes all of them, reuses anybody the Account
+       already has, and is safe to re-run. Tracked for rollback below. */
+    let promotedContacts = null;
+    /* Promotion is NOT the last thing this request does — a Journey insert can
+       still lose a race, and anything after it can throw. Contacts created a
+       moment ago, fields filled on existing ones, `linkedLeads` entries and
+       every `promotedContactId` written onto the Lead are all just as wrong in
+       that case as a half-finished promotion. `undoPromotion` puts all of it
+       back, and every failure path below calls it. Deleting the created
+       contacts (which is all the old rollback did) left the rest behind. */
+    if (sourceLead) {
+      const promotion = await promoteLeadContacts({ Contact, Lead }, {
+        lead: sourceLead,
+        account,
+        scopeClause: sourceScope,
+        ownership: journeyOwnership,
+        actor: actor(req),
+      });
+      promotedContacts = promotion.summary;
+      undoPromotion = promotion.undo;
+      compensate = undoPromotion;
+
+      /* An explicitly supplied contact is the caller's decision and is already
+         validated above — it is never overridden. Otherwise prefer the CRM
+         Contact this Lead's own primary became, then whatever primary the
+         Account itself already had. */
+      if (!primaryContactId && promotedContacts.primaryContactId) {
+        primaryContactId = promotedContacts.primaryContactId;
       }
+    }
+    if (!primaryContactId) {
+      /* Same rule as an explicit choice: an archived or non-contactable
+         primary is not a fallback, it is a different bug wearing the answer's
+         clothes. */
+      const accountPrimary = await Contact.findOne(
+        await scoped(req, { accountId: account._id, isPrimary: true, isActive: true, doNotContact: { $ne: true } }),
+      ).select("_id status isActive doNotContact").lean();
+      if (accountPrimary && isUsableContact(accountPrimary)) primaryContactId = accountPrimary._id;
     }
 
     // ── Optional commercial parties, each a real active Account ───────────
@@ -634,7 +712,8 @@ router.post("/", salesAuth, async (req, res) => {
     for (const [field, label] of Object.entries(PARTY_FIELDS)) {
       const value = b.parties?.[field];
       if (!value) continue;
-      await assertUsableAccount(value, label);
+      /* Commercial parties are Accounts too, and are scoped identically. */
+      await assertUsableAccount(value, label, sourceScope);
       parties[field] = value;
     }
 
@@ -693,7 +772,20 @@ router.post("/", salesAuth, async (req, res) => {
      * made where it can be: services/sampleStyleProvision.js, one style at a
      * time, against whether that row is linked to a registered stock item.
      */
-    const journey = await createWithRef(SalesJourney, payload);
+    /* Ownership was resolved at the top of this handler, with the source
+       scope, and is reused here — see there for the contract: proven, or the
+       journey is not created. */
+    const journey = await createWithRef(SalesJourney, { ...payload, ...journeyOwnership });
+
+    /* From here the Journey — and any Activity it gains — belong to the same
+       uncommitted operation as the promoted contacts. Scoped deletes: a
+       rollback that could reach further than the write it is undoing is a
+       rollback nobody should have to reason about. */
+    compensate = async () => {
+      if (journey.currentNextActionId) await Activity.deleteOne({ _id: journey.currentNextActionId }).catch(() => {});
+      await SalesJourney.deleteOne(await scoped(req, { _id: journey._id })).catch(() => {});
+      await undoPromotion().catch(() => {});
+    };
 
     await recordChange(req, {
       departmentSlug: "sales",
@@ -763,9 +855,7 @@ router.post("/", salesAuth, async (req, res) => {
     // than left behind as a duplicate. No multi-document transaction is
     // needed for that guarantee; the condition IS the lock.
     if (sourceLead) {
-      const convertedLead = await Lead.findOneAndUpdate(
-        { _id: sourceLead._id, qualificationState: "readyToConvert" },
-        {
+      const convertedLead = await Lead.findOneAndUpdate(await scoped(req, { _id: sourceLead._id, qualificationState: "readyToConvert" }), {
           $set: {
             qualificationState: "converted",
             stage: deriveLegacyStage("converted", sourceLead.stage),
@@ -779,42 +869,75 @@ router.post("/", salesAuth, async (req, res) => {
             updatedBy: actor(req),
           },
         },
-        { new: true },
-      );
+        { new: true },);
 
       if (!convertedLead) {
-        // Lost the race — roll back so a retry never leaves two Journeys.
-        if (journey.currentNextActionId) await Activity.deleteOne({ _id: journey.currentNextActionId }).catch(() => {});
-        await SalesJourney.deleteOne({ _id: journey._id }).catch(() => {});
-        // The Contact we seeded from the Lead belongs to this rolled-back
-        // conversion — remove it too, so the winning request seeds its own.
-        if (createdContactId) await Contact.deleteOne({ _id: createdContactId }).catch(() => {});
+        /* Lost the race. The whole operation goes back — Activity, Journey and
+           every trace of the promotion — so a retry never leaves two Journeys
+           and the winning request promotes from a clean record. */
+        await compensate();
         return res.status(409).json({
           success: false,
           message: "This Lead already started a Sales Journey — refresh and open its record instead.",
         });
       }
 
+      /* COMMITTED. The Lead is converted and points at this Journey; undoing
+         anything from here would mean reversing a conversion another request
+         may already be acting on. */
+      committed = true;
+
       const leadLabel = convertedLead.company || `${convertedLead.firstName || ""} ${convertedLead.lastName || ""}`.trim() || convertedLead.leadId;
-      await recordChange(req, {
-        departmentSlug: "sales",
-        entity: "lead",
-        entityId: convertedLead._id,
-        entityLabel: leadLabel,
-        action: "update",
-        summary: `Lead ${convertedLead.leadId} converted to Sales Journey ${journey.journeyId}`,
-        after: convertedLead.toObject(),
-      });
+      try {
+        await recordChange(req, {
+          departmentSlug: "sales",
+          entity: "lead",
+          entityId: convertedLead._id,
+          entityLabel: leadLabel,
+          action: "update",
+          summary: `Lead ${convertedLead.leadId} converted to Sales Journey ${journey.journeyId}`,
+          after: convertedLead.toObject(),
+        });
+      } catch (auditErr) {
+        /* An audit entry records what happened; failing to write one does not
+           unhappen it. Reversing a committed conversion to keep the log tidy
+           would be the more damaging choice. */
+        warning = [warning, `The Journey and Lead conversion were saved, but the audit entry could not be written (${auditErr.message}).`]
+          .filter(Boolean).join(" ");
+      }
+    } else {
+      /* No source Lead: the Journey and its audit entry ARE the operation. */
+      committed = true;
     }
 
-    const saved = await SalesJourney.findById(journey._id).populate(POPULATE_DETAIL).lean({ virtuals: false });
+    /* Scoped like the write that preceded it: a reload must not be able to
+       return a record the update itself could not have reached. Past the
+       commit point, so a failure here is a thin response — never a reversal of
+       work that is already done and already visible to other requests. */
+    let saved = null;
+    try {
+      saved = await SalesJourney.findOne(await scoped(req, { _id: journey._id }))
+        .populate(POPULATE_DETAIL).lean({ virtuals: false });
+    } catch (reloadErr) {
+      warning = [warning, `The Journey was created, but could not be re-read for this response (${reloadErr.message}). Open it from the Journeys list.`]
+        .filter(Boolean).join(" ");
+    }
 
     res.status(201).json({
       success: true,
-      journey: stripJourneyCommercial(detailDto(saved), req.user),
+      journey: saved
+        ? stripJourneyCommercial(detailDto(saved), req.user)
+        : { id: String(journey._id), journeyId: journey.journeyId, name: journey.name },
       ...(warning ? { warning } : {}),
     });
   } catch (err) {
+    /* Anything that threw BEFORE the commit point takes the whole operation
+       with it — promoted contacts, the Journey, its Activity. After the commit
+       point nothing is reversed: the Lead is converted and other requests can
+       already see it. `compensate` grows as the operation does, and is
+       declared in the enclosing scope precisely so this catch can reach it. */
+    if (!committed) await compensate().catch(() => {});
+    if (answeredTenantRefusal(res, err)) return;
     // LeadTransitionError is assertLeadConvertible's — same 4xx treatment as
     // this route's own ValidationError, just a different class from the
     // shared Lead service.
@@ -835,13 +958,134 @@ router.post("/", salesAuth, async (req, res) => {
    never even reaches here: salesWrites() at the mount has already answered 202
    and held it as a ChangeRequest.) */
 
+/* ── THE ORDER LINK'S COMPANY CONTEXT ───────────────────────────────────────
+   From THIS already-authorised request, never from the journey or enquiry
+   being examined — the same construction the close gate uses. */
+async function orderLinkCtx(req) {
+  const scope = await salesScopeFor(req);
+  return createServiceContext({ companyId: scope.companyId, reason: "sales order link", legacyAware: true });
+}
+
+/** The PO path's link. Never throws — the PO is already durable. */
+async function orderLinkOnPo(req, journey) {
+  try {
+    return await ensureOrderLink(await orderLinkCtx(req), journey);
+  } catch (err) {
+    console.error("[salesJourneys] order link after PO:", err?.message || err);
+    return {
+      status: ORDER_LINK.UNAVAILABLE, method: null, customerRequestId: null, requestId: null,
+      message: "The order link could not be checked right now. The PO is recorded; try again shortly.",
+      needsChoice: false, candidateCount: null, confirmedAt: null, confirmedBy: null,
+    };
+  }
+}
+
+/** Load a journey for an order-link call, with the owner-or-manager rule. */
+async function journeyForOrderLink(req, res, { write }) {
+  const journey = await SalesJourney.findOne(await scoped(req, { journeyId: req.params.journeyId, isActive: true }));
+  if (!journey) {
+    res.status(404).json({ success: false, message: `No Sales Journey matches ${req.params.journeyId}.` });
+    return null;
+  }
+  const isOwner = String(journey.ownerId) === String(req.user?.id);
+  if (!isOwner && !(await isSalesManager(req.user))) {
+    res.status(403).json({
+      success: false,
+      message: write
+        ? "Only this Journey's owner or a Sales manager can choose its order."
+        : "Only this Journey's owner or a Sales manager can see its order candidates.",
+    });
+    return null;
+  }
+  return journey;
+}
+
+// GET /api/cms/crm/sales-journeys/:journeyId/order-link
+// Which order this deal is, and — when that is not proved — the orders an
+// authorised salesperson may choose from. Read-only. Candidates are only ever
+// this company's: orders raised from this enquiry, or orders of the portal
+// customer this company's account alone is linked to.
+router.get("/:journeyId/order-link", salesAuth, async (req, res) => {
+  try {
+    const journey = await journeyForOrderLink(req, res, { write: false });
+    if (!journey) return;
+    const ctx = await orderLinkCtx(req);
+    const enquiry = await Enquiry.findOne(serviceFilter(ctx, { journeyId: journey._id, isActive: true }));
+    const orderLink = await resolveOrderLink(ctx, enquiry);
+    const candidates = enquiry && orderLink.needsChoice ? await listOrderCandidates(ctx, enquiry) : [];
+    return res.json({ success: true, orderLink, candidates });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
+    console.error("[salesJourneys] GET order-link", err);
+    return res.status(500).json({ success: false, message: "The order link could not be checked right now." });
+  }
+});
+
+// POST /api/cms/crm/sales-journeys/:journeyId/order-link
+// Body: { customerRequestId, expectedCustomerRequestId: <the link you saw, or null>, reason? }
+// An authorised salesperson settles which existing order this deal is. The
+// order must be one GET offered; replacing a link needs a reason and the link
+// you saw, so a stale screen cannot overwrite someone else's correction.
+// Re-sending the same choice is a no-op.
+router.post("/:journeyId/order-link", salesAuth, async (req, res) => {
+  try {
+    const journey = await journeyForOrderLink(req, res, { write: true });
+    if (!journey) return;
+    const b = req.body || {};
+    const chosen = String(b.customerRequestId || "").trim();
+    if (!mongoose.isValidObjectId(chosen)) {
+      return res.status(400).json({ success: false, code: "invalid_order", message: "Choose an order to link." });
+    }
+    if (!Object.prototype.hasOwnProperty.call(b, "expectedCustomerRequestId")) {
+      return res.status(400).json({
+        success: false, code: "expected_required",
+        message: "Send the order link you are replacing (null when there is none).",
+      });
+    }
+    const ctx = await orderLinkCtx(req);
+    const enquiry = await Enquiry.findOne(serviceFilter(ctx, { journeyId: journey._id, isActive: true }));
+    if (!enquiry) {
+      return res.status(404).json({ success: false, code: "no_enquiry", message: "This journey has no active enquiry." });
+    }
+
+    const out = await chooseOrderLink(ctx, enquiry, {
+      customerRequestId: chosen,
+      expectedCustomerRequestId: b.expectedCustomerRequestId,
+      reason: b.reason,
+      actor: actor(req),
+    });
+    if (out.changed) {
+      await recordChange(req, {
+        departmentSlug: "sales",
+        entity: "crm-enquiry",
+        entityId: enquiry._id,
+        entityLabel: journey.journeyId,
+        action: "update",
+        summary: `Sales Journey ${journey.journeyId} order ${out.before ? "re-linked" : "linked"}`
+          + (out.orderLink.requestId ? ` to ${out.orderLink.requestId}` : "")
+          + (b.reason ? ` — ${String(b.reason).trim()}` : ""),
+        before: { customerRequestId: out.before },
+        after: { customerRequestId: out.orderLink.customerRequestId, method: out.orderLink.method },
+      });
+    }
+    return res.json({ success: true, changed: out.changed, orderLink: out.orderLink });
+  } catch (err) {
+    if (err instanceof OrderLinkError) {
+      return res.status(err.status).json({ success: false, code: err.code, message: err.message });
+    }
+    if (answeredTenantRefusal(res, err)) return;
+    console.error("[salesJourneys] POST order-link", err);
+    return res.status(500).json({ success: false, message: "The order could not be linked right now." });
+  }
+});
+
 // PATCH /api/cms/crm/sales-journeys/:journeyId/po
 // Record the customer's purchase order against the journey. This is what makes
 // "do not start production without a PO" checkable at all — before it, nothing
 // anywhere held a PO, so the PO/Contract stage could complete on nothing.
 router.patch("/:journeyId/po", salesAuth, async (req, res) => {
   try {
-    const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true });
+    const journey = await SalesJourney.findOne(await scoped(req, { journeyId: req.params.journeyId, isActive: true }));
     if (!journey) {
       return res.status(404).json({ success: false, message: `No Sales Journey matches ${req.params.journeyId}.` });
     }
@@ -909,11 +1153,13 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
     await journey.save();
 
     // Recording the PO is the moment an opportunity becomes an order, so it is
-    // the moment to pin its order record by id instead of leaving the post-PO
-    // screens to find it by matching the customer's name. Advisory: never
-    // throws, and a PO is recorded whether or not the link resolves. See
-    // services/orderBookLink.js for why it links but does not create.
-    const orderLink = await ensureOrderLink(journey);
+    // the moment to say WHICH order. Only a proved link is written — the one
+    // order raised from this enquiry — and anything else is REPORTED
+    // ("order not linked", "not verified", …) for a salesperson to settle
+    // through /order-link. Never throws: the PO above is already recorded,
+    // and a retry or correction resolves to the same answer. See
+    // services/orderBookLink.js.
+    const orderLink = await orderLinkOnPo(req, journey);
 
     await recordChange(req, {
       departmentSlug: "sales",
@@ -922,20 +1168,26 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
       entityLabel: journey.journeyId,
       action: "update",
       summary: `Sales Journey ${journey.journeyId} PO recorded (${number})`
-        + (orderLink.linked && orderLink.requestId ? ` — order ${orderLink.requestId} linked` : ""),
+        + (orderLink.status === ORDER_LINK.LINKED && orderLink.requestId
+          ? ` — order ${orderLink.requestId} linked` : " — order not linked"),
       before,
       after: journey.toObject(),
     });
 
-    const saved = await SalesJourney.findById(journey._id).populate(POPULATE_DETAIL).lean({ virtuals: false });
+    /* Scoped like the write that preceded it: a reload must not be able to
+       return a record the update itself could not have reached. */
+    const saved = await SalesJourney.findOne(await scoped(req, { _id: journey._id }))
+      .populate(POPULATE_DETAIL).lean({ virtuals: false });
     return res.json({
       success: true,
       journey: stripJourneyCommercial(detailDto(saved), req.user),
-      // Advisory only — the UI does not depend on it yet. Surfaced so the link
-      // (or the reason it could not be made) is visible rather than silent.
+      // The PO is recorded whatever this says. `status` other than "linked"
+      // means the Order Book cannot yet be trusted for this deal; the contract
+      // is documented at the top of services/orderBookLink.js.
       orderLink,
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     const status = err instanceof ValidationError || err.name === "ValidationError" ? 400 : 500;
     return res.status(status).json({ success: false, message: err.message });
   }
@@ -960,7 +1212,7 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
 // only from whatever somebody typed on this PO, so two journeys for the same
 // buyer could gate on different figures and neither was wrong. The journey may
 // still override for one deal — that is recorded as a deviation, not hidden.
-async function advanceStatus(journey) {
+async function advanceStatus(journey, req) {
   const AccountModel = require("../../../models/CMS_Models/Sales/Account");
   // Populated on the detail GET, a bare ObjectId on the stage POST — take the
   // id either way rather than depending on which caller we are serving.
@@ -974,14 +1226,27 @@ async function advanceStatus(journey) {
   const terms = resolvePaymentTerms(account, journey.po);
   if (terms.advancePercent === null) return null;
 
-  const EnquiryModel = require("../../../models/CMS_Models/Sales/Enquiry");
+  /* ── ONLY THIS DEAL'S PROVED ORDER COUNTS (G02) ─────────────────────────
+     This read the journey's enquiry with no company and trusted whatever
+     order its link held — so a link written by the old recency or name guess
+     counted ANOTHER order's payments as this deal's advance received. The
+     money is now read only from the order proved to be this deal's; with none
+     proved, nothing is counted as received, which holds the gate shut rather
+     than opening it on someone else's payment. */
   const CustomerRequestModel = require("../../../models/Customer_Models/CustomerRequest");
-  const enquiry = await EnquiryModel.findOne({ journeyId: journey._id, isActive: true })
-    .select("customerRequestId").lean();
-  const order = enquiry?.customerRequestId
-    ? await CustomerRequestModel.findById(enquiry.customerRequestId)
-        .select("grandTotal totalPaidAmount quotations.grandTotal").lean()
-    : null;
+  let order = null;
+  try {
+    const ctx = await orderLinkCtx(req);
+    const enquiry = await Enquiry.findOne(serviceFilter(ctx, { journeyId: journey._id, isActive: true }));
+    const { customerRequestId } = enquiry ? await provedOrderFor(ctx, enquiry) : { customerRequestId: null };
+    order = customerRequestId
+      ? await CustomerRequestModel.findById(customerRequestId)
+          .select("grandTotal totalPaidAmount quotations.grandTotal").lean()
+      : null;
+  } catch (err) {
+    console.error("[salesJourneys] advance status order read:", err?.message || err);
+    order = null;
+  }
 
   // The PO's own amount is the agreed value and wins. The order's total is the
   // fallback for a PO recorded without one.
@@ -1000,7 +1265,7 @@ async function advanceStatus(journey) {
 
 router.post("/:journeyId/stage", salesAuth, async (req, res) => {
   try {
-    const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true });
+    const journey = await SalesJourney.findOne(await scoped(req, { journeyId: req.params.journeyId, isActive: true }));
     if (!journey) {
       return res.status(404).json({ success: false, message: `No Sales Journey matches ${req.params.journeyId}.` });
     }
@@ -1027,8 +1292,23 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
     // so no other transition pays for the four queries behind it.
     let context;
     if (b.action === "close") {
-      const closing = await closingVerdictForJourney(journey._id);
-      if (closing) context = { closing };
+      /* The company comes from THIS already-authorised request — the journey
+         was loaded under it — not from the journey or enquiry being examined. */
+      const closingScope = await salesScopeFor(req);
+      /* The legacy allowance is settled by the factory against the company
+         master, not asserted by this caller — a boolean passed in is not
+         proof of anything. */
+      const closing = await closingVerdictForJourney(journey._id, await createServiceContext({
+        companyId: closingScope.companyId,
+        reason: "sales journey stage transition",
+        legacyAware: true,
+      }));
+      /* Always handed over. This used to be `if (closing) context = …`, which
+         dropped a null verdict on the floor — and the planner, finding no
+         verdict, closed the order. The verdict service no longer returns null,
+         and even if it did, an absent verdict must reach the planner as the
+         refusal it is rather than vanish here. (G03.) */
+      context = { closing };
     } else if (b.action === "lose") {
       // Derived, never trusted from the client: whether a PO exists is the one
       // thing standing between "we lost it" and "we have to cancel a committed
@@ -1040,7 +1320,7 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
       // client for the obvious reason.
       context = {
         poOnFile: Boolean(journey.po?.number),
-        advance: await advanceStatus(journey),
+        advance: await advanceStatus(journey, req),
         // Styles Sales has approved but the CUSTOMER has not (2 Sept 2026,
         // explicit request: "jabtak the customer not approved this sample,
         // the purchase invoice/order should be initiate against this
@@ -1136,9 +1416,13 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
       after: journey.toObject(),
     });
 
-    const saved = await SalesJourney.findById(journey._id).populate(POPULATE_DETAIL).lean({ virtuals: false });
+    /* Scoped like the write that preceded it: a reload must not be able to
+       return a record the update itself could not have reached. */
+    const saved = await SalesJourney.findOne(await scoped(req, { _id: journey._id }))
+      .populate(POPULATE_DETAIL).lean({ virtuals: false });
     res.json({ success: true, journey: stripJourneyCommercial(detailDto(saved), req.user) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     const status =
       err instanceof ValidationError || err instanceof JourneyTransitionError ||
       err.name === "ValidationError" || err.name === "JourneyTransitionError"

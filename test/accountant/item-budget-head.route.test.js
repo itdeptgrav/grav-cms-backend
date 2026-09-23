@@ -27,6 +27,13 @@ jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
   },
 }));
 jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  /* Lane A Chunk 3A added the canonical company-scope guard, which the routers
+     under test now mount. Pass-through doubles here on purpose: these suites
+     are about budget and ledger behaviour, and company isolation has its own
+     suite (company-isolation.route.test.js) that exercises the real guard. A
+     mock has to offer what the module offers, or the router fails to load. */
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
   orgAuth: (req, res, next) => {
     const raw = req.headers["x-test-user"];
     if (!raw) return res.status(401).json({ error: "Authentication required." });
@@ -488,6 +495,84 @@ describe("coverage", () => {
     /* An uncategorised item is the store's data problem, never counted as
        something finance failed to map. */
     expect(body.rows.find((r) => r.uncategorised).mapped).toBe(false);
+  });
+
+  test("a typed category is counted under itself, not as uncategorised", async () => {
+    /* ── WHAT THIS FIXES ──────────────────────────────────────────────────
+       An item whose category was typed rather than picked stores it in
+       `customCategory` with `category` set to "". The coverage aggregation
+       grouped on `$category` alone, so every one of them fell into the
+       nameless bucket Finance reads as "uncategorised — the store's data to
+       fix". They were not: each had a perfectly good category living in the
+       other field, and mapping it moved a count that never moved.
+
+       Coverage now groups by the SAME `customCategory || category` the
+       resolver applies, so what Finance maps is what actually resolves. */
+    const { company, spendHead, finance } = await seedCompany();
+    const typed = `Specialty Weave ${++seq}`;
+    await mkItem("", { customCategory: typed });
+    await mkItem("", { customCategory: typed });
+    await mkItem("");                       // genuinely no category, either form
+
+    const before = await call(`/item-categories?companyId=${company._id}`, { user: finance });
+    const typedRow = before.body.rows.find((r) => r.category === typed);
+    expect(typedRow).toBeDefined();
+    expect(typedRow.items).toBe(2);
+    expect(typedRow.mapped).toBe(false);
+    /* And it is NOT pooled with the item that has no category at all. */
+    expect(before.body.rows.find((r) => r.uncategorised)?.items).not.toBe(3);
+
+    /* Mapping it counts, on the screen and in the resolution. */
+    await call(`/item-categories/${encodeURIComponent(typed)}`, {
+      method: "PUT", user: finance,
+      body: { companyId: String(company._id), budgetLedgerId: String(spendHead._id) },
+    });
+    const after = await call(`/item-categories?companyId=${company._id}`, { user: finance });
+    const mapped = after.body.rows.find((r) => r.category === typed);
+    expect(mapped.mapped).toBe(true);
+    expect(String(mapped.budgetLedgerId)).toBe(String(spendHead._id));
+    expect(after.body.itemsMapped).toBeGreaterThanOrEqual(2);
+  });
+
+  test("the override panel names and resolves a typed category", async () => {
+    const { company, spendHead, finance } = await seedCompany();
+    const typed = `Handloom ${++seq}`;
+    /* Held in a variable: `mkItem` bumps `seq` itself, so building the name
+       and the search term from it separately gave two different strings. */
+    const itemName = `Weave ${seq}`;
+    const it = await mkItem("", { customCategory: typed, name: itemName });
+    await call(`/item-categories/${encodeURIComponent(typed)}`, {
+      method: "PUT", user: finance,
+      body: { companyId: String(company._id), budgetLedgerId: String(spendHead._id) },
+    });
+
+    const { body } = await call(
+      `/item-budget-heads/items?companyId=${company._id}&search=${encodeURIComponent(itemName)}`,
+      { user: finance },
+    );
+    const row = body.items.find((r) => String(r._id) === String(it._id));
+    /* The row names the category the head beside it was decided by. It used
+       to show a blank while the head came from a mapping nobody could see. */
+    expect(row.category).toBe(typed);
+    expect(row.resolution.source).toBe("category_mapping");
+    expect(String(row.resolution.budgetLedgerId)).toBe(String(spendHead._id));
+  });
+
+  test("the resolve endpoint agrees with the coverage screen", async () => {
+    const { company, spendHead, finance } = await seedCompany();
+    const typed = `Jacquard ${++seq}`;
+    const it = await mkItem("", { customCategory: typed });
+    await call(`/item-categories/${encodeURIComponent(typed)}`, {
+      method: "PUT", user: finance,
+      body: { companyId: String(company._id), budgetLedgerId: String(spendHead._id) },
+    });
+
+    const { body } = await call(`/item-budget-heads/resolve?companyId=${company._id}`, {
+      method: "POST", user: finance, body: { itemIds: [String(it._id)] },
+    });
+    expect(body.results[0].source).toBe("category_mapping");
+    expect(String(body.results[0].budgetLedgerId)).toBe(String(spendHead._id));
+    expect(body.results[0].category).toBe(typed);
   });
 });
 

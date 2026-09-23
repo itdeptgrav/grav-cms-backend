@@ -44,6 +44,20 @@ const fulfilment = require("../../services/storeFulfilment.service");
 const financeDecision = require("../../services/spendFinanceDecision.service");
 const budgetMatch = require("../../services/budgetCommitment.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const {
   orgAuth,
   requirePermission,
@@ -115,7 +129,7 @@ const listRow = (r) => ({
  * What is waiting on finance. Newest last, because this is a queue somebody
  * works down rather than a feed they scan.
  */
-router.get("/", async (req, res) => {
+router.get("/", companyScopeOptional, async (req, res) => {
   try {
     const filter = { status: chain.PENDING_FINANCE };
 
@@ -169,7 +183,7 @@ router.get("/", async (req, res) => {
  * request. The snapshot is a record of what Store was looking at when they
  * priced it; finance is deciding now, and the envelope has moved since.
  */
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     const doc = await SpendRequest.findById(req.params.id).lean();
     if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
@@ -519,7 +533,7 @@ async function answer(req, res, outcome) {
  * Approval is never BLOCKED by an overrun. Finance may always say yes; this is
  * an alternative to approving, not a gate in front of it.
  */
-router.post("/:id/budget-exception", requirePermission("canEdit"), async (req, res) => {
+router.post("/:id/budget-exception", companyScope, requirePermission("canEdit"), async (req, res) => {
   try {
     if (!isApprover(req.user)) {
       return res.status(403).json({

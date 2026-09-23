@@ -52,6 +52,25 @@ function dropRoleCaches(slug, email) {
   }
 }
 
+/**
+ * A role change is an authorisation change, so the HR contract's resolved-actor
+ * cache has to forget what it knew — otherwise a revoked approver keeps
+ * approving, and a freshly granted editor is refused, for up to thirty seconds
+ * with nothing on screen to explain either.
+ *
+ * Required lazily and never allowed to throw: this module is imported by the
+ * access layer, and an invalidation failure must not fail a grant that has
+ * already been written. That exact shape — the write lands, the response says
+ * otherwise — is what test/access/department-role-cache.test.js pins.
+ */
+function dropHrAuthorizationCache(reason) {
+  try {
+    require("./access/hrAuthorization").invalidateHrAuthorization(reason);
+  } catch (err) {
+    console.warn("[department-roles] HR cache invalidation skipped:", err.message);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Reading                                                             */
 /* ------------------------------------------------------------------ */
@@ -187,6 +206,7 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
     const { setAccountantRole, revokeAccountantRole } = require("./accountantAccess");
     if (role === null) {
       await revokeAccountantRole(mail);
+      dropHrAuthorizationCache("revoked accountant role");
       return { role: null, revoked: true };
     }
     const { user, created } = await setAccountantRole({
@@ -201,6 +221,7 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
       { $set: { isActive: false } },
       { new: true },
     );
+    dropHrAuthorizationCache(`revoked ${slug} role`);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -250,6 +271,10 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
      database on every call — there is no cache in front of them to invalidate,
      so a cache-drop here would be a no-op at best. If one is ever added, its
      invalidation belongs next to it, not as an undefined name here. */
+
+  /* Covers the incumbent-owner demotion a few lines above as well: that
+     updateMany changes somebody ELSE's role, and they are not the caller. */
+  dropHrAuthorizationCache(`set ${slug} role`);
 
   return { role: row.role, created: !before, previous: before?.role || null };
 }
@@ -319,6 +344,10 @@ async function followEmailChange(oldEmail, newEmail) {
   } catch (err) {
     console.warn("[department-roles] could not follow an accounting email:", err.message);
   }
+
+  /* An address change moves the grants keyed on it, so every cached decision
+     made under the old address is now wrong in both directions. */
+  if (moved) dropHrAuthorizationCache("followed an email change");
 
   return moved;
 }

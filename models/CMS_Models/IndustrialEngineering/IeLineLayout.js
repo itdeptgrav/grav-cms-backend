@@ -71,6 +71,9 @@ const LIMITS = Object.freeze({
   NOTE: 1000,
   SUMMARY: 300,
   HISTORY: 200,
+  /* Planned-canvas coordinates are bounded so a stray value cannot make the
+     plan unrenderable; the unit is the plan's own, not a floor measurement. */
+  COORDINATE: 100000,
 });
 
 /* ── THE SOURCE ROW, FROZEN AT BINDING ────────────────────────────────────
@@ -112,9 +115,67 @@ const sourceRowSchema = new mongoose.Schema(
           }, { _id: false })],
           default: () => [],
         },
+        /* ── CHUNK 8A-iii: THE OTHER TWO DIMENSIONS ──────────────────────
+           A layout COPIES the bulletin version's frozen rows, so whatever the
+           version froze has to survive the copy. Optional and unbackfilled: a
+           layout opened from a version that predates the capture keeps exactly
+           the three fields it always had. */
+        dimensionsCaptured: { type: [String], default: undefined },
+        machines: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            machineType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+          }, { _id: false })],
+          default: undefined,
+        },
+        attachments: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            code: { type: String, required: true, trim: true },
+            name: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
+        labour: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            workerType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            skillCode: { type: String, trim: true, default: "" },
+            skillName: { type: String, trim: true, default: "" },
+            grade: { type: String, trim: true, default: "" },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
       }, { _id: false }),
       default: null,
     },
+  },
+  { _id: false },
+);
+
+/* ── WHERE SOMETHING IS DRAWN ON THE PLANNED LINE (2D contract, v1) ────────
+   A point on the IE planning canvas, in plan units. It is GEOMETRY ONLY: it
+   says where a planned station or a planned machine-type slot is drawn, and
+   nothing else. It does not order anything — a station's `sequence` and its
+   assignments are separate facts that no position ever changes — and it is not
+   a floor coordinate of any physical machine.
+
+   Absent (never defaulted) on everything planned before this existed: a
+   `default` would write a fabricated position onto every legacy layout the
+   first time any field was saved. No position means "draw it where its
+   sequence puts it", which is how every layout rendered before. */
+const positionSchema = new mongoose.Schema(
+  {
+    x: { type: Number, required: true, min: -LIMITS.COORDINATE, max: LIMITS.COORDINATE },
+    y: { type: Number, required: true, min: -LIMITS.COORDINATE, max: LIMITS.COORDINATE },
   },
   { _id: false },
 );
@@ -165,9 +226,19 @@ const stationSchema = new mongoose.Schema(
       type: [new mongoose.Schema({
         machineType: { type: String, required: true, trim: true, maxlength: LIMITS.LABEL },
         quantity: { type: Number, required: true, min: 1, max: 999 },
+        /* ── THE SLOT: THIS TYPE REQUIREMENT AS A THING ON THE CANVAS ─────
+           Server-minted once, like `stationId`, and kept through edits so the
+           canvas can move the same slot twice. It identifies a planned TYPE
+           requirement at a station — never a machine. Both fields are absent on
+           entries planned before the 2D contract. */
+        slotId: { type: String, trim: true },
+        position: { type: positionSchema, default: undefined },
       }, { _id: false })],
       default: () => [],
     },
+
+    /* Where this station is drawn on the planned line. See `positionSchema`. */
+    position: { type: positionSchema, default: undefined },
   },
   { _id: false },
 );

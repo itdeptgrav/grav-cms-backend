@@ -1,4 +1,49 @@
 const express = require("express");
+/* Server-owned field policy. `selectFor` narrows the QUERY to what this caller
+   may read; `projectFor` narrows the RESPONSE to the declared allowlist. Both
+   fail closed to the directory class when the HR contract did not run. */
+const { projectFor, selectFor } = require("../../services/access/hrFieldPolicy");
+
+/* ── Employment state is authorisation state ─────────────────────────────────
+ *
+ * The HR contract resolves an actor from their Employee record and caches the
+ * answer for thirty seconds, and a deactivated employee is refused HR outright
+ * (services/access/hrAuthorization.js). So a write that deactivates somebody is
+ * an authorisation change, and the cache has to be told — otherwise the person
+ * HR has just switched off keeps their HR session for another half minute with
+ * the token already in their browser, and nothing on screen says why.
+ *
+ * This is a DIFFERENT decision from `invalidateAppAccess`, which drops the
+ * five-minute per-employee cache that decides whether the mobile app will let
+ * somebody in at all. Both are kept, and both are called on the paths that
+ * matter to them; neither replaces the other.
+ *
+ * Called only AFTER a write has succeeded. Evicting on a failed mutation would
+ * throw away correct answers for every HR user to no purpose.
+ */
+const AUTHORISATION_RELEVANT_FIELDS = [
+  "status",
+  "isActive",
+  "employmentType",
+  "accessDepartmentId",
+  "additionalDepartmentIds",
+];
+
+function touchesHrEligibility(fields) {
+  if (!fields || typeof fields !== "object") return false;
+  return Object.keys(fields).some((key) =>
+    AUTHORISATION_RELEVANT_FIELDS.includes(String(key).split(/[.[]/)[0]),
+  );
+}
+
+function dropHrAuthorizationCache(reason) {
+  try {
+    require("../../services/access/hrAuthorization").invalidateHrAuthorization(reason);
+  } catch (err) {
+    /* A cache that will not clear must not fail a write that already landed. */
+    console.warn("[employees] HR authorisation cache invalidation skipped:", err.message);
+  }
+}
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
@@ -689,6 +734,12 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       invalidateAppAccess(id);
     }
 
+    // …and the HR contract's own cache, when the write changed whether this
+    // person may open HR at all. The update has already succeeded here.
+    if (touchesHrEligibility(updateData)) {
+      dropHrAuthorizationCache("employee update changed employment state");
+    }
+
     // Decrypt salary before sending to client
     const decryptedDoc = decryptEmployeeDoc(updated);
 
@@ -947,10 +998,18 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 
            The rest are large sub-documents the list has no column for either.
            The single-employee GET is untouched and still returns everything. */
+        /* …and, on top of that, whatever THIS caller may not read.
+           `selectFor` appends the capability-derived exclusion list, so a
+           directory viewer's query never loads the salary block — which also
+           means it is never decrypted below. Fails closed to the directory
+           class if the contract did not run. */
         .select(
-          "-password -temporaryPassword -__v -sopPoints " +
-            "-personalCustomFields -workCustomFields -salaryCustomFields " +
-            "-documentCustomFields -addressCustomFields",
+          selectFor(
+            req,
+            "-password -temporaryPassword -__v -sopPoints " +
+              "-personalCustomFields -workCustomFields -salaryCustomFields " +
+              "-documentCustomFields -addressCustomFields",
+          ),
         )
         .lean(),
       Employee.countDocuments(filter),
@@ -976,12 +1035,25 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Decrypt salary fields in each employee doc before sending to client.
     // List views only show minimal salary info (gross/net) so this is fast.
+    // A caller without `compensation.read` has no salary block here at all —
+    // `selectFor` above left it in the database — so this is a no-op for them.
     const decryptedEmployees = decryptEmployeeDocs(employees);
+
+    /* THE ALLOWLIST, ON THE REAL RESPONSE.
+     *
+     * The query exclusion above is a denylist and denylists protect the fields
+     * somebody remembered: this list used to go out whole, so a directory
+     * viewer received every employee's personal phone, home address, date of
+     * birth, family details and uploaded document metadata. `projectFor` keeps
+     * only the fields the caller's class DECLARES — so a column added to
+     * Employee next week is withheld by default instead of published by
+     * default. The envelope, pagination and stats are untouched. */
+    const projected = projectFor(req, decryptedEmployees);
 
     res.status(200).json({
       success: true,
       data: {
-        employees: decryptedEmployees,
+        employees: projected,
         pagination: {
           currentPage: parseInt(page),
           totalPages,
@@ -1077,6 +1149,10 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
+    /* Decided once, from what the request actually carries, and consulted after
+       each save below — a bulk deactivation is a bulk revocation. */
+    const hrEligibilityTouched = touchesHrEligibility(clean);
+
     // Nested objects → dot paths, so a partial {salary:{gross}} or
     // {address:{current:{city}}} merges instead of replacing the sub-document.
     const flatten = (obj, prefix = "", out = {}) => {
@@ -1128,6 +1204,9 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
         // type changes whether the app will let them in, and the answer is
         // cached for five minutes.
         if (doc.employmentType !== beforeType) invalidateAppAccess(doc._id);
+        if (hrEligibilityTouched) {
+          dropHrAuthorizationCache("bulk update changed employment state");
+        }
 
         const name = `${doc.firstName || ""} ${doc.lastName || ""}`.trim();
         recordChange(req, {
@@ -1198,15 +1277,16 @@ router.get("/history", EmployeeAuthMiddlewear, async (req, res) => {
 router.get("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const employee = await Employee.findById(req.params.id)
-      .select("-password -temporaryPassword -__v")
+      .select(selectFor(req, "-password -temporaryPassword -__v"))
       .lean();
     if (!employee)
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
-    // Decrypt salary fields before sending to client
+    // Decrypt salary fields before sending to client. Absent for a caller
+    // without compensation.read — selectFor left it in the database.
     const decrypted = decryptEmployeeDoc(employee);
-    res.status(200).json({ success: true, data: decrypted });
+    res.status(200).json({ success: true, data: projectFor(req, decrypted) });
   } catch (error) {
     console.error("Get employee error:", error);
     if (error.name === "CastError")
@@ -1225,7 +1305,7 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
 
     const employee = await Employee.findById(id)
-      .select("-password -temporaryPassword -__v")
+      .select(selectFor(req, "-password -temporaryPassword -__v"))
       .populate("departmentId", "name designations managers")
       .populate(
         "primaryManager.managerId",
@@ -1243,6 +1323,16 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
+    /* NO projectFor HERE, deliberately.
+     *
+     * This route returns a RESHAPED view — `basicInfo`, `workInfo`, dates
+     * pre-formatted for display — not an Employee document, so an allowlist of
+     * Employee field names has nothing to match against. Its protection is the
+     * two layers that do apply: `selectFor` above never loads what this caller
+     * may not read (so `salary` is simply absent and the block below computes
+     * zeroes), and the contract's response scrub removes any protected leaf
+     * that survives under its own name. The declaration also puts this route
+     * behind `people.read.private`, so a directory viewer never reaches it. */
     // Decrypt salary before building the response object
     const sal = decryptSalaryFields(employee.salary || {});
 
@@ -1586,6 +1676,12 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
+    // Deactivation IS revocation: the HR contract refuses an inactive employee,
+    // and until the cached answer is dropped they keep the session they already
+    // have. Both caches, because they answer different questions.
+    invalidateAppAccess(req.params.id);
+    dropHrAuthorizationCache("employee deactivated");
 
     // Audit: who deactivated this employee.
     recordChange(req, {

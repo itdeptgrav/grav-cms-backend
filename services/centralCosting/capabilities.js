@@ -55,6 +55,49 @@ const CAPABILITIES = Object.freeze({
   APPROVE: "costing.approve",
   MARGIN_READ: "costing.margin.read",
   POLICY_MANAGE: "costing.policy.manage",
+  /* ── ASKING FOR AN ESTIMATE IS NOT BUILDING ONE ──────────────────────
+     May ask Central Costing to assemble the departmental inputs and prepare
+     or refresh an estimate for an enquiry this actor may already reach.
+
+     It exists because the alternative was `costing.draft.write`, and that is
+     a different authority: it carries `cost.read`, it opens the whole
+     internal build-up, and it belongs to the people who maintain costings
+     rather than to the people who ask for one. Sales pressing "Prepare
+     estimate" is a request; whether it produces a version at all is decided
+     by the resolved sources and the fingerprint, not by the person.
+
+     It implies NOTHING. Not cost, not margin, not draft write, not approval,
+     not policy. Holding it lets somebody start a calculation whose result
+     they may then be shown almost none of — which is exactly right, and is
+     why it could not be expressed by reusing an existing name. */
+  PREPARE: "costing.prepare",
+
+  /* ── THE COMMERCIAL REVIEW, IN THREE SEPARATE AUTHORITIES ────────────
+     Deciding a price is not one job. Asking for a decision, taking an
+     ordinary one, and waiving the company's own floor are three, held by
+     three different people — so they are three capabilities and never a
+     rank test on one of them.
+
+     None implies `cost.read` or `margin.read`. A person may decide whether a
+     PRICE may be quoted without being shown what the garment costs, what the
+     Board marks it up by, or what a supplier charges — and that separation
+     is the whole reason these are not `costing.approve`, which was written
+     for the internal Costing workspace and is held by administrators. */
+
+  /* Ask for a prepared estimate to be reviewed commercially. A request, not
+     a decision: it commits the company to nothing and changes no price. */
+  COMMERCIAL_SUBMIT: "costing.commercial.submit",
+
+  /* Take the ORDINARY decision — approve or return a proposal that is at or
+     above the company's own floor. Deliberately cannot clear a below-floor
+     price: that is a different decision with a different owner, and letting
+     one capability do both would make the floor advisory. */
+  COMMERCIAL_APPROVE: "costing.commercial.approve",
+
+  /* Waive the floor. The one authority that may approve a price BELOW what
+     management said the company sells at, and only with a stated reason.
+     Held by the executive authority, not by whoever happens to run Sales. */
+  COMMERCIAL_EXCEPTION: "costing.commercial.exception",
 });
 
 const ALL = Object.freeze(Object.values(CAPABILITIES));
@@ -70,23 +113,40 @@ const ADMIN_SET = Object.freeze([...ALL]);
 /**
  * Grant → capabilities, by department slug and ranked role.
  *
- * `sales` is the one department mapped, and it is mapped to ONE capability:
- * the approved commercial output. A Sales grant deliberately does NOT carry
- * cost, supplier prices, margin, draft access or policy — reading a costing
- * they may quote from is not the same authority as seeing what it is built
- * from, and today's Sales screens already work on exactly that basis
- * (services/crmCostVisibility.js rule 1: "Sales does not see cost").
+ * `sales` carries the approved commercial output at every rank, and from
+ * `editor` upward the right to ASK for an estimate. A Sales grant deliberately
+ * does NOT carry cost, supplier prices, margin, draft access, approval or
+ * policy — reading a costing they may quote from is not the same authority as
+ * seeing what it is built from, and today's Sales screens already work on
+ * exactly that basis (services/crmCostVisibility.js rule 1: "Sales does not
+ * see cost").
  *
- * `ceo` is the existing board-level authority and holds everything.
+ * ── WHY `viewer` STOPS AT READING ──────────────────────────────────────────
+ * Preparing an estimate is a WRITE: it can bring a costing and a frozen
+ * version into existence, and every one of those is a durable company record
+ * somebody may later be asked about. `viewer` is the rank this system gives to
+ * people who need to see the work without being answerable for it, and the
+ * ranked resolution below means an unnamed rank falls to the highest rank at
+ * or below it — so leaving `viewer` at output-only is what keeps a junior or
+ * read-only Sales grant from silently acquiring a write.
+ *
+ * `ceo` is the existing board-level authority and holds everything, which is
+ * where the platform administrator and CEO already sit.
  *
  * Every other slug is ABSENT ON PURPOSE, not forgotten. See the header.
  */
 const GRANTS = Object.freeze({
   sales: {
     viewer: [C.OUTPUT_READ],
-    editor: [C.OUTPUT_READ],
-    approver: [C.OUTPUT_READ],
-    owner: [C.OUTPUT_READ],
+    /* An editor prepares and asks for a decision; they do not take one. */
+    editor: [C.OUTPUT_READ, C.PREPARE, C.COMMERCIAL_SUBMIT],
+    /* ── AND THE APPROVER DECIDES, WITHIN THE FLOOR ──────────────────
+       Approve or return a proposal at or above the floor. NOT
+       `COMMERCIAL_EXCEPTION`: waiving the company's own floor is an
+       executive act, and a Sales approver who could do it would make the
+       floor a suggestion enforced by nobody. */
+    approver: [C.OUTPUT_READ, C.PREPARE, C.COMMERCIAL_SUBMIT, C.COMMERCIAL_APPROVE],
+    owner: [C.OUTPUT_READ, C.PREPARE, C.COMMERCIAL_SUBMIT, C.COMMERCIAL_APPROVE],
   },
   ceo: {
     viewer: [...ADMIN_SET],
@@ -135,7 +195,43 @@ function capabilitiesFromGrants(rows = [], isAdmin = false) {
     for (const c of table[roleKey]) granted.add(c);
   }
 
-  return { capabilities: [...granted].sort(), via: via.sort() };
+  return { capabilities: applyImplications(granted), via: via.sort() };
+}
+
+/**
+ * Capabilities that follow from other capabilities.
+ *
+ * ── THE ONE IMPLICATION, AND WHY IT IS HERE AND NOT IN A COMPONENT ──────────
+ * `costing.draft.write` implies `costing.cost.read`. A person cannot
+ * professionally edit a costing while being unable to read the inputs they are
+ * editing: they would be typing a fabric rate into a form that then refuses to
+ * show them what the fabric rate is, and re-costing would mean retyping every
+ * line from memory. Chunk 1 kept them strictly separate and recorded the
+ * question as open; this closes it.
+ *
+ * It is resolved HERE, once, rather than in whichever screen noticed the
+ * problem — a frontend that grants itself a capability is a frontend that has
+ * stopped agreeing with the server, and the server would still strip the block
+ * from the payload.
+ *
+ * ── AND IT IMPLIES NOTHING ELSE ────────────────────────────────────────────
+ * Not margin, not approval, not policy. Being able to build a costing is not
+ * the same authority as knowing what the company adds on top of it, deciding
+ * that a costing is approved, or setting the floor everyone else is measured
+ * against. Those remain separate grants, and the tests say so.
+ *
+ * ── AND `costing.prepare` IMPLIES NOTHING IN EITHER DIRECTION ──────────────
+ * It does not grant cost, margin, draft write, approval or policy, and none of
+ * those grants it. A holder can start a calculation and then be shown almost
+ * none of its result; a person who maintains costings is not thereby somebody
+ * Sales has authorised to quote from this enquiry. Adding either implication
+ * here would quietly hand Sales the internal build-up, which is the exact
+ * outcome this capability was introduced to avoid.
+ */
+function applyImplications(granted) {
+  const out = new Set(granted);
+  if (out.has(C.DRAFT_WRITE)) out.add(C.COST_READ);
+  return [...out].sort();
 }
 
 /**
@@ -195,5 +291,5 @@ const hasAny = (capabilities, any) => {
 
 module.exports = {
   CAPABILITIES, ALL, GRANTS, ADMIN_SET,
-  capabilitiesFromGrants, resolveCapabilities, hasAll, hasAny,
+  capabilitiesFromGrants, applyImplications, resolveCapabilities, hasAll, hasAny,
 };

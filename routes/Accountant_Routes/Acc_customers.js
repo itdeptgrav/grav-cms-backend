@@ -5,7 +5,20 @@ const router = express.Router();
 const Customer = require("../../models/Customer_Models/Customer");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const mongoose = require("mongoose");
-const jwt = require("jsonwebtoken");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 
 const {
   Acc_Voucher,
@@ -368,7 +381,7 @@ async function getAllCustomersForExport(companyId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /  — paginated list
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/", verifyAccountantToken, async (req, res) => {
+router.get("/", verifyAccountantToken, companyScopeOptional, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(
@@ -704,7 +717,7 @@ router.get("/", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /all — full unpaginated list for the Customers page
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/all", verifyAccountantToken, async (req, res) => {
+router.get("/all", verifyAccountantToken, companyScopeOptional, async (req, res) => {
   try {
     // FIX: filter out deactivated (merged ghost) CRM customers
     const allCustomers = await Customer.find({ isActive: { $ne: false } })
@@ -1049,7 +1062,7 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /export/xlsx
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/export/xlsx", verifyAccountantToken, async (req, res) => {
+router.get("/export/xlsx", verifyAccountantToken, companyScopeOptional, async (req, res) => {
   try {
     const ExcelJS = require("exceljs");
     const {
@@ -1266,7 +1279,7 @@ router.get("/export/xlsx", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /export/pdf
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/export/pdf", verifyAccountantToken, async (req, res) => {
+router.get("/export/pdf", verifyAccountantToken, companyScopeOptional, async (req, res) => {
   try {
     const PDFDocument = require("pdfkit");
     const { customers, totalRevenue, totalPaid, totalOutstanding } =
@@ -1659,8 +1672,7 @@ router.get(
 // FIX: linkedCustomerId lookup first, then name match with isActive:{$ne:false}
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
-  "/:customerId/accounting",
-  verifyAccountantToken,
+  "/:customerId/accounting", verifyAccountantToken, companyScope,
   async (req, res) => {
     try {
       const { customerId } = req.params;

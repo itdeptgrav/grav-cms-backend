@@ -205,7 +205,17 @@ async function released(name) {
       body: {
         expectedRevision: op.revision,
         machineRequirements: [{ machineType: "SNLS", quantity: 1 }],
-        attachmentRequirements: [], labourRequirements: [],
+        /* ── ALL THREE DIMENSIONS, CONFIGURED ───────────────────────────
+           Chunk 5A has always modelled attachments and labour; Chunk 8A-iii is
+           what freezes them onto a bulletin row. The fixture configures all
+           three so the frozen evidence this suite compares is real. */
+        attachmentRequirements: [
+          { code: `FOLD-${i + 1}`, name: "Hemming folder", quantity: 1, note: "20 mm" },
+        ],
+        labourRequirements: [
+          { workerType: "OPERATOR", quantity: 1, skillCode: `SEW-${i + 1}`, skillName: "Sewing", grade: "B" },
+          { workerType: "HELPER", quantity: 1 },
+        ],
       },
     });
     expect(configured.status).toBe(200);
@@ -377,9 +387,24 @@ async function moveCurrentTo(ctx, mutate) {
   return next;
 }
 
-const rowFor = (body, rowId) => body.impact.rows.find(
-  (r) => r.released?.identity?.rowId === rowId || r.current?.identity?.rowId === rowId,
-);
+const rowFor = (body, rowId) => body.impact.rows.find((r) => r.rowId === rowId);
+
+/**
+ * Rewrite a frozen row's machine requirement the way the capture path writes
+ * it — BOTH arrays, because a snapshot holds the Chunk 6B `machineTypes` shape
+ * and the Chunk 8A-iii `machines` shape and they are written from one source.
+ */
+const setMachines = (row, machines) => {
+  row.requirementSnapshot.machineTypes = machines.map((m) => ({
+    machineType: m.machineType, quantity: m.quantity,
+  }));
+  row.requirementSnapshot.machines = machines.map((m, i) => ({
+    requirementId: m.requirementId || `req_${i + 1}`,
+    sequence: i + 1,
+    machineType: m.machineType,
+    quantity: m.quantity,
+  }));
+};
 
 /* ══ 1. AUTHORITY AND COMPANY ═════════════════════════════════════════════ */
 
@@ -462,20 +487,21 @@ describe("the bulletin comparison", () => {
     expect(res.status).toBe(200);
     const i = res.body.impact;
 
-    expect(i.comparison.state).toBe("SAME_APPROVED_BULLETIN");
-    expect(i.comparison.moved).toBe(false);
-    expect(i.comparison.sourceFingerprintChanged).toBe(false);
-    expect(i.comparison.currentBulletin.bulletinVersionId)
-      .toBe(i.comparison.releasedBulletin.bulletinVersionId);
-    expect(i.digests.approval.approvalDigestChanged).toBe(false);
-    expect(i.digests.requirement.requirementDigestChanged).toBe(false);
+    expect(i.bulletin.verdict).toBe("CURRENT");
+    expect(i.bulletin.moved).toBe(false);
+    expect(i.bulletin.sourceFingerprint.moved).toBe(false);
+    expect(i.bulletin.currentBulletinVersionId)
+      .toBe(i.bulletin.releasedBulletinVersionId);
+    expect(i.bulletin.approvalDigest.moved).toBe(false);
+    expect(i.bulletin.requirementDigest.moved).toBe(false);
     expect(i.rows).toHaveLength(4);
-    expect(i.rows.every((r) => r.changes.length === 1 && r.changes[0] === "UNCHANGED")).toBe(true);
-    expect(i.rowTally).toEqual({ UNCHANGED: 4 });
+    expect(i.rows.every((r) => r.classifications.length === 1 && r.classifications[0] === "UNCHANGED")).toBe(true);
+    expect(i.summary.rowTally).toEqual({ UNCHANGED: 4 });
     expect(i.garmentSam.released).toBeCloseTo(4.5, 6);
-    expect(i.garmentSam.deltaMinutes).toBe(0);
+    expect(i.garmentSam.delta).toBe(0);
     expect(i.capacity.delta).toBe(0);
-    expect(i.capacity.unknownReason).toBeNull();
+    expect(i.capacity.unavailableReason).toBe("");
+    expect(i.capacity.available).toBe(true);
     expect(i.stored).toBe(false);
   });
 
@@ -487,20 +513,20 @@ describe("the bulletin comparison", () => {
     );
     const i = (await impact(ctx)).body.impact;
 
-    expect(i.comparison.state).toBe("NO_CURRENT_APPROVED_BULLETIN");
-    expect(i.comparison.currentBulletin).toBeNull();
-    expect(i.comparison.sourceFingerprintChanged).toBeNull();
-    expect(i.digests.approval.approvalDigestChanged).toBeNull();
-    expect(i.digests.requirement.requirementDigestChanged).toBeNull();
+    expect(i.bulletin.verdict).toBe("NO_CURRENT_APPROVED");
+    expect(i.bulletin.currentBulletinVersionId).toBeNull();
+    expect(i.bulletin.sourceFingerprint.moved).toBeNull();
+    expect(i.bulletin.approvalDigest.moved).toBeNull();
+    expect(i.bulletin.requirementDigest.moved).toBeNull();
     expect(i.garmentSam.current).toBeNull();
-    expect(i.garmentSam.deltaMinutes).toBeNull();
+    expect(i.garmentSam.delta).toBeNull();
     /* Never a zero standing in for an unknown. */
     expect(i.capacity.current).toBeNull();
     expect(i.capacity.delta).toBeNull();
-    expect(i.capacity.unknownReason).toBe("NO_CURRENT_APPROVED_BULLETIN");
+    expect(i.capacity.unavailableReason).toBe("NO_CURRENT_APPROVED_BULLETIN");
     /* The released rows are still named — they did not stop existing. */
     expect(i.rows).toHaveLength(4);
-    expect(i.rows.every((r) => r.changes[0] === "REMOVED")).toBe(true);
+    expect(i.rows.every((r) => r.classifications[0] === "REMOVED")).toBe(true);
   });
 
   test("each classification, one at a time", async () => {
@@ -516,10 +542,10 @@ describe("the bulletin comparison", () => {
       v.totals.garmentSamMinutes = 5.9;
     });
     let i = (await impact(ctx)).body.impact;
-    expect(i.comparison.state).toBe("APPROVED_BULLETIN_MOVED");
-    expect(i.comparison.moved).toBe(true);
+    expect(i.bulletin.verdict).toBe("MOVED");
+    expect(i.bulletin.moved).toBe(true);
     let row = rowFor({ impact: i }, ids[0]);
-    expect(row.changes).toEqual(["RETIMED"]);
+    expect(row.classifications).toEqual(["RETIMED"]);
     const retimed = row.reasons.find((r) => r.change === "RETIMED");
     /* Both studies and both submissions, named. */
     expect(retimed.releasedMethodStudyId).toBe(String(released0.rows[0].methodStudyId));
@@ -528,33 +554,42 @@ describe("the bulletin comparison", () => {
       .toBe(String(released0.rows[0].approvedSubmissionId));
     expect(retimed.currentApprovedSubmissionId).toBe("sub_retimed");
     expect(retimed.deltaMinutes).toBeCloseTo(1.4, 6);
-    expect(row.released.timing.standardTimeMinutes).toBe(1);
-    expect(row.current.timing.standardTimeMinutes).toBe(2.4);
+    expect(row.released.standardTimeMinutes).toBe(1);
+    expect(row.current.standardTimeMinutes).toBe(2.4);
 
     /* ── REQUIREMENT_CHANGED ─────────────────────────────────────────── */
     await moveCurrentTo(ctx, (v) => {
-      v.rows[1].requirementSnapshot.machineTypes = [{ machineType: "OL4", quantity: 2 }];
+      setMachines(v.rows[1], [{ machineType: "OL4", quantity: 2 }]);
     });
     i = (await impact(ctx)).body.impact;
     row = rowFor({ impact: i }, ids[1]);
-    expect(row.changes).toEqual(["REQUIREMENT_CHANGED"]);
+    expect(row.classifications).toEqual(["REQUIREMENT_CHANGED"]);
     const reqReason = row.reasons[0];
-    expect(reqReason.code).toBe("MACHINE_REQUIREMENT_EVIDENCE_MOVED");
-    expect(reqReason.releasedMachineTypes).toEqual([{ machineType: "SNLS", quantity: 1 }]);
-    expect(reqReason.currentMachineTypes).toEqual([{ machineType: "OL4", quantity: 2 }]);
+    expect(reqReason.code).toBe("REQUIREMENT_EVIDENCE_MOVED");
+    /* Named by DIMENSION — not one undifferentiated "requirements changed". */
+    expect(reqReason.movedDimensions).toEqual(["MACHINE"]);
+    expect(reqReason.perDimension).toEqual({
+      MACHINE: "MOVED", ATTACHMENT: "UNCHANGED", LABOUR: "UNCHANGED",
+    });
+    expect(row.released.requirements.machines)
+      .toEqual([{ requirementId: expect.any(String), sequence: 1, machineType: "SNLS", quantity: 1 }]);
+    expect(row.current.requirements.machines[0].machineType).toBe("OL4");
     /* The full evidence on both sides, with the two dimensions nobody froze
        stated as uncompared rather than reported as empty. */
-    expect(row.released.requirements.machine.state).toBe("CAPTURED");
-    expect(row.released.requirements.machine.requirementsConfigured).toBe(true);
-    expect(row.released.requirements.machine.capturedAt).toMatch(/^\d{4}-/);
-    expect(row.released.requirements.attachment.state).toBe("NOT_CAPTURED");
-    expect(row.current.requirements.labour.state).toBe("NOT_CAPTURED");
-    expect(i.requirementCoverage).toEqual({
-      compared: ["MACHINE"],
-      uncompared: ["ATTACHMENT", "LABOUR"],
-      reason: "NOT_FROZEN_BY_ANY_BULLETIN_VERSION",
-      requiredUpstreamContract: "BULLETIN_ROW_ATTACHMENT_AND_LABOUR_REQUIREMENT_SNAPSHOT",
+    expect(row.released.requirements.dimensionState.MACHINE).toBe("CAPTURED");
+    expect(row.released.requirements.configured).toBe(true);
+    expect(row.released.requirements.capturedAt).toMatch(/^\d{4}-/);
+    /* ── ALL THREE DIMENSIONS NOW FROZEN (Chunk 8A-iii) ───────────────
+       The release in this suite was issued through the real verbs after the
+       capture path began freezing attachments and labour, so all three are
+       CAPTURED on both sides and all three are comparable. */
+    expect(row.released.requirements.dimensionState).toEqual({
+      MACHINE: "CAPTURED", ATTACHMENT: "CAPTURED", LABOUR: "CAPTURED",
     });
+    expect(row.current.requirements.dimensionState.LABOUR).toBe("CAPTURED");
+    expect(i.requirementCoverage.comparedOnAtLeastOneRow)
+      .toEqual(["MACHINE", "ATTACHMENT", "LABOUR"]);
+    expect(i.requirementCoverage.notComparableOnAtLeastOneRow).toEqual([]);
 
     /* A requirement going from configured to unconfigured is a change too —
        "nobody has decided" is not the same fact as "requires nothing". */
@@ -562,7 +597,7 @@ describe("the bulletin comparison", () => {
       v.rows[1].requirementSnapshot.requirementsConfigured = false;
     });
     i = (await impact(ctx)).body.impact;
-    expect(rowFor({ impact: i }, ids[1]).changes).toEqual(["REQUIREMENT_CHANGED"]);
+    expect(rowFor({ impact: i }, ids[1]).classifications).toEqual(["REQUIREMENT_CHANGED"]);
 
     /* ── RESEQUENCED ─────────────────────────────────────────────────── */
     await moveCurrentTo(ctx, (v) => {
@@ -570,7 +605,7 @@ describe("the bulletin comparison", () => {
     });
     i = (await impact(ctx)).body.impact;
     row = rowFor({ impact: i }, ids[2]);
-    expect(row.changes).toEqual(["RESEQUENCED"]);
+    expect(row.classifications).toEqual(["RESEQUENCED"]);
     expect(row.reasons[0]).toMatchObject({ releasedSequence: 3, currentSequence: 9 });
 
     /* ── OPERATION_REPLACED ──────────────────────────────────────────── */
@@ -581,7 +616,7 @@ describe("the bulletin comparison", () => {
     });
     i = (await impact(ctx)).body.impact;
     row = rowFor({ impact: i }, ids[3]);
-    expect(row.changes).toEqual(["OPERATION_REPLACED"]);
+    expect(row.classifications).toEqual(["OPERATION_REPLACED"]);
     expect(row.reasons[0].code).toBe("STABLE_OPERATION_ID_DIFFERS");
     expect(row.reasons[0].currentIeOperationId).toBe(String(replacement));
 
@@ -597,13 +632,13 @@ describe("the bulletin comparison", () => {
       });
     });
     i = (await impact(ctx)).body.impact;
-    expect(rowFor({ impact: i }, ids[2]).changes).toEqual(["REMOVED"]);
-    expect(rowFor({ impact: i }, freshRowId).changes).toEqual(["ADDED"]);
+    expect(rowFor({ impact: i }, ids[2]).classifications).toEqual(["REMOVED"]);
+    expect(rowFor({ impact: i }, freshRowId).classifications).toEqual(["ADDED"]);
     /* ── AND POSITION PROVES NOTHING ─────────────────────────────────
        Removing row three shifted row four's index, and it is still UNCHANGED:
        a positional comparison would have called it replaced AND re-timed. */
-    expect(rowFor({ impact: i }, ids[3]).changes).toEqual(["UNCHANGED"]);
-    expect(rowFor({ impact: i }, ids[0]).changes).toEqual(["UNCHANGED"]);
+    expect(rowFor({ impact: i }, ids[3]).classifications).toEqual(["UNCHANGED"]);
+    expect(rowFor({ impact: i }, ids[0]).classifications).toEqual(["UNCHANGED"]);
   });
 
   test("simultaneous changes stay simultaneous", async () => {
@@ -612,7 +647,7 @@ describe("the bulletin comparison", () => {
     await moveCurrentTo(ctx, (v) => {
       v.rows[0].standardTimeMinutes = 3.3;
       v.rows[0].approvedSubmissionId = "sub_simultaneous";
-      v.rows[0].requirementSnapshot.machineTypes = [{ machineType: "FOA", quantity: 3 }];
+      setMachines(v.rows[0], [{ machineType: "FOA", quantity: 3 }]);
       v.rows[0].sequence = 7;
       v.rows[0].ieOperationId = String(new mongoose.Types.ObjectId());
     });
@@ -621,18 +656,18 @@ describe("the bulletin comparison", () => {
 
     /* All four, and a reason for each. Not one "primary" result with the other
        three hidden behind an arbitrary precedence. */
-    expect(new Set(row.changes)).toEqual(new Set([
+    expect(new Set(row.classifications)).toEqual(new Set([
       "OPERATION_REPLACED", "RETIMED", "REQUIREMENT_CHANGED", "RESEQUENCED",
     ]));
-    expect(row.changes).toHaveLength(4);
+    expect(row.classifications).toHaveLength(4);
     expect(row.reasons).toHaveLength(4);
-    expect(new Set(row.reasons.map((r) => r.change))).toEqual(new Set(row.changes));
+    expect(new Set(row.reasons.map((r) => r.change))).toEqual(new Set(row.classifications));
     for (const r of row.reasons) {
       expect(typeof r.code).toBe("string");
       expect(r.message.length).toBeGreaterThan(10);
     }
-    expect(i.rowTally.RETIMED).toBe(1);
-    expect(i.rowTally.RESEQUENCED).toBe(1);
+    expect(i.summary.rowTally.RETIMED).toBe(1);
+    expect(i.summary.rowTally.RESEQUENCED).toBe(1);
   });
 
   test("a rename is not a replacement", async () => {
@@ -648,15 +683,15 @@ describe("the bulletin comparison", () => {
     const i = (await impact(ctx)).body.impact;
     const row = rowFor({ impact: i }, ids[0]);
 
-    expect(row.changes).toEqual(["UNCHANGED"]);
-    expect(row.changes).not.toContain("OPERATION_REPLACED");
+    expect(row.classifications).toEqual(["UNCHANGED"]);
+    expect(row.classifications).not.toContain("OPERATION_REPLACED");
     expect(row.labelsChanged).toBe(true);
     expect(row.reasons[0].code).toBe("LABEL_ONLY_RENAME");
-    expect(row.released.identity.ieOperationId).toBe(row.current.identity.ieOperationId);
+    expect(row.released.ieOperationId).toBe(row.current.ieOperationId);
     expect(row.reasons[0].releasedOperationName).toBe("Operation 1");
     expect(row.reasons[0].currentOperationName).toBe("Attach collar (revised wording)");
     /* And the row whose code was borrowed is untouched by the collision. */
-    expect(rowFor({ impact: i }, ids[1]).changes).toEqual(["UNCHANGED"]);
+    expect(rowFor({ impact: i }, ids[1]).classifications).toEqual(["UNCHANGED"]);
   });
 
   test("the two digests move independently", async () => {
@@ -664,14 +699,14 @@ describe("the bulletin comparison", () => {
 
     await moveCurrentTo(ctx, (v) => { v.sourceApprovalDigest = "a".repeat(64); });
     let i = (await impact(ctx)).body.impact;
-    expect(i.digests.approval.approvalDigestChanged).toBe(true);
-    expect(i.digests.requirement.requirementDigestChanged).toBe(false);
-    expect(i.digests.approval.released).not.toBe(i.digests.approval.current);
+    expect(i.bulletin.approvalDigest.moved).toBe(true);
+    expect(i.bulletin.requirementDigest.moved).toBe(false);
+    expect(i.bulletin.approvalDigest.released).not.toBe(i.bulletin.approvalDigest.current);
 
     await moveCurrentTo(ctx, (v) => { v.sourceRequirementDigest = "b".repeat(64); });
     i = (await impact(ctx)).body.impact;
-    expect(i.digests.approval.approvalDigestChanged).toBe(false);
-    expect(i.digests.requirement.requirementDigestChanged).toBe(true);
+    expect(i.bulletin.approvalDigest.moved).toBe(false);
+    expect(i.bulletin.requirementDigest.moved).toBe(true);
   });
 });
 
@@ -686,11 +721,11 @@ describe("SAM and capacity", () => {
     expect(i.garmentSam.released).toBeCloseTo(4.5, 6);
     expect(i.garmentSam.current).toBeCloseTo(4.8, 6);
     /* 4.8 - 4.5 through scaled integers, not 0.30000000000000004. */
-    expect(i.garmentSam.deltaMinutes).toBe(0.3);
+    expect(i.garmentSam.delta).toBe(0.3);
 
     await moveCurrentTo(ctx, (v) => { v.totals.garmentSamMinutes = 4.1; });
     i = (await impact(ctx)).body.impact;
-    expect(i.garmentSam.deltaMinutes).toBe(-0.4);
+    expect(i.garmentSam.delta).toBe(-0.4);
   });
 
   test("the capacity delta uses the one calculator and the release's own assumptions", async () => {
@@ -713,7 +748,8 @@ describe("SAM and capacity", () => {
     expect(i.capacity.delta).toBe(expected.wholePieceDailyTarget - 3200);
     expect(i.capacity.delta).toBeLessThan(0);
     expect(i.capacity.basis).toBe("RELEASED_ASSUMPTIONS_WITH_CURRENT_GARMENT_SAM");
-    expect(i.capacity.unknownReason).toBeNull();
+    expect(i.capacity.unavailableReason).toBe("");
+    expect(i.capacity.available).toBe(true);
   });
 
   test("an underivable capacity target is null with a typed reason, never zero", async () => {
@@ -724,10 +760,10 @@ describe("SAM and capacity", () => {
     let i = (await impact(ctx)).body.impact;
     expect(i.capacity.current).toBeNull();
     expect(i.capacity.delta).toBeNull();
-    expect(i.capacity.unknownReason).toBe("CURRENT_CAPACITY_UNAVAILABLE");
+    expect(i.capacity.unavailableReason).toBe("CURRENT_CAPACITY_UNAVAILABLE");
     expect(i.capacity.unavailableReasons).toContain("NO_GARMENT_SAM");
     expect(i.garmentSam.current).toBe(0);
-    expect(i.garmentSam.deltaMinutes).toBe(-4.5);
+    expect(i.garmentSam.delta).toBe(-4.5);
 
     /* And a release whose own frozen assumptions are incomplete. */
     await moveCurrentTo(ctx, (v) => { v.totals.garmentSamMinutes = 4.5; });
@@ -737,7 +773,7 @@ describe("SAM and capacity", () => {
     );
     i = (await impact(ctx)).body.impact;
     expect(i.capacity.current).toBeNull();
-    expect(i.capacity.unknownReason).toBe("RELEASED_ASSUMPTIONS_INCOMPLETE");
+    expect(i.capacity.unavailableReason).toBe("RELEASED_ASSUMPTIONS_INCOMPLETE");
   });
 });
 
@@ -748,33 +784,140 @@ describe("which work orders are provably affected", () => {
     const ctx = await released("WoProved");
     const i = (await impact(ctx)).body.impact;
 
-    expect(i.workOrders.affected).toHaveLength(1);
-    expect(i.workOrders.affected[0]).toEqual({
+    expect(i.workOrders.provablyAffected).toHaveLength(1);
+    expect(i.workOrders.provablyAffected[0]).toEqual({
       workOrderId: String(ctx.workOrder._id),
-      workOrderNumber: ctx.workOrder.workOrderNumber,
-      candidateSource: "DIRECT_STYLE_LINK",
+      workOrderRef: ctx.workOrder.workOrderNumber,
       status: "planned",
+      quantity: 500,
+      bulletinVersionNo: null,
+      candidateSource: "DIRECT_STYLE_LINK",
       provenBy: { styleLink: "SAMPLE_STYLE_ID", ownership: "SALES_JOURNEY" },
     });
-    expect(i.workOrders.unprovable).toEqual([]);
+    expect(i.workOrders.ownershipUnproven).toEqual([]);
+    expect(i.workOrders.coverage.complete).toBe(true);
+    expect(i.workOrders.coverage.withheldForTenantSafety).toBe(false);
     expect(i.workOrders.readOnly).toBe(true);
     expect(i.workOrders.writesProduction).toBe(false);
+    expect(i.summary.affectedWorkOrderCount).toBe(1);
+    expect(i.summary.unprovenWorkOrderCount).toBe(0);
   });
 
-  test("legacy, ambiguous, parentless and foreign candidates are named, never dropped", async () => {
-    const ctx = await released("WoUnprovable");
+  test("your OWN order on another of your styles is named; nobody else's is", async () => {
+    const ctx = await released("WoOwnOther");
 
-    /* LEGACY — the same product, no style reference at all. The Chunk 1C
-       audit's 141: reachable, recognisable and unprovable. */
-    const legacy = await WorkOrder.create({
-      workOrderNumber: `WO-LEGACY-${++seq}`, stockItemId: ctx.stockItem._id,
+    /* The caller's own company, a different style of theirs, reached through
+       the shared stock item. Actionable, and safe to name. */
+    const mineOtherStyle = await SampleStyle.create({
+      sampleStyleId: `SS-MINE-${++seq}`, productName: "Tee", styleCode: `ST-MINE-${seq}`,
+      journeyId: ctx.journey._id, sourceStockItemId: ctx.stockItem._id,
+      materials: { status: "pending", rawItems: [] },
+    });
+    const ownOrder = await WorkOrder.create({
+      workOrderNumber: `WO-MINE-${++seq}`, stockItemId: ctx.stockItem._id,
       stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
-      quantity: 100, originalQuantity: 100, status: "planned",
+      sampleStyleId: mineOtherStyle._id,
+      quantity: 120, originalQuantity: 120, status: "planned",
       timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
-      customerId: new mongoose.Types.ObjectId(), customerName: "Someone Else Ltd",
+      customerId: new mongoose.Types.ObjectId(), customerName: "Mine Ltd",
     });
 
-    /* AMBIGUOUS PARENTAGE — a style naming a journey that carries no company. */
+    const i = (await impact(ctx)).body.impact;
+    expect(i.workOrders.ownershipUnproven).toHaveLength(1);
+    expect(i.workOrders.ownershipUnproven[0]).toMatchObject({
+      workOrderId: String(ownOrder._id),
+      workOrderRef: ownOrder.workOrderNumber,
+      quantity: 120,
+      reasonCode: "DIFFERENT_STYLE",
+    });
+    expect(i.workOrders.ownershipUnproven[0].reasonMessage.length).toBeGreaterThan(20);
+    expect(i.summary.unprovenWorkOrderCount).toBe(1);
+    expect(i.workOrders.coverage.complete).toBe(true);
+  });
+
+  test("TENANT SAFETY — a shared stock item cannot reveal another company's order", async () => {
+    /* ── THE TWO-COMPANY REGRESSION ────────────────────────────────────
+       Two companies, one stock item. Company A asks for its own release's
+       impact; company B has work orders reachable through that shared item.
+       Hiding B's company id is not enough — an order NUMBER is B's record, and
+       an exact count of them is an enumeration oracle. Neither may leave. */
+    const a = await released("TenantA");
+    const b = await released("TenantB");
+
+    /* B's orders, all reachable from A's sweep through the shared product. */
+    const theirs = [];
+    for (let k = 0; k < 3; k += 1) {
+      theirs.push(await WorkOrder.create({
+        workOrderNumber: `WO-THEIRS-SECRET-${++seq}`, stockItemId: a.stockItem._id,
+        stockItemName: a.stockItem.name, stockItemReference: a.stockItem.reference,
+        sampleStyleId: b.style._id,
+        quantity: 900 + k, originalQuantity: 900 + k, status: "in_progress",
+        timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
+        customerId: new mongoose.Types.ObjectId(), customerName: "Their Buyer Ltd",
+      }));
+    }
+    /* And one legacy order with no style link at all — unattributable to
+       anybody, so unattributable to A. */
+    const legacy = await WorkOrder.create({
+      workOrderNumber: `WO-LEGACY-SECRET-${++seq}`, stockItemId: a.stockItem._id,
+      stockItemName: a.stockItem.name, stockItemReference: a.stockItem.reference,
+      quantity: 77, originalQuantity: 77, status: "planned",
+      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
+      customerId: new mongoose.Types.ObjectId(), customerName: "Nobody Ltd",
+    });
+
+    const i = (await impact(a)).body.impact;
+    const wire = JSON.stringify(i);
+
+    /* A sees only its own order. */
+    expect(i.workOrders.provablyAffected.map((w) => w.workOrderId))
+      .toEqual([String(a.workOrder._id)]);
+    expect(i.workOrders.ownershipUnproven).toEqual([]);
+
+    /* ── NOTHING OF B'S, ANYWHERE IN THE ENVELOPE ─────────────────────── */
+    for (const wo of [...theirs, legacy]) {
+      expect(wire).not.toContain(String(wo._id));
+      expect(wire).not.toContain(wo.workOrderNumber);
+    }
+    expect(wire).not.toContain(String(b.co._id));
+    expect(wire).not.toContain(String(b.style._id));
+    expect(wire).not.toContain("Their Buyer Ltd");
+    expect(wire).not.toContain("Nobody Ltd");
+    expect(wire).not.toContain("SECRET");
+
+    /* ── AND NO COUNT TO ENUMERATE THEM WITH ──────────────────────────
+       The warning is a boolean and a set of reason codes. Four orders were
+       withheld and no number anywhere in the response says four — adding a
+       fifth must not change a single figure. */
+    expect(i.workOrders.coverage.complete).toBe(false);
+    expect(i.workOrders.coverage.withheldForTenantSafety).toBe(true);
+    expect(i.workOrders.coverage.withheldReasonCodes.sort())
+      .toEqual(["COMPANY_MISMATCH", "NO_STYLE_LINK"]);
+    expect(i.workOrders.coverage.message.length).toBeGreaterThan(20);
+    expect(Object.keys(i.workOrders.coverage)).not.toContain("withheldCount");
+    expect(Object.keys(i.workOrders)).not.toContain("examinedCount");
+    expect(i.summary.unprovenWorkOrderCount).toBe(0);
+    expect(wire).not.toContain('"4"');
+
+    const before = JSON.stringify((await impact(a)).body.impact.summary);
+    await WorkOrder.create({
+      workOrderNumber: `WO-THEIRS-SECRET-${++seq}`, stockItemId: a.stockItem._id,
+      stockItemName: a.stockItem.name, stockItemReference: a.stockItem.reference,
+      sampleStyleId: b.style._id,
+      quantity: 42, originalQuantity: 42, status: "planned",
+      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
+      customerId: new mongoose.Types.ObjectId(), customerName: "Their Buyer Ltd",
+    });
+    const after = (await impact(a)).body.impact;
+    /* Not one number moved. The oracle is closed. */
+    expect(JSON.stringify(after.summary)).toBe(before);
+    expect(after.workOrders.coverage).toEqual(i.workOrders.coverage);
+  });
+
+  test("parentless, missing-style and foreign candidates are all withheld, each with its code", async () => {
+    const ctx = await released("WoWithheld");
+
+    /* AMBIGUOUS PARENTAGE — a journey that carries no company. */
     const danglingJourney = await SalesJourney.create({
       journeyId: `SJ-DANGLE-${++seq}`, accountId: new mongoose.Types.ObjectId(),
       ownerId: new mongoose.Types.ObjectId(), ownerName: "O", name: "Dangling", isActive: true,
@@ -784,90 +927,48 @@ describe("which work orders are provably affected", () => {
       journeyId: danglingJourney._id, sourceStockItemId: ctx.stockItem._id,
       materials: { status: "pending", rawItems: [] },
     });
-    const ambiguous = await WorkOrder.create({
-      workOrderNumber: `WO-AMBIG-${++seq}`, stockItemId: ctx.stockItem._id,
-      stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
-      sampleStyleId: ambiguousStyle._id,
-      quantity: 100, originalQuantity: 100, status: "planned",
-      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
-      customerId: new mongoose.Types.ObjectId(), customerName: "Someone Else Ltd",
-    });
-
-    /* NO PARENT — a style with neither journey nor enquiry. */
+    /* NO PARENT — neither journey nor enquiry. */
     const orphanStyle = await SampleStyle.create({
       sampleStyleId: `SS-ORPH-${++seq}`, productName: "Tee", styleCode: `ST-ORPH-${seq}`,
       sourceStockItemId: ctx.stockItem._id, materials: { status: "pending", rawItems: [] },
     });
-    const orphan = await WorkOrder.create({
-      workOrderNumber: `WO-ORPHAN-${++seq}`, stockItemId: ctx.stockItem._id,
-      stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
-      sampleStyleId: orphanStyle._id,
-      quantity: 100, originalQuantity: 100, status: "planned",
-      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
-      customerId: new mongoose.Types.ObjectId(), customerName: "Someone Else Ltd",
-    });
 
-    /* FOREIGN — a style that belongs, provably, to somebody else. */
-    const them = await released("WoForeign");
-    const foreign = await WorkOrder.create({
-      workOrderNumber: `WO-FOREIGN-${++seq}`, stockItemId: ctx.stockItem._id,
-      stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
-      sampleStyleId: them.style._id,
-      quantity: 100, originalQuantity: 100, status: "planned",
-      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
-      customerId: new mongoose.Types.ObjectId(), customerName: "Someone Else Ltd",
-    });
-
-    const i = (await impact(ctx)).body.impact;
-    const by = new Map(i.workOrders.unprovable.map((u) => [u.workOrderId, u]));
-
-    expect(i.workOrders.affected.map((a) => a.workOrderId)).toEqual([String(ctx.workOrder._id)]);
-    expect(i.workOrders.examinedCount).toBe(5);
-    expect(by.size).toBe(4);
-
-    expect(by.get(String(legacy._id))).toMatchObject({
-      reason: "NO_STYLE_LINK", candidateSource: "SHARED_STOCK_ITEM",
-    });
-    expect(by.get(String(ambiguous._id))).toMatchObject({
-      reason: "DIFFERENT_STYLE", ownershipReason: "JOURNEY_UNPROVABLE",
-    });
-    expect(by.get(String(orphan._id))).toMatchObject({
-      reason: "DIFFERENT_STYLE", ownershipReason: "NO_PARENT",
-    });
-    expect(by.get(String(foreign._id))).toMatchObject({ reason: "DIFFERENT_STYLE" });
-
-    /* ── AND NOTHING ABOUT THE OTHER COMPANY LEAVES ──────────────────── */
-    const wire = JSON.stringify(i.workOrders);
-    expect(wire).not.toContain(String(them.co._id));
-    expect(wire).not.toContain(String(them.style._id));
-    expect(wire).not.toContain("Someone Else Ltd");
-    expect(wire).not.toContain("Northwind Apparel Ltd");
-    for (const row of [...i.workOrders.affected, ...i.workOrders.unprovable]) {
-      expect(Object.keys(row)).not.toContain("companyId");
-      expect(Object.keys(row)).not.toContain("sampleStyleId");
-      expect(Object.keys(row)).not.toContain("customerName");
+    const made = [];
+    for (const [label, styleId] of [
+      ["AMBIG", ambiguousStyle._id], ["ORPHAN", orphanStyle._id],
+      ["GHOST", new mongoose.Types.ObjectId()],
+    ]) {
+      made.push(await WorkOrder.create({
+        workOrderNumber: `WO-${label}-${++seq}`, stockItemId: ctx.stockItem._id,
+        stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
+        sampleStyleId: styleId,
+        quantity: 100, originalQuantity: 100, status: "planned",
+        timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
+        customerId: new mongoose.Types.ObjectId(), customerName: "Someone Else Ltd",
+      }));
     }
-  });
 
-  test("a work order whose linked style no longer exists is reported, not hidden", async () => {
-    const ctx = await released("WoMissingStyle");
-    const ghost = await WorkOrder.create({
-      workOrderNumber: `WO-GHOST-${++seq}`, stockItemId: ctx.stockItem._id,
-      stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
-      sampleStyleId: new mongoose.Types.ObjectId(),
-      quantity: 100, originalQuantity: 100, status: "planned",
-      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
-      customerId: new mongoose.Types.ObjectId(), customerName: "Ghost Ltd",
-    });
     const i = (await impact(ctx)).body.impact;
-    const row = i.workOrders.unprovable.find((u) => u.workOrderId === String(ghost._id));
-    expect(row).toMatchObject({ reason: "STYLE_NOT_FOUND", ownershipReason: "STYLE_RECORD_MISSING" });
+    const wire = JSON.stringify(i);
+
+    expect(i.workOrders.provablyAffected.map((w) => w.workOrderId))
+      .toEqual([String(ctx.workOrder._id)]);
+    expect(i.workOrders.ownershipUnproven).toEqual([]);
+    expect(i.workOrders.coverage.withheldForTenantSafety).toBe(true);
+    /* An unprovable parent and a missing style record are DIFFERENT reasons and
+       stay different — the aggregate loses the records, not the diagnosis. */
+    expect(i.workOrders.coverage.withheldReasonCodes.sort())
+      .toEqual(["OWNERSHIP_UNPROVEN", "STYLE_NOT_FOUND"]);
+
+    for (const wo of made) {
+      expect(wire).not.toContain(String(wo._id));
+      expect(wire).not.toContain(wo.workOrderNumber);
+    }
+    expect(wire).not.toContain(String(ambiguousStyle._id));
+    expect(wire).not.toContain(String(orphanStyle._id));
   });
 
-  test("the company the ORDER belongs to is the acting one, or it is unprovable", async () => {
-    /* The release's own style moved to another company's journey after the
-       release was issued: the order still links the style, and the company can
-       no longer be proved to be this one. */
+  test("a style that has moved company takes its order out of the list entirely", async () => {
     const ctx = await released("WoCompanyMoved");
     const elsewhere = await Acc_Company.create({
       companyName: `Elsewhere ${++seq}`, booksFromDate: new Date("2026-04-01"),
@@ -875,10 +976,751 @@ describe("which work orders are provably affected", () => {
     await SalesJourney.updateOne({ _id: ctx.journey._id }, { $set: { companyId: elsewhere._id } });
 
     const i = (await impact(ctx)).body.impact;
-    expect(i.workOrders.affected).toEqual([]);
-    const row = i.workOrders.unprovable.find((u) => u.workOrderId === String(ctx.workOrder._id));
-    expect(row).toMatchObject({ reason: "COMPANY_MISMATCH", candidateSource: "DIRECT_STYLE_LINK" });
-    expect(JSON.stringify(i.workOrders)).not.toContain(String(elsewhere._id));
+    const wire = JSON.stringify(i);
+
+    /* It was the acting company's a moment ago; it is not now, and a stale
+       memory of it is not a reason to keep publishing it. */
+    expect(i.workOrders.provablyAffected).toEqual([]);
+    expect(i.workOrders.ownershipUnproven).toEqual([]);
+    expect(i.workOrders.coverage.withheldReasonCodes).toEqual(["COMPANY_MISMATCH"]);
+    expect(wire).not.toContain(String(ctx.workOrder._id));
+    expect(wire).not.toContain(ctx.workOrder.workOrderNumber);
+    expect(wire).not.toContain(String(elsewhere._id));
+    expect(i.summary.affectedWorkOrderCount).toBe(0);
+  });
+});
+
+/* ══ 3b. REQUIREMENT DIMENSIONS ═══════════════════════════════════════════ */
+
+describe("requirement evidence, per dimension", () => {
+  test("all three dimensions are frozen, compared, and named when they move", async () => {
+    const ctx = await released("ThreeDimensions");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+
+    /* The released side froze all three from the operation's Chunk 5A profile. */
+    const before = (await impact(ctx)).body.impact;
+    const r0 = rowFor({ impact: before }, ids[0]).released.requirements;
+    expect(r0.dimensionsCaptured).toEqual(["MACHINE", "ATTACHMENT", "LABOUR"]);
+    expect(r0.attachments).toEqual([{
+      requirementId: expect.stringMatching(/^areq_/), sequence: 1,
+      code: "FOLD-1", name: "Hemming folder", quantity: 1, note: "20 mm",
+    }]);
+    expect(r0.labour).toEqual([
+      {
+        requirementId: expect.stringMatching(/^lreq_/), sequence: 1,
+        workerType: "OPERATOR", quantity: 1,
+        skillCode: "SEW-1", skillName: "Sewing", grade: "B", note: "",
+      },
+      {
+        requirementId: expect.stringMatching(/^lreq_/), sequence: 2,
+        workerType: "HELPER", quantity: 1,
+        skillCode: "", skillName: "", grade: "", note: "",
+      },
+    ]);
+
+    /* ── ATTACHMENT ALONE ──────────────────────────────────────────────── */
+    await moveCurrentTo(ctx, (v) => {
+      v.rows[0].requirementSnapshot.attachments = [{
+        requirementId: "areq_x", sequence: 1, code: "GUIDE-9", name: "Edge guide",
+        quantity: 2, note: "",
+      }];
+    });
+    let row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+    expect(row.classifications).toEqual(["REQUIREMENT_CHANGED"]);
+    expect(row.reasons[0].movedDimensions).toEqual(["ATTACHMENT"]);
+    expect(row.reasons[0].perDimension.MACHINE).toBe("UNCHANGED");
+    expect(row.reasons[0].perDimension.LABOUR).toBe("UNCHANGED");
+    expect(row.reasons[0].message).toMatch(/attachment/i);
+
+    /* ── LABOUR ALONE — and a GRADE change is a change ─────────────────── */
+    await moveCurrentTo(ctx, (v) => {
+      v.rows[0].requirementSnapshot.labour[0].grade = "A";
+    });
+    row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+    expect(row.reasons[0].movedDimensions).toEqual(["LABOUR"]);
+
+    /* ── TWO AT ONCE, BOTH NAMED ───────────────────────────────────────── */
+    await moveCurrentTo(ctx, (v) => {
+      setMachines(v.rows[0], [{ machineType: "FOA", quantity: 1 }]);
+      v.rows[0].requirementSnapshot.labour = [];
+    });
+    row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+    expect(row.reasons[0].movedDimensions).toEqual(["MACHINE", "LABOUR"]);
+    expect(row.reasons[0].perDimension.ATTACHMENT).toBe("UNCHANGED");
+  });
+
+  /**
+   * ONE PREVIOUSLY-IGNORED FIELD AT A TIME.
+   *
+   * Each case edits a field that the first cut of this comparison did not look
+   * at, while leaving every field it DID look at identical. If the canonical
+   * form were still `machineType:quantity` / `code:quantity:name` /
+   * `workerType:quantity:skillCode:grade`, every one of these rows would report
+   * UNCHANGED — which is the whole failure being closed.
+   *
+   * The digest is asserted beside the verdict because the two must never
+   * disagree about what a requirement change is.
+   */
+  test.each([
+    ["machine requirement identity", "MACHINE",
+      (r) => { r.requirementSnapshot.machines[0].requirementId = "mreq_rewritten"; }],
+    ["machine sequence", "MACHINE",
+      (r) => { r.requirementSnapshot.machines[0].sequence = 9; }],
+    ["attachment note", "ATTACHMENT",
+      (r) => { r.requirementSnapshot.attachments[0].note = "25 mm, revised"; }],
+    ["attachment identity", "ATTACHMENT",
+      (r) => { r.requirementSnapshot.attachments[0].requirementId = "areq_rewritten"; }],
+    ["attachment sequence", "ATTACHMENT",
+      (r) => { r.requirementSnapshot.attachments[0].sequence = 6; }],
+    ["labour skill name", "LABOUR",
+      (r) => { r.requirementSnapshot.labour[0].skillName = "Overlocking"; }],
+    ["labour note", "LABOUR",
+      (r) => { r.requirementSnapshot.labour[0].note = "left-hand feed"; }],
+    ["labour identity", "LABOUR",
+      (r) => { r.requirementSnapshot.labour[0].requirementId = "lreq_rewritten"; }],
+    ["labour sequence", "LABOUR",
+      (r) => { r.requirementSnapshot.labour[0].sequence = 8; }],
+  ])("a change to %s moves only %s", async (_label, dimension, mutate) => {
+    const ctx = await released(`Field${_label.replace(/[^a-z]/gi, "")}`);
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const beforeSnapshot = ctx.version.rows[0].requirementSnapshot;
+
+    await moveCurrentTo(ctx, (v) => mutate(v.rows[0]));
+    const i = (await impact(ctx)).body.impact;
+    const row = rowFor({ impact: i }, ids[0]);
+
+    /* Only this dimension moved, and it did move. */
+    expect(row.classifications).toEqual(["REQUIREMENT_CHANGED"]);
+    expect(row.reasons[0].movedDimensions).toEqual([dimension]);
+    expect(row.requirementMovement.perDimension[dimension]).toBe("MOVED");
+    for (const other of ["MACHINE", "ATTACHMENT", "LABOUR"].filter((d) => d !== dimension)) {
+      expect(`${other}:${row.requirementMovement.perDimension[other]}`).toBe(`${other}:UNCHANGED`);
+    }
+    /* Compared at FULL granularity — both sides captured everything. */
+    expect(row.requirementMovement.reducedGranularity).toEqual([]);
+
+    /* ── AND THE STORED DIGEST AGREES ──────────────────────────────────
+       A comparison that said MOVED while the source digest said nothing had
+       changed would be two surfaces giving opposite answers about one row. */
+    const afterSnapshot = (await IeBulletinVersion.findOne({
+      companyId: ctx.co._id, versionNo: ctx.nextVersionNo,
+    }).lean()).rows[0].requirementSnapshot;
+    expect(requirementDigestOf(afterSnapshot)).not.toBe(requirementDigestOf(beforeSnapshot));
+  });
+
+  test("re-ordering the stored array is not a change; each requirement keeps its own identity", async () => {
+    const ctx = await released("Reordered");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const before = ctx.version.rows[0].requirementSnapshot;
+    expect(before.labour).toHaveLength(2);
+
+    await moveCurrentTo(ctx, (v) => {
+      /* Same two requirements, same ids, same sequences — typed the other way
+         round. Position has never been evidence and is not evidence now. */
+      v.rows[0].requirementSnapshot.labour.reverse();
+    });
+    const i = (await impact(ctx)).body.impact;
+    const row = rowFor({ impact: i }, ids[0]);
+
+    expect(row.classifications).toEqual(["UNCHANGED"]);
+    expect(row.requirementMovement.perDimension.LABOUR).toBe("UNCHANGED");
+
+    const after = (await IeBulletinVersion.findOne({
+      companyId: ctx.co._id, versionNo: ctx.nextVersionNo,
+    }).lean()).rows[0].requirementSnapshot;
+    expect(after.labour[0].requirementId).toBe(before.labour[1].requirementId);
+    expect(requirementDigestOf(after)).toBe(requirementDigestOf(before));
+  });
+
+  test("a captured-but-empty dimension is comparable and unchanged against another empty one", async () => {
+    const ctx = await released("CapturedEmpty");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+
+    /* Both sides captured ATTACHMENT and both are genuinely empty. That is
+       agreement about a real fact — not the absence of evidence. */
+    await mongoose.connection.collection("ie_bulletin_versions").updateOne(
+      { _id: new mongoose.Types.ObjectId(String(ctx.version._id)) },
+      { $set: { "rows.0.requirementSnapshot.attachments": [] } },
+    );
+    await mongoose.connection.collection("ie_releases").updateOne(
+      { _id: new mongoose.Types.ObjectId(ctx.release.releaseId) },
+      { $set: { "source.rows.0.requirementSnapshot.attachments": [] } },
+    );
+    await moveCurrentTo(ctx, (v) => { v.rows[0].requirementSnapshot.attachments = []; });
+
+    const row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+    expect(row.released.requirements.dimensionState.ATTACHMENT).toBe("CAPTURED");
+    expect(row.released.requirements.attachments).toEqual([]);
+    expect(row.requirementMovement.perDimension.ATTACHMENT).toBe("UNCHANGED");
+    expect(row.requirementMovement.notComparable).toEqual([]);
+    expect(row.classifications).toEqual(["UNCHANGED"]);
+
+    /* And an empty CAPTURED dimension still hashes differently from a snapshot
+       that never captured it at all. */
+    const captured = {
+      ieOperationRevision: 2, requirementsConfigured: true,
+      machineTypes: [{ machineType: "SNLS", quantity: 1 }],
+      dimensionsCaptured: ["MACHINE", "ATTACHMENT", "LABOUR"],
+      machines: [], attachments: [], labour: [],
+    };
+    const legacy = {
+      ieOperationRevision: 2, requirementsConfigured: true,
+      machineTypes: [{ machineType: "SNLS", quantity: 1 }],
+    };
+    expect(requirementDigestOf(captured)).not.toBe(requirementDigestOf(legacy));
+  });
+
+  test("a version frozen before the capture existed reads NOT_CAPTURED and is never compared", async () => {
+    const ctx = await released("Legacy");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+
+    /* A current version shaped exactly as one submitted before Chunk 8A-iii:
+       the machine half only, and no `dimensionsCaptured` marker. NOTHING
+       backfills it — a frozen version is evidence of what was said then. */
+    await moveCurrentTo(ctx, (v) => {
+      for (const r of v.rows) {
+        delete r.requirementSnapshot.dimensionsCaptured;
+        delete r.requirementSnapshot.machines;
+        delete r.requirementSnapshot.attachments;
+        delete r.requirementSnapshot.labour;
+      }
+    });
+    const i = (await impact(ctx)).body.impact;
+    const row = rowFor({ impact: i }, ids[0]);
+
+    expect(row.current.requirements.dimensionState).toEqual({
+      MACHINE: "CAPTURED", ATTACHMENT: "NOT_CAPTURED", LABOUR: "NOT_CAPTURED",
+    });
+    expect(row.current.requirements.dimensionsCaptured).toEqual([]);
+    /* The machine half still compares — it has been frozen since Chunk 6B — and
+       a legacy row's machine list is rebuilt from `machineTypes` with the
+       stable id and sequence stated as ABSENT rather than invented. */
+    expect(row.current.requirements.machines)
+      .toEqual([{ requirementId: null, sequence: null, machineType: "SNLS", quantity: 1 }]);
+
+    /* ── AND THE OTHER TWO ARE NOT CALLED UNCHANGED ──────────────────── */
+    expect(row.classifications).toEqual(["UNCHANGED"]);
+    expect(row.requirementMovement.perDimension).toEqual({
+      MACHINE: "UNCHANGED", ATTACHMENT: "NOT_COMPARABLE", LABOUR: "NOT_COMPARABLE",
+    });
+    expect(row.reasons[0].notComparableDimensions).toEqual(["ATTACHMENT", "LABOUR"]);
+    /* ── AND THE MACHINE VERDICT SAYS WHAT IT IS WORTH ────────────────
+       One side froze machine identities and the other never did, so the two
+       were compared on type and quantity alone. `MACHINE: UNCHANGED` here must
+       never be read as "the requirement identities agree" — they were not
+       compared, and the reduction is published rather than left to be
+       inferred from the absence of a complaint. */
+    expect(row.requirementMovement.reducedGranularity).toEqual(["MACHINE"]);
+    expect(i.requirementCoverage.comparedOnAtLeastOneRow).toEqual(["MACHINE"]);
+    expect(i.requirementCoverage.notComparableOnAtLeastOneRow)
+      .toEqual(["ATTACHMENT", "LABOUR"]);
+
+    /* An attachment appearing on one side only is the ARRIVAL of evidence, not
+       a change to it, and must not be reported as a requirement movement. */
+    expect(row.released.requirements.attachments.length).toBeGreaterThan(0);
+    expect(row.current.requirements.attachments).toEqual([]);
+    expect(row.classifications).not.toContain("REQUIREMENT_CHANGED");
+  });
+
+  test("a moved operation revision is not a requirement change — on either surface", async () => {
+    /* ── THE DISAGREEMENT THIS CLOSES ───────────────────────────────────
+       The v2 digest used to be the LEGACY digest with a tail bolted on, and the
+       legacy head carries `ieOperationRevision`. So re-saving an operation
+       moved the requirement digest while every requirement field stayed
+       identical: the row said nothing had changed and `requirementDigest.moved`
+       said something had. One release, two answers.
+
+       A v2 digest is now built only from what a requirement IS. */
+    const ctx = await released("RevisionOnly");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const before = ctx.version.rows[0].requirementSnapshot;
+
+    await moveCurrentTo(ctx, (v) => {
+      /* The operation was re-saved; its requirements were not touched. */
+      v.rows[0].ieOperationRevision = v.rows[0].ieOperationRevision + 5;
+      v.rows[0].requirementSnapshot.ieOperationRevision =
+        v.rows[0].requirementSnapshot.ieOperationRevision + 5;
+      v.rows[0].requirementSnapshot.capturedAt = new Date("2027-01-01T00:00:00.000Z").toISOString();
+    });
+    const i = (await impact(ctx)).body.impact;
+    const row = rowFor({ impact: i }, ids[0]);
+
+    expect(row.classifications).not.toContain("REQUIREMENT_CHANGED");
+    expect(row.requirementMovement.perDimension).toEqual({
+      MACHINE: "UNCHANGED", ATTACHMENT: "UNCHANGED", LABOUR: "UNCHANGED",
+    });
+
+    const after = (await IeBulletinVersion.findOne({
+      companyId: ctx.co._id, versionNo: ctx.nextVersionNo,
+    }).lean()).rows[0].requirementSnapshot;
+    expect(after.ieOperationRevision).not.toBe(before.ieOperationRevision);
+    /* The two surfaces now agree, because the digest stopped answering a
+       question nobody asked it. */
+    expect(requirementDigestOf(after)).toBe(requirementDigestOf(before));
+
+    /* The revision moving is still VISIBLE — the row's own identity carries it,
+       and the approval half of the source fingerprint still covers it. It is
+       simply not a REQUIREMENT change. */
+    expect(row.current.ieOperationRevision).toBe(row.released.ieOperationRevision + 5);
+  });
+
+  test("a renamed operation is visible as a rename and moves no requirement digest", async () => {
+    const ctx = await released("LabelOnlyDigest");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const before = ctx.version.rows[0].requirementSnapshot;
+
+    await moveCurrentTo(ctx, (v) => {
+      v.rows[0].operationCode = "OP-RENAMED";
+      v.rows[0].operationName = "Attach collar (revised wording)";
+    });
+    const row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+
+    /* The rename is visible, on both sides, and named as what it is. */
+    expect(row.labelsChanged).toBe(true);
+    expect(row.reasons[0].code).toBe("LABEL_ONLY_RENAME");
+    expect(row.released.operationCode).not.toBe(row.current.operationCode);
+    /* And it is not a requirement change on either surface. */
+    expect(row.classifications).toEqual(["UNCHANGED"]);
+    expect(row.requirementMovement.moved).toEqual([]);
+    const after = (await IeBulletinVersion.findOne({
+      companyId: ctx.co._id, versionNo: ctx.nextVersionNo,
+    }).lean()).rows[0].requirementSnapshot;
+    expect(requirementDigestOf(after)).toBe(requirementDigestOf(before));
+  });
+
+  test("whether requirements were decided AT ALL is itself a requirement change", async () => {
+    const ctx = await released("ConfiguredMoved");
+    const ids = ctx.version.rows.map((r) => r.rowId);
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const before = ctx.version.rows[0].requirementSnapshot;
+
+    /* Every list identical; only the flag moves. "Nobody has decided what this
+       operation requires" and "somebody decided it requires exactly this" are
+       different requirements, and both surfaces have to say so. */
+    await moveCurrentTo(ctx, (v) => {
+      v.rows[0].requirementSnapshot.requirementsConfigured = false;
+    });
+    const row = rowFor({ impact: (await impact(ctx)).body.impact }, ids[0]);
+
+    expect(row.classifications).toEqual(["REQUIREMENT_CHANGED"]);
+    expect(row.reasons[0].configuredChanged).toBe(true);
+    expect(row.reasons[0].movedDimensions).toEqual([]);
+    expect(row.reasons[0].releasedConfigured).toBe(true);
+    expect(row.reasons[0].currentConfigured).toBe(false);
+
+    const after = (await IeBulletinVersion.findOne({
+      companyId: ctx.co._id, versionNo: ctx.nextVersionNo,
+    }).lean()).rows[0].requirementSnapshot;
+    expect(requirementDigestOf(after)).not.toBe(requirementDigestOf(before));
+  });
+
+  test("the requirement digest covers all three dimensions, and leaves legacy evidence alone", () => {
+    const { requirementDigestOf } = require("../../services/industrialEngineering/ieLineLayout.service");
+    const legacy = {
+      ieOperationRevision: 2, requirementsConfigured: true,
+      machineTypes: [{ machineType: "SNLS", quantity: 1 }],
+    };
+    /* ── NOT ONE BYTE OF HISTORY RESTATED ─────────────────────────────
+       Every stored layout fingerprint, frozen capacity-standard digest and
+       issued release was computed with the old function. Widening it for OLD
+       evidence would have made an in-flight capacity standard fail its own
+       re-proof at approval. */
+    expect(requirementDigestOf(legacy)).toBe("2~1~SNLS:1");
+
+    /* Shaped as the capture path actually writes one: all three dimensions
+       together, machines included. `requirementSnapshotOf` never produces a
+       half-captured snapshot, and a fixture that did would be testing a state
+       the system cannot reach. */
+    const captured = {
+      ...legacy,
+      dimensionsCaptured: ["MACHINE", "ATTACHMENT", "LABOUR"],
+      machines: [{ requirementId: "mreq_1", sequence: 1, machineType: "SNLS", quantity: 1 }],
+      attachments: [{ requirementId: "areq_1", sequence: 1, code: "F12", name: "Folder", quantity: 1 }],
+      labour: [{
+        requirementId: "lreq_1", sequence: 1, workerType: "OPERATOR",
+        quantity: 1, skillCode: "S1", grade: "A",
+      }],
+    };
+    const base = requirementDigestOf(captured);
+    expect(base).not.toBe(requirementDigestOf(legacy));
+    /* ── TWO FORMATS, NOT ONE WITH A TAIL ─────────────────────────────
+       A v2 digest does not begin with the legacy head, and carries none of the
+       facts that head carried. Those are facts ABOUT the row; this digest
+       answers what the row REQUIRES. */
+    expect(base.startsWith("v2~")).toBe(true);
+    expect(base.startsWith(requirementDigestOf(legacy))).toBe(false);
+    expect(requirementDigestOf({ ...captured, ieOperationRevision: 99 })).toBe(base);
+    /* Once `machines` is captured, `machineTypes` is a duplicate of evidence the
+       canonical form already covers — so it no longer participates. (For a
+       legacy snapshot it IS the machine evidence, and still does.) */
+    expect(requirementDigestOf({ ...captured, machineTypes: [] })).toBe(base);
+    expect(requirementDigestOf({ ...captured, machines: [] })).not.toBe(base);
+    expect(requirementDigestOf({ ...captured, capturedAt: new Date("2030-01-01") })).toBe(base);
+    /* But the one flag that IS a requirement still moves it. */
+    expect(requirementDigestOf({ ...captured, requirementsConfigured: false })).not.toBe(base);
+    /* Captured-and-empty is a different fact from never-captured. */
+    expect(requirementDigestOf({ ...captured, attachments: [], labour: [] }))
+      .not.toBe(requirementDigestOf(legacy));
+    /* Each dimension moves the digest on its own. */
+    expect(requirementDigestOf({
+      ...captured, attachments: [{ code: "F12", name: "Folder", quantity: 2 }],
+    })).not.toBe(base);
+    expect(requirementDigestOf({
+      ...captured, labour: [{ workerType: "OPERATOR", quantity: 1, skillCode: "S1", grade: "B" }],
+    })).not.toBe(base);
+    /* Order is not a requirement. */
+    expect(requirementDigestOf({
+      ...captured,
+      attachments: [{ code: "F12", name: "Folder", quantity: 1 }, { code: "A1", name: "A", quantity: 1 }],
+    })).toBe(requirementDigestOf({
+      ...captured,
+      attachments: [{ code: "A1", name: "A", quantity: 1 }, { code: "F12", name: "Folder", quantity: 1 }],
+    }));
+  });
+});
+
+/* ══ 4a. UNKNOWN STAYS UNKNOWN ════════════════════════════════════════════ */
+
+describe("tri-state evidence", () => {
+  /* `true`, `false` and "not stated" are THREE answers. Collapsing the third
+     into `false` hands out a denial the server never made; collapsing it into
+     `true` hands out a reassurance. Each case below pins one of them. */
+
+  test("a digest with only one side present cannot have moved or stayed", async () => {
+    const ctx = await released("OneSidedDigest");
+
+    /* ── ABSENT CURRENT DIGEST ───────────────────────────────────────── */
+    await moveCurrentTo(ctx, (v) => { v.sourceRequirementDigest = ""; });
+    let i = (await impact(ctx)).body.impact;
+    expect(i.bulletin.requirementDigest.released).not.toBeNull();
+    expect(i.bulletin.requirementDigest.current).toBeNull();
+    /* Not `true`: the digests are not equal, but an opaque value compared
+       against nothing has not been compared. */
+    expect(i.bulletin.requirementDigest.moved).toBeNull();
+    /* The approval digest beside it is unaffected — they stay two answers. */
+    expect(i.bulletin.approvalDigest.moved).toBe(false);
+
+    /* ── ABSENT RELEASED DIGEST ──────────────────────────────────────── */
+    await moveCurrentTo(ctx, (v) => { v.sourceRequirementDigest = "e".repeat(64); });
+    await mongoose.connection.collection("ie_releases").updateOne(
+      { _id: new mongoose.Types.ObjectId(ctx.release.releaseId) },
+      { $set: { "source.sourceRequirementDigest": "" } },
+    );
+    i = (await impact(ctx)).body.impact;
+    expect(i.bulletin.requirementDigest.released).toBeNull();
+    expect(i.bulletin.requirementDigest.current).toBe("e".repeat(64));
+    expect(i.bulletin.requirementDigest.moved).toBeNull();
+
+    /* ── AND BOTH ABSENT IS STILL NOT AGREEMENT ──────────────────────── */
+    await moveCurrentTo(ctx, (v) => { v.sourceRequirementDigest = ""; });
+    i = (await impact(ctx)).body.impact;
+    expect(i.bulletin.requirementDigest.moved).toBeNull();
+  });
+
+  test("NO_CURRENT_APPROVED never reads as reassurance", async () => {
+    const ctx = await released("NoReassurance");
+    await mongoose.connection.collection("ie_style_files").updateOne(
+      { _id: new mongoose.Types.ObjectId(String(ctx.fileId)) },
+      { $unset: { currentApprovedBulletinVersionId: "", currentApprovedVersionNo: "" } },
+    );
+    const i = (await impact(ctx)).body.impact;
+
+    expect(i.bulletin.verdict).toBe("NO_CURRENT_APPROVED");
+    /* ── THE ONE THAT MATTERS ──────────────────────────────────────────
+       `false` here would render as "nothing has moved" on a screen that has
+       just been told there is nothing to have moved TO. */
+    expect(i.bulletin.moved).toBeNull();
+    expect(i.bulletin.moved).not.toBe(false);
+    expect(i.bulletin.currentVersionNo).toBeNull();
+    expect(i.bulletin.approvalDigest.moved).toBeNull();
+    expect(i.bulletin.requirementDigest.moved).toBeNull();
+    expect(i.bulletin.sourceFingerprint.moved).toBeNull();
+    expect(i.garmentSam.current).toBeNull();
+    expect(i.garmentSam.delta).toBeNull();
+    expect(i.capacity.current).toBeNull();
+    expect(i.capacity.delta).toBeNull();
+    expect(i.capacity.available).toBe(false);
+    expect(i.capacity.unavailableReason).toBe("NO_CURRENT_APPROVED_BULLETIN");
+    expect(i.capacity.unavailableMessage.length).toBeGreaterThan(30);
+
+    /* Nothing anywhere in the envelope is a zero standing in for an unknown. */
+    expect(i.garmentSam.current).not.toBe(0);
+    expect(i.capacity.current).not.toBe(0);
+    expect(i.capacity.delta).not.toBe(0);
+  });
+
+  test("capacity availability is true, false or null — and false carries a reason a person can act on", async () => {
+    const ctx = await released("CapTriState");
+    const frozenStandard = (await IeRelease.findById(ctx.release.releaseId).lean())
+      .source.capacityStandard;
+
+    /* FALSE — derivable in principle, refused in fact, with the reason. */
+    await moveCurrentTo(ctx, (v) => { v.totals.garmentSamMinutes = 0; });
+    let i = (await impact(ctx)).body.impact;
+    expect(i.capacity.available).toBe(false);
+    expect(i.capacity.current).toBeNull();
+    expect(i.capacity.delta).toBeNull();
+    expect(i.capacity.unavailableReason).toBe("CURRENT_CAPACITY_UNAVAILABLE");
+    expect(i.capacity.unavailableReasons).toContain("NO_GARMENT_SAM");
+    expect(i.capacity.unavailableMessage).toMatch(/garment SAM/i);
+
+    /* ── NULL — THE QUESTION WAS NEVER RAISED ────────────────────────
+       A release that froze no capacity standard at all has no target to
+       compare and no derivation that failed. `false` would report a failure
+       nobody attempted; `null` is the server declining to answer, which is the
+       truth. This is the third state, and it is reachable. */
+    await mongoose.connection.collection("ie_releases").updateOne(
+      { _id: new mongoose.Types.ObjectId(ctx.release.releaseId) },
+      { $unset: { "source.capacityStandard": "" } },
+    );
+    i = (await impact(ctx)).body.impact;
+    expect(i.capacity.available).toBeNull();
+    expect(i.capacity.available).not.toBe(false);
+    expect(i.capacity.released).toBeNull();
+    expect(i.capacity.current).toBeNull();
+    expect(i.capacity.delta).toBeNull();
+    expect(i.capacity.unavailableReason).toBe("");
+    expect(i.capacity.unavailableMessage).toBe("");
+    await mongoose.connection.collection("ie_releases").updateOne(
+      { _id: new mongoose.Types.ObjectId(ctx.release.releaseId) },
+      { $set: { "source.capacityStandard": frozenStandard } },
+    );
+
+    /* TRUE — and the reason field is empty rather than a placeholder. */
+    await moveCurrentTo(ctx, (v) => { v.totals.garmentSamMinutes = 4.5; });
+    i = (await impact(ctx)).body.impact;
+    expect(i.capacity.available).toBe(true);
+    expect(i.capacity.unavailableReason).toBe("");
+    expect(i.capacity.unavailableMessage).toBe("");
+    expect(i.capacity.delta).toBe(0);
+  });
+
+  test("genuine agreement IS published as agreement", async () => {
+    /* The control. Everything above proves an unknown is not turned into a
+       verdict; this proves a real verdict is not turned into an unknown. */
+    const ctx = await released("GenuineUnchanged");
+    const i = (await impact(ctx)).body.impact;
+
+    expect(i.bulletin.verdict).toBe("CURRENT");
+    expect(i.bulletin.moved).toBe(false);
+    expect(i.bulletin.approvalDigest.moved).toBe(false);
+    expect(i.bulletin.requirementDigest.moved).toBe(false);
+    expect(i.bulletin.sourceFingerprint.moved).toBe(false);
+    expect(i.bulletin.releasedVersionNo).toBe(i.bulletin.currentVersionNo);
+    expect(i.garmentSam.delta).toBe(0);
+    expect(i.capacity.available).toBe(true);
+    expect(i.capacity.delta).toBe(0);
+    expect(i.summary.changedRowCount).toBe(0);
+    expect(i.summary.unchangedRowCount).toBe(i.summary.totalRowCount);
+  });
+});
+
+/* ══ 4b. THE PUBLISHED CONTRACT ═══════════════════════════════════════════ */
+
+/**
+ * EVERY FIELD THE ACCEPTED FRONTEND CONTRACT REQUIRES.
+ *
+ * Copied verbatim from `REQUIRED_FIELDS` in
+ * `grav-cms/components/industrialEngineering/releaseImpact/releaseImpactAdapter.js`,
+ * which is the accepted contract of record. The test below ALSO reads that file
+ * when the sibling checkout is present and fails if the two lists have drifted
+ * — so this copy cannot quietly go stale, and the suite still runs where the
+ * frontend repo is not checked out.
+ */
+const REQUIRED_FIELDS = Object.freeze([
+  "release.releaseId",
+  "release.releaseRef",
+  "release.versionNo",
+  "bulletin.releasedVersionNo",
+  "bulletin.currentVersionNo",
+  "bulletin.verdict",
+  "bulletin.approvalDigest.released",
+  "bulletin.approvalDigest.current",
+  "bulletin.approvalDigest.moved",
+  "bulletin.requirementDigest.released",
+  "bulletin.requirementDigest.current",
+  "bulletin.requirementDigest.moved",
+  "garmentSam.released",
+  "garmentSam.current",
+  "garmentSam.delta",
+  "capacity.released",
+  "capacity.current",
+  "capacity.delta",
+  "capacity.available",
+  "capacity.unavailableReason",
+  "rows[].rowId",
+  "rows[].classifications",
+  "rows[].released.ieOperationId",
+  "rows[].released.ieOperationRevision",
+  "rows[].current.ieOperationId",
+  "rows[].current.ieOperationRevision",
+  "rows[].released.operationCode",
+  "rows[].released.operationName",
+  "rows[].released.sequence",
+  "rows[].released.standardTimeMinutes",
+  "rows[].released.methodStudyId",
+  "rows[].released.approvedSubmissionId",
+  "rows[].released.requirements.machines[].machineType",
+  "rows[].released.requirements.machines[].quantity",
+  "rows[].released.requirements.labour[].workerType",
+  "rows[].released.requirements.labour[].skillCode",
+  "rows[].released.requirements.labour[].skillName",
+  "rows[].released.requirements.labour[].grade",
+  "rows[].released.requirements.attachments[].code",
+  "rows[].released.requirements.attachments[].name",
+  "rows[].released.requirements.attachments[].quantity",
+  "rows[].current.operationCode",
+  "rows[].current.operationName",
+  "rows[].current.sequence",
+  "rows[].current.standardTimeMinutes",
+  "rows[].current.methodStudyId",
+  "rows[].current.approvedSubmissionId",
+  "rows[].current.requirements.machines[].machineType",
+  "rows[].current.requirements.labour[].workerType",
+  "rows[].current.requirements.labour[].skillCode",
+  "rows[].current.requirements.labour[].skillName",
+  "rows[].current.requirements.labour[].grade",
+  "rows[].current.requirements.attachments[].code",
+  "rows[].current.requirements.attachments[].name",
+  "rows[].current.requirements.attachments[].note",
+  "workOrders.provablyAffected[]",
+  "workOrders.ownershipUnproven[].reasonCode",
+  "workOrders.ownershipUnproven[].reasonMessage",
+  "bulletin.releasedBulletinVersionId",
+  "bulletin.currentBulletinVersionId",
+  "rows[].reasons[].code",
+  "rows[].reasons[].message",
+  "rows[].requirementMovement.perDimension",
+  "rows[].requirementMovement.reducedGranularity",
+  "rows[].released.requirements.dimensionState.MACHINE",
+  "rows[].released.requirements.dimensionState.LABOUR",
+  "rows[].released.requirements.dimensionState.ATTACHMENT",
+  "rows[].current.requirements.dimensionState.MACHINE",
+  "rows[].current.requirements.dimensionState.LABOUR",
+  "rows[].current.requirements.dimensionState.ATTACHMENT",
+  "workOrders.coverage.complete",
+  "workOrders.coverage.withheldForTenantSafety",
+  "workOrders.coverage.message",
+  "summary.totalRowCount",
+  "summary.changedRowCount",
+  "summary.unchangedRowCount",
+  "summary.affectedWorkOrderCount",
+  "summary.unprovenWorkOrderCount",
+]);
+
+/**
+ * Resolve one contract path against a payload.
+ *
+ * PRESENCE, not truthiness. `null` is a stated absence and a legitimate value
+ * for every tri-state field in the contract, so a check that asked "is it
+ * truthy" would reject exactly the answers this chunk exists to publish.
+ */
+function resolvePath(value, path) {
+  const steps = path.split(".").filter(Boolean);
+  let nodes = [value];
+  for (const rawStep of steps) {
+    const isList = rawStep.endsWith("[]");
+    const key = isList ? rawStep.slice(0, -2) : rawStep;
+    const next = [];
+    for (const node of nodes) {
+      if (node === null || node === undefined || typeof node !== "object") {
+        return { ok: false, why: `missing at "${key}"` };
+      }
+      if (!(key in node)) return { ok: false, why: `missing key "${key}"` };
+      const child = node[key];
+      if (isList) {
+        if (!Array.isArray(child)) return { ok: false, why: `"${key}" is not a list` };
+        if (!child.length) return { ok: false, why: `"${key}" is empty in this fixture` };
+        next.push(...child);
+      } else next.push(child);
+    }
+    nodes = next;
+  }
+  return { ok: true, nodes };
+}
+
+describe("the published contract", () => {
+  test("the real payload satisfies every field the accepted frontend contract requires", async () => {
+    /* The UNCHANGED case deliberately: every row has both sides, so every
+       per-side path in the contract is genuinely exercised. A removed row's
+       `current` is legitimately null and would make the sweep vacuous. */
+    const ctx = await released("Contract");
+    const own = await SampleStyle.create({
+      sampleStyleId: `SS-CT-${++seq}`, productName: "Tee", styleCode: `ST-CT-${seq}`,
+      journeyId: ctx.journey._id, sourceStockItemId: ctx.stockItem._id,
+      materials: { status: "pending", rawItems: [] },
+    });
+    /* One of the caller's own orders on another of their styles, so
+       `ownershipUnproven[]` is populated and its paths are exercised too. */
+    await WorkOrder.create({
+      workOrderNumber: `WO-CT-${++seq}`, stockItemId: ctx.stockItem._id,
+      stockItemName: ctx.stockItem.name, stockItemReference: ctx.stockItem.reference,
+      sampleStyleId: own._id, quantity: 60, originalQuantity: 60, status: "planned",
+      timeline: { plannedStartDate: new Date("2026-10-01"), plannedEndDate: new Date("2026-10-20") },
+      customerId: new mongoose.Types.ObjectId(), customerName: "Mine Ltd",
+    });
+
+    const res = await impact(ctx);
+    expect(res.status).toBe(200);
+    const payload = res.body.impact;
+
+    const failures = REQUIRED_FIELDS
+      .map((path) => ({ path, ...resolvePath(payload, path) }))
+      .filter((r) => !r.ok)
+      .map((r) => `${r.path} — ${r.why}`);
+    expect(failures).toEqual([]);
+
+    /* ── AND THE JUDGMENTS ARE THE SERVER'S ────────────────────────────
+       Lane B reshapes; it must not have to decide. Each of these is a
+       conclusion a browser could only reach by re-deriving something. */
+    expect(["CURRENT", "MOVED", "NO_CURRENT_APPROVED"]).toContain(payload.bulletin.verdict);
+    expect(typeof payload.summary.totalRowCount).toBe("number");
+    expect(typeof payload.summary.changedRowCount).toBe("number");
+    expect(typeof payload.summary.unchangedRowCount).toBe("number");
+    expect(typeof payload.summary.affectedWorkOrderCount).toBe("number");
+    expect(typeof payload.summary.unprovenWorkOrderCount).toBe("number");
+    expect(payload.summary.totalRowCount)
+      .toBe(payload.summary.changedRowCount + payload.summary.unchangedRowCount);
+    expect(payload.summary.totalRowCount).toBe(payload.rows.length);
+    expect(payload.summary.affectedWorkOrderCount).toBe(payload.workOrders.provablyAffected.length);
+    expect(payload.summary.unprovenWorkOrderCount).toBe(payload.workOrders.ownershipUnproven.length);
+    for (const row of payload.rows) {
+      expect(Array.isArray(row.classifications)).toBe(true);
+      expect(row.classifications.length).toBeGreaterThan(0);
+      for (const c of row.classifications) expect(payload.changeVocabulary).toContain(c);
+    }
+    /* Every labour and attachment row carries the full display evidence — an
+       earlier cut of this envelope published a grade and lost the skill. */
+    const labour = payload.rows[0].released.requirements.labour[0];
+    expect(Object.keys(labour).sort()).toEqual([
+      "grade", "note", "quantity", "requirementId", "sequence", "skillCode",
+      "skillName", "workerType",
+    ]);
+    const attachment = payload.rows[0].released.requirements.attachments[0];
+    expect(Object.keys(attachment).sort()).toEqual([
+      "code", "name", "note", "quantity", "requirementId", "sequence",
+    ]);
+  });
+
+  test("this copy of the contract has not drifted from the accepted one", () => {
+    const adapter = path.join(__dirname, "..", "..", "..", "grav-cms", "components",
+      "industrialEngineering", "releaseImpact", "releaseImpactAdapter.js");
+    if (!fs.existsSync(adapter)) {
+      /* Stated rather than skipped silently: a reader must be able to tell
+         "checked and agreed" from "could not check". */
+      expect(fs.existsSync(adapter)).toBe(false);
+      return;
+    }
+    const source = fs.readFileSync(adapter, "utf8");
+    const block = source.slice(source.indexOf("export const REQUIRED_FIELDS"));
+    const theirs = [...block.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(theirs.length).toBeGreaterThan(40);
+    expect(theirs).toEqual([...REQUIRED_FIELDS]);
   });
 });
 
@@ -941,12 +1783,12 @@ describe("what this chunk does not touch", () => {
     );
 
     const i = (await impact(ctx)).body.impact;
-    expect(i.comparison.currentBulletin.bulletinVersionId).toBe(String(pointed._id));
-    expect(i.comparison.currentBulletin.sourceFingerprint).toBe(pointed.sourceFingerprint);
-    expect(i.digests.approval.current).toBe("c".repeat(64));
+    expect(i.bulletin.currentBulletinVersionId).toBe(String(pointed._id));
+    expect(i.bulletin.sourceFingerprint.current).toBe(pointed.sourceFingerprint);
+    expect(i.bulletin.approvalDigest.current).toBe("c".repeat(64));
     expect(i.garmentSam.current).toBe(5.5);
     const row = rowFor({ impact: i }, ctx.version.rows[0].rowId);
-    expect(row.current.timing.standardTimeMinutes).toBe(2);
+    expect(row.current.standardTimeMinutes).toBe(2);
 
     const wire = JSON.stringify(i);
     expect(wire).not.toContain(String(decoy._id));

@@ -41,6 +41,62 @@ Use the following template for each approved architecture decision.
 
 ---
 
+## ADR-003: IE and PPC are separate department applications
+
+- **Decision ID:** ADR-003
+- **Date:** 2026-09-07
+- **Status:** Approved
+- **Context:** The original garment-manufacturer direction grouped Industrial Engineering and Production Planning and Control in one application. GRAV is organising applications by stable departmental responsibility, not by employee designation. IE owns manufacturing methods and standards; PPC owns order loading, capacity commitments and schedules. Keeping them behind one application boundary would make it easier for a plan to redefine the standard it is meant to consume.
+- **Decision:** IE and PPC are separate department applications. IE owns operation bulletins, routes, SAM/SMV, method studies, machine/manpower requirements, line-balance standards, capacity standards and standard targets. PPC consumes released IE versions and owns factory/line allocation, order loading, capacity booking, production calendars and recovery plans. Production executes the released plan. Production Manager and Production Supervisor remain roles inside the Production application, not separate applications.
+- **Alternatives considered:** One combined Planning & IE application with role-controlled workspaces; superseded because the departments have independent authority and approval boundaries. Separate applications by designation; rejected because designations change while departmental responsibility remains stable.
+- **Consequences:** The existing `project-manager` and `production-supervisor` interfaces are transitional shells. Their features must move by fact ownership to IE, PPC or Production without deleting live records or links. Production may request an IE revision but cannot directly change an approved route or SAM. PPC must retain the exact IE version used by each plan.
+- **Related task/files:** `docs/product/garment-manufacturer-app-architecture.md`, `docs/product/industrial-engineering-app-plan.md`, `docs/audits/industrial-engineering-chunk-00-boundary.md`, `docs/tasks/industrial-engineering-chunk-00.md`
+
+---
+
+## ADR-004: Mautic is the Marketing automation engine, not the CRM authority
+
+- **Decision ID:** ADR-004
+- **Date:** 2026-09-09
+- **Status:** Approved
+- **Context:** GRAV needs an internal Marketing application and intends to build
+  from Mautic. GRAV already owns Account, Contact, Lead, Activity and Sales
+  Journey records. A deep Mautic fork or a bidirectional customer-master sync
+  would create competing identity, consent and commercial lifecycles.
+- **Decision:** Deploy one separately operated Mautic instance for the internal
+  GRAV organisation. GRAV owns identity, consent, qualification and commercial
+  outcomes. Mautic owns segments, campaign definitions, marketing assets,
+  automation execution and native engagement events. Integrate through a
+  GRAV-owned adapter using supported APIs and authenticated webhooks. Prefer a
+  Mautic plugin to core changes; a core fork requires a separate approved ADR.
+  Sales and Marketing use canonical GRAV records and one CRM Activity timeline.
+  GRAV's intelligence layer may recommend audiences, content and Sales
+  handovers from Mautic engagement plus approved context, but its outputs
+  remain explained, auditable and human-approved; it cannot override consent
+  or write Sales lifecycle decisions. Marketing may operate approved branded
+  one-to-many communication and a neutral automatic acknowledgement, but Sales
+  owns every personal customer conversation. A new handover enters Sales as an
+  awaiting-review Prospect, never as an Active Lead.
+- **Alternatives considered:** Make Mautic the primary CRM; rejected because it
+  duplicates and weakens GRAV's established domain ownership. Import Mautic
+  code or tables into the Node/Mongo application; rejected because it couples
+  GRAV to Mautic internals and creates an unsupported mixed runtime. Maintain a
+  deep white-label fork immediately; deferred because the internal first
+  release does not justify the upgrade and licensing burden.
+- **Consequences:** GRAV needs canonical channel-consent and identity-mapping
+  records, an idempotent outbound projection, a verified webhook ledger,
+  conservative suppression behavior and reconciliation. The initial Marketing
+  UI may deep-link to Mautic for complex asset and automation editing. There is
+  no multi-tenant abstraction in the first release. Intelligent features need
+  versioned input snapshots, evidence/freshness, explicit feedback and outcome
+  evaluation rather than an opaque score alone.
+- **Related task/files:** `docs/product/marketing-app-mautic-plan.md`,
+  `docs/tasks/marketing-mautic-roadmap.md`,
+  `docs/product/crm-master-requirements.md`,
+  `docs/product/connected-lifecycle.md`
+
+---
+
 ## ADR-005: Pre-order development is Merchandising's, and its ownership is split seven ways
 
 - **Decision ID:** ADR-005

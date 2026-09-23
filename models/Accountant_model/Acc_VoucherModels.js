@@ -830,11 +830,21 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
  * next month would silently not release at all. This is the chokepoint they
  * all pass through.
  *
- * ── WHY IT RE-READS BEFORE ACTING ───────────────────────────────────────────
- * Two of those paths save inside a transaction that can still abort. A hook
- * that trusted the document in front of it would release a commitment for a
- * voucher that never posted. So it asks the database what is actually stored
- * before changing anything, and a rolled-back save finds nothing to act on.
+ * ── AND WHY IT STANDS ASIDE FOR A TRANSACTION ───────────────────────────────
+ * A `post("save")` hook is NOT an after-commit hook. For `save({ session })`
+ * it fires while the transaction is still open, and a reread outside that
+ * session sees the PRE-transaction document. A cancellation reread as
+ * `posted`, took the posted branch, did nothing, and then committed — leaving
+ * a cancelled voucher whose commitment was still released.
+ *
+ * An earlier comment here claimed the reread proved the write was durably
+ * committed. That was false and has been removed.
+ *
+ * So: a save carrying a session is left alone. The route that owns that
+ * transaction calls the shared reconciler once `commitTransaction()` has
+ * returned, which is the only moment at which reading the voucher's state is
+ * evidence of anything. This hook now covers exactly the non-transactional
+ * saves, which have no such moment and need one here.
  *
  * ── AND WHY IT NEVER THROWS ─────────────────────────────────────────────────
  * A failure here must not unpost a voucher that is correctly posted. It is
@@ -842,8 +852,15 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
  * are not.
  */
 tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
+  /* ── A TRANSACTIONAL SAVE IS NOT THIS HOOK'S BUSINESS ──────────────────
+     `$session()` is the session this document was saved with. Its presence
+     means a transaction is still open around us: nothing here is committed
+     yet, a reread would see the old state, and the transaction may still
+     abort. The route reconciles after it commits. */
+  if (typeof doc?.$session === "function" && doc.$session()) return;
+
   const status = String(doc?.status || "");
-  if (status !== "posted" && status !== "cancelled") return;
+  if (status !== "posted" && status !== "cancelled" && status !== "void") return;
   /* Nothing to do for the overwhelming majority of vouchers, and this check
      costs nothing — the link is on the document already. */
   if (status === "posted" && !doc.spendRequestId && !doc.budgetCommitmentId &&
@@ -860,32 +877,17 @@ tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
        Both are gone. `orchestrate` is the single entry point; it decides
        legacy versus line-wise from the COMMITMENT, because that is a property
        of the promise and not of the call site. */
+    /* ── ONE SHARED OPERATION, WHICHEVER DOOR REACHED IT ───────────────────
+       The same `reconcileVoucher` the transactional routes call after they
+       commit. It reads the stored voucher itself — which outside a
+       transaction IS the committed state — so there is one implementation of
+       "what does this voucher's current state mean for its commitment". */
     const release = require("../../services/commitmentRelease.service");
-    const Model = doc.constructor;
-
-    /* ── WHAT IS ACTUALLY STORED, INCLUDING THE LINES ──────────────────────
-       `inventoryEntries` was NOT selected, so the release engine saw a voucher
-       with no lines and could only ever conclude "nothing mapped". Partial
-       release is impossible without them — this projection is the difference
-       between discharging the right allocation and discharging none.
-
-       Re-read rather than trusted: two posting paths save inside a
-       transaction that can still abort, and a rolled-back save must find
-       nothing to act on. This is also what makes the release run only after
-       the posting is durably committed. */
-    const fresh = await Model.findById(doc._id)
-      .select("_id status companyId voucherType voucherNumber grandTotal "
-        + "referenceNumber spendRequestId budgetCommitmentId updatedBy inventoryEntries")
-      .lean();
-    if (!fresh) return;
-
-    if (fresh.status === "posted" || fresh.status === "cancelled") {
-      await release.orchestrate({
-        voucher: fresh,
-        actor: { id: fresh.updatedBy },
-        transition: fresh.status,
-      });
-    }
+    await release.reconcileVoucher({
+      voucherId: doc._id,
+      actor: { id: doc.updatedBy },
+      model: doc.constructor,
+    });
   } catch (e) {
     console.error("[budget commitment] voucher hook failed:", e.message);
   }

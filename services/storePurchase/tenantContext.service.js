@@ -160,8 +160,40 @@ function tenantFilter(ctx) {
   return { companyId: ctx.companyId };
 }
 
-/** Fields every new operational record must carry, taken from context only. */
+/**
+ * Fields every new operational record must carry, taken from context only.
+ *
+ * ── AND IT REFUSES RATHER THAN STAMPING NOTHING ─────────────────────────────
+ * This returned `{ companyId: undefined }` whenever the context carried no
+ * company, and mongoose simply left the field off — so the record was created
+ * UNOWNED. A supplier registered that way appeared instantly as "Not yet
+ * owned — this supplier predates company ownership", could not be edited, and
+ * could not be chosen in the quotation register: indistinguishable from a
+ * record migrated from before ownership existed, which it was not.
+ *
+ * Legacy mode is a READ scope. It selects the records nobody has claimed so
+ * they can be looked at and migrated; creating a new one inside it would mint
+ * exactly the problem the migration exists to clear up. Both cases refuse,
+ * loudly, rather than producing a record nobody owns.
+ */
 function stamp(ctx) {
+  if (!ctx) {
+    throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
+  }
+  if (ctx.legacyMode) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Legacy scope is for reading records nobody has claimed yet. A new record cannot be created in it.",
+      { reason: "LEGACY_SCOPE_IS_READ_ONLY" },
+    );
+  }
+  if (!ctx.companyId) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Your company could not be resolved, so a new record cannot be created. Nothing was saved.",
+      { reason: "COMPANY_CONTEXT_UNRESOLVED" },
+    );
+  }
   const out = { companyId: ctx.companyId };
   if (ctx.siteId) out.siteId = ctx.siteId;
   return out;

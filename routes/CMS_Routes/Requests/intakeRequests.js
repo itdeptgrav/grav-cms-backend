@@ -54,6 +54,10 @@ const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+/* Cache-immune Store-grant path — the same additive treatment the spend router
+   uses, so "may act for Store" survives a momentarily-stale department cache. */
+const { resolveCapabilities: resolveSpCapabilities, hasAll: spHasAll, CAPABILITIES: SP_CAP } =
+  require("../../../services/storePurchase/capabilities");
 const vendorResolve = require("../../../services/vendorResolve.service");
 /* The material door's own fulfilment rules — the split between what is issued
    and what is bought, and the tax on top of the quote. Shared rather than
@@ -207,7 +211,7 @@ function refuseStandIn(res, emp, what) {
  * A single role field would have to pick one and would be wrong for them.
  */
 async function viewerOf(emp) {
-  const [managedDocIds, accUser, fulfil] = await Promise.all([
+  const [managedDocIds, accUser, fulfil, caps] = await Promise.all([
     mrfApprover.listManagedEmployeeIds(emp?.biometricId || emp?.identityId).catch(() => []),
     emp?.email
       ? Acc_User.findOne({ email: String(emp.email).trim().toLowerCase() })
@@ -216,7 +220,12 @@ async function viewerOf(emp) {
           .catch(() => null)
       : null,
     resolveFulfilmentAccess(emp).catch(() => ({ allowed: false, via: null })),
+    /* Cache-immune Store grant via the resolved capability set (from
+       department-role grants, not the 30s department cache). ADDITIVE. */
+    resolveSpCapabilities({ email: emp?.email, employeeRef: emp?._id, biometricId: emp?.biometricId })
+      .catch(() => ({ capabilities: [], isAdmin: false })),
   ]);
+  const capabilityFulfils = Boolean(caps?.isAdmin) || spHasAll(caps?.capabilities || [], [SP_CAP.SOURCING_MANAGE]);
 
   /* listManagedEmployeeIds answers with Mongo _ids; everything else in this
      flow — requestedById, approverBiometricId, the session's own employeeId —
@@ -242,8 +251,8 @@ async function viewerOf(emp) {
     /* Finance classifies too. They see every request that spends money anyway,
        and a request stuck because the one store person is on leave is a
        request somebody raises again through a channel nobody is measuring. */
-    canFulfil: Boolean(fulfil?.allowed) || isFinance,
-    fulfilVia: fulfil?.via || (isFinance ? "finance" : null),
+    canFulfil: Boolean(fulfil?.allowed) || isFinance || capabilityFulfils,
+    fulfilVia: fulfil?.via || (isFinance ? "finance" : capabilityFulfils ? "store" : null),
   };
 }
 
@@ -1224,8 +1233,12 @@ router.post("/", async (req, res) => {
     const purpose = text(b.purpose, 1000);
 
     /* Lines first, matching the form's own order — a refusal that names the
-       last field while the first is empty is a refusal somebody has to hunt. */
-    const { lines, estimatedTotal, estimateComplete, error } = await buildLines(b.items);
+       last field while the first is empty is a refusal somebody has to hunt.
+       The request type is passed so a canonical service link can be refused on a
+       PRODUCT request. */
+    const { lines, estimatedTotal, estimateComplete, error } = await buildLines(b.items, {
+      requestType: String(b.requestType || "PRODUCT").toUpperCase(),
+    });
     if (error) return res.status(400).json({ success: false, message: error });
 
     if (!purpose) {
@@ -1447,11 +1460,36 @@ router.post("/", async (req, res) => {
  * yet whether this costs the company anything, and a required rate would make
  * the requester invent one for a box of blades the store already holds.
  */
-async function buildLines(raw) {
+async function buildLines(raw, { requestType = "PRODUCT" } = {}) {
   if (!Array.isArray(raw) || raw.length === 0) {
     return { error: "Add at least one thing you need." };
   }
   if (raw.length > 30) return { error: "That is more than thirty lines — split it up." };
+
+  /* ── CANONICAL SERVICE IDENTITY, RESOLVED SERVER-SIDE ────────────────────────
+     A line may carry a `serviceId` from "Request this service". It is NEVER
+     trusted for its name/price/unit — only the id is read, and the record is
+     resolved against an ACTIVE service in the server-proven company. A PRODUCT
+     request may not carry one; a malformed/foreign/inactive/missing id is
+     refused; a plain described service with no id stays valid. */
+  const rawServiceIds = raw.map((r) => r?.serviceId).filter(Boolean);
+  let activeServiceById = new Map();
+  if (rawServiceIds.length) {
+    if (requestType === "PRODUCT") {
+      return { error: "A product request cannot carry a service. Choose Service, or remove the service link." };
+    }
+    if (rawServiceIds.some((id) => !mongoose.isValidObjectId(id))) {
+      return { error: "That service link is not valid." };
+    }
+    const { company, error: companyError } = await theCompany();
+    if (!company) return { error: companyError || "This request has no company, so its service cannot be verified." };
+    const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
+    const found = await Service.find({
+      _id: { $in: rawServiceIds.filter((id) => mongoose.isValidObjectId(id)) },
+      companyId: company._id, status: "ACTIVE",
+    }).select("_id serviceCode name billingUnit").lean();
+    activeServiceById = new Map(found.map((s) => [String(s._id), s]));
+  }
 
   const lines = [];
   let estimatedTotal = 0;
@@ -1478,17 +1516,28 @@ async function buildLines(raw) {
 
   for (const [i, r] of raw.entries()) {
     const at = `Line ${i + 1}`;
+
+    /* Resolve the canonical service for this line, if it carries an id. */
+    let svc = null;
+    if (r?.serviceId) {
+      if (r?.rawItemId) return { error: `${at}: a line cannot be both a catalogue item and a service.` };
+      svc = activeServiceById.get(String(r.serviceId)) || null;
+      if (!svc) return { error: `${at}: that service is unavailable — it may be inactive, removed, or from another company.` };
+    }
+
     const picked = r?.rawItemId ? catalogue.get(String(r.rawItemId)) : null;
     /* The catalogue's name wins over whatever is in the box. They are usually
        the same; when they are not it is because somebody typed over a pick,
-       and the store must issue what was picked. */
-    const name = picked ? picked.name : text(r?.name, 200);
+       and the store must issue what was picked. A matched service's OWN name
+       wins the same way, so a tampered browser name cannot override it. */
+    const name = svc ? svc.name : picked ? picked.name : text(r?.name, 200);
     if (!name) return { error: `${at}: name what you need.` };
 
     const quantity = num(r?.quantity);
     if (quantity === null || quantity <= 0) return { error: `${at}: add a quantity.` };
 
-    const unit = text(r?.unit, 40);
+    /* A matched service's canonical billing unit wins over the browser's. */
+    const unit = svc && svc.billingUnit ? svc.billingUnit : text(r?.unit, 40);
     if (!unit) return { error: `${at}: say what the quantity is in — pieces, metres, hours.` };
 
     const rate = r?.rate === "" || r?.rate === undefined || r?.rate === null ? null : num(r.rate);
@@ -1504,6 +1553,10 @@ async function buildLines(raw) {
       rawItem: picked ? picked._id : null,
       rawItemSku: picked ? picked.sku || "" : "",
       baseUnit: picked ? picked.customUnit || picked.unit || "" : "",
+      /* Canonical service identity, stamped from the RESOLVED record. */
+      service: svc ? svc._id : null,
+      serviceCode: svc ? svc.serviceCode || "" : "",
+      serviceName: svc ? svc.name || "" : "",
       quantity,
       unit,
       ...(rate === null ? {} : { rate }),
@@ -2891,6 +2944,19 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
   const lines = [];
   let totalAmount = 0;
 
+  /* Revalidate the carried service identities ONCE — a master deactivated or
+     moved between intake and classification must not travel forward. The
+     canonical commercial-identity fields (code, billing unit, SAC) are read
+     from the master here, exactly as the manual `/service-lines` match would. */
+  const carriedServiceIds = (doc.items || []).map((l) => l.service).filter(Boolean);
+  const activeCarryServices = carriedServiceIds.length
+    ? new Map(
+        (await require("../../../models/CMS_Models/Inventory/Services/Service")
+          .find({ _id: { $in: carriedServiceIds }, companyId: company._id, status: "ACTIVE" })
+          .select("_id serviceCode name billingUnit sacCode").lean()).map((s) => [String(s._id), s]),
+      )
+    : new Map();
+
   for (const [i, l] of (doc.items || []).entries()) {
     /* ── ONLY THE BALANCE, ON A PARTIAL ─────────────────────────────────
        `buyQty` is what the store could NOT cover off the shelf. Null means
@@ -2954,6 +3020,17 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
       rawItem: perLine?.rawItemId || l.rawItem || null,
       rawItemSku: perLine?.rawItemSku || l.rawItemSku || "",
       baseUnit: l.baseUnit || "",
+      /* ── THE CANONICAL SERVICE IDENTITY TRAVELS TOO ──────────────────────
+         Carried from the intake line the requester started from "Request this
+         service", REVALIDATED (still active, still this company) just above, so
+         Store does not match the same master a second time and the eventual
+         Service Order line opens the exact record. If it no longer resolves,
+         the link is dropped to null and the line becomes an ordinary service
+         line — never a stale or foreign reference. */
+      service: (l.service && activeCarryServices.has(String(l.service))) ? l.service : null,
+      serviceCode: (l.service && activeCarryServices.get(String(l.service))?.serviceCode) || "",
+      billingUnit: (l.service && activeCarryServices.get(String(l.service))?.billingUnit) || "",
+      sacCode: (l.service && activeCarryServices.get(String(l.service))?.sacCode) || "",
       spec: perLine?.spec || l.note || "",
       /* Both names, so finance can see that Store went somewhere other than
          where the requester pointed them — and why. */

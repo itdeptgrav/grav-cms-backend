@@ -111,13 +111,17 @@ bw.instrumentFirestore(admin, db);
    services/allowedOrigins.js. A preview URL or LAN IP no longer needs an
    edit-and-restart. */
 const originCheck = require("./services/allowedOrigins").makeOriginCheck(allowedOrigins);
+const appCors = cors({ origin: originCheck, credentials: true });
 
-app.use(
-  cors({
-    origin: originCheck,
-    credentials: true,
-  }),
-);
+// A BOM decision link is deliberately a public, token-protected HTML form.
+// Mail clients may attach their own Origin when opening it, but that origin is
+// neither a CMS client nor an authority check for this capability URL.
+app.use((req, res, next) => {
+  if (req.path === "/api/public/bom-approval" || req.path.startsWith("/api/public/bom-approval/")) {
+    return next();
+  }
+  return appCors(req, res, next);
+});
 
 app.use(bw.middleware);
 
@@ -149,6 +153,15 @@ if (process.env.BANDWIDTH_ENABLE_GZIP === "1") {
 // `verify` stashes the raw request body so the WhatsApp webhook can validate
 // Meta's X-Hub-Signature-256 HMAC (which must be computed over the exact bytes
 // Meta sent, not the re-serialized JSON). Harmless for every other route.
+/* ── THE MAUTIC WEBHOOK IS PARSED ONLY AFTER ITS SIGNATURE IS CHECKED ───────
+   Mounted ABOVE the global JSON parser on purpose. body-parser skips a request
+   another parser has already consumed, so this claims the marketing webhook path
+   and leaves the bytes as a Buffer for the route to verify before anything reads
+   them. With only the global parser, JSON.parse ran on unauthenticated input
+   first — the signature was still checked against the true bytes via `rawBody`,
+   so nothing forged was ever believed, but parsing untrusted input before
+   authenticating it is work done on an attacker's behalf. */
+app.use("/api/cms/marketing/events", express.raw({ type: "*/*", limit: "1mb" }));
 app.use(express.json({ limit: "50mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
 /* Every 5xx becomes a fingerprinted DevAlert on the developer side — see
    Middlewear/errorWatch.js. Mounted this early so it sees every router below;
@@ -784,6 +797,15 @@ const connectDB = async () => {
   }
 };
 
+/* ─── BOARD WAITS FOR ITS OWN GRANT ───────────────────────────────────────
+ * Armed HERE, before anything is mounted or listening, because the thing being
+ * declared is that this process has a boot sequence Board must wait for. The
+ * seeding block below reports the outcome, and
+ * `services/board/boardReadiness.js` explains what each state answers.
+ * --------------------------------------------------------------------- */
+const boardReadiness = require("./services/board/boardReadiness");
+boardReadiness.arm();
+
 /* ─── BOOT SEEDING ────────────────────────────────────────────────────────
  * Departments are now created and managed from the CEO Access Control screen,
  * so recreating seven of them on every restart is worse than pointless:
@@ -799,13 +821,68 @@ const connectDB = async () => {
  * prints nothing about credentials.
  * --------------------------------------------------------------------- */
 connectDB().then(async () => {
+  /* ── THE WINDOW THIS OPENS, AND WHY IT IS TIMED ──────────────────────────
+     Express is already listening by the time this runs, so everything below
+     happens while requests are being served. In DEVELOPMENT that window is not
+     short: `autoIndex` is on (see `connectDB` above), so Mongoose holds each
+     model's queries until its ~285 declared indexes are confirmed against
+     Atlas — and every line below is such a query. A person who opens the Board
+     app inside that window is told it is still starting, which is true and, with
+     nothing to compare it against, indistinguishable from stuck.
 
-  // Register the department/access tables on whatever database this instance
-  // is pointed at, so moving from local to production needs no manual step.
-  // Strictly additive: it inserts what is missing and modifies nothing that
-  // already exists — no renames, no password changes, no reactivations.
-  const { ensureAccessDepartments } = require("./services/ensureAccessDepartments");
-  await ensureAccessDepartments(mongoose.connection);
+     So it is timed and reported, and the whole thing is inside one `try`:
+     anything that throws marks Board FAILED with a named diagnostic instead of
+     leaving it pending forever with nothing in the log. */
+  const startedAt = Date.now();
+  try {
+    // Register the department/access tables on whatever database this instance
+    // is pointed at, so moving from local to production needs no manual step.
+    // Strictly additive: it inserts what is missing and modifies nothing that
+    // already exists — no renames, no password changes, no reactivations.
+    const { ensureAccessDepartments } = require("./services/ensureAccessDepartments");
+    await ensureAccessDepartments(mongoose.connection);
+
+    /* ── BOARD'S OWN GRANT, BEFORE BOARD ANSWERS ANYTHING ────────────────
+       The Board app reads the `board` department, which the seeder above has
+       just registered. The people who hold Board access today hold it through
+       an active explicit `ceo` role, from when the two applications shared one
+       grant, so those roles are copied across once — see
+       `scripts/migrations/board-department-split.js` for why the compatibility
+       is a migration rather than a `ceo || board` branch in the guard.
+
+       `boardReadiness` holds Board shut until this line returns. Until then a
+       Board request would be told it has no grant, which is untrue and is
+       exactly the report that gets somebody to restore the `ceo` fallback. If
+       the migration refuses, Board stays shut with the reason: no fallback, and
+       nobody's existing access is altered. */
+    const { migrateBoardDepartment } = require("./scripts/migrations/board-department-split");
+    const plan = await migrateBoardDepartment();
+    if (plan.rolesCopied || plan.membershipsAdded || plan.hiddenFromOnboarding) {
+      console.log(
+        `[board] Board access separated from the Executive Office: `
+          + `${plan.rolesCopied} role(s) copied, ${plan.membershipsAdded} membership(s) added. `
+          + `No ceo row was changed.`,
+      );
+    }
+    boardReadiness.markReady();
+    console.log(`[board] Board policy ready in ${Date.now() - startedAt}ms.`);
+  } catch (err) {
+    /* Deliberately not fatal for the rest of the server — HR, Sales, Store and
+       the Executive Office are untouched by this and must keep working. Board
+       alone refuses, with the reason.
+
+       The diagnostic is NAMED (`BOARD_MIGRATION_REFUSED` plus the migration's
+       own outcome code) so it can be searched for and alerted on. A sentence in
+       a boot log is not a diagnostic; somebody has to be able to find this
+       without knowing the wording. */
+    boardReadiness.markFailed(err);
+    console.error(
+      `[board] BOARD_MIGRATION_REFUSED [${err.code || "UNKNOWN"}] after `
+        + `${Date.now() - startedAt}ms — Board policy is unavailable on this database. `
+        + `Board requests answer BOARD_NOT_READY; no access has been changed and no `
+        + `fallback has been applied.\n${err.message}`,
+    );
+  }
 });
 
 /* ─── NO ACCOUNTS ARE SEEDED, DELIBERATELY ─────────────────────────────────
@@ -900,6 +977,46 @@ const CATEGORY_MEASUREMENTS = {
  * is ever wanted again; the account half is what CEO → Access Control is for.
  */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  HR AUTHORISATION CONTRACT — part 1 of 2
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * One guard, five prefixes, and an explicit declaration for every HR endpoint
+ * in services/access/hrRouteContract.js. See Middlewear/hrContract.js for what
+ * it does and why it is mount-level.
+ *
+ * Four things are enforced that a valid session alone never proved:
+ *   1. application access  — an `hr` grant or role, not merely a login;
+ *   2. capability          — reading the directory is not reading pay;
+ *   3. record scope        — self-service cannot name another employee, and a
+ *                            company/factory scope nothing can prove is refused
+ *                            rather than silently answered across all of them;
+ *   4. field projection    — `req.hrAuth.project`, plus a scrub on the way out.
+ *
+ * SPLIT ACROSS TWO PLACES, AND THE SPLIT IS LOAD-BEARING.
+ *
+ * These two prefixes are here because Express walks mounts in registration
+ * order and their routers are mounted below — `/api/ceo/hr` on the very next
+ * line, the `/api/employee/*` routers scattered over the next two thousand.
+ * Neither has a conditionalGet in front of it, so nothing constrains them
+ * further.
+ *
+ * The other three — /api/hr, /hr, /api/employees — are mounted further down,
+ * immediately AFTER conditionalGet. The guard wraps res.json to scrub protected
+ * fields, conditionalGet wraps it to compute an ETag, and the last wrapper
+ * installed is the first one called: mounting the guard second is what makes
+ * the ETag cover the scrubbed bytes. The other way round, two callers with
+ * different capabilities would share an ETag and a 304 could hand one of them
+ * the other's body.
+ *
+ * `/employee/public/:identityId` is declared in the contract but deliberately
+ * NOT guarded: it is a public ID-card lookup, and the declaration exists so the
+ * endpoint matrix and the field tests cover it.
+ */
+const hrContract = require("./Middlewear/hrContract");
+app.use("/api/ceo/hr", hrContract());
+app.use("/api/employee", hrContract());
+
 // CEO Routes
 const ceoHrRoutes = require("./routes/CEO_Routes/hr");
 app.use("/api/ceo/hr", ceoHrRoutes);
@@ -992,6 +1109,20 @@ app.use("/api/hr", conditionalGet);
 app.use("/hr", conditionalGet);
 app.use("/api/employees", conditionalGet);
 app.use("/api/accountant", conditionalGet);
+
+/* ─── HR AUTHORISATION CONTRACT — part 2 of 2 ─────────────────────────────
+ *
+ * The three HR prefixes that sit behind conditionalGet. Mounted AFTER it so the
+ * guard's response scrub is the outer wrapper and the ETag is computed over what
+ * the caller actually receives — see part 1 above for why that ordering is the
+ * whole point. Mounted BEFORE hrAuditTrail and hrWrites so a refusal never
+ * reaches the change log or the approval queue: a write nobody may attempt must
+ * not become a pending request an approver could rubber-stamp. Refusals are
+ * recorded by the guard itself, with the route TEMPLATE rather than the URL, so
+ * an id it declined to disclose does not end up in a log line instead. */
+app.use("/api/hr", hrContract());
+app.use("/hr", hrContract());
+app.use("/api/employees", hrContract());
 
 app.use("/api/hr", hrAuditTrail);
 app.use("/hr", hrAuditTrail);
@@ -1462,6 +1593,37 @@ app.use(
 // then a costing capability. Authentication alone reaches nothing.
 app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
 
+/* ── WHAT EACH DEPARTMENT STILL OWES COSTING ─────────────────────────────
+   Mounted OUTSIDE /api/costings, and gated on a department grant rather than
+   a costing capability — for the same reason the supplier register is: a
+   merchandiser must not need a costing session to be told their own bill of
+   materials is unfinished. Returns presence, never a rate, a supplier or a
+   policy value. */
+app.use("/api/cms/costing-inputs", require("./routes/CMS_Routes/Costing/sourceRequirements"));
+
+/* ── THE BOARD'S OWN POLICY SURFACE ────────────────────────────────────────
+   Company-wide decisions — today, the financing methodology — with a draft,
+   an approval, an effective date and a history. Mounted outside /api/costings
+   because the Board holds no costing capability and should not need one: what
+   money costs is a governance decision, and Central Costing consumes it.
+
+   Gated on the `board` department grant read per request, with no administrator
+   bypass — see services/board/boardAccess.js for why `requireDepartmentRole`
+   is deliberately not used here.
+
+   `requireBoardReady` in front of it, so nothing is answered before the grant it
+   reads has been seeded and migrated. Without it the startup window answers
+   "you have no Board grant" to people who do. */
+app.use("/api/cms/board/policies", boardReadiness.requireBoardReady);
+app.use("/api/cms/board/policies", require("./routes/CMS_Routes/Board/policies"));
+
+/* ── PRODUCTION'S ROUTE AND STANDARD TIME ────────────────────────────────
+   A narrow door onto one array — `techSheet.technical.operations[]` — gated on
+   the project-manager grant. Not on the sample-style router, which is behind a
+   Sales session and carries materials, requirements and the sample lifecycle:
+   a route editor must not share a door with a material substitution. */
+app.use("/api/cms/production/style-route", require("./routes/CMS_Routes/Manufacturing/productionStyleRoute"));
+
 /* ── INDUSTRIAL ENGINEERING'S READ BOUNDARY ──────────────────────────────
    ADR-003 makes IE a department application of its own, separate from PPC and
    from Production. Chunk 1A is its first door and it only READS: a
@@ -1474,7 +1636,6 @@ app.use("/api/costings", require("./routes/CMS_Routes/Costing/costings"));
    given the two departments one grant, which is exactly the ownership
    ambiguity Chunk 0 was written to stop. */
 app.use("/api/cms/ie", require("./routes/CMS_Routes/IndustrialEngineering/ieRoutes"));
-
 
 /* ── MERCHANDISING'S OWN READ DOOR ───────────────────────────────────────
    Mounted ONCE, at its own top-level URL, and gated on the `merchandiser`
@@ -1580,6 +1741,142 @@ app.use("/api/cms/sales/development-requests", require("./routes/CMS_Routes/Sale
    versioned confirmed requirement, on the proven order line, behind Sales'
    own authority. A Merchandising grant opens none of it. */
 app.use("/api/cms/sales/merchandising-handovers", require("./routes/CMS_Routes/Sales/merchandisingHandovers"));
+/* Read-only buyer-approved order brief for one Order Book record. */
+app.use("/api/cms/sales/order-brief", require("./routes/CMS_Routes/OrderBrief/orderBrief"));
+
+/* ── MARKETING ↔ SALES PROSPECT HANDOVER (ADR-004) ───────────────────────
+   Two doors, one per application, and neither writes the other's records.
+
+   The Marketing door carries Mautic's signed webhook and the marketer's
+   submission. It is mounted BEFORE nothing in particular and needs no
+   ordering care except its own: its webhook route installs a raw-body parser
+   for itself, because a signature is over the exact bytes Mautic signed and
+   a re-serialised object is different bytes.
+
+   The Sales door is the handover inbox: accept, return, reject, link a
+   duplicate. Accepting assigns the Prospect to a salesperson; it does not
+   make it an Active Lead. That remains the existing Sales act on the Lead
+   routes, and no route in either of these two touches it. */
+/* ── MOUNTED FIRST, AND WHY ORDER MATTERS HERE ──────────────────────────────
+   Every authenticated Marketing router runs the Marketing guard for EVERY
+   request that reaches it, matched or not, and they share this prefix. A route
+   that must answer without a Marketing session has to be registered before the
+   first of them, or that guard refuses it first.
+
+   Where Google posts a submitted lead form: the ONLY unauthenticated route in
+   Marketing, because Google holds no session and knows nothing about
+   companies. Its trust is a signed route token naming the binding, then a
+   webhook key derived from a deployment master. Nothing in the body is
+   believed before that key verifies — in particular the company, which never
+   comes from a payload. It used to be mounted below the handover router, whose
+   guard answered Google with 401 before the webhook ever ran.
+
+   What this person may do in Marketing, and why not: answered even to somebody
+   the guard would refuse, because they are the person who needs the reason. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/googleLeadWebhook"));
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/access"));
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/marketingHandovers"));
+/* The read-only operator view of marketing synchronisation. Its own router
+   rather than more routes on the handover one: that file is the handover
+   contract and its test asserts its exact route list, so adding a route there is
+   a deliberate act. Same mount prefix, same Marketing auth, same company
+   boundary. Every route is a GET — draining the retry backlog is a named service
+   operation, not something a page view can trigger. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/dataHealth"));
+/* Website tracking configuration: the container, measurement and pixel
+   identifiers a company's PUBLIC site will later be told about. Nothing it
+   serves is ever loaded in GRAV, and nothing it stores is a provider secret.
+   Reading is open to Marketing; changing it needs an administrator, which is a
+   narrower rule than the middleware's allowlist and therefore lives in the
+   router. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/trackingIntegrations"));
+/* The read-only Mautic content inventory: which emails, forms and landing pages
+   exist. Every route is a GET and the client behind them is GET-only against a
+   closed table of three endpoints — Mautic owns content storage, editing,
+   publishing and sending, and GRAV reads a catalogue. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/contentInventory"));
+/* The content planner: planned content items and their calendar. A planning
+   record only; it creates, schedules, sends and publishes nothing. It reads the
+   content library above only to confirm a linked asset exists. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/contentPlan"));
+/* The creative media library: images for planned social content, behind an
+   authenticated preview. It publishes and approves nothing; the advertising
+   image library and the Campaign Builder are separate and untouched. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/creativeMedia"));
+/* Advertising channels: Google Ads and Meta Ads connection state, campaign
+   inventory and campaign performance, plus Google Analytics reporting. Every
+   route is a GET, the three provider adapters expose named read operations only,
+   and the shared HTTP core refuses any verb that could change something in an
+   advertising account. Campaign creation arrives in a later chunk as paused
+   drafts and will need a new route rather than a new method here.
+
+   Mounted after the other Marketing routers and on the same prefix, so one
+   request resolves one company through the shared memo key. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/advertisingChannels"));
+/* GRAV campaign plans: write, submit, approve. These are GRAV DOCUMENTS — no
+   provider adapter is reachable from this router and `approved` creates nothing
+   in any advertising account, commits no budget and starts no spending. Marketing
+   writes and submits; an administrator decides; Sales has no part in it. The
+   deployment step that would make an approved plan real is the router mounted
+   directly below, with its own route, its own record and its own authority. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/campaignDrafts"));
+
+/* Google's lead-form webhook is mounted ABOVE the handover router — see the
+   note there. */
+
+/* Whether GRAV has missed any lead-form enquiry, and an administrator's "check
+   now". Company from the session; accepts no account, campaign, form or query. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/leadRecovery"));
+
+/* The enquiries inbox: recorded lead-form submissions and what processing has
+   done with each. Read only; company from the session; writes no Sales record. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/enquiries"));
+/* IndiaMART as a lead source: read-only connection status for Marketing, and an
+   administrator's Check now that pulls one bounded window into the enquiries
+   inbox. The key stays in the server environment. Creates nothing in Sales. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/leadSources"));
+
+/* What each campaign type can and cannot do. A declaration the campaign builder
+   reads at runtime, so the form and the backend cannot disagree about which
+   settings a channel actually applies. It describes; it permits nothing, and it
+   offers no control that starts a campaign. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/campaignCapabilities"));
+
+/* The marketer's landing page. One read, assembled from records GRAV already
+   holds: it contacts no advertising channel, asks no model anything and writes
+   nothing. Mounted before the narrower campaign routers because it answers a
+   different question — what the whole company's marketing did — rather than
+   anything about one plan. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/marketingOverview"));
+
+/* The Campaign Health Adviser. Reading costs nothing and contacts nobody;
+   generating is an explicit action by a Marketing user, behind the
+   provider-neutral GRAV AI gateway — the only model caller on the Marketing
+   surface (older CMS modules still call models directly; consolidating them is
+   separate migration work). Nothing the assistant says can change a campaign,
+   an advertising account or a Sales record — it produces words and citations. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/campaignIntelligence"));
+
+/* What a campaign actually did. Reading a report contacts nobody — it assembles
+   observations GRAV already stored — and the separate refresh route reads the
+   advertising channels and writes only GRAV's own records. Nothing here can
+   change, pause or start an external campaign. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/campaignPerformance"));
+
+/* The advertising image library. Bytes arrive as bytes — no route here accepts
+   a URL, a storage identifier or a channel's own image hash — and uploading
+   stores a picture without making it deployable: that needs a separate decision
+   by somebody other than the uploader. Storage is the existing company Drive. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/advertisingAssets"));
+
+/* Advertising account binding, deployment preflight and PAUSED creation. The one
+   router in GRAV that changes anything in an advertising account, and everything
+   it creates is created stopped — there is no activation route here or anywhere
+   else, and the write client refuses any payload that could let an object
+   deliver. Mounted after the plan router because both share the
+   `/campaign-drafts/:id` prefix and this one's paths are strictly longer. */
+app.use("/api/cms/marketing", require("./routes/CMS_Routes/Marketing/campaignDeployment"));
+app.use("/api/cms/sales/marketing-handovers", require("./routes/CMS_Routes/Sales/marketingHandovers"));
 
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
@@ -1604,11 +1901,26 @@ app.use("/api/cms/services", serviceRoutes);
 
 // Products Category
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
+/* ── SUPPLIER OFFERS ARE STORE'S MASTER ──────────────────────────────────
+   Mounted in the Store/Inventory namespace, not under /api/costings. A
+   storekeeper must not need a costing session to open their own supplier
+   register — which is what the first mount required. */
+app.use("/api/cms/inventory/supplier-offers", require("./routes/CMS_Routes/Inventory/Sourcing/supplierOffers"));
+/* Beside the register, because a quotation and the decision to use it are the
+   same commercial act at two moments. */
+app.use("/api/cms/inventory/sourcing-decisions", require("./routes/CMS_Routes/Inventory/Sourcing/sourcingDecisions"));
+/* The services counterpart. A separate register because a service is billed in
+   units the Unit Master deliberately does not hold — see the model header. */
+app.use("/api/cms/inventory/service-offers", require("./routes/CMS_Routes/Inventory/Sourcing/serviceOffers"));
+app.use("/api/cms/inventory/freight-offers", require("./routes/CMS_Routes/Inventory/Sourcing/freightOffers"));
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
 // ✅ Sibling route — no conflict
 const stockAdjRoutes = require("./routes/CMS_Routes/Inventory/Products/stockAdjustments");
 app.use("/api/cms/inventory/stock-adjustments", stockAdjRoutes);
+
+// Warehouse Stock Count V1 — cycle count → review variance → post one correction.
+app.use("/api/cms/inventory/stock-counts", require("./routes/CMS_Routes/Inventory/Operations/stockCountRoutes"));
 
 const rawItemBarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/rawItemBarcodeRoutes");
 app.use(
@@ -1626,6 +1938,14 @@ const workerWorkOrderRoutes = require("./routes/CMS_Routes/Store/workerWorkOrder
 app.use("/api/cms/store/work-orders-worker", workerWorkOrderRoutes);
 const storepurchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrderRoutes");
 app.use("/api/cms/store/purchase-orders", storepurchaseOrderRoutes);
+// Store → Finished Products & BOM (read-only bridge over the legacy StockItem
+// catalogue; single-company only, writes nothing).
+const storeProductsRoutes = require("./routes/CMS_Routes/StorePurchase/storeProducts");
+app.use("/api/cms/store/products", storeProductsRoutes);
+// Store → Goods Receipts register + detail (read-only views over the
+// authoritative GoodsReceipt documents; creation lives on the PO route).
+const goodsReceiptsRoutes = require("./routes/CMS_Routes/StorePurchase/goodsReceipts");
+app.use("/api/cms/store/goods-receipts", goodsReceiptsRoutes);
 
 // Operations Category
 /* Store & Purchase — Chunk 1. Tenant context, capabilities and the immutable
@@ -1654,6 +1974,12 @@ app.use(
 // Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
+// Operational home — company-scoped work queues (Store & Purchase Chunk 10A).
+const overviewOperationsRoutes = require("./routes/CMS_Routes/Inventory/overview/operations");
+app.use("/api/cms/inventory/overview/operations", overviewOperationsRoutes);
+// Stock exceptions — company-scoped inventory-integrity queues (Chunk 10B).
+const stockExceptionsRoutes = require("./routes/CMS_Routes/Inventory/overview/stockExceptions");
+app.use("/api/cms/inventory/overview/stock-exceptions", stockExceptionsRoutes);
 
 // Inventory Chatbot (Store Assistant) — PM-facing Q&A over live inventory data
 const inventoryChatbotRoutes = require("./routes/CMS_Routes/Inventory/chatbot/inventoryChatbot.routes");
@@ -1719,6 +2045,14 @@ app.use(
 app.use(
   "/api/cms/production/pdf-settings",
   require("./routes/CMS_Routes/Manufacturing/productionPdfSettingsRoutes"),
+);
+
+/* Production answers PPC's sewing target here — its own door, with its own
+   company scope and `project-manager` role rules, deliberately NOT inside the
+   ungated /api/cms/manufacturing/manufacturing-orders router below. */
+app.use(
+  "/api/cms/manufacturing/production/sewing-targets",
+  require("./routes/CMS_Routes/Manufacturing/Production/sewingTargetRoutes"),
 );
 
 // Manufacturing Routes
@@ -1844,6 +2178,20 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionSupervisorWrites("machine layout"), productionMachineLayout);
 
+/* Packaging & Dispatch answers PPC's packing target here — its own door, with
+   its own company scope and `packaging-dispatch` role rules.
+
+   Both this router and the execution router below are now guarded (see
+   routes/.../Packaging/packagingAccess.js), but their rules are deliberately
+   not the same: this door resolves `packaging-dispatch` alone and fails
+   closed, while the execution routes let a project-manager or ceo viewer READ
+   the floor. Mounted BEFORE the execution router so this prefix resolves
+   here and never falls through to the wider read rule. */
+app.use(
+  "/api/cms/manufacturing/packaging/packing-targets",
+  require("./routes/CMS_Routes/Manufacturing/Packaging/packingTargetRoutes"),
+);
+
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
 
@@ -1880,6 +2228,15 @@ app.use(
 
 const salesOverview = require("./routes/CMS_Routes/Sales/dashboard");
 app.use("/api/cms/sales/overview", salesOverview);
+
+/* ── PRODUCTION COST CLOSEOUT (Chunk 8C) ───────────────────────────────────
+   What a work order actually produced and what became of its material. It
+   records evidence for costing and moves nothing: no stock, no voucher, no
+   payroll, no costing version. */
+app.use(
+  "/api/cms/production-closeout",
+  require("./routes/CMS_Routes/Manufacturing/Production/productionCloseout"),
+);
 
 const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", salesWrites("quotation"), quotationRoutes);
@@ -2087,9 +2444,21 @@ app.use(
   "/api/accountant/eway-bill",
   require("./routes/Accountant_Routes/Acc_ewayBill"),
 );
+// Registered BEFORE the vendors router: that router's `GET /:id` matches any
+// single segment and would otherwise swallow "/reports" as a vendor id.
+app.use(
+  "/api/accountant/vendors/reports",
+  require("./routes/Accountant_Routes/Acc_vendorReports"),
+);
 app.use(
   "/api/accountant/vendors",
   require("./routes/Accountant_Routes/Acc_vendors"),
+);
+// Registered BEFORE the customers router: that router's `GET /:customerId`
+// matches any single segment and would otherwise swallow "/reports".
+app.use(
+  "/api/accountant/customers/reports",
+  require("./routes/Accountant_Routes/Acc_customerReports"),
 );
 app.use(
   "/api/accountant/customers",
@@ -2273,6 +2642,14 @@ const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
 // Import the cutting master routes
+/* Cutting's own resources — its tables, shifts and crew. Mounted BEFORE the
+   cutting-master router below so this prefix resolves here; PPC reads them
+   only through its own preview, never through this door. */
+app.use(
+  "/api/cms/manufacturing/cutting-master/resources",
+  require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingResourceRoutes"),
+);
+
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
@@ -3152,21 +3529,24 @@ app.post("/api/cms/production/sync/manual", async (req, res) => {
   }
 });
 
-app.post("/api/cms/production/cleanup/manual", async (req, res) => {
-  try {
-    await productionSyncService.manualCleanup();
-    res.json({
-      success: true,
-      message: "Manual cleanup completed successfully",
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error during manual cleanup",
-      error: error.message,
-    });
-  }
-});
+/* ── S0a: THE MANUAL CLEANUP TRIGGER IS GONE, DELIBERATELY ─────────────────
+   `POST /api/cms/production/cleanup/manual` used to run
+   `productionSyncService.manualCleanup()`, which `deleteMany`s ProductionTracking
+   day documents older than 15 days whose scans all belong to completed work
+   orders, and strips those scans out of mixed documents. It had no auth guard,
+   so any caller could destroy the raw scan evidence Chunk 9 would compare
+   against — and completed orders are exactly the ones worth comparing.
+
+   Not guarded — removed. A guard would still leave evidence deletion one grant
+   away, and nothing needs it: no frontend, script or CI job calls it, and the
+   production traffic record (bandwidth_samples, 2026-08-29 to 2026-09-21) shows
+   no call. `manualCleanup()` stays in the service, unreachable over HTTP, until a
+   retention policy decides what may be deleted and by whom.
+
+   The scheduled 02:00 run stays off as well: `productionSyncService.initialize()`
+   is still commented out above. Do not re-enable it without that policy.
+
+   Pinned by test/production/s0-security-containment.test.js. */
 
 app.get("/api/app/version", (req, res) => {
   res.json({
@@ -3471,6 +3851,54 @@ server.listen(PORT, () => {
     }
   }, 5 * 60 * 1000);
 
+  /* Google lead form processing that stopped part-way — GRAV answered Google
+     and then restarted before processing began. The receipt written with each
+     enquiry is the durable instruction; this finds unfinished ones (and any
+     enquiry whose receipt was never written) and finishes them. Idempotent, so
+     two instances running it at once produce one set of effects. The 60-day
+     read-back from Google is NOT scheduled here: it needs a campaign GRAV has
+     created, which is a later chunk. */
+  let _leadRecoveryRunning = false;
+  const leadRecovery = setInterval(async () => {
+    if (_leadRecoveryRunning) return;
+    _leadRecoveryRunning = true;
+    try {
+      if (!(await require("./services/jobRegistry").isEnabled("marketing-lead-recovery"))) return;
+      const out = await require("./services/marketing/leads/leadRecovery.service").sweepAll();
+      const done = out.results.reduce((n, r) => n + r.completed, 0);
+      if (done) console.log(`[lead-recovery] finished ${done} enquiries across ${out.companies} companies`);
+    } catch (e) {
+      console.warn("[lead-recovery]", String(e?.message || "").slice(0, 160));
+    } finally {
+      _leadRecoveryRunning = false;
+    }
+  }, 5 * 60 * 1000);
+  if (typeof leadRecovery.unref === "function") leadRecovery.unref();
+
+  /* Google lead reconciliation: reads Google's 60-day record for enquiries the
+     webhook never delivered. A DIFFERENT job from the one above — that one
+     finishes processing GRAV already owes and never contacts Google. Idle until
+     a company has a bound lead form; bounded per cycle; switchable through the
+     `marketing-lead-reconciliation` job flag; never throws. */
+  const leadReconciliation = setInterval(() => {
+    void require("./services/marketing/leads/leadReconciliationScheduler").runCycle();
+  }, require("./constants/marketingLeadProcessing").RECOVERY.SCHEDULE_EVERY_MS);
+  if (typeof leadReconciliation.unref === "function") leadReconciliation.unref();
+
+  /* IndiaMART lead source: the normal way its enquiries arrive. Pulls one
+     bounded window (never more than IndiaMART's one call in 5 minutes — the
+     fence is the source's state row, shared by every instance), then routes
+     genuine buyer enquiries to Sales through the existing Marketing handover
+     and retries undelivered handovers. Idle without a key for
+     MARKETING_COMPANY_ID; switchable through the `marketing-indiamart-pull`
+     job flag; never throws. A first cycle a minute after boot catches up
+     after downtime without waiting a full interval. */
+  const runIndiamartCycle = () => void require("./services/integration/indiamartScheduler").runCycle();
+  const indiamartBoot = setTimeout(runIndiamartCycle, 60 * 1000);
+  if (typeof indiamartBoot.unref === "function") indiamartBoot.unref();
+  const indiamartCycle = setInterval(runIndiamartCycle, require("./constants/marketingIndiamart").SCHEDULE.EVERY_MS);
+  if (typeof indiamartCycle.unref === "function") indiamartCycle.unref();
+
   let _timerSopLastRunDate = null;
   setInterval(
     async () => {
@@ -3500,4 +3928,3 @@ server.listen(PORT, () => {
   );
   console.log("✅ Timer SOP daily finalize cron initialized (runs ~00:15 IST)");
 });
-

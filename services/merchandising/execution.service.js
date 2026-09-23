@@ -183,6 +183,23 @@ function handoverView(version, receipt) {
     packingRequirement: str(p.packingRequirement),
     testingRequirement: str(p.testingRequirement),
     deliveryRequirement: str(p.deliveryRequirement),
+    /* The buyer's special-process requirement Sales stated for this line, with
+       the buyer approval each definite answer rests on. Read-only here; null
+       on a version that states none, which is never "not required". */
+    processRequirements: Array.isArray(p.processRequirements?.processes)
+      ? {
+        statedAt: p.processRequirements.statedAt || null,
+        processes: p.processRequirements.processes.map((r) => ({
+          process: str(r.process), otherLabel: str(r.otherLabel), requirement: str(r.requirement),
+          buyerSpecification: str(r.buyerSpecification),
+          evidence: r.evidence ? {
+            label: "Buyer-approved order (PO)", poNumber: str(r.evidence.poNumber),
+            poDate: r.evidence.poDate || null, approvedAt: r.evidence.approvedAt || null,
+            approvalRevision: r.evidence.approvalRevision ?? null, documentName: str(r.evidence.documentName),
+          } : null,
+        })),
+      }
+      : null,
     receiptState: computeReceiptState(version, receipt),
     clarification: receipt?.state === "CLARIFICATION_REQUESTED"
       ? {
@@ -864,11 +881,28 @@ async function countOpenChangesFor(ctx, files) {
   ]));
 }
 
-async function getFile(ctx, { id } = {}) {
+/**
+ * The one place a file is proved to belong to the acting company.
+ *
+ * ── MISSING AND FOREIGN ARE THE SAME ANSWER ─────────────────────────────────
+ * A malformed id, an id nobody has, and an id belonging to somebody else all
+ * raise the identical NOT_FOUND. Any difference between them would let a
+ * stranger enumerate other companies' files by reading the refusal.
+ *
+ * Read-only and un-shaped: callers that need the record itself — not the view
+ * — go through here rather than opening their own query, so there is one
+ * ownership rule and not one per feature.
+ */
+async function loadOwnedFile(ctx, id) {
   assertContext(ctx);
   if (!isId(id)) throw fail("NOT_FOUND", "Execution file not found.");
   const file = await ExecutionFile.findOne({ _id: id, companyId: ctx.companyId }).lean();
   if (!file) throw fail("NOT_FOUND", "Execution file not found.");
+  return file;
+}
+
+async function getFile(ctx, { id } = {}) {
+  const file = await loadOwnedFile(ctx, id);
   const units = await ExecutionUnit.find({ fileId: file._id }).sort({ unitDiscriminator: 1 }).lean();
   return { file: fileView(file, { units }) };
 }
@@ -1191,7 +1225,9 @@ async function executionOverview(ctx) {
        figure nobody can act on. A plan-less company simply counts zero. */
     TnaMilestone.countDocuments({
       companyId: ctx.companyId,
-      status: { $in: ["OVERDUE", "FORECAST_LATE"] },
+      /* The at-risk definition, shared with the register view this figure
+         opens — see tnaPortfolio.service. */
+      status: { $in: [...require("./tnaPortfolio.service").AT_RISK_STATUSES] },
     }),
     /* ── M6 ────────────────────────────────────────────────────────────
        Packs sent downstream and not yet decided on. Counted from the PACK,
@@ -1244,6 +1280,6 @@ module.exports = {
   computeReceiptState, deriveUnits, handoverView, fileView,
   listHandovers, countPendingHandovers, getHandover,
   acceptHandover, requestClarification,
-  listFiles, getFile, patchFile, assignFile, moveLifecycle,
+  listFiles, getFile, loadOwnedFile, patchFile, assignFile, moveLifecycle,
   fileHistory, executionOverview, listCompaniesFor,
 };

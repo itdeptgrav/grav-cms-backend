@@ -430,7 +430,7 @@ describe("required-machine compatibility", () => {
 
     expect(res.status).toBe(200);
     const stations = res.body.layout.stations;
-    expect(stations[0].plannedMachineTypes).toEqual([{ machineType: "snls", quantity: 1 }]);
+    expect(stations[0].plannedMachineTypes).toEqual([{ machineType: "snls", quantity: 1, slotId: expect.stringMatching(/^slt_/), position: null }]);
     expect(stations[0].assignments[0].machineTypeCompatibility).toMatchObject({
       state: "COMPATIBLE", reason: "STATION_PLANS_REQUIRED_MACHINE_TYPES",
       requiredMachineTypes: [{ machineType: "SNLS", quantity: 1 }], missingMachineTypes: [],
@@ -777,7 +777,7 @@ describe("evidence and supersession", () => {
       stations: [{ stationId: saved.body.layout.stations[0].stationId, assignments: [{ rowId: w.rows[0].rowId }] }],
     });
     expect(omitted.body.updated).toBe(true);
-    expect(omitted.body.layout.stations[0].plannedMachineTypes).toEqual([{ machineType: "SNLS", quantity: 1 }]);
+    expect(omitted.body.layout.stations[0].plannedMachineTypes).toEqual([{ machineType: "SNLS", quantity: 1, slotId: expect.stringMatching(/^slt_/), position: null }]);
 
     const changedPlan = await patchLayout(w.maker, w, layout.layoutId, {
       expectedRevision: omitted.body.layout.revision,

@@ -11,6 +11,8 @@
 //   - profile.avatar field handled on create + update
 
 const express = require("express");
+const mongoose = require("mongoose");
+const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Customer = require("../../../models/Customer_Models/Customer");
@@ -307,7 +309,7 @@ router.get("/stock-items/search", salesAuth, async (req, res) => {
 router.get("/for-account/:accountId", salesAuth, async (req, res) => {
   try {
     const Account = require("../../../models/CMS_Models/Sales/Account");
-    const account = await Account.findById(req.params.accountId)
+    const account = await Account.findOne(await scoped(req, { _id: req.params.accountId }))
       .select("companyName displayName normalizedName linkedCustomer")
       .populate("linkedCustomer", "name email phone customerId profile.companyName isActive")
       .lean();
@@ -316,10 +318,10 @@ router.get("/for-account/:accountId", salesAuth, async (req, res) => {
     const accountName = account.displayName || account.companyName || "";
 
     if (account.linkedCustomer) {
-      const sharedWith = await Account.find({
+      const sharedWith = await Account.find(await scoped(req, {
         _id: { $ne: account._id },
         linkedCustomer: account.linkedCustomer._id,
-      }).select("companyName displayName").lean();
+      })).select("companyName displayName").lean();
       return res.json({
         success: true,
         customer: account.linkedCustomer,
@@ -919,6 +921,7 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
   try {
     const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
     const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+    const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
     const customer = await Customer.findById(req.params.id)
       .select("name email phone profile customerId")
       .lean();
@@ -980,8 +983,20 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
         });
       }
       if (!validatedVariants.length) continue;
+      let sampleStyleId = null;
+      if (item.sampleStyleId && mongoose.Types.ObjectId.isValid(String(item.sampleStyleId))) {
+        const style = await SampleStyle.findById(item.sampleStyleId)
+          .select("production.stockItemId")
+          .lean();
+        // A style may only be carried where it is already linked to this exact
+        // finished item. A customer request cannot invent a commercial link.
+        if (style && String(style.production?.stockItemId || "") === String(stockItem._id)) {
+          sampleStyleId = style._id;
+        }
+      }
       validatedItems.push({
         stockItemId: stockItem._id,
+        sampleStyleId,
         stockItemName: stockItem.name,
         stockItemReference: stockItem.reference,
         variants: validatedVariants,

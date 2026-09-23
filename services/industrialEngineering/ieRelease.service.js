@@ -635,6 +635,24 @@ function freezeAggregate({ version, layout, standard, metrics, published }) {
     },
     ramp: published.ramp,
 
+    /* ── THE APPROVED PROCESS ROUTE, WHEN THE VERSION HAS ONE ─────────────
+       Spread in only when present. The aggregate fingerprint canonicalises
+       every key, an undefined one included, so writing `processRoute:
+       undefined` would move the fingerprint of every route-less aggregate and
+       mint a new release version for a change nobody made. Present, it is part
+       of the fingerprint, so an approved route change is a new release. */
+    ...(version.processRoute?.stages?.length
+      ? { processRoute: { stages: version.processRoute.stages.map((st) => ({
+        stageId: st.stageId, sequence: st.sequence, process: st.process, label: st.label || "",
+        applicability: st.applicability, predecessorStageIds: [...(st.predecessorStageIds || [])],
+        /* The approved technical standard travels with its stage, verbatim.
+           Part of the fingerprint like everything else here, so changing a
+           standard and re-approving mints a NEW release — and a plan frozen
+           to the old one keeps the figures it was planned against. */
+        ...(st.technicalStandard ? { technicalStandard: { ...st.technicalStandard } } : {}),
+      })) } }
+      : {}),
+
     capturedAt: new Date(),
   };
 }
@@ -965,7 +983,58 @@ function publishRelease(doc, { supersededVersionNo = null } = {}) {
   };
 }
 
+/**
+ * WHAT IE PUBLISHES ABOUT ONE STYLE'S CURRENT ENGINEERING RELEASE.
+ *
+ * ── WHY IT IS HERE AND NOT IN THE CALLER ────────────────────────────────────
+ * Merchandising's Pre-Production Meeting has to record WHICH engineering
+ * release was on the table. The link from a style to a release runs through
+ * `IeStyleFile`, which is IE's own record, and a consumer joining those two
+ * collections itself would be a second application that knows IE's internal
+ * shape — and would keep answering the old question the day IE changes it.
+ *
+ * So IE says it. Identity and state only: the reference, the version, whether
+ * it still stands and who issued it. No bulletin rows, no SAM, no station
+ * layout, no fingerprint — a consumer that needs the contents opens the
+ * release through IE's own door, which is where the authorisation for that
+ * lives.
+ *
+ * Returns `null` where this style has no IE file or no issued release, which
+ * is a real answer: plenty of orders are made before IE has released anything,
+ * and a caller must be able to say so rather than show a blank.
+ */
+async function currentReleaseForStyle(ctx, { sampleStyleId } = {}) {
+  assertContext(ctx);
+  if (!isId(sampleStyleId)) return null;
+
+  const file = await IeStyleFile.findOne({
+    companyId: ctx.companyId, sampleStyleId: oid(sampleStyleId),
+  }).select("_id").lean();
+  if (!file) return null;
+
+  /* The one in force. A withdrawn or superseded release is not what a meeting
+     reviewed, and offering it as "current" would be a lie by omission. */
+  const doc = await IeRelease.findOne({
+    companyId: ctx.companyId, ieStyleFileId: file._id, state: STATE.ISSUED,
+  }).sort({ versionNo: -1 })
+    .select("_id releaseRef versionNo state issuedAt issuedByName supersededByVersionNo updatedAt")
+    .lean();
+  if (!doc) return null;
+
+  return {
+    releaseId: String(doc._id),
+    releaseRef: str(doc.releaseRef),
+    versionNo: doc.versionNo,
+    state: str(doc.state),
+    issuedAt: doc.issuedAt || null,
+    issuedByName: str(doc.issuedByName),
+    supersededByVersionNo: doc.supersededByVersionNo ?? null,
+    updatedAt: doc.updatedAt || null,
+  };
+}
+
 module.exports = { SCOPE, BODY_FIELDS, OVERRIDE_FIELDS, REFUSED_FIELDS,
+  currentReleaseForStyle,
   issueRelease, publishRelease, freezeAggregate, proveOperations, readOverrides, releaseRefFor,
   resolveAggregate, sameFrozenRows, refuseUnknown, normalize, event,
   aggregateFingerprintOf, requestHashOf, transactionsAvailable,

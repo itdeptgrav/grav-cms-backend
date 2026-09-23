@@ -53,7 +53,7 @@ const {
   MerchandisingOutboxEvent, MerchandisingIntakeLedger, OUTBOX_KIND,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 const {
-  ensureProductLineIdentities, carryProductLineIdentities, PRODUCT_LINE_REF_PATTERN,
+  ensureProductLineIdentities, reconcileProductLineIdentities, PRODUCT_LINE_REF_PATTERN,
 } = require("../../models/CMS_Models/Sales/enquiryProductLineIdentity");
 
 let server, base, salesBase, rs, seq = 0;
@@ -226,24 +226,40 @@ describe("a Journey product line has a permanent name", () => {
     expect(after.products.map((p) => p.productLineRef)).toEqual([held[1], held[0]]);
   });
 
-  test("a rebuilt row carries its identity when the payload names it", () => {
+  /* These two used to assert a PRODUCT-NAME fallback: an unnamed "Polo" row
+     inherited the first unclaimed "Polo" line's reference, and a forged
+     reference was silently swapped for that name match. One enquiry carries
+     "Polo" twice as two development jobs, so a name match hands one line's
+     Development File to the other. Identity is now the reference alone (G01);
+     see test/crm/enquiry-product-identity.route.test.js for the route. */
+  test("a rebuilt row carries its identity only when the payload names it", () => {
     const existing = [
       { productLineRef: "PL-aaaaaaaaaaaa", product: "Polo" },
       { productLineRef: "PL-bbbbbbbbbbbb", product: "Tee" },
     ];
-    const rebuilt = [{ productLineRef: "PL-bbbbbbbbbbbb", product: "Tee" }, { product: "Polo" }];
-    carryProductLineIdentities(existing, rebuilt);
-    expect(rebuilt[0].productLineRef).toBe("PL-bbbbbbbbbbbb");
-    /* Pass 2: matched back by product name, in order. */
-    expect(rebuilt[1].productLineRef).toBe("PL-aaaaaaaaaaaa");
+    /* Reordered and renamed — both rows still name their own line. */
+    const rebuilt = [
+      { productLineRef: "PL-bbbbbbbbbbbb", product: "Tee" },
+      { productLineRef: "PL-aaaaaaaaaaaa", product: "Polo (navy)" },
+    ];
+    const verdict = reconcileProductLineIdentities(existing, rebuilt);
+    expect(verdict.ok).toBe(true);
+    expect(rebuilt.map((r) => r.productLineRef)).toEqual(["PL-bbbbbbbbbbbb", "PL-aaaaaaaaaaaa"]);
+
+    /* An unnamed row beside a missing held line is NOT matched by name. */
+    const stale = reconcileProductLineIdentities(existing, [
+      { productLineRef: "PL-bbbbbbbbbbbb", product: "Tee" }, { product: "Polo" },
+    ]);
+    expect(stale.ok).toBe(false);
+    expect(stale.code).toBe("PRODUCT_LINES_STALE");
   });
 
   test("a client cannot invent one the enquiry does not hold", () => {
     const existing = [{ productLineRef: "PL-aaaaaaaaaaaa", product: "Polo" }];
-    const rebuilt = [{ productLineRef: "PL-ffffffffffff", product: "Polo" }];
-    carryProductLineIdentities(existing, rebuilt);
-    /* The guessed value is discarded and the real one matched by name. */
-    expect(rebuilt[0].productLineRef).toBe("PL-aaaaaaaaaaaa");
+    const verdict = reconcileProductLineIdentities(existing, [{ productLineRef: "PL-ffffffffffff", product: "Polo" }]);
+    /* Refused — not quietly replaced with a same-named line. */
+    expect(verdict.ok).toBe(false);
+    expect(verdict.code).toBe("PRODUCT_LINE_REF_UNKNOWN");
   });
 
   test("a duplicate reference is refused, never quietly repaired", () => {

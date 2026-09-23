@@ -9,6 +9,7 @@
 // Buying house, brand, billing party and consignee are NOT stored as free text
 // here — each is its own Account, connected through CRMAccountRelationship.
 const mongoose = require("mongoose");
+const { companyOwnershipFields, addCompanyIndexes, sealCompanyOwnership } = require("./companyOwnership");
 const {
   ACCOUNT_ROLE_CODES,
   ACCOUNT_STATUS_CODES,
@@ -161,6 +162,12 @@ garmentSalesProfileSchema.pre("validate", function (next) {
 
 const accountSchema = new mongoose.Schema(
   {
+    /* ── COMPANY OWNERSHIP (Chunk 3B1) ────────────────────────────────────
+       Server-derived at creation, never from the request. See
+       models/CMS_Models/Sales/companyOwnership.js for the hierarchy and why
+       every level carries the company directly rather than through a join. */
+    ...companyOwnershipFields(),
+
     accountId: { type: String, unique: true },
 
     // Company Info
@@ -372,4 +379,12 @@ accountSchema.pre("findOneAndUpdate", function (next) {
   next();
 });
 
+/* Company-prefixed indexes for the scoped list and lookup patterns. */
+addCompanyIndexes(accountSchema, [{ "accountId": 1 }, { "companyName": 1 }, { "status": 1, "updatedAt": -1 }]);
+
+
+/* Ownership is stamped once, at creation, from the server-resolved company.
+   Nothing after that — a PATCH, an archive, a replacement — may move it.
+   See sealCompanyOwnership() in ./companyOwnership.js. */
+sealCompanyOwnership(accountSchema);
 module.exports = mongoose.model("CRMAccount", accountSchema);

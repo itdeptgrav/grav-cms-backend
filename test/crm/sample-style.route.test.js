@@ -11,11 +11,20 @@
 const express = require("express");
 const mongoose = require("mongoose");
 
-jest.mock("../../Middlewear/SalesAuthMiddlewear", () => (req, res, next) => {
-  const raw = req.headers["x-test-user"];
-  if (!raw) return res.status(401).json({ success: false, message: "Authentication required." });
-  req.user = JSON.parse(raw);
-  next();
+/* The route widens the guard with `withRoles(RND_ROLES)` so R&D can reach its
+   own screens. A bare function has no `withRoles`, so requiring the route threw
+   before a single test ran — the mock has to offer the same shape the real
+   middleware does. */
+jest.mock("../../Middlewear/SalesAuthMiddlewear", () => {
+  const mw = (req, res, next) => {
+    const raw = req.headers["x-test-user"];
+    if (!raw) return res.status(401).json({ success: false, message: "Authentication required." });
+    req.user = JSON.parse(raw);
+    next();
+  };
+  mw.withRoles = () => mw;
+  mw.RND_ROLES = [];
+  return mw;
 });
 
 const Account = require("../../models/CMS_Models/Sales/Account");
@@ -67,6 +76,20 @@ async function makeJourneyWithProducts(products) {
   });
   return { ref, journey, acc };
 }
+
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Account, Lead and Contact creation now refuses unless the actor's company is
+ * provable. These suites are not about tenancy, so they seed the simplest
+ * thing that makes ownership provable: a single company, which is the
+ * documented deployment fallback. Without it every creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
 
 describe("GET /by-journey/:ref — get-or-create from enquiry products", () => {
   test("creates one SampleStyle per product, snapshots the brief, is idempotent", async () => {

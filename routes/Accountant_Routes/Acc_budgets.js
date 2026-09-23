@@ -37,6 +37,20 @@ const roundNames = require("../../services/budgetRoundName.service");
 const subWindow = require("../../services/budgetSubmissionWindow.service");
 const classification = require("../../services/budgetClassification.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(AccountantAuthMiddleware.accountantAuth);
 
 /**
@@ -411,7 +425,7 @@ async function filterByDepartment(budgets, department, req) {
 }
 
 /* ── LIST ────────────────────────────────────────────────────────────────── */
-router.get("/", async (req, res) => {
+router.get("/", companyScopeOptional, async (req, res) => {
   try {
     const { financialYear, status, period, department, scope, withTotals } = req.query;
     const filter = {};
@@ -474,7 +488,181 @@ router.get("/", async (req, res) => {
  * Finance's override is honoured in both directions: a head finance marked
  * budgetable is offered even if its group would not have qualified, which is
  * the escape hatch for a chart of accounts that does not fit the rules. */
-router.get("/ledger-options", async (req, res) => {
+/* ══ ITEM-WISE BUDGET USAGE ══════════════════════════════════════════════════
+ * WHICH ITEMS AND SERVICES ARE CONSUMING EACH BUDGET HEAD.
+ *
+ * A budget head already reports what is committed against it. It could not say
+ * what — which fabric, which AMC, out of which requests, how much of it has
+ * been billed and how much is still reserved. Every one of those facts is
+ * already stored, one row at a time, on `Acc_BudgetCommitment.allocations`.
+ *
+ * ── READ ONLY, AND NO SECOND ALLOCATION ENGINE ──────────────────────────────
+ * This route queries and projects. It does not recompute a split, does not
+ * consult the Item Master, and writes nothing. A report that recalculated the
+ * allocation would eventually disagree with the commitment that actually
+ * governs the budget — and people would believe the report.
+ *
+ * ── WHAT `billed` MEANS HERE, EXACTLY ───────────────────────────────────────
+ * Bills MATCHED TO THESE COMMITMENTS. Not the accounting actuals for the head:
+ * a voucher posted straight to the ledger, or one whose lines carried no
+ * request-line identity, is a real actual and is not in this figure. The
+ * screen says so in those words.
+ *
+ * ── SNAPSHOTS ARE THE HISTORY ───────────────────────────────────────────────
+ * Item names, SKUs and ledger names come back exactly as stored on the
+ * allocation — what they were when the promise was made. Refreshing them from
+ * today's masters would rewrite the record the commitment exists to keep.
+ */
+router.get("/item-usage", companyScope, async (req, res) => {
+  try {
+    /* ── THE ASKED-FOR COMPANY MUST BE THE CALLER'S OWN ───────────────────
+       `companyOf` prefers the header, then the query, then the session — so a
+       caller whose session names company A can ask for company B and be given
+       it. That is the shared helper for this whole router and predates this
+       route; widening or narrowing it is not this chunk's to do. What this
+       route can do is refuse the disagreement, which is exactly what the
+       item-category mapping routes already do.
+
+       A caller with no company on their session still resolves through the
+       parameter, unchanged — that is how a multi-company operator picks. */
+    const asked = req.headers["x-company-id"] || req.query.companyId || null;
+    const session = req.user && req.user.companyId ? String(req.user.companyId) : null;
+    if (session && asked && String(asked) !== session) {
+      return res.status(403).json({ success: false, message: "That company is not yours to read." });
+    }
+
+    const companyId = actuals.oid(companyOf(req));
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: "A company is required." });
+    }
+
+    const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
+    const usage = require("../../services/itemBudgetUsage.service");
+
+    /* ── SCOPED, AND ONLY SCOPED, IN THE QUERY ────────────────────────────
+       The company boundary is the one thing that must never be a filter the
+       caller can widen. Everything else is applied to the ALLOCATION ROWS,
+       because a commitment is matched by what its lines say: a request with a
+       Packaging line and a Raw Materials line matches a Packaging filter, and
+       only that line should appear. A `$match` on the document would return
+       both lines or neither.
+
+       ── AND AN UNSCOPED COMMITMENT IS NOT EVERYBODY'S ────────────────────
+       This read `companyId === selected OR companyId missing`, which handed
+       every historical unscoped commitment to EVERY company's report. On a
+       list screen that is a stale row; on a financial report it is one
+       company's spending counted into another company's totals, and the
+       figure looks entirely ordinary.
+
+       So an unscoped commitment is included only when its own SPEND REQUEST
+       proves it belongs here. Ownership that cannot be proven is not
+       assumed in either direction: the commitment is left out of the totals
+       and the detail rows, and the count of what was withheld is reported so
+       the omission is visible rather than silent.
+
+       "Legacy" and "ownership unknown" stay separate ideas. A legacy
+       commitment is one written before line-wise allocation — it has no
+       `allocations` and its VALUE cannot be attributed to items. An
+       ownership-unknown commitment is one whose COMPANY cannot be proven,
+       and it does not appear at all. A row can be either, both or neither. */
+    const SpendRequest = require("../../models/CMS_Models/Requests/SpendRequest");
+    const PROJECTION = "_id spendRequestId spendRequestNumber companyId department ledgerId "
+      + "ledgerName financialYear amount status allocations allocationMode headCount "
+      + "committedAt committedByName releasedAmount reconciliationWarning";
+
+    const owned = await Commitment.find({ companyId })
+      .select(PROJECTION).sort({ committedAt: -1 }).lean();
+
+    const unscoped = await Commitment.find({
+      $or: [{ companyId: { $exists: false } }, { companyId: null }],
+    }).select(PROJECTION).sort({ committedAt: -1 }).lean();
+
+    /* ── THREE ANSWERS, NOT TWO ───────────────────────────────────────────
+       This queried only THIS company's requests and treated every commitment
+       it did not match as "ownership unknown". So a commitment whose request
+       proves it belongs to company B was reported to company A as one of A's
+       own unresolved records — an alarm about somebody else's data, raised on
+       a screen that cannot show it and by a team who cannot fix it.
+
+       Ownership has three states and they need three answers:
+
+         proven MINE       → include
+         proven SOMEBODY    → exclude, and say nothing. It is not this
+           ELSE'S             company's business that it exists, and counting
+                              it here would leak its existence.
+         genuinely unknown  → no request at all, a request that has been
+                              deleted, or a request that itself records no
+                              company. Only these are counted and disclosed. */
+    let adopted = [];
+    let ownershipUnknown = 0;
+    if (unscoped.length) {
+      /* One query for the whole set, and NOT filtered by company — the whole
+         point is to learn which other company each one belongs to. */
+      const requestIds = unscoped.map((c) => c.spendRequestId).filter(Boolean);
+      const requests = requestIds.length
+        ? await SpendRequest.find({ _id: { $in: requestIds } })
+          .select("_id companyId").lean()
+        : [];
+      const ownerOf = new Map(requests.map((r) => [
+        String(r._id),
+        r.companyId ? String(r.companyId) : null,
+      ]));
+
+      const selected = String(companyId);
+      for (const c of unscoped) {
+        const requestId = c.spendRequestId ? String(c.spendRequestId) : null;
+        /* No request, or a request that no longer exists: nothing can prove
+           anything either way. */
+        if (!requestId || !ownerOf.has(requestId)) { ownershipUnknown += 1; continue; }
+        const owner = ownerOf.get(requestId);
+        /* A request that records no company of its own proves nothing. */
+        if (!owner) { ownershipUnknown += 1; continue; }
+        if (owner === selected) adopted.push(c);
+        /* else: proven to be another company's. Excluded in silence. */
+      }
+    }
+
+    const commitments = [...owned, ...adopted];
+
+    const report = usage.buildReport({
+      commitments,
+      filters: {
+        financialYear: String(req.query.financialYear || "").trim() || null,
+        department: String(req.query.department || "").trim() || null,
+        ledgerId: String(req.query.ledgerId || "").trim() || null,
+        kind: String(req.query.kind || "").trim() || null,
+        status: String(req.query.status || "").trim() || null,
+        search: String(req.query.search || "").trim() || null,
+      },
+      page: req.query.page,
+      limit: req.query.limit,
+      /* ── THE GROUPING IS THE SERVER'S TO DO ──────────────────────────────
+         Both foldings are built from the complete filtered population and
+         only then paginated. Folding a PAGE of item groups by head — which
+         is what the screen used to do — gives head totals that are true of
+         that page and of nothing else. */
+      groupBy: String(req.query.groupBy || "item").trim() === "head" ? "head" : "item",
+    });
+
+    res.json({
+      success: true,
+      ...report,
+      /* Withheld, and said so. A report that quietly dropped rows would be
+         indistinguishable from one that had nothing to drop. The count is
+         all that is disclosed — naming another company's records here is
+         the thing this whole change exists to stop. */
+      ownershipUnknown: {
+        count: ownershipUnknown,
+        note: "Commitments with no company recorded, whose spend request could not prove they belong to this company. They are excluded from every figure above.",
+      },
+    });
+  } catch (e) {
+    console.error("[budgets] item-usage:", e);
+    res.status(500).json({ success: false, message: "Item-wise budget usage could not be read." });
+  }
+});
+
+router.get("/ledger-options", companyScope, async (req, res) => {
   try {
     const companyId = actuals.oid(companyOf(req));
     const want = String(req.query.type || "").trim();
@@ -981,7 +1169,7 @@ function attentionLine(line, budget) {
   };
 }
 
-router.get("/dashboard", async (req, res) => {
+router.get("/dashboard", companyScopeOptional, async (req, res) => {
   try {
     const { financialYear, status, period, department, scope } = req.query;
 
@@ -1383,7 +1571,7 @@ router.get("/dashboard", async (req, res) => {
  * refusal they get on submit cannot come from different arithmetic.
  *
  * Declared before /:id, like /dashboard. */
-router.post("/check-availability", async (req, res) => {
+router.post("/check-availability", companyScope, async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -1427,7 +1615,7 @@ router.post("/check-availability", async (req, res) => {
 });
 
 /* ── DETAIL ──────────────────────────────────────────────────────────────── */
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     if (!isUsableId(req.params.id)) {
       return res.status(404).json({ success: false, message: "Budget not found" });
@@ -1548,7 +1736,7 @@ function lineSummary(item, meta) {
  * drifted would produce a list that does not add up to the figure above it.
  * There is a test asserting the two agree.
  */
-router.get("/:id/items/:itemId/vouchers", async (req, res) => {
+router.get("/:id/items/:itemId/vouchers", companyScope, async (req, res) => {
   try {
     if (!isUsableId(req.params.id)) {
       return res.status(404).json({ success: false, message: "Budget not found" });
@@ -1901,7 +2089,7 @@ function validateLinePhasing(items, { startDate, endDate }) {
 }
 
 /* ── CREATE ──────────────────────────────────────────────────────────────── */
-router.post("/", async (req, res) => {
+router.post("/", companyScopeOptional, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
     const periodError = invalidEnumField(Acc_Budget, "period", req.body?.period);
@@ -2045,7 +2233,7 @@ router.post("/", async (req, res) => {
 });
 
 /* ── UPDATE ──────────────────────────────────────────────────────────────── */
-router.put("/:id", async (req, res) => {
+router.put("/:id", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
     const periodError = invalidEnumField(Acc_Budget, "period", req.body?.period);
@@ -2580,7 +2768,7 @@ async function budgetForRequests(req, { mutating }) {
 }
 
 /* ── LIST REQUESTS ───────────────────────────────────────────────────────── */
-router.get("/:id/requests", async (req, res) => {
+router.get("/:id/requests", companyScope, async (req, res) => {
   try {
     const { budget, error } = await budgetForRequests(req, { mutating: false });
     if (error) return res.status(error.status).json({ success: false, message: error.message });
@@ -2642,7 +2830,7 @@ router.get("/:id/requests", async (req, res) => {
 });
 
 /* ── CREATE REQUEST ──────────────────────────────────────────────────────── */
-router.post("/:id/requests", async (req, res) => {
+router.post("/:id/requests", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
     const { budget, error } = await budgetForRequests(req, { mutating: true });
@@ -2753,7 +2941,7 @@ router.post("/:id/requests", async (req, res) => {
 });
 
 /* ── UPDATE REQUEST ──────────────────────────────────────────────────────── */
-router.put("/:id/requests/:requestId", async (req, res) => {
+router.put("/:id/requests/:requestId", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
     const { budget, error } = await budgetForRequests(req, { mutating: true });
@@ -3246,7 +3434,7 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
  * are created, then maps it here — and the mapping records that it was newly
  * made, so the trail says so.
  */
-router.post("/:id/requests/:requestId/resolve-head", async (req, res) => {
+router.post("/:id/requests/:requestId/resolve-head", companyScope, async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });

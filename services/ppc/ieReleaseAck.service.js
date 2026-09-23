@@ -751,8 +751,47 @@ async function decide(ctx, {
 const accept = (ctx, args) => decide(ctx, { ...args, decision: "accept" });
 const requestClarification = (ctx, args) => decide(ctx, { ...args, decision: "clarify" });
 
+/**
+ * WHAT PPC PUBLISHES ABOUT ITS ANSWER TO ONE ENGINEERING RELEASE.
+ *
+ * A Pre-Production Meeting records whether PPC has taken the release on, and
+ * that is PPC's fact. Merchandising asks; it does not read PPC's collection
+ * and decide for itself what a missing row means.
+ *
+ * `PENDING` is a real answer and the common one: a release PPC has not decided
+ * yet is not an error, and it is emphatically not an acceptance.
+ */
+async function receiptStateFor(ctx, { releaseRef, versionNo } = {}) {
+  assertContext(ctx);
+  const ref = str(releaseRef);
+  const version = Number(versionNo);
+  if (!ref || !Number.isFinite(version)) return null;
+
+  const receipt = await IeReleaseReceipt.findOne({
+    companyId: ctx.companyId, releaseRef: ref, versionNo: version,
+  }).select("state decidedAt decidedByName clarification updatedAt").lean();
+
+  if (!receipt) {
+    return {
+      releaseRef: ref, versionNo: version,
+      state: "PENDING",
+      decidedAt: null, decidedByName: "",
+      clarificationCategory: "", updatedAt: null,
+    };
+  }
+  return {
+    releaseRef: ref, versionNo: version,
+    state: str(receipt.state),
+    decidedAt: receipt.decidedAt || null,
+    decidedByName: str(receipt.decidedByName),
+    clarificationCategory: str(receipt.clarification?.category),
+    updatedAt: receipt.updatedAt || null,
+  };
+}
+
 module.exports = {
   DEFAULT_LIMIT, MAX_LIMIT, VIEWS, QUEUE_STATES, CLARIFICATION_CATEGORY,
+  receiptStateFor,
   effectiveStateOf, publicRelease,
   listReleases, readRelease, decide, accept, requestClarification,
 };

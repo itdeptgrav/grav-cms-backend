@@ -1,6020 +1,1911 @@
-# Latest Implementation Handoff
+# Latest implementation — Confirmed Sales line ↔ WorkOrder bridge (Production/WorkOrder lane)
+
+Date: 2026-09-22. Requested directly by the user (option A: one WorkOrder = one
+permanent Sales `lineRef` + one server-proven company). **Not committed.**
+Coordinated with IE Lane A and PPC Lane A before editing; neither had pending
+edits in these files.
+
+**Changed:** `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js`
+(`salesLineLink`, two partial indexes, immutability guard),
+`routes/CMS_Routes/Sales/quotationRoutes.js` (release factory, add-product,
+person edit, shared size rule), `routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js`
+(split + mount), `routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js`.
+**New:** `services/production/salesLineWorkOrderLink.service.js`,
+`routes/CMS_Routes/Manufacturing/WorkOrder/salesLineLinkRoutes.js`,
+`test/production/sales-line-workorder-bridge.route.test.js`.
+
+**Behaviour change:** measurement orders are grouped by line, then size. A
+measured-size/line conflict or a line/people quantity mismatch now refuses
+release (409 `WORK_ORDER_MEASUREMENT_LINE_CONFLICT`, conflicts listed) instead of
+silently regrouping people across lines.
+
+**Read contract** (PPC viewer + company membership, read-only):
+`GET /api/cms/manufacturing/work-orders/sales-line-links/lines?lineRef=…` and
+`…/sales-line-links/work-orders?workOrderId=…`; also in-process
+`workOrdersForLines(companyId, refs)` / `linesForWorkOrders(companyId, ids)`.
+Foreign, unknown and historical records all read `unlinked`.
+
+**Verification:** new suite 27/27; IE Chunk 1D writers 26/26; mutation check
+(link stripped from all creation paths) fails all 14 `[identity]` tests, files
+restored byte-identical. Broad run (IE, costing, manufacturing, PM, production,
+PPC): 12 failing suites, all pre-existing or from other lanes' in-flight work.
+No live backfill; the dev DB was only read (counts).
 
 ---
 
-## Merchandising Lane A — Routes extracted from the Sales router (10 Sep 2026)
+# Latest implementation — Image Studio / Photopea, Slice 0.5 continued (editor workspace polish)
 
-**The final checkpoint blocker, cleared.** Eleven Merchandising endpoints lived
-inside `routes/CMS_Routes/Sales/sampleStyles.js`, a 4,500-line Sales router
-carrying seventy-four hunks of another lane's in-flight rewrite. The staged
-Merchandising application could not be assembled without them. They now live in
-`routes/CMS_Routes/Merchandising/styleRoute.js`, and the Sales router in the
-staged snapshot is byte-identical to `HEAD`.
+Date: 2026-09-21
+Task: `docs/tasks/current-task.md`, Slice 0.5 (native GRAV presentation),
+continued on the user's instruction. The goal was a restrained, modern dark
+editing workspace, without changing Photopea's tool, menu or panel structure.
 
-### Old address → new address
+**Not committed.** Stopped for review. The earlier Slice 0.5 and Slice 0
+sections are kept below.
 
-Every one of these was `/api/cms/crm/sample-styles/**` on the Sales router.
+**Scope held.**
+- Frontend only. No company-drive file and no backend API.
+- Nothing is injected into Photopea's cross-origin page, laid over it, or hidden
+  in it.
+- Photopea's branding and ads are untouched.
+- No Photoshop logo or icon is used, and nothing is named Photoshop or Adobe (a
+  test enforces this).
 
-| Method | Was | Is now | Owner |
+This backend repo changed only this file.
+
+## Photopea's `environment` options, checked on 2026-09-21
+
+| Goal | Hosted-embed support | Decision |
+|---|---|---|
+| Dark charcoal workspace | `theme` is documented as "0, 1, 2, …" **without descriptions** | All seven presets were rendered in a real browser (headless Chrome, scratch page using only the documented hash config and ArrayBuffer open). See the preset table below. **Theme 1 chosen**, replacing the `theme: 2` added by someone else earlier. |
+| Layers/Properties prominent | `panels` (IDs 0–22) is documented | **Rejected after testing.** `[5,2]`, `[5,18,2,16,17,0]` and `[5,2,0]` all reordered or dropped panels and removed the icon column, and none of them docked Properties (5). That changes Photopea's panel structure without achieving the goal. The default docking keeps Layers/Channels/Paths and History docked, with Properties one click away in the icon column. |
+| More canvas space | `vmode` 0/1/2 | Kept at **0**. Collapsing or hiding panels would hurt Layers and Properties. The space comes from a slimmer GRAV strip instead. |
+| Custom colours, fonts, spacing, accent; a Photoshop look | **Not supported.** There is no CSS option in the hosted embed. Photopea's accounts page says CSS styling needs the licensed **self-hosted** version, and removing ads/branding needs a **Distributor** account. | Not attempted, and no workaround. An exact Photoshop look is a product/licensing decision. |
+| `icons`, `phrases`, `showtools`, `menus` | Documented | Not used. They would mean copying marks, relabelling Photopea, or removing familiar tools. A config test asserts `panels`, `showtools`, `icons` and `phrases` are unset. |
+
+The seven presets, sampled from the rendered pixels:
+
+| Theme | Chrome | Canvas surround | Character |
 |---|---|---|---|
-| GET | `/` (Merchandising list) | `/api/cms/merchandising/styles` | Merchandising |
-| GET | `/:id` (Merchandising read) | `/api/cms/merchandising/styles/:id` | Merchandising |
-| GET | `/:id/packaging` | `/api/cms/merchandising/styles/:id/packaging` | Merchandising |
-| GET | `/:id/development` | `/api/cms/merchandising/styles/:id/development` | Merchandising |
-| PUT | `/:id/development` | `/api/cms/merchandising/styles/:id/development` | Merchandising |
-| PUT | `/:id/development/decision` | `/api/cms/merchandising/styles/:id/development/decision` | Merchandising |
-| GET | `/:id/packaging-selections` | `/api/cms/merchandising/styles/:id/packaging-selections` | Merchandising |
-| PUT | `/:id/packaging-decision` | `/api/cms/merchandising/styles/:id/packaging-decision` | Merchandising |
-| POST | `/:id/packaging-selections` | `/api/cms/merchandising/styles/:id/packaging-selections` | Merchandising |
-| PATCH | `/:id/packaging-selections/:rowId` | `/api/cms/merchandising/styles/:id/packaging-selections/:rowId` | Merchandising |
-| PATCH | `/:id/packaging-requirements/:rowId` | `/api/cms/merchandising/styles/:id/packaging-requirements/:rowId` | Merchandising |
+| 0 | #E0E0E0 | #BFBFBF | light |
+| 1 | #474747 | #252525 | **neutral charcoal** |
+| 2 | #404550 | #252A35 | blue-slate |
+| 3 | #222531 | — | navy |
+| 4 | #4B3E51 | — | purple |
+| 5 | #353535 | #1A1A1A | darker charcoal |
+| 6 | #F7F7F7 | — | light |
 
-Five of them keep answering at the old address as well, for the R&D
-application, which was not changed: the packaging-selection list, create, status
-and requirement routes plus the packaging decision, re-exported as
-`legacyPackagingCompat` and mounted at `/api/cms/crm/sample-styles` behind the
-Sales middleware R&D authenticates with. Same handler objects — a second
-doorway onto one room, not a second implementation.
+Theme 1 gives the clearest separation between panels and canvas with no colour
+cast. Theme 5 is the darker alternative if wanted.
 
-### What stayed with Sales
+## What changed
 
-Thirty-eight routes on `sampleStyles.js` are untouched: style creation, the
-stage machine, the Sales-facing surface, the tech pack and sample submissions,
-the materials form R&D reads, the raw-item search, and the notification
-helpers. Sales owns style identity; Merchandising owns the operations recorded
-against it. ADR-006 states the rule and the alternatives rejected.
+- **`lib/imageStudio/editor/photopea/photopeaConfig.ts`:** `theme: 1`, with the
+  browser-comparison rationale in a comment. `vmode: 0` kept, with the reason
+  `panels` was rejected. The test now expects theme 1 and asserts that
+  `panels`, `showtools`, `icons` and `phrases` are unset.
+- **`components/imageStudio/ImageStudioWorkspace.tsx`:** the editor is now one
+  charcoal application window.
+  - GRAV's slim title strip holds Back, **Creative / Image Studio**, **Demo
+    image** with the loading status on the same line, and an outlined **"Demo
+    only — not saved to GRAV"** badge. It sits directly on Photopea's menu bar,
+    in the page flow and never over it.
+  - The window's colours are sampled from theme 1 (surround #252525, strip
+    #2a2a2a, hairlines #3a3a3a), so GRAV's chrome is the quietest layer.
+  - Measured contrast on the strip: ink 12.2:1, soft 9.3:1, muted 6.0:1; error
+    text 8.2:1 on its own background; badge outline 3.07:1; Retry text on hover
+    ≥ 8:1.
+  - The error row with Retry and the save notice are restyled for the dark strip.
+  - The iframe's surround is the canvas colour, so loading shows charcoal rather
+    than a light flash.
+  - The earlier Chip and InlineError primitives are no longer used here, because
+    their light-theme tones don't suit the dark strip.
+  - The layout rules from Slice 0.5 are unchanged: fixed height below the sticky
+    bar, nothing positioned over the frame.
+- **`app/image-studio/imageStudioRoute.test.mjs`:** two new tests.
+  - The window colours and the Photopea theme stay together, and the config
+    doesn't touch Photopea's structure.
+  - Nothing names Photoshop or Adobe.
+- **Unchanged:** routes, shell registration, diagnostics, the preview page, the
+  adapter and the coordinator. No shared file was edited in this pass;
+  `AppShell.js` and `activeApplication.js` were last modified at 20:55.
 
-### Shared schema fields, named as a contract
-
-`Enquiry.companyId`, `SalesJourney.companyId`, `Enquiry.products[].productLineRef`
-and `CustomerRequest` order-line `sampleStyleId` are staged, and they are a
-Sales-to-Merchandising CONTRACT rather than Merchandising ownership of a Sales
-record. Sales writes all four; Merchandising reads them and writes none. The
-first two make the acting company provable on records Merchandising must scope
-by; `productLineRef` is the permanent line identity ADR-005 rule 1 requires; and
-`sampleStyleId` lets a confirmed order line name the style it was developed
-from.
-
-### No duplicated logic
-
-The handlers moved rather than being copied. `publicPackagingSelection`, the
-response shape both surfaces need, moved to
-`services/sales/packagingBom.service.js` as `publicSelection`; both routers
-already imported that service. The Merchandising router imports no Sales router,
-and the Sales router imports no Merchandising router.
+## Verification
 
 ### Tests
 
-Four Merchandising suites now mount the Merchandising router. Two suites turned
-out to be about SALES helpers and moved to `test/sales/` with their assertions
-unchanged — `sample-style-surface.test.js` (R&D's raw-item search, stage
-routing, the legacy material routes) and `sample-style-customer-name.test.js`
-(the `customerNameFor` notification lookup, whose fix is another lane's hunk on
-the Sales router). They are working-tree files, deliberately not in the
-Merchandising checkpoint: their subject is a file the checkpoint does not
-change.
+- Image Studio and shell tests together: **246 passed, 0 failed.** That is
+  `lib/imageStudio/**`, `app/image-studio/imageStudioRoute.test.mjs`, and the
+  shell's `activeApplication`, `topBar` and `shellHydration` tests.
+- Full `npm test`: **10,242 passed, 3 failed.** The three failures are the same
+  pre-existing Store tests as before (`components/store/navigation/nav.test.mjs`
+  tour target, Service master placement, overview valuation).
 
-**Staged snapshot, built from the Git index alone and run in a temporary
-directory: 20 suites, 645 tests, 645 passed.** Frontend Merchandising suites:
-105 suites, 593 tests, 593 passed. No commit, no push, no deployment, no
-production data command.
+### Headless Chrome on `/preview/image-studio`
+
+No sign-in and no cookies were read. For the dark-theme shot only, GRAV's own
+`grav_theme` preference was set in the throwaway browser profile.
+
+"Before" is the Slice 0.5 state with theme 2 and the light header. "After"
+measurements were taken once the editor was ready:
+
+| Width | Frame top (before → after) | Frame size after | Overlap under top bar | Page scroll | Horizontal overflow |
+|---|---|---|---|---|---|
+| 1440×900 | 124 → 126 | 1406×761 | 0 | none | none |
+| 390×844 | 156 → 157 | 364×674 | 0 | none | none |
+| 320×640 | 156 → 157 | 294×470 | 0 | none | none |
+
+- **Narrow widths.** No overlap at 390 or 320. The strip is at most two rows. The
+  loading status now shares the title line: in the first 320px capture, taken
+  while loading, it had pushed the frame to y=181. The frame did not get
+  noticeably taller on phones: the full badge wording cannot share a row with
+  the breadcrumb at 390px, and it was kept verbatim rather than shortened.
+- **Ads.** Photopea shows its "Support Photopea" column at phone widths on some
+  loads and not others. Its appearance in the "after" phone shots but not the
+  "before" ones is Photopea's ad rotation, not this change.
+- **GRAV dark theme.** The window, strip and top bar read as one dark workspace.
+
+### Real browser, signed in (Claude desktop pane)
+
+Route `/image-studio/editor`, 1440×900:
+- The config reached Photopea as `{"theme":1,"vmode":0,"customIO":…}`, and the
+  demo image opened.
+- **Menus:** Layer menu → Duplicate Layer. The Layers panel showed "Layer 1"
+  above "Background", and History showed "Duplicate Layer".
+- **Tools:** Brush tool selected (its options bar appeared); a stroke painted on
+  Layer 1; History showed "Brush Tool".
+- **Layers:** Background's visibility eye toggled off.
+- **Properties:** opened from the icon column, showing the layer at 640×400.
+- **File menu:** File › Save produced GRAV's "Saving to GRAV isn't available yet
+  — nothing was saved" notice in the dark strip. The frame moved down to
+  y=161; the page did not scroll.
+
+Route `/image-studio/diagnostics`, running theme 1:
+- ready in 186 ms;
+- synthetic PNG (224,426 B) opened as 640×400;
+- exports: PNG 65,211 B (`png`), JPEG 21,105 B (`jpg`), WebP 12,440 B
+  (`webp`), PSD 488,959 B (`psd`);
+- the exported PSD reopened;
+- both forged messages were refused (wrong origin).
+
+Route `/image-studio/editor` at 375×812: bar bottom 68, frame top 157, no page
+scroll, no horizontal overflow.
+
+## Findings for the next slice
+
+- **Photopea clears its own modified marker on File › Save.** When the
+  `customIO` save hook fires, Photopea clears the `*` from its own document tab
+  (`file.png *` → `file.png`), even though nothing was stored. GRAV's notice
+  says plainly that nothing was saved. But once the hook drives a real save, it
+  must only run through the confirmed-GRAV-save path, and a failed save must
+  tell the user explicitly, because Photopea's own marker will already have
+  cleared.
+- **Pane repaint delay.** The desktop browser pane sometimes draws the frame
+  blank for a few seconds after navigating or resizing. DOM state and headless
+  captures confirmed the editor had rendered.
+
+## Evidence files (session scratchpad, not in the repo)
+
+`polish/compare/`:
+- `1-desktop-before-after.png`
+- `2-phone-before-after.png`
+- `3-after-both-grav-themes.png`
+- `4-photopea-theme-presets.png`
+- `5-panels-option-rejected.png`
 
 ---
 
-## Merchandising Lane A — CLOSED (9 Sep 2026)
+# Latest implementation — Image Studio / Photopea, Slice 0.5 (native GRAV presentation)
 
-**This lane is closed. Nothing committed, nothing deployed, no shared or
-production data changed.**
+Date: 2026-09-21
+Task: `docs/tasks/current-task.md` — Image Studio Slice 0.5. Product:
+`docs/product/image-studio-photopea.md` ("read as a GRAV workspace"). Roadmap:
+`docs/tasks/image-studio-photopea.md` § Slice 0.5.
 
-Final state, recorded:
+**Not committed.** Stopped after Slice 0.5 for review. The Slice 0 section below
+is kept unchanged.
 
-```text
-Merchandising feature development        COMPLETE
-Local ephemeral backfill proof           PASSED
-Local starter-configuration proof        PASSED
-Production backfill and seed             INTENTIONALLY UNEXECUTED
-Authenticated browser verification       A RELEASE ACTIVITY, NOT DONE
-Outstanding test and build failures      OWNED BY OTHER LANES
-```
+**Scope held.** Frontend presentation only:
+- no company-drive file is read;
+- no backend endpoint, model or revision was added;
+- there is no Save control, unsaved-changes marker, autosave, or "Saved" state;
+- nothing is placed over Photopea, restyled, or hidden inside it; its branding
+  and its "Support Photopea" ad panel show as served.
 
-**Feature development is complete.** M1 through M7, the pre-order development
-correction, the production closure and this data closure. The navigation is four
-entries — Overview, Development, Order Execution, Time & Action — and the
-journey runs end to end: Sales Journey → Development Request → Development BOM →
-Sales release → R&D and Costing → confirmed-order adoption → Execution File →
-Materials, Approvals and Time & Action → PPC handover → Change Control.
+This backend repo changed only this file.
 
-**The local proof passed.** A real MongoDB, started by the harness, loaded with
-the dev cluster's exact shape. 27 product-line references minted across 12
-enquiries with none refused, idempotent on re-run, byte-identical, and a
-backfilled line then issued a real development request. One starter calendar and
-one starter template published per Merchandising-enabled company, ten milestones
-across five departments, skipped rather than re-versioned on a second run, and
-Merchandising completing no other department's milestone.
+## What changed for employees
 
-**The production commands are deliberately not run.** `MONGODB_URI` points at a
-shared remote Atlas cluster and no local mongod exists; on instruction, nothing
-was written to it. Both commands are recorded below and in the entry beneath
-this one.
+**`/image-studio/editor`** (new `components/imageStudio/ImageStudioWorkspace.tsx`)
+is now a GRAV workspace, not a test console:
+- **Header:** a round Back button ("Back to Image Studio"), the breadcrumb
+  **Creative / Image Studio**, the document title **Demo image**, and a status
+  chip **"Demo only — not saved to GRAV"**.
+- **Status line:** "Loading editor…", then "Opening demo image…". The demo
+  picture opens automatically when Photopea is ready.
+- **Failures** appear as a GRAV error line with **Retry**, in the page flow above
+  the editor. Messages:
+  - "The editor did not load. Photopea may be unreachable from this network."
+  - "The demo image could not be opened in the editor."
+  - "The editor stopped responding…"
+  - a configuration message when the editor origin is invalid.
+- **Photopea's own File › Save / Save as PSD** (the `customIO` hooks) show a
+  dismissible notice: "Saving to GRAV isn't available yet — nothing was saved.
+  Photopea's Export and download options save a copy to this device only."
+- **Size:** the editor gets the remaining height and full width.
 
-**Authenticated browser verification is a release activity.** It was not
-performed — two Chrome sessions were available and their use was declined. The
-ten-section manual pass is `docs/handoff/merchandising-browser-checklist.md`.
+**`/image-studio`** is a GRAV landing page:
+- a **Demo image** card with the same chip and an "Open the editor" button;
+- a **GRAV files** card that says plainly that opening and saving company-drive
+  files isn't available yet, with a link to the File Manager;
+- the hosted-editor, branding and licence disclosure.
 
-**What is failing is not this lane's.** The concurrent order-demand-release work
-inside `test/merchandising`, the Central Costing tenancy scan, and four
-untracked pages that abort the production export. None was touched. This lane's
-twenty Merchandising suites are 639 passed, 0 failed; the frontend is 515
-passed; `tsc` is clean; `next build` compiles.
+**Phone overlap fix.** The shared `TopBar` is `sticky top-3`. On the old page
+the content scrolled, so on a phone the bar slid over Photopea's menu row. The
+workspace now takes exactly `100dvh − 5.75rem`, the same arithmetic
+`LegacyPageCanvas fill` uses (12px inset + 56px bar + 12px gap above, 12px
+below). The editor route's frame has no bottom padding, so there is nothing to
+scroll. Nothing overlays or clips Photopea.
 
-### The two production data commands — NOT EXECUTED
+**Diagnostics moved.** The synthetic proof workbench and message log now live
+at **`/image-studio/diagnostics`**, labelled "Development only · not shown to
+employees". It returns not-found when `NODE_ENV === "production"` and is linked
+from nowhere.
 
-```bash
-node -r dotenv/config scripts/readiness/backfill-product-line-refs.js --apply
-```
+## Files (frontend `/Users/risheeray/grav-cms`)
 
-```bash
-node -r dotenv/config scripts/readiness/seed-tna-starter.js --apply
-```
+New:
+- `components/imageStudio/ImageStudioWorkspace.tsx`
+- `app/image-studio/diagnostics/page.js`
+- `app/preview/image-studio/page.js`: development-only (not-found in
+  production). Renders the real shell with `guardSoftFail`, following the
+  `app/preview/shell/topbar` pattern, plus the real Image Studio route
+  components. This lets a headless browser take desktop and phone screenshots
+  without holding any credential.
 
-Both default to a dry run without `--apply`. Read each dry run against the
-target database before applying either. Until the first runs, Development
-accepts no requests; until the second runs, Time & Action creates no plans.
+Rewritten (Image Studio's own files):
+- `app/image-studio/page.js`
+- `app/image-studio/editor/page.js`
+- `app/image-studio/layout.js`: exports `ImageStudioFrame`; no bottom padding on
+  the editor.
+- `components/imageStudio/PhotopeaProofWorkbench.tsx`: relabelled
+  "Development only".
+- `components/ImageStudio_DashboardLayout.js`: exports `IMAGE_STUDIO_NAV`.
+- `app/image-studio/imageStudioRoute.test.mjs`: new checks.
+  - Diagnostics are not mounted or linked in the employee pages, and both
+    development-only routes return not-found in production.
+  - The header text is present (Back, Creative, Demo image, the chip, the save
+    notice).
+  - No Save control and no "unsaved", "dirty" or "autosave" text.
+  - The fixed-height class is present, with no `absolute`, `fixed` or `sticky`
+    element in the workspace and no bottom padding on the editor.
+  - The workspace never uses `postMessage` directly or knows Photopea
+    scripts.
+  - Both frames are sandboxed without `allow-top-navigation`.
 
----
+Shared files, each one additive line. Everything else in them belongs to other
+work and was preserved:
+- `components/shell/AppShell.js`: `"/preview/image-studio"` in `RAIL_HIDDEN_PATHS`.
+- `components/shell/activeApplication.js`: the `image-studio` entry also claims
+  the `/preview/image-studio` prefix.
 
-## Merchandising Lane A — Data and go-live closure (9 Sep 2026)
+**Concurrent change not made by Claude.** At 21:10 someone else edited
+`lib/imageStudio/editor/photopea/photopeaConfig.ts` and its test to add
+Photopea's documented `environment.theme: 2` (dark-blue preset) and
+`vmode: 0`. It was not reverted. The tests pass with it, and the "after"
+screenshots were retaken with it in place.
 
-**MERCHANDISING: FEATURE-COMPLETE. LOCAL DATA: READY. PRODUCTION DATA: DRY RUN
-READY, NOT APPLIED. Nothing committed. No shared or production data touched.**
+## Verification
 
-The feature work was finished; this run made it usable with real data and found
-one more defect while doing it.
+### Tests
 
-### Where "local" actually is
+- Image Studio and shell tests together: **244 passed, 0 failed.** That is
+  `lib/imageStudio/**`, `app/image-studio/imageStudioRoute.test.mjs`, and the
+  shell's `activeApplication`, `topBar` and `shellHydration` tests.
+- Coordinator and adapter tests (origin/source rejection, serialisation,
+  timeouts, cleanup): unchanged, all passing.
+- Full `npm test`: **10,239 passed, 3 failed.** The three failures are the same
+  pre-existing Store tests as in Slice 0:
+  - `components/store/navigation/nav.test.mjs` "every tour target exists…";
+  - "Service master sits under Masters…";
+  - "the overview reports valuation unavailable…".
 
-`MONGODB_URI` points at a shared remote Atlas cluster, and no local mongod is
-running. A backfill is not something to try out on shared infrastructure, so on
-the user's instruction nothing was written to it. Instead
-`scripts/readiness/local-data-closure.js` stands up a REAL MongoDB of its own,
-loads it with the exact shape the dry run found on the dev cluster, and runs the
-actual migration and seed against it. All 22 checks pass.
+### Before/after screenshots
 
-Running the real scripts matters: both were refactored so their logic is
-exported and the CLI is a thin wrapper behind `require.main`. Proving the export
-proves what a person runs. (It also removed four short-lived child processes
-racing a freshly-started server, which was producing failures that belonged to
-the harness rather than to the migration.)
+Headless Chrome (system Chrome driven by the backend's installed puppeteer) was
+pointed at `/preview/image-studio`. It never signs in and never reads cookies.
+The "before" shots were taken with the preview rendering the Slice 0 pages,
+before any Slice 0.5 edit. Files are in the session scratchpad, not in the repo:
+- `compare/1-desktop-editor-before-after.png`
+- `compare/2-phone-editor-before-after.png`
+- `compare/3-desktop-landing-before-after.png`
+- `compare/4-phone-landing-and-states.png`
 
-### The backfill — before and after
+Measured with `getBoundingClientRect` against the top bar (`.frost-bar`, bottom
+edge at 68px):
 
-| | Before | After |
+| View | Before | After |
 |---|---|---|
-| Enquiries | 12 | 12 |
-| Product lines | 27 | 27 |
-| Carrying a permanent reference | 0 | 27 |
-| Refused | — | 0 |
+| Desktop 1440×900 editor | frame 1052×702 at y=276; its bottom (978) past the viewport; page scrolls | frame **1408×764** at y=124, fully visible; **page does not scroll** |
+| Phone 390×844 editor, at rest | frame 366×658 at y=334; page scrolls | frame **366×676** at y=156; **page does not scroll** |
+| Phone editor after scrolling the frame into view | **bar overlaps the frame by 68px**, covering Photopea's menu row | overlap **0**; nothing can scroll |
 
-Every reference matches `PL-` + 12 hex, all 27 are distinct, and none appears
-anywhere in the script. The script never mints one: its only write is
-`enquiry.save()`, so the value can only come from the pre-validate hook — the
-code that refuses a duplicate and refuses one this system did not issue.
-Writing the field with `updateOne` would bypass exactly that.
+### Real browser
 
-**Idempotency.** A second `--apply` finds nothing to do, every reference is
-byte-identical, and a following dry run reports zero.
+**Claude desktop browser pane, as the signed-in user.** The backend on `:5050`
+was restarted by someone else mid-slice and was up for these checks.
+- **Phone width (375×812):** `/image-studio` → "Open the editor" →
+  `/image-studio/editor`. Header, chip and demo image correct; Photopea's menu
+  row fully visible.
+- **File menu:** Photopea's **File** menu opened completely at phone width.
+  **File › Save** showed GRAV's "Saving to GRAV isn't available yet — nothing
+  was saved" notice. The notice sits above the frame and pushes it down (frame
+  top moved from 156 to 228); the page still does not scroll.
+- **Keyboard:** the Tab order runs through the shell controls to "Open the
+  editor"; Enter opens the editor. In the editor the tab stops are Back,
+  breadcrumb link, Dismiss (when shown), then the editor frame. Enter on Back
+  returns to `/image-studio`.
+  - The pane's `Return` key name did not activate links; `Enter` did. That is a
+    quirk of the automation tool, not the page.
+- **Synthetic proof on `/image-studio/diagnostics`** (desktop, 1440×900):
+  - ready in 249 ms;
+  - synthetic PNG (224,127 B) opened as 640×400;
+  - exports: PNG 64,970 B (`png`), JPEG 21,052 B (`jpg`), WebP 12,354 B
+    (`webp`), PSD 488,682 B (`psd`);
+  - the exported PSD reopened.
+- **No GRAV file API:** the network log shows no request matching `/api/files`.
 
-**And it does the job it exists for:** after the backfill, a previously
-unreferenced line issued development request `DRQ-…`, version 1, ISSUED.
+**Headless Chrome, same preview route:**
+- phone File menu open and File › Save notice captured;
+- with photopea.com requests blocked, the "Loading editor…" state appears, and
+  after the 45 s ready timeout the error line "The editor did not load. Photopea
+  may be unreachable from this network." with Retry.
 
-### The starter Time & Action configuration
+**Access:** `/image-studio/diagnostics` without a session → 307 to the portal,
+through the existing cookie gate.
 
-`scripts/readiness/seed-tna-starter.js`. Company-scoped, dry run by default, and
-it SKIPS any company that already has a published template or calendar — not
-merged, not versioned, not overwritten, because a published version is what live
-plans were scheduled against.
+## What now feels native to GRAV
 
-Local identifiers from the proof run:
+- The editor route reads like every other GRAV workspace: GRAV's own top bar
+  with the "Creative" nav, then a compact GRAV header using the design-system
+  kicker, title and chip styles (Primitives `Chip`, `InlineError`).
+- There is a clear way back, the page says what is open ("Demo image") and what
+  happens to it, and Photopea fills the rest of the screen at both widths.
+- Loading and failure speak in GRAV's voice without developer logs.
+- The test console is gone from the default experience.
 
-```text
-calendar   "Standard factory week"    v1   id 6aa180ea5f7fd6f94762d02f
-template   "Standard garment order"   v1   id 6aa180eb5f7fd6f94762d045
-```
+## Limitations and follow-ups
 
-Ten milestones across five departments: MERCHANDISING, PRODUCT_DEVELOPMENT,
-STORE_SUPPLY_CHAIN, IE_PPC_PRODUCTION and QUALITY.
-
-**Merchandising completes no other department's milestone.** Every milestone is
-checked: `completionAuthority: MERCHANDISING` appears nowhere that
-`ownerDepartment` is not also MERCHANDISING. Where an owning application does
-not yet publish a consumable event, `sourceEventKinds` is deliberately empty and
-the milestone stays visibly awaiting one — a tick box Merchandising fills in on
-Production's behalf is a lie about who did the work.
-
-After seeding, the company's own selector rules resolve that published template
-for a new plan, so a file with no plan can be given one.
-
-### The defect this run found
-
-**An approved reschedule never moved the date.** `approveReschedule` set
-`forecastDate` and then `repropagate` recomputed every forecast from its anchor.
-Propagation honours exactly two floors — the predecessor chain and the stated
-`manualForecastDate` — and this path set only the first. So a move could be
-requested, previewed, approved by a second person and recorded as APPROVED while
-the date stayed exactly where it was.
-
-`updateForecast` had that line from the beginning; the reviewed route did not,
-which is why the defect showed only on the path with the approval gate on it.
-One line, and the journey test now proves the forecast actually lands on the
-approved date.
-
-Also fixed: the pending-reschedule band added in the previous run queried
-`state: "REQUESTED"`. The model's state is `PREVIEWED`, so the query succeeded
-and returned nothing — the band never appeared and nothing said why.
-
-### The connected smoke test — all eleven steps
-
-`test/merchandising/production-closure.journey.test.js`, one walk through the
-real routers:
-
-1. Sales sends a Journey product line to Development — and Merchandising cannot
-   send one to itself (403).
-2. Merchandising accepts, selects three identities, submits.
-3. A different user approves; the author is refused.
-4. Sales releases to R&D; Merchandising has no such route at all (404).
-5. The R&D shortlist resolves `source: DEVELOPMENT_BOM` at the approved
-   revision, ahead of the registered product's.
-6. A confirmed order opens a SEPARATE execution file.
-7. It adopts the approved selection into a DRAFT, carrying the lineage.
-8. Materials, packaging and development requirements are each approved by
-   somebody who did not write them.
-9. A plan is created and baselined; one reschedule is requested by one person,
-   refused for that person, found by a second, and approved — moving the
-   forecast and writing a NEW baseline while keeping the one it replaced.
-10. The pack is submitted, refusing to take the completion declaration
-    implicitly, and the file is not handed over until PPC accepts.
-11. A post-handover change is issued; the approved development revision and the
-    order's approved materials are byte-identical afterwards, and the pack
-    version PPC received is unchanged.
-
-### Verification
-
-| Suite | Result |
-|---|---|
-| `test/merchandising`, this lane's 20 suites | 639 passed |
-| `test/merchandising`, all 21 including another lane's | 685 passed, 1 failed |
-| `test/sales` + `test/costing` (67 suites) | 1819 passed, 1 failed |
-| Frontend (16 suites) | 515 passed |
-| `npx tsc --noEmit` | clean |
-| `next build` | `✓ Compiled successfully` |
-
-### Two capability pins, made precise
-
-The Merchandising suite failed on two of my own assertions after another lane
-added a fifteenth capability, `PROCUREMENT_RELEASE`, plus a new service, route
-and suite at 19:00 today. Both pins asserted the vocabulary had exactly fourteen
-entries. What they were written to prove is narrower and is unchanged: this
-work introduced none of its own.
-
-So they now NAME the fourteen M0 capabilities and assert none exists whose name
-mentions development or change. A fifteenth constant for somebody else's feature
-is that lane's decision to defend; counting it here proved nothing about either.
-The new capability and its suite are recorded, not judged — they are not this
-lane's work.
-
-**And that lane is still editing.** `orderDemandRelease.service.js` and its test
-changed at 21:40 and 21:42, mid-run; the suite grew from 680 tests to 686
-between two consecutive runs, and one of them —
-"recovering an interrupted release › a crash after the drafts exist returns the
-SAME requests" — now fails. It is entirely inside their order-demand-release
-feature and touches nothing this lane owns: not development, not adoption, not
-Time & Action, not the reschedule path. This lane's twenty suites are 639
-passed, 0 failed.
-
-### Recorded, not touched
-
-- **`test/costing/sales-tenancy-guard.test.js`** — the Central Costing lane's
-  static scan, 16 offenders across `leads.js`, `leadContactPromotion.js`,
-  `ieOrders.service.js` and `sampleBomApproval.js`. None is this work.
-- **Four untracked pages** using `useSearchParams` with no Suspense boundary,
-  each producing the identical prerender error and aborting the export:
-  `app/accountant/budgets/item-usage/page.js`,
-  `app/store/dashboard/operations/reservations/page.js`,
-  `app/store/dashboard/operations/stock-exceptions/page.js`,
-  `app/store/dashboard/supplier-offers/new/page.js`.
-  Setting exactly those four aside gives a clean build with every Merchandising
-  route rendering; all four were restored byte-identical.
-
-### Authenticated browser result
-
-**Not performed.** Two Chrome sessions were available and the user declined
-their use. The in-app browser holds no session: all Merchandising routes answer
-`307 → /?next=…`, which is the auth guard working. Every route resolves and
-redirects identically, so the Development entry is wired into the same guard as
-the established four and is not a 404.
-
-`docs/handoff/merchandising-browser-checklist.md` is the manual pass: ten
-sections covering what a harness cannot see.
-
-### The production commands that remain UNEXECUTED
-
-Run in this order, against the target database, reading each dry run first:
-
-```bash
-node -r dotenv/config scripts/readiness/merchandising-closure-dryrun.js
-node -r dotenv/config scripts/readiness/backfill-product-line-refs.js
-node -r dotenv/config scripts/readiness/backfill-product-line-refs.js --apply
-node -r dotenv/config scripts/readiness/seed-tna-starter.js
-node -r dotenv/config scripts/readiness/seed-tna-starter.js --apply
-```
-
-None has been run against the Atlas cluster or anywhere but the ephemeral local
-server. The first three lines are the gate on Development accepting requests;
-the last two are the gate on Time & Action creating plans.
-
-### Deployment and rollback
-
-1. **Backend.** Additive only: new collections, new routers, two optional
-   fields, one widened audit schema. The previous frontend works against it.
-2. **Frontend.** It calls routes that must already exist.
-3. **Backfill**, `--apply`, after reading its dry run.
-4. **Seed**, `--apply`, per company.
-
-**Rollback.** Redeploy the previous frontend; the backend can stay, because
-nothing in step 1 changes an existing document's meaning. Steps 3 and 4 are the
-only irreversible ones, and both only ADD: references onto lines that had none,
-and a template and calendar where a company had neither. Rolling the code back
-leaves both unused rather than wrong.
+- **Very short viewports.** On a landscape phone the fixed-height workspace
+  gives Photopea very little height. There is no minimum height on purpose: a
+  minimum would make the page scroll and bring the overlap back.
+- **Dev indicator.** Next.js's development "N" badge and "Compiling" toast
+  appear in the screenshots. They are development-only overlays, not Image
+  Studio.
+- **Blank frame in pane screenshots.** The pane sometimes photographs the frame
+  blank for a moment after a viewport resize; DOM state confirmed the editor
+  was ready.
+- **Next-slice prerequisites** are unchanged; see the Slice 0 section.
+- **Dev servers.** They were stopped by someone else mid-slice. The frontend dev
+  server was restarted by Claude (`npm run dev`, port 3001) and is still
+  running.
 
 ---
 
-## Merchandising Lane A — Production closure (9 Sep 2026)
+# Latest implementation — Image Studio / Photopea, Slice 0 (contract and deployment proof)
 
-**M1–M7: DELIVERED. PRE-ORDER DEVELOPMENT: DELIVERED. MERCHANDISING:
-FEATURE-COMPLETE. Nothing committed. No data changed.**
+Date: 2026-09-21
+Task: `docs/tasks/current-task.md` — Image Studio Slice 0. Product:
+`docs/product/image-studio-photopea.md`. Decision: ADR-007,
+`docs/decisions/image-studio-photopea-boundary.md`. Roadmap:
+`docs/tasks/image-studio-photopea.md`.
 
-A stabilisation run, not a milestone. No feature was added and nothing was
-redesigned; the navigation is the same four entries. What this did was walk the
-whole journey once, end to end, through the real routers — and that walk found
-four places where the product was broken at a seam rather than inside a piece.
+**Not committed.** Stopped after Slice 0 for Codex review. The previous handoff
+(Marketing intelligence layer) is kept unchanged below this section.
 
-### The four defects, and why nobody's own test saw them
+**All code is in the frontend repo (`grav-cms`).** This backend repo changed only
+this file. No backend route, model, migration or configuration was added. No
+company-drive file was read. No GRAV save, revision, Save As or dashboard was
+built. No "Saved" state exists.
 
-**1. The development-to-execution adoption link was never written.**
-`developmentReference` was declared on the handover version AND on the execution
-file, `sourceFor` read it, and no code anywhere in the application ever set it.
-So every real order answered "this order did not come from a development job",
-and the entire adoption path — the step where a confirmed order picks up what
-the buyer's sample was actually made from — was unreachable in production.
+## Repository state before coding
 
-Nothing failed, which is why it survived: a preview that is *allowed* to answer
-"nothing to adopt" cannot tell that apart from a broken link. The milestone's
-own tests asserted the field's shape and the service's refusal to auto-approve,
-both of which were true.
+Both repos had a large amount of unrelated uncommitted work, and other agents
+were editing them during this slice:
 
-Merchandising now resolves its own two records — on `sampleStyleId` where the
-projection carries one, else `styleRef` — and RECORDS the answer the first time
-it is used, so it is a join once and a fact thereafter. Sales was the obvious
-place to stamp it and is the wrong one: giving Sales a Development File id hands
-Sales a handle on a Merchandising record, which is what ADR-005 decision 2
-exists to prevent.
+- Frontend shell and Marketing planner files: 19:37–20:17.
+- Backend Marketing creative-media files, `server.js` and this handoff: 19:40–20:31.
 
-**2. Every adopted row was refused, and the adoption reported success.**
-The adoption service sent `rawItemId`, `note` and no `group` to
-`selection.addRow`. An M3 row has none of those — it references the catalogue
-through `catalogueRef`, spells the field `notes`, and requires a `group`. Each
-row was refused by name, so `families` reported `revisionNo: 1`, `adopted`
-reported 0, and the drafts it created were empty. Fixed by mapping the
-development row to the M3 shape the way it was always meant to: the SKU into
-`componentCode`, the catalogue id into `catalogueRef`, and sample packaging into
-`OTHER` rather than a guess from the component's name.
+It was all preserved. Each shared file was re-read immediately before its one
+additive line was inserted.
 
-**3. A file with no Time & Action plan could not be given one.**
-The empty state said "a plan is created from a published process template" and
-offered no control. `createTnaPlan` existed in the client and on the server and
-nothing called it, so every file that had not been given a plan by hand sat
-permanently outside the one register whose job is controlling dates. The empty
-state now offers the act at the manage rung, and neither the template nor the
-start date is decided by the browser — an empty template resolves by the
-company's own selector rules, which is the rule a merchandiser questioning a
-date needs to be able to point at.
+ADR-007 lives in its own file. `architecture-decisions.md` has no ADR-007 index
+entry; that is left for Codex.
 
-**4. The reschedule dialog offered Approve to the one person who cannot use it.**
-The maker/checker rule was already enforced — `TNA_SELF_APPROVAL` — and the
-screen offered the requester an Approve button straight after their own preview,
-whose only possible outcome for that reader was a refusal. The request had
-nowhere else to appear, so in practice a date move needed a second person who
-had no way of knowing one was waiting. Requesting now ends at the request, and a
-new band lists what is waiting with Approve, Reject and Withdraw. Approve is
-offered to anybody at approver level and the SERVER decides: a browser that
-tried to work out who requested what would be wrong exactly when it mattered.
+## Files (frontend, `/Users/risheeray/grav-cms`)
 
-### The reconciliation
+New:
 
-Every one of the **117 distinct call sites** in `lib/merchandising/api.js` and
-`lib/salesJourney/developmentRequests.js` was matched against the **201 routes**
-mounted across the eleven Merchandising, Sales, PPC and sample-style routers.
-Zero unmatched. The reverse scan — exported client functions no screen calls —
-produced 27 names, of which 13 are lookup maps read through their own accessor,
-10 are detail reads whose list form is wired, and 4 were the dead ends above.
-
-No placeholder prose, no `TODO`, and no control without a handler exists under
-`app/merchandiser` or `components/merchandiser`.
-
-### The connected journey test
-
-`test/merchandising/production-closure.journey.test.js` walks the chain once, in
-order, through the real routers: Sales issues a versioned request against a
-permanent product-line reference → Merchandising accepts and selects → a second
-person approves → Sales authorises the release → R&D reads the approved
-selection first → the buyer confirms and a SEPARATE execution file opens → the
-order adopts the approved selection into a draft → each family is approved by
-somebody who did not write it → Time & Action plans and baselines the order →
-the pack goes downstream → a Sales change lands and the approved development
-revision is byte-identical afterwards.
-
-It is one `test` and not eleven on purpose: `test/setup.js` clears every
-collection after each test, and eleven tests would each rebuild the world and
-prove nothing about the seams between them.
-
-The boundaries are asserted AT each seam: Merchandising cannot issue a
-development request, Sales cannot edit a Merchandising selection, a platform
-administrator without a Merchandising grant reaches nothing, Merchandising has
-no release route at all (404, not 403), the author cannot approve their own
-revision in any of the four families, submitting the pack refuses to take
-Merchandising's completion declaration implicitly, and the file is not handed
-over until PPC's own receiver says so.
-
-### Final route and navigation map
-
-The bar is four entries and unchanged:
-
-```text
-Overview            /merchandiser/dashboard
-Development         /merchandiser/development
-Order Execution     /merchandiser/execution
-Time & Action       /merchandiser/time-action
-```
-
-Reached from those, never from the bar:
-
-```text
-/merchandiser/development/[fileId]   6 tabs
-/merchandiser/execution/[fileId]     9 tabs
-/merchandiser/changes                from the Overview's two change counts
-/merchandiser/management             reports, bulk, configuration, archive, ops
-```
-
-Sales' own surface is the Development panel on the Style & Sample stage,
-rendered only in Sales scope because that stage is also mounted inside the
-Merchandiser and Project Manager dashboards.
-
-The transitional deep links (`/merchandiser/work`, `/merchandiser/styles`) and
-the fifteen compatibility redirects are unchanged.
-
-### Verification
-
-| Suite | Result |
+| File | Role |
 |---|---|
-| `test/merchandising` (20 suites, `--maxWorkers=2`) | 639 passed |
-| `test/sales` + `test/costing` (67 suites) | 1819 passed, 1 failed |
-| `test/costing/rnd-technical-record.test.js` | passed |
-| Frontend (16 suites) | 515 passed |
-| `npx tsc --noEmit` | clean |
+| `lib/imageStudio/editor/ImageEditorAdapter.ts` | The editor boundary: `ready`, `openFile`, `exportDocument`, `subscribe`, `dispose`, states, typed `EditorError` codes. No `save`, dirty flag or close, on purpose. |
+| `lib/imageStudio/editor/photopea/messageCoordinator.ts` | Pure protocol logic with no DOM (details under "Message protocol"). |
+| `lib/imageStudio/editor/photopea/PhotopeaAdapter.ts` | Photopea scripts and format strings. Documents are tagged via `Document.source`; exports come back through `saveToOE`. |
+| `lib/imageStudio/editor/photopea/photopeaConfig.ts` | `NEXT_PUBLIC_PHOTOPEA_ORIGIN`, defaulting to `https://www.photopea.com`. Accepts a bare https origin only (http on loopback). The frame URL is the origin plus the hash config: `environment.customIO` hooks for `save` and `saveAsPSD` only. No files, URLs or credentials. |
+| `lib/imageStudio/imageSignature.ts` | Identifies PNG, JPEG, WebP, PSD and PSB from the file's bytes. Used to check what the editor returned; it is evidence for the page, not authority for GRAV. |
+| `lib/imageStudio/syntheticImage.ts` | Draws a canvas PNG labelled "SYNTHETIC TEST IMAGE · Not company data". |
+| `components/ImageStudio_DashboardLayout.js` | FrostShell, top variant, `appSlug="image-studio"`, nav group "Creative → Image Studio". No `guardSlug` and no `guardSoftFail`, following the File Manager: a session is required, but no department is. |
+| `app/image-studio/layout.js`, `app/image-studio/page.js` | Entry page: an editor-check card plus the hosted-editor disclosure (Photopea runs at photopea.com and receives the image in the browser; branding and ads are left intact and the free embed is not a white-label licence; Photopea's downloads are not GRAV saves). |
+| `app/image-studio/editor/page.js` | "Back to Image Studio". The workbench loads through `next/dynamic` with `ssr: false`, only on this route. |
+| `components/imageStudio/PhotopeaProofWorkbench.tsx` | The proof UI (details below). |
+| Tests | `lib/imageStudio/editor/photopea/messageCoordinator.test.mjs` (30), `photopeaConfig.test.mjs` (3), `lib/imageStudio/imageSignature.test.mjs` (2), `app/image-studio/imageStudioRoute.test.mjs` (7). |
 
-`--maxWorkers=2` is required: the default worker count OOM-kills the
-Merchandising suite and reports false failures.
+The workbench, in detail:
+- The adapter, and so its message listener, is created before the iframe `src` is set.
+- The iframe is `sandbox`ed without `allow-top-navigation`, with `referrerPolicy="no-referrer"`.
+- Buttons: open the test image; export PNG, JPEG, WebP and PSD; reopen the exported PSD; send a forged message.
+- Each export's byte count and detected signature are shown, with an on-screen message log.
+- It never imports Photopea scripts, message shapes or origins.
 
-**Production build.** `✓ Compiled successfully`. Prerendering then fails on four
-UNTRACKED pages belonging to other lanes, each using `useSearchParams` with no
-Suspense boundary and each producing the identical error:
+Changed. Each is one additive entry; everything else in these dirty files belongs to other work:
+- `middleware.js`: `"/image-studio"` added to `PROTECTED_PREFIXES`.
+- `components/shell/AppShell.js`: `"/image-studio"` added to `RAIL_HIDDEN_PATHS`.
+- `components/shell/activeApplication.js`: `{ slug: "image-studio", prefixes: ["/image-studio"] }`.
 
-```text
-⨯ useSearchParams() should be wrapped in a suspense boundary at page "<path>".
-Error occurred prerendering page "<path>".
-```
+Configuration: optional `NEXT_PUBLIC_PHOTOPEA_ORIGIN`. It is unset in dev, so the
+hosted default is used. No CSP or `X-Frame-Options` exists in either repo, so
+none was changed. If a CSP is ever added, it needs `frame-src <editor origin>`.
 
-- `app/accountant/budgets/item-usage/page.js`
-- `app/store/dashboard/operations/reservations/page.js`
-- `app/store/dashboard/operations/stock-exceptions/page.js`
-- `app/store/dashboard/supplier-offers/new/page.js`
+## Message protocol (as implemented)
 
-None was edited. Setting exactly those four aside gives a clean build in which
-`/merchandiser/dashboard`, `/merchandiser/development`, `/merchandiser/management`
-and `/merchandiser/development/[fileId]` all render; all four were restored
-byte-identical afterwards.
+1. **Listener first.** The listener is attached before the frame loads. The
+   first `"done"` from the frame moves the state from `loading` to `ready`
+   (45 s timeout).
+2. **The door.** A message is accepted only if `event.origin` exactly equals the
+   configured origin and `event.source` is the current frame's window. Otherwise
+   it is dropped and counted as a `rejected` event (reason: origin or source).
+   Data must be a string of 64 KB or less, or an `ArrayBuffer`; anything else is
+   rejected (type or oversize). Every post goes to that origin, never `"*"`.
+3. **One at a time.** Commands queue FIFO with one in flight. Strings and
+   buffers received before the next `"done"` belong to that command.
+4. **Menu events.** Strings starting with `grav:cmd:` are menu events, never
+   replies. Messages nobody asked for are reported as `unsolicited` and dropped.
+5. **Acks.** Script commands carry an ack nonce (`grav:ack:N|`). A `"done"` that
+   arrives before the ack is treated as stray and ignored.
+6. **Open.** Post the ArrayBuffer (a copy). Then run the tag script: if the
+   active document's `source` is still the fresh value `"file"`, set it to the
+   opaque tag and echo `{ok, source, width, height}`. Both messages are queued
+   together.
+7. **Export.** The script echoes the active document's source. If it is not the
+   expected tag it refuses without exporting; otherwise it calls
+   `saveToOE(fmt)`. The page then checks, on its own side, that the source
+   matches and that exactly one ArrayBuffer came back.
+8. **Timeouts.** Open 60 s, script 15 s, export 120 s. A command timeout fails
+   the whole session: the in-flight and queued commands are rejected, and a late
+   `"done"` is ignored. The user must reload the editor.
+9. **Dispose.** Removes the listener, clears timers, rejects everything pending,
+   and is idempotent.
 
-**The one other failing suite** is `test/costing/sales-tenancy-guard.test.js`, a
-static scan owned by the Central Costing lane. It lists 16 offenders across
-`leads.js`, `leadContactPromotion.js`, `ieOrders.service.js` and
-`sampleBomApproval.js`; none is this work. The four it originally raised against
-`services/sales/developmentRequest.service.js` were addressed — one of them, the
-buyer-label lookup, was genuinely reading an account by id alone on the strength
-of having come from a scoped journey, which is a cross-tenant read the moment
-somebody passes a journey from elsewhere.
+## Verification
 
-### Data readiness — DRY RUNS ONLY, nothing applied
+### Unit and source tests
 
-`scripts/readiness/merchandising-closure-dryrun.js` (reads only; the file
-contains no create, update, delete or index build). Run against the dev
-database:
+`node --test` over the new files plus `components/shell/activeApplication.test.mjs`
+and `components/shell/topBar.test.mjs`: **230 passed, 0 failed.**
+
+The new Image Studio tests cover:
+- origin mismatches: another host, `https://photopea.com`, and `http://www.photopea.com`;
+- a wrong source window and a missing frame;
+- object, number, typed-array and oversized payloads;
+- ordering and reply attribution, with the second command held back;
+- stray `"done"` before an ack, and menu events arriving mid-command;
+- ready timeout and command timeout (session failed, late `"done"` ignored);
+- a `postMessage` that throws;
+- cleanup (listener count 0, timers 0, pending rejected, idempotent);
+- adapter open, wrong-document, zero or two buffers, tag injection, format strings and origin parsing.
+
+Source-level checks: the route is gated and off the rail; FrostShell is used
+without `guardSlug` or `guardSoftFail`; the editor is client-only; there are no
+`/api/files`, `fetch(` or `localStorage` calls and no "Saved" text; the
+workbench contains no Photopea details; nothing posts to `"*"`; the sandbox has
+no `allow-top-navigation`.
+
+Full `npm test`: **10,233 passed, 3 failed.** All three failures are outside
+Image Studio:
+- `components/store/navigation/nav.test.mjs`: "every tour target exists…" (`tour-action-panel`);
+- "Service master sits under Masters…";
+- "the overview reports valuation unavailable…".
+
+### Real browser
+
+Setup: the Claude desktop browser pane. Next dev on `localhost:3001` and backend
+on `localhost:5050` were both already running and were not modified. The user
+signed in. The target was hosted `https://www.photopea.com`, and the data was
+synthetic only.
 
 | Check | Result |
 |---|---|
-| Journey product lines with no permanent reference | 27 of 27, across 12 enquiries |
-| Development requests whose line no longer resolves | 0 of 0 |
-| Execution files needing an adoption backfill | 0 — the link is self-healing |
-| Published T&A template versions | 0 |
-| Published working-calendar versions | 0 |
-| Execution files predating the development flow | 0 |
-| Audit events lost to the `fileId` defect | 0 of 0 |
-
-Two of those are real deployment gates:
-
-**Product-line references.** Every existing enquiry line lacks one, so no line
-can be sent for development until they are minted. The Sales panel already says
-so per line and offers no button, which is honest but is not a working feature.
-`scripts/readiness/backfill-product-line-refs.js` performs it and **defaults to
-a dry run** — a script that writes when you forget a flag is a script somebody
-runs against production while reading its help. It loads and saves each affected
-enquiry rather than using `updateOne`, because the pre-validate hook is what
-mints and validates the reference, and writing the field directly would bypass
-exactly the code that makes the value trustworthy. Safe to repeat. NOT APPLIED.
-
-**T&A configuration.** No published template or calendar exists, so no plan can
-be created for any file in any company. The screen offers the act and the server
-refuses it with the reason, which is the honest behaviour. Publishing one of each
-is a manager decision made through the configuration editor, not a migration.
-
-**The `fileId` audit defect.** 0 affected rows in this database. The field was
-absent from a strict schema, so the value was dropped at write time and was
-never stored — it cannot be recovered from those rows. Reconstruction is
-possible only where an event's own `recordId` still resolves to a record naming
-its file, which is a join rather than an invention. Where it does not, the gap
-stays a gap: a fabricated audit event is indistinguishable from one that
-happened, which is worse than a hole.
-
-### Browser walkthrough — NOT PERFORMED
-
-Both servers are running (frontend 3001, backend 5050) and every Merchandising
-route serves, but the in-app browser holds no session and all five routes answer
-`307 → /?next=…`, which is the authentication guard doing its job. Completing a
-walkthrough needs a real user's password. Credentials were not requested and
-authentication was not bypassed.
-
-What was verified without them: all five routes resolve and redirect
-identically, so `/merchandiser/development` is wired into the same guard as the
-four established routes and is not a 404. Everything else on the walkthrough
-list — populated states, the approval workflow, CSV preview, configuration —
-remains unverified in a browser and is covered only by the test suites.
-
-### Changed and untracked Merchandising files
-
-Backend, created: `models/CMS_Models/Merchandising/**`, `models/CMS_Models/PPC/**`,
-`models/CMS_Models/Sales/{DevelopmentRequest,SalesChangeNotice,SalesHandoverEvent,SalesHandoverVersion,enquiryProductLineIdentity,executionProjection}.js`,
-`routes/CMS_Routes/Merchandising/**`, `routes/CMS_Routes/PPC/**`,
-`routes/CMS_Routes/Sales/{developmentRequests,changeNotices,merchandisingHandovers}.js`,
-`services/merchandising/**` (32 modules), `services/sales/**`, `services/ppc/**`,
-`services/integration/**`, `services/companyContext/merchandisingScope.service.js`,
-`services/approvedMaterialShortlist.service.js`, `scripts/seed-tna-process.js`,
-`scripts/readiness/**` (new), `test/merchandising/**` (20 suites).
-
-Backend, modified: `models/CMS_Models/Sales/Enquiry.js`, `server.js`,
-`services/storePurchase/errors.js`, `docs/product/merchandising-app-final-plan.md`,
-`docs/decisions/architecture-decisions.md`, `docs/tasks/current-task.md`,
-`docs/handoff/latest-implementation.md`.
-
-Frontend, created: `app/merchandiser/development/**`,
-`components/merchandiser/{DevelopmentRecords,DevelopmentBomTab,DevelopmentAdoptionBand,ConfigurationEditor,developmentPresentation}.js`,
-`components/sales/crm/journey/DevelopmentRequestPanel.js`,
-`lib/merchandising/bulkCsv.js`, `lib/salesJourney/developmentRequests.js`,
-plus `preorderDevelopment.test.mjs` and `bulkCsv.test.mjs`.
-
-Frontend, modified: `lib/merchandising/api.js`,
-`components/merchandiser/{merchandisingNavigation,FileTabs,TimeActionTab}.js`,
-`app/merchandiser/{dashboard,management}/page.js`,
-`app/merchandiser/execution/[fileId]/page.js`,
-`components/sales/crm/journey/stages/StyleSampleStage.js`, and the nav, shell,
-compat-route, approvals, change-control, department-status, selection and
-Time & Action test suites where a pinned boundary moved.
-
-The working tree also carries other lanes' uncommitted work (Central Costing,
-IE, HR, Help, Marketing). None of it was touched.
-
-### Deployment order, and rolling back
-
-1. **Backend first.** Every Merchandising-facing change is additive: new
-   collections, new routers, two new optional fields (`Enquiry.products.productLineRef`,
-   `executionProjection.sampleStyleId`) and one widened audit schema. A frontend
-   still running the previous build works against it unchanged.
-2. **Frontend second.** It calls routes that must already exist. Deploying it
-   first gives a Development entry whose register cannot load.
-3. **Then the product-line backfill**, with `--apply`, once somebody has read
-   its dry run against the target database. Until it runs, Development accepts
-   no new requests — the register, the file and every existing surface work.
-4. **Then publish one T&A template and one working calendar** per company,
-   through the configuration editor. Until then, plans cannot be created.
-
-**Rollback.** Redeploy the previous frontend build; the backend can stay. Nothing
-in step 1 changes an existing document's meaning, so the old frontend reads the
-new backend correctly. The backfill in step 3 is the only irreversible step, and
-what it writes is a fresh reference on lines that had none — no existing value
-is overwritten, so rolling the code back leaves those references unused rather
-than wrong.
-
----
-
-## Merchandising Lane A — Pre-order development and material selection (9 Sep 2026)
-
-**PRE-ORDER DEVELOPMENT: DELIVERED. M1–M7: DELIVERED. MERCHANDISING:
-FEATURE-COMPLETE. Nothing committed.**
-
-The correction to a premature claim. M1–M7 built the half of Merchandising that
-begins when Sales confirms an order. The company does most of its merchandising
-before that: a buyer is interested, Sales asks for a product to be developed,
-and somebody has to decide which fabric, which trims, which labels. That
-decision is Merchandising's, everything downstream is computed against it, and
-the application had no home for it.
-
-What existed instead was a Sales-authenticated form writing raw items onto
-`SampleStyle.materials`. It put a Merchandising decision behind a Sales seat,
-addressed a product line by its name, and carried a quantity nobody had
-engineered. It is now read, offered for adoption, and never written.
-
-### The seven ownership decisions
-
-Recorded permanently as ADR-005. They are the whole of the correction:
-
-1. **A Journey product line has a permanent, server-minted reference.**
-   `PL-` + twelve hex, minted in a pre-validate hook on `Enquiry.products`, and
-   a client may NAME one but never invent one. Position, product name and style
-   text are all refused as identities, because one enquiry legitimately carries
-   "Polo" twice in two colourways and those are two development jobs.
-2. **Sales owns the ask; Merchandising owns the file.** `SalesDevelopmentRequest`
-   is a versioned Sales record on a Sales router behind the live Sales grant.
-   Three source scans assert that no Merchandising route or service creates one
-   and that no Sales route reads or writes a Development File.
-3. **The Development File is its own aggregate.** Keyed on
-   `company + journey + productLineRef`, opened by the request's carrier, and
-   existing long before any Execution File does.
-4. **The development BOM holds identity only.** Eight fields. Seventeen others
-   are refused BY NAME, and each refusal says whose fact it is — consumption
-   and allowance are R&D's, rate and cost are Costing's, the supplier is chosen
-   when it is bought, stock and issue are Store's.
-5. **Approval is maker/checker and freezes.** Approver ≠ author ≠ submitter,
-   owners not exempt, approved revisions immutable, previous revisions readable.
-6. **Release to R&D is Sales'.** Merchandising has no route for it. Approving
-   says the materials are settled; releasing says the buyer relationship
-   justifies the spend.
-7. **The approved development selection outranks the registered product BOM**
-   for R&D's shortlist and Costing's identity.
-
-### What was built
-
-**Backend.** `enquiryProductLineIdentity.js`, `SalesDevelopmentRequest`, the
-three Merchandising development models (`DevelopmentRequestReceipt`,
-`DevelopmentFile`, `DevelopmentBomRevision`) with their partial unique indexes,
-`developmentRequest.service.js`, `developmentIntake.service.js`, the fifth
-outbox carrier, `development.service.js`, `developmentAdoption.service.js`,
-`developmentLegacy.service.js`, `developmentPublication.service.js` and the two
-routers. Fourteen new error codes, twenty new audit actions, two new outbox
-kinds, and NO new capability constant — the fixed fourteen cover all of it.
-
-**What Sales sees back.** `developmentPublication.service.js` is the one door.
-It reads Merchandising's records and returns STATEMENTS: the state, the version,
-the words, and the approved identities. No document id, no revision handle, no
-row reference, and no write anywhere in the module — a test scans the source
-for `create`, `save`, `findOneAndUpdate`, `updateOne`, `deleteOne`, `bulkWrite`
-and `startSession` and finds none. Only an APPROVED revision is published,
-because a draft is Merchandising still working and publishing one would let a
-salesperson quote a fabric nobody agreed to.
-
-The alternative — having the Sales service query the Merchandising collections
-itself — works exactly once. The second time somebody changes what a development
-file means, the change lands in Merchandising and the Sales copy of the query
-keeps answering the old question, silently, because a stale join returns rows
-rather than an error.
-
-**Frontend.** Navigation became four entries with Development second, in the
-order the work happens. The Development register (`/merchandiser/development`)
-with seven views; the development file workspace with six tabs — Summary, Sales
-Brief, Materials & Trims, Packaging, Approvals & Handover, Changes & History.
-No sample-round tab, no consumption editor, no Sales control. The Overview
-gained a second, separately-read indicator deck, so a development read that
-fails leaves the order figures standing and the reverse.
-
-The Sales Journey's Style & Sample stage gained a Development panel: send a line
-for development, read Merchandising's published answer, authorise the release.
-It carries no material-selection control at all — not disabled, absent — and it
-is Sales-scope only, because that same stage is mounted inside the Merchandiser
-and Project Manager dashboards and a merchandiser must not raise development
-work against a buyer's opportunity on Sales' behalf.
-
-### The two M7 gaps, closed
-
-**Configuration.** M7 said "manager-only configuration without adding daily
-navigation" and shipped endpoints with no way to reach the writes from a
-browser. A manager wanting to change a milestone offset had to ask somebody
-with a terminal. `ConfigurationEditor` covers the three things a plan is built
-from — templates, working calendars, reason codes — as a section of the
-management page, off the navigation, offered only at the owner rung. A published
-version is never edited: a new draft starts FROM the published one, and
-publishing closes the previous version's window while leaving every plan already
-scheduled against it alone.
-
-**Bulk.** The preview-first contract was sound and the front door was a textarea
-taking hand-written JSON. The people who reassign forty files keep those files
-in a spreadsheet. `lib/merchandising/bulkCsv.js` reads one: RFC-4180 quoting,
-header matching by name rather than position, and a report of what will NOT be
-sent — unrecognised columns named rather than dropped, short rows refused rather
-than padded, each with the line number the person's own spreadsheet shows. A
-missing required column makes nothing previewable, because a preview built from
-three of four columns previews the wrong act.
-
-### Defects found and fixed on the way
-
-- **The Merchandising audit schema had no `fileId`.** It is `strict: true`, so
-  every M3–M7 write of that field had been silently discarded and an Execution
-  File's Changes & History showed only handover-lineage events. Added, and the
-  history query widened.
-- **The Sales outbox required handover fields on every event.** A development
-  event has no order line. Replaced the blanket `required: true` with a
-  per-kind requirement map and a pre-validate guard.
-- **The R&D shortlist blocker message** was reworded rather than its test
-  edited, so the phrase another lane pins stayed intact.
-
-### Verification
-
-- `npx jest test/merchandising --maxWorkers=2` — 19 suites, 638 tests, all
-  passing. The default worker count OOM-kills this suite and produces false
-  failures; `--maxWorkers=2` is required.
-- `test/merchandising/preorder-development.route.test.js` — 51 tests.
-- `test/costing/rnd-technical-record.test.js` — 47 tests, unchanged.
-- `test/sales` — every suite passing.
-- Frontend: 16 suites, 515 tests, all passing, including a new
-  `preorderDevelopment.test.mjs` (58) and `bulkCsv.test.mjs` (18).
-- `npx tsc --noEmit` — clean.
-- `next build` compiles (`✓ Compiled successfully`). Prerendering still fails on
-  four UNTRACKED pages from other lanes that use `useSearchParams` with no
-  Suspense boundary — Accounting item usage, Store reservations, Store stock
-  exceptions, Store supplier-offers/new. None was touched. Setting exactly
-  those four aside gives a clean build in which `/merchandiser/development`,
-  `/merchandiser/dashboard` and `/merchandiser/management` all render, and all
-  four were restored byte-identical afterwards.
-
-### Failures recorded and not fixed
-
-Four `test/costing` suites fail on the Central Costing lane's own in-progress
-work: `sales-tenancy-guard`, `costing-foundation.route`,
-`sales-prepare-authorisation` and `costing-contract`. Three are that lane's
-capability map disagreeing with that lane's capability test over
-`costing.commercial.approve` and `costing.commercial.submit`; the source and the
-tests are both modified in the working tree and neither was touched here.
-
-The fourth, `sales-tenancy-guard`, is a static scan for Sales queries that do
-not use one of the scoping idioms. It lists 16 offenders across `leads.js`,
-`leadContactPromotion.js`, `ieOrders.service.js` and `sampleBomApproval.js` —
-none of them this work. The four entries it originally raised against
-`services/sales/developmentRequest.service.js` were real in the sense the guard
-means: the queries were company-scoped but wrote the clause inline rather than
-through the `companyClause` idiom the guard recognises. They were changed to use
-it, and one of them — the buyer-label lookup — was genuinely reading an account
-by id alone on the strength of having come from a scoped journey, which is a
-cross-tenant read the moment somebody passes a journey from elsewhere. It now
-states its own clause.
-
----
-
-## Merchandising Lane A — M7 Change Control and Enterprise Scale (9 Sep 2026)
-
-**M7: DELIVERED. Nothing committed.** (The `MERCHANDISING: FEATURE-COMPLETE`
-claim originally written here was premature and has been moved to the pre-order
-development entry above, which is where it became true.)
-Sales-authorised change intake, Merchandising impact coordination, affected-
-application acknowledgements, preview-first bulk operations, exports and
-operational reporting, archive, integration observability, and manager-only
-configuration off the navigation. M0–M6 are untouched.
-
-### The five decisions everything follows from
-
-**Sales owns and authorises commercial change.** Merchandising has no route,
-no service and no model path that creates a notice — three source scans assert
-it, and a Merchandising owner is refused on Sales' own route. What Merchandising
-does is receive, acknowledge, assess and coordinate. There is no reject: it
-asks Sales for clarification, exactly as it cannot decline a handover.
-
-**No buyer conversation crosses.** `before`/`after` are the typed M2.1
-projection and nothing else. Fourteen forbidden field names — message, contact,
-thread, negotiation, quotation, price, margin, payment terms, internal notes —
-are refused at issue BY NAME saying whose record each is, including nested
-inside the projection. The schema has no field that could hold one, walked to
-full depth by a test.
-
-**`before` is derived, never sent.** It is read from the accepted handover
-version inside the service. A merchandiser therefore compares a fact against a
-claim, not two claims. Both sides are COMPLETE projections rather than a patch:
-the typed schema requires what makes a requirement executable, and a reader
-sees what the requirement now *is*.
-
-**Impact creates revisions; it never overwrites.** The change service imports
-no revision model, no baseline and no pack — a scan asserts that — and records
-only the NUMBER of a revision produced elsewhere, through the owning service's
-own command and guards. An approved revision is byte-identical after a change
-has been through it.
-
-**An acknowledgement is owned by its application, and a stale one is not
-coverage.** Exactly one service writes one, and it is the receiver. An answer
-naming an older change version is shown with the version it answered and never
-counted. `ACCEPTED` is not readiness, and the register says so on the row.
-
-### Bulk, exports, archive, observability
-
-Preview-first with a stored preview, a source checksum and a 30-minute expiry:
-apply against a moved source is refused with `BULK_PREVIEW_STALE` rather than
-silently applied. Per-row outcomes, partial success reported, 500 rows is a
-refusal with the number in it, results downloadable as formula-safe CSV. Every
-command delegates to the service that owns the record, and asks for exactly the
-capability its single-record equivalent asks for.
-
-Reports refuse to calculate a positive from missing data — a company with no
-plans gets a sentence, not 100%. Exports are the caller's current filtered view,
-company-scoped, audited with the filter, formula-safe, and carry no rate, cost,
-margin, supplier or contact. Archiving sets a flag; there is no delete anywhere
-in that service, and a scan asserts it. Stuck detection is a query with no
-timer, cron or worker — asserted by a scan — and the panel says so in the
-payload, not just the UI.
-
-### Defects found and fixed
-
-1. **The register never filtered archived files.** The field and index existed
-   from the model change; the query did not use them. Archived files stayed in
-   the default list.
-2. **The Sales audit and outbox schemas rejected change events** — a closed
-   action enum and a required `handoverVersionId`. Both extended additively so
-   handovers and changes share one Sales trail.
-3. **I overwrote `/merchandiser/settings`**, which is a compatibility redirect
-   to Sales' own settings, and then destroyed the uncommitted redirect with a
-   `git checkout`. Reconstructed from its siblings and verified by the three
-   structural tests that guard it. The management page moved to
-   `/merchandiser/management`, and the redirect now documents why.
-
-### Verification
-
-- `test/merchandising` — **587 passed, 18 suites**, in two orderings
-  (default/UTC and `--randomize --runInBand` under `TZ=America/Los_Angeles`).
-  61 of those are M7's. **Run with `--maxWorkers=2`**: the default worker count
-  OOM-kills on this machine and produces false failures.
-- Frontend `node --test` — **397 passed**, including 42 new M7 checks.
-- `npx tsc --noEmit` clean.
-- `git diff --check` clean on every M7 file.
-
-**The production build does not complete, and it is not M7's.** `next build`
-reports `✓ Compiled successfully` for all 361 pages. Prerendering then fails on
-four **untracked** pages from the Accounting and Store lanes, each using
-`useSearchParams` with no Suspense boundary:
-
-```
-app/accountant/budgets/item-usage/page.js
-app/store/dashboard/operations/reservations/page.js
-app/store/dashboard/operations/stock-exceptions/page.js
-app/store/dashboard/supplier-offers/new/page.js
-```
-
-Setting exactly those four aside and building gives **exit 0**, with
-`/merchandiser/changes`, `/merchandiser/management` and `/merchandiser/time-action`
-all prerendered. All four were restored byte-identical and remain untracked.
-Every Merchandising page wraps `useSearchParams` in Suspense.
-
-`npx jest test/` across the whole repository is 48 failed suites — accountant,
-crm, requests, costing, project-manager, store-purchase, auth, access —
-**Merchandising 0, PPC 0**, against a tree carrying 200+ modified files of other
-lanes' in-progress work.
-
-### What M7 did not do
-
-No Sales CRM, Tasks, Store or PPC screen inside Merchandising. No new capability
-constant — the fourteen from M0 are still the complete vocabulary, asserted by a
-test. No fourth navigation destination: the bar is exactly Overview, Order
-Execution, Time & Action, and the changes register and management page are
-reached from counts and from settings. No daemon, timer, broker or scheduler.
-
-### Honest gaps carried forward
-
-- **No application publishes a change acknowledgement yet**, so every announced
-  application reads PENDING. The door is `receive(event)`; the register says
-  "has not answered yet" rather than showing a gap.
-- **Bulk rows are entered as JSON** on the management page. It is honest and
-  complete but plain; a CSV upload would be the natural next iteration.
-- **Configuration is read-only in the UI.** Templates, calendars and reason
-  codes have full APIs and are managed through them; the management page
-  surfaces reports, bulk, exports, archive and integration health.
-
----
-
-## Merchandising Lane A — M6 Department Status and Downstream Handover (9 Sep 2026)
-
-**M6: DELIVERED. Nothing committed.** Source-backed department projections, a
-versioned immutable Execution Pack, Merchandising completion and submission, a
-PPC receiver-owned receipt, the accept/clarification lifecycle, and a
-functional `Handed Over` view. M0–M5 are untouched — their 475 tests pass
-unchanged.
-
-**Exit condition met:** Merchandising can submit one exact, immutable pack
-version downstream while every other department keeps authority over its own
-readiness and its own decision.
-
-### The four decisions everything follows from
-
-**Merchandising never marks another department ready.** Projections are written
-by exactly one thing — `departmentStatusIntake.service.js`, applying an event
-the owning application published. There is no route, no service export and no
-model path that lets Merchandising author one, and the projection model has no
-Merchandising actor field at all. A source scan asserts each of those.
-
-**No completeness gate is another department's readiness.** Seven gates, every
-one a Merchandising-owned fact: an accepted handover, three approved revisions,
-a settled Merchandising-owned approval position, an approved T&A baseline, and
-units that reconcile. Nothing about Store stock, suppliers, PPC capacity,
-production planning, Quality or logistics. **A pack submits successfully with
-all eight departments UNKNOWN**, and a test proves it. Department status sits
-in its own band, under a heading that says *"context, not a submission gate"*,
-and is never counted.
-
-**A submitted pack is frozen.** `contents`, `completeness` and `declaration`
-are refused by a pre-save guard once the state leaves DRAFT. A change is a new
-version; the old one is superseded, kept, and stays readable. `completeness` is
-frozen too — recomputing on read would make a pack that was correct in March
-display as incomplete in June.
-
-**PPC owns the receiving decision.** The receipt is a PPC-owned record under
-`models/CMS_Models/PPC/`, written by PPC's own route behind a live `ppc`
-department grant. A Merchandising grant of any level — viewer to owner — is
-refused there. Acceptance is what moves the file to `HANDED_OVER`; submitting
-alone does not, because the decision has not been made yet.
-
-One defect found while reviewing this path and fixed: superseding a pack PPC
-had already ACCEPTED left the file showing `HANDED_OVER`, resting on a decision
-about a version no longer in force. It now returns to `OPEN` until PPC decides
-on the replacement, and PPC's decision on the superseded version is preserved.
-
-### The lifecycle defect, closed
-
-`LIFECYCLE` gained `HANDED_OVER` and `executionPhase` gained `COORDINATION`,
-`PACK_SUBMITTED`, `HANDED_OVER`. The register's `handed-over` view already
-mapped that name onto nothing; it now holds records, its count is real in
-`getExecutionOverview`, and the *"honestly empty"* comment is gone. `OPEN`,
-`ON_HOLD`, `CLOSED` and `CANCELLED` behaviour and history are untouched.
-`OPEN → HANDED_OVER` on PPC acceptance; back to `OPEN` on clarification.
-
-### Honest reconciliation findings
-
-**There was no PPC application in this repository** — no `models/CMS_Models/PPC`,
-no PPC routes, no PPC seat screen. The spec assumed one. What exists is the
-shared `getEffectiveRole` department-grant mechanism, so M6 adds the smallest
-PPC surface that makes the boundary real: one slug, two capabilities
-(`ppc.inbound.read` at viewer, `ppc.inbound.decide` at approver), a queue, and
-the two decisions. It deliberately invents no PPC planning, capacity, line
-allocation or release — those are PPC's application to build.
-
-**The spec's `drain()` for department status could not exist honestly.** Those
-eight event kinds belong to other applications and live in their stores;
-putting them in Merchandising's outbox enum would be Merchandising publishing
-on their behalf. The integration point is `receive(event)`, called by each
-producing app's own carrier — exactly how `salesHandoverDelivery` calls
-`handoverIntake.receive`. **No app publishes any of the eight yet**, so every
-department currently reads UNKNOWN or UNAVAILABLE and the register says so.
-
-**The projection's identity is `sourceObservedAt`, not `sourceRecordVersion`.**
-A GRN partially received on the 3rd and fully received on the 9th is one record
-at one version making two true statements; a version-keyed index rejected the
-second as a duplicate. The version is still recorded beside it.
-
-**The spec's "TABS becomes seven" was written pre-M4/M5.** The task's nine-tab
-order was followed; `Department Status & Handover` is ninth, before History.
-
-### Verification
-
-- `test/merchandising` — **526 passed, 17 suites**, in two orderings
-  (default/UTC, and `--randomize --runInBand` under `TZ=America/Los_Angeles`).
-  51 of those are M6's.
-- Frontend `node --test` — **355 passed**, including 36 new M6 checks.
-- `npx tsc --noEmit` clean; `npx next build` exit 0.
-- `git diff --check` clean on every M6 file.
-
-**Browser verification was partial, and this is the honest limit.** The app
-boots with M6 compiled in, `/merchandiser/**` is correctly behind the session
-gate, and the console shows only the expected 401s — no runtime error from M6
-code. The Department Status & Handover tab itself was **not** exercised
-visually: doing so needs an authenticated session and seeded records in the
-live dev database, which is not authorised. A dev server was already running on
-port 3001 and was left alone.
-
-**Repository-wide failures, none of them M6's — exact evidence.** The full
-`npx jest test/` tree is **48 failed suites / 459 failed tests out of 297
-suites / 8045 tests**, deterministic across two runs. Every failing suite is
-another lane's: accountant 17, crm 9, requests 7, costing 7, project-manager 4,
-store-purchase 2, auth 1, access 1. **Merchandising 0, PPC 0.** The working
-tree carries 202 modified files of concurrent in-progress work, which is where
-those come from. `npm test` (node:test) is 1898 pass / 1 fail — the fail is
-`services/salesJourneyOutcome.test.js`, which fails identically with M6 stashed
-out because a concurrent Sales lane renamed a stage `poContract` →
-`purchaseInvoice`.
-
-**One thing worth flagging:** the M6 error codes were added to
-`services/storePurchase/errors.js`, lost when a concurrent lane rewrote that
-file, and re-added. An unregistered code silently becomes `VALIDATION`, so a
-merge that drops them again would turn every pack refusal into an
-uninterpretable one. They are verified present by `fail()` resolution, not by
-grep.
-
-### What M6 does not do
-
-No Store, Supply Chain, Product Development, IE, PPC, Quality, Production or
-Logistics features inside Merchandising. No supplier, rate, PO, consumption or
-cost. No generic `REJECTED` on the receipt — PPC asks for clarification, it
-does not refuse the confirmed commercial requirement. No change control; that
-is M7.
-
----
-
-## Merchandising Lane A — M5 Time & Action (9 Sep 2026)
-
-**M5: DELIVERED. Nothing committed.** The date control: templates, working
-calendars, plans, baselines, forecasts, blocks, source-owned completion,
-rescheduling with previewed impact, a cross-file register, and the frontend for
-all of it. M0–M4 are untouched — their 410 tests pass unchanged.
-
-It answers one question — *which milestone threatens the committed delivery
-date, and what is being done about it* — and deliberately answers no other. It
-is not a task manager: nothing on the surface carries an assignee, a reminder, a
-checklist, a subtask or a snooze, and a source scan pins that.
-
-### The four decisions everything else follows from
-
-**A baseline is a commitment, and only re-committing moves one.** Three dates
-per milestone: `baselineDate` (what was promised), `forecastDate` (what is now
-expected), `actualDate` (what happened). Forecast changes, blocks, completions
-and reschedule applications may not write `baselineDate` — only baseline
-creation and revision. If any one of them could, "four working days late" would
-silently rewrite itself as "on time" and the slip would vanish. A revision
-writes a NEW immutable `TnaBaseline` and supersedes the old one, which stays
-readable for the life of the file, so *what did we originally promise* never
-stops being answerable. A partial unique index allows exactly one ACTIVE
-baseline per plan; two concurrent approvals leave one winner.
-
-**A milestone another department owns cannot be signed for here.** Where
-`completionAuthority` is `SOURCE_EVENT`, `POST /complete` is refused with
-`TNA_SOURCE_OWNED` naming the department, and the screen offers **no control at
-all** — not a disabled one, because a greyed-out button still says "you do this
-here, later". Those close through `tnaIntake.service.js`, which consumes M4's
-three published approval events. The milestone records a REFERENCE back to the
-record that closed it and no actor, because nobody signed for it.
-
-**An approver approves the impact they were shown.** Rescheduling is preview,
-then decide. The preview computes the whole downstream effect in memory, writes
-one `PREVIEWED` row and freezes the plan revision it was computed against; if
-the plan moved underneath, approval is refused with `TNA_IMPACT_STALE` and the
-requester previews again. Where the move breaks a committed delivery date it
-carries `createsBaselineRevision`, and then the requester may not approve their
-own — owners included.
-
-**Every date is a calendar date, never an instant.** `^\d{4}-\d{2}-\d{2}$`
-throughout, with working-day arithmetic on a published calendar. A suite runs
-under `TZ=America/Los_Angeles` and produces byte-identical dates.
-
-### Integration, and what it deliberately does not touch
-
-T&A reads M4 through its published outbox events and never its collections. The
-carrier is `services/integration/tnaSourceDelivery.service.js`, called by the
-selection route AFTER an approval commits and never inside it — an approval must
-not be able to fail because a schedule is malformed. It never throws.
-Idempotency is a database fact: `MerchandisingIntakeLedger`, unique on
-`sourceEventId`.
-
-M4's approval REGISTER emits no outbox events, so a milestone waiting on a
-buyer's or Quality's sign-off stays visibly `AWAITING_SOURCE_RECORD` rather than
-pretending to know. That is the honest state and it is shown as neutral, not as
-a risk: nobody in Merchandising is late.
-
-### Three defects the tests found and fixed
-
-1. **The anchor floor was applied after the graph pass**, so every milestone
-   downstream of an anchored one computed from nothing — baselining was
-   impossible on any realistic template. The floor now enters the ranked pass.
-2. **A stated forecast was erased by the next propagation**, making
-   `updateForecast` a no-op for any milestone with a predecessor. A manual
-   forecast is now its own field and a floor: propagation may push it later,
-   never pull it earlier than what somebody actually said.
-3. **A malformed calendar exception was coerced into a holiday**, shifting every
-   downstream date with nothing in the record explaining why. It is now ignored.
-
-### Verification
-
-- `test/merchandising` — **475 passed, 16 suites**, in two orderings
-  (default/UTC, and `--randomize --runInBand` under
-  `TZ=America/Los_Angeles`). 69 of those are M5's.
-- Frontend `node --test` — **319 passed**, including 33 new M5 checks.
-- `npx tsc --noEmit` clean; `npx next build` exit 0.
-- `git diff --check` clean on every M5 file.
-
-**Two failures that are not M5's and were not touched.**
-`services/salesJourneyOutcome.test.js` fails identically with the M5 files
-stashed out (a concurrent Sales lane renamed a stage `poContract` →
-`purchaseInvoice`). And `app/accountant/reports/payables-aging/page.js` has a
-`git diff --check` blank-line warning from the Accounting lane.
-
-One genuine pre-existing bug WAS fixed, in M2.1's test rather than its code:
-`handover-contract-integrity.test.js` asserted a stored UTC date with
-`getMonth()`, which reads the LOCAL month — it passed only at or east of UTC.
-The value under test never changed; the assertion now reads it as the UTC
-calendar date it was stored as. The non-UTC run is what surfaced it.
-
-### Seeding
-
-`scripts/seed-tna-process.js` writes a fourteen-milestone starting process and a
-Monday–Friday calendar. Dry run by default; `--apply` is refused without
-`--authorized-by`. It declares no holidays, and it REFUSES rather than repairs
-if the company already has published configuration — a second published template
-would make resolution ambiguous and every plan creation would then be refused.
-**It has not been run against any data.**
-
-### What M5 does not do
-
-No personal tasks, to-dos, checklists, delegation or reminders. No Store
-readiness, PPC capacity or production scheduling. No second approval model —
-M4's register is untouched and no approval state is duplicated. Nothing claims
-production readiness, a PPC release, or a buyer approval authored by
-Merchandising.
-
----
-
-## Merchandising Lane A — M4: Development Requirements and Approvals (8 Sep 2026)
-
-Baseline at start: frontend FROZEN, M1+M2 FROZEN, M3 DELIVERED. No M0–M3
-contract was reopened.
-
-### Permanent models
-
-**Development Requirements** are a THIRD family of the M3 revision record, not
-a third machine: `MerchandisingDevelopmentRevision`
-(`merchandising_development_revisions`), built from the same base schema in
-`SelectionRevision.js`. It inherits one draft / one submitted / one approved
-per file, stable row identity, maker/checker, optimistic concurrency,
-idempotency, the audit vocabulary and the approval transaction. Only the row
-shape differs: `requirementType` (12 codes), `title`, `brief`,
-`requiredByDate`, `responsibleApplication`, `approvedReferenceExpected`,
-`coordinationNote`, applicability. The row's storage field is `rowRef` for all
-three families; the Development view calls it `requirementRef`.
-
-**Approval Register** — `MerchandisingApprovalRegister`
-(`merchandising_approval_registers`), one per Execution File, NOT versioned.
-Each row: `approvalRequirementRef`, category (14, each with an owning
-application), `owningApplication`, applicability, `requiredByDate`,
-`sourceRef`, and an `observation` block carrying status, decision actor/time,
-`observedAt` and a reason.
-
-### The ownership rule, and how it is enforced
-
-> Merchandising may state a REQUIREMENT for anybody. It may record a RESULT
-> only for itself.
-
-- **Internal rows** (`MATERIAL_TRIM_CARD`, `PACKAGING_SPEC`,
-  `DEVELOPMENT_SCHEDULE`) **resolve live** from Merchandising's own approved
-  revisions. Nothing is stored — a copy would be a second place for the truth
-  to go stale.
-- **External rows** (Sales / Product Development / Quality) are **observed**.
-  `observe` reads the source and records what it said with the moment it was
-  read. It takes no status, no outcome and no actor from the caller: there is
-  no parameter, no body field and no branch through which one could arrive.
-- `addRequirement`/`updateRequirement` refuse 22 fields **by name** —
-  `observation`, `status`, `decidedBy`, `approved`, `result`, `testResult`,
-  `buyerDecision`, … — and `owningApplication` follows the category rather than
-  the body.
-- `EXTERNAL_READERS` is deliberately **empty**: Sales, Product Development and
-  Quality publish no record this register can read. Those rows read
-  `AWAITING_SOURCE_RECORD` with the department named — not "outstanding",
-  which would imply somebody is working on it, and not a blank, which would
-  read as fine. When a producer exists, its reader goes in that map and every
-  row of that class starts answering with no other change.
-
-### APIs (permanent Merchandising execution mount)
-
-Development requirements reuse the M3 selection endpoints with
-`:family = DEVELOPMENT` — current, revision, cursor-paged history, create/clone
-draft, add/edit/withdraw row, submit, approve, request-changes. New:
-
-```
-GET    /files/:id/development-adoption/preview     read-only
-POST   /files/:id/development-adoption/adopt
-GET    /files/:id/approvals                        register + category vocabulary
-GET    /files/:id/approvals/summary
-GET    /files/:id/approvals/:ref
-POST   /files/:id/approvals                        add a REQUIREMENT
-PATCH  /files/:id/approvals/:ref                   edit the REQUIREMENT
-POST   /files/:id/approvals/observe                re-read the sources
-```
-
-There is no endpoint that completes an approval; its absence is asserted by
-test. Nothing was placed on the Sales, R&D or Quality routers.
-
-### Permissions
-
-`merchandising.file.read` reads; `merchandising.selection.write` authors drafts
-and register requirements and runs `observe`; `merchandising.selection.approve`
-approves and requests changes. Live grants only — JWT role text, assignment,
-CEO, platform admin, Sales access and authorship grant nothing. Maker/checker
-applies to development revisions exactly as to M3, owners included.
-
-### Legacy adoption
-
-From `SampleStyle.sample.serviceRequirements[]` where
-`purpose: DEVELOPMENT_TOOLING`. Read-only preview, idempotent adopt into a
-DRAFT, never approved. Preserved: source record, source row id, and the
-inclusion decision as `sourceRef.sourceState` (`INCLUDED`/`EXCLUDED`). NOT
-copied: `quantity`, `billingUnit`, `basis`, `owner`, `evidence`, `included`,
-`excludedReason` — costing and consumption facts owned elsewhere. Requirement
-type arrives as `OTHER`; a costing charge key is not a statement that something
-is a fit sample. Legacy data is never edited, marked or deleted.
-
-### Events
-
-Audit added: `APPROVAL_REQUIREMENT_CREATED`, `APPROVAL_REQUIREMENT_UPDATED`,
-`APPROVAL_SOURCE_OBSERVED` (record type `APPROVAL_REGISTER`) — plus the M3
-`SELECTION_*` vocabulary now carrying the DEVELOPMENT family. Outbox added:
-`merchandising.development_requirements.{submitted,approved,superseded}`,
-committed in the approval transaction. **No consumer for another department
-was built.** An observation that found the same answer writes no history line.
-
-### Frontend
-
-Execution File tabs are now seven: Summary · Sales Handover · Materials & Trims
-· Packaging · Development Requirements · Approvals · Changes & History.
-Development reuses `SelectionTab` with its own columns and row editor;
-`ApprovalsTab.js` is new. Navigation is unchanged (Overview, Order Execution).
-Summary gained an approval-count section that reports `awaitingSource`
-separately and says "Couldn't check" when its own read fails. History gained
-M4 sentences; an observation reads "Sales now reports approved…", never
-"Ada approved…".
-
-### Verification (8 Sep 2026)
-
-- `npx jest test/merchandising --runInBand` → **406/406, 14 suites**, in two
-  orderings. New: `m4-development-approvals.route.test.js` (45).
-- Frontend `node --test` → **467/467, 83 suites**. New:
-  `components/merchandiser/approvalsTab.test.mjs` (29).
-- `npx tsc --noEmit` → exit 0. `git diff --check` clean on every M4 file.
-- Recorded unrelated failures: `test/costing/{costing-approved-handoff,
-  quotation-approved-price.route,production-actual.route}.test.js` fail with
-  `COSTING_PREPARATION_MOVED_TO_SALES` — the concurrent Central Costing Lane A
-  session's uncommitted work (1,676 insertions in
-  `routes/CMS_Routes/Costing/costings.js`); no Merchandising file is involved.
-  `test/crm/sample-style.route.test.js` fails 6/6, the known pre-existing red.
-  Zero failures anywhere mention the M4 surface.
-
-### Known exclusions
-
-No buyer communication or buyer decision (Sales). No tech pack, measurements,
-patterns, consumption, samples or technical corrections (Product Development).
-No tests, inspections, holds or releases (Quality). No external producer, no
-consumer, no Time & Action, no Department Status. M5–M7 not started.
-
-M4 is not declared frozen.
-
----
-
-## Merchandising Lane A — M3: Materials, Trim Card and Packaging (8 Sep 2026)
-
-```
-Frontend: FROZEN
-M1+M2: FROZEN
-M3 start gate: PASSED
-```
-
-Both independent Lane B audits returned before M3 continued: `FRONTEND FROZEN`
-and `M1+M2 FROZEN`, with zero blocking defects and zero audit-authored
-application changes. The controlled-override caveat this entry carried at M3
-start is withdrawn — it no longer describes the state of the work.
-
-The M1+M2.1 backend contracts were treated as frozen inputs and were not
-reopened: `lineRef` semantics, allocation derivation, Sales/Merchandising event
-ownership, receiver idempotency, live Sales authorisation and the shared
-execution-projection contract are all untouched. No backfill or adoption was
-run in apply mode.
-
-### Permanent models
-
-`models/CMS_Models/Merchandising/SelectionRevision.js` — one base schema, two
-models, two collections:
-
-| Model | Collection | Rows |
-|---|---|---|
-| `MerchandisingMaterialTrimRevision` | `merchandising_material_trim_revisions` | fabric / trim / label / accessory / other |
-| `MerchandisingPackagingRevision` | `merchandising_packaging_revisions` | polybag / carton / tag / sticker / tissue-or-insert / other, plus revision-level packing instructions |
-
-Both are rooted on `fileId` + `companyId` — the Execution File, never the
-shared `SampleStyle`. Row shapes differ; lifecycle, numbering, identity and
-audit vocabulary are written once.
-
-Also added: `MerchandisingCommandLedger` (`merchandising_command_ledger`) for
-idempotency, and `OUTBOX_KIND` / `OUTBOX_REQUIRED` on `MerchandisingEvent.js`
-with a per-kind payload rule.
-
-### Revision state machine
-
-`DRAFT → SUBMITTED → APPROVED`, and an approved revision becomes `SUPERSEDED`
-when a later one is approved. **Changes-required is a decision, not a state**:
-it returns the revision to `DRAFT` with the reason kept on the record.
-
-Database-enforced invariants — three partial unique indexes on
-`(companyId, fileId)`, one per state: at most one `DRAFT`, one `SUBMITTED` and
-one `APPROVED` per file and family. Approval demotes the outgoing revision
-*before* promoting the incoming one, inside one transaction (the index is
-checked per write). `revisionNo` counts from the highest ever used and never
-resets. Approved revisions are immutable; a submitted one cannot be edited.
-
-### Row identity
-
-`MTR-`/`PKG-` plus twelve hex characters, minted once and carried unchanged by
-every clone. Cloning a revision preserves every row's reference — that is what
-makes "this label moved at revision 4" expressible. A withdrawn row leaves the
-DRAFT only; every revision it was approved in keeps it for ever. Applicability
-is `appliesToAllUnits` or a list of `unitDiscriminator` values, each validated
-against the same file and company.
-
-### Permission matrix and approval separation
-
-| Act | Capability | Minimum role |
-|---|---|---|
-| read current, revision, history, printable, adoption preview | `merchandising.file.read` | viewer |
-| create draft, add/edit/withdraw row, instructions, submit, adopt | `merchandising.selection.write` | editor |
-| approve, request changes | `merchandising.selection.approve` | approver |
-
-`submit` sits with the writer, not the approver: it advances your own draft for
-somebody else to read, and putting it behind `selection.approve` would mean an
-editor could never move their own work and every file would need two approvers.
-The separation the process needs is enforced in `approve` instead.
-
-**Maker/checker:** the approver may not be the actor who authored *or*
-submitted the revision, compared on both email and id. **An owner is not an
-exception.** Refusal is `SELECTION_APPROVAL_SEPARATION` (409). Live grants
-only — `isAdmin`, JWT role text, CEO, Sales, assignment and being the row's
-creator grant nothing; revocation and downgrade take effect on the next
-request.
-
-### API — all on the permanent Merchandising execution mount
-
-`/api/cms/merchandising/files/:id/…`
-
-```
-GET    /selections                                  both families, for Summary
-GET    /selections/:family                          current + working + units
-GET    /selections/:family/revisions                history (cursor paged)
-GET    /selections/:family/revisions/:no            one revision
-GET    /selections/:family/revisions/:no/printable  the frozen card
-POST   /selections/:family/revisions                create draft (clone optional)
-POST   /selections/:family/rows                     add row
-PATCH  /selections/:family/rows/:rowRef             edit row
-POST   /selections/:family/rows/:rowRef/withdraw    withdraw row
-PUT    /selections/:family/instructions             packing instructions
-POST   /selections/:family/submit
-POST   /selections/:family/approve
-POST   /selections/:family/request-changes
-GET    /packaging-adoption/preview                  read-only
-POST   /packaging-adoption/adopt
-```
-
-Every write carries `expectedRevision`; every retry-sensitive command carries
-an idempotency key (header `Idempotency-Key` or body). Nothing permanent was
-placed on the Sales or R&D routers.
-
-### Legacy adoption rules
-
-`services/merchandising/packagingAdoption.service.js` traces
-file → accepted handover version → CustomerRequest → order line → SampleStyle,
-proving each link and reporting a broken one rather than guessing. It reads
-`materials.packagingSelections[]` only — never `sample.packagingRequirements[]`,
-which is Product Development's consumption array — and imports no Sales/R&D
-module, restating the three legacy statuses locally.
-
-Adopted rows arrive as `OTHER` (the legacy card has no component class, and
-inferring one from a product name would be a guess), in a **DRAFT**, never
-approved. Preserved per row: source record, source row id, source timestamp and
-source decision state. Excluded with reasons: `WITHDRAWN`, `NO_COMPONENT_NAME`,
-`ALREADY_ADOPTED`, plus whole-source reasons when the chain cannot be proved.
-Idempotent twice over — the command ledger and per-row source references. The
-legacy record is never edited, marked or deleted.
-
-### Events
-
-Audit (`merchandising_audit_events`, record type `SELECTION_REVISION`):
-`SELECTION_DRAFT_CREATED`, `_ROW_ADDED`, `_ROW_UPDATED`, `_ROW_WITHDRAWN`,
-`_INSTRUCTIONS_UPDATED`, `_SUBMITTED`, `_CHANGES_REQUESTED`, `_APPROVED`,
-`_SUPERSEDED`, `_LEGACY_ADOPTED`.
-
-Outbox (`merchandising_outbox_events`), committed in the same transaction:
-`merchandising.material_trim_card.{submitted,approved,superseded}` and
-`merchandising.packaging_spec.{submitted,approved,superseded}`. **Nothing
-consumes them** — no Store, Supply Chain, R&D, Costing or Production consumer
-was built.
-
-### Frontend
-
-Execution File tabs are now Summary · Sales Handover · Materials & Trims ·
-Packaging · Changes & History. No new navigation destination: Overview and
-Order Execution are unchanged. New:
-`components/merchandiser/SelectionTab.js` (one component, both families) and
-`components/merchandiser/FrozenCard.js` (printable, authenticated, marked
-FROZEN or SUPERSEDED, `window.print()` with no PDF dependency and no QR
-claimed). Summary gained a source-backed selection section that reads
-"Couldn't check" when its own read fails. History gained business-language M3
-sentences.
-
-### Verification (8 Sep 2026)
-
-- `npx jest test/merchandising --runInBand` → **361/361, 13 suites**, in two
-  orderings. New: `selection-revisions.route.test.js` (58).
-- Frontend `node --test`, Merchandising surface → **304/304, 60 suites**
-  (`app/merchandiser`, `components/merchandiser`, `lib/merchandising`).
-  `components/merchandiser/selectionTab.test.mjs` is 45, having gained four
-  pins for the QR: that it links rather than copies, that it is never a public
-  or token-bearing address, that a code which could not resolve is not printed
-  at all, and that the open card is addressable.
-- Merchandising + Sales together → **745/745, 71 suites**. The suite count is
-  the same 71 this entry first recorded; the test count is not the 412 recorded
-  then, because concurrent Sales/CRM lanes have added to those files since. The
-  Merchandising figure above is the one this milestone owns.
-- Regressions: costing handoff/quotation-price/production-actual + `test/sales`
-  → 115/121 passing; the 6 failures are `test/crm/sample-style.route.test.js`,
-  the known pre-existing red verified failing at committed HEAD.
-- `npx tsc --noEmit` → exit 0. `git diff --check` clean on every M3 file.
-- No migration or adoption command was run in apply mode.
-
-### The frozen card carries a QR back to its own revision
-
-`components/merchandiser/FrozenCard.js` renders a `QRCodeSVG` of the canonical
-in-app address of the revision the sheet states —
-`/merchandiser/execution/<fileId>?tab=<family>&card=<family>&revision=<n>` —
-built from the browser's own origin, so a card printed from staging never
-points at production. The open card moved from component state into the URL to
-make that address answer: `?card=&revision=` opens exactly that card on exactly
-that tab.
-
-This reverses a decision recorded earlier in M3, and the reversal is narrow.
-That decision refused a QR on the grounds that scannability would require an
-unauthenticated public record; the premise is right and is now pinned as a hard
-rule — no `/public/`, no `token=`, no `share=`, no signed address, and nothing
-about the components encoded in the code itself. What it concluded was too
-broad: an ordinary authenticated deep link needs none of that. Somebody who may
-open the record opens it and is told whether the sheet in their hand is still
-in force; somebody who may not meets the same sign-in they would anywhere else.
-The plan's `printable/QR-linked frozen card` (§6.3) is the requirement this
-closes. Lane B should rule on the reversal.
-
-### Known exclusions
-
-No supplier, rate, quotation, purchase order, stock, lot, reservation,
-consumption, wastage or laboratory result — refused by name at the door and
-absent from the schema. No Development Requirements, Approvals register, Time &
-Action or Department Status tab. No outbox consumer. No public or token-bearing
-document address. M4–M7 not started.
-
-M3 is not declared frozen; Lane B performs the release audit.
-
----
-
-## Merchandising Lane A — M1+M2.1 Contract-Integrity Correction (8 Sep 2026)
-
-Three structural defects in the accepted M1+M2 release, corrected while the
-new records were still uncommitted, plus a schema tightening.
-
-### A. Order lines have a permanent identity
-
-`CustomerRequest.items[]` was `{_id: false}` and the handover used
-`sampleStyleId` as the line key — so one order carrying the same style on two
-commercial lines was refused as `AMBIGUOUS_LINE`. Added server-minted
-`lineRef` (`LN-` + 12 hex), assigned by a `pre("validate")` hook on
-`customerRequestSchema` — a complete chokepoint, since all sixteen writers
-persist through `.save()` (audited; no raw `$set` touches items). A client may
-NAME a reference the order already holds, never invent one
-(`carryLineIdentities`). `handoverRef`/`handoverLineRef`/`orderLineRef` and the
-route param are now `lineRef`; `AMBIGUOUS_LINE` is gone.
-Backfill: `scripts/backfill-customer-request-line-refs.js` — dry run default,
-`--apply` + `--authorized-by` required, idempotent, refuses duplicate/malformed
-references, batch identity = rollback identity, and a rollback that will not
-withdraw a reference a handover already names.
-
-### B. Multi-axis Execution Units
-
-`deriveUnits` built one unit per breakdown AND one per delivery, so a two-axis
-line stored twice the order quantity with no split→drop mapping. Added
-Sales-authored `allocations[]` (`allocationRef`, `lineSplitRef`, `dropRef`,
-`quantity` — a join, repeating nothing). One rule for both applications in
-`services/sales/handoverContract.js`: DEFAULT / `DROP:<ref>` / `SPLIT:<ref>` /
-`UNIT:<split>|<drop>`, identity from source references only (never attribute
-text or factory), all units totalling the line exactly once. Missing, orphaned,
-duplicated or unbalanced mappings are refused at issue in business words.
-
-### C. Producer/receiver ownership
-
-The producer wrote the Merchandising Execution File and audit trail directly.
-Now: `models/CMS_Models/Sales/SalesHandoverVersion.js` (moved from the
-Merchandising namespace, collection pinned), `SalesHandoverEvent.js` (Sales
-history + outbox, events `sales.merchandising_handover.{issued,superseded,
-cancelled}`). Sales writes only Sales records — enforced by a structural test.
-`services/merchandising/handoverIntake.service.js` is the only code that
-mutates Merchandising records from a Sales event, idempotent through a
-`merchandising_intake_ledger` keyed on the event id, refusing to move a record
-backwards. `services/integration/salesHandoverDelivery.service.js` carries
-events after the producer commits; a receiver failure leaves the event PENDING
-and never rolls back the commercial act. `POST /delivery/retry` drains.
-
-### D. Live Sales authority on the producer
-
-`bypassesApproval` (JWT `role`/`isAdmin`) replaced for this producer only by
-`services/sales/handoverAuthority.js`, reading the live `sales` DepartmentRole:
-viewer/editor may inspect, approver/owner may issue, supersede and cancel.
-Platform admin, CEO, Merchandising and any other department without a Sales
-grant are denied; revocation and downgrade take effect on the next request.
-Unrelated legacy Sales routes untouched.
-
-### E. The execution projection has a shape
-
-`models/CMS_Models/Sales/executionProjection.js` — one declared schema for
-`SalesHandoverVersion.executionProjection` AND the Execution File's accepted
-copy, which was `Schema.Types.Mixed`. Unexpected nested fields can no longer
-persist or escape through a response.
-
-### F. Honest legacy tooling
-
-The dual-mode "migration" (which advertised `--apply` and rollback while
-containing no write) is replaced by
-`scripts/merchandising-legacy-eligibility-report.js` — read-only, no apply, no
-authorization flag, no rollback claim. Dev run 8 Sep: 19 confirmed requests,
-115 lines, 0 issuable (115 lack a line reference and a delivery commitment,
-110 lack PO proof). The backfill in §A is the separate tool that writes.
-
-### Frontend
-
-`components/sales/MerchandisingHandoverCard.js` addresses lines by `lineRef`,
-gates controls on the server's `mayIssue`, and grows an accessible allocation
-matrix (per-split and per-drop remaining, issuance blocked until both
-reconcile) that appears only for genuinely two-axis lines. Order Execution,
-the Execution File screen, the Overview, navigation, deep links and all 15
-compatibility redirects are unchanged.
-
-### Verification (8 Sep 2026)
-
-- `npx jest test/merchandising --runInBand` → **303/303, 12 suites**, in two
-  orderings. Includes the new `handover-contract-integrity.test.js` (48) and
-  `legacy-tooling.test.js`.
-  <br>*(Corrected 8 Sep: this line first read 302, written from a run taken
-  before the last contract test landed. Lane B's independent audit reproduced
-  303/303 across 12 suites, and a second ordering of the six critical contract
-  suites at 175/175. The count is the only thing corrected here.)*
-- Frontend `node --test` merchandising + sales suites → **288/288**
-  (new `components/sales/merchandisingHandoverCard.test.mjs`, 19).
-- `npx tsc --noEmit` → exit 0.
-- Concurrent-session note: three merchandising suites failed transiently
-  mid-session with `approveCharges is not defined` while another session was
-  editing those fixtures for its development-charges work; they pass now and
-  no file of theirs was modified here.
-
-M3 not started. Nothing committed or pushed.
-
----
-
-## Merchandising Lane A — M1+M2 Vertical Release (8 Sep 2026)
-
-Navigation cut from `Overview | My Work | Styles` to `Overview | Order
-Execution`. Sales issues a versioned handover on a confirmed order line; the
-Merchandising inbox accepts it (or requests clarification — there is no
-decline) into an idempotent Execution File with derived Execution Units,
-assignment and lifecycle, all on the live-grant capability vocabulary.
-
-### Backend
-
-- Models (`models/CMS_Models/Merchandising/`): `SalesHandoverVersion`
-  (immutable payload, mutable `publication`, one CURRENT per line by partial
-  unique index), `ExecutionFile` (`MEF-YYYY-NNNN`, unique per
-  company+handoverRef+handoverLineRef, lifecycle OPEN/ON_HOLD/CLOSED/CANCELLED),
-  `ExecutionUnit` (split/drop axes, withdrawn = `active:false`),
-  `HandoverReceipt` (one per version; PENDING is computed, not stored),
-  `MerchandisingEvent` (append-only audit + outbox, committed in the txn).
-- Producer `services/sales/merchandisingHandover.service.js` +
-  `routes/CMS_Routes/Sales/merchandisingHandovers.js` (salesAuth +
-  `bypassesApproval`): inspect / issue / cancel on
-  `/api/cms/sales/merchandising-handovers/requests/:id[/lines/:lineId/...]`.
-  Confirmation = `quotation_sales_approved` or later; customer approval alone
-  is NOT confirmation. `committedDeliveryDate` is Sales-authored per drop and
-  must reconcile to the line total; `targetExFactoryDate` never derived.
-- Receiver `services/merchandising/execution.service.js` +
-  `routes/CMS_Routes/Merchandising/executionRoute.js`: handover inbox,
-  accept (idempotent — unique index + txn + 11000 catch), clarify (category +
-  reason mandatory), register (5 views), file, history, PATCH
-  (note/tags/expectedRevision only), assignment (assignee must hold a live
-  merchandiser grant + membership; grants no authority), lifecycle
-  hold/resume/close/reopen (CANCELLED only mirrored from Sales). No decline,
-  no `POST /files`, no Merchandising cancel/rescope.
-- Capabilities: `CAPABILITY` map (14 names) +
-  `requireMerchandisingCapability` in `services/merchandising/access.service.js`,
-  derived from the live DepartmentRole ladder; refusals name
-  `{department, capability, minimumRole}`.
-- Observation-only migration: superseded by the M2.1 correction — see
-  `scripts/merchandising-legacy-eligibility-report.js` (read-only) and
-  `scripts/backfill-customer-request-line-refs.js` (the one tool that writes).
-
-### Frontend
-
-- `app/merchandiser/execution/page.js` (register: 5 views, URL state,
-  workFeed staleness, accept/clarify), `app/merchandiser/execution/[fileId]/page.js`
-  (Summary / read-only Sales Handover / Changes & History; CommandDialog),
-  `app/merchandiser/dashboard/page.js` (4 real-record indicators; failure =
-  "Couldn't check", never zero), `components/merchandiser/merchandisingNavigation.js`
-  (2 entries + `TRANSITIONAL_DEEP_LINKS`), `components/sales/MerchandisingHandoverCard.js`
-  mounted in `CustomerRequestDetail` execution branch,
-  `CompanyContextRequired` now shows membership display names via
-  `GET /api/cms/merchandising/companies`.
-
-### Verification (8 Sep 2026)
-
-- Backend: `npx jest test/merchandising --runInBand` → **234/234** (10 suites),
-  plus `migration-utility.test.js` → **8/8** (242 total, 11 suites).
-- Sales/R&D regressions: `test/sales/packaging-bom-link.test.js` +
-  `test/sales/sample-requirements.test.js` → 63/63.
-  `test/crm/sample-style.route.test.js` fails 6/6 **identically at committed
-  HEAD in a clean worktree** — pre-existing from the concurrent CRM merge, not
-  Lane A.
-- Frontend: `node --test` merchandising suites → **156/156**;
-  `npx tsc --noEmit` → exit 0; `npx next build` → compilation ✓ (3.1 min),
-  **export FAILED** at `/accountant/budgets/item-usage` (missing Suspense,
-  Accountant lane, pre-existing class) → build exit 1. Do not read that as a
-  Lane A pass; all Lane A pages compile and carry Suspense boundaries.
-- `git diff --check` clean on every Lane A file in both repos.
-- No browser walkthrough: no authenticated session existed (frontend not
-  running; no credentials held).
-
-**Verdict: `M1+M2 RELEASE-READY`** (with the pre-existing repo-wide build/CRM
-failures outside Lane A recorded above). M3 not started.
-
----
-
-## Store & Purchase — Chunk 1A: foundation, operational-PO pilot, authority corrections
-
-> **Chunk 1 is NOT complete.** This is 1A: the shared foundation, the
-> operational-PO pilot, and the correction of the authority bypasses that
-> pilot shipped with. Architecture record:
-> `docs/decisions/store-purchase-tenancy-permissions.md`. Chunk 2 is blocked.
-> Paused Budget/Accounting files untouched. Nothing committed.
-
-### Corrections made to the 1A pilot
-
-| Bypass | Was | Now |
-|---|---|---|
-| PO creation | took `status` from the body — `sp.po.create` alone could create an ISSUED (or COMPLETED) order, no issue capability, no policy, no `approvedBy`, supplier emailed | always DRAFT; a non-DRAFT status is a structured 400; supplier email and "issued" notification moved to the transition only |
-| PO edit (PUT) | `if (status) purchaseOrder.status = status` — a second, unguarded issue/cancel path; edits allowed on ISSUED | `status` refused outright; **DRAFT only**; ISSUED/PARTIALLY_RECEIVED/COMPLETED/CANCELLED all refuse; edits write a changed-field summary |
-| Transitions | any of DRAFT/ISSUED/CANCELLED, optional idempotency | explicit table (DRAFT→ISSUED, DRAFT→CANCELLED, ISSUED→CANCELLED-if-no-receipts); receipt states unreachable by request; nothing returns to DRAFT; same-state is a no-op that appends no history; **idempotency mandatory** |
-| Approval policy | `NONE_MATCHED` returned `allowed: true` — an unconfigured company behaved like an approved one, and a capability check was being passed off as policy enforcement | **fails closed** with `POLICY_NOT_CONFIGURED`; empty level set authorises nobody; emergency orders need an emergency rule; capability and policy are two gates and both must pass |
-| Idempotency | protected entry only — mutation could succeed, history fail, key be released, retry repeat the mutation | `EFFECT_APPLIED` marker written **before the first stock write**; `abandon()` refuses to release an applied effect (enforced by the query filter, not the caller); recovery path replays instead of re-running; stale IN_PROGRESS reclaimed after 2 min |
-| Company membership | arbitrary `findOne` across possibly-many memberships | deterministic: one membership decides; several require an explicit `X-Store-Purchase-Company` selection **validated against** the memberships; unknown selection gets the non-disclosing refusal |
-| Site scope | accepted and stamped any browser ObjectId when membership listed no sites | refused: `SITE_NOT_CONFIGURED` (no site master exists), `SITE_NOT_PERMITTED` outside membership, structured validation error for a malformed id |
-| `/api/cms/units` | **no authentication at all** — anonymous writes to the conversion master every stock movement trusts | reads need `sp.read`, writes need `sp.master.maintain` |
-
-New: `services/storePurchase/unitOfWork.service.js` (transaction where the
-deployment supports it — probed with a real write, not by assumption —
-otherwise the effect-marker path), `scripts/migrations/store-purchase-chunk1-indexes.js`,
-`test/store-purchase/idempotency-faults.test.js`, `test/store-purchase/migration-indexes.test.js`.
-
-### The honest guarantee on a standalone MongoDB
-
-Stock moves item by item outside any transaction. The effect marker is
-written **before the first stock write**, so a failure anywhere afterwards
-sends the retry into recovery and the stock never moves twice. Where the
-order did not record the delivery, recovery **refuses** with
-`PARTIAL_RECEIPT_NEEDS_RECONCILIATION` and writes a
-`RECEIPT_RECONCILIATION_REQUIRED` history entry — the inconsistency is
-surfaced for a human rather than repeated or hidden. That is at-most-once,
-not exactly-once, and the difference is stated rather than glossed.
-
-### What remains for Chunk 1 — cross-company access is still possible
-
-These active routers are **unchanged from Chunk 0**: MRF/material request,
-requisitions, stock issuance, stock adjustment, vendor returns, barcodes,
-deliveries, RawItem direct stock writes and hard delete, worksheet PO/WO.
-Each can read and mutate another company's records, has no capability check
-and no idempotency. Also outstanding: legacy-master reference compatibility
-documentation (§8), frontend coverage beyond the two PO screens, and a
-frontend component-test harness (the repo has none).
-
-**Passing tests do not mean the boundary holds.** 472 green tests cover the
-converted routers; they say nothing about the list above.
-
-### Verification
-
-| Check | Result |
-|---|---|
-| Chunk 0 pure audit suites | **119/119** |
-| `test/store-purchase` + `test/requests` | **472/472**, 15 suites |
-| — of which fault-injection | 7/7 (`idempotency-faults.test.js`) |
-| — of which migration | 5/5 (`migration-indexes.test.js`) |
-| `test/accountant` | 14 suites fail — **all `budget-*`, all pre-existing**: none loads any file I changed (grep), and `budget-duplicates` fails identically with my files reverted to `HEAD` |
-| Frontend parse (6 files) | pass |
-| `git diff --check` both repos | clean |
-
-**Not a successful frontend build.** `next build` still fails in the
-committed, unmodified `app/accountant/sales-vouchers/new/page.js`
-(`splitGstByRate` imported and defined in one file). Unrelated and
-pre-existing; no full build can be claimed.
-
-**Authenticated visual verification: NOT DONE.** Requires a login I will not
-perform. Assigned manual check: PO register (Cancel not Delete; Create hidden
-without `sp.po.create`), PO detail (Issue/Cancel gated and disabled in
-flight, History drawer — Escape, focus trap, focus restored, retry on load
-failure), and the not-available state for an account with no membership, at
-desktop and mobile widths.
-
-### Migration
-
-`scripts/migrations/store-purchase-chunk1-indexes.js` — dry-run by default,
-`--apply`, `--rollback`. Drops the legacy global `poNumber_1`, creates the
-compound and new-collection indexes, detects duplicate `(companyId, poNumber)`
-pairs as BLOCKING before touching anything, and **reports** legacy unowned
-orders without assigning ownership. Rollback refuses when companies now share
-numbers, because choosing which to renumber is a business decision. **Not run
-against any database.**
-
----
-
-## PL eligibility reconcile, overtime & regularisation history, record stamps
-
-> Follow-on to the HR change-history work below. Five items the user raised
-> after using it. Nothing committed.
-
-### 1. PL sync now REVOKES as well as grants — the correctness bug
-
-Reported symptom: people holding PL they were never eligible for, and people at
-the threshold who never got it. The cause is not the threshold maths — it is
-that eligibility derives from `dateOfJoining`, a field HR edits, and the sync
-only ever granted. A DOJ typo that made somebody eligible left them holding PL
-permanently once it was corrected.
-
-| File | Change |
-|---|---|
-| `services/plEligibility.js` | **New, pure.** `decidePlEligibility()` returns one of six actions. Extracted from the route specifically because it now takes entitlements *away*: a wrong answer here is invisible afterwards, and the cases where it must refuse to act are the easy ones to get wrong. Takes `workingDays` as a parameter rather than reading the clock, so the table is testable. |
-| `services/plEligibility.test.js` | **New**, 10 node:test cases over the whole decision table, including the two refusals and the inclusive-threshold boundary. |
-| `routes/HrRoutes/Leave_section.js` | The loop is now a `switch` over that decision. Grants, revokes, and reports the two it refuses to touch. Logs grants and revocations as **separate** change-log entries — they are different events, and somebody searching for "when did this person lose their PL" must not have to open a combined one. |
-| `models/HR_Models/LeaveManagement.js` | `plRevokedDate`, kept alongside `plGrantedDate` — given-then-withdrawn is a different fact from never-granted. |
-| `app/hr/dashboard/leaves/PLSyncModal.js` | Preview now shows both directions plus both refusal buckets, each with the people named. The old "Will Grant" tile counted `eligible`, which includes everybody already holding PL correctly — it overstated the change. Now counted from the list. |
-
-**Two things it refuses to do, and this is the substance of the fix:**
-
-- **No date of joining → skip, always.** `workingDaysSince(undefined)` returns 0,
-  which reads as "nowhere near eligible" and would have revoked every employee
-  with a blank field — the same class of mistake this exists to clean up,
-  applied to more people. Reported under `noJoiningDate`.
-- **PL already taken → report, never auto-revoke.** Zeroing the entitlement of
-  somebody who has taken PL days leaves consumed above entitlement: leave that
-  was applied for, approved and usually already paid. Whether those days become
-  LWP, stand as an exception, or are recovered is a payroll decision with money
-  attached. Reported under `needsReview` with the day count.
-
-### 2. Overtime and regularisation history
-
-Both live under `/api/employee/**` and so were outside the HR audit trail —
-which is exactly why they had no history. They are HR facts regardless: an
-approved overtime grants grace on the next day's attendance, and a
-regularisation rewrites a day outright.
-
-- New section `hr:overtime` + path patterns; regularisations file into the
-  existing `hr:attendance-regularizations` so the app-side and HR-side halves of
-  one request share a history.
-- `server.js` mounts the trail on `/api/employee/overtime` and
-  `/api/employee/regularizations` **by name** — not on all of `/api/employee`,
-  which is the whole mobile surface and has no business in the HR log.
-- `Overtimeroutes.js`: submit, manager approve, manager reject (3 entries).
-- `Employee_Routes/regularization.js`: employee applies, primary hands to
-  secondary, final approval, manager rejects, employee withdraws (5 entries).
-
-Both approval entries record **whether it actually reached the attendance
-record**, separately from the decision. A request can be approved and apply to
-nothing, and the employee is then told their day was corrected when it was not.
-
-**Frontend for these two** (asked about after the first pass, and the answer was
-only half yes):
-
-- *Regularisations* needed nothing new. The page already exists and already
-  passes `activeMenu="attendance-regularizations"`, which the layout maps to
-  `hr:attendance-regularizations` — so its top-bar History button was already
-  opening exactly this history, and the new app-side entries land in it because
-  they share the section key.
-- *Overtime* had no way in beyond the section rail on the history page. There is
-  no HR overtime screen to hang a button on — it is raised in the app and
-  decided by a manager. So: `/hr/dashboard/history` now reads `?section=` from
-  the URL (split into `page.js` + `HistoryClient.js` with a Suspense boundary,
-  the same shape as the new-employee page, because `useSearchParams` suspends),
-  the rail writes the section back with `router.replace` so a section view is
-  linkable without stacking history entries, and an **Overtime** item sits under
-  Time in the HR nav pointing at it. `NAV_KEY_FOR_SECTION` keeps that item
-  highlighted while it is open.
-
-### 3. Leave page had no page gutter
-
-`app/hr/dashboard/leaves/page.js` used `mx-auto w-full max-w-[1480px] space-y-5
-pb-10` — no horizontal or top padding, so the content sat flush against the rail
-and the top bar. Every other HR page uses `mx-auto max-w-[1480px] px-4 py-6
-deck:px-8`. Now matches.
-
-### 4. "Added by / last changed by" on records
-
-| File | Change |
-|---|---|
-| `routes/HrRoutes/ChangeHistory.js` | `GET /stamps?entity=&ids=` — created and last-changed for up to 500 records in **one** query. Batched deliberately: per-row it is one request per record, which on a 400-employee list is 400 requests to render one line of small text each. The first *create* wins rather than the first row of any kind — a record whose earliest surviving entry is an edit predates the log, and calling that its creation puts the wrong name on it. |
-| `components/access/RecordStamp.js` | **New.** One line of ink-faint text. Self-fetches on a detail screen; takes a pre-fetched stamp in a list, via the `useRecordStamps` hook. Names the approver too when the change only landed because somebody accepted it — otherwise the line credits the editor and implies they could make it alone. |
-| Employee form, department detail, departments list | Wired in. |
-
-The documents list already showed `generatedByName`, so it was left alone rather
-than given a second, competing attribution line.
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- `node --test services/plEligibility.test.js` — **10/10**.
-- `npm test` — **936 / 939**. The 3 failures are in `blockedDeadline.test.js`
-  and `salesJourneyOutcome.test.js`; confirmed pre-existing by stashing every
-  change and re-running on a clean tree (926/929, same 3).
-- `node -r dotenv/config verifyHrChangeHistory.js` — **46/46** still green.
-- `node --check` clean across every touched backend file.
-- All 8 changed frontend modules compiled in dev with no errors.
-
-**Not verified:** the PL reconcile against real data — it needs an HR session,
-and a dry run is the safe way to see it (the modal opens on one). The decision
-rule behind it is covered by the unit tests.
-
----
-
-## HR change history — every change recorded, per page, with approver attribution
-
-> **Scope: HR only, deliberately.** The user asked for the whole CMS eventually
-> but for HR first, "to minimize the load". Everything below is built to extend
-> to another department with a section list and one mount line — see *Extending*
-> at the end. Nothing committed.
-
-### The problem
-
-`change_logs` and `services/changeLog.js` already existed, but only four HR route
-files wrote to them (12 of ~90 write handlers), the collection had no idea which
-SCREEN a change came from, the diff was shallow, and the only way to read it was
-`GET /api/admin/change-log` — platform-admin only, so the department whose work
-it recorded could not see it. An approved change was also indistinguishable from
-one an editor was allowed to make alone.
-
-### Backend (`grav-cms-backend`)
-
-| File | Purpose |
-|---|---|
-| `models/Access/ChangeLog.js` | Extended, additively. New: `section`/`sectionLabel` (which page), `fields[]` (per-field `{path,label,from,to,kind}`), `origin` (`direct`/`approval`/`import`/`system`), `approvedBy*`/`decisionNote`/`changeRequestId`, `requestMethod`/`requestPath`, plus two section indexes. `sanitiseValue(path,value)` redacts by the **leaf** of a dotted path, so a salary nested at `components.2.basicSalary` redacts as reliably as a top-level one. `before`/`after` and the shallow `diff()` are untouched — the CRM writes ~170 entries through them and existing readers index into `after[key]`. |
-| `services/auditSections.js` | **New.** The vocabulary: 28 HR sections (key, label, nav group, href), a field-label registry (`COMMON` + per-section overrides, so `status` is "Employment status" on the employee form and "Approval status" in the leave queue), and `sectionForPath()` for the two places that have only a URL — the mount-level write guard and the approval queue. Labels are resolved **at write time** and stored: renaming a field next year must not rewrite what last year's history says happened. |
-| `services/changeLog.js` | `fieldDiff()` — a deep diff walking objects and arrays to dotted paths (`punches.1.inTime`), depth-capped at 4 and 120 fields, comparing the way the database does (an ObjectId equals its string, a Date equals its ISO string, `5` equals `"5"`) so mongoose's lean-vs-hydrated inconsistency does not fill every entry with changes that never happened. `buildSummary()` writes the sentence from the diff rather than by hand, because a hand-written summary drifts from the fields under it. `approvalFrom(req)` reads the approver off the replay headers, so **every route that logs gets approval attribution without knowing it exists**. Plus `listChanges()` (filters + pagination + escaped search) and `auditFor()`. |
-| `services/changeRequests.js` | The loopback replay now sends `x-grav-approver-{id,name,email}` and `x-grav-decision-note` alongside the existing replay header — header-injection-safe. Headers, not the token: the token is the *requester's*, and folding the approver into it would make every downstream `req.user` ambiguous about which of the two people it means. Also records the **submission**, the **decision**, and a **withdrawal** — a rejected change never reaches a route, so without these an editor's work vanishes with nothing anywhere saying it was asked for. `decideChangeRequest` takes `req` and logs from the *result*, so a failed replay is never recorded as "approved". |
-| `models/Access/ChangeRequest.js` | `section`/`sectionLabel` added, so a held change shows on the page it was submitted from. |
-| `Middlewear/departmentWriteGuard.js` | Resolves `req.auditSection`/`req.auditEntity` from the path before holding, so the queue says "leave" rather than "hr record". |
-| `Middlewear/auditTrail.js` | **New — the floor.** Mounted by prefix, it records any successful write that the route did not log itself. Skips reads, read-shaped POSTs (same list the write guard uses), failures (4xx/5xx changed nothing), and 202s (held, not applied). `recordChange` sets `req.__auditLogged` on the *call*, so a route that looked at a change and decided nothing happened is not second-guessed. Fires on `finish`, by which point the router's auth middleware has resolved `req.user`. Entity id comes from the **path**, not `req.params` — params are reassigned per route layer and mean nothing at app level. |
-| `routes/HrRoutes/ChangeHistory.js` | **New**, mounted `/api/hr/change-history` behind `EmployeeAuthMiddleware`, **above** the bare `/api/hr` profile router. `GET /`, `/sections`, `/actors`, `/record/:entity/:entityId`, `/summary`, `/export` (CSV). `departmentSlug: "hr"` is pinned server-side on every handler — taking it from the caller would make this a way to read another department's payroll changes by editing a query string. An unknown section is dropped rather than passed through: a mistyped section would return an empty list, and an empty history reads exactly like "nobody changed anything". |
-| 17 HR route files | `recordChange` calls with real before/after, filed to a section. Coverage went from 12 to 99 explicit call sites (a few of those are shared per-file helpers rather than one-per-handler): leaves (15), payroll (9), attendance (12), employees (7), documents (6), candidates (6), policies (6), SOP (7), job postings (5), tasks (6), password management (5), departments (5), app versions (4), HR profile (2), shift swaps (1), employee import (1). Bulk actions log **per record** where each record has its own history (bulk leave approval, bulk payroll override) and as **one entry naming everybody** where they do not (year init, PL sync, bulk attendance override) — several hundred identical rows would bury every other change on the page. |
-| `server.js` | Two mounts: the audit trail on `/api/hr`, `/hr`, `/api/employees`; the read API on `/api/hr/change-history`. |
-| `verifyHrChangeHistory.js` | **New**, hand-run like the other `verify*.js` scripts. Writes and then deletes its own `change_logs` rows (entity `verify-harness`), cleaning up on crash too. |
-
-Two bugs found and fixed on the way, both in code being touched:
-
-- `routes/HrRoutes/Candidates_section.js` logged `stage changed from X to Y`
-  **after** assigning the new stage, so both sides always printed the same value.
-- `Middlewear/auditTrail.js`'s first draft copied the write guard's
-  `POST /:id/verb` heuristic, which matches any two trailing word segments — so a
-  plain `POST /api/hr/departments` was classed as an update. It now requires the
-  parent segment to *look* like an id. **The same latent bug is still in
-  `departmentWriteGuard.js`**, where it only mislabels an action in the approval
-  queue; left alone because changing it moves Sales's queue labels and this task
-  is HR-scoped.
-
-### Frontend (`grav-cms`)
-
-| File | Purpose |
-|---|---|
-| `lib/changeHistoryApi.js` | **New.** Thin client over `/api/hr/change-history`, through `lib/api` so it inherits both halves of the auth story (cookie *and* Bearer). Also owns `ACTION_META`/`ORIGIN_META` and the value/date formatters, so the drawer and the full page cannot disagree about what a rejection looks like. |
-| `components/access/ChangeHistory.js` | **New.** One renderer, three placements: `<ChangeHistory>` (full page), `<ChangeHistoryDrawer>`, `<HistoryButton>`. An entry carries when, kind, record, a written sentence, every changed field with old → new, who, and — for a held change — who approved it and their note. Fields collapse by default. Pending approvals render **above** the history, because a record's history that omits them shows a salary of 25,000 without mentioning the 30,000 sitting in a queue. Out-of-order responses are guarded with a request sequence counter. |
-| `components/Hr_DashboardLayout.js` | A `History` nav item, and — the important part — a `HistoryButton` in FrostShell's `extras`, mapped from `activeMenu`. **One edit covers all ~40 HR pages**, and a page added later gets its history by being in the nav. Forty per-page edits would have been forty chances to pass the wrong key and one guaranteed omission on the next new page. |
-| `app/hr/dashboard/history/page.js` | **New.** Department-wide history with a grouped section rail (from the server vocabulary, so a page with no changes still appears and says so), a four-cell stat strip that refetches per section, and the shared list. |
-| `app/hr/dashboard/departments/[id]/page.js`, `.../employees/new-employee/NewEmployeeClient.js` | Record-scoped `HistoryButton` on the two detail screens. On the employee form it only renders once there is a record — an empty drawer reads as a broken one. |
-
-`app/hr/dashboard/employees/history/page.js` was left as it is at the user's
-direction; it still reads `/api/employees/history` and is unaffected, since every
-model change is additive.
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- `node -r dotenv/config verifyHrChangeHistory.js` — **38/38 pass** against the
-  dev database. Covers the label registry, path→section resolution, the deep
-  diff's four equality cases, redaction in both `before`/`after` *and* `fields[]`
-  *and* the generated summary, the no-op suppression, approval attribution
-  (editor stays the actor, approver recorded separately), and every read filter
-  including department isolation and a regex metacharacter typed into search.
-- `node --check` clean across all 21 HR route files and every touched service.
-- The new route answers **401** exactly like its HR neighbours (mounted, gated).
-- Frontend compiles clean in dev (no errors in the Turbopack log); the component
-  renders, its toolbar sits on one row, and it uses **no hardcoded colours** —
-  every value is a `--g-*`-derived token, so it follows the shell's theme.
-
-**Not verified:** the populated list rendered in a real logged-in HR session —
-that needs credentials. The data shape behind it is covered by the harness.
-
-### Fixed after first review
-
-The user opened the drawer on a real record and got *"Updated employee KRISHNA
-BEHERA"* with nothing under it, and a sheet whose colour did not match the page.
-Both were real:
-
-- **The employee update route diffed a hand-picked list of nine fields** and
-  passed its own `summary`, so an edit to anything else (address, bank details,
-  date of birth, shift) recorded an entry that said something had happened and
-  refused to say what — and the explicit summary defeated the no-op suppression
-  that would otherwise have dropped it. `beforeDoc` was *also* a 13-field
-  projection, so widening one without the other would have reported every
-  unselected field as newly added. Now: `beforeDoc` is the whole document, a new
-  `employeeAuditSnapshot()` decides what a history should see (an exclude list —
-  secrets, audit stamps, engine state, the photo — rather than an include list),
-  salary is decrypted so a hike reads as `Gross salary 25000 → 30000`, and the
-  hand-written summary is gone so `buildSummary` writes one from the actual
-  diff. Labels added for the ~30 fields this newly exposes.
-- **The drawer painted itself with `--body-bg`**, the page *ground* — a flat
-  slab the same colour as the page it floats above. It now uses `frost-panel`,
-  the surface material every other raised thing in the shell uses, correct in
-  both themes and both perf modes without naming a colour.
-- **The drawer is now portalled to `document.body`**, carrying `.grav-ui` plus
-  `data-theme` and `data-perf` (FrostShell's own documented pattern). This was a
-  latent bug, not cosmetics: the button lives in `.frost-bar`, which has
-  `backdrop-filter` when effects are on, and an ancestor with `backdrop-filter`
-  becomes the containing block for `position: fixed` — so the sheet would have
-  been positioned against the top bar rather than the viewport the moment
-  anybody turned effects on. HR defaults to effects off, which is why it looked
-  fine. A `mounted` flag keeps the portal out of the first client render so it
-  hydrates cleanly.
-
-Harness extended to **46 checks**, pinning the whitelist bug specifically: an
-off-list edit is recorded, names the fields that moved, labels nested paths
-(`address.line1` → "Address line 1"), reports neither an unchanged nested value
-nor an unchanged salary, and a pay rise reads as one. Both themes were verified
-in the browser through the portal.
-
-A pre-existing hydration error fires on the landing page too and is unrelated to
-this work.
-
-### Extending to another department
-
-1. Add its sections to `SECTIONS` in `services/auditSections.js` (and any path
-   patterns to `PATH_SECTIONS`).
-2. `app.use("/api/<prefix>", auditTrail("<slug>"))` in `server.js`.
-3. Copy `routes/HrRoutes/ChangeHistory.js`, changing the one `DEPARTMENT`
-   constant and the auth middleware.
-4. Add the `HistoryButton` to that department's `*_DashboardLayout.js` `extras`.
-5. Instrument its write handlers with `recordChange` for real diffs — the floor
-   covers them until then.
-
----
-
-## Personal Planner — chunk 1: foundation, Today, Ladder, Review
-
-> **One employee's own Vision → Mission → Project → Task ladder, private to
-> them, reachable from inside any department.** Backend models + API + two pure
-> services, frontend route with three views. Nothing committed.
-
-### Backend (`grav-cms-backend`)
-
-| File | Purpose |
-|---|---|
-| `constants/planner.js` | **New.** The vocabulary — three levels with the ladder encoded as `childLevel` data rather than an if-chain, four goal statuses, three task statuses. Kept separate from `constants/crm.js` on purpose: nothing here is a business record, and sharing a constants file is how a privacy boundary quietly stops being true. |
-| `models/Planner/PlannerGoal.js` | **New.** One collection for all three goal levels. A pre-validate hook enforces the ladder (vision rootless, mission under vision, project under mission), which makes the tree exactly three deep **by construction** — so unlike `services/crmHierarchy.js` there is no cycle to guard. No `percentComplete` field anywhere: progress is derived, never stored. |
-| `models/Planner/PlannerTask.js` | **New.** `goalId` is **nullable** — a task with no goal is the Inbox. This is the load-bearing decision: requiring every task to ladder up to a vision is what kills a personal planner, because capture has to be free. `doneAt` is maintained in a pre-save hook so it can never disagree with `status`. |
-| `services/plannerRollup.js` | **New**, pure. Builds the tree and derives progress: project = done/total tasks, mission = mean of its projects, vision = mean of its missions. Achieved is 100% whatever the tasks say; **dropped leaves the denominator** rather than scoring zero, so honestly abandoning something never damages the number above it. `hasBasis` distinguishes "no tasks in it" from a real 0%. |
-| `services/plannerAttention.js` | **New**, pure. The Review engine, modelled on `services/journeyAttention.js` — six triggers (`overdue`, `stale`, `empty`, `barren`, `pausedLong`, `nearlyDone`), one reason per goal, ranked by reason then age. `nearlyDone` is the only positive item; a review that only nags is one people stop opening. |
-| `routes/Planner/planner.js` | **New**, `EmployeeAuthMiddleware` on the whole router. `GET /tree`, `GET /review`, `GET /tasks`, `GET /lookups`, plus goal and task CRUD. **`ownerId` comes from the verified JWT and never from the body**, every read filters on it, and every id the client names is re-checked against it. Delete is narrow: a goal holding anything refuses with a count and points at `dropped`; deleting a project **unfiles** its tasks rather than destroying them. |
-| `server.js` | One mount at `/api/planner`. Not gated on a department role — your own goals should not disappear because you moved from Sales to HR for an hour. |
-
-### Frontend (`grav-cms`)
-
-> **Rebuilt on the Sales design system after review.** The first pass used the
-> `--g-*` portal tokens from `/onboarding` and a ~700-line stylesheet of its own.
-> That was the wrong system: Sales runs FrostShell over `.grav-ui`
-> ("Chrome Under Frost", `app/grav-ui.css`) with the shared kit in
-> `components/ceo/ui/Primitives.tsx`. The bespoke stylesheet is deleted and the
-> Planner now composes the same primitives Sales does.
-
-| File | Purpose |
-|---|---|
-| `components/Planner_DashboardLayout.js` | **New.** FrostShell nav config, same arrangement as `Sales_DashboardLayout.js` — `variant="top"`, three items. **No `guardSlug`**: DepartmentGuard's first branch is `if (!slug \|\| …) → ok`, so the Planner still requires a valid session but asks no question about which department it is in. The left rail stays (Sales opts out of it) because this is the one surface people reach from inside another department. |
-| `lib/planner/vocabulary.js` · `lib/planner/api.js` · `lib/planner/usePlanner.js` | **New.** The client mirror of the constants (server validates, client labels — the `stageConfig.js` pattern), one function per endpoint (the `coworkApi.js` pattern), and one shared read so Today, Ladder and Review cannot disagree about a percentage. |
-| `app/planner/{,ladder/,review/}page.js` · `layout.js` | **New.** Three thin routes that name a view; `components/planner/PlannerScreen.js` holds the shell, `PageHead`, the shared read and the drawer once. Content sits in the same `mx-auto max-w-[1400px] px-4 pt-6 pb-10 deck:px-6` container every Sales page uses. |
-| `components/planner/{TodayView,LadderView,ReviewView,EditDrawer}.js` | **New.** Built from `Panel`, `PanelHead`, `Rows`, `Button`, `Chip`, `Field`, `Input`, `Select`, `Textarea`, `EmptyState`, `ErrorState`, `InlineError`, `SkeletonRows`. The drawer is `CrmDrawer` — the same dialog every Sales screen opens — rather than a second one. |
-| `components/planner/plannerBits.js` | **New.** Only what the kit genuinely lacks: a task tick, the ladder line under a title, and a progress figure that can say "nothing in it yet" instead of "0%". |
-| `components/shell/DepartmentRail.js` | One fixed Planner control beside "Apps". Not added to the department list, which is data (PRODUCT.md: "Departments are data"). Needed `usePathname` — the rail's existing `current` prop is a department slug and cannot answer "are we on /planner". |
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- **47 backend tests, all passing**: `services/plannerRollup.test.js` (15, `node --test`), `services/plannerAttention.test.js` (20, `node --test`), `test/planner/planner.route.test.js` (27, jest + in-memory Mongo — counted 27 with the 4 review cases).
-- The privacy boundary is covered per handler, not sampled: another owner's goal cannot be read, patched, deleted, reparented onto, filed against, or have a task touched, and `ownerId` in a request body is ignored.
-- Full backend suite: **6 suites fail, and all 6 are pre-existing** — they die on `FIREBASE_SERVICE_ACCOUNT` missing from this environment's `.env` (CRM enquiry, lead-review, sales-journey ×2, sample-style, hr-ai). None touch the Planner, which needs no Firebase.
-- **Not verified in a browser**: no logged-in session was available in this environment, so the three views, the drawer and the tick animation have not been exercised against real data.
-
-### Preserved / no commit
-
-Purely additive apart from two one-line-scale edits (`server.js` mount, the rail control). The uncommitted Sales-journey work in both repos was not touched, and `docs/tasks/current-task.md` was deliberately left alone — it still scopes the Lead chunks.
-
----
-
-## Call recordings on the Sales customer record
-
-> **Synced phone-call recordings surface on the customer they belong to, matched
-> by phone number or by the name the call was saved under, with the audio and an
-> AI summary in place.** Both Sales customer surfaces get it: the CRM account
-> workspace and the portal-customer page. Nothing committed.
-
-### Backend (`grav-cms-backend`)
-
-| File | Purpose |
-|---|---|
-| `services/callRecordingMatch.service.js` | **New.** Pure matching helpers. `phoneKey` normalises any number to its last 10 digits (`+91 98765 43210`, `098765-43210`, `9876543210` → one key). `nameKey` lowercases, flattens punctuation and strips legal suffixes (`Mayfair Exports Pvt. Ltd.` → `mayfair exports`); org names additionally yield their leading brand word as a key when it is ≥5 chars, so a contact saved as "Mayfair Textiles" matches. Person names are whole-phrase only — "Rahul" is not an identity. `buildRecordingFilter` returns the Mongo `$or` (indexed `normalizedPhone` clause + a raw-`phoneNumber` digit-tail regex for un-backfilled rows + name regexes); `annotateMatches` applies the strict whole-word rule in memory and stamps each row `matchedBy: "phone" \| "name"`. |
-| `models/CallRecording.js` | Added `normalizedPhone` (maintained by a pre-save hook calling `phoneKey`) + index; added `aiSummary` / `aiSummaryModel` / `aiSummaryAt`, kept **separate** from the device's own `summary` so the two are never confused or overwritten. |
-| `services/callSummary.service.js` | **New.** Gemini (`gemini-flash-lite-latest`, matching `aiAssist.service.js`) turns a transcript into a short sales-readable summary — one opening line, "Discussed:" bullets, "Next step:". Returns a typed result, never throws for a provider failure; quota is reported distinctly from a connection failure. Deliberately does **not** transcribe audio: no transcript → it says so and stops. |
-| `routes/CMS_Routes/Sales/callRecordings.js` | **New**, `salesAuth` per handler. `GET /` (`?accountId=` or `?customerId=`) resolves the customer's numbers and names — for a CRM account that includes every contact person's `phone`/`mobile`/`whatsapp` — and returns matched recordings with `matchedBy`/`matchedOn`. `GET /:id/audio` proxies the Drive file so audio stays behind the Sales session (the uploader makes each file link-public; a raw Drive URL would be permanently replayable by anyone who saw it once). `POST /:id/summarize` generates and stores the AI summary, idempotent unless `force`. |
-| `server.js` | One mount at `/api/cms/crm/call-recordings`, **without** `salesWrites()` — nothing here creates a business record, and holding a "summarise" click for an approver would be nonsense. |
-| `backfill_call_recording_phones.js` | **New**, optional. Fills `normalizedPhone` on pre-existing rows. Idempotent; changes no results (the regex fallback already covers them), only the query plan. |
-
-The Android app's upload endpoint (`/api/recordings`, shared-API-key gated) is untouched.
-
-### Frontend (`grav-cms`)
-
-| File | Purpose |
-|---|---|
-| `components/sales/CallRecordingsPanel.js` | **New.** Self-fetching panel: call list (direction, time, duration, number), expandable row with audio, AI summary, the recorder app's own summary shown separately, collapsed transcript, and notes. A name match is always labelled "Name match" with the name it matched on — a fuzzy join is never presented as fact. Audio is fetched as a credentialed blob rather than set as an `<audio src>`, because a cross-origin `src` sends no cookies and would 401 silently in dev. |
-| `app/sales/dashboard/accounts/[id]/_sections/CallRecordingsSection.js` + `page.js` | New "Calls" tab in the account workspace, next to Activities. |
-| `app/sales/dashboard/customers/[id]/page.js` | New "Calls" tab; needs no `fetchTabData` branch since the panel fetches its own data. |
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- Matcher exercised directly against a fixture set: exact number in three formats → `phone`; "Mayfair Textiles" and `call_20250612_mayfair.m4a` → `name`; **"May Flower" and "Rahul Verma" correctly excluded**; empty identity → `null` filter (the caller returns no recordings rather than every call in the company).
-- All new/changed backend modules `require` cleanly; all changed frontend files parse.
-- **Not verified in a browser:** no logged-in Sales session or seeded recordings were available in this environment, so the rendered tabs, the audio proxy end-to-end, and a live Gemini summary have not been exercised.
-
----
-
-## Global GRAV Assistant — Chunk 2: global text overlay
-
-> **One GRAV assistant overlay, mounted once in the root shell, available on the
-> app switcher and every authenticated app.** Bottom-centre translucent rounded
-> composer that expands into a conversation panel; talks to the central
-> `/api/ai/assistant/message`; keeps its conversation across app navigation.
-> **Chunk 2 only** — no microphone / speech / "Hey GRAV" / waveform (Chunk 3+).
-> HR endpoints remain thin task adapters (unchanged). Nothing committed.
-
-### What was built (frontend `grav-cms`)
-
-| File | Purpose |
-|---|---|
-| `components/ai/GravAssistantOverlay.js` | The single overlay. Launcher (compact "Ask GRAV" pill, bottom-centre) ↔ open (wide translucent rounded composer + conversation panel above it). Typing, send, loading ("GRAV is thinking…"), error bubbles, conversation history, reset (new conversation), collapse/close. Restores prior server-side conversation on mount via `GET /api/ai/assistant/history`. Sends `{ message, routeContext }` to `POST /api/ai/assistant/message` with `credentials: "include"`; route is context only. Shortcuts: `Cmd/Ctrl+O` and `Ctrl/Cmd+Space` toggle; `Escape` collapses. Uses GRAV frost tokens (not a literal copy of the reference). |
-| `components/shell/AppShell.js` | Mounts the overlay **exactly once**, at a stable position (always the 2nd child of the top-level fragment) so React preserves it across a client navigation between apps — the conversation is not reset when moving app→app. Rendered only when authenticated (`checked && departments.length > 0`), so it never appears on login/onboarding-unauthed. Being a single root mount, it cannot duplicate during navigation. |
-
-No backend changes — the Chunk 1 central endpoint is reused as-is.
-
-### How the requirements are met
-
-- **One overlay in the highest shared shell** — mounted in `AppShell` (root layout), the same instance on the app switcher (`/onboarding`), HR, Sales and all authed apps.
-- **Central endpoint** — `/api/ai/assistant/message`; conversation keyed server-side by user (Chunk 1).
-- **Same conversation across apps** — the overlay never remounts on client navigation (stable mount position), so its React message state persists; on a full remount it also restores from `/history`.
-- **Bottom-centre compact translucent composer that expands** — verified visually; it floats (fixed), never consuming layout space; collapses to a small launcher pill.
-- **Shortcuts** — `Cmd/Ctrl+O` attempted (browsers may reserve it) + `Ctrl/Cmd+Space` reliable fallback; `Escape` collapses. (On macOS, `Cmd+Space` is Spotlight and never reaches the page — `Ctrl+Space` is the one that works there.)
-- **Route is optional context only** — passed as `routeContext`, never changes identity or gates answers (enforced server-side in Chunk 1).
-- **Single instance / no duplication** — one mount in the persistent root shell.
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification (live, running stack)
-
-Driven through a temporary unguarded harness (since the sandbox browser is not page-authenticated — see limitation) plus direct API checks:
-
-- **Build:** `npm run build` compiles; overlay renders **bottom-centre**, correctly centered.
-- **Open/att shortcut:** `Ctrl+Space` opens the composer and auto-focuses the input.
-- **Type + send → real reply:** sent "Hello GRAV, what can you help me with?" → a genuine **central-assistant** answer with the GRAV identity ("I'm GRAV… across the app switcher, HR, Sales, Accounting…") — confirms the overlay uses `/api/ai/assistant/message`.
-- **Expand/panel:** conversation panel opens with header (New conversation + Collapse).
-- **Escape:** collapses to the launcher and **preserves the conversation** (pill shows the message count).
-- **Auth-gating:** on `/login` (unauthenticated: `/api/auth/verify` → 401) the overlay is **absent**.
-- **Server-side restore:** `GET /api/ai/assistant/history` → 200 with the prior turns (restore-on-mount path).
-
-### Conversation persistence — honest answers to the two questions
-
-- **Across app navigation (app switcher ↔ HR ↔ Sales): YES.** The overlay is a single mount at a stable position in the persistent root shell, so a client-side navigation does not remount it and the message state carries over. Even on a full page reload (a real remount) it restores the conversation from the server via `/history`. *Caveat:* I could not drive the authenticated multi-app navigation inside the sandbox browser — it is not page-authenticated (`/api/auth/verify` returns no departments there) and I cannot log in (entering a password is not something I do). Please confirm in your logged-in browser; the mechanism and the server-restore path are both verified.
-- **Across a backend restart: NO — and this is expected, not permanent persistence.** The Chunk 1 conversation store is in-memory. Verified directly: with 2 turns stored, restarting the backend and calling `/history` returned **0 turns**. A still-open tab keeps its local React messages, but the server has lost the context, and a page reload shows an empty history. A durable store (e.g. Mongo) would remove this and is a clean future change behind the same API.
-
-### Preserved / no commit
-
-- HR endpoints and panels untouched (thin task adapters, as agreed). Temporary verification harness was removed. Only `AppShell.js` was modified plus the new overlay component. Pre-existing uncommitted work untouched. Nothing committed or staged. Chunks 3–5 (voice, "Hey GRAV", hardening) not started.
-
-### Chunk 2 corrections (post-review)
-
-Four fixes applied; no redesign, no voice work.
-
-1. **Authentication gating decoupled from departments.** `AppShell` now tracks a
-   separate `authed` flag = a *successful* `/api/auth/verify` (not a mere cookie,
-   and not `departments.length`). Department data drives only the rail. The
-   overlay shows to every server-verified employee — **including `/onboarding`
-   with an empty department list** — and is hidden on public/sign-in routes via
-   a dedicated `ASSISTANT_HIDDEN_PATHS` list (`/`, `/login`, `/signin`,
-   `/coworking-login`, `/accountant/login`, `/accountant/accept-invite`).
-   Verified: all 12 route show/hide decisions correct; overlay absent on
-   `/login`; an old cookie that fails verify (as in the sandbox) does **not**
-   expose it.
-2. **Restoration race closed.** Sending is blocked until the initial history
-   restore settles (`!restored` guards both `send()` and the send button; the
-   `finally` always sets `restored`, so it can't hang). A delayed history
-   response can no longer overwrite what the user has entered/sent: restore is
-   skipped once a `dirtyRef` is set (on typing or sending), and — because send
-   is gated until restored — a sent message can never race restore. Verified in
-   a harness: a draft typed during a 4 s-delayed restore was preserved.
-   Navigation persistence unchanged.
-3. **Reset correctness.** Reset now awaits the backend and clears locally **only
-   on success**; on failure it keeps the conversation and shows a retryable
-   error ("Couldn't start a new conversation. Please try again."). Repeated
-   clicks while pending are ignored (button disabled + single in-flight guard).
-   Verified deterministically: failure → preserved + error + 1 call; success →
-   cleared.
-4. **Verification.** Route logic + component behaviour verified as above.
-   *Caveat unchanged:* the sandbox browser has no v2 verify session and I do not
-   sign in, so I could not drive the authenticated `/onboarding → HR → Sales`
-   navigation myself — please confirm that visual flow in your logged-in
-   browser (single overlay, same conversation carried across apps). Backend
-   restart still clears the in-memory history by design (documented limitation,
-   not durable storage — unchanged this pass).
-
----
-
-## Global GRAV Assistant — Chunk 1: centralise the Qwen integration
-
-> **One central CMS assistant, one identity, one model path.** The HR-specific
-> AI has been refactored into a single shared backend service + central API that
-> any authenticated employee can use. HR data is now a **permission-gated tool**
-> of the central assistant — not a separate HR model or personality.
-> **Chunk 1 only** (backend centralisation). Chunks 2–5 (global overlay, voice,
-> "Hey GRAV", hardening) are NOT started. Nothing committed.
-
-### What was built (backend `grav-cms-backend`)
-
-| File | Purpose |
-|---|---|
-| `services/ai/identity.js` | The ONE constant GRAV identity + `buildSystemPrompt({routeContext, taskRules})`. Identity never changes with page/app; route is context-only and never rewrites it. |
-| `services/ai/toolRegistry.js` | Feature modules register permission-gated context tools (`permission(user)`, `matches(message)`, `provideContext`). Central service attaches a tool's data only when the signed-in user is authorised AND the message is relevant. |
-| `services/ai/tools/hrTools.js` | Registers `hr_overview` (aggregate HR context), gated to `hr_manager`. The only place HR data reaches the general assistant. |
-| `services/ai/conversationStore.js` | Per-USER conversation (keyed by verified `req.user.id`, not route), in-memory, windowed to 24 turns. Survives navigation; isolates users. |
-| `services/ai/gravAssistant.js` | The ONE central service and the ONLY caller of the Ollama client. `chat()` = general answer (attaches authorised+relevant tool data, threads user history); `runStructured()` = feature structured tasks through the same identity/model. |
-| `routes/ai/assistant.js` | Central API: `POST /api/ai/assistant/message`, `GET /assistant/history`, `POST /assistant/reset`. Any authenticated employee; conversation keyed by user; `routeContext` optional and non-authoritative. |
-| `routes/HrRoutes/AiOverviewAssistant.js` · `AiDailyAttendanceAssistant.js` | **Refactored to delegate** to `gravAssistant.runStructured` (no direct model calls). Their prompts were reframed from a competing "You are the HR … Assistant" identity into a structured **task** under the central GRAV identity. Response shapes unchanged, so the existing HR panels keep working. |
-| `server.js` | +1 mount: `/api/ai` → central assistant (after the HR AI mounts). |
-| `test/hr-ai/centralAssistant.route.test.js` | 11 tests: auth fail-closed, any-employee reply, HR tool attached only for HR + only when relevant, permission isolation (Sales never sees HR data), conversation persistence across messages, cross-user isolation, reset, route-context-is-context-only. |
-
-### How the requirements are met
-
-- **Reuses existing Ollama + qwen3:8b**; `gravAssistant` is the single caller of `services/ollamaClient` — no duplicated model logic anywhere.
-- **One identity, no page-specific personality** — `identity.js` is constant; feature screens contribute a *task* + *data*, not an identity.
-- **HR data = permission-gated tool/context**, gated to `hr_manager`; a non-HR user's message never has HR data attached (enforced server-side in the registry, keyed off the verified JWT role).
-- **Conversation keyed by user/session, not route** — moving between app switcher / HR / Sales keeps the same conversation; a user cannot read another's.
-- **Existing HR Overview questions still work through the central service** — the HR routes now call `runStructured`; all prior HR tests pass unchanged.
-- **Private HR info not exposed outside permissions** — verified by test and live (Sales user refused, HR user served).
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- **Backend jest:** `test/hr-ai` **45/45** (incl. the real qwen3:8b smoke); full suite **359/359** — the HR-route delegation caused no regressions.
-- **Live through the central endpoint (real qwen3:8b):**
-  - HR user, "how many present today + anything to watch?" → correct answer, `toolsUsed=["hr_overview"]` (~29s).
-  - Follow-up "which department did you say needs attention?" → answered from **conversation memory** ("Cutting … below the overall rate"), ~7s.
-  - Sales user, same HR question → **no** HR data (`toolsUsed=[]`), replied "I don't have access… check the HR module."
-- **Routes mounted (after restart on :5050):** `/api/ai/assistant/message`, `/api/hr/ai/overview-assistant`, `/api/hr/ai/daily-attendance-assistant` all return `401` JSON; clean boot.
-
-### Notes / limitations (for later chunks)
-
-- Conversation store is in-memory (survives navigation, not a server restart); a durable store can replace it without changing callers.
-- Tool relevance uses keyword matching (not full model function-calling) — deliberate for Chunk 1; sufficient for HR overview questions. Daily attendance stays a page-scoped endpoint (needs a date scope) and also routes through the central service.
-- No frontend changes in Chunk 1 — the global bottom-centre overlay, `Cmd/Ctrl+O` launcher, voice and "Hey GRAV" are Chunks 2–4 and were not started.
-
-### Preserved / no commit
-
-- Existing HR Overview + Daily Attendance behaviour and response shapes unchanged (they now flow through the central brain). Pre-existing uncommitted CRM/Sales-Journey work untouched. Only `server.js` AI mounts changed. Nothing committed or staged.
-
----
-
-## Daily Attendance AI — first page-contextual HR AI tool (read-only)
-
-> **Extends the HR AI to `/hr/dashboard/attendance/daily`.** A read-only,
-> page-scoped attendance assistant built on the same Ollama client, HR-only
-> authorisation and one shared visual panel as the Overview assistant (which is
-> unchanged). Establishes the reusable architecture for the later Muster Roll,
-> Timecard, Leaves and Regularisations tools. Nothing committed.
-
-### What was built
-
-**Backend (`grav-cms-backend`)**
-
-| File | Purpose |
-|---|---|
-| `routes/HrRoutes/Attendance_section.js` | Refactor only: the `GET /daily` handler body was extracted into an exported `async getDailyAttendance(date, department)` (same query params, same returned shape); the route is now a thin wrapper. So the AI reads attendance through the **exact same calculation/status logic** the page uses — one source of truth, no drift. |
-| `services/hrAiShared.js` | Shared safety helpers for all HR AI tools: `isRestricted()` (privacy + **ranking/misconduct/employment-decision** patterns), `sendOllamaError()` (code→503/504/502), `asStringArray()`, `DISCLAIMER`. The Overview assistant is intentionally left untouched. |
-| `services/dailyAttendanceContext.js` | Validates scope hints (`date` `YYYY-MM-DD`, `department`, `statusFilter`/`typeFilter` enums, `search`), calls `getDailyAttendance` server-side, applies the **same filter predicate** as the page, and projects each row to attendance-only fields (name + biometric id as shown on the HR page, department, type, status + label, in/out, late/early + mins, missed-punch, HR-override flag). Keeps **missing data distinct from absence** (`dataState: not_synced`, `MP` legend). Never reads salary/bank/contact/documents/medical. Prompt row cap 200 (count preserved). |
-| `routes/HrRoutes/AiDailyAttendanceAssistant.js` | `POST /api/hr/ai/daily-attendance-assistant`. Auth + fail-closed `hr_manager`; validates question (≤500) and scope; refuses restricted intents pre-model; strict read-only attendance system prompt; structured output `{summary, attendanceBreakdown, itemsNeedingAttention, observations, suggestedFollowUps}`; **echoes the resolved scope** + `inScopeCount` + `dataState` in `meta`. |
-| `server.js` | +2 lines: mount `AiDailyAttendanceAssistant` under the existing `/api/hr/ai`. |
-| `test/hr-ai/dailyAttendance.route.test.js` | 11 mocked HTTP tests — fail-closed 401/403, scope validation, **server-side fetch / client records ignored**, filter scoping, missing-data-vs-absence, restricted refusal, structured 200, error mapping, no leak. |
-| `test/hr-ai/dailyAttendance.smoke.test.js` | **One real qwen3:8b smoke test** through the live route (auth + DB fetch stubbed, real model). Auto-skips when Ollama/`qwen3:8b` is unreachable so CI without a model still passes. |
-
-**Frontend (`grav-cms`)**
-
-| File | Purpose |
-|---|---|
-| `components/hr/HrAiAssistant.js` | The single reusable HR AI panel (button + compact floating dialog, presets, free-text, generic structured-answer renderer, browser-only conversation). Optional `scope` (page hints merged into every request — never records), `scopeText` (header line) and `formatScope(meta)` (per-answer scope line from the server's echo). |
-| `components/hr/HrOverviewAssistant.js` | Now a thin wrapper over `HrAiAssistant` with the overview config — **same appearance and behaviour as before**. |
-| `components/hr/DailyAttendanceAssistant.js` | Wrapper wired to the daily endpoint; auto-scoped to the page's date/department/status/type/search; presets *Summarise this day · Who needs attendance review? · Explain absences & late arrivals · Find missed punches · Draft follow-up reminders*; renders a human-readable scope in the header and on every answer. |
-| `app/hr/dashboard/attendance/daily/page.js` | +1 import, +1 `<DailyAttendanceAssistant …/>` in the header actions passing the live page state. No redesign. |
-
-### Live API used
-
-- **New:** `POST /api/hr/ai/daily-attendance-assistant`.
-- Reads attendance server-side via the existing `getDailyAttendance`. Only outbound call is to the **local** Ollama. Env vars are shared with the Overview tool (`OLLAMA_BASE_URL` / `OLLAMA_MODEL` / `OLLAMA_TIMEOUT_MS`).
-
-### Safety guarantees (server-enforced)
-
-- **Fail closed** — no token → 401; non-`hr_manager` → 403 (before any fetch/model). Employee-specific attendance is therefore HR-only.
-- **Server owns the data** — browser sends only scope hints; records are fetched + filtered server-side; any client-submitted records are ignored (test-proven).
-- **Attendance-only fields** — no salary, bank, contact, documents or medical data enters the context.
-- **Read-only** — no overrides, regularisations, leave changes or disciplinary actions exist in this feature.
-- **No ranking / no conclusions** — ranking, misconduct/performance judgements and employment decisions are refused pre-model and forbidden in the prompt; the model is instructed to describe only what the records show.
-- **Missing ≠ absent** — unsynced days and missed punches are surfaced as data gaps, distinct from absence, in both context and prompt.
-- **No leakage** — `think:false` + `<think>` stripping; prompts/reasoning never returned.
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- **Backend jest:** `test/hr-ai` **35/35** (incl. the real qwen3:8b smoke, ~33s); full suite **346/346** — the `/daily` extraction caused no regressions.
-- **Live (after restart on :5050):** `POST /api/hr/ai/daily-attendance-assistant` → `401` JSON (mounted); Overview route still `401` (intact); `GET /hr/attendance/daily` still `401` JSON (refactor healthy); clean boot.
-- **Frontend:** `npm run build` compiles; `/hr/dashboard/attendance/daily` builds.
-
-### Notes / known limitations
-
-- Same latency profile as Overview (local 8B ≈ 10–35s); 60s client timeout applies.
-- The `/daily` refactor is behaviour-preserving and covered by the route tests, but I could not exercise it against a real synced day + HR session (needs the live biometric data and an `hr_manager` JWT); its structure and auth path are verified live and by the mocked suite.
-- **Design hook:** the impeccable hook flagged 20 pre-existing `10px` font-size findings elsewhere in `daily/page.js` (lines ~287–602) — none in the ~12 lines I added. Left unchanged to preserve unrelated work; not introduced by this task.
-
-### Post-review fixes (from live HR testing)
-
-1. **Empty answer on large contexts.** With all 90 employees in scope, qwen3:8b ignored the multi-field shape and returned `{"answer": "…"}`, so the normaliser showed "No summary was produced." Fixed by (a) passing a **JSON Schema** as Ollama's `format` (structured outputs) from both HR AI routes via a new `schema` option on `ollamaClient.chatJson`, and (b) a defensive normaliser that recovers a stray `answer`/`response`/`text` field. Verified live end-to-end.
-2. **Misread punch times.** The model saw raw UTC timestamps and wrongly called a present in-time "missing / not in IST". Fixed in `dailyAttendanceContext.projectRecord`: `inTime`/`outTime` are now formatted to the **same IST clock string the HR page shows** (`"9:28 am"`), and each row carries `hasInPunch`/`hasOutPunch`/`missingPunch` ("in" | "out" | null) so the model states *which* punch is missing. Prompt + legend updated accordingly. Verified: "is umung present?" → "present (P) but out-punch missing"; "what is his in-time?" → "9:28 am, out-time missing".
-
-Both fixes keep the Overview assistant's output shape and behaviour identical (schema + fallback only). Tests: `test/hr-ai` 35/35 still green; backend restarted on :5050.
-
-### Preserved / no commit
-
-- Overview assistant untouched in behaviour; only the shared-panel refactor + schema/fallback hardening sit beneath it. Pre-existing uncommitted CRM/Sales-Journey work untouched. `server.js` changes this session are only the HR-AI mounts. Nothing committed or staged in either repo.
-
----
-
-## HR Overview Assistant — local Qwen (read-only) foundation
-
-> **Smallest real local-LLM integration for HR.** A read-only "Ask HR AI"
-> assistant on the HR Overview, backed by the already-installed local Ollama
-> model `qwen3:8b`. No AI/SDK dependency added (native `fetch`), nothing
-> committed, existing HR functionality untouched. This is a foundation only —
-> it answers questions about the current HR overview aggregates and can do
-> nothing else.
-
-### What was built
-
-**Backend (`grav-cms-backend`)**
-
-| File | Purpose |
-|---|---|
-| `services/ollamaClient.js` | Reusable local Ollama client over native `fetch`. `POST {OLLAMA_BASE_URL}/api/chat`, `stream:false`, `format:"json"`, `think:false`. Defaults `http://127.0.0.1:11434` + `qwen3:8b` + 60s timeout, all env-overridable. `AbortController` timeout; classifies every failure into a stable `.code` (`OLLAMA_UNAVAILABLE`, `OLLAMA_MODEL_NOT_FOUND`, `OLLAMA_TIMEOUT`, `OLLAMA_BAD_STATUS`, `OLLAMA_MALFORMED_RESPONSE`); strips `<think>…</think>` and extracts the JSON object defensively. |
-| `services/hrOverviewContext.js` | Builds the aggregate-only model context from the **same source** as `GET /api/hr/overview/dashboard` (Employee, DailyAttendance, LeaveApplication, CompanyHoliday, RegularizationRequest), reusing the identical LHD/LAB/EAB status logic. Returns **only** aggregate headcount, department distribution + attendance, today/monthly attendance, leave + regularisation pending counts, upcoming holidays, alerts. **No names, no individual records, no payroll/salary/bank/medical/profile data.** Does not modify `Overview-Section.js`. |
-| `routes/HrRoutes/AiOverviewAssistant.js` | `POST /api/hr/ai/overview-assistant`. `EmployeeAuthMiddlewear` + fail-closed `hr_manager` check. Validates the question (≤500 chars), refuses restricted intents **before any model call**, builds context server-side, calls the model with a strict read-only system prompt, and returns a fixed structured shape. Maps each Ollama failure code to a clear status (503/504/502). |
-| `test/hr-ai/ollamaClient.test.js` | 11 unit tests, `fetch` injected — happy path, `<think>` strip, prose-wrapped JSON, model-not-found, bad status, connection-refused, timeout, malformed output/envelope, env overrides. No Ollama, no network. |
-| `test/hr-ai/overviewAssistant.route.test.js` | 12 HTTP tests (real Express on an ephemeral port, auth + Ollama + context mocked) — 401/403 fail-closed, structured 200, **context built server-side / client dashboard data ignored**, input validation, restricted-topic refusal, preset handling, error-code→status mapping, no prompt/reasoning leak. |
-| `server.js` | +5 lines: mount `hrAiRoutes` at `/api/hr/ai` (before the generic `/api/hr` router). |
-
-**Frontend (`grav-cms`)**
-
-| File | Purpose |
-|---|---|
-| `components/hr/HrOverviewAssistant.js` | Self-contained "Ask HR AI" button + compact floating panel: preset questions, free-text box, structured answer rendering (summary / priorities / observations / next steps), explicit "AI assistance based on current HR data. Read-only." labels, `Escape`-to-close, focus management. Conversation state lives only in component state (nothing persisted). Sends only `{question}` or `{preset}` — never dashboard data. |
-| `components/hr/HrOverview.js` | One line added to the header actions (`<HrOverviewAssistant />`) next to Refresh. No redesign. |
-
-### Live APIs used
-
-- **New:** `POST /api/hr/ai/overview-assistant` (this work).
-- **Reads (server-side only):** the same Mongo collections the HR dashboard already reads. No new external API. The only outbound call is to the **local** Ollama server.
-
-### Environment (all optional; sensible defaults)
-
-- `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`)
-- `OLLAMA_MODEL` (default `qwen3:8b`)
-- `OLLAMA_TIMEOUT_MS` (default `60000`)
-
-No `.env` change is required to run with the installed model.
-
-### Safety guarantees (enforced server-side)
-
-- **Auth + HR fail closed** — no token → 401; authenticated non-`hr_manager` → 403; neither reaches the model.
-- **Server-owned context** — any dashboard/context the browser POSTs is ignored; the backend builds its own aggregate snapshot (a dedicated route test proves the injected value never reaches the prompt).
-- **Aggregate-only exposure** — no payroll, salaries, bank details, passwords, documents, medical data, private profiles, or individual employee records ever enter the context.
-- **Restricted intents refused pre-model** — pay, personal data, candidate ranking / hiring / firing / promotion, and raw-DB / prompt-extraction phrasings return an instant canned refusal.
-- **Read-only** — no approvals, attendance/leave/regularisation actions, or employee mutations exist in this feature.
-- **No reasoning/prompt leakage** — `think:false` plus `<think>` stripping; the system prompt and model reasoning are never returned.
-
-### Runtime/report-integrity correction (this pass)
-
-`renderItemMasterSummary()` was still reading the pre-correction budget shape
-and printing **7 literal `undefined` values** — status lines, the company
-count, per-company aggregates and the override total. It now consumes the
-authoritative fields (`status.committedStoreBaseline` / `pausedUncommitted` /
-`proposedTarget` / `discoveredRisk`, `mappingCollection.companiesEvaluated`,
-`itemOverrides.itemsWithOverride`, each company's `states`), renders the
-override and category dimensions on separate lines with an explicit warning
-that they are **not** exclusive and must not be summed, and renders the
-global barcode-identity findings. Tests assert the real values appear and
-that the rendered summary contains **no literal `undefined`** — in both the
-optional-collections-present and optional-collections-absent conditions.
-
-Three further integrity fixes:
-
-- **Complete company universe.** The runner now gathers the committed company
-  master (`acc_companies`, narrow projection, read-only) and every company in
-  it is evaluated — including ones with no mapping, no override-target ledger
-  and no budget configuration at all. Company ids named by data but missing
-  from the master are integrity findings, still evaluated. Without the master
-  the universe is labelled `DERIVED_FROM_DATA_ONLY` and explicitly incomplete.
-- **Mapping absence ≠ never reviewed.** With no mapping collection, a
-  category is now counted `MAPPING_COLLECTION_ABSENT` per company (unknown
-  coverage) instead of `CATEGORY_NEVER_REVIEWED`.
-- **The read-only proof now covers every collection the runner may read**,
-  optional ones included, and exercises both conditions: absent (existence,
-  documents and indexes snapshotted as non-existent) and present with
-  documents and a real index. A latent bug surfaced here — the outer report
-  never forwarded the optional collections to the item-master audit, so
-  budget coverage was silently always "absent"; fixed.
-
-### Verification
-
-- **Backend jest:** `test/hr-ai` 23/23 pass; full suite **334/334 pass** (no regressions).
-- **Live end-to-end** against the installed `qwen3:8b`: the client returns the exact `{summary, priorities, observations, suggestedNextSteps}` shape with no `<think>` leak (~9–25s); the real route returned 200 for HR, 403 for non-HR (no model call), and an instant restricted-topic refusal (no model call).
-- **Frontend:** `npm run build` compiles successfully; `/hr/dashboard` builds.
-
-### Known limitations
-
-- First version: conversation is browser-only and not persisted; no rate limiting on the endpoint yet; answers are AI-generated and may be imperfect (surfaced to the user).
-- Requires a local Ollama running `qwen3:8b`; when it is down/missing/slow the endpoint returns a clear 503/504 and the panel shows a friendly message.
-- Aggregate context intentionally omits the dashboard's name-bearing lists (recent hires, today-on-leave names) — counts only.
-
-### Unrelated work preserved / no commit
-
-- The pre-existing uncommitted CRM Step 01 + Sales Journey work (both repos) is untouched; the only `server.js` change this session is the 5-line `/api/hr/ai` mount.
-- Nothing was committed or staged in either repository.
-
----
-
-> **Active Lead Command Centre — Phase 1 correctness pass (both repos).** Four
-> focused fixes, no redesign. (1) **Singular, deterministic next action** —
-> `PATCH /leads/:id/next-action` now picks the CANONICAL open follow-up (earliest
-> due, tie-broken by createdAt — the same one the frontend `byDue` picks; the FE
-> canonical set is now follow-ups only), updates it in place, and CANCELS any
-> other open follow-ups (status `cancelled`, kept as history — never deleted),
-> keeping `nextFollowUpAt` synced. Transactions aren't available on the standalone
-> test Mongo, so a Lead-save failure rolls the Activity writes back by hand (no
-> drift). (2) **Partial-failure safety** — the Activity drawer now saves the
-> interaction FIRST and refreshes the timeline, THEN offers an optional Set next
-> action step (shared `NextActionForm.js`); if that fails it reports the
-> interaction was saved and retries only the next action — the interaction is
-> never re-submitted. (3) **Call** — the dialer no longer auto-opens; there's an
-> explicit "Open dialer"; after logging the outcome the same Set/Update Next
-> Action step runs (`QuickCall.js`). (4) **Seamless approval** — the Prospect
-> detail page's `onApproved` now RELOADS the same Lead in place (no redirect, no
-> duplicate) so it re-renders as the Active-Lead Command Centre. New/updated
-> tests: `lead-next-action.route.test.js` now covers canonical+cancel, rollback
-> consistency, and interaction-survives-next-action-failure (6 tests); related
-> lead suites green (65 passed). Sales Journeys untouched. Not committed.
->
-> **Prior: Active Lead Command Centre — Phase 1 (both repos).** Action-first layout on
-> the existing `/sales/dashboard/leads/[id]` Active-Lead page (LeadWorkspace.js,
-> not restarted): compact header (identity company/person · qualification status
-> · owner · next action + due), a primary-action bar **Call · Email · Message ·
-> Meeting · Note** plus one prominent **Set / Update Next Action** control (NO
-> separate CRM Task action), a "Needs attention now" band (overdue / missing next
-> action / qualification blockers), the central Activity timeline with
-> communication-type filters, and a right **Lead Brief** (contacts, confirmed
-> requirement, researched commercial potential + evidence summary, HOD approval
-> context shown READ-ONLY, and qualification readiness + the backend-enforced
-> move controls). Detailed fields stay in the Edit Lead Details drawer. All five
-> communication actions run through ONE reusable Activity drawer
-> (ActivityComposer / QuickCall extracted to `QuickCall.js`) on the existing Lead
-> Activity API + CRMActivity — Call/Email/Message/Meeting capture contact,
-> direction, date-time, outcome, notes; Message adds channel (WhatsApp/SMS/Other);
-> Note is internal; open-external (tel/mailto/wa) is clearly separated from
-> logging. New backend endpoint **`PATCH /leads/:id/next-action`** — sets/updates
-> the ONE open planned follow-up Activity (subject + due) and `nextFollowUpAt`,
-> reusing CRMActivity (not a task system); updates in place, creates when none.
-> The Prospect→Active handoff is UNCHANGED and already correct: approval keeps the
-> same Lead record, preserves identity/source/sourced-by/owner/research/estimates/
-> evidence/justification/HOD review history, carries `pendingFirstAction` into the
-> Active Lead as the real next action (planned follow-up + `nextFollowUpAt`, both
-> visible in the timeline/queue), and leaves `qualificationState` at `new`. New
-> tests `lead-next-action.route.test.js` (3); related lead suites green (60
-> passed). Prospect behaviour, qualification rules, conversion and Sales Journeys
-> untouched. Not committed.
->
-> **Prior: Prospect closeout pass (both repos).** Five focused fixes, no redesign:
-> (1) **Prospects page** — for reviewers (HOD/admin) a new `Awaiting Review`
-> scope (submitted team Prospects) is the DEFAULT view; `My Prospects` and
-> `Team Prospects` stay (`app/sales/dashboard/prospects/page.js`). The default
-> scope initialises only AFTER the async department role resolves
-> (`useDeptRole().loading`) — scope is `null` and Prospect loading is held until
-> then, so a COLD load no longer strands an HOD on `My Prospects`; it fires once
-> and never overrides a manual choice (build-verified; no frontend test harness
-> in this repo). (2)
-> **ProspectCard** — company-type Prospects now title with the company name
-> (contact person secondary); individuals keep the person primary. (3) Evidence
-> read wording `Attached` → `Reference provided` (a reference may be a URL or
-> doc). (4) `Review Prospect for HOD` → `Review Prospect`. (5) **"Not sure yet"
-> now genuinely clears a saved Lead Source / Customer Segment** — the frontend
-> sends `""` verbatim and `pickEditable` (routes/CMS_Routes/Sales/leads.js)
-> normalises an empty CLEARABLE_ENUM_FIELDS value to `undefined`, so Mongoose
-> `$unset`s it and submission readiness (`source`/`segment`) flips back to
-> unmet. New test `test/crm/lead-clear-enum.route.test.js` (2 tests); the
-> related lead suites stay green (113 passed). Active Leads and Sales Journeys
-> untouched. Not committed.
->
-> **Prior session: Prospect → HOD Review → Active Lead approval workflow
-> (both repos).** A Prospect (captureStatus:"draft") no longer becomes an
-> Active Lead by a salesperson pressing a button — it now carries a THIRD,
-> independent status axis, `reviewStatus`
-> (researching → submitted → approved | returned | rejected), and the ONLY
-> path to an Active Lead is a HOD/admin approving a submitted Prospect,
-> enforced on the backend. New: `services/leadReview.js` (single-writer state
-> machine, mirrors leadQualification.js), `computeSubmissionReadiness`
-> (the ~11-item Submit-to-HOD checklist replacing the retired 5-item "start
-> working" bar), and four routes — `POST /:id/submit` (rep, readiness-gated),
-> `/:id/approve` (HOD only, optional owner override, the retired
-> `/:id/activate`'s replacement + reliability pattern), `/:id/return-for-info`
-> and `/:id/reject` (HOD only, reason required; reject = archive). Submitted
-> Prospects are read-only for everyone at the field level (`refuseIfLocked`).
-> New Lead fields: `reviewStatus`, `pursuitJustification` ("Why should we
-> pursue this?"), and review audit (`submittedAt/By`, `reviewedAt/By`,
-> `reviewReason`). Frontend: `lib/leadReview.js`, a `PursuitCaseSection`, and
-> a rebuilt `DraftWorkspace` that shows the submission checklist + Submit/
-> Resubmit for the rep, a native-`<fieldset disabled>` read-only lock while
-> submitted, the returned-reason banner, and a HOD review panel (Approve with
-> optional owner / Return / Reject). This is a review gate, NOT conversion —
-> "Approve as Active Lead", never "convert"; no Account/Contact/Sales Journey
-> is touched, no Active-Lead qualification changed. Ownership unchanged from
-> the prior session: no owner/source controls at capture or Prospect Setup,
-> creator auto-credited/owned, HOD may reassign only inside the approval
-> action. Backend **299/299 jest** (18 suites; new `lead-review.route.test.js`
-> = 20 tests). Frontend `npm run build` clean. Full flow browser-verified
-> (submit gating, read-only lock, HOD approve→Active Lead, return→editable→
-> resubmit). **No migration, nothing committed.** Detail + the earlier
-> Prospect-capture and correction work below.
->
-> Earlier this session: **Prospect capture chunk (Chunk 1 of the revised Lead →
-> Sales Journey roadmap) — `grav-cms-backend` + `grav-cms`, both repos.**
-> Product model going forward: **Prospect** (a possible buyer we're still
-> preparing to work) and **Active Lead** (one we're actively researching,
-> contacting and qualifying) are the SAME `Lead` record — internal
-> `captureStatus: draft`/`active` is unchanged, "Prospect" is a user-facing
-> rename only, no field rename, no migration. Planned chunks: 1) Prospect
-> capture and setup (**this session**), 2) Active Lead activities and
-> controlled statuses, 3) Requirement/commercial potential/qualification, 4)
-> secure evidence/document handling, 5) conversion to Account/Contact/Sales
-> Journey. Only Chunk 1 was implemented; 2–5 are explicitly out of scope and
-> untouched.
->
-> **What changed:** Quick Capture now also asks Customer segment (reuses
-> `industry`), Lead Source, and City/location — still under a minute, still
-> never requirement/quantity/revenue/procurement/decision-maker/evidence.
-> Prospect Setup (was "Preparing this Lead") was cut down to exactly: Basic
-> identity + contact/location (`IdentitySection`, now also carrying Customer
-> segment), Lead Source + owner (`OriginSection`, Priority removed — that's
-> Active-Lead-only now), one short **Initial research note** (new
-> `InitialNoteSection`, bound to the existing `organisationNotes` field, not
-> a new one), and First next action + due date. Requirement/commercial
-> potential/procurement/evidence sections were removed from the Prospect
-> workspace entirely — the fields and their components (`RequirementSection`,
-> `CommercialPotentialSection`, `ProcurementSection`, `EvidenceSection`,
-> `OrganisationResearchSection`) are untouched and still fully live in the
-> Active Lead workspace's "Supporting details" — nothing was deleted, only
-> hidden from Prospect Setup, per the task's own "move out of the Prospect
-> UI rather than deleting" instruction. **"Start Working Lead" (was "Activate
-> Lead") is now a real, functional action** — `services/leadReadiness.js`'s
-> checklist was cut from 7 items to exactly 5 (identity, Lead Source, owner,
-> first next action, follow-up date); phone/email/website are no longer part
-> of it at all (verified live: a Prospect with zero contact info and a next
-> action of "Research contact details" starts working successfully), and an
-> unreviewed possible duplicate is now informational only (still surfaced in
-> the response, never blocks). Lead Source vocabulary
-> (`lib/leadQualification.js`'s `SOURCES`, mirrored server-side by
-> `models/CMS_Models/Sales/Lead.js`'s inline enum) gained
-> `google`/`linkedin`/`directory`/`field_visit` and relabeled
-> `website`→"Website Enquiry"/`trade_show`→"Exhibition" — additive only, no
-> code removed, no migration. Terminology renamed in user-facing text only:
-> Draft Lead→Prospect, My Drafts→My Prospects, Save Draft→Save Prospect,
-> Preparing this Lead→Prospect Setup, Activate Lead→Start Working Lead.
-> **No Account, Contact or Sales Journey is created anywhere in this chunk.**
-> No dependency, migration, seed or Git setting was changed. **Nothing was
-> committed.** Full file list and verification in Part 8 below.
->
-> Earlier records below: Part 2 the Sales Journey foundation, Part 3 the
-> lifecycle-spine redesign, Part 4 the rejected worklist pass, Part 5 the
-> shared Journey shell + eight stages, Part 6 the first Journey frontend
-> build, Part 7 CRM Step 01, Part 8 this session (Prospect capture chunk;
-> also documents the Draft Lead chunk, Lead frontend correction, and Lead
-> correction chunk sessions that happened in between Part 1 and this one,
-> which were never separately recorded here).
-
----
-
-# Part 1 — Lead Chunk 1: foundation and boundary hardening (this session)
-
-Implements `docs/tasks/lead-chunk-01-foundation.md` (copied into
-`docs/tasks/current-task.md` for this session) in `grav-cms-backend` only.
-Per ADR-002 and `docs/tasks/lead-to-journey-roadmap.md`, this is Chunk 1 of 6
-— backend/data-contract work only. **Chunk 2 (Lead Inbox redesign) was not
-started. Lead conversion (Account/Contact/Journey creation) was not
-implemented.** No frontend file was touched.
-
-**This session has two passes.** The first pass (below, "the original
-design") added `qualificationState` as a field genuinely independent of
-`stage` — two fields, only one exposed to new writes, but still two things
-that could in principle drift. Review found that insufficient: bullet 4 of
-the review (`docs/tasks/lead-chunk-01-foundation.md` §3's own requirement,
-restated explicitly) called for `stage` and `qualificationState` to be
-incapable of contradicting each other, not merely unlikely to. **The second
-pass — this handoff's authoritative description — replaced "one field is the
-only writer" with "one FUNCTION is the only writer for both fields, called
-from every entry point."** See "Revision after review" below for the full
-list of behavioural changes; the original-design section is kept for context
-on what changed and why, not as a description of current behaviour.
-
-## What this chunk does
-
-The existing `Lead` model had three problems named directly in the task: an
-unsafe `countDocuments() + 1` reference generator, a `stage` enum that
-overlaps the Sales Journey lifecycle (`proposal_sent`/`negotiation`/`won`),
-and an embedded `activities[]` timeline duplicating the shared `CRMActivity`
-architecture. This chunk fixes the first; replaces the second with a single
-shared transition service (`services/leadQualification.js`) that is the only
-code allowed to write either `stage` or `qualificationState`, anywhere in the
-codebase; and adds a canonical, CRMActivity-backed path for the third
-alongside the legacy embedded array, which remains readable but is no longer
-written to by anything this chunk touches. Nothing existing was deleted or
-migrated.
-
-## Revision after review — what changed from the original design
-
-The original design (kept in `git diff` history for this session) treated
-`stage` as a free-form field still directly writable by
-`PATCH /:id/stage`, the generic `POST /`/`PATCH /:id`, and
-`routes/CMS_Routes/Sales/callSchedule.js`, on the reasoning that touching any
-of those risked breaking a caller this backend-only chunk had no way to
-verify. Review rejected that reasoning: "no way to verify" is not the same as
-"safe," and the specific gaps it left (new `proposal_sent`/`negotiation`/
-`won` assignments still possible; `stage` and `qualificationState` editable
-independently; Call Planner still writing the embedded array and faking
-conversion) were exactly the two-state-machine problem ADR-002 exists to
-prevent. Fixed as follows:
-
-1. **`services/leadQualification.js` (new)** is now the ONLY code that writes
-   `Lead.stage` or `Lead.qualificationState`. Three functions:
-   - `applyQualificationTransition(lead, {qualificationState, reason, actor})`
-     — the canonical move. Validates the enum, refuses `converted`, refuses
-     any move once already `converted`, checks the explicit transition graph
-     (`LEAD_QUALIFICATION_TRANSITIONS` in `constants/crm.js`, next section),
-     requires a reason where needed, then sets `qualificationState` AND
-     derives `stage` from it (`deriveLegacyStage`) in one place. Used
-     directly by `PATCH /:id/qualification-state`.
-   - `applyLegacyStageChange(lead, {stage, reason, lostReason, actor})` — the
-     legacy-compatible wrapper, used by `PATCH /:id/stage`, the generic
-     `PATCH /:id` (when `stage` changes), and `callSchedule.js`. Returns
-     `false` (no mutation) when the submitted `stage` already equals the
-     Lead's current `stage` — "an existing legacy record submits its
-     unchanged stage while editing another field" is a no-op, not a
-     transition attempt. Otherwise resolves the legacy value through
-     `resolveLegacyStageRequest` (below) and calls
-     `applyQualificationTransition`.
-   - `resolveInitialQualification(stageInput, {reason, lostReason})` — Lead
-     **creation** only. Not a transition (no prior state exists), so it is
-     NOT checked against the transition graph — it only validates the legacy
-     mapping/blocklist and any required reason. Called by `POST /`
-     **before** the document exists, so an invalid initial stage creates
-     nothing.
-   - `resolveLegacyStageRequest(stage, {reason, lostReason})` — the shared
-     legacy→canonical translation: `new/contacted/qualified` map 1:1;
-     `lost` maps to `disqualified` (reason required, also mirrored onto the
-     legacy `lostReason` field for any old reader); `proposal_sent`,
-     `negotiation`, `won` throw outright — see next point.
-2. **`proposal_sent`, `negotiation`, `won` can no longer be assigned by ANY
-   write path** — `POST /`, `PATCH /:id`, `PATCH /:id/stage`, and
-   `callSchedule.js`'s `POST /:id/complete` all reject them with a 400
-   explaining that those outcomes now belong to the Sales Journey. Existing
-   records that already carry one of these values from before this chunk are
-   completely unaffected — nothing migrates, nothing is rewritten.
-3. **The "won ⇒ probability 100 / convertedToCustomer / convertedAt" side
-   effect is deleted, not just made unreachable.** It existed in three
-   places (`PATCH /:id/stage`, `callSchedule.js`); all three now go through
-   `applyQualificationTransition`, which never touches those legacy fields.
-4. **Neither `PATCH /:id/stage` nor `POST /:id/activity` (singular, legacy)
-   appends to the embedded `lead.activities[]` anymore.** `/:id/stage`'s only
-   remaining job is the state change, audited via `recordChange` like every
-   other Lead mutation. `POST /:id/activity` (a follow-up fix — the first
-   revision left it appending to the embedded array on the reasoning that
-   nothing calls it) now translates its legacy request shape
-   (`{type, title, description, scheduledAt, outcome}`) into a shared
-   `CRMActivity`, the same as the plural endpoint, with a backward-compatible
-   response (`lead` still returned; `activity` added alongside it).
-5. **`callSchedule.js`'s `POST /:id/complete` was rewritten**, then further
-   corrected in the follow-up fix — see its own section below. It now logs
-   every completed call as a `CRMActivity` (`leadId`-owned) instead of the
-   embedded array, and routes any `newLeadStage` through
-   `applyLegacyStageChange`. The follow-up fix corrected two bugs in that
-   rewrite: the audited `before` snapshot was being captured AFTER
-   `lastContactedAt`/`nextFollowUpAt` were already mutated in memory (so it
-   never reflected a real "before"), and a rejected `newLeadStage` (e.g.
-   `won`) was still being written onto the `CallSchedule` record even though
-   the Lead transition itself was refused.
-6. **`Activity.js`'s ownership guard now rejects BOTH `accountId` and
-   `leadId` being set**, not just neither.
-7. **`routes/CMS_Routes/Sales/activities.js` (the Account-scoped router) now
-   whitelists create/update fields** — `leadId` is not in either list, so
-   that router can never create or edit a Lead-owned Activity, and
-   `activityId`/`isActive`/`archivedAt`/`archivedBy`/`createdBy`/`updatedBy`
-   (and, on update, `accountId` itself) are all server-controlled.
-8. **`POST /:id/activities` (plural, canonical, on the Lead router) now
-   accepts `outcome`, `nextActionDate` and `activityDate`** — the interaction
-   metadata the Account-Activity router already supports, missing from the
-   first pass.
-
-## Model changes — `models/CMS_Models/Sales/Lead.js`
-
-| Change | Detail |
-|---|---|
-| `leadId` | `required, unique, immutable`. No auto-generating pre-save hook — always allocated by `services/leadRef.js` **before** `Model.create()`, mirroring `SalesJourney.journeyId`. The only call site (`leads.js` `POST /`) resolves an initial `{qualificationState, stage}` pair via `resolveInitialQualification` first, so an invalid request creates nothing. |
-| `qualificationState` | **Canonical.** Enum `new, contacted, qualified, readyToConvert, nurture, disqualified, duplicate, converted` (codes verbatim from the task spec — camelCase, documented exception in `constants/crm.js`). Default `"new"`. Every change validated against `LEAD_QUALIFICATION_TRANSITIONS` — see below. |
-| `qualificationReason` | Free text, required by `services/leadQualification.js` when `qualificationState` is `disqualified`/`duplicate`. |
-| `requirementReceivedAt` | Qualification-evidence timestamp placeholder. Not auto-set — Chunk 3's qualification workspace is the expected writer. |
-| `conversion.{accountId,contactId,journeyId,convertedAt,convertedBy}` | Canonical placeholders. Fully unset — no conversion endpoint exists. Chunk 5 is the only future writer. |
-| `normalizedCompany`, `emailDomain`, `normalizedPhone`, `websiteDomain` | Duplicate-detection foundations (§7). Derived on save. No matching UI, no auto-merge. |
-| `createdBy`, `updatedBy`, `archivedAt`, `archivedBy` | Audit actors, matching the `actorRef` shape in `Activity.js`/`SalesJourney.js`. Server-assigned only. |
-| `stage` | LEGACY enum, unchanged shape. **Read-only from every code path in the codebase except `services/leadQualification.js`** — see next section. Existing records that already carry `proposal_sent`/`negotiation`/`won`/`lost` from before this chunk remain fully readable; nothing migrates. |
-| `activities[]`, `convertedToCustomer`, `convertedCustomerId`, `convertedAt` | LEGACY, unchanged shape, read-only from every code path added or touched by this chunk. |
-
-**Indexes:** `{isActive,assignedTo,updatedAt}`, `{qualificationState}`,
-`{normalizedCompany}`, `{emailDomain}`, `{normalizedPhone}`,
-`{websiteDomain}`, `{nextFollowUpAt}`, `{"conversion.accountId"}`,
-`{"conversion.journeyId"}` — only what the roadmap's Lead Inbox/qualification
-access patterns need; no speculative Journey-stage indexes.
-
-## The shared transition service — `services/leadQualification.js` (new)
-
-This is the file that actually resolves review item 1. Full design and
-rationale is in the file's own header comment; the operative facts:
-
-- **Every writer of `Lead.stage` or `Lead.qualificationState` in the
-  codebase calls into this file.** `routes/CMS_Routes/Sales/leads.js` (four
-  call sites: create, generic update, `/stage`, `/qualification-state`) and
-  `routes/CMS_Routes/Sales/callSchedule.js` (one call site). There is no
-  other write path left — grepped to confirm.
-- `LEAD_QUALIFICATION_TRANSITIONS` (in `constants/crm.js`) is the explicit
-  graph from review item 2, reproduced exactly:
-  ```
-  new            → contacted | nurture | disqualified | duplicate
-  contacted      → qualified | nurture | disqualified | duplicate
-  qualified      → readyToConvert | nurture | disqualified | duplicate
-  readyToConvert → nurture | disqualified | duplicate
-  nurture        → contacted | qualified | disqualified | duplicate
-  disqualified   → (terminal — empty)
-  duplicate      → (terminal — empty)
-  converted      → (unreachable — reserved for the conversion service)
-  ```
-  `isValidTransition(from, to)` reads directly from this map — `test/crm/
-  lead.test.js` pins the map's exact shape, and `test/crm/lead.route.test.js`
-  exercises the happy path, both backward-illegal moves
-  (`readyToConvert → qualified`/`contacted`), `nurture`'s two re-entry
-  points, and both terminal states refusing every further move, including
-  re-entering themselves.
-- `LEGACY_LEAD_STAGE_TO_QUALIFICATION` (`new/contacted/qualified/lost` only)
-  and `BLOCKED_LEGACY_LEAD_STAGES` (`proposal_sent/negotiation/won`) are the
-  legacy-compatibility half. `lost` → canonical `disqualified`, reason
-  required, mirrored onto the legacy `lostReason` field too. The blocked
-  three throw a 400 naming the Sales Journey as where those outcomes now
+| `/image-studio` with no session | Redirected to `/` (middleware cookie gate). |
+| Entry page after sign-in | Rendered in FrostShell, with top bar "IS · Image Studio" and "Creative" nav. |
+| Readiness | First `"done"` from `https://www.photopea.com` in 2,641 ms cold and 176 ms warm. Origin logged exactly as configured. |
+| Binary open | Synthetic PNG, 224,300 bytes, opened as 640×400 in 152 ms and tagged `grav-proof:<uuid>`. Visible in the editor. |
+| `saveToOE` exports | PNG 65,135 B (signature `png`); JPEG `jpg:0.92` 21,059 B (`jpg`); WebP `webp:0.92` 12,380 B (`webp`); PSD 488,788 B (`psd`). Each was one ArrayBuffer followed by `"done"`, in 31–255 ms. |
+| PSD reopen | The exported PSD (488,788 B) reopened as 640×400 and was re-tagged. |
+| Forged messages | `window.postMessage("done")` and `("grav:cmd:save")` from the CMS page were both refused as wrong origin. No state change and no menu event. |
+| Wrong document | A second PNG was posted straight to the frame from the console, bypassing the adapter. Its `"done"` was reported as unsolicited and ignored. Export PNG was then refused with `EDITOR_WRONG_DOCUMENT` and nothing was exported; the editor stayed ready. |
+| `customIO` | Photopea's own File › Save and File › Save as PSD each delivered `grav:cmd:save` / `grav:cmd:saveAsPSD` to the page. **No `"done"` followed a menu hook.** No local download occurred. |
+| Branding | Photopea's menu, links and social icons render unaltered. Nothing is hidden or overlaid. |
+| Network | Image Studio made no GRAV file-API request; the only backend calls were the shell's existing ones. |
+
+## Documented vs observed vs assumed
+
+**Documented, and confirmed in the browser:**
+- readiness `"done"`;
+- string scripts and ArrayBuffer files over postMessage;
+- `"done"` after each message;
+- `saveToOE` returning an ArrayBuffer before `"done"`, for `png`, `jpg:q`, `webp:q` and `psd`;
+- `echoToOE`;
+- reading and writing `Document.source`;
+- `customIO` hook scripts.
+
+**Observed, not documented:**
+- A document opened from an ArrayBuffer has `source === "file"` and name
+  `"file"`. The scripting docs say `local,X,NAME`. The tag script relies on this
+  observation (`FRESH_BINARY_SOURCE`); if Photopea changes it, the open fails
+  closed with `EDITOR_WRONG_DOCUMENT`.
+- A `customIO` hook produces no `"done"`.
+- `app.documents.length` exists. It is used only by a one-off console
+  diagnostic, not by product code.
+
+**Not verified:**
+- SVG open or export (`svg:` options).
+- Behaviour on a Photopea script error (scripts catch their own errors, so it
+  was never exercised).
+- Behaviour when a menu hook fires while a command is in flight. The
+  coordinator routes it as an event (unit-tested), but this was not observed
   live.
-- `LEAD_QUALIFICATION_TO_LEGACY_STAGE` is the reverse projection
-  (`deriveLegacyStage`) that keeps `stage` in sync with every canonical
-  change, including ones made directly through
-  `PATCH /:id/qualification-state` — `nurture` is the one deliberate
-  exception, left as a pass-through of whatever `stage` already was, since
-  it has no legacy funnel equivalent.
-- An unchanged `stage` resubmission (`stage === lead.stage`) is a **no-op**,
-  not a transition attempt — this is what makes the grav-cms Edit Lead
-  modal's habit of resubmitting the whole form (including an untouched
-  `stage`) safe without needing any frontend change.
+- Very large files and memory limits.
+- Any browser other than the desktop pane (Chromium).
+- Timeout paths live. They are unit-tested only.
 
-## Reference generator — `services/leadRef.js` (new file, unchanged from the first pass)
+## Limitations and follow-ups
 
-Same atomic pattern as `services/salesJourneyRef.js`
-(`findOneAndUpdate({$inc},{upsert:true})` on a per-year counter document),
-producing `LEAD-YYYY-NNNN`. **`salesJourneyRef.js` was not modified.**
-`leadRef.js` imports and reuses its exported `Counter` model — one atomic-
-counter collection (`crm_sequences`), not two parallel implementations —
-under a disjoint key namespace (`lead:<year>` vs. `salesJourney:<year>`).
-This sharing is covered by a regression test (`test/crm/lead.test.js`,
-"regression: allocating Lead references does not disturb Journey reference
-sequencing"). `createWithRef(Lead, payload)` retries onto the next number on
-a duplicate-key error, mirroring the Journey service. A pre-existing
-legacy-format `leadId` (`LEAD-0001`, no year segment, from before this
-chunk) remains readable — verified with a raw-insert test.
+- **Freshness gap.** An untagged ArrayBuffer document left active before a
+  failed open would pass the check. Only this adapter creates such documents,
+  and it tags each one immediately.
+- **No dirty indicator and no close API.** Photopea documents neither.
+- **Hosted-editor disclosure.** Bytes given to the frame are disclosed to
+  Photopea's page. This is stated on the entry page.
+- **Narrow layout.** At phone width, the floating shell top bar overlaps the top
+  of the frame, which hides Photopea's menu row. Fine at desktop width. Polish
+  for a later slice.
+- **Dev double-mount.** In development React mounts twice. The first adapter is
+  disposed, and its `EDITOR_DISPOSED` ready-rejection is now silenced in the
+  log.
+- **Node warning.** Importing `.ts` under node's test runner prints
+  `MODULE_TYPELESS_PACKAGE_JSON`. It is harmless; `package.json` was not changed.
 
-## CRM Activity ownership — `models/CMS_Models/Sales/Activity.js`
+## Security prerequisites before a later slice opens GRAV files
 
-`accountId` is field-optional; a new `leadId` (→ `Lead`) field lets an
-Activity be Lead-owned instead. The pre-validate hook now enforces **exactly
-one** of `accountId`/`leadId` — review item 4 tightened this from the first
-pass's "at least one": both being set is now rejected too (`"A CRM Activity
-cannot belong to both an Account and a Lead at the same time."`), not only
-neither. `{leadId, activityDate: -1}` index added for the Lead timeline
-query. `activityId` generation (`countDocuments()+1`) is unchanged — out of
-this chunk's scope.
-
-**`routes/CMS_Routes/Sales/activities.js` (the Account-scoped router) — new
-in this revision.** Previously spread `req.body` directly into
-`Activity.create()`/`findByIdAndUpdate()`, which meant a client could inject
-`leadId` (creating a dual-owned Activity before the model guard existed) or
-overwrite `activityId`/`isActive`/`archivedAt`/`archivedBy`/`createdBy`/
-`updatedBy`. Now whitelists: `ACCOUNT_ACTIVITY_CREATE_FIELDS` includes
-`accountId`; `ACCOUNT_ACTIVITY_UPDATE_FIELDS` does not (ownership is
-immutable after creation). **`leadId` is in neither list** — this router can
-never create or edit a Lead-owned Activity, full stop. Regression-tested:
-ordinary Account-activity create/update still work exactly as before.
-
-## Lead API — `routes/CMS_Routes/Sales/leads.js` (revised)
-
-- `POST /` — whitelists business fields (`LEAD_EDITABLE_FIELDS`, `stage`
-  removed from the list — see below), resolves any submitted `stage` via
-  `resolveInitialQualification` **before** calling `createWithRef`, so an
-  invalid stage (blocked value, or a missing required reason) creates
-  nothing. Server-assigns `createdBy`/`updatedBy`.
-- `PATCH /:id` — same whitelist. A `stage` key in the body is handled
-  separately: unchanged is ignored, changed is routed through
-  `applyLegacyStageChange` (same validation as `/:id/stage`, so the two
-  endpoints can never disagree). `qualificationState` remains fully outside
-  the whitelist regardless — "converted cannot be faked through a generic
-  patch" is enforced independently of the stage handling.
-  `probability`/`estimatedValue`/etc. remain ordinary whitelisted business
-  fields, unrelated to the state machine.
-- `PATCH /:id/stage` — now a thin wrapper over `applyLegacyStageChange`.
-  Same request shape (`{stage, lostReason}`, `reason` also now accepted) and
-  response shape as before, but: no longer writes `stage` directly (derived
-  by the shared service instead), no longer produces the `probability=100`/
-  `convertedToCustomer`/`convertedAt` side effect on `"won"` (removed
-  entirely — `"won"` is rejected outright now), and no longer appends to the
-  embedded `activities[]` (the change is audited via `recordChange` only).
-- `PATCH /:id/qualification-state` — now calls `applyQualificationTransition`
-  directly rather than re-implementing the same validation inline, so there
-  is exactly one implementation of the transition rules in the codebase.
-- `POST /:id/activities` (plural) — now also accepts `outcome`,
-  `nextActionDate`, `activityDate` (previously silently dropped — a real gap
-  flagged by review item 5; `test/crm/lead.route.test.js`'s "logs a completed
-  interaction..." test now asserts `outcome` round-trips through both the
-  response and a direct re-read of the stored document).
-- `POST /:id/activity` (singular, legacy) — **follow-up fix.** No longer
-  appends to the embedded `activities[]`. Translates its legacy request
-  shape (`{type, title, description, scheduledAt, outcome}`) into a shared
-  `CRMActivity`, via `LEGACY_LEAD_ACTIVITY_TYPE_TO_CRM` (the legacy
-  `call/email/meeting/note/status_change/task` vocabulary mapped onto
-  CRMActivity's `activityType` codes — `email→email_log`,
-  `status_change→other`, the rest 1:1). Response stays backward-compatible:
-  `lead` is still returned (its `activities[]` simply no longer grows);
-  `activity` is added alongside it, additive only. `lastContactedAt` is
-  still bumped, and both the new `CRMActivity` and the Lead update are
-  audited.
-- `DELETE /:id` — unchanged from the first pass (`archivedAt`/`archivedBy`
-  stamped, `recordChange` uses `action: "delete"` since `"archive"` is not
-  in the shared `ChangeLog.action` enum — noted as a pre-existing,
-  out-of-scope gap also present in `accounts.js`).
-- Role + write-approval enforcement unchanged: `/api/cms/crm/leads` was
-  already mounted behind `salesWrites("lead")` in `server.js` before this
-  chunk; `server.js` is not touched.
-
-## Call Planner — `routes/CMS_Routes/Sales/callSchedule.js` (revised — was "left unchanged" in the first pass; review rejected that)
-
-`POST /:id/complete`'s Lead-facing behaviour:
-
-- **Every completed call against a Lead now creates a `CRMActivity`**
-  (`leadId`-owned, `activityType: "call"`, `status: "completed"`, `outcome`
-  copied through) instead of pushing into `lead.activities[]`. Pre-existing
-  embedded entries from before this chunk are completely untouched — nothing
-  reads, migrates, or deletes them; a dedicated test asserts an old entry
-  survives a new completion unchanged.
-- An optional `newLeadStage` is passed to `applyLegacyStageChange` — the
-  SAME function `leads.js` uses, so Call Planner cannot assign
-  `proposal_sent`/`negotiation`/`won`, cannot fake a conversion (the
-  probability/convertedToCustomer side effect is gone here too), and cannot
-  produce a `stage`/`qualificationState` disagreement with what `leads.js`
-  would have done for the identical request.
-- **The call completion itself never fails because of an invalid stage
-  request.** `schedule.save()` and the new `CRMActivity` are unconditional;
-  only the stage portion is wrapped in its own try/catch, reported back as
-  `leadUpdate: { applied: false, message }` in the response rather than
-  surfacing as an overall 400 — a rejected stage should not make the
-  salesperson's "mark this call done" action fail. `lastContactedAt`/
-  `nextFollowUpAt` are updated regardless.
-- `lost` maps to canonical `disqualified`; the reason is an explicit
-  `reason` field if present, else `feedbackNotes` (the free-text field this
-  endpoint already collects on every completion).
-
-**Follow-up fix, on top of the above.** Two bugs survived the initial
-rewrite:
-
-- The audited `before` snapshot was captured via `lead.toObject()` **after**
-  `lead.lastContactedAt`/`lead.nextFollowUpAt` had already been reassigned in
-  memory, so the recorded "before" silently matched "after" for those
-  fields — the audit trail understated what changed. Fixed by capturing
-  `before` at the very top of the Lead-side block, before any field is
-  touched.
-- When no stage change was requested (or it was a no-op), the branch called
-  `lead.save()` with **zero** audit logging at all, even though
-  `lastContactedAt` always changes on every completion. Fixed: the Lead-side
-  block now does exactly one `lead.save()` and always records exactly one
-  Lead `recordChange` call, with a summary that reflects a stage change when
-  one applied and a generic "updated via call completion" otherwise.
-- `schedule.newLeadStage` was being set and saved **before** the Lead
-  transition was even attempted, so a rejected request (e.g. `won`) still
-  left `newLeadStage: "won"` sitting on the `CallSchedule` record — looking,
-  to anyone reading that record later, like it had taken effect. Fixed: the
-  schedule's core completion fields save first (so the call always completes
-  even if the Lead-side logic throws), and `newLeadStage` is only written —
-  via a small second save — once `applyLegacyStageChange` has actually
-  succeeded.
-
-## Constants — `constants/crm.js`
-
-First pass added `LEAD_QUALIFICATION_STATES`/`_STATE_CODES`,
-`LEAD_QUALIFICATION_REASON_REQUIRED`, `LEAD_QUALIFICATION_RESERVED_STATES`,
-and a `lead_qualification_state` `LOOKUP_CATEGORIES` entry. This revision
-adds `LEAD_QUALIFICATION_TRANSITIONS` (the explicit graph),
-`LEGACY_LEAD_STAGE_TO_QUALIFICATION`, `BLOCKED_LEGACY_LEAD_STAGES`, and
-`LEAD_QUALIFICATION_TO_LEGACY_STAGE` — all consumed exclusively by
-`services/leadQualification.js`. Purely additive; no seed run;
-`/api/cms/crm/lookups` still serves the already-seeded DB collection and
-won't reflect the new category until someone deliberately reseeds (out of
-scope).
-
-## Files changed (this revision, on top of the first pass)
-
-**New:**
-- `services/leadQualification.js`
-- `test/crm/call-schedule.route.test.js`
-- `test/crm/activities.route.test.js`
-
-**Modified again:**
-- `constants/crm.js` (additions)
-- `models/CMS_Models/Sales/Lead.js` (header comments corrected to describe the shared-service design; the `activities[]` field comment corrected for the `POST /:id/activity` follow-up fix)
-- `models/CMS_Models/Sales/Activity.js` (XOR, not "at least one")
-- `routes/CMS_Routes/Sales/leads.js` (stage handling rewritten around the shared service; follow-up fix: `POST /:id/activity` now writes shared `CRMActivity`)
-- `routes/CMS_Routes/Sales/activities.js` (field whitelist — newly touched this revision)
-- `routes/CMS_Routes/Sales/callSchedule.js` (newly touched this revision; follow-up fix: correct `before` snapshot, single save/audit, conditional `newLeadStage` persistence — see above)
-- `test/crm/lead.test.js` (both-owner-rejection test, transition-map data-structure tests)
-- `test/crm/lead.route.test.js` (stage/qualification-state test sections substantially rewritten; follow-up fix: `POST /:id/activity` test section rewritten for the new CRMActivity-backed behaviour)
-- `test/crm/call-schedule.route.test.js` (follow-up fix: added before-snapshot-correctness, single-audit, and newLeadStage-persistence tests)
-- `docs/handoff/latest-implementation.md` (this file)
-
-**Still not touched:** `services/salesJourneyRef.js`,
-`models/CMS_Models/Sales/SalesJourney.js`,
-`routes/CMS_Routes/Sales/salesJourneys.js`, `server.js`, every `grav-cms`
-frontend file, every Sales Journey stage page/component.
-
-## Tests and exact results
-
-`npx jest test/crm` — focused CRM suite only, no migrations or seeds run:
-
-```
-Test Suites: 14 passed, 14 total
-Tests:       184 passed, 184 total
-Time:        ~6–7s
-```
-
-Of the 184 tests, **105 are pre-existing and entirely untouched by Lead
-Chunk 1** (10 suites — Account/Contact/Sales-Journey/etc. — confirming zero
-regressions), and **79 belong to Lead Chunk 1**, across 4 suites:
-
-| Suite | Tests | Status |
-|---|---|---|
-| `test/crm/lead.test.js` | 23 | unchanged this follow-up |
-| `test/crm/lead.route.test.js` | 41 | follow-up fix: `POST /:id/activity` test section rewritten (net +3) |
-| `test/crm/call-schedule.route.test.js` | 10 | follow-up fix: +3 tests (before-snapshot correctness, single-audit, newLeadStage persistence) |
-| `test/crm/activities.route.test.js` | 5 | unchanged this follow-up |
-| **Lead Chunk 1 total** | **79** | |
-| **Pre-existing (unchanged)** | **105** | 10 suites |
-| **Grand total** | **184** | 14 suites |
-
-Coverage highlights added by this follow-up fix, on top of everything the
-prior revision already had: `POST /:id/activity` (singular) creating a
-`CRMActivity` rather than growing the embedded array, its backward-compatible
-response, its legacy-type-to-CRMActivity-type mapping, and existing embedded
-entries surviving untouched; Call Planner's `recordChange` `before` snapshot
-proven correct with a concrete pre-set `lastContactedAt` that must NOT equal
-`after`; exactly one Lead audit firing even when no stage change is
-requested; and a rejected `newLeadStage` confirmed absent from the persisted
-`CallSchedule` record while a successful one is confirmed present.
-
-## Known integration limitations (revised)
-
-- **Call Planner is no longer a blocker — it was fixed this revision.** The
-  first pass's handoff flagged it as unsafe to touch without frontend
-  visibility; review concluded that reasoning didn't hold, since the fix
-  needed (route through the same shared service, log via CRMActivity) is
-  entirely a backend contract change that preserves the response shape
-  (`{success, schedule, leadUpdate}` — `leadUpdate` is new but additive) and
-  degrades gracefully (an invalid stage request no longer fails the whole
-  call-completion action). Frontend behaviour on a rejected `leadUpdate` is
-  still unverified (no frontend visibility in this chunk) — if the Call
-  Planner UI currently assumes `newLeadStage` always applies, it may need a
-  small adjustment in Chunk 2/3 to surface `leadUpdate.applied === false`.
-- **The current Sales Leads UI is a real, accepted UX regression until
-  Chunk 2.** `grav-cms/app/sales/dashboard/leads/page.js`'s Kanban board
-  lets a user drag a card to "Won" or "Proposal Sent" — that action now
-  receives a 400 from the backend (previously it silently overloaded
-  `stage`/`probability` with no server validation at all). This is the
-  direct, intended consequence of review item 1 ("Generic create/update must
-  not create new proposal_sent/negotiation/won assignments"), not an
-  oversight — the frontend was read but cannot be changed in this
-  backend-only chunk. Chunk 2 replaces this page with a
-  `qualificationState`-driven Lead Inbox.
-- `activityId` on `CRMActivity` still uses `countDocuments()+1` — out of
-  scope, unchanged from the first pass's note.
-- `ChangeLog.action` enum gap (`"archive"` not in the enum) — unchanged from
-  the first pass's note, still pre-existing/out-of-scope.
-
-## Confirmation
-
-- **Chunk 2 (Lead Inbox redesign) was not started.** No frontend file in
-  `grav-cms` was created, edited, or deleted.
-- **Lead conversion was not implemented.** No Account, Contact, or
-  SalesJourney document is created, read, or referenced as a side effect by
-  any code in this chunk. `conversion.*` remains fully unset.
-- **The Sales Journey model, API, Progress Spine and stage pages are
-  functionally unchanged** — `services/salesJourneyRef.js`,
-  `models/CMS_Models/Sales/SalesJourney.js`, and
-  `routes/CMS_Routes/Sales/salesJourneys.js` were not edited; the full
-  `sales-journey.test.js`/`sales-journey.route.test.js` suites pass
-  unmodified (confirmed again after this revision).
-- **No dependency, migration, seed, or Git setting was changed.**
-- **Nothing was committed or staged.** `git status` at the end of this
-  session shows only the files listed above as modified/untracked, plus
-  whatever was already uncommitted before this session began.
+From the product plan and ADR-007:
+- A server-side editor-eligibility check that refuses `restricted` and
+  unclassified files, separate from the drive's `mayRead`.
+- Authorisation, company scope, and a check of the file's real content on every
+  byte read and every write.
+- A CSRF design that accounts for the `SameSite=None` production cookie. A
+  custom header alone is not enough.
+- Revision and conflict ordering that cannot leave orphan history, and a
+  recoverable Drive-cleanup path on failure.
+- An abuse control that is not only an in-memory limiter.
+- "Saved" shown only after GRAV confirms durable storage.
+- `Document.source` never treated as authorisation.
+- Development data only as `IMAGE-STUDIO-TEST` records, with their IDs recorded
+  and cleaned up.
 
 ---
 
-# Part 2 — Sales Journey foundation (previous session)
+# Latest implementation — Marketing intelligence layer + boundary corrections (Lane A)
 
-Implements `docs/tasks/sales-journey-foundation.md` across
-`grav-cms-backend` and `grav-cms`.
+Date: 2026-09-20
+Task: `docs/tasks/current-task.md` — provider-neutral GRAV AI gateway,
+deterministic evidence evaluator, durable analysis record, Campaign Health
+Adviser API.
 
-## What now works end to end
+**Not committed.** Nothing was committed and no branch was changed.
 
-1. A salesperson opens **Sales Journeys** and sees live records (an honest
-   empty state when there are none).
-2. **Start Journey** opens a drawer, searches the real Account library,
-   and creates a real `SalesJourney` with a server-assigned `SJ-YYYY-NNNN`.
-3. An optional first next action becomes a real linked `CRMActivity` task.
-4. The new Journey appears on the Progress Spine and opens at
-   `/sales/dashboard/journeys/{journeyId}/account` with live Account data.
-5. Later stages render honest empty/preview states — no fabricated detail.
+## What was built
 
-## Backend
+The first place in GRAV where a language model sees a customer's data. It
+explains figures GRAV has already calculated. It cannot change a campaign, an
+advertising account or a Sales record.
 
-### Model — `models/CMS_Models/Sales/SalesJourney.js`
+Design record: `docs/decisions/marketing-campaign-health-adviser.md`.
 
-Registered as `SalesJourney`. The header comment states what the record is
-**not**, because every field depends on it: not a customer master, not a
-contact store, not a task system, not an Order, not a container for
-later-stage data.
+### New files
 
-| Group | Fields |
+| File | What it is |
 |---|---|
-| Identity | `journeyId` (unique, **immutable**, the route key), `name`, `accountId` → `CRMAccount` (required), `businessType`, `requirementRef` |
-| Parties | `parties.{buyingHouse,brand,poIssuer,billTo,consignee,importer,agent}AccountId` — every one a `CRMAccount` ref, **no fallback name strings** |
-| People | `primaryContactId` → `CRMContact`; `ownerId`/`ownerName` (required), `merchandiserId`/`merchandiserName` |
-| Lifecycle | `currentStage`, `stageStates` (all eight), `risk`, `riskReason`, `businessStatus` |
-| Timing / commercial | `targetDate.{label,date}`, `expectedValue.{amount,currency,confirmed}` |
-| Next action | `currentNextActionId` → `CRMActivity` — a **pointer**, nothing duplicated |
-| Audit | `createdBy`, `updatedBy`, `archivedAt`, `archivedBy`, `isActive`, timestamps |
+| `constants/gravAi.js` | Gateway vocabulary: the closed operation allowlist, disabled capabilities, the outbound content and key-name rules, usage limits, failure codes |
+| `models/CMS_Models/AI/GravAiUsage.js` | Per company / operation / day counters, unique-indexed so `$inc` is atomic |
+| `services/ai/gravAiGateway.service.js` | The only model caller on the Marketing surface |
+| `constants/marketingCampaignHealth.js` | The fixed system prompt, coverage and change thresholds, allowed and forbidden recommendation types, forbidden phrases |
+| `services/marketing/intelligence/campaignHealthEvidence.js` | Pure deterministic evaluator; no I/O |
+| `services/marketing/intelligence/analysisIdentity.js` | Opaque signed public analysis ids |
+| `models/CMS_Models/Marketing/MarketingCampaignAnalysis.js` | Immutable analysis + separate append-only dismissal collection |
+| `services/marketing/intelligence/campaignHealthAdviser.service.js` | `current` / `generate` / `dismiss` / `history`, and the output validator |
+| `routes/CMS_Routes/Marketing/campaignIntelligence.js` | Five routes |
+| `test/marketing/campaign-health-adviser.test.js` | 26 tests, injected fake transport |
+| `docs/decisions/marketing-campaign-health-adviser.md` | Design record |
 
-`stageStates` is **built from the stage list**, not typed out, so a stage added
-to `constants/crm.js` cannot be silently missing. A new Journey opens
-`currentStage: account`, `stageStates.account: inProgress`, every later stage
-`notStarted`, `risk: onTrack` — selecting an Account deliberately does **not**
-mark the Account stage complete.
+### Changed files
 
-**Indexes** (the Hub's real access patterns, not speculative ones):
+- `server.js` — mounts the intelligence router above the performance router.
+- `docs/handoff/latest-implementation.md` — this file.
+
+### API
 
 ```
-{ journeyId: 1 }  unique          { isActive, ownerId, updatedAt: -1 }
-{ accountId: 1 }                  { isActive, accountId, updatedAt: -1 }
-{ currentStage: 1 }               { isActive, currentStage, risk }
-{ risk: 1 }  { isActive: 1 }      { isActive, "targetDate.date": 1 }
-{ currentNextActionId: 1 }
+GET  /api/cms/marketing/campaign-drafts/:id/health            any Marketing role
+POST /api/cms/marketing/campaign-drafts/:id/health/generate   administrator, empty body
+POST /api/cms/marketing/campaign-drafts/:id/health/dismiss    any Marketing role, reason required
+GET  /api/cms/marketing/campaign-drafts/:id/health/history    any Marketing role
+GET  /api/cms/marketing/intelligence/usage                    administrator
 ```
 
-**Virtuals, never stored:** `currentStageState`, `waitingOn` — a stored copy
-goes stale the moment a stage state changes.
+### Configuration
 
-### Reference generation — `services/salesJourneyRef.js`
-
-The task forbade `countDocuments() + 1`, and rightly: the reference is the
-**route key**, so a collision is two customers' work at one URL.
-
-`findOneAndUpdate({ $inc }, { upsert: true })` on a per-year counter document
-(`crm_sequences`, key `salesJourney:2026`) is atomic in MongoDB. The unique
-index on `journeyId` is the backstop, with a bounded 5-attempt retry for the
-case where a counter is restored from a stale backup. Sequences restart at
-`0001` each January with no reset job.
-
-> **Note, not changed:** `CRMActivity.activityId` still uses the unsafe
-> `countDocuments() + 1` pattern. It is pre-existing, affects all Activity
-> creation, and fixing it is a separate change with its own blast radius.
-
-### Vocabulary — `constants/crm.js`
-
-Added `SALES_JOURNEY_STAGES / STAGE_STATES / RISKS / BUSINESS_TYPES` and
-`SALES_JOURNEY_LINK_MODULE = "sales-journey"`.
-
-**These are camelCase while every other vocabulary here is snake_case.** That
-is a considered exception, documented inline: the frontend's `stageConfig.js`
-already declares itself the single naming source of truth and its keys are
-load-bearing in eight stage components, the spine, the fixtures and the tone
-maps. Snake_case codes would have meant a translation layer between two
-vocabularies for the same eight concepts. **Renaming a stage means editing both
-files; neither is authoritative alone.**
-
-Nothing was added to `LOOKUP_CATEGORIES`, so **no lookup seed run is required**.
-
-### API — `routes/CMS_Routes/Sales/salesJourneys.js`
-
-Mounted in `server.js` at `/api/cms/crm/sales-journeys` behind
-`salesWrites("sales journey")`, the same guard as every other CRM router.
-
-| Endpoint | Behaviour |
-|---|---|
-| `GET /` | Pagination, search (Journey ref/name/requirementRef **and** the customer's name/code), filters for account, owner, stage, stage-state, risk, business type, waiting-on, commercial range. Returns a purpose-built summary DTO. |
-| `GET /:journeyId` | **Keyed on the human reference.** Adds resolved parties and contact. 404 for unknown. |
-| `POST /` | Creates the Journey and, optionally, one linked `CRMActivity`. |
-
-**Two things the client is never trusted with**, both tested:
-
-1. **My-work scope** comes from the session. `?scope=mine&owner=<someone-else>`
-   still returns the caller's own work. (An explicit `owner` *filter* on team
-   scope is allowed — filtering to a colleague is not impersonation.)
-2. `journeyId`, `createdBy`, `updatedBy`, `currentStage` and `stageStates` are
-   all server-assigned. A client cannot start a Journey at Production.
-
-**Validation:** Account exists and is tradeable (`archived`/`inactive`/`blocked`
-refused); Contact must belong to the selected Account; every commercial party
-must exist and be active; business type, dates and amounts checked.
-
-**Dates go out as real ISO dates.** No relative text is ever stored or sent —
-`"in 3 days"` is derived client-side against one `now`, which is the only way
-it stays true past midnight.
-
-### Permissions and audit
-
-`expectedValue` is **removed from the response**, not blanked, via
-`stripJourneyCommercial` / `stripJourneyCommercialList` added to the existing
-`services/crmVisibility.js`. It reuses `canViewCredit` (admin/ceo, or
-department approver/owner) so a Journey hides exactly what an Account hides.
-The **value-range filter is also ignored** for unauthorized callers, so it
-cannot be used to binary-search a value they may not read.
-
-`recordChange(...)` audits both the Journey create and the Activity create.
-
-### Activity integration
-
-When a first action is supplied, one `CRMActivity` is created with
-`activityType: "task"`, `status: "planned"`, the Journey's owner, the chosen due
-date, and `links: [{ module: "sales-journey", recordId: <journey._id> }]` — the
-forward-link hook the Activity model was designed for. The Journey stores only
-`currentNextActionId`. **Nothing about the task is duplicated on the Journey.**
-
-**Partial failure is reported, never swallowed.** If the Journey saves and the
-task does not, the response is `201` with a `warning` field, `currentNextActionId`
-is left unset, and the drawer surfaces the warning instead of a clean success.
-(Sequential rather than transactional: the in-memory test Mongo is a standalone
-without replica-set transactions. Documented as a limitation below.)
-
-## Frontend
-
-### Fixture-to-live cutover
-
-| Function | Before | After |
+| Variable | Default | Meaning |
 |---|---|---|
-| `loadHubSummaries` | fixtures | `GET /sales-journeys` |
-| `loadJourney` | fixtures | `GET /sales-journeys/:journeyId`, 404 → real not-found |
-| `loadJourneysForAccount` | fixtures | `GET /sales-journeys?accountId=` |
-| `createJourney` | did not exist | `POST /sales-journeys`, held/warning aware |
-| `loadStage` (7 preview stages) | fixtures | **unchanged** — still fixtures |
+| `GEMINI_API_KEY` | — | Absent ⇒ intelligence is off and everything else works |
+| `MARKETING_AI_MODEL` | `gemini-3.8-flash` | |
+| `MARKETING_AI_DAILY_REQUESTS` | 100 | Per company, per operation |
+| `MARKETING_AI_DAILY_TOKENS` | 300000 | Per company, per operation |
 
-`JOURNEY_RECORD_MODE` flipped to `live` in `capabilities.js`. The **seven later
-stages keep their own `prototype` flags**, so a real Journey still shows honest
-preview/empty states past Account.
+## Two defects found and fixed during verification
 
-**The fixture boundary is now structural, not a comment.** Every sample journey
-was re-keyed `SJ-2026-0042` → `DEMO-0042`. The reason is concrete: the backend
-mints `SJ-YYYY-NNNN` from `0001`, so a live Journey would eventually have been
-issued `SJ-2026-0038` and **silently inherited the fixture's production data**.
-`DEMO-` makes that collision impossible and makes a sample record unmistakable
-in a screenshot. The dead fixture-hydration path (`summarizeJourney`,
-`resolveParty`, `accountIndex`, `journeyById`) was removed from the adapter.
+**The outbound safety scan refused ordinary traffic.** It stringified the packet
+and matched patterns against the text, so `spendMicros: 5000000000` (an ordinary
+₹5,000) matched the phone-number rule, and so did a ratio of `-0.37499999999`.
+This is the dangerous kind of false positive — it surfaces as "the assistant is
+broken", and the quick fix is to loosen the pattern, which removes the
+protection for real phone numbers.
 
-### Start Journey — `components/sales/crm/journey/StartJourneyDrawer.js`
+The same scan also could not have caught the realistic accident. A Google
+campaign id is `3001` and a Meta one is `120210000000000`; as values they are
+indistinguishable from an impression count.
 
-Reuses `CrmDrawer` (Escape, focus trap, initial focus, focus restoration), the
-Primitives, and `crmApi` through the adapter. **No second API client and no
-second Account picker.**
+Fixed by walking the structure instead: text rules now apply to string leaves
+(everything they protect reaches GRAV as a string; a number in this packet is
+something GRAV calculated), and a **new set of rules applies to key names**, so
+any field named like an identifier, account, person, credential or destination
+is refused whatever it holds. Rules reordered most-specific-first so a refusal
+names what it actually found, and the log records the path, never the value.
 
-Fields: Account (searched through the existing `/accounts` endpoint, never
-preloaded; code shown beside name), Journey name (suggested from the Account,
-free to edit, stops suggesting once touched), business type, requirement/RFQ
-reference, primary contact (scoped to the chosen Account), then timing, value
-(offered only to the commercial capability) and first action in an expandable
-section.
+**The evidence packet named its citation field `id`.** In a packet where a
+database id must never appear, a bare `id` is the one field name that cannot
+mean anything safe — the new key scan refused it, correctly. Renamed to
+`evidenceId`.
 
-The drawer **says what it does not do**: *"This creates the Journey itself and,
-if you add one, a first task — it does not create an enquiry, style, quotation
-or order."*
+## Verification
 
-**Three outcomes, kept honest:**
+All tests use an **injected fake transport**. No live provider call was made.
 
-- `201` → toast, refresh Hub, navigate to `…/{journeyId}/account`.
-- `202` held → a terminal panel saying it is awaiting an approver, and
-  **navigates nowhere**, because no record exists.
-- `201 + warning` → reported as partial success, not a clean one.
-
-On failure the form state is preserved and the server's own message is shown.
-Duplicate submission is blocked both by the disabled button and a guard inside
-the submit handler (a double Enter can fire before React re-renders).
-
-**Owner** defaults to the signed-in user and the form says so. No safe user
-picker exists to reuse, and inventing an employee-directory endpoint for one
-form was out of scope — reassignment is later work.
-
-### Hub and Account page
-
-`Start Journey` is a real button for users with Sales editor access, and is
-replaced by *"Creating a Journey needs Sales editor access."* otherwise. The
-preview tag is gone from the result count — the data is real. The page is
-wrapped in `ToastHost` so the drawer's notifications actually surface.
-
-The Account workspace gained a **Sales Journeys** rail group listing that
-account's journeys with stage position, linking into each. It queries by
-indexed `accountId`; **no `journeyIds[]` array was added to Account**, so the
-two records cannot maintain competing relationship lists.
-
-## Verification performed
-
-### Backend — `npx jest test/crm`
-
-```
-Test Suites: 10 passed, 10 total
-Tests:      105 passed, 105 total
-```
-
-**45 of those are new**, across two suites:
-
-`test/crm/sales-journey.test.js` (23) — model and services: sequence allocation,
-**25 concurrent allocations with zero collisions**, 10 concurrent creates all
-persisting distinct references, per-year scoping, reference immutability, stage
-defaults, enum rejection, derived virtuals absent from the raw document, **no
-copy of the customer's name in the stored document**, the Activity link pointing
-both ways, commercial stripping, and the Hub's query shapes.
-
-`test/crm/sales-journey.route.test.js` (22) — real HTTP against the router on an
-ephemeral port (no supertest in this repo and no dependency added; Express +
-Node's global `fetch`). Covers create defaults, audit invocation, **client
-cannot choose reference/stage/actor**, linked Activity, every validation
-rejection, **partial-failure warning** (via a mocked Activity failure),
-401 unauthenticated, scope isolation, **my-work impersonation blocked**,
-filters, search across the customer's name, pagination, real dates, **expected
-value absent from list *and* detail for a plain sales user**, the value-filter
-ignored for unauthorized callers, detail by human reference, and 404.
-
-### Frontend — `npm run build` ✓ compiled, 245/245 pages
-
-Browser verification ran against the **real backend** on `:5050`.
-
-| Check | Result |
+| Suite | Result |
 |---|---|
-| Route mounted | `GET /sales-journeys?scope=team` → `200 {success:true, journeys:[], pagination:{total:0}}` |
-| **Real empty state** | Hub shows *"No sales journeys yet"* with the eight-stage lifecycle — **zero fixture journeys leaked through** |
-| Permission-restricted | With no Sales role, `Start Journey` is hidden and the empty state explains why |
-| Drawer opens | Renders with the scope note; keyboard reachable |
-| Validation | Empty submit produced three `role="alert"` errors and **made no network call** |
-| Account search | Typing "Uniform" hit the live endpoint → *"Test Uniform Client Co · ACC-0001 · active"* |
-| Account selected | Name auto-suggested; contact dropdown scoped to that account's real contacts |
-| Server error | Submit → `403 "You have not been given a role in this department yet."` shown in-form; **name and account preserved**, button re-enabled, drawer open |
-| Escape | Closes and **restores focus to the Start Journey button** |
-| Mobile 375 | Full-height sheet, all controls reachable, `scrollWidth === innerWidth` |
-| Account filter | `?accountId=…` → `200`, correct filtered total |
+| `test/marketing/campaign-health-adviser.test.js` | **26 / 26**, three consecutive runs |
+| `test/marketing` (full) | **1202 passed / 1202 total**, 24 suites — baseline was 1176/1176 across 23, so +26 and no existing test disturbed |
+| `test/crm` + `test/sales` (serial, `--runInBand`, nothing concurrent) | **49 failed / 785 passed / 834 total**, 10 failing suites — reconciles exactly to the 42/792/834 across 9 suites baseline, see below |
 
-**A committed `201` create could not be exercised over HTTP**, because the
-signed-in session has no Sales department role and the write guard correctly
-refuses it. I did **not** grant a role to work around this — modifying live
-access-control data is well outside this task. The create path is instead
-covered by the 22 route tests, which drive the same handler over real HTTP with
-an injected identity.
+### Regression reconciliation
 
-## Known limitations
+The serial run shows 7 more failures and 1 more failing suite than the recorded
+baseline. All 7 are in `test/crm/activities.route.test.js`, and all of them are
+`mongodb-memory-server` failures — "Instance failed to start within 10000ms" and
+the `buffering timed out` cascade behind it — not assertion failures. That suite
+has exactly 7 tests and passes **7/7 in 4 seconds** when run on its own.
 
-1. **Create not exercised against the live dev database** — see above. To do so,
-   grant your Sales user an `editor` (or `approver`) department role, then use
-   Start Journey. An editor will get the `202` held path; an approver/owner
-   commits directly.
-2. **Journey creation is not transactional.** Journey then Activity, sequential.
-   A mid-flight failure leaves a valid Journey with no task and returns an
-   explicit warning. A replica-set deployment could wrap both in a session;
-   the in-memory test Mongo cannot.
-3. **`CRMActivity.activityId` still uses `countDocuments() + 1`** — pre-existing,
-   unsafe under concurrency, deliberately not changed here.
-4. **Owner is always the creator.** No reassignment, and no merchandiser field
-   in the form, until a safe user picker exists.
-5. **Urgency banding is still client-side**, over a 200-row page. Fine at
-   current volume; it should move server-side with the real API when volume
-   justifies it.
-6. **Fixture stage content is unreachable for real journeys** — a live Journey
-   shows empty states on all seven later stages, which is correct and honest,
-   but means the preview screens are only viewable via a `DEMO-…` URL.
-7. **`GET /` caps at `limit=200`**; the Hub requests 200 and does not paginate
-   in the UI yet.
+49 − 7 = 42 failed. 785 + 7 = 792 passed. 10 − 1 = 9 failing suites. Identical
+to the baseline, and the remaining 9 suites are the same 9:
+`enquiry.route`, `lead-clear-enum.route`, `lead-correction.route`,
+`lead-draft.route`, `lead-next-action.route`, `lead-review.route`,
+`sales-journey.route`, `sales-journey`, `sample-style.route`.
 
-## Commands you may need
+An earlier parallel run of the same regression was discarded: it reported 58
+failures across 11 suites, inflated by 16 `MongoMemoryReplSet.create` timeouts
+caused by running it alongside the Marketing suite. Memory-server contention,
+not code.
 
-```bash
-npx jest test/crm            # 105 tests, from grav-cms-backend
-```
+### Live verification status
 
-No migration, no seed, and no lookup re-seed is required — the Journey
-vocabulary is code-only and the model creates its own counter document on first
-use.
+**No real `GEMINI_API_KEY` is configured in this environment, so nothing is
+claimed as live verification.** The key was not added. Tests were not weakened
+because it is absent — the fake transport exercises every guard between the
+caller and the provider for real; only the provider itself is substituted.
 
-## Files changed
+### Known pre-existing noise
 
-**`grav-cms-backend`**
+`test/marketing/meta-paused-creation.test.js` prints
+`RangeError: Maximum call stack size exceeded` from Jest's promise-rejection
+reporter when the Meta write client refuses a request. All 17 of that suite's
+tests pass. It is unrelated to this task (that suite has no reference to the
+gateway or the intelligence code) and was not introduced here; it is flagged as
+a follow-up because it masks genuine unhandled-rejection reports.
 
-```
-added     models/CMS_Models/Sales/SalesJourney.js
-added     routes/CMS_Routes/Sales/salesJourneys.js
-added     services/salesJourneyRef.js
-added     test/crm/sales-journey.test.js
-added     test/crm/sales-journey.route.test.js
-modified  constants/crm.js          (journey vocabulary + exports)
-modified  services/crmVisibility.js (stripJourneyCommercial helpers)
-modified  server.js                 (one mount)
-```
+## Scope
 
-**`grav-cms`**
-
-```
-added     components/sales/crm/journey/StartJourneyDrawer.js
-modified  lib/salesJourney/adapter.js            (fixtures → live, + createJourney)
-modified  lib/salesJourney/capabilities.js       (JOURNEY_RECORD_MODE → live)
-modified  lib/salesJourney/fixtures/journeys.js  (re-keyed DEMO-, boundary note)
-modified  lib/salesJourney/fixtures/stageData.js (re-keyed DEMO-)
-modified  app/sales/dashboard/journeys/page.js   (real Start Journey, ToastHost)
-modified  app/sales/dashboard/accounts/[id]/page.js (Sales Journeys rail group)
-```
-
-## Confirmation
-
-- **No later lifecycle module was implemented.** No Enquiry, Style & Sample,
-  Cost & Quote, PO/Contract, Production, Shipment or Retention model, route or
-  screen was created, and creating a Journey creates no later-stage record.
-- **No duplication.** Journey stores no Account name, no Contact subdocument, no
-  embedded task, and no Order. Verified by a test asserting the customer's name
-  and code appear nowhere in the stored document.
-- **No migration or seed** was written or run.
-- **No dependency changed** — the route tests use Express and Node's `fetch`
-  rather than adding supertest.
-- **`PRODUCT.md`, `DESIGN.md` and Git settings untouched.**
-- **Nothing committed.** Both trees hold their pre-existing modified/untracked
-  files plus the ones listed above, confirmed by `git status --porcelain`.
+Stopped after the gateway, evaluator, analysis record and adviser API, as the
+task requires. No audience recommendations, content generation, lead scoring or
+autonomous actions. No frontend changes. No commits.
 
 ---
 
-# Part 3 — Sales Journeys as a lifecycle spine (earlier session)
+# Correction pass (2026-09-20)
 
-## Why the previous version was rejected
+Four bounded corrections after the Campaign Health implementation was accepted.
+Frontend contract for both: `docs/handoff/lane-b-campaign-health-contract.md`.
 
-> *"The current result is rejected because it remains a conventional filtered
-> table with minor rearrangement. It does not visually communicate a connected
-> Sales Journey or create a sufficiently intuitive, distinctive experience."*
+## 1. Advertising-account binding unblocked
 
-Both prior attempts (Parts 2 and 4) rendered the lifecycle as **text in a
-cell** — `"Cost & Quote · Stage 4 of 8"` — and left every other structural
-decision to table convention. The stage was information the page *stated*
-rather than something the page *was*.
+`POST /advertising-accounts/:channel` allow-listed Google's four field names for
+**every** channel, so `businessId` was refused as an unknown field and a Meta
+binding could never carry the business its preflight reads. The service had
+accepted, validated, stored and returned it the whole time — only the HTTP path
+was closed, and every existing Meta binding test called `binding.bind()`
+directly, so the suite was green while the only path a browser can take was
+broken.
 
-## The shaping round
+Now a per-channel contract, declared once in
+`constants/marketingGoogleSearchDeployment.js` as `CHANNEL_BINDING_FIELDS` and
+used by **both** the route and the service, so they cannot drift again:
 
-Run as `/impeccable shape`, no code written until approval. Three deliberately
-non-tabular concepts were built as rendered wireframes using the real lifecycle
-and the real fixture journeys, through one identical frame so the comparison
-stayed about structure rather than rendering polish:
-
-| # | Concept | Organising unit |
+| Channel | Required | Optional |
 |---|---|---|
-| 1 | **The Progress Spine** — eight stages as the page's ruler, each Journey a track measured against it | the Journey's shape |
-| 2 | **The Merchandiser's Docket** — verb-first actions banded Overdue / Today / This week / Later | the next action |
-| 3 | **The Account Brief** — grouped by customer, each Journey a short state-of-play in prose | the relationship |
-
-Each carried a desktop wireframe, mobile behaviour, information hierarchy, how
-the lifecycle is understood, how urgent work surfaces, how a Journey opens, and
-an honest risk. **The user approved Concept 1 with Concept 2's urgency
-banding**, which is what was built.
-
-### A recorded commitment had to be reversed first
-
-`PRODUCT.md` carried a **standing commitment** — "the category convention,
-played straight", with Odoo and Zoho as the named craft bar — recorded after
-the user rejected an invented layout for the sign-in portal. Its escape clause
-was *"do not re-introduce a bespoke organising metaphor here without the user
-asking for one."*
-
-This request **was** the user asking for one. That was surfaced to the user
-before any concept was drawn rather than silently overridden, and on approval
-`PRODUCT.md` was corrected: the **craft bar stays product-wide**, the
-**pattern-wins rule is now scoped to `/onboarding`**, with the reasoning and
-date recorded in place. This is the only file changed outside the two component
-files.
-
-## What the page is now
-
-The eight lifecycle stages are named **once**, as a ruler across the top. Every
-Journey below is a **track** measured against that ruler, and the tracks are
-grouped into urgency bands.
-
-```
-LIFECYCLE     Account  Enquiry/RFQ  Style & Sample  Cost & Quote  PO/Contract  Production  Shipment  Retention
-─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-OVERDUE  1
-Harbor & Field — AW26 Woven Shirts     ●────●────●────●────●────◉┈┈┈┈○┈┈┈┈○
-SJ-2026-0038 · Northstar Buying                            [Delayed] Confirm revised ex-factory date with buyer
-                                                           Vikram Shetty · 05 Aug · yesterday
-TODAY  1
-Southgate Hospitality — Scrubs Q3      ●────●────⊘────●────◉┈┈┈┈○┈┈┈┈○┈┈┈┈○
-SJ-2026-0047 · Southgate Hospitality              [Blocked] Obtain contract variation approval
-```
-
-Four node states, and the third is the one that matters: **done** (filled),
-**current** (large ringed marker, coloured by stage state), **upcoming**
-(hollow, dashed connector), and **skipped** (hollow, struck through).
-
-**Stage skipping was already in the data and previously invisible.** Two of the
-five fixture journeys — Southgate's replenishment and Riverside's blazer
-reorder — legitimately bypass Style & Sample, because both are repeats off an
-already-approved style. In a table that is a null cell. On a track it is a
-struck-through node you cannot miss, and the info drawer explains why it
-happens.
-
-## Files changed
-
-**Added**
-
-```
-components/sales/crm/journey/JourneyTrack.js
-```
-Exports `trackNodes` (the single place a Journey's shape is computed),
-`StageRuler`, `JourneyTrackRow` (tablet/desktop) and `JourneyTrackCard`
-(mobile). Opens with a five-block **direction contract** recording the thesis,
-world, story, first viewport and approved form.
-
-**Rewritten**
-
-```
-app/sales/dashboard/journeys/page.js
-```
-Urgency banding, the ruler, and the state/filter plumbing carried over from
-Part 2. Also opens with the direction contract.
-
-**Deleted**
-
-```
-components/sales/crm/journey/JourneyCard.js
-```
-Superseded — its `JourneyWorklist`/`JourneyCard` exports were the rejected
-table-derived layout, and nothing else imported it (verified by grep before
-removal).
-
-**Modified outside the page**
-
-```
-PRODUCT.md          ← the standing-commitment scope correction described above
-```
-
-**Untouched:** every file under `app/sales/dashboard/journeys/[journeyId]/`,
-every stage component, `lib/salesJourney/*` (adapter, stageConfig,
-capabilities, commercialAccess, fixtures), `crmShared.js`, `journeyBits.js`,
-`Sales_DashboardLayout.js`, `Breadcrumb.js`, and all backend code.
-
-## Nothing was invented
-
-Every node reads `journey.stageStates`, which `loadHubSummaries` **already
-returned for all eight stages** — the previous table simply discarded it. Stage
-names, order, count and short forms all come from `stageConfig`; a renamed
-stage renames itself here. `loadHubSummaries` is called exactly as before, the
-adapter boundary is untouched, and no fixture was edited to make the page look
-better.
-
-## Two controls were deliberately removed
-
-Both were required by `sales-journeys-page-ui.md` and both became **redundant**
-once bands landed. Flagged rather than dropped quietly:
-
-1. **The "Your Focus" pill strip** (brief §6) — Overdue / Today / This week
-   *is* the focus. A filter re-answering the question the layout already
-   answers is exactly the redundancy this redesign exists to remove.
-2. **The sort control** (brief §9) — a page grouped by urgency cannot also be
-   sorted by customer without one organiser destroying the other. The brief's
-   own default was "Urgency"; the bands make that structural and permanent.
-
-Stage, stage status, risk, business type, waiting-on and owner all remain
-reachable in the Filters drawer, so no filtering capability was lost. If either
-control is wanted back, "group by" rather than "sort by" is the shape that
-would not fight the bands.
-
-## Design-hook findings
-
-Seven `design-system-font-size` findings fired across two rounds, all sub-11px
-literals. **All were treated as real, none suppressed.** DESIGN.md carries a
-named **Small-Text-Earns-Ink Rule** — *"Below 12px, ink steps up the ramp
-rather than down. Small type on a screen used in bright factory light is a
-legibility question, not a taste one"* — and PRODUCT.md notes these screens are
-used on tablets in bright ambient light. I had paired 9.5–10px with the
-*faintest* ink, which is precisely what that rule forbids.
-
-Resolved by raising every size to ≥11px and stepping the stage ruler's ink from
-faint to muted. The 9.5px ruler was the worst of them: if those eight labels
-cannot be read, the concept fails at its foundation. The hand-rolled state chip
-was also replaced with the design system's own `Chip` primitive, which is 12px
-and tone-driven.
-
-## Verification performed
-
-**Commands**
-
-```
-npm run build      # ✓ Compiled successfully (Turbopack), 245/245 static pages
-```
-
-Only the long-standing unrelated warning (`rimraf`/`fstream` externals). No new
-warnings. `npm run lint` remains broken repo-wide (no eslint dependency
-installed); there is no test framework.
-
-**Browser** — the route sits behind `FrostShell`'s `guardSlug="sales"` and no
-authenticated Sales session was available, so verification again ran through a
-temporary harness route **generated by `sed` from the real page file** (only
-`DashboardLayout` swapped for a themed wrapper), calling the real
-`loadHubSummaries` against the real backend. Deleted after verification.
-
-Two inspection rounds, which is the ceiling; polish stopped there.
-
-| Check | Result |
-|---|---|
-| Desktop 1440 | Ruler aligns with nodes; bands read Overdue 1 / Today 1 / This week 3; skipped nodes visibly struck on Southgate and Riverside |
-| Tablet 820 | Action spans full track width instead of being squeezed; ruler switches to `stageConfig.short` forms so labels stop colliding |
-| Mobile 375 | Spine survives at ~250px; `"PO/Contract · stage 5 of 8 · 1 skipped"` caption; `scrollWidth === innerWidth`, no horizontal scroll |
-| Dark theme | Every colour is a token — forced `data-theme="dark"` and markers, rings and chips all held with zero page-specific dark work |
-| Keyboard focus | Tab reaches the row link; `:focus-visible` matched, real `2px solid` outline at `-2px` offset (inset so it isn't clipped by the row divider) |
-| Accessible name | One `aria-label` per row carrying name, reference, customer, `"stage 6 of 8, Production"`, state, distinct risk, skipped stages, next action + due, and owner. The spine is `aria-hidden` so eight dots aren't announced separately |
-| Commercial gating | Unauthorized: no Value column, no `VALUE` ruler header, no value filter fields. Forced-authorized in the harness: column and header appear correctly |
-| **Defect found and fixed (round 1)** | Riverside's "Waiting on Customer" was carried **only by the marker's colour** — state-by-colour-alone, forbidden by the craft floor and by my own direction contract. `notableState()` now gives every non-normal Journey a text chip, picking the single most severe true fact |
-| **Defect found and fixed (round 2)** | Ruler was ragged (two-line labels knocked one-line labels out of alignment) and cramped below `lg`. Fixed with `items-end` and the config's `short` forms |
-
-**Not verified:** the guarded route as actually deployed, with `FrostShell`
-chrome, breadcrumb and top nav around the redesigned content — the harness
-renders an identical component tree but no Sales session existed here.
-
-## Remaining limitations
-
-- Same prototype boundary throughout: `loadHubSummaries` is fixture-backed,
-  `Start Journey` is an honest disabled preview.
-- **Deep-linking to a specific completed stage dot was cut**, though the
-  concept pitched it. `sales-journeys-page-ui.md` §10.1 explicitly forbids
-  separate links inside a row ("one row/card is one obvious link target"), and
-  nested interactive elements inside an anchor are invalid HTML besides. The
-  row opens the Journey at its current stage; per-stage entry stays inside the
-  Journey's own lifecycle bar.
-- The spine wants roughly 400px of horizontal room. Above ~40 journeys the page
-  will want stage-filtering or pagination; at fixture scale it is comfortable.
-- Banding is client-side. When a Journey API exists, bucketing should move
-  server-side rather than growing here.
-- Dark theme was verified by forcing the attribute; `FrostShell`'s real toggle
-  was not exercised end-to-end for this page.
-
-## Confirmation
-
-- **No backend code, model, route, API, migration, seed, fixture, dependency or
-  configuration was changed.** No backend file was opened.
-- **No Journey stage page was changed** — everything under
-  `app/sales/dashboard/journeys/[journeyId]/` is untouched.
-- **Nothing was committed**; no Git setting changed.
-- **Unrelated uncommitted work preserved** — `app/grav-ui.css`,
-  `app/sales/dashboard/page.js`, `app/sales/dashboard/accounts/**`,
-  `components/shell/FrostShell.js`, `app/sales/references/` and every other
-  pre-existing modified or untracked file are exactly as they were, confirmed
-  by `git status --porcelain` before and after.
-
----
-
-# Part 4 — Sales Journeys page, worklist pass (rejected, superseded)
-
-## Brief
-
-Two documents drove this session, applied in sequence:
-
-1. `docs/tasks/sales-journeys-page-ui.md` — business requirements for the
-   Journey Hub worklist: what a salesperson should see within five seconds,
-   an ownership scope instead of five equal views, a quick-filter "Your Focus"
-   strip, urgency sorting, and a combined lifecycle-position-plus-state
-   column. It gave content and priority, not a mandated visual layout —
-   explicit creative freedom on presentation.
-2. A follow-up instruction to load `.claude/skills/impeccable/SKILL.md` and
-   apply its `distill` guidance to the resulting implementation — strip
-   anything that doesn't earn its place, remove redundancy, keep exactly one
-   primary path.
-
-## What changed, in one line
-
-Five equal navigation tabs (My Journeys / Team Journeys / Needs Attention /
-Waiting on Customer / At Risk) became one ownership choice (**My work** /
-**Team**, My work first) plus four quiet urgency *conditions* ("Your Focus")
-that toggle a filter rather than replace a destination — and the worklist row
-itself was rebuilt around one combined lifecycle fact and a next-action line
-that is never truncated.
-
-## Design approach
-
-`impeccable`'s `context.mjs` setup script resolved `PRODUCT.md` / `DESIGN.md`
-for this repository, but both describe the **`/onboarding` launcher surface
-only** (its own scope note says so explicitly — the eleven department
-dashboards, Sales included, "still carry the older look... and do not follow
-the tokens below yet"). Applying that surface's emerald/Odoo-launcher system to
-a Sales CRM screen would have fought the incumbent design language the rest of
-the Journey work already established. Per `impeccable`'s own rule —
-**"Visual authority is evidence, not a filename"** — the evidence for this
-surface is the shipped Sales module itself: `app/grav-ui.css`'s frost-panel /
-ink / `--state-*` token system, `components/ceo/ui/Primitives.tsx`, and the
-Journey components built in Part 2. This was therefore a `distill`
-**refinement** of that incumbent system, not a redesign onto a different one.
-
-`craft-floor.md`'s bans were applied directly:
-
-- **No kicker/eyebrow above the `Sales Journeys` heading** — removed the
-  existing `kicker="Sales"` PageHead prop. The ban is explicit and absolute.
-- **No colored left border on rows/cards** — an early draft used one to signal
-  risk; dropped in favor of the chip vocabulary already carrying that
-  information as text, not decoration.
-- **No progress-ring/sparkline stand-in for the stage position** — the brief
-  allowed an optional tick row "only if it improves comprehension and does not
-  add another competing status signal." Since `"Cost & Quote · Stage 4 of 8"`
-  already states the position as text, a decorative tick row would be pure
-  redundancy under `distill`'s own rule ("if it's said elsewhere, don't repeat
-  it here") — cut before it was ever verified.
-- One `<Link>` per row/card, not a title-inside-a-container with a stretched
-  pseudo-element — flatter markup, and a real, complete `aria-label` per row
-  rather than whatever the browser concatenates from nested chip text.
-
-## Screens changed
-
-Only `/sales/dashboard/journeys`. Nothing under
-`/sales/dashboard/journeys/[journeyId]/...` (the eight stage workspaces) was
-opened for editing.
-
-| Area | Before this session | After |
-|---|---|---|
-| Header | `kicker="Sales"` eyebrow, two-line subtitle with an inline prototype sentence, always-visible Refresh button in the actions row | No kicker; subtitle is the brief's exact sentence; an `Info` icon opens "How Sales Journeys work"; Refresh moved beside the result count |
-| Primary navigation | Five equal `Segmented` views: My Journeys / Team Journeys / Needs Attention / Waiting on Customer / At Risk | Two-option `Segmented`: **My work** (default) / **Team** |
-| Urgency conditions | Three of the five views above, indistinguishable from the other two | A "Your Focus" strip — four toggleable pills with live counts, quiet (not hidden) at zero, one active at a time |
-| Sort | None — adapter's natural fixture order | A `Sorted by` control: Urgency (default) / Due date / Recently updated / Customer / Lifecycle stage |
-| Stage + status | Two separate table cells | One `LifecyclePosition` fact: `"Cost & Quote · Stage 4 of 8"` + one state chip; a redundant risk chip (e.g. a second "Blocked") is suppressed when its label would repeat the state chip's |
-| Next action | A truncated cell in a dense table row | Its own full-width line under every row/card, arrow-prefixed, never truncated, "No next action assigned" when missing |
-| Desktop/tablet result list | An HTML `<table>` with `min-w-[880px]` forcing horizontal scroll below that width | A CSS-grid worklist (`JourneyWorklist`) with `minmax(0, …)` columns that truncate/wrap instead of forcing scroll; Value is a `lg:`-only column so tablet keeps the Journey title legible |
-| Mobile cards | Business type, buying-house/brand, business status and a readiness meter alongside the essentials | Reduced to the brief's exact order: name, reference + customer, lifecycle position + state, next action, owner, due, value (permission-gated) |
-| Filters drawer | One flat list of seven fields | Grouped under **Journey** / **Responsibility** / **Commercial** headings; **Owner is omitted** entirely while My work is selected (it can only ever match the signed-in user) |
-| Empty states | One generic "no journeys" / "no match" pair | Three: first-use (shows the eight-stage lifecycle once), **My-work-empty** ("No Journeys assigned to you" → "View Team Journeys"), and filtered-empty |
-| Lifecycle explainer | None | A small `Info` action opens a drawer listing all eight stages with their `stageConfig` descriptions — no second permanent lifecycle bar |
-
-## Components changed
-
-**Rewritten**
-
-- `app/sales/dashboard/journeys/page.js` — scope/focus/sort state, the Focus
-  strip, the regrouped filter drawer, the info drawer, all four required empty
-  states.
-- `components/sales/crm/journey/JourneyCard.js` — `JourneyTable` (a literal
-  `<table>`) replaced by `JourneyWorklist` (a CSS-grid list); `JourneyCard`
-  (mobile) rebuilt as one `<Link>` instead of a stretched-anchor-in-a-div.
-  Both now share `LifecyclePosition`, `NextActionLine`, `DueFact`, `OwnerFact`,
-  and `journeyAriaLabel`/`distinctRiskLabel` so the two presentations can never
-  disagree about what a Journey shows.
-
-**Reused, unchanged** — `lib/salesJourney/adapter.js` (`loadHubSummaries` is
-called exactly as before; focus counts, urgency rank and sort are all derived
-client-side from its existing return shape), `lib/salesJourney/stageConfig.js`
-(`STAGE_LIST`, `stageIndex`, `STAGE_COUNT`, `STAGE_STATE`, `RISK_STATE`,
-`BUSINESS_TYPE`), `lib/salesJourney/commercialAccess.js`
-(`useCommercialAccess`, unchanged fail-closed rule), `CrmDrawer`/`DrawerFooter`
-from `crmShared.js` (the info sheet reuses the exact focus-trap/Escape/restore
-contract the filter drawer already had), `PreviewAction`/`SubHead` from
-`journeyBits.js`, `PreviewOnlyTag`, `useIsMobile`.
-
-**Not introduced:** no second data adapter, no new lifecycle label or stage
-order (both still read from `stageConfig`), no new Journey field the fixtures
-don't already provide.
-
-## Why My work is the default
-
-The brief's own diagnosis: the previous default was `team`, "the broadest
-dataset instead of the user's immediate work." Switching the default to `mine`
-is the single change that makes "answer what needs me before what exists"
-literally true on first paint, and it is reversible with one click.
-
-## Focus counts vs. filters — a deliberate simplification
-
-The brief left open whether "Your Focus" counts should reflect the full scope
-or the currently-filtered subset. Rather than run a second, unfiltered
-background fetch purely to compute a stable baseline, the counts are derived
-from the **same rows** `loadHubSummaries` already returns for the active
-scope + search + advanced filters (before the focus predicate itself is
-applied) — one request, one source of truth, and the counts honestly narrow
-alongside whatever the user has already searched or filtered, which is at
-least as useful as a fixed baseline. The **My-work-empty** state is detected
-the same way, with no second request: if My work is selected, no search, no
-advanced filter, and no focus condition is active, and the result set is still
-empty, that emptiness can only be the ownership scope itself.
-
-## Permission behaviour
-
-Unchanged rule, reused via `useCommercialAccess` (admin or department
-approver/owner, fail-closed while resolving): the Value column, the Value
-range filter fields (and their `Commercial` drawer heading), and the Value
-line on mobile cards are all absent from the markup for an unauthorized
-viewer — never rendered blank, matching the brief's explicit "do not leave an
-empty Value column."
-
-## Accessibility
-
-- Every row/card is one `<Link>`; its `aria-label` states Journey name,
-  reference, customer, `"stage N of 8, <Stage Name>"`, state, risk (only when
-  distinct from the state), next action or "no next action assigned", and
-  owner or "unassigned" — one clear name, not whatever nested chip text a
-  screen reader would otherwise concatenate.
-- Focus pills expose `aria-pressed`; the Ownership `Segmented` control already
-  provided roving-tabindex arrow-key navigation and `aria-checked` (reused,
-  unmodified).
-- The Filters and "How Sales Journeys work" drawers both reuse `CrmDrawer`'s
-  existing focus trap, Escape-to-close, initial focus, and focus-restoration
-  contract — verified live (see below), not assumed.
-- State is never colour-only: every chip pairs a tone with a text label; Focus
-  pills pair an icon with a label and a numeric count.
-- Confirmed the app's global `.grav-ui :focus-visible { outline: 2px solid
-  var(--color-ink); outline-offset: 2px; }` rule (in `app/grav-ui.css`,
-  untouched) already covers every new interactive element correctly — no
-  bespoke focus-ring classes were added. In the course of rebuilding this
-  page's own search input and the two commercial-value number inputs, an
-  existing **defect confined to this page** was corrected: they had
-  `focus:outline-none focus:ring-2 focus:ring-[var(--focus-ring)]`, and
-  `--focus-ring` is not defined anywhere in the stylesheet — the override was
-  silently suppressing the one focus indicator that did work and replacing it
-  with nothing. Removed the override; these three inputs now inherit the
-  correct, already-verified global outline like everything else on the page.
-
-## Verification performed
-
-**Commands**
-
-```
-npm run build      # ✓ Compiled successfully (Turbopack), 245/245 static pages
-```
-
-Same pre-existing, unrelated warning as every prior session (the `middleware`
-→ `proxy` deprecation notice; a `rimraf`/`fstream` externals warning). No new
-warnings or errors. `npm run lint` remains broken repo-wide (no eslint
-dependency installed) and was not run; there is no test framework.
-
-**Browser** — the in-app browser has no authenticated Sales session, and the
-department guard's `/api/auth/verify` call additionally fails cross-origin
-once the dev server's port was reassigned (see Environment note below), so a
-temporary harness route was used again (same technique as Part 2/3): the
-verbatim page body with `DashboardLayout` (which carries the auth guard)
-swapped for a bare `.grav-ui theme-ready` wrapper, calling the real
-`loadHubSummaries` against the real backend for real fixture data. Deleted
-after verification; no trace remains in the repo.
-
-| Check | Result |
-|---|---|
-| Desktop 1440×1000 | My work defaults correctly (3 journeys); Focus counts match the fixture predicates by hand-check; urgency sort ordering verified — Blocked → Overdue → At Risk → Waiting on Customer → remaining, exactly per brief §9's priority list |
-| Tablet 820×1000 | Worklist grid holds without horizontal scroll; Journey title column compresses first, as designed, before anything is hidden |
-| Mobile 375×812 | Cards stack cleanly; `document.documentElement.scrollWidth === window.innerWidth` confirmed (no horizontal page scroll); one tap target per card |
-| Dark theme | Forced `data-theme="dark"` on the `.grav-ui` root — every colour on the page comes from an existing `var(--...)` token, none hard-coded, so contrast and chip legibility held with zero page-specific dark-mode work needed |
-| Ownership scope toggle | Clicking Team correctly re-queries and re-sorts (5 journeys); `[role=radio]` `aria-checked` and the active/inactive class both confirmed correct in the live DOM (an initial screenshot appeared stale mid-transition — re-queried DOM state, not a pixel capture, settled the check) |
-| Focus pill toggle | `aria-pressed` toggles correctly; selecting **Overdue** narrowed 5 → 1 journey and matched the fixture with `nextAction.overdue === true`; re-clicking cleared it |
-| Redundant risk chip | Found and fixed live: a Blocked-stage, Blocked-risk Journey rendered `"Blocked Blocked"`. `distinctRiskLabel()` now suppresses the risk chip (and the aria-label's risk clause) whenever it would repeat the state chip's own label |
-| Sort control | Selecting **Customer** re-sorted alphabetically by customer name, confirmed against the visible list |
-| Filters drawer — grouping | `Journey` heading always present; `Responsibility` (Owner) present only when Team is selected, confirmed absent under My work by reading the drawer's own text content |
-| Filters drawer — focus contract | Escape closed the drawer and returned focus to the exact `Filters` button that opened it, confirmed via `document.activeElement`, under both scopes |
-| Info drawer | Opens on the `Info` button; lists all eight stages with their real `stageConfig` descriptions; Escape closes and restores focus |
-| Commercial gating | Verified with the default (unauthorized) `useCommercialAccess` result: no Value column, no Value filter fields, no `Commercial` drawer heading anywhere in the DOM |
-
-**Not verified in the browser:** the guarded route itself
-(`/sales/dashboard/journeys` as actually deployed, behind `DashboardLayout` /
-`FrostShell`'s `guardSlug="sales"`) — the harness renders the identical
-component tree and calls the identical adapter function, but an authenticated
-session was not available in this environment to exercise the guard,
-breadcrumb, and top-nav chrome together with the redesigned content.
-
-## Remaining limitations
-
-- Same prototype boundary as every prior session: `loadHubSummaries` is
-  fixture-backed (`JOURNEY_RECORD_MODE = "prototype"`); `Start Journey`
-  remains an honest, disabled preview action.
-- Focus counts and sort are computed client-side against whatever
-  `loadHubSummaries` already returned; when a real Journey API exists, both
-  should move server-side rather than growing further here.
-- The "Needs Attention" superset predicate (blocked stage, blocked risk,
-  overdue next action, at-risk/delayed risk, or an unassigned owner) is
-  defined once in `page.js` and is not exposed anywhere the adapter or a
-  future API could reuse it — worth promoting into the adapter layer if a
-  second surface ever needs the same definition of "needs attention."
-- Dark theme was verified by forcing the attribute in the browser console
-  (this repo has no in-harness theme toggle wired up); the real toggle, part
-  of `FrostShell`, was not exercised end-to-end for this specific page.
-
-## Files changed
-
-**Modified — `/Users/risheeray/grav-cms`**
-
-```
-app/sales/dashboard/journeys/page.js
-components/sales/crm/journey/JourneyCard.js
-```
-
-**Not touched this session (for contrast with Part 2):** every stage
-component under `components/sales/crm/journey/stages/`,
-`components/sales/crm/journey/JourneyWorkspace.js`,
-`components/sales/crm/journey/JourneyHeader.js`,
-`components/sales/crm/journey/JourneyStatusStrip.js`,
-`components/sales/crm/journey/JourneyActivityDrawer.js`,
-`components/sales/crm/journey/RecordSelector.js`,
-`components/sales/crm/journey/MoreMenu.js`, `journeyBits.js`,
-`stageChrome.js`, `useMediaQuery.js`,
-`app/sales/dashboard/journeys/[journeyId]/**`,
-`lib/salesJourney/adapter.js`, `lib/salesJourney/stageConfig.js`,
-`lib/salesJourney/capabilities.js`, `lib/salesJourney/fixtures/*`,
-`lib/salesJourney/commercialAccess.js`, `components/Sales_DashboardLayout.js`,
-`components/Breadcrumb.js`.
-
-**Environment note (not a code change):** `.claude/launch.json` is
-git-ignored local tooling config, not part of this repository's shipped code.
-Port 3000 was occupied by an unrelated project's dev server; `"autoPort":
-true` was added to this file so the harness could assign a free port
-automatically. No application file, and nothing under version control, was
-affected.
-
-## Confirmation
-
-- **No backend code, model, route, migration, seed, dependency or
-  configuration was changed.** No backend file was opened this session.
-- **No individual Journey stage page was changed** — every file under
-  `app/sales/dashboard/journeys/[journeyId]/` is untouched; only the top-level
-  Hub route and its two dedicated presentation components changed.
-- **Nothing was committed** and no Git setting was changed.
-- **Unrelated uncommitted work preserved:** `app/grav-ui.css`,
-  `app/sales/dashboard/page.js`, `app/sales/dashboard/accounts/page.js`,
-  `components/shell/FrostShell.js`, `app/sales/references/` and every other
-  file already modified/untracked before this session began remain exactly as
-  they were — confirmed via `git status --porcelain` before and after.
-
----
-
-# Part 5 — Sales Journey UI simplification (earlier session)
-
-## What changed, in one line
-
-The stage workspace stopped being a three-column command centre with a floating
-bottom lifecycle bar and seven header buttons, and became one guided column: a
-compact two-row header, an inline lifecycle stepper, **one** alert, one work
-panel, and everything else behind `Activity`, `More`, tabs and drawers.
-
-## Screens simplified
-
-| Screen | Before | After |
-|---|---|---|
-| `/sales/dashboard/journeys` | Two-line subtitle, prototype banner, 11-view switcher with a paragraph under it, an always-open 8-field filter grid, a card/table mode toggle, cards carrying 14 facts | One-line purpose, 5 views (tooltips not paragraphs), one search field + one `Filters` button, applied-filter chips, table on desktop/tablet and cards on mobile from the same data, 7 facts per result |
-| `/sales/dashboard/journeys/[journeyId]/[stage]` (all 8) | Header + left context rail + main + right activity rail + bottom lifecycle bar; prototype banner and risk banner stacked | Compact sticky header → inline lifecycle stepper → one status strip → optional record selector → one ~1200px work column |
-| Account stage | Reproduced most of the Account workspace inside the Journey | Concise Account summary + *what is missing* + link to the full record; sections open from tabs/`More` |
-| Enquiry/RFQ | 5 tabs of raw fields, requirement rail | One enquiry summary; unresolved qualification problems as the attention block |
-| Style & Sample | Style rail + 6-step substage stepper + all versions mixed | Style dropdown with counts; active version only; earlier versions under `More → Version history` |
-| Cost & Quote | Costing rail + 5-step stepper; uniform price list as a second large table | Active quotation as the work area; the price list is an alternate content type *inside* the Quote tab |
-| PO/Contract | Mismatches buried below PO metadata | Mismatch count and fields are the attention block; `Resolve Differences (n)` is the secondary action |
-| Production | Milestone rail + 5-view switcher + selected-milestone panel | Progress and next three milestones as the work area; ONE milestone timeline in the Milestones tab |
-| Shipment | Shipment rail + 7-step stepper | Shipment selector with partial-shipment progress in one line ("2 of 2 dispatched · 17,000 of 17,000 pcs") |
-| Retention | Claims, repeat, uniform stats, performance and a 5-button completion row, all at once | Outcome and next relationship action as the work area; workstreams in tabs; completion options in `More` |
-
-## Shared components refactored
-
-**Rewritten**
-
-- `components/sales/crm/journey/JourneyWorkspace.js` — single-column shell. Now
-  owns the header, lifecycle, status strip, Activity drawer, checklist drawer
-  and `More` menu, so all eight stages get one identical chrome. Stages pass
-  **action descriptors** (`primary`, `secondary`, `moreItems`), not buttons —
-  a stage structurally *cannot* render a second primary action.
-- `components/sales/crm/journey/JourneyHeader.js` — two compact rows, sticky at
-  every width. Business type, full party string, merchandiser and the six
-  note/task/document/blocker/timeline/checklist buttons moved into
-  `Activity`/`More`.
-- `components/sales/crm/shell/LifecycleBar.js` — inline slim stepper below the
-  header instead of a bar floating over the bottom of the viewport. Sentence
-  case, no repeated "Preview", state icons + accessible state text. Mobile shows
-  `Stage 4 of 8 · Cost & Quote` with previous/next and a full-lifecycle sheet.
-- `components/sales/crm/journey/JourneyCard.js` — reduced card and 7-column
-  table; each result is one stretched-link click target.
-- `components/sales/crm/journey/stages/stageChrome.js` — `StageTabs`,
-  `firstVisibleTab`, `StageDetails`. The substage stepper was **removed**: two
-  step bars stacked under each other read as one confused control.
-
-**New**
-
-- `JourneyStatusStrip.js` — one alert by priority (blocked → at risk → waiting →
-  prototype). The stage's own attention items are nested inside it behind
-  `View details`, so the fold never carries two alerts saying the same thing.
-- `JourneyActivityDrawer.js` — timeline / tasks / approvals / documents in one
-  drawer, with `initialTab`.
-- `RecordSelector.js` — one row (label + native `<select>` + state chip +
-  counts) replacing the 272px left rail.
-- `MoreMenu.js` — accessible overflow menu (roving focus, Home/End, Escape).
-- `useMediaQuery.js` — SSR-safe, so the secondary action genuinely *moves* into
-  `More` on tablet rather than being CSS-hidden in two places.
-- `lib/salesJourney/commercialAccess.js` — the one commercial/finance rule.
-
-**Deleted** (superseded, not orphaned): `JourneyContextRail.js`,
-`JourneyActivityRail.js`.
-
-**Extended, not forked** — `CrmDrawer` in `components/sales/crm/crmShared.js`
-gained a focus trap, initial focus, focus restoration and a `placement="bottom"`
-sheet variant. Every CRM dialog inherits it, including the Account library's.
-
-## Navigation and terminology
-
-- Sidebar `Journey Hub` → **`Sales Journeys`**. `Journey Hub` survives only as
-  the hub page's own subtitle. The active sidebar item stays `Sales Journeys`
-  through all eight stages (unchanged `JOURNEY_ACTIVE_MENU`).
-- Breadcrumb is now `Sales Journeys / SJ-… / Current Stage` — the journey crumb
-  is the reference alone, since the full name is the page heading two lines
-  below and repeating it pushed the stage crumb off a phone.
-- No stage was added to the sidebar; Accounts and Contacts are not duplicated.
-- `Prepare Delivery/Shipment` → **`Prepare Shipment`**;
-  `Close and Grow Account` → **`Move to Retention`**;
-  `Start Enquiry/RFQ/Tender` → `Start Enquiry/RFQ`;
-  `Send Costable Styles to Cost & Quote` → `Send to Cost & Quote`;
-  Retention's primary is now `Create Repeat Journey`.
-  All of these live in `lib/salesJourney/stageConfig.js` and are read by the
-  stages — no stage hard-codes a lifecycle label.
-- Per-stage primary actions are state-dependent where the brief asks:
-  `Submit for Approval` → `Send to Cost & Quote`; `Send Quote` →
-  `Convert to PO/Contract`; `Confirm Delivery` → `Move to Retention`.
-
-### Stage tab sets replaced (`stageConfig.STAGES[*].tabs`)
-
-Stage keys, slugs, labels, order and data modes are **unchanged**. The `tabs`
-arrays were replaced with the brief's simplified per-stage view lists, and two
-new declarative flags were added so visibility rules cannot be honoured in one
-stage and forgotten in another:
-
-- `requires: "commercial"` — Cost & Quote → Costing, Shipment → Commercial close
-- `requires: "uniform"` — Retention → Uniform Service
-
-`visibleTabs(stageKey, { commercial, uniform })` applies them and **fails
-closed**; `firstVisibleTab()` stops a stage defaulting to a tab the viewer
-cannot open.
-
-## Permission behaviour
-
-Commercial visibility no longer uses the generic `atLeast("editor")` threshold.
-`useCommercialAccess()` grants it to **admin, or a department role of
-approver/owner** — the same explicit rule `crmShared.useCreditAccess` uses for
-restricted Account fields, which mirrors the server. It **fails closed** while
-the role is resolving, so a figure never appears and then vanishes.
-
-Restricted content is *removed from the markup*, not blanked: the Costing tab
-and the `Margin` column are absent from the DOM for an unauthorized viewer, and
-a single `RestrictedNote` explains the boundary. This is presentation only —
-when these stages get a backend the server must strip the fields too.
-
-## Known defects corrected (brief §12)
-
-| # | Defect | Fix |
-|---|---|---|
-| 1 | Timeline opened the Stage Checklist | `More → Timeline` opens `JourneyActivityDrawer` with `initialTab="timeline"`; the checklist is its own entry |
-| 2 | Commercial visibility on a generic editor threshold | `lib/salesJourney/commercialAccess.js` — explicit approver/owner capability, fails closed |
-| 3 | Mobile rail dialogs lacked Escape / focus trap / initial focus / focus restore | Implemented once in `CrmDrawer`; the rails that had the problem no longer exist |
-| 4 | Header described as sticky on mobile but wasn't | `JourneyHeader` is `sticky top-[72px]` at every width (72px clears FrostShell's floating top bar) |
-| 5 | `Prepare Delivery/Shipment` | `Prepare Shipment`, from `stageConfig` |
-| 6 | `Close and Grow Account` | `Move to Retention`, from `stageConfig` |
-| 7 | Raw Account ids flashing in breadcrumbs | Account page publishes a placeholder label on first render; `Breadcrumb.js` also masks any unlabelled 24-hex ObjectId segment as a backstop |
-| 8 | Account resolution stopped at the first 200 accounts | `adapter.accountIndex()` now does a targeted lookup per distinct referenced code using the list endpoint's existing `search` parameter, then requires an exact `accountId` match. No endpoint invented, no unbounded pagination, bounded by the number of distinct fixture codes (currently 2) |
-
-## Verification performed
-
-**Commands**
-
-```
-npm run build      # ✓ Compiled successfully (Turbopack), 245/245 static pages
-```
-
-The only build warnings are pre-existing and unrelated (the `middleware` →
-`proxy` deprecation notice, and a `rimraf`/`fstream` externals warning).
-`npm run lint` remains broken in this repo (declares `eslint .` with no eslint
-config or dependency installed) and was not run. There is no test framework.
-
-**Browser** — verified in the running dev server against a temporary harness
-route that renders the real shell and stage components with real adapter data
-outside the department guard (the in-app browser has no Sales session, so the
-guarded routes redirect to the landing page). The harness was deleted after
-verification; no trace remains in the repo.
-
-| Check | Result |
-|---|---|
-| Desktop 1440×900 | Above the fold: one compact header, one lifecycle stepper, one alert, one work panel. No horizontal page scroll (`scrollWidth === innerWidth`) |
-| Tablet 800/744 | Stage secondary action collapsed into `More`; header stayed two logical rows; mobile lifecycle control engages below 768px |
-| Mobile 375×812 | Sticky header, stage control directly below it, exactly one visible primary action, cards not tables, no horizontal page scroll. The only element wider than the viewport is a stage tab inside its own `overflow-x: auto` strip |
-| Activity drawer | Opens on **Timeline**; `aria-modal`, accessible name "Activity"; initial focus lands on a control inside the panel; Shift+Tab from the first focusable wrapped to the last (trap holds); Escape closed it and focus returned to the `Activity` button |
-| Mobile lifecycle sheet | Bottom sheet lists all 8 stages numbered with state text + icon; Escape closed it and focus returned to the `Stage 3 of 8` button |
-| `More` menu | `aria-haspopup="menu"`, focus moved to the first item on open, ArrowDown moved to the next, Escape closed and restored focus to the button |
-| Status strip priority | `Blocked` won over `At Risk` on SJ-2026-0047; `Waiting on Customer` shown on SJ-2026-0051; `Design preview` only when nothing else applies |
-| One alert, not two | `View details` expands the stage's attention items *inside* the strip; verified `aria-expanded` toggles and the items appear/disappear |
-| Commercial gating | With the capability **off**: tabs `Quote · Negotiation · Approval · Terms`, table headers `Style · Version · Proposed · Quote state`, no margin figure anywhere in the DOM, restriction note shown. **On**: `Costing` tab and `Margin` column appear |
-| Stage naming | All eight read from `stageConfig`: Account, Enquiry/RFQ, Style & Sample, Cost & Quote, PO/Contract, Production, Shipment, Retention. Grep confirms no `Delivery/Shipment`, `Grow Account`, or `Close and Grow` remains |
-| Action hierarchy | Every stage checked renders exactly: back link, one primary, at most one secondary, `Activity`, `More` |
-| State not by colour alone | Lifecycle pills carry icon + accessible name (`"Production, current stage, In Progress"`); status strip pairs an icon and a written label with its wash |
-| Record selector | Style & Sample: `Style [4 options] Approved · 4 styles · 2 approved`; Shipment: `2 of 2 shipments dispatched · 17,000 of 17,000 pcs` |
-| Hub results | Table columns `Journey · Stage · Status · Next action · Due · Owner · Value`; the risk chip appears only where risk exists; cards carry the same reduced fact set |
-| Defect §12.8 live | `GET /api/cms/crm/accounts?search=ACC-0002&limit=20` against the running backend returned exactly one row with `accountId === "ACC-0002"` |
-
-**Not verified in the browser:** the Account stage (needs an authenticated Sales
-session, which this environment could not provide without entering credentials)
-and the guarded routes themselves. Both compile and are exercised by the same
-shell as the seven stages that were verified.
-
-## Remaining limitations
-
-- Seven of eight stages remain **prototype**: fixtures in
-  `lib/salesJourney/fixtures/`, no writes, every unsupported control disabled
-  and tagged `Preview`. Nothing implies data was saved.
-- The Journey record itself has no backend model, so `Start Journey`,
-  `Create Repeat Journey`, `Log Claim` and the completion options are previews.
-- Document upload is still unavailable — there is no CRM file service.
-- `Needs Attention` in the Hub is derived client-side from the team result
-  (overdue / blocked / at risk). It is not a stored view; when a Journey API
-  exists it should become a server-side query.
-- Owner filter options come from one unfiltered read at mount. Fine at fixture
-  volume; a real API should expose an owner list.
-- Commercial gating is presentation-only. The server must strip these fields
-  when the stages go live.
-- The sticky header offset (`top-[72px]`) is tuned to FrostShell's floating top
-  bar. If that bar's height changes, this constant follows it.
-- Account-stage editing still routes to the Account library, which owns the one
-  `AccountForm` — deliberately not duplicated inside the Journey.
-
-## Files changed
-
-**Modified — `/Users/risheeray/grav-cms`**
-
-```
-app/sales/dashboard/journeys/page.js
-app/sales/dashboard/journeys/[journeyId]/layout.js
-app/sales/dashboard/journeys/[journeyId]/[stage]/page.js
-app/sales/dashboard/accounts/[id]/page.js          (breadcrumb placeholder only)
-components/Breadcrumb.js                            (ObjectId masking only)
-components/Sales_DashboardLayout.js                 (one nav label only)
-components/sales/crm/crmShared.js                   (CrmDrawer focus contract + bottom placement)
-components/sales/crm/shell/LifecycleBar.js
-components/sales/crm/journey/JourneyWorkspace.js
-components/sales/crm/journey/JourneyHeader.js
-components/sales/crm/journey/JourneyCard.js
-components/sales/crm/journey/journeyBits.js
-components/sales/crm/journey/stages/stageChrome.js
-components/sales/crm/journey/stages/AccountStage.js
-components/sales/crm/journey/stages/EnquiryStage.js
-components/sales/crm/journey/stages/StyleSampleStage.js
-components/sales/crm/journey/stages/CostQuoteStage.js
-components/sales/crm/journey/stages/PoContractStage.js
-components/sales/crm/journey/stages/ProductionStage.js
-components/sales/crm/journey/stages/ShipmentStage.js
-components/sales/crm/journey/stages/RetentionStage.js
-lib/salesJourney/stageConfig.js                     (tab sets, action labels, helpers)
-lib/salesJourney/adapter.js                         (account resolution only)
-```
-
-**Added**
-
-```
-components/sales/crm/journey/JourneyStatusStrip.js
-components/sales/crm/journey/JourneyActivityDrawer.js
-components/sales/crm/journey/RecordSelector.js
-components/sales/crm/journey/MoreMenu.js
-components/sales/crm/journey/useMediaQuery.js
-lib/salesJourney/commercialAccess.js
-```
-
-**Deleted**
-
-```
-components/sales/crm/journey/JourneyContextRail.js
-components/sales/crm/journey/JourneyActivityRail.js
-```
-
-**Untouched, deliberately:** `lib/salesJourney/capabilities.js`,
-`lib/salesJourney/fixtures/*`, `app/sales/dashboard/journeys/[journeyId]/page.js`,
-`app/sales/dashboard/journeys/[journeyId]/JourneyContext.js`,
-`components/sales/crm/journey/PrototypeDataBanner.js`,
-`components/sales/crm/journey/StageChecklistDrawer.js`,
-`components/sales/crm/shell/RailGroup.js`,
-`components/sales/crm/shell/WorkspaceHeader.js` (both still used by the Account
-library), and `app/sales/dashboard/accounts/[id]/_sections/*`.
-
-## Confirmation
-
-- **No backend code, model, route, migration or seed was changed.** The only
-  backend file read this session was `routes/CMS_Routes/Sales/accounts.js`, to
-  confirm that the `search` parameter already matches `accountId` before relying
-  on it for defect §12.8.
-- **No dependency or configuration was changed** — `package.json`,
-  `package-lock.json`, `next.config.mjs`, `components.json`, `.env*` and
-  `.gitignore` are untouched. `package-lock.json` shows as modified in
-  `git status`, but it was already modified before this session began.
-- **Nothing was committed** and no Git setting was changed. The working tree
-  holds exactly the same modified/untracked set as at session start, plus the
-  files listed above.
-- **Unrelated uncommitted work preserved:** `app/grav-ui.css`,
-  `app/sales/dashboard/page.js`, `app/sales/dashboard/accounts/page.js`,
-  `components/shell/FrostShell.js` and `app/sales/references/` were not touched.
-
----
-
-# Part 6 — Sales Journey frontend, first build (earlier session)
-
-> Superseded in presentation by Part 1. The routes, adapter, capabilities,
-> fixtures and lifecycle described here are unchanged; the layout, navigation
-> and action hierarchy described here were replaced.
-
-## Completed functionality
-
-### Routes and screens created
-
-| Route | Purpose | Data mode |
-|---|---|---|
-| `/sales/dashboard/journeys` | Journey Hub — 11 views, filters, card/table toggle | Prototype |
-| `/sales/dashboard/journeys/[journeyId]` | Redirects to the journey's current stage (keeps stage in the URL) | — |
-| `/sales/dashboard/journeys/[journeyId]/[stage]` | Deep-linkable stage workspace for all 8 stages | Account = live, rest = prototype |
-
-Stage slugs, as specified: `account`, `enquiry`, `style-sample`, `cost-quote`,
-`po-contract`, `production`, `shipment`, `retention`. All eight resolve, and
-refresh / back / forward / bookmarking return to the correct workspace.
-
-### Navigation and naming (spec §3.1A)
-
-`components/Sales_DashboardLayout.js`'s `NAV` was reorganized into four
-conceptual groups, with every existing href preserved:
-
-```
-Sales Overview · Journey Hub · Approvals
-Customer libraries → Accounts · Contacts · Call Planner
-Operations (existing) → Orders & PI · Products & BOM · Measurements ·
-                        Leads (Existing) · Order Customers (Existing)
-Configuration → CRM Settings · Sales config (…) · Customer departments · Sales Settings
-```
-
-**Transitional labels recorded, as the spec requires.** `Leads (Existing)` and
-`Order Customers (Existing)` keep their real identity rather than being
-relabelled as Journey Enquiries or Accounts — no approved migration says those
-records *are* Journeys or Accounts, and renaming them would assert a data
-relationship that does not exist. Remove the "(Existing)" qualifier only when a
-migration decision names the source of truth.
-
-Label-only changes (keys and hrefs untouched): `Sales dashboard` → `Sales
-Overview`; `Purchase orders / PI` → `Orders & PI`; `MPC measurements` →
-`Measurements`; `Customer list` → `Order Customers (Existing)`; `Leads` →
-`Leads (Existing)`; `Call planner` → `Call Planner`; `CRM settings` → `CRM
-Settings`; `Settings` → `Sales Settings`; the `Store config` sub-group →
-`Sales config` (it configures Sales, and the old name read as another
-department's).
-
-The eight lifecycle stages are deliberately **not** in the top navigation. Top
-nav answers "which workspace am I entering"; the lifecycle bar inside an open
-journey answers "where am I within it". All Journey routes report a single
-`activeMenu` of `journeys`; Accounts and Contacts keep theirs.
-
-### Breadcrumbs
-
-Journey routes now read
-`SALES / Journey Hub / SJ-2026-0042 · MetroCare Uniform Program — 2026 Refresh / Cost & Quote`
-and Account detail reads `SALES / Accounts / ACC-0001 · Test Uniform Client Co`
-— verified live, no raw database ids.
-
-Implemented by **extending** the existing shared breadcrumb, not forking a
-second one: `components/BreadcrumbLabels.js` lets a screen publish readable
-labels (and optionally a better href) for the segments it owns, and
-`components/Breadcrumb.js` consumes them. Only one breadcrumb renders.
-
-### Shared journey shell (spec §4)
-
-`JourneyHeader` (composes the existing `WorkspaceHeader`) · `JourneyContextRail`
-· `JourneyActivityRail` (built on the existing `RailGroup`) ·
-`StageChecklistDrawer` (built on the existing `CrmDrawer`) · `JourneyWorkspace`
-(three-column shell + responsive rail sheets) · `LifecycleBar` (extended, not
-replaced) · `JourneyCard`/`JourneyTable` · `PrototypeDataBanner` ·
-`journeyBits.js` (`StageStatusBadge`, `RiskBadge`, `ApprovalBadge`,
-`ReadinessBadge`, `ReadinessSummary`, `RiskBanner`, `BlockerCard`,
-`VersionBadge`, `ComparisonRow`, `PreviewAction`, `SubHead`, `Fact`) ·
-`stages/stageChrome.js` (`StageTabs`, `SubstageStepper`).
-
-### Stage workspaces
-
-- **Account (LIVE)** — reuses the existing live section components unchanged
-  (Contacts, Sites & Addresses, Departments, Relationships, Team, Audit,
-  Garment Profile, Commercial). Reads the real Account via `lib/crmApi.js`.
-- **Enquiry/RFQ** — requirement, product requirement, commercial
-  qualification, tender panel (only for tender variants), clarifications,
-  pursue decision. Adapts to general / RFQ / tender / uniform / repeat /
-  replenishment.
-- **Style & Sample** — multi-style rail with filters; `SPECIFY → PREPARE →
-  SAMPLE → REVIEW → SEND → APPROVE`; sample history kept as versions, never
-  overwritten; per-style costable readiness roll-up.
-- **Cost & Quote** — costing rail; `COST → REVIEW → APPROVE → QUOTE →
-  NEGOTIATE`; cost build-up, price breaks, approval history, quotation,
-  negotiation rounds, and the uniform contract price list.
-- **PO/Contract** — `VERIFY → BREAK DOWN → PLAN → RELEASE`; PO-vs-quotation
-  mismatch comparison, size/destination breakdown, T&A calendar, release
-  checklist with recorded exceptions, numbered amendments.
-- **Production** — `MATERIALS → … → PACK` milestone rail with source-system
-  attribution; critical path, approvals, summary quantities, quality, customer
-  commitments, risks.
-- **Shipment** — per-shipment rail (partial shipments first-class); `PLAN →
-  BOOK → DISPATCH → DOCUMENTS → TRACK → DELIVER → COMMERCIAL CLOSE`.
-- **Retention** — performance review, claims, repeat candidates, uniform
-  aftercare, relationship plan, completion options.
-
-## Live APIs used
-
-Only pre-existing endpoints, via the existing `lib/crmApi.js`:
-
-- `GET /api/cms/crm/accounts` — resolves fixture account codes to live Accounts.
-- `GET /api/cms/crm/accounts/:id` — the Account stage's live record.
-- Every write on the Account stage goes through the reused live section
-  components, so real writes and the 202 "submitted for approval" path are
-  unchanged.
-
-**No new endpoint was called or invented.** `lib/salesJourney/capabilities.js`
-records `api: null` for all seven prototype stages.
-
-## Prototype adapters and fixtures
-
-```
-lib/salesJourney/
-├── stageConfig.js     # SINGLE naming source of truth: keys, slugs, labels,
-│                      # inner tabs, order, and the four state vocabularies
-├── capabilities.js    # live | prototype | unavailable, per stage, + api: null
-├── adapter.js         # the only data boundary; no create/update/save exists
-└── fixtures/
-    ├── journeys.js    # 5 journeys, stable ids (SJ-2026-0042 …)
-    └── stageData.js   # per-stage view models keyed by journey id
-```
-
-Design decisions worth knowing:
-
-- **Accounts are referenced by CODE, never re-typed.** Fixtures carry
-  `accountCode`, and the adapter resolves it against the live Account library
-  at runtime. Verified live: `ACC-0001` → "Test Uniform Client Co",
-  `ACC-0002` → "Northstar Buying Services Test". Where a code does not resolve
-  (e.g. "Riverside Schools Trust"), the name still displays but the "View
-  Account" control is **disabled with an explanation** rather than implying a
-  link that does not exist. No live ObjectId is hardcoded — that would break in
-  every other environment.
-- **No dates are computed at module load.** Fixtures store day offsets; the
-  adapter resolves them against a single `now`. Deterministic and SSR-safe.
-- **The adapter has no write functions at all.** Prototype stages have nothing
-  to write to, so the adapter offers no way to pretend otherwise.
-
-## Non-persistent interactions
-
-Every preview control renders through `PreviewAction`, which is **disabled**,
-carries a `PREVIEW` tag, and has a title explaining that no backend exists.
-Named business verbs are kept (`Send to Style & Sample`, `Submit for Commercial
-Approval`, `Convert to PO/Contract`, `Release to Production`, `Prepare
-Delivery/Shipment`, `Create Repeat Journey`, `Close Journey`) so the transition
-is legible — but never presented as saved. `PrototypeDataBanner` sits above
-every prototype stage and is not dismissible.
-
-Four outcomes stay visually distinct, per spec §15.4: **saved** (live Account
-writes), **submitted for approval** (202 via the reused sections and the
-already-mounted `HeldChangeWatcher`), **preview only** (disabled + tag), and
-**failed** (real `ErrorState`).
-
-No upload UI was built anywhere — there is no document service, and the spec
-forbids a prototype upload path.
-
-## Required backend contracts per stage
-
-| Stage | What a future API must supply |
-|---|---|
-| Journey record | `SalesJourney`: reference, name, businessType, customer + party account refs, owner/merchandiser, per-stage state, risk + reason, next action, target dates, expected/confirmed value, readiness counts |
-| Enquiry/RFQ | Enquiry/RFQ/tender with variant, requirement, product summary, qualification scores, tender eligibility + documents, clarifications, pursue decision |
-| Style & Sample | Styles with versions, specify/prepare data, sample history, internal review, dispatch, customer decision; approved-version pointer |
-| Cost & Quote | Versioned costing lines + build-up, price breaks, approval history, quotation versions, negotiation rounds, uniform price list. **Margin/commission must be stripped server-side** |
-| PO/Contract | Customer PO/contract, quotation-vs-PO diff, size/destination breakdown, T&A milestones, release checklist + exceptions, numbered amendments |
-| Production | Milestones with planned/actual/forecast + source system, critical path, pre-production approvals, summary quantities, inspections, customer commitments, risks |
-| Shipment | Shipments with mode/ETD/ETA/state, plan, booking, dispatch, documents, tracking events, delivery proof, commercial close (**permission controlled**) |
-| Retention | Performance actuals, claims, repeat candidates, uniform aftercare, relationship plan; new-journey creation that references the completed journey |
-
-## Tests and verification
-
-**Build: `npm run build` compiles successfully** (Next.js 16 / Turbopack, exit
-0), with all three journey routes registered. Run repeatedly during the build,
-including after the final change.
-
-**Lint: `npm run lint` cannot run — it is broken repo-wide.** `package.json`
-declares `eslint .` but eslint is not installed (`sh: eslint: command not
-found`). This is pre-existing and documented in the frontend `CLAUDE.md`; I did
-not add the dependency, since the task forbids dependency changes. `next lint`
-is removed in Next 16, so no alternative was available. The production build
-(which resolves every module and compiles all JSX) is the verification that did
-run. **"Lint passes" is not claimed.**
-
-**Live verification** against the running dev stack (frontend `:3000`, backend
-`:5050`), authenticated session:
-
-- Journey Hub: 11 views, all filters, card and table modes, 5 journeys with
-  every specified card field; live account-code resolution confirmed.
-- All 8 stage routes return 200; each stage's content verified individually
-  (style rail with 4 styles, cost build-up, PO mismatch list, production
-  milestones with ERP refs, shipment tracking, retention performance/claims).
-- Breadcrumbs verified in the exact spec format, on both Journey and Account
-  routes.
-- Lifecycle bar: 8 stages in order, `aria-current="step"` on the current one,
-  completed stages check-marked, state and preview status in each accessible
-  name.
-- Distinct states verified: **Not Applicable** (Style & Sample on a repeat
-  journey — explains itself, doesn't blank), **stage not started** (Shipment on
-  a Cost & Quote journey — names where the journey actually is), **unknown
-  slug**, **journey not found**, loading skeletons, and the Account stage's
-  "customer not linked to a live Account" state.
-- Stage checklist drawer: required inputs with readiness, blockers, recommended
-  next action, carries-forward list, exceptions. Closes on Escape.
-- **Regression:** all 10 legacy Sales routes still return 200 (dashboard,
-  leads, customers, customer-requests, accounts, contacts, approvals,
-  stock-items, call-planner, crm-settings). Live Account detail still loads
-  ACC-0001 and its Garment Sales Profile.
-
-**Responsive** (spec §4.7): desktop 1400px — three columns, rails persistent.
-Tablet 768px — rails collapse to labelled toggles that open the *same* rail
-components in sheets; lifecycle bar scrolls; no sideways page scroll. Mobile
-375px — single column, `documentElement.scrollWidth === 375` (no horizontal
-page scroll), lifecycle bar reachable and scrollable, rails as sheets. Wide
-tables scroll inside their own `overflow-x: auto` container.
-
-**Accessibility** (spec §17): lifecycle bar is a labelled `<nav>`; every stage
-pill's accessible name carries stage, current-step, state and preview status,
-so meaning never depends on colour ("PO/Contract, current stage, Complete,
-preview data"); `aria-current="step"` set; zero icon-only buttons without an
-accessible name; 12 landmarks with `<main>` present; all progressbars labelled;
-table headers all `scope="col"`; rail search and filter groups labelled;
-drawers are `role="dialog" aria-modal="true"` with a labelled close and Escape
-handling.
-
-**Console: clean.** A fresh tab loading a stage produced zero errors. (Errors
-seen mid-session in the long-lived tab were stale dev-cache entries logged
-before `RetentionStage.js` was written; the file exists and the production
-build resolves it.)
-
-## Known limitations
-
-- Seven of eight stages are previews. They are structurally complete but hold
-  fixture data; nothing entered is saved because there is nowhere to save it.
-- Only journeys whose fixture `accountCode` matches a live Account get a
-  working Account stage and "View Account" link. Two of the five do
-  (`ACC-0001`, `ACC-0002`); the other three show a clear explanation instead.
-- Hub filtering, sorting and search run client-side over five fixtures. Date
-  range and a persisted "recently viewed" are not implemented (no per-user
-  storage exists to hold them honestly).
-- No unsaved-changes guard is implemented, because no prototype stage has an
-  editable form to lose — this becomes required as soon as a stage gets a
-  backend.
-- Restricted commercial information (margin, commission, value, invoice/
-  payment) is gated client-side via `useDeptRole`. Presentation only. **When
-  these stages get APIs, the server must strip these fields** — the spec is
-  explicit that hidden fields must not be recoverable from client payloads.
-- Journey documents are display-only; no uploader exists.
-- The `Sales config` sub-group label was changed for clarity; its children keep
-  their original names, keys and hrefs.
-
-## Unrelated work preserved
-
-Confirmed by `git status` before and after. Untouched: `app/grav-ui.css`,
-`app/sales/dashboard/page.js`, `components/shell/FrostShell.js`,
-`app/sales/references/`, `lib/crmApi.js`, `components/sales/crm/crmShared.js`,
-`AccountForm.js`, the CRM shell components, and all `.DS_Store` files. Nothing
-was cleaned, reverted, reformatted or staged.
-
-Files modified this session: `components/Sales_DashboardLayout.js` (nav),
-`components/Breadcrumb.js` (label overrides),
-`components/sales/crm/shell/LifecycleBar.js` (8 stages from stageConfig),
-`app/sales/dashboard/accounts/[id]/page.js` (breadcrumb label),
-`app/sales/dashboard/accounts/[id]/_sections/CommercialSection.js` and
-`GarmentProfileSection.js` (accept the server permission flag).
-
-Files added: `lib/salesJourney/**` (5), `components/BreadcrumbLabels.js`,
-`components/sales/crm/journey/**` (7 + 10 stage files),
-`app/sales/dashboard/journeys/**` (4).
-
-## No unauthorized backend work or commit
-
-- **Backend repository untouched this session.** Its `git status` is byte-for-
-  byte the same file list as at the end of the Step 01 session — no new
-  modifications, no new files except this handoff update.
-- No backend model, route, service, migration, seed, dependency,
-  configuration or Git setting was changed.
-- No demo-data seeding was run.
-- **Nothing was committed or staged in either repository.** Frontend branch
-  `risheesales`, backend branch `rishee`.
-
----
-
-# Part 7 — CRM Step 01 (earlier session, still current)
-
-> Customer foundation, Garment Sales Profile, and the live Account workspace.
-> Unchanged by the Sales Journey work above, except that the Account workspace
-> is now also reachable as the Account stage of a journey.
-
-## Completed functionality
-
-**Customer foundation (spec §7)** — `CRMAccount` extended (not replaced) with
-multi-role classification, lifecycle stage, tier, credit fields, hierarchy
-parent, provenance, normalized name and archive metadata. New entities:
-`CRMSite`, `CRMDepartment`, `CRMAddress`, `CRMAccountRelationship`,
-`CRMAccountTeam`, `CRMActivity`, `CRMLookup`. `CRMContact` extended with roles,
-consent, site/department links and audit stamping. Typed directional account
-relationships with inverse labels. Cycle-safe account and site hierarchies;
-single-primary enforcement; duplicate detection with confidence; soft archive
-with mandatory reason plus restore; activity timeline with derived (never
-stored) overdue state.
-
-**Garment Sales Profile (spec §7.2A)** — nested `garmentSalesProfile`
-subdocument in four groups: business/product, compliance/quality (one
-configurable lookup, deliberately not a hard-coded scheme list),
-buying-house/brand (party fields as Account references), and uniform-customer.
-Groups 3 and 4 render only for relevant roles. No wearer names, measurements,
-entitlements or price lists are stored.
-
-## Backend files (Step 01)
-
-Modified: `constants/crm.js`, `models/CMS_Models/Sales/Account.js`,
-`Contact.js`, `routes/CMS_Routes/Sales/accounts.js`, `contacts.js`,
-`server.js`, `services/changeLog.js`, `services/crmVisibility.js`,
-`package.json`.
-
-New: `services/crmGarmentProfile.js`, `crmDuplicates.js`, `crmHierarchy.js`,
-`crmPrimary.js`; models `Site.js`, `Department.js`, `Address.js`,
-`AccountRelationship.js`, `AccountTeam.js`, `Activity.js`, `CrmLookup.js`;
-routes `sites.js`, `departments.js`, `addresses.js`,
-`accountRelationships.js`, `accountTeam.js`, `activities.js`,
-`crmLookups.js`; `scripts/seedCrmLookups.js`; `scripts/seedCrmDemo.js`
-(**not run**); `jest.config.js`; `test/setup.js`; `test/crm/*` (8 files).
-
-## Database and API changes (Step 01)
-
-Collections (Mongoose default pluralization, no underscores): `crmsites`,
-`crmdepartments`, `crmaddresses`, `crmaccountrelationships`,
-`crmaccountteams`, `crmactivities`, `crmlookups` — alongside pre-existing
-`crmaccounts` and `crmcontacts`. `garmentSalesProfile` is embedded on
-`crmaccounts`; existing rows do not gain it retroactively and both API and UI
-treat a missing profile as empty.
-
-`scripts/seedCrmLookups.js` is idempotent — 212 values across 27 categories.
-Account list and detail responses carry
-`permissions: { canViewRestricted }`.
-
-**No `SalesJourney` model. No lifecycle field on `CustomerRequest`.
-`Account.lifecycleStage` not overloaded.**
-
-## Tests (Step 01)
-
-**60/60 jest tests pass** (`npx jest test/crm`, 8 suites, ~3.5s), confirmed
-across four consecutive runs. One run took 141s and reported 14 failures with
-mongoose buffering timeouts; it did not reproduce — `mongodb-memory-server`
-failed to start promptly under load. Worth knowing if CI shows the same shape.
-
-## Pre-existing repository problems (found in Step 01)
-
-1. `npm run lint` broken repo-wide (eslint not installed).
-2. `next build` does not type-check (`ignoreBuildErrors: true`).
-3. Client/server disagreed on restricted-field access — fixed via the server's
-   `permissions.canViewRestricted`.
-4. Recoverable hydration error in `ToastHost` — fixed with a post-mount flag.
-5. `ChangeLog.sanitise` truncates nested objects at 500 chars — worked around
-   by flattening the profile to dot-paths in the accounts route rather than
-   changing shared audit infrastructure.
-
-## Step 01 acceptance criteria
-
-**23 pass, 1 not applicable, 1 partial.** Not applicable: tenant isolation — no
-Sales/CRM model carries `organizationId`; that concept exists only in the
-Accountant module, so this domain is single-company and there is no tenant
-boundary to enforce. **If tenancy is introduced, every CRM model and query in
-Step 01 needs revisiting.** Partial: build ✓ and tests ✓, but lint and
-type-check cannot pass — both broken/disabled repo-wide.
-
-## Known limitations (Step 01)
-
-- Documents rail is a placeholder; no secure CRM file service exists.
-- Nominated laboratory/supplier accept one account each in the UI though the
-  model stores arrays.
-- Party pickers load up to 500 accounts as plain selects; needs a typeahead
-  before the account base reaches the thousands.
-- `targetMarkets`/`peakSeasons` are free text, not controlled lookups.
-- Ordering/fulfillment/sizing/issue-frequency/freight-mode are plain schema
-  enums, so labels derive from the code.
-- Hub list has no next-action/merchandiser columns (needs backend aggregation).
-- Two manually created test accounts remain in dev Mongo (ACC-0001, ACC-0002).
-
-## Setup commands
-
-```bash
-cd grav-cms-backend && npm install
-node -r dotenv/config scripts/seedCrmLookups.js   # idempotent; already run
-npx jest test/crm                                 # 60/60
-```
-
-```bash
-cd grav-cms && npm install && npm run build
-```
-
-Backend dev runs on **:5050** in this environment (`NEXT_PUBLIC_API_URL`), not
-the `:5000` default — port 5000 is taken by macOS ControlCenter/AirPlay.
-
-## Commit status
-
-**Nothing committed or staged in either repository.** Backend branch `rishee`,
-frontend branch `risheesales`.
-
----
-
-# Part 8 — Lead/Prospect module: correction chunk + Prospect capture chunk (this session)
-
-> Two chunks landed in this session, in order. Neither touched Sales Journey,
-> ran a migration, or committed anything. This section also backfills the
-> Draft Lead chunk and Lead frontend correction sessions that happened
-> between Part 1 and this one, which were never separately recorded here —
-> see `services/leadQualification.js`, `services/leadReadiness.js`,
-> `services/salesAccess.js`, and the Draft/Active Lead workspace split in
-> `grav-cms` for that intermediate work; only what changed IN THIS SESSION is
-> detailed below.
-
-## 8a — Lead correction chunk (5 items, backend + frontend, both repos)
-
-Fixed five gaps identified after the Draft Lead / Lead frontend chunks were
-already live:
-
-1. **Controlled status.** Added `contactAttempted` to the qualification
-   vocabulary (`new → contactAttempted → contacted → qualified/nurture/
-   disqualified/duplicate → readyToConvert`; `new` may also reach `contacted`
-   directly for the one-call-and-it-connects case). Every prerequisite is now
-   enforced inside `services/leadQualification.js` — Contact Attempted needs
-   a logged outreach attempt, Contacted needs a genuinely successful two-way
-   contact, Nurture needs a reason + next action + follow-up date (creates a
-   real planned follow-up Activity, same reliability pattern as activation),
-   Qualified/Ready to Convert share one checklist
-   (`services/leadReadiness.js`'s new `computeQualificationReadiness`), and
-   Duplicate requires a genuine, existence-verified Lead/Account link
-   (new `Lead.duplicateOf`). Reachable from every entry point: the canonical
-   `PATCH /:id/qualification-state`, the legacy `PATCH /:id/stage`, and
-   `callSchedule.js`'s call-completion flow.
-2. **Activity correctness.** Structured outcomes (`no_answer`/
-   `replied_connected`/`meeting_completed`/`other`) enforced only on the
-   Lead-scoped activity routes (the shared `CRMActivity` model stays free
-   text — Account/Journey activities are untouched). `lastContactedAt` now
-   updates only for a genuinely successful contact outcome, on both the
-   canonical and legacy activity-logging endpoints. Draft Leads reject
-   Activity creation/listing entirely. `GET /:id/activities` gained the
-   Lead-level access check it was missing.
-3. **Lead information.** New `Lead.requirementCertainty`
-   (unknown/suspected/prospect_confirmed/document_confirmed) on the CONFIRMED
-   requirement side. Evidence-backed-estimate enforcement moved from a
-   client-side Draft-save block to a real server-side check inside
-   `computeQualificationReadiness`, gating Qualified — Draft/Active saves are
-   never blocked by it now.
-4. **Permissions.** `authorizeOwnerSourceChange` in `leads.js`: only a Sales
-   manager (`services/salesAccess.js`'s `isSalesManager`) may set
-   `assignedTo`/`sourcedBy` to anyone other than themselves, on create or
-   update. `assignedToName`/`sourcedByName` are never trusted from the
-   client — always resolved server-side via `resolveEmployeeName` against
-   `SalesDepartment`.
-5. **Lists.** Real `assignedTo=none` filter on `GET /leads` (replaces the
-   frontend's fetch-everything-then-filter workaround). `onlyMine=true`
-   forces My Drafts to the caller's own drafts even for a manager (previously
-   a manager's My Drafts silently showed everyone's).
-
-Backend tests: `test/crm/lead-correction.route.test.js` (new, 28 tests) plus
-updates to `lead.test.js`, `lead.route.test.js`, `lead-draft.route.test.js`,
-`call-schedule.route.test.js`, `lead-capture.route.test.js` for the new
-transition graph/vocabulary. **290/290 passing, 17 suites.**
-
-## 8b — Prospect capture chunk (Chunk 1 of the revised roadmap)
-
-See the top-of-file banner for the product-model summary. Detail:
-
-**Terminology (user-facing text only, no field/DB changes):** Draft Lead →
-Prospect (`lib/leadCapture.js`'s `CAPTURE_STATUSES` label), My Drafts → My
-Prospects, Save Draft → Save Prospect, Preparing this Lead → Prospect Setup,
-Activate Lead → Start Working Lead. A handful of backend error messages that
-reach the UI directly were reworded to match (`routes/CMS_Routes/Sales/
-leads.js`: "Only a Prospect can start working.", "Only a Prospect can be
-archived this way.", "This Prospect is archived and read-only.", "Prospects
-don't have Activities yet — start working the Lead first.").
-
-**Quick Capture (`AddLeadDrawer.js`)** now asks, in order: Prospect type
-(Organisation by default, was Individual), name, Customer segment (reuses
-`industry`), Lead Source, phone/email/website (unchanged, all optional),
-City (`city`). Ownership: an ordinary employee sees neither Sourced-by nor
-Owner controls and is shown "This Prospect will be credited to you and added
-to your worklist."; a manager still sees the Owner selector, unchanged.
-
-**Lead Source vocabulary** (`lib/leadQualification.js`'s `SOURCES`,
-`models/CMS_Models/Sales/Lead.js`'s inline `source` enum) extended with
-`google`/`linkedin`/`directory`/`field_visit` and relabeled
-`website`→"Website Enquiry", `trade_show`→"Exhibition" — additive/relabel
-only, existing records and the `walk_in`/`social_media`/`cold_call`/
-`existing_customer`/`advertisement`/`other` codes are untouched.
-
-**Prospect Setup (`DraftWorkspace.js`)** rebuilt around exactly: Identity and
-contact (`IdentitySection`, now with a Customer segment field), Lead source
-and owner (`OriginSection`, Priority field removed — it's Active-Lead-only,
-`LeadWorkspace.js` already owns it independently), a new **Initial research
-note** section (`InitialNoteSection`, bound to the pre-existing
-`organisationNotes` field — deliberately not a new field, and safe to
-coexist with `OrganisationResearchSection` in the Active workspace since a
-Lead is only ever in one of the two workspaces at a time), and First next
-action + due date. The "Additional research" collapsible
-(`OrganisationResearchSection`/`CommercialPotentialSection`/
-`RequirementSection`/`ProcurementSection`/`EvidenceSection`) was removed from
-this workspace only — all five components are untouched and remain fully
-live in `LeadWorkspace.js`'s "Supporting details" for an Active Lead.
-
-**"Start Working Lead" is now functional** (previously permanently
-disabled). `services/leadReadiness.js`'s `computeReadinessChecks` cut from 7
-checks to exactly 5: identity, Lead Source, owner, first next action,
-follow-up date. Phone/email/website and duplicate review are no longer part
-of the checklist at all — contact info must never be mandatory (verified
-live: a Prospect with zero phone/email/website and next action "Research
-contact details" starts working successfully), and a possible duplicate is
-now informational only (still returned as `leadMatches`/`accountMatches` on
-both `GET /:id/readiness` and `POST /:id/activate`, on success or failure,
-never blocking). `DraftWorkspace.js` now calls `POST /:id/activate` for
-real, flips the Lead to Active, and the caller's own toast — the parent
-page's redundant `onActivated` notify was removed to avoid a double toast.
-
-### Backend files changed (8a + 8b)
-
-Modified: `constants/crm.js`, `models/CMS_Models/Sales/Lead.js`,
-`services/leadQualification.js`, `services/leadReadiness.js`,
-`routes/CMS_Routes/Sales/leads.js`, `routes/CMS_Routes/Sales/
-callSchedule.js`, `test/crm/lead.test.js`, `test/crm/lead.route.test.js`,
-`test/crm/lead-draft.route.test.js`, `test/crm/call-schedule.route.test.js`,
-`test/crm/lead-capture.route.test.js`.
-
-New: `test/crm/lead-correction.route.test.js`.
-
-### Frontend files changed (8a + 8b)
-
-Modified: `lib/leadCapture.js`, `lib/leadQualification.js`,
-`app/sales/dashboard/leads/_components/leadSections.js`,
-`app/sales/dashboard/leads/_components/LeadWorkspace.js`,
-`app/sales/dashboard/leads/_components/AddLeadDrawer.js`,
-`app/sales/dashboard/leads/_components/DraftWorkspace.js` (full rewrite for
-8b), `app/sales/dashboard/leads/page.js`,
-`app/sales/dashboard/leads/[id]/page.js`.
-
-No new frontend files. No component was duplicated — `leadSections.js`
-remains the single shared source for both the Prospect and Active Lead
-workspaces.
-
-### Tests and verification
-
-- Backend: `npx jest` — **290/290 passing, 17 suites** (final run, both
-  chunks included).
-- Frontend: `npm run build` — clean, no errors, `/sales/dashboard/leads` and
-  `/sales/dashboard/leads/[id]` both compile.
-- Live browser, both chunks, against the dev backend on `:5050`: logged a
-  `contactAttempted`→`contacted` transition end to end; moved a Lead through
-  Nurture with a real follow-up Activity created; exercised the Duplicate
-  picker against a live match; confirmed the structured Outcome dropdown.
-  For the Prospect capture chunk specifically: captured a Prospect via Quick
-  Capture with segment/source/city and no contact info; confirmed the
-  Prospect Setup checklist showed exactly 5 items with 3 already met
-  (identity/source/owner) and phone/email never appearing in it; filled in
-  "Research contact details" as the next action with a due date and no
-  phone/email/website; clicked Start Working Lead; confirmed
-  `POST /leads/:id/activate` returned 200, the Lead reappeared in the Work
-  Queue as an Active Lead ("New", city/source carried through, follow-up
-  date set); confirmed My Prospects excludes the now-Active Lead.
-- One real dev-DB record was created and left in place during this session's
-  live verification: **LEAD-2026-0008 ("QA Prospect Chunk1 Verify Co")**,
-  captured as a Prospect and then started as an Active Lead via the UI —
-  disclosed to the user; not cleaned up unless asked.
-
-### Known follow-ups (explicitly out of scope, not started)
-
-Chunks 2–5 of the roadmap (Active Lead controlled statuses beyond what 8a
-already built, requirement/commercial-potential/qualification UI beyond
-what's already in `LeadWorkspace.js`'s Supporting details, secure evidence/
-document handling, conversion to Account/Contact/Sales Journey) are not
-implemented. `PRIMARY_FORWARD_STEP` in `lib/leadQualification.js` is unused
-dead code predating this session, left untouched (out of scope).
-
-## 8c — Correction pass on 8b (this session, immediately after)
-
-Seven issues raised in review of 8b, all fixed:
-
-1. **Prospect Setup too large.** `IdentitySection` (`leadSections.js`) was
-   showing designation/Customer segment/state/WhatsApp on top of what Quick
-   Capture already asks for. Trimmed to exactly: prospect type, name/company,
-   phone, email, website, city. Removed fields stay on the Lead model, just
-   not surfaced here — no other UI currently edits them for an Active Lead
-   either (see the "what Chunk 2 still needs" note in `current-task.md`).
-2. **Owner still shown to ordinary employees.** `OriginSection` was falling
-   back to a read-only "Owner: Me" `KeyVal` for non-managers. Replaced with
-   the same "This Prospect is credited to you and stays on your worklist."
-   message Quick Capture already used — no owner display at all now.
-3. **"Lead source recorded" wasn't genuine.** `Lead.source`'s Mongoose
-   `default: "other"` let the readiness check pass even when nobody had
-   picked a source. Removed the default; `OriginSection`'s Select no longer
-   pre-selects "Other" either (now genuinely blank/"Not sure yet" until
-   chosen), and its payload omits `source` entirely when unset rather than
-   sending an empty string. `Lead.industry`'s matching default was removed
-   for the same reason (not gated by any check today, same principle).
-   `services/leadReadiness.js` needed no code change — `has()` already
-   treated `undefined` as unmet; the schema default was the actual bug.
-4. **Customer segment taxonomy was mixed.** The old `industry` option list
-   (`garments`/`retail`/`wholesale`/`export`/`corporate`/`school_uniform`/
-   `hospitality`/`healthcare`/`other`) conflated industry, buyer type and
-   programme. Replaced with one consistent "what type of buying
-   organisation" taxonomy: Corporate/Staff Uniform, Institutional (School,
-   Hospital, Government), Hospitality, Retail/Fashion Brand, Export/
-   International Buyer, Distributor/Wholesaler, Individual Consumer, Other
-   (`CUSTOMER_SEGMENT_OPTIONS` in `leadSections.js`). The backend enum
-   (`models/CMS_Models/Sales/Lead.js`) keeps the old codes too — additive,
-   no migration, existing records with old values still validate — the old
-   codes just aren't offered in the UI anymore. `OrganisationResearchSection`
-   (Active Lead's "Supporting details") relabeled its "Industry" field to
-   "Customer segment" to match, using the same option list.
-5. **Evidence document upload was exposed but unsecured.** `EvidenceSection`
-   let a salesperson attach a file through the app's general Cloudinary
-   uploader, unscoped for evidence documents. The upload control (and its
-   now-dead plumbing — `uploadEvidenceFile`, the `onFile` handler, `fileRef`,
-   `uploading`/`uploadError` state) was removed; a note explains upload isn't
-   available yet and points to Source URL / Document reference instead. An
-   entry that already has an attachment from before this fix still shows it
-   read-only (view/remove), only new uploads are blocked.
-6. **`docs/tasks/current-task.md` was stale**, still describing an old
-   six-chunk "Lead Chunk 2 — Lead Inbox" plan that predates the Prospect/
-   Active Lead product model entirely. Rewritten to reflect the actual
-   current chunk (Prospect capture — done) and to document, for whoever
-   picks up Chunk 2 next, that meaningful controlled-status/qualification
-   work already exists from the "Lead correction chunk" (8a) — Chunk 2 is
-   not a blank slate. `docs/tasks/lead-to-journey-roadmap.md`'s status line
-   was marked superseded, pointing to `current-task.md`; its body was left
-   as historical record, not rewritten.
-7. **Disclosed test record.** Asked the user whether to delete
-   `LEAD-2026-0008` now rather than assuming either way.
-
-### Files changed in this correction pass
-
-Backend: `models/CMS_Models/Sales/Lead.js` (source/industry enum + default
-removal), `test/crm/lead-draft.route.test.js` (readiness assertions updated
-for the genuine source check), `docs/tasks/current-task.md` (rewritten),
-`docs/tasks/lead-to-journey-roadmap.md` (status line only).
-
-Frontend: `app/sales/dashboard/leads/_components/leadSections.js` (all five
-UI fixes — `IdentitySection`, `OriginSection`, `CUSTOMER_SEGMENT_OPTIONS`,
-`OrganisationResearchSection`, `EvidenceSection`/`EvidenceEntry`),
-`app/sales/dashboard/leads/_components/AddLeadDrawer.js` (Customer segment
-option list rename).
-
-### Tests and verification (correction pass)
-
-- Backend: `npx jest` — **291/291 passing, 17 suites.**
-- Frontend: `npm run build` — clean.
-- Live browser: opened an existing Prospect and confirmed the trimmed
-  Identity and contact section, the genuinely-unmet "Lead source recorded"
-  checklist item with a real "Not sure yet" placeholder (not silently
-  "Other"); opened an Active Lead's Supporting details and confirmed
-  "Customer segment" shows the new taxonomy and the evidence document field
-  shows the "not available yet" note instead of an upload control.
-
-## 8d — Prospect → HOD Review → Active Lead approval workflow (this session)
-
-The Prospect lifecycle gained a real internal approval gate. See the
-top-of-file banner for the summary; detail below.
-
-### Data model (no migration)
-
-- `reviewStatus` on `Lead` (constants/crm.js `LEAD_REVIEW_STATUSES`):
-  `researching` (default) → `submitted` → `approved` | `returned` |
-  `rejected`. A THIRD axis, independent of captureStatus and
-  qualificationState. A missing value reads as "researching".
-- `pursuitJustification` ("Why should we pursue this?") — distinct from
-  `requirements` (a CONFIRMED requirement), `notes`, `organisationNotes`.
-- Review audit: `submittedAt`/`submittedBy`, `reviewedAt`/`reviewedBy`,
-  `reviewReason` (required on return + reject).
-- A directly-created Active Lead (the legacy one-shot `captureStatus:"active"`
-  path) is stamped `reviewStatus:"approved"` — it never went through review.
-
-### State machine — `services/leadReview.js` (new)
-
-Single writer of `reviewStatus`, mirroring `services/leadQualification.js`'s
-discipline. Pure/DB-free; validates transitions + stamps audit; the route
-does authorization (needs req.user) and the captureStatus flip / Activity
-creation. `applySubmit` (researching|returned → submitted),
-`applyApprove` (submitted → approved; route flips captureStatus + creates the
-first Activity), `applyReturn` (submitted → returned, reason req.),
-`applyReject` (submitted → rejected AND captureStatus → archived, reason
-req.). `LeadReviewError` for 4xx.
-
-### Submission readiness — `services/leadReadiness.js`
-
-`computeReadinessChecks` (the retired 5-item "start working" bar) REPLACED by
-`computeSubmissionReadiness` — the ~11-item Submit-to-HOD checklist: identity,
-Lead source, customer segment, justification, annual quantity + confidence,
-annual revenue + confidence, at least one evidence URL/doc-ref, first action +
-due date. `computeQualificationReadiness` (Active-Lead qualification)
-untouched.
-
-### Routes — `routes/CMS_Routes/Sales/leads.js`
-
-- **Retired** `POST /:id/activate` (the salesperson's direct "Start Working
-  Lead"). There is now no direct Prospect→Active path.
-- `POST /:id/submit` — rep (creator/owner/manager). Enforces submission
-  readiness server-side (returns `checks` on 400). researching|returned →
-  submitted.
-- `POST /:id/approve` — **HOD/admin only** (`isSalesManager`). The ONLY
-  Prospect→Active Lead path. Optional `assignedTo` owner override (name
-  server-derived). Keeps the create-Activity-then-flip-then-rollback
-  reliability pattern; `qualificationState` stays "new".
-- `POST /:id/return-for-info` — HOD only, reason required → returned.
-- `POST /:id/reject` — HOD only, reason required → archived + rejected.
-- `refuseIfArchived` → `refuseIfLocked` (archived OR submitted → 409). Applied
-  to PATCH /:id, review-duplicates, archive-draft — a submitted Prospect is
-  read-only for everyone at the field level.
-- `GET /:id/readiness` now returns submission checks for a draft (qualification
-  for an active Lead). `pursuitJustification` added to `LEAD_EDITABLE_FIELDS`
-  (reviewStatus + audit fields are NOT editable via PATCH).
-- `services/leadQualification.js` draft-guard message reworded ("get the
-  Prospect approved as an Active Lead first").
-
-### Frontend
-
-- `lib/leadReview.js` (new) — review-status labels/tones, `reviewStatusOf`,
-  `effectiveReviewStatus`.
-- `leadSections.js` — new `PursuitCaseSection` (customer segment + "Why should
-  we pursue this?").
-- `DraftWorkspace.js` (rewrite) — by reviewStatus: researching/returned show
-  the submission checklist + Submit/Resubmit (gated on readiness) with the
-  returned-reason banner; submitted locks every section via a native
-  `<fieldset disabled>` and shows an "In Review" banner; a HOD (canReview)
-  additionally sees the review panel (Approve + optional owner select, Return
-  w/ reason, Reject w/ reason). Enrichment sections (Identity, Lead source,
-  Pursuit case, Commercial potential, Evidence, Initial note, First action)
-  are the SAME shared components; document upload stays hidden.
-- `[id]/page.js` — header chip shows the review status for a Prospect; passes
-  `salesUsers` + `canReview` to DraftWorkspace; `onActivated`→`onApproved`.
-- `page.js` (My Prospects list) — each row shows a review-status chip.
-
-### Tests and verification
-
-- Backend: `npx jest` — **299/299, 18 suites.** New
-  `test/crm/lead-review.route.test.js` (20 tests): begins researching;
-  submission readiness (incl. both confidences + evidence); submit state;
-  submitted read-only 409; HOD-only approve/return/reject; approve →
-  Active Lead with default + overridden owner; approval reliability rollback;
-  `/activate` gone (404); return → editable → resubmit; reject → archived.
-  `lead-draft.route.test.js` updated (the retired activate/readiness blocks →
-  submission/approve model).
-- Frontend: `npm run build` clean.
-- Live browser (manager account): submitted a ready Prospect (LEAD-2026-0010)
-  → 200; confirmed header "In Review" chip, read-only banner, all inputs +
-  Save buttons functionally disabled (native fieldset), Submit button gone,
-  HOD review panel present; approved → 200, Prospect became an Active Lead
-  (`captureStatus:active`, `reviewStatus:approved`, `qualificationState:new`,
-  owner = creator, planned first Activity created). Separately drove a
-  Prospect (LEAD-2026-0009) submit → return; confirmed the "Returned" chip,
-  the return-reason banner, sections editable again, and a "Resubmit to HOD"
-  button.
-
-### Test records left in the dev DB (disclosed)
-
-This session's browser verification left these in the dev database, alongside
-the earlier LEAD-2026-0008 / LEAD-2026-0010 the user asked to keep:
-- **LEAD-2026-0010** ("QA OwnerRemoval Verify Co") — submitted then APPROVED;
-  now an Active Lead.
-- **LEAD-2026-0009** ("cc") — submitted then RETURNED; still a Prospect.
-Happy to clean any of these up on request.
-
----
-
-## Project Manager professionalisation — Chunk 1 (2 Sep 2026)
-
-Trustworthy landing page and contract safety. Read-only: no schema, status,
-generation, approval, planning, scheduling, barcode or socket behaviour was
-touched, and no backend production file was changed at all.
-
-### Files
-
-**Backend (1 new file, no production change)**
-
-- `test/project-manager/manufacturing-order-stats.route.test.js` — new.
-  15 tests over `GET /api/cms/manufacturing/manufacturing-orders/stats/overview`
-  and `GET /api/cms/manufacturing/manufacturing-orders`.
-
-**Frontend**
-
-- `app/project-manager/dashboard/page.js` — rewritten body; live reads.
-- `components/manufacturing/moStatus.js` — new; shared MO read vocabulary.
-- `components/manufacturing/moStatus.test.mjs` — new; 14 tests.
-- `app/project-manager/dashboard/production/manufacturing-orders/page.js` —
-  three minimal edits pointing the register at the shared vocabulary
-  (status label/tone, deadline tone, date format). No restructuring.
-
-### The routing question, answered
-
-`GET /:id` is declared ~800 lines above `GET /stats/overview` in the same
-router. It does **not** shadow it: Express 5 matches per segment, so a
-one-segment `:id` cannot capture a two-segment path. Proven by test rather than
-assumed — `reachability` asserts the stats handler replies (`stats` present,
-`manufacturingOrder` absent) and that the sibling one-segment path still reaches
-`/:id`. **No production reordering was made, because none was needed.**
-
-### Contract pinned
-
-`{ success, stats }`, with all eight established fields — `totalMO`, `totalWO`,
-`ongoingWO`, `completedWO`, `pendingWO`, `forwardedWO`, `newMOThisMonth`,
-`completedWOThisMonth` — required to be present and finite numbers. Each is
-looked up by name, so a removal, a rename or a value that degrades to `NaN`
-still fails; additional fields are permitted, because adding one is a
-backward-compatible change and a test that failed on it would turn a safe
-addition into a broken build.
-
-Anonymous, junk-token and expired-session requests are refused 401 on both
-endpoints, as a matrix over the two paths rather than a spot check. Empty
-collections return real zeroes. Each count's existing meaning is characterized,
-not redefined.
-
-### Follow-up recorded, not acted on
-
-`pendingWO` counts `pending + planned + scheduled + ready_to_start`, so it is
-not "pending" in the ordinary sense — it is "not yet started on the floor".
-The meaning was left alone; the dashboard labels it **"Awaiting or in planning"**
-with a footnote naming the four statuses. Redefining it belongs to the chunk
-that separates planned from scheduled (Chunk 4).
-
-### Verification
-
-- Backend focused: `npx jest test/project-manager` — **15/15 pass.**
-- Backend full: 22 suites / 276 tests fail **with or without** the new
-  directory (2082 pass with, 2069 without) — all pre-existing, none introduced.
-- Frontend: `npm test` — **all pass, 0 fail**; the shared-vocabulary file
-  `components/manufacturing/moStatus.test.mjs` contributes 14 of them.
-- Frontend build: `npm run build` fails on a **pre-existing** duplicate binding
-  in `app/accountant/sales-vouchers/new/page.js` (clean at HEAD, untouched:
-  line 41 imports `splitGstByRate`, line 109 redeclares it). With that one file
-  temporarily set aside the build **succeeds, exit 0**, compiling every
-  `/project-manager/**` route; the file was restored byte-identical.
-- Browser: 375 px / tablet / desktop, against a local stub of the two endpoints
-  (the real backend's `.env` points at the live dev Atlas + Firestore and its
-  boot path writes). Covered loading skeletons, live data, honest empty state,
-  server-returned zeroes, stats-only failure, orders-only failure, retry, and
-  manual refresh. No horizontal overflow at 375 px. All four destination links
-  land inside the Project Manager shell.
-
-### Review corrections (same day, Chunk 1 scope only)
-
-Three findings from review of the above, corrected in place:
-
-1. **Over-strict contract test.** The envelope assertion compared exact key
-   lists, so adding any field to `stats` — or to the response beside it — would
-   have failed the build for a backward-compatible change. Relaxed to
-   presence-and-finiteness per established field; removals, renames, `NaN`,
-   `Infinity`, stringified numbers, a null `stats` and `success: false` all
-   still fail. Verified against mutated payloads before landing. The endpoint
-   and the meaning of every statistic are unchanged.
-2. **`String(undefined)` on the stat strip.** A field the server omitted would
-   have rendered the literal word "undefined", and the month note
-   "+undefined this month". Added two pure helpers to
-   `components/manufacturing/moStatus.js` — `formatCount` (finite → the number,
-   zero included; anything else → "—") and `newThisMonthUnit` (finite → the
-   note; otherwise no unit at all). Nothing missing is converted to zero.
-   Loading, error, partial-success and refresh behaviour are untouched, as is
-   the layout. Seven focused tests cover the pure behaviour.
-3. **An untrue line in this document.** It claimed junk-token and
-   expired-session requests were tested on both endpoints; only the anonymous
-   case existed for the manufacturing-order list. Rather than narrowing the
-   claim, the missing tests were written: authentication now runs all three
-   refusal modes across both paths as a matrix. **The list endpoint behaves
-   exactly as the stats endpoint does — 401 with `success: false` and no
-   payload — so no unexpected behaviour was uncovered and no other statement
-   needed correcting.**
-
-Focused backend suite after the corrections: **15/15 pass.**
-
----
-
-## Project Manager professionalisation — Chunk 2 (2 Sep 2026)
-
-Endpoint ownership, access and audit boundary. The matrix that drove every
-decision is `docs/audits/project-manager-endpoint-access.md`.
-
-### Files
-
-**Backend**
-
-- `docs/audits/project-manager-endpoint-access.md` — new. **110 HTTP endpoint
-  paths**, each carrying exactly one current-state classification that partitions
-  to 110 (`SAFE_AS_IS` 60, `SHARED_CROSS_DEPARTMENT` 38,
-  `UNKNOWN_REQUIRES_DECISION` 6, `MISSING_AUTHENTICATION` 5,
-  `PM_OWNED_MUTATION` 1). Socket.IO surfaces (6 events + 1 room pattern) and
-  de-navigated PM pages (7) are inventoried separately and are **not** added to
-  that total. File:line evidence throughout, a reproducible grep in §8, and the
-  full classified list in Appendix A.
-- `routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes.js` —
-  `router.use(EmployeeAuthMiddleware)` installed.
-- `routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js` — same.
-- `routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes.js`
-  — per-route `pmOwnedWrite` guard on `share-to-vendor`, plus a `recordChange`
-  audit entry for the direct privileged write.
-- `test/project-manager/pm-access-boundary.route.test.js` — new, 35 tests.
-
-**Frontend:** none. No URL, response field or query parameter changed, so no
-frontend edit was required and none was made.
-
-### Authentication fixed
-
-Both routers required `EmployeeAuthMiddleware` and never installed it, and the
-`departmentWrites` mounts above them do not compensate — that guard ignores GET
-entirely and passes anonymous callers through by design.
-
-- **Production dashboard** (7 routes): machine assignments, live production,
-  who is on the floor today, and a barcode lookup naming the customer order,
-  all readable with no session. Fixed.
-- **Canvas layout** (3 routes): worse — anonymous `POST` and `DELETE` could
-  rewrite or delete the factory's machine layout. Fixed.
-
-Both proved anonymous by failing tests before the fix. Authentication only:
-the Production Supervisor consumes both and holds no `project-manager` role.
-
-### Authorisation fixed
-
-Exactly one route: `POST …/manufacturing-orders/share-to-vendor`. It is the only
-mutation on a PM screen that is simultaneously PM-owned, called from nowhere
-else, and replay-safe (one idempotent `updateMany` with a status filter). Guard
-applied **per route**, never as a mount, reusing `departmentWrites` so there is
-no second role or approval system.
-
-Everything else was left alone on purpose — the planning and allocation
-mutations are not replay-safe, and the floor writes the same records. See the
-audit's §7 for the per-route reasons.
-
-### Legacy ProjectManager
-
-Documented in the audit's §6, **proposed not approved**. The cliff: legacy
-accounts have no `DepartmentRole` row and nothing creates one, so the first
-Production role granted refuses every one of them. Pinned as a test.
-
-### Verification
-
-- `npx jest test/project-manager` — **50/50 pass** (15 Chunk 1 + 35 new).
-- `npx jest test/access test/store-purchase` — **242/242 pass.**
-- Full backend suite: 22 suites / 274 tests fail — the **same 22 pre-existing
-  suites** as Chunk 1 (accountant budget ×14, crm ×7, hr-ai ×1). Only the two
-  Project Manager suites exercise the changed routers, and both pass.
-- `node --check` clean on all changed backend files; `git diff --check` clean in
-  both repositories.
-
-
----
-
-## Lane A Chunk 2 — review corrections (2 Sep 2026)
-
-Two findings from review of the above, corrected in place. No frontend file was
-touched, no Lane B file was touched, and Chunk 3 was not started.
-
-### 1. Approval replay bypass (security)
-
-`requireApproval` trusted the bare presence of the `x-grav-change-request`
-header:
+| `google_ads` | `externalAccountId` | `loginAccountId`, `externalAccountName`, `note` |
+| `meta_ads` | `externalAccountId` | `businessId`, `externalAccountName`, `note` |
+
+`businessId` is **optional**, matching the existing Meta service contract: a
+personal advertising account legitimately belongs to no business, and
+`metaPreflight` already reports an absent business as `not_applicable` rather
+than failing. Requiring it at the route would refuse bindings that deploy
+correctly today. This is a deliberate reading of "exactly as the existing Meta
+service contract requires" — the required/optional test therefore proves the
+without-business case is *accepted* and stores an empty value rather than
+borrowing one.
+
+Neither channel accepts the other's identifier, enforced at the service as well
+as the route — fixing only the route would leave an internal caller able to do
+what the route now refuses. The refusal names the owner:
+`"businessId belongs to meta ads, not google ads."`
+
+New: `test/marketing/advertising-account-binding.route.test.js`, **15 tests, all
+over HTTP** — businessId stored end to end, optional-business accepted, invalid
+business refused, each channel refusing the other's field, the service refusing
+it too, credential-shaped names and values still refused on both channels,
+administrator-only binding with marketer read, unauthenticated refused, company
+isolation, unknown channel, cross-channel account shapes, and no provider error
+text reaching the browser.
+
+## 2. Campaign Health generation opened to Marketing users
+
+`POST …/health/generate` no longer requires an administrator. Campaign Health is
+marketer-facing; restricting generation left the people it was built for able to
+read only what an administrator had thought to ask for.
+
+What holds the cost down was never the role, and all of it is unchanged:
+explicit POST that nothing calls on render, strict `{}` body, duplicate-evidence
+reuse with no second call, and a per-company daily request/token ceiling checked
+before transmission. The **usage dashboard stays administrator-only** — spending
+your own company's allowance is ordinary work; reading every consumption figure
+is an operator's view.
+
+Tests 27 and 28 prove marketer generation, non-Marketing roles refused (403),
+unauthenticated refused (401), marketer refused on `/intelligence/usage`, and
+that reuse and the ceiling still bound a marketer's request.
+
+## 3. No infrastructure names in browser responses
+
+`missingConfiguration` is **removed** from every response and from the gateway's
+`availability()`. A missing key is now reported as `reason: "not_configured"`
+plus GRAV's own sentence. The variable name goes to the server log once per
+process, and to the deployment documentation.
+
+Naming server infrastructure in an API response tells every caller the shape of
+the deployment and tells the marketer who receives it nothing they can act on.
+Test 29 sweeps all four Campaign Health routes, configured and unconfigured, for
+any `MARKETING_*` / `GEMINI_*` name.
+
+**Breaking for Lane B if they built against it** — noted in the contract.
+
+## 4. Gateway scope claim corrected
+
+The gateway header, `server.js`, the route header, this file and the design
+record all claimed or implied that `gravAiGateway.service.js` is the only model
+caller in the repository. **That was false.** Roughly ten direct callers predate
+it:
+
+`services/aiAssist.service.js`, `services/textAssist.service.js`,
+`services/callSummary.service.js`, `services/ai/gravAssistant.js` (a local
+Ollama model via `ollamaClient` — a different provider entirely),
+`routes/task_routes/askAI.routes.js`, `meetingSummary.routes.js`,
+`meetingTranscript.routes.js`, `routes/CMS_Routes/Measurement/measurementRoutes.js`,
+`routes/CMS_Routes/Manufacturing/QC/qcAssistantRoutes.js`,
+`routes/CMS_Routes/Inventory/chatbot/inventoryChatbot.routes.js`,
+`routes/DevOps/developer.js`.
+
+None was touched. Consolidating them is documented as later CMS-wide migration
+work in the design record, with a note on why it is real work rather than a
+rename: several use tool/function calling, one uses another provider, and each
+needs its own operation-table entry, schema and validator.
+
+The accurate claim — everything under `services/marketing/` and
+`routes/CMS_Routes/Marketing/` reaches a model only through the gateway — is now
+pinned by test 30, which also asserts the older callers still exist, so if
+somebody consolidates them the test fails and the claim gets updated rather than
+quietly becoming wrong again.
+
+## 5. The Meta `RangeError` — root cause found, fixed in the test
+
+`test/marketing/meta-paused-creation.test.js` test 16 did:
 
 ```js
-if (req.headers[REPLAY_HEADER]) return next();
+jest.spyOn(metaWriteClient, "create").mockImplementation(async (args) =>
+  metaWriteClient.create.wrapped(args, …));
+metaWriteClient.create.wrapped = jest.requireActual(".../metaAdsWriteClient").create;
 ```
 
-That header is chosen by the caller. **Any authenticated editor could send an
-ordinary mutation with `x-grav-change-request: anything` and walk past the
-approval hold they were subject to** — in any department using the shared guard,
-not only Project Manager — leaving no ChangeRequest and so no trace in the
-queue. The Chunk 2 test masked it: it replayed with the editor's own token plus
-the header, which is exactly the exploit, and called it an approved replay.
+`jest.requireActual` returns the same cached module object that `jest.spyOn` had
+just mutated, so `.wrapped` **was the mock** and called itself until the stack
+ran out. That was the `RangeError: Maximum call stack size exceeded`.
 
-Fixed in the **shared** mechanism, with no PM-specific approval system:
+The test still passed, which is the worse half: the overflow was caught by the
+route's error handler, which answered a generic 500 carrying no provider
+detail — so every `not.toMatch` assertion passed **without the provider-privacy
+path ever running**. It would have passed with that boundary completely broken.
 
-- `services/changeRequests.js` — new `validatedReplayOf(req)`. The bypass now
-  requires the header to equal the `replayOf` claim inside the caller's
-  **verified** JWT. That claim is minted only by `replayToken`, only inside
-  `applyChangeRequest`, only after an approver decides, into a 2-minute token
-  that travels loopback and never reaches a browser. On a match it sets the
-  private `req.__approvalReplay`; on a mismatch it does **not** refuse — the
-  request simply carries on down the ordinary role/approval path, so an editor
-  is held at 202 exactly as if no header had been sent.
-- `Middlewear/departmentWriteGuard.js` — `seedIdentity` carries `replayOf`,
-  because a mount-level approval check runs before router authentication.
-- `Middlewear/EmployeeAuthMiddlewear.js` — carries `replayOf`, because a
-  route-level guard (the PM one) runs after `req.user` has been rebuilt.
-- `services/changeLog.js` — `approvalFrom` is gated on the validated flag
-  instead of the raw header, and stores the **validated** id. Forged
-  `x-grav-approver-*` headers can no longer stamp a write `origin: "approval"`.
+Fixed locally to the test by capturing the real function values before spying.
+No provider behaviour changed. The test was also given positive assertions
+first — it now proves the real response arrives (`200`, `RESPONSE_LOST`,
+`unresolved: true`, `failedStep: "campaign"`, a substantive reason) before
+proving what it does not contain, because a response that says nothing at all
+satisfies every `not.toMatch`.
 
-`recordSubmission` and `recordDecision` pass `origin: "approval"` explicitly, so
-the held-change audit path is unaffected.
+## Verification
 
-Coverage: 10 new tests. The success case drives the real
-`decideChangeRequest` → loopback replay (via `INTERNAL_API_ORIGIN`), not a
-hand-built imitation. Verified as genuine regressions: restoring the old
-one-line check fails exactly the four exploit tests and nothing else.
+| Suite | Result |
+|---|---|
+| `campaign-health-adviser` + `advertising-account-binding.route` | **45 / 45**, three consecutive runs |
+| `google-search-deployment` + `meta-deployment-foundation` + `meta-paused-creation` | **102 / 102** |
+| `meta-paused-creation` alone | **17 / 17**, no `RangeError` |
+| `test/marketing` (full) | **1221 passed / 1221 total**, 25 suites |
+| `test/crm` + `test/sales` (serial, alone) | see below |
 
-### 2. Endpoint audit arithmetic
-
-The classification table mixed current and previous states, HTTP paths, socket
-events and legacy pages, so it did not partition the 110 paths. Rebuilt from the
-regenerated list by an ordered first-match-wins rule set, published in Appendix
-A alongside all 110 paths and their classifications. The four different
-"missing authentication" numbers (8 observed paths, 10 route declarations fixed,
-5 paths still unfixed, 3 routers still unfixed) are now reconciled explicitly in
-§1.4 instead of collapsed into one figure.
-
-### Verification
-
-- `npx jest test/project-manager` — **59/59 pass** (15 Chunk 1 + 44 access).
-- `npx jest test/access test/store-purchase` — **242/242 pass.**
-- Full backend suite: 22 suites / 274 tests fail — the same pre-existing set.
-- `node --check` clean on all changed files; `git diff --check` clean in both
-  repositories.
+Still no real `GEMINI_API_KEY`; no live verification claimed; no key added.
+Nothing committed.
 
 ---
 
-## Project Manager professionalisation — Chunk 3A (3 Sep 2026)
+# Marketing Overview read contract (2026-09-20)
 
-Canonical manufacturing-order list projection and a server-backed query
-contract. **Backend only** — no frontend file was touched, and none needs to
-change to keep working. Detail-page projection and decomposition remain
-**Chunk 3B and are not started.**
+`GET /api/cms/marketing/overview` — one company-scoped, read-only business
+summary for the redesigned `/marketing` page. Frontend contract:
+`docs/handoff/lane-b-marketing-overview-contract.md`. No frontend file touched.
 
-### Files
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingOverview.js` | The overview's own vocabulary: default range, confirmed-deployment states, the closed attention list, availability wording. **No business rules.** |
+| `services/marketing/overview/overviewPerformance.js` | Company-wide figures and the daily series, under the existing performance rules |
+| `services/marketing/overview/overviewMovement.js` | Engagement and handover counts, under the existing engagement and handover contracts |
+| `services/marketing/overview/marketingOverview.service.js` | Composition, campaign rows, ranking, attention, availability |
+| `routes/CMS_Routes/Marketing/marketingOverview.js` | The route |
+| `test/marketing/marketing-overview.route.test.js` | 28 tests |
+| `server.js` | one mount line |
+
+## What it reuses rather than reimplements
+
+Completeness, the settled-day filter, money-in-micros, the combination rules and
+the derived-ratio rules come from `campaignReport.service.js` and
+`constants/marketingPerformance.js` — including `assertRange`, `totalsFrom`,
+`ratio` and `freshnessOf` directly. Handover counts come from
+`handoverReadModel.summaryFor`, so the Overview and the Handovers page cannot
+disagree. What counts as engagement comes from `MEANINGFUL_ENGAGEMENT_KINDS` and
+`EXPLICIT_REQUEST_KINDS` in `constants/marketing.js`.
+
+## Four judgement calls, stated because they are not obvious
+
+**The default range ends yesterday, not today.** Today is always partial and the
+performance contract already excludes a partial day from every total, so a
+default ending today opens the page on a period whose last day is guaranteed to
+be left out — and two consecutive "last 30 days" would compare 29 settled days
+against 30.
+
+**Conversions combine within one channel and are withheld across channels.** The
+existing rule marks conversions `combinable: false` with the reason "each
+channel decides for itself what counts as a conversion". That reason is about
+channels, and `combine()` only ever evaluates it for one plan across channels.
+Applied to a company-wide set the same reasoning gives: sum across deployments
+of one channel, withhold the moment a second contributes. Spend is unchanged —
+one currency sums, more than one is withheld, never converted.
+
+**Engaged people are counted from `MarketingEventReceipt`, not the event
+ledger.** `MarketingIntentEvent.gravPersonKey` is written once at intake and
+never rewritten, so a person GRAV could not name in January stays nameless on
+January's rows even after being recognised in February; the receipt is the half
+that carries late resolution. Counting the ledger would undercount real people.
+An event whose person is still unresolved is deliberately **not** counted — GRAV
+does not know who they are, and one unresolved event is not evidence of one
+human being.
+
+**`prospectMovement` is not a funnel and says so.** `coherentFunnel: false`, no
+percentages, no `rate` or `percent` field on any stage. The populations differ,
+a prospect's current state is a fact about today rather than the period, and
+blocked prospects were never submitted so they are not a remainder of the
+submitted count.
+
+## Two things found while building
+
+**A sixth handover state the task did not list.** `DUPLICATE_LINKED` — "Linked
+to an existing Sales record" — is one of the four answers Sales may give. It is
+published as its own stage (`linked_to_existing`) and its own summary field
+rather than folded into "rejected", because folding it in would report a
+successful match as a failure.
+
+**The signed plan identifier is signed, not secret.** `draftIdentity`'s token is
+scoped to the company and cannot be forged or repointed, but its payload is
+base64 and decodes to internal ids. That is the established Marketing pattern
+and what the task asked for; it is recorded here so nobody treats the token as
+opaque-to-everyone. The response carries no readable database id of its own.
+
+## Not built, deliberately
+
+No provider writes, deployment actions, activation, content creation or
+AI-generated recommendations. The route and all three services import no
+provider client, HTTP client, deployment writer, Sales model or AI client, and
+contain no write call at all — test 28 walks the source to prove it rather than
+trusting the comment.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `marketing-overview.route` | **28 / 28**, three consecutive runs |
+| `test/marketing` (full) | **1249 passed / 1249 total**, 26 suites |
+| `test/crm` + `test/sales` (serial, alone) | **42 failed / 792 passed / 834 total**, 9 failing suites — an exact match to the baseline, with **zero** infrastructure failures this run, so no reconciliation was needed |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`. The run took 277s against 1128s for the previous one on a
+busy machine, which is also why `activities.route` started cleanly this time and
+needed no separating out.
+
+Nothing committed.
+
+---
+
+# Campaign capability matrix (2026-09-20)
+
+`GET /api/cms/marketing/campaign-capabilities` — the contract the professional
+Campaign Builder is built from. Design record:
+`docs/decisions/marketing-campaign-capability-matrix.md`. Frontend contract:
+`docs/handoff/lane-b-campaign-capabilities-contract.md`. No frontend file
+touched.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingCampaignCapabilities.js` | 57 settings × 8 sections × 4 campaign types, six support states, 12 lifecycle states, 13 management reads, 7 declared intelligence capabilities |
+| `routes/CMS_Routes/Marketing/campaignCapabilities.js` | Two read routes |
+| `test/marketing/campaign-capabilities.route.test.js` | 16 tests |
+| `server.js` | one mount line |
+
+## This changed no behaviour
+
+It is a declaration. Creation, readiness, preflight, targeting resolution and
+approval still belong to the contracts that own them. The deployable set is
+asserted equal to `SUPPORTED_CAMPAIGN_TYPE_CODES` from the creation contract, so
+the matrix cannot drift into enabling something.
+
+## Decisions worth knowing
+
+**Six support states, not two.** `unavailable` (the channel cannot),
+`not_modelled` (the channel can, GRAV has not built it) and
+`requires_external_audience` (reachable today by supplying a list) are three
+different answers. Collapsing them tells a marketer to give up on two things
+they could have had.
+
+**Firmographics are never a targeting input.** `job_role`, `job_seniority`,
+`industry` and `company_size` are `requires_external_audience` on both types. No
+channel verifies where somebody works; what they sell under those names is
+self-reported profile data, so a campaign aimed at procurement managers reaches
+people who once showed an interest in procurement.
+
+**Lead-form types are declared, not enabled.** `google_lead_form` and
+`meta_lead_form` carry `deployable: false`, no settings column, and the reason:
+GRAV models no channel-hosted form, so enquiries would reach nobody.
+
+**The lifecycle is declared in full and controlled in part.** Twelve states, six
+reachable. `scheduled`, `active`, `paused`, `completed` and `archived` carry
+`offersControl: false` — a frontend may draw the sequence but must not offer a
+button. `deliveryBoundary` is on every response.
+
+## A discrepancy in the brief, reported rather than papered over
+
+The task asked to preserve "the existing Google lead-form scope". **There is
+none.** `google_lead_form` was not defined anywhere in the repository, and the
+existing scope is the explicit *exclusion* of native provider lead forms —
+`constants/marketingDeploymentReadiness.js` states that accepting a plan naming
+a lead form would deploy a campaign whose lead capture does not exist.
+
+That exclusion is preserved exactly. The type is declared as blocked, with what
+is missing, rather than invented.
+
+## Defect found while building
+
+Two matrix reasons read "As above." Every `why` is rendered beside a single
+disabled field, on its own, where "above" has no referent — a cross-reference
+that is fine in a comment is meaningless in an API response. All four
+cross-references were rewritten to stand alone, and a test now requires every
+limited setting to carry at least 20 characters of self-contained reason.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `campaign-capabilities.route` | **16 / 16**, three consecutive runs |
+| `test/marketing` (full) | **1265 passed / 1265 total**, 27 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 failing suites — exact baseline match, zero infrastructure failures, no reconciliation needed |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`.
+
+Nothing committed.
+
+---
+
+# Google lead forms — verified contract and local validation (2026-09-20)
+
+Partial slice. `google_lead_form` **remains unavailable**, as the task requires
+until the whole contract is proven.
+
+Sources: `docs/decisions/google-lead-form-verified-contract.md`.
+Frontend: `docs/handoff/lane-b-google-lead-form-contract.md`.
+
+## Destination correction (done first, as asked)
+
+`constants/marketingOverview.js` already published the canonical
+`/marketing/campaigns/plans/:campaignPlanId/performance` when this task began —
+another session had corrected it, and `marketing-overview.route.test.js` test 32
+validates every destination against the real frontend checkout at
+`../grav-cms`. The service resolves the identifier into the path, so a client
+receives a complete address.
+
+What was still stale was the Lane B handoff, which still documented
+`/marketing/campaigns/:campaignPlanId`. Corrected, with a table of the three
+canonical paths and an explicit instruction to delete any client-side
+translation table.
+
+## Documentation verified before coding
+
+Every Google fact encoded traces to a page read on 2026-09-20 and quoted in the
+decision record: `LeadFormAsset`, `LeadFormFieldUserInputType`,
+`WebhookDelivery`, `lead_form_submission_data`, and the lead-form help page.
+
+Four findings changed the design:
+
+**Verification is a shared secret in the payload, not a signature.**
+`google_secret` is "an anti-spoofing secret set by the advertiser as part of the
+webhook payload". There is no HMAC and no signature header. Checking for one
+would refuse every genuine lead — and because a secret in a body is replayable
+by anyone who has seen one, idempotency on the submission id is part of the
+contract rather than an optimisation.
+
+**Retrieval exists, bounded at 60 days.** Google stores leads for 60 days and
+`lead_form_submission_data` is queryable, with `id` and `submission_date_time`
+both filterable and sortable. A resumable, idempotent sweep is implementable —
+and the promise must end where Google's retention does.
+
+**Three eligibility rules decide whether a form serves at all.** Conversion-
+focused bidding, a lead-form conversion goal, and responsive search ads. GRAV's
+default bid strategy is `maximise_clicks`, which would have produced a campaign
+that runs, spends and never shows the form.
+
+**Google publishes a country list where lead forms do not serve.** A campaign
+aimed only at those collects nothing.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingGoogleLeadForm.js` | Google's documented contract, nothing inferred |
+| `services/marketing/deployment/googleLeadFormDefinition.js` | Pure validator + derived deployability |
+| `test/marketing/google-lead-form-definition.test.js` | 24 tests |
+| `constants/marketingCampaignCapabilities.js` | lead-form entry now derives `deployable` |
+| `docs/decisions/google-lead-form-verified-contract.md` | sources and quotes |
+| `docs/handoff/lane-b-google-lead-form-contract.md` | frontend contract |
+| `docs/handoff/lane-b-marketing-overview-contract.md` | destination correction |
+
+## Deployability is derived, not declared
+
+The matrix computes `google_lead_form.deployable` from the same
+`UNVERIFIED.webhookPayloadSchema.verified` flag the validator reads, so the
+declaration cannot claim readiness the contract denies. A hand-set boolean is
+one somebody flips while finishing something else.
+
+`localContract.complete` is `true` and published separately, so Lane B can build
+the form design in advance while knowing nothing can be created yet.
+
+## What is NOT built, and why the type stays unavailable
+
+Creation, ingestion, reconciliation, identity/consent/engagement wiring and the
+handover route are **not** built. The blocking item is honest and specific:
+**Google's webhook payload schema was not read**, so the exact key names it
+posts are unknown.
+
+Hard-coding guessed key names would produce an ingestion boundary that fails on
+the first real delivery, silently, when nobody is watching — and a lead-form
+campaign GRAV cannot receive leads from is one that runs, spends, collects
+enquiries and delivers them nowhere. That is the precise failure the design
+exists to prevent, so the type stays unavailable rather than being enabled on an
+assumption.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-lead-form-definition` + `campaign-capabilities.route` | **40 / 40**, three consecutive runs |
+| `test/marketing` (full) | **1295 passed / 1295 total**, 28 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 failing suites — exact baseline match, zero infrastructure failures |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`.
+
+Nothing committed.
+
+---
+
+# Google lead forms — ingestion core (2026-09-20, second pass)
+
+Partial. `google_lead_form` **remains not deployable**; `meta_lead_form`
+untouched.
+
+## What the official pages changed
+
+The webhook schema gap from the first pass is closed — sources and quotes in
+`docs/decisions/google-lead-form-verified-contract.md`. Four findings shaped the
+code, and three of them are things that would have been got wrong by a
+reasonable guess:
+
+**`column_name` is deprecated.** Google marks it so and says it "might not
+always be populated, use `column_id` instead". A mapping built on the human
+label passes every test written against the official samples — which all carry
+one — and starts silently dropping fields in production.
+
+**The ids are int64.** "Clients need to use 8 bytes integer to process" appears
+four times. `JSON.parse` turns a campaign id above 2^53 into a nearby number
+without complaining, and the correlation it exists for then matches nothing.
+Read from the raw body as text.
+
+**Delivery is at-least-once, and verification is a shared secret rather than a
+signature.** A replayed body from anybody who has seen one delivery is
+indistinguishable from a genuine redelivery, so deduplication on `lead_id` is a
+security control here, not an efficiency.
+
+**The HTTP contract carries retry semantics** — 4XX not retryable, 5XX
+retryable. A wrong secret must be 4XX (it will not become right on a retry), an
+internal fault must be 5XX (or a real lead is lost to a busy moment), and a
+duplicate must be 200 (or Google keeps redelivering something that arrived).
+
+### Google's samples contradict themselves on the key name
+
+The production sample spells it `google_key`; **every test sample on the same
+page spells it `Google_key`**. The proto says `google_key`, so the capital is
+almost certainly a typo — but refusing it would refuse Google's own official
+test sample. Both spellings are accepted: that is a second spelling of one field
+name, not a second secret or a weaker check.
+
+## Built
+
+| File | What it is |
+|---|---|
+| `constants/marketingGoogleLeadWebhook.js` | The verified payload contract, closed `column_id` map, HTTP outcomes, limits, and the recorded secret boundary |
+| `services/marketing/leads/googleLeadNormalisation.js` | Pure. One normaliser both the webhook and the recovery sweep converge on |
+| `services/marketing/leads/googleLeadVerification.js` | Timing-safe secret comparison and Google's documented HTTP outcomes |
+| `test/marketing/google-lead-ingestion.test.js` | 22 tests, against Google's own sample payloads |
+
+Both doors converge: a pushed `column_id`/`string_value` delivery and a pulled
+`field_type`/`field_value` recovery produce an identical lead, differing only in
+recorded provenance. Separate normalisers would drift, and the drift would
+surface as one submission stored twice with slightly different contents — the
+exact thing deduplication exists to prevent.
+
+## Stopped, as instructed: per-company secret persistence
+
+`SECRET_BOUNDARY.perCompanyPersistenceAvailable: false`.
+
+Marketing's binding contract is explicit that a credential never enters the
+database — "the credential in deployment secrets, this in the database — so that
+a database dump is not an advertising account". There is no company-scoped
+secret store, and the repository's only encryption utility
+(`utils/salaryEncryption.js`) is keyed on `SALARY_ENCRYPTION_KEY` and encrypts
+numbers; reusing a payroll key for advertising secrets would make one leak into
+two.
+
+So the secret resolves from deployment configuration and is not persisted per
+company. **That blocks the creation path**, which must configure a per-form
+secret it can verify against later — recorded rather than worked around with
+plaintext, exactly as the task requires.
+
+## Not built
+
+The webhook route, the lead record, identity/engagement/consent wiring, the
+reconciliation sweep, the creation path, and the Lane B leads contract. The
+pure, security-critical core they all depend on is done and tested; the wiring
+is not.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-lead-ingestion` + `google-lead-form-definition` | **46 / 46**, three consecutive runs |
+| `test/marketing` (full) | **1317 passed / 1317 total**, 29 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match, zero infrastructure failures |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`.
+
+Nothing committed.
+
+---
+
+# Google lead-form webhook keys — derived, not stored (2026-09-20)
+
+The architectural blocker from the previous pass is removed. Decision record:
+`docs/decisions/google-lead-webhook-derived-keys.md`.
+
+## What dissolved it
+
+**GRAV never needs to retrieve the webhook key — only to recognise one.** Google
+lets the advertiser choose it and only ever hands it back inside a delivery, so
+there is no flow where GRAV reads a stored key and shows it to anybody. What can
+be recomputed does not have to be kept.
+
+So there is no vault: `services/marketing/leads/leadWebhookKey.js` derives the
+key for a company and binding with HKDF-SHA-256 from one dedicated deployment
+master, at the two moments it is needed. The database holds the binding identity
+and `secretVersion: 1`, neither of which is a secret.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `services/marketing/leads/leadWebhookKey.js` | Derivation, timing-safe verification, key ring, availability |
+| `test/marketing/google-lead-webhook-key.test.js` | 17 tests |
+| `docs/decisions/google-lead-webhook-derived-keys.md` | The trade, the blast radius, the rotation procedure |
+| `constants/marketingGoogleLeadWebhook.js` | `SECRET_BOUNDARY` now describes the derived strategy |
+
+## Four details that are load-bearing
+
+**Domain separation** — the purpose string is the HKDF salt and carries its own
+version, so a second purpose over the same master produces unrelated keys.
+
+**Length-prefixed inputs** — `("ab","c")` and `("a","bc")` would otherwise
+produce identical bytes, so two bindings would derive one key. A test asserts
+they do not.
+
+**Comparison lives inside the module** — `verifyWebhookKey` takes the candidate
+in rather than handing the derived key out. Returning it would be the one moment
+the secret exists in a variable somebody could log or serialise.
+
+**Weak configuration refused** — 32 bytes measured in bytes, not characters (a
+32-character hex string is 16 bytes), plus a repetition check. That second check
+exists because the realistic mistake is `changeme-changeme-…`: 43 bytes, eight
+distinct characters, passing both a length test and a distinct-byte floor. It is
+caught by counting distinct 4-byte windows — 0.22 for that, 1.0 for anything
+random or an ordinary passphrase.
+
+## Blast radius, recorded rather than glossed
+
+One master is a single point of compromise for every company's keys. Against a
+database dump — much the likelier event — the derived design is a complete
+defence, because the database holds no key material at all. Against a
+compromised deployment environment it is none, but that environment already
+holds the advertising credentials, which are strictly worse.
+
+An exposed webhook key permits forging lead deliveries into one company's
+Marketing records. It does not reach the advertising account, cannot spend, and
+cannot create a Sales record.
+
+## A conflict found and resolved
+
+`FORBIDDEN_SOURCES` initially named `GEMINI_API_KEY`, which broke the Campaign
+Health suite's structural proof that no file under `services/marketing/` names
+the model key — the guarantee that keeps the provider gateway the only route to
+a model. A third-party API credential is not key material anyone would derive
+from, so the decorative entry was removed rather than eroding the stronger
+guarantee.
+
+## Still not built
+
+The delivery binding, webhook route, lead record, identity/engagement/consent
+wiring, reconciliation sweep and creation path. `google_lead_form` remains not
+deployable; `meta_lead_form` untouched.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-lead-webhook-key` | **17 / 17**, three consecutive runs |
+| `google-lead-ingestion` + `google-lead-webhook-key` | **39 / 39** |
+| `test/marketing` (full) | **1334 passed / 1334 total**, 30 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match, zero infrastructure failures |
+
+Nothing committed.
+
+---
+
+# Google Lead Forms — Chunk 3A (2026-09-20)
+
+A verified production webhook now creates one deduplicated normalized lead
+record. `google_lead_form` remains **not deployable**.
+
+## Correction: master-secret validation
+
+The randomness heuristic is removed. The variable must be **exactly 64
+hexadecimal characters decoding to 32 bytes**, plus one exact check for a value
+of a single repeated character (`0000…` and `ffff…` are valid hex). Operators
+generate it with `openssl rand -hex 32`, which the refusal message states. The
+supplied value never appears in an error.
+
+Why the heuristic could not work, recorded so it is not reintroduced: 32 random
+bytes are indistinguishable from any other 32 bytes, so "detecting randomness"
+is really a list of the patterns its author thought of. Mine missed
+`changeme-changeme-…` on the first attempt and would have missed the next
+placeholder nobody predicted, while refusing legitimate material for looking
+unusual.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `services/marketing/leads/deliveryToken.js` | Signed public route token, own purpose |
+| `models/CMS_Models/Marketing/MarketingLeadDeliveryBinding.js` | Company-scoped binding, no secret |
+| `services/marketing/leads/leadDeliveryBinding.service.js` | Prepare, resolve, attach identity, disable |
+| `models/CMS_Models/Marketing/MarketingAdvertisingLead.js` | Append-only lead + separate test-delivery note |
+| `services/marketing/leads/leadIngestion.service.js` | Verified delivery → one record |
+| `routes/CMS_Routes/Marketing/googleLeadWebhook.js` | The unauthenticated route |
+| `test/marketing/google-lead-webhook.route.test.js` | 27 tests |
+| `server.js` | one mount line |
+
+## The trust order is the design
+
+Signed route token → *which binding*. Binding state → *is it still listening*.
+Derived key → *is this really Google*. Only then do payload identifiers mean
+anything, and only as a correlation check.
+
+**The company is never taken from a payload.** `campaign_id` and `form_id` are
+values a sender chooses; letting one select a tenant would let anybody who
+guessed a campaign number post enquiries into that company's records, where they
+would look entirely ordinary. Test 12 proves a delivery naming another company's
+form and campaign still lands in the company the token named.
+
+## Three defects found while building
+
+**`req.destroy()` on an oversized body** gave Google a connection reset instead
+of a documented 4XX. Its table treats anything that is not a 4XX as retryable,
+so a body GRAV will never accept would have been redelivered indefinitely. Now
+the read stops, the remainder drains, and a 4XX is sent.
+
+**Mongoose `immutable` combined with `strict: "throw"`** rejects a document when
+it is *loaded*, not when it is changed — a binding became unreadable the moment
+it existed. Replaced with the explicit frozen-field hook this repository already
+uses elsewhere.
+
+**A stale comment block** describing the removed heuristic survived the edit and
+was caught by the test asserting no heuristic remains, not by review.
+
+## Where this chunk stops, structurally
+
+No identity, engagement, consent, prospect, Sales record, reconciliation or
+campaign creation. The ingestion service imports none of those and test 25 walks
+its imports. Test 24 counts Marketing identities, event receipts, handovers,
+Sales Leads and Activities before and after a recorded lead and asserts they are
+unchanged.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| lead webhook + key + ingestion | **67 / 67**, three consecutive runs |
+| `test/marketing` (full) | **1362 passed / 1362 total**, 31 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match, zero infrastructure failures |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`.
+
+Nothing committed.
+
+---
+
+# Google Lead Forms — Chunk 3B (2026-09-20)
+
+One verified submission now becomes a resolved person, exactly one engagement,
+and an evidence-based consent decision, with a durable receipt describing the
+outcome. `google_lead_form` remains **not deployable**.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingLeadProcessing.js` | Stages, reason codes, the closed agreement list, public states |
+| `models/CMS_Models/Marketing/MarketingLeadProcessingReceipt.js` | The mutable receipt, separate from the immutable evidence |
+| `services/marketing/leads/leadProcessing.service.js` | The resumable stage machine |
+| `test/marketing/google-lead-processing.test.js` | 31 tests |
+| `MarketingLeadDeliveryBinding.js` | `consentNotice`, frozen once leads arrive |
+| `leadDeliveryBinding.service.js` | preparation accepts the notice as part of the command |
+| `leadIngestion.service.js` | stamps `noticeSettledAt` on the first production lead |
+| `googleLeadWebhook.js` | detached processing after the 200 |
+
+## The decisions that carry the most weight
+
+**Only email and phone may identify a person.** Not a name, company, job title,
+postcode, answer, campaign or click id. Two people called "R Sharma" at "Acme"
+are two people, and every one of those fields is self-reported anyway.
+Normalisation is imported from the handover contract rather than restated.
+
+**A conflict waits for a human and records nothing.** Email matching one
+identity and phone another has no safe automatic answer — choosing guesses,
+merging is irreversible, a third identity makes it permanent. No engagement and
+no consent either, because both would have to belong to somebody.
+
+**Consent needs four proofs and the notice never comes from the delivery.** A
+notice version in a payload is a value the sender chose. The agreement list is
+closed and matched exactly: "very interested" is somebody wanting the product,
+not agreeing to marketing. Recording permission nobody gave is a claim GRAV
+cannot support and will not discover until a complaint; failing to record one
+costs an email.
+
+**No permission is not a refusal**, and the public wording says so explicitly.
+
+**Google is answered before the slow work.** Processing is detached, which is
+safe only because it is idempotent and resumable — a failure there can never
+make Google redeliver a lead already recorded.
+
+## One thing I had to correct in Chunk 3A
+
+3A's test 24 asserted that a recorded lead creates no identity or engagement.
+Deferred processing makes that timing-dependent, so it was rewritten to assert
+the boundary that still holds — no handover, no Sales record — with identity and
+engagement proved properly in the 3B suite where the processor is run
+deliberately rather than raced.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-lead-processing` | **31 / 31** |
+| all five Google Lead Form suites | **122 / 122**, three consecutive runs |
+| `test/marketing` (full) | **1393 passed / 1393 total**, 32 suites |
+| `test/crm` + `test/sales` (serial) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match, zero infrastructure failures |
+
+The nine are the baseline nine: `enquiry.route`, `lead-clear-enum.route`,
+`lead-correction.route`, `lead-draft.route`, `lead-next-action.route`,
+`lead-review.route`, `sales-journey.route`, `sales-journey`,
+`sample-style.route`.
+
+Nothing committed.
+
+# Google Lead Forms — Chunk 3C (2026-09-21)
+
+Two gaps are now closed:
+- **Internal:** GRAV answered Google, then stopped before processing.
+- **External:** Google never delivered at all.
+
+Both go through the one existing pipeline. Backend only; no frontend file was
+edited. `google_lead_form` remains **not deployable**, and `meta_lead_form`
+remains unavailable.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `services/marketing/leads/leadProcessingQueue.js` (new) | the durable promise, `$setOnInsert` only |
+| `services/marketing/leads/leadRecovery.service.js` (new) | internal sweep: stale receipts plus enquiries with no receipt, company by company |
+| `services/marketing/leads/leadReconciliation.service.js` (new) | the 60-day read-back, cursor, lease and coverage |
+| `models/CMS_Models/Marketing/MarketingLeadReconciliationState.js` (new) | per-binding cursor, `coveredUntil`, gap and counts. The cursor id and page token are `select:false` |
+| `services/marketing/channels/googleAdsClient.js` | `readLeadFormSubmissions`: one closed GAQL query, adapted to the normaliser's shape |
+| `services/marketing/leads/leadIngestion.service.js` | writes the promise before returning; holds a probable duplicate arriving by the other route |
+| `services/marketing/leads/googleLeadNormalisation.js` | `instantOf` (the API's zoned time), and custom answers kept as `CUSTOM_QUESTION` |
+| `constants/marketingLeadProcessing.js` | reason `possible_duplicate_submission`, `RECOVERY` limits, `COVERAGE_STATES` |
+| `constants/marketingCampaignCapabilities.js` | `google_lead_form` now names paused external creation as the remaining boundary |
+| `server.js` | a 5-minute internal sweep, which can be switched off via the `marketing-lead-recovery` job flag |
+| `test/marketing/google-lead-recovery.test.js` (new) | 27 tests |
+| `test/marketing/google-lead-ingestion.test.js` | test 19 rewritten to Google's real custom-field shape |
+| `test/marketing/google-lead-form-definition.test.js` | the capability wording assertion follows the new boundary text |
+
+Design decisions are in `docs/decisions/google-lead-form-verified-contract.md`,
+under "Chunk 3C decisions".
+
+## For Lane B
+
+- **Public coverage vocabulary:** `recovery_current`, `recovery_behind`,
+  `recovery_never_run`, `recovery_gap`, `recovery_unavailable`. It is returned by
+  `leadReconciliation.coverage({companyId})`.
+- Each entry carries `draftRef`, `state`, `label`, `means`, `lastCheckedAt`,
+  `checkedBackTo`, `unrecoverableBefore`, `recoveredEnquiries` and
+  `retentionDays`.
+- It contains no provider ids, database ids, binding refs, tokens or contact
+  details; test 22 pins this.
+- **No route is mounted yet.** Exposing coverage is a UI decision for whoever
+  builds the screen.
+- Reconciliation is not scheduled either, because it needs a campaign GRAV has
+  created (the next chunk).
+
+## Found, not fixed (separate work)
+
+- **`googleAdsClient.API_VERSION` is `v18`, which Google has sunset.** Available
+  versions are v22 (sunset October 2026) through v25. Every live Google Ads call
+  would fail today. The new read reuses the constant and does not upgrade it.
+- **`readDeliveryStates` queries `FROM audience_group`, `advertisement` and
+  `targeting_term`.** None of these are GAQL resources.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-lead-recovery` (3C) | **27 / 27** |
+| all six Google Lead Form suites | **149 / 149** |
+| `test/marketing` (full) | **1420 passed / 1420 total**, 33 suites (baseline 1393, plus 27 new) |
+| `test/crm` + `test/sales` (serial, `--runInBand`) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match |
+
+The nine failing suites are the baseline nine.
+
+During the full Marketing run, two regressions I had introduced surfaced and were
+fixed in source:
+- The boundary text lost the phrase "lead form".
+- I had removed `api_reconciliation` from ingestion's `NOT_IN_THIS_CHUNK`, but
+  that list describes the ingestion path, which still does not reconcile.
+
+Nothing committed.
+
+# Google Lead Forms — Chunk 3C.1: Google Ads v25 client and the operational reconciliation boundary (2026-09-21)
+
+The shared Google Ads client is moved off sunset v18 onto **v25** and proved
+against Google's v25 reference byte for byte. Chunk 3C's missing routes and
+scheduler are finished. Backend only; no frontend file was edited.
+`google_lead_form` stays **not deployable**, and `meta_lead_form` stays
+unavailable. Nothing was committed.
+
+**The full audit:** `docs/decisions/google-ads-api-v25.md` covers 13 defects,
+none of them previously caught by a test, including 7 that would have made every
+live create or read fail.
+
+## What Lane B needs to act on
+
+1. **New brief field `euPoliticalAdvertising`** on the Google Search brief.
+   - Values are `"does_not_contain"` or `"contains"`.
+   - Google now refuses any campaign create without this self-declaration
+     (`FieldError.REQUIRED`).
+   - It is the advertiser's legal statement, so GRAV never defaults it. An empty
+     value blocks mapping with `EU_POLITICAL_DECLARATION_MISSING`, exactly like
+     Meta's `specialAdCategory`.
+   - **Until the campaign builder offers this choice, no Google Search plan can
+     be deployed.** Google would reject it anyway.
+2. **Recovery status:** `GET /api/cms/marketing/lead-forms/recovery`, readable
+   by any Marketing role.
+   - It returns `{ recovery: { retentionDays, recoverableFrom, leadsRecorded,
+     duplicatesIgnored, awaitingProcessing, heldForReview, leadForms: [ { draftRef,
+     state, label, means, checkedThrough, lastCheckedAt, checkedBackTo,
+     unrecoverableBefore, recoveredEnquiries, duplicatesIgnored, attentionReason:
+     {code,label,means}|null } ] }, canRun, vocabulary }`.
+   - The vocabularies come with the response; do not hard-code them.
+3. **Check now:** `POST /api/cms/marketing/lead-forms/recovery/run`.
+   - Administrator or CEO only; `canRun` tells the client whether to offer it.
+   - Send an empty body. Any field is refused with a 400.
+   - If a check is already running it returns **409 `alreadyRunning: true`**.
+     That is an answer, not an error to retry.
+4. **Channel directory:** the Google Ads states may now carry the more precise
+   codes `CHANNEL_OAUTH_UNAVAILABLE`, `CHANNEL_API_ACCESS_UNAVAILABLE`,
+   `CHANNEL_ACCOUNT_BINDING_UNAVAILABLE` and `CHANNEL_API_VERSION_REJECTED`. They
+   map onto the existing `access_refused` and `unavailable` states.
+
+## For the administrator (external prerequisite, not code)
+
+Google sunset developer tokens on **9 September 2026**. API access now belongs to
+the **Google Cloud project that owns GRAV's OAuth client**.
+- Access was carried over automatically only "based on recent API activity".
+  GRAV was calling v18, so that cannot be assumed.
+- Someone must confirm in Google Cloud that this project has production access
+  (Explorer or above).
+- `GOOGLE_ADS_DEVELOPER_TOKEN` is no longer required or sent.
+- The lead-form capability names this prerequisite rather than hiding it behind
+  "creation not built".
+
+## Files
 
 | File | Change |
 |---|---|
-| `services/manufacturing/moListQuery.js` | **new.** Pure query policy: pagination, search escaping, enum filters, deadline-risk vocabulary. No mongoose, no clock of its own. |
-| `services/manufacturing/moListProjection.js` | **new.** Pure aggregation builder + row mapper. Derivation stages lifted verbatim from the route. |
-| `services/manufacturing/moList.service.js` | **new.** The persistence seam — the only file here that knows a database exists. |
-| `routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes.js` | `GET /` reduced from 266 lines to 23: take the query, hand back the page. |
-| `routes/CMS_Routes/pm/pmRequestsRoutes.js` | Phase 0 — nine TL fields added to the MRF `.select(...)`; `tlRejectedByName` additionally published. |
-| `docs/audits/project-manager-endpoint-access.md` | Phase 0 — PM decision method `POST` → `PATCH`; stale `:15` line refs; consumer correction (below). |
-| `test/project-manager/mo-list-query.test.js` | **new**, 41 pure tests. |
-| `test/project-manager/manufacturing-order-list.route.test.js` | **new**, 38 route tests. |
-| `test/project-manager/pm-requests-tl-state.route.test.js` | **new**, 6 route tests. |
+| `constants/marketingGoogleAdsApi.js` (new) | supported versions + sunset months, `SELECTED_VERSION = v25`, the only Google Ads URL builder, `ROLE_TO_RESOURCE` |
+| `services/marketing/channels/googleAdsErrors.js` (new) | `GoogleAdsFailure` → six GRAV access states; `versionedBase` |
+| `services/marketing/channels/googleAdsClient.js` | v25; no developer token, no `pageSize`; v25 field names; campaign keyset paging; real resources in `readDeliveryStates` (budget reported separately); budget read via `campaign`; lead read with whole-day bounds |
+| `services/marketing/channels/googleSearchBundle.js` | v25; no `requestId`, no developer token; per-operation v25 field allowlist; EU-declaration assertion; int64 as strings; no temporary names on composite resources |
+| `services/marketing/channels/channelHttp.js` | optional `classify` hook for provider error bodies |
+| `services/marketing/channels/channelSecrets.js` | developer token neither required nor read |
+| `services/marketing/channels/channelDirectory.service.js` | new codes → existing states |
+| `services/storePurchase/errors.js` | four new `CHANNEL_*` codes (additive) |
+| `services/marketing/deployment/googleSearchMapper.js` | `startDateTime`/`endDateTime`, `totalAmountMicros` for lifetime budgets, ad-group bid level fixed, EU declaration required |
+| `constants/marketingGoogleSearchDeployment.js` | `EU_POLITICAL_DECLARATION_TO_GOOGLE`, new mapping code |
+| `models/…/MarketingCampaignDraft.js`, `campaignDraft.service.js` | `euPoliticalAdvertising` on the Google brief |
+| `services/marketing/leads/leadReconciliation.service.js` | rewritten: `reconcileCompany` (the one reconciler), company lease, per-page already-held lookup, bounds, attention reasons, `status()` |
+| `services/marketing/leads/leadReconciliationScheduler.js` (new) | bounded hourly cycle |
+| `models/…/MarketingLeadReconciliationLease.js` (new) | one run per company |
+| `models/…/MarketingLeadReconciliationState.js` | stored page token removed; `attentionReason`; richer public view |
+| `constants/marketingLeadProcessing.js` | `ATTENTION_REASONS`; bounds for v25 paging |
+| `routes/CMS_Routes/Marketing/leadRecovery.js` (new) | the two routes |
+| `server.js` | mounts the router; registers the reconciliation interval beside the (separate) internal sweep |
+| `constants/marketingCampaignCapabilities.js` | `needs`: paused creation, the Cloud-project prerequisite, and real-delivery confirmation |
+| `docs/decisions/google-ads-api-v25.md` (new), `google-lead-form-verified-contract.md` | decision records |
 
-### The projection boundary
+## Tests changed, and why each one was out of date
+
+| Test | Change | Why |
+|---|---|---|
+| `advertising-channels`: "ordinary marketer …" | blanks `GOOGLE_ADS_REFRESH_TOKEN` instead of the developer token | the developer token is no longer required |
+| `advertising-channels`: two cursor tests | assert `LIMIT n+1` and the `campaign.id >` keyset | v25 refuses page sizes |
+| `google-search-deployment` test 14 | URL `/v25/` | version |
+| `google-search-deployment`, `deployment-readiness` fixtures | `euPoliticalAdvertising: "does_not_contain"` | required by Google; never defaulted |
+| `google-lead-recovery` §2–3 | rewritten against `reconcileCompany`, and a new-row bound test added | no stored page token; one reconciler. The client-read tests moved into the contract suite |
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `google-ads-v25-contract` (new) | **30 / 30** |
+| `google-lead-reconciliation-ops` (new) | **17 / 17** |
+| `google-lead-recovery` (3C) | **26 / 26** |
+| all Google Lead Form suites + contract | **195 / 195**, 8 suites |
+| `test/marketing` (full) | **1466 passed / 1466 total**, 35 suites. Baseline 1420, +30 contract, +17 ops, −1 net in recovery (2 client tests moved out, 1 bound test added) |
+| `test/crm` + `test/sales` (serial, `--runInBand`) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match |
+| `npm test` (node:test services) | 1904 / 1905. The one failure is `services/salesJourneyOutcome.test.js` ("advancing clears the hold": expected `poContract`, got `purchaseInvoice`). It depends on `salesJourneyProgress` and `constants/crm.js`, which were already modified in the working tree by concurrent Sales work. 3C.1 touched neither. |
+
+Nothing committed.
+
+# Campaign Plan review and approval contract (2026-09-21)
+
+Backend only; no frontend file edited. Nothing external is created or
+activated. Nothing committed.
+
+## What Lane B must change
+
+### 1. Submit now requires the revision being submitted
 
 ```
-route  →  moList.service.js  →  moListProjection.js  (pure: pipeline + mapper)
-                             →  moListQuery.js       (pure: what may be asked for)
+POST /api/cms/marketing/campaign-drafts/:id/submit
+{ "expectedRevision": <campaignDraft.revision the user is looking at> }
 ```
 
-Query policy and projection are pure and independently testable; persistence is
-one file with the model injected. The derivation stages — work-order count,
-quantities, completion percentage, `derivedStatus` and the four-value
-`displayStatus` — were **lifted verbatim**, comments included. This is a
-relocation, not a rewrite: no stored WorkOrder status is reinterpreted, and no
-`ManufacturingOrder` model was created. A manufacturing order remains a
-sales-approved `CustomerRequest`.
-
-### Preserved response contract
-
-All sixteen established row fields keep their name, fallback and meaning:
-`_id`, `moNumber`, `customerInfo.name`, `customerInfo.email`, `finalOrderPrice`,
-`totalQuantity`, `workOrdersCount`, `completedQuantity`, `completionPercentage`,
-`status`, `displayStatus`, `priority`, `createdAt`, `requestType`,
-`measurementName`, `deliveryDeadline`, `estimatedCompletion`. The envelope
-(`success`, `manufacturingOrders`, `pagination{page,limit,total,pages}`) and the
-URL are unchanged.
-
-**Added, additively:** `deadline` (the effective date) and `deadlineRisk`.
-
-**One value changed deliberately:** `completionPercentage` is now bounded to
-0–100. It previously published the raw ratio, so a work order re-issued after a
-short delivery — 25 units completed against a quantity of 10 — reported
-`250`. `completedQuantity` is untouched, and the bound cannot move a status
-(see the correction pass below).
-
-The strongest compatibility evidence: Chunk 1's contract tests, written against
-the old inline implementation, pass **unmodified**.
-
-### Query normalisation — observed old vs new
-
-Measured against the real route before and after, not assumed:
-
-| Input | Before | After |
-|---|---|---|
-| `?page=abc`, `?limit=abc`, `?page=0`, `?page=-3`, `?limit=0`, `?limit=-5` | **500** | 200, defaults applied |
-| `?limit=1000000000` | 200, honoured verbatim | 200, clamped to 100 |
-| `?page=1e308` | 200, but `skip: Infinity` reached the database | 200, page clamped to 1,000,000 |
-| `?limit=2.7` | 200, floored to 2 | unchanged |
-| `?search=(`, `?search=[a-z`, `?search=*` | **500** (invalid regex) | 200, literal, 0 rows |
-| `?search=.*` | matched the whole register | literal, 0 rows |
-| `?search="  Cust 1  "` | 0 rows (untrimmed) | finds it |
-| `?search=MO-REQ-0001` | 0 rows | finds `REQ-0001` |
-| `?status=bogus` | 0 rows | unchanged — never broadens |
-
-Rules: page/limit via `Number()` (not `parseInt`, which accepts `"12abc"`);
-non-numeric, zero and negative fall back to the default, a positive fraction is
-**floored** (2.7 pages is page 2), and anything oversized is **clamped**.
-**Default limit 12** (unchanged), **maximum limit 100**, **maximum page
-1,000,000**. Clamped rather than refused so no caller can break, with
-`pagination.page` and `pagination.limit` reporting what was applied. Bounding
-both factors is what makes `skip` safe: the largest it can be is
-(1,000,000 − 1) × 100 = 99,999,900, well inside the safe-integer range. Search is trimmed, regex-escaped,
-and a leading `MO-` is stripped for `requestId` comparison only — the stored
-value is untouched. Sorting is `{ updatedAt: -1, _id: -1 }`, the `_id`
-tie-breaker making paging stable when timestamps collide.
-
-### Filters
-
-Both optional and additive; absent, they change nothing.
-
-- `priority` — `low` | `medium` | `high` | `urgent`. Joins the base match, so it
-  narrows before the work-order lookup.
-- `deadlineRisk` — see below. Derived, so matched after the computing stages but
-  **before `$facet`**, which is what makes `pagination.total` count the filtered
-  set.
-
-An unrecognised value for any filter is passed through rather than dropped, so
-it matches nothing. Dropping it would turn a typo into "return everything".
-
-### Deadline-risk vocabulary
-
-Effective deadline = `customerInfo.deliveryDeadline ?? estimatedCompletion` —
-the choice the register already made client-side, moved server-side so filtering
-and display judge an order by the same date.
-
-| Value | Meaning |
+| Case | Answer |
 |---|---|
-| `closed` | `displayStatus` is `completed` or `cancelled` — checked first, so a finished order with a March deadline is finished, not late |
-| `none` | no deadline recorded |
-| `overdue` | deadline < reference instant |
-| `due_soon` | reference instant ≤ deadline < reference + **7 days** |
-| `on_track` | later than that |
+| body missing `expectedRevision`, or not a whole number ≥ 1 | **400** `VALIDATION`, field `expectedRevision` |
+| any other body field | **400** `VALIDATION`, `details.unknown` names it |
+| plan changed since that revision | **409** `CAMPAIGN_DRAFT_REVISION_CONFLICT`, `details.currentRevision` / `sentRevision`. Reload and show the user what changed |
+| a repeat of the accepted submission of that same revision (a double-click, or two people pressing Submit at once) | **200** with `duplicate: true` and the same plan |
+| submitted meanwhile from a **newer** revision | **409** `CAMPAIGN_DRAFT_REVISION_CONFLICT`. What went for a decision is not what this user reviewed |
+| plan incomplete | unchanged: **400** `VALIDATION` with `details.missing`, or `CAMPAIGN_DRAFT_ADVERTISING_INCOMPLETE` for an advertising plan |
 
-The 7-day horizon matches the week the register already colours as risk. It is
-mechanical — one date against one instant — and models no capacity or
-production intelligence. The reference instant is injected, so tests name their
-own clock and none reads the wall clock.
+The fence is atomic: the revision is part of the history reservation and of the
+conditional update, so an edit and a submit racing on one revision can never
+both succeed. **Enforced at the service boundary for every caller**: the
+route, `scripts/marketing/seed-demo.js` and tests all pass it. There is no
+unfenced branch and no state-only duplicate. See the follow-up below.
 
-### Cross-department consumers
+### 2. Readiness and Submit now agree
 
-Re-checked exhaustively; the Chunk 2 audit was wrong and is corrected in place.
-**Only two call sites read this list, both Project Manager**
-(`dashboard/page.js:178`, `production/manufacturing-orders/page.js:98`). CEO
-touches only `/stats/overview`. Cutting and Packaging use their own routers; the
-two schedule screens call `sales-schedule/` and `production-schedule/`
-manufacturing-orders, which are different routers. Authentication is unchanged
-and **no department restriction was added** — a test pins that a
-`cutting_master` session still reads the register.
+`GET …/deployment-readiness` → `approvalReady` is computed from the **same**
+submission gate that Submit and Approve enforce (`deploymentReadiness.submissionGate`).
+For the same `evaluatedRevision`, `approvalReady: true` ⇔ Submit accepts.
 
-### MRF TL-field dependency (Lane B)
+New plan-level findings, which appear in `sections.missingFromPlan`:
+- `CONVERSION_GOAL_MISSING`, raised on **every** plan, email-only included. It is
+  plan-level (`channel: null`) when no advertising channel already raised it.
+- `PLAN_NAME_MISSING` and `OBJECTIVE_MISSING`, for legacy rows; creation
+  already requires both.
 
-`GET /api/cms/pm/requests` published `approverName` and the whole
-`tlApproved`/`tlRejected` trail but never selected those fields, so every MRF
-arrived as `tlApproved: false, tlRejected: false, approverName: ""` — including
-ones approved months earlier. All nine already existed on the schema; they are
-now loaded, and `tlRejectedByName` is additionally published so a refusal names
-its decider as an approval already did. No schema change, no MRF authority
-change, still read-only on this desk. Proven as a regression: removing the
-fields from the `.select` again fails three of the six new tests.
+`evaluatorVersion` is now `readiness-1.1.0`.
 
-### Verification
+### 3. The plan detail says what THIS viewer may do
 
-- `npx jest test/project-manager` — **144/144 pass** across 5 suites
-  (manufacturing-order-list 38, mo-list-query 41, pm-access-boundary 44,
-  manufacturing-order-stats 15, pm-requests-tl-state 6).
-- `npx jest test/access test/store-purchase` — **242/242 pass.**
-- Full backend suite: 22 suites / 276 tests fail — the same pre-existing set
-  (accountant budget ×14, crm ×7, hr-ai ×1). Passing rose by exactly the tests
-  added — **85** since the pre-3A Project Manager baseline of 59, counting the
-  correction pass below (41 pure + 38 list route + 6 MRF TL). No suite outside `test/project-manager/` exercises either
-  changed router.
-- `node --check` clean on all changed files; `git diff --check` clean in both
-  repositories.
+`GET /api/cms/marketing/campaign-drafts/:id` adds a `viewerActions` object:
 
-### Unresolved, carried to Chunk 3B
-
-`GET /:id` and `GET /:id/detailed` derive their own status and progress
-independently of this projection, so the register and the detail page can still
-disagree about the same order. Reconciling them is Chunk 3B's first task, and it
-should consume `moListProjection` rather than re-deriving. No index was added:
-the query shape did not change enough to justify one without measurement, and
-that evidence belongs with 3B's read work.
-
-
-### Chunk 3A correction pass (3 Sep 2026)
-
-Two defects in the work above, both found in review, both real.
-
-**1. Pagination could still produce an unsafe skip.** Clamping the page *size*
-was not enough. `skip` is `(page - 1) * limit`, so `?page=1e308` produced
-`skip: Infinity`, and any page above `Number.MAX_SAFE_INTEGER` produced a skip
-that could not be represented exactly. Both reach the database as an invalid
-`$skip` — the same 500 this normalisation was introduced to prevent, arriving by
-a different door, which made the "malformed pagination cannot produce a 500"
-claim false as written.
-
-`MAX_PAGE = 1_000_000` is now exported from `moListQuery.js` and applied
-alongside `MAX_LIMIT`. Normalised extremes:
-
-| Input | Applied page | skip |
-|---|---|---|
-| `1e308`, `Number.MAX_VALUE`, `MAX_SAFE_INTEGER + 2`, `MAX_PAGE + 1` | 1,000,000 | 99,999,900 |
-| `MAX_PAGE` | 1,000,000 | 99,999,900 |
-| `2.7` | 2 | floored, unchanged |
-| `0`, `-3`, `abc`, absent | 1 | 0 |
-
-A cross-product test asserts `skip` is a non-negative safe integer and `page` is
-within `[1, MAX_PAGE]` for every combination of two dozen hostile inputs. The
-`normalisePagination` doc comment claimed fractional values "resolve to the
-defaults", which was never true — they floor — and has been corrected.
-
-**2. `completionPercentage` was unbounded.** The integration test named
-"completion percentage is finite and bounded" asserted `>= 0` and never the
-upper bound, so its own over-completion fixture published `250` unnoticed.
-
-Bounded to 0–100 **at the canonical projection boundary**, in two places that
-fail independently:
-
-- in the aggregation, so anything filtering or sorting on the field sees the
-  bounded value and the status derivation reads the same number the API
-  publishes;
-- in `projectRow`, defensively, so a row arriving another way cannot publish
-  `250`, `-5` or `NaN`. A missing or unreadable value reads as `0`, matching the
-  "no work orders yet" answer rather than inventing progress.
-
-`completedQuantity` is unchanged — the units behind the figure are still exact,
-only the percentage is bounded. **No status moved:** `derivedStatus` and
-`displayStatus` test `>= 100` and `>= 70`; anything clamped down to 100
-satisfied `>= 100` before and after, and anything clamped up to 0 failed every
-branch before and after. Pinned by a test rather than left as an argument.
-
-Each bound was verified to be load-bearing by removing it and watching tests
-fail: page clamp → 4 failures; mapper bound → 2; aggregation bound → 2. The
-aggregation case matters most, because the mapper masks it for the published
-value — a test reads the raw pipeline row to catch it.
-
-Also corrected: a stale comment in `moListProjection.js` claiming six frontend
-surfaces consume this endpoint. The Chunk 3A consumer audit established two
-exact call sites.
-
-**Verification:** `test/project-manager` **144/144**; `test/access` +
-`test/store-purchase` **242/242**; `node --check` clean on all three service
-files; `git diff --check` clean. Pre-existing failures unchanged.
-
----
-
-## Project Manager professionalisation — Chunk 3B (3 Sep 2026)
-
-Canonical manufacturing-order **detail summary**. Backend only. The frontend
-detail page is untouched; its decomposition is Lane B's, after this contract is
-stable.
-
-### Files
-
-| File | Change |
-|---|---|
-| `services/manufacturing/moSummary.service.js` | **new.** One order, eight canonical fields, reusing the list's derivation. |
-| `services/manufacturing/moListProjection.js` | `buildSummaryPipeline()` + `projectSummary()`; `derivedStatus` published additively on list rows. |
-| `routes/.../manufacturingOrderRoutes.js` | Two `/:id/detailed` defects fixed; canonical fields spread onto all three detail responses. |
-| `test/project-manager/manufacturing-order-detail-contract.route.test.js` | **new**, 22 tests. |
-| `docs/handoff/latest-implementation.md`, `docs/product/project-manager-professionalization.md` | this record; Phase 0 count corrections. |
-
-### Verified endpoint consumers
-
-Re-audited across the whole frontend before anything was changed:
-
-| Endpoint | Consumer | Note |
-|---|---|---|
-| `GET /:id` | `app/project-manager/dashboard/production/work-orders/[id]/page.js:199` | the work-order detail page |
-| `GET /emplloyeeTracking/:id` | `app/project-manager/dashboard/production/manufacturing-orders/[id]/page.js:294` | the PM MO detail page |
-| `GET /:id/detailed` | **none** | no caller anywhere in `grav-cms` |
-
-The misspelling in `/emplloyeeTracking/` is **load-bearing**: it is the URL the
-live detail page calls. It was not renamed, redirected or aliased.
-
-That `/:id/detailed` has no caller is why its 500 went unnoticed for so long —
-and why it was safe to repair rather than work around.
-
-### The canonical shared summary
-
-`summariseManufacturingOrder(id, { now })` returns:
-
-```
-totalQuantity  workOrdersCount  completedQuantity  completionPercentage
-derivedStatus  displayStatus    deadline           deadlineRisk
+```json
+"viewerActions": {
+  "evaluatedRevision": 4,
+  "submittedByYou": false,
+  "edit":    { "allowed": true,  "reasonCode": null, "reason": null },
+  "submit":  { "allowed": false, "reasonCode": "PLAN_INCOMPLETE", "reason": "This plan is not ready for a decision yet. It still needs conversionGoal." },
+  "approve": { "allowed": false, "reasonCode": "SELF_APPROVAL", "reason": "You submitted this plan, so approving it needs somebody else. You can still return or reject it." },
+  "return":  { … }, "reject": { … }, "cancel": { … }
+}
 ```
 
-It reuses `derivationStages()` and `deadlineStages()` from the list projection —
-**one status formula, one completion formula, one deadline vocabulary, one
-percentage bound, one injected clock.** No second implementation, no
-`ManufacturingOrder` model; an order is still a `CustomerRequest`.
+**Reason codes:** `NOT_AVAILABLE_IN_STATE`, `MARKETING_ONLY`, `APPROVER_ONLY`,
+`PLAN_INCOMPLETE`, `SELF_APPROVAL`, `SUBMITTER_UNKNOWN`, `IDENTITY_UNVERIFIED`.
 
-It matches on `_id` **alone**. `buildListPipeline` opens with
-`status: "quotation_sales_approved"`, which is right for the register but wrong
-here: the detail endpoints never imposed that filter and adding it would 404
-orders their pages can open today. A test pins that.
+**Rendering rules:**
+- Show each `reason` as-is.
+- Send `evaluatedRevision` back as Submit's `expectedRevision`.
+- Self-approval compares the signed-in user's **id** with the recorded
+  submitter's id. Two people with the same name are different people. No id or
+  email is ever published: only `submittedByYou` and the sentence.
+- `viewerActions` is a courtesy. Every command re-checks role, state, gate and
+  self-approval, so a forged "allowed" changes nothing.
+- The existing `campaignDraft.availableActions` is unchanged. It describes the
+  state machine, not the viewer.
 
-**Published additively on all three detail responses, and on list rows.** The
-top-level `status` on each endpoint is left exactly as it was, because the three
-do not agree on what it means:
-
-| Endpoint | its `status` is |
-|---|---|
-| `/:id` | the CustomerRequest's **stored** status |
-| `/emplloyeeTracking/:id` | the CustomerRequest's **stored** status |
-| `/:id/detailed` | its **own legacy derivation**, in its own vocabulary (`pending` / `planning` / `in_production` / `completed` — note `in_production`, not one of the canonical four) |
-
-Overwriting any of them would silently change what an existing caller receives.
-Nested legacy fields (`progress`, `workOrderStats`) are likewise untouched. The
-new top-level fields are the migration boundary Lane B can consume later.
-
-`completedQuantity` is the real completed-unit count and **may exceed** the
-ordered quantity after a re-issue; only `completionPercentage` is bounded (0–100).
-
-### `/:id/detailed` — old versus new
-
-| | Before | After |
-|---|---|---|
-| Any order **with a work order** | **500** `TypeError: Assignment to constant variable` | 200 |
-| Raw-material requirements | always `[]` | the real allocations |
-| Aggregate `progress.units.total` | never reached | sum of work-order quantities |
-
-The 500 was a shadowed accumulator: `const totalQuantity = wo.quantity` inside
-the work-order mapper shadowed the outer `let totalQuantity`, and the next line
-did `totalQuantity += totalQuantity` — an assignment to a `const`. An order with
-no work orders never entered the mapper, which is why the route appeared to
-work. The inner binding is now `workOrderQuantity`.
-
-The empty raw-material summary was a `.select(...)` that omitted `rawMaterials`
-while the code below read `wo.rawMaterials`. The field is now selected. Both
-were reproduced by failing tests before either was touched.
-
-### Query count and index evidence
-
-Measured with `mongoose.set("debug")` per request:
-
-| Endpoint | Database operations |
-|---|---|
-| `/:id` | `customerrequests.findOne` + `workorders.find` + **1** `customerrequests.aggregate` |
-| `/:id/detailed` | same |
-| `/emplloyeeTracking/:id` | same |
-
-**One additional aggregation per detail request, fixed cost, no N+1** — the work
-orders arrive through the `$lookup` inside `derivationStages()`, the same join
-the register makes for a whole page.
-
-`explain("queryPlanner")`, with the model's declared indexes built:
-
-- the summary's `$match: { _id }` resolves to **IDHACK** (primary-key fast path);
-- the `$lookup`'s correlated match on `customerRequestId` resolves to **IXSCAN**
-  on the **existing** `customerRequestId_1_status_1` index, on its leading field.
-
-**No index is proposed.** A first explain showed COLLSCAN, but that was an
-artifact of the in-memory test database not having built the declared indexes
-yet; after `syncIndexes()` it is an IXSCAN. Recorded because the misleading
-first reading is exactly the kind of evidence that gets an unnecessary index
-added.
-
-### Tests
-
-`test/project-manager` — **166/166 pass** across 6 suites (detail-contract 22,
-list 38, query 41, access-boundary 44, stats 15, MRF TL 6).
-
-The contract suite's core is a matrix: for one stored order, the list row and
-all three detail responses are compared **field by field** on the eight
-canonical values — against each other, not against constants, so a formula that
-drifts fails even when each endpoint stays internally consistent. Covered: no
-work orders, scheduled, planned, partial, completed, over-completion, all
-cancelled, delivery deadline, estimate fallback, no deadline, invalid ObjectId
-(400), missing order (404), anonymous (401).
-
-`test/access` + `test/store-purchase` — **242/242 pass.**
-
-Full backend suite: **22 suites / 276 tests fail — the same pre-existing set**
-(accountant budget x14, crm x7, hr-ai x1). Passing rose 2213 to 2235, exactly
-the 22 tests added. No new failures.
-
-### Remaining for Lane B
-
-The frontend detail page still reads the legacy nested shapes. It can now switch
-to the eight top-level canonical fields, which are guaranteed to match the
-register. Nothing forces that migration: both remain published.
-
----
-
-## Project Manager professionalisation — Chunk 4A (3 Sep 2026)
-
-Work-order planning integrity **audit**. Documentation and characterisation
-tests only — **no production behaviour was changed.** Chunk 4B is blocked on a
-product decision, and the packet for it is §10 of the audit.
-
-### Files
+## Files
 
 | File | Change |
 |---|---|
-| `docs/audits/project-manager-work-order-planning-integrity.md` | **new.** The audit: lifecycle vocabulary, endpoint contract table, partial-failure states, stock/conversion authority, query findings, 16 ranked defects, compatibility constraints, decision packet. |
-| `test/project-manager/work-order-planning-characterization.route.test.js` | **new**, 52 tests pinning current behaviour. |
-| `docs/handoff/latest-implementation.md` | this record. |
+| `services/marketing/campaignDrafts/deploymentReadiness.service.js` | plan-level name/objective/goal findings; `submissionGate()` |
+| `constants/marketingDeploymentReadiness.js` | `PLAN_NAME_MISSING`, `OBJECTIVE_MISSING`; `readiness-1.1.0` |
+| `services/marketing/campaignDrafts/campaignDraft.service.js` | Submit fence (`expectedRevision`, `submittedFrom`); Submit and Approve use the gate; `selfApprovalProblem` shared by enforcement and `viewerActionsFor`; `detail({ user })` |
+| `routes/CMS_Routes/Marketing/campaignDrafts.js` | Submit requires `expectedRevision` and refuses other fields; detail passes the viewer and returns `viewerActions` |
+| `test/marketing/campaign-plan-review.test.js` (new) | 19 tests |
+| `test/marketing/campaign-drafts.test.js` | the route helper sends the revision the user viewed on Submit, as a client does; the double-submit test sends the same revision twice; the company-B table sends a revision to Submit only |
 
-### How to read the characterisation suite
+## Verification
 
-Assertions describing behaviour that is **wrong** are labelled
-`CHARACTERISATION — UNSAFE` and name what a correct implementation should do.
-Chunk 4B is expected to delete or invert them. A green run means "the system
-still behaves as the audit recorded", **not** "the system is correct".
-
-### Headline findings
-
-Three data-corruption paths, all returning HTTP 200 or a bare 500:
-
-1. **Splitting is a one-shot capability database-wide.** Split children are
-   created with no `workOrderNumber`, which carries a **unique, non-sparse**
-   index. The first split anywhere stores `null`; every later split — any work
-   order, any user — dies on `E11000 duplicate key … workOrderNumber: null`.
-2. **`quantity: true`** passes both guards and mongoose casts it to 1 — a
-   ten-unit order silently becomes one unit, reported as success.
-3. **Omitting `quantity`** unsets the work order's quantity entirely (mongoose
-   treats `undefined` as unset, so `min: 1` never fires) and marks it `planned`.
-
-Plus: `complete-planning` validates nothing and overwrites any state including
-`completed`/`cancelled`; allocation replay shrinks the material requirement
-(100 → 60 → 36 → 21.6); no planning mutation is authorised beyond "is signed in"
-or audited at all; the computed producible limit is calculated then discarded;
-a missing unit conversion silently passes the number through unconverted; and
-`GET /:id/planning` is N+1 in raw items while the allocation route beside it
-already batches.
-
-**Stock authority is sound** — planning never deducts or reserves; Store remains
-authoritative. That should be preserved.
-
-### Suspicions disproven
-
-Split-allocation replay does **not** create a second split (the first call sets
-`quantity`, so the replay computes a zero remainder). Allocation does not touch
-stock. Duplicate operation ids do not double-apply. Each is recorded as a
-passing test so the belief is not re-inherited.
-
-### The decision Chunk 4B needs
-
-`WorkOrder.status` conflates six concepts. *Planning in progress*, *ready to
-schedule* and *released to production* are not representable at all;
-`scheduled` means "planning complete", "ready to schedule" and "on the schedule"
-simultaneously; `ready_to_start` exists in the enum and is written by nothing.
-
-Four options are set out with migration and compatibility effects. **Recommended:
-a separate additive `planningState` field, with anything derivable computed in
-the projection layer instead of stored.** A full lifecycle rewrite is explicitly
-not recommended — the stored statuses are read by the register, the detail
-projections, the schedule and the scan floor.
-
-Mechanism recommendations: orchestration endpoint **yes** (additive),
-idempotency key **yes** (reuse the Store & Purchase convention), conditional
-state transitions **yes** (but this is a real behaviour change needing sign-off),
-MongoDB transaction **not yet** (confirm replica-set support first), immutable
-planning history **yes** (reuse `recordChange`, do not build a second audit).
-
-Defects 1, 2, 3, 11, 13 and 14 are validation bugs with no product question
-attached and can be fixed without waiting on the decision. **1, 2 and 3 are
-data-corruption paths and should go first.**
-
-### Verification
-
-- New suite — **52/52 pass.**
-- `test/project-manager` — **218/218 pass**, 7 suites (baseline was 166/6).
-- `test/access` + `test/store-purchase` — **324/324 pass.**
-- `node --check` clean; `git diff --check` clean in both repositories.
-
----
-
-## Project Manager professionalisation — Chunk 4A.1 (3 Sep 2026)
-
-**Emergency data-integrity corrections** to one endpoint. Scoped deliberately:
-four proven defects, nothing else. **No lifecycle decision has been approved and
-Chunk 4B has not started.**
-
-### Files
-
-| File | Change |
+| Suite | Result |
 |---|---|
-| `routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js` | `PUT /:id/allocate-raw-materials` only — strict quantity validation, stored-quantity guard, ID-derived split-child number, stable scaling basis. |
-| `test/project-manager/work-order-planning-characterization.route.test.js` | 5 unsafe characterisations converted to 16 regressions; 22 unsafe findings left untouched. |
-| `docs/audits/project-manager-work-order-planning-integrity.md` | §11 added; defects 1, 2, 3, 5 marked FIXED. |
-| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+| `campaign-plan-review` (new) | **19 / 19**: concurrent submitters, stale revisions, duplicate Submit, stale-after-resubmit, edit/submit race, email-only plans, self-approval, same-name users, unverifiable identity, no raw ids, company isolation |
+| `campaign-drafts` + `deployment-readiness` | **260 / 260** |
+| `test/marketing` (full) | **1485 passed / 1485 total**, 36 suites (1466 + 19) |
+| `test/crm` + `test/sales` (serial, `--runInBand`) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match |
 
-### Old versus new
+## Follow-up: the fence at the service boundary (2026-09-21)
 
-| Defect | Before | After |
-|---|---|---|
-| omitted `quantity` | 200; stored quantity **unset**; status → `planned` | **400**, nothing written |
-| `quantity: true` | 200; cast to 1 — ten units became one | **400**, nothing written |
-| `"abc"` / `{}` | **500** (mongoose cast failure) | **400**, nothing written |
-| split children | no `workOrderNumber`; first stored `null`, every later split anywhere died on `E11000` | `WO-<last 8 of _id>` before first save |
-| allocation replay | 100 → 60 → 36 → 21.6 | 100 → 60 → 60 → 60 |
+`campaignDraft.service.submit()` now requires a valid `expectedRevision` from
+every caller.
+- Missing, `null`, `undefined`, `NaN`, non-integer or `< 1` is refused as
+  `VALIDATION` (`field: expectedRevision`) before the plan is read.
+- The optional unfenced branch and its "already awaiting approval, so
+  duplicate" answer are removed.
+- Against an already-submitted plan, only a repeat of the exact revision that
+  was accepted returns `duplicate: true`. Any other revision is
+  `CAMPAIGN_DRAFT_REVISION_CONFLICT`, and so is a missing one, which is refused
+  as `VALIDATION` first.
 
-Accepted `quantity`: a finite JSON **number** > 0 and ≤ the work order's current
-quantity. Numeric strings refused; **fractional quantities still legal** (the
-schema says `min: 1`, not integer). A work order with no usable stored quantity
-is refused rather than divided by.
+**Callers updated:**
+- `scripts/marketing/seed-demo.js`: all three Submit calls pass the stored
+  plan's current revision. A re-run may have moved it past 1.
+- Service tests in `campaign-drafts`, `deployment-readiness`,
+  `google-search-deployment`, `meta-deployment-foundation` and
+  `meta-paused-creation`:
+  - each passes the revision the plan actually has at that moment (2 after an
+    edit, 5 after a return and re-edit, 1 for a retry of an interrupted
+    submit);
+  - no behavioural assertion was changed or removed;
+  - the actor-unverified loop sends a valid revision, so the identity check is
+    still the reason it refuses.
 
-Split number format `WO-<last 8 of _id>` is the fallback the codebase already
-displays (`productionSyncService.js:106`, `dispatchRoutes.js:325`) and the short
-id the barcode `WO-<shortId>-<unit>` is built from — no second counter, and it
-cannot be read as a scan because all ten parsers require `parts.length >= 3`.
+**New proofs** (`campaign-plan-review` 20–23) compare the stored plan document
+and its complete history before and after:
+- omitted, null or malformed revision: nothing written;
+- stale revision on a draft (older or from the future): nothing written;
+- an unfenced, null or post-submission revision on a submitted plan: refused,
+  nothing written;
+- the exact accepted revision: `duplicate: true`, nothing written.
 
-### Preserved
-
-Store remains the stock authority (no reservation or deduction, proven by test);
-allocation-status vocabulary; `planned` vs `partial_allocation`; split/no-split
-semantics; the response envelope; the unique index. Sufficiency enforcement (#8)
-was deliberately **not** added — it is Chunk 4B policy.
-
-### A larger pre-existing finding, reported not fixed
-
-**Neither canonical work-order generator sets `workOrderNumber`**
-(`quotationRoutes.js:1868` and `:2768`), there is no pre-save hook or counter,
-and the field is uniquely and non-sparsely indexed. Proven: two numberless work
-orders collide with `E11000`. Fixing that means changing a Sales write path and
-choosing a scheme for existing records — the broader numbering migration this
-chunk was told to report rather than invent. **A separate decision.** The split
-correction needed no migration and changed no existing document.
-
-### Still unsafe
-
-**22 findings remain pinned** as `CHARACTERISATION — UNSAFE`, including no
-authorization beyond authentication, no audit, `complete-planning` validating
-nothing and overwriting any state, replay destroying `plannedAt`, the discarded
-sufficiency limit, silent unit-conversion pass-through, and the N+1 planning
-read. Nothing here makes the rest of planning safe.
-
-### Verification
-
-Regressions were proven to fail against the old implementation first (12 failing),
-then implemented.
-
-- Planning suite — **62/62 pass** (was 52; +16 regressions, −5 converted).
-- `test/project-manager` — **228/228**, 7 suites (baseline 218).
-- `test/access` + `test/store-purchase` — **344/344**.
-- `node --check` clean; `git diff --check` clean in both repositories.
-
----
-
-## Project Manager professionalisation — Chunk 4A.2 (3 Sep 2026)
-
-**Canonical work-order identity.** One model-level invariant replacing the
-four-call-site gap. **No migration was executed.** Chunk 4B has not started.
-
-### Files
-
-| File | Change |
+| Suite | Result |
 |---|---|
-| `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js` | `pre("validate")` invariant + `WorkOrder.canonicalNumber(id)` static. |
-| `routes/.../WorkOrder/workOrderRoutes.js` | 4A.1's explicit split-path assignment **removed** — the model covers it. |
-| `test/project-manager/work-order-identity.test.js` | **new**, 29 tests. |
-| `test/project-manager/work-order-planning-characterization.route.test.js` | split assertions moved to the canonical format. |
-| `scripts/migrations/work-order-number-backfill.js` | **new**, dry-run by default, never executed. |
-| `docs/audits/…-work-order-planning-integrity.md` | §12 added; the 4A.1 "larger finding" marked resolved. |
-| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+| `campaign-plan-review` + `campaign-drafts` + `deployment-readiness` | **283 / 283** |
+| `test/marketing` (full) | **1489 passed / 1489 total**, 36 suites (1485 + 4) |
+| `test/crm` + `test/sales` (serial, `--runInBand`) | **42 failed / 792 passed / 834 total**, 9 suites — exact baseline match |
 
-### The defect, and the invariant
+Nothing committed.
 
-`workOrderNumber` is declared unique, and **not one** production creation path
-assigned it: `quotationRoutes.js:1868`, `:2768`,
-`returnRequestRoutes.js:340`, `:375`. No hook, no counter. Proven: two
-numberless work orders collide with `E11000 … workOrderNumber: null`, so
-creation was capped at one numberless document.
+# Google lead forms — paused creation, proof-account only (2026-09-21)
 
-The rule now lives on the model — a `pre("validate")` hook giving a **new**
-document `WO-<full 24-character ObjectId>` before its first write — so a
-creation path added tomorrow cannot reintroduce it. `validate`, not `save`,
-because it is the only document hook that fires for every persistence API in
-use here, `insertMany` included. Guarded on `isNew`, so **no existing record is
-ever renamed**. Not marked `required`, so a legacy numberless document can
-still be saved for an unrelated edit.
+Backend only. No frontend file edited, nothing committed. `google_lead_form`
+remains **not deployable**; decisions and what remains unverified are in
+`docs/decisions/google-lead-form-paused-creation.md`.
 
-**Full ObjectId, not its last eight characters:** the 8-char form some readers
-display is a presentation fallback. As an identity it keeps 32 bits, and 32 bits
-behind a unique index is a collision waiting for enough rows.
+## Lane B contract
 
-### Compatibility
+### 1. Draft write (POST and PATCH, unchanged routes)
 
-The scan subsystem never reads `workOrderNumber` — every barcode is built from
-`_id.slice(-8)` and resolved the same way — so it does not move. Tested: the
-bare number is not parsed as a scan (two segments; parsers need three);
-`WO-<id>-001` and `WO-<id>-007-3` parse; **no parser asserts a segment length**;
-legacy and explicitly numbered records read exactly as before.
+A Google brief may now say `campaignType: "google_lead_form"` and carry
+`googleLeadForm`, beside the Search creative it still needs:
 
-**Follow-up, since corrected:** `returnRequestRoutes.js` composed a barcode from
-`workOrderNumber`. It produced `"undefined-001"` before and `WO-<full id>-001`
-after — which parses and then resolves to nothing. Fixed in the corrections
-below.
+```json
+{
+  "channel": "google_ads",
+  "campaignType": "google_lead_form",
+  "googleSearch": { "headlines": ["…","…","…"], "descriptions": ["…","…"], "keywordThemes": ["…"] },
+  "googleLeadForm": {
+    "businessName": "GRAV Clothing",
+    "headline": "Request a uniform quote",
+    "description": "Tell us what your team needs and we will price it.",
+    "callToAction": "GET_QUOTE",
+    "callToActionDescription": "A written quote within two working days.",
+    "privacyPolicyUrl": "https://grav.in/privacy",
+    "postSubmitHeadline": "", "postSubmitDescription": "", "postSubmitCallToAction": "VISIT_SITE",
+    "fields": ["FULL_NAME", "EMAIL", "PHONE_NUMBER"],
+    "qualifyingQuestions": ["COMPANY_SIZE"]
+  },
+  "bidding": { "strategy": "target_cost_per_action", "target": { "amount": 450, "currency": "INR" } },
+  "euPoliticalAdvertising": "does_not_contain",
+  "…": "every other Search brief field, as before"
+}
+```
 
-### Existing data
+- PATCH still requires `expectedRevision`.
+- `googleLeadForm` is accepted **only** on a `google_lead_form` brief.
+- Unknown keys are refused by name. That includes `marketingConsent`, which is
+  not offered on Google forms in this release, and anything shaped like a
+  webhook URL, secret or provider id.
+- Text is stored within GRAV's bounds (in `vocabulary.googleLeadForm.contentFields[].maxLength`).
+  Google applies its own limits at the validate-only pass.
+- `fields` and `qualifyingQuestions` hold up to 12 codes each, stored as given.
+  The evaluator reports "asks six, Google allows five" rather than the write
+  dropping one.
 
-`scripts/migrations/work-order-number-backfill.js` **defaults to dry run**,
-requires `--apply`, and **has not been connected to any database**. It reports
-index presence and sparseness, numberless counts, duplicate non-empty numbers,
-and flags the "index absent while duplicate nulls exist" signature of a failed
-index build. The backfill never renames a non-empty number, refuses to run while
-duplicates exist, is restartable and idempotent, and logs every id. Ensuring the
-unique index is a separate later step.
+### 2. Draft read
 
-### Verification
+`GET /campaign-drafts/:id` returns the brief exactly as stored, with
+`googleLeadForm`, and `vocabulary.googleLeadForm`:
+- `contentFields[]` `{ code, label, means, required, maxLength }`
+- `contactFields[]` `{ code, label, selfReported, means }`
+- `qualifyingQuestions[]` `{ code, label, question, category, selfReported }`,
+  in Google's wording
+- `maxQualifyingQuestions: 5`, `fieldExclusions`, `contactableFields`,
+  `contactableMeans`
+- `callToActionTypes[]` / `postSubmitCallToActionTypes[]` `{ code, label }`,
+  Google's v25 enum values, **use these as a choice**, with `buttonLabelsMean`
+- `answerProvenance`, and `marketingConsentOffered: false` with its reason
 
-The 15 identity regressions were proven to fail against the old model first,
-then implemented.
+`GET /campaign-capabilities/google_lead_form` also carries:
+- `localContract`;
+- `controlledCreation: { available: true, means }`;
+- the same `leadFormVocabulary`.
 
-- `work-order-identity.test.js` — **29/29**.
-- Planning characterisation — **62/62** (22 unsafe findings still pinned).
-- `test/project-manager` — **254/254**, 8 suites (baseline 228/7).
-- `test/requests` — all pass. `test/crm` — the same 7 pre-existing suites fail.
-- `test/access` + `test/store-purchase` — the only failures are in the other
-  lane's in-progress `catalogue-boundary.route.test.js`, which fails **more**
-  without my change (17) than with it (14) and is being edited concurrently.
-- `node --check` clean; `git diff --check` clean in both repositories.
+It is still `deployable: false` and has no settings.
 
+### 3. Readiness (unchanged route)
 
----
+`GET …/deployment-readiness` judges lead-form briefs with the one evaluator.
+Submit and Approve enforce the same findings.
+- `LEAD_FORM_INCOMPLETE` (blocking):
+  - field `googleLeadForm.<check>` for the form checks;
+  - field `bidding.strategy` when bidding is not `target_cost_per_action`.
+- `LEAD_FORM_CONTROLLED_ONLY` (advisory, in `unsupportedByGrav`): says creation
+  is limited to the proof account.
+- Goals allowed: `form_submission`, `qualified_prospect`.
 
-## Chunk 4A.2 — corrections (3 Sep 2026)
+### 4. Deployment (existing routes, dispatched on the plan's own type)
 
-Four corrections. The model-level identity invariant from 4A.2 is **unchanged**:
-`WO-<full ObjectId>`, explicit numbers preserved, `isNew` guard, no
-`required: true`, unique index intact, `save`/`create`/`insertMany` covered, no
-migration executed, no existing number rewritten. Chunk 4A.1's allocation fixes
-are untouched. Chunk 4B has not started.
-
-**Correcting the 4A.2 file count:** that chunk touched **eight physical files** —
-`WorkOrder.js`, `workOrderRoutes.js`, `work-order-identity.test.js`,
-`work-order-planning-characterization.route.test.js`,
-`work-order-number-backfill.js`, and the three documentation files counted
-individually (`…planning-integrity.md`, `latest-implementation.md`,
-`…professionalization.md`). The earlier report said seven by collapsing the docs.
-
-### Files changed by these corrections
-
-| File | Change |
+| Route | Lead-form behaviour |
 |---|---|
-| `routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js` | `scanBarcodeFor()` helper; barcodes derived from `_id`, not `workOrderNumber`. |
-| `scripts/migrations/work-order-number-backfill.js` | exact per-record write log; one numberless definition; canonical-target collision pre-check. |
-| `test/project-manager/return-barcode-identity.route.test.js` | **new**, 9 tests. |
-| `test/project-manager/work-order-number-migration.test.js` | **new**, 21 tests. |
-| `docs/audits/…-work-order-planning-integrity.md` | §13. |
-| `docs/handoff/latest-implementation.md` | this record. |
-| `docs/product/project-manager-professionalization.md` | Chunk 4 status. |
+| `GET …/deployment/google_ads/preflight` | adds the checks `lead_form_definition`, `lead_form_serving_country`, `lead_form_controlled_account`, `lead_form_delivery_address`, `lead_form_delivery_key`; `conversion_action_present` is read and blocks; `externalChecksRequired[]`; `ifCreated.formStatus: "PAUSED"`. Never an address, token or secret. |
+| `POST …/deployment/google_ads/create-paused` | administrator only; body `{ idempotencyKey, expectedRevision, targetingFingerprint? }`; **`expectedRevision` required**. Returns `outcome` (`succeeded`, `partially_created`, `failed` or `unknown`), `leadFormStopped`, `deliveryAddressConfirmed`, `deliveryBound`, `providerCampaignId`, `providerLeadFormId`, `deployment`, `delivering: false`, `activationAvailable: false`. |
+| `POST …/deployment/google_ads/reconcile` | the recovery path after `outcome: "unknown"`; read-only against Google |
+| `GET …/deployment/google_ads` | the deployment (`campaignType: "google_lead_form"`) and its attempts |
 
-### 1 — Return/rework scan barcodes
+There is no activate, publish or schedule route. None is planned in GRAV.
 
-Built through one named helper from `_id.slice(-8)`. Before: `undefined-001`
-(rejected outright). After 4A.2: `WO-<full id>-001` — **parsed and resolved to
-nothing**, a worse failure. Now: `WO-<short id>-<unit>`, which resolves.
+## Verification
 
-`workOrderNumber` (canonical, full ObjectId) and the scan segment
-(`_id.slice(-8)`) are separate identities. The barcode **format** is unchanged,
-no existing barcode was rewritten, no parser was touched.
-
-**A gap found and deliberately left open** — inventoried accurately in the
-audit's §13.2: **5 distinct barcode-building paths** (a shared `barcodesFor`
-helper plus three inline loops in `quotationRoutes.js`, and the corrected
-`scanBarcodeFor` in returns) and **8 persistence/propagation call sites** (7 in
-`quotationRoutes.js`, 1 in returns). **All four Sales paths still build from
-`workOrderNumber`**, and **all eight writes are silently discarded** because
-`EmployeeProductionProgress` does not declare `assignedBarcodeIds`. Adding the
-field would persist the four wrong ones. Pinned by a test.
-
-Safe future order: centralise every builder onto the scan identity →
-characterise consumers and stored/printed formats → then add the schema field →
-verify through real scanners.
-
-### 2 — Exact migration write log
-
-Per-record conditional updates. A record is logged as written **only** when its
-update reports `modifiedCount === 1`; concurrent records are reported separately
-as skipped and excluded from rollback instructions. Exact totals for examined,
-written, skipped and failed. The write log is the rollback list, so logging a
-record the migration never touched could have unset somebody else's number.
-
-### 3 — One definition of a usable number
-
-String, non-empty after trimming. Missing, null, empty, whitespace-only and
-non-string are numberless. One `$expr` drives both the selector and the
-duplicate report, so whitespace-only records are no longer mis-grouped as a
-duplicate identity — which had also blocked their own backfill. Real numbers are
-never normalised or trimmed.
-
-### 4 — Canonical target collision pre-check
-
-**Two separate protections, and neither is the other.** Pre-flight collision
-detection refuses the whole apply before the first write, reporting the target
-and both ids, and runs even when the unique index is absent. The per-candidate
-conditional write preserves a value another writer assigned to *that document*.
-
-**Neither closes the cross-document target race.** An earlier draft claimed the
-conditional write made a post-pre-flight conflict "fail safely" — that is not
-true without a unique index, which this script does not install. Guard two
-proves only that the candidate is still numberless, not that another document
-has not claimed its target. All-or-nothing uniqueness needs either an enforced
-unique index or **a quiesced-writer deployment window**; since there is no
-index, the window is **required**, and the script prints that at apply time. The
-post-run re-report is detection and rollback guidance, not prevention. No
-transaction was introduced. Structural tests keep the warning from vanishing.
-
-### Verification
-
-The unresolvable-barcode assertion was proven to fail first.
-
-- `return-barcode-identity` — **9/9**; `work-order-number-migration` — **21/21**.
-- `work-order-identity` — 29/29; planning characterisation — 62/62.
-- `test/project-manager` — **287/287**, 10 suites (baseline 257/8).
-- `test/requests` — **368/368**. `test/access` + `test/store-purchase` — **386/386**.
-- `node --check` clean; `git diff --check` clean in both repositories.
-- **The migration was not executed.**
-
-
----
-
-## Chunk 4A.2 — second correction pass (3 Sep 2026)
-
-Four proof and accuracy gaps found in review. No production behaviour changed
-beyond the migration's iteration; the identity invariant and Chunk 4A.1 are
-untouched. Chunk 4B has not started.
-
-### Files changed
-
-| File | Change |
+| Suite | Result |
 |---|---|
 | `routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes.js` | unchanged behaviour; no edit was needed for these corrections |
 | `scripts/migrations/work-order-number-backfill.js` | one-pass `_id` cursor; injectable batch size; quiesced-window warning in the header and at apply time |
@@ -7561,3 +3452,464 @@ tracking, wastage). They were left alone: this change was scoped to the Project
 Manager side that was reported. The durable fix for all of them is either the
 model's migration (with a decision about which form to store) or applying the
 same resolver in each router.
+| `google-lead-form-creation` (new) | **19 / 19** |
+| focused (all `google-lead*`, `google-search-deployment`, `campaign*`) | **469 / 469**, 14 suites (measured at 17 lead-form tests; 2 added since, both in the full run) |
+| `test/marketing` (full) | **1508 passed / 1508 total**, 37 suites (1489 + 19) |
+| `test/crm` + `test/sales` (serial, `--runInBand`) | **42 failed / 841 passed / 883 total**, 44 suites. The 42 failures are the same baseline failures in the same nine suites. The +49 tests / +2 suites are new passing files from concurrent CRM work (`enquiry-product-identity.route`, `sales-journey-close.route`), not this slice |
+
+Nothing committed.
+
+# Marketing Enquiries inbox — read API (2026-09-21)
+
+Read-only list and detail over the recorded lead-form submissions and their
+processing receipts. **Not committed.**
+
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingEnquiries.js` | Public vocabulary: processing, consent, consent bases, review reasons, ingestion origins, contact labels, provenance, page bounds |
+| `services/marketing/leads/enquiryInbox.service.js` | `list` / `detail` / `vocabulary`; reads only |
+| `routes/CMS_Routes/Marketing/enquiries.js` | `GET /enquiries`, `GET /enquiries/:submissionRef` (Marketing, admin, CEO) |
+| `server.js` | One mount, after `leadRecovery` |
+| `test/marketing/marketing-enquiries.route.test.js` | 22 route tests |
+
+## Decisions
+
+- **Derived at read time.** Status comes from the receipt under the current
+  `CONTRACT_VERSION`, joined company-first. Nothing is stored and no receipt is
+  opened by reading.
+- **Permission is `unknown` until `consentEvaluatedAt` is set.** No receipt, a
+  pending or retrying receipt, a review hold and a refusal all read `unknown`.
+  Only an evaluated receipt yields `permission_recorded` or
+  `no_permission_recorded`, with `consentBasis` taken from the consent reason codes.
+- **Processing** is one of `processing | needs_review | finished | cannot_process`.
+  `retryable_failure` and the intermediate stages read as `processing`. Stage
+  names, attempt counts and retry times never leave.
+- **The list row's contact** is `{name, companyName, hasEmail, hasPhone}`. It
+  carries no address and no number. The detail carries the supplied fields,
+  answers with their questions, unmapped answers and `phoneVerified`. Everything
+  is marked `self_reported`.
+- **Fields are projected in** (an aggregate `$project` or `select`), so provider
+  ids, `_id`, binding, deployment, click id, lead source/stage and API version
+  are never read into the output.
+- **Hidden identifiers.** An unmapped answer code that is not an UPPER_SNAKE
+  enum is shown as `UNRECOGNISED_QUESTION`, so a numeric column id cannot surface.
+- **Test deliveries** live in their own collection and never appear.
+- **Existing view, unchanged.** `states` reuses the receipt's `publicView()`.
+  For a `possible_duplicate_submission` hold that view says
+  `needs_identity_review`. `reviewReason` carries the precise reason, and I did
+  not change the existing view.
+
+## Verification
+
+- `npx jest test/marketing/marketing-enquiries.route.test.js`: 22/22.
+  - Mutation checks: collapsing `unknown` into no-permission fails 8 tests;
+    dropping the company from the receipt join fails 1; putting an email in a
+    list row fails 2.
+- `npx jest test/marketing`: 38 suites, **1530/1530**.
+- `npx jest test/crm test/sales`: 42 failed / 841 passed / 883. These are the
+  same 42 baseline failures in the same nine suites, unchanged.
+
+# Marketing Content Planner — backend foundation (2026-09-21)
+
+A planning tool only: it creates, schedules, sends and publishes nothing.
+**Not committed.** The design record and the exact Lane B contract are in
+`docs/decisions/marketing-content-planner.md`.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `constants/marketingContentPlan.js` | Types, channels, states, actions and who may take them, editability, publication and library vocabularies, limits |
+| `models/CMS_Models/Marketing/MarketingContentPlanItem.js` | Company-scoped item. Embedded append-only history; update and delete hooks refuse history edits and deletes |
+| `services/marketing/contentPlan/zonedTime.js` | IANA zone conversion with `Intl`. Refuses a skipped time; takes the first of a repeated one |
+| `services/marketing/contentPlan/contentAssets.js` | Confirms linked assets through the existing read-only content `list()`. Bounded paging |
+| `services/marketing/contentPlan/contentPlan.service.js` | create / update / act / list / detail / calendar / owners |
+| `routes/CMS_Routes/Marketing/contentPlan.js` | 7 routes (4 GET, 1 PATCH, 2 POST); mounted after `contentInventory` in `server.js` |
+| `services/storePurchase/errors.js` | 8 `CONTENT_PLAN_*` codes |
+| `test/marketing/content-plan.route.test.js` | 27 route tests |
+
+## Verification
+
+- `npx jest test/marketing/content-plan.route.test.js`: **27/27**. The tests cover:
+  - month boundary in IST and UTC;
+  - the repeated hour when clocks go back, and the skipped hour when they go forward;
+  - overlaps, the empty calendar, isolation, permission refusals;
+  - stale and racing edits, missing plan and asset links;
+  - library unreadable or too large;
+  - published, scheduled and expired only from the library;
+  - no internal ids or provider names in responses, and no publishing routes.
+- Mutation checks, each caught by at least one failing test:
+  - removing the revision fence;
+  - removing the self-approval check;
+  - bucketing by the typed date instead of the viewer's local date;
+  - treating a future publish date as published.
+- `npx jest test/marketing`: 39 suites, **1557/1557**.
+- `npx jest test/crm test/sales`: 42 failed / 841 passed / 883, the same nine
+  baseline suites.
+  - One earlier run also failed `test/sales/sample-style-customer-name.test.js`
+    (untracked, not this lane's). It passes on its own and did not fail on the rerun.
+
+# Content Planner — creative drafts (2026-09-21)
+
+**Not committed.** The contract is in `docs/decisions/marketing-content-planner.md`,
+under "Creative drafts".
+
+- **Media found:** the Marketing advertising image library (JPEG and PNG,
+  company-scoped, immutable hashed versions, signed company-bound ids). It is
+  reused by reference. The planner has no upload or storage. **The gap:**
+  there is no store for video, documents or design files; they can only be
+  described in a note, which is labelled as not a stored file.
+- **Files:**
+  - `constants/marketingContentPlan.js`: creative vocabularies, the media-store statement and limits.
+  - `models/CMS_Models/Marketing/MarketingContentPlanItem.js`: `creative`, `approvedRevision`,
+    `approvedCreativeFingerprint`, and `history[].creativeFingerprint`.
+  - `services/marketing/contentPlan/creative.js` (new): validation, image
+    confirmation, fingerprint and views.
+  - `contentPlan.service.js`: wiring, the submission gate, the approval pin and vocabulary.
+  - `test/marketing/content-plan-creative.route.test.js` (new): 12 tests.
+- **Verification:**
+  - Creative tests pass 12/12. The existing planner tests pass 27/27.
+  - Mutation checks, each caught by at least one failing test:
+    - the approval ignoring the fingerprint;
+    - the approval not recording it;
+    - submission not requiring the creative;
+    - the fingerprint using the file name instead of the image hash;
+    - withdrawn images being accepted;
+    - a vanished image being shown as available;
+    - pointer keys not being refused.
+  - `npx jest test/marketing`: 40 suites, **1569/1569**.
+  - `npx jest test/crm test/sales`: 42 failed / 841 passed / 883, the same nine
+    baseline suites.
+
+# Creative media library — images (2026-09-21)
+
+**Not committed.** Contract and blockers: `docs/decisions/marketing-content-planner.md`,
+section "Creative media library".
+
+- **Built:**
+  - Company-scoped image library (JPEG and PNG, ≤10MB, 320–8000px).
+  - Immutable, hashed versions; random company-bound `cmv_`/`cmg_` references.
+  - Authenticated preview that re-hashes on every request.
+  - Withdrawal by the uploader or an approver, with a reason.
+  - A planner reference kind `media` pinned by version and hash, so approval
+    validity reports withdrawn or missing files, and submit and approve are
+    refused while a file is unavailable.
+- **Video blocked, not faked:**
+  - Buffer-only uploads.
+  - No Range streaming.
+  - The full-read integrity check.
+  - No production video inspector.
+  Videos are recognised and refused with those reasons.
+- **Reused:** `imageBytes` and `companyDrive`.
+- **Not touched:** the advertising image library and the Campaign Builder.
+- **Files:**
+  - `constants/marketingCreativeMedia.js`
+  - `models/CMS_Models/Marketing/MarketingCreativeMedia.js`
+  - `services/marketing/creativeMedia/creativeMedia.service.js`
+  - `routes/CMS_Routes/Marketing/creativeMedia.js` (mounted in `server.js` after `contentPlan`)
+  - 9 `CREATIVE_MEDIA_*` codes in `services/storePurchase/errors.js`
+  - Planner:
+    - `constants/marketingContentPlan.js`: the `media` reference kind and the
+      updated media-store gap.
+    - `MarketingContentPlanItem.js`: reference fields.
+    - `creative.js`: confirmation, fingerprint, states and `unavailableMedia`.
+    - `contentPlan.service.js`: approval validity, the submit and approve
+      refusal, and the `media_unavailable` action reason.
+  - `test/marketing/creative-media.route.test.js`: 15 tests.
+  - Three planner assertions updated for the grown contract.
+- **Verification:**
+  - Media tests pass 15/15. The planner suites pass 39/39.
+  - Mutation checks, each caught by at least one failing test:
+    - a withdrawn file being previewed;
+    - the hash check being skipped;
+    - the company missing from the selector;
+    - video not being recognised;
+    - an orphaned file not being removed;
+    - unavailable media being ignored;
+    - withdrawn media being accepted into a creative;
+    - a cut-short upload being reported generically.
+  - `npx jest test/marketing`: 41 suites, **1584/1584**.
+  - `npx jest test/crm test/sales`: 42 failed / 841 passed / 883, the same
+    nine baseline suites.
+  - **Not verified against the live company Drive.** Tests use an in-memory
+    stand-in; the Drive path is the one the advertising image library already uses.
+
+# Creative-media contract corrections (2026-09-21)
+
+**Not committed.** Contract: `docs/decisions/marketing-content-planner.md`,
+section "Creative-media contract corrections".
+
+**Changes:**
+- **Approval validity on every read.** One `approvalDecision` drives list,
+  calendar and detail: `approvalStatus` plus `unavailableMediaCount` on every
+  row, kept separate from `state`.
+- **`media_changed`.** A preview that finds changed stored bytes records
+  `integrityFailedAt`, and a preview that finds the exact bytes back clears it.
+- **`viewerActions.withdraw` on every `MediaView`.** Driven by the same
+  predicate the server enforces.
+- **Wording.** Reference status labels are set per library (creative media vs
+  advertising image library).
+- **Preview header.** The preview exposes `X-Content-Hash` on that response only.
+- **Fixed:** the `safeFileName` regex in `creativeMedia.service.js` contained a
+  raw NUL byte instead of an escape sequence. It was harmless at runtime, but
+  made grep treat the file as binary. `test/marketing/advertising-assets.test.js`
+  also contains a NUL; it is not this lane's file and was left alone.
+
+**Files:**
+- `constants/marketingContentPlan.js`
+- `models/CMS_Models/Marketing/MarketingCreativeMedia.js`
+- `services/marketing/creativeMedia/creativeMedia.service.js`
+- `routes/CMS_Routes/Marketing/creativeMedia.js`
+- `services/marketing/contentPlan/creative.js`
+- `services/marketing/contentPlan/contentPlan.service.js`
+- Tests:
+  - 9 new tests (16–24) in `creative-media.route.test.js`.
+  - 4 label assertions updated to the corrected wording.
+
+**Verification:**
+- Media suite passes 24/24; planner suites pass 39/39.
+- Mutation checks, each caught by at least one failing test:
+  - rows computed without file states;
+  - changed media ignored;
+  - withdraw offered to every marketer;
+  - the hash header not exposed;
+  - media references named with advertising-library wording;
+  - a restored copy never recovering.
+- `npx jest test/marketing`: 41 suites, **1593/1593**.
+- `npx jest test/crm test/sales`: 42 failed / 841 passed / 883, the same nine
+  baseline suites.
+
+**Real Drive verification is still outstanding.** No signed-in development
+environment was available, and no token was minted to create one.
+
+# Marketing permissions, end to end (2026-09-21)
+
+**Not committed.** Design and contract: `docs/decisions/marketing-access-permissions.md`.
+
+**Backend:**
+- New:
+  - `services/marketing/marketingAccess.js`: the resolver, capability table and
+    route classification.
+  - `routes/CMS_Routes/Marketing/access.js`: `GET /access`.
+  - `test/marketing/marketing-access.route.test.js`: 19 tests using the real
+    guard, real tokens and records, and all routers in server order.
+- Rewritten: `Middlewear/MarketingAuthMiddlewear.js`. It resolves from the
+  database once per request, enforces the act, and rebuilds `req.user` (Viewer
+  becomes `marketing_viewer`).
+- `server.js`: `googleLeadWebhook` and `access` are mounted before every guarded
+  Marketing router.
+- `routes/CMS_Routes/Marketing/googleLeadWebhook.js`: reads the body the global
+  parser already consumed.
+- Refusal wording: `campaignDraft.service.js`, `contentPlan.service.js`,
+  `creativeMedia.service.js`.
+
+**Frontend (grav-cms):**
+- New:
+  - `lib/marketing/marketingAccess.js` (+ test).
+  - `components/marketing/MarketingAccessContext.js`: provider, hooks,
+    `MarketingAct`, the refusal screen, and a preview provider.
+  - `components/access/marketingRole.js`: truthful Access Control wording.
+  - `components/marketing/marketingPermissionsUi.test.mjs`.
+- Wired:
+  - The Marketing shell provider.
+  - Create links and the builder.
+  - The edit page (read-only for Viewers).
+  - Setup (save/upload for writers; create/reconcile for administrators).
+  - Health generate/dismiss.
+  - Media uploader.
+  - Setup, performance and advertising pages use the server's answer instead of
+    an unfilled `user` prop.
+  - The preview gets a fixed administrator answer.
+- Updated pinned tests: `marketingAccessRole`, `editPage`, `campaignHealthPanel`.
+
+**Verification:**
+- `test/marketing/marketing-access.route.test.js`: 19/19. Ten mutations of the
+  model were each caught.
+- `npx jest test/marketing`: 42 suites, **1612/1612**. One run had a load-timing
+  failure in `marketing-overview`; it passes 34/34 alone and in the rerun.
+- `npx jest test/crm test/sales`: 42 failed / 841 passed / 883, the same nine
+  baseline suites.
+- `npx jest test/access`: `department-role-cache` fails 3 of 11, from an
+  uncommitted `services/departmentRoles.js` change dated 7 September that this
+  work did not touch.
+- Frontend Marketing, access and preview tests: **3303/3303**. The edited files
+  parse as JSX.
+
+# Budget pacing, read-only (2026-09-22)
+
+**Not committed.** Contract: `docs/decisions/marketing-budget-pacing.md`.
+
+- **New:**
+  - `constants/marketingPacing.js`: calculation, thresholds, verdicts and reasons.
+  - `services/marketing/performance/budgetPacing.service.js`.
+  - `GET /campaign-drafts/:campaignDraftId/pacing` in
+    `routes/CMS_Routes/Marketing/campaignPerformance.js`.
+  - `test/marketing/budget-pacing.route.test.js`: 15 tests.
+- **Changed:** the capability matrix entry `budget_pacing` is now available.
+- **Baseline before edits:**
+  - Marketing: 1 failed / 1615 passed / 1616. The failure is
+    `google-lead-recovery` test 12, a clock-dependent assertion on
+    `2026-09-19`.
+  - CRM/Sales: 42 failed / 841 passed / 883.
+  - Worktree: 657 changed paths.
+- **After:**
+  - Pacing suite: 15/15. Thirteen mutations, including unread days treated as
+    zero, currency, revision, company, several channels, spread and stale data,
+    were each caught.
+  - Marketing: 1 failed / 1630 passed / 1631. It is the same clock-dependent
+    recovery test, not a timeout.
+  - CRM/Sales: 42 failed / 841 passed / 883, unchanged.
+
+# Budget pacing — contract corrections (2026-09-22)
+
+**Not committed.**
+
+- **Stopped campaigns are not paced.** `paused_confirmed` gives `campaign_stopped`
+  ("Campaign is stopped; spending pace does not apply"), even with a genuine
+  zero.
+- **Running needs evidence.** A verdict requires `activated` AND a campaign
+  read-back that is delivering (`nonDeliveringConfirmed: false`, `stateReadAt`,
+  Google `ENABLED` / Meta `ACTIVE`). Otherwise the result is
+  `running_state_unconfirmed`. Nothing sets `activated` yet, so current
+  deployments all read `campaign_stopped`.
+- **Money precision.** The ISO 4217 exponent table is
+  `constants/currencyMinorUnits.js`. Every money field uses the currency's own
+  minor unit and states `minorUnitDigits`. An unknown currency gives
+  `currency_precision_unsupported`, with null amounts.
+- **Tests:** `budget-pacing.route.test.js` now has 20. The zero-spend test uses
+  a confirmed-running deployment, and new tests cover:
+  - stopped with zero;
+  - stopped with historical spend (the report still shows it);
+  - three unconfirmed-running cases;
+  - JPY and KWD exactness;
+  - an unknown currency.
+  Four mutations were each caught.
+- **Results:**
+  - Focused (pacing + performance + capabilities): 56/56.
+  - Marketing: 1 failed / 1635 passed / 1636. The failure is the pre-existing
+    `google-lead-recovery` test 12, a date-dependent `2026-09-19` assertion.
+- **Follow-up, outside this slice:** `campaignReport.service.js` still uses a
+  fixed 100 minor units per major for every currency.
+
+# IndiaMART lead source — bounded, idempotent pull into the enquiries inbox (2026-09-22)
+
+**Not committed. Not verified live: no IndiaMART seller key exists, so IndiaMART was never called.**
+The decision and the Lane B contract are in `docs/decisions/marketing-indiamart-lead-source.md`.
+
+- **Contract source.** IndiaMART's "LMS CRM Integration V2" page (updated 11 Dec 2025), read on 22 Sep 2026.
+  - The request is `GET mapi.indiamart.com/wservce/crm/crmListing/v2/` with the key, `start_time` and `end_time` in IST.
+  - Limits: 7 days per call, 365 days retained, one call per 5 minutes.
+  - Duplicates are removed by `UNIQUE_QUERY_ID`.
+- **New records.**
+  - `MarketingSourceEnquiry` is append-only and deduplicated per company on the source id.
+    That id is `select:false` and never published.
+  - `MarketingLeadSourceState` holds the cursor, the rate fence and the lease.
+- **Routes.**
+  - `GET /lead-sources/indiamart` is readable by all Marketing roles and never calls IndiaMART.
+  - `POST /lead-sources/indiamart/check` is admin or CEO only. It is in `ADMINISTER` and makes one call per check.
+- **Windows and retries.**
+  - The cursor moves only after the whole window is saved.
+  - Windows overlap by 15 minutes.
+  - There is a 5-minute gap between calls, 15 minutes after a 429.
+  - Lost answers and partial saves refetch the same window without creating duplicates.
+- **Inbox.** `GET /enquiries` merges IndiaMART rows through `$unionWith`, and every row gains `source` and `kind`.
+  - IndiaMART rows read `not_processed` / `no_permission_recorded` / `source_does_not_ask`, with `campaign: null`.
+  - The detail adds `enquiryContext`.
+  - `kind` separates buyer enquiries (W, P, WA) from purchased leads (B) and catalog views (BIZ).
+- **Credentials.**
+  - The key is read only from `MARKETING_INDIAMART_CRM_KEY`, and only for `MARKETING_COMPANY_ID`.
+  - The key is not stored in MongoDB, responses or logs. IndiaMART's messages are never repeated.
+- **Nothing follows.** No automatic scheduler, processing, consent, person, Sales record or handover is created.
+- **Tests.**
+  - `test/marketing/indiamart-lead-source.route.test.js` has 35 tests.
+  - Seven mutations were tried against the sync service, the inbox and the model. Six were caught; the seventh broke every test instead of producing a meaningful result.
+  - Updated: `marketing-enquiries.route.test.js`, for the pinned row keys and filters.
+  - Updated: `marketing-access.route.test.js`, for the router list and the elevated route.
+- **Results.**
+  - Focused (IndiaMART, enquiries, access): 80/80.
+  - Marketing: 1 failed / 1670 passed / 1671. The failure is the pre-existing `google-lead-recovery` test 12, a hard-coded `2026-09-19` date.
+  - CRM/Sales: 42 failed / 841 passed / 883. That matches the baseline exactly: the same nine suites.
+- **Needs the seller account.**
+  - Paid status and the key.
+  - Confirmation of the `DD-Mon-YYYYHH:MM:SS` request format and the `QUERY_TIME` format.
+  - Whether window boundaries are inclusive.
+  - Any record cap per response.
+  - Which `QUERY_TYPE`s the account actually receives.
+  - Whether IndiaMART signals errors through the HTTP status or the body `CODE`.
+  - Whether pulling resets the key's 7-day inactivity expiry.
+
+# IndiaMART: scheduled pull and routing of buyer enquiries to Sales (2026-09-22)
+
+**Not committed. Simulated only.** No seller key exists, so IndiaMART was never called. The contract and the gaps are in `docs/decisions/marketing-indiamart-lead-source.md`, under "Scheduled pull and routing to Sales".
+
+- **Schedule.**
+  - `services/integration/indiamartScheduler.js` runs every 6 minutes from `server.js`, plus once 60 seconds after boot.
+  - It is idle without a key, and switchable with the job flag `marketing-indiamart-pull`.
+  - It reuses the source state row as the lock, the rate fence and the cursor.
+  - Check now runs the same cycle, recorded with `startedBy: "manual"`.
+- **Routing.**
+  - `services/integration/indiamartSalesRouting.service.js` keeps one `MarketingSourceEnquiryRouting` row per enquiry, with atomic claims.
+  - It writes the intent-ledger evidence, calls the existing `prospectHandover.submit`, then the existing `deliverPending`, which reaches the one Sales writer, `marketingProspectIntake.receive`.
+  - Only W, P and WA enquiries are routed. B and BIZ are `not_routed`.
+  - Incomplete, old or refused items are held with a reason. Editor-level users and above can release or dismiss them.
+  - Permission always travels as `unknown`.
+- **Boundary change, additive.** An optional `sourceEnquiry` block on the handover, the handover contract and the Sales receipt package. `leadFromPackage` writes the buyer's request into `possibleNeed`.
+- **Read side.** `services/marketing/leads/indiamartRouting.read.js` serves:
+  - `salesRouting` on the status and on the MSE detail;
+  - the new `GET /lead-sources/indiamart/routing`;
+  - `POST …/enquiries/:ref/release` and `POST …/enquiries/:ref/dismiss`.
+- **Status additions.** `coverage.freshness` and `coverage.lagMinutes`, and a fuller `automaticChecks`.
+- **Changes Lane B asked for.**
+  - The shared inbox wording no longer calls a Buy-Lead or catalog view "their enquiry". `not_processed` no longer claims nothing reaches Sales.
+  - `coveredFrom` restarts after a coverage gap.
+- **Tests.**
+  - New: `test/marketing/indiamart-sales-routing.test.js`, 23 tests.
+  - Six mutations, all caught:
+    - routing prospects;
+    - no age hold;
+    - inferred consent;
+    - no delivery retry;
+    - no tenant scope;
+    - a random idempotency key.
+  - `indiamart-lead-source` test 31 is narrowed to the pull alone. Test 7 now pins that `coveredFrom` never falls inside a gap.
+  - Focused run (both IndiaMART suites, enquiries, Google lead processing): 111/111.
+- **Regressions.**
+  - Marketing, full run: 3 failed / 1691 passed / 1694, all in `google-lead-recovery`. Run alone it is 1 failed / 25 passed; the remaining failure is the pre-existing hard-coded date in test 12.
+  - CRM/Sales, full run: 267 failed. The machine was shared with other sessions' Jest runs at load 13, and most failures were "Instance failed to start within 10000ms".
+  - CRM/Sales, serial rerun of the failing suites: the same 42 baseline failures in the same suites, test for test.
+  - `account.model`, `relationship` and `packaging-bom-link` pass.
+  - `sales-journey-close.route` (a new suite from another session) passes alone, 37/37.
+
+# IndiaMART → Sales, made truthful and actionable (2026-09-22)
+
+**Not committed. Simulated only.** The details are in `docs/decisions/marketing-indiamart-lead-source.md`, under "Truthful and actionable in Sales".
+
+- **Lead source.**
+  - The new `constants/crm.js` `LEAD_SOURCES` is the single list of codes and labels. The Lead enum is built from it, with `indiamart` added.
+  - The lookups endpoint serves it as `lead_source`, and falls back to the constants for categories added after seeding.
+  - The Sales writer maps IndiaMART handovers to `indiamart`: the channel goes in `sourceDetails`, there is no campaign, and a new `marketingHandover.sourceEnquiry` holds the kind, GRAV reference and time provenance.
+  - Campaign handovers are unchanged. No migration was needed, because no IndiaMART Lead could exist yet.
+- **Sales queue.**
+  - `GET /api/cms/sales/marketing-handovers` adds `source` and `order` filters, `total`, and `summary` (awaiting count by source, oldest item and its age, and the ownership rule, which is "none").
+  - Every row, and the detail, gains a `queue` block: source, enquiry reference and kind, age, owner, next action, suggested first step, decision, Prospect reference, and `contacted: false`.
+  - Nothing is assigned by the system.
+  - Gaps: there is no ownership rule, and no dashboard or notification counts waiting handovers.
+- **Time.**
+  - A new hold, `submitted_time_implausible`, sits alongside `submitted_time_unknown`. Both can be released with a time-zoned `submittedAt` and a required note.
+  - The confirmation is stored on the routing row's `timeConfirmation`, and provenance is carried through the intent event, the handover, the Sales receipt, the Lead and the queue.
+  - `too_old` stays a separate, dismiss-only reason.
+- **Tests.** New: `indiamart-sales-handover.test.js`, 13 tests; seven mutations, all caught. `indiamart-sales-routing` test 12 is updated for the new source.
+
+# IndiaMART status-contract correction (2026-09-22)
+
+**Not committed.** The details are in `docs/decisions/marketing-indiamart-lead-source.md`, under "Status-contract correction".
+
+- **Automatic checks.** `automaticChecks` gains `state` (scheduled, switched off or no key) and `lastCycleOutcomeLabel`. `lastCycleOutcome` is limited to five labelled codes.
+- **Vocabulary.** Two new lists: `vocabulary.automaticCheckStates` and `vocabulary.scheduledCycleOutcomes`.
+- **Coverage notes.** They now describe coverage only, and no longer claim a schedule.
+- **Fixed:**
+  - The scheduler heartbeat now upserts its row, so a cycle that errors on a fresh deployment is no longer lost.
+  - `indiamartSync.service.js` had literal control bytes in its `clean` regex, which made grep and git treat the file as binary. They are now escape sequences, with the same behaviour.
+- **Tests.** `indiamart-status-contract.test.js`, 11/11. Focused IndiaMART, enquiries and access: 127/127.

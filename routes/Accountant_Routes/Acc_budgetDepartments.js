@@ -21,6 +21,19 @@ const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalMod
 const departments = require("../../services/budgetDepartment.service");
 const actuals = require("../../services/budgetActuals.service");
 
+/* Lane A Chunk 3A — canonical company isolation. See
+   Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(AccountantAuthMiddleware.accountantAuth);
 
 function companyOf(req) {
@@ -74,7 +87,7 @@ const shape = (d) => ({
  * be picked today. A closed department disappears from the picker but never
  * from the budgets that reference it.
  */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const companyId = actuals.oid(companyOf(req));
     if (!companyId) {
@@ -126,7 +139,7 @@ router.get("/", async (req, res) => {
  * type is a second name to keep in step with the first, and the whole point
  * of this table is that there is exactly one identity per department.
  */
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
 
@@ -196,7 +209,7 @@ router.post("/", async (req, res) => {
  * is displayed, aliases only add resolutions, and retiring only removes it
  * from the picker. None of the three rewrites a budget or changes a figure.
  */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
 

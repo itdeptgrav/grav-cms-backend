@@ -17,6 +17,20 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const auth = accountantAuth;
 
 /* ------------------------------------------------------------------ */
@@ -59,7 +73,7 @@ function nestGroups(groups) {
  * Returns groups+ledgers with debit/credit columns.
  * Computes per-ledger movement within date range PLUS opening balance carried forward.
  */
-router.get("/trial-balance", auth, async (req, res) => {
+router.get("/trial-balance", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -241,7 +255,7 @@ router.get("/trial-balance", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* DAY BOOK — chronological list of all vouchers                       */
 /* ------------------------------------------------------------------ */
-router.get("/day-book", auth, async (req, res) => {
+router.get("/day-book", auth, companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -327,7 +341,7 @@ router.get("/day-book", auth, async (req, res) => {
  * Sums revenue (Cr balance on revenue ledgers) - expenses (Dr balance on expense ledgers)
  * within date range, returns nested by group.
  */
-router.get("/profit-loss", auth, async (req, res) => {
+router.get("/profit-loss", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -466,7 +480,7 @@ router.get("/profit-loss", auth, async (req, res) => {
  * openingBalance + sum of signedAmount across all postings up to date.
  * Group by nature: assets / liabilities / equity.
  */
-router.get("/balance-sheet", auth, async (req, res) => {
+router.get("/balance-sheet", auth, companyScope, async (req, res) => {
   try {
     const { companyId, asOf, from } = req.query;
     if (!companyId)
@@ -836,7 +850,7 @@ router.get("/balance-sheet", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GST SUMMARY (GSTR-1 / GSTR-3B style)                                */
 /* ------------------------------------------------------------------ */
-router.get("/gst-summary", auth, async (req, res) => {
+router.get("/gst-summary", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1038,7 +1052,7 @@ router.get("/gst-summary", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* CASH FLOW (simplified: movements on cash & bank ledgers)            */
 /* ------------------------------------------------------------------ */
-router.get("/cash-flow", auth, async (req, res) => {
+router.get("/cash-flow", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1137,7 +1151,7 @@ router.get("/cash-flow", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* DASHBOARD — quick KPIs for the homepage                             */
 /* ------------------------------------------------------------------ */
-router.get("/dashboard", auth, async (req, res) => {
+router.get("/dashboard", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1292,7 +1306,7 @@ router.get("/dashboard", auth, async (req, res) => {
 /* shows empty Cash Flow / GST / Balance Sheet because the UI defaulted */
 /* to the calendar-current FY (which has no vouchers yet).             */
 /* ------------------------------------------------------------------ */
-router.get("/data-range", auth, async (req, res) => {
+router.get("/data-range", auth, companyScopeOptional, async (req, res) => {
   try {
     let cId;
     if (req.query.companyId) {
@@ -1378,7 +1392,7 @@ router.get("/data-range", auth, async (req, res) => {
  *   from      — ISO date (default: FY start, April 1)
  *   to        — ISO date (default: today)
  */
-router.get("/dashboard-overview", auth, async (req, res) => {
+router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
   try {
     const { companyId, from, to } = req.query;
     if (!companyId)

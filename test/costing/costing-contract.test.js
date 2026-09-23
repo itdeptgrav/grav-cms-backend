@@ -22,11 +22,25 @@ describe("the capability mapping", () => {
   test("every capability the chunk names exists, and nothing else does", () => {
     expect([...capabilities.ALL].sort()).toEqual([
       "costing.approve",
+      /* ── THE COMMERCIAL REVIEW, IN THREE AUTHORITIES ──────────────
+         Asking for a decision, taking an ordinary one, and waiving the
+         company's own floor are three acts held by three people. One
+         capability that could do all three would make the floor advisory —
+         see `sales-commercial-review.test.js`. */
+      "costing.commercial.approve",
+      "costing.commercial.exception",
+      "costing.commercial.submit",
       "costing.cost.read",
       "costing.draft.write",
       "costing.margin.read",
       "costing.output.read",
       "costing.policy.manage",
+      /* Added when the Sales preparation endpoints were found to be guarded by
+         authentication and company alone. It means only: may ask Central
+         Costing to prepare or refresh an estimate for an enquiry this actor
+         may already reach. It implies nothing — see
+         `sales-prepare-authorisation.test.js`. */
+      "costing.prepare",
     ]);
   });
 
@@ -46,9 +60,34 @@ describe("the capability mapping", () => {
     expect(Object.keys(capabilities.GRANTS).sort()).toEqual(["ceo", "sales"]);
   });
 
-  test("a Sales grant of any rank carries approved output and nothing more", () => {
+  test("a Sales grant carries approved output at every rank, and the right to ASK from editor up", () => {
+    /* ── THE ONE ADDITION, AND WHERE THE LINE SITS ────────────────────────
+       `costing.prepare` lets somebody ask Central Costing to prepare or
+       refresh an estimate. It is a write — it can bring a costing and a
+       frozen version into existence — so `viewer` does not get it, and no
+       rank gets anything that lets it READ the build-up. */
     for (const role of ["viewer", "editor", "approver", "owner"]) {
-      expect(capabilitiesFrom([{ departmentSlug: "sales", role }])).toEqual([CAPABILITIES.OUTPUT_READ]);
+      const caps = capabilitiesFrom([{ departmentSlug: "sales", role }]);
+      expect(caps).toContain(CAPABILITIES.OUTPUT_READ);
+      for (const denied of [
+        CAPABILITIES.COST_READ, CAPABILITIES.MARGIN_READ,
+        CAPABILITIES.DRAFT_WRITE, CAPABILITIES.APPROVE, CAPABILITIES.POLICY_MANAGE,
+      ]) {
+        expect(caps).not.toContain(denied);
+      }
+    }
+    expect(capabilitiesFrom([{ departmentSlug: "sales", role: "viewer" }]))
+      .toEqual([CAPABILITIES.OUTPUT_READ]);
+    /* An editor asks; an approver decides. Neither may waive the floor. */
+    expect(capabilitiesFrom([{ departmentSlug: "sales", role: "editor" }]).sort())
+      .toEqual([CAPABILITIES.OUTPUT_READ, CAPABILITIES.PREPARE,
+        CAPABILITIES.COMMERCIAL_SUBMIT].sort());
+    for (const role of ["approver", "owner"]) {
+      expect(capabilitiesFrom([{ departmentSlug: "sales", role }]).sort())
+        .toEqual([CAPABILITIES.OUTPUT_READ, CAPABILITIES.PREPARE,
+          CAPABILITIES.COMMERCIAL_SUBMIT, CAPABILITIES.COMMERCIAL_APPROVE].sort());
+      expect(capabilitiesFrom([{ departmentSlug: "sales", role }]))
+        .not.toContain(CAPABILITIES.COMMERCIAL_EXCEPTION);
     }
   });
 
@@ -125,7 +164,13 @@ describe("what leaves the server", () => {
     /* Permitted but uncalculated is stated as such. A zero would be a claim. */
     expect(v.cost.calculated).toBe(false);
     expect(v.cost).not.toHaveProperty("totals");
-    expect(v.margin).toEqual({ calculated: false });
+    /* Chunk 2 gave the margin block a shape: the band the company set and the
+       effective margin each scenario realises. Uncalculated is still stated as
+       such rather than zeroed, and `band: null` says "no policy was snapshotted
+       into this version", which is true of a Chunk 1 draft. */
+    expect(v.margin.calculated).toBe(false);
+    expect(v.margin.band).toBeNull();
+    expect(v.margin.scenarios).toEqual([]);
     expect(v.output).toEqual({ approved: false, reason: "NO_APPROVED_VERSION" });
     expect(payload.visibility.withheld).toEqual([]);
   });

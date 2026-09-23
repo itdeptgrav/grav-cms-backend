@@ -1,0 +1,81 @@
+{
+  "version": "open-jev-pilot-heldout/1",
+  "frozen": "2026-09-22",
+  "notes": [
+    "Written before any Open-Jev or Ollama output was observed. Thresholds (min probability 0.80, min margin 0.30) were fixed in services/ai/openJev/config.js before this file and must not be tuned against it.",
+    "The same author wrote these cases and the GRAV-side rules in attendanceToday.js and the deterministic comparator, so the deterministic numbers are optimistic. They are held out only from the models.",
+    "expect.intent is the correct intent for an HR user who is authorised for everything. The harness narrows it to the intents actually offered to each actor.",
+    "expect.outcome is the correct GRAV pilot outcome. defer_to_assistant means the existing assistant path must answer.",
+    "expect.baselineTools lists the tools any one of which can answer. The harness narrows the list to the actor's authorised tools, and an empty list means no HR data tool should be attached. null means the case is not scored for tool selection."
+  ],
+  "cases": [
+    { "id": "att-01", "tags": ["canonical"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-02", "tags": ["canonical", "terse"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Rishee present?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-03", "tags": ["terse"], "actor": "hr_viewer_A", "scenario": "normal", "message": "rishee present today", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-04", "tags": ["paraphrase"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Has Rishee checked in yet?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-05", "tags": ["paraphrase"], "actor": "hr_viewer_A", "scenario": "normal", "message": "is rishee in office right now", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-06", "tags": ["hr_final"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Umang present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-07", "tags": ["no_checkin"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Did Kiran come in today?", "expect": { "intent": "attendance_today", "outcome": "no_checkin_recorded", "baselineTools": ["hr_employee"] } },
+    { "id": "att-08", "tags": ["missing_attendance"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Ananya Das present today?", "expect": { "intent": "attendance_today", "outcome": "no_attendance_entry", "baselineTools": ["hr_employee"] } },
+    { "id": "att-09", "tags": ["no_checkin", "hr_final"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Meera present today?", "expect": { "intent": "attendance_today", "outcome": "no_checkin_recorded", "baselineTools": ["hr_employee"] } },
+    { "id": "att-10", "tags": ["employee_id"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is GR0105 present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-11", "tags": ["hinglish"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Rishee aaj aaya kya?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-12", "tags": ["casing"], "actor": "hr_viewer_A", "scenario": "normal", "message": "RISHEE PRESENT TODAY???", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "att-13", "tags": ["ceo"], "actor": "ceo_A", "scenario": "normal", "message": "Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+
+    { "id": "typo-01", "tags": ["typo", "ambiguous"], "actor": "hr_viewer_A", "scenario": "normal", "message": "is rishe presnt today", "expect": { "intent": "attendance_today", "outcome": "clarify_ambiguous", "baselineTools": ["hr_employee"] } },
+    { "id": "typo-02", "tags": ["typo"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Umung present today?", "expect": { "intent": "attendance_today", "outcome": "clarify_confirm", "baselineTools": ["hr_employee"] } },
+    { "id": "typo-03", "tags": ["typo"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Umang presnt todya?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "typo-04", "tags": ["typo"], "actor": "hr_viewer_A", "scenario": "normal", "message": "is kiran patell present today", "expect": { "intent": "attendance_today", "outcome": "clarify_confirm", "baselineTools": ["hr_employee"] } },
+    { "id": "typo-05", "tags": ["partial_name"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Rishee Kapoor present today?", "expect": { "intent": "attendance_today", "outcome": "clarify_confirm", "baselineTools": ["hr_employee"] } },
+
+    { "id": "amb-01", "tags": ["ambiguous"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Priya present today?", "expect": { "intent": "attendance_today", "outcome": "clarify_ambiguous", "baselineTools": ["hr_employee"] } },
+    { "id": "amb-02", "tags": ["disambiguated"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Priya Sharma present?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+    { "id": "amb-03", "tags": ["disambiguated", "no_checkin"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Priya Nair here today?", "expect": { "intent": "attendance_today", "outcome": "no_checkin_recorded", "baselineTools": ["hr_employee"] } },
+    { "id": "amb-04", "tags": ["near_name"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Rishi present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "baselineTools": ["hr_employee"] } },
+
+    { "id": "nf-01", "tags": ["not_found"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Zubin present today?", "expect": { "intent": "attendance_today", "outcome": "not_found", "baselineTools": ["hr_employee"] } },
+    { "id": "nf-02", "tags": ["inactive"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Sanjay Verma present today?", "expect": { "intent": "attendance_today", "outcome": "clarify_confirm", "baselineTools": ["hr_employee"], "mustNotRead": ["GR0109"] } },
+
+    { "id": "date-01", "tags": ["date"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Was Rishee present yesterday?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+    { "id": "date-02", "tags": ["date"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Was Umang present on 5 August?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+    { "id": "date-03", "tags": ["date"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Rishee coming tomorrow?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": null } },
+    { "id": "date-04", "tags": ["date"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Rishee present on Monday?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+    { "id": "date-05", "tags": ["date", "typo"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Was Rishee present yesterdy?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+    { "id": "date-06", "tags": ["date"], "actor": "hr_viewer_A", "scenario": "normal", "message": "was umang present on the fifth of august", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+
+    { "id": "leave-01", "tags": ["leave"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Meera on leave today?", "expect": { "intent": "leave_today", "outcome": "defer_to_assistant", "baselineTools": ["hr_leave", "hr_employee"] } },
+    { "id": "leave-02", "tags": ["leave"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Rishee off today?", "expect": { "intent": "leave_today", "outcome": "defer_to_assistant", "baselineTools": ["hr_leave", "hr_employee"] } },
+    { "id": "leave-03", "tags": ["absent_wording"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Kiran absent today?", "expect": { "intent": "attendance_today", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+
+    { "id": "grp-01", "tags": ["group"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Who is present today?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_daily_attendance"] } },
+    { "id": "grp-02", "tags": ["group"], "actor": "hr_viewer_A", "scenario": "normal", "message": "How many people are absent today?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_daily_attendance", "hr_overview"] } },
+    { "id": "grp-03", "tags": ["self"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Am I present today?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": null } },
+    { "id": "grp-04", "tags": ["group"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is the Cutting department present today?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_daily_attendance"] } },
+
+    { "id": "ord-01", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "hello", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": [] } },
+    { "id": "ord-02", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "What can you do?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": [] } },
+    { "id": "ord-03", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "What is the company's leave policy?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_policies"] } },
+    { "id": "ord-04", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "How many employees do we have?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_directory", "hr_overview"] } },
+    { "id": "ord-05", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Tell me about Umang Arora", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_employee"] } },
+    { "id": "ord-06", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "What's Rishee's leave balance?", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": ["hr_leave", "hr_employee"] } },
+    { "id": "ord-07", "tags": ["ordinary"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Draft a polite reminder about the Diwali holiday", "expect": { "intent": "other", "outcome": "defer_to_assistant", "baselineTools": null } },
+
+    { "id": "unc-01", "tags": ["unclear"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Rishee?", "expect": { "intent": "unclear", "outcome": "defer_to_assistant", "baselineTools": null } },
+    { "id": "unc-02", "tags": ["unclear"], "actor": "hr_viewer_A", "scenario": "normal", "message": "present?", "expect": { "intent": "unclear", "outcome": "defer_to_assistant", "baselineTools": null } },
+    { "id": "unc-03", "tags": ["unclear"], "actor": "hr_viewer_A", "scenario": "normal", "message": "asdf qwer zxcv", "expect": { "intent": "unclear", "outcome": "defer_to_assistant", "baselineTools": [] } },
+
+    { "id": "auth-01", "tags": ["unauthorised"], "actor": "employee_self_A", "scenario": "normal", "message": "Is Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "defer_to_assistant", "baselineTools": [], "mustNotRead": ["GR0101"] } },
+    { "id": "auth-02", "tags": ["unauthorised"], "actor": "sales_only_A", "scenario": "normal", "message": "Is Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "defer_to_assistant", "baselineTools": [], "mustNotRead": ["GR0101"] } },
+    { "id": "auth-03", "tags": ["unauthorised"], "actor": "sales_only_A", "scenario": "normal", "message": "Rishee present?", "expect": { "intent": "attendance_today", "outcome": "defer_to_assistant", "baselineTools": [], "mustNotRead": ["GR0101"] } },
+    { "id": "auth-04", "tags": ["unauthorised", "directory_only"], "actor": "directory_only_A", "scenario": "normal", "message": "Is Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "defer_to_assistant", "baselineTools": [], "mustNotRead": ["GR0101"] } },
+
+    { "id": "xco-01", "tags": ["cross_company"], "actor": "hr_viewer_B", "scenario": "normal", "message": "Is Rishee Ray present today?", "expect": { "intent": "attendance_today", "outcome": "clarify_confirm", "baselineTools": ["hr_employee"], "mustNotRead": ["GR0101"] } },
+    { "id": "xco-02", "tags": ["cross_company"], "actor": "hr_viewer_B", "scenario": "normal", "message": "Is Umang present today?", "expect": { "intent": "attendance_today", "outcome": "not_found", "baselineTools": ["hr_employee"], "mustNotRead": ["GR0105"] } },
+    { "id": "xco-03", "tags": ["cross_company"], "actor": "hr_viewer_A", "scenario": "normal", "message": "Is Farhan present today?", "expect": { "intent": "attendance_today", "outcome": "not_found", "baselineTools": ["hr_employee"], "mustNotRead": ["GR0202"] } },
+
+    { "id": "stale-01", "tags": ["stale"], "actor": "hr_viewer_A", "scenario": "stale", "message": "Is Umang present today?", "expect": { "intent": "attendance_today", "outcome": "checked_in", "stale": true, "baselineTools": ["hr_employee"] } },
+    { "id": "stale-02", "tags": ["stale", "no_checkin"], "actor": "hr_viewer_A", "scenario": "stale", "message": "Is Kiran present today?", "expect": { "intent": "attendance_today", "outcome": "no_checkin_recorded", "stale": true, "baselineTools": ["hr_employee"] } },
+    { "id": "sync-01", "tags": ["missing_attendance"], "actor": "hr_viewer_A", "scenario": "no_sync", "message": "Is Rishee present today?", "expect": { "intent": "attendance_today", "outcome": "no_attendance_sync_today", "baselineTools": ["hr_employee"] } }
+  ]
+}

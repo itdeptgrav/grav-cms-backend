@@ -27,13 +27,10 @@ const express = require("express");
 
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
 const { handle, fail, sendError } = require("../../../services/storePurchase/errors");
-const { ppcCapability, requirePpcCapability, CAPABILITY } = require("../../../services/ppc/access.service");
+const { ppcCapability, requirePpcCapability, authorizedPpcCompanies, CAPABILITY } = require("../../../services/ppc/access.service");
 const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
-const {
-  listMembershipCompanies,
-} = require("../../../services/companyContext/companyMembership.service");
 const ack = require("../../../services/ppc/ieReleaseAck.service");
 
 const router = express.Router();
@@ -99,20 +96,17 @@ const idempotencyKey = (req) => String(req.get("Idempotency-Key") || "").trim();
  * grant learns nothing here — `access.service.js` already refuses each of them,
  * and `isAdmin` grants nothing.
  *
- * ── THE ANSWER IS THE ACTOR'S OWN MEMBERSHIPS, AND NOTHING ELSE ────────────
- * `listMembershipCompanies` is the shared rule every domain uses, reused rather
- * than re-implemented: a PPC copy of the membership query is a second place for
- * the rule to drift. It returns the actor's ACTIVE memberships, deduplicated by
- * company and ordered by display name, carrying exactly `companyId` and
- * `displayName`. No address, no tax registration, no books date, no
- * configuration and no membership internals — a chooser needs a name and an id.
+ * ── THE ANSWER IS THE ACTOR'S PPC-AUTHORISED COMPANIES ─────────────────────
+ * Membership alone is insufficient. The shared company-access service filters
+ * active memberships to those with an effective PPC grant, so a Sales-only
+ * company never appears as a PPC choice.
  *
  * Nothing narrows it: an `X-Costing-Company` header is not read here, no
  * company is accepted from a body or query, and no company is chosen on the
  * caller's behalf. Selecting is the person's act, and it happens next.
  */
 router.get("/companies", canRead, handle(async (req, res) => {
-  const { companies } = await listMembershipCompanies(req.user);
+  const companies = await authorizedPpcCompanies(req.user);
   return res.json({ success: true, companies });
 }));
 

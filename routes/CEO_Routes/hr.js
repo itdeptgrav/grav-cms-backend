@@ -32,6 +32,13 @@ const http = require("http");
 
 const Employee = require("../../models/Employee");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+/* The same server-owned field policy the HR routes use. The declarations for
+   this router promise the DIRECTORY class to management (see
+   services/access/hrRouteContract.js); this is what makes that true rather than
+   aspirational — the projection excludes salary, banking, government
+   identifiers, medical data and private contact details, and withholds any
+   field added to Employee later by default. */
+const { projectFor, selectFor } = require("../../services/access/hrFieldPolicy");
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 function ceoAuth(req, res, next) {
@@ -73,11 +80,15 @@ router.get("/employees", ceoAuth, async (req, res) => {
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        // Use projection object (not string) to exclude salary
-        const projection = { salary: 0, password: 0, temporaryPassword: 0 };
-
+        /* This used to be `{ salary: 0, password: 0, temporaryPassword: 0 }` —
+           three names on a document with eighty fields, so every management
+           read of the employee list also carried personal phone numbers, home
+           addresses, dates of birth, family details, bank accounts and Aadhaar
+           numbers. `selectFor` narrows the QUERY to what this caller may read;
+           `projectFor` narrows the RESPONSE to the declared directory class. */
         const [employees, total] = await Promise.all([
-            Employee.find(query, projection)
+            Employee.find(query)
+                .select(selectFor(req, "-password -temporaryPassword -__v"))
                 .sort({ firstName: 1, lastName: 1 })
                 .skip(skip)
                 .limit(parseInt(limit))
@@ -87,7 +98,7 @@ router.get("/employees", ceoAuth, async (req, res) => {
 
         res.json({
             success: true,
-            data: employees,
+            data: projectFor(req, employees),
             pagination: {
                 total,
                 page: parseInt(page),
@@ -137,9 +148,11 @@ router.get("/employees/:id/sop-points", ceoAuth, async (req, res) => {
 // GET /api/ceo/hr/employees/:id
 router.get("/employees/:id", ceoAuth, async (req, res) => {
     try {
-        const emp = await Employee.findById(req.params.id, { salary: 0, password: 0, temporaryPassword: 0 }).lean();
+        const emp = await Employee.findById(req.params.id)
+            .select(selectFor(req, "-password -temporaryPassword -__v"))
+            .lean();
         if (!emp) return res.status(404).json({ success: false, message: "Employee not found" });
-        res.json({ success: true, data: emp });
+        res.json({ success: true, data: projectFor(req, emp) });
     } catch (err) {
         console.error("[CEO] GET /employees/:id:", err.message);
         res.status(500).json({ success: false, message: "Server error: " + err.message });

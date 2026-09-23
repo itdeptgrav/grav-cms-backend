@@ -1,4 +1,5 @@
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 // services/customerPurge.service.js
 //
 // "Delete this customer and everything raised for them."
@@ -68,7 +69,12 @@ const countOf = (Model, filter) => (Model ? Model.countDocuments(filter) : Promi
  * Always run before deleting, and shown to the person doing it: a cascade whose
  * scope you cannot see before confirming is not a decision, it is a gamble.
  */
-async function deletionImpact(customerId) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function deletionImpact(customerId, ctx) {
   const Customer = M.Customer();
   const customer = await Customer.findById(customerId)
     .select("name customerId email phone isActive")
@@ -84,7 +90,7 @@ async function deletionImpact(customerId) {
     ? await CustomerRequest.find({ customerId: id }).select("_id requestId").lean()
     : [];
   const accounts = Account
-    ? await Account.find({ linkedCustomer: id }).select("_id companyName").lean()
+    ? await Account.find(serviceFilter(ctx, { linkedCustomer: id })).select("_id companyName").lean()
     : [];
   const requestIds = requests.map((r) => r._id);
   const accountIds = accounts.map((a) => a._id);

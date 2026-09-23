@@ -91,6 +91,20 @@ const dayBookImporter = require("../../services/tallyDayBookImporter.service");
 // how Balance-Sheet accounts get their true brought-forward position.
 const tbOpenings = require("../../services/tallyTrialBalanceOpenings.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 // ─── Multer: in-memory upload, 50MB cap (Tally exports rarely exceed this) ──
@@ -110,7 +124,7 @@ const upload = multer({
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /upload
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/upload", upload.single("file"), async (req, res) => {
+router.post("/upload", companyScope, upload.single("file"), async (req, res) => {
   try {
     if (!req.file)
       return res
@@ -233,7 +247,7 @@ router.get("/sessions/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /sessions  — paginated list
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/sessions", async (req, res) => {
+router.get("/sessions", companyScopeOptional, async (req, res) => {
   try {
     const { companyId, status, page = 1, limit = 20 } = req.query;
     const filter = {};
@@ -288,7 +302,7 @@ router.post("/sessions/:id/suggest-mapping", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /sessions/:id/mapping  — save the mapping the user finalised in the UI
 // ─────────────────────────────────────────────────────────────────────────────
-router.put("/sessions/:id/mapping", async (req, res) => {
+router.put("/sessions/:id/mapping", companyScopeOptional, async (req, res) => {
   try {
     const {
       mappings,
@@ -867,7 +881,7 @@ async function commitOne(prepared, session, mapping, accountantId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /sessions/:id/rollback  — undo a completed import
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/sessions/:id/rollback", async (req, res) => {
+router.post("/sessions/:id/rollback", companyScope, async (req, res) => {
   try {
     const session = await Acc_ImportSession.findById(req.params.id);
     if (!session)
@@ -998,7 +1012,7 @@ router.post("/sessions/:id/rollback", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // MAPPING TEMPLATES
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/mappings", async (req, res) => {
+router.get("/mappings", companyScopeOptional, async (req, res) => {
   try {
     const { entityType, companyId } = req.query;
     const filter = { isActive: true };
@@ -1050,7 +1064,7 @@ router.delete("/mappings/:id", async (req, res) => {
 //   POST /bsheet/commit   — write parsed data to DB
 // ═════════════════════════════════════════════════════════════════════════════
 
-router.post("/bsheet/preview", upload.single("file"), async (req, res) => {
+router.post("/bsheet/preview", companyScope, upload.single("file"), async (req, res) => {
   try {
     if (!req.file)
       return res
@@ -1189,7 +1203,7 @@ router.post("/bsheet/preview", upload.single("file"), async (req, res) => {
 //      Acc_Ledger ObjectIds, marks status="posted"
 //   6. Records what was created in session.rollbackTokens for /rollback
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/bsheet/commit", async (req, res) => {
+router.post("/bsheet/commit", companyScopeOptional, async (req, res) => {
   try {
     const { sessionId, ledgerOverrides } = req.body || {};
     const overrides = ledgerOverrides || {};
@@ -1688,7 +1702,7 @@ function guessGroupForUnknownLedger(name) {
 //   POST /masters/commit  — bulk-insert groups then ledgers
 // ═════════════════════════════════════════════════════════════════════════════
 
-router.post("/masters/preview", upload.single("file"), async (req, res) => {
+router.post("/masters/preview", companyScope, upload.single("file"), async (req, res) => {
   try {
     if (!req.file)
       return res
@@ -1804,7 +1818,7 @@ router.post("/masters/preview", upload.single("file"), async (req, res) => {
   }
 });
 
-router.post("/masters/commit", async (req, res) => {
+router.post("/masters/commit", companyScopeOptional, async (req, res) => {
   try {
     const { sessionId, ledgerOverrides } = req.body || {};
     const overrides = ledgerOverrides || {};
@@ -2287,7 +2301,7 @@ function reconcileReports({ pl, tb, bs, vouchers, ledgersByName }) {
   return out;
 }
 
-router.post("/combined/preview", combinedUpload, async (req, res) => {
+router.post("/combined/preview", companyScope, combinedUpload, async (req, res) => {
   try {
     const mFile = req.files?.mastersFile?.[0];
     // Day Book can arrive as its own field (new 5-file flow) or in the
@@ -2669,7 +2683,7 @@ router.post("/combined/preview", combinedUpload, async (req, res) => {
   }
 });
 
-router.post("/combined/commit", async (req, res) => {
+router.post("/combined/commit", companyScopeOptional, async (req, res) => {
   try {
     const { sessionId, ledgerOverrides } = req.body || {};
     const overrides = ledgerOverrides || {};
@@ -3591,7 +3605,7 @@ router.post("/combined/commit", async (req, res) => {
 //
 // This endpoint NEVER writes data — it only reads and compares.
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/reconcile", upload.single("summaryFile"), async (req, res) => {
+router.post("/reconcile", companyScope, upload.single("summaryFile"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({
@@ -3818,7 +3832,7 @@ router.post("/reconcile", upload.single("summaryFile"), async (req, res) => {
 // confirm string so it can't fire by accident. Does NOT touch company
 // settings, users, or any non-accounting collection.
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/reset-accounting", async (req, res) => {
+router.post("/reset-accounting", companyScope, async (req, res) => {
   try {
     const { companyId, confirm } = req.body || {};
     if (!companyId)
@@ -4013,7 +4027,7 @@ router.post("/opening-balances/preview", tbUpload, async (req, res) => {
   }
 });
 
-router.post("/opening-balances/apply", tbUpload, async (req, res) => {
+router.post("/opening-balances/apply", companyScope, tbUpload, async (req, res) => {
   try {
     const plan = await buildOpeningPlan(req);
     let updated = 0;

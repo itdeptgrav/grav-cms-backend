@@ -136,72 +136,83 @@ describe("assign existing stock", () => {
   });
 });
 
-// ── Receipt ──────────────────────────────────────────────────────────────────
-describe("receipt to a location", () => {
-  // 1
-  test("a receipt records the selected destination and preserves the company total", async () => {
+// ── Standalone stock-changing endpoints are RETIRED ──────────────────────────
+describe("standalone location endpoints cannot bypass canonical stock", () => {
+  test("the standalone /issue and /receipt are gone (410) and change nothing", async () => {
     const s = await scene({ quantity: 10 });
-    const before = (await RawItem.findById(s.item._id).lean()).quantity;
-    const r = await call("/api/cms/inventory/locations/receipt", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.recv._id), quantity: 4, reference: "GRN-1",
+    const iss = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 1,
     } });
-    expect([200, 201]).toContain(r.status);
-    const after = (await RawItem.findById(s.item._id).lean()).quantity;
-    expect(after).toBe(before); // preserved
-    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
-    const recvBal = view.body.item.balances.find((b) => b.locationId === String(s.recv._id));
-    expect(recvBal.onHand).toBe(4);
-    expect(recvBal.locationCode).toBe("RECV");
+    expect(iss.status).toBe(410);
+    expect(iss.body.reason).toBe("ENDPOINT_RETIRED");
+    const rec = await call("/api/cms/inventory/locations/receipt", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.recv._id), quantity: 1,
+    } });
+    expect(rec.status).toBe(410);
+    expect(rec.body.reason).toBe("ENDPOINT_RETIRED");
+    expect(await LocationMovement.countDocuments({ itemId: s.item._id })).toBe(0);
+    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(10);
   });
 });
 
-// ── Issue ────────────────────────────────────────────────────────────────────
-describe("issue from a location", () => {
-  // 2
-  test("issue refuses more than the selected location holds", async () => {
+// ── Canonical issue (stock adjustment) now carries location ──────────────────
+const ISSUE_REASON = "issued to the production floor for the morning run";
+const canonicalIssue = (s, { direction = "debit", qty = 1, loc, key } = {}) =>
+  call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: key || newKey(), body: {
+    direction, reason: ISSUE_REASON,
+    items: [{ rawItemId: String(s.item._id), issuedQty: qty, issuedUnit: "PCS",
+      ...(loc ? { warehouseId: String(s.wh._id), locationId: String(loc._id) } : {}) }],
+  } });
+
+describe("canonical stock issue with location", () => {
+  async function placed(qty, at) {
     const s = await scene({ quantity: 10 });
     await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5,
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String((at || s.stock)._id), quantity: qty,
     } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 6, reason: "over-issue",
-    } });
+    return s;
+  }
+
+  test("a canonical issue writes stock history AND a location out together", async () => {
+    const s = await placed(8);
+    const r = await canonicalIssue(s, { qty: 3, loc: s.stock });
+    expect([200, 201]).toContain(r.status);
+    const item = await RawItem.findById(s.item._id).lean();
+    expect(item.quantity).toBe(7);
+    const tx = item.stockTransactions.find((t) => t.type === "REDUCE");
+    expect(tx).toBeTruthy();
+    expect(String(tx.locationCode)).toBe("STOCK");
+    const mv = await LocationMovement.findOne({ itemId: s.item._id, type: "issue" }).lean();
+    expect(mv.direction).toBe("out");
+    expect(mv.source.kind).toBe("stock_issue");
+    expect(String(mv.source.id)).toBeTruthy();
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    expect(view.body.item.balances.find((b) => b.locationId === String(s.stock._id)).onHand).toBe(5);
+  });
+
+  test("a canonical issue refuses more than the source location holds", async () => {
+    const s = await placed(5);
+    const r = await canonicalIssue(s, { qty: 6, loc: s.stock });
     expect(r.status).toBe(400);
     expect(r.body.error?.details?.reason).toBe("INSUFFICIENT_AT_LOCATION");
   });
 
-  test("issue reduces the company total and the location together", async () => {
-    const s = await scene({ quantity: 10 });
-    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 8,
-    } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 3, reason: "issued to floor",
-    } });
-    expect([200, 201]).toContain(r.status);
-    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(7); // 10 − 3
-    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
-    const bal = view.body.item.balances.find((b) => b.locationId === String(s.stock._id));
-    expect(bal.onHand).toBe(5); // 8 − 3
-    expect(view.body.item.assigned + view.body.item.unassigned).toBe(7); // reconcile to new total
+  test("when the location side fails neither side is applied", async () => {
+    const s = await placed(5);
+    const before = (await RawItem.findById(s.item._id).lean()).quantity;
+    const r = await canonicalIssue(s, { qty: 6, loc: s.stock });
+    expect(r.status).toBe(400);
+    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(before);
+    expect(await LocationMovement.countDocuments({ itemId: s.item._id, type: "issue" })).toBe(0);
   });
 
-  // 9
-  test("a refused issue leaves no orphan location entry", async () => {
-    const s = await scene({ quantity: 10 });
-    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5,
-    } });
-    // Company on-hand quietly drops to 3 (as if depleted by another flow), while
-    // the location still shows 5. An issue of 5 passes the location soft-check
-    // but the atomic company guard refuses — and must write NO location entry.
-    await RawItem.updateOne({ _id: s.item._id }, { $set: { quantity: 3 } });
-    const r = await call("/api/cms/inventory/locations/issue", { method: "POST", token: s.token, key: newKey(), body: {
-      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 5, reason: "x",
-    } });
-    expect(r.status).toBe(400);
-    expect(r.body.error?.details?.reason).toBe("INSUFFICIENT_ON_HAND");
-    expect(await LocationMovement.countDocuments({ itemId: s.item._id, type: "issue" })).toBe(0);
+  test("a canonical issue records exactly one canonical stock transaction", async () => {
+    const s = await placed(8);
+    await canonicalIssue(s, { qty: 3, loc: s.stock });
+    const item = await RawItem.findById(s.item._id).lean();
+    const reduces = item.stockTransactions.filter((t) => t.type === "REDUCE");
+    expect(reduces.length).toBe(1);
+    expect(reduces[0].quantity).toBe(3);
   });
 });
 
@@ -256,6 +267,56 @@ describe("internal transfer", () => {
     expect(r.body.error?.details?.reason).toBe("SAME_LOCATION");
   });
 
+  test("the transfer response carries the committed before/after result facts", async () => {
+    const s = await assignedScene(); // STOCK holds 10, RECV holds 0
+    const r = await call("/api/cms/inventory/locations/transfer", { method: "POST", token: s.token, key: newKey(), body: transferBody(s, 4) });
+    expect([200, 201]).toContain(r.status);
+    const t = r.body.transfer;
+    expect(t.transferId).toBeTruthy();
+    expect(t.quantity).toBe(4);
+    expect(t.baseUnit).toBe("PCS");
+    expect(String(t.item.rawItemId)).toBe(String(s.item._id));
+    expect(t.variantId).toBeNull();
+    // Source snapshot + before/after — from the committed operation.
+    expect(String(t.source.locationId)).toBe(String(s.stock._id));
+    expect(t.source.locationCode).toBe("STOCK");
+    expect(t.source.before).toBe(10);
+    expect(t.source.after).toBe(6);
+    // Destination snapshot + before/after.
+    expect(String(t.destination.locationId)).toBe(String(s.recv._id));
+    expect(t.destination.before).toBe(0);
+    expect(t.destination.after).toBe(4);
+    // Company on-hand is unchanged by a transfer.
+    expect(t.companyOnHand.before).toBe(10);
+    expect(t.companyOnHand.after).toBe(10);
+  });
+
+  // Correction pass — committed before/after facts under concurrency.
+  test("two simultaneous transfers that both succeed return CHAINED before→after, not a stale duplicate", async () => {
+    const s = await assignedScene(); // STOCK holds 10, RECV holds 0
+    const [a, b] = await Promise.all([
+      call("/api/cms/inventory/locations/transfer", { method: "POST", token: s.token, key: newKey(), body: transferBody(s, 2) }),
+      call("/api/cms/inventory/locations/transfer", { method: "POST", token: s.token, key: newKey(), body: transferBody(s, 2) }),
+    ]);
+    expect([200, 201]).toContain(a.status);
+    expect([200, 201]).toContain(b.status);
+
+    // Source chain: {10→8, 8→6} in either order — NEVER both 10→8.
+    const src = [a.body.transfer.source, b.body.transfer.source].sort((x, y) => y.before - x.before);
+    expect(src.map((v) => [v.before, v.after])).toEqual([[10, 8], [8, 6]]);
+    // Destination chains the same way: {0→2, 2→4}.
+    const dst = [a.body.transfer.destination, b.body.transfer.destination].sort((x, y) => x.before - y.before);
+    expect(dst.map((v) => [v.before, v.after])).toEqual([[0, 2], [2, 4]]);
+
+    // The projection agrees with the last committed figures.
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    expect(view.body.item.balances.find((x) => x.locationId === String(s.stock._id)).onHand).toBe(6);
+    expect(view.body.item.balances.find((x) => x.locationId === String(s.recv._id)).onHand).toBe(4);
+    // Company on-hand is unchanged and comes from the company authority.
+    expect(a.body.transfer.companyOnHand.before).toBe(a.body.transfer.companyOnHand.after);
+    expect((await RawItem.findById(s.item._id).lean()).quantity).toBe(10);
+  });
+
   // 7
   test("replaying the same transfer key does not duplicate either leg", async () => {
     const s = await assignedScene();
@@ -267,6 +328,68 @@ describe("internal transfer", () => {
     expect(await LocationMovement.countDocuments({ itemId: s.item._id, type: { $in: ["transfer_in", "transfer_out"] } })).toBe(2);
     const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
     expect(view.body.item.balances.find((b) => b.locationId === String(s.stock._id)).onHand).toBe(6); // not 2
+  });
+});
+
+// ── Put-away destination semantics ───────────────────────────────────────────
+describe("put-away destination semantics", () => {
+  const TYPES = [
+    { code: "RECV", name: "Receiving", type: "RECEIVING", status: "Active" },
+    { code: "RECV2", name: "Receiving 2", type: "RECEIVING", status: "Active" },
+    { code: "STOCK", name: "Usable", type: "USABLE_STOCK", status: "Active" },
+    { code: "QUAR", name: "Quarantine", type: "QUARANTINE", status: "Active" },
+    { code: "INSP", name: "Inspection", type: "INSPECTION", status: "Active" },
+    { code: "RETN", name: "Returns", type: "RETURNS", status: "Active" },
+    { code: "SCRAP", name: "Scrap", type: "SCRAP", status: "Active" },
+  ];
+  async function putawayScene() {
+    const c = await company();
+    const wh = await warehouse(c._id, { locations: TYPES });
+    const item = await rawItem(c._id, { quantity: 20 });
+    const token = await actor(c);
+    const byCode = {};
+    wh.locations.forEach((l) => { byCode[l.code] = l; });
+    // Put 20 into the RECV dock so a put-away has something to move.
+    await call("/api/cms/inventory/locations/assign", { method: "POST", token, key: newKey(), body: {
+      rawItemId: String(item._id), warehouseId: String(wh._id), locationId: String(byCode.RECV._id), quantity: 20,
+    } });
+    return { c, wh, item, token, byCode };
+  }
+  const put = (s, toCode, qty = 5) => call("/api/cms/inventory/locations/transfer", { method: "POST", token: s.token, key: newKey(), body: {
+    rawItemId: String(s.item._id),
+    fromWarehouseId: String(s.wh._id), fromLocationId: String(s.byCode.RECV._id),
+    toWarehouseId: String(s.wh._id), toLocationId: String(s.byCode[toCode]._id),
+    quantity: qty,
+  } });
+
+  test("Receiving → Usable Stock is allowed", async () => {
+    const s = await putawayScene();
+    expect([200, 201]).toContain((await put(s, "STOCK")).status);
+  });
+  test("Receiving → another Receiving is refused as a put-away", async () => {
+    const s = await putawayScene();
+    const r = await put(s, "RECV2");
+    expect(r.status).toBe(400);
+    expect(r.body.error?.details?.reason).toBe("PUTAWAY_DESTINATION_NOT_USABLE");
+  });
+  for (const code of ["QUAR", "INSP", "RETN", "SCRAP"]) {
+    test(`Receiving → ${code} (an exception type) is refused as a put-away`, async () => {
+      const s = await putawayScene();
+      const r = await put(s, code);
+      expect(r.status).toBe(400);
+      expect(r.body.error?.details?.reason).toBe("PUTAWAY_DESTINATION_NOT_USABLE");
+    });
+  }
+  test("an ORDINARY transfer (usable source, not a put-away) may still reach a non-usable active location", async () => {
+    const s = await putawayScene();
+    expect([200, 201]).toContain((await put(s, "STOCK", 10)).status); // stock now in Usable
+    const r = await call("/api/cms/inventory/locations/transfer", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id),
+      fromWarehouseId: String(s.wh._id), fromLocationId: String(s.byCode.STOCK._id),
+      toWarehouseId: String(s.wh._id), toLocationId: String(s.byCode.QUAR._id),
+      quantity: 3,
+    } });
+    expect([200, 201]).toContain(r.status);
   });
 });
 
@@ -284,6 +407,48 @@ describe("variant separation", () => {
     const b = view.body.variants.find((v) => v.variantId === String(vB));
     expect(a.assigned).toBe(5); expect(a.unassigned).toBe(1); // on-hand 6
     expect(b.assigned).toBe(0); expect(b.unassigned).toBe(4); // untouched
+  });
+
+  // Correction 2 regression: Red and Blue at DIFFERENT locations. The item
+  // endpoint must return each variant's OWN balances (so a Red MRF line can be
+  // offered Red stock, not Blue's or the whole item's), and a truthful `tracked`
+  // flag per scope.
+  test("Red and Blue at different locations — each variant returns only its own stock, tracked", async () => {
+    const red = oid(); const blue = oid();
+    const s = await scene({
+      quantity: 10,
+      variants: [
+        { _id: red, sku: "RED", combination: ["Red"], quantity: 6 },
+        { _id: blue, sku: "BLUE", combination: ["Blue"], quantity: 4 },
+      ],
+    });
+    // Red → RECV, Blue → STOCK (two distinct locations).
+    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), variantId: String(red), warehouseId: String(s.wh._id), locationId: String(s.recv._id), quantity: 6,
+    } });
+    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), variantId: String(blue), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 4,
+    } });
+
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    const r = view.body.variants.find((v) => v.variantId === String(red));
+    const b = view.body.variants.find((v) => v.variantId === String(blue));
+
+    // Red offers ONLY its own location, with its own quantity — never Blue's.
+    expect(r.tracked).toBe(true);
+    expect(r.balances).toHaveLength(1);
+    expect(String(r.balances[0].locationId)).toBe(String(s.recv._id));
+    expect(r.balances[0].onHand).toBe(6);
+    expect(r.balances.some((x) => String(x.locationId) === String(s.stock._id))).toBe(false);
+
+    // Blue is separate, at the other location.
+    expect(b.tracked).toBe(true);
+    expect(b.balances).toHaveLength(1);
+    expect(String(b.balances[0].locationId)).toBe(String(s.stock._id));
+    expect(b.balances[0].onHand).toBe(4);
+
+    // The whole-item scope, by contrast, was never placed → not tracked.
+    expect(view.body.item.tracked).toBe(false);
   });
 });
 
@@ -339,5 +504,39 @@ describe("warehouse stock view", () => {
     expect(stockLoc.items).toHaveLength(1);
     expect(stockLoc.items[0].onHand).toBe(7);
     expect(String(stockLoc.items[0].itemId)).toBe(String(s.item._id));
+  });
+});
+
+// ── Concurrency: atomic guards prevent oversubscription ──────────────────────
+describe("concurrent oversubscription is refused", () => {
+  test("two simultaneous assignments of the same headroom: only one wins", async () => {
+    const s = await scene({ quantity: 10 });
+    const body = { rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 6 };
+    const [a, b] = await Promise.all([
+      call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body }),
+      call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body }),
+    ]);
+    const oks = [a, b].filter((r) => r.status === 201 || r.status === 200).length;
+    expect(oks).toBe(1);
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    expect(view.body.item.assigned).toBe(6);
+    expect(view.body.item.assigned).toBeLessThanOrEqual(view.body.item.onHand);
+  });
+
+  test("two simultaneous canonical issues from one location: only one wins", async () => {
+    const s = await scene({ quantity: 20 });
+    await call("/api/cms/inventory/locations/assign", { method: "POST", token: s.token, key: newKey(), body: {
+      rawItemId: String(s.item._id), warehouseId: String(s.wh._id), locationId: String(s.stock._id), quantity: 8,
+    } });
+    const body = { direction: "debit", reason: ISSUE_REASON, items: [{ rawItemId: String(s.item._id), issuedQty: 6, issuedUnit: "PCS", warehouseId: String(s.wh._id), locationId: String(s.stock._id) }] };
+    const [a, b] = await Promise.all([
+      call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: newKey(), body }),
+      call("/api/cms/inventory/stock-adjustments/issue", { method: "POST", token: s.token, key: newKey(), body }),
+    ]);
+    const oks = [a, b].filter((r) => r.status === 200 || r.status === 201).length;
+    expect(oks).toBe(1);
+    const view = await call(`/api/cms/inventory/locations/item/${s.item._id}`, { token: s.token });
+    const bal = view.body.item.balances.find((x) => x.locationId === String(s.stock._id));
+    expect(bal.onHand).toBe(2);
   });
 });

@@ -1345,7 +1345,12 @@ describe("no Sales, buyer, money or payroll field leaves an order response", () 
     const w = await world("OrderShape");
     const a = await ieViewer(w.co);
     const res = await call("/orders", { token: a.token, company: w.co._id });
+    /* `engineeringStandardSummary` is the approved IE operation standard across
+       the order's styles, added deliberately beside `routeSummary` so approved
+       evidence is never folded into R&D's route. The list stays exact: any
+       OTHER new key still fails here. */
     expect(Object.keys(res.body.rows[0]).sort()).toEqual([
+      "engineeringStandardSummary",
       "gaps", "historicalStyles", "ieReadiness", "linePlanning", "orderId", "plannedEndDate",
       "plannedQuantity", "plannedStartDate", "planningState", "priority", "product", "reference",
       "routeSummary", "status", "styleCount", "styleLinkState", "stylesReady", "stylesWithGaps",

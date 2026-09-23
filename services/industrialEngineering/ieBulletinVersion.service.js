@@ -46,6 +46,7 @@ const styleFiles = require("./ieStyleFile.service");
    not be a convenience, it would be a second answer that eventually disagrees
    with the first about which approval was current. */
 const layouts = require("./ieLineLayout.service");
+const processRoutes = require("./ieProcessRoute.service");
 
 const { STATE, LIMITS } = IeBulletinVersion;
 
@@ -347,16 +348,15 @@ async function snapshotOf(ctx, file) {
       machineType: row.machineType || "",
       proposedSamMinutes: row.proposedSamMinutes ?? null,
       note: row.note || "",
-      requirementSnapshot: row.requirementSnapshot
-        ? {
-          capturedAt: row.requirementSnapshot.capturedAt || null,
-          ieOperationRevision: row.requirementSnapshot.ieOperationRevision ?? null,
-          requirementsConfigured: Boolean(row.requirementSnapshot.requirementsConfigured),
-          machineTypes: (row.requirementSnapshot.machineTypes || []).map((m) => ({
-            machineType: m.machineType, quantity: m.quantity,
-          })),
-        }
-        : null,
+      /* ── THE FROZEN REQUIREMENT EVIDENCE, COPIED WHOLE ─────────────────
+         Copied from the draft row, never re-read from the operation library:
+         a version is evidence of what the bulletin said when it was submitted.
+
+         Chunk 8A-iii adds the attachment and labour halves. They are carried
+         only when the DRAFT row actually froze them — `dimensionsCaptured` is
+         what says so — because a version cannot invent evidence its draft never
+         held, and a row drafted before this existed stays NOT_CAPTURED. */
+      requirementSnapshot: freezeRequirementSnapshot(row.requirementSnapshot),
       standardTimeMinutes: evidence?.standardTimeMinutes ?? null,
       standardTimeSource: evidence?.standardTimeSource || "",
       methodStudyId: evidence?.methodStudyId ?? null,
@@ -366,6 +366,55 @@ async function snapshotOf(ctx, file) {
   });
 
   return { rows, bound, timeGaps };
+}
+
+/**
+ * The stored form of a frozen requirement snapshot on a bulletin version.
+ *
+ * Deliberately NOT `publishRequirementSnapshot` — that one is the wire shape,
+ * with ISO dates and nulls for the dimensions a row never captured. This is
+ * what goes on disk, and it keeps the draft's own types and omits what the
+ * draft omitted, so a legacy row stores exactly the three fields it always did.
+ */
+function freezeRequirementSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const frozen = {
+    capturedAt: snapshot.capturedAt || null,
+    ieOperationRevision: snapshot.ieOperationRevision ?? null,
+    requirementsConfigured: Boolean(snapshot.requirementsConfigured),
+    machineTypes: (snapshot.machineTypes || []).map((m) => ({
+      machineType: m.machineType, quantity: m.quantity,
+    })),
+  };
+  const captured = Array.isArray(snapshot.dimensionsCaptured) ? snapshot.dimensionsCaptured : [];
+  if (!captured.length) return frozen;
+
+  frozen.dimensionsCaptured = [...captured];
+  frozen.machines = (snapshot.machines || []).map((m) => ({
+    requirementId: m.requirementId,
+    sequence: m.sequence,
+    machineType: m.machineType,
+    quantity: m.quantity,
+  }));
+  frozen.attachments = (snapshot.attachments || []).map((a) => ({
+    requirementId: a.requirementId,
+    sequence: a.sequence,
+    code: a.code,
+    name: a.name,
+    quantity: a.quantity,
+    note: a.note || "",
+  }));
+  frozen.labour = (snapshot.labour || []).map((l) => ({
+    requirementId: l.requirementId,
+    sequence: l.sequence,
+    workerType: l.workerType,
+    quantity: l.quantity,
+    skillCode: l.skillCode || "",
+    skillName: l.skillName || "",
+    grade: l.grade || "",
+    note: l.note || "",
+  }));
+  return frozen;
 }
 
 /** Decimal-safe totals, on the lane's one rounding policy. */
@@ -444,17 +493,11 @@ const publishRow = (r) => ({
   machineType: r.machineType || "",
   proposedSamMinutes: r.proposedSamMinutes ?? null,
   note: r.note || "",
-  requirementSnapshot: r.requirementSnapshot
-    ? {
-      capturedAt: r.requirementSnapshot.capturedAt
-        ? new Date(r.requirementSnapshot.capturedAt).toISOString() : null,
-      ieOperationRevision: r.requirementSnapshot.ieOperationRevision ?? null,
-      requirementsConfigured: Boolean(r.requirementSnapshot.requirementsConfigured),
-      machineTypes: (r.requirementSnapshot.machineTypes || []).map((m) => ({
-        machineType: m.machineType, quantity: m.quantity,
-      })),
-    }
-    : null,
+  /* The one shared wire projection — see `ieStyleFile.service.js`. Three
+     surfaces publishing frozen requirement evidence in three spellings is how
+     a screen ends up reading the draft's shape and the version's shape as two
+     different kinds of fact. */
+  requirementSnapshot: styleFiles.publishRequirementSnapshot(r.requirementSnapshot),
   standardTimeMinutes: r.standardTimeMinutes ?? null,
   standardTimeSource: r.standardTimeSource || "",
   methodStudyId: r.methodStudyId ? String(r.methodStudyId) : null,
@@ -491,6 +534,10 @@ function publishVersion(doc, { withRows = true, withHistory = false } = {}) {
     },
     allowancePolicyId: doc.allowancePolicyId ? String(doc.allowancePolicyId) : null,
     allowancePolicyRevision: doc.allowancePolicyRevision ?? null,
+
+    /* The route frozen with this version: DECLARED with its stages, or
+       UNKNOWN with `stages: null` when none was declared at submission. */
+    processRoute: processRoutes.publishRoute(doc.processRoute),
 
     source: {
       fingerprint: doc.sourceFingerprint,
@@ -562,6 +609,7 @@ async function submitVersion(ctx, { fileId, body = {}, actor } = {}) {
      rows, so a version and a layout of the same source agree digit for digit. */
   const digests = layouts.sourceDigestsOf(rows);
   const fingerprint = layouts.sourceFingerprintOf(rows);
+  const frozenRoute = processRoutes.freezeRoute(file.bulletin?.processRoute);
 
   /* ── A DUPLICATE KEY HERE IS A LOST RACE, AND IS ANSWERED AS ONE ────────
      Two mechanisms refuse a second submission and either is sufficient: the
@@ -611,6 +659,9 @@ async function submitVersion(ctx, { fileId, body = {}, actor } = {}) {
       revision: 1,
       fileRevisionAtSubmit: expected,
       rows,
+      /* The draft route, frozen with the rows it was declared beside. Left
+         absent — never an empty route — when the draft declared none. */
+      ...(frozenRoute ? { processRoute: frozenRoute } : {}),
       totals,
       allowancePolicyId: policy.allowancePolicyId,
       allowancePolicyRevision: policy.allowancePolicyRevision,

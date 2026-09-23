@@ -99,6 +99,27 @@ function foldAllocations(rows = []) {
         // existing, already-shipped implementation (see the comment on
         // `dueDate` above); this field has no such precedent to preserve.
         voucherDueDate: r.voucherDueDate || null,
+        /* The document that RAISED the bill, for an ageing report that has to
+         * say what kind of thing is overdue. Set from the `new_ref` row below
+         * — a settlement's own type describes the receipt, not the debt. */
+        voucherType: null,
+        voucherTypeName: null,
+        /* ── THE DATE THE BILL WAS RAISED WITH ──────────────────────────────
+         * `dueDate`/`creditDays` above are first-ROW-wins, and the rows come
+         * from an unsorted aggregation — so for a bill with a settlement
+         * against it, whichever of the invoice row and the receipt row Mongo
+         * happens to return first decides the date. A receipt carries no due
+         * date, so half the time the invoice's date vanished and the bill
+         * looked undated.
+         *
+         * These two capture the same values from the `new_ref` row — the
+         * document that ESTABLISHED the bill, which is the only row whose due
+         * date is a fact about the debt rather than about a payment. Added
+         * alongside rather than replacing: the ledger-detail statement has
+         * shipped on the first-row rule and this migration does not get to
+         * redefine it. Invoice-wise ageing reads these. */
+        refDueDate: null,
+        refCreditDays: null,
         voucherNumbers: new Set(),
       });
     }
@@ -106,7 +127,15 @@ function foldAllocations(rows = []) {
 
     const amount = Number(r.amount) || 0;
     bill.remaining += (r.entryType === "Dr" ? 1 : -1) * amount;
-    if (r.billType === "new_ref") bill.originalAmount += amount;
+    if (r.billType === "new_ref") {
+      bill.originalAmount += amount;
+      if (!bill.voucherType) {
+        bill.voucherType = r.voucherType || null;
+        bill.voucherTypeName = r.voucherTypeName || null;
+      }
+      if (!bill.refDueDate && r.dueDate) bill.refDueDate = r.dueDate;
+      if (bill.refCreditDays == null && r.creditDays) bill.refCreditDays = r.creditDays;
+    }
 
     const d = r.voucherDate ? new Date(r.voucherDate).getTime() : null;
     const f = bill.firstVoucherDate ? new Date(bill.firstVoucherDate).getTime() : null;
@@ -210,7 +239,7 @@ function castId(v) {
  *
  * Not exported: the two named entry points below are the public surface.
  */
-async function fetchAllocationRows(companyId, ledgerIds) {
+async function fetchAllocationRows(companyId, ledgerIds, { asOf = null } = {}) {
   const ids = (ledgerIds || []).map(castId).filter(Boolean);
   if (ids.length === 0) return [];
 
@@ -218,6 +247,16 @@ async function fetchAllocationRows(companyId, ledgerIds) {
   if (!cid) return []; // never guess the scope — no company, no query, no rows
 
   const match = { status: "posted", isOptional: { $ne: true }, companyId: cid };
+
+  /* ── AS-OF BOUND (added for invoice-wise ageing) ────────────────────────
+   * Optional, and absent by default, so every existing caller — the parties
+   * list, the ledger-detail statement — keeps exactly the behaviour it had.
+   * An ageing report dated "as on 30 June" must not let a receipt banked in
+   * July settle a bill that was open on the 30th; without this bound the
+   * fold would show the bill as paid and the report would understate the
+   * debt at the date it claims to describe. */
+  const when = asOf instanceof Date ? asOf : asOf ? new Date(asOf) : null;
+  if (when && !Number.isNaN(when.getTime())) match.voucherDate = { $lte: when };
 
   return Acc_Voucher.aggregate([
     { $match: { ...match, "ledgerEntries.ledgerId": { $in: ids } } },
@@ -244,6 +283,8 @@ async function fetchAllocationRows(companyId, ledgerIds) {
         // usually empty.
         voucherDueDate: "$dueDate",
         voucherNumber: "$voucherNumber",
+        voucherType: "$voucherType",
+        voucherTypeName: "$voucherTypeName",
         voucherDate: "$voucherDate",
       },
     },
@@ -256,11 +297,11 @@ async function fetchAllocationRows(companyId, ledgerIds) {
  * Scoped to the ledgers passed in — normally one page of the parties list —
  * rather than sweeping every ledger in the company.
  */
-async function openItemsByLedger(companyId, ledgerIds = []) {
+async function openItemsByLedger(companyId, ledgerIds = [], opts = {}) {
   const ids = (ledgerIds || []).map(castId).filter(Boolean);
   if (ids.length === 0) return new Map();
 
-  const rows = await fetchAllocationRows(companyId, ids);
+  const rows = await fetchAllocationRows(companyId, ids, opts);
 
   const unnamedByLedger = new Map();
   for (const r of rows) {
@@ -283,10 +324,10 @@ async function openItemsByLedger(companyId, ledgerIds = []) {
  * so a caller who wants settled bills too (an export, an audit view) still
  * can. `agedBillsForLedger` does its own open/settled filtering.
  */
-async function billsByLedger(companyId, ledgerIds = []) {
+async function billsByLedger(companyId, ledgerIds = [], opts = {}) {
   const ids = (ledgerIds || []).map(castId).filter(Boolean);
   if (ids.length === 0) return new Map();
-  const rows = await fetchAllocationRows(companyId, ids);
+  const rows = await fetchAllocationRows(companyId, ids, opts);
   return foldAllocations(rows);
 }
 

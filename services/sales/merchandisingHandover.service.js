@@ -60,6 +60,7 @@ const {
   HANDOVER_EVENT_KINDS, SalesHandoverAuditEvent, SalesHandoverOutboxEvent,
 } = require("../../models/CMS_Models/Sales/SalesHandoverEvent");
 const contract = require("./handoverContract");
+const processRequirement = require("./lineProcessRequirement");
 /* Tenancy, not costing. See services/integration/styleOwnershipProof.service.js
    for why this moved out of the Central Costing module. */
 const { ownershipProofFor } = require("../integration/styleOwnershipProof.service");
@@ -95,6 +96,10 @@ const REFUSED_FIELDS = Object.freeze({
 const ISSUE_FIELDS = Object.freeze([
   "expectedCurrentVersionNo", "deliveries", "breakdown", "allocations",
   "packingRequirement", "testingRequirement", "deliveryRequirement",
+  /* The buyer's special-process requirement for this exact line — see
+     services/sales/lineProcessRequirement.js. Optional: a version issued
+     without it states nothing, which is never "not required". */
+  "processRequirements",
 ]);
 
 /**
@@ -243,10 +248,25 @@ function lineView(item, style, currentVersion) {
           dropRef: str(a.dropRef),
           quantity: a.quantity,
         })),
+        processRequirements: processRequirement.statementView(p.processRequirements),
       }
       : null,
   };
 }
+
+/* The authorities a definite process answer on THIS line may cite — the
+   buyer's approved order, or, on a genuine company order, Sales' own
+   authorisation. Identities only, no price. Empty when none of them names
+   this line, and on a customer's order pushed through without the customer's
+   approval, which can then only say UNKNOWN. */
+const approvalsView = (request, item) => processRequirement.evidenceOptions(request, item).map((a) => ({
+  evidenceRef: a.evidenceRef, kind: a.kind, label: processRequirement.evidenceLabel(a.kind),
+  approvalRevision: a.approvalRevision,
+  approvedAt: a.approvedAt || null, poNumber: a.poNumber || "", poDate: a.poDate || null,
+  documentName: a.documentName || "",
+  authorisedAt: a.authorisedAt || null,
+  needsReason: a.kind === "INTERNAL_ORDER",
+}));
 
 /** The producer panel: each line, its eligibility, its publication state. */
 async function inspectRequest(scope, { requestId } = {}) {
@@ -265,6 +285,7 @@ async function inspectRequest(scope, { requestId } = {}) {
     const blockers = await lineBlockers(request, item, style);
     lines.push({
       ...lineView(item, style, str(item.lineRef) ? currentByLine.get(str(item.lineRef)) : null),
+      buyerApprovals: approvalsView(request, item),
       eligible: blockers.length === 0,
       blockers,
     });
@@ -296,6 +317,14 @@ function assertIssueBodyShape(body) {
     }
     if (!ISSUE_FIELDS.includes(key)) {
       throw fail("FIELD_NOT_ACCEPTED", `"${key}" is not part of a handover.`, { field: key });
+    }
+  }
+  /* The process statement's own rows are checked field by field in
+     lineProcessRequirement; a refused money or buyer field is named here first. */
+  for (const [i, row] of (Array.isArray(body?.processRequirements?.processes) ? body.processRequirements.processes : []).entries()) {
+    for (const key of Object.keys(row || {})) {
+      const refused = REFUSED_FIELDS[key];
+      if (refused) throw fail("FIELD_NOT_ACCEPTED", `A process requirement cannot carry ${refused}.`, { field: key, index: i });
     }
   }
   for (const [arrayKey, allowed, label] of nested) {
@@ -349,6 +378,10 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
   if (!Number.isInteger(expected) || expected < 0) {
     throw fail("VALIDATION", "Say which version you believe is current (0 for a first issue).", { field: "expectedCurrentVersionNo" });
   }
+  /* Resolved against THIS order's stored buyer approvals, stamped with the
+     issuer. A buyer change is a new issue — the successor version — and the
+     version it supersedes keeps its own statement untouched. */
+  const processRequirements = processRequirement.normaliseStatement(body.processRequirements, request, { item, actor });
 
   const executionProjection = {
     orderRef: handoverRef,
@@ -366,6 +399,7 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
     ...(str(body.packingRequirement) ? { packingRequirement: str(body.packingRequirement).slice(0, 2000) } : {}),
     ...(str(body.testingRequirement) ? { testingRequirement: str(body.testingRequirement).slice(0, 2000) } : {}),
     ...(str(body.deliveryRequirement) ? { deliveryRequirement: str(body.deliveryRequirement).slice(0, 2000) } : {}),
+    ...(processRequirements ? { processRequirements } : {}),
   };
   /* Derived here purely to prove the projection resolves to a coherent set of
      units before it is published. Merchandising derives its own from the
@@ -398,6 +432,17 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
           ? `Version ${current.versionNo} is already current for this line. Re-read it and issue against it.`
           : "No version is current for this line any more. Re-read before issuing.",
         { currentVersionNo: currentNo });
+    }
+
+    /* A successor never drops a stated requirement by omission: a date change
+       that forgot the processes would read, downstream, as "not stated" and
+       lose an approved fact without a word. Sales restates it (the form
+       carries it forward); the server never copies it silently. */
+    if (current?.executionProjection?.processRequirements?.processes?.length && !processRequirements) {
+      throw fail("PROCESS_REQUIREMENT_RESTATE_REQUIRED",
+        `Version ${current.versionNo} states this line's buyer-approved processes. Restate them on the new version — `
+        + "they are not carried forward silently.",
+        { field: "processRequirements", currentVersionNo: current.versionNo });
     }
 
     /* ── RETIRE FIRST, THEN ISSUE ─────────────────────────────────────

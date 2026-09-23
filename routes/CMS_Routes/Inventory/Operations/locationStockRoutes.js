@@ -35,8 +35,21 @@ const idempotency = require("../../../../services/storePurchase/idempotency.serv
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
 const loc = require("../../../../services/storePurchase/locationStock.service");
+const reservationSvc = require("../../../../services/storePurchase/reservation.service");
 
 const ENTITY = "LOCATION_MOVEMENT";
+
+// Overlay the reservation hold onto derived per-location on-hand rows so the
+// stock register reads On hand / Reserved / Available together, all base unit.
+// Reserving never changes on-hand — Reserved is a separate live figure, and
+// Available = max(0, on-hand − reserved). Movements never carry a reservation.
+async function withReserved(req, itemId, variantId, balances) {
+  const map = await reservationSvc.reservedMapForItem({ companyId: req.tenant.companyId, itemId, variantId: variantId || null });
+  return (balances || []).map((b) => {
+    const reserved = reservationSvc.r4(map.get(`${b.warehouseId}:${b.locationId}`) || 0);
+    return { ...b, reserved, available: reservationSvc.r4(Math.max(0, (Number(b.onHand) || 0) - reserved)) };
+  });
+}
 
 router.use(EmployeeAuthMiddleware);
 router.use(requireTenant);
@@ -113,7 +126,19 @@ router.get("/item/:id", requireCapability(CAPABILITIES.READ), async (req, res) =
       const movements = await movementsFor(req, item._id, variantId);
       const balances = loc.deriveLocationBalances(movements);
       const onHand = loc.onHandOf(item, variantId);
-      return { ...loc.reconcile({ onHand, balances }), balances };
+      const reservedBalances = await withReserved(req, item._id, variantId, balances);
+      const reserved = reservationSvc.r4(reservedBalances.reduce((t, b) => t + (b.reserved || 0), 0));
+      // `tracked` is TRUTHFUL: it means this scope has location HISTORY, not that
+      // it currently holds stock. A scope with movements but zero live balance is
+      // still location-tracked — the caller must ask for a location, not fall
+      // back to Unassigned (which the write path would refuse with
+      // LOCATION_REQUIRED). Never infer tracked from a positive balance.
+      return {
+        ...loc.reconcile({ onHand, balances }),
+        // On hand / Reserved / Available at the company scope, and per location.
+        reserved, available: reservationSvc.r4(Math.max(0, onHand - reserved)),
+        balances: reservedBalances, tracked: movements.length > 0,
+      };
     }
 
     const whole = await forScope(null);
@@ -159,9 +184,17 @@ router.get("/warehouse/:id", requireCapability(CAPABILITIES.READ), async (req, r
       prev.onHand += m.direction === "in" ? Number(m.quantity) : -Number(m.quantity);
       items.set(ik, prev);
     }
+    // One read of the warehouse's reservation holds, overlaid onto each line.
+    const resRows = await reservationSvc.LocationReservation.find(scoped(req, { warehouseId: wid })).lean();
+    const resMap = new Map();
+    for (const rr of resRows) resMap.set(`${rr.locationId}:${rr.itemId}:${rr.variantId || ""}`, reservationSvc.r4(rr.reserved));
     const locations = (warehouse.locations || []).map((l) => {
       const items = [...(byLoc.get(String(l._id))?.values() || [])]
-        .map((x) => ({ ...x, onHand: loc.round4(x.onHand) }))
+        .map((x) => {
+          const onHand = loc.round4(x.onHand);
+          const reserved = reservationSvc.r4(resMap.get(`${l._id}:${x.itemId}:${x.variantId || ""}`) || 0);
+          return { ...x, onHand, reserved, available: reservationSvc.r4(Math.max(0, onHand - reserved)) };
+        })
         .filter((x) => Math.abs(x.onHand) > loc.QTY_TOL);
       return { locationId: String(l._id), code: l.code, name: l.name, type: l.type, status: l.status, items };
     });
@@ -242,13 +275,36 @@ router.post("/transfer", requireCapability(CAPABILITIES.STOCK_ADJUST), refuseLeg
     const from = await loadActiveLocation(req, fromWarehouseId, fromLocationId);
     const to = await loadActiveLocation(req, toWarehouseId, toLocationId);
 
-    // Source must hold enough.
-    const balances = loc.deriveLocationBalances(await movementsFor(req, item._id, vId));
-    const srcBal = balances.find((b) => b.warehouseId === String(from.warehouse._id) && b.locationId === String(from.location._id));
-    const srcOnHand = srcBal ? srcBal.onHand : 0;
-    if (qty > loc.round4(srcOnHand) + loc.QTY_TOL) {
-      throw fail("VALIDATION", `Source location holds only ${loc.round4(srcOnHand)}.`, { reason: "INSUFFICIENT_AT_SOURCE", available: loc.round4(srcOnHand), requested: qty });
+    /* Put-away semantics enforced at the source of truth: a move OUT of a
+       Receiving location is a put-away, and put-away goes to USABLE STORAGE
+       only — never another Receiving dock, and not silently into Quarantine,
+       Inspection, Returns or Scrap (each of those is a deliberate exception move,
+       not "put it away"). UI filtering alone is not enough. An ordinary transfer
+       (non-Receiving source) keeps broader active-location movement. */
+    if (from.location.type === "RECEIVING" && to.location.type !== "USABLE_STOCK") {
+      throw fail(
+        "VALIDATION",
+        `Put away from a receiving location must go to usable storage, not ${String(to.location.type || "").toLowerCase() || "that location type"}.`,
+        { reason: "PUTAWAY_DESTINATION_NOT_USABLE", destinationType: to.location.type || "" },
+      );
     }
+
+    // EARLY refusal only — an over-quantity is caught up front for a clean
+    // message. This is NOT the committed figure: the response's before/after
+    // come from the atomic projection updates below.
+    const earlyBalances = loc.deriveLocationBalances(await movementsFor(req, item._id, vId));
+    const srcEarly = earlyBalances.find((b) => b.warehouseId === String(from.warehouse._id) && b.locationId === String(from.location._id));
+    const srcEarlyOnHand = srcEarly ? loc.round4(srcEarly.onHand) : 0;
+    if (qty > srcEarlyOnHand + loc.QTY_TOL) {
+      throw fail("VALIDATION", `Source location holds only ${srcEarlyOnHand}.`, { reason: "INSUFFICIENT_AT_SOURCE", available: srcEarlyOnHand, requested: qty });
+    }
+
+    // Company on-hand is the company-level authority (RawItem), and a transfer
+    // never changes it — read once, reported unchanged.
+    const companyBefore = loc.round4(loc.onHandOf(item, vId));
+    const variantCombination = vId
+      ? ((item.variants || []).find((v) => String(v._id) === String(vId))?.combination || [])
+      : [];
 
     const transferId = new mongoose.Types.ObjectId();
     const { result } = await runStockMutation(req, {
@@ -258,22 +314,43 @@ router.post("/transfer", requireCapability(CAPABILITIES.STOCK_ADJUST), refuseLeg
           transferId, actor: { id: req.user?.id, name: req.user?.name }, note, idempotencyKey: req.idempotent?.key || "",
           source: { kind: "transfer", id: transferId, reference: "" },
         };
-        // ATOMIC source guard: the loser of two concurrent transfers spending
-        // the same source balance is refused, never driven below zero.
-        const ok = await loc.decLocationGuarded(session, req.tenant.companyId, item._id, vId, from.warehouse._id, from.location._id, qty);
-        if (!ok) {
+        /* ATOMIC source guard AND source of the committed after-balance: the
+           single-document update both refuses the loser of two concurrent
+           transfers and hands back the on-hand it actually produced. Two
+           transfers spending the same source therefore chain (10→8, then 8→6);
+           neither reports a stale 10→8. */
+        const dec = await loc.decLocationGuardedReturning(session, req.tenant.companyId, item._id, vId, from.warehouse._id, from.location._id, qty);
+        if (!dec.ok) {
           throw fail("VALIDATION", `Source location ${from.location.code} no longer holds ${qty}.`, { reason: "INSUFFICIENT_AT_SOURCE", requested: qty });
         }
-        await loc.incLocation(session, req.tenant.companyId, item._id, vId, to.warehouse._id, to.location._id, qty);
+        const inc = await loc.incLocationReturning(session, req.tenant.companyId, item._id, vId, to.warehouse._id, to.location._id, qty);
         // Equal out/in legs, one transfer identity. Company total unchanged.
         await LocationMovement.create([
           { ...tenantContext.stamp(req.tenant), ...loc.buildMovement({ ...common, warehouse: from.warehouse, location: from.location, direction: "out", quantity: qty, type: "transfer_out" }) },
           { ...tenantContext.stamp(req.tenant), ...loc.buildMovement({ ...common, warehouse: to.warehouse, location: to.location, direction: "in", quantity: qty, type: "transfer_in" }) },
         ], { session, ordered: true });
+
+        // Before/after are DERIVED from the committed after-balances the atomic
+        // updates returned — no second, unprotected read.
+        const srcAfter = dec.after;
+        const srcBefore = loc.round4(srcAfter + qty);
+        const destAfter = inc.after;
+        const destBefore = loc.round4(destAfter - qty);
         return {
           entityType: ENTITY, entityId: transferId,
           entry: { entityType: ENTITY, entityId: transferId, documentNumber: String(transferId), action: "STOCK_TRANSFERRED", reason: note || "", requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { transferId: String(transferId), quantity: qty } },
-          result: { transferId: String(transferId), quantity: qty },
+          result: {
+            transferId: String(transferId),
+            quantity: qty,
+            baseUnit: loc.baseUnitOf(item),
+            item: { rawItemId: String(item._id), name: item.name || "", sku: item.sku || "" },
+            variantId: vId ? String(vId) : null,
+            variantCombination,
+            source: { ...loc.txLocationSnapshot(from.warehouse, from.location), before: srcBefore, after: srcAfter },
+            destination: { ...loc.txLocationSnapshot(to.warehouse, to.location), before: destBefore, after: destAfter },
+            /* Identical: a transfer never changes company on-hand. */
+            companyOnHand: { before: companyBefore, after: companyBefore },
+          },
         };
       },
     });

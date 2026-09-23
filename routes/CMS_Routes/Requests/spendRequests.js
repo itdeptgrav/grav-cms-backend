@@ -43,6 +43,11 @@ const itemBudgetHead = require("../../../services/itemBudgetHead.service");
 /* The same Store/board/finance grant the intake door reads. Shared so
    "Store & Purchase" means one thing across both routers. */
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+/* The resolved Store & Purchase capability set — a cache-immune ADDITIONAL path
+   to "may act for Store", so the department-role grant is recognised even when
+   the shared 30s department cache is momentarily stale. Additive only: it never
+   removes the existing department or finance paths. */
+const { resolveCapabilities, hasAll, CAPABILITIES: SP_CAPS } = require("../../../services/storePurchase/capabilities");
 const vendorResolve = require("../../../services/vendorResolve.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const documentSequence = require("../../../services/storePurchase/documentSequence.service");
@@ -200,7 +205,7 @@ function buildLines(raw) {
  * that line for its own writes.
  */
 async function viewerOf(emp) {
-  const [managedDocIds, accUser, fulfil] = await Promise.all([
+  const [managedDocIds, accUser, fulfil, caps] = await Promise.all([
     /* Takes a biometric id STRING and answers with Mongo _ids — passing the
        document returns nothing and comparing its answer to a biometric id
        matches nothing, which is how a TL's queue came back empty for requests
@@ -213,7 +218,14 @@ async function viewerOf(emp) {
           .catch(() => null)
       : null,
     resolveFulfilmentAccess(emp).catch(() => ({ allowed: false, via: null })),
+    /* The resolved Store capability set, read from department-role grants (not
+       the cached department list) — a cache-immune path to the SAME "Store may
+       act" answer. */
+    resolveCapabilities({ email: emp?.email, employeeRef: emp?._id, biometricId: emp?.biometricId })
+      .catch(() => ({ capabilities: [], isAdmin: false })),
   ]);
+  /* Holds the operational Store grant, or is a platform admin. */
+  const capabilityFulfils = Boolean(caps?.isAdmin) || hasAll(caps?.capabilities || [], [SP_CAPS.SOURCING_MANAGE]);
   /* Back into biometric ids, which is the identity everything else in this
      flow speaks — `requestedById`, `viewer.employeeId`, and MRF's own routing.
      One vocabulary end to end rather than two that have to be translated at
@@ -241,7 +253,9 @@ async function viewerOf(emp) {
        request that spends money anyway, and a confirmed quote stuck because
        the one store person is on leave is a quote somebody re-raises through
        a channel nobody is measuring. */
-    canFulfil: Boolean(fulfil?.allowed) || (accUser?.isActive !== false && chain.isFinanceApprover(accUser)),
+    canFulfil: Boolean(fulfil?.allowed)
+      || (accUser?.isActive !== false && chain.isFinanceApprover(accUser))
+      || capabilityFulfils,
   };
 }
 

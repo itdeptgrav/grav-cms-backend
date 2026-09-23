@@ -106,6 +106,18 @@ const AUDIT_ACTIONS = Object.freeze([
   "PACK_SUPERSEDED",
   "PACK_CANCELLED",
   "PACK_ACCEPTED_BY_PPC",
+  /* ── M8: the Pre-Production Meeting ──────────────────────────────────
+     Coordination evidence, not a readiness verdict. `PPM_SOURCE_MOVED` is
+     the one action about somebody ELSE's record: it says a source an issued
+     minute referenced has since changed, which is a fact about this file and
+     never a change to the minute. */
+  "PPM_DRAFTED",
+  "PPM_UPDATED",
+  "PPM_CONDUCTED",
+  "PPM_ISSUED",
+  "PPM_CANCELLED",
+  "PPM_SUPERSEDED",
+  "PPM_SOURCE_MOVED",
   "PACK_CLARIFICATION_REQUESTED_BY_PPC",
   /* ── M7: change control, and the enterprise operations ────────────────
      `CHANGE_OBSERVED` and `CHANGE_ACK_RECEIVED` are passive and about a
@@ -245,6 +257,7 @@ const auditEventSchema = new mongoose.Schema(
       enum: [
         "HANDOVER_VERSION", "HANDOVER_RECEIPT", "EXECUTION_FILE", "SELECTION_REVISION",
         "APPROVAL_REGISTER", "TNA_PLAN", "EXECUTION_PACK", "DEPARTMENT_STATUS",
+        "PRE_PRODUCTION_MEETING",
         "CHANGE_NOTICE", "CHANGE_IMPACT", "BULK_OPERATION", "CONFIGURATION",
         "DEVELOPMENT_REQUEST", "DEVELOPMENT_FILE", "DEVELOPMENT_BOM",
       ],
@@ -458,6 +471,18 @@ const commandLedgerSchema = new mongoose.Schema(
       state: { type: String, trim: true, default: "" },
       note: { type: String, trim: true, default: "" },
     },
+    /* ── AND THE REPLY ITSELF, FOR COMMANDS THAT PROMISE AN IDENTICAL RETRY ──
+       `result` above is a summary in four fixed fields, which is enough to
+       say WHAT happened and not enough to say it the same way twice: a caller
+       whose connection dropped and who retried got a differently-shaped object
+       from the caller who did not, and had to special-case the retry — which
+       is the one path nobody tests.
+
+       This holds the public response verbatim, so a replay is the first
+       answer rather than a reconstruction of it. It is optional and additive:
+       every existing writer keeps filling `result` alone and is unaffected,
+       and a replay falls back to `result` when no payload was stored. */
+    payload: { type: mongoose.Schema.Types.Mixed, default: null },
     at: { type: Date, required: true },
   },
   { timestamps: true, collection: "merchandising_command_ledger" },

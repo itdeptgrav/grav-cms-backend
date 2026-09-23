@@ -234,11 +234,19 @@ describe("the IE side of the fence", () => {
         expect(name).not.toMatch(forbidden);
       }
     }
-    /* IE's planned machine types are TYPES and counts, and nothing else. */
+    /* IE's planned machine types are TYPES and counts — plus, since the 2D
+       contract, the slot's own id and where it is drawn. Still no machine. */
     const station = IeLineLayout.schema.path("stations").schema;
     const planned = station.path("plannedMachineTypes").schema;
-    expect(Object.keys(planned.paths).sort()).toEqual(["machineType", "quantity"]);
+    expect(Object.keys(planned.paths).sort()).toEqual(["machineType", "position", "quantity", "slotId"]);
     expect(planned.path("machineType").instance).toBe("String");
+    expect(planned.path("slotId").instance).toBe("String");
+    /* A position is a planned point and nothing else: x and y, both numbers. */
+    for (const position of [planned.path("position").schema, station.path("position").schema]) {
+      expect(Object.keys(position.paths).sort()).toEqual(["x", "y"]);
+      expect(position.path("x").instance).toBe("Number");
+      expect(position.path("y").instance).toBe("Number");
+    }
   });
 
   test("IE never reads the Machine register or a tracking record", () => {

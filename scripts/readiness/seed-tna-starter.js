@@ -131,10 +131,26 @@ const MILESTONES = [
     sortOrder: 7,
   },
   {
+    /* ── ANCHORED TO THE DATE SALES ALWAYS STATES ──────────────────────
+       This was anchored to `EX_FACTORY` — meaning the target ex-factory date
+       on the Sales handover, which the handover contract makes OPTIONAL and
+       which an ordinary order does not carry. The Execution File says so in
+       as many words: "Ex-factory date not stated by Sales". So this milestone
+       had no date, and a plan with an undated milestone cannot be baselined:
+       every company set up from this starter was permanently unable to commit
+       to a schedule, which in turn blocked the execution pack and the PPC
+       handover behind it.
+
+       The committed DELIVERY date is the one Sales always states — it is what
+       the order is — so both this and ex-factory count back from it. Ten
+       working days here against ex-factory's seven keeps the three working
+       days between them that the original offset expressed, without depending
+       on a field that may never arrive. The dependency edges below then hold
+       the order of events whatever the dates do. */
     milestoneCode: "FINAL_INSPECTION", name: "Final inspection passed",
     ownerDepartment: "QUALITY", completionAuthority: "SOURCE_EVENT",
     sourceEventKinds: [],
-    anchor: "EX_FACTORY", offsetWorkingDays: -3, scope: "FILE",
+    anchor: "DELIVERY", offsetWorkingDays: -10, scope: "PER_DELIVERY",
     criticalPathCandidate: true, sortOrder: 8,
   },
   {
@@ -155,7 +171,55 @@ const DEPENDENCIES = [
   { predecessorCode: "FABRIC_IN_HOUSE", successorCode: "PPC_HANDOVER", lagWorkingDays: 0 },
   { predecessorCode: "TRIMS_IN_HOUSE", successorCode: "PPC_HANDOVER", lagWorkingDays: 0 },
   { predecessorCode: "PPC_HANDOVER", successorCode: "PRODUCTION_START", lagWorkingDays: 0 },
+  /* ── AND THE END OF THE ORDER, WHICH USED TO HANG OFF THE GRAPH ──────
+     Final inspection and ex-factory were anchored to Sales dates and joined
+     to nothing, so the critical path stopped at production start and neither
+     could ever be said to be held up by anything. They are the last two
+     events of the order and they happen in that order: goods cannot leave
+     before they are passed, and neither can happen before production starts.
+
+     The graph takes the LATER of a milestone's anchor and its predecessors,
+     so these edges never pull a date earlier than Sales committed to — they
+     only stop one being forecast before the work that must precede it. */
+  { predecessorCode: "PRODUCTION_START", successorCode: "FINAL_INSPECTION", lagWorkingDays: 0 },
+  { predecessorCode: "FINAL_INSPECTION", successorCode: "EX_FACTORY", lagWorkingDays: 0 },
 ];
+
+/* ── THE STARTER AS IT FIRST SHIPPED ─────────────────────────────────────
+   Every company seeded before the final-inspection fix holds a PUBLISHED
+   version with this definition, and a published version is never edited. It
+   is described here only so the repair below can recognise it EXACTLY: the
+   current definition with final inspection anchored back to the target
+   ex-factory date, and without the two edges that join the end of the order
+   to the graph. */
+const SHIPPED_V1_MILESTONES = Object.freeze(MILESTONES.map((m) => (m.milestoneCode === "FINAL_INSPECTION"
+  ? { ...m, anchor: "EX_FACTORY", offsetWorkingDays: -3, scope: "FILE" }
+  : m)));
+const SHIPPED_V1_DEPENDENCIES = Object.freeze(DEPENDENCIES.filter((d) => !(
+  (d.predecessorCode === "PRODUCTION_START" && d.successorCode === "FINAL_INSPECTION")
+  || (d.predecessorCode === "FINAL_INSPECTION" && d.successorCode === "EX_FACTORY"))));
+
+/** The parts of a definition that decide a date. Labels and ordering do not. */
+const milestoneShape = (list) => (list || []).map((m) => [
+  m.milestoneCode, m.ownerDepartment, m.completionAuthority, m.anchor,
+  Number(m.offsetWorkingDays ?? 0), m.scope,
+].join("|")).sort();
+const edgeShape = (list) => (list || []).map((d) => [
+  d.predecessorCode, d.successorCode, Number(d.lagWorkingDays ?? 0),
+].join("|")).sort();
+
+/**
+ * Is this published version the starter exactly as it shipped?
+ *
+ * Deliberately exact. A company that has edited its template — one milestone
+ * added, one offset changed — has made it theirs, and a script that "fixed"
+ * it would be overwriting a decision somebody took. Those are reported and
+ * left alone; only the untouched shipped definition is repaired.
+ */
+function isShippedStarter(version) {
+  return JSON.stringify(milestoneShape(version?.milestones)) === JSON.stringify(milestoneShape(SHIPPED_V1_MILESTONES))
+    && JSON.stringify(edgeShape(version?.dependencies)) === JSON.stringify(edgeShape(SHIPPED_V1_DEPENDENCIES));
+}
 
 /** What a person may give as a reason. A closed list, so delays are countable. */
 const REASON_CODES = [
@@ -191,11 +255,60 @@ async function merchandisingCompanies() {
  * child four times meant four connections to the same server in as many
  * seconds, and the failures that produced were the harness's, not the seed's.
  */
-async function seedCompany(company, { apply = false } = {}) {
+/**
+ * REPAIR A COMPANY THAT ALREADY PUBLISHED THE SHIPPED STARTER.
+ *
+ * Its plans can never approve baseline 1: final inspection anchors to a date
+ * an ordinary order does not carry and has nothing upstream to date it from.
+ * The published version is permanent and is not touched. The repair publishes
+ * a SUCCESSOR version with the corrected definition, through the same publish
+ * path an administrator uses — which closes the old version's window and
+ * changes nothing else.
+ *
+ * The successor takes the SAME effective-from date. A plan resolves its
+ * version by its start date, so a correction effective only from today would
+ * still hand the broken definition to any plan started earlier; the defect is
+ * not date-dependent, so neither is the correction.
+ *
+ * What it does not do: rewrite a running plan. Every plan pinned its version
+ * when it was created, and moving one onto another definition is the plan
+ * owner's decision, not a configuration script's.
+ */
+async function repairShippedStarter(company, { apply, ctx, actor, out }) {
+  const template = await TnaTemplate.findOne({ companyId: company._id, name: STARTER_TEMPLATE }).lean();
+  if (!template) return;
+  const current = await TnaTemplateVersion.findOne({
+    companyId: company._id, templateId: template._id, state: "PUBLISHED", effectiveTo: null,
+  }).lean();
+  if (!current || !isShippedStarter(current)) return;
+
+  out.repairable = { templateId: String(template._id), versionNo: current.versionNo };
+  if (!apply) return;
+
+  const created = await config.createVersion(ctx, {
+    templateId: String(template._id), actor,
+    body: {
+      milestones: MILESTONES,
+      dependencies: DEPENDENCIES,
+      effectiveFrom: new Date(current.effectiveFrom).toISOString().slice(0, 10),
+      ...(current.defaultCalendarId ? { defaultCalendarId: String(current.defaultCalendarId) } : {}),
+    },
+  });
+  await config.publishVersion(ctx, {
+    templateId: String(template._id), versionNo: created.version.versionNo, actor,
+  });
+  out.template = {
+    id: String(template._id), name: STARTER_TEMPLATE,
+    versionNo: created.version.versionNo, repairedFromVersionNo: current.versionNo,
+  };
+  out.repairable = null;
+}
+
+async function seedCompany(company, { apply = false, skipTemplate = false } = {}) {
   const APPLY = apply;
   const ctx = { companyId: company._id };
   const actor = { name: "Starter configuration" };
-  const out = { calendar: null, template: null, skipped: [] };
+  const out = { calendar: null, template: null, repairable: null, skipped: [] };
 
   /* ── The calendar ──────────────────────────────────────────────────── */
   const publishedCal = await WorkingCalendarVersion
@@ -231,10 +344,13 @@ async function seedCompany(company, { apply = false } = {}) {
   }
 
   /* ── The template ──────────────────────────────────────────────────── */
-  const publishedTpl = await TnaTemplateVersion
+  const publishedTpl = skipTemplate ? null : await TnaTemplateVersion
     .findOne({ companyId: company._id, state: "PUBLISHED" }).select("_id").lean();
-  if (publishedTpl) {
+  if (skipTemplate) {
+    out.skipped.push("template not requested");
+  } else if (publishedTpl) {
     out.skipped.push("a published template already exists");
+    await repairShippedStarter(company, { apply: APPLY, ctx, actor, out });
   } else if (APPLY) {
     const existing = await TnaTemplate
       .findOne({ companyId: company._id, name: STARTER_TEMPLATE }).lean();
@@ -294,6 +410,18 @@ async function main() {
   for (const company of companies) {
     const res = await seedCompany(company, { apply: APPLY });
     const label = `${company.companyName || company._id}`;
+    /* A company that already published the shipped starter: its plans cannot
+       approve a baseline until the corrected successor is published. */
+    if (res.repairable) {
+      line(`WOULD REPAIR  ${label} — starter template v${res.repairable.versionNo} leaves final inspection undated`);
+      continue;
+    }
+    if (res.template?.repairedFromVersionNo) {
+      seeded += 1;
+      line(`REPAIRED  ${label} — published starter v${res.template.versionNo} after v${res.template.repairedFromVersionNo}`
+        + " (version 1 unchanged; running plans unchanged)");
+      continue;
+    }
     if (res.skipped.length) {
       skipped += 1;
       line(`SKIP  ${label} — ${res.skipped.join("; ")}`);
@@ -316,7 +444,7 @@ async function main() {
 
 module.exports = {
   seedCompany, merchandisingCompanies,
-  MILESTONES, DEPENDENCIES, REASON_CODES, WEEK_PATTERN,
+  MILESTONES, DEPENDENCIES, REASON_CODES, WEEK_PATTERN, isShippedStarter,
   STARTER_CALENDAR, STARTER_TEMPLATE,
 };
 

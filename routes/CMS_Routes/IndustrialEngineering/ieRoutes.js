@@ -76,6 +76,7 @@ const ieRead = require("../../../services/industrialEngineering/ieRead.service")
 const ieOrders = require("../../../services/industrialEngineering/ieOrders.service");
 const ieLibrary = require("../../../services/industrialEngineering/ieOperationLibrary.service");
 const ieStyleFile = require("../../../services/industrialEngineering/ieStyleFile.service");
+const ieProcessRoute = require("../../../services/industrialEngineering/ieProcessRoute.service");
 const ieMethodStudy = require("../../../services/industrialEngineering/ieMethodStudy.service");
 const ieAllowancePolicy = require("../../../services/industrialEngineering/ieAllowancePolicy.service");
 const ieLineLayout = require("../../../services/industrialEngineering/ieLineLayout.service");
@@ -454,6 +455,21 @@ router.patch("/engineering-files/:fileId/bulletin", requireCompany, canWrite, ha
   return res.json({ success: true, ...out });
 }));
 
+/**
+ * DECLARE the draft process route — which production processes this style
+ * passes through, their dependencies, and which optional ones do not apply.
+ * Frozen with the bulletin on submission and approved with it; the same
+ * revision rule and the same review freeze as the rows.
+ */
+router.patch("/engineering-files/:fileId/process-route", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieProcessRoute.updateProcessRoute(req.ie, {
+    fileId: req.params.fileId,
+    body: req.body,
+    actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
 /** The append-only audit trail, newest first. */
 router.get("/engineering-files/:fileId/history", requireCompany, canRead, handle(async (req, res) => {
   const out = await ieStyleFile.readHistory(req.ie, {
@@ -648,6 +664,18 @@ router.get("/line-layouts/:layoutId", requireCompany, canRead, handle(async (req
 /** EDIT the stations — one revision, one audit entry, or nothing at all. */
 router.patch("/line-layouts/:layoutId", requireCompany, canWrite, handle(async (req, res) => {
   const out = await ieLineLayout.updateLayout(req.ie, {
+    layoutId: req.params.layoutId, body: req.body, actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/**
+ * MOVE stations and machine-type slots on the planned 2D canvas — positions
+ * only. Same guards, same revision rule and same audit as the edit above,
+ * because it IS the edit above with everything but geometry held fixed.
+ */
+router.patch("/line-layouts/:layoutId/geometry", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieLineLayout.updateLayoutGeometry(req.ie, {
     layoutId: req.params.layoutId, body: req.body, actor: actorOf(req),
   });
   return res.json({ success: true, ...out });

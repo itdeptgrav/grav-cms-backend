@@ -23,8 +23,11 @@ require("./tools/accountingTools");
 const { chatJson, chatStream, chatWithTools } = require("../ollamaClient");
 const { buildSystemPrompt } = require("./identity");
 const { relevantTools, authorizedToolDefs, getTool } = require("./toolRegistry");
-const { resolveHrAccess } = require("../access/hrAccess");
+const { resolveHrAccess, resolveHrActor } = require("../access/hrAccess");
 const { resolveAccountingAccess } = require("../access/accountingAccess");
+// Optional Open-Jev intent-routing pilot; returns null (→ the path below) unless
+// GRAV_OPEN_JEV_PILOT_ENABLED=true. See docs/decisions/open-jev-cms-pilot.md.
+const { tryOpenJevPilot } = require("./openJev/pilot");
 
 const REPLY_SCHEMA = { type: "object", properties: { reply: { type: "string" } }, required: ["reply"] };
 
@@ -155,6 +158,18 @@ async function ensureAccess(user) {
       user.hrAccess = { allowed: false, via: null };
     }
   }
+  /* The SAME resolved actor the mounted HR routes are checked against, so an
+     HR tool and an HR endpoint cannot disagree about the same person. Attached
+     here rather than inside each tool because `permission(user)` is
+     synchronous — the tools ask a question, they do not perform a lookup.
+     Failing closed: an unresolvable actor holds no capabilities. */
+  if (user.hrActor === undefined) {
+    try {
+      user.hrActor = await resolveHrActor(user);
+    } catch {
+      user.hrActor = { capabilities: new Set(), hasHrApplicationAccess: false, template: null };
+    }
+  }
   if (user.accountingAccess === undefined) {
     try {
       user.accountingAccess = await resolveAccountingAccess(user);
@@ -246,6 +261,8 @@ async function selectContext({ user, message, history = [], routeContext }) {
 }
 
 async function chat({ user, message, routeContext, history = [] } = {}) {
+  const pilot = await tryOpenJevPilot({ user, message, ensureAccess });
+  if (pilot) return { reply: pilot.reply.slice(0, 4000), model: pilot.model, toolsUsed: pilot.toolsUsed };
   const { toolData, toolsUsed, directAnswer } = await selectContext({ user, message, history, routeContext });
   if (directAnswer && !toolData.length) {
     return { reply: directAnswer.slice(0, 4000), model: "qwen3", toolsUsed: [] };
@@ -264,6 +281,11 @@ async function chat({ user, message, routeContext, history = [] } = {}) {
  * conversational reply is emitted as-is.
  */
 async function chatStreaming({ user, message, routeContext, history = [], onThinking, onAnswer, signal } = {}) {
+  const pilot = await tryOpenJevPilot({ user, message, ensureAccess });
+  if (pilot) {
+    if (onAnswer) onAnswer(pilot.reply);
+    return { reply: pilot.reply.slice(0, 4000), model: pilot.model, toolsUsed: pilot.toolsUsed };
+  }
   const { toolData, toolsUsed, directAnswer } = await selectContext({ user, message, history, routeContext });
   if (directAnswer && !toolData.length) {
     if (onAnswer) onAnswer(directAnswer);
@@ -302,4 +324,10 @@ async function warmupTools() {
   }
 }
 
-module.exports = { chat, chatStreaming, runStructured, warmupTools };
+/** The exact tool-selection system prompt, for the offline routing evaluation
+ *  (scripts/open-jev-pilot/evaluate.js) to compare against the same baseline. */
+function toolSelectionSystemPrompt() {
+  return buildSystemPrompt({ taskRules: `${todayLine()}\n${SELECT_RULES}` });
+}
+
+module.exports = { chat, chatStreaming, runStructured, warmupTools, toolSelectionSystemPrompt };

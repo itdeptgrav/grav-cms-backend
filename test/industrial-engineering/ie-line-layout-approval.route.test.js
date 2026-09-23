@@ -1559,3 +1559,330 @@ describe("the frozen evidence is compared field by field", () => {
 });
 
 const IeLineLayoutService = require("../../services/industrialEngineering/ieLineLayout.service");
+
+/* ══ THE 2D PLANNED-LAYOUT CONTRACT (ie-line-layout-2d/v1) ═════════════════
+ *
+ * A DRAFT layout may say WHERE each planned station and each planned
+ * machine-type slot is drawn. The claims worth holding:
+ *
+ *   · positions and slot ids are stored, returned and kept through edits —
+ *     including edits from a client that has never heard of them;
+ *   · a position is geometry only: moving a station reorders nothing, moves
+ *     no operation and changes no code, time or balance;
+ *   · a layout planned before this has no positions, reads as sequence-placed,
+ *     and a read writes nothing to it;
+ *   · the ordinary revision, company and approval rules apply unchanged;
+ *   · a position can carry no machine, operator or scan, and nothing new
+ *     reaches a release snapshot.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+const moveGeometry = (a, w, layoutId, body) => call(`/line-layouts/${layoutId}/geometry`, {
+  method: "PATCH", token: a.token, company: w.co._id, body,
+});
+const placedAt = (layout) => layout.stations.map((s) => ({
+  stationId: s.stationId, sequence: s.sequence, label: s.label,
+  plannedMachineTypes: s.plannedMachineTypes.map((m) => ({ machineType: m.machineType, quantity: m.quantity })),
+  assignments: s.assignments.map((a) => ({
+    rowId: a.rowId, sequence: a.sequence, operationCode: a.operationCode,
+    operationName: a.operationName, standardTimeMinutes: a.standardTimeMinutes,
+  })),
+}));
+
+describe("2D planned geometry — create and edit", () => {
+  test("positions and slots are stored, returned, and recorded as geometry", async () => {
+    const w = await world("Geo2dCreate");
+    const layout = await arranged(w);
+    expect(layout.geometry).toMatchObject({ contract: "ie-line-layout-2d/v1", placement: "SEQUENCE", positionedStationCount: 0 });
+    // `arranged` saved through the ordinary edit, so every slot already has an id.
+    for (const s of layout.stations) {
+      expect(s.position).toBeNull();
+      for (const m of s.plannedMachineTypes) expect(m.slotId).toMatch(/^slt_[0-9a-f]{18}$/);
+    }
+
+    const [front, close] = layout.stations;
+    const saved = await patchLayout(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: [
+        { stationId: front.stationId, label: front.label, position: { x: 120, y: 40 },
+          plannedMachineTypes: [{ ...front.plannedMachineTypes[0], position: { x: 130, y: 60 } }],
+          assignments: front.assignments.map((a) => ({ rowId: a.rowId })) },
+        { stationId: close.stationId, label: close.label, position: { x: 320.5, y: -40 },
+          assignments: close.assignments.map((a) => ({ rowId: a.rowId })) },
+      ],
+    });
+    expect(saved.status).toBe(200);
+    const after = saved.body.layout;
+    expect(after.revision).toBe(layout.revision + 1);
+    expect(after.stations[0].position).toEqual({ x: 120, y: 40 });
+    expect(after.stations[0].plannedMachineTypes[0]).toMatchObject({
+      slotId: front.plannedMachineTypes[0].slotId, position: { x: 130, y: 60 },
+    });
+    expect(after.stations[1].position).toEqual({ x: 320.5, y: -40 });
+    // Omitted planned types keep theirs, slot id and all.
+    expect(after.stations[1].plannedMachineTypes).toEqual(close.plannedMachineTypes);
+    expect(after.geometry).toMatchObject({ placement: "POSITIONED", positionedStationCount: 2, positionedSlotCount: 1 });
+    expect(saved.body.events[0].changed).toEqual(["geometry"]);
+    // The arrangement is exactly what it was.
+    expect(placedAt(after)).toEqual(placedAt(layout));
+    expect(after.metrics).toEqual(layout.metrics);
+
+    const read = await readLayout(w.maker, w, layout.layoutId);
+    expect(read.body.layout.stations.map((s) => s.position)).toEqual([{ x: 120, y: 40 }, { x: 320.5, y: -40 }]);
+  });
+
+  test("moving a station on the canvas reorders nothing and moves no operation", async () => {
+    const w = await world("Geo2dMove");
+    const layout = await arranged(w);
+    const [front, close] = layout.stations;
+    // Draw the SECOND station to the left of the first.
+    const moved = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: [
+        { stationId: front.stationId, position: { x: 500, y: 0 } },
+        { stationId: close.stationId, position: { x: 0, y: 0 } },
+      ],
+      slots: [{ slotId: close.plannedMachineTypes[0].slotId, position: { x: 10, y: 20 } }],
+    });
+    expect(moved.status).toBe(200);
+    const after = moved.body.layout;
+    expect(after.stations.map((s) => s.stationId)).toEqual([front.stationId, close.stationId]);
+    expect(after.stations.map((s) => s.sequence)).toEqual([1, 2]);
+    expect(placedAt(after)).toEqual(placedAt(layout));
+    expect(after.metrics).toEqual(layout.metrics);
+    expect(after.source.rows.map((r) => r.operationCode)).toEqual(layout.source.rows.map((r) => r.operationCode));
+    expect(moved.body.events[0].changed).toEqual(["geometry"]);
+    expect(after.stations[1].plannedMachineTypes[0].position).toEqual({ x: 10, y: 20 });
+
+    // Clearing a position returns the station to sequence placement.
+    const cleared = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: after.revision,
+      stations: [{ stationId: close.stationId, position: null }],
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.layout.stations[1].position).toBeNull();
+    expect(cleared.body.layout.geometry.placement).toBe("MIXED");
+  });
+
+  test("the geometry write accepts positions and nothing else", async () => {
+    const w = await world("Geo2dOnly");
+    const layout = await arranged(w);
+    const [front] = layout.stations;
+    const attempts = [
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1 }, label: "Renamed" }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1 }, assignments: [] }] },
+      { stations: [{ stationId: front.stationId, sequence: 2, position: { x: 1, y: 1 } }] },
+      { slots: [{ slotId: front.plannedMachineTypes[0].slotId, quantity: 9, position: { x: 1, y: 1 } }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1, machineId: "M-1" } }] },
+      { slots: [{ slotId: front.plannedMachineTypes[0].slotId, machineId: "M-1", position: { x: 1, y: 1 } }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1, operatorId: "E1" } }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1, barcodeId: "B" } }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1e9, y: 0 } }] },
+      { stations: [{ stationId: front.stationId, position: { x: "1", y: 0 } }] },
+      { stations: [{ stationId: "stn_000000000000000000", position: { x: 1, y: 1 } }] },
+      { slots: [{ slotId: "slt_000000000000000000", position: { x: 1, y: 1 } }] },
+      { stations: [{ stationId: front.stationId, position: { x: 1, y: 1 } }], firebaseUid: "abc" },
+      {},
+    ];
+    for (const extra of attempts) {
+      const res = await moveGeometry(w.maker, w, layout.layoutId, { expectedRevision: layout.revision, ...extra });
+      expect(res.status).toBe(400);
+    }
+    // And the ordinary edit refuses a machine in a slot just the same.
+    const viaEdit = await patchLayout(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: [{ stationId: front.stationId, assignments: front.assignments.map((a) => ({ rowId: a.rowId })),
+        plannedMachineTypes: [{ machineType: "SNLS", quantity: 2, machineId: "M-1" }] }],
+    });
+    expect(viaEdit.status).toBe(400);
+    expect(viaEdit.body.error.code).toBe("FIELD_NOT_ACCEPTED");
+    const stored = await IeLineLayout.findById(layout.layoutId).lean();
+    expect(stored.revision).toBe(layout.revision);
+    expect(JSON.stringify(stored.stations)).not.toMatch(/machineId|operatorId|barcodeId|firebase/i);
+  });
+
+  test("an edit from a client that knows nothing of geometry keeps every position and slot", async () => {
+    const w = await world("Geo2dOldClient");
+    const layout = await arranged(w);
+    const [front, close] = layout.stations;
+    const placed = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: [{ stationId: front.stationId, position: { x: 5, y: 6 } }],
+      slots: [{ slotId: front.plannedMachineTypes[0].slotId, position: { x: 7, y: 8 } }],
+    });
+    // The pre-2D body: labels, types and counts, row ids — no ids for slots, no positions.
+    const relabel = await patchLayout(w.maker, w, layout.layoutId, {
+      expectedRevision: placed.body.layout.revision,
+      stations: [
+        { stationId: front.stationId, label: "Front panel", plannedMachineTypes: [{ machineType: "snls", quantity: 3 }],
+          assignments: front.assignments.map((a) => ({ rowId: a.rowId })) },
+        { stationId: close.stationId, label: close.label, assignments: close.assignments.map((a) => ({ rowId: a.rowId })) },
+      ],
+    });
+    expect(relabel.status).toBe(200);
+    const s0 = relabel.body.layout.stations[0];
+    expect(s0.label).toBe("Front panel");
+    expect(s0.position).toEqual({ x: 5, y: 6 });
+    expect(s0.plannedMachineTypes).toEqual([
+      { machineType: "snls", quantity: 3, slotId: front.plannedMachineTypes[0].slotId, position: { x: 7, y: 8 } },
+    ]);
+    expect(relabel.body.events[0].changed).not.toContain("geometry");
+  });
+});
+
+describe("2D planned geometry — revision, company and approval rules", () => {
+  test("a stale revision conflicts and writes nothing, through either write", async () => {
+    const w = await world("Geo2dStale");
+    const layout = await arranged(w);
+    const [front] = layout.stations;
+    const first = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision, stations: [{ stationId: front.stationId, position: { x: 1, y: 1 } }],
+    });
+    expect(first.status).toBe(200);
+
+    const stale = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision, stations: [{ stationId: front.stationId, position: { x: 99, y: 99 } }],
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.error.code).toBe("IE_LINE_LAYOUT_REVISION_CONFLICT");
+    const staleEdit = await patchLayout(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: layout.stations.map((s) => ({ stationId: s.stationId, position: { x: 99, y: 99 },
+        assignments: s.assignments.map((a) => ({ rowId: a.rowId })) })),
+    });
+    expect(staleEdit.status).toBe(409);
+
+    const stored = await IeLineLayout.findById(layout.layoutId).lean();
+    expect(stored.revision).toBe(layout.revision + 1);
+    expect(stored.stations[0].position).toEqual({ x: 1, y: 1 });
+  });
+
+  test("the same geometry again is a no-op that moves no revision", async () => {
+    const w = await world("Geo2dNoop");
+    const layout = await arranged(w);
+    const body = { stations: [{ stationId: layout.stations[0].stationId, position: { x: 3, y: 4 } }] };
+    const once = await moveGeometry(w.maker, w, layout.layoutId, { expectedRevision: layout.revision, ...body });
+    const twice = await moveGeometry(w.maker, w, layout.layoutId, { expectedRevision: once.body.layout.revision, ...body });
+    expect(twice.status).toBe(200);
+    expect(twice.body.updated).toBe(false);
+    expect(twice.body.layout.revision).toBe(once.body.layout.revision);
+  });
+
+  test("another company's layout is indistinguishable from absent, and a viewer cannot move anything", async () => {
+    const mine = await world("Geo2dIsoMine");
+    const layout = await arranged(mine);
+    const theirs = await world("Geo2dIsoTheirs");
+    const outsider = await editorIn(theirs.co);
+    const move = { expectedRevision: layout.revision, stations: [{ stationId: layout.stations[0].stationId, position: { x: 1, y: 1 } }] };
+
+    const foreign = await moveGeometry(outsider, theirs, layout.layoutId, move);
+    const invented = await moveGeometry(outsider, theirs, new mongoose.Types.ObjectId(), move);
+    expect(foreign.status).toBe(404);
+    expect(foreign.body.error.code).toBe("IE_LINE_LAYOUT_NOT_FOUND");
+    expect(foreign.body).toEqual(invented.body);
+
+    const viewer = await viewerIn(mine.co);
+    const viewed = await moveGeometry(viewer, mine, layout.layoutId, move);
+    expect(viewed.status).toBe(403);
+
+    const stored = await IeLineLayout.findById(layout.layoutId).lean();
+    expect(stored.revision).toBe(layout.revision);
+    expect(stored.stations[0].position).toBeUndefined();
+  });
+
+  test("an approved layout's geometry is frozen with the rest of it", async () => {
+    const w = await world("Geo2dFrozen");
+    const drafted = await arranged(w);
+    const placed = await moveGeometry(w.maker, w, drafted.layoutId, {
+      expectedRevision: drafted.revision,
+      stations: [{ stationId: drafted.stations[0].stationId, position: { x: 11, y: 12 } }],
+    });
+    const approved = await approveLayout(w.approver, w, drafted.layoutId, { expectedRevision: placed.body.layout.revision });
+    expect(approved.status).toBe(200);
+    const layout = approved.body.layout;
+    expect(layout.stations[0].position).toEqual({ x: 11, y: 12 });
+    const before = await IeLineLayout.findById(layout.layoutId).lean();
+
+    const moved = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision, stations: [{ stationId: layout.stations[0].stationId, position: { x: 0, y: 0 } }],
+    });
+    expect(moved.status).toBe(409);
+    expect(moved.body.error.code).toBe("IE_LAYOUT_IMMUTABLE");
+    const edited = await patchLayout(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: layout.stations.map((s) => ({ stationId: s.stationId, position: { x: 0, y: 0 },
+        assignments: s.assignments.map((a) => ({ rowId: a.rowId })) })),
+    });
+    expect(edited.status).toBe(409);
+    // Even a direct query write naming a station position is refused by the model.
+    await expect(IeLineLayout.updateOne({ _id: layout.layoutId }, { $set: { "stations.0.position": { x: 1, y: 1 } } }))
+      .rejects.toThrow(/approved line layout/i);
+
+    expect(await IeLineLayout.findById(layout.layoutId).lean()).toEqual(before);
+  });
+});
+
+describe("2D planned geometry — layouts planned before it", () => {
+  test("a layout with no positions reads as sequence-placed and a read writes nothing", async () => {
+    const w = await world("Geo2dLegacy");
+    const layout = await arranged(w);
+    // Strip the 2D fields, as a layout planned before this contract stores them.
+    await IeLineLayout.collection.updateOne({ _id: new mongoose.Types.ObjectId(layout.layoutId) }, {
+      $unset: { "stations.$[].position": "", "stations.$[].plannedMachineTypes.$[].slotId": "",
+        "stations.$[].plannedMachineTypes.$[].position": "" },
+    });
+    const raw = await IeLineLayout.findById(layout.layoutId).lean();
+
+    const read = await readLayout(w.maker, w, layout.layoutId);
+    expect(read.status).toBe(200);
+    const legacy = read.body.layout;
+    expect(legacy.geometry).toMatchObject({ placement: "SEQUENCE", positionedStationCount: 0, positionedSlotCount: 0 });
+    expect(legacy.stations.map((s) => s.sequence)).toEqual([1, 2]);
+    for (const s of legacy.stations) {
+      expect(s.position).toBeNull();
+      for (const m of s.plannedMachineTypes) expect(m).toMatchObject({ slotId: null, position: null });
+    }
+    expect(placedAt(legacy)).toEqual(placedAt(layout));
+    // Reading minted nothing and wrote nothing.
+    expect(await IeLineLayout.findById(layout.layoutId).lean()).toEqual(raw);
+
+    // A slot with no id yet is addressed by station and type, and gets one.
+    const s0 = legacy.stations[0];
+    const moved = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: legacy.revision,
+      slots: [{ stationId: s0.stationId, machineType: "SNLS", position: { x: 2, y: 3 } }],
+    });
+    expect(moved.status).toBe(200);
+    const slot = moved.body.layout.stations[0].plannedMachineTypes[0];
+    expect(slot.slotId).toMatch(/^slt_/);
+    expect(slot.position).toEqual({ x: 2, y: 3 });
+    expect(placedAt(moved.body.layout)).toEqual(placedAt(layout));
+    // The other station's legacy slot is untouched and still unplaced.
+    expect(moved.body.layout.stations[1].plannedMachineTypes[0].position).toBeNull();
+  });
+});
+
+describe("2D planned geometry — nothing downstream moves", () => {
+  test("a release snapshot of a positioned layout is identical to one of the same layout unpositioned", async () => {
+    const w = await world("Geo2dRelease");
+    const layout = await arranged(w);
+    const moved = await moveGeometry(w.maker, w, layout.layoutId, {
+      expectedRevision: layout.revision,
+      stations: layout.stations.map((s, i) => ({ stationId: s.stationId, position: { x: i * 100, y: 50 } })),
+      slots: layout.stations.map((s) => ({ slotId: s.plannedMachineTypes[0].slotId, position: { x: 1, y: 1 } })),
+    });
+    expect(moved.status).toBe(200);
+
+    const { freezeAggregate } = require("../../services/industrialEngineering/ieRelease.service");
+    const positioned = await IeLineLayout.findById(layout.layoutId).lean();
+    const unpositioned = JSON.parse(JSON.stringify(positioned));
+    for (const s of unpositioned.stations) {
+      delete s.position;
+      for (const m of s.plannedMachineTypes) { delete m.position; delete m.slotId; }
+    }
+    const freeze = (l) => freezeAggregate({
+      version: {}, layout: l, standard: {}, published: {}, metrics: calculateLineBalance(l.stations),
+    }).lineLayout;
+    expect(JSON.stringify(freeze(positioned))).toBe(JSON.stringify(freeze(unpositioned)));
+    expect(JSON.stringify(freeze(positioned))).not.toMatch(/position|slotId/);
+  });
+});

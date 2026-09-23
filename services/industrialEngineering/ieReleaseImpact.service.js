@@ -44,6 +44,14 @@ const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkO
 
 const { styleOwnerFrom } = require("../companyContext/merchandisingScope.service");
 const { OWNERSHIP_MODE } = require("./workOrderStyleLink.service");
+/* The ONE published shape for frozen requirement evidence — shared with the
+   draft bulletin and the bulletin version rather than re-spelled here. */
+const { publishRequirementSnapshot } = require("./ieStyleFile.service");
+/* The ONE canonical form of a frozen requirement — shared with the stored
+   source digest, so the two can never disagree about what a change is. */
+const {
+  DIMENSIONS, canonicalDimension, machineLevel, canonicalMachineReduced,
+} = require("./requirementCanonical");
 const {
   calculateCapacity, toUnits, unitsToMinutes,
 } = require("./capacityCalculation");
@@ -79,9 +87,24 @@ const CHANGE = Object.freeze({
 
 /** How the two bulletins relate. Three answers, never inferred from silence. */
 const COMPARISON = Object.freeze({
-  SAME_APPROVED_BULLETIN: "SAME_APPROVED_BULLETIN",
-  APPROVED_BULLETIN_MOVED: "APPROVED_BULLETIN_MOVED",
-  NO_CURRENT_APPROVED_BULLETIN: "NO_CURRENT_APPROVED_BULLETIN",
+  CURRENT: "CURRENT",
+  MOVED: "MOVED",
+  NO_CURRENT_APPROVED: "NO_CURRENT_APPROVED",
+});
+
+/** A sentence per capacity refusal. A code alone is something to look up. */
+const CAPACITY_MESSAGE = Object.freeze({
+  NO_CURRENT_APPROVED_BULLETIN:
+    "There is no current approved bulletin version to compare against, so no comparable capacity "
+    + "target can be derived. Approve a bulletin version for this style file.",
+  RELEASED_ASSUMPTIONS_INCOMPLETE:
+    "The capacity standard this release froze does not carry every planning assumption the "
+    + "calculation needs, so the comparison cannot be made. Re-issue from a complete standard.",
+  CURRENT_CAPACITY_UNAVAILABLE:
+    "The current bulletin does not yield a capacity target — usually because its garment SAM is "
+    + "not yet established. Approve the outstanding standard times and try again.",
+  RELEASED_TARGET_UNAVAILABLE:
+    "This release froze no capacity target, so there is nothing to compare the current one with.",
 });
 
 /** Why a work order could not be proved. Stable, so it can be reported on. */
@@ -135,108 +158,189 @@ const deltaWhole = (from, to) => {
   return b - a;
 };
 
-/* ═══ REQUIREMENT EVIDENCE ═════════════════════════════════════════════════
+/* ═══ REQUIREMENT EVIDENCE — TRI-STATE, PER DIMENSION ═════════════════════
  *
- * ── WHAT IS ACTUALLY FROZEN, AND WHAT IS NOT ──────────────────────────────
- * Chunk 5A models three requirement dimensions on an operation — machine,
- * attachment and labour — but the bulletin row freezes only the MACHINE half
- * (`IeBulletinVersion.rows[].requirementSnapshot.machineTypes`, and the style
- * file's draft row before it). Attachment and labour requirements were never
- * captured into a bulletin version, so neither the released side nor the
- * current side holds them.
+ * Chunk 5A models three dimensions on an operation: machine, attachment and
+ * labour. Chunk 8A-iii freezes all three onto a bulletin row at submission, so
+ * a version submitted from now on can be compared on all three.
  *
- * They are therefore published as `NOT_CAPTURED` on BOTH sides and compared as
- * `UNKNOWN`. Reading them live from the operation library would re-answer an
- * issued handover with today's configuration; reporting them as `[]` would say
- * "this operation needs no attachment", which is a claim nobody made. An
- * unknown stays an unknown, and the gap names the contract that would close it.
+ * A version submitted BEFORE that froze only the machine half, and there is no
+ * backfill — restating a historical version is the one thing a frozen record
+ * must never do. Those rows therefore compare as `NOT_CAPTURED`, which is a
+ * THIRD answer and not a quiet "unchanged": saying two sides agree about
+ * evidence neither of them holds is a reassurance nobody earned.
+ *
+ * So every dimension answers one of three things, and `REQUIREMENT_CHANGED`
+ * names exactly which comparable dimensions moved.
  */
-const REQUIREMENT_DIMENSION = Object.freeze({
+const DIMENSION_STATE = Object.freeze({
   CAPTURED: "CAPTURED",
   NOT_CAPTURED: "NOT_CAPTURED",
 });
 
-const machineEvidence = (snapshot) => (snapshot ? {
-  state: REQUIREMENT_DIMENSION.CAPTURED,
-  capturedAt: iso(snapshot.capturedAt),
-  ieOperationRevision: snapshot.ieOperationRevision ?? null,
-  requirementsConfigured: Boolean(snapshot.requirementsConfigured),
-  machineTypes: (snapshot.machineTypes || [])
-    .map((m) => ({ machineType: str(m.machineType), quantity: num(m.quantity) })),
-} : {
-  state: REQUIREMENT_DIMENSION.NOT_CAPTURED,
-  capturedAt: null,
-  ieOperationRevision: null,
-  requirementsConfigured: false,
-  machineTypes: [],
+/** MOVED / UNCHANGED / null — null being "these two cannot be compared". */
+const DIMENSION_COMPARISON = Object.freeze({
+  MOVED: "MOVED",
+  UNCHANGED: "UNCHANGED",
+  NOT_COMPARABLE: "NOT_COMPARABLE",
 });
 
-const uncapturedDimension = (dimension) => ({
-  state: REQUIREMENT_DIMENSION.NOT_CAPTURED,
-  dimension,
-  items: [],
-  /* Said plainly, because an empty list is otherwise read as a requirement of
-     nothing — and that is a claim this chunk has no evidence for. */
-  note: "No bulletin version has ever frozen this requirement dimension, so neither the "
-    + "released nor the current side holds it and the two cannot be compared.",
-});
+const requirementEvidence = (snapshot) => {
+  const published = publishRequirementSnapshot(snapshot);
+  if (!published) {
+    return {
+      configured: null,
+      capturedAt: null,
+      ieOperationRevision: null,
+      dimensionsCaptured: [],
+      machines: [],
+      attachments: [],
+      labour: [],
+      dimensionState: {
+        MACHINE: DIMENSION_STATE.NOT_CAPTURED,
+        ATTACHMENT: DIMENSION_STATE.NOT_CAPTURED,
+        LABOUR: DIMENSION_STATE.NOT_CAPTURED,
+      },
+    };
+  }
+  const captured = published.dimensionsCaptured || [];
+  /* The machine half has been frozen since Chunk 6B, in `machineTypes`, so a
+     legacy row IS comparable on machines even without the marker. The richer
+     `machines` array — with the stable requirement id and sequence — exists
+     only from Chunk 8A-iii, so a legacy row's machine list is rebuilt from
+     `machineTypes` with those two stated as absent rather than invented. */
+  const machines = published.machines
+    || (published.machineTypes || []).map((m) => ({
+      requirementId: null, sequence: null,
+      machineType: m.machineType, quantity: num(m.quantity),
+    }));
+  return {
+    configured: published.requirementsConfigured,
+    capturedAt: published.capturedAt,
+    ieOperationRevision: published.ieOperationRevision,
+    dimensionsCaptured: [...captured],
+    machines,
+    /* Empty list when a dimension was captured and is genuinely empty; empty
+       list AND a NOT_CAPTURED state when it was never frozen. The state is what
+       a reader branches on — the list alone cannot tell the two apart. */
+    attachments: published.attachments || [],
+    labour: published.labour || [],
+    dimensionState: {
+      MACHINE: DIMENSION_STATE.CAPTURED,
+      ATTACHMENT: published.attachments ? DIMENSION_STATE.CAPTURED : DIMENSION_STATE.NOT_CAPTURED,
+      LABOUR: published.labour ? DIMENSION_STATE.CAPTURED : DIMENSION_STATE.NOT_CAPTURED,
+    },
+  };
+};
 
-const requirementEvidence = (snapshot) => ({
-  machine: machineEvidence(snapshot),
-  attachment: uncapturedDimension("ATTACHMENT"),
-  labour: uncapturedDimension("LABOUR"),
-});
+/**
+ * One dimension, compared three ways — from the SAME canonical form the stored
+ * requirement digest is built from.
+ *
+ * Deliberately taken from the RAW frozen snapshot rather than from the
+ * published side object: the digest hashes the stored shape, and a comparison
+ * reading a projection of it could drift from the digest by one mapping
+ * decision. Then a release would report REQUIREMENT_CHANGED while its own
+ * requirement digest said nothing had moved, and nobody could say which was
+ * right.
+ *
+ * `NOT_COMPARABLE` whenever EITHER side failed to freeze the dimension:
+ * comparing an absence against a list would report a change that is really just
+ * the arrival of the evidence, and comparing two absences would report
+ * agreement about nothing.
+ */
+function compareDimension(dimension, beforeSnapshot, afterSnapshot) {
+  /* ── ONE MIXED CASE, ANSWERED HONESTLY ────────────────────────────────
+     A release frozen with full machine identity, compared against a bulletin
+     version frozen before that existed (or the reverse). Their requirement ids
+     differ because one side HAS them and the other never did — the identity did
+     not move, it arrived. Reporting MOVED there would send somebody to look for
+     a machine change that never happened.
 
-/* Order-independent equality over the machine multiset: a plan needing two SNLS
-   and one OL4 is the same plan whichever order the pair was typed in. */
-const machineKey = (evidence) => (evidence.machineTypes || [])
-  .map((m) => `${m.machineType}:${m.quantity}`)
-  .sort()
-  .join("|");
+     So both sides drop to the granularity both can answer — type and quantity,
+     which Chunk 6B has always frozen — and the reduction travels with the
+     verdict. Nothing is silently equated: a reader is told the identities were
+     not compared. */
+  const reduced = dimension === "MACHINE"
+    && machineLevel(beforeSnapshot) !== machineLevel(afterSnapshot);
+  const before = reduced
+    ? canonicalMachineReduced(beforeSnapshot) : canonicalDimension(beforeSnapshot, dimension);
+  const after = reduced
+    ? canonicalMachineReduced(afterSnapshot) : canonicalDimension(afterSnapshot, dimension);
+  if (before === null || after === null) {
+    return { verdict: DIMENSION_COMPARISON.NOT_COMPARABLE, reduced: false };
+  }
+  return {
+    verdict: before === after ? DIMENSION_COMPARISON.UNCHANGED : DIMENSION_COMPARISON.MOVED,
+    reduced,
+  };
+}
 
-function machineRequirementMoved(before, after) {
-  if (before.state !== after.state) return true;
-  if (before.state === REQUIREMENT_DIMENSION.NOT_CAPTURED) return false;
-  if (before.requirementsConfigured !== after.requirementsConfigured) return true;
-  return machineKey(before) !== machineKey(after);
+/** Which comparable dimensions actually moved, plus the configured flag. */
+function requirementMovement(beforeSnapshot, afterSnapshot) {
+  const perDimension = {};
+  const moved = [];
+  const notComparable = [];
+  const reducedGranularity = [];
+  for (const dimension of DIMENSIONS) {
+    const { verdict, reduced } = compareDimension(dimension, beforeSnapshot, afterSnapshot);
+    perDimension[dimension] = verdict;
+    if (verdict === DIMENSION_COMPARISON.MOVED) moved.push(dimension);
+    if (verdict === DIMENSION_COMPARISON.NOT_COMPARABLE) notComparable.push(dimension);
+    if (reduced) reducedGranularity.push(dimension);
+  }
+  /* "Nobody has decided what this operation requires" becoming "somebody has"
+     is a requirement change even when no list moved with it. */
+  const beforeConfigured = beforeSnapshot ? Boolean(beforeSnapshot.requirementsConfigured) : null;
+  const afterConfigured = afterSnapshot ? Boolean(afterSnapshot.requirementsConfigured) : null;
+  const configuredMoved = beforeConfigured !== null && afterConfigured !== null
+    && beforeConfigured !== afterConfigured;
+  return {
+    perDimension,
+    moved,
+    notComparable,
+    /* Compared, but only on the fields both sides could answer. Stated so a
+       MACHINE "UNCHANGED" is never read as "the identities agree". */
+    reducedGranularity,
+    configuredMoved,
+    changed: moved.length > 0 || configuredMoved,
+  };
 }
 
 /* ═══ ROW IDENTITY AND EVIDENCE ════════════════════════════════════════════ */
 
-const rowIdentity = (r) => (r ? {
-  rowId: str(r.rowId),
-  sequence: num(r.sequence),
+/**
+ * ONE SIDE OF A ROW — released, or current.
+ *
+ * The identity belongs to the SIDE, never to the row: when an operation is
+ * replaced the two sides are two different operations, each with its own id and
+ * revision, and a single row-level identity could only ever name one of them,
+ * hiding the very fact the classification reports.
+ *
+ * `null` when the row exists on one side only. An empty object there would
+ * render as a row of blanks that reads like missing data rather than like an
+ * operation that is genuinely not there.
+ */
+const side = (r) => (r ? {
   ieOperationId: r.ieOperationId ? String(r.ieOperationId) : null,
   ieOperationRevision: num(r.ieOperationRevision),
   operationCode: str(r.operationCode),
   operationName: str(r.operationName),
-  machineType: str(r.machineType),
-} : null);
-
-/* Both timing identities, named on every row rather than only on a changed one:
-   a reader asking "which study produced this number" must not have to infer it
-   from whether anything moved. */
-const timingEvidence = (r) => (r ? {
+  sequence: num(r.sequence),
   standardTimeMinutes: num(r.standardTimeMinutes),
   standardTimeSource: str(r.standardTimeSource),
+  /* The timing IDENTITY, on every row and not only a changed one: a reader
+     asking "which study produced this number" must not have to infer it from
+     whether anything moved. */
   methodStudyId: r.methodStudyId ? String(r.methodStudyId) : null,
-  approvedSubmissionId: str(r.approvedSubmissionId),
+  approvedSubmissionId: str(r.approvedSubmissionId) || null,
   approvedAt: iso(r.approvedAt),
+  machineType: str(r.machineType),
+  requirements: requirementEvidence(r.requirementSnapshot),
 } : null);
 
 const reason = (change, code, message, extra = {}) => ({ change, code, message, ...extra });
 
-/* ═══ THE ROW COMPARISON ═══════════════════════════════════════════════════ */
-
-/**
- * Pair the released rows with the current ones by stable identity.
- *
- * `rowId` first, because a bulletin row keeps its id across every version of
- * the file it belongs to. Only where that fails does `ieOperationId` get a
- * turn, and only when it matches EXACTLY ONE unclaimed current row — two
- * candidates is an ambiguity, and guessing between them would invent a history
- * the records do not support, so both sides are reported as REMOVED and ADDED.
- */
 function pairRows(releasedRows, currentRows) {
   const pairs = [];
   const currentByRowId = new Map();
@@ -274,64 +378,64 @@ function pairRows(releasedRows, currentRows) {
 }
 
 function comparePair({ released, current, matchedBy }) {
-  const releasedEvidence = {
-    identity: rowIdentity(released),
-    timing: timingEvidence(released),
-    requirements: released ? requirementEvidence(released.requirementSnapshot) : null,
-  };
-  const currentEvidence = {
-    identity: rowIdentity(current),
-    timing: timingEvidence(current),
-    requirements: current ? requirementEvidence(current.requirementSnapshot) : null,
-  };
-  const base = { matchedBy, released: releasedEvidence, current: currentEvidence };
+  const releasedSide = side(released);
+  const currentSide = side(current);
+  /* `rowId` names the POSITION the two sides are compared at, which is what
+     makes them comparable — it is not an operation identity. */
+  const rowId = str(released?.rowId) || str(current?.rowId) || null;
+  const base = { rowId, matchedBy, released: releasedSide, current: currentSide };
 
   if (!current) {
     return {
       ...base,
-      changes: [CHANGE.REMOVED],
+      classifications: [CHANGE.REMOVED],
       reasons: [reason(CHANGE.REMOVED, "NO_MATCHING_CURRENT_ROW",
         "No row in the current approved bulletin carries this row id, and no single current row "
         + "carries this operation either.")],
+      requirementMovement: null,
+      labelsChanged: null,
     };
   }
   if (!released) {
     return {
       ...base,
-      changes: [CHANGE.ADDED],
+      classifications: [CHANGE.ADDED],
       reasons: [reason(CHANGE.ADDED, "NOT_IN_RELEASED_BULLETIN",
         "The current approved bulletin carries this row and the released one did not.")],
+      requirementMovement: null,
+      labelsChanged: null,
     };
   }
 
-  const changes = [];
+  const classifications = [];
   const reasons = [];
 
   /* ── THE OPERATION ITSELF ────────────────────────────────────────────────
      By stable id ONLY. A renamed or re-coded operation is the SAME operation
      and must never read as a replacement — the codes and names travel as
      evidence on both sides so a reader can see the rename for what it is. */
-  const releasedOp = releasedEvidence.identity.ieOperationId;
-  const currentOp = currentEvidence.identity.ieOperationId;
-  const labelsMoved = releasedEvidence.identity.operationCode !== currentEvidence.identity.operationCode
-    || releasedEvidence.identity.operationName !== currentEvidence.identity.operationName;
+  const labelsChanged = releasedSide.operationCode !== currentSide.operationCode
+    || releasedSide.operationName !== currentSide.operationName;
 
-  if (releasedOp !== currentOp) {
-    changes.push(CHANGE.OPERATION_REPLACED);
+  if (releasedSide.ieOperationId !== currentSide.ieOperationId) {
+    classifications.push(CHANGE.OPERATION_REPLACED);
     reasons.push(reason(CHANGE.OPERATION_REPLACED, "STABLE_OPERATION_ID_DIFFERS",
       "This row names a different Industrial Engineering operation than the released bulletin did.",
-      { releasedIeOperationId: releasedOp, currentIeOperationId: currentOp }));
+      {
+        releasedIeOperationId: releasedSide.ieOperationId,
+        currentIeOperationId: currentSide.ieOperationId,
+      }));
   }
 
   /* ── TIMING ──────────────────────────────────────────────────────────────
      The number, and the evidence behind it. Either moving is a re-timing, and
      the two are reported separately so "same minutes, new study" is not
      mistaken for "nothing happened". */
-  const timeMoved = releasedEvidence.timing.standardTimeMinutes !== currentEvidence.timing.standardTimeMinutes;
-  const studyMoved = releasedEvidence.timing.methodStudyId !== currentEvidence.timing.methodStudyId
-    || releasedEvidence.timing.approvedSubmissionId !== currentEvidence.timing.approvedSubmissionId;
+  const timeMoved = releasedSide.standardTimeMinutes !== currentSide.standardTimeMinutes;
+  const studyMoved = releasedSide.methodStudyId !== currentSide.methodStudyId
+    || releasedSide.approvedSubmissionId !== currentSide.approvedSubmissionId;
   if (timeMoved || studyMoved) {
-    changes.push(CHANGE.RETIMED);
+    classifications.push(CHANGE.RETIMED);
     reasons.push(reason(CHANGE.RETIMED,
       timeMoved && studyMoved ? "STANDARD_TIME_AND_STUDY_MOVED"
         : timeMoved ? "STANDARD_TIME_MOVED" : "TIMING_EVIDENCE_MOVED",
@@ -343,63 +447,69 @@ function comparePair({ released, current, matchedBy }) {
         standardTimeChanged: timeMoved,
         timingEvidenceChanged: studyMoved,
         deltaMinutes: deltaMinutes(
-          releasedEvidence.timing.standardTimeMinutes, currentEvidence.timing.standardTimeMinutes,
+          releasedSide.standardTimeMinutes, currentSide.standardTimeMinutes,
         ),
-        releasedMethodStudyId: releasedEvidence.timing.methodStudyId,
-        currentMethodStudyId: currentEvidence.timing.methodStudyId,
-        releasedApprovedSubmissionId: releasedEvidence.timing.approvedSubmissionId,
-        currentApprovedSubmissionId: currentEvidence.timing.approvedSubmissionId,
+        releasedMethodStudyId: releasedSide.methodStudyId,
+        currentMethodStudyId: currentSide.methodStudyId,
+        releasedApprovedSubmissionId: releasedSide.approvedSubmissionId,
+        currentApprovedSubmissionId: currentSide.approvedSubmissionId,
       }));
   }
 
-  /* ── REQUIREMENTS ────────────────────────────────────────────────────────
-     Machine only, because machine is the only dimension either side froze.
-     Attachment and labour are `NOT_CAPTURED` on both and are never claimed to
-     have changed OR to have stayed the same. */
-  if (machineRequirementMoved(releasedEvidence.requirements.machine, currentEvidence.requirements.machine)) {
-    changes.push(CHANGE.REQUIREMENT_CHANGED);
-    reasons.push(reason(CHANGE.REQUIREMENT_CHANGED, "MACHINE_REQUIREMENT_EVIDENCE_MOVED",
-      "The frozen machine requirement evidence for this row is not the evidence the release froze.",
+  /* ── REQUIREMENTS, PER DIMENSION ─────────────────────────────────────────
+     `REQUIREMENT_CHANGED` names exactly which comparable dimensions moved, and
+     lists the ones that could not be compared beside them. A dimension neither
+     side froze is never reported as unchanged. */
+  const movement = requirementMovement(released.requirementSnapshot, current.requirementSnapshot);
+  if (movement.changed) {
+    classifications.push(CHANGE.REQUIREMENT_CHANGED);
+    reasons.push(reason(CHANGE.REQUIREMENT_CHANGED, "REQUIREMENT_EVIDENCE_MOVED",
+      movement.moved.length
+        ? `The frozen ${movement.moved.map((d) => d.toLowerCase()).join(" and ")} requirement `
+          + "evidence for this row is not the evidence the release froze."
+        : "Whether this operation's requirements had been decided at all has changed since the "
+          + "release froze it.",
       {
-        dimension: "MACHINE",
-        releasedMachineTypes: releasedEvidence.requirements.machine.machineTypes,
-        currentMachineTypes: currentEvidence.requirements.machine.machineTypes,
-        releasedRequirementsConfigured: releasedEvidence.requirements.machine.requirementsConfigured,
-        currentRequirementsConfigured: currentEvidence.requirements.machine.requirementsConfigured,
-        uncomparedDimensions: ["ATTACHMENT", "LABOUR"],
+        movedDimensions: movement.moved,
+        notComparableDimensions: movement.notComparable,
+        perDimension: movement.perDimension,
+        configuredChanged: movement.configuredMoved,
+        releasedConfigured: releasedSide.requirements.configured,
+        currentConfigured: currentSide.requirements.configured,
       }));
   }
 
   /* ── SEQUENCE ────────────────────────────────────────────────────────────
      The row's own stated sequence, not its index in the array. */
-  if (releasedEvidence.identity.sequence !== currentEvidence.identity.sequence) {
-    changes.push(CHANGE.RESEQUENCED);
+  if (releasedSide.sequence !== currentSide.sequence) {
+    classifications.push(CHANGE.RESEQUENCED);
     reasons.push(reason(CHANGE.RESEQUENCED, "SEQUENCE_MOVED",
       "This row sits at a different point in the bulletin than the release froze it at.",
-      {
-        releasedSequence: releasedEvidence.identity.sequence,
-        currentSequence: currentEvidence.identity.sequence,
-      }));
+      { releasedSequence: releasedSide.sequence, currentSequence: currentSide.sequence }));
   }
 
-  if (!changes.length) {
-    changes.push(CHANGE.UNCHANGED);
-    reasons.push(labelsMoved
+  if (!classifications.length) {
+    classifications.push(CHANGE.UNCHANGED);
+    reasons.push(labelsChanged
       ? reason(CHANGE.UNCHANGED, "LABEL_ONLY_RENAME",
         "The operation's code or name was edited, but it is the same operation at the same time, "
         + "with the same requirements, in the same place. A rename is not a replacement.",
         {
-          releasedOperationCode: releasedEvidence.identity.operationCode,
-          currentOperationCode: currentEvidence.identity.operationCode,
-          releasedOperationName: releasedEvidence.identity.operationName,
-          currentOperationName: currentEvidence.identity.operationName,
+          releasedOperationCode: releasedSide.operationCode,
+          currentOperationCode: currentSide.operationCode,
+          releasedOperationName: releasedSide.operationName,
+          currentOperationName: currentSide.operationName,
+          notComparableDimensions: movement.notComparable,
         })
       : reason(CHANGE.UNCHANGED, "NO_MOVEMENT",
-        "Same operation, same approved standard time and evidence, same frozen machine "
-        + "requirements, same sequence."));
+        "Same operation, same approved standard time and evidence, same comparable requirements, "
+        + "same sequence.",
+        { notComparableDimensions: movement.notComparable }));
   }
 
-  return { ...base, changes, reasons, labelsChanged: labelsMoved };
+  return {
+    ...base, classifications, reasons, requirementMovement: movement, labelsChanged,
+  };
 }
 
 /* ═══ WORK ORDERS — REPORTED, NEVER TOUCHED ════════════════════════════════
@@ -455,10 +565,11 @@ async function workOrderImpact(ctx, release, file) {
   const releaseStyle = owners.get(releaseStyleId)?.style || null;
 
   /* ── THE CANDIDATE SET ─────────────────────────────────────────────────
-     One provable path and two weak ones. The weak paths exist ONLY so that the
-     orders somebody might expect to see here are named and refused rather than
-     quietly absent; neither of them can make an order provable. */
-    const or = [{ sampleStyleId: new mongoose.Types.ObjectId(releaseStyleId) }];
+     One provable path and two weak ones. The weak paths exist ONLY so that an
+     order somebody might expect to see here is accounted for rather than
+     quietly absent; neither of them can make an order provable, and neither of
+     them is allowed to make an order IDENTIFIABLE — see below. */
+  const or = [{ sampleStyleId: new mongoose.Types.ObjectId(releaseStyleId) }];
   if (isId(file?.openedFromOrderId)) {
     or.push({ _id: new mongoose.Types.ObjectId(str(file.openedFromOrderId)) });
   }
@@ -466,7 +577,7 @@ async function workOrderImpact(ctx, release, file) {
     or.push({ stockItemId: new mongoose.Types.ObjectId(str(releaseStyle.sourceStockItemId)) });
   }
   const candidates = await WorkOrder.find({ $or: or })
-    .select("_id workOrderNumber sampleStyleId stockItemId status")
+    .select("_id workOrderNumber sampleStyleId stockItemId status quantity")
     .sort({ _id: 1 })
     .lean();
 
@@ -478,84 +589,110 @@ async function workOrderImpact(ctx, release, file) {
     return CANDIDATE_SOURCE.SHARED_STOCK_ITEM;
   };
 
-  /* Ownership for every OTHER style these candidates name, so a foreign or
-     parentless style is answered with its own reason rather than a shrug. */
-  const otherStyleIds = candidates.map((w) => str(w.sampleStyleId)).filter((id) => id && id !== releaseStyleId);
+  /* Ownership for every OTHER style these candidates name — resolved so that a
+     tenant decision can be made about each one, never so that it can be
+     reported on. */
+  const otherStyleIds = candidates
+    .map((w) => str(w.sampleStyleId))
+    .filter((id) => id && id !== releaseStyleId);
   const otherOwners = await ownershipFor(otherStyleIds);
 
-  const affected = [];
-  const unprovable = [];
+  const mine = (styleId) => {
+    const verdict = styleId === releaseStyleId ? owners.get(releaseStyleId) : otherOwners.get(styleId);
+    if (!verdict) return { proved: false, reason: "STYLE_RECORD_MISSING" };
+    if (!verdict.companyId) return { proved: false, reason: verdict.reason };
+    if (str(verdict.companyId) !== str(ctx.companyId)) {
+      return { proved: false, reason: "COMPANY_MISMATCH" };
+    }
+    return { proved: true, reason: verdict.reason };
+  };
+
+  const identity = (wo) => ({
+    workOrderId: str(wo._id),
+    workOrderRef: str(wo.workOrderNumber),
+    status: str(wo.status),
+    quantity: num(wo.quantity),
+    /* Which bulletin version this order was raised against, when IE knows.
+       Absent rather than guessed: Production does not store one today. */
+    bulletinVersionNo: num(wo.ieBulletinVersionNo),
+  });
+
+  const provablyAffected = [];
+  const ownershipUnproven = [];
+  /* ── WHAT THE ACTING COMPANY IS NOT TOLD ───────────────────────────────
+     A candidate whose linked style is NOT proved to belong to the acting
+     company contributes nothing identifiable: no id, no order number, no
+     customer, no style, and no count. Hiding only the foreign company id was
+     not enough — an order number is itself a tenant's record, and an exact
+     count of them is an enumeration oracle: a caller could add one stock item
+     at a time and read another company's order volume off the difference.
+
+     So the hidden candidates collapse into ONE boolean. A reader is told the
+     sweep was not exhaustive and why; nothing about the records themselves
+     survives to the wire. */
+  let withheld = false;
+  const withheldReasons = new Set();
 
   for (const wo of candidates) {
-    const head = {
-      workOrderId: str(wo._id),
-      workOrderNumber: str(wo.workOrderNumber),
-      candidateSource: sourceOf(wo),
-    };
     const linked = str(wo.sampleStyleId);
 
     if (!linked) {
-      unprovable.push({
-        ...head, reason: UNPROVABLE.NO_STYLE_LINK, ownershipReason: null,
-        message: "This work order stores no style reference, so nothing links it to this release. "
-          + "Its product or order number may look right; neither is proof.",
-      });
+      /* Legacy: no stored style reference at all, so nothing about this order
+         can be attributed to any company — least of all to the caller's. */
+      withheld = true;
+      withheldReasons.add(UNPROVABLE.NO_STYLE_LINK);
       continue;
     }
-    if (linked !== releaseStyleId) {
-      /* Resolved so the reason is specific, but NOTHING about the other
-         company or the other style leaves — not its id, not its owner. */
-      const other = otherOwners.get(linked);
-      unprovable.push({
-        ...head,
-        reason: other ? UNPROVABLE.DIFFERENT_STYLE : UNPROVABLE.STYLE_NOT_FOUND,
-        ownershipReason: other ? other.reason : "STYLE_RECORD_MISSING",
-        message: other
-          ? "This work order is linked to a different style from the one this release covers."
-          : "This work order names a style record that no longer exists, so nothing about it can "
-            + "be proved either way.",
+
+    const ownership = mine(linked);
+    if (!ownership.proved) {
+      withheld = true;
+      withheldReasons.add(ownership.reason === "STYLE_RECORD_MISSING"
+        ? UNPROVABLE.STYLE_NOT_FOUND
+        : ownership.reason === "COMPANY_MISMATCH"
+          ? UNPROVABLE.COMPANY_MISMATCH
+          : UNPROVABLE.OWNERSHIP_UNPROVEN);
+      continue;
+    }
+
+    /* From here the order's style is PROVED to belong to the acting company,
+       so naming the order discloses nothing that is not already theirs. */
+    if (linked === releaseStyleId) {
+      provablyAffected.push({
+        ...identity(wo),
+        candidateSource: sourceOf(wo),
+        provenBy: { styleLink: "SAMPLE_STYLE_ID", ownership: ownership.reason },
       });
       continue;
     }
 
-    const verdict = owners.get(releaseStyleId);
-    if (!verdict) {
-      unprovable.push({
-        ...head, reason: UNPROVABLE.STYLE_NOT_FOUND, ownershipReason: "STYLE_RECORD_MISSING",
-        message: "The style this release covers no longer exists as a record, so ownership cannot "
-          + "be proved.",
-      });
-      continue;
-    }
-    if (!verdict.companyId) {
-      unprovable.push({
-        ...head, reason: UNPROVABLE.OWNERSHIP_UNPROVEN, ownershipReason: verdict.reason,
-        message: "The company that owns this order's style cannot be proved from its sales "
-          + "records. Correct the style's journey or enquiry in Sales.",
-      });
-      continue;
-    }
-    if (str(verdict.companyId) !== str(ctx.companyId)) {
-      unprovable.push({
-        ...head, reason: UNPROVABLE.COMPANY_MISMATCH, ownershipReason: verdict.reason,
-        message: "This order's style belongs to a different company from the one you are working "
-          + "in.",
-      });
-      continue;
-    }
-
-    affected.push({
-      ...head,
-      status: str(wo.status),
-      /* Both halves of the proof, stated rather than implied. */
-      provenBy: { styleLink: "SAMPLE_STYLE_ID", ownership: verdict.reason },
+    /* The caller's own order, on a different style of theirs — reachable
+       through a weak path, actionable, and safe to name. */
+    ownershipUnproven.push({
+      ...identity(wo),
+      candidateSource: sourceOf(wo),
+      reasonCode: UNPROVABLE.DIFFERENT_STYLE,
+      reasonMessage: "This order belongs to your company but is linked to a different style from "
+        + "the one this release covers, so this release does not govern it.",
     });
   }
 
   return {
-    examinedCount: candidates.length,
-    affected,
-    unprovable,
+    provablyAffected,
+    ownershipUnproven,
+    /* ── THE AGGREGATE COVERAGE WARNING ──────────────────────────────────
+       A boolean and a set of reason codes. Deliberately NO count and no
+       identity: the point of the warning is "do not read this list as the
+       whole factory", which needs neither. */
+    coverage: {
+      complete: !withheld,
+      withheldForTenantSafety: withheld,
+      withheldReasonCodes: [...withheldReasons].sort(),
+      message: withheld
+        ? "Some work orders reached by product or provenance could not be proved to belong to your "
+          + "company, so they are not listed. Link them to a style in Sales to see them here."
+        : "",
+    },
     /* Said explicitly so a reader never reads this list as an instruction. */
     readOnly: true,
     writesProduction: false,
@@ -563,6 +700,29 @@ async function workOrderImpact(ctx, release, file) {
 }
 
 /* ═══ THE ANSWER ═══════════════════════════════════════════════════════════ */
+
+/* ═══ TRI-STATE EVIDENCE ═══════════════════════════════════════════════════
+ *
+ * `true`, `false` and "not stated" are THREE answers. Collapsing the third into
+ * `false` hands out a denial the server never made; collapsing it into `true`
+ * hands out a reassurance. Every published boolean below that could be unknown
+ * is `null` when it is.
+ */
+
+/**
+ * Did a digest move?
+ *
+ * `null` unless BOTH values exist. A digest is opaque: with only one side there
+ * is nothing to compare, and answering `true` ("it moved") or `false` ("it did
+ * not") would both be inventions. An absent released digest is a legacy record
+ * that never carried one; an absent current digest is usually no current
+ * bulletin at all.
+ */
+const digestBlock = (released, current) => {
+  const a = str(released) || null;
+  const b = str(current) || null;
+  return { released: a, current: b, moved: a !== null && b !== null ? a !== b : null };
+};
 
 async function readImpact(ctx, { releaseId } = {}) {
   assertContext(ctx);
@@ -593,24 +753,20 @@ async function readImpact(ctx, { releaseId } = {}) {
   const releasedRows = src.rows || [];
   const currentRows = current ? (current.rows || []) : [];
 
-  const comparisonState = !current
-    ? COMPARISON.NO_CURRENT_APPROVED_BULLETIN
+  const verdict = !current
+    ? COMPARISON.NO_CURRENT_APPROVED
     : (String(current._id) === String(src.bulletinVersionId)
-      ? COMPARISON.SAME_APPROVED_BULLETIN
-      : COMPARISON.APPROVED_BULLETIN_MOVED);
+      ? COMPARISON.CURRENT
+      : COMPARISON.MOVED);
 
   const rows = pairRows(releasedRows, currentRows).map(comparePair);
   const tally = {};
-  for (const row of rows) for (const change of row.changes) tally[change] = (tally[change] || 0) + 1;
-
-  /* ── THE TWO DIGESTS, SEPARATELY ───────────────────────────────────────
-     They answer different questions — "did an approval move" and "did a
-     requirement move" — and a single "something changed" flag would send a
-     reader to the wrong department half the time. */
-  const releasedApprovalDigest = str(src.sourceApprovalDigest);
-  const currentApprovalDigest = current ? str(current.sourceApprovalDigest) : null;
-  const releasedRequirementDigest = str(src.sourceRequirementDigest);
-  const currentRequirementDigest = current ? str(current.sourceRequirementDigest) : null;
+  for (const row of rows) {
+    for (const change of row.classifications) tally[change] = (tally[change] || 0) + 1;
+  }
+  const unchangedRowCount = rows.filter(
+    (r) => r.classifications.length === 1 && r.classifications[0] === CHANGE.UNCHANGED,
+  ).length;
 
   const releasedSam = num(src.garmentSamMinutes);
   const currentSam = current ? num(current.totals?.garmentSamMinutes) : null;
@@ -621,19 +777,30 @@ async function readImpact(ctx, { releaseId } = {}) {
      are held fixed and only the garment SAM moves, which is what "the same
      plan, against the bulletin as it now stands" means.
 
-     Null plus a typed reason whenever that cannot be done honestly. An unknown
-     target is never a target of nought. */
+     `available` is three-state: `true` when a comparable target was derived,
+     `false` when it could not be and the reason is stated, and `null` only
+     where the question has not been reached at all. An unknown target is never
+     a target of nought. */
   const inputs = src.capacityStandard?.inputs || {};
   const releasedTarget = num(src.capacityStandard?.calculation?.wholePieceDailyTarget);
+  /* ── THE THIRD ANSWER, AND WHEN IT IS THE TRUE ONE ─────────────────────
+     A release that froze NO capacity standard raises no capacity question at
+     all: there is no target to compare and no derivation that failed. Saying
+     `false` there would report a failure nobody attempted, and `true` would be
+     worse. That is what `null` means on this field, and it is why the field is
+     three-state rather than a boolean with a reason beside it. */
+  const hasFrozenStandard = Boolean(src.capacityStandard);
 
   let currentTarget = null;
-  let capacityUnknownReason = null;
-  let capacityUnavailableReasons = [];
-  if (!current) {
-    capacityUnknownReason = CAPACITY_UNKNOWN.NO_CURRENT_APPROVED_BULLETIN;
+  let unknownReason = null;
+  let unavailableReasons = [];
+  if (!hasFrozenStandard) {
+    unknownReason = null;
+  } else if (!current) {
+    unknownReason = CAPACITY_UNKNOWN.NO_CURRENT_APPROVED_BULLETIN;
   } else if ([inputs.availableShiftMinutes, inputs.breakMinutes, inputs.shiftsPerDay,
     inputs.plannedOperatorCount, inputs.targetEfficiencyPercent].some((v) => num(v) === null)) {
-    capacityUnknownReason = CAPACITY_UNKNOWN.RELEASED_ASSUMPTIONS_INCOMPLETE;
+    unknownReason = CAPACITY_UNKNOWN.RELEASED_ASSUMPTIONS_INCOMPLETE;
   } else {
     const recomputed = calculateCapacity({
       availableShiftMinutes: inputs.availableShiftMinutes,
@@ -643,16 +810,25 @@ async function readImpact(ctx, { releaseId } = {}) {
       targetEfficiencyPercent: inputs.targetEfficiencyPercent,
       garmentSamMinutes: currentSam,
     });
-    if (recomputed.available) {
-      currentTarget = num(recomputed.wholePieceDailyTarget);
-    } else {
-      capacityUnknownReason = CAPACITY_UNKNOWN.CURRENT_CAPACITY_UNAVAILABLE;
-      capacityUnavailableReasons = [...(recomputed.unavailableReasons || [])];
+    if (recomputed.available) currentTarget = num(recomputed.wholePieceDailyTarget);
+    else {
+      unknownReason = CAPACITY_UNKNOWN.CURRENT_CAPACITY_UNAVAILABLE;
+      unavailableReasons = [...(recomputed.unavailableReasons || [])];
     }
   }
-  if (currentTarget !== null && releasedTarget === null) {
-    capacityUnknownReason = CAPACITY_UNKNOWN.RELEASED_TARGET_UNAVAILABLE;
+  if (hasFrozenStandard && currentTarget !== null && releasedTarget === null) {
+    unknownReason = CAPACITY_UNKNOWN.RELEASED_TARGET_UNAVAILABLE;
   }
+  const capacityDelta = deltaWhole(releasedTarget, currentTarget);
+  /* Explicitly three-state:
+       true  — a comparable target was derived;
+       false — it could not be, and `unavailableReason` says why;
+       null  — the release raises no capacity question at all.
+     Derived from whether a COMPARISON was possible, never from whether one
+     number happens to be present. */
+  const capacityAvailable = capacityDelta !== null
+    ? true
+    : (hasFrozenStandard ? false : null);
 
   const workOrders = await workOrderImpact(ctx, release, file);
 
@@ -661,83 +837,99 @@ async function readImpact(ctx, { releaseId } = {}) {
       release: {
         releaseId: String(release._id),
         releaseRef: release.releaseRef,
-        versionNo: release.versionNo,
+        versionNo: num(release.versionNo),
         state: release.state,
         issuedAt: iso(release.issuedAt),
+        issuedByName: str(release.issuedByName),
         styleFileId: String(release.ieStyleFileId),
+        companyId: String(release.companyId),
       },
 
-      comparison: {
-        state: comparisonState,
-        releasedBulletin: {
-          bulletinVersionId: src.bulletinVersionId ? String(src.bulletinVersionId) : null,
-          versionNo: num(src.bulletinVersionNo),
-          sourceFingerprint: str(src.sourceFingerprint),
-        },
-        currentBulletin: current ? {
-          bulletinVersionId: String(current._id),
-          versionNo: num(current.versionNo),
-          sourceFingerprint: str(current.sourceFingerprint),
-        } : null,
-        /* The verdict in one word, beside the evidence for it. */
-        moved: comparisonState === COMPARISON.APPROVED_BULLETIN_MOVED,
-        sourceFingerprintChanged: current
-          ? str(src.sourceFingerprint) !== str(current.sourceFingerprint) : null,
-      },
-
-      digests: {
-        approval: {
-          released: releasedApprovalDigest || null,
-          current: currentApprovalDigest || null,
-          approvalDigestChanged: current ? releasedApprovalDigest !== currentApprovalDigest : null,
-        },
-        requirement: {
-          released: releasedRequirementDigest || null,
-          current: currentRequirementDigest || null,
-          requirementDigestChanged: current
-            ? releasedRequirementDigest !== currentRequirementDigest : null,
-        },
+      /* ── THE COMPARISON, AS A VERDICT ──────────────────────────────────
+         One of three words, decided here. Not left to a browser to infer from
+         two version numbers: a version number can be equal while the content
+         behind it was corrected, and the digests are what say so. */
+      bulletin: {
+        releasedBulletinVersionId: src.bulletinVersionId ? String(src.bulletinVersionId) : null,
+        releasedVersionNo: num(src.bulletinVersionNo),
+        currentBulletinVersionId: current ? String(current._id) : null,
+        currentVersionNo: current ? num(current.versionNo) : null,
+        verdict,
+        /* `null`, not `false`, with no current bulletin: "it did not move" and
+           "there is nothing to have moved to" are different facts, and only one
+           of them is a reassurance. */
+        moved: verdict === COMPARISON.NO_CURRENT_APPROVED ? null : verdict === COMPARISON.MOVED,
+        sourceFingerprint: digestBlock(
+          src.sourceFingerprint, current ? current.sourceFingerprint : null,
+        ),
+        approvalDigest: digestBlock(
+          src.sourceApprovalDigest, current ? current.sourceApprovalDigest : null,
+        ),
+        requirementDigest: digestBlock(
+          src.sourceRequirementDigest, current ? current.sourceRequirementDigest : null,
+        ),
       },
 
       garmentSam: {
         released: releasedSam,
         current: currentSam,
-        deltaMinutes: deltaMinutes(releasedSam, currentSam),
-        unit: "MINUTES",
+        delta: deltaMinutes(releasedSam, currentSam),
+        unit: "min",
         rounding: "HALF_UP_4DP",
       },
 
       capacity: {
         released: releasedTarget,
         current: currentTarget,
-        delta: deltaWhole(releasedTarget, currentTarget),
-        unit: "WHOLE_PIECES_PER_DAY",
+        delta: capacityDelta,
+        unit: "pcs/day",
         wholePiecePolicy: "FLOOR",
-        /* Null when it is known. Never a zero standing in for an unknown. */
-        unknownReason: currentTarget === null || releasedTarget === null
-          ? capacityUnknownReason : null,
-        unavailableReasons: capacityUnavailableReasons,
+        available: capacityAvailable,
+        unavailableReason: unknownReason || "",
+        /* A sentence somebody can act on, not a code to look up. */
+        unavailableMessage: unknownReason ? CAPACITY_MESSAGE[unknownReason] : "",
+        unavailableReasons,
         /* Said out loud: only the SAM moved. The shift, break, manpower and
            efficiency assumptions are the release's own, held fixed. */
         basis: "RELEASED_ASSUMPTIONS_WITH_CURRENT_GARMENT_SAM",
         assumptionsFrom: "RELEASED_CAPACITY_STANDARD",
       },
 
-      /* Chunk 5A models three requirement dimensions; a bulletin version has
-         only ever frozen the machine half, so the other two are stated as
-         uncompared rather than silently reported as unchanged. */
+      /* Which requirement dimensions this response could compare at all. Row
+         level says it per row; this says it once, for a banner. */
       requirementCoverage: {
-        compared: ["MACHINE"],
-        uncompared: ["ATTACHMENT", "LABOUR"],
-        reason: "NOT_FROZEN_BY_ANY_BULLETIN_VERSION",
-        requiredUpstreamContract: "BULLETIN_ROW_ATTACHMENT_AND_LABOUR_REQUIREMENT_SNAPSHOT",
+        dimensions: [...DIMENSIONS],
+        comparedOnAtLeastOneRow: DIMENSIONS.filter((d) => rows.some(
+          (r) => r.requirementMovement?.perDimension?.[d]
+            && r.requirementMovement.perDimension[d] !== DIMENSION_COMPARISON.NOT_COMPARABLE,
+        )),
+        notComparableOnAtLeastOneRow: DIMENSIONS.filter((d) => rows.some(
+          (r) => r.requirementMovement?.perDimension?.[d] === DIMENSION_COMPARISON.NOT_COMPARABLE,
+        )),
+        reason: "A bulletin version frozen before attachment and labour evidence was captured "
+          + "cannot be compared on those dimensions, and nothing is backfilled onto it.",
       },
 
       rows,
-      rowTally: tally,
       changeVocabulary: Object.values(CHANGE),
 
       workOrders,
+
+      /* ── THE SERVER'S OWN COUNTS ───────────────────────────────────────
+         Published rather than left to the browser: a count computed there
+         becomes "how many rows this page happens to hold", which is a different
+         number the moment anything is paginated or filtered. */
+      summary: {
+        totalRowCount: rows.length,
+        changedRowCount: rows.length - unchangedRowCount,
+        unchangedRowCount,
+        affectedWorkOrderCount: workOrders.provablyAffected.length,
+        /* The DISCLOSED unproven rows only — every one of which belongs to the
+           acting company. Withheld candidates are never counted; see
+           `workOrders.coverage`. */
+        unprovenWorkOrderCount: workOrders.ownershipUnproven.length,
+        rowTally: tally,
+      },
 
       /* Computed on demand and kept nowhere — stated on the wire so nothing
          built against this treats it as a stored record with a freshness. */
@@ -751,8 +943,9 @@ async function readImpact(ctx, { releaseId } = {}) {
 }
 
 module.exports = {
-  CHANGE, COMPARISON, UNPROVABLE, CANDIDATE_SOURCE, CAPACITY_UNKNOWN, REQUIREMENT_DIMENSION,
-  pairRows, comparePair, requirementEvidence, machineRequirementMoved,
-  deltaMinutes, deltaWhole, ownershipFor, workOrderImpact,
+  CHANGE, COMPARISON, UNPROVABLE, CANDIDATE_SOURCE, CAPACITY_UNKNOWN, CAPACITY_MESSAGE,
+  DIMENSIONS, DIMENSION_STATE, DIMENSION_COMPARISON,
+  pairRows, comparePair, side, requirementEvidence, compareDimension, requirementMovement,
+  digestBlock, deltaMinutes, deltaWhole, ownershipFor, workOrderImpact,
   readImpact,
 };

@@ -1,79 +1,56 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { ensureOrderLink } = require("./orderBookLink");
+const fs = require("node:fs");
+const path = require("node:path");
+const { originHeads } = require("./orderBookLink");
 
-/* Minimal stand-ins for the three mongoose models. Each mimics only the calls
-   ensureOrderLink actually makes, including the chained .select()/.sort()/.lean(). */
-const chain = (value) => {
-  const c = { select: () => c, sort: () => c, lean: async () => value };
-  return c;
-};
-const models = ({ enquiry = null, account = null, request = null, onSave } = {}) => ({
-  Enquiry: { findOne: async () => (enquiry ? { ...enquiry, save: async function () { onSave?.(this); } } : null) },
-  Account: { findById: () => chain(account) },
-  CustomerRequest: { findOne: () => chain(request) },
+/* The route behaviour — PO linking, the chooser, company proof — is covered
+   against a real database in test/crm/order-link.route.test.js. These pin the
+   pure rule and the things the service must never do again. */
+
+const r = (id, over = {}) => ({ _id: id, status: "pending", ...over });
+
+test("the head of a supersession chain is the current order", () => {
+  const heads = originHeads([
+    r("a"),
+    r("b", { salesOrigin: { supersedesRequestId: "a" } }),
+    r("c", { salesOrigin: { supersedesRequestId: "b" } }),
+  ]);
+  assert.deepEqual(heads.map((h) => h._id), ["c"]);
 });
 
-const JOURNEY = { _id: "j1", accountId: "a1" };
-
-test("links the enquiry to the account's newest order record", async () => {
-  let saved = null;
-  const res = await ensureOrderLink(JOURNEY, models({
-    enquiry: { customerRequestId: null },
-    account: { linkedCustomer: "cust1" },
-    request: { _id: "req9", requestId: "REQ-2026-0009" },
-    onSave: (doc) => { saved = doc; },
-  }));
-  assert.equal(res.linked, true);
-  assert.equal(res.reason, "linked");
-  assert.equal(res.requestId, "REQ-2026-0009");
-  assert.equal(saved.customerRequestId, "req9", "the id must actually be written to the enquiry");
+test("a cancelled order is never a head", () => {
+  assert.deepEqual(originHeads([r("a", { status: "cancelled" })]), []);
 });
 
-test("an already-linked enquiry is left alone — no second write", async () => {
-  let wrote = false;
-  const res = await ensureOrderLink(JOURNEY, models({
-    enquiry: { customerRequestId: "existing" },
-    account: { linkedCustomer: "cust1" },
-    request: { _id: "req9" },
-    onSave: () => { wrote = true; },
-  }));
-  assert.equal(res.reason, "already-linked");
-  assert.equal(res.customerRequestId, "existing");
-  assert.equal(wrote, false, "must not overwrite a link that already exists");
+test("two unrelated orders from one enquiry are both heads — ambiguity is reported, not resolved", () => {
+  assert.equal(originHeads([r("a"), r("b")]).length, 2);
 });
 
-/* The four ways this legitimately cannot resolve. Each must report WHY and must
-   not throw — a PO is recorded whether or not the link is made. */
-for (const [name, opts, reason] of [
-  ["no enquiry on the journey", { enquiry: null }, "no-enquiry-on-journey"],
-  ["account not linked to a portal customer", { enquiry: { customerRequestId: null }, account: { linkedCustomer: null } }, "account-not-linked-to-portal-customer"],
-  ["customer has no order record yet", { enquiry: { customerRequestId: null }, account: { linkedCustomer: "cust1" }, request: null }, "no-order-record-for-this-customer"],
-]) {
-  test(`reports "${reason}" when ${name}`, async () => {
-    const res = await ensureOrderLink(JOURNEY, models(opts));
-    assert.equal(res.linked, false);
-    assert.equal(res.reason, reason);
-  });
-}
+const src = fs.readFileSync(path.join(__dirname, "orderBookLink.js"), "utf8")
+  .replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
 
-test("a journey with no account resolves nothing and does not throw", async () => {
-  const res = await ensureOrderLink({ _id: "j1", accountId: null }, models({ enquiry: { customerRequestId: null } }));
-  assert.equal(res.linked, false);
-  assert.equal(res.reason, "journey-has-no-account");
+test("it never creates a CustomerRequest or a portal customer", () => {
+  assert.ok(!/CustomerRequest\.create|new CustomerRequest\(|Customer\.create|new Customer\(/.test(src));
 });
 
-test("a thrown model error is swallowed, never propagated to the PO save", async () => {
-  const res = await ensureOrderLink(JOURNEY, {
-    Enquiry: { findOne: async () => { throw new Error("mongo is down"); } },
-    Account: {}, CustomerRequest: {},
-  });
-  assert.equal(res.linked, false);
-  assert.equal(res.reason, "error");
+test("it never picks the newest order for a customer", () => {
+  assert.ok(!/findOne\(\s*\{\s*customerId/.test(src), "a single order looked up by customer is a guess");
+  assert.ok(!/\.findById\(\s*journey\.accountId/.test(src), "the account must be read under the caller's company");
 });
 
-test("it never creates a CustomerRequest", () => {
-  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "orderBookLink.js"), "utf8");
-  assert.ok(!/CustomerRequest\.create|new CustomerRequest\(/.test(src),
-    "linking only: creating one needs a portal customerId this path cannot honestly supply");
+test("there is one link writer, it claims the order first and is conditional on the link it expects", () => {
+  const writes = src.match(/Enquiry\.(updateOne|updateMany|findOneAndUpdate|findByIdAndUpdate)\(/g) || [];
+  assert.equal(writes.length, 1, "every link write goes through writeLink");
+  const writer = src.slice(src.indexOf("async function writeLink"), src.indexOf("/* ══ CANDIDATES"));
+  assert.ok(writer.indexOf("claimOrder(") < writer.indexOf("Enquiry.findOneAndUpdate("), "claim before link");
+  assert.match(writer, /customerRequestId: current \}/, "conditional on the link the caller saw");
+  assert.ok(!/enquiry\.save\(/.test(src), "an unconditional save could overwrite a concurrent correction");
+});
+
+test("the enquiry routes no longer carry a name-match order guess", () => {
+  const routes = fs.readFileSync(path.join(__dirname, "../routes/CMS_Routes/Sales/enquiries.js"), "utf8")
+    .replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(!/async function resolveRequestId/.test(routes));
+  assert.ok(!/PortalCustomer\.find/.test(routes), "a portal customer found by name is a guess");
 });

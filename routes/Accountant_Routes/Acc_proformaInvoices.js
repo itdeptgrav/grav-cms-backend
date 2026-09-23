@@ -15,6 +15,20 @@
 const express = require("express");
 const router = express.Router();
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const {
   Acc_ProformaInvoice,
 } = require("../../models/Accountant_model/Acc_ProformaInvoice");
@@ -221,7 +235,7 @@ function round2(n) {
 //   limit      — default 100
 //   sort       — voucherDate-desc (default), voucherNumber-desc
 // -----------------------------------------------------------------------------
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -285,7 +299,7 @@ router.get("/", async (req, res) => {
 // -----------------------------------------------------------------------------
 // GET /:id — single PI with seller + bank info for the detail page / PDF
 // -----------------------------------------------------------------------------
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id).lean();
     if (!pi)
@@ -340,7 +354,7 @@ router.get("/:id", async (req, res) => {
 // IGST applies; otherwise CGST+SGST split. If stateCode isn't set on
 // either side, defaults to intra-state.
 // -----------------------------------------------------------------------------
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.companyId) {
@@ -433,7 +447,7 @@ router.post("/", async (req, res) => {
 // agreed to). To edit an accepted PI, the user must explicitly revert
 // it to `draft` via PATCH /:id/status first.
 // -----------------------------------------------------------------------------
-router.put("/:id", async (req, res) => {
+router.put("/:id", companyScope, async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id);
     if (!pi)

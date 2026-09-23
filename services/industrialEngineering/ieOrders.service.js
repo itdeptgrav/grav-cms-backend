@@ -87,6 +87,11 @@ const orderNotFound = () => fail(CODES.NOT_FOUND, "That order was not found.");
  * there, so the two cannot describe the same order differently. Re-exported
  * below so no existing importer breaks. */
 const { LINE_RESOLUTION, STYLE_LINK, STYLE_LINK_STATUS, COMPANY_ATTRIBUTION } = orderStyleLink;
+/* The approved IE operation standard, resolved through the file's own pointer
+   and nothing else — see `approvedStandard.service.js`. */
+const {
+  STANDARD_STATE, STANDARD_SOURCE, approvedStandardsFor, standardSummaryOf,
+} = require("./approvedStandard.service");
 const { resolveOrderLine, resolveOrderStyleLink } = orderStyleLink;
 
 /** Where one style stands as an engineering unit. */
@@ -427,9 +432,21 @@ function styleLinksFor(orders, bound) {
  * comparison state are the ones the style endpoint publishes, so a style reads
  * the same inside an order as it does on its own.
  */
-function styleReadinessOf(parts) {
+function styleReadinessOf(parts, standard = null) {
   const S = routeComparison.STATE;
   const { comparison, technical } = parts;
+
+  /* ── THE APPROVED IE STANDARD COMES FIRST ────────────────────────────────
+     A current approved Operation Bulletin Version IS the operation standard IE
+     exists to produce: every row identified, active and timed, approved by
+     somebody other than its author. It satisfies the requirement outright.
+
+     The legacy route comparison below is still computed and still published —
+     it is source context about R&D's record and the product's route — but it
+     is no longer allowed to overrule the department's own signed-off standard.
+     Before this, an empty R&D route made a style with an approved seven-row
+     bulletin read NOT_STARTED. */
+  if (standard?.state === STANDARD_STATE.APPROVED_CURRENT) return STYLE_READINESS.READY;
 
   if (comparison.state === S.AMBIGUOUS) return STYLE_READINESS.AMBIGUOUS;
   if (comparison.state === S.NO_ROUTE) return STYLE_READINESS.NOT_STARTED;
@@ -445,6 +462,66 @@ function styleReadinessOf(parts) {
     return STYLE_READINESS.INCOMPLETE;
   }
   return STYLE_READINESS.READY;
+}
+
+/**
+ * The legacy gaps an approved IE standard answers, and nothing more.
+ *
+ * Each of these tells IE to RECORD an operation route, a standard time or an
+ * identified operation. An approved bulletin version has done exactly that, so
+ * publishing them beside it would contradict the department's own record —
+ * "no route recorded" over a style with seven approved operations.
+ *
+ * Everything else the legacy comparison raises is kept, because it is still
+ * true and still somebody's to fix: R&D's record not being approved, the
+ * product route disagreeing or missing, a duplicated code in the register.
+ * Those are source context, and an approved IE standard does not make them go
+ * away — it only stops them deciding IE's readiness.
+ */
+const SATISFIED_BY_APPROVED_STANDARD = Object.freeze([
+  "NO_ROUTE_RECORDED",
+  "TECHNICAL_ROUTE_MISSING",
+  "STANDARD_TIME_MISSING",
+  "OPERATION_NOT_IDENTIFIED",
+]);
+
+function styleGapsWith(legacyGaps, standard) {
+  if (standard?.state !== STANDARD_STATE.APPROVED_CURRENT) {
+    return { gaps: legacyGaps, satisfied: [] };
+  }
+  const satisfied = [];
+  const gaps = [];
+  for (const g of legacyGaps || []) {
+    if (SATISFIED_BY_APPROVED_STANDARD.includes(g.code)) satisfied.push(g.code);
+    else gaps.push(g);
+  }
+  return { gaps, satisfied };
+}
+
+/**
+ * The figures a style row HEADLINES — its operation count and SAM — with the
+ * source they came from stated rather than implied.
+ *
+ * The approved IE standard wins when there is one. Otherwise the legacy
+ * technical route, exactly as before. The legacy numbers are never overwritten:
+ * they stay in `routeSources.technical`, where they always were.
+ */
+function headlineOf(parts, standard) {
+  if (standard?.state === STANDARD_STATE.APPROVED_CURRENT) {
+    return {
+      operationCount: standard.operationCount,
+      samMinutes: standard.garmentSamMinutes,
+      samComplete: standard.garmentSamMinutes !== null,
+      standardSource: STANDARD_SOURCE.APPROVED_BULLETIN_VERSION,
+    };
+  }
+  return {
+    operationCount: parts.technical.operationCount,
+    samMinutes: parts.technical.totalSamMinutes,
+    samComplete: parts.technical.samComplete,
+    standardSource: parts.technical.present
+      ? STANDARD_SOURCE.LEGACY_TECHNICAL_ROUTE : STANDARD_SOURCE.NONE,
+  };
 }
 
 /** The order's own state, from its styles' — never better than the worst. */
@@ -468,13 +545,58 @@ function routeSummaryOf(perStyle) {
   const totals = withRoute
     .map((s) => s.technical.totalSamMinutes)
     .filter((v) => v !== null && v !== undefined);
+  const legacyTotal = totals.length ? Number(totals.reduce((a, b) => a + b, 0).toFixed(6)) : null;
+  const legacyComplete = perStyle.length > 0 && perStyle.every((s) => s.technical.samComplete);
+
+  /* ── WHICH STANDARD THE ORDER'S HEADLINE SAM STANDS ON ─────────────────
+     `totalSamMinutes` is the number somebody quotes as this order's standard
+     time, so it follows the same precedence a style does — under the order
+     aggregate rule in `approvedStandard.service.js`:
+
+       · every style approved → the approved sum, complete;
+       · no style approved    → exactly the legacy technical figure, as before;
+       · some but not all     → NO total. Adding an approved 6.25 to a legacy
+         route nobody approved would publish a figure that looks like the
+         order's standard and is not, so it is withheld and the reason named.
+
+     The legacy figures are not erased — they are kept whole in
+     `legacyTechnical` beside it. */
+  const standards = perStyle.map((s) => s.standard);
+  const approvedCount = standards.filter((x) => x?.state === STANDARD_STATE.APPROVED_CURRENT).length;
+  const summary = standardSummaryOf(standards);
+
+  let totalSamMinutes = legacyTotal;
+  let samComplete = legacyComplete;
+  let standardSource = withRoute.length ? STANDARD_SOURCE.LEGACY_TECHNICAL_ROUTE : STANDARD_SOURCE.NONE;
+  let samUnavailableReason = null;
+  if (perStyle.length && approvedCount === perStyle.length) {
+    totalSamMinutes = summary.garmentSamMinutes;
+    samComplete = true;
+    standardSource = STANDARD_SOURCE.APPROVED_BULLETIN_VERSION;
+  } else if (approvedCount > 0) {
+    totalSamMinutes = null;
+    samComplete = false;
+    standardSource = "MIXED";
+    samUnavailableReason = summary.unavailableReason;
+  }
+
   return {
     styles: perStyle.length,
     stylesWithTechnicalRoute: withRoute.length,
     stylesWithoutTechnicalRoute: perStyle.length - withRoute.length,
     stylesSamComplete: perStyle.filter((s) => s.technical.samComplete).length,
-    totalSamMinutes: totals.length ? Number(totals.reduce((a, b) => a + b, 0).toFixed(6)) : null,
-    samComplete: perStyle.length > 0 && perStyle.every((s) => s.technical.samComplete),
+    totalSamMinutes,
+    samComplete,
+    standardSource,
+    samUnavailableReason,
+    /* R&D's technical route, exactly as it was always summed. Source context,
+       never overwritten. */
+    legacyTechnical: {
+      totalSamMinutes: legacyTotal,
+      samComplete: legacyComplete,
+      stylesWithTechnicalRoute: withRoute.length,
+      stylesSamComplete: perStyle.filter((s) => s.technical.samComplete).length,
+    },
   };
 }
 
@@ -614,6 +736,10 @@ function orderRow(order, { decision, perStyle, readiness, routeSummary, gaps }) 
     stylesWithGaps: perStyle.filter((s) => s.readiness !== STYLE_READINESS.READY).length,
     ieReadiness: readiness,
     routeSummary,
+    /* The approved IE standard across this order's styles, under the one
+       aggregate rule — see `standardSummaryOf`. Separate from `routeSummary`
+       so the approved evidence is never confused with R&D's route. */
+    engineeringStandardSummary: standardSummaryOf(perStyle.map((s) => s.standard)),
     /* Reported as unavailable rather than guessed — see LINE_PLANNING. */
     linePlanning: LINE_PLANNING,
     /* HOW the order's style link stands, as a state rather than a count. The
@@ -635,7 +761,7 @@ function orderRow(order, { decision, perStyle, readiness, routeSummary, gaps }) 
  * order's readiness — the detail is the same computation with the styles left
  * in rather than counted.
  */
-async function assembleOrders(orders, bound) {
+async function assembleOrders(orders, bound, companyId) {
   const links = styleLinksFor(orders, bound);
 
   /* Every style named by the whole page, loaded once. */
@@ -659,6 +785,13 @@ async function assembleOrders(orders, bound) {
   }
   const duplicated = await ieRead.duplicateCodes(pageCodes);
 
+  /* ── THE APPROVED IE STANDARD, FOR EVERY STYLE ON THE PAGE AT ONCE ──────
+     Two queries for the whole page — the engineering files, then only the
+     versions those files POINT at — company-scoped in both. Never a read per
+     style, and never "the latest approved version": the pointer is the
+     decision. */
+  const standards = await approvedStandardsFor(companyId, wantedStyleIds);
+
   return orders.map((order) => {
     const own = links.get(str(order._id)) || { styles: [], decision: null };
 
@@ -667,9 +800,17 @@ async function assembleOrders(orders, bound) {
       const style = styleById.get(styleId);
       const projection = projected.get(styleId);
       const parts = ieRead.assemble(style, projection, ieRead.ownDuplicates(projection, duplicated));
+      const standard = standards.get(styleId) || null;
+      const { gaps: styleGaps, satisfied } = styleGapsWith(parts.gaps, standard);
       return {
         styleId, via, style, parts, ...parts,
-        readiness: styleReadinessOf(parts),
+        /* The approved standard and the legacy gaps it answered. `parts.gaps`
+           stays untouched; `gaps` here is the precedence-aware set. */
+        standard,
+        satisfiedLegacyGaps: satisfied,
+        gaps: styleGaps,
+        headline: headlineOf(parts, standard),
+        readiness: styleReadinessOf(parts, standard),
         /* Lane A: the style's own lifecycle, and any contradiction between it
            and this order. Terminal styles are kept, not hidden — this is what
            explains them. */
@@ -723,7 +864,7 @@ async function listOrders(ctx, { limit, cursor } = {}) {
     .lean();
 
   const page = found.slice(0, size);
-  const assembled = await assembleOrders(page, bound);
+  const assembled = await assembleOrders(page, bound, ctx.companyId);
   const rows = assembled.map((a) => orderRow(a.order, a));
 
   const last = page[page.length - 1];
@@ -760,7 +901,7 @@ async function readOrder(ctx, { orderId } = {}) {
     .lean();
   if (!order) throw orderNotFound();
 
-  const [assembled] = await assembleOrders([order], bound);
+  const [assembled] = await assembleOrders([order], bound, ctx.companyId);
 
   return {
     order: orderRow(order, assembled),
@@ -785,6 +926,34 @@ async function readOrder(ctx, { orderId } = {}) {
       routeSources: {
         technical: { ...s.parts.technical, rows: s.parts.technicalRows },
         product: { ...s.parts.product, rows: s.parts.productRows },
+      },
+      /* ── THE HEADLINE FIGURES, WITH THEIR SOURCE ────────────────────────
+         `styleListRow` fills these from R&D's technical route. When IE has an
+         approved standard for the style, THAT is the standard, so it wins here
+         — and `standardSource` says which one a reader is looking at. The
+         technical route's own figures are untouched in `routeSources` above. */
+      operationCount: s.headline.operationCount,
+      samMinutes: s.headline.samMinutes,
+      samComplete: s.headline.samComplete,
+      standardSource: s.headline.standardSource,
+      /* The legacy gaps minus the ones the approved standard answers. */
+      gaps: s.gaps,
+      /* ── THE APPROVED IE OPERATION STANDARD ─────────────────────────────
+         Its own projection, beside the legacy route sources rather than over
+         them. Every figure is a stated absence when there is no approved
+         standard, and the state says which link broke. */
+      engineeringStandard: {
+        ...s.standard,
+        /* The legacy gap codes this standard answered on this style — so a
+           reader can see WHY "no route recorded" is no longer shown, rather
+           than wondering where it went. */
+        satisfiesLegacyGaps: s.satisfiedLegacyGaps,
+      },
+      /* Enough identity to open the existing engineering file — through the
+         route that already opens it, scoped by this order and style. */
+      engineeringFile: {
+        styleFileId: s.standard?.styleFileId || null,
+        href: `/api/cms/ie/orders/${str(order._id)}/styles/${s.styleId}/engineering-file`,
       },
       linkedVia: s.via,
       ieReadiness: s.readiness,
@@ -815,5 +984,6 @@ module.exports = {
   orderOwnershipBound, resolveOrderLine, resolveOrderStyleLink, styleOwnersFor,
   styleLinksFor, styleReadinessOf, orderReadinessOf,
   routeSummaryOf, orderGapsFor, orderRow,
+  SATISFIED_BY_APPROVED_STANDARD, styleGapsWith, headlineOf,
   listOrders, readOrder,
 };

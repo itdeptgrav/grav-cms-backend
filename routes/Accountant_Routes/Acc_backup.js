@@ -18,10 +18,22 @@
 //                                takes a pre-restore safety snapshot first)
 //   POST /test                 — verify the Drive service account works
 //
-// AUTH CHOICE
-//   Uses the legacy `accountantAuth`, which verifies the JWT WITHOUT a DB
-//   lookup. That matters: restore must work even when the database has been
-//   wiped (orgAuth would fail because it reads the user from Mongo).
+// AUTH CHOICE — READ THIS, IT NO LONGER SAYS WHAT IT USED TO
+//   This router was put on `accountantAuth` deliberately, because that
+//   middleware verified the JWT WITHOUT a database lookup, and restore has to
+//   work when the database is exactly what has been lost.
+//
+//   That is no longer true. Lane A Chunk 2 turned `accountantAuth` into a
+//   façade over `orgAuth`, which confirms the Acc_User and organisation in
+//   Mongo on every request. So restoring into a wiped or unreachable database
+//   now fails at the door: there is no Acc_User to confirm.
+//
+//   Left as it is rather than carved out, because the carve-out would be a
+//   second authentication path — the thing Chunk 2 exists to remove — and
+//   choosing what may open that door in a disaster (a break-glass credential,
+//   an operator-only bootstrap, a CLI that skips HTTP entirely) is an owner's
+//   decision, not a middleware detail. Until it is made, restore-after-wipe
+//   needs a working Acc_User record.
 //
 // The scheduler self-starts the first time this file is required.
 

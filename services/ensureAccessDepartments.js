@@ -61,24 +61,6 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: "merchandiserdepartments",
     legacyUserType: "merchandiser", dashboardPath: "/merchandiser/dashboard",
     description: "Style execution, component selection and development coordination." },
-  /* ── INDUSTRIAL ENGINEERING ──────────────────────────────────────────
-     A department application in its own right (ADR-003), not a designation:
-     Production Manager and Production Supervisor stay ROLES inside Production
-     rather than becoming a second name for this.
-
-     No legacy collection — nobody ever signed in to an "industrial
-     engineering" module — so like Merchandising and Developer it only
-     registers the department, which is what makes it appear in
-     CEO → Access Control and therefore GRANTABLE from there. That grant is the
-     whole access model: every /api/cms/ie endpoint checks
-     DepartmentRole("ie"), and the frontend shell is gated on the same slug.
-
-     Sorted at 47, between Merchandising (45) and Accounting (50): IE sits with
-     the make-side departments rather than at the end of the list. */
-  { key: "ie", slug: "ie", name: "Industrial Engineering", sortOrder: 47,
-    legacyModel: null, legacyCollection: "iedepartments",
-    legacyUserType: "ie", dashboardPath: "/industrial-engineering/orders",
-    description: "Operation standards, style bulletins, SAM, line balance and capacity standards." },
   { key: "accountant", slug: "accountant", name: "Accounting", sortOrder: 50,
     legacyModel: "Acc_Department", legacyCollection: "acc_departments",
     legacyUserType: "accountant", dashboardPath: "/accountant/",
@@ -116,10 +98,91 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: "developerdepartments",
     legacyUserType: "developer", dashboardPath: "/developer",
     description: "Cross-department history, anomaly alerts, live settings and system health." },
+  /* Industrial Engineering. A department application in its own right
+     (ADR-003) — it owns operation standards, style bulletins, SAM, method
+     studies, machine and skill requirements, line balance and capacity
+     standards. PPC owns scheduling; Production owns execution, and Production
+     Manager and Production Supervisor stay ROLES inside Production rather than
+     becoming a second name for this.
+
+     No legacy collection — nobody ever signed in to an "industrial
+     engineering" module — so like Merchandising and Developer it only
+     registers the department, which is what makes it appear in
+     CEO → Access Control and therefore GRANTABLE from there. That grant is the
+     whole access model: every /api/cms/ie endpoint checks
+     DepartmentRole("ie"), and the frontend shell is gated on the same slug.
+
+     Sorted at 47, between Merchandising (45) and Accounting (50): IE sits with
+     the make-side departments rather than at the end of the list. */
+  { key: "ie", slug: "ie", name: "Industrial Engineering", sortOrder: 47,
+    legacyModel: null, legacyCollection: "iedepartments",
+    legacyUserType: "ie", dashboardPath: "/industrial-engineering/orders",
+    description: "Operation standards, style bulletins, SAM, line balance and capacity standards." },
+  /* PPC owns planning decisions and capacity booking, separate from IE's
+     engineering standards and Production's execution. This row only makes
+     the existing PPC grant and Order Book landing available in Access Control;
+     it creates no role grant or production authority. */
+  { key: "ppc", slug: "ppc", name: "Production Planning & Control", sortOrder: 48,
+    legacyModel: null, legacyCollection: "ppcdepartments",
+    legacyUserType: "ppc", dashboardPath: "/ppc",
+    description: "Confirmed-order planning, engineering release receipts and capacity booking." },
   { key: "packaging", slug: "packaging-dispatch", name: "Packaging & Dispatch", sortOrder: 120,
     legacyModel: "PackagingDispatchDepartment", legacyCollection: "packagingdispatchdepartments",
     legacyUserType: "packaging-dispatch", dashboardPath: "/packaging-dispatch/dashboard",
     description: "Packing, dispatch and delivery." },
+  /* Marketing. A department application in its own right, and deliberately NOT
+     a second door into Sales: `Middlewear/MarketingAuthMiddlewear.js` is a
+     separate allowlist over the same token precisely so the marketing team does
+     not inherit the Sales customer master.
+
+     No legacy collection — nobody ever signed in to a "marketing" module — so
+     like Merchandising, Developer and IE this registers the department and
+     nothing else. That registration is what makes the app appear in
+     CEO → Access Control and therefore GRANTABLE: without a row here the
+     `/marketing` shell and every `/api/cms/marketing` endpoint are correct and
+     unreachable by everyone except a platform administrator.
+
+     Sorted at 44, immediately before Merchandising: Marketing's work precedes
+     the order in the life of a garment, and it belongs beside Sales (40) rather
+     than at the end of the make-side list.
+
+     Registration ONLY. Nothing here grants a Mautic credential, a consent
+     record or a handover — those are Lane A's services, and this file does not
+     import one. */
+  { key: "marketing", slug: "marketing", name: "Marketing", sortOrder: 44,
+    legacyModel: null, legacyCollection: "marketingdepartments",
+    legacyUserType: "marketing", dashboardPath: "/marketing",
+    description: "Campaign state, consent and synchronisation health, and Prospect handovers to Sales." },
+  /* ── BOARD — ITS OWN APPLICATION, ITS OWN GRANT ──────────────────────────
+     The Board app existed before this row did, and its authority read the
+     `ceo` grant because that was the only board-level boundary the repository
+     had. The two are not one thing: Executive Office is company-wide reporting
+     and oversight; the Board sets the policies a costing is calculated under.
+     Coupling them meant a person had to be given the Executive Office before
+     the Board role selector would even appear, and revoking one silently moved
+     the other.
+
+     No legacy collection: there have never been Board logins to mirror. It is
+     a grant an administrator makes in Access Control and nothing else.
+
+     ── AND NOT ON THE PUBLIC GRID ──────────────────────────────────────
+     `showOnOnboarding: false`, the only seeded row that says so. `/onboarding`
+     is an unauthenticated page that invites somebody to pick the department
+     they work in and sign in; Board is not a department anybody works in. It is
+     an internal application granted, per person, by an administrator, and then
+     only usable with an explicit Board ROLE on top — see
+     `services/board/boardAccess.js`.
+
+     Hiding it there is not protection and is not claimed to be: `/board` is a
+     route anyone may type, and the server refuses them per request. It is about
+     not inviting the company at large to ask for a seat on the Board.
+
+     It stays fully visible in Access Control, which reads the department list
+     through the authenticated admin route and does not filter on this flag. */
+  { key: "board", slug: "board", name: "Board", sortOrder: 21,
+    legacyModel: null, legacyCollection: null, showOnOnboarding: false,
+    legacyUserType: "board", dashboardPath: "/board/dashboard/policies/financing",
+    description: "Company policy: the rules every costing is calculated under." },
 ];
 
 // Platform administration is NOT a department.
@@ -162,10 +225,17 @@ async function ensureAccessDepartments(connection) {
       // a default instead of the stored value would break authorization for
       // every store user, permanently and silently.
       let rows = [];
-      try {
-        rows = await connection.collection(dept.legacyCollection).find({}).toArray();
-      } catch {
-        // Collection absent on this database — nothing to mirror.
+      // A department with no legacy collection has no logins to mirror — Board
+      // has never had any. Asked for by name, `connection.collection(null)`
+      // registers a null-named collection on the connection, which then breaks
+      // anything that walks `connection.collections` (the test harness's own
+      // clean-up, for one).
+      if (dept.legacyCollection) {
+        try {
+          rows = await connection.collection(dept.legacyCollection).find({}).toArray();
+        } catch {
+          // Collection absent on this database — nothing to mirror.
+        }
       }
 
       const legacyRole = dominantRole(rows) || dept.slug;
@@ -180,7 +250,12 @@ async function ensureAccessDepartments(connection) {
             name: dept.name,
             description: dept.description,
             dashboardPath: dept.dashboardPath,
-            showOnOnboarding: true,
+            /* Every department is on the onboarding grid unless its own entry
+               says otherwise. Board is the one that does: it is an internal,
+               role-controlled application, not a login somebody chooses off a
+               public page. Still `$setOnInsert`, so an administrator's later
+               decision either way survives every restart. */
+            showOnOnboarding: dept.showOnOnboarding !== false,
             sortOrder: dept.sortOrder,
             isSystem: true,
             isActive: true,

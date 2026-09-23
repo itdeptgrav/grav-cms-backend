@@ -41,8 +41,17 @@ const MAX_LIMIT = 100;
 const MAX_BULK_ROWS = 200;
 
 /** The register's views, and the statuses each one shows. */
+/* ── AT RISK: THE ONE DEFINITION ──────────────────────────────────────────
+   Past due, or forecast beyond what was committed. The Overview counts it,
+   the register lists it and the counts endpoint reports it — all from this
+   list, so the figure and the records behind it cannot drift apart. It used
+   to exist only as a sum in two places, and the Overview's link opened the
+   overdue half of it. */
+const AT_RISK_STATUSES = Object.freeze([MILESTONE_STATUS.OVERDUE, MILESTONE_STATUS.FORECAST_LATE]);
+
 const PORTFOLIO_VIEWS = Object.freeze({
   "due-soon": [MILESTONE_STATUS.DUE_SOON],
+  "at-risk": AT_RISK_STATUSES,
   overdue: [MILESTONE_STATUS.OVERDUE],
   blocked: [MILESTONE_STATUS.BLOCKED],
   "forecast-late": [MILESTONE_STATUS.FORECAST_LATE],
@@ -94,33 +103,34 @@ function decodeCursor(value, filterKey) {
  * Ordered by forecast date — the thing somebody is chasing — with the row id
  * breaking ties so the page boundary is stable under insertion.
  */
-async function portfolio(ctx, {
+/* ── ONE FILTER, FOR THE LIST AND FOR EVERY COUNT OF IT ─────────────────
+   The register, the schedule and the calendar's day counts all ask the same
+   question with the same filters. Built once, here, so a calendar day that
+   says "7" opens a list of exactly those seven: two copies of this logic is
+   how a count and its list come to disagree.
+
+   `undated` asks for the milestones that have no forecast at all — the ones
+   a date range can never contain, and so the ones a calendar would otherwise
+   silently lose. */
+async function milestoneMatch(ctx, {
   view = "due-soon", q = "", owner = "", assignedTo = "", buyer = "", factory = "",
-  from = "", to = "", cursor, limit,
+  from = "", to = "", undated = false,
 } = {}) {
   assertContext(ctx);
   if (!isPortfolioView(view)) {
     throw fail("VALIDATION",
       `"${view}" is not a Time & Action view.`, { field: "view", allowed: Object.keys(PORTFOLIO_VIEWS) });
   }
-  const size = boundedLimit(limit);
   const statuses = PORTFOLIO_VIEWS[str(view)];
 
   const match = { companyId: ctx.companyId };
   if (statuses) match.status = { $in: statuses };
   if (str(owner)) match.ownerDepartment = str(owner).toUpperCase();
-  if (str(from)) match.forecastDate = { ...(match.forecastDate || {}), $gte: cal.assertDate(from, "from") };
-  if (str(to)) match.forecastDate = { ...(match.forecastDate || {}), $lte: cal.assertDate(to, "to") };
-
-  /* The filter identity a cursor is bound to. */
-  const filterKey = crypto.createHash("sha1")
-    .update(JSON.stringify({ view, owner, assignedTo, buyer, factory, from, to, q })).digest("hex").slice(0, 8);
-  const after = decodeCursor(cursor, filterKey);
-  if (after) {
-    match.$or = [
-      { forecastDate: { $gt: after.forecastDate } },
-      { forecastDate: after.forecastDate, _id: { $gt: after.id } },
-    ];
+  if (undated) {
+    match.forecastDate = null;
+  } else {
+    if (str(from)) match.forecastDate = { ...(match.forecastDate || {}), $gte: cal.assertDate(from, "from") };
+    if (str(to)) match.forecastDate = { ...(match.forecastDate || {}), $lte: cal.assertDate(to, "to") };
   }
 
   /* ── FILE-LEVEL FILTERS ────────────────────────────────────────────────
@@ -156,11 +166,44 @@ async function portfolio(ctx, {
     restrictFiles = true;
   }
 
-  let files = null;
   if (restrictFiles) {
-    files = await ExecutionFile.find(fileFilter).select("_id").limit(2000).lean();
-    if (!files.length) return { rows: [], nextCursor: null, hasMore: false };
+    const files = await ExecutionFile.find(fileFilter).select("_id").limit(2000).lean();
+    if (!files.length) return { match, empty: true };
     match.fileId = { $in: files.map((f) => f._id) };
+  }
+  return { match, empty: false };
+}
+
+async function portfolio(ctx, {
+  view = "due-soon", q = "", owner = "", assignedTo = "", buyer = "", factory = "",
+  from = "", to = "", undated = false, cursor, limit,
+} = {}) {
+  const size = boundedLimit(limit);
+  const wantUndated = undated === true || str(undated) === "1" || str(undated) === "true";
+  const { match, empty } = await milestoneMatch(ctx, {
+    view, q, owner, assignedTo, buyer, factory, from, to, undated: wantUndated,
+  });
+  if (empty) return { rows: [], nextCursor: null, hasMore: false };
+
+  /* The filter identity a cursor is bound to. */
+  const filterKey = crypto.createHash("sha1")
+    .update(JSON.stringify({ view, owner, assignedTo, buyer, factory, from, to, q, undated: wantUndated }))
+    .digest("hex").slice(0, 8);
+  const after = decodeCursor(cursor, filterKey);
+  if (after) {
+    /* Undated milestones sort FIRST. When a page ends on one, "later than
+       null" must mean "every dated milestone" — `$gt: null` matches nothing,
+       and every dated row after that page used to vanish from the register. */
+    const later = after.forecastDate == null
+      ? { forecastDate: { $ne: null } }
+      : { forecastDate: { $gt: after.forecastDate } };
+    const clause = [later, { forecastDate: after.forecastDate ?? null, _id: { $gt: after.id } }];
+    if (match.forecastDate && typeof match.forecastDate === "object") {
+      match.$and = [{ forecastDate: match.forecastDate }, { $or: clause }];
+      delete match.forecastDate;
+    } else {
+      match.$or = clause;
+    }
   }
 
   const rows = await TnaMilestone.find(match)
@@ -203,6 +246,65 @@ async function portfolio(ctx, {
   };
 }
 
+/**
+ * HOW MANY MILESTONES FALL ON EACH DAY OF A RANGE — ALL OF THEM.
+ *
+ * The calendar's numbers. A page of the list holds at most a hundred rows, so
+ * a month counted from the list would stop counting at the first page and a
+ * crowded day would read as a quiet one. This counts in the database, with
+ * the SAME filter the list uses (`milestoneMatch`), so opening a day lists
+ * exactly the milestones its number counted.
+ *
+ * Read-only and company-scoped. The range is bounded: a calendar shows about
+ * six weeks, and an unbounded range would be a way to aggregate a whole
+ * company's history on every page load.
+ *
+ * `undated` is the number of milestones matching the same filters that have
+ * no forecast date at all — which no day can contain, and which the screen
+ * lists in its own "Date not available" area rather than losing.
+ */
+const MAX_DAY_RANGE = 62;
+
+async function portfolioDays(ctx, {
+  view = "all", q = "", owner = "", assignedTo = "", buyer = "", factory = "", from = "", to = "",
+} = {}) {
+  const start = cal.assertDate(from, "from");
+  const end = cal.assertDate(to, "to");
+  if (end < start) throw fail("VALIDATION", "The range ends before it starts.", { field: "to" });
+  const span = Math.round((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86400000) + 1;
+  if (span > MAX_DAY_RANGE) {
+    throw fail("VALIDATION", `Ask for at most ${MAX_DAY_RANGE} days at a time.`, { field: "to", maximum: MAX_DAY_RANGE });
+  }
+
+  const filters = { view, q, owner, assignedTo, buyer, factory };
+  const dated = await milestoneMatch(ctx, { ...filters, from: start, to: end });
+  const undatedMatch = await milestoneMatch(ctx, { ...filters, undated: true });
+  if (dated.empty) return { from: start, to: end, days: [], undated: 0, generatedAt: new Date() };
+
+  const [grouped, undated] = await Promise.all([
+    TnaMilestone.aggregate([
+      { $match: dated.match },
+      { $group: { _id: { date: "$forecastDate", status: "$status" }, n: { $sum: 1 } } },
+    ]),
+    undatedMatch.empty ? 0 : TnaMilestone.countDocuments(undatedMatch.match),
+  ]);
+
+  const byDay = new Map();
+  for (const g of grouped) {
+    const date = str(g._id.date);
+    const day = byDay.get(date) || { date, total: 0, byStatus: {} };
+    day.total += g.n;
+    day.byStatus[str(g._id.status)] = (day.byStatus[str(g._id.status)] || 0) + g.n;
+    byDay.set(date, day);
+  }
+  return {
+    from: start, to: end,
+    days: [...byDay.values()].sort((a, b) => (a.date < b.date ? -1 : 1)),
+    undated,
+    generatedAt: new Date(),
+  };
+}
+
 const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
@@ -226,8 +328,10 @@ async function portfolioCounts(ctx) {
     completed: byStatus[MILESTONE_STATUS.COMPLETED] || 0,
     all: rows.reduce((t, r) => t + r.n, 0),
   };
-  /* What the Overview shows beside its existing four figures. */
-  counts.deliveryAtRisk = counts.overdue + counts["forecast-late"];
+  counts["at-risk"] = AT_RISK_STATUSES.reduce((t, st) => t + (byStatus[st] || 0), 0);
+  /* What the Overview shows beside its existing four figures — the same
+     population the `at-risk` view lists. */
+  counts.deliveryAtRisk = counts["at-risk"];
   return { counts, generatedAt: new Date() };
 }
 
@@ -417,7 +521,7 @@ async function bulkApply(ctx, { previewId, rows = [], actor = null } = {}) {
 }
 
 module.exports = {
-  PORTFOLIO_VIEWS, isPortfolioView, MAX_BULK_ROWS, DEFAULT_LIMIT, MAX_LIMIT,
+  PORTFOLIO_VIEWS, AT_RISK_STATUSES, isPortfolioView, MAX_BULK_ROWS, DEFAULT_LIMIT, MAX_LIMIT,
   encodeCursor, decodeCursor, boundedLimit,
-  portfolio, portfolioCounts, nextMilestoneFor, bulkPreview, bulkApply,
+  portfolio, portfolioCounts, portfolioDays, milestoneMatch, MAX_DAY_RANGE, nextMilestoneFor, bulkPreview, bulkApply,
 };

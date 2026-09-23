@@ -106,11 +106,41 @@ const SUBMISSION_FIELDS = {
 // A Prospect with the full submission checklist satisfied; returns its id.
 async function submittableDraft(over = {}, user = SALES_USER) {
   const lead = await createDraft(over, user);
-  await call(`/${lead._id}`, { method: "PATCH", body: SUBMISSION_FIELDS, user });
+  await call(`/${lead._id}`, { method: "PATCH", body: {
+    ...SUBMISSION_FIELDS,
+    /* The Prospect bar as it now stands: reachable, sourced, and with an
+       observed interest signal. The commercial fields in SUBMISSION_FIELDS are
+       still written — they are simply no longer a gate. */
+    phone: over.phone || "9876500088",
+    interestSignal: "requested_sample",
+    interestNote: "Asked for a sample of the poly-cotton twill.",
+  }, user });
+  /* And the customer actually engaged, which a PATCH cannot express — the
+     outcome is what says so, not the fact that a call was logged. */
+  const Activity = require("../../models/CMS_Models/Sales/Activity");
+  await Activity.create({
+    leadId: lead._id, activityType: "call", subject: "Intro call",
+    status: "completed", completedAt: new Date(), outcome: "replied_connected",
+    ownerId: user.id, ownerName: user.name,
+  });
   return lead._id;
 }
 
 /* ── Quick Capture (draft creation) ──────────────────────────────────────── */
+
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3A) ─────────────────────
+ * SalesJourney creation now refuses unless the actor's company is provable.
+ * These suites are not about tenancy, so they seed the simplest thing that
+ * makes ownership provable: a single company, which is the documented
+ * deployment fallback. Without it every journey-creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
 
 describe("POST /leads — Quick Capture (captureStatus: draft)", () => {
   test("creates a draft with qualificationState 'new' and no real Activity, even if company-only", async () => {
@@ -246,16 +276,20 @@ describe("GET /:id/readiness — submission checklist for a Prospect", () => {
     expect(body.ready).toBe(false);
     const byKey = Object.fromEntries(body.checks.map((c) => [c.key, c.met]));
     expect(byKey.identity).toBe(true); // company was given
-    // The submission bar (not the retired "start working" bar): segment,
-    // justification, annual estimates + confidence, evidence, first action.
+    /* The Prospect bar. It asks what a salesperson observes — where they came
+       from, that somebody reached them, and what the customer did — and no
+       longer asks them to forecast a possible customer's annual spend. */
     expect(byKey.source).toBe(false);
-    expect(byKey.segment).toBe(false);
-    expect(byKey.justification).toBe(false);
-    expect(byKey.annualQuantity).toBe(false);
-    expect(byKey.evidence).toBe(false);
-    // The old keys are gone — contact info / owner were never submission reqs.
-    expect(byKey.owner).toBeUndefined();
-    expect(byKey.contactRoute).toBeUndefined();
+    expect(byKey.contact).toBe(false);
+    expect(byKey.interaction).toBe(false);
+    expect(byKey.interestSignal).toBe(false);
+    expect(byKey.interestNote).toBe(false);
+    expect(byKey.firstAction).toBe(false);
+    /* Retired from the Prospect bar — still on the model, still written, and
+       still required of an ACTIVE Lead being qualified. */
+    for (const gone of ["segment", "justification", "annualQuantity", "annualRevenue", "evidence", "owner", "contactRoute"]) {
+      expect(byKey[gone]).toBeUndefined();
+    }
   });
 
   test("becomes submission-ready only once every required field is filled", async () => {
@@ -488,8 +522,11 @@ describe("Archived draft — read-only", () => {
     const { body: created } = await call("/", { method: "POST", body: { firstName: "Active One", phone: "9800000000" } });
     const edit = await call(`/${created.lead._id}`, { method: "PATCH", body: { notes: "fine" } });
     expect(edit.status).toBe(200);
-    await Activity.create({ leadId: created.lead._id, activityType: "call", subject: "Intro", status: "completed", outcome: "replied_connected" });
-    const move = await call(`/${created.lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contacted" } });
+    await call(`/${created.lead._id}`, { method: "PATCH", body: {
+      requirementItems: [{ product: "Shirts", quantity: 200 }],
+      requirementCertainty: "suspected",
+    } });
+    const move = await call(`/${created.lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "qualified" } });
     expect(move.status).toBe(200);
   });
 });

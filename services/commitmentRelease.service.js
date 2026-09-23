@@ -400,6 +400,105 @@ async function restoreVoucher({ commitment, voucher } = {}) {
  * of the call site. A caller that had to know which kind it was holding would
  * be a seventh place to get it wrong.
  */
+/**
+ * Find the commitment a voucher's reconciliation concerns.
+ *
+ * By the release ROW first — that survives a partially released commitment,
+ * where the legacy status lookup could not see it — then by the explicit link
+ * for a voucher that has released nothing yet.
+ */
+async function commitmentForReconcile(voucher) {
+  const Commitment = require("../models/Accountant_model/Acc_BudgetCommitment");
+  const byRow = await Commitment.findOne({ "allocations.releases.voucherId": voucher._id });
+  if (byRow) return byRow;
+
+  const commitments = require("./budgetCommitment.service");
+  return commitments.commitmentForVoucher(voucher);
+}
+
+/**
+ * THE ONE SHARED COMMITMENT-LIFECYCLE OPERATION.
+ *
+ * ── WHY IT TAKES AN ID AND NOT A DOCUMENT ───────────────────────────────────
+ * Because the caller's document is not evidence. The previous design ran in a
+ * `post("save")` hook, which for `save({ session })` fires while the
+ * transaction is still OPEN, and reread with `findById()` outside that
+ * session — so it saw the PRE-transaction voucher. A cancellation reread as
+ * `posted`, took the posted branch, did nothing, and then committed: the
+ * voucher was cancelled and its commitment stayed released. A comment in that
+ * hook claimed the reread proved durable commit. It did not, and it is gone.
+ *
+ * This runs AFTER `commitTransaction()`. The read is then genuinely of
+ * committed state, which is the only condition under which acting on it is
+ * sound.
+ *
+ * ── AND WHY IT IS RESTORE-THEN-APPLY, NOT APPLY ─────────────────────────────
+ * An edited posted voucher must end with a release that matches its NEW lines.
+ * Calling an idempotent apply again would see this voucher's existing rows and
+ * do nothing, leaving the stored distribution describing a bill that no longer
+ * exists. Reversing this voucher's own contribution first and reapplying from
+ * the current lines is the only thing that converges — and it is idempotent by
+ * construction, so a retry or a replay reaches the same state rather than a
+ * doubled one.
+ *
+ * It reverses only THIS voucher's rows; another still-posted bill's discharge
+ * is untouched.
+ */
+async function reconcileVoucher({ voucherId, actor, model = null } = {}) {
+  if (!voucherId) return { reconciled: false, why: "no_voucher" };
+
+  const Voucher = model
+    || require("../models/Accountant_model/Acc_VoucherModels").Acc_Voucher;
+
+  /* Committed state, read after the transaction closed. */
+  const fresh = await Voucher.findById(voucherId)
+    .select("_id status companyId voucherType voucherNumber grandTotal "
+      + "referenceNumber spendRequestId budgetCommitmentId updatedBy inventoryEntries")
+    .lean();
+  if (!fresh) return { reconciled: false, why: "voucher_gone" };
+
+  const commitment = await commitmentForReconcile(fresh);
+  if (!commitment) return { reconciled: false, why: "no_commitment" };
+
+  if (commitment.companyId && fresh.companyId
+    && String(commitment.companyId) !== String(fresh.companyId)) {
+    return { reconciled: false, why: "different_company" };
+  }
+
+  const hasAllocations = Array.isArray(commitment.allocations) && commitment.allocations.length;
+
+  /* ── LEGACY, UNCHANGED ────────────────────────────────────────────────── */
+  if (!hasAllocations) {
+    const commitments = require("./budgetCommitment.service");
+    if (fresh.status === "posted") {
+      return commitments.releaseForVoucher({ commitment, voucher: fresh, actor });
+    }
+    if (fresh.status === "cancelled" || fresh.status === "void") {
+      return commitments.restoreForVoucher({ voucher: fresh });
+    }
+    return { reconciled: false, why: "no_transition" };
+  }
+
+  /* ── LINE-WISE ────────────────────────────────────────────────────────── */
+  if (fresh.status === "posted") {
+    /* Reverse this voucher's own prior contribution, then apply from the
+       lines as they now stand. */
+    await restoreVoucher({ commitment, voucher: fresh });
+    const out = await applyRelease({ commitment, voucher: fresh, actor });
+    return { ...out, reconciled: true };
+  }
+
+  if (fresh.status === "cancelled" || fresh.status === "void") {
+    const out = await restoreVoucher({ commitment, voucher: fresh });
+    return { ...out, reconciled: true };
+  }
+
+  /* A draft or a pending voucher promises nothing — and if it previously did
+     (it was posted and has been moved back), that contribution is reversed. */
+  const out = await restoreVoucher({ commitment, voucher: fresh });
+  return { ...out, reconciled: true, why: "not_posted" };
+}
+
 async function orchestrate({ voucher, actor, transition } = {}) {
   const Commitment = require("../models/Accountant_model/Acc_BudgetCommitment");
   const commitments = require("./budgetCommitment.service");
@@ -523,6 +622,8 @@ async function reconciliationFor(voucher) {
 
 module.exports = {
   orchestrate,
+  reconcileVoucher,
+  commitmentForReconcile,
   reconciliationFor,
   attributeByLine,
   planRelease,

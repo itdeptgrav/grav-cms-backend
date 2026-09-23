@@ -5,14 +5,31 @@
 // through the shared CRMActivity model (leadId-owned) instead of appending
 // to the embedded `lead.activities[]` — existing embedded entries from
 // before this chunk remain fully readable, nothing migrates or deletes them.
-// An optional `newLeadStage` is routed through
-// services/leadQualification.js, the SAME shared service leads.js uses, so
-// it can never assign `proposal_sent`/`negotiation`/`won` or fake a
-// conversion, and `stage`/`qualificationState` cannot drift out of sync with
-// what leads.js would produce for the same request. If the requested stage
-// is no longer valid, the call itself still completes — only the stage
-// portion is skipped, reported back via `leadUpdate.applied === false`.
+// ── COMPLETING A CALL NO LONGER MOVES A LEAD ────────────────────────────────
+//
+// `newLeadStage` used to be routed through services/leadQualification.js and
+// could take a Lead to `qualified`, `disqualified` or another lifecycle state
+// as a side effect of ticking off a phone call.
+//
+// The Lead lifecycle is Interest Confirmed → Requirement Captured → Ready
+// for Enquiry, and every one of those steps is decided by requirement
+// evidence. A call is not requirement evidence; it is a record that a
+// conversation happened. Two ways to write one field is how the two disagree,
+// and a stage that moved because somebody closed a call reminder is a stage
+// nobody can explain afterwards.
+//
+// So the field is accepted and refused rather than rejected: an older client
+// that still sends it gets its call completed, its Activity written and its
+// follow-up saved, plus `leadUpdate.applied === false` and a message naming
+// where stages actually move. Nothing is written to the Lead's
+// `qualificationState` or legacy `stage`, and the refused value is never
+// recorded on the CallSchedule as though it had taken effect.
+//
+// PATCH /leads/:id/qualification-state is the ordinary writer. The legacy
+// PATCH /leads/:id/stage wrapper still exists and still routes through the
+// same shared service.
 const express = require("express");
+const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
 const router = express.Router();
 const CallSchedule = require("../../../models/CMS_Models/Sales/CallSchedule");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
@@ -20,18 +37,12 @@ const Activity = require("../../../models/CMS_Models/Sales/Activity");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
-const { applyLegacyStageChange } = require("../../../services/leadQualification");
-const { LEGACY_LEAD_STAGE_TO_QUALIFICATION } = require("../../../constants/crm");
+/* `applyLegacyStageChange` and LEGACY_LEAD_STAGE_TO_QUALIFICATION are no longer
+   imported: this route does not move Leads. Removed rather than left in place,
+   because an import that looks like a live capability is how the capability
+   gets used again. */
 
 const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
-
-// Lead correction chunk: moving a Lead's canonical qualificationState to
-// "contacted" now requires a genuinely successful two-way contact — this
-// call-schedule flow has its own, richer outcome vocabulary (CallSchedule.js)
-// rather than the Lead-activity ACTIVITY_OUTCOME_CODES, so "successful"
-// is judged against THAT vocabulary here: any outcome other than one where
-// the call plainly never connected.
-const CALL_OUTCOMES_WITHOUT_CONTACT = new Set(["no_answer", "busy", "wrong_number", "voicemail"]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -129,7 +140,7 @@ router.post("/", salesAuth, async (req, res) => {
     // Auto-populate denormalized entity fields if not provided
     if (!data.entityName && data.entityId && data.entityType) {
       if (data.entityType === "lead") {
-        const lead = await Lead.findById(data.entityId)
+        const lead = await Lead.findOne(await scoped(req, { _id: data.entityId }))
           .select("firstName lastName company phone email stage")
           .lean();
         if (lead) {
@@ -141,7 +152,7 @@ router.post("/", salesAuth, async (req, res) => {
           data.entityModel   = "Lead";
         }
       } else if (data.entityType === "contact") {
-        const contact = await Contact.findById(data.entityId)
+        const contact = await Contact.findOne(await scoped(req, { _id: data.entityId }))
           .select("firstName lastName company phone email")
           .lean();
         if (contact) {
@@ -214,16 +225,15 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
     schedule.feedbackNotes      = feedbackNotes;
     schedule.callDurationActual = callDurationActual;
     schedule.nextFollowUpAt     = nextFollowUpAt;
-    // `newLeadStage` is deliberately NOT set here. It is only persisted
-    // below, in a second small save, and only once the Lead transition has
-    // actually succeeded — a rejected value (e.g. "won") must never be
-    // recorded as if it took effect.
+    // `newLeadStage` is never persisted on the schedule. It used to be
+    // written here once the Lead transition succeeded; no transition happens
+    // any more, so recording it would say a stage moved when none did.
     await schedule.save();
 
     let leadUpdate = null;
 
     if (schedule.entityType === "lead" && schedule.entityId) {
-      const lead = await Lead.findById(schedule.entityId);
+      const lead = await Lead.findOne(await scoped(req, { _id: schedule.entityId }));
       if (lead) {
         // Captured before ANY field below is touched — lastContactedAt,
         // nextFollowUpAt and the qualification transition are all mutated
@@ -260,41 +270,22 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
         lead.lastContactedAt = new Date();
         if (nextFollowUpAt) lead.nextFollowUpAt = new Date(nextFollowUpAt);
 
-        if (newLeadStage && newLeadStage !== lead.stage) {
-          try {
-            const targetState = LEGACY_LEAD_STAGE_TO_QUALIFICATION[newLeadStage];
-            const context =
-              targetState === "contacted"
-                ? { hasSuccessfulContact: Boolean(outcome) && !CALL_OUTCOMES_WITHOUT_CONTACT.has(outcome) }
-                : {};
-            applyLegacyStageChange(lead, {
-              stage: newLeadStage,
-              reason: reason || feedbackNotes,
-              actor: actor(req),
-              context,
-            });
-            leadUpdate = { applied: true, stage: null, qualificationState: null };
-          } catch (err) {
-            // The call itself still completes — only the stage request is
-            // rejected (e.g. "won"/"negotiation"/"proposal_sent", or an
-            // invalid transition from the Lead's current state).
-            leadUpdate = { applied: false, message: err.message };
-          }
+        /* Accepted, then refused — see the file header. An old client keeps
+           working; the Lead does not move. `stage` and `qualificationState`
+           are echoed back UNCHANGED so a caller can see for itself that
+           nothing shifted. */
+        if (newLeadStage) {
+          leadUpdate = {
+            applied: false,
+            stage: lead.stage,
+            qualificationState: lead.qualificationState,
+            message: "Completing a call no longer changes a Lead's stage. Lead stages move through the requirement workflow — Interest Confirmed → Requirement Captured → Enquiry Ready — on the Lead itself.",
+          };
         }
 
-        // Exactly one save for whatever changed above (lastContactedAt
-        // always; nextFollowUpAt and the qualification state if requested
-        // and, for the latter, only if the transition actually applied).
+        // Exactly one save, for the two things a completed call really does
+        // know: that contact happened just now, and when the next one is due.
         await lead.save();
-
-        if (leadUpdate?.applied) {
-          leadUpdate.stage = lead.stage;
-          leadUpdate.qualificationState = lead.qualificationState;
-          // Only now, once the transition is known to have succeeded, is it
-          // recorded on the CallSchedule.
-          schedule.newLeadStage = newLeadStage;
-          await schedule.save();
-        }
 
         // One Lead audit call, always — lastContactedAt changed unconditionally
         // in this branch, so there is always something to record.
@@ -304,9 +295,7 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
           entityId: lead._id,
           entityLabel: `${lead.firstName} ${lead.lastName || ""}`.trim(),
           action: "update",
-          summary: leadUpdate?.applied
-            ? `Stage (via call completion): ${before.stage} → ${newLeadStage}`
-            : "Updated via call completion",
+          summary: "Updated via call completion",
           before,
           after: lead.toObject(),
         });
@@ -315,7 +304,7 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
 
     // ── Update contact lastContactedAt ─────────────────────────────────────
     if (schedule.entityType === "contact" && schedule.entityId) {
-      await Contact.findByIdAndUpdate(schedule.entityId, {
+      await Contact.findOneAndUpdate(await scoped(req, { _id: schedule.entityId }), {
         lastContactedAt: new Date(),
         ...(nextFollowUpAt ? { nextFollowUpAt: new Date(nextFollowUpAt) } : {}),
       });

@@ -638,6 +638,14 @@ function publicSupplier(doc) {
     recordVersion: d.recordVersion ?? 0,
   };
 
+  /* ── OWNERSHIP IS PUBLISHED AS A FACT, NOT AS A FIELD TO INFER FROM ──
+     `companyId` is deliberately NOT in the allowlist above: it is an
+     internal id, and a reader only ever sees their own company's suppliers
+     anyway. What they need is the ANSWER, and this is it.
+
+     The register's screens must read this and nothing else. Inferring
+     "unowned" from a `companyId` the API never sends is how a supplier
+     created a minute ago came to be shown as predating company ownership. */
   out.legacy = d.companyId == null;
   out.selectable = isSelectable(d);
   /* Says whether there is anything behind the private endpoint, never what. */

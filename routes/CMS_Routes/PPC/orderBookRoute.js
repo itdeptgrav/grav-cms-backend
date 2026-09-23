@@ -61,6 +61,10 @@ const canRead = ppcCapability(CAPABILITY.PLANNING_READ);
 const canPlan = ppcCapability(CAPABILITY.PLANNING_WRITE);
 /** Marking planned, holding, replacing a plan. PPC `approver`. */
 const canApprove = ppcCapability(CAPABILITY.PLANNING_APPROVE);
+/* Reserving capacity is the same authority that books a sewing line — a
+   reservation takes real minutes off a real resource, which is more than
+   planning a date. The capability is the one PPC already has for it. */
+const canBook = ppcCapability(CAPABILITY.CAPACITY_BOOK);
 
 const actor = (req) => (req.user?.id
   ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" }
@@ -210,6 +214,108 @@ router.post("/planning-files/:planningFileId/hold/remove",
     const out = await planning.removeHold(req.merchandising, {
       planningFileId: req.params.planningFileId,
       expectedRevision, body, actor: actor(req), idempotencyKey: idempotencyKey(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ══ THE MULTI-STAGE SCHEDULE ════════════════════════════════════════════
+   Planned start/finish per stage of the IE route this plan froze — PPC-internal
+   planning targets. Nothing is published to another app, nothing is booked,
+   and nothing here authorizes Production. */
+const stageSchedule = require("../../../services/ppc/stageSchedule.service");
+const stagePublication = require("../../../services/ppc/stagePublication.service");
+
+router.get("/planning-files/:planningFileId/stage-schedule",
+  requireCompany, canRead, handle(async (req, res) => {
+    const out = await stageSchedule.read(req.merchandising, { planningFileId: req.params.planningFileId });
+    return res.json({ success: true, ...out });
+  }));
+
+/**
+ * A read-only cutting capacity preview: IE's approved standard against
+ * Cutting's published resources. Reserves nothing, publishes nothing, and
+ * writes nothing — `canRead`, because previewing is reading.
+ */
+router.get("/planning-files/:planningFileId/cutting-capacity",
+  requireCompany, canRead, handle(async (req, res) => {
+    const preview = require("../../../services/ppc/cuttingCapacityPreview.service");
+    const out = await preview.previewForPlan(req.merchandising, {
+      planningFileId: req.params.planningFileId,
+      from: req.query?.from || null,
+    });
+    return res.json({ success: true, preview: out });
+  }));
+
+/* ══ CUTTING CAPACITY — RESERVED, NEVER TYPED ═════════════════════════════
+ *
+ * The preview above calculates; these three commands reserve, give up and
+ * move a reservation. A cutting stage's dates are written from the booking
+ * inside the same transaction, which is why there is no route here that
+ * accepts a cutting date.
+ *
+ * The body carries only the plan, the resource and the proof from the preview
+ * that was read. Everything else is recomputed server-side.
+ */
+router.post("/planning-files/:planningFileId/cutting-capacity/book",
+  requireCompany, canBook, handle(async (req, res) => {
+    const booking = require("../../../services/ppc/cuttingCapacityBooking.service");
+    const out = await booking.bookCuttingCapacity(req.merchandising, {
+      body: { ...(req.body || {}), planningFileId: req.params.planningFileId },
+      from: req.query?.from || null,
+      actor: actor(req), idempotencyKey: idempotencyKey(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+/** Every reservation this plan's cutting stage has had, newest first. */
+router.get("/planning-files/:planningFileId/cutting-bookings",
+  requireCompany, canRead, handle(async (req, res) => {
+    const booking = require("../../../services/ppc/cuttingCapacityBooking.service");
+    const [bookings, active] = await Promise.all([
+      booking.bookingsFor(req.merchandising, req.params.planningFileId),
+      booking.activeBooking(req.merchandising, { planningFileId: req.params.planningFileId }),
+    ]);
+    return res.json({ success: true, bookings, active });
+  }));
+
+/** Give the minutes back. The schedule and the booking stay readable. */
+router.post("/cutting-bookings/:bookingId/release",
+  requireCompany, canBook, handle(async (req, res) => {
+    const booking = require("../../../services/ppc/cuttingCapacityBooking.service");
+    const out = await booking.releaseBooking(req.merchandising, {
+      bookingId: req.params.bookingId, body: req.body || {},
+      actor: actor(req), idempotencyKey: idempotencyKey(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/** Move it: a successor reservation from a fresh preview. */
+router.post("/cutting-bookings/:bookingId/replan",
+  requireCompany, canBook, handle(async (req, res) => {
+    const booking = require("../../../services/ppc/cuttingCapacityBooking.service");
+    const out = await booking.replanBooking(req.merchandising, {
+      bookingId: req.params.bookingId, body: req.body || {},
+      from: req.query?.from || null,
+      actor: actor(req), idempotencyKey: idempotencyKey(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+/* Publishing is its own act: saving dates above shows them to nobody. */
+router.post("/planning-files/:planningFileId/stage-schedule/publish",
+  requireCompany, canPlan, handle(async (req, res) => {
+    const out = await stagePublication.publish(req.merchandising, {
+      planningFileId: req.params.planningFileId, body: req.body || {},
+      actor: actor(req), idempotencyKey: idempotencyKey(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+router.post("/planning-files/:planningFileId/stage-schedule",
+  requireCompany, canPlan, handle(async (req, res) => {
+    const out = await stageSchedule.save(req.merchandising, {
+      planningFileId: req.params.planningFileId, body: req.body || {},
+      actor: actor(req), idempotencyKey: idempotencyKey(req),
     });
     return res.json({ success: true, ...out });
   }));

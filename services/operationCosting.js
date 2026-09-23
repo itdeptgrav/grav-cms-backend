@@ -135,12 +135,37 @@ async function costOperations(operations, { fallbackFrom = [] } = {}) {
         }).select("name operationCode salaryDept salaryDesig machineType").lean()
       : [];
 
+    /* ── A CODE THAT NAMES TWO RECORDS NAMES NEITHER ──────────────────────
+       The register genuinely holds duplicate codes (TS008 among them). This
+       used to `set` in a loop, so the LAST record the database happened to
+       return won — silently, and a different one could win tomorrow. Two
+       operations under one code may carry different salary groups, which
+       makes that an arbitrary choice of labour rate.
+
+       Ambiguous codes are collected instead. A row matching one resolves to
+       NOTHING here and is reported, so the caller refuses rather than costs
+       against a coin toss. Names are handled the same way for the same
+       reason. Nothing is merged or deleted: reconciling two real records is a
+       production decision, not this function's. */
     const byCode = new Map();
     const byName = new Map();
+    const ambiguousCodes = new Set();
+    const ambiguousNames = new Set();
     for (const r of registered) {
-      if (r.operationCode) byCode.set(r.operationCode, r);
-      if (r.name) byName.set(r.name.toLowerCase(), r);
+      if (r.operationCode) {
+        if (byCode.has(r.operationCode)) ambiguousCodes.add(r.operationCode);
+        else byCode.set(r.operationCode, r);
+      }
+      if (r.name) {
+        const key = r.name.toLowerCase();
+        if (byName.has(key)) ambiguousNames.add(key);
+        else byName.set(key, r);
+      }
     }
+    /* An ambiguous key resolves to nothing at all — keeping the first would
+       be the same arbitrary pick wearing a different hat. */
+    for (const c of ambiguousCodes) byCode.delete(c);
+    for (const n of ambiguousNames) byName.delete(n);
 
     // Salary lookups are the expensive part and repeat heavily across rows
     // (most operations on a garment share one department), so each distinct
@@ -156,13 +181,34 @@ async function costOperations(operations, { fallbackFrom = [] } = {}) {
 
     const out = [];
     for (const op of rows) {
+      const code = String(op.operationCode || "").trim();
+      const name = String(op.type || "").trim().toLowerCase();
+      /* ── STABLE IDENTITY FIRST, CODE ONLY AS A FALLBACK ────────────────
+         A row that already carries the registered record's id says exactly
+         which operation it is, and no duplicate code can confuse it. Codes
+         are matched only when there is no id — which is every row written
+         before identity was recorded. */
+      const byIdMatch = op.operationId
+        ? registered.find((r) => String(r._id) === String(op.operationId))
+        : null;
       const match =
-        (op.operationCode && byCode.get(String(op.operationCode).trim())) ||
-        (op.type && byName.get(String(op.type).trim().toLowerCase())) ||
+        byIdMatch ||
+        (code && byCode.get(code)) ||
+        (name && byName.get(name)) ||
         null;
+      /* Named so the caller can say WHICH code is ambiguous rather than
+         reporting an operation that simply "could not be costed". */
+      /* Identity precedence also governs ambiguity. A unique exact code is a
+         complete match even when another registered operation happens to
+         share its display name under a different code. Name ambiguity matters
+         only when no usable code match exists. */
+      const ambiguous = !byIdMatch && (
+        (code && ambiguousCodes.has(code))
+        || (!(code && byCode.has(code)) && name && ambiguousNames.has(name))
+      );
       const prior =
-        (op.operationCode && priorByCode.get(String(op.operationCode).trim())) ||
-        (op.type && priorByName.get(String(op.type).trim().toLowerCase())) ||
+        (code && priorByCode.get(code)) ||
+        (name && priorByName.get(name)) ||
         null;
 
       const salaryDept = String(op.salaryDept || match?.salaryDept || prior?.salaryDept || "").trim();
@@ -194,7 +240,21 @@ async function costOperations(operations, { fallbackFrom = [] } = {}) {
         operatorCost = Number(prior.operatorCost);
       }
 
-      out.push({ ...op, machineType, salaryDept, salaryDesig, operatorSalary, operatorCost });
+      out.push({
+        ...op,
+        /* The identity that was actually resolved, carried forward so the next
+           read never has to match on a code again. */
+        ...(match ? { operationId: match._id } : {}),
+        machineType, salaryDept, salaryDesig, operatorSalary, operatorCost,
+        /* ── SET *OR* CLEARED, NEVER LEFT ────────────────────────────────
+           Stamped so downstream can refuse with the exact code rather than a
+           generic failure. Written on EVERY row, including as an empty
+           string, because `...op` above carries a previous run's marker
+           forward — and a row that was ambiguous last time and is fine now
+           would otherwise stay blocked after the manager had already
+           reconciled the duplicate. */
+        ambiguousOperationCode: ambiguous ? (code || op.type || "") : "",
+      });
     }
     return out;
   } catch (err) {

@@ -37,6 +37,7 @@
 "use strict";
 
 const mongoose = require("mongoose");
+const { processRouteSchema } = require("./processRoute.schema");
 
 /* Only one status exists in this chunk, and it is written out rather than
    implied: a file that cannot yet be anything but DRAFT should still SAY
@@ -56,6 +57,10 @@ const EVENT_TYPES = [
   "BULLETIN_VERSION_SUBMITTED",
   "BULLETIN_VERSION_RETURNED",
   "BULLETIN_VERSION_APPROVED",
+  /* The draft process route changed — which stages, their order, whether each
+     applies. Its own event so the trail never records a route decision as a
+     bulletin row edit. */
+  "PROCESS_ROUTE_EDITED",
 ];
 
 const LIMITS = Object.freeze({
@@ -137,6 +142,51 @@ const bulletinRowSchema = new mongoose.Schema(
           }, { _id: false })],
           default: () => [],
         },
+        /* ── CHUNK 8A-iii: THE OTHER TWO DIMENSIONS, ADDED ADDITIVELY ──
+           Chunk 5A models three requirement dimensions on an operation —
+           machine, attachment and labour — but only the machine half was ever
+           frozen here. A comparison that silently reported the other two as
+           "unchanged" would be a reassurance nobody had evidence for.
+
+           These fields are OPTIONAL and there is no backfill. A row frozen
+           before this existed simply has no `dimensionsCaptured`, which is what
+           makes "never captured" distinguishable from "captured, and genuinely
+           empty" — without that marker an operation needing no attachment would
+           be indistinguishable from a snapshot taken before anybody looked. */
+        dimensionsCaptured: { type: [String], default: undefined },
+        machines: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            machineType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+          }, { _id: false })],
+          default: undefined,
+        },
+        attachments: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            code: { type: String, required: true, trim: true },
+            name: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
+        labour: {
+          type: [new mongoose.Schema({
+            requirementId: { type: String, required: true, trim: true },
+            sequence: { type: Number, required: true, min: 1 },
+            workerType: { type: String, required: true, trim: true },
+            quantity: { type: Number, required: true, min: 1 },
+            skillCode: { type: String, trim: true, default: "" },
+            skillName: { type: String, trim: true, default: "" },
+            grade: { type: String, trim: true, default: "" },
+            note: { type: String, trim: true, default: "" },
+          }, { _id: false })],
+          default: undefined,
+        },
       }, { _id: false }),
       default: null,
     },
@@ -199,6 +249,13 @@ const ieStyleFileSchema = new mongoose.Schema(
        what lets a bulletin change and its audit event be one atomic write. */
     bulletin: {
       rows: { type: [bulletinRowSchema], default: () => [] },
+      /* ── THE DRAFT PROCESS ROUTE ──────────────────────────────────────
+         Which production processes this style passes through, in what order,
+         and which optional ones do NOT apply. Beside the rows because it is
+         frozen with them: submitting the bulletin freezes the route into the
+         same version, and the same review approves both. Absent until somebody
+         declares one — see processRoute.schema.js. */
+      processRoute: { type: processRouteSchema, default: undefined },
     },
 
     /* ── THE BULLETIN VERSION POINTERS (Chunk 7C1) ────────────────────────

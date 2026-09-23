@@ -276,12 +276,74 @@ const cuttingStandard = (over = {}) => ({
   resourceLabel: "",
   basis: "24-ply lay, 1.6m marker, cotton jersey.",
   source: { method: "TIME_STUDY", reference: "TS-2026-014" },
+  /* What the minutes mean and what they assume about people. Required on
+     every cutting standard: without it PPC cannot tell labour content from
+     elapsed team time, and refuses the standard rather than guessing. */
+  capacityModel: {
+    timeBasis: "LABOUR_MINUTES",
+    standardCrewSize: 3,
+    minimumCrewSize: 2,
+    maximumUsefulCrewSize: 4,
+    scalingMethod: "CAPPED_LINEAR",
+    standardEfficiencyPercent: 80,
+    requiredRoles: [
+      { role: "CUTTER", count: 1 },
+      { role: "SPREADER_OR_HELPER", count: 2 },
+    ],
+  },
   declaredAt: new Date("2026-09-01"),
   declaredByName: "IE",
   ...over,
 });
 
+/* ══ A CUTTING WINDOW, RESERVED ═══════════════════════════════════════════
+ *
+ * A cutting stage's dates are written from a capacity reservation and cannot
+ * be typed, so any suite that needs a DATED cutting stage — even one whose
+ * subject is somebody else's door — has to reserve one the way a planner
+ * does. This publishes a plain table through Cutting's own service and books
+ * against it through PPC's, from the preview's own proof.
+ *
+ * It is deliberately service-level: the suites that use it mount their own
+ * department's routes, and mounting Cutting's resource door in each of them
+ * would test the fixture rather than the thing under test.
+ */
+const CUT_WEEK = [0, 1, 2, 3, 4, 5, 6].map((i) => (i < 6
+  ? { working: true, shifts: [{ shiftKey: "A", start: "09:00", end: "18:00", breakMinutes: 60 }] }
+  : { working: false, shifts: [] }));
+
+let cutSeq = 0;
+async function reserveCutting(co, { planningFileId, actor: who, from = "2026-09-28" }) {
+  const resources = require("../../services/production/cuttingResource.service");
+  const previewSvc = require("../../services/ppc/cuttingCapacityPreview.service");
+  const booking = require("../../services/ppc/cuttingCapacityBooking.service");
+  const ctx = { companyId: String(co._id) };
+  const person = { id: String(who.id), name: who.name || "Fixture" };
+
+  const resourceRef = `FXCUT-${++cutSeq}-${Date.now()}`;
+  await resources.saveDraft(String(co._id), {
+    actor: person,
+    body: {
+      resourceRef, name: `Fixture table ${cutSeq}`, siteRef: "UNIT-1",
+      resourceType: "STRAIGHT_KNIFE", timezone: "Asia/Kolkata", isActive: true,
+      effectiveFrom: "2026-01-01", effectiveTo: null, weekPattern: CUT_WEEK, exceptions: [],
+      crew: [{ role: "CUTTER", count: 1 }, { role: "SPREADER_OR_HELPER", count: 2 }],
+      operationalEfficiencyPercent: 90,
+    },
+  });
+  await resources.publish(String(co._id), resourceRef, { actor: person });
+
+  const seen = await previewSvc.previewForPlan(ctx, { planningFileId, from });
+  const option = (seen.options || []).find((o) => o.resourceRef === resourceRef);
+  if (!option) throw new Error(`reserveCutting: no option for ${resourceRef} (${seen.blocker || seen.state})`);
+  const out = await booking.bookCuttingCapacity(ctx, {
+    body: { planningFileId: String(planningFileId), resourceRef, proof: option.proof },
+    actor: person, idempotencyKey: nextKey(), from,
+  });
+  return out.booking;
+}
+
 module.exports = {
-  cuttingStandard,
+  cuttingStandard, reserveCutting,
   server, nextKey, actor, company, orderLine, pack, minutes, release, readyWorld, SalesHandoverVersion,
 };

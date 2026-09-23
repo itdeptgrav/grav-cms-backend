@@ -11,6 +11,16 @@ const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
+/* Who may use Cutting's queue, and which company's work it shows — see
+   cuttingAccess.js. The order detail is read by the project manager's Cutting
+   tab too, so it is company-scoped without the Cutting-only guard. */
+const cutting = require("./cuttingAccess");
+const stageTargets = require("../../../../services/production/cuttingStageTarget.service");
+
+/* PPC's published cutting targets, answered by Cutting. Declared before the
+   ":moId" routes below so "stage-targets" is never read as an order id. */
+router.use("/stage-targets", require("./stageTargetRoutes"));
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper — compute unit-wise + person-wise progress for a measurement order
 // (used by the listing endpoint to power the per-MO progress bar)
@@ -223,7 +233,7 @@ router.get("/barcode-search", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET all manufacturing orders (listing endpoint — unchanged from previous step)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders", async (req, res) => {
+router.get("/manufacturing-orders", cutting.cuttingDepartment("viewer"), cutting.cuttingCompany, async (req, res) => {
   try {
     const manufacturingOrders = await CustomerRequest.aggregate([
       { $match: { status: "quotation_sales_approved" } },
@@ -236,6 +246,9 @@ router.get("/manufacturing-orders", async (req, res) => {
               $match: {
                 $expr: { $eq: ["$customerRequestId", "$$reqId"] },
                 status: { $ne: "pending" },
+                /* This company's WorkOrders and historical unlinked ones —
+                   never another company's. */
+                ...cutting.workOrderScope(req.cutting.companyId),
               },
             },
             {
@@ -283,6 +296,26 @@ router.get("/manufacturing-orders", async (req, res) => {
       { $sort: { createdAt: -1 } },
     ]);
 
+    /* PPC's targets in force for this company's work orders on these
+       orders — read only; Cutting answers them on its own door. */
+    const queueWorkOrders = manufacturingOrders.length
+      ? await WorkOrder.find({
+        customerRequestId: { $in: manufacturingOrders.map((o) => o._id) },
+        ...cutting.workOrderScope(req.cutting.companyId),
+      }).select("_id customerRequestId").lean()
+      : [];
+    const targetByWorkOrder = await stageTargets.targetsByWorkOrder(
+      req.cutting.companyId, queueWorkOrders.map((w) => String(w._id)),
+    );
+    const targetsByOrder = new Map();
+    for (const w of queueWorkOrders) {
+      const t = targetByWorkOrder.get(String(w._id));
+      if (!t) continue;
+      const key = String(w.customerRequestId);
+      if (!targetsByOrder.has(key)) targetsByOrder.set(key, new Map());
+      targetsByOrder.get(key).set(t.publicationId, t);
+    }
+
     const measurementMOIds = manufacturingOrders
       .filter((o) => o.requestType === "measurement_conversion")
       .map((o) => o._id);
@@ -327,8 +360,14 @@ router.get("/manufacturing-orders", async (req, res) => {
 
       const { _bulkTotalUnits, _bulkDoneUnits, ...rest } = order;
 
+      const orderTargets = [...(targetsByOrder.get(order._id.toString())?.values() || [])];
+
       return {
         ...rest,
+        /* PPC's cutting targets for this order, and how many still await
+           Cutting's answer. Absent targets are simply none. */
+        ppcTargets: orderTargets,
+        awaitingPpcTargetCount: orderTargets.filter((t) => t.awaitingResponse).length,
         orderType: isMeasurement
           ? "measurement_conversion"
           : "customer_bulk_order",
@@ -484,9 +523,11 @@ router.get("/cutting-history-bulk", async (req, res) => {
 //   – `qrGenerationStatus` is still computed and returned — it remains the
 //     source of truth for the Employee tab inside the detail page.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:moId", async (req, res) => {
+router.get("/manufacturing-orders/:moId", cutting.cuttingCompany, async (req, res) => {
   try {
     const { moId } = req.params;
+    /* Another company's order is answered exactly like one that does not exist. */
+    if (!(await cutting.orderInScope(req.cutting.companyId, moId))) return cutting.notFound(res, "MO");
 
     const manufacturingOrder = await CustomerRequest.findById(moId)
       .select("requestId customerInfo requestType measurementId createdAt")
@@ -499,10 +540,11 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
     const workOrders = await WorkOrder.find({
       customerRequestId: moId,
       status: { $ne: "pending" },
+      ...cutting.workOrderScope(req.cutting.companyId),
     })
       .select(
         "workOrderNumber stockItemName stockItemId quantity variantAttributes " +
-          "cuttingStatus cuttingProgress status createdAt _id",
+          "cuttingStatus cuttingProgress status createdAt _id salesLineLink",
       )
       .sort({ createdAt: -1 })
       .lean();
@@ -538,6 +580,10 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
       manufacturingOrder.requestType === "measurement_conversion"
         ? await Measurement.findOne({ poRequestId: moId }).lean()
         : null;
+
+    const detailTargets = await stageTargets.targetsByWorkOrder(
+      req.cutting.companyId, workOrders.map((w) => String(w._id)),
+    );
 
     const enhancedWorkOrders = workOrders.map((wo) => {
       const stockItemKey = wo.stockItemId?.toString();
@@ -610,10 +656,13 @@ router.get("/manufacturing-orders/:moId", async (req, res) => {
 
       // Strip raw cuttingProgress to avoid the consumer confusing it
       // with the new cuttingUnitProgress block.
-      const { cuttingProgress: _raw, ...woRest } = wo;
+      const { cuttingProgress: _raw, salesLineLink: _link, ...woRest } = wo;
 
       return {
         ...woRest,
+        companyProof: cutting.proofOf(wo, req.cutting.companyId),
+        /* PPC's published target for this work order, if it has one. */
+        ppcTarget: detailTargets.get(String(wo._id)) || null,
         cuttingStatus: derivedCuttingStatus,
         genderCategory,
         stockItemImage,

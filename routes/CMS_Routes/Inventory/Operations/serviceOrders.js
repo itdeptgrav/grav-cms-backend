@@ -20,8 +20,8 @@ const mongoose = require("mongoose");
 const ServiceOrder = require("../../../../models/CMS_Models/Inventory/Operations/ServiceOrder");
 const Employee = require("../../../../models/Employee");
 const mrfApprover = require("../../../../services/mrfApprover.service");
-const { resolveFulfilmentAccess } = require("../../../../services/access/fulfilmentAccess");
-const { requireTenant } = require("../../../../Middlewear/storePurchaseTenant");
+const { hasAll } = require("../../../../services/storePurchase/capabilities");
+const { requireTenant, CAPABILITIES } = require("../../../../Middlewear/storePurchaseTenant");
 
 /* Authenticate, THEN resolve the acting company through the established
    tenant/membership contract. `requireTenant` fails closed — a missing,
@@ -47,11 +47,60 @@ async function actor(req) {
   ).lean();
 }
 
-/** Whether this person may act for Store. */
-async function mayFulfil(emp) {
-  const a = await resolveFulfilmentAccess(emp).catch(() => ({ allowed: false }));
-  return Boolean(a?.allowed);
+/* ── READING IS NOT OPERATING ────────────────────────────────────────────────
+ * Both read from the capability set `requireTenant` already resolved onto
+ * `req.tenant` (the SAME set the PO/MRF/stock routes use — not a second,
+ * department-cached definition). But they are DIFFERENT capabilities:
+ *
+ *   · mayRead  — `sp.read`: list and open a service order. Every Store role has
+ *     it, and so does a read-only CEO grant — viewing is not a commitment.
+ *   · mayOperate — `sp.sourcing.manage`: the supplier-side transitions (issue,
+ *     start, record completion, cancel) that COMMIT the company to a supplier.
+ *     A viewer (`sp.read` only) and a read-only CEO do NOT hold it, so neither
+ *     can move an order; an editor/approver/owner does.
+ *
+ * A platform admin qualifies for both. Company scope is untouched — the set is
+ * resolved for the acting company, and every query below is company-scoped too.
+ */
+function mayRead(tenant) {
+  return Boolean(tenant?.isAdmin) || hasAll(tenant?.capabilitySet, [CAPABILITIES.READ]);
 }
+function mayOperate(tenant) {
+  return Boolean(tenant?.isAdmin) || hasAll(tenant?.capabilitySet, [CAPABILITIES.SOURCING_MANAGE]);
+}
+
+/* ── TWO IDENTITIES, AND ONLY ONE OF THEM GATES READING ─────────────────────
+ * There are two different things a caller can be, and this router used to
+ * demand both before it would show anything:
+ *
+ *   · an AUTHENTICATED PRINCIPAL in a company — a session plus a resolved
+ *     tenant and capability set. That is the whole basis for a company-scoped
+ *     READ, and it is what `requireTenant` above already proved.
+ *   · a NAMED EMPLOYEE — an HR row. Needed only to RECORD an operational act
+ *     ("issued by", "accepted by") or to prove somebody is the requester.
+ *
+ * A CEO or platform account signs in as a department and has no `employees`
+ * row — EmployeeAuthMiddlewear says so in its own comments. Requiring one
+ * before a read meant an account holding `sp.read` could not open the register
+ * at all, and was told its staff record was missing, as if viewing a list were
+ * an act somebody had to be named for. It is not.
+ *
+ * So: reads ask for capability, mutations ask for identity. Nothing here
+ * invents an HR record to paper over the difference.
+ */
+const refuseUnlinkedStaff = (res) => res.status(403).json({
+  success: false,
+  code: "STAFF_RECORD_NOT_LINKED",
+  /* ── SAY WHAT CANNOT BE DONE, AND WHAT STILL CAN ────────────────────
+     This refusal is now reached ONLY by a mutation, so it says the ACTION
+     cannot be recorded — never "service orders cannot be shown", which was
+     both wrong (they can) and pointed the reader at the wrong screen. One
+     object, used by every transition, so the three copies cannot drift. */
+  message: "Your sign-in is not linked to a staff record, so this action cannot be recorded. "
+    + "A service order stores who issued, completed and accepted the work by name, so the "
+    + "action needs an employee identity. You can still view service orders. "
+    + "Ask an administrator to link your account to an employee record.",
+});
 
 /**
  * Whether this employee is the requester of an order.
@@ -173,9 +222,11 @@ const publicServiceOrder = (so, { detail = false } = {}) => ({
 /* ══ REGISTER ═══════════════════════════════════════════════════════════════ */
 router.get("/", async (req, res) => {
   try {
-    const emp = await actor(req);
-    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
-    if (!(await mayFulfil(emp))) {
+    /* Capability, and nothing else. `actor(req)` is deliberately NOT called
+       here: a register is a company-scoped list, and no row of it is
+       attributed to the reader. An authorised principal with no HR row sees
+       exactly what an authorised employee sees. */
+    if (!mayRead(req.tenant)) {
       return res.status(403).json({ success: false, message: "Only Store & Purchase can view service orders." });
     }
     /* Scoped to the resolved tenant — never an unscoped `{}` that would expose
@@ -224,17 +275,26 @@ router.get("/", async (req, res) => {
 /* ══ DETAIL ═════════════════════════════════════════════════════════════════ */
 router.get("/:id", async (req, res) => {
   try {
-    const emp = await actor(req);
-    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ success: false, message: "Service order not found." });
     }
+    /* Company-scoped from the first read, BEFORE any authority question, so a
+       cross-company order is "not found" and never distinguishable from one
+       that does not exist. */
     const so = await ServiceOrder.findOne({ _id: req.params.id, companyId: req.tenant.companyId }).lean();
     if (!so) return res.status(404).json({ success: false, message: "Service order not found." });
-    const canFulfil = await mayFulfil(emp);
+    const canRead = mayRead(req.tenant);
+    const canOperate = mayOperate(req.tenant);
+    /* ── IDENTITY IS RESOLVED FOR ONE QUESTION ONLY ────────────────────
+       Not "may you look at this" — that is `canRead` above — but "are you the
+       person who asked for this work". An account with no employee row is
+       simply NOT the requester: `isRequester` false, `canAccept` false, and
+       the rest of the response is unaffected. It is an answer, not a refusal,
+       so the whole page no longer collapses over it. */
+    const emp = await actor(req);
     const isRequester = isRequesterOf(emp, so);
     /* Store may view any; the requester may view their own. */
-    if (!canFulfil && !isRequester) {
+    if (!canRead && !isRequester) {
       return res.status(403).json({ success: false, message: "This service order is not yours to view." });
     }
     /* Supplier bills raised against this order, so the detail page can show
@@ -269,10 +329,11 @@ router.get("/:id", async (req, res) => {
     res.json({
       success: true,
       serviceOrder: publicServiceOrder(so, { detail: true }),
-      /* So the screen offers exactly the lifecycle actions this person may
-         take — Store's, the requester's, or none — without re-deriving the
-         rule the server already enforces. */
-      viewer: { canFulfil, isRequester },
+      /* Separate, honest flags — the screen offers exactly the actions this
+         person may take, using the SAME server-authoritative meaning. A read
+         permission is `canRead`, never mislabelled as the right to operate.
+         `canAccept` is the requester's right (accept / request rework). */
+      viewer: { canRead, canOperate, canAccept: isRequester, isRequester },
       billing,
     });
   } catch (e) {
@@ -291,8 +352,13 @@ async function transition(req, res, {
   from, to, action, actionKey, requireRequester = false, requireReason = false, reasonMessage, verb,
 }) {
   try {
+    /* ── A MUTATION STILL NEEDS A NAMED EMPLOYEE ──────────────────────
+       Every transition writes `by` (an Employee ObjectId) and `byName` into
+       the audit trail, and the requester-only transitions are decided by that
+       same identity. Refused BEFORE the order is read and before any write,
+       so nothing moves and no history entry is left behind. */
     const emp = await actor(req);
-    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+    if (!emp) return refuseUnlinkedStaff(res);
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ success: false, message: "Service order not found." });
     }
@@ -309,8 +375,10 @@ async function transition(req, res, {
           message: "Only the department that requested this service can accept it or ask for a correction.",
         });
       }
-    } else if (!(await mayFulfil(emp))) {
-      return res.status(403).json({ success: false, message: "Only Store & Purchase can do that on a service order." });
+    } else if (!mayOperate(req.tenant)) {
+      /* Supplier-side transitions COMMIT the company — they need the operational
+         capability (`sp.sourcing.manage`), not merely read access. */
+      return res.status(403).json({ success: false, message: "You need Store sourcing/operational access to do that on a service order." });
     }
 
     const fromStates = Array.isArray(from) ? from : [from];

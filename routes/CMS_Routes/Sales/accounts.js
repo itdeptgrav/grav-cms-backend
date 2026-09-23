@@ -13,6 +13,40 @@
 // The mount-level salesWrites() guard already handles role + approval; an
 // editor's write is held as a ChangeRequest before it ever reaches here.
 const express = require("express");
+const { scopeFor: dupScopeFor } = require("../../../services/companyContext/salesScope.service");
+const { createServiceContext: dupServiceContext } = require("../../../services/companyContext/serviceScope.service");
+
+/* The service context a duplicate check runs under: this request's already
+   resolved company, so "is this a duplicate?" is answered from our own
+   customers and never from somebody else's. */
+const dupCtx = async (req) => {
+  const scope = await dupScopeFor(req);
+  /* `legacyAware`, because duplicate detection has to see the records that
+     predate company ownership — and the factory grants that only where the
+     company master proves exactly one company, never on this caller's say-so. */
+  return dupServiceContext({
+    companyId: scope.companyId,
+    reason: "duplicate detection",
+    legacyAware: true,
+  });
+};
+const {
+  scopedFilter: scoped, scopeFor: salesScopeFor, scopeAndOwnership,
+} = require("../../../services/companyContext/salesScope.service");
+const { stripCompanyOwnershipInput } = require("../../../models/CMS_Models/Sales/companyOwnership");
+
+/* The account loader the cycle walk is allowed to use: the SAME company
+   clause the rest of the request runs under. A parent outside it does not
+   load, and is refused exactly as a missing one is. */
+const scopedAccountLoader = (scope) => (id) =>
+  Account.findOne({ $and: [scope.clause, { _id: id }] }).select("parentAccountId").lean();
+
+/** A tenant refusal keeps its own status rather than becoming a generic 500. */
+function answeredTenantRefusal(res, err) {
+  if (err?.name !== "StorePurchaseError") return false;
+  res.status(err.status).json(err.toResponse());
+  return true;
+}
 const router = express.Router();
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
@@ -107,8 +141,9 @@ router.get("/", salesAuth, async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === "asc" ? 1 : -1;
 
-    const total = await Account.countDocuments(filter);
-    const accounts = await Account.find(filter)
+    const scopedFilterForList = await scoped(req, filter);
+    const total = await Account.countDocuments(scopedFilterForList);
+    const accounts = await Account.find(scopedFilterForList)
       .sort(sort)
       .skip((page - 1) * limit)
       .limit(parseInt(limit))
@@ -117,11 +152,15 @@ router.get("/", salesAuth, async (req, res) => {
 
     const accountIds = accounts.map((a) => a._id);
     const [contactCounts, leadCounts] = await Promise.all([
+      /* The company clause goes in the INITIAL $match: aggregating globally
+         and filtering afterwards has already read every company's rows. */
       Contact.aggregate([
+        { $match: await scoped(req, {}) },
         { $match: { accountId: { $in: accountIds }, isActive: true } },
         { $group: { _id: "$accountId", count: { $sum: 1 } } },
       ]),
       Lead.aggregate([
+        { $match: await scoped(req, {}) },
         // Draft Lead chunk: a draft/archived Lead is not real pipeline, so it
         // must not inflate an account's leadCount or openLeadsValue. `$nin`
         // still counts legacy Leads with no captureStatus as active.
@@ -141,11 +180,11 @@ router.get("/", salesAuth, async (req, res) => {
     }));
 
     const stats = {
-      total: await Account.countDocuments({ isActive: true }),
-      prospect: await Account.countDocuments({ isActive: true, type: "prospect" }),
-      customer: await Account.countDocuments({ isActive: true, type: "customer" }),
-      partner: await Account.countDocuments({ isActive: true, type: "partner" }),
-      hot: await Account.countDocuments({ isActive: true, rating: "hot" }),
+      total: await Account.countDocuments(await scoped(req, { isActive: true })),
+      prospect: await Account.countDocuments(await scoped(req, { isActive: true, type: "prospect" })),
+      customer: await Account.countDocuments(await scoped(req, { isActive: true, type: "customer" })),
+      partner: await Account.countDocuments(await scoped(req, { isActive: true, type: "partner" })),
+      hot: await Account.countDocuments(await scoped(req, { isActive: true, rating: "hot" })),
     };
 
     res.json({
@@ -168,7 +207,7 @@ router.get("/", salesAuth, async (req, res) => {
 // Returns candidate matches so the UI can warn before final save.
 router.post("/duplicate-check", salesAuth, async (req, res) => {
   try {
-    const matches = await findAccountDuplicates(Account, req.body || {}, req.body?.excludeId || null);
+    const matches = await findAccountDuplicates(Account, await dupCtx(req), req.body || {}, req.body?.excludeId || null);
     res.json({ success: true, matches, hasHighConfidence: matches.some((m) => m.confidence === "high") });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
@@ -178,10 +217,19 @@ router.post("/duplicate-check", salesAuth, async (req, res) => {
 // POST /api/cms/crm/accounts
 router.post("/", salesAuth, async (req, res) => {
   try {
-    const data = { ...req.body };
+    /* One company decision for the whole request: the parent-account check,
+       the ownership stamp and every related lookup below all use it. */
+    const { scope, ownership } = await scopeAndOwnership(req);
+    /* Ownership is never taken from the body — see stripCompanyOwnershipInput. */
+    const data = stripCompanyOwnershipInput({ ...req.body });
     delete data.excludeId;
     if (data.garmentSalesProfile) {
       await assertValidGarmentProfileRefs(Account, data.garmentSalesProfile);
+    }
+    /* A parent from another company is not a parent. Validated BEFORE the
+       create, so an invalid relationship writes nothing at all. */
+    if (data.parentAccountId) {
+      await assertNoAccountCycle(scopedAccountLoader(scope), null, data.parentAccountId);
     }
     if (req.user) {
       data.assignedTo = data.assignedTo || req.user.id;
@@ -189,7 +237,9 @@ router.post("/", salesAuth, async (req, res) => {
       data.createdBy = actor(req);
       data.updatedBy = actor(req);
     }
-    const account = await Account.create(data);
+    /* Ownership from the actor's own membership — proven, or nothing is
+       created. Never from `data`, which is the request. */
+    const account = await Account.create({ ...data, ...ownership });
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-account",
@@ -201,6 +251,7 @@ router.post("/", salesAuth, async (req, res) => {
     });
     res.status(201).json({ success: true, account: stripRestrictedAccountFields(account.toObject(), req.user) });
   } catch (err) {
+    if (err instanceof HierarchyError) return res.status(err.status).json({ success: false, message: err.message });
     res.status(400).json({ success: false, message: err.message });
   }
 });
@@ -210,7 +261,7 @@ router.post("/", salesAuth, async (req, res) => {
 // in a chain it answers "who owns this, and which other properties are theirs".
 router.get("/:id/hierarchy", salesAuth, async (req, res) => {
   try {
-    const self = await Account.findById(req.params.id).select("accountId companyName parentAccountId").lean();
+    const self = await Account.findOne(await scoped(req, { _id: req.params.id })).select("accountId companyName parentAccountId").lean();
     if (!self) return res.status(404).json({ success: false, message: "Account not found" });
 
     // Walk UP the parent chain (bounded).
@@ -219,7 +270,7 @@ router.get("/:id/hierarchy", salesAuth, async (req, res) => {
     const seen = new Set([String(self._id)]);
     while (cursor && !seen.has(String(cursor)) && ancestors.length < 50) {
       seen.add(String(cursor));
-      const p = await Account.findById(cursor).select("accountId companyName parentAccountId").lean();
+      const p = await Account.findOne(await scoped(req, { _id: cursor })).select("accountId companyName parentAccountId").lean();
       if (!p) break;
       ancestors.push({ _id: p._id, accountId: p.accountId, companyName: p.companyName });
       cursor = p.parentAccountId;
@@ -229,10 +280,10 @@ router.get("/:id/hierarchy", salesAuth, async (req, res) => {
     // root account would otherwise "sibling" every other root account, which is
     // not a group, it is the whole customer list.
     const [children, siblings, sites] = await Promise.all([
-      Account.find({ parentAccountId: self._id, isActive: true })
+      Account.find(await scoped(req, { parentAccountId: self._id, isActive: true }))
         .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean(),
       self.parentAccountId
-        ? Account.find({ parentAccountId: self.parentAccountId, isActive: true, _id: { $ne: self._id } })
+        ? Account.find(await scoped(req, { parentAccountId: self.parentAccountId, isActive: true, _id: { $ne: self._id } }))
             .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean()
         : Promise.resolve([]),
       Site.find({ accountId: self._id, isActive: true }).select("siteId name siteType isPrimary").lean(),
@@ -277,7 +328,7 @@ router.get("/:id/history", salesAuth, async (req, res) => {
 // GET /api/cms/crm/accounts/:id — enriched detail
 router.get("/:id", salesAuth, async (req, res) => {
   try {
-    const account = await Account.findById(req.params.id)
+    const account = await Account.findOne(await scoped(req, { _id: req.params.id }))
       .populate("primaryContact", "firstName lastName email phone designation")
       .populate("assignedTo", "name email")
       .populate("parentAccountId", "accountId companyName")
@@ -295,12 +346,12 @@ router.get("/:id", salesAuth, async (req, res) => {
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
 
     const [contacts, leads, sites, departments, addresses, team, relationships, activityAgg] = await Promise.all([
-      Contact.find({ accountId: req.params.id, isActive: true })
+      Contact.find(await scoped(req, { accountId: req.params.id, isActive: true }))
         .select("firstName lastName email phone mobile designation jobTitle roles isPrimary status siteId departmentId")
         .lean(),
       // Draft/archived Leads are excluded from an account's related-leads
       // list too — same active-only rule as the count above.
-      Lead.find({ accountId: req.params.id, isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } })
+      Lead.find(await scoped(req, { accountId: req.params.id, isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } }))
         .select("leadId firstName lastName stage estimatedValue priority expectedCloseDate")
         .lean(),
       Site.find({ accountId: req.params.id, isActive: true }).lean(),
@@ -363,19 +414,24 @@ router.patch("/:id", salesAuth, async (req, res) => {
     // Loaded as a real document (not findByIdAndUpdate) so document middleware
     // — including the Garment Sales Profile's cross-field pre("validate")
     // hook, which query-style updates bypass entirely — actually runs.
-    const account = await Account.findById(req.params.id);
+    const scope = await salesScopeFor(req);
+    const account = await Account.findOne({ $and: [scope.clause, { _id: req.params.id }] });
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
     const before = account.toObject();
 
-    // Cycle-safety before we touch the tree.
+    // Cycle-safety AND company-safety before we touch the tree: the walk can
+    // only load accounts inside this request's company, so a foreign parent is
+    // refused with the same answer a missing one gets. Nothing is saved first.
     if ("parentAccountId" in req.body) {
-      await assertNoAccountCycle(Account, req.params.id, req.body.parentAccountId || null);
+      await assertNoAccountCycle(scopedAccountLoader(scope), req.params.id, req.body.parentAccountId || null);
     }
     if ("garmentSalesProfile" in req.body) {
       await assertValidGarmentProfileRefs(Account, req.body.garmentSalesProfile);
     }
 
-    const update = stripRestrictedUpdates({ ...req.body }, req.user);
+    /* Ownership out of the payload before anything is assigned. The model
+       refuses it too; this is what turns a 500 into a clean, quiet no-op. */
+    const update = stripCompanyOwnershipInput(stripRestrictedUpdates({ ...req.body }, req.user));
     update.updatedBy = actor(req);
 
     for (const [key, value] of Object.entries(update)) {
@@ -413,18 +469,20 @@ router.post("/:id/archive", salesAuth, async (req, res) => {
     if (!reason || !String(reason).trim()) {
       return res.status(400).json({ success: false, message: "An archive reason is required." });
     }
-    const before = await Account.findById(req.params.id).lean();
+    const before = await Account.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!before) return res.status(404).json({ success: false, message: "Account not found" });
 
     // Impact surface — returned so the caller can show what archiving affects.
     const [openTasks, activeRelationships, children] = await Promise.all([
       Activity.countDocuments({ accountId: req.params.id, status: "planned", isActive: true }),
       Relationship.countDocuments({ isActive: true, $or: [{ fromAccountId: req.params.id }, { toAccountId: req.params.id }] }),
-      Account.countDocuments({ parentAccountId: req.params.id, isActive: true }),
+      Account.countDocuments(await scoped(req, { parentAccountId: req.params.id, isActive: true })),
     ]);
 
-    const account = await Account.findByIdAndUpdate(
-      req.params.id,
+    /* A scoped read followed by an unscoped update is not enough: the update
+       is what changes the record, so the company belongs in ITS filter. */
+    const account = await Account.findOneAndUpdate(
+      await scoped(req, { _id: req.params.id }),
       { status: "archived", isActive: false, archivedAt: new Date(), archivedBy: actor(req) },
       { new: true },
     );
@@ -449,11 +507,13 @@ router.post("/:id/archive", salesAuth, async (req, res) => {
 // POST /api/cms/crm/accounts/:id/restore
 router.post("/:id/restore", salesAuth, async (req, res) => {
   try {
-    const before = await Account.findById(req.params.id).lean();
+    const before = await Account.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!before) return res.status(404).json({ success: false, message: "Account not found" });
 
-    const account = await Account.findByIdAndUpdate(
-      req.params.id,
+    /* A scoped read followed by an unscoped update is not enough: the update
+       is what changes the record, so the company belongs in ITS filter. */
+    const account = await Account.findOneAndUpdate(
+      await scoped(req, { _id: req.params.id }),
       { status: "active", isActive: true, archivedAt: null, archivedBy: null },
       { new: true },
     );
@@ -479,7 +539,7 @@ router.post("/:id/restore", salesAuth, async (req, res) => {
 // accounts page). Archiving via /:id/archive is preferred.
 router.delete("/:id", salesAuth, async (req, res) => {
   try {
-    const account = await Account.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
+    const account = await Account.findOneAndUpdate(await scoped(req, { _id: req.params.id }), { isActive: false }, { new: true });
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
     await recordChange(req, {
       departmentSlug: "sales",

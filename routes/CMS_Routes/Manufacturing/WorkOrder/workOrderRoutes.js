@@ -9,16 +9,72 @@ const express = require("express");
 const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const workOrderStyleLink = require("../../../../services/industrialEngineering/workOrderStyleLink.service");
+const salesLineLink = require("../../../../services/production/salesLineWorkOrderLink.service");
 const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
+/* Read to prove a stranded order really is stranded before it may be
+   cancelled — never written by the cancellation itself. */
+const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
+/* `DefectRecord` is what QC inspections are stored as — the same model
+   qcRoutes reads under this name. */
+const QCInspection = require("../../../../models/CMS_Models/Manufacturing/QC/DefectRecord");
+const CuttingMasterRecord = require("../../../../models/CMS_Models/Manufacturing/CuttingMaster/CuttingMasterRecord");
+/* Cancelling a work order is only half the transition — the STYLE has to come
+   back to R&D too, or the page that says "define the route" keeps hiding the
+   panel that defines it. */
+const sampleStyleReturn = require("../../../../services/manufacturing/sampleStyleReturn.service");
 const Employee = require("../../../../models/Employee");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const mongoose = require("mongoose");
+const departmentWrites = require("../../../../Middlewear/departmentWriteGuard");
 
 router.use(EmployeeAuthMiddleware);
+
+/* The read-only Sales line ↔ WorkOrder bridge. Mounted before every `/:id`
+   route so "sales-line-links" is never read as a work-order id. */
+router.use("/sales-line-links", require("./salesLineLinkRoutes"));
+
+/*
+ * ── AUTHORISED, NOT MERELY SIGNED IN ─────────────────────────────────────────
+ * Every route in this file is authenticated-employee only. That is fine for
+ * planning edits; it is not fine for cancelling an order, which is the one
+ * write here that ends a record rather than advancing it.
+ *
+ * So the cancellation carries the codebase's OWN role mechanism —
+ * `departmentWrites`, used as route middleware exactly as
+ * manufacturingOrderRoutes.js already uses it — rather than a second
+ * authorization model invented for one endpoint. Platform admins go round it
+ * for the reason set out there: requireDepartmentRole ahead of requireApproval
+ * would otherwise refuse an administrator holding no Production role.
+ *
+ * It fails open until an administrator grants the first Production role (see
+ * services/departmentRoles.js), so this does not lock anybody out today; it
+ * means the cancellation is governed the moment roles are configured, which a
+ * bespoke check bolted on here would not be.
+ */
+const cancellationGuard = (req, res, next) => {
+  if (req.user?.isAdmin) return next();
+  return departmentWrites("project-manager", { entity: "work order" })(req, res, next);
+};
+
+/* ── AND THE SAME AUTHORITY FOR CREATING ONE (IE Chunk 1D) ──────────────────
+ * `PUT /:id/allocate-raw-materials` with `splitRemaining` does not merely edit
+ * a work order — it CREATES one. Creating and altering work orders is the
+ * Project Manager's throughout Manufacturing (`pmOwnedWrite` in
+ * manufacturingOrderRoutes.js, the cancellation above), so the split carries
+ * the same guard rather than a second authorization model invented for it.
+ *
+ * Membership is NOT this check. The shared company-context service provides
+ * identity and company scope, explicitly not capability; company membership is
+ * proved separately inside the handler, and neither substitutes for the other.
+ *
+ * It is the same object as `cancellationGuard` because it is the same rule;
+ * the alias exists so each call site says which act it is protecting. */
+const splitGuard = cancellationGuard;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: unit conversion
@@ -736,7 +792,7 @@ router.get("/:id/raw-item-requirement", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /:id/allocate-raw-materials
 // ─────────────────────────────────────────────────────────────────────────────
-router.put("/:id/allocate-raw-materials", async (req, res) => {
+router.put("/:id/allocate-raw-materials", splitGuard, async (req, res) => {
   try {
     const { id } = req.params;
     const { quantity, splitRemaining = false, planningNotes } = req.body;
@@ -854,6 +910,20 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
     }
 
     if (splitRemaining && remainingQuantity > 0) {
+      /* ── IE CHUNK 1D — A SPLIT MUST KNOW ITS STYLE ─────────────────────
+         Resolved from the exact order being split: its canonical link, or —
+         for a legacy parent — the accepted resolver over that parent's own
+         stored references. Never inherited as absence: a split that could not
+         prove a style is not created at all. The parent is read, never
+         written to. */
+      const splitActingCompanyId = await workOrderStyleLink.resolveActingCompany(req, "work-order split");
+      const splitStyleId = await workOrderStyleLink.styleForDerivative([workOrder._id], {
+        label: "This split work order", expectedCompanyId: splitActingCompanyId,
+      });
+      /* The child makes the same confirmed Sales line as its parent: the
+         parent's stored link, unchanged. A historical parent with no link
+         yields a child with none — its absence is inherited, never filled. */
+      const splitLineLink = salesLineLink.linkForSplit(workOrder, { actingCompanyId: splitActingCompanyId });
       const newRawMaterials = workOrder.rawMaterials.map(rm => {
         const req = rm.quantityRequired / basisQuantity;
         return {
@@ -870,6 +940,8 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 
       newWorkOrder = new WorkOrder({
         customerRequestId: workOrder.customerRequestId, stockItemId: workOrder.stockItemId,
+        ...(splitLineLink ? { salesLineLink: splitLineLink } : {}),
+        sampleStyleId: splitStyleId,
         stockItemName: workOrder.stockItemName, stockItemReference: workOrder.stockItemReference,
         variantId: workOrder.variantId, variantAttributes: workOrder.variantAttributes,
         quantity: remainingQuantity, originalQuantity: remainingQuantity,
@@ -956,6 +1028,11 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
       remainingQuantity, splitCreated: !!newWorkOrder,
     });
   } catch (error) {
+    /* IE Chunk 1D: a typed linkage or company refusal keeps its registered
+       status, code and actionable message. Anything else is still a 500. */
+    if (error && error.name === "StorePurchaseError") {
+      return workOrderStyleLink.sendTypedError(res, error, "");
+    }
     console.error("Error allocating raw materials:", error);
     res.status(500).json({ success: false, message: "Server error while allocating raw materials", error: error.message });
   }
@@ -1052,6 +1129,252 @@ router.put("/:id/plan-operations", async (req, res) => {
   } catch (error) {
     console.error("Error planning operations:", error);
     res.status(500).json({ success: false, message: "Server error while planning operations" });
+  }
+});
+
+/**
+ * POST /:id/cancel-unrouted — return a stranded sample order to R&D.
+ *
+ * ── THE STATE THIS EXISTS FOR ───────────────────────────────────────────────
+ * A work order created before its product had any operations cannot progress:
+ * there is nothing for a production scan to complete and nothing for QC to
+ * inspect against. The guards now refuse to create one, but the ones already
+ * out there are stuck — and the only previous way out was deleting records
+ * somebody may need to explain.
+ *
+ * So it is CANCELLED, not deleted. The manufacturing order, the work order,
+ * the cutting records and the customer request all stay exactly where they
+ * are; what changes is the status and the account of why.
+ *
+ * ── AND IT REFUSES THE MOMENT THERE IS REAL WORK ────────────────────────────
+ * A route, a production scan or a QC inspection each mean somebody has done
+ * something against this order, and cancelling it would be discarding their
+ * work on the strength of a status. Each is checked and each is named.
+ * Cutting is deliberately NOT a refusal — cutting happens before the sewing
+ * route matters — but it IS reported, because the fabric is cut and the
+ * replacement order must not silently inherit it.
+ */
+/**
+ * What was already cut against this work order.
+ *
+ * `CuttingMasterRecord` is one document per cutting master per DAY and keys
+ * the work order on `entries[].woId` — there is no `workOrderId` on it at all.
+ * The entries are matched and the units summed, because "2 sessions" and "180
+ * pieces" are different facts and it is the pieces somebody has to go and find.
+ */
+async function cuttingAgainst(workOrderId) {
+  const docs = await CuttingMasterRecord
+    .find({ "entries.woId": workOrderId }).select("entries").lean().catch(() => []);
+  const entries = docs.flatMap((d) => (d.entries || [])
+    .filter((e) => String(e?.woId || "") === String(workOrderId)));
+  const records = entries.length;
+  const unitsCut = entries.reduce((n, e) => n + (Number(e.quantityCut) || 0), 0);
+  if (!records) return { records: 0, unitsCut: 0, payload: null };
+  return {
+    records,
+    unitsCut,
+    payload: {
+      records,
+      unitsCut,
+      note: `Cutting already recorded belongs to this cancelled attempt — ${unitsCut} piece${unitsCut === 1 ? "" : "s"} across ${records} session${records === 1 ? "" : "s"}. It is kept for the record and is NOT carried into a replacement order: the new work order starts at zero and those pieces will not be counted against it. Check the cut pieces before cutting again.`,
+    },
+  };
+}
+
+/**
+ * Reconcile the style that governs this work order.
+ *
+ * Called on a first cancellation AND on a replay, because cancelling the work
+ * order was only ever half the transition: `SampleStyle.production.status` is
+ * what R&D's page branches on, and a work order that stopped short of it left
+ * the style saying "sent to production" over a screen telling the reader to
+ * define a route it was hiding.
+ */
+async function reconcileStyle({ workOrder, actor, reason, at }) {
+  try {
+    const style = await sampleStyleReturn.governingStyleFor(workOrder._id);
+    if (!style) return null;
+    const r = await sampleStyleReturn.returnStyleToRouteEditing({
+      style, workOrder, actor, reason, at,
+    });
+    return { styleId: String(style._id), styleRef: style.sampleStyleId || "", ...r };
+  } catch (err) {
+    /* The work order IS cancelled — that is committed and correct. A style
+       that could not be reconciled is reported as exactly that rather than
+       turning a completed cancellation into a 500 the reader would retry. */
+    console.error("[workOrders] cancel-unrouted: style return failed", err);
+    return {
+      returned: false, blockedBy: [], error: true,
+      message: "The order is cancelled, but the style could not be returned to R&D automatically. Open the style and check its production status.",
+    };
+  }
+}
+
+/** The one response shape both the first cancellation and a replay return. */
+function cancellationBody({ wo, account, cutting, styleReturn, replayed }) {
+  return {
+    success: true,
+    replayed: Boolean(replayed),
+    message: styleReturn?.returned
+      ? `${wo.workOrderNumber || "The work order"} is cancelled and the style is back with R&D.`
+      : `${wo.workOrderNumber || "The work order"} is cancelled.`,
+    workOrder: { id: String(wo._id), number: wo.workOrderNumber || "", status: wo.status },
+    /* ── THE ACCOUNT, READ BACK ON THE RESPONSE ──────────────────────
+       Everything the panel needs to show what happened, so it never has to
+       read a `workOrder` prop loaded before the cancellation and render a
+       blank reason. On a replay these are the ORIGINAL facts, read off the
+       stored record — never the replaying caller's. */
+    cancellation: account,
+    cutting: cutting.payload,
+    styleReturn,
+    nextStep: styleReturn && !styleReturn.returned && styleReturn.blockedBy?.length
+      ? styleReturn.message
+      : "Define the sample operation route in R&D, then send a new order to production.",
+  };
+}
+
+router.post("/:id/cancel-unrouted", cancellationGuard, async (req, res) => {
+  try {
+    const wo = await WorkOrder.findById(req.params.id);
+    if (!wo) return res.status(404).json({ success: false, message: "Work order not found." });
+
+    /* ── A REPLAY STILL RECONCILES THE STYLE ───────────────────────────
+       This used to return here, before the style was touched at all. Any
+       order cancelled before the style-return existed — and any second call
+       against one cancelled after it — left `production.status` at
+       "submitted" for ever, which is the exact state the live walkthrough
+       record was found in: work order cancelled, style still submitted, the
+       route panel unreachable on a page correctly showing the cancelled
+       attempt.
+
+       So the replay does everything the first call does except cancel: it
+       re-reads the recorded account, re-reads what was cut, and reconciles
+       the style — using the ORIGINAL reason, actor and timestamp, not
+       whoever is making this call now. */
+    if (wo.status === "cancelled") {
+      const recorded = wo.cancellation || {};
+      const account = {
+        reason: recorded.reason || "",
+        at: recorded.at || null,
+        by: { id: recorded.byActorId || "", name: recorded.byName || "" },
+        cuttingRecorded: Boolean(recorded.cuttingRecorded),
+        operationsAtCancellation: recorded.operationsAtCancellation ?? null,
+        productionScansAtCancellation: recorded.productionScansAtCancellation ?? null,
+        qcInspectionsAtCancellation: recorded.qcInspectionsAtCancellation ?? null,
+      };
+      const cutting = await cuttingAgainst(wo._id);
+      const styleReturn = await reconcileStyle({
+        workOrder: wo,
+        actor: { id: recorded.byActorId || undefined, name: recorded.byName || "" },
+        reason: recorded.reason || "",
+        at: recorded.at || undefined,
+      });
+      return res.json(cancellationBody({ wo, account, cutting, styleReturn, replayed: true }));
+    }
+
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      /* Without one, a cancelled order is indistinguishable from a mistake,
+         and nobody can tell whether to raise it again. */
+      return res.status(400).json({
+        success: false, code: "CANCEL_REASON_REQUIRED",
+        message: "Say why this order is being cancelled and returned to R&D.",
+      });
+    }
+
+    /* ── 1. IT MUST ACTUALLY BE UNROUTED ──────────────────────────────── */
+    const operations = (wo.operations || []).length;
+    if (operations) {
+      return res.status(409).json({
+        success: false, code: "WORK_ORDER_IS_ROUTED",
+        message: `${wo.workOrderNumber || "This work order"} has ${operations} operations, so it is not stranded. Cancelling a routed order is a production decision, not a repair.`,
+      });
+    }
+
+    /* ── 2. AND NOBODY MUST HAVE WORKED AGAINST IT ─────────────────────
+       A scan already voided by the reconciliation is not activity: it was
+       written against no route and has been withdrawn. Only LIVE scans
+       count. */
+    const shortId = String(wo._id).slice(-8);
+    /* ── AND THE COUNT IS THIS ORDER'S SCANS, NOT THE DAY'S ────────────
+       A ProductionCompletionScanRecord is one document PER DATE holding
+       every work order scanned that day, so the documents the query matches
+       carry other orders' scans too. Counting the array would refuse this
+       cancellation because somebody scanned a different order on the same
+       day — which is not activity against this one. Each barcode is matched
+       individually. */
+    const mine = new RegExp(`^WO-${shortId}-`);
+    const scanDocs = await ProductionCompletionScanRecord
+      .find({ "scans.barcodeId": { $regex: mine } }).select("scans.barcodeId").lean()
+      .catch(() => []);
+    const liveScans = scanDocs.reduce(
+      (n, d) => n + (d.scans || []).filter((x) => mine.test(String(x?.barcodeId || ""))).length,
+      0,
+    );
+    if (liveScans) {
+      return res.status(409).json({
+        success: false, code: "PRODUCTION_ACTIVITY_EXISTS",
+        message: `${liveScans} production scan${liveScans === 1 ? " has" : "s have"} been recorded against this order. Cancelling it would discard work somebody did.`,
+        productionScans: liveScans,
+      });
+    }
+
+    const qcCount = await QCInspection.countDocuments({ workOrderId: wo._id }).catch(() => 0);
+    if (qcCount) {
+      return res.status(409).json({
+        success: false, code: "QC_ACTIVITY_EXISTS",
+        message: `${qcCount} QC inspection${qcCount === 1 ? " has" : "s have"} been recorded against this order.`,
+        qcInspections: qcCount,
+      });
+    }
+
+    /* ── 3. WHAT WAS ALREADY CUT, REPORTED RATHER THAN REUSED ────────── */
+    const cutting = await cuttingAgainst(wo._id);
+
+    const cancelledAt = new Date();
+    const actor = { id: String(req.user?.id || ""), name: req.user?.name || "" };
+    wo.status = "cancelled";
+    wo.cancellation = {
+      at: cancelledAt,
+      byActorId: actor.id,
+      byName: actor.name,
+      reason,
+      operationsAtCancellation: operations,
+      productionScansAtCancellation: liveScans,
+      qcInspectionsAtCancellation: qcCount,
+      cuttingRecorded: cutting.records > 0,
+    };
+    await wo.save();
+
+    /* ── 4. AND THE STYLE COMES BACK TO R&D ────────────────────────────
+       The half that was missing. Cancelling the work order moved the work
+       order; `SampleStyle.production.status` is what R&D's page reads to
+       decide whether route editing is open, and it stayed at "submitted" —
+       so the screen said "define the route" while hiding the panel that
+       defines it. The service reopens the style only when no work order
+       still governs it, and writes nothing at all when one does. */
+    const styleReturn = await reconcileStyle({
+      workOrder: wo, actor: { id: req.user?.id, name: actor.name }, reason, at: cancelledAt,
+    });
+
+    return res.json(cancellationBody({
+      wo,
+      account: {
+        reason,
+        at: cancelledAt,
+        by: actor,
+        cuttingRecorded: cutting.records > 0,
+        operationsAtCancellation: operations,
+        productionScansAtCancellation: liveScans,
+        qcInspectionsAtCancellation: qcCount,
+      },
+      cutting,
+      styleReturn,
+      replayed: false,
+    }));
+  } catch (err) {
+    console.error("[workOrders] POST /:id/cancel-unrouted", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

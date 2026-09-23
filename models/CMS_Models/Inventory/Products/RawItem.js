@@ -161,6 +161,23 @@ const rawItemSchema = new mongoose.Schema(
 
     category:       { type: String, default: "" },
 
+    /* ── HOW CUSTOMS CLASSIFIES THESE GOODS ───────────────────────────────
+       The tariff heading an import of this item is entered under. A property
+       of the GOODS, so it is recorded once here rather than on every
+       quotation — two suppliers of one fabric do not classify it differently,
+       and storing it per offer would let them appear to.
+
+       ── AND IT IS NOT THE HSN ON A QUOTATION ─────────────────────────────
+       `SupplierOffer.hsnCode` is what the supplier wrote for GST. The two
+       derive from the same Harmonised System and are routinely different
+       lengths for the same goods — the GST code is what the seller charges
+       tax under, this is what the importer clears customs under. Reading one
+       as the other is how a duty is worked out against the wrong heading.
+
+       Empty means nobody has classified it. It is never defaulted, never
+       inferred from the category, and never read as "no duty". */
+    customsTariffCode: { type: String, trim: true, uppercase: true, maxlength: 20, default: "" },
+
     /* ── THIS ITEM'S OWN BUDGET HEAD, WHERE IT DIFFERS FROM ITS CATEGORY ───
        Normally empty. The head comes from the item's CATEGORY (see
        Acc_ItemCategoryBudget) because mapping 15 categories is a meeting and

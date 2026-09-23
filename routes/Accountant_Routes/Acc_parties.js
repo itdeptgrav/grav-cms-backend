@@ -44,6 +44,20 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const openItems = require("../../services/openItems.service");
 const creditTerms = require("../../services/creditTerms.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 const auth = accountantAuth;
 
@@ -134,7 +148,7 @@ async function balanceByLedger(cId, ledgerIds) {
 /* ------------------------------------------------------------------ */
 /* GET /parties                                                        */
 /* ------------------------------------------------------------------ */
-router.get("/", auth, async (req, res) => {
+router.get("/", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -248,7 +262,7 @@ router.get("/", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /parties/:ledgerId                                              */
 /* ------------------------------------------------------------------ */
-router.get("/:ledgerId", auth, async (req, res) => {
+router.get("/:ledgerId", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -298,7 +312,7 @@ router.get("/:ledgerId", auth, async (req, res) => {
 /* GET /parties/:ledgerId/transactions                                 */
 /* Every posted voucher line touching this party's ledger.             */
 /* ------------------------------------------------------------------ */
-router.get("/:ledgerId/transactions", auth, async (req, res) => {
+router.get("/:ledgerId/transactions", auth, companyScope, async (req, res) => {
   try {
     const { companyId, from, to } = req.query;
     if (!companyId)
@@ -415,7 +429,7 @@ router.get("/:ledgerId/transactions", auth, async (req, res) => {
 //      a DIFFERENT company, just by guessing/enumerating a ledger id. Both
 //      the read that resolves the party and the write that changes it are
 //      filtered by `{ _id, companyId }` together, never `_id` alone.
-router.patch("/:ledgerId/credit-terms", auth, async (req, res) => {
+router.patch("/:ledgerId/credit-terms", auth, companyScope, async (req, res) => {
   try {
     if (!creditTerms.canEditTerms(req.user)) {
       return res.status(403).json({
@@ -547,7 +561,7 @@ router.patch("/:ledgerId/credit-terms", auth, async (req, res) => {
 // literally cannot be part of the `updateMany` scope, whatever the request
 // claims about it. Every id from the request that isn't in that eligible set
 // comes back in `skipped`, with a reason, so nothing disappears silently.
-router.patch("/bulk-credit-terms", auth, async (req, res) => {
+router.patch("/bulk-credit-terms", auth, companyScope, async (req, res) => {
   try {
     if (!creditTerms.canEditTerms(req.user)) {
       return res.status(403).json({

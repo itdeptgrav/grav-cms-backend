@@ -472,6 +472,22 @@ const CODES = {
   /* The plan moved between the preview and the approval, so the impact the
      approver was shown is no longer the impact they would be approving. */
   TNA_IMPACT_STALE: { status: 409, code: "TNA_IMPACT_STALE" },
+  /* ── THE PRE-PRODUCTION MEETING ─────────────────────────────────────── */
+  PPM_NOT_FOUND: { status: 404, code: "PPM_NOT_FOUND" },
+  /* A draft already exists on this file, or an issued version already does. */
+  PPM_STATE_CONFLICT: { status: 409, code: "PPM_STATE_CONFLICT" },
+  PPM_REVISION_CONFLICT: { status: 409, code: "PPM_REVISION_CONFLICT" },
+  PPM_IDENTITY_REQUIRED: { status: 403, code: "PPM_IDENTITY_REQUIRED" },
+  /* An issued minute is permanent evidence and takes no edit. */
+  PPM_IMMUTABLE: { status: 409, code: "PPM_IMMUTABLE" },
+  /* Something Merchandising owns is missing, and issuing would record a
+     meeting that did not have it. Never raised for another department's
+     silence — that is preserved in the snapshot instead. */
+  PPM_INCOMPLETE: { status: 409, code: "PPM_INCOMPLETE" },
+  /* The person issuing wrote or conducted it. Minutes are checked by somebody
+     other than the person who took them. */
+  PPM_SELF_ISSUE: { status: 409, code: "PPM_SELF_ISSUE" },
+  PPM_REVIEW_REQUIRED: { status: 409, code: "PPM_REVIEW_REQUIRED" },
   TNA_STATE_CONFLICT: { status: 409, code: "TNA_STATE_CONFLICT" },
   TNA_SELF_APPROVAL: { status: 409, code: "TNA_SELF_APPROVAL" },
   TNA_REASON_REQUIRED: { status: 400, code: "TNA_REASON_REQUIRED" },
@@ -628,6 +644,10 @@ const CODES = {
   IE_SOURCE_VERSION_REQUIRED: { status: 409, code: "IE_SOURCE_VERSION_REQUIRED" },
   IE_SOURCE_VERSION_AMBIGUOUS: { status: 409, code: "IE_SOURCE_VERSION_AMBIGUOUS" },
   IE_FILE_REVISION_CONFLICT: { status: 409, code: "IE_FILE_REVISION_CONFLICT" },
+  /* A declared process route that cannot be stored: an unknown process, an
+     applicability nobody stated, a predecessor that is later, missing or does
+     not apply. 400, naming every entry at once. */
+  IE_PROCESS_ROUTE_INVALID: { status: 400, code: "IE_PROCESS_ROUTE_INVALID" },
   IE_BULLETIN_ROW_DUPLICATE: { status: 400, code: "IE_BULLETIN_ROW_DUPLICATE" },
   /* An operation this company's library does not hold — unknown, another
      company's, or not an id at all. One answer for all three. */
@@ -740,6 +760,12 @@ const CODES = {
   IE_LINE_LAYOUT_STATION_INVALID: { status: 400, code: "IE_LINE_LAYOUT_STATION_INVALID" },
   IE_LINE_LAYOUT_ROW_NOT_IN_SOURCE: { status: 400, code: "IE_LINE_LAYOUT_ROW_NOT_IN_SOURCE" },
   IE_LINE_LAYOUT_ROW_DUPLICATE: { status: 400, code: "IE_LINE_LAYOUT_ROW_DUPLICATE" },
+  /* ── IE — 2D PLANNED GEOMETRY (ie-line-layout-2d/v1) ──────────────────────
+   * A position outside the plan, a slot the layout does not hold, and the same
+   * slot twice. All 400: each names the exact entry a canvas sent. */
+  IE_LINE_LAYOUT_POSITION_INVALID: { status: 400, code: "IE_LINE_LAYOUT_POSITION_INVALID" },
+  IE_LINE_LAYOUT_SLOT_INVALID: { status: 400, code: "IE_LINE_LAYOUT_SLOT_INVALID" },
+  IE_LINE_LAYOUT_SLOT_DUPLICATE: { status: 400, code: "IE_LINE_LAYOUT_SLOT_DUPLICATE" },
   /* ── IE — PLANNED STATION MACHINE TYPES (Chunk 6B) ────────────────────────
    * A station plans machine TYPES and counts. Both codes are 400 and name the
    * exact entry: the type list is a form somebody fills in, and a duplicate
@@ -1124,6 +1150,18 @@ const CODES = {
    * and retrying changes nothing — somebody must connect the channel. */
   CHANNEL_NOT_CONFIGURED: { status: 409, code: "CHANNEL_NOT_CONFIGURED" },
 
+  /* ── MARKETING LEAD SOURCES (IndiaMART pull) ─────────────────────────────
+   * Registered rather than left to fall through to VALIDATION: none of these
+   * is a caller mistake.
+   *   NOT_CONFIGURED  no key for this company. 409: somebody must add one.
+   *   IN_PROGRESS     a check is running. 409: wait for its result.
+   *   TOO_SOON        IndiaMART allows one call in 5 minutes. 429, with
+   *                   `details.nextAllowedAt`. */
+  LEAD_SOURCE_NOT_CONFIGURED: { status: 409, code: "LEAD_SOURCE_NOT_CONFIGURED" },
+  LEAD_SOURCE_CHECK_IN_PROGRESS: { status: 409, code: "LEAD_SOURCE_CHECK_IN_PROGRESS" },
+  LEAD_SOURCE_CHECK_TOO_SOON: { status: 429, code: "LEAD_SOURCE_CHECK_TOO_SOON" },
+
+
   /* Credentials present, channel declined them. Deliberately NOT 503: a retry
    * cannot fix a revoked token or a missing permission, and reporting it as
    * temporary is how an expired refresh token goes unnoticed for a month. */
@@ -1133,6 +1171,23 @@ const CODES = {
    * says NOTHING about whether campaigns are running — a caller must not render
    * this as stopped, paused or zero. */
   CHANNEL_UNAVAILABLE: { status: 503, code: "CHANNEL_UNAVAILABLE" },
+
+  /* ── WHICH ACCESS PROBLEM, FOR THE ONE CHANNEL WHERE IT MATTERS ─────────
+   * Google Ads access has four independent parts, and each is fixed by a
+   * different person in a different console. One "access refused" for all four
+   * sends an administrator to the wrong place. All 409: none is fixed by
+   * retrying. */
+  /* The OAuth credential is missing, expired, revoked or refused. */
+  CHANNEL_OAUTH_UNAVAILABLE: { status: 409, code: "CHANNEL_OAUTH_UNAVAILABLE" },
+  /* The Google Cloud project that owns the OAuth client has no API access —
+   * disabled, not approved for production accounts, or missing sign-up. */
+  CHANNEL_API_ACCESS_UNAVAILABLE: { status: 409, code: "CHANNEL_API_ACCESS_UNAVAILABLE" },
+  /* The bound account, or the manager it is reached through, is wrong, closed
+   * or not reachable from that manager. */
+  CHANNEL_ACCOUNT_BINDING_UNAVAILABLE: { status: 409, code: "CHANNEL_ACCOUNT_BINDING_UNAVAILABLE" },
+  /* The provider refused the API version GRAV spoke, or GRAV is configured for
+   * one it does not support. A release is needed; retrying changes nothing. */
+  CHANNEL_API_VERSION_REJECTED: { status: 409, code: "CHANNEL_API_VERSION_REJECTED" },
 
   /* The channel answered and GRAV could not read the answer. 502, and distinct
    * from unavailable on purpose: one is an outage to wait out, the other is a
@@ -1256,6 +1311,42 @@ const CODES = {
    * obstacle, and the answer carries the findings a marketer can act on. */
   CAMPAIGN_DRAFT_ADVERTISING_INCOMPLETE: { status: 422, code: "CAMPAIGN_DRAFT_ADVERTISING_INCOMPLETE" },
 
+  /* ── THE MARKETING CONTENT PLANNER ─────────────────────────────────────────
+     A planning record. None of these means anything was created, scheduled,
+     sent or published anywhere. Another company's item and a missing one share
+     NOT_FOUND. A stale edit is a conflict, never a silent overwrite. A link the
+     server could not confirm is refused rather than stored as though it were. */
+  CONTENT_PLAN_ITEM_NOT_FOUND: { status: 404, code: "CONTENT_PLAN_ITEM_NOT_FOUND" },
+  CONTENT_PLAN_REVISION_CONFLICT: { status: 409, code: "CONTENT_PLAN_REVISION_CONFLICT" },
+  CONTENT_PLAN_STATE_CONFLICT: { status: 409, code: "CONTENT_PLAN_STATE_CONFLICT" },
+  CONTENT_PLAN_DECISION_FORBIDDEN: { status: 403, code: "CONTENT_PLAN_DECISION_FORBIDDEN" },
+  CONTENT_PLAN_ACTOR_UNVERIFIED: { status: 403, code: "CONTENT_PLAN_ACTOR_UNVERIFIED" },
+  CONTENT_PLAN_KEY_REUSED: { status: 409, code: "CONTENT_PLAN_KEY_REUSED" },
+  /* The linked campaign plan, owner or content asset does not exist for this
+     company. 422: the request is understood and names something that is not
+     there. */
+  CONTENT_PLAN_LINK_NOT_FOUND: { status: 422, code: "CONTENT_PLAN_LINK_NOT_FOUND" },
+  /* The content library could not be read, so the asset link could not be
+     confirmed. Nothing was saved; saving without the link still works. */
+  CONTENT_PLAN_LINK_UNCONFIRMED: { status: 503, code: "CONTENT_PLAN_LINK_UNCONFIRMED" },
+
+  /* ── THE CREATIVE MEDIA LIBRARY ────────────────────────────────────────────
+     Files for planned social content. Nothing here publishes anything, and its
+     states say nothing about advertising approval. Another company's media and
+     a forged reference both answer NOT_FOUND. */
+  CREATIVE_MEDIA_NOT_FOUND: { status: 404, code: "CREATIVE_MEDIA_NOT_FOUND" },
+  /* Withdrawn: kept for the record, never shown. */
+  CREATIVE_MEDIA_WITHDRAWN: { status: 409, code: "CREATIVE_MEDIA_WITHDRAWN" },
+  /* The stored bytes no longer hash to the recorded version. Not shown. */
+  CREATIVE_MEDIA_INTEGRITY_FAILED: { status: 409, code: "CREATIVE_MEDIA_INTEGRITY_FAILED" },
+  /* The upload did not arrive whole. Nothing was stored. */
+  CREATIVE_MEDIA_UPLOAD_INCOMPLETE: { status: 400, code: "CREATIVE_MEDIA_UPLOAD_INCOMPLETE" },
+  CREATIVE_MEDIA_TOO_LARGE: { status: 413, code: "CREATIVE_MEDIA_TOO_LARGE" },
+  CREATIVE_MEDIA_UNSUPPORTED: { status: 415, code: "CREATIVE_MEDIA_UNSUPPORTED" },
+  /* Storage could not take or return the file. Nothing was recorded. */
+  CREATIVE_MEDIA_STORAGE_UNAVAILABLE: { status: 503, code: "CREATIVE_MEDIA_STORAGE_UNAVAILABLE" },
+  CREATIVE_MEDIA_FORBIDDEN: { status: 403, code: "CREATIVE_MEDIA_FORBIDDEN" },
+
   /* ── DEPLOYING AN APPROVED PLAN INTO AN ADVERTISING ACCOUNT ────────────────
      Nothing has been created when any of these is returned.
 
@@ -1283,6 +1374,201 @@ const CODES = {
      advertising account with no confirmed record, and creating now would make a
      duplicate. A person has to reconcile before anything else is attempted. */
   CAMPAIGN_DEPLOYMENT_RECONCILIATION_REQUIRED: { status: 409, code: "CAMPAIGN_DEPLOYMENT_RECONCILIATION_REQUIRED" },
+
+  /* ── PPC PLANNING (PPC Lane A — the order book and the planning file) ─────
+   * Registered rather than left to fall through to VALIDATION, for the reason
+   * the Mautic block above states: "your form is wrong" is unfixable advice
+   * for most of what can go wrong here, and several of these are not the
+   * caller's fault at all.
+   *
+   * The one worth reading twice is `PPC_ORDER_BOOK_UNAVAILABLE` at 503. A
+   * register whose confirmed order lines could not be read must NOT answer 200
+   * with an empty list: an empty order book reads as "no confirmed orders",
+   * which is the single most misleading thing this screen could say. Same
+   * reasoning as `MAUTIC_UNAVAILABLE` — silence and emptiness are different
+   * facts, and only one of them is safe to render.
+   *
+   * `PPC_PLANNING_READINESS_UNDETERMINED` is 503 for the same reason: the
+   * planner did nothing wrong, an upstream source could not be read, and
+   * telling them their request was invalid would send them editing a correct
+   * one. It is deliberately NOT the same code as PPC_PLANNING_NOT_READY, which
+   * is a proved absence the planner can act on by chasing somebody. */
+  PPC_ORDER_BOOK_UNAVAILABLE: { status: 503, code: "PPC_ORDER_BOOK_UNAVAILABLE" },
+  PPC_ORDER_BOOK_VIEW_UNKNOWN: { status: 400, code: "PPC_ORDER_BOOK_VIEW_UNKNOWN" },
+  PPC_ORDER_BOOK_LIMIT_INVALID: { status: 400, code: "PPC_ORDER_BOOK_LIMIT_INVALID" },
+  PPC_ORDER_BOOK_CURSOR_INVALID: { status: 400, code: "PPC_ORDER_BOOK_CURSOR_INVALID" },
+
+  PPC_ORDER_LINE_NOT_FOUND: { status: 404, code: "PPC_ORDER_LINE_NOT_FOUND" },
+  PPC_ORDER_LINE_REQUIRED: { status: 400, code: "PPC_ORDER_LINE_REQUIRED" },
+
+  PPC_PLANNING_FILE_NOT_FOUND: { status: 404, code: "PPC_PLANNING_FILE_NOT_FOUND" },
+  /* Superseded or cancelled: it no longer owns its line, so it is not editable
+     — and the refusal carries the successor's reference so a reader can follow. */
+  PPC_PLANNING_FILE_CLOSED: { status: 400, code: "PPC_PLANNING_FILE_CLOSED" },
+
+  /* 409, not 400: the line is a perfectly valid line and the request was well
+     formed. What is missing is somebody else's document. */
+  PPC_PLANNING_NOT_READY: { status: 409, code: "PPC_PLANNING_NOT_READY" },
+  PPC_PLANNING_READINESS_UNDETERMINED: { status: 503, code: "PPC_PLANNING_READINESS_UNDETERMINED" },
+
+  /* A body carrying an upstream identity, a frozen basis, a state or a later
+     chunk's field. Named individually in `details.fields`, each with why. */
+  PPC_PLANNING_FIELD_REFUSED: { status: 400, code: "PPC_PLANNING_FIELD_REFUSED" },
+  PPC_PLANNING_FIELD_UNKNOWN: { status: 400, code: "PPC_PLANNING_FIELD_UNKNOWN" },
+
+  /* Optimistic concurrency. Carries the revision to re-read. */
+  PPC_PLANNING_REVISION_STALE: { status: 409, code: "PPC_PLANNING_REVISION_STALE" },
+  PPC_EXPECTED_REVISION_REQUIRED: { status: 400, code: "PPC_EXPECTED_REVISION_REQUIRED" },
+  PPC_PLANNING_STATE_INVALID: { status: 400, code: "PPC_PLANNING_STATE_INVALID" },
+
+  PPC_PLANNING_OWNER_INVALID: { status: 400, code: "PPC_PLANNING_OWNER_INVALID" },
+  PPC_PLANNING_PRIORITY_INVALID: { status: 400, code: "PPC_PLANNING_PRIORITY_INVALID" },
+  PPC_PLANNING_TEXT_TOO_LONG: { status: 400, code: "PPC_PLANNING_TEXT_TOO_LONG" },
+  PPC_PLANNING_DATE_INVALID: { status: 400, code: "PPC_PLANNING_DATE_INVALID" },
+  PPC_PLANNING_WINDOW_INVALID: { status: 400, code: "PPC_PLANNING_WINDOW_INVALID" },
+  PPC_PLANNING_ASSUMPTIONS_INVALID: { status: 400, code: "PPC_PLANNING_ASSUMPTIONS_INVALID" },
+  PPC_HOLD_REASON_INVALID: { status: 400, code: "PPC_HOLD_REASON_INVALID" },
+  /* Resuming planning must say what changed — enforced by the server so no
+     client can lift a hold without an explanation. */
+  PPC_HOLD_RESOLUTION_REQUIRED: { status: 400, code: "PPC_HOLD_RESOLUTION_REQUIRED" },
+  /* PPC's multi-stage schedule. Stages come only from the IE process route
+     frozen in the plan's release; an unproven route is a blocker, never a guess. */
+  PPC_ROUTE_UNREADABLE: { status: 503, code: "PPC_ROUTE_UNREADABLE" },
+  PPC_ROUTE_STAGE_UNKNOWN: { status: 409, code: "PPC_ROUTE_STAGE_UNKNOWN" },
+  PPC_STAGE_NOT_IN_ROUTE: { status: 400, code: "PPC_STAGE_NOT_IN_ROUTE" },
+  PPC_STAGE_DATES_INVALID: { status: 400, code: "PPC_STAGE_DATES_INVALID" },
+  PPC_STAGE_PREDECESSOR_CONFLICT: { status: 400, code: "PPC_STAGE_PREDECESSOR_CONFLICT" },
+  PPC_STAGE_SCHEDULE_UNCHANGED: { status: 400, code: "PPC_STAGE_SCHEDULE_UNCHANGED" },
+  PPC_STAGE_REPLAN_REASON_REQUIRED: { status: 400, code: "PPC_STAGE_REPLAN_REASON_REQUIRED" },
+  PPC_STAGE_SCHEDULE_CLOSED: { status: 409, code: "PPC_STAGE_SCHEDULE_CLOSED" },
+  PPC_STAGE_SCHEDULE_STALE: { status: 409, code: "PPC_STAGE_SCHEDULE_STALE" },
+  PPC_LINE_ROUTE_UNPROVEN: { status: 409, code: "PPC_LINE_ROUTE_UNPROVEN" },
+  PPC_LINE_ROUTE_UNREADABLE: { status: 503, code: "PPC_LINE_ROUTE_UNREADABLE" },
+  PROCESS_REQUIREMENT_EVIDENCE_REQUIRED: { status: 400, code: "PROCESS_REQUIREMENT_EVIDENCE_REQUIRED" },
+  PROCESS_REQUIREMENT_RESTATE_REQUIRED: { status: 409, code: "PROCESS_REQUIREMENT_RESTATE_REQUIRED" },
+  PPC_PUBLISH_STAGE_NOT_PUBLISHABLE: { status: 409, code: "PPC_PUBLISH_STAGE_NOT_PUBLISHABLE" },
+  PPC_PUBLISH_SCHEDULE_STALE: { status: 409, code: "PPC_PUBLISH_SCHEDULE_STALE" },
+  PPC_PUBLISH_SOURCE_MOVED: { status: 409, code: "PPC_PUBLISH_SOURCE_MOVED" },
+  PPC_PUBLISH_NO_WORKORDER: { status: 409, code: "PPC_PUBLISH_NO_WORKORDER" },
+  PPC_PUBLISH_WORKORDER_INELIGIBLE: { status: 409, code: "PPC_PUBLISH_WORKORDER_INELIGIBLE" },
+  PPC_PUBLISH_CONTENT_CONFLICT: { status: 409, code: "PPC_PUBLISH_CONTENT_CONFLICT" },
+  PPC_PUBLISH_LINE_ALREADY_TARGETED: { status: 409, code: "PPC_PUBLISH_LINE_ALREADY_TARGETED" },
+  PPC_PUBLISH_REPLAN_REASON_REQUIRED: { status: 400, code: "PPC_PUBLISH_REPLAN_REASON_REQUIRED" },
+  CUTTING_TARGET_NOT_FOUND: { status: 404, code: "CUTTING_TARGET_NOT_FOUND" },
+  CUTTING_TARGET_ALREADY_ANSWERED: { status: 409, code: "CUTTING_TARGET_ALREADY_ANSWERED" },
+  CUTTING_TARGET_PLAN_RETIRED: { status: 409, code: "CUTTING_TARGET_PLAN_RETIRED" },
+  CUTTING_TARGET_REFUSAL_REASON_REQUIRED: { status: 400, code: "CUTTING_TARGET_REFUSAL_REASON_REQUIRED" },
+  EMBROIDERY_TARGET_NOT_FOUND: { status: 404, code: "EMBROIDERY_TARGET_NOT_FOUND" },
+  EMBROIDERY_TARGET_ALREADY_ANSWERED: { status: 409, code: "EMBROIDERY_TARGET_ALREADY_ANSWERED" },
+  EMBROIDERY_TARGET_PLAN_RETIRED: { status: 409, code: "EMBROIDERY_TARGET_PLAN_RETIRED" },
+  EMBROIDERY_TARGET_REFUSAL_REASON_REQUIRED: { status: 400, code: "EMBROIDERY_TARGET_REFUSAL_REASON_REQUIRED" },
+  /* Sewing's target stands on a capacity booking PPC made separately. All
+     three are 409: the request is well formed, and the reservation behind it
+     is simply not one these dates may be published against. Telling a planner
+     to check the form would be unfixable advice — the remedy is a booking or
+     a schedule they decide on in their own screens. */
+  PPC_PUBLISH_NO_CAPACITY_BOOKING: { status: 409, code: "PPC_PUBLISH_NO_CAPACITY_BOOKING" },
+  PPC_PUBLISH_BOOKING_MISMATCH: { status: 409, code: "PPC_PUBLISH_BOOKING_MISMATCH" },
+  PPC_PUBLISH_BOOKING_UNHEALTHY: { status: 409, code: "PPC_PUBLISH_BOOKING_UNHEALTHY" },
+  SEWING_TARGET_NOT_FOUND: { status: 404, code: "SEWING_TARGET_NOT_FOUND" },
+  SEWING_TARGET_ALREADY_ANSWERED: { status: 409, code: "SEWING_TARGET_ALREADY_ANSWERED" },
+  SEWING_TARGET_PLAN_RETIRED: { status: 409, code: "SEWING_TARGET_PLAN_RETIRED" },
+  SEWING_TARGET_REFUSAL_REASON_REQUIRED: { status: 400, code: "SEWING_TARGET_REFUSAL_REASON_REQUIRED" },
+  SEWING_TARGET_BOOKING_INACTIVE: { status: 409, code: "SEWING_TARGET_BOOKING_INACTIVE" },
+  /* Packing's target door. Packing reserves no capacity, so it has no
+     booking code — the four below are the same four every receiver has. */
+  PACKING_TARGET_NOT_FOUND: { status: 404, code: "PACKING_TARGET_NOT_FOUND" },
+  PACKING_TARGET_ALREADY_ANSWERED: { status: 409, code: "PACKING_TARGET_ALREADY_ANSWERED" },
+  PACKING_TARGET_PLAN_RETIRED: { status: 409, code: "PACKING_TARGET_PLAN_RETIRED" },
+  PACKING_TARGET_REFUSAL_REASON_REQUIRED: { status: 400, code: "PACKING_TARGET_REFUSAL_REASON_REQUIRED" },
+  /* Cutting's technical standard is IE's to publish. 409 on both: the request
+     is well formed, and the engineering it needs simply is not there yet —
+     telling a planner to check the form would be unfixable advice. */
+  PPC_CUTTING_STANDARD_MISSING: { status: 409, code: "PPC_CUTTING_STANDARD_MISSING" },
+  PPC_CUTTING_STANDARD_UNREADABLE: { status: 409, code: "PPC_CUTTING_STANDARD_UNREADABLE" },
+  PPC_CUTTING_QUANTITY_UNKNOWN: { status: 409, code: "PPC_CUTTING_QUANTITY_UNKNOWN" },
+  /* Cutting's own resources, and PPC's read-only preview against them. All
+     409: the request is well formed and the cutting room simply cannot do the
+     work yet — advice to check the form would be unfixable. */
+  CUTTING_RESOURCE_INVALID: { status: 400, code: "CUTTING_RESOURCE_INVALID" },
+  CUTTING_RESOURCE_NOT_FOUND: { status: 404, code: "CUTTING_RESOURCE_NOT_FOUND" },
+  CUTTING_RESOURCE_REASON_REQUIRED: { status: 400, code: "CUTTING_RESOURCE_REASON_REQUIRED" },
+  CUTTING_RESOURCE_IMMUTABLE: { status: 409, code: "CUTTING_RESOURCE_IMMUTABLE" },
+  PPC_CUTTING_NO_PUBLISHED_RESOURCES: { status: 409, code: "PPC_CUTTING_NO_PUBLISHED_RESOURCES" },
+  PPC_CUTTING_NO_ELIGIBLE_RESOURCE: { status: 409, code: "PPC_CUTTING_NO_ELIGIBLE_RESOURCE" },
+  PPC_CUTTING_CAPACITY_INSUFFICIENT: { status: 409, code: "PPC_CUTTING_CAPACITY_INSUFFICIENT" },
+  /* ── CUTTING CAPACITY BOOKING ────────────────────────────────────────────
+     A cutting window is reserved on a Cutting-owned resource, never typed.
+     Every code below is 409: each request is well formed, and what refuses it
+     is the state of the world — a plan, a roster, a standard or somebody
+     else's reservation. Telling a planner to check the form would be
+     unfixable advice; the remedy is a fresh preview. */
+  PPC_CUTTING_DATES_NOT_TYPED: { status: 409, code: "PPC_CUTTING_DATES_NOT_TYPED" },
+  PPC_CUTTING_BOOKING_PROOF_REQUIRED: { status: 400, code: "PPC_CUTTING_BOOKING_PROOF_REQUIRED" },
+  PPC_CUTTING_BOOKING_STALE: { status: 409, code: "PPC_CUTTING_BOOKING_STALE" },
+  PPC_CUTTING_BOOKING_NOT_BOOKABLE: { status: 409, code: "PPC_CUTTING_BOOKING_NOT_BOOKABLE" },
+  PPC_CUTTING_BOOKING_NOT_FOUND: { status: 404, code: "PPC_CUTTING_BOOKING_NOT_FOUND" },
+  /* A resource id that is not in this company's PUBLISHED projection. Not
+     found rather than forbidden: another company's table is not a table this
+     one may be told exists. */
+  PPC_CUTTING_RESOURCE_NOT_FOUND: { status: 404, code: "PPC_CUTTING_RESOURCE_NOT_FOUND" },
+  PPC_CUTTING_BOOKING_CLOSED: { status: 409, code: "PPC_CUTTING_BOOKING_CLOSED" },
+  PPC_CUTTING_BOOKING_PLAN_CLOSED: { status: 409, code: "PPC_CUTTING_BOOKING_PLAN_CLOSED" },
+  PPC_CUTTING_BOOKING_NO_STAGE: { status: 409, code: "PPC_CUTTING_BOOKING_NO_STAGE" },
+  PPC_CUTTING_BOOKING_REASON_INVALID: { status: 400, code: "PPC_CUTTING_BOOKING_REASON_INVALID" },
+  PPC_CUTTING_BOOKING_IMMUTABLE: { status: 409, code: "PPC_CUTTING_BOOKING_IMMUTABLE" },
+  PPC_CUTTING_CAPACITY_OVERBOOKED: { status: 409, code: "PPC_CUTTING_CAPACITY_OVERBOOKED" },
+  /* Publishing a cutting target needs the exact reservation its dates came
+     from — the same shape sewing's own booking gate already has. */
+  PPC_PUBLISH_NO_CUTTING_BOOKING: { status: 409, code: "PPC_PUBLISH_NO_CUTTING_BOOKING" },
+  PPC_PUBLISH_CUTTING_BOOKING_MISMATCH: { status: 409, code: "PPC_PUBLISH_CUTTING_BOOKING_MISMATCH" },
+  PPC_SUCCESSOR_REASON_REQUIRED: { status: 400, code: "PPC_SUCCESSOR_REASON_REQUIRED" },
+  PPC_CANCELLATION_REASON_INVALID: { status: 400, code: "PPC_CANCELLATION_REASON_INVALID" },
+  /* A PLANNED file's planning fields are evidence of an approved plan. 409,
+     because the request was well formed — the plan is simply no longer
+     editable, and the way forward is a successor. */
+  PPC_PLANNING_FILE_FROZEN: { status: 409, code: "PPC_PLANNING_FILE_FROZEN" },
+  /* The line's last plan was cancelled; a new one must name it. */
+  PPC_PLANNING_PRIOR_CANCELLED: { status: 409, code: "PPC_PLANNING_PRIOR_CANCELLED" },
+
+  /* A planning decision has to be attributable to a person. 401, because the
+     session is what is missing. */
+  PPC_ACTOR_UNRESOLVED: { status: 401, code: "PPC_ACTOR_UNRESOLVED" },
+  /* Retiring a plan and creating its successor are one fact. Without
+     transactions neither happens, and the refusal says `wrote: NOTHING`. */
+  PPC_PLANNING_TRANSACTION_REQUIRED: { status: 409, code: "PPC_PLANNING_TRANSACTION_REQUIRED" },
+
+  /* ── PPC CAPACITY PLANNING (Lane A — capacity, first slice) ────────────────
+   * A preview is not a booking, and these codes keep the difference audible.
+   *
+   * `PPC_CAPACITY_UNDETERMINED` is 503: an input could not be READ, the planner
+   * did nothing wrong, and "your request was invalid" would send them editing a
+   * correct one. `PPC_CAPACITY_NOT_BOOKABLE` is 409: every input was read and at
+   * least one PROVES the booking cannot be made — a draft-only calendar, a gap
+   * in it, a shortage, a moved source. `PPC_CAPACITY_OVERBOOKED` is 409 and is
+   * what the database-level guard produces when a day filled between preview and
+   * commit. `PPC_CAPACITY_STALE` names what moved since the preview. */
+  PPC_CAPACITY_UNDETERMINED: { status: 503, code: "PPC_CAPACITY_UNDETERMINED" },
+  PPC_CAPACITY_NOT_BOOKABLE: { status: 409, code: "PPC_CAPACITY_NOT_BOOKABLE" },
+  PPC_CAPACITY_OVERBOOKED: { status: 409, code: "PPC_CAPACITY_OVERBOOKED" },
+  PPC_CAPACITY_STALE: { status: 409, code: "PPC_CAPACITY_STALE" },
+  PPC_CAPACITY_PROOF_REQUIRED: { status: 400, code: "PPC_CAPACITY_PROOF_REQUIRED" },
+  PPC_CAPACITY_ALREADY_BOOKED: { status: 409, code: "PPC_CAPACITY_ALREADY_BOOKED" },
+  PPC_CAPACITY_BOOKING_NOT_FOUND: { status: 404, code: "PPC_CAPACITY_BOOKING_NOT_FOUND" },
+  PPC_CAPACITY_BOOKING_CLOSED: { status: 409, code: "PPC_CAPACITY_BOOKING_CLOSED" },
+  PPC_CAPACITY_REVISION_STALE: { status: 409, code: "PPC_CAPACITY_REVISION_STALE" },
+  PPC_CAPACITY_REASON_INVALID: { status: 400, code: "PPC_CAPACITY_REASON_INVALID" },
+  PPC_CAPACITY_INPUT_INVALID: { status: 400, code: "PPC_CAPACITY_INPUT_INVALID" },
+  PPC_CAPACITY_FIELD_UNKNOWN: { status: 400, code: "PPC_CAPACITY_FIELD_UNKNOWN" },
+  PPC_CAPACITY_REF_TAKEN: { status: 409, code: "PPC_CAPACITY_REF_TAKEN" },
+  /* The counter and the booking disagree. Never papered over: 409, nothing moved. */
+  PPC_CAPACITY_LEDGER_MISMATCH: { status: 409, code: "PPC_CAPACITY_LEDGER_MISMATCH" },
+  PPC_CALENDAR_NOT_FOUND: { status: 404, code: "PPC_CALENDAR_NOT_FOUND" },
+  PPC_CALENDAR_CONTENT_INVALID: { status: 400, code: "PPC_CALENDAR_CONTENT_INVALID" },
+  PPC_CALENDAR_VERSION_PUBLISHED: { status: 409, code: "PPC_CALENDAR_VERSION_PUBLISHED" },
+  PPC_CALENDAR_REVISION_STALE: { status: 409, code: "PPC_CALENDAR_REVISION_STALE" },
+  PPC_LINE_NOT_FOUND: { status: 404, code: "PPC_LINE_NOT_FOUND" },
+  PPC_LINE_REVISION_STALE: { status: 409, code: "PPC_LINE_REVISION_STALE" },
 };
 
 class StorePurchaseError extends Error {

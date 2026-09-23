@@ -41,6 +41,20 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const mapSvc = require("../../services/tallyImportMapping.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -198,8 +212,7 @@ function mergeParties(primary, ledgers) {
 }
 /* ------------------------------------------------------------------ */
 router.post(
-  "/analyze",
-  accountantAuth,
+  "/analyze", accountantAuth, companyScope,
   upload.single("file"),
   async (req, res) => {
     try {
@@ -285,7 +298,7 @@ router.post(
 /*    }                                                                 */
 /*  }                                                                   */
 /* ------------------------------------------------------------------ */
-router.post("/commit", accountantAuth, async (req, res) => {
+router.post("/commit", accountantAuth, companyScopeOptional, async (req, res) => {
   try {
     const { sessionId, decisions } = req.body || {};
     if (!sessionId || !SESSIONS.has(sessionId))
@@ -455,7 +468,7 @@ router.post("/commit", accountantAuth, async (req, res) => {
 /* preview and returns a vendor/customer suggestion per Sundry party.   */
 /*  body: { companyId?, sessionId?, ledgers:[{name,groupName,gstin}] }  */
 /* ------------------------------------------------------------------ */
-router.post("/suggest-from-session", accountantAuth, async (req, res) => {
+router.post("/suggest-from-session", accountantAuth, companyScopeOptional, async (req, res) => {
   try {
     const { ledgers } = req.body || {};
     if (!Array.isArray(ledgers) || !ledgers.length)

@@ -91,6 +91,83 @@ const allocationSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/* ── THE BUYER'S SPECIAL-PROCESS REQUIREMENT ────────────────────────────────
+ * Whether THIS line's buyer requires embroidery, printing and washing — the
+ * line-level fact a style route cannot supply, because two lines of one style
+ * may differ. Stated by Sales at issue, frozen with the version, and copied
+ * with the rest of the projection into the Merchandising file that accepts it.
+ *
+ * Optional, and never defaulted: a version issued without it (every legacy
+ * version) states nothing, which is different from "not required". A definite
+ * answer carries the buyer approval it rests on, resolved by the server from
+ * the order's own stored record — never typed. See
+ * services/sales/lineProcessRequirement.js for the rules. */
+const processEvidenceSchema = new mongoose.Schema(
+  {
+    /* BUYER_PO — the buyer-approved ORDER: the quotation round the customer
+       approved on this order, with the purchase order they uploaded as proof.
+       It proves the buyer approved the order; the Sales-authored
+       `buyerSpecification` says what in it the answer rests on.
+
+       INTERNAL_ORDER — a genuine company order, which has no buyer to approve
+       it. Sales authorises it instead: the order is marked an internal order,
+       a named Sales approver signed the round off, and the person issuing the
+       handover says why. It is NOT available to a customer's order that Sales
+       pushed through without the customer's approval — there a real buyer
+       exists and has not answered, so that line stays UNKNOWN. */
+    kind: { type: String, enum: ["BUYER_PO", "INTERNAL_ORDER"], required: true },
+    buyerApprovalRef: { type: String, trim: true, required: true },
+    /* Which negotiation round was approved — pinned, so a later round cannot
+       quietly stand in for the one the buyer signed. */
+    approvalRevision: { type: Number, default: null },
+    approvedAt: { type: Date, default: null },
+    poNumber: { type: String, trim: true, default: "" },
+    poDate: { type: Date, default: null },
+    /* The buyer's document — required for, and only for, a buyer PO. */
+    documentRef: { type: String, trim: true, default: "",
+      required: function requiredForBuyerPo() { return this.kind === "BUYER_PO"; } },
+    documentName: { type: String, trim: true, default: "" },
+
+    /* ── AN INTERNAL ORDER'S AUTHORITY ────────────────────────────────── */
+    /* Who signed the order off inside the company, when it was marked an
+       internal order, and why this process answer was authorised — the actor
+       is read from the order, the reason is said by the issuer. */
+    authorisedById: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+    authorisedAt: { type: Date, default: null },
+    internalOrderMarkedAt: { type: Date, default: null },
+    reason: { type: String, trim: true, default: "", maxlength: 300,
+      required: function requiredForInternal() { return this.kind === "INTERNAL_ORDER"; } },
+  },
+  { _id: false },
+);
+
+const processRequirementSchema = new mongoose.Schema(
+  {
+    process: { type: String, enum: ["EMBROIDERY", "PRINTING", "WASHING", "OTHER"], required: true },
+    /* What an OTHER process is. Free text, so PPC can never match it to a
+       route stage — which is why a required OTHER blocks planning. */
+    otherLabel: { type: String, trim: true, default: "", maxlength: 80 },
+    requirement: { type: String, enum: ["REQUIRED", "NOT_REQUIRED", "UNKNOWN"], required: true },
+    /* What the buyer approved, in their document's terms: "left chest logo,
+       3 colours", "no wash". Required with a definite answer. */
+    buyerSpecification: { type: String, trim: true, default: "", maxlength: 500 },
+    evidence: { type: processEvidenceSchema, default: undefined },
+  },
+  { _id: false },
+);
+
+const processRequirementsSchema = new mongoose.Schema(
+  {
+    processes: { type: [processRequirementSchema], default: undefined },
+    statedAt: { type: Date, required: true },
+    statedBy: {
+      id: { type: mongoose.Schema.Types.ObjectId },
+      name: { type: String, trim: true },
+    },
+  },
+  { _id: false },
+);
+
 /**
  * A fresh instance of the projection schema.
  *
@@ -146,6 +223,9 @@ function executionProjectionSchema() {
       packingRequirement: { type: String, trim: true },
       testingRequirement: { type: String, trim: true },
       deliveryRequirement: { type: String, trim: true },
+
+      /* Absent on every version issued without a statement — never defaulted. */
+      processRequirements: { type: processRequirementsSchema, default: undefined },
     },
     { _id: false },
   );

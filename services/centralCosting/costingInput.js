@@ -19,7 +19,9 @@
 
 const mongoose = require("mongoose");
 
-const { CONTEXT_TYPES, CONTEXT_RULES } = require("../../models/CMS_Models/Costing/costingContext");
+const {
+  CONTEXT_TYPES, ENABLED_CONTEXT_TYPES, CONTEXT_RULES,
+} = require("../../models/CMS_Models/Costing/costingContext");
 const CostingVersion = require("../../models/CMS_Models/Costing/CostingVersion");
 const { parseCurrency, parseMoney, MoneyError, DEFAULT_CURRENCY } = require("./money");
 const { fail } = require("../storePurchase/errors");
@@ -54,7 +56,20 @@ function parseContext(input) {
   if (!CONTEXT_TYPES.includes(type)) {
     throw bad(
       "That is not a kind of thing a costing can be raised against.",
-      { field: "context.type", reason: "CONTEXT_TYPE_UNKNOWN", allowed: CONTEXT_TYPES },
+      { field: "context.type", reason: "CONTEXT_TYPE_UNKNOWN", allowed: ENABLED_CONTEXT_TYPES },
+    );
+  }
+  /* ── KNOWN, MODELLED, AND NOT YET SAFE TO ACCEPT ──────────────────────────
+     Separated from "unknown" on purpose: the caller has not made a mistake,
+     and the client should be able to offer the option with an honest label
+     rather than inferring one from prose. A style, order or sample-style
+     reference cannot be checked for ownership today, and a resolver that
+     could not check it would be an unsafe adapter dressed as validation. */
+  if (!ENABLED_CONTEXT_TYPES.includes(type)) {
+    throw fail(
+      "CONTEXT_NOT_SUPPORTED_YET",
+      "Costings cannot be raised against that yet.",
+      { field: "context.type", contextType: type, enabled: ENABLED_CONTEXT_TYPES },
     );
   }
 
@@ -193,7 +208,7 @@ function parseSourceFact(input, field) {
  * what a version is based on, and the snapshot freezes what those things said.
  * Chunk 2's engine reads exactly this shape.
  */
-function parseSourceReferences(input, { baseCurrency }) {
+function parseSourceReferences(input, { baseCurrency, trusted = false }) {
   if (input === undefined || input === null) return [];
   if (!Array.isArray(input)) {
     throw bad("Sources must be a list.", { field: "sourceReferences", reason: "NOT_A_LIST" });
@@ -232,14 +247,39 @@ function parseSourceReferences(input, { baseCurrency }) {
 
     out.label = text(raw.label).slice(0, 300);
 
-    const confidence = text(raw.confidence).toUpperCase() || "PROVISIONAL";
-    if (!CostingVersion.SOURCE_CONFIDENCE.includes(confidence)) {
+    /* ── A CLIENT MAY NOT CERTIFY ITS OWN INPUT ────────────────────────────
+       `VERIFIED` is a statement that the server checked something against a
+       master — a supplier quotation with a validity, an approved rate table.
+       Nothing typed into a request has been checked by anybody, so a payload
+       that declares itself verified is not a stronger fact, it is a stronger
+       CLAIM, and accepting it would let the label mean whatever the caller
+       wanted. Chunk 5's economies-of-scale rules and Chunk 8's variance
+       analysis both read this field; a self-certified row poisons them
+       silently, years later.
+
+       So: refused, loudly, rather than downgraded in silence — a caller who
+       asked for verified must learn that it did not happen. Only an internal
+       adapter running in a service context may pass `trusted`, and no request
+       value reaches that flag. */
+    const askedConfidence = text(raw.confidence).toUpperCase();
+    if (askedConfidence && !CostingVersion.SOURCE_CONFIDENCE.includes(askedConfidence)) {
       throw bad("A source is either provisional or verified.", {
         field: `${field}.confidence`, reason: "CONFIDENCE_UNKNOWN",
         allowed: CostingVersion.SOURCE_CONFIDENCE,
       });
     }
-    out.confidence = confidence;
+    if (!trusted && askedConfidence && askedConfidence !== "PROVISIONAL") {
+      throw bad(
+        "A source recorded through the API is provisional; it cannot declare itself verified.",
+        {
+          field: `${field}.confidence`, reason: "CONFIDENCE_NOT_CLIENT_SETTABLE",
+          requested: askedConfidence, applied: "PROVISIONAL",
+        },
+      );
+    }
+    /* Manual/API input is provisional, always — not "provisional unless the
+       caller says otherwise". */
+    out.confidence = trusted ? (askedConfidence || "PROVISIONAL") : "PROVISIONAL";
 
     const facts = raw.snapshot;
     if (facts !== undefined && facts !== null) {
@@ -292,11 +332,28 @@ function parseBaseCurrency(input) {
  * Note what it does NOT return: no company, no actor, no status, no version
  * number. Those are server-derived, and there is no code path here that could
  * take them from a payload even if one were sent.
+ *
+ * `trusted` is an INTERNAL option. The router never passes it and never
+ * computes it from a request value — see the route, which calls this with one
+ * argument. It exists so a future server-side import (Chunk 2's legacy
+ * adapter) can record a source it actually checked.
  */
-function parseCreateRequest(body = {}) {
+function parseCreateRequest(body = {}, { trusted = false } = {}) {
   const context = parseContext(body.context);
   const baseCurrency = parseBaseCurrency(body.baseCurrency);
-  const sourceReferences = parseSourceReferences(body.sourceReferences, { baseCurrency });
+  const sourceReferences = parseSourceReferences(body.sourceReferences, { baseCurrency, trusted });
+
+  /* ── A RESOLVED CONTEXT OWNS ITS OWN DISPLAY COPY ──────────────────────
+     For a context the server resolves, the snapshot is built from the
+     document it resolved — see contextResolver.service.js. Quietly discarding
+     a label the caller sent would leave them believing it was stored, so a
+     supplied one is refused with the reason instead. */
+  if (context.type === "ENQUIRY_STYLE" && (body.contextSnapshot !== undefined || text(body.label))) {
+    throw bad(
+      "The display details for an enquiry costing are taken from the enquiry itself.",
+      { field: "contextSnapshot", reason: "CONTEXT_SNAPSHOT_SERVER_GENERATED", contextType: context.type },
+    );
+  }
   const contextSnapshot = parseContextSnapshot(body.contextSnapshot, { label: body.label });
 
   const note = text(body.note);

@@ -53,6 +53,10 @@ const IeStyleFile = require("../../models/CMS_Models/IndustrialEngineering/IeSty
 const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering/IeBulletinVersion");
 const IeMethodStudy = require("../../models/CMS_Models/IndustrialEngineering/IeMethodStudy");
 const { fail } = require("../storePurchase/errors");
+const { canonicalAll } = require("./requirementCanonical");
+/* The ONE published shape for frozen requirement evidence — shared with the
+   draft bulletin, the bulletin version and the release-impact comparison. */
+const styleFiles = require("./ieStyleFile.service");
 const { calculateLineBalance } = require("./lineBalanceCalculation");
 const { encodeCursor, decodeCursor, pageSize } = require("./ieRead.service");
 
@@ -100,7 +104,11 @@ const COMPATIBILITY_REASON = Object.freeze({
    as a sequence, exactly like a bulletin, and stable station ids plus one
    atomic revision check are what make that safe. */
 const PATCH_FIELDS = Object.freeze(["expectedRevision", "stations"]);
-const STATION_FIELDS = Object.freeze(["stationId", "label", "note", "assignments", "plannedMachineTypes"]);
+const STATION_FIELDS = Object.freeze(["stationId", "label", "note", "assignments", "plannedMachineTypes", "position"]);
+/* A planned machine type is a TYPE, a count, and — for the 2D canvas — the
+   slot's identity and where it is drawn. Never a machine. */
+const PLANNED_MACHINE_TYPE_FIELDS = Object.freeze(["machineType", "quantity", "slotId", "position"]);
+const POSITION_FIELDS = Object.freeze(["x", "y"]);
 const ASSIGNMENT_FIELDS = Object.freeze(["rowId"]);
 
 /* Fields somebody will reasonably try to send, refused by name with where the
@@ -161,6 +169,7 @@ const layoutNotFound = () => fail("IE_LINE_LAYOUT_NOT_FOUND", "That line layout 
 const fileNotFound = () => fail("IE_FILE_NOT_FOUND", "That engineering file was not found.");
 
 const mintStationId = () => `stn_${crypto.randomBytes(9).toString("hex")}`;
+const mintSlotId = () => `slt_${crypto.randomBytes(9).toString("hex")}`;
 const mintEventId = () => `lle_${crypto.randomBytes(9).toString("hex")}`;
 
 const actorName = (actor) => str(actor?.name || actor?.email);
@@ -227,18 +236,94 @@ function laterApproval(a, b) {
  * Versioned (`v1`) so a later change to what the fingerprint covers cannot
  * silently make old layouts look current.
  */
+/**
+ * The stored copy of a frozen requirement snapshot, carried from a bulletin
+ * version onto a layout.
+ *
+ * Deliberately NOT the wire projection: this keeps the version's own types and
+ * omits what the version omitted, so a layout opened from a pre-Chunk-8A-iii
+ * version stores exactly the three fields that version held.
+ */
+function copyRequirementSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const copy = {
+    capturedAt: snapshot.capturedAt || null,
+    ieOperationRevision: snapshot.ieOperationRevision ?? null,
+    requirementsConfigured: Boolean(snapshot.requirementsConfigured),
+    machineTypes: (snapshot.machineTypes || []).map((m) => ({
+      machineType: m.machineType, quantity: m.quantity,
+    })),
+  };
+  const captured = Array.isArray(snapshot.dimensionsCaptured) ? snapshot.dimensionsCaptured : [];
+  if (!captured.length) return copy;
+  copy.dimensionsCaptured = [...captured];
+  copy.machines = (snapshot.machines || []).map((m) => ({
+    requirementId: m.requirementId, sequence: m.sequence,
+    machineType: m.machineType, quantity: m.quantity,
+  }));
+  copy.attachments = (snapshot.attachments || []).map((a) => ({
+    requirementId: a.requirementId, sequence: a.sequence, code: a.code,
+    name: a.name, quantity: a.quantity, note: a.note || "",
+  }));
+  copy.labour = (snapshot.labour || []).map((l) => ({
+    requirementId: l.requirementId, sequence: l.sequence, workerType: l.workerType,
+    quantity: l.quantity, skillCode: l.skillCode || "", skillName: l.skillName || "",
+    grade: l.grade || "", note: l.note || "",
+  }));
+  return copy;
+}
+
 function requirementDigestOf(snapshot) {
   if (!snapshot) return "";
-  /* Machine types sorted, so the order somebody typed them in is not a
-     different requirement. Quantity travels with the type. */
-  const types = (snapshot.machineTypes || [])
-    .map((m) => `${String(m.machineType).trim().toUpperCase()}:${m.quantity}`)
-    .sort()
-    .join(",");
+  const captured = Array.isArray(snapshot.dimensionsCaptured) ? snapshot.dimensionsCaptured : [];
+
+  /* ── FORMAT 1: LEGACY, PRESERVED BYTE FOR BYTE ──────────────────────────
+     A snapshot frozen before Chunk 8A-iii. Its digest is exactly the string it
+     has always been, including the operation revision it has always carried —
+     every stored layout fingerprint, frozen capacity-standard digest and issued
+     release was computed from it, and restating any of them would make evidence
+     that was true yesterday fail its own re-proof today. */
+  if (!captured.length) {
+    /* Machine types sorted, so the order somebody typed them in is not a
+       different requirement. Quantity travels with the type. */
+    const types = (snapshot.machineTypes || [])
+      .map((m) => `${String(m.machineType).trim().toUpperCase()}:${m.quantity}`)
+      .sort()
+      .join(",");
+    return [
+      snapshot.ieOperationRevision ?? "",
+      snapshot.requirementsConfigured ? "1" : "0",
+      types,
+    ].join("~");
+  }
+
+  /* ── FORMAT 2: v2 — THE REQUIREMENTS, AND NOTHING ELSE ──────────────────
+     A separate format, not the legacy one with a tail bolted on. The previous
+     cut prefixed the legacy head, which carries `ieOperationRevision` and
+     `machineTypes` — so re-saving an operation moved this digest while every
+     requirement field stayed identical, and the release reported
+     `requirementDigest.moved === true` beside a row with no
+     `REQUIREMENT_CHANGED` on it. One surface said the requirements had changed
+     and the other said they had not.
+
+     So a v2 digest is built ONLY from what a requirement IS:
+
+       · the `v2` marker, naming the format;
+       · `requirementsConfigured`, because "nobody has decided" and "somebody
+         decided none" are different requirements;
+       · which dimensions were captured, so an empty captured list can never
+         hash like a dimension nobody froze;
+       · `canonicalAll` — the SAME canonical form `ieReleaseImpact` compares.
+
+     Nothing else. Not the operation revision, not `machineTypes`, not the
+     capture time, not a label. Those are facts ABOUT the row, and the row's own
+     approval half of the source fingerprint already carries the revision — this
+     digest answers one question and answers only it. */
   return [
-    snapshot.ieOperationRevision ?? "",
+    "v2",
     snapshot.requirementsConfigured ? "1" : "0",
-    types,
+    [...captured].sort().join("+"),
+    ...canonicalAll(snapshot),
   ].join("~");
 }
 
@@ -357,16 +442,10 @@ async function approvedTimesFor(ctx, file) {
       /* The bulletin row's own frozen evidence, carried so compatibility is
          decided from the layout alone. `null` for a row authored before the
          freeze existed — and nothing invents one. */
-      requirementSnapshot: row.requirementSnapshot
-        ? {
-          capturedAt: row.requirementSnapshot.capturedAt || null,
-          ieOperationRevision: row.requirementSnapshot.ieOperationRevision ?? null,
-          requirementsConfigured: Boolean(row.requirementSnapshot.requirementsConfigured),
-          machineTypes: (row.requirementSnapshot.machineTypes || []).map((m) => ({
-            machineType: m.machineType, quantity: m.quantity,
-          })),
-        }
-        : null,
+      /* Copied WHOLE, including the attachment and labour halves when the
+         version froze them — a layout that dropped half the evidence on the way
+         in would make its own source look different from the version it names. */
+      requirementSnapshot: copyRequirementSnapshot(row.requirementSnapshot),
     });
   }
   return { bound, gaps };
@@ -585,14 +664,7 @@ const publishSourceRow = (r) => ({
   ieOperationRevision: r.ieOperationRevision,
   operationCode: r.operationCode || "",
   operationName: r.operationName || "",
-  requirementSnapshot: r.requirementSnapshot ? {
-    capturedAt: r.requirementSnapshot.capturedAt ? new Date(r.requirementSnapshot.capturedAt).toISOString() : null,
-    ieOperationRevision: r.requirementSnapshot.ieOperationRevision ?? null,
-    requirementsConfigured: Boolean(r.requirementSnapshot.requirementsConfigured),
-    machineTypes: (r.requirementSnapshot.machineTypes || []).map((m) => ({
-      machineType: m.machineType, quantity: m.quantity,
-    })),
-  } : null,
+  requirementSnapshot: styleFiles.publishRequirementSnapshot(r.requirementSnapshot),
   requirementEvidence: r.requirementSnapshot
     ? (r.requirementSnapshot.requirementsConfigured ? "FROZEN" : "FROZEN_NOT_CONFIGURED")
     : "NOT_PROVABLE",
@@ -770,7 +842,12 @@ function publishLayout(doc, { current, withHistory = false } = {}) {
          never a machine, an availability or a maintenance status. */
       plannedMachineTypes: (s.plannedMachineTypes || []).map((m) => ({
         machineType: m.machineType, quantity: m.quantity,
+        /* 2D contract: null on an entry planned before slots existed. */
+        slotId: m.slotId || null,
+        position: m.position ? { x: m.position.x, y: m.position.y } : null,
       })),
+      /* null = never placed: draw it where its sequence puts it. */
+      position: s.position ? { x: s.position.x, y: s.position.y } : null,
       assignments: (s.assignments || []).map((a) => {
         const compatibility = compatibilityOf(a, s, sourceByRow);
         allCompatibility.push({ ...compatibility, stationId: s.stationId, rowId: a.rowId });
@@ -789,6 +866,12 @@ function publishLayout(doc, { current, withHistory = false } = {}) {
       idleMinutes: workloadById.get(s.stationId)?.idleMinutes ?? null,
       isBottleneck: Boolean(workloadById.get(s.stationId)?.isBottleneck),
     })),
+
+    /* ── THE 2D PLANNED-LAYOUT CONTRACT, SUMMARISED ────────────────────────
+       Derived, never stored. `placement` tells a canvas whether to draw from
+       stored positions, from sequence alone (every layout before this
+       existed), or from both — unplaced stations taking their sequence slot. */
+    geometry: geometryOf(doc.stations || []),
 
     metrics: {
       totalWorkContentMinutes: metrics.totalWorkContentMinutes,
@@ -1194,6 +1277,60 @@ const text = (v, field, max, errs, index) => {
 };
 
 /**
+ * A planned-canvas position, as sent. Returns `undefined` for "not sent" (keep
+ * what is stored), `null` for an explicit clear (back to sequence-derived
+ * placement), or `{x, y}`. Nothing is rounded or clamped: a value outside the
+ * plan is refused, never quietly moved.
+ */
+function shapePosition(raw, field, index) {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  const refuse = (message, code = "INVALID") => fail("IE_LINE_LAYOUT_POSITION_INVALID", message,
+    { field, index, fieldErrors: [{ field, code, message, index }] });
+  if (typeof raw !== "object" || Array.isArray(raw)) throw refuse("A position is an object with x and y.");
+  for (const key of Object.keys(raw)) {
+    const refused = REFUSED_FIELDS[key];
+    if (refused) {
+      throw fail("FIELD_NOT_ACCEPTED", `A position cannot carry ${refused}.`,
+        { field: `${field}.${key}`, index, fieldErrors: [{ field: `${field}.${key}`, code: "NOT_ACCEPTED", message: `"${key}" is not accepted.`, index }] });
+    }
+    if (!POSITION_FIELDS.includes(key)) {
+      throw fail("FIELD_NOT_ACCEPTED", `"${key}" is not part of a position. A position is x and y, nothing else.`,
+        { field: `${field}.${key}`, index, fieldErrors: [{ field: `${field}.${key}`, code: "NOT_ACCEPTED", message: `"${key}" is not accepted.`, index }] });
+    }
+  }
+  const out = {};
+  for (const axis of POSITION_FIELDS) {
+    const v = raw[axis];
+    if (typeof v !== "number" || !Number.isFinite(v)) throw refuse(`A position needs a numeric ${axis}.`, "REQUIRED");
+    if (Math.abs(v) > LIMITS.COORDINATE) {
+      throw refuse(`${axis} is outside the planning canvas (±${LIMITS.COORDINATE}).`, "OUT_OF_RANGE");
+    }
+    out[axis] = v;
+  }
+  return out;
+}
+
+const GEOMETRY_CONTRACT = "ie-line-layout-2d/v1";
+
+function geometryOf(stations) {
+  const positioned = stations.filter((s) => s.position).length;
+  const slots = stations.flatMap((s) => s.plannedMachineTypes || []);
+  return {
+    contract: GEOMETRY_CONTRACT,
+    unit: "PLAN_UNIT",
+    coordinateLimit: LIMITS.COORDINATE,
+    stationCount: stations.length,
+    positionedStationCount: positioned,
+    slotCount: slots.length,
+    positionedSlotCount: slots.filter((m) => m.position).length,
+    placement: !positioned ? "SEQUENCE" : positioned === stations.length ? "POSITIONED" : "MIXED",
+  };
+}
+
+const samePosition = (a, b) => (a ? `${a.x},${a.y}` : "") === (b ? `${b.x},${b.y}` : "");
+
+/**
  * Shape the stations a caller sent into stations this layout may store.
  *
  * EVERYTHING is validated before anything is written: one bad station refuses
@@ -1221,6 +1358,17 @@ function shapeStations(list, { existingIds, existingById = new Map(), sourceByRo
   const seenStations = new Set();
   const seenRows = new Map();
   const shaped = [];
+
+  /* Every slot the layout already holds, by id, with the station it is at.
+     A slot id is unique across the layout, so one can be moved to another
+     station and keep its identity. */
+  const existingSlots = new Map();
+  for (const [sid, st] of existingById) {
+    for (const m of st?.plannedMachineTypes || []) {
+      if (m.slotId) existingSlots.set(m.slotId, { stationId: sid, entry: m });
+    }
+  }
+  const seenSlots = new Set();
 
   for (let i = 0; i < list.length; i += 1) {
     const raw = list[i];
@@ -1287,7 +1435,7 @@ function shapeStations(list, { existingIds, existingById = new Map(), sourceByRo
         }
         for (const field of Object.keys(entry)) {
           const refused = REFUSED_FIELDS[field];
-          if (refused || !["machineType", "quantity"].includes(field)) {
+          if (refused || !PLANNED_MACHINE_TYPE_FIELDS.includes(field)) {
             throw fail("FIELD_NOT_ACCEPTED",
               refused
                 ? `A planned machine type cannot carry ${refused}.`
@@ -1318,12 +1466,64 @@ function shapeStations(list, { existingIds, existingById = new Map(), sourceByRo
               fieldErrors: [{ field: mf("machineType"), code: "DUPLICATE", message: "Planned twice.", index: k }] });
         }
         seenTypes.add(key);
-        plannedMachineTypes.push({ machineType, quantity });
+
+        /* ── WHICH SLOT THIS IS ─────────────────────────────────────────
+           A slot id the layout holds keeps its identity (and may move to
+           another station). One it does not hold is refused, never minted.
+           With none sent, the entry is the one already planned for the same
+           type at the same station — the key a client that predates slots
+           has always used — so an edit from such a client keeps the slot's
+           id and position instead of dropping them. Otherwise it is new. */
+        let slotId = str(entry.slotId);
+        let was = null;
+        if (slotId) {
+          was = existingSlots.get(slotId)?.entry || null;
+          if (!was) {
+            throw fail("IE_LINE_LAYOUT_SLOT_INVALID", "That machine-type slot is not part of this layout.",
+              { field: mf("slotId"), slotId, index: k,
+                fieldErrors: [{ field: mf("slotId"), code: "INVALID", message: "Not part of this layout.", slotId, index: k }] });
+          }
+        } else {
+          was = (existingById.get(stationId)?.plannedMachineTypes || [])
+            .find((m) => upperType(m.machineType) === key) || null;
+          slotId = was?.slotId || mintSlotId();
+        }
+        if (seenSlots.has(slotId)) {
+          throw fail("IE_LINE_LAYOUT_SLOT_DUPLICATE", "The same machine-type slot appears twice.",
+            { field: mf("slotId"), slotId, index: k,
+              fieldErrors: [{ field: mf("slotId"), code: "DUPLICATE", message: "Appears twice.", slotId, index: k }] });
+        }
+        seenSlots.add(slotId);
+
+        const sent = shapePosition(entry.position, mf("position"), k);
+        const position = sent === undefined ? (was?.position || null) : sent;
+        plannedMachineTypes.push({
+          machineType, quantity, slotId,
+          ...(position ? { position: { x: position.x, y: position.y } } : {}),
+        });
       }
     } else if (stationId && existingIds.has(stationId)) {
       const was = existingById.get(stationId);
-      plannedMachineTypes.push(...((was?.plannedMachineTypes || []).map((m) => ({ ...m }))));
+      for (const m of was?.plannedMachineTypes || []) {
+        if (m.slotId) {
+          if (seenSlots.has(m.slotId)) {
+            throw fail("IE_LINE_LAYOUT_SLOT_DUPLICATE", "The same machine-type slot appears twice.",
+              { field: at("plannedMachineTypes"), slotId: m.slotId, index: i,
+                fieldErrors: [{ field: at("plannedMachineTypes"), code: "DUPLICATE", message: "Appears twice.", slotId: m.slotId, index: i }] });
+          }
+          seenSlots.add(m.slotId);
+        }
+        plannedMachineTypes.push({ ...m, ...(m.position ? { position: { ...m.position } } : {}) });
+      }
     }
+
+    /* ── WHERE THE STATION IS DRAWN ───────────────────────────────────────
+       Omitted keeps the stored position; `null` clears it. Never read to
+       decide `sequence`, which is the station's place in this list and
+       nothing else — moving a station on the canvas reorders nothing. */
+    const sentPosition = shapePosition(raw.position, at("position"), i);
+    const keptPosition = existingIds.has(stationId) ? (existingById.get(stationId)?.position || null) : null;
+    const stationPosition = sentPosition === undefined ? keptPosition : sentPosition;
 
     const rawAssignments = raw.assignments === undefined ? [] : raw.assignments;
     if (!Array.isArray(rawAssignments)) {
@@ -1389,7 +1589,10 @@ function shapeStations(list, { existingIds, existingById = new Map(), sourceByRo
       });
     }
 
-    shaped.push({ stationId, sequence: shaped.length + 1, label, note, plannedMachineTypes, assignments });
+    shaped.push({
+      stationId, sequence: shaped.length + 1, label, note, plannedMachineTypes, assignments,
+      ...(stationPosition ? { position: { x: stationPosition.x, y: stationPosition.y } } : {}),
+    });
   }
 
   if (errs.length) {
@@ -1409,12 +1612,17 @@ function sameStations(before = [], after = []) {
       if ((a[f] ?? "") !== (b[f] ?? "")) return false;
     }
     if (a.sequence !== b.sequence) return false;
+    if (!samePosition(a.position, b.position)) return false;
     const ap = a.plannedMachineTypes || [];
     const bp = b.plannedMachineTypes || [];
     if (ap.length !== bp.length) return false;
     for (let k = 0; k < ap.length; k += 1) {
       if (upperType(ap[k].machineType) !== upperType(bp[k].machineType)) return false;
       if ((ap[k].quantity ?? null) !== (bp[k].quantity ?? null)) return false;
+      /* A slot id minted for an entry that had none is not a change on its
+         own: nothing is written for it, and it is minted again when there is. */
+      if (bp[k].slotId && ap[k].slotId !== bp[k].slotId) return false;
+      if (!samePosition(ap[k].position, bp[k].position)) return false;
     }
     const aa = a.assignments || [];
     const bb = b.assignments || [];
@@ -1452,6 +1660,13 @@ function changedCategories(before, after) {
     const wasPlan = (was.plannedMachineTypes || []).map((m) => `${upperType(m.machineType)}:${m.quantity}`).join("|");
     const nowPlan = (station.plannedMachineTypes || []).map((m) => `${upperType(m.machineType)}:${m.quantity}`).join("|");
     if (wasPlan !== nowPlan && !changed.includes("machine_plan")) changed.push("machine_plan");
+    /* Geometry is its own category, so the trail never records a drag as a
+       re-balance — or a re-balance as a drag. */
+    const slotGeometry = (list) => (list || []).map((m) => `${m.slotId || upperType(m.machineType)}@${
+      m.position ? `${m.position.x},${m.position.y}` : "-"}`).sort().join("|");
+    if ((!samePosition(was.position, station.position)
+      || slotGeometry(was.plannedMachineTypes) !== slotGeometry(station.plannedMachineTypes))
+      && !changed.includes("geometry")) changed.push("geometry");
   }
   return changed.length ? changed : ["stations"];
 }
@@ -1566,6 +1781,148 @@ async function updateLayout(ctx, { layoutId, body = {}, actor = null } = {}) {
     updated: true,
     events: [publishEvent(audit)],
   };
+}
+
+/* ═══ MOVE THINGS ON THE CANVAS — THE 2D GEOMETRY WRITE ════════════════════
+ *
+ * The canvas's own verb: it can say WHERE a station or a machine-type slot is
+ * drawn, and it cannot say anything else. It carries no station list, so it
+ * cannot reorder stations, move an operation, relabel anything or change a
+ * planned type or count — the arrangement and the balance are what they were.
+ *
+ * It is not a second writer. It reads the stored stations, replaces only
+ * positions, and hands the whole list to `updateLayout`, so the approved-layout
+ * refusal, the source-changed refusal, the revision conflict, the no-op, the
+ * one conditional write and the audit line are all the ordinary edit's own.
+ */
+const GEOMETRY_FIELDS = Object.freeze(["expectedRevision", "stations", "slots"]);
+
+async function updateLayoutGeometry(ctx, { layoutId, body = {}, actor = null } = {}) {
+  const current = await loadOwnedLayout(ctx, layoutId);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw fail("VALIDATION", "That is not a layout geometry change.");
+  }
+  for (const key of Object.keys(body)) {
+    if (!GEOMETRY_FIELDS.includes(key)) {
+      throw fail("FIELD_NOT_ACCEPTED",
+        `"${key}" is not part of a geometry change. Positions only — the arrangement is edited with the stations.`,
+        { field: key, fieldErrors: [{ field: key, code: "NOT_ACCEPTED", message: `"${key}" is not accepted here.` }] });
+    }
+  }
+  /* Asked first, for the same reason the ordinary edit asks it first. */
+  if (current.status === "APPROVED") throw layoutImmutable(current, "edited");
+
+  const list = (value, field) => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) {
+      throw fail("VALIDATION", `${field} is a list.`,
+        { field, fieldErrors: [{ field, code: "NOT_A_LIST", message: "This is a list." }] });
+    }
+    return value;
+  };
+  const stationMoves = list(body.stations, "stations");
+  const slotMoves = list(body.slots, "slots");
+  if (!stationMoves.length && !slotMoves.length) {
+    throw fail("VALIDATION", "Say which stations or slots moved.", {
+      field: "stations",
+      fieldErrors: [{ field: "stations", code: "REQUIRED", message: "Send at least one station or slot position." }],
+    });
+  }
+
+  const stored = (current.stations || []).map((st) => ({
+    ...st,
+    plannedMachineTypes: (st.plannedMachineTypes || []).map((m) => ({ ...m })),
+  }));
+  const byStation = new Map(stored.map((st) => [st.stationId, st]));
+  const onlyKeys = (entry, allowed, field, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw fail("VALIDATION", "Every move is an object.",
+        { field, index, fieldErrors: [{ field, code: "INVALID", message: "This is an object.", index }] });
+    }
+    for (const key of Object.keys(entry)) {
+      if (!allowed.includes(key)) {
+        const refused = REFUSED_FIELDS[key];
+        throw fail("FIELD_NOT_ACCEPTED",
+          refused ? `A geometry change cannot carry ${refused}.` : `"${key}" is not part of a geometry change.`,
+          { field: `${field}.${key}`, index, fieldErrors: [{ field: `${field}.${key}`, code: "NOT_ACCEPTED", message: `"${key}" is not accepted here.`, index }] });
+      }
+    }
+    if (!("position" in entry)) {
+      throw fail("VALIDATION", "Send the position (or null to clear it).",
+        { field: `${field}.position`, index, fieldErrors: [{ field: `${field}.position`, code: "REQUIRED", message: "Send the position.", index }] });
+    }
+  };
+  const unknown = (code, message, field, index, extra) => fail(code, message,
+    { field, index, ...extra, fieldErrors: [{ field, code: "INVALID", message, index }] });
+
+  const movedStations = new Set();
+  stationMoves.forEach((move, i) => {
+    const field = `stations.${i}`;
+    onlyKeys(move, ["stationId", "position"], field, i);
+    const target = byStation.get(str(move.stationId));
+    if (!target) {
+      throw unknown("IE_LINE_LAYOUT_STATION_INVALID", "That station is not part of this layout.", `${field}.stationId`, i);
+    }
+    if (movedStations.has(target.stationId)) {
+      throw unknown("IE_LINE_LAYOUT_STATION_INVALID", "The same station is moved twice.", `${field}.stationId`, i);
+    }
+    movedStations.add(target.stationId);
+    const position = shapePosition(move.position, `${field}.position`, i);
+    if (position) target.position = position; else delete target.position;
+  });
+
+  /* A slot is addressed by its id; one planned before slots existed has none
+     yet, and is addressed by its station and type instead — the pair that is
+     unique by rule — and given an id by the write. */
+  const movedSlots = new Set();
+  slotMoves.forEach((move, i) => {
+    const field = `slots.${i}`;
+    onlyKeys(move, ["slotId", "stationId", "machineType", "position"], field, i);
+    let entry = null;
+    const slotId = str(move.slotId);
+    if (slotId) {
+      for (const st of stored) {
+        entry = st.plannedMachineTypes.find((m) => m.slotId === slotId) || entry;
+      }
+    } else if (str(move.stationId) && str(move.machineType)) {
+      entry = (byStation.get(str(move.stationId))?.plannedMachineTypes || [])
+        .find((m) => !m.slotId && upperType(m.machineType) === upperType(move.machineType)) || null;
+    }
+    if (!entry) {
+      throw unknown("IE_LINE_LAYOUT_SLOT_INVALID", "That machine-type slot is not part of this layout.", `${field}.slotId`, i);
+    }
+    const key = entry.slotId || `${move.stationId}:${upperType(entry.machineType)}`;
+    if (movedSlots.has(key)) {
+      throw unknown("IE_LINE_LAYOUT_SLOT_DUPLICATE", "The same slot is moved twice.", `${field}.slotId`, i);
+    }
+    movedSlots.add(key);
+    const position = shapePosition(move.position, `${field}.position`, i);
+    if (position) entry.position = position; else delete entry.position;
+  });
+
+  /* The whole list, exactly as stored except for positions, through the
+     ordinary edit. Every other field is sent back unchanged — `stationId`,
+     label, note, each planned type and count with its slot, and each
+     assignment by row id — so the shaper rebuilds the same arrangement. */
+  const stations = stored.map((st) => ({
+    stationId: st.stationId,
+    label: st.label || "",
+    note: st.note || "",
+    position: st.position || null,
+    plannedMachineTypes: st.plannedMachineTypes.map((m) => ({
+      machineType: m.machineType,
+      quantity: m.quantity,
+      ...(m.slotId ? { slotId: m.slotId } : {}),
+      position: m.position || null,
+    })),
+    assignments: (st.assignments || []).map((a) => ({ rowId: a.rowId })),
+  }));
+
+  return updateLayout(ctx, {
+    layoutId,
+    body: { expectedRevision: body.expectedRevision, stations },
+    actor,
+  });
 }
 
 /* ═══ APPROVE (Chunk 7C2) ══════════════════════════════════════════════════
@@ -2008,10 +2365,11 @@ async function approveLayout(ctx, { layoutId, body = {}, actor = null } = {}) {
 module.exports = {
   SOURCE_STATE, SOURCE_CHANGE_REASON, COMPATIBILITY, COMPATIBILITY_REASON,
   PATCH_FIELDS, STATION_FIELDS, ASSIGNMENT_FIELDS, REFUSED_FIELDS,
+  PLANNED_MACHINE_TYPE_FIELDS, GEOMETRY_FIELDS, GEOMETRY_CONTRACT,
   compatibilityOf, compatibilitySummaryOf, requirementDigestOf, sourceDigestsOf,
   publishLayout, publishEvent, sourceStateOf, sameStations, changedCategories, shapeStations,
   approvedTimesFor, readinessFor, currentSourceFor, sourceFingerprintOf, laterApproval,
-  createLayout, readLayout, listLayouts, updateLayout, approveLayout,
+  createLayout, readLayout, listLayouts, updateLayout, updateLayoutGeometry, approveLayout,
   approvalGapsFor, sameFrozenRows, authorOf, versionAsSource, sourceForLayout,
   APPROVE_FIELDS, APPROVE_REFUSED,
 };

@@ -12,6 +12,8 @@
 // nothing here; a valid token with no costing grant reaches no endpoint.
 "use strict";
 
+const crypto = require("crypto");
+
 const companyContext = require("../services/centralCosting/companyContext.service");
 const { hasAll, hasAny } = require("../services/centralCosting/capabilities");
 const idempotency = require("../services/storePurchase/idempotency.service");
@@ -92,9 +94,30 @@ const requireAnyCapability = (...any) => (req, res, next) => {
  * instead of `res.json` on the success path, so the replayed response is
  * exactly the one the first caller got.
  */
-const withIdempotency = (operation, { required = true } = {}) => async (req, res, next) => {
+/**
+ * @param {string} operation  stays stable — the record being acted on goes into
+ *   the fingerprint, not into a new operation name per record.
+ * @param {object} [opts]
+ * @param {boolean} [opts.required]
+ * @param {(req) => string|null} [opts.target]  the record this key is bound to,
+ *   derived on the SERVER from the URL. See the block comment below.
+ */
+const withIdempotency = (operation, { required = true, target = null } = {}) => async (req, res, next) => {
   const key = req.get("Idempotency-Key") || req.get("idempotency-key");
   if (!key && !required) return next();
+
+  /* ── WHAT A KEY IS BOUND TO ────────────────────────────────────────────
+   * The body alone is not the whole intent. `POST /costings/A/versions` and
+   * `POST /costings/B/versions` with the same cost lines are byte-identical
+   * bodies, so without the target the second replays the first's answer and B
+   * is never costed — while the caller is told it was.
+   *
+   * The target is read from the URL, never from the body: a caller that could
+   * name its own target could aim a key at any costing it liked.
+   *
+   * (Store & Purchase's own routes pass `target` only where they already did;
+   * nothing about their fingerprints changes here.) */
+  const targetKey = typeof target === "function" ? target(req) : undefined;
 
   try {
     const claim = await idempotency.begin({
@@ -102,6 +125,7 @@ const withIdempotency = (operation, { required = true } = {}) => async (req, res
       operation,
       key,
       body: req.body,
+      ...(targetKey === undefined ? {} : { target: targetKey }),
     });
 
     if (claim.outcome === "REPLAY") {
@@ -111,29 +135,56 @@ const withIdempotency = (operation, { required = true } = {}) => async (req, res
 
     /* ── A RECOVERED CLAIM IS NOT A SECOND CREATE ────────────────────────
      * The effect already committed on an earlier attempt whose response never
-     * landed. Re-running the create would produce a second costing for one
-     * user action, which is the failure idempotency exists to prevent — so the
-     * handler is never reached. The record names what it produced, and the
-     * caller is pointed at it.
+     * landed. The handler is still reached, but it is told so — and its first
+     * act is to look the existing record up by the claim id below and return
+     * it, rather than writing anything.
      *
-     * There is no "finish the bookkeeping" branch here because, unlike Store's
-     * receipts, a costing create writes no separate history entry to be left
-     * behind: the version's own provenance IS the record, and it committed
-     * with the version. */
-    if (claim.outcome === "RECOVER") {
-      const id = claim.effect?.entityId ? String(claim.effect.entityId) : null;
-      res.set("Idempotency-Recovered", "true");
-      return sendError(res, fail(
-        "CONFLICT",
-        "This request was interrupted after the costing had already been created. Open it rather than sending again.",
-        { reason: "RECONCILIATION_REQUIRED", costingId: id },
-      ));
-    }
+     * It is NOT refused outright any more. Refusing was safe but unhelpful:
+     * the caller's action HAD succeeded, and telling them to go and find it
+     * themselves is worse than handing it back. The recovery is safe because
+     * the claim id is on the costing itself and is uniquely indexed — the
+     * handler cannot accidentally create a second one even if it tried. */
+    const recovering = claim.outcome === "RECOVER";
 
     let settled = false;
 
+    /* ── THE CLAIM IDENTITY, DERIVED ON THE SERVER ───────────────────────
+     * The same four facts the idempotency record is keyed on, hashed into one
+     * stable string that the created record carries and a unique index
+     * defends. Deterministic on purpose: the SAME key from the same actor, in
+     * the same company, on the same operation always yields the same claim —
+     * which is what lets a retry find its own earlier record even if the
+     * idempotency row itself has since expired or been released.
+     *
+     * ── AND THE TARGET IS DELIBERATELY *NOT* IN IT ─────────────────────────
+     * Folding the target in here would make the same key aimed at costing B a
+     * DIFFERENT claim, so once the bookkeeping row had expired the reuse would
+     * quietly succeed and cost B under a key that already belongs to A. Left
+     * out, the claim collides, and the handler — which knows what the claim
+     * was spent on, because the target is stored beside it — answers 409.
+     *
+     * Nothing a client sends contributes to it except the key it is entitled
+     * to choose; company and actor come from the resolved context. */
+    const claimId = crypto
+      .createHash("sha256")
+      .update(JSON.stringify([
+        String(req.costing.companyId), String(req.costing.actorId),
+        operation, String(key).trim(),
+      ]))
+      .digest("hex");
+
     req.idempotent = {
       key,
+      claimId,
+      /* What this key was spent on, stored with the claim so a later reuse
+         against a different record is recognisable after the bookkeeping row
+         has gone. */
+      claimTarget: targetKey === undefined || targetKey === null ? "" : String(targetKey),
+      /* The canonical body fingerprint — TARGET INCLUDED, so "the same request
+         again" and "this key, reused for something else" stay distinguishable
+         long after the idempotency record's own retention has lapsed. */
+      requestHash: idempotency.hashRequest(req.body, targetKey),
+      recovering,
       record: claim.record,
       /* ── THE DURABLE MARKER ────────────────────────────────────────────
        * Written the instant the domain write commits and before anything that
