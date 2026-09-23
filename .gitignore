@@ -82,6 +82,15 @@ docker-compose.override.yml
 .env.bak-lan
 .history/
 
-# Python bytecode from the face engine (services/face-biometric)
-__pycache__/
-*.pyc
+# ===============================
+# Mautic development stack (deploy/mautic)
+# ===============================
+# The stack's real settings, its database and media volumes if anybody binds
+# them to the host, and any dump taken by the backup drill. The two
+# *.env.example files beside them are deliberately named so they do NOT match
+# the `.env.*` rule above and stay committable.
+deploy/mautic/.env
+deploy/mautic/data/
+deploy/mautic/backups/
+deploy/mautic/*.sql
+deploy/mautic/*.sql.gz

@@ -14,7 +14,15 @@ const cuttingEntrySchema = new mongoose.Schema(
     quantityCut:   { type: Number, default: 0 },
     startUnit:     { type: Number, default: 0 },
     endUnit:       { type: Number, default: 0 },
-    timestamp:     { type: Date, default: Date.now }
+    timestamp:     { type: Date, default: Date.now },
+    /* Who recorded this cut — the signed-in session, never a body field. */
+    recordedBy: {
+      id:   { type: mongoose.Schema.Types.ObjectId },
+      name: { type: String, default: "" },
+    },
+    /* Whether the WorkOrder's company was proved through its Sales line
+       ("linked") or cannot be ("unlinked", a historical order). */
+    companyProof: { type: String, enum: ["linked", "unlinked"], default: undefined },
   },
   { _id: true }
 );

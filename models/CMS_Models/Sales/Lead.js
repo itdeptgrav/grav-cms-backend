@@ -49,12 +49,19 @@
 // The canonical placeholders live under `conversion.*` below and remain
 // fully unset until the Chunk 5 conversion bridge exists.
 const mongoose = require("mongoose");
+const { companyOwnershipFields, addCompanyIndexes, sealCompanyOwnership } = require("./companyOwnership");
 const {
   LEAD_QUALIFICATION_STATE_CODES,
   LEAD_CAPTURE_STATUS_CODES,
   LEAD_REVIEW_STATUS_CODES,
   CUSTOMER_POTENTIAL_CODES,
   REQUIREMENT_CERTAINTY_CODES,
+  BUDGET_STATUS_CODES,
+  REQUIREMENT_UNIT_CODES,
+  LEAD_SOURCE_CODES,
+  CONTACT_ROLE_CODES,
+  CONTACT_STATUS_CODES,
+  PREFERRED_CHANNEL_CODES,
 } = require("../../../constants/crm");
 
 const actorRef = () => ({
@@ -131,26 +138,106 @@ const evidenceSchema = new mongoose.Schema(
   { _id: true, timestamps: true },
 );
 
-// Multiple people on a pre-Account Lead. B2B garment buyers are rarely one
-// person — a buyer, a merchandiser, a finance approver, the decision-maker.
-// These are LEAD-LOCAL only: they are NOT CRMContacts (those belong to an
-// Account, created at conversion). `decisionMakerName`/`decisionMakerRole`
-// below remain the single canonical decision-maker for backward compatibility
-// and the qualification check; a contact flagged `isDecisionMaker` ALSO
-// satisfies that check (see services/leadReadiness.js).
+/* ── THE PEOPLE ON A PROSPECT ───────────────────────────────────────────────
+ * B2B garment buyers are rarely one person: a merchandiser, a purchase
+ * manager, an admin head and whoever actually signs are four different people
+ * from the first call onwards. `contacts[]` is where they live.
+ *
+ * LEAD-LOCAL, deliberately. These are NOT CRMContacts. A CRMContact belongs to
+ * an Account, and creating one for a Prospect that may never convert produces
+ * an orphan customer record — polluting Contact search, the Contact duplicate
+ * checker and every Account-side count with somebody nobody has qualified.
+ * They are promoted to real Contacts when the Account is created (Chunk 5).
+ *
+ * ── CONTACTS ARE THE CANONICAL PERSON DATA ─────────────────────────────────
+ * Once a Prospect has `contacts[]`, the PRIMARY contact is the authority for
+ * every person-specific value. The Lead's own top-level `firstName`,
+ * `lastName`, `designation`, `email`, `phone`, `whatsapp` and the four
+ * communication-preference fields become COMPATIBILITY MIRRORS, written FROM
+ * the primary and never back into it. Duplicate detection, identityFor, call
+ * and WhatsApp matching, the readiness gate and every card read those
+ * top-level fields; mirroring keeps all of that working, and a single
+ * direction of authority is what stops the two disagreeing.
+ *
+ * Records captured before `contacts[]` existed have none, and are read exactly
+ * as they always were. See syncPrimaryContactMirrors below.
+ *
+ * `role` (free text) and `isDecisionMaker` are RETAINED unchanged. Old values
+ * are prose a salesperson typed — "buyer for the north region" — and are not
+ * reinterpreted as enum codes; `roleCode` is the new, separate, structured
+ * field and existing rows simply have none. `decisionMakerName`/
+ * `decisionMakerRole` on the Lead itself likewise stay the canonical single
+ * decision-maker for the qualification check.
+ */
 const leadContactSchema = new mongoose.Schema(
   {
     name: { type: String, trim: true, required: true },
+    jobTitle: { type: String, trim: true },
+    department: { type: String, trim: true },
+
+    /* The existing canonical CRM contact roles (constants/crm.js
+       CONTACT_ROLES), unchanged. Deliberately NOT a new generic taxonomy:
+       these are the roles this business actually deals with, and they are what
+       a CRMContact carries after promotion, so a parallel vocabulary would
+       have to be mapped — lossily — at conversion. The list is not restated
+       here; restating it is how a comment ends up describing a vocabulary that
+       has since grown. A later UI may surface the common ones first. */
+    roleCode: { type: String, enum: CONTACT_ROLE_CODES },
+    /* LEGACY, untouched: free-text role, and the decision-maker flag the
+       readiness gate already reads. Not migrated into `roleCode` — prose is
+       not an enum value, and guessing which code somebody meant would put
+       invented structure into the record. */
     role: { type: String, trim: true },
+    isDecisionMaker: { type: Boolean, default: false },
+
     email: { type: String, trim: true, lowercase: true },
     phone: { type: String, trim: true },
-    isDecisionMaker: { type: Boolean, default: false },
+    whatsapp: { type: String, trim: true },
+
+    /* Person-specific communication preferences. These previously sat on the
+       LEAD, which was wrong the moment a second contact existed: a purchase
+       manager and a site admin do not share a preferred channel or a good time
+       to call. The Lead's copies remain as mirrors of the primary. */
+    preferredChannel: { type: String, enum: PREFERRED_CHANNEL_CODES },
+    bestContactTime: { type: String, enum: ["morning", "afternoon", "evening", "anytime"] },
+    contactTimeNote: { type: String, trim: true },
+    preferredLanguage: { type: String, trim: true },
+
+    /* Exactly one active primary — enforced by the schema hook below and again
+       at the route boundary, because a rule only the frontend keeps is not a
+       rule. */
+    isPrimary: { type: Boolean, default: false },
+    /* active · left_organization · do_not_contact, from the CRM's own list.
+       `do_not_contact` will block outreach to THIS person while leaving the
+       other contacts reachable (Chunk 3); nothing enforces it yet. */
+    status: { type: String, enum: CONTACT_STATUS_CODES, default: "active" },
+    notes: { type: String, trim: true },
+
+    /* Normalised identity, kept ON the person rather than in a record-level
+       array, so a later duplicate result can say WHICH contact matched rather
+       than only that the record did (Chunk 4). Derived, never client-supplied
+       — see the pre-validate hook below. */
+    normalizedEmail: { type: String, trim: true, lowercase: true },
+    normalizedPhone: { type: String, trim: true },
+    normalizedWhatsapp: { type: String, trim: true },
+
+    /* Set at Account promotion (Chunk 5) so the Lead's own timeline can still
+       resolve people afterwards, and so a re-run cannot double-create.
+       Additive and unused for now — introducing it here costs nothing and
+       saves a second schema change on a collection this size. */
+    promotedContactId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMContact" },
   },
   { _id: true },
 );
 
 const leadSchema = new mongoose.Schema(
   {
+    /* ── COMPANY OWNERSHIP (Chunk 3B1) ────────────────────────────────────
+       Server-derived at creation, never from the request. See
+       models/CMS_Models/Sales/companyOwnership.js for the hierarchy and why
+       every level carries the company directly rather than through a join. */
+    ...companyOwnershipFields(),
+
     // Server-assigned, atomic per-year sequence (services/leadRef.js) —
     // mirrors SalesJourney.journeyId exactly. Required + immutable because a
     // Lead is always created WITH its reference already reserved (see
@@ -190,6 +277,46 @@ const leadSchema = new mongoose.Schema(
     reviewedAt: { type: Date },
     reviewedBy: actorRef(),
     reviewReason: { type: String, trim: true },
+
+    /* ── WHY THIS PROSPECT BECAME A LEAD ─────────────────────────────────────
+     * A Prospect is only a possible customer. What turns it into a Lead is not
+     * a commercial estimate — it is an observed signal that the customer wants
+     * something: they asked for a catalogue, a sample, a price.
+     *
+     * Recorded as its own small group rather than folded into `notes`, because
+     * "what made us believe this was real" is the one fact a later review, a
+     * manager, or the salesperson themselves will actually go looking for, and
+     * a free-text note is where questions like that go to be lost.
+     *
+     * The signal is a fixed vocabulary so it can be counted — "how many Leads
+     * came from a sample request" is a question the business can ask of this
+     * field and cannot ask of prose. `interestNote` carries the specifics that
+     * a vocabulary cannot.
+     *
+     * Additive. Nothing reads these before conversion, and every existing
+     * Prospect and Lead keeps working with them empty. */
+    interestSignal: {
+      type: String,
+      enum: [
+        "requested_product_info",
+        "requested_catalogue",
+        "requested_sample",
+        "requested_quotation",
+        "requested_meeting",
+        "shared_requirement",
+        "asked_price_or_delivery",
+        "agreed_to_continue",
+        "other",
+      ],
+      // No default, for the same reason `source` has none: an unset signal
+      // must fail the conversion check rather than quietly pass it as "other".
+    },
+    interestNote: { type: String, trim: true },
+    /* Server-set at conversion, exactly like submittedBy/reviewedBy above. The
+       client never sends these — who confirmed the interest, and when, is a
+       claim the server has to make on its own or it is worth nothing. */
+    interestConfirmedAt: { type: Date },
+    interestConfirmedBy: actorRef(),
 
     // "Archive Draft" (not the general hard-archive below) — who and when.
     // Deliberately separate from archivedAt/archivedBy: those belong to the
@@ -361,27 +488,162 @@ const leadSchema = new mongoose.Schema(
     // (not these codes) live in lib/leadQualification.js's SOURCES.
     source: {
       type: String,
-      enum: [
-        "website",
-        "referral",
-        "cold_call",
-        "trade_show",
-        "social_media",
-        "existing_customer",
-        "advertisement",
-        "walk_in",
-        "google",
-        "linkedin",
-        "directory",
-        "field_visit",
-        "other",
-      ],
+      /* The codes live in constants/crm.js LEAD_SOURCES, in their original
+         order, so the model, the lookups endpoint and every label agree.
+         `marketing_campaign` (Marketing handover chunk) and `indiamart`
+         (IndiaMART routing, 2026-09-22) were added there — additive only: no
+         existing record's `source` changes and no migration runs. `indiamart`
+         is what a buyer enquiry routed from IndiaMART carries, so it is never
+         reported as a Marketing campaign. */
+      enum: LEAD_SOURCE_CODES,
       // No `default` (correction) — "Lead source recorded" is a genuine
       // readiness/activation check (services/leadReadiness.js); a silent
       // "other" default let that check pass even when nobody had actually
       // picked a source. Every write path (Quick Capture, Prospect Setup's
       // OriginSection) now only sends `source` when a real choice was made.
     },
+
+    /* ── WHERE THIS PROSPECT ACTUALLY CAME FROM ──────────────────────────────
+     * `source` is a category; these are the specifics that make it findable
+     * again. "Referral" is only useful if somebody recorded WHO referred them;
+     * "trade show" is only useful with the name of the show.
+     *
+     * Three separate fields rather than one free-text blob because two of them
+     * are conditional on the source and one is not — folding them together
+     * would mean parsing prose to answer "which exhibition produced the most
+     * Prospects", which is a question the business will ask.
+     *
+     * All optional, all additive. Nothing reads them as a gate. */
+    sourceDetails: { type: String, trim: true },
+    referredBy: { type: String, trim: true },
+    campaignOrEvent: { type: String, trim: true },
+
+    /* ── WHAT MARKETING HANDED OVER, IF ANYTHING ────────────────────────────
+     * A COMPACT PROJECTION, NOT A SECOND MARKETING STORE.
+     *
+     * Present only on a Prospect created by the Marketing application's
+     * handover (services/sales/marketingProspectIntake.service.js is the only
+     * writer). Every other Lead has no such field, no migration runs, and
+     * nothing in the existing Prospect or Lead workflow reads it.
+     *
+     * WHY IT IS HERE AND NOT ONLY ON THE RECEIPT. A salesperson opening a
+     * Prospect must see, in the record itself, that Marketing sent it, from
+     * which campaign, on what permission, and how fresh that is — otherwise
+     * they call somebody whose consent state they cannot see. The full
+     * package, the evidence and the decision live on the receipt
+     * (models/CMS_Models/Sales/MarketingProspectIntake.js); this is the label
+     * on the front of the record.
+     *
+     * WHAT IT MAY NEVER GROW: the raw engagement stream, a marketing score, or
+     * anything a Sales screen would then have to keep in step with Mautic.
+     * Duplicating Marketing's event store here is exactly the "second activity
+     * timeline inside Sales" the roadmap forbids.
+     *
+     * IT CARRIES NO LIFECYCLE MEANING. `captureStatus`, `reviewStatus` and
+     * `qualificationState` remain the only lifecycle axes, each with its
+     * single existing writer. A handover cannot move any of them. */
+    marketingHandover: {
+      /* The identity Marketing and Sales both quote. Unique per company (see
+         the partial index below), which is what makes a redelivered handover
+         event structurally incapable of creating a second Prospect. */
+      handoverRef: { type: String, trim: true },
+      receivedAt: { type: Date },
+      campaignId: { type: String, trim: true },
+      campaignName: { type: String, trim: true },
+      assetName: { type: String, trim: true },
+      sourceSystem: { type: String, trim: true },
+      /* Marketing permission as it stood when Sales was told. A stale copy is
+         better than no copy only because it is dated: `permissionAsOf` is what
+         lets a salesperson see that it is stale. */
+      emailConsent: { type: String, trim: true },
+      phoneConsent: { type: String, trim: true },
+      permissionAsOf: { type: Date },
+      lastEngagedAt: { type: Date },
+      accountFit: { type: String, trim: true },
+      intent: { type: String, trim: true },
+      handoverReason: { type: String, trim: true },
+      recommendedAction: { type: String, trim: true },
+      /* Which data provider enriched this person, by name — so an enriched
+         field is never presented as something GRAV observed itself. */
+      dataProviders: [{ type: String, trim: true }],
+      /* ── WHEN THE HANDOVER CAME FROM A LEAD SOURCE (IndiaMART) ─────────────
+         Additive (2026-09-22). What the buyer's enquiry was, under GRAV's own
+         reference (MSE-…) — never the source's id — and when it was made,
+         with where that time came from. Absent on every campaign handover. */
+      sourceEnquiry: {
+        source: { type: String, trim: true },
+        sourceRef: { type: String, trim: true },
+        kind: { type: String, trim: true },
+        channel: { type: String, trim: true },
+        submittedAt: { type: Date },
+        submittedAtText: { type: String, trim: true },
+        submittedAtProvenance: { type: String, trim: true },
+        submittedAtConfirmedBy: { type: String, trim: true },
+      },
+    },
+
+    /* An early observation of what the customer might want — deliberately NOT
+     * `requirements[]`, which is a structured commitment made on an Active
+     * Lead. This is the sentence a salesperson writes after one phone call,
+     * and it is allowed to be wrong. */
+    possibleNeed: { type: String, trim: true },
+
+    /* ── WHAT IS ACTUALLY KNOWN ABOUT A POSSIBLE CUSTOMER ────────────────────
+     * Factual, optional context a salesperson can record before anybody has
+     * qualified anything. Deliberately NOT commercial: no quantities, budgets,
+     * delivery dates or revenue estimates live here — those are an Active
+     * Lead's business, and asking for them this early is how an invented
+     * figure becomes an indistinguishable "fact".
+     *
+     * Controlled vocabularies where the options are fixed, so they can be
+     * counted; free text only where a vocabulary genuinely cannot carry the
+     * answer. Every one is optional, none gates conversion, and all of them
+     * survive Prospect → Lead untouched — it is the same record. */
+
+    /* What KIND of buyer this is, in the words the sales floor uses. Distinct
+     * from `industry` (the "Customer segment" taxonomy used in reporting),
+     * which is a qualification judgement made later. */
+    businessType: {
+      type: String,
+      enum: [
+        "hotel_hospitality",
+        "hospital_healthcare",
+        "school_education",
+        "corporate_office",
+        "industrial_workwear",
+        "retail_fashion",
+        "distributor_wholesaler",
+        "government_institution",
+        "individual",
+        "other",
+      ],
+    },
+    // How they would rather be reached, and when — the difference between a
+    // follow-up that lands and one that annoys.
+    preferredContactMethod: { type: String, enum: ["call", "whatsapp", "email", "none"] },
+    bestContactTime: { type: String, enum: ["morning", "afternoon", "evening", "anytime"] },
+    contactTimeNote: { type: String, trim: true },
+    preferredLanguage: { type: String, trim: true },
+    /* A BROAD, early guess at what they might buy — a fixed vocabulary so it
+     * can be counted and filtered. Deliberately separate from
+     * `productInterest[]`, which is derived from `requirementItems[]` (the
+     * confirmed, per-product requirement on an Active Lead) and would be
+     * overwritten by that sync. These two answer different questions: "what do
+     * we think they're in the market for" and "what have they actually asked
+     * us to quote". */
+    productInterests: [{
+      type: String,
+      enum: [
+        "uniforms",
+        "workwear",
+        "hospitality_linen",
+        "corporate_apparel",
+        "school_wear",
+        "healthcare_garments",
+        "custom_garments",
+        "not_known",
+      ],
+    }],
     // LEGACY. Unchanged enum, unchanged default, unchanged meaning — see the
     // file header. Only ever written by services/leadQualification.js now,
     // derived from a validated qualificationState change.
@@ -429,7 +691,21 @@ const leadSchema = new mongoose.Schema(
     priority: {
       type: String,
       enum: ["low", "medium", "high", "urgent"],
-      default: "medium",
+      /* ── NO DEFAULT ────────────────────────────────────────────────────────
+       * It defaulted to "medium", which made every record claim a priority
+       * nobody had chosen — and made the Prospect form's "Optional / Not set"
+       * a lie twice over: new Prospects arrived as Medium, and choosing "Not
+       * set" sent "" into an enum that refused it.
+       *
+       * Unset is now a real state. The Leads list already handled it:
+       * `PRIORITY_RANK[a.priority] ?? 2` sorts an absent priority exactly
+       * where "medium" used to sit, so ordering is unchanged for every record
+       * that never had one deliberately.
+       *
+       * Records already holding "medium" keep it. This removes the default for
+       * NEW documents; it does not migrate existing ones, and a stored
+       * "medium" is indistinguishable from a chosen one — which is precisely
+       * the ambiguity the default created and why it is going. */
     },
     estimatedValue: { type: Number, default: 0 },
     probability: { type: Number, min: 0, max: 100, default: 20 },
@@ -442,7 +718,15 @@ const leadSchema = new mongoose.Schema(
     // keep working unchanged.
     requirementItems: [
       new mongoose.Schema(
-        { product: { type: String, trim: true }, quantity: { type: Number, min: 0 } },
+        {
+          product: { type: String, trim: true },
+          quantity: { type: Number, min: 0 },
+          /* Per row, because one requirement can mix them: 400 shirts and 200
+             metres of the same fabric. Left unset rather than defaulted — the
+             form shows "pieces" as the pre-selected answer, but storing that
+             for a row nobody typed would claim a unit the customer never gave. */
+          unit: { type: String, enum: REQUIREMENT_UNIT_CODES },
+        },
         { _id: false },
       ),
     ],
@@ -454,8 +738,23 @@ const leadSchema = new mongoose.Schema(
     // (the legacy sales-pipeline close-date field, which this form does not
     // use).
     requirementDate: { type: Date },
+    /* Optional DETAIL behind `budgetStatus`. Free text, and deliberately still
+       free text: existing values like "₹50L approved for FY26" stay readable
+       and editable exactly as typed. Nothing reinterprets or migrates them. */
     budget: { type: String, trim: true },
+    /* Where the money stands, as a state rather than a figure — see
+       constants/crm.js BUDGET_STATUSES for why. Optional; no stage reads it. */
+    budgetStatus: { type: String, enum: BUDGET_STATUS_CODES },
+    /* The one thing most likely to stop this order, in the salesperson's own
+       words. Optional. Not a stage input — a fact worth having on the record
+       before somebody quotes. */
+    keyObjection: { type: String, trim: true },
     requirements: { type: String, trim: true },
+    /* The programme this requirement belongs to — "hotel opening", "annual
+       staff uniforms", "school term intake". The one genuinely missing
+       requirement field: without it a 400-shirt line reads the same whether it
+       is a one-off event or the start of a yearly cycle. */
+    requirementUseCase: { type: String, trim: true },
     // Lead correction chunk — how firmly the CONFIRMED current requirement
     // above is actually known, separate from `estimatedAnnual*Confidence`
     // (which grades the RESEARCHED annual commercial potential, not this).
@@ -502,6 +801,14 @@ const leadSchema = new mongoose.Schema(
       subject: { type: String, trim: true },
       dueDate: { type: Date },
       notes: { type: String, trim: true },
+      /* WHO this one action is aimed at — an embedded contact's `_id`, not a
+         CRMContact. Optional: a general next action ("chase the tender
+         document") is about the record, and every existing record has none.
+
+         Deliberately ONE action with an optional target, not a follow-up
+         schedule per person. A Prospect has one thing to do next; giving each
+         contact their own would turn a work queue into four. */
+      leadContactId: { type: mongoose.Schema.Types.ObjectId },
     },
 
     // ── Conversion — LEGACY (top-level). See file header. Not written by any
@@ -538,6 +845,11 @@ const leadSchema = new mongoose.Schema(
     normalizedCompany: { type: String, trim: true, lowercase: true },
     emailDomain: { type: String, trim: true, lowercase: true },
     normalizedPhone: { type: String, trim: true },
+    /* The record's own WhatsApp number, normalised like the rest. It had no
+       derived form, so a cross-record identity check could not see it — a Lead
+       whose WhatsApp matched another Lead's looked unique. Additive: existing
+       records gain it on their next save. */
+    normalizedWhatsapp: { type: String, trim: true, index: true },
     websiteDomain: { type: String, trim: true, lowercase: true },
 
     // ── Audit actors (§4), matching the Step-01 CRM convention (Activity.js,
@@ -569,13 +881,213 @@ const hostOf = (url) => {
   }
 };
 
+/* ── ONE PRIMARY, AND THE MIRRORS THAT FOLLOW IT ────────────────────────────
+ * Everything below runs on WRITE only. A read never mutates a record — a GET
+ * that quietly materialises a contact would rewrite history on every page
+ * load, and would do it under whichever user happened to open the page.
+ *
+ * The form adapter presents a legacy record's top-level person as a synthetic
+ * contact for display; it becomes real the first time somebody saves.
+ */
+
+/* ── TWO CHANNEL VOCABULARIES, MAPPED ONCE ─────────────────────────────────
+   A contact carries the CRM's own `PREFERRED_CHANNELS` (email · phone ·
+   messaging · portal · none) — the same list CRMContact uses, so promotion to
+   a real Contact at Account creation is lossless.
+
+   The Lead's legacy `preferredContactMethod` is a different, older set (call ·
+   whatsapp · email · none) written for the Prospect form. Mirroring one onto
+   the other without a translation writes an invalid enum value and the whole
+   save fails — which is exactly what happened the first time this ran.
+
+   `portal` has no legacy equivalent, so the mirror is cleared rather than
+   guessed at: an absent preference is honest, a wrong one is not. */
+const LEGACY_CONTACT_METHOD = {
+  phone: "call",
+  messaging: "whatsapp",
+  email: "email",
+  none: "none",
+  // portal → undefined
+};
+
+/** The comparable form of a phone number: digits only, matching the Lead's own
+ *  `normalizedPhone` rule so a contact and a record normalise identically. */
+const contactPhone = (v) => String(v ?? "").replace(/\D+/g, "");
+const contactEmail = (v) => String(v ?? "").trim().toLowerCase();
+
+/** A structural violation of the contact contract. Carries `status: 400` so a
+ *  route's existing catch reports it as the client error it is. */
+class LeadContactError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LeadContactError";
+    this.status = 400;
+  }
+}
+
+/**
+ * Normalise each contact's identity, then ASSERT the primary contract.
+ *
+ * ── IT VALIDATES, IT NO LONGER REPAIRS ─────────────────────────────────────
+ * The first version of this silently settled a malformed list: several
+ * primaries became "the last one wins", no primary became "the first active
+ * one". Both are guesses. This function cannot know which contact somebody
+ * just clicked, and choosing by array order means a reorder in the UI silently
+ * moves the primary. A rejected save is visible and correctable; a repaired
+ * one is neither.
+ *
+ * So the rules are assertions:
+ *   · an Individual Prospect has at most ONE contact — `prospectType` is the
+ *     authority, and a record that needs several must be changed to
+ *     Organisation deliberately, not overridden here;
+ *   · at most one contact may be marked primary;
+ *   · only an ACTIVE contact may be primary;
+ *   · several active contacts with none marked is ambiguous and refused.
+ *
+ * The single permitted inference: one active contact and nothing marked
+ * becomes primary. There is no choice to get wrong.
+ *
+ * A Prospect with no contacts at all is valid — early capture often knows only
+ * the company. A Prospect whose contacts are all inactive may have no primary;
+ * it simply cannot convert.
+ */
+function settleContacts(lead) {
+  const list = lead.contacts;
+  if (!Array.isArray(list) || list.length === 0) return null;
+
+  for (const c of list) {
+    c.normalizedEmail = contactEmail(c.email) || undefined;
+    c.normalizedPhone = contactPhone(c.phone) || undefined;
+    c.normalizedWhatsapp = contactPhone(c.whatsapp) || undefined;
+    if (!c.status) c.status = "active";
+  }
+
+  /* ── `prospectType` IS THE AUTHORITY ──────────────────────────────────
+     An earlier version inferred the type from the presence of a company name,
+     so an explicitly Individual Prospect with an employer on file was treated
+     as an Organisation — overriding a choice the user actually made, forever
+     and invisibly. A record that genuinely needs several people is changed to
+     Organisation deliberately. Extra contacts are neither demoted nor
+     deleted: the save is refused and says why. */
+  if (lead.prospectType === "individual" && list.length > 1) {
+    throw new LeadContactError(
+      "An Individual Prospect can have only one contact — that person IS the prospect. Change its type to Organisation to record several people.",
+    );
+  }
+
+  const active = list.filter((c) => c.status === "active");
+  const flagged = list.filter((c) => c.isPrimary);
+
+  if (flagged.length > 1) {
+    throw new LeadContactError("Only one contact can be the primary contact. Mark exactly one.");
+  }
+  if (flagged.length === 1 && flagged[0].status !== "active") {
+    throw new LeadContactError(
+      `The primary contact must be active — "${flagged[0].name}" is marked ${flagged[0].status.replace(/_/g, " ")}. Mark another active contact as primary.`,
+    );
+  }
+  if (flagged.length === 1) return flagged[0];
+
+  /* Nothing marked. One active contact is unambiguous; several is a question
+     only the user can answer. */
+  if (active.length === 1) {
+    active[0].isPrimary = true;
+    return active[0];
+  }
+  if (active.length > 1) {
+    throw new LeadContactError("Mark which of these people is the primary contact.");
+  }
+  return null;   // contacts exist but none is active — valid, cannot convert
+}
+
+/**
+ * Copy the primary contact's person data onto the Lead's legacy fields.
+ *
+ * ONE DIRECTION ONLY. Syncing both ways would create two authorities that
+ * agree until the first conflicting edit, and then quietly disagree forever.
+ * The primary contact is the authority; these fields are its shadow, kept
+ * because duplicate detection, identityFor, call/WhatsApp matching, the
+ * readiness gate and every list column read them.
+ *
+ * A record with no contacts is left completely alone — that is a legacy
+ * Prospect, and its top-level fields are its real data.
+ */
+function syncPrimaryContactMirrors(lead) {
+  const primary = settleContacts(lead);
+  if (!primary) return;
+
+  const parts = String(primary.name || "").trim().split(/\s+/).filter(Boolean);
+  lead.firstName = parts[0] || "";
+  lead.lastName = parts.slice(1).join(" ");
+  lead.designation = primary.jobTitle || primary.role || "";
+  lead.email = primary.email || "";
+  lead.phone = primary.phone || "";
+  lead.whatsapp = primary.whatsapp || "";
+  lead.preferredContactMethod = LEGACY_CONTACT_METHOD[primary.preferredChannel];
+  lead.bestContactTime = primary.bestContactTime || undefined;
+  lead.contactTimeNote = primary.contactTimeNote || "";
+  lead.preferredLanguage = primary.preferredLanguage || "";
+}
+
+/* Runs before validation so a required `name` is still enforced by Mongoose,
+   and before the identity hook below so the mirrored phone/email are what get
+   normalised into normalizedPhone/emailDomain. */
+leadSchema.pre("validate", function (next) {
+  if (!this.isModified("contacts") && !this.isModified("prospectType")) return next();
+  try {
+    syncPrimaryContactMirrors(this);
+  } catch (err) {
+    /* A contract violation, not a crash — handed to Mongoose so it surfaces
+       through the same path every other validation failure uses. */
+    return next(err);
+  }
+  next();
+});
+
+/* ── THE PROJECTIONS ARE DERIVED, NOT MAINTAINED ─────────────────────────────
+   `productInterest[]` (flat product names) and `estimatedQuantity` (the total)
+   are views of `requirementItems[]`, and the form used to send all three. Two
+   writers of one fact eventually disagree, and here the disagreement would be
+   silent: the readiness gate reads the projections, so a stale total could
+   qualify a Lead whose lines say otherwise. The rows are now the only thing
+   anybody edits, and these follow from them.
+
+   Only when `requirementItems` is actually touched — a Lead that predates the
+   structured rows keeps whatever its projections already hold, because
+   rebuilding them from an empty array would erase real data. */
 leadSchema.pre("save", function (next) {
+  if (this.isModified("requirementItems")) {
+    const rows = (this.requirementItems || []).filter((r) => String(r.product ?? "").trim());
+    this.productInterest = rows.map((r) => String(r.product).trim());
+    const quantities = rows.filter((r) => r.quantity != null && r.quantity !== "");
+    this.estimatedQuantity = quantities.length
+      ? quantities.reduce((sum, r) => sum + (Number(r.quantity) || 0), 0)
+      : undefined;
+  }
+  next();
+});
+
+leadSchema.pre("save", function (next) {
+  /* ── EVERY IDENTITY THE DUPLICATE CHECK READS ──────────────────────────
+     A duplicate review certifies the identity data it was performed against.
+     `whatsapp` and the people in `contacts[]` are both identity now — the
+     cross-record ambiguity check matches on them — so changing either has to
+     retire the review. Leaving them out meant adding a second contact whose
+     number already sat on another Lead kept a green "reviewed" stamp that had
+     never seen that number. */
   const identityChanged =
     this.isModified("company") || this.isModified("email") ||
-    this.isModified("phone") || this.isModified("website");
+    this.isModified("phone") || this.isModified("website") ||
+    this.isModified("whatsapp") || this.isModified("contacts");
   if (this.isModified("company")) this.normalizedCompany = String(this.company || "").trim().toLowerCase();
   if (this.isModified("email")) this.emailDomain = domainOf(this.email);
   if (this.isModified("phone")) this.normalizedPhone = digitsOnly(this.phone);
+  /* The record's own WhatsApp number, normalised like the rest. It had no
+     derived form, so a cross-record identity check could not see it — a Lead
+     whose WhatsApp matched another Lead's looked unique. Additive; existing
+     records gain it on their next save and are matched on the raw field
+     meanwhile. */
+  if (this.isModified("whatsapp")) this.normalizedWhatsapp = digitsOnly(this.whatsapp);
   if (this.isModified("website")) this.websiteDomain = hostOf(this.website);
   // A duplicate review is only meaningful for the identity data it was
   // performed against — see the field's own comment above.
@@ -596,6 +1108,23 @@ leadSchema.index({ nextFollowUpAt: 1 });
 leadSchema.index({ "conversion.accountId": 1 });
 leadSchema.index({ "conversion.journeyId": 1 });
 
+/* ── ONE PROSPECT PER MARKETING HANDOVER, ENFORCED BY THE DATABASE ──────────
+   The Sales intake ledger already refuses a second receipt for the same
+   handover. This is the same guarantee stated about STATE rather than about
+   events: even if two intakes raced past the ledger, only one of them can
+   create a Prospect carrying the reference.
+
+   `partialFilterExpression` is what keeps it additive — the index covers only
+   documents that actually have the field, so every existing Lead (and every
+   Lead created by hand from now on) is outside it and cannot collide. */
+leadSchema.index(
+  { companyId: 1, "marketingHandover.handoverRef": 1 },
+  {
+    unique: true,
+    partialFilterExpression: { "marketingHandover.handoverRef": { $type: "string" } },
+  },
+);
+
 const LeadModel = mongoose.model("Lead", leadSchema);
 
 // Exposed as static helpers (same pattern as Mongoose's own Model.find/
@@ -610,5 +1139,20 @@ LeadModel.normalizeCompany = (s) => String(s || "").trim().toLowerCase();
 LeadModel.normalizePhoneDigits = digitsOnly;
 LeadModel.normalizeEmailDomain = domainOf;
 LeadModel.normalizeWebsiteDomain = hostOf;
+/* The contact normalisers, exposed for the same reason as the four above: a
+   later duplicate check must normalise a CANDIDATE person exactly the way the
+   hook normalised a STORED one. */
+LeadModel.normalizeContactPhone = contactPhone;
+LeadModel.normalizeContactEmail = contactEmail;
+LeadModel.settleContacts = settleContacts;
+LeadModel.LeadContactError = LeadContactError;
 
+/* Company-prefixed indexes for the scoped list and lookup patterns. */
+addCompanyIndexes(leadSchema, [{ "leadId": 1 }, { "captureStatus": 1, "updatedAt": -1 }, { "ownerId": 1 }]);
+
+
+/* Ownership is stamped once, at creation, from the server-resolved company.
+   Nothing after that — a PATCH, an archive, a replacement — may move it.
+   See sealCompanyOwnership() in ./companyOwnership.js. */
+sealCompanyOwnership(leadSchema);
 module.exports = LeadModel;

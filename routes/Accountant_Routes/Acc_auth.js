@@ -14,17 +14,28 @@ const {
 } = require("../../models/Accountant_model/Acc_OrgModels");
 
 const orgAuthModule = require("../../Middlewear/AccountantOrgAuthMiddleware");
-const { orgAuth, signOrgToken, extractToken } = orgAuthModule;
+const {
+  orgAuth,
+  // The ONLY middleware that accepts a legacy CMS session, and the only place
+  // it may be mounted: GET /me (so the frontend can detect the legacy session)
+  // and POST /sync-legacy (which upgrades it). It attaches a zero-permission
+  // identity — see AccountantOrgAuthMiddleware.js.
+  legacyBootstrapAuth,
+  ACCOUNTING_SESSION_UPGRADE_REQUIRED,
+  signOrgToken,
+  extractToken,
+} = orgAuthModule;
 
 if (
   typeof orgAuth !== "function" ||
+  typeof legacyBootstrapAuth !== "function" ||
   typeof signOrgToken !== "function" ||
   typeof extractToken !== "function"
 ) {
   const have = Object.keys(orgAuthModule || {}).join(", ") || "(empty module)";
   throw new Error(
     `[accountantAuthRoutes] AccountantOrgAuthMiddleware.js is missing required exports.\n` +
-      `  Expected: orgAuth, signOrgToken, extractToken (all functions).\n` +
+      `  Expected: orgAuth, legacyBootstrapAuth, signOrgToken, extractToken (all functions).\n` +
       `  Got: ${have}\n` +
       `  Fix: replace backend/Middlewear/AccountantOrgAuthMiddleware.js with the latest version\n` +
       `  from coa-updates/backend/Middlewear/AccountantOrgAuthMiddleware.js, then restart node.`,
@@ -192,7 +203,11 @@ router.delete("/push-token", orgAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // GET /me  — needs auth
 // ─────────────────────────────────────────────────────────────────────────
-router.get("/me", orgAuth, async (req, res) => {
+// Mounted on `legacyBootstrapAuth`, not `orgAuth`: a legacy CMS session must
+// still be able to identify itself here, because that is exactly how the
+// frontend learns it needs to call /sync-legacy. The session it gets carries no
+// permissions, so this endpoint tells the caller who they are and nothing else.
+router.get("/me", legacyBootstrapAuth, async (req, res) => {
   // ── Dev bypass ───────────────────────────────────────────────────────────
   // FIX: added `return` so execution stops here; moved hiddenNavItems
   // reference inside a block where it's safely hard-coded to [] for dev mode.
@@ -220,22 +235,32 @@ router.get("/me", orgAuth, async (req, res) => {
     });
   }
 
-  // ── Legacy token ─────────────────────────────────────────────────────────
+  // ── Legacy token — bootstrap identity only ───────────────────────────────
+  // Every permission is false and there is no organisation. The response is
+  // deliberately explicit: `isLegacy` is what AuthProvider already keys off to
+  // POST /sync-legacy, and `code` + `upgradeEndpoint` say so unambiguously for
+  // anything else reading this. Nothing in the accounting module is reachable
+  // with this session until the upgrade succeeds.
   if (req.user?.isLegacy) {
     return res.json({
       success: true,
+      code: ACCOUNTING_SESSION_UPGRADE_REQUIRED,
+      requiresUpgrade: true,
+      upgradeEndpoint: "/api/accountant/auth/sync-legacy",
       user: {
         id: req.user.id,
         name: req.user.name,
         email: req.user.email,
-        role: req.user.role || "owner",
+        // No silent promotion to "owner" — an absent role is an absent role.
+        role: req.user.role || "legacy",
         isLegacy: true,
       },
       organization: null,
       permissions: req.user.permissions,
       hiddenNavItems: [],
       message:
-        "Logged in via legacy token. Sub-account features unavailable until you log in via the accountant login.",
+        "Legacy CMS session detected. It grants no accounting access — " +
+        "sync your accounting session to continue, or sign in to the accounting module.",
     });
   }
 
@@ -472,26 +497,40 @@ router.post("/bootstrap", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /sync-legacy — auto-bootstrap from a legacy CMS login
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/sync-legacy", async (req, res) => {
+// Mounted on `legacyBootstrapAuth` — the same door as /me — rather than
+// extracting a token itself. That is what makes the guard below possible: this
+// endpoint consumes a LEGACY BOOTSTRAP IDENTITY, and can now tell one from an
+// organisation-aware session instead of feeding whatever token came first into
+// an Acc_Department lookup.
+//
+// Why that mattered: an accountant_token carries the Acc_User's own email, so
+// the department lookup below would MATCH on it and mint a fresh session. The
+// revocation check further down reads `iat` from a CMS token and knows nothing
+// about tokenVersion, so a token already revoked by "log out of all devices"
+// could have re-minted itself here — the exact thing that check exists to stop.
+router.post("/sync-legacy", legacyBootstrapAuth, async (req, res) => {
   try {
-    const token = extractToken(req);
-    if (!token) {
-      return res
-        .status(401)
-        .json({ success: false, message: "No legacy session detected" });
+    // Already organisation-aware (or a dev session): there is nothing to
+    // upgrade, and its token is not a department identity. Answered rather than
+    // refused, so a frontend that calls this speculatively just carries on.
+    if (!req.user?.isLegacy || !req.legacyBootstrap?.decoded) {
+      return res.json({
+        success: true,
+        promoted: false,
+        alreadyUpgraded: true,
+        message: "This session is already organisation-aware — nothing to upgrade.",
+        user: {
+          id: req.user?.id,
+          organizationId: req.user?.organizationId || null,
+          name: req.user?.name,
+          email: req.user?.email,
+          role: req.user?.role,
+          isOwner: req.user?.role === "owner",
+        },
+      });
     }
 
-    let decoded;
-    try {
-      decoded = jwt.verify(
-        token,
-        process.env.JWT_SECRET || "grav_clothing_secret_key",
-      );
-    } catch (e) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Invalid legacy token" });
-    }
+    const decoded = req.legacyBootstrap.decoded;
 
     const legacyUserId =
       decoded.id || decoded._id || decoded.userId || decoded.employeeId;
@@ -592,6 +631,11 @@ router.post("/sync-legacy", async (req, res) => {
         success: true,
         promoted: false,
         message: "Existing account — session refreshed.",
+        // Returned in the body as well as the cookie. lib/api.js stores this
+        // and replays it as `Authorization: Bearer`, which is now the only
+        // cross-origin fallback there is — falling back to the CMS token buys
+        // the bootstrap flow and nothing else.
+        token: jwtToken,
         user: {
           id: user._id,
           organizationId: user.organizationId,
@@ -653,6 +697,11 @@ router.post("/sync-legacy", async (req, res) => {
         success: true,
         promoted: false,
         message: "Existing account — session refreshed.",
+        // Returned in the body as well as the cookie. lib/api.js stores this
+        // and replays it as `Authorization: Bearer`, which is now the only
+        // cross-origin fallback there is — falling back to the CMS token buys
+        // the bootstrap flow and nothing else.
+        token: jwtToken,
         user: {
           id: user._id,
           organizationId: user.organizationId,
@@ -705,6 +754,7 @@ router.post("/sync-legacy", async (req, res) => {
       success: true,
       promoted: true,
       message: "Legacy account promoted to organization owner.",
+      token: jwtToken,
       user: {
         id: user._id,
         organizationId: user.organizationId,

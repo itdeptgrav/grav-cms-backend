@@ -1,6 +1,7 @@
 // models/Customer_models/CustomerRequest.js
 
 const mongoose = require("mongoose");
+const { ensureLineIdentities } = require("./customerRequestLineIdentity");
 
 // ========== REQUEST ITEM SCHEMAS ==========
 const requestItemVariantSchema = new mongoose.Schema(
@@ -67,9 +68,46 @@ const requestItemVariantSchema = new mongoose.Schema(
 
 const requestItemSchema = new mongoose.Schema(
   {
+    // ── THIS LINE'S PERMANENT NAME ────────────────────────────────────────
+    //
+    // Server-minted, unique within the request, and never reissued. It is the
+    // identity anything outside this record points at — the Sales →
+    // Merchandising handover above all, which used to point at
+    // `sampleStyleId` and therefore could not tell two commercial lines of
+    // the same style apart.
+    //
+    // Position cannot be that identity: the quotation paths filter emptied
+    // lines out and reassign the array. Neither can the style: one order
+    // legitimately carries a style twice, for two destinations or two
+    // delivery commitments. See customerRequestLineIdentity.js for how it is
+    // minted and why a client can name one but never invent one.
+    lineRef: {
+      type: String,
+      trim: true,
+      index: true,
+    },
     stockItemId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "StockItem",
+    },
+    // The approved style this customer-request line represents. This is the
+    // durable identity bridge to Central Costing; the quotation never infers a
+    // price from a product name or SKU.
+    sampleStyleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SampleStyle",
+      default: null,
+      index: true,
+    },
+    /* ── AND WHICH COMMERCIAL LINE IT IS ────────────────────────────────
+       The style alone is not the key: the commercial line is keyed by the
+       permanent `productLineRef` AND the style, because one enquiry can
+       carry the same garment twice in two colourways. Stamped on a line
+       raised from an enquiry, so the quantity on it can be traced back to
+       the line it was read from. Absent on a request raised any other way. */
+    productLineRef: {
+      type: String,
+      trim: true,
     },
     stockItemName: {
       type: String,
@@ -85,6 +123,41 @@ const requestItemSchema = new mongoose.Schema(
     totalEstimatedPrice: {
       type: Number,
       min: 0,
+    },
+
+    /* ── WHICH COMMERCIAL DECISION PRICED THIS LINE ─────────────────────
+       A proforma raised from an enquiry line is priced by an APPROVED
+       costing version and the selling price that version was approved with.
+       This records which one, so the figure on a customer-facing document
+       can be accounted for without anybody reconstructing it from memory.
+       Absent on a request raised any other way, and never accepted from a
+       request body — `proformaRequest.service` resolves and stamps it.
+
+       The floor and the standing are internal commercial facts. They live
+       here, on the request record, and are not part of what a customer
+       document renders. */
+    commercialDecision: {
+      type: new mongoose.Schema({
+        costingId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        costingVersionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        costingVersionNumber: { type: Number, default: null },
+        scenarioKey: { type: String, trim: true, default: null },
+        /* The confirmed quantity and the approved price, in the units each is
+           authoritative in — minor units for money, so no rounding happens
+           between the decision and the document. */
+        quantity: { type: Number, default: null },
+        unitPriceMinor: { type: Number, default: null },
+        floorPriceMinor: { type: Number, default: null },
+        standing: { type: String, trim: true, default: null },
+        /* Said rather than inferred: a below-floor price is only invoiceable
+           through a completed executive exception, and a reader must be able
+           to see that this was one. */
+        wasBelowFloorException: { type: Boolean, default: false },
+        approvedAt: { type: Date, default: null },
+        approvedByName: { type: String, trim: true, default: null },
+        decisionReason: { type: String, trim: true, default: null },
+      }, { _id: false }),
+      default: undefined,
     },
   },
   { _id: false },
@@ -251,6 +324,40 @@ const quotationItemSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "StockItem",
     },
+
+    // ── WHICH STYLE THIS LINE IS FOR (Central Costing handoff) ─────────────
+    //
+    // THE SMALLEST ADDITIVE REFERENCE THAT MAKES THE JOIN REAL. A quotation
+    // line carried `stockItemId` and free text, and Central Costing is keyed
+    // by `{enquiryId, productName}` — so there was no stored path between a
+    // priced line and the costing that priced it. The only bridge available
+    // was `SampleStyle.production.stockItemId`, and that is one-to-many: two
+    // variant styles routinely share a finished good, so a reverse lookup
+    // would price the navy line from the ecru costing and look perfectly
+    // reasonable doing it.
+    //
+    // Matching on product name, SKU text, amount or array position was never
+    // an option — a rename, a reorder or a coincidence of wording would each
+    // silently repoint the price.
+    //
+    // Nullable, and absent on every existing line: a quotation without it
+    // simply has no approved price to offer, which is the honest state for
+    // the 25 quotations that predate this.
+    sampleStyleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SampleStyle",
+      default: null,
+      index: true,
+    },
+
+    /* ── AND WHICH ROW OF THE ENQUIRY IT IS ────────────────────────────────
+       The permanent reference of the commercial line this quotation line was
+       priced from. A style says which colourway; this says which of the
+       enquiry's rows, which is what tells two rows of the same garment apart
+       when they share a style or a finished good. Absent on every manual and
+       historical line — nothing infers one. */
+    productLineRef: { type: String, trim: true, default: undefined },
+
     itemName: {
       type: String,
     },
@@ -285,6 +392,68 @@ const quotationItemSchema = new mongoose.Schema(
       type: Number,
       min: 0,
     },
+    // ── WHERE THIS PRICE CAME FROM ────────────────────────────────────────
+    //
+    // Present when Sales took an approved costing price; absent when they
+    // typed one. The absence is the record of a manual price — there is no
+    // "MANUAL" marker to forge, and a line that has never been linked cannot
+    // claim to have been.
+    //
+    // Every field is resolved and stamped BY THE SERVER from the approved
+    // version. A browser that could post its own `unitPriceMinor` or
+    // `costingVersionId` could quote any number and have the record say a
+    // costing approved it.
+    //
+    // Frozen, like every other provenance in this system: a later approval,
+    // policy change or recosting cannot alter what a saved quotation says it
+    // was priced from. See `services/centralCosting/approvedOutput.service.js`.
+    costingSource: {
+      source: { type: String, enum: ["APPROVED_COSTING"], default: undefined },
+      costingId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+      costingVersionId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+      costingVersionNumber: { type: Number, default: undefined },
+      sampleStyleId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+      styleCode: { type: String, trim: true, default: undefined },
+      productName: { type: String, trim: true, default: undefined },
+      scenarioKey: { type: String, trim: true, default: undefined },
+      // The quantity the price was APPROVED for. Kept beside the line's own
+      // quantity so a later edit to the line is visible as a divergence
+      // rather than silently inheriting an approval it no longer matches.
+      quantity: { type: String, trim: true, default: undefined },
+      /* ── WHICH APPROVED PRICE THIS LINE WAS TAKEN FROM ──────────────────
+         `floor` on a costing approved under the pricing floor policy; one of
+         the three retired tiers on a historical one. Both are kept: the tiers
+         still describe quotations the company really sent, and reading a
+         floor as a "target" would restate what was quoted. */
+      priceTier: { type: String, enum: ["floor", "minimum", "target", "preferred"], default: undefined },
+      /* ── OR NO TIER AT ALL, BECAUSE SALES ALREADY DECIDED ───────────────
+         A tier is a price the costing OFFERS. A Sales-origin proforma line is
+         not offered a choice: the enquiry's commercial review already settled
+         which figure this customer is charged, and froze it on the customer
+         request as `items[].commercialDecision`. That figure can sit BELOW the
+         floor — an executive exception is exactly that — so resolving this
+         line through the tier machinery would quote the floor and call it
+         approved. It carries `priceBasis` and no tier instead.
+
+         `approvalKind` is how it was cleared, and it is the whole of what the
+         proforma may say about the decision. The floor it was measured
+         against, the cost behind it and the reason somebody typed are internal
+         commercial facts; a customer-facing document has no business
+         carrying them. */
+      priceBasis: { type: String, enum: ["SALES_APPROVED_DECISION"], default: undefined },
+      approvalKind: { type: String, enum: ["COMMERCIAL", "EXECUTIVE"], default: undefined },
+      // Minor units, and EXCLUDING GST — the quotation applies tax afterwards.
+      unitPriceMinor: { type: Number, default: undefined },
+      currency: { type: String, trim: true, default: undefined },
+      linkedAt: { type: Date, default: undefined },
+      approvedAt: { type: Date, default: undefined },
+      assumptions: { type: [String], default: undefined },
+      // Identity evidence over the ids and figures that produced the price.
+      // Not a signature: it proves the saved line still describes the same
+      // approved facts, not that nobody with database access changed them.
+      fingerprint: { type: String, trim: true, default: undefined },
+    },
+
     discountPercentage: {
       type: Number,
       default: 0,
@@ -825,6 +994,39 @@ const customerRequestSchema = new mongoose.Schema(
     requestId: {
       type: String,
     },
+    /* ── WHERE A SALES-RAISED REQUEST CAME FROM ─────────────────────────
+       A proforma raised from Cost & Invoicing is for ONE enquiry, and the
+       quantity on every line was read from that enquiry's confirmed
+       commercial lines rather than sent by the browser. Recording the
+       enquiry makes that provenance readable, and `actionKey` is what makes
+       an exact retry replay instead of creating a second document. */
+    salesOrigin: {
+      enquiryId: { type: mongoose.Schema.Types.ObjectId, ref: "Enquiry" },
+      actionKey: { type: String, trim: true },
+      /* ── THE COMMERCIAL STATE THIS DOCUMENT WAS RAISED ON ────────────
+         A server-derived digest of the company, the enquiry, and every
+         invoiced line's confirmed quantity, approved selling price and the
+         costing version that approved it — nothing a request body can
+         influence.
+
+         `actionKey` only ever answered "is this the SAME press again?", so
+         two presses of one button minted two keys, the server saw two
+         commands and honoured both: a live double-click produced two
+         customer requests for one enquiry. The claim answers the question
+         that actually matters — "has this commercial state already been
+         invoiced?" — and the unique index below makes the answer the
+         database's rather than a check-then-insert's.
+
+         Absent on every request raised outside Cost & Invoicing (and on
+         every record that predates this), which is why the index below is
+         partial: those are not claims, and they must not collide. */
+      commercialClaimId: { type: String, trim: true },
+      /* Set only on a successor raised through the explicit supersession
+         path. The earlier request is never deleted, never rewritten and
+         stays readable — this is the forward pointer that makes the pair
+         legible rather than a replacement. */
+      supersedesRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
+    },
     customerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Customer",
@@ -1105,5 +1307,59 @@ customerRequestSchema.index({ status: 1, createdAt: -1 });
 customerRequestSchema.index({ createdAt: -1 });
 customerRequestSchema.index({ customerId: 1, createdAt: -1 });
 customerRequestSchema.index({ requestId: 1 });
+
+/* ── ONE COMMERCIAL STATE, ONE CURRENT REQUEST — ENFORCED BY THE DATABASE ──
+ * The proforma command used to read first and insert second. Between those
+ * two statements sits every concurrent press, every retried tab and every
+ * duplicated request a proxy makes: both callers read "nothing yet" and both
+ * inserted. A guard in the browser closes the double-click and nothing else,
+ * because it is not where two processes meet.
+ *
+ * This is where they meet. The claim is derived from the company, the enquiry
+ * and the approved commercial figures, so two calls for the same state carry
+ * the same string and the SECOND INSERT FAILS — whatever key, actor, tab or
+ * process it came from. The loser then reads the winner's request and returns
+ * it, so a caller gets the one durable document rather than a second one.
+ *
+ * PARTIAL, and deliberately: every request raised outside Cost & Invoicing
+ * carries no claim, and a plain unique index would let exactly one of them
+ * exist in the whole collection. */
+customerRequestSchema.index(
+  { "salesOrigin.commercialClaimId": 1 },
+  { unique: true, partialFilterExpression: { "salesOrigin.commercialClaimId": { $type: "string" } } },
+);
+
+/* ── WHICH BACKFILL RUN GAVE THIS ORDER'S LINES THEIR NAMES ───────────────
+   Present only on records whose lines predated permanent line references and
+   were filled in by `scripts/backfill-customer-request-line-refs.js`. It is
+   what makes that run reversible: the batch identity, who authorised it, and
+   exactly which references it assigned. Absent on every record created since,
+   because those lines were minted by the hook below as they were written. */
+customerRequestSchema.add({
+  lineRefBackfill: {
+    batchId: { type: String, trim: true },
+    at: { type: Date },
+    authorizedBy: { type: String, trim: true },
+    assigned: [{ type: String, trim: true }],
+  },
+});
+
+/* ── EVERY ORDER LINE LEAVES HERE WITH A NAME ──────────────────────────────
+   Sixteen writers across customer self-service, Sales, measurement
+   conversion, sampling, return cloning and six quotation paths all persist
+   through `.save()`, so this is the one place identity has to be handled. It
+   mints only for lines that have none, which makes a filtered-and-reassigned
+   array, an in-place quantity edit and a pushed line all behave correctly
+   without any of those writers knowing this exists. */
+customerRequestSchema.pre("validate", function ensureCustomerRequestLineIdentities(next) {
+  try {
+    ensureLineIdentities(this.items);
+    /* An edit proposal's lines are a payload, not the record — they are given
+       identities only if and when they are adopted onto `items`. */
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = mongoose.model("CustomerRequest", customerRequestSchema);

@@ -1,0 +1,105 @@
+{
+  "_source": "Captured from a real Mautic 7.2.0 webhook delivery on 2026-09-10.",
+  "_note": "The contact's email lives at stat.emailAddress and at stat.lead.fields.core.email.value. There is NO stat.lead.email. Field groups carry full descriptors, not plain values.",
+  "payload": {
+    "mautic.email_on_open": [
+      {
+        "stat": {
+          "id": 1,
+          "emailAddress": "chunk0.live@grav-integration-test.invalid",
+          "dateSent": "2026-09-10T02:17:52+00:00",
+          "dateRead": "2026-09-10T02:18:15+00:00",
+          "isRead": true,
+          "openCount": 1,
+          "source": "email",
+          "sourceId": 1,
+          "trackingHash": "6aa21350bd95f364744366",
+          "viewedInBrowser": false,
+          "ipAddress": [],
+          "email": {
+            "id": 1,
+            "name": "GRAV Chunk 0 probe"
+          },
+          "lead": {
+            "id": 1,
+            "points": 0,
+            "color": null,
+            "fields": {
+              "core": {
+                "email": {
+                  "id": "6",
+                  "label": "Email",
+                  "alias": "email",
+                  "type": "email",
+                  "group": "core",
+                  "object": "lead",
+                  "is_fixed": "1",
+                  "properties": "a:0:{}",
+                  "default_value": null,
+                  "value": "chunk0.live@grav-integration-test.invalid",
+                  "normalizedValue": "chunk0.live@grav-integration-test.invalid"
+                },
+                "firstname": {
+                  "id": "2",
+                  "label": "First Name",
+                  "alias": "firstname",
+                  "type": "text",
+                  "group": "core",
+                  "object": "lead",
+                  "is_fixed": "1",
+                  "properties": "a:0:{}",
+                  "default_value": null,
+                  "value": "Chunk0",
+                  "normalizedValue": "Chunk0"
+                },
+                "lastname": {
+                  "id": "3",
+                  "label": "Last Name",
+                  "alias": "lastname",
+                  "type": "text",
+                  "group": "core",
+                  "object": "lead",
+                  "is_fixed": "1",
+                  "properties": "a:0:{}",
+                  "default_value": null,
+                  "value": "LiveProbe",
+                  "normalizedValue": "LiveProbe"
+                },
+                "company": {
+                  "id": "4",
+                  "label": "Primary company",
+                  "alias": "company",
+                  "type": "text",
+                  "group": "core",
+                  "object": "lead",
+                  "is_fixed": "1",
+                  "properties": "a:0:{}",
+                  "default_value": null,
+                  "value": "GRAV Integration Test Ltd",
+                  "normalizedValue": "GRAV Integration Test Ltd"
+                },
+                "grav_person_key": {
+                  "id": "44",
+                  "label": "GRAV person key",
+                  "alias": "grav_person_key",
+                  "type": "text",
+                  "group": "core",
+                  "object": "lead",
+                  "is_fixed": "0",
+                  "properties": "a:0:{}",
+                  "default_value": null,
+                  "value": "c520b91b17339a2ed3d5e951",
+                  "normalizedValue": "c520b91b17339a2ed3d5e951"
+                }
+              },
+              "social": {},
+              "personal": {},
+              "professional": {}
+            }
+          }
+        },
+        "timestamp": "2026-09-10T02:18:17+00:00"
+      }
+    ]
+  }
+}

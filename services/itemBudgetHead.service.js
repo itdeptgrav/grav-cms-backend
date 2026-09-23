@@ -45,7 +45,8 @@ const classification = require("./budgetClassification.service");
    they are re-exported here so every existing caller is unaffected. */
 const vocabulary = require("./budgetAllocationVocabulary");
 const {
-  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL, SOURCE_NONE,
+  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD, SOURCE_NONE,
   RESOLUTION_SOURCES,
   STATUS_RESOLVED, STATUS_UNRESOLVED, STATUS_MANUAL_REQUIRED, RESOLUTION_STATUSES,
 } = vocabulary;
@@ -75,6 +76,38 @@ const categoryKeyOf = (s) =>
 
 /* Kept as the short internal name the rest of this file already reads by. */
 const key = categoryKeyOf;
+
+/* ── WHICH CATEGORY AN ITEM IS ACTUALLY IN ──────────────────────────────────
+ * The Item Master stores a category in TWO fields. Pick one from the list and
+ * it lands in `category` with `customCategory` blank; type your own and it
+ * lands in `customCategory` with `category` set to the empty string. Both are
+ * the item's category to everybody who looks at the screen.
+ *
+ * This function read only `category`, so every custom-category item resolved
+ * to "This item has no category, so no budget head can be derived" — no
+ * matter what Finance had mapped. The visible damage was worse than an
+ * unmapped item, because the Add-item form previews the typed value and
+ * resolved it confidently: an item showed a mapped head before saving and
+ * became unresolved the moment it was saved. Nothing on either screen
+ * explained the change, and the head it had promised was never used.
+ *
+ * `customCategory || category`, in that order, because the custom value is
+ * what somebody typed for THIS item and the standard field is blank whenever
+ * they did. One rule, defined here — not in the two routes and not in the
+ * form, which is how a preview and a saved answer drifted apart in the first
+ * place.
+ *
+ * ── AND NORMALISATION IS UNTOUCHED ──────────────────────────────────────────
+ * This chooses WHICH string. `categoryKeyOf` still decides how it is compared
+ * — trimmed, inner whitespace collapsed, lowercased — so "Specialty Weave"
+ * typed by hand still matches a mapping saved as "specialty  weave", exactly
+ * as a standard category would. A whitespace-only custom value is truthy and
+ * wins here, then normalises to the empty key, which is the same "no
+ * category" answer it has always produced. */
+const effectiveCategoryOf = (item = {}) =>
+  (typeof item.customCategory === "string" && item.customCategory ? item.customCategory : null)
+  || item.category
+  || null;
 
 /**
  * Every category mapping for a company, as a Map keyed by the normalised
@@ -124,7 +157,10 @@ async function categoryMap(companyId) {
  * `budgetLedgerId`. Pass the map from `categoryMap()` when resolving several.
  */
 function headForItem(item = {}, map = new Map()) {
-  const category = item.category || null;
+  /* Both storage forms, one answer. The value returned in `category` is the
+     effective one too, so a caller rendering the resolution shows the same
+     category the item is actually resolved under. */
+  const category = effectiveCategoryOf(item);
 
   if (item.budgetLedgerId) {
     return {
@@ -418,8 +454,12 @@ async function resolveItemIds({ itemIds = [], companyId, RawItem }) {
   const ids = [...new Set(itemIds.map(String).filter(Boolean))];
   if (!ids.length) return [];
 
+  /* `customCategory` is selected because the resolver reads it. A projection
+     that omitted it would make every custom-category item resolve as though
+     it had no category at all — the field would be absent, not empty, and
+     absent is indistinguishable from blank once it reaches the rule. */
   const found = await RawItem.find({ _id: { $in: ids } })
-    .select("_id name sku category budgetLedgerId budgetLedgerName")
+    .select("_id name sku category customCategory budgetLedgerId budgetLedgerName")
     .lean();
   const byId = new Map(found.map((i) => [String(i._id), i]));
 
@@ -456,8 +496,34 @@ async function resolveItemIds({ itemIds = [], companyId, RawItem }) {
  * Fabric and Accessories — half the master.
  */
 async function coverage({ companyId, RawItem }) {
+  /* Grouped by the EFFECTIVE category, the same `customCategory || category`
+     the resolver applies. Grouping by `$category` alone pooled every
+     custom-category item into one nameless bucket that Finance read as
+     "uncategorised — the store's data to fix", when in fact each of them had
+     a perfectly good category that simply lived in the other field. Mapping
+     one of those categories then changed a count that never moved.
+
+     The `$cond` is `||` for strings exactly: only the empty string is falsy,
+     so a whitespace-only custom value wins here and normalises to the empty
+     key below — the same answer it has always given. */
   const counts = await RawItem.aggregate([
-    { $group: { _id: "$category", items: { $sum: 1 } } },
+    {
+      $group: {
+        _id: {
+          $let: {
+            vars: { custom: { $ifNull: ["$customCategory", ""] } },
+            in: {
+              $cond: [
+                { $eq: ["$$custom", ""] },
+                { $ifNull: ["$category", ""] },
+                "$$custom",
+              ],
+            },
+          },
+        },
+        items: { $sum: 1 },
+      },
+    },
     { $sort: { items: -1 } },
   ]);
   const map = await categoryMap(companyId);
@@ -627,10 +693,12 @@ async function assertMappable(ledgerId, companyId, opts = {}) {
 
 module.exports = {
   categoryKeyOf,
+  effectiveCategoryOf,
   SOURCE_ITEM,
   SOURCE_CATEGORY,
   SOURCE_SERVICE,
   SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD,
   SOURCE_NONE,
   RESOLUTION_SOURCES,
   STATUS_RESOLVED,

@@ -1,4 +1,5 @@
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 // services/customerIdentityLookup.service.js
 //
 // Extracted out of routes/CMS_Routes/Sales/callRecordings.js (21 Aug 2026) so
@@ -54,9 +55,14 @@ const emailsOf = (list) => [
  *
  * Returns null when the id resolves to nothing.
  */
-async function identityFor({ accountId, customerId, leadId }) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function identityFor({ accountId, customerId, leadId }, ctx) {
   if (leadId) {
-    const lead = await Lead.findById(leadId)
+    const lead = await Lead.findOne(serviceFilter(ctx, { _id: leadId }))
       .select("company firstName lastName phone whatsapp email contacts")
       .lean();
     if (!lead) return null;
@@ -82,12 +88,12 @@ async function identityFor({ accountId, customerId, leadId }) {
   }
 
   if (accountId) {
-    const account = await Account.findById(accountId)
+    const account = await Account.findOne(serviceFilter(ctx, { _id: accountId }))
       .select("companyName displayName legalName brandName primaryPhone alternatePhone primaryEmail")
       .lean();
     if (!account) return null;
 
-    const contacts = await Contact.find({ accountId })
+    const contacts = await Contact.find(serviceFilter(ctx, { accountId }))
       .select("firstName lastName phone mobile whatsapp alternatePhone email")
       .lean();
 

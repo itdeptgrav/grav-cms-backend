@@ -1,7 +1,21 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
-const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const accAuth = require("../../Middlewear/AccountantAuthMiddleware");
+const { accountantAuth } = accAuth;
+
+/* Two GETs on this router write accounting objects despite the verb:
+     • /parties/preview      — doPartiesSync self-heals an empty chart by
+                               seeding the 28 reserved groups BEFORE it looks
+                               at its dryRun flag, so a "preview" can create
+                               groups.
+     • /payroll/runs/:runId/preview — buildPayrollVouchers resolves the payroll
+                               ledgers it needs and creates the missing ones.
+   Both are refused for a Viewer before anything is created. Editors and above
+   are unaffected, and both URLs are unchanged. */
+// Resolved per request — see the note on Acc_vouchers.js's canEditLedgers.
+const canEditCoa = (req, res, next) =>
+  accAuth.requireCapability("canEdit")(req, res, next);
 const classification = require("../../services/budgetClassification.service");
 const itemBudget = require("../../services/itemBudgetHead.service");
 const ItemCategoryBudget = require("../../models/Accountant_model/Acc_ItemCategoryBudget");
@@ -20,7 +34,20 @@ const {
 // contactDetails still trigger "no state code" errors on the voucher form.
 const { applyGstAutoState } = require("../../services/gstState.util");
 const openItems = require("../../services/openItems.service");
-const { inheritablePartyLinks } = require("../../services/partyLinkSafety");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -121,7 +148,7 @@ async function ensureDefaultGroups(companyId, createdBy) {
 // company. Safe to call any time; idempotent. The CoA page surfaces a
 // button calling this when the chart looks empty.
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/ensure-defaults", async (req, res) => {
+router.post("/ensure-defaults", companyScope, async (req, res) => {
   try {
     const { companyId } = req.body || {};
     if (!companyId) {
@@ -210,7 +237,7 @@ function rollupGroupTotals(group) {
 // GET /api/accountant/chart-of-accounts/tree?companyId=...
 // Returns the full Group→Ledger tree + per-group rolled-up balances
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/tree", async (req, res) => {
+router.get("/tree", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -696,7 +723,7 @@ async function coaApprovalGate(req, res, next) {
 
 router.use(coaApprovalGate);
 
-router.get("/groups", async (req, res) => {
+router.get("/groups", companyScopeOptional, async (req, res) => {
   try {
     const { companyId, nature, parent } = req.query;
     const filter = { isActive: true };
@@ -711,7 +738,7 @@ router.get("/groups", async (req, res) => {
   }
 });
 
-router.post("/groups", async (req, res) => {
+router.post("/groups", companyScope, async (req, res) => {
   try {
     const { companyId, name, parent, nature, description } = req.body;
     if (!companyId || !name || !nature) {
@@ -824,7 +851,7 @@ router.delete("/groups/:id", async (req, res) => {
 //   • Both groups must belong to the requested company.
 //   • Either group being reserved is fine — we only change display order.
 // ─────────────────────────────────────────────────────────────────────────────
-router.patch("/groups/:id/order", async (req, res) => {
+router.patch("/groups/:id/order", companyScope, async (req, res) => {
   try {
     const { companyId, destGroupId, siblingIds } = req.body || {};
     if (!companyId)
@@ -922,7 +949,7 @@ router.patch("/groups/:id/order", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // LEDGERS — CRUD
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/ledgers", async (req, res) => {
+router.get("/ledgers", companyScopeOptional, async (req, res) => {
   try {
     const {
       companyId,
@@ -1114,7 +1141,6 @@ router.get("/ledgers", async (req, res) => {
       37: "Andhra Pradesh",
       38: "Ladakh",
     };
-    const bulkFixOps = [];
     const ledgers = ledgersRaw.map((l) => {
       // Add vendor code (VEN-XXXXXX) so client-side search can find
       // ledgers by vendor code. The code is derived from the last 6
@@ -1136,20 +1162,7 @@ router.get("/ledgers", async (req, res) => {
         const code = l.gstin.slice(0, 2);
         if (GST_STATES[code]) {
           if (!l.contactDetails) l.contactDetails = {};
-          if (!l.contactDetails.stateCode) {
-            l.contactDetails.stateCode = code;
-            bulkFixOps.push({
-              updateOne: {
-                filter: { _id: l._id },
-                update: {
-                  $set: {
-                    "contactDetails.stateCode": code,
-                    "contactDetails.state": GST_STATES[code],
-                  },
-                },
-              },
-            });
-          }
+          if (!l.contactDetails.stateCode) l.contactDetails.stateCode = code;
           if (!l.contactDetails.state)
             l.contactDetails.state = GST_STATES[code];
         }
@@ -1163,10 +1176,15 @@ router.get("/ledgers", async (req, res) => {
     // contactDetails still trips the "no state code" validator.
     for (const l of ledgers) applyGstAutoState(l);
 
-    // Fire-and-forget bulk fix so next request doesn't need it
-    if (bulkFixOps.length > 0) {
-      Acc_Ledger.bulkWrite(bulkFixOps).catch(() => {});
-    }
+    // NO WRITE HERE. This used to fire a `bulkWrite` that persisted the derived
+    // state/stateCode back onto every ledger it had filled in — a listing
+    // request quietly repairing the collection it was asked to read. That made
+    // the Viewer role a writer: opening the Chart of Accounts was enough.
+    //
+    // The derivation above is unchanged, so the response is byte-for-byte what
+    // it was; only the persistence is gone. The stored repair belongs on a path
+    // that says it writes — ledger create/update, or the Tally import — where
+    // `canEdit` already applies.
 
     res.json({
       success: true,
@@ -1180,7 +1198,7 @@ router.get("/ledgers", async (req, res) => {
   }
 });
 
-router.post("/ledgers", async (req, res) => {
+router.post("/ledgers", companyScope, async (req, res) => {
   try {
     const { companyId, name, groupId, openingBalance, openingBalanceType } =
       req.body;
@@ -1221,7 +1239,7 @@ router.post("/ledgers", async (req, res) => {
  * in the Ledger Balances page, this endpoint finds all ledgers that
  * have transactions with that voucher number.
  */
-router.get("/ledgers/search-by-voucher", async (req, res) => {
+router.get("/ledgers/search-by-voucher", companyScopeOptional, async (req, res) => {
   try {
     const { companyId, q } = req.query;
     if (!companyId || !q) return res.json({ ledgerIds: [] });
@@ -1304,18 +1322,18 @@ router.get("/ledgers/:id", async (req, res) => {
         37: "Andhra Pradesh",
         38: "Ladakh",
       };
-      let dirty = false;
+      // Derived for the RESPONSE only — the assignments below stay in memory
+      // and reach the caller through `ledger.toObject()`. The `await
+      // ledger.save()` that used to follow them made opening a ledger a write,
+      // which is how a Viewer could modify stored records. Permanent repair
+      // belongs on the ledger create/update routes or the Tally import, all of
+      // which already require `canEdit`.
       if (!ledger.contactDetails) ledger.contactDetails = {};
       if (!ledger.contactDetails.stateCode && GST_STATES[code]) {
         ledger.contactDetails.stateCode = code;
-        dirty = true;
       }
       if (!ledger.contactDetails.state && GST_STATES[code]) {
         ledger.contactDetails.state = GST_STATES[code];
-        dirty = true;
-      }
-      if (dirty) {
-        await ledger.save();
       }
     }
 
@@ -1462,7 +1480,7 @@ router.get("/item-categories", async (req, res) => {
 /* Set (or clear) one category's head. A null head is stored rather than
  * deleted: a row with no head is finance saying "looked at it, not decided",
  * which is a different state from a category nobody has opened. */
-router.put("/item-categories/:category", async (req, res) => {
+router.put("/item-categories/:category", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
 
@@ -1542,7 +1560,7 @@ router.put("/item-categories/:category", async (req, res) => {
  * companies would still get different heads for the same item. If the item
  * master ever becomes multi-company, this route needs the scope added.
  */
-router.put("/raw-items/:id/budget-head", async (req, res) => {
+router.put("/raw-items/:id/budget-head", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     /* Needed even though the ITEM is not company-scoped: the LEDGER is, and
@@ -1602,7 +1620,7 @@ router.put("/raw-items/:id/budget-head", async (req, res) => {
  * Capped hard: this exists to find the handful of items that need an
  * exception, not to browse a catalogue.
  */
-router.get("/item-budget-heads/items", async (req, res) => {
+router.get("/item-budget-heads/items", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     const scope = mappingCompany(req);
@@ -1622,12 +1640,17 @@ router.get("/item-budget-heads/items", async (req, res) => {
         { sku: { $regex: safe, $options: "i" } },
       ];
     }
-    if (category) filter.category = category;
+    /* Either storage form — the same category reaches the item through two
+       fields, and filtering on one of them hid half the answer. */
+    if (category) filter.$and = [{ $or: [{ category }, { customCategory: category }] }];
     if (onlyOverridden) filter.budgetLedgerId = { $ne: null };
 
     const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    /* `customCategory` is loaded because the resolver reads it — an item whose
+       category was typed rather than picked lives there, and a projection
+       without it resolves as though the item had no category at all. */
     const items = await RawItem.find(filter)
-      .select("_id name sku category budgetLedgerId budgetLedgerName budgetLedgerSetByName budgetLedgerSetAt")
+      .select("_id name sku category customCategory budgetLedgerId budgetLedgerName budgetLedgerSetByName budgetLedgerSetAt")
       .sort({ name: 1 })
       .limit(50)
       .lean();
@@ -1639,7 +1662,11 @@ router.get("/item-budget-heads/items", async (req, res) => {
         _id: String(i._id),
         name: i.name,
         sku: i.sku || null,
-        category: i.category || null,
+        /* The EFFECTIVE category, so the row names the same category the
+           resolution beside it was decided by. Reporting the raw `category`
+           showed a blank for every custom-category item while the head came
+           from a mapping the reader could not see. */
+        category: itemBudget.effectiveCategoryOf(i),
         setByName: i.budgetLedgerSetByName || null,
         setAt: i.budgetLedgerSetAt || null,
         resolution: itemBudget.headForItem(i, map),
@@ -1659,7 +1686,7 @@ router.get("/item-budget-heads/items", async (req, res) => {
  * twenty items needs to see which two do not exist rather than receive
  * eighteen rows that look like a complete answer.
  */
-router.post("/item-budget-heads/resolve", async (req, res) => {
+router.post("/item-budget-heads/resolve", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     const scope = mappingCompany(req);
@@ -1738,7 +1765,7 @@ const serviceRow = (s) => ({
  * are all the services", which is how a screen convinces somebody their setup
  * is complete.
  */
-router.get("/service-budget-heads/services", async (req, res) => {
+router.get("/service-budget-heads/services", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     const scope = mappingCompany(req);
@@ -1796,7 +1823,7 @@ router.get("/service-budget-heads/services", async (req, res) => {
  * is how a screen shows a head that nothing resolves to any more — the two
  * fields are one fact and they move together.
  */
-router.put("/services/:id/budget-head", async (req, res) => {
+router.put("/services/:id/budget-head", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     const scope = mappingCompany(req);
@@ -1855,7 +1882,7 @@ router.put("/services/:id/budget-head", async (req, res) => {
 /* ── WHAT WOULD THESE SERVICES RESOLVE TO? ──────────────────────────────────
  * One row per requested id, including ids that match nothing in this company.
  */
-router.post("/service-budget-heads/resolve", async (req, res) => {
+router.post("/service-budget-heads/resolve", companyScope, async (req, res) => {
   try {
     if (!financeOnly(req, res)) return;
     const scope = mappingCompany(req);
@@ -2037,7 +2064,7 @@ router.delete("/ledgers/:id", async (req, res) => {
 // GET /primary-invoice-bank?companyId=...
 // Returns the currently-flagged primary bank for a company (or null).
 // Used by the Settings page when it loads.
-router.get("/primary-invoice-bank", async (req, res) => {
+router.get("/primary-invoice-bank", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId) {
@@ -2068,7 +2095,7 @@ router.get("/primary-invoice-bank", async (req, res) => {
 // resolved group has a nature other than "asset" — and (b) have at least
 // a bankName populated, otherwise printing it on an invoice is
 // meaningless.
-router.post("/ledgers/:id/set-primary-bank", async (req, res) => {
+router.post("/ledgers/:id/set-primary-bank", companyScope, async (req, res) => {
   try {
     const ledger = await Acc_Ledger.findById(req.params.id);
     if (!ledger) {
@@ -2138,7 +2165,7 @@ router.post("/ledgers/:id/clear-primary-bank", async (req, res) => {
 //   period.closing   = monthlySummary.last.closing
 //                    = opening + totals.debit − totals.credit
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/ledgers/:id/statement", async (req, res) => {
+router.get("/ledgers/:id/statement", companyScopeOptional, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const ledger = await Acc_Ledger.findById(req.params.id).lean();
@@ -2605,7 +2632,7 @@ router.get("/ledgers/:id/statement", async (req, res) => {
 // currentBalance on both ledgers in one bulkWrite. Same primitive every other
 // voucher uses, just exposed as a one-shot endpoint for the ledger view.
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/ledgers/:id/transactions", async (req, res) => {
+router.post("/ledgers/:id/transactions", companyScope, async (req, res) => {
   try {
     const ledgerId = req.params.id;
     const {
@@ -2761,7 +2788,7 @@ router.post("/ledgers/:id/transactions", async (req, res) => {
 // Includes opening + period transactions + closing in a single row per ledger.
 // Total Dr should equal Total Cr (basic accounting identity).
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/trial-balance", async (req, res) => {
+router.get("/trial-balance", companyScope, async (req, res) => {
   try {
     const { companyId, startDate, endDate } = req.query;
     if (!companyId)
@@ -2946,7 +2973,7 @@ router.get("/trial-balance", async (req, res) => {
 // Used when accountant clicks a group node and wants to see "all postings under
 // this group in one report" (e.g. "Show me all bank transactions").
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/groups/:id/statement", async (req, res) => {
+router.get("/groups/:id/statement", companyScopeOptional, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const group = await Acc_Group.findById(req.params.id).lean();
@@ -3210,7 +3237,7 @@ async function findOrCreateLedger(
 // live figures, so Accounts maps against real money rather than a guess), and
 // the expense/liability ledgers available to map onto. One request because the
 // screen is useless without all three.
-router.get("/payroll/ledger-map", async (req, res) => {
+router.get("/payroll/ledger-map", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -3350,7 +3377,7 @@ router.get("/payroll/ledger-map", async (req, res) => {
 });
 
 // ── PUT /payroll/ledger-map — save it ─────────────────────────────────────
-router.put("/payroll/ledger-map", async (req, res) => {
+router.put("/payroll/ledger-map", companyScope, async (req, res) => {
   try {
     const { companyId } = req.body || {};
     if (!companyId)
@@ -3480,7 +3507,7 @@ router.put("/payroll/ledger-map", async (req, res) => {
 // something that does not exist and send reconciliation after a voucher number
 // nobody issued. The runs list reads this as a third state, and Unpost is
 // refused for it — there is nothing of ours to undo.
-router.post("/payroll/runs/:runId/mark-external", async (req, res) => {
+router.post("/payroll/runs/:runId/mark-external", companyScope, async (req, res) => {
   try {
     const { companyId, voucherNumber, note } = req.body || {};
     if (!companyId)
@@ -3550,7 +3577,7 @@ router.post("/payroll/runs/:runId/mark-external", async (req, res) => {
 // Not "unpost": it deletes a note, touches no voucher and moves no money. A
 // mis-marked run must be correctable, and the alternative — a marker nobody
 // can lift — is how a wrong record becomes permanent.
-router.delete("/payroll/runs/:runId/mark-external", async (req, res) => {
+router.delete("/payroll/runs/:runId/mark-external", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -3585,7 +3612,7 @@ router.delete("/payroll/runs/:runId/mark-external", async (req, res) => {
 });
 
 // ── GET /payroll/runs — list payroll runs with posting status ─────────────
-router.get("/payroll/runs", async (req, res) => {
+router.get("/payroll/runs", companyScope, async (req, res) => {
   try {
     const { companyId, year, status } = req.query;
     if (!companyId)
@@ -4366,7 +4393,7 @@ async function buildPayrollVoucher(companyId, run, items, opts = {}) {
 }
 
 // ── GET /payroll/runs/:runId/preview ──────────────────────────────────────
-router.get("/payroll/runs/:runId/preview", async (req, res) => {
+router.get("/payroll/runs/:runId/preview", canEditCoa, companyScope, async (req, res) => {
   try {
     const { companyId, bankLedgerId } = req.query;
     if (!companyId)
@@ -4805,7 +4832,7 @@ router.post("/payroll/runs/:runId/unlink-payment", async (req, res) => {
 });
 
 // ── POST /payroll/runs/:runId/post ────────────────────────────────────────
-router.post("/payroll/runs/:runId/post", async (req, res) => {
+router.post("/payroll/runs/:runId/post", companyScope, async (req, res) => {
   try {
     const { companyId, bankLedgerId } = req.body;
     if (!companyId)
@@ -4925,7 +4952,7 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
 });
 
 // ── POST /payroll/runs/post-all — post every unposted run for a company ──
-router.post("/payroll/runs/post-all", async (req, res) => {
+router.post("/payroll/runs/post-all", companyScope, async (req, res) => {
   try {
     const { companyId, year } = req.body;
     if (!companyId)
@@ -5007,7 +5034,7 @@ router.post("/payroll/runs/post-all", async (req, res) => {
 // up the voucher numbers. Use this when previous post/unpost attempts have
 // left the database in an inconsistent state (typically: duplicate-key
 // errors after multiple failed unposts).
-router.post("/payroll/cleanup", async (req, res) => {
+router.post("/payroll/cleanup", companyScope, async (req, res) => {
   try {
     const { companyId, confirm } = req.body;
     if (!companyId)
@@ -5064,7 +5091,7 @@ router.post("/payroll/cleanup", async (req, res) => {
 //     looks at most-recently-created (not max-numeric), and finding a
 //     cancelled voucher with number N can mislead it into returning N+1
 //     when N+1 is also already taken (cancelled).
-router.post("/payroll/runs/:runId/unpost", async (req, res) => {
+router.post("/payroll/runs/:runId/unpost", companyScope, async (req, res) => {
   try {
     const { companyId } = req.body;
     if (!companyId)
@@ -5389,7 +5416,7 @@ const MANUFACTURING_CHART = [
   { kind: "ledger", parent: "Finance Costs", name: "Bank Charges" },
 ];
 
-router.post("/seed-manufacturing", async (req, res) => {
+router.post("/seed-manufacturing", companyScope, async (req, res) => {
   try {
     const { companyId, dryRun } = req.body;
     if (!companyId)
@@ -5744,7 +5771,7 @@ async function reconcilePartyLedger(
 }
 
 // ── GET /parties/preview ─────────────────────────────────────────────────
-router.get("/parties/preview", async (req, res) => {
+router.get("/parties/preview", canEditCoa, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -5758,7 +5785,7 @@ router.get("/parties/preview", async (req, res) => {
 });
 
 // ── POST /parties/sync ───────────────────────────────────────────────────
-router.post("/parties/sync", async (req, res) => {
+router.post("/parties/sync", companyScope, async (req, res) => {
   try {
     const { companyId } = req.body;
     if (!companyId)
@@ -6086,7 +6113,7 @@ router.get("/gstin-lookup/:gstin", async (req, res) => {
 //   • For a liability/revenue source (Cr balance): Dr source / Cr destination
 //   • Updates currentBalance on both ledgers
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/ledgers/:id/transfer-balance", async (req, res) => {
+router.post("/ledgers/:id/transfer-balance", companyScope, async (req, res) => {
   try {
     const {
       destinationLedgerId,
@@ -6232,7 +6259,7 @@ router.post("/ledgers/:id/transfer-balance", async (req, res) => {
 // startDate is irrelevant to the imbalance (it only splits opening vs period;
 // the sum is identical), so only endDate matters. READ-ONLY.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/trial-balance/diagnose", async (req, res) => {
+router.get("/trial-balance/diagnose", companyScope, async (req, res) => {
   try {
     // Lazy-require so the top-of-file imports don't need touching.
     const {
@@ -6434,7 +6461,7 @@ async function postPayrollRunById(companyId, runId, options = {}) {
 // Use transfer-balance when both ledgers are real and you're moving money.
 // Use merge when the source is a DUPLICATE that shouldn't exist.
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/ledgers/:id/merge", async (req, res) => {
+router.post("/ledgers/:id/merge", companyScope, async (req, res) => {
   try {
     const { destinationLedgerId, deactivateSource = true } = req.body || {};
     if (!destinationLedgerId)

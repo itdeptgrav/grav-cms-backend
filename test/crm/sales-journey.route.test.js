@@ -42,16 +42,33 @@ const Lead = require("../../models/CMS_Models/Sales/Lead");
 const { SALES_JOURNEY_LINK_MODULE } = require("../../constants/crm");
 
 let leadSeq = 0;
-/** A minimal Active Lead, Ready for Journey by default — the only state this
+/** A minimal Active Lead, Enquiry Ready by default — the only state this
  *  bridge accepts. `leadId` is assigned directly (not through the ref-
  *  generator service) since these are route-level tests of the JOURNEY side
- *  of the bridge; Lead reference allocation has its own suite. */
+ *  of the bridge; Lead reference allocation has its own suite.
+ *
+ *  The fixture now also SATISFIES the Enquiry bar, not just carries its state.
+ *  The bridge re-runs the checklist at creation time — the stored state records
+ *  that the Lead cleared the bar once, and an ordinary edit can undo it — so a
+ *  fixture with the label and none of the facts would have been testing a
+ *  record that must legitimately be refused. */
 const readyLead = (over = {}) =>
   Lead.create({
     leadId: `LEAD-2026-90${String(++leadSeq).padStart(2, "0")}`,
     company: "Northstar Buying Services",
+    /* A buying house is an organisation, and `prospectType` defaults to
+       "individual" — which allows exactly one contact. Promotion re-saves the
+       Lead to record where each person went, so an untyped fixture with two
+       contacts now trips the Lead's own Individual invariant. */
+    prospectType: "company",
     qualificationState: "readyToConvert",
     stage: "qualified",
+    phone: "9876500000",
+    requirementItems: [{ product: "Housekeeping shirts", quantity: 500 }],
+    productInterest: ["Housekeeping shirts"],
+    estimatedQuantity: 500,
+    requirementCertainty: "prospect_confirmed",
+    decisionMakerName: "Ravi Kumar",
     ...over,
   });
 
@@ -100,6 +117,20 @@ const validBody = (accountId, over = {}) => ({
 });
 
 /* ── Create ───────────────────────────────────────────────────────────────── */
+
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3A) ─────────────────────
+ * SalesJourney creation now refuses unless the actor's company is provable.
+ * These suites are not about tenancy, so they seed the simplest thing that
+ * makes ownership provable: a single company, which is the documented
+ * deployment fallback. Without it every journey-creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
 
 describe("POST /sales-journeys", () => {
   test("creates a Journey at the Enquiry stage with a server-assigned reference", async () => {
@@ -427,11 +458,17 @@ describe("POST /sales-journeys with sourceLeadId — the Lead conversion bridge"
     );
   });
 
-  test("carries the Lead's decision-maker across as the Account's primary contact", async () => {
+  /* ── EVERY PERSON, NOT THE ONE THE OLD RULE PICKED ──────────────────────
+     This used to seed exactly ONE contact — "decision-maker, else the first
+     one" — and only when the Account had none at all. A Lead carrying a
+     merchandiser, a purchase manager and an admin head arrived with one of
+     them, and the rest were re-typed by hand. Journey now shares the promotion
+     service with POST /leads/:id/account, so both produce the same people. */
+  test("carries EVERY person on the Lead across to the Account", async () => {
     const acc = await activeAccount(); // no contacts yet
     const lead = await readyLead({
       contacts: [
-        { name: "Ravi Menon", role: "Procurement Head", email: "ravi@northstar.test", phone: "+91 90000 11111", isDecisionMaker: true },
+        { name: "Ravi Menon", role: "Procurement Head", email: "ravi@northstar.test", phone: "+91 90000 11111", isDecisionMaker: true, isPrimary: true },
         { name: "Junior Buyer", role: "Buyer" },
       ],
     });
@@ -443,33 +480,64 @@ describe("POST /sales-journeys with sourceLeadId — the Lead conversion bridge"
     expect(status).toBe(201);
 
     const seeded = await Contact.find({ accountId: acc._id, isActive: true }).lean();
-    expect(seeded).toHaveLength(1);
-    expect(seeded[0].firstName).toBe("Ravi");
-    expect(seeded[0].lastName).toBe("Menon");
-    expect(seeded[0].isPrimary).toBe(true);
-    expect(seeded[0].roles).toContain("decision_maker");
-    // …and the new Journey names that contact as its primary.
-    expect(String(body.journey.primaryContact?.id || "")).toBe(String(seeded[0]._id));
+    expect(seeded).toHaveLength(2);
+    const ravi = seeded.find((c) => c.firstName === "Ravi");
+    expect(ravi.lastName).toBe("Menon");
+    expect(ravi.isPrimary).toBe(true);
+    expect(ravi.roles).toContain("decision_maker");
+    expect(seeded.some((c) => c.firstName === "Junior")).toBe(true);
+    // The Journey names the CRM Contact the Lead's own primary became.
+    expect(String(body.journey.primaryContact?.id || "")).toBe(String(ravi._id));
   });
 
-  test("does not seed a contact when the Account already has one", async () => {
+  /* Previously this asserted the Lead's people were DROPPED whenever the
+     Account already had somebody. That was never the right outcome — the
+     Account's existing contact simply keeps the primary role. */
+  test("an Account that already has a primary keeps it, and still gains the Lead's people", async () => {
     const acc = await activeAccount();
-    await Contact.create({ accountId: acc._id, firstName: "Existing", lastName: "Person", isPrimary: true });
-    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", isDecisionMaker: true }] });
+    const incumbent = await Contact.create({ accountId: acc._id, firstName: "Existing", lastName: "Person", isPrimary: true });
+    /* The primary contact is the authority for the Lead's top-level phone, so a
+       primary with no number would clear the very contact route that made this
+       Lead Enquiry Ready. */
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isDecisionMaker: true, isPrimary: true }] });
 
-    const { status } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    const { status, body } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
     expect(status).toBe(201);
-    expect(await Contact.countDocuments({ accountId: acc._id, isActive: true })).toBe(1);
+
+    const contacts = await Contact.find({ accountId: acc._id, isActive: true }).lean();
+    expect(contacts).toHaveLength(2);
+    const primaries = contacts.filter((c) => c.isPrimary);
+    expect(primaries).toHaveLength(1);
+    expect(String(primaries[0]._id)).toBe(String(incumbent._id));
+    expect(String(body.journey.primaryContact?.id || "")).toBe(String(incumbent._id));
   });
 
-  test("refuses a Lead that is not Ready for Journey, and creates nothing", async () => {
+  test("an explicitly supplied primary contact is never overridden by promotion", async () => {
+    const acc = await activeAccount();
+    const chosen = await Contact.create({ accountId: acc._id, firstName: "Chosen", lastName: "One" });
+    /* The primary contact is the authority for the Lead's top-level phone, so a
+       primary with no number would clear the very contact route that made this
+       Lead Enquiry Ready. */
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isDecisionMaker: true, isPrimary: true }] });
+
+    const { status, body } = await call("", {
+      method: "POST",
+      body: validBody(acc._id, { sourceLeadId: String(lead._id), primaryContactId: String(chosen._id) }),
+    });
+    expect(status).toBe(201);
+    expect(String(body.journey.primaryContact?.id || "")).toBe(String(chosen._id));
+    // Ravi still came across — he just did not take the role.
+    expect(await Contact.countDocuments({ accountId: acc._id, isActive: true })).toBe(2);
+  });
+
+  test("refuses a Lead that is not Enquiry Ready, and creates nothing", async () => {
     const acc = await activeAccount();
     const lead = await readyLead({ qualificationState: "qualified" });
 
     const { status, body } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
 
     expect(status).toBe(400);
-    expect(body.message).toMatch(/ready for journey/i);
+    expect(body.message).toMatch(/enquiry ready/i);
     expect(await SalesJourney.countDocuments({})).toBe(0);
     expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("qualified");
   });
@@ -522,6 +590,303 @@ describe("POST /sales-journeys with sourceLeadId — the Lead conversion bridge"
     expect(await Activity.countDocuments({})).toBe(0);
     // The Lead itself was never actually touched by the losing request.
     expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("readyToConvert");
+  });
+
+  /* ── PROMOTION IS NOT THE LAST THING THIS REQUEST DOES ──────────────────
+     A Journey promotes the Lead's people and then keeps working: it inserts
+     the Journey, flips the Lead, writes an audit entry. Any of those can fail,
+     and until now the only thing put back was the contacts promotion had
+     CREATED. Fields filled on contacts that already existed, `linkedLeads`
+     entries and every `promotedContactId` written onto the Lead all survived a
+     failed request — so the Lead believed its people were promoted for a
+     customer conversion that never happened. */
+
+  test("losing the flip race undoes the promotion, not just the contacts it created", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({
+      contacts: [
+        { name: "Ravi Menon", phone: "9876500000", isDecisionMaker: true, isPrimary: true },
+        { name: "Junior Buyer", phone: "9876500123" },
+      ],
+    });
+
+    const spy = jest.spyOn(Lead, "findOneAndUpdate").mockResolvedValueOnce(null);
+    try {
+      const { status } = await call("", {
+        method: "POST",
+        body: validBody(acc._id, { sourceLeadId: String(lead._id) }),
+      });
+      expect(status).toBe(409);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await Contact.countDocuments({ accountId: acc._id })).toBe(0);
+    const after = await Lead.findById(lead._id).lean();
+    expect(after.contacts.every((c) => !c.promotedContactId)).toBe(true);
+  });
+
+  test("a matched contact is restored when the request fails after promotion", async () => {
+    const acc = await activeAccount();
+    /* Already on the customer, with no job title and linked to nobody — the
+       two things promotion would have changed. */
+    const incumbent = await Contact.create({
+      accountId: acc._id, firstName: "Ravi", lastName: "Menon", phone: "9876500000",
+    });
+    const lead = await readyLead({
+      contacts: [{ name: "Ravi Menon", jobTitle: "Procurement Head", phone: "9876500000", isPrimary: true, isDecisionMaker: true }],
+    });
+
+    const spy = jest.spyOn(Lead, "findOneAndUpdate").mockResolvedValueOnce(null);
+    try {
+      await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const after = await Contact.findById(incumbent._id).lean();
+    expect(after.jobTitle == null).toBe(true);          // the fill was undone
+    expect(after.linkedLeads).toEqual([]);              // and so was the link
+    expect(await Contact.countDocuments({ accountId: acc._id })).toBe(1);
+    const leadAfter = await Lead.findById(lead._id).lean();
+    expect(leadAfter.contacts[0].promotedContactId == null).toBe(true);
+  });
+
+  test("a failure after promotion, anywhere, still puts the people back", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({
+      contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }],
+    });
+
+    /* The audit write is the last thing this route does — well past promotion,
+       and the exact window where a throw used to escape with the contacts
+       already created. */
+    const { recordChange } = require("../../services/changeLog");
+    recordChange.mockRejectedValueOnce(new Error("audit store unreachable"));
+
+    const { status } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    expect(status).toBeGreaterThanOrEqual(400);
+
+    expect(await Contact.countDocuments({ accountId: acc._id })).toBe(0);
+    const after = await Lead.findById(lead._id).lean();
+    expect(after.contacts.every((c) => !c.promotedContactId)).toBe(true);
+  });
+
+  /* ── AN ARCHIVED CONTACT IS NOT A VALID CHOICE ──────────────────────────── */
+
+  test("an archived contact cannot be named as the Journey's primary", async () => {
+    const acc = await activeAccount();
+    const archived = await Contact.create({
+      accountId: acc._id, firstName: "Gone", lastName: "Person",
+      isActive: false, status: "archived", archivedAt: new Date(),
+    });
+
+    const { status, body } = await call("", {
+      method: "POST",
+      body: validBody(acc._id, { primaryContactId: String(archived._id) }),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/archived, marked do-not-contact, or otherwise not contactable/i);
+  });
+
+  test("a contact who has left cannot be named as the Journey's primary either", async () => {
+    const acc = await activeAccount();
+    const departed = await Contact.create({
+      accountId: acc._id, firstName: "Left", lastName: "Person", status: "left_organization",
+    });
+
+    const { status } = await call("", {
+      method: "POST",
+      body: validBody(acc._id, { primaryContactId: String(departed._id) }),
+    });
+    expect(status).toBe(400);
+  });
+
+  /* ── ONE COMMIT BOUNDARY, AND COMPLETE STATE ON EITHER SIDE ─────────────
+     The core operation is the promoted contacts, the Journey, its optional
+     first Activity and the Lead's conversion. It commits when the conditional
+     Lead flip succeeds. Before that, a failure takes ALL of it; after it,
+     nothing is reversed and the problem is reported as a warning.
+
+     Partial rollback was the bug: the outer catch undid only the contact
+     promotion, leaving a Journey and a converted Lead pointing at contacts
+     that no longer existed. Each test below asserts the WHOLE final state. */
+
+  const wholeState = async (acc, lead) => ({
+    journeys: await SalesJourney.countDocuments({}),
+    activities: await Activity.countDocuments({}),
+    contacts: await Contact.countDocuments({ accountId: acc._id }),
+    account: await Account.countDocuments({ _id: acc._id }),
+    lead: await Lead.findById(lead._id).lean(),
+  });
+
+  test("a Journey insert failure leaves no Journey, no contacts and an unconverted Lead", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    const spy = jest.spyOn(SalesJourney, "create").mockRejectedValueOnce(new Error("insert failed"));
+    try {
+      await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    } finally { spy.mockRestore(); }
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(0);
+    expect(state.activities).toBe(0);
+    expect(state.contacts).toBe(0);
+    expect(state.account).toBe(1);                                  // never this route's to delete
+    expect(state.lead.qualificationState).toBe("readyToConvert");
+    expect(state.lead.conversion?.journeyId == null).toBe(true);
+    expect(state.lead.contacts.every((c) => !c.promotedContactId)).toBe(true);
+  });
+
+  test("a Journey audit failure — before the commit — takes the whole operation with it", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    const { recordChange } = require("../../services/changeLog");
+    recordChange.mockRejectedValueOnce(new Error("audit store unreachable"));
+
+    const { status } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    expect(status).toBeGreaterThanOrEqual(400);
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(0);
+    expect(state.activities).toBe(0);
+    expect(state.contacts).toBe(0);
+    expect(state.lead.qualificationState).toBe("readyToConvert");
+    expect(state.lead.contacts.every((c) => !c.promotedContactId)).toBe(true);
+  });
+
+  /* The one deliberate exception, preserved: the first action is OPTIONAL, so
+     losing it returns a usable Journey with a warning — and the promotion that
+     came with it must survive intact, because the operation did commit. */
+  test("a failed optional first action still returns a Journey, with its contacts kept", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    const spy = jest.spyOn(Activity, "create").mockRejectedValueOnce(new Error("activity store down"));
+    let body;
+    try {
+      ({ body } = await call("", {
+        method: "POST",
+        body: validBody(acc._id, { sourceLeadId: String(lead._id), nextAction: { label: "Kick off" } }),
+      }));
+    } finally { spy.mockRestore(); }
+
+    expect(body.success).toBe(true);
+    expect(body.warning).toMatch(/first next action could not be saved/i);
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(1);
+    expect(state.activities).toBe(0);
+    expect(state.contacts).toBe(1);                                  // promotion kept
+    expect(state.lead.qualificationState).toBe("converted");
+    expect(state.lead.contacts[0].promotedContactId).toBeTruthy();
+  });
+
+  test("losing the conversion race removes the Journey, the Activity and the promotion together", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    const spy = jest.spyOn(Lead, "findOneAndUpdate").mockResolvedValueOnce(null);
+    try {
+      const { status } = await call("", {
+        method: "POST",
+        body: validBody(acc._id, { sourceLeadId: String(lead._id), nextAction: { label: "Kick off" } }),
+      });
+      expect(status).toBe(409);
+    } finally { spy.mockRestore(); }
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(0);
+    expect(state.activities).toBe(0);
+    expect(state.contacts).toBe(0);
+    expect(state.account).toBe(1);
+    expect(state.lead.qualificationState).toBe("readyToConvert");
+    expect(state.lead.contacts.every((c) => !c.promotedContactId)).toBe(true);
+  });
+
+  test("a Lead-audit failure — after the commit — keeps everything and warns", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    const { recordChange } = require("../../services/changeLog");
+    /* First call is the Journey audit (pre-commit) and must succeed; the
+       SECOND is the Lead's, written after the conversion has committed. */
+    recordChange.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("audit store unreachable"));
+
+    const { status, body } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) });
+    expect(status).toBe(201);
+    expect(body.warning).toMatch(/audit entry could not be written/i);
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(1);
+    expect(state.contacts).toBe(1);
+    expect(state.lead.qualificationState).toBe("converted");        // never reversed
+    /* `journey.id` in the DTO is the human reference (SJ-…), so the link is
+       checked against the actual document. */
+    const stored = await SalesJourney.findOne({}).lean();
+    expect(String(state.lead.conversion.journeyId)).toBe(String(stored._id));
+    expect(state.lead.contacts[0].promotedContactId).toBeTruthy();
+  });
+
+  test("a failed final reload still reports the committed Journey", async () => {
+    const acc = await activeAccount();
+    const lead = await readyLead({ contacts: [{ name: "Ravi Menon", phone: "9876500000", isPrimary: true, isDecisionMaker: true }] });
+
+    /* The reload is the LAST findOne on the model, well past the commit point.
+       Failing it must not reverse a conversion other requests can already see. */
+    const real = SalesJourney.findOne.bind(SalesJourney);
+    let calls = 0;
+    const spy = jest.spyOn(SalesJourney, "findOne").mockImplementation((...args) => {
+      calls += 1;
+      if (calls === 1) throw new Error("reload failed");
+      return real(...args);
+    });
+    let status, body;
+    try {
+      ({ status, body } = await call("", { method: "POST", body: validBody(acc._id, { sourceLeadId: String(lead._id) }) }));
+    } finally { spy.mockRestore(); }
+
+    expect(status).toBe(201);
+    expect(body.warning).toMatch(/could not be re-read/i);
+    expect(body.journey.journeyId).toBeTruthy();
+
+    const state = await wholeState(acc, lead);
+    expect(state.journeys).toBe(1);
+    expect(state.contacts).toBe(1);
+    expect(state.lead.qualificationState).toBe("converted");
+    expect(state.lead.contacts[0].promotedContactId).toBeTruthy();
+  });
+
+  /* ── A SUPPRESSED PERSON IS NOT A PRIMARY ──────────────────────────────── */
+
+  test("a do-not-contact contact cannot be named as the Journey's primary", async () => {
+    const acc = await activeAccount();
+    const suppressed = await Contact.create({
+      accountId: acc._id, firstName: "Do", lastName: "NotCall",
+      status: "active", isActive: true, doNotContact: true,
+    });
+
+    const { status, body } = await call("", {
+      method: "POST",
+      body: validBody(acc._id, { primaryContactId: String(suppressed._id) }),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/do-not-contact/i);
+  });
+
+  test("a do-not-contact Account primary is not inherited as the Journey's primary", async () => {
+    const acc = await activeAccount();
+    await Contact.create({
+      accountId: acc._id, firstName: "Do", lastName: "NotCall",
+      isPrimary: true, status: "active", isActive: true, doNotContact: true,
+    });
+
+    const { status, body } = await call("", { method: "POST", body: validBody(acc._id) });
+    expect(status).toBe(201);
+    // Better no primary than a suppressed one.
+    expect(body.journey.primaryContact?.id == null).toBe(true);
   });
 
   test("an invalid or missing sourceLeadId is a clear 400, not a 500", async () => {
@@ -702,4 +1067,63 @@ describe("planStageTransition (service)", () => {
 
   // (Removed 13 Aug 2026: the account-readiness gate no longer exists — "account"
   // is not a journey stage; the customer is set up on the Active Lead.)
+});
+
+
+/* ══ THE STORED STATE IS A MEMORY, NOT A GUARANTEE ═════════════════════════
+ * `readyToConvert` records that a Lead cleared the Enquiry bar at some moment
+ * in the past. Nothing re-checked it afterwards, and an ordinary edit can undo
+ * it — so a Journey could be raised against a Lead that no longer satisfied a
+ * single one of the rules it was let through on.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+describe("a stale Ready-for-Enquiry Lead cannot start a Journey", () => {
+  const createJourney = (lead, account) => call("", {
+    method: "POST",
+    body: validBody(account._id, { sourceLeadId: String(lead._id) }),
+  });
+
+  test("a Lead that still meets the bar creates exactly one Journey", async () => {
+    const account = await activeAccount();
+    const lead = await readyLead();
+    const r = await createJourney(lead, account);
+    expect(r.status).toBe(201);
+    expect(await SalesJourney.countDocuments({ leadId: lead._id })).toBe(1);
+    expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("converted");
+  });
+
+  for (const [what, patch, expected] of [
+    ["its decision-maker was removed", { decisionMakerName: "", contacts: [] }, /decision-maker/i],
+    ["its requirement certainty was downgraded to suspected", { requirementCertainty: "suspected" }, /confirmed by the customer or a document/i],
+    ["its only contact route was removed", { phone: "", email: "", whatsapp: "" }, /contact route/i],
+    ["a researched estimate lost its source", { estimatedAnnualQuantity: 12000, estimatedAnnualQuantityConfidence: "researched" }, /source/i],
+  ]) {
+    test(`refuses it after ${what}, and creates nothing`, async () => {
+      const account = await activeAccount();
+      const lead = await readyLead();
+      await Lead.updateOne({ _id: lead._id }, { $set: patch });
+
+      const r = await createJourney(lead, account);
+      expect(r.status).toBe(400);
+      expect(r.body.message).toMatch(/no longer meets the bar/i);
+      expect(r.body.message).toMatch(expected);
+
+      // nothing created, and the Lead is NOT partially converted
+      expect(await SalesJourney.countDocuments({ leadId: lead._id })).toBe(0);
+      const after = await Lead.findById(lead._id).lean();
+      expect(after.qualificationState).toBe("readyToConvert");
+      expect(after.conversion?.journeyId).toBeUndefined();
+      expect(after.conversion?.accountId).toBeUndefined();
+    });
+  }
+
+  test("the refusal names every missing item, not just the first", async () => {
+    const account = await activeAccount();
+    const lead = await readyLead();
+    await Lead.updateOne({ _id: lead._id }, { $set: { decisionMakerName: "", contacts: [], requirementCertainty: "suspected" } });
+    const r = await createJourney(lead, account);
+    expect(r.status).toBe(400);
+    expect(r.body.message).toMatch(/decision-maker/i);
+    expect(r.body.message).toMatch(/confirmed by the customer or a document/i);
+  });
 });

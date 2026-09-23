@@ -132,6 +132,46 @@ function nextApplicableIndex(fromIdx, states) {
  *          values the route should assign; `summary` is the audit phrase.
  * @throws {JourneyTransitionError} for any illegal move.
  */
+/**
+ * What a refused close says. A verdict that could not reach the evidence says
+ * so, naming it; one that reached it and found it short says what is short.
+ * Neither turns a missing fact into a number of "unmet" checks.
+ */
+/**
+ * A verdict the close may act on. Anything else — absent, a non-boolean
+ * `canClose`, or a `canClose: true` that contradicts its own blockers — is a
+ * check that did not run properly, and is refused rather than trusted.
+ */
+function isWellFormedVerdict(v) {
+  if (!v || typeof v !== "object" || typeof v.canClose !== "boolean") return false;
+  if (typeof v.available !== "boolean" || !Number.isInteger(v.blockers) || v.blockers < 0) return false;
+  if (!Array.isArray(v.blocking)) return false;
+  if (v.canClose) return v.available === true && v.blockers === 0 && v.blocking.length === 0;
+  return true;
+}
+
+function closingRefusal(verdict) {
+  if (verdict.available === false && verdict.message) return verdict.message;
+  const blocking = Array.isArray(verdict.blocking) ? verdict.blocking : [];
+  const missing = blocking.filter((b) => b.status === "unavailable").map((b) => b.label);
+  const unmet = blocking.filter((b) => b.status !== "unavailable").map((b) => b.label);
+  const parts = [];
+  if (unmet.length) parts.push(`Not met: ${unmet.join("; ")}.`);
+  if (missing.length) {
+    /* Not "yet": nothing the salesperson can do makes these pass. No issued
+       invoice, recorded receipt or actual-cost record is connected to Sales,
+       so while that is true no order can be closed here. Saying so plainly is
+       better than a refusal that reads like a to-do list. */
+    parts.push(`Evidence not available: ${missing.join("; ")} — no issued invoice, recorded receipt or `
+      + "actual-cost record is connected to Sales, so closing is not available until it is.");
+  }
+  if (parts.length) return `The order cannot be closed. ${parts.join(" ")}`;
+  const n = verdict.blockers;
+  return typeof n === "number" && n > 0
+    ? `${n} closing ${n === 1 ? "check is" : "checks are"} unmet — the order cannot be closed yet.`
+    : "The closing checks are not met — the order cannot be closed yet.";
+}
+
 function planStageTransition(journey = {}, input = {}) {
   const action = String(input.action || "").trim();
   const context = input.context || {};
@@ -142,6 +182,44 @@ function planStageTransition(journey = {}, input = {}) {
   const states = readStates(journey.stageStates);
   const currentState = states[current];
   const currentIdx = STAGE_ORDER.indexOf(current);
+
+  /* ── recordWork — A STAGE THE BUSINESS HAS DEMONSTRABLY REACHED ─────────
+   *
+   * Every other verb here is a person's decision. This one is a FACT reported
+   * by a command that already succeeded: a proforma invoice was raised, which
+   * is work done at Cost & Invoicing and nowhere else. Until this existed the
+   * journey had no way to hear about it, so the lifecycle strip said
+   * "Not Started" beside a document that plainly existed, and the only way to
+   * reconcile the two was for a browser to decide for itself what the stage
+   * state ought to be.
+   *
+   * IT ONLY EVER LIFTS `notStarted` TO `inProgress`, on the stage it is told
+   * about. It does not mark anything complete, does not touch `currentStage`,
+   * does not skip or complete the stages in between (nobody did that work, and
+   * saying they did would be the same invention in the other direction), and
+   * never overwrites a state a person set — a stage somebody blocked, parked
+   * or marked complete keeps what they said.
+   *
+   * Anything else is a no-op rather than a refusal: this is a side effect of a
+   * command that has already committed, and failing it would turn "the strip
+   * is a little behind" into "the proforma could not be raised". */
+  if (action === "recordWork") {
+    const target = String(input.stage || "").trim();
+    if (!STAGE_ORDER.includes(target)) {
+      throw new JourneyTransitionError(`"${target || "(none)"}" is not a valid stage.`);
+    }
+    const toState = String(input.toState || "inProgress").trim();
+    if (toState !== "inProgress") {
+      throw new JourneyTransitionError("Recorded work can only move a stage to In progress.");
+    }
+    if (states[target] !== "notStarted") {
+      return { set: {}, noop: true, summary: "" };
+    }
+    return {
+      set: { [`stageStates.${target}`]: "inProgress" },
+      summary: `recorded work at ${labelOf(target)}`,
+    };
+  }
 
   // ── The outcome axis gates every other verb ─────────────────────────────
   //
@@ -299,13 +377,16 @@ function planStageTransition(journey = {}, input = {}) {
     // button could not work at all. Closing is its own verb: it completes the
     // final stage rather than moving to a next one.
     //
-    // The financial gate: `context.closing` carries the closing report's verdict
-    // ({canClose, blockers, checklist}). When the caller supplies it, this
-    // REFUSES a close with unmet checks — the UI's disabled button is not a
-    // control, since anything hitting the API directly bypasses it. When it is
-    // absent the close proceeds, which is deliberate for now: the route does not
-    // yet assemble the verdict, and failing closed would leave no way to close
-    // an order at all. Wiring that assembly is the remaining half of this fix.
+    // The financial gate: `context.closing` carries the closing verdict. A close
+    // is permitted ONLY on a verdict that exists and says `canClose: true`.
+    //
+    // It used to refuse only an explicit `canClose: false` and let everything
+    // else through — so an ABSENT verdict closed the order. The verdict service
+    // returned null for a missing enquiry, a missing order link, an order with
+    // no work order and any thrown error, and the route dropped the null before
+    // it got here: every way of breaking the check was a way of passing it.
+    // (G03.) The verdict service now always answers, and this treats a missing
+    // answer as the refusal it is.
     case "close": {
       if (currentIdx !== STAGE_ORDER.length - 1) {
         throw new JourneyTransitionError(
@@ -319,13 +400,13 @@ function planStageTransition(journey = {}, input = {}) {
         throw new JourneyTransitionError("This order is already closed.");
       }
       const verdict = context.closing;
-      if (verdict && verdict.canClose === false) {
-        const n = verdict.blockers;
+      if (!isWellFormedVerdict(verdict)) {
         throw new JourneyTransitionError(
-          typeof n === "number"
-            ? `${n} closing ${n === 1 ? "check is" : "checks are"} unmet — the order cannot be closed yet.`
-            : "The closing checks are not met — the order cannot be closed yet.",
+          "The closing checks could not be run for this order, so it cannot be closed.",
         );
+      }
+      if (verdict.canClose !== true) {
+        throw new JourneyTransitionError(closingRefusal(verdict));
       }
       return {
         set: {
@@ -345,6 +426,14 @@ function planStageTransition(journey = {}, input = {}) {
       }
       if (states[current] === toState) {
         throw new JourneyTransitionError(`${labelOf(current)} is already ${stateLabelOf(toState)}.`);
+      }
+      /* Completing the FINAL stage is closing the order. It writes exactly the
+         state `close` writes, so letting `setState` do it was a second, ungated
+         close — no verdict, no closedAt. It has to go through `close`. (G03.) */
+      if (toState === "complete" && currentIdx === STAGE_ORDER.length - 1) {
+        throw new JourneyTransitionError(
+          `Completing ${labelOf(current)} closes the order — use Close the order, which runs the closing checks.`,
+        );
       }
       // Waiting on an outside party has to say WHO. Free text, because the list
       // of mills, labs and job-work units is the supply chain and no dropdown

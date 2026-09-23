@@ -35,7 +35,7 @@ const fulfilment = require("../../../services/storeFulfilment.service");
 const financeDecision = require("../../../services/spendFinanceDecision.service");
 /* The service-classification read lives beside the finance gate that is
    blocked on it, so the screen and the refusal cannot disagree. */
-const { serviceClassification, isServiceRequest } = financeDecision;
+const { serviceClassification, isServiceRequest, allocationSummary } = financeDecision;
 const chain = require("../../../services/spendApproval.service");
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 const budgetMatch = require("../../../services/budgetCommitment.service");
@@ -43,6 +43,11 @@ const itemBudgetHead = require("../../../services/itemBudgetHead.service");
 /* The same Store/board/finance grant the intake door reads. Shared so
    "Store & Purchase" means one thing across both routers. */
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+/* The resolved Store & Purchase capability set — a cache-immune ADDITIONAL path
+   to "may act for Store", so the department-role grant is recognised even when
+   the shared 30s department cache is momentarily stale. Additive only: it never
+   removes the existing department or finance paths. */
+const { resolveCapabilities, hasAll, CAPABILITIES: SP_CAPS } = require("../../../services/storePurchase/capabilities");
 const vendorResolve = require("../../../services/vendorResolve.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const documentSequence = require("../../../services/storePurchase/documentSequence.service");
@@ -200,7 +205,7 @@ function buildLines(raw) {
  * that line for its own writes.
  */
 async function viewerOf(emp) {
-  const [managedDocIds, accUser, fulfil] = await Promise.all([
+  const [managedDocIds, accUser, fulfil, caps] = await Promise.all([
     /* Takes a biometric id STRING and answers with Mongo _ids — passing the
        document returns nothing and comparing its answer to a biometric id
        matches nothing, which is how a TL's queue came back empty for requests
@@ -213,7 +218,14 @@ async function viewerOf(emp) {
           .catch(() => null)
       : null,
     resolveFulfilmentAccess(emp).catch(() => ({ allowed: false, via: null })),
+    /* The resolved Store capability set, read from department-role grants (not
+       the cached department list) — a cache-immune path to the SAME "Store may
+       act" answer. */
+    resolveCapabilities({ email: emp?.email, employeeRef: emp?._id, biometricId: emp?.biometricId })
+      .catch(() => ({ capabilities: [], isAdmin: false })),
   ]);
+  /* Holds the operational Store grant, or is a platform admin. */
+  const capabilityFulfils = Boolean(caps?.isAdmin) || hasAll(caps?.capabilities || [], [SP_CAPS.SOURCING_MANAGE]);
   /* Back into biometric ids, which is the identity everything else in this
      flow speaks — `requestedById`, `viewer.employeeId`, and MRF's own routing.
      One vocabulary end to end rather than two that have to be translated at
@@ -241,7 +253,9 @@ async function viewerOf(emp) {
        request that spends money anyway, and a confirmed quote stuck because
        the one store person is on leave is a quote somebody re-raises through
        a channel nobody is measuring. */
-    canFulfil: Boolean(fulfil?.allowed) || (accUser?.isActive !== false && chain.isFinanceApprover(accUser)),
+    canFulfil: Boolean(fulfil?.allowed)
+      || (accUser?.isActive !== false && chain.isFinanceApprover(accUser))
+      || capabilityFulfils,
   };
 }
 
@@ -1101,6 +1115,9 @@ async function decide(req, res, outcome) {
       /* Finance's deliberate answer where a service's configured default does
          not match the head being approved. Absent on an ordinary approval. */
       lineDecisions: req.body?.serviceClassification || null,
+      /* Finance's per-line budget heads. Absent when every line resolves on
+         its own, which is the common case. */
+      lineAllocations: req.body?.lineAllocations || null,
     });
     if (!r.ok) {
       return res.status(r.status).json({
@@ -1110,9 +1127,22 @@ async function decide(req, res, outcome) {
         ...(r.classification ? { classification: r.classification } : {}),
         ...(r.unresolved ? { unresolved: r.unresolved } : {}),
         ...(r.unclassified ? { unclassified: r.unclassified } : {}),
+        /* Which lines still need a head, and why — so the screen can render
+           the choice rather than send finance off to find it. */
+        ...(r.problems ? { problems: r.problems } : {}),
+        ...(r.totals ? { totals: r.totals } : {}),
       });
     }
-    return res.json({ success: true, request: publicRequest(doc.toObject()) });
+    return res.json({
+      success: true,
+      request: publicRequest(doc.toObject()),
+      /* ── WHAT WAS PROMISED, AND OUT OF WHAT ─────────────────────────────
+         Per line and grouped per head, from the plan the approval used —
+         not recomputed, so the result and the commitment cannot disagree.
+         A promise, not an accounting actual: nothing posts until a voucher
+         does. */
+      ...(r.plan ? { allocation: allocationSummary(r.plan) } : {}),
+    });
   }
 
   /* ── THE TL STEP ────────────────────────────────────────────────────────
@@ -1555,6 +1585,12 @@ router.post("/:id/purchase-order", async (req, res) => {
           ? Math.round(l.taxAmount * 100) / 100
           : Math.round(((net * gstRate) / 100) * 100) / 100;
       return {
+        /* ── THE REQUEST LINE THIS ORDER LINE IS ──────────────────────────
+           So a supplier bill can later say which budget allocation it
+           discharges. The service chain already carried this; goods did not,
+           which is why billing one line of a four-line request released the
+           whole commitment. */
+        spendLineId: l._id,
         rawItem: l.rawItem || undefined,
         itemName: l.name,
         sku: l.rawItemSku || "",
@@ -2397,6 +2433,89 @@ router.patch("/:id/confirm", async (req, res) => {
  */
 
 /* ── WHAT STORE AND FINANCE BOTH LOOK AT ──────────────────────────────────── */
+
+/* ══ LINE-WISE BUDGET ALLOCATION ═════════════════════════════════════════════
+ * A request buys fabric from Raw Materials, packaging from Packaging and a
+ * repair from Repairs & Maintenance. Finance is not made to force all three
+ * into one head; each line commits against its own, and the request still
+ * produces exactly ONE commitment document.
+ *
+ * A promise, never an accounting actual. Nothing posts until a voucher does.
+ */
+
+/* ── WHAT FINANCE REVIEWS BEFORE APPROVING ──────────────────────────────────
+ * The same plan the approval will use, computed the same way, so the screen
+ * and the decision cannot disagree about what a line resolves to.
+ *
+ * Read-only. It never refuses: an unresolved line comes back as a `problem`
+ * for the screen to render, because this is the surface on which finance
+ * fixes it.
+ */
+router.get("/:id/line-allocations", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!maySeeRequest(doc, emp, viewer) && !viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "This request is not yours to read." });
+    }
+
+    const plan = await financeDecision.planLineAllocations({
+      request: doc,
+      body: req.query.dryRun ? null : null,
+      actor: { id: emp._id, name: mrfApprover.buildFullName(emp) },
+    });
+
+    if (!plan.ok) {
+      return res.json({
+        success: true,
+        /* Not an error on a REVIEW surface — this is exactly what finance is
+           here to resolve. */
+        allocation: null,
+        code: plan.code,
+        message: plan.message,
+        problems: plan.problems || [],
+        totals: plan.totals || null,
+        heads: await approvedHeadOptions(doc),
+      });
+    }
+
+    res.json({
+      success: true,
+      allocation: allocationSummary(plan),
+      problems: [],
+      heads: await approvedHeadOptions(doc),
+    });
+  } catch (e) {
+    console.error("[spend] line-allocations:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** The heads this department may actually choose — approved lines, not the
+ *  chart of accounts. */
+async function approvedHeadOptions(doc) {
+  if (!doc.companyId) return [];
+  const { heads } = await budgetMatch.approvedHeadsFor({
+    companyId: doc.companyId,
+    department: doc.budgetDepartment || doc.department || "",
+  }).catch(() => ({ heads: [] }));
+  return heads.map((h) => ({
+    budgetLineId: String(h.budgetLineId),
+    ledgerId: String(h.ledgerId),
+    name: h.name,
+    financialYear: h.financialYear,
+    approved: h.approved,
+    committed: h.committed,
+    actual: h.actual,
+    available: h.available,
+  }));
+}
+
 router.get("/:id/service-classification", async (req, res) => {
   try {
     const emp = await requester(req);

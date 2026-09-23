@@ -15,6 +15,20 @@
 const express = require("express");
 const router = express.Router();
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const {
   Acc_ProformaInvoice,
 } = require("../../models/Accountant_model/Acc_ProformaInvoice");
@@ -251,7 +265,7 @@ function round2(n) {
 //   limit      — default 100
 //   sort       — voucherDate-desc (default), voucherNumber-desc
 // -----------------------------------------------------------------------------
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -315,34 +329,7 @@ router.get("/", async (req, res) => {
 // -----------------------------------------------------------------------------
 // GET /:id — single PI with seller + bank info for the detail page / PDF
 // -----------------------------------------------------------------------------
-/* GET /next-number — what the next PI will be called.
- *
- * The number was only ever allocated inside the save, so the form had nothing
- * to show and the user could not set one either. This previews it; the save
- * still allocates authoritatively, so two people drafting at once do not both
- * get PI/2627/00042 written to the database.
- *
- * MUST stay above the "/:id" route below, or Express matches this path as an
- * id and looks for a proforma invoice called "next-number".
- */
-router.get("/next-number", async (req, res) => {
-  try {
-    const { companyId, date } = req.query;
-    if (!companyId)
-      return res
-        .status(400)
-        .json({ success: false, message: "companyId required" });
-    const when = date ? new Date(date) : new Date();
-    const fyString = computeFY(isNaN(when) ? new Date() : when);
-    const voucherNumber = await nextPINumber(companyId, fyString);
-    res.json({ success: true, voucherNumber, financialYear: fyString });
-  } catch (e) {
-    console.error("[proforma next-number]", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id).lean();
     if (!pi)
@@ -397,7 +384,7 @@ router.get("/:id", async (req, res) => {
 // IGST applies; otherwise CGST+SGST split. If stateCode isn't set on
 // either side, defaults to intra-state.
 // -----------------------------------------------------------------------------
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.companyId) {
@@ -511,7 +498,7 @@ router.post("/", async (req, res) => {
 // agreed to). To edit an accepted PI, the user must explicitly revert
 // it to `draft` via PATCH /:id/status first.
 // -----------------------------------------------------------------------------
-router.put("/:id", async (req, res) => {
+router.put("/:id", companyScope, async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id);
     if (!pi)

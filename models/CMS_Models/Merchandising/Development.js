@@ -1,0 +1,366 @@
+// models/CMS_Models/Merchandising/Development.js
+//
+// MERCHANDISING'S PRE-ORDER WORK. THREE RECORDS.
+//
+//   DevelopmentRequestReceipt  Merchandising's answer to Sales' request.
+//   DevelopmentFile            the permanent pre-order aggregate.
+//   DevelopmentBomRevision     the versioned material selection.
+//
+// ── WHY THIS IS NOT THE EXECUTION FILE ──────────────────────────────────────
+// An Execution File exists because a customer placed a confirmed order, and
+// everything on it is an instruction to execute that order. A Development File
+// exists because Sales is trying to WIN an order, and everything on it is a
+// proposal — a selection made to be costed and sampled, which may never become
+// an order at all.
+//
+// Folding them together would mean either an Execution File that exists
+// without a confirmed requirement (and a register full of speculative work
+// nobody has ordered), or a Development selection carrying the guarantees of a
+// confirmed instruction. The two records have different grains, different
+// lifecycles and different consumers, so they are two records.
+//
+// Grain: one Development File per company + Sales Journey + product line.
+//
+// ── AND WHY THE BOM HOLDS IDENTITY ONLY ─────────────────────────────────────
+// Fabric, trims, labels, accessories, sample packaging — what they ARE, in
+// what colour and finish, on which part of the garment. Not how much of them:
+// consumption, allowance and wastage are R&D's, engineered for this style.
+// Not what they cost: rates are Costing's and suppliers are Supply Chain's.
+//
+// A quantity copied here would be presented as established by a record that
+// established nothing, which is precisely the failure
+// `approvedMaterialShortlist.service.js` was written to end.
+"use strict";
+
+const mongoose = require("mongoose");
+
+const actorRef = () => ({
+  id: { type: mongoose.Schema.Types.ObjectId },
+  name: { type: String, trim: true },
+  email: { type: String, trim: true, lowercase: true },
+});
+
+const dateOnly = (extra = {}) => ({
+  type: String, trim: true,
+  match: [/^\d{4}-\d{2}-\d{2}$/, "Use a calendar date, YYYY-MM-DD."],
+  ...extra,
+});
+
+/* ═══ 1. MERCHANDISING'S ANSWER TO SALES ═══════════════════════════════════ */
+
+/**
+ * `PENDING` is computed, not stored — a request with no receipt is pending,
+ * the rule every receipt in this module follows. There is no `REJECTED`:
+ * Merchandising cannot refuse to look at what Sales is trying to sell; it
+ * accepts, or asks a question.
+ */
+const RECEIPT_STATE = Object.freeze({
+  ACCEPTED: "ACCEPTED",
+  CLARIFICATION_REQUESTED: "CLARIFICATION_REQUESTED",
+  SUPERSEDED: "SUPERSEDED",
+  CANCELLED_BY_SALES: "CANCELLED_BY_SALES",
+});
+
+const CLARIFICATION_CATEGORY = Object.freeze([
+  "REQUIREMENT_UNCLEAR",
+  "REFERENCE_MISSING",
+  "DATE_NOT_ACHIEVABLE",
+  "CATEGORY_NOT_APPLICABLE",
+  "OTHER",
+]);
+
+const MIN_REASON = 15;
+
+const receiptSchema = new mongoose.Schema(
+  {
+    companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
+    requestRef: { type: String, trim: true, required: true, immutable: true },
+    requestVersionNo: { type: Number, required: true, immutable: true },
+    requestId: { type: mongoose.Schema.Types.ObjectId, required: true, immutable: true },
+    developmentFileId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+
+    state: { type: String, enum: Object.values(RECEIPT_STATE), required: true },
+    clarification: {
+      category: { type: String, enum: CLARIFICATION_CATEGORY, default: undefined },
+      reason: { type: String, trim: true, default: "", maxlength: 2000 },
+    },
+    decidedBy: actorRef(),
+    decidedAt: { type: Date, default: null },
+    revision: { type: Number, default: 0 },
+  },
+  { timestamps: true, collection: "merchandising_development_receipts" },
+);
+
+receiptSchema.index({ companyId: 1, requestId: 1 }, { unique: true });
+
+/* ═══ 2. THE DEVELOPMENT FILE ══════════════════════════════════════════════ */
+
+/**
+ * Where the pre-order job has got to.
+ *
+ * `RELEASED_TO_RND` is written when SALES authorises release — not when
+ * Merchandising approves. Approving says the selection is settled; releasing
+ * says the buyer relationship is ready for the money to be spent on sampling,
+ * and that is Sales' call. Merchandising approving its own work into R&D's
+ * queue would be Merchandising deciding to spend Sales' development budget.
+ */
+const LIFECYCLE = Object.freeze({
+  NEW: "NEW",                       // the request arrived; nobody has started
+  ACTIVE: "ACTIVE",                 // a merchandiser is selecting
+  AWAITING_APPROVAL: "AWAITING_APPROVAL",
+  APPROVED: "APPROVED",             // Merchandising's selection is settled
+  RELEASED_TO_RND: "RELEASED_TO_RND", // Sales authorised onward development
+  ON_HOLD: "ON_HOLD",
+  CLOSED: "CLOSED",
+  CANCELLED: "CANCELLED",           // mirrored from Sales; never authored here
+});
+
+const developmentFileSchema = new mongoose.Schema(
+  {
+    developmentNumber: { type: String, required: true, unique: true, immutable: true, trim: true },
+    companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
+
+    /* ── THE GRAIN, AND IT IS IMMUTABLE ──────────────────────────────────
+       One file per company + Journey + product line. A file that could be
+       re-pointed would take its whole approved selection history with it. */
+    journeyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
+    journeyRef: { type: String, trim: true, default: "" },
+    productLineRef: { type: String, trim: true, required: true, immutable: true },
+
+    /* The request version in force, and the whole history of them. */
+    currentRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    currentRequestVersionNo: { type: Number, default: null },
+    requestHistory: [new mongoose.Schema({
+      requestId: { type: mongoose.Schema.Types.ObjectId },
+      versionNo: { type: Number },
+      event: { type: String, trim: true },
+      at: { type: Date },
+      by: actorRef(),
+    }, { _id: false })],
+
+    /* Copied at creation from the request, for the register's own read. A
+       later Sales edit does not reach it: this is what the file was opened
+       from, and the current request version is always readable beside it. */
+    productName: { type: String, trim: true, default: "" },
+    styleRef: { type: String, trim: true, default: "" },
+    buyerDisplayLabel: { type: String, trim: true, default: "" },
+    sampleStyleId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+    stockItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    requiredByDate: dateOnly({ default: null }),
+
+    lifecycleStatus: {
+      type: String, enum: Object.values(LIFECYCLE), default: LIFECYCLE.NEW, index: true,
+    },
+    lifecycleReason: { type: String, trim: true, default: "" },
+
+    /* ── RESPONSIBILITY, NOT AUTHORITY ───────────────────────────────────
+       Who answers for this file. A record attribute and a filter — never a
+       permission: the access layer deliberately does not read it. */
+    responsibleMerchandiser: {
+      email: { type: String, trim: true, lowercase: true },
+      name: { type: String, trim: true },
+      assignedAt: { type: Date },
+      assignedBy: actorRef(),
+    },
+
+    /* The approved selection in force. Written only by the approval command. */
+    currentBomRevisionNo: { type: Number, default: null },
+
+    /* ── SALES RELEASES, MERCHANDISING DOES NOT ──────────────────────────
+       Mirrored from Sales' own authorisation. Display-only here; the
+       authoritative record is the release event in the audit trail. */
+    releasedToRndAt: { type: Date, default: null },
+    releasedBy: actorRef(),
+    releaseReference: { type: String, trim: true, default: "" },
+
+    coordinationNote: { type: String, trim: true, default: "", maxlength: 4000 },
+    archived: { type: Boolean, default: false, index: true },
+
+    revision: { type: Number, default: 0 },
+    createdBy: actorRef(),
+    updatedBy: actorRef(),
+  },
+  { timestamps: true, collection: "merchandising_development_files" },
+);
+
+/* One file per line. The database, not the handler, is what makes a second
+   impossible. */
+developmentFileSchema.index(
+  { companyId: 1, journeyId: 1, productLineRef: 1 }, { unique: true },
+);
+/* The register's own reads. */
+developmentFileSchema.index({ companyId: 1, archived: 1, lifecycleStatus: 1, updatedAt: -1, _id: -1 });
+developmentFileSchema.index({ companyId: 1, "responsibleMerchandiser.email": 1, updatedAt: -1 });
+
+developmentFileSchema.statics.LIFECYCLE = LIFECYCLE;
+
+/* ═══ 3. THE VERSIONED MATERIAL SELECTION ══════════════════════════════════ */
+
+const BOM_STATE = Object.freeze({
+  DRAFT: "DRAFT",
+  SUBMITTED: "SUBMITTED",
+  APPROVED: "APPROVED",
+  SUPERSEDED: "SUPERSEDED",
+});
+
+/** What kind of thing a row is. Sample packaging is explicitly sample-stage. */
+const ROW_CATEGORY = Object.freeze({
+  FABRIC: "FABRIC",
+  TRIM: "TRIM",
+  LABEL: "LABEL",
+  ACCESSORY: "ACCESSORY",
+  SAMPLE_PACKAGING: "SAMPLE_PACKAGING",
+});
+
+/**
+ * One selected material.
+ *
+ * Read the fields and note what is not among them: no quantity, no unit, no
+ * allowance, no wastage, no supplier, no rate, no cost, no purchase order, no
+ * stock, no receipt, no reservation, no issue quantity, no sample result. Each
+ * belongs to a department that is not Merchandising, and a copy here would be
+ * a second answer to a question somebody else owns.
+ */
+const bomRowSchema = new mongoose.Schema(
+  {
+    /* ── THE ROW'S PERMANENT NAME ────────────────────────────────────────
+       Opaque, minted once, and CARRIED when a revision is cloned. That is
+       what makes "this label changed at revision 4" a sentence somebody can
+       write, and what lets the confirmed order trace a selection back to the
+       development row it came from. */
+    rowRef: { type: String, trim: true, required: true },
+
+    category: { type: String, enum: Object.values(ROW_CATEGORY), required: true },
+
+    /* ── MATERIAL IDENTITY ───────────────────────────────────────────────
+       The catalogue item and its physical variant — the colour/vendor
+       combination, not a garment size. Both are references into the item
+       master, which Merchandising reads and never writes. */
+    rawItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    rawItemName: { type: String, trim: true, default: "", maxlength: 200 },
+    rawItemSku: { type: String, trim: true, default: "" },
+    variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    variantCombination: [{ type: String, trim: true }],
+
+    /* What a merchandiser actually specifies about it. */
+    colourOrShade: { type: String, trim: true, default: "", maxlength: 120 },
+    finish: { type: String, trim: true, default: "", maxlength: 120 },
+    placement: { type: String, trim: true, default: "", maxlength: 200 },
+
+    /* Which part of the style this applies to. Empty means the whole style. */
+    appliesTo: { type: String, trim: true, default: "", maxlength: 200 },
+
+    selectionNote: { type: String, trim: true, default: "", maxlength: 1000 },
+
+    /* ── WHERE THIS IDENTITY CAME FROM ───────────────────────────────────
+       A safe catalogue reference, so a reader can see whether a row was
+       chosen fresh, adopted from a registered product's BOM, or carried
+       from a legacy selection — and go and look. */
+    source: {
+      kind: {
+        type: String,
+        enum: ["MERCHANDISING_SELECTION", "REGISTERED_PRODUCT_BOM", "LEGACY_STYLE_PICK"],
+        default: "MERCHANDISING_SELECTION",
+      },
+      stockItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      reference: { type: String, trim: true, default: "" },
+      observedAt: { type: Date, default: null },
+    },
+  },
+  { _id: false },
+);
+
+const bomRevisionSchema = new mongoose.Schema(
+  {
+    companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
+    developmentFileId: {
+      type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true,
+    },
+    revisionNo: { type: Number, min: 1, required: true, immutable: true },
+    state: { type: String, enum: Object.values(BOM_STATE), default: BOM_STATE.DRAFT, index: true },
+
+    rows: { type: [bomRowSchema], default: [] },
+
+    /* Where this draft started, so a reader can see it was cloned. */
+    clonedFromRevisionNo: { type: Number, default: null },
+
+    submittedBy: actorRef(),
+    submittedAt: { type: Date, default: null },
+    /* ── MAKER AND CHECKER ───────────────────────────────────────────────
+       The approver may not be the author or the submitter, and an owner is
+       NOT an exception — the rung that would be exempt is the rung the
+       separation exists to constrain. Enforced in the service, recorded
+       here. */
+    approvedBy: actorRef(),
+    approvedAt: { type: Date, default: null },
+    changesRequestedBy: actorRef(),
+    changesRequestedAt: { type: Date, default: null },
+    changeReason: { type: String, trim: true, default: "", maxlength: 2000 },
+
+    supersededByRevisionNo: { type: Number, default: null },
+    supersededAt: { type: Date, default: null },
+
+    createdBy: actorRef(),
+    revision: { type: Number, default: 0 },
+  },
+  { timestamps: true, collection: "merchandising_development_bom_revisions" },
+);
+
+bomRevisionSchema.index(
+  { companyId: 1, developmentFileId: 1, revisionNo: 1 }, { unique: true },
+);
+
+/* ── ONE DRAFT, ONE SUBMITTED, ONE APPROVED — ENFORCED BY THE DATABASE ────
+   Three partial unique indexes. Two drafts is two answers to one question;
+   two approved revisions is two selections both claiming to be in force, and
+   R&D would have no way to choose. Superseded revisions accumulate freely. */
+bomRevisionSchema.index(
+  { companyId: 1, developmentFileId: 1 },
+  { unique: true, partialFilterExpression: { state: "DRAFT" }, name: "one_draft_bom" },
+);
+bomRevisionSchema.index(
+  { companyId: 1, developmentFileId: 1 },
+  { unique: true, partialFilterExpression: { state: "SUBMITTED" }, name: "one_submitted_bom" },
+);
+bomRevisionSchema.index(
+  { companyId: 1, developmentFileId: 1 },
+  { unique: true, partialFilterExpression: { state: "APPROVED" }, name: "one_approved_bom" },
+);
+
+/* ── APPROVED MEANS FROZEN ────────────────────────────────────────────────
+   The guard, not the convention. R&D engineers consumption against an
+   approved selection and Costing prices it; a selection edited underneath
+   them would invalidate both without either being told. A change is a new
+   revision, and the old one is superseded and kept. */
+const FROZEN_AFTER_DRAFT = ["rows", "clonedFromRevisionNo"];
+
+bomRevisionSchema.pre("save", function freezeApproved(next) {
+  if (this.isNew) return next();
+  const wasDraft = this.$__.originalState?.state === BOM_STATE.DRAFT
+    || (this.state === BOM_STATE.DRAFT && !this.isModified("state"))
+    || this.isModified("state");
+  if (wasDraft) return next();
+
+  const touched = this.modifiedPaths().filter((p) => FROZEN_AFTER_DRAFT.includes(p.split(".")[0]));
+  if (touched.length) {
+    const err = new Error(
+      `A ${this.state.toLowerCase()} development BOM is frozen. ${touched.join(", ")} cannot `
+      + "change — start a new revision, so what R&D and Costing worked against stays what it was.",
+    );
+    err.name = "DevelopmentBomImmutable";
+    err.touched = touched;
+    return next(err);
+  }
+  return next();
+});
+
+module.exports = {
+  RECEIPT_STATE, CLARIFICATION_CATEGORY, MIN_REASON,
+  LIFECYCLE, BOM_STATE, ROW_CATEGORY,
+  DevelopmentRequestReceipt: mongoose.models.DevelopmentRequestReceipt
+    || mongoose.model("DevelopmentRequestReceipt", receiptSchema),
+  DevelopmentFile: mongoose.models.DevelopmentFile
+    || mongoose.model("DevelopmentFile", developmentFileSchema),
+  DevelopmentBomRevision: mongoose.models.DevelopmentBomRevision
+    || mongoose.model("DevelopmentBomRevision", bomRevisionSchema),
+};

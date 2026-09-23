@@ -73,6 +73,8 @@ async function seed() {
   const storeDept = (await AccessDepartment.findOne({ slug: "store" })) ||
     (await AccessDepartment.create({ key: `store-${n}`, slug: "store", name: "Store & Purchase", dashboardPath: "/store", isActive: true }));
   const store = await Employee.create({ firstName: "Bikash", lastName: `S${n}`, email: `store${n}@demo.example`, isActive: true, gender: "Other", biometricId: `ST${n}`, department: "Store", accessDepartmentId: storeDept._id });
+  /* Store grant → cache-immune "may act for Store" via the capability path. */
+  await require("../../models/Access/DepartmentRole").create({ departmentSlug: "store", role: "editor", email: store.email, name: "Bikash", isActive: true });
   return { company, ledger, emp, tl, finEmp, store };
 }
 

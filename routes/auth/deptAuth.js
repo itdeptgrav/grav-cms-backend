@@ -91,19 +91,35 @@ async function resolveEmployeeDepartments(employee) {
 
   const active = await activeDepartments();
 
+  let allowed;
   if (ids.length) {
     // Preserve the caller's order so the primary stays first.
     const byId = new Map(active.map((d) => [String(d._id), d]));
-    return ids.map((id) => byId.get(String(id))).filter(Boolean);
+    allowed = ids.map((id) => byId.get(String(id))).filter(Boolean);
+  } else {
+    const label = String(employee.department || "").trim().toLowerCase();
+    const matches = label
+      ? active.filter((d) => String(d.name || "").trim().toLowerCase() === label)
+      : [];
+    allowed = matches.length === 1 ? matches : [];
   }
 
-  const label = String(employee.department || "").trim();
-  if (!label) return [];
+  // A company-scoped PPC grant is also the employee's launcher assignment.
+  // Recompute on session checks so revocation removes the tile without leaving
+  // a second, manually maintained department pointer behind.
+  const ppc = active.find((d) => d.slug === "ppc");
+  if (ppc && employee.email) {
+    const authorised = await require("../../services/ppc/access.service")
+      .authorizedPpcCompanies({ id: employee._id, email: employee.email });
+    if (authorised.length && !allowed.some((d) => String(d._id) === String(ppc._id))) allowed.push(ppc);
+  }
+  return allowed;
+}
 
-  const wanted = label.toLowerCase();
-  const matches = active.filter((d) => String(d.name || "").trim().toLowerCase() === wanted);
-
-  return matches.length === 1 ? matches : [];
+async function deptUserMayOpenPpc(user) {
+  if (!user?.email) return false;
+  return Boolean(await require("../../services/ppc/access.service")
+    .bestPpcRoleForUser({ id: user._id, email: user.email }));
 }
 
 /* What a session check needs from the employee record: identity, status and
@@ -738,6 +754,9 @@ router.post("/login", async (req, res) => {
     const payload = {
       v: 2,
       id: String(legacyUser._id),
+      // A legacy collection id is not a DeptUser id. Verification must look
+      // it up in the collection that authenticated the password.
+      subject: "legacy_department",
       role: legacyUser.role || "",
       userType,
       deptId: dept ? String(dept._id) : null,
@@ -779,6 +798,41 @@ router.post("/login", async (req, res) => {
 /* POST /api/auth/verify                                               */
 /* ------------------------------------------------------------------ */
 
+async function verifiedLegacyDepartment(decoded) {
+  // Pre-v2 HR tokens did not always carry userType; preserve that fallback.
+  const userType = decoded.userType || (decoded.v === 2 ? null : "hr");
+  const Model = legacyModel(userType);
+  if (!Model) return null;
+  const legacyUser = await Model.findById(decoded.id).select("-password");
+  if (!legacyUser || legacyUser.isActive === false) return null;
+  if (decoded.email && String(legacyUser.email || "").toLowerCase() !== String(decoded.email).toLowerCase()) return null;
+
+  // The legacy fallback also runs before access_departments is populated.
+  // A missing row is allowed there; an explicitly disabled row is not.
+  const dept = await AccessDepartment.findOne({ legacyUserType: userType });
+  if (dept && dept.isActive === false) return null;
+  const tile = dept?.toPublicTile() || null;
+  return {
+    success: true,
+    user: {
+      id: legacyUser._id,
+      name: legacyUser.name,
+      email: legacyUser.email,
+      role: legacyUser.role,
+      deptRole: dept
+        ? await require("../../services/departmentRoles").getRole(dept.slug, legacyUser.email)
+        : null,
+      employeeId: legacyUser.employeeId,
+      department: dept?.name || legacyUser.department,
+      deptSlug: resolveSlug(dept, userType),
+      userType,
+      isAdmin: false,
+    },
+    department: tile,
+    departments: tile ? [tile] : [],
+  };
+}
+
 router.post("/verify", async (req, res) => {
   try {
     const token =
@@ -790,6 +844,13 @@ router.post("/verify", async (req, res) => {
     }
 
     const decoded = verifyToken(token);
+
+    if (decoded.v === 2 && decoded.subject === "legacy_department") {
+      const view = await verifiedLegacyDepartment(decoded);
+      return view
+        ? res.status(200).json(view)
+        : res.status(401).json({ success: false, message: "Unauthorized" });
+    }
 
     /* ---- v2, accounting-only subject ------------------------------ */
     // An Acc_User with no employee record. Re-read every time so revoking the
@@ -897,7 +958,9 @@ router.post("/verify", async (req, res) => {
          of two. Each is a cross-region query on the most-called route. */
       const [accSession, deptRole] = await Promise.all([
         attachAccountantSession(res, dept, employee.email, decoded.iat),
-        require("../../services/departmentRoles").getRole(dept.slug, employee.email),
+        dept.slug === "ppc"
+          ? require("../../services/ppc/access.service").bestPpcRoleForUser({ id: employee._id, email: employee.email })
+          : require("../../services/departmentRoles").getRole(dept.slug, employee.email),
       ]);
 
       return res.status(200).json({
@@ -930,6 +993,13 @@ router.post("/verify", async (req, res) => {
     /* ---- v2, department account ----------------------------------- */
     if (decoded.v === 2 && decoded.deptId) {
       const user = await DeptUser.findById(decoded.id);
+      // Tokens issued by the old legacy-login path were v2 but had no
+      // subject. Only when no DeptUser exists may an old CEO token be read
+      // from CEODepartment; a deactivated DeptUser is never bypassed.
+      if (!user && !decoded.subject && decoded.userType === "ceo") {
+        const view = await verifiedLegacyDepartment(decoded);
+        if (view) return res.status(200).json(view);
+      }
       if (!user || !user.isActive) {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
@@ -944,9 +1014,14 @@ router.post("/verify", async (req, res) => {
       // An admin's session may be pointed at a department other than the one
       // their account belongs to (see switch-department). Everyone else is read
       // from their own record, so a hand-edited token cannot move them.
-      const dept = user.isAdmin && decoded.deptId
-        ? await AccessDepartment.findById(decoded.deptId)
-        : await AccessDepartment.findById(user.departmentId);
+      const own = await AccessDepartment.findById(user.departmentId);
+      let dept = own;
+      if (decoded.deptId && String(decoded.deptId) !== String(user.departmentId)) {
+        const requested = await AccessDepartment.findById(decoded.deptId);
+        if (user.isAdmin || (requested?.slug === "ppc" && await deptUserMayOpenPpc(user))) {
+          dept = requested;
+        }
+      }
 
       if (!dept || !dept.isActive) {
         return res.status(401).json({ success: false, message: "Department is not active" });
@@ -969,10 +1044,12 @@ router.post("/verify", async (req, res) => {
           // department reports THAT department's role, not their own, or the
           // page and the token would disagree about who is asking.
           role:
-            (user.isAdmin && String(dept._id) !== String(user.departmentId)
+            (String(dept._id) !== String(user.departmentId)
               ? null
               : user.legacyRole) || dept.legacyRole || dept.slug,
-          deptRole: await require("../../services/departmentRoles").getRole(dept.slug, user.email),
+          deptRole: dept.slug === "ppc"
+            ? await require("../../services/ppc/access.service").bestPpcRoleForUser({ id: user._id, email: user.email })
+            : await require("../../services/departmentRoles").getRole(dept.slug, user.email),
           employeeId: user.employeeId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -1000,7 +1077,9 @@ router.post("/verify", async (req, res) => {
               slug: { $ne: "platform-admin" },
             }).sort({ sortOrder: 1, name: 1 }))
               .map((d) => d.toPublicTile())
-          : [dept.toPublicTile()],
+          : [own, ...((own?.slug !== "ppc" && await deptUserMayOpenPpc(user))
+            ? [await AccessDepartment.findOne({ slug: "ppc", isActive: true })]
+            : [])].filter((d) => d?.isActive).map((d) => d.toPublicTile()),
         accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
       });
@@ -1010,30 +1089,10 @@ router.post("/verify", async (req, res) => {
     // Includes `store`, which the original switch omitted entirely — store
     // tokens fell through to an HRDepartment lookup and 401'd. Driving this
     // from the table fixes that as a side effect.
-    const Model = legacyModel(decoded.userType) || require("../../models/HRDepartment");
-    const legacyUser = await Model.findById(decoded.id).select("-password");
-
-    if (!legacyUser || legacyUser.isActive === false) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
-    }
-
-    const dept = await AccessDepartment.findOne({ legacyUserType: decoded.userType });
-
-    return res.status(200).json({
-      success: true,
-      user: {
-        id: legacyUser._id,
-        name: legacyUser.name,
-        email: legacyUser.email,
-        role: legacyUser.role,
-        deptRole: dept ? await require("../../services/departmentRoles").getRole(dept.slug, legacyUser.email) : null,
-        employeeId: legacyUser.employeeId,
-        department: legacyUser.department,
-        deptSlug: resolveSlug(dept, userType),
-        userType: decoded.userType || "hr",
-        isAdmin: false,
-      },
-    });
+    const view = await verifiedLegacyDepartment(decoded);
+    return view
+      ? res.status(200).json(view)
+      : res.status(401).json({ success: false, message: "Unauthorized" });
   } catch (error) {
     return res.status(401).json({ success: false, message: "Invalid or expired token" });
   }
@@ -1230,14 +1289,13 @@ router.post("/switch-department", async (req, res) => {
     // An administrator may open any active department — the route guard and
     // every /api/admin route already admit them anywhere, so refusing here
     // just meant the portal showed a tile that then would not open.
-    const dept = user.isAdmin
+    const dept = user.isAdmin || (slug === "ppc" && await deptUserMayOpenPpc(user))
       ? await AccessDepartment.findOne({ slug, isActive: true })
       : own;
 
     if (!dept || dept.slug !== slug || !dept.isActive) return deny();
 
-    const adoptDeptRole =
-      Boolean(user.isAdmin) && String(dept._id) !== String(user.departmentId);
+    const adoptDeptRole = String(dept._id) !== String(user.departmentId);
 
     const fresh = signToken(buildTokenPayload(user, dept, { adoptDeptRole }));
     res.cookie(COOKIE_NAME, fresh, cookieOptions());

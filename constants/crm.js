@@ -175,6 +175,35 @@ const ENQUIRY_STATUS_TRANSITIONS = {
   cancelled: ["new", "contacted", "requirement_gathering", "qualified"],
 };
 
+// ── WHERE A LEAD CAME FROM ──────────────────────────────────────────────────
+// The ONE list of Lead source codes. models/CMS_Models/Sales/Lead.js builds its
+// `source` enum from these codes, and GET /api/cms/crm/lookups serves them with
+// labels as `lead_source`, so a screen never has to guess what a code means.
+//
+// `assignedBy` names a code only the system writes:
+//   marketing_campaign — a Prospect handed over from a Marketing campaign
+//   indiamart          — a buyer enquiry routed from IndiaMART's Lead Manager
+// A person may still pick them (a salesperson who took an IndiaMART call by
+// hand is right to say so); `selectable` is the UI's hint, not a rule.
+// Additive: the order and meaning of the pre-existing codes are unchanged.
+const LEAD_SOURCES = [
+  { code: "website", label: "Website" },
+  { code: "referral", label: "Referral" },
+  { code: "cold_call", label: "Cold call" },
+  { code: "trade_show", label: "Trade show" },
+  { code: "social_media", label: "Social media" },
+  { code: "existing_customer", label: "Existing customer" },
+  { code: "advertisement", label: "Advertisement" },
+  { code: "walk_in", label: "Walk-in" },
+  { code: "google", label: "Google" },
+  { code: "linkedin", label: "LinkedIn" },
+  { code: "directory", label: "Directory" },
+  { code: "field_visit", label: "Field visit" },
+  { code: "marketing_campaign", label: "Marketing campaign", selectable: false, assignedBy: "marketing_handover" },
+  { code: "indiamart", label: "IndiaMART", selectable: true, assignedBy: "indiamart_routing" },
+  { code: "other", label: "Other" },
+];
+
 // How the enquiry came in — distinct from a Lead's source (how a prospect was
 // found). An enquiry usually arrives from an existing relationship.
 const ENQUIRY_SOURCES = [
@@ -296,6 +325,28 @@ const CONTACT_ROLES = [
   pair("chef", "Chef / F&B"),
   pair("engineering_head", "Engineering Head"),
   pair("other", "Other"),
+];
+
+/* How a requirement line is counted. Garment orders are overwhelmingly in
+   pieces, so that is what the form pre-selects — but sets and metres are both
+   real here (a two-piece uniform, or fabric bought by length), and forcing
+   them into "pieces" would make the quantity a lie. */
+const REQUIREMENT_UNITS = [
+  { code: "pieces", label: "Pieces" },
+  { code: "sets", label: "Sets" },
+  { code: "metres", label: "Metres" },
+];
+
+/* Where the money stands, as a buyer would describe it. Deliberately a STATE,
+   not a figure: the old free-text `budget` invited invented precision
+   ("₹50L approved for FY26") that nobody had actually been told. That field
+   survives as optional DETAIL — this says how much weight to give it. */
+const BUDGET_STATUSES = [
+  { code: "not_discussed", label: "Not discussed yet" },
+  { code: "indicative", label: "Indicative figure mentioned" },
+  { code: "allocated", label: "Budget allocated" },
+  { code: "approved", label: "Budget approved" },
+  { code: "not_available", label: "No budget available" },
 ];
 
 const CONTACT_STATUSES = [
@@ -585,6 +636,24 @@ const CURRENCIES = [
   pair("CNY", "Chinese Yuan"),
 ];
 
+/* ── WHEN THE CLOCK ON THE BALANCE STARTS ───────────────────────────────────
+ *
+ * "30 days" is not a duration until somebody says thirty days from WHAT. The
+ * same term measured from the invoice and from the bill of lading differ by
+ * the whole shipping time, which on a sea shipment is most of the money's
+ * exposure.
+ *
+ * ── NEW VOCABULARY, AND SAYING SO ──────────────────────────────────────────
+ * Nothing in this system distinguished these before: `paymentTermsCode` is
+ * free text and `creditDays` carried no anchor. So this is added rather than
+ * reused, and kept to the three events a garment order actually turns on.
+ * `negotiatedTerms` stays free text beside it for anything stranger. */
+const PAYMENT_DUE_FROM = [
+  pair("INVOICE", "Invoice date"),
+  pair("DISPATCH", "Dispatch from our warehouse"),
+  pair("BILL_OF_LADING", "Bill of lading / shipment"),
+];
+
 const COUNTRIES = [
   pair("IN", "India"),
   pair("US", "United States"),
@@ -857,17 +926,46 @@ const LEAD_REVIEW_STATUSES = [
   pair("rejected", "Rejected"),
 ];
 
+/* ── THE LEAD LIFECYCLE IS ABOUT THE REQUIREMENT, NOT THE PHONE ─────────────
+   A Lead exists because a Prospect was converted, and a Prospect only converts
+   after a successful two-way interaction and a confirmed interest signal. So a
+   Lead that opened at "New → Contacting → Contacted" restarted a funnel that
+   had already been completed: it asked the salesperson to prove contact they
+   had just proved, and told them nothing about the only question that matters
+   at this stage — what does this customer actually want?
+
+   The labels below re-describe the SAME codes as the work that is really
+   happening. No stored value changes, no field is renamed, and no record is
+   migrated: `new` still means new, it is just called what it is for.
+
+   `contactAttempted` and `contacted` are LEGACY-ONLY (see
+   LEAD_QUALIFICATION_LEGACY_STATES). Records sitting in them stay readable and
+   can still advance; no new work can target them. */
 const LEAD_QUALIFICATION_STATES = [
-  pair("new", "New"),
-  pair("contactAttempted", "Contacting"),
-  pair("contacted", "Contacted"),
-  pair("qualified", "Qualified"),
-  pair("readyToConvert", "Ready for Journey"),
+  pair("new", "Interest Confirmed"),
+  pair("contactAttempted", "Contacting (legacy)"),
+  pair("contacted", "Contacted (legacy)"),
+  pair("qualified", "Requirement Captured"),
+  pair("readyToConvert", "Enquiry Ready"),
   pair("nurture", "Nurture"),
   pair("disqualified", "Disqualified"),
   pair("duplicate", "Duplicate"),
-  pair("converted", "Journey Started"),
+  pair("converted", "Enquiry Raised"),
 ];
+
+/* Reachable, readable, advanceable — but never a TARGET again. Old records in
+   these two states display under Interest Confirmed and may move on to
+   Requirement Captured; nothing rewrites them in bulk and their activity and
+   audit history is untouched. */
+const LEAD_QUALIFICATION_LEGACY_STATES = new Set(["contactAttempted", "contacted"]);
+
+/* Which lifecycle position a state is SHOWN at. The two legacy states have no
+   position of their own any more, so they are shown where the work actually
+   stands: nobody has identified the requirement yet. */
+const LEAD_QUALIFICATION_DISPLAY_STATE = {
+  contactAttempted: "new",
+  contacted: "new",
+};
 
 // `disqualified`/`duplicate`/`nurture` require a reason on the canonical
 // transition API — nurture's "reason" is "why is this being parked" (in
@@ -887,25 +985,31 @@ const LEAD_QUALIFICATION_RESERVED_STATES = new Set(["converted"]);
 // via LEAD_QUALIFICATION_RESERVED_STATES so the rejection message can be
 // specific about why, rather than a generic "not a valid transition."
 //
-// `contactAttempted` sits between `new` and `contacted`: reaching it requires
-// a LOGGED outreach attempt (any completed call/email/meeting/site visit),
-// reaching `contacted` requires a genuinely SUCCESSFUL two-way contact
-// outcome — two different bars, checked in services/leadQualification.js
-// against real Activity data, not merely a button click. `new` may also move
-// straight to `contacted` (still gated by the SAME successful-contact proof)
-// for the common one-call-and-it-connects case — `contactAttempted` is a
-// real, useful waypoint, not a mandatory one; nothing about the "contacted"
-// bar is weaker for skipping it. `nurture` can return to either
-// `contactAttempted` or `contacted` since a parked Lead may resume from
-// either point depending on what had actually happened before it was
-// nurtured.
+// The forward path is three steps and nothing else:
+//
+//   new (Interest Confirmed) → qualified (Requirement Captured)
+//                               → readyToConvert (Enquiry Ready)
+//                               → the Sales Journey, created by its own route
+//
+// `contactAttempted` and `contacted` appear ONLY as sources. Nothing targets
+// them, which is what makes them legacy rather than merely discouraged: the
+// graph itself refuses to put a record there. Both may advance straight to
+// `qualified`, so an old record is never stranded.
+//
+// Parked/Lost/Duplicate stay side outcomes reachable from every active state,
+// under the same safeguards as before (reason required; nurture also needs a
+// next action and a future revisit date; duplicate needs a verified link).
+//
+// `nurture` returns to `new` or `qualified` — wherever the requirement work had
+// actually got to. It deliberately no longer returns to the legacy pair: a
+// parked Lead resuming must resume in the current vocabulary.
 const LEAD_QUALIFICATION_TRANSITIONS = {
-  new: ["contactAttempted", "contacted", "nurture", "disqualified", "duplicate"],
-  contactAttempted: ["contacted", "nurture", "disqualified", "duplicate"],
+  new: ["qualified", "nurture", "disqualified", "duplicate"],
+  contactAttempted: ["qualified", "nurture", "disqualified", "duplicate"],
   contacted: ["qualified", "nurture", "disqualified", "duplicate"],
   qualified: ["readyToConvert", "nurture", "disqualified", "duplicate"],
   readyToConvert: ["nurture", "disqualified", "duplicate"],
-  nurture: ["contactAttempted", "contacted", "qualified", "disqualified", "duplicate"],
+  nurture: ["new", "qualified", "disqualified", "duplicate"],
   disqualified: [],
   duplicate: [],
   converted: [],
@@ -1055,6 +1159,14 @@ const SAMPLE_STYLE_STAGES = [
 ];
 
 module.exports = {
+  /* ── ONE COUNTRY LIST, NOT TWO ────────────────────────────────────────
+     Exported so Store & Purchase can record a country of origin against the
+     same ISO-2 codes the CRM already uses. A second list would mean "IN" and
+     "India" both existing as the same fact, and a costing joining on the
+     wrong one. Additive: `LOOKUP_CATEGORIES.country` is unchanged and still
+     serves the CRM's own picker. */
+  COUNTRIES,
+  PAYMENT_DUE_FROM,
   ACCOUNT_ROLES,
   ACCOUNT_STATUSES,
   LIFECYCLE_STAGES,
@@ -1078,6 +1190,8 @@ module.exports = {
   RELATIONSHIP_TYPES,
 
   // Requirement certainty (Lead correction chunk)
+  LEAD_QUALIFICATION_LEGACY_STATES,
+  LEAD_QUALIFICATION_DISPLAY_STATE,
   REQUIREMENT_CERTAINTIES,
   REQUIREMENT_CERTAINTY_CODES: codes(REQUIREMENT_CERTAINTIES),
   REQUIREMENT_CERTAINTY_CONFIRMED,
@@ -1152,6 +1266,8 @@ module.exports = {
   COSTING_REQUEST_PURPOSE_CODES: codes(COSTING_REQUEST_PURPOSES),
   ENQUIRY_STATUS_TRANSITIONS,
   ENQUIRY_SOURCE_CODES: codes(ENQUIRY_SOURCES),
+  LEAD_SOURCES,
+  LEAD_SOURCE_CODES: codes(LEAD_SOURCES),
   ENQUIRY_LOST_REASON_CODES: codes(ENQUIRY_LOST_REASONS),
   GARMENT_GENDER_CODES: codes(GARMENT_GENDERS),
   ENQUIRY_PRIORITY_CODES: codes(ENQUIRY_PRIORITIES),
@@ -1162,6 +1278,10 @@ module.exports = {
   ADDRESS_TYPE_CODES: codes(ADDRESS_TYPES),
   CONTACT_ROLE_CODES: codes(CONTACT_ROLES),
   CONTACT_STATUS_CODES: codes(CONTACT_STATUSES),
+  REQUIREMENT_UNITS,
+  REQUIREMENT_UNIT_CODES: codes(REQUIREMENT_UNITS),
+  BUDGET_STATUSES,
+  BUDGET_STATUS_CODES: codes(BUDGET_STATUSES),
   PREFERRED_CHANNEL_CODES: codes(PREFERRED_CHANNELS),
   CONSENT_STATUS_CODES: codes(CONSENT_STATUSES),
   TEAM_ROLE_CODES: codes(TEAM_ROLES),
@@ -1214,6 +1334,7 @@ module.exports = {
     freight_arrangement: FREIGHT_ARRANGEMENTS,
     enquiry_status: ENQUIRY_STATUSES,
     enquiry_source: ENQUIRY_SOURCES,
+    lead_source: LEAD_SOURCES,
     enquiry_lost_reason: ENQUIRY_LOST_REASONS,
     garment_gender: GARMENT_GENDERS,
     enquiry_priority: ENQUIRY_PRIORITIES,
@@ -1238,6 +1359,7 @@ module.exports = {
     relationship_type: RELATIONSHIP_TYPES.map((r) => ({ code: r.code, label: r.label, inverse: r.inverse, inverseLabel: r.inverseLabel })),
     currency: CURRENCIES,
     country: COUNTRIES,
+    payment_due_from: PAYMENT_DUE_FROM,
     business_model: BUSINESS_MODELS,
     product_category: PRODUCT_CATEGORIES,
     construction_type: CONSTRUCTION_TYPES,

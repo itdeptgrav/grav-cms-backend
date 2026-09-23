@@ -34,6 +34,20 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 const auth = accountantAuth;
 
@@ -43,7 +57,7 @@ const VOUCHER_FIELDS =
   "_id voucherNumber voucherType voucherDate partyLedgerName " +
   "grandTotal narration status referenceNumber inventoryEntries.stockItemName";
 
-router.get("/", auth, async (req, res) => {
+router.get("/", auth, companyScope, async (req, res) => {
   try {
     const { q, companyId, scope } = req.query;
     if (!companyId)

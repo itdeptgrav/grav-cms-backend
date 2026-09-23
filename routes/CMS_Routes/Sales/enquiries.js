@@ -19,13 +19,32 @@
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
+const { reconcileProductLineIdentities } = require("../../../models/CMS_Models/Sales/enquiryProductLineIdentity");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../../models/CMS_Models/Sales/Account");
+/* Structured payment terms — the duration half of financing, which the
+   company rate has never had. Sales agrees them; Costing reads them. */
+const paymentTermsResolution = require("../../../services/sales/paymentTermsResolution.service");
+/* What Sales asks Central Costing to price. Read by the costing engine,
+   written only here. */
+const costingBrief = require("../../../services/sales/costingBrief.service");
+const commercialLine = require("../../../services/sales/commercialLine.service");
+const preparation = require("../../../services/sales/costingPreparation.service");
+/* Sales asks for an estimate; this resolves every source and decides whether
+   a version is even needed. Central Costing stays an engine. */
+const costingPreparation = require("../../../services/sales/costingPreparation.service");
+const costingResult = require("../../../services/sales/costingResult.service");
+const { fail: costingFail } = require("../../../services/storePurchase/errors");
+const { CAPABILITIES } = require("../../../services/centralCosting/capabilities");
+const commercialReview = require("../../../services/sales/commercialReview.service");
+const proformaRequest = require("../../../services/sales/proformaRequest.service");
+const lineReadiness = require("../../../services/sales/lineReadiness.service");
 const Customer = require("../../../models/Customer_Models/Customer");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Employee = require("../../../models/Employee");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
+const { ownershipFieldsFor } = require("../../../services/companyContext/ownershipStamp.service");
 const { createWithRef } = require("../../../services/enquiryRef");
 const NotificationService = require("../../../services/NotificationService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
@@ -55,18 +74,62 @@ function escapeHtml(s) {
 // So every notification email below can say WHICH customer this is, not just
 // which enquiry — a bare enquiry reference means nothing to someone on
 // another department's dashboard who has never opened this record.
-async function customerNameFor(enquiry) {
+async function customerNameFor(enquiry, req) {
   if (!enquiry?.accountId) return "—";
-  const acc = await Account.findById(enquiry.accountId).select("displayName companyName").lean();
+  const acc = await Account.findOne(await scopedForEnquiry(enquiry, req, { _id: enquiry.accountId }))
+    .select("displayName companyName").lean();
   return acc?.displayName || acc?.companyName || "—";
+}
+
+/**
+ * SCOPE AN ENQUIRY'S OWN LOOKUP, WITH OR WITHOUT A SESSION.
+ *
+ * ── THE PUBLIC-ROUTE DEFECT THIS CLOSES ─────────────────────────────────────
+ * `customerNameFor` used `scoped(req, …)` unconditionally, and `salesScope`
+ * begins `if (!req.user?.id) throw UNAUTHENTICATED`. The customer-approval link
+ * is deliberately session-less — a customer follows it from an email and has no
+ * account — so every decision recorded through it threw 401 before anything was
+ * written. The route was unusable in production, not merely untestable.
+ *
+ * ── AND WHY THE TOKEN IS A SUFFICIENT SCOPE ─────────────────────────────────
+ * By the time this is called the opaque token has already been matched against
+ * a single enquiry, and that enquiry carries the company it belongs to. So the
+ * scope is not absent — it is narrower than a session's: exactly one company,
+ * named by the record the token authorised, rather than every company the
+ * caller is a member of.
+ *
+ * ── WHAT IS NOT WEAKENED ────────────────────────────────────────────────────
+ * Nothing on an authenticated path. Where `req.user` exists this defers to
+ * `scoped` unchanged, so a signed-in caller is still held to their own
+ * memberships and a foreign enquiry is still simply not found. The token branch
+ * is reachable only for a request that has no session at all, and it pins the
+ * company to the enquiry rather than trusting anything the caller sent.
+ */
+async function scopedForEnquiry(enquiry, req, selector = {}) {
+  if (req?.user?.id) return scoped(req, selector);
+  /* The company comes from the enquiry the opaque token resolved to, never
+     from the request. An enquiry with no company is not silently widened: the
+     selector alone would match across tenants, so it is refused.
+
+     This is a SCOPING HELPER, not an exemption — every path through it returns
+     a filter carrying a company, or throws. It is named in the tenancy guard's
+     own list of such helpers rather than carrying a reviewed-query marker,
+     because there is no unscoped query here to review. */
+  const companyId = enquiry?.companyId || null;
+  if (!companyId) {
+    const err = new Error("This enquiry has no company, so it cannot be read without a session.");
+    err.status = 409;
+    throw err;
+  }
+  return { ...selector, companyId };
 }
 
 // The account's own contact email — for the per-product costing approval
 // email (24 Aug 2026). Falls back to nothing rather than guessing; the
 // send-to-customer route refuses to fire without a real address.
-async function customerEmailFor(enquiry) {
+async function customerEmailFor(enquiry, req) {
   if (!enquiry?.accountId) return null;
-  const acc = await Account.findById(enquiry.accountId).select("primaryEmail").lean();
+  const acc = await Account.findOne(await scoped(req, { _id: enquiry.accountId })).select("primaryEmail").lean();
   return acc?.primaryEmail || null;
 }
 
@@ -84,8 +147,27 @@ function hashApprovalToken(plain) {
 // Resolve a plaintext token back to the enquiry + the ONE costingLifecycle
 // entry it belongs to. Returns null on anything not live: unknown, expired,
 // or already redeemed (hash cleared on decide).
+//
+// ── DELIBERATELY NOT COMPANY-SCOPED, AND REVIEWED AS SUCH (Chunk 3A) ────────
+// Every other Enquiry lookup in this file now carries the caller's company.
+// This one cannot and must not: it runs on a PUBLIC route for a customer who
+// has no CMS session, so there is no actor to scope by, and inventing one
+// would mean picking a company from the record being requested — the exact
+// circularity the tenant rules refuse.
+//
+// What authorises it is the token itself. The lookup is keyed on a SHA-256 of
+// an unguessable secret, so it is not an enumeration path: there is no id to
+// walk, a wrong guess returns null, and the same null answers unknown, expired
+// and already-redeemed alike. The token is single-use — the hash is cleared on
+// decision — and time-bounded by COSTING_APPROVAL_TOKEN_LIFETIME_MS.
+//
+// The caller is a customer acting on ONE costing entry they were sent, not a
+// user browsing enquiries, and the route must keep it that way.
 async function resolveCostingApprovalToken(token) {
   const hash = hashApprovalToken(token);
+  /* tenancy-guard:reviewed-public-token — authorised by the opaque token
+     itself, not by a company; see the block comment above. The marker exempts
+     THIS query only, and the guard scans the rest of this file normally. */
   const enquiry = await Enquiry.findOne({ "costingLifecycle.customerApprovalTokenHash": hash, isActive: true });
   if (!enquiry) return null;
   const entry = (enquiry.costingLifecycle || []).find((c) => c.customerApprovalTokenHash === hash);
@@ -94,26 +176,32 @@ async function resolveCostingApprovalToken(token) {
   return { enquiry, entry };
 }
 
-// Once the customer approves, the price they just confirmed is what the
-// product actually sells at — written onto EVERY variant of the linked
-// stock item (24 Aug 2026, explicit request: "the corresponding product
-// price will be filled in the corresponding product stock item variant
-// price... for all variant"). Silently a no-op if nothing's registered yet
-// for this product — the approval itself is still real either way.
-async function syncApprovedPriceToStockItem(enquiry, productName, price) {
-  if (!(price > 0)) return;
-  const product = (enquiry.products || []).find((p) => p.product === productName);
-  if (!product?.stockItemId) return;
-  try {
-    const stockItem = await StockItem.findById(product.stockItemId);
-    if (!stockItem) return;
-    for (const v of stockItem.variants || []) v.salesPrice = price;
-    stockItem.baseSalesPrice = price;
-    await stockItem.save();
-  } catch (err) {
-    console.error("[enquiries] price → stock item sync failed:", err.message);
-  }
-}
+/* ── REMOVED: THE CUSTOMER-APPROVAL PRICE NO LONGER TOUCHES THE ITEM MASTER ──
+ *
+ * This used to write the approved price onto `baseSalesPrice` and onto EVERY
+ * variant of the linked stock item. Three things were wrong with it, and the
+ * third was reaching the customer:
+ *
+ *   1. It found the price with `costLedger.find(l => l.productName === ...)`.
+ *      Ledger rows carry a name even when they are keyed by the permanent
+ *      pair, so an enquiry with the same garment in two colourways has two
+ *      rows with one name and `.find` took the first — Navy's price could be
+ *      written for Sand.
+ *   2. It then fanned that single figure across every variant, so one
+ *      colourway's approval overwrote the prices of all the others.
+ *   3. `proformaRequest` read `variant.salesPrice || baseSalesPrice` back out
+ *      as the PI price. A price approved for 500 therefore invoiced a line
+ *      confirmed at 750, and nothing compared it to the floor.
+ *
+ * The item master is a catalogue, not a record of what one customer agreed.
+ * What a customer approved lives on the enquiry's own commercial record, keyed
+ * by `productLineRef + sampleStyleId`, and the PI resolves its price from the
+ * approved costing version — see `services/sales/proformaRequest.service.js`.
+ *
+ * (Its catch also called `answeredTenantRefusal(res, err)` with no `res` in
+ * scope, so any save failure raised a ReferenceError out of the handler and
+ * failed the customer's approval. Removing the function removes that too.)
+ */
 
 // The margin policy. Hardcoded for now and deliberately server-side: the floor
 // price is computed here and only the RESULT is sent, so cost never has to be
@@ -146,7 +234,14 @@ async function markupPercent() {
 /* Costing visibility — see services/crmCostVisibility.js for the rules and
    why they live outside this file (it cannot be required without Firebase). */
 
-const { ENQUIRY_STATUS_CODES, ENQUIRY_STATUS_TRANSITIONS, ENQUIRY_SOURCE_CODES, ENQUIRY_LOST_REASON_CODES, ENQUIRY_PRIORITY_CODES, CUSTOMER_SERIOUSNESS_CODES, ENQUIRY_REFERENCE_TYPE_CODES } = require("../../../constants/crm");
+const { ENQUIRY_STATUS_CODES, ENQUIRY_STATUS_TRANSITIONS, ENQUIRY_SOURCE_CODES, ENQUIRY_LOST_REASON_CODES, ENQUIRY_PRIORITY_CODES, CUSTOMER_SERIOUSNESS_CODES, ENQUIRY_REFERENCE_TYPE_CODES, FREIGHT_ARRANGEMENT_CODES } = require("../../../constants/crm");
+/* The two registers a delivery term points at. Both are read company-scoped
+   where they are used: an address on somebody else's account and a warehouse
+   in another company must be indistinguishable from ones that do not exist. */
+const {
+  resolveShippingDestination, shippingAddressesFor, REASON: SHIPPING_REASON,
+} = require("../../../services/centralCosting/shippingDestination.service");
+const Warehouse = require("../../../models/CMS_Models/Inventory/Configurations/Warehouse");
 
 const express = require("express");
 const router = express.Router();
@@ -373,20 +468,35 @@ function summarizeCostingSheetChange(before, after) {
  * Best-effort and never awaited by its caller for the same reason the
  * forward link isn't: a product row saving must never fail on this.
  */
-async function unlinkRemovedEnquiryProducts({ accountId, removedStockItemIds, excludeEnquiryId }) {
+/**
+ * @param {object} args.companyClause  the caller's already-resolved company
+ *   filter. Passed in rather than re-resolved: this runs as background work
+ *   after a write, and "which company" must be the one that made the write,
+ *   not whatever a second lookup happens to decide.
+ */
+async function unlinkRemovedEnquiryProducts({ accountId, removedStockItemIds, excludeEnquiryId, companyClause }) {
   if (!accountId || !removedStockItemIds?.length) return;
   try {
-    const account = await Account.findById(accountId).select("linkedCustomer");
+    const account = await Account.findOne(await scoped(req, { _id: accountId })).select("linkedCustomer");
     if (!account?.linkedCustomer) return;
 
     const stillNeeded = new Set(
       (
-        await Enquiry.find({
-          accountId,
-          isActive: true,
-          _id: { $ne: excludeEnquiryId },
-          "products.stockItemId": { $in: removedStockItemIds },
-        })
+        /* Scoped: "is this stock item still wanted" must be answered from
+           THIS company's enquiries. Another company still wanting it is not a
+           reason to keep this company's link, and reading their enquiries to
+           find out is the leak. */
+        await Enquiry.find(await scoped(req, {
+          $and: [
+            companyClause || {},
+            {
+              accountId,
+              isActive: true,
+              _id: { $ne: excludeEnquiryId },
+              "products.stockItemId": { $in: removedStockItemIds },
+            },
+          ],
+        }))
           .select("products.stockItemId")
           .lean()
       ).flatMap((e) => (e.products || []).map((p) => p.stockItemId && String(p.stockItemId))),
@@ -422,6 +532,12 @@ function sanitizeProducts(input) {
       const sid = String(p.stockItemId || "").trim();
       const validSid = mongoose.Types.ObjectId.isValid(sid) ? sid : undefined;
       const out = {
+        /* The line this row claims to be — carried through UNTRUSTED. It is
+           only a claim: `reconcileProductLineIdentities` accepts it solely if
+           this enquiry already holds that exact reference. Dropping it here
+           (as this function used to) made every save re-mint every line, and
+           orphaned the Development Files rooted on the old references. */
+        productLineRef: String(p.productLineRef || "").trim() || undefined,
         product: String(p.product).trim(),
         stockItemId: validSid,
         stockItemReference: String(p.stockItemReference || "").trim() || undefined,
@@ -500,11 +616,59 @@ function sanitizeReferences(input) {
  * Resolve the Journey by its human reference (SJ-YYYY-NNNN) or Mongo id, and
  * return the loaded document. Throws a 404-shaped error object if absent.
  */
-async function loadJourney(journeyRef) {
+/* ══════════════════════════════════════════════════════════════════════════
+ * TENANT SCOPE (Chunk 3A correction)
+ *
+ * ── WHY EVERY LOOKUP IN THIS FILE GOES THROUGH ONE FUNCTION ────────────────
+ * This router selects an Enquiry in thirty-five places. A rule that each of
+ * them must remember to add `companyId` holds until the thirty-sixth is
+ * written — and the one that forgets is indistinguishable from the ones that
+ * did not: it works, it returns data, and nothing fails until the data belongs
+ * to somebody else.
+ *
+ * So the company clause is built in
+ * `services/companyContext/salesScope.service.js` and folded in here. A future
+ * route that writes `Enquiry.findOne(await scoped(req, {_id}))` is now visibly doing something
+ * the rest of the file does not.
+ *
+ * Foreign, missing and (in a multi-company deployment) unowned records are all
+ * simply absent — one answer, no way to tell them apart.
+ * ═════════════════════════════════════════════════════════════════════════ */
+const { scopedFilter: salesScopedFilter, scopeFor: salesScopeFor } = require("../../../services/companyContext/salesScope.service");
+
+
+/**
+ * A tenant refusal keeps its own status.
+ *
+ * Every `catch` in this router ends in a generic 500. That is right for a bug
+ * and wrong for a refusal: "choose which company you are working in" (409),
+ * "your account is not linked to a company" (403) and "we could not check just
+ * now" (503) are all actionable answers, and a 500 tells the caller none of
+ * them and invites a retry that will fail the same way.
+ *
+ * Returns true when it has answered, so a catch block can fall through to its
+ * existing behaviour for anything that is genuinely a fault.
+ */
+function answeredTenantRefusal(res, err) {
+  if (err?.name !== "StorePurchaseError") return false;
+  res.status(err.status).json(err.toResponse());
+  return true;
+}
+
+/** A selector with this actor's company clause folded in. */
+const scoped = (req, selector = {}) => salesScopedFilter(req, selector);
+
+async function loadJourney(req, journeyRef) {
   const query = isObjectId(journeyRef)
     ? { $or: [{ _id: journeyRef }, { journeyId: journeyRef }] }
     : { journeyId: journeyRef };
-  const journey = await SalesJourney.findOne({ ...query, isActive: true });
+  /* ── THE JOURNEY IS SCOPED TOO, AND THAT IS THE POINT ──────────────────
+     An Enquiry is created FROM a journey. Loading the journey unscoped and
+     then stamping the actor's company onto the resulting enquiry is a way to
+     CLAIM one: open another company's journey and its opportunity is quietly
+     adopted, with the adoption looking like ordinary use. The company is part
+     of the same query, so a foreign journey is simply not found. */
+  const journey = await SalesJourney.findOne(await scoped(req, { ...query, isActive: true }));
   return journey;
 }
 
@@ -512,9 +676,9 @@ async function loadJourney(journeyRef) {
 async function decorate(enquiry, req = null) {
   const obj = enquiry.toObject ? enquiry.toObject() : enquiry;
   const [account, contact, journey] = await Promise.all([
-    obj.accountId ? Account.findById(obj.accountId).select("accountId companyName displayName").lean() : null,
-    obj.primaryContactId ? Contact.findById(obj.primaryContactId).select("firstName lastName jobTitle email mobile whatsapp").lean() : null,
-    obj.journeyId ? SalesJourney.findById(obj.journeyId).select("journeyId name").lean() : null,
+    obj.accountId ? Account.findOne(await scoped(req, { _id: obj.accountId })).select("accountId companyName displayName").lean() : null,
+    obj.primaryContactId ? Contact.findOne(await scoped(req, { _id: obj.primaryContactId })).select("firstName lastName jobTitle email mobile whatsapp").lean() : null,
+    obj.journeyId ? SalesJourney.findOne(await scoped(req, { _id: obj.journeyId })).select("journeyId name").lean() : null,
   ]);
   const out = {
     ...obj,
@@ -540,16 +704,16 @@ async function decorate(enquiry, req = null) {
 // Get-or-create the enquiry for a journey, seeded from account/contact/lead.
 router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
   try {
-    const journey = await loadJourney(req.params.journeyRef);
+    const journey = await loadJourney(req, req.params.journeyRef);
     if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
 
-    let enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true });
+    let enquiry = await Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true }));
 
     if (!enquiry) {
       // Seed from the source Lead (the one whose conversion points at this
       // journey), if any — it carries the source, the summary and the
       // product-wise requirement captured at lead stage.
-      const lead = await Lead.findOne({ "conversion.journeyId": journey._id })
+      const lead = await Lead.findOne(await scoped(req, { "conversion.journeyId": journey._id }))
         .select("leadId source company firstName lastName requirements requirementItems productInterest "
               + "estimatedUnitPrice estimatedUnitPriceConfidence estimatedUnitPriceSource "
               + "estimatedAnnualQuantity estimatedAnnualQuantityConfidence estimatedAnnualQuantitySource "
@@ -557,10 +721,19 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         .lean();
       const primaryContact = journey.primaryContactId
         ? journey.primaryContactId
-        : (await Contact.findOne({ accountId: journey.accountId, isActive: true, isPrimary: true }).select("_id").lean())?._id
-          || (await Contact.findOne({ accountId: journey.accountId, isActive: true }).select("_id").lean())?._id;
+        : (await Contact.findOne(await scoped(req, { accountId: journey.accountId, isActive: true, isPrimary: true })).select("_id").lean())?._id
+          || (await Contact.findOne(await scoped(req, { accountId: journey.accountId, isActive: true })).select("_id").lean())?._id;
+
+      /* ── OWNERSHIP, FROM THE SERVER ──────────────────────────────────
+         Resolved from the actor's own membership (or the documented
+         single-company deployment rule) and never from the request. When it
+         cannot be proved the enquiry is created UNOWNED with the reason
+         recorded, rather than refused — Sales keeps working, and costing
+         refuses to use an unowned enquiry once a second company exists. */
+      const ownership = await ownershipFieldsFor(req.user);
 
       enquiry = await createWithRef(Enquiry, {
+        ...ownership,
         journeyId: journey._id,
         accountId: journey.accountId,
         primaryContactId: primaryContact || undefined,
@@ -604,7 +777,7 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       // below) — best-effort, never awaited: an email failing must not
       // affect the enquiry that was just created.
       (async () => {
-        const customerName = await customerNameFor(enquiry);
+        const customerName = await customerNameFor(enquiry, req);
         const products = enquiry.products || [];
         const productSummary = products.length
           ? products.map((p) => (p.quantity ? `${p.product} (${p.quantity} pcs)` : p.product)).join(", ")
@@ -626,8 +799,29 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
+    /* ── AND WHETHER A PROFORMA HAS BEEN RAISED ON IT ──────────────────
+       The product board draws all three Pipeline stages from this one read,
+       and had no way of knowing that the Cost & Invoicing work had finished
+       in the only way it can finish — a document. It showed "Priced — ready
+       to send / waiting on you" beside a raised invoice.
+
+       On the SINGLE-enquiry read only. `decorate` also serves the list
+       routes, and one extra lookup per row there would be a query per
+       enquiry for a fact no list shows. */
+    const decorated = await decorate(enquiry, req);
+    let proforma = null;
+    try {
+      proforma = await proformaRequest.currentProformaFor(await costingCtxFor(req), enquiry);
+    } catch (e) {
+      /* A fact the board can do without. The enquiry itself must still load:
+         failing the whole stage because a summary could not be built is the
+         worse outcome by a distance. */
+      proforma = null;
+    }
+
+    return res.json({ success: true, enquiry: { ...decorated, proforma } });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /by-journey", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -700,10 +894,10 @@ function styleHistoryEntries(style) {
 // (the customer, and Merchandising, respectively) and stay out of this list.
 router.get("/by-journey/:journeyRef/pending-approvals", salesAuth, async (req, res) => {
   try {
-    const journey = await loadJourney(req.params.journeyRef);
+    const journey = await loadJourney(req, req.params.journeyRef);
     if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
 
-    const enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true })
+    const enquiry = await Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true }))
       .select("costingChangeLog").lean();
     const styles = await SampleStyle.find({ journeyId: journey._id, isActive: true })
       .select("productName styleCode sampleStyleId materialsChangeLog techSheet sample").lean();
@@ -764,6 +958,7 @@ router.get("/by-journey/:journeyRef/pending-approvals", salesAuth, async (req, r
     approvals.sort((a, b) => new Date(a.submittedAt || 0) - new Date(b.submittedAt || 0));
     return res.json({ success: true, approvals });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /by-journey/:journeyRef/pending-approvals", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -771,11 +966,11 @@ router.get("/by-journey/:journeyRef/pending-approvals", salesAuth, async (req, r
 
 router.get("/by-journey/:journeyRef/change-log", salesAuth, async (req, res) => {
   try {
-    const journey = await loadJourney(req.params.journeyRef);
+    const journey = await loadJourney(req, req.params.journeyRef);
     if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
     const limit = Math.min(Number(req.query.limit) || 50, 200);
 
-    const enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true }).select("_id").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true })).select("_id").lean();
     const styles = await SampleStyle.find({ journeyId: journey._id, isActive: true }).select("history productName styleCode sampleStyleId").lean();
 
     const enquiryEntries = enquiry ? await historyFor("crm-enquiry", enquiry._id, limit) : [];
@@ -787,6 +982,7 @@ router.get("/by-journey/:journeyRef/change-log", salesAuth, async (req, res) => 
 
     return res.json({ success: true, entries });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /by-journey/:journeyRef/change-log", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -803,10 +999,549 @@ const EDITABLE = [
 ];
 
 // PATCH /api/cms/crm/enquiries/:id — update header fields.
+/**
+ * GET /:id/delivery-options — what the delivery-terms picker may offer.
+ *
+ * ── ONLY SHIPPING ADDRESSES, AND ONLY THIS COMPANY'S ────────────────────────
+ * A picker that lists billing and office addresses is a picker somebody will
+ * eventually choose one from, and the save refuses it — so it never offers
+ * them. Warehouses are this company's active ones, by the same rule.
+ *
+ * No money of any kind: this answers where and how, never what it costs.
+ */
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE SALES COSTING BRIEF — WHAT SALES ASKS CENTRAL COSTING TO PRICE
+   ═══════════════════════════════════════════════════════════════════════════
+   Which approved style is being quoted, what quantities the customer wants
+   priced, in what unit, at what proposed selling price, by when, and why.
+
+   ── WHAT THESE ROUTES REFUSE TO STORE ────────────────────────────────────
+   No material cost, no rate, no standard time, no supplier quotation, no
+   company or Board policy value, no overhead and no margin floor. Sales says
+   WHAT to cost; every figure that answers it belongs to a department or to the
+   Board, and Central Costing reads them itself. A field accepted here would be
+   Sales costing the garment.
+
+   ── AND NOTHING IS RETARGETED ────────────────────────────────────────────
+   A confirmed brief is what a frozen costing version cites. Moving the
+   quotation to a different style confirms a NEW brief and supersedes the old
+   one explicitly, with a reason. Editing the old one to point elsewhere would
+   make every version citing it describe a garment it was not calculated for.
+════════════════════════════════════════════════════════════════════════════ */
+
+/* ══ THE COMMERCIAL LINE — SALES' OWN QUANTITY COMMAND ═══════════════════
+   The number a garment is priced FOR. Confirmed in Cost & Invoicing, keyed by
+   the product line's permanent reference and the approved style, and never by
+   a product name.
+
+   The routes below are the whole of Sales' involvement. Confirming a quantity
+   writes the commercial line AND drives the costing request underneath it, so
+   nobody has to know a "costing brief" exists.
+
+   Deliberately absent: a portal customer. A prospect's order is priced before
+   anybody is linked; that requirement belongs to issuing a proforma invoice.
+════════════════════════════════════════════════════════════════════════════ */
+
+/** GET every commercial line on one enquiry. */
+router.get("/:id/commercial-lines", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const scope = await salesScopeFor(req);
+    const out = await commercialLine.readLines(
+      { companyId: scope.companyId }, { enquiryId: req.params.id },
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, "GET /:id/commercial-lines");
+  }
+});
+
+/**
+ * POST the confirmed quantity for one product line.
+ *
+ * Idempotent by value: confirming the number already in force mints no
+ * revision and starts no second costing.
+ */
+router.post("/:id/commercial-lines/confirm-quantity", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const scope = await salesScopeFor(req);
+    const out = await commercialLine.confirmQuantity(
+      { companyId: scope.companyId },
+      {
+        enquiryId: req.params.id,
+        productLineRef: String(req.body?.productLineRef || ""),
+        sampleStyleId: String(req.body?.sampleStyleId || ""),
+        quantity: req.body?.quantity,
+        reason: String(req.body?.reason || ""),
+        actor: actor(req),
+      },
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, "POST /:id/commercial-lines/confirm-quantity");
+  }
+});
+
+/** GET the briefs on one enquiry, and the styles Sales may choose from. */
+router.get("/:id/costing-briefs", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const scope = await salesScopeFor(req);
+    const out = await costingBrief.readBriefs(
+      { companyId: scope.companyId },
+      { enquiryId: req.params.id, productName: String(req.query.product || "").trim() },
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, "GET /:id/costing-briefs");
+  }
+});
+
+/** PUT a draft brief — the style, the quantities, the unit, the price, the note. */
+router.put("/:id/costing-briefs", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const scope = await salesScopeFor(req);
+    const out = await costingBrief.saveBrief(
+      { companyId: scope.companyId },
+      { enquiryId: req.params.id, body: req.body || {}, actor: actor(req) },
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, "PUT /:id/costing-briefs");
+  }
+});
+
+/**
+ * POST the confirmation — the act that turns a draft into the fact a costing
+ * may read, and supersedes whatever it replaces.
+ */
+router.post("/:id/costing-briefs/:briefId/confirm", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const scope = await salesScopeFor(req);
+    const out = await costingBrief.confirmBrief(
+      { companyId: scope.companyId },
+      {
+        enquiryId: req.params.id,
+        briefId: req.params.briefId,
+        reason: String(req.body?.reason || ""),
+        actor: actor(req),
+      },
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, "POST /:id/costing-briefs/:briefId/confirm");
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PREPARING THE ESTIMATE — SALES ASKS, THE ENGINE ANSWERS
+   ═══════════════════════════════════════════════════════════════════════════
+   Sales never opens Central Costing. These two routes are the whole of their
+   involvement: read where the estimate stands, and ask for it to be prepared
+   or refreshed.
+
+   ── WHAT THE BROWSER SENDS ───────────────────────────────────────────────
+   An enquiry, a product and an action key. Not a style, not a quantity, not a
+   scenario, not a policy date — every one of those is resolved server-side
+   from records. A browser that could compose a calculation could compose one
+   from figures nobody recorded.
+
+   ── AND READING WRITES NOTHING ───────────────────────────────────────────
+   The GET is called on every page load. A screen that created a version by
+   being looked at would fill the history with versions nobody asked for, and
+   would make "how many times was this re-costed?" unanswerable.
+════════════════════════════════════════════════════════════════════════════ */
+
+/** GET where the estimate stands: readiness, blockers, freshness, result. */
+/**
+ * GET /api/cms/crm/enquiries/:id/proforma-readiness
+ *
+ * CAN EACH LINE BE INVOICED, AND IF NOT, WHAT IS THE NEXT THING TO DO?
+ *
+ * ── WHY A READ EXISTS AT ALL ────────────────────────────────────────────────
+ * The screen used to work this out for itself — a confirmed quantity, a floor
+ * on screen, a price typed, and a review whose stored state said APPROVED. Four
+ * facts, and none of them the question. A price edited after approval leaves
+ * that state saying APPROVED while the proforma command refuses, so the page
+ * said "everything it needs is in place" above a button that could not work.
+ *
+ * This asks the command's own authority and publishes the answer. The summary
+ * and the gate are then the same sentence.
+ *
+ * Read-only: it writes nothing, creates nothing, and is safe on every load.
+ */
+router.get("/:id/proforma-readiness", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    }
+    const ctx = await costingCtxFor(req);
+
+    /* ── COMPANY FIRST, THEN THE RECORD ────────────────────────────────
+       A foreign enquiry is NOT FOUND, never forbidden: a refusal that varies
+       with the answer is a way to enumerate other companies' enquiries. */
+    const enquiry = await Enquiry.findOne(
+      await scoped(req, { _id: req.params.id, isActive: true }),
+    ).lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "That enquiry was not found." });
+
+    /* One verdict per CONFIRMED LINE, keyed by the pair the commercial line
+       itself is keyed by. A product row with no confirmed line has nothing to
+       be ready for and is simply absent. */
+    const lines = [];
+    for (const line of enquiry.commercialLines || []) {
+      const key = {
+        productLineRef: String(line.productLineRef || ""),
+        sampleStyleId: String(line.sampleStyleId || ""),
+        productName: String(line.productName || ""),
+      };
+      if (!key.productLineRef || !key.sampleStyleId) continue;
+      lines.push(await lineReadiness.issuanceProjection(ctx, enquiry, key));
+    }
+
+    /* ── AND WHAT HAS ALREADY BEEN RAISED ──────────────────────────────
+       The page kept offering "Create proforma invoice" beside a document that
+       existed, because nothing on the read side ever mentioned it — the only
+       trace was a link the BROWSER wrote when somebody happened to open the
+       request. The figures are the ones the document was stamped with, so the
+       screen repeats what it says rather than recomputing it. */
+    const proforma = await proformaRequest.currentProformaFor(ctx, enquiry);
+
+    return res.json({ success: true, lines, proforma: proforma || null });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
+    console.error("[enquiries] GET /:id/proforma-readiness", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/cms/crm/enquiries/:id/proforma-request
+ *
+ * RAISE THE CUSTOMER REQUEST A PROFORMA IS BUILT ON.
+ *
+ * ── WHY THIS AND NOT THE GENERIC ENDPOINT ───────────────────────────────────
+ * `POST /customers/:id/create-request` takes items with quantities and has no
+ * enquiry identity, so it cannot look up what Sales confirmed — it stores what
+ * arrives. A draft at 500 against a line confirmed at 750 was creatable, and
+ * only the later quotation-pricing command would notice.
+ *
+ * This route is owned by the enquiry, so it can resolve the commercial line
+ * itself. It takes NO quantity. The generic endpoint is untouched for the
+ * callers that still use it.
+ */
+router.post("/:id/proforma-request", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    }
+    const ctx = await costingCtxFor(req);
+    const out = await proformaRequest.createForEnquiry(ctx, req.params.id, {
+      customerId: String(req.body?.customerId || "").trim(),
+      items: Array.isArray(req.body?.items) ? req.body.items : [],
+      customerInfo: req.body?.customerInfo || {},
+      /* The idempotency anchor, so a lost response replays rather than
+         raising a second proforma. */
+      actionKey: String(req.headers["idempotency-key"] || req.body?.actionKey || ""),
+      /* ── A SUCCESSOR IS NAMED, NEVER INFERRED ─────────────────────────
+         Only set when the caller means to replace a proforma that already
+         exists. Absent, a moved commercial state is refused with the
+         reference of what is there rather than quietly raising a second
+         document beside it. */
+      supersedes: String(req.body?.supersedes || "").trim(),
+      actor: actor(req),
+    });
+    return res.status(out.replayed ? 200 : 201).json({ success: true, ...out });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
+    if (err?.code === proformaRequest.CODES.LINE_REFUSED) {
+      /* ── 409, NOT 422 ───────────────────────────────────────────────
+         Every refusal here is well-formed and no longer true: the document
+         asked for disagrees with the commercial state as it stands, and
+         re-reading that state is the fix. The same distinction the
+         quotation save door draws. */
+      return res.status(409).json({
+        success: false,
+        code: "PROFORMA_COMMERCIAL_STATE_CONFLICT",
+        message: err.message,
+        lines: err.details?.lines || [],
+      });
+    }
+    if (err?.code === proformaRequest.CODES.ALREADY_RAISED
+      || err?.code === proformaRequest.CODES.SUPERSESSION_MISMATCH) {
+      /* ── 409, AND IT NAMES WHAT EXISTS ──────────────────────────────
+         Not a malformed request: a well-formed one aimed at an enquiry that
+         already has a proforma. The reference travels with the refusal so a
+         caller can open that document instead of guessing. */
+      return res.status(409).json({
+        success: false,
+        code: err.code,
+        message: err.message,
+        ...(err.details || {}),
+      });
+    }
+    if (err?.code === proformaRequest.CODES.NOT_FOUND) {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    if (err?.code === proformaRequest.CODES.VALIDATION) {
+      return res.status(400).json({ success: false, message: err.message, ...(err.details || {}) });
+    }
+    console.error("[enquiries] POST /:id/proforma-request", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * THE LINE A COSTING REQUEST IS ABOUT.
+ *
+ * ── ADDITIVE, AND VERIFIED DOWNSTREAM ───────────────────────────────────────
+ * These routes took only `product` — a NAME — so an enquiry carrying the same
+ * garment twice in two colourways had one costing, one review and one floor
+ * between them. Both fields are optional here, so an older client still works,
+ * and `costingPreparation.resolve` refuses a pair that does not belong to this
+ * enquiry rather than answering with whatever the name found.
+ */
+const lineFrom = (src = {}) => ({
+  product: String(src.product || "").trim(),
+  productLineRef: String(src.productLineRef || "").trim(),
+  sampleStyleId: String(src.sampleStyleId || "").trim(),
+});
+
+router.get("/:id/costing-estimate", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const ctx = await costingCtxFor(req);
+    const resolved = await costingPreparation.resolve(ctx, {
+      enquiryId: req.params.id,
+      ...lineFrom(req.query),
+    });
+    return res.json({
+      success: true,
+      ...costingResult.resultFor({ resolved, caps: ctx.capabilitySet }),
+    });
+  } catch (err) {
+    return sendBriefError(res, err, "GET /:id/costing-estimate");
+  }
+});
+
+/**
+ * POST prepare or refresh.
+ *
+ * ── AN EXPLICIT ACTION, DELIBERATELY ─────────────────────────────────────
+ * Not a background job and not a page-load side effect. Somebody presses a
+ * button, and the fingerprint then decides whether that produces a version at
+ * all — identical sources produce none, so pressing it twice is safe and so is
+ * leaving the page open.
+ */
+router.post("/:id/costing-estimate/prepare", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const ctx = await costingCtxFor(req);
+    /* ── THE GRANT TO ASK, CHECKED AT THE DOOR ────────────────────────
+       `costingCtxFor` has proved WHICH company this actor belongs to. It has
+       not asked what they may do in it, and company membership is not
+       authority: every Sales rank belongs to the same company and only some
+       of them may cause a costing to exist.
+
+       Refused here so the work is never started, and again inside the
+       service so a future route cannot arrive without it. The capability set
+       is the shared resolver's, re-read from the database on this request —
+       so a grant revoked a minute ago is gone now, not when a token
+       expires. */
+    assertMayPrepare(ctx);
+    const out = await costingPreparation.prepare(ctx, {
+      enquiryId: req.params.id,
+      ...lineFrom(req.body),
+      /* The idempotency anchor. Sent by the screen, so a retry after a lost
+         response replays rather than making a second version. */
+      actionKey: String(req.headers["idempotency-key"] || req.body?.actionKey || ""),
+      actor: actor(req),
+    });
+    return res.json({
+      success: true,
+      outcome: out.outcome,
+      ...costingResult.resultFor({ resolved: out, caps: ctx.capabilitySet }),
+    });
+  } catch (err) {
+    return sendBriefError(res, err, "POST /:id/costing-estimate/prepare");
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE COMMERCIAL REVIEW — SALES DECIDES WHETHER A PRICE MAY BE QUOTED
+   ═══════════════════════════════════════════════════════════════════════════
+   Submit, approve, return, and the executive exception for a price below the
+   company's own floor. All five are commercial acts on an enquiry, so all five
+   live here rather than in the Costing workspace.
+
+   ── WHAT THESE ROUTES DO NOT DO ──────────────────────────────────────────
+   They release no procurement demand, create no purchase request, send no
+   customer approval and touch no Board policy. Approving an estimate says a
+   price may be quoted; it does not say an order exists. The customer-facing
+   token flow at `/costing-approval/:token` is a separate workflow on a
+   separate record and is not reached from here.
+════════════════════════════════════════════════════════════════════════════ */
+
+/** GET the review state — read-only, and writes nothing. */
+router.get("/:id/costing-estimate/review", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const ctx = await costingCtxFor(req);
+    return res.json({
+      success: true,
+      ...(await commercialReview.stateFor(ctx, {
+        enquiryId: req.params.id,
+        ...lineFrom(req.query),
+      })),
+    });
+  } catch (err) {
+    return sendBriefError(res, err, "GET /:id/costing-estimate/review");
+  }
+});
+
+/**
+ * The four commands, which differ only in which service verb they call.
+ *
+ * Each names the VERSION it is about. A decision taken on figures somebody
+ * read is refused if the estimate has been prepared again since — approving
+ * "the latest" would approve figures the approver never saw.
+ */
+const reviewCommand = (verb, where) => async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const ctx = await costingCtxFor(req);
+    const body = req.body || {};
+    const out = await commercialReview[verb](ctx, {
+      enquiryId: req.params.id,
+      ...lineFrom(body),
+      versionId: String(body.versionId || "").trim() || null,
+      reason: String(body.reason || ""),
+      note: String(body.note || ""),
+      /* The idempotency anchor, so a retry after a lost response replays the
+         decision rather than taking a second one. */
+      actionKey: String(req.headers["idempotency-key"] || body.actionKey || ""),
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    return sendBriefError(res, err, where);
+  }
+};
+
+router.post("/:id/costing-estimate/submit", salesAuth,
+  reviewCommand("submit", "POST /:id/costing-estimate/submit"));
+
+router.post("/:id/costing-estimate/approve", salesAuth,
+  reviewCommand("approve", "POST /:id/costing-estimate/approve"));
+
+router.post("/:id/costing-estimate/return", salesAuth,
+  reviewCommand("returnToSales", "POST /:id/costing-estimate/return"));
+
+/* The executive door. Same shape, different authority and a mandatory
+   reason — enforced in the service, not here. */
+router.post("/:id/costing-estimate/exception/approve", salesAuth,
+  reviewCommand("approveException", "POST /:id/costing-estimate/exception/approve"));
+
+/**
+ * The caller's OWN costing context, resolved the way the costing app resolves
+ * it.
+ *
+ * ── WHY NOT A STUB SET ──────────────────────────────────────────────────────
+ * The result projection publishes a cost figure only to a caller holding
+ * `costing.cost.read`. Handing it an empty set would withhold everything from
+ * everybody — safe, and wrong: a Sales manager who legitimately holds the
+ * capability would be shown nothing and would go looking for another way to
+ * see it. Handing it a set this file invented would be worse.
+ *
+ * So it is the real one, from the same resolver `/api/costings` uses. Company
+ * membership is proved there too, which is why the company below comes from
+ * the resolved context rather than from the request.
+ */
+/**
+ * The grant that lets somebody ASK for an estimate.
+ *
+ * Deliberately not applied to the GET. Reading where an estimate stands is
+ * not preparing one — it writes nothing, and a Sales viewer is entitled to
+ * the commercial output their own grant already carries. Gating the read too
+ * would hide from a viewer the very number they are allowed to quote.
+ */
+function assertMayPrepare(ctx) {
+  if (ctx?.capabilitySet?.has?.(CAPABILITIES.PREPARE)) return;
+  throw costingFail(
+    "COSTING_PREPARE_FORBIDDEN",
+    "You do not have permission to prepare an estimate for this enquiry.",
+    { reason: "PREPARE_NOT_GRANTED", required: CAPABILITIES.PREPARE },
+  );
+}
+
+async function costingCtxFor(req) {
+  const companyContext = require("../../../services/centralCosting/companyContext.service");
+  const scope = await salesScopeFor(req);
+  const ctx = await companyContext.resolveForActor(req.user, {
+    requestedCompanyId: scope.companyId,
+  });
+  /* Belt and braces: the Sales scope and the costing context must agree about
+     which company this is, or one of the two resolved something the other did
+     not intend. */
+  if (String(ctx.companyId) !== String(scope.companyId)) {
+    throw costingFail("TENANT_MISMATCH", "Your company could not be confirmed for this estimate.");
+  }
+  return ctx;
+}
+
+/* One shape for every refusal these three raise: a stable code the screen can
+   branch on, and a sentence a person can act on. */
+function sendBriefError(res, err, where) {
+  if (err?.status && typeof err.toResponse === "function") {
+    return res.status(err.status).json(err.toResponse());
+  }
+  if (err?.code === costingBrief.CODES.NOT_FOUND) {
+    return res.status(404).json({ success: false, message: "Not found." });
+  }
+  if (err?.code) {
+    return res.status(err.status && err.status !== 500 ? err.status : 400).json({
+      success: false, code: err.code, message: err.message, details: err.details || {},
+    });
+  }
+  console.error(`[enquiries] ${where}`, err);
+  return res.status(500).json({ success: false, message: err.message });
+}
+
+router.get("/:id/delivery-options", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }))
+      .select("accountId").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const scope = await salesScopeFor(req);
+    const [addresses, warehouses] = await Promise.all([
+      shippingAddressesFor(scope.companyId, enquiry.accountId),
+      Warehouse.find({ companyId: scope.companyId, status: "Active" })
+        .select("name shortName addressDetail.city").sort({ name: 1 }).limit(100).lean(),
+    ]);
+    return res.json({
+      success: true,
+      shippingAddresses: addresses,
+      warehouses: warehouses.map((wh) => ({
+        id: String(wh._id),
+        label: [wh.name, wh.addressDetail?.city].filter(Boolean).join(" — "),
+        code: wh.shortName || "",
+      })),
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[enquiries] GET /:id/delivery-options", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.patch("/:id", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const body = req.body || {};
@@ -834,9 +1569,140 @@ router.patch("/:id", salesAuth, async (req, res) => {
       if (key === "seriousness" && body.seriousness && !CUSTOMER_SERIOUSNESS_CODES.includes(body.seriousness)) continue;
       enquiry[key] = body[key] === "" ? undefined : body[key];
     }
+    /* ── HOW THIS ORDER IS DELIVERED, AND WHO PAYS ──────────────────────
+       An object, not a scalar, so it is validated rather than assigned. Every
+       identity is checked against THIS company's records: an address on
+       somebody else's account and a warehouse in another company must be
+       indistinguishable from ones that do not exist.
+
+       Sales is never asked for freight MONEY here. What is asked for is who
+       bears it, where it goes, how it travels and — for a prepaid order —
+       whether the company recovers it. The rate comes from Store's register. */
+    if ("freight" in body) {
+      const f = body.freight || {};
+      const next = {};
+      /* Absent means "leave it alone"; an explicit empty string is not a
+         value either. Nothing here is defaulted into a claim. */
+      const present = (v) => v !== null && v !== undefined && v !== "";
+
+      if (present(f.arrangement)) {
+        if (!FREIGHT_ARRANGEMENT_CODES.includes(f.arrangement)) {
+          return res.status(400).json({ success: false, message: "That is not a delivery arrangement this system recognises." });
+        }
+        next.arrangement = f.arrangement;
+      }
+      if (present(f.mode)) {
+        if (!["ROAD", "RAIL", "AIR", "SEA", "COURIER"].includes(String(f.mode).toUpperCase())) {
+          return res.status(400).json({ success: false, message: "That is not a freight mode this system recognises." });
+        }
+        next.mode = String(f.mode).toUpperCase();
+      }
+      if (present(f.shippingAddressId)) {
+        if (!isObjectId(f.shippingAddressId)) {
+          return res.status(400).json({ success: false, message: "Invalid delivery address." });
+        }
+        /* ── A SHIPPING ADDRESS, ON A COMPANY-OWNED ACCOUNT ──────────
+           Billing and shipping are separate records precisely because they
+           differ, and delivering garments to the accounts department is a
+           mistake nobody notices until the lorry arrives. The type is
+           required; nothing here converts or falls back. */
+        const scope = await salesScopeFor(req);
+        const { destination, reason, addressType } = await resolveShippingDestination(
+          scope.companyId, { addressId: f.shippingAddressId, accountId: enquiry.accountId },
+        );
+        if (!destination) {
+          return res.status(400).json({
+            success: false,
+            message: reason === SHIPPING_REASON.NOT_SHIPPING
+              ? `That is the ${addressType} address. Choose a shipping address, or add one to this customer.`
+              : "That delivery address is not on this customer's account.",
+          });
+        }
+        next.shippingAddressId = destination.addressId;
+      }
+      if (present(f.originWarehouseId)) {
+        if (!isObjectId(f.originWarehouseId)) {
+          return res.status(400).json({ success: false, message: "Invalid dispatch warehouse." });
+        }
+        const scope = await salesScopeFor(req);
+        const warehouse = await Warehouse.findOne({
+          _id: f.originWarehouseId, companyId: scope.companyId, status: "Active",
+        }).select("_id").lean();
+        if (!warehouse) {
+          return res.status(400).json({ success: false, message: "That is not an active warehouse in this company." });
+        }
+        next.originWarehouseId = warehouse._id;
+      }
+      if (present(f.deliveryCount)) {
+        const n = Number(f.deliveryCount);
+        if (!Number.isInteger(n) || n < 1) {
+          return res.status(400).json({ success: false, message: "A delivery count is a whole number of deliveries, at least one." });
+        }
+        next.deliveryCount = n;
+      }
+      if (present(f.prepaidTreatment)) {
+        if (!["IN_PRICE", "RECOVERED_SEPARATELY"].includes(f.prepaidTreatment)) {
+          return res.status(400).json({ success: false, message: "Say whether prepaid freight sits inside the price or is recovered separately." });
+        }
+        next.prepaidTreatment = f.prepaidTreatment;
+      }
+      if (present(f.notes)) next.notes = String(f.notes).trim().slice(0, 1000);
+
+      enquiry.freight = { ...(enquiry.freight ? enquiry.freight.toObject?.() ?? enquiry.freight : {}), ...next };
+    }
+
+    /* ── WHEN THIS ORDER GETS PAID ────────────────────────────────────────
+       Sales is never asked for a financing RATE here, or for an amount. What
+       is asked for is the advance, how long the balance runs and what it runs
+       from — the facts the company's financing rule has never had.
+
+       `confirm: true` puts them in force. Until then they are a draft, and a
+       costing reads an unconfirmed enquiry as unanswered rather than as an
+       order paid in cash. */
+    if ("paymentTerms" in body) {
+      const account = enquiry.accountId
+        ? await Account.findOne(await scoped(req, { _id: enquiry.accountId }))
+          .select("advancePercent creditDays paymentTermsCode negotiatedTerms").lean()
+        : null;
+      const existing = enquiry.paymentTerms?.toObject?.() ?? enquiry.paymentTerms ?? null;
+      const result = paymentTermsResolution.validate(body.paymentTerms || {}, {
+        account,
+        confirm: body.paymentTerms?.confirm === true,
+        actor: actor(req),
+        existing,
+      });
+      if (!result.ok) {
+        /* Named by field, so the screen marks the box rather than the person
+           hunting for what went wrong. */
+        return res.status(400).json({
+          success: false, code: "PAYMENT_TERMS_INVALID",
+          field: result.field, message: result.message,
+        });
+      }
+      enquiry.paymentTerms = { ...(existing || {}), ...result.terms };
+    }
+
     // Products is an array — sanitize rather than trust the raw body.
     if ("products" in body) {
-      enquiry.products = sanitizeProducts(body.products) || [];
+      /* ── EVERY LINE KEEPS ITS PERMANENT REFERENCE (G01) ─────────────────
+         Each existing row must name the `productLineRef` it was issued; a
+         genuinely new row names none and is minted by the model hook. A
+         removal is declared in `removedProductLineRefs`, never inferred from
+         a row going missing — see reconcileProductLineIdentities for why.
+         Anything that cannot be decided for certain is refused BEFORE the
+         save, so a refused request changes nothing on the enquiry. */
+      const verdict = reconcileProductLineIdentities(
+        enquiry.products,
+        sanitizeProducts(body.products) || [],
+        { removed: body.removedProductLineRefs },
+      );
+      if (!verdict.ok) {
+        const status = verdict.code === "PRODUCT_LINES_STALE" || verdict.code === "PRODUCT_LINE_REF_UNKNOWN" ? 409 : 400;
+        return res.status(status).json({
+          success: false, code: verdict.code, message: verdict.message, ...verdict.details,
+        });
+      }
+      enquiry.products = verdict.rows;
 
       // costingSheets is keyed by product NAME (see its own schema comment —
       // sanitizeProducts above discards every product's _id on every save,
@@ -906,7 +1772,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
 
       if (toAddIds.length) {
         (async () => {
-          const account = await Account.findById(enquiry.accountId).select("linkedCustomer");
+          const account = await Account.findOne(await scoped(req, { _id: enquiry.accountId })).select("linkedCustomer");
           if (!account?.linkedCustomer) return;
           const customer = await Customer.findById(account.linkedCustomer).select("assignedStockItems");
           if (!customer) return;
@@ -926,7 +1792,12 @@ router.patch("/:id", salesAuth, async (req, res) => {
       }
 
       if (removedIds.length) {
-        unlinkRemovedEnquiryProducts({ accountId: enquiry.accountId, removedStockItemIds: removedIds, excludeEnquiryId: enquiry._id })
+        unlinkRemovedEnquiryProducts({
+          accountId: enquiry.accountId,
+          removedStockItemIds: removedIds,
+          excludeEnquiryId: enquiry._id,
+          companyClause: (await salesScopeFor(req)).clause,
+        })
           .catch((e) => console.error("[enquiries] product unlink (PATCH) failed:", e.message));
       }
     }
@@ -937,7 +1808,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
     // labelled "estimated"). A firmer number from Cost & Quote later sets
     // confirmed=true and outranks this — so we never overwrite a confirmed value.
     if ("opportunitySize" in body) {
-      const journey = await SalesJourney.findById(enquiry.journeyId).select("expectedValue");
+      const journey = await SalesJourney.findOne(await scoped(req, { _id: enquiry.journeyId })).select("expectedValue");
       if (journey && !journey.expectedValue?.confirmed) {
         journey.expectedValue = {
           amount: enquiry.opportunitySize,
@@ -965,6 +1836,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id", err);
     return res.status(400).json({ success: false, message: err.message });
   }
@@ -979,10 +1851,20 @@ router.patch("/:id", salesAuth, async (req, res) => {
 router.get("/:id/change-log", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    /* ── THE ENQUIRY IS PROVED VISIBLE BEFORE ITS HISTORY IS READ ────────
+       This route reads the change log by entity id and never touched the
+       Enquiry, so it answered for another company's enquiry — audit history is
+       as confidential as the record it describes, and often more revealing.
+       Absent enquiry, absent history: the same answer a missing one gets. */
+    const visible = await Enquiry.findOne(await scoped(req, { _id: req.params.id }))
+      .select("_id").lean();
+    if (!visible) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const entries = await historyFor("crm-enquiry", req.params.id, limit);
     return res.json({ success: true, entries });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/change-log", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1009,6 +1891,7 @@ router.get("/cowork-employees", salesAuth, async (req, res) => {
       .sort((a, b) => a.name.localeCompare(b.name));
     return res.json({ success: true, employees });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /cowork-employees", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1025,10 +1908,10 @@ router.get("/my-pending-count", salesAuth, async (req, res) => {
     const me = await coworkIdentity(req);
     if (!me) return res.json({ success: true, count: 0 });
 
-    const enquiries = await Enquiry.find({
+    const enquiries = await Enquiry.find(await scoped(req, {
       isActive: true,
       "costingSheets.members.employeeId": me.coworkEmployeeId,
-    }).select("costingSheets").lean();
+    })).select("costingSheets").lean();
 
     let count = 0;
     for (const enquiry of enquiries) {
@@ -1044,6 +1927,7 @@ router.get("/my-pending-count", salesAuth, async (req, res) => {
 
     return res.json({ success: true, count });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /my-pending-count", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1092,6 +1976,7 @@ async function notifyAssignee(assignee, { enquiry, productName, part }) {
       data: { kind: "costing_sheet_assigned", enquiryId: enquiry.enquiryId, productName, part },
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] notifyAssignee", err.message);
   }
 }
@@ -1111,13 +1996,17 @@ const ROLE_LABEL = { merchandiser: "merchandiser", industrialEngineer: "industri
  * same two people whoever is raising the costing, and scoping it per salesperson
  * would mean the second salesperson picks from scratch for no reason.
  */
-async function lastUsedCostingTeam(excludeEnquiryId) {
+async function lastUsedCostingTeam(req, excludeEnquiryId) {
   const q = {
     isActive: true,
     "costingTeam.merchandiser.employeeId": { $exists: true, $ne: "" },
   };
   if (excludeEnquiryId) q._id = { $ne: excludeEnquiryId };
-  const prev = await Enquiry.findOne(q).sort({ updatedAt: -1 }).select("costingTeam").lean();
+  /* Scoped like everything else: "who did this last" must mean "who did this
+     last HERE". Reading another company's costing team would suggest their
+     staff as a default on this company's screen. */
+  const prev = await Enquiry.findOne(await scoped(req, q))
+    .sort({ updatedAt: -1 }).select("costingTeam").lean();
   return prev?.costingTeam || null;
 }
 
@@ -1327,10 +2216,41 @@ function sanitizeMiscRows(input) {
 // fill in) and hands each to the person responsible for it. Creating again for
 // the same product REPLACES the costingSheets entries rather than editing the
 // old ones in place.
+/* ── THE LEGACY SHEET IS READ-ONLY NOW ──────────────────────────────────────
+ *
+ * `POST /:id/costing-sheet`, `PATCH .../assign`, `PATCH .../members`,
+ * `PATCH .../:productName/data` and `POST .../change/:changeId/decide` created
+ * and edited costing calculations on the enquiry, and membership on them
+ * decided cost visibility: `crmCostVisibility.costingTier` gives a sheet
+ * owner or editor the FULL build-up — materials, operations, unit costs — and
+ * the assign door let a Sales user grant themselves that role.
+ *
+ * Two problems, and they compound. Sales must not see cost, and no new
+ * calculation should be recorded anywhere but Central Costing, whose floor the
+ * Board controls.
+ *
+ * So the write doors refuse. Records already recorded stay loadable for a
+ * reader who is authorised for cost — losing the company's own history is not
+ * an improvement — and nothing new joins them.
+ */
+const legacySheetRetired = (what) => (req, res) => res.status(410).json({
+  success: false,
+  error: {
+    code: "COSTING_SHEET_RETIRED",
+    message: `${what} is no longer recorded on the enquiry. Costing is prepared by Central Costing, `
+      + "and the price to quote from is the floor it calculates.",
+    details: { reason: "MOVED_TO_CENTRAL_COSTING" },
+  },
+  message: `${what} is no longer recorded on the enquiry.`,
+});
+
+router.post("/:id/costing-sheet", salesAuth, legacySheetRetired("A costing sheet"));
+
+/* Retired — kept for reference; the refusal above answers first. */
 router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -1352,7 +2272,7 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
     // the pair used most recently on any enquiry. The last step is what makes
     // this "chosen once" instead of "chosen every time" — before it, every new
     // enquiry started blank even though the answer had not changed in months.
-    const remembered = await lastUsedCostingTeam(enquiry._id);
+    const remembered = await lastUsedCostingTeam(req, enquiry._id);
     const team = {
       merchandiser:
         normaliseAssignee(req.body?.merchandiser)
@@ -1427,6 +2347,7 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
 
     return res.status(201).json({ success: true, costingSheets: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/costing-sheet", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1441,7 +2362,7 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
 router.get("/:id/costing-sheet/:productName/stock-item-sync", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("products").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).select("products").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const product = (enquiry.products || []).find((p) => p.product === req.params.productName);
     if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
@@ -1452,6 +2373,7 @@ router.get("/:id/costing-sheet/:productName/stock-item-sync", salesAuth, async (
     const rows = await stockItemCostingRows(product.stockItemId);
     return res.json({ success: true, ...rows });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/costing-sheet/:productName/stock-item-sync", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1466,10 +2388,13 @@ router.get("/:id/costing-sheet/:productName/stock-item-sync", salesAuth, async (
 // a sheet, silently, from a screen they cannot see is worse than one extra
 // person retaining access; if they should be off it, that is a deliberate act
 // through the members route.
+router.patch("/:id/costing-sheet/assign", salesAuth, legacySheetRetired("Costing-sheet assignment"));
+
+/* Retired — kept for reference; the refusal above answers first. */
 router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -1527,6 +2452,7 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
 
     return res.json({ success: true, changed, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/costing-sheet/assign", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1543,10 +2469,13 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
 // `part` picks one of the product's sheets; omitting it applies the change to
 // every sheet of that product, which is what "give my manager access to this
 // costing" actually means.
+router.patch("/:id/costing-sheet/members", salesAuth, legacySheetRetired("Costing-sheet membership"));
+
+/* Retired — kept for reference; the refusal above answers first. */
 router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -1591,6 +2520,7 @@ router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/costing-sheet/members", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1612,7 +2542,7 @@ router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
 router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true })
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }))
       .select("costingSheets costingChangeLog ownerId").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
@@ -1697,9 +2627,21 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
         success: true,
         tier,
         linked: Boolean(me),
+        /* ── NO SECOND FLOOR IS PUBLISHED ANY MORE ─────────────────────
+           This used to answer `{ costed, floorPrice, markupPercent }` for
+           every caller below the cost tier, computed by `costingTotals` from
+           `CRMSettings.commercial.markupPct` — a Sales setting defaulting to
+           22% that no Board approved. Two floor authorities for one garment
+           is one too many, and the one somebody quotes from has to be the one
+           management decided.
+
+           The COST tier still gets its own build-up: this route remains the
+           reader for sheets recorded before Central Costing, and a
+           historical record has to stay readable. What it no longer does is
+           hand anybody a price to quote from. */
         summary: tier === "cost"
           ? totals
-          : { costed: totals.costed, floorPrice: totals.floorPrice, markupPercent: totals.markupPercent },
+          : { costed: totals.costed, floorSource: "CENTRAL_COSTING" },
         parts: parts.map((p) => ({
           part: p.part,
           title: p.title,
@@ -1725,6 +2667,7 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
       pendingChanges,
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/costing-sheet/:productName/data", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1748,10 +2691,13 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
 //                           person" (anyone in either role can propose a
 //                           change to any part of any product's costing).
 //                           Sales approves or rejects it below.
+router.patch("/:id/costing-sheet/:productName/data", salesAuth, legacySheetRetired("Editing a costing sheet"));
+
+/* Retired — kept for reference; the refusal above answers first. */
 router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -1848,6 +2794,7 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
 
     return res.json({ success: true, updatedAt: sheet.updatedAt });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/costing-sheet/:productName/data", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1857,13 +2804,16 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
 // Sales/admin/CEO approves or rejects one pending change-log entry. Approve
 // copies whichever field(s) the entry carries onto the real costingSheets
 // row-set; reject just marks it decided and changes nothing live.
+router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth, legacySheetRetired("Deciding a costing-sheet change"));
+
+/* Retired — kept for reference; the refusal above answers first. */
 router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth, async (req, res) => {
   try {
     if (!bypassesApproval(req.user)) {
       return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can decide a submitted change." });
     }
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -1911,6 +2861,7 @@ router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth
 
     return res.json({ success: true, status: entry.status, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/costing-sheet/:productName/change/:changeId/decide", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -1938,15 +2889,201 @@ function findOrCreateLifecycle(enquiry, productName) {
 //
 // The one figure Sales reads off the costing workbook's Master tab, and the
 // price they decided to quote. Replaces the localStorage the Cost & Invoicing
+/**
+ * MAY A SELLING PRICE BE SET FOR THIS PRODUCT YET?
+ *
+ * Three things have to be true, and each is read from the record that owns it
+ * rather than decided here: Sales has confirmed a commercial quantity, the
+ * costing underneath it is running for THAT quantity, and an approved version
+ * has produced a floor for it.
+ *
+ * The refusal names which one is missing, because "not yet" is not something
+ * anybody can act on and "confirm the quantity first" is.
+ */
+/* The commercial line is resolved by `lineReadiness.lineOn` — one place,
+   because two versions of "which line is this" drifted apart before. */
+
+async function sellingPriceGateFor(enquiry, productName, key = {}) {
+  /* ── ASKED, NOT RESTATED ──────────────────────────────────────────────
+     This used to resolve the line itself and then accept ANY floor on the
+     approved version — so a floor calculated for 500 satisfied a line
+     confirmed at 750. The same question is asked by the proforma command,
+     and two versions of it drifted apart exactly that way. One authority
+     now; this maps its reasons onto the codes this door already published. */
+  const ready = await lineReadiness.readinessFor(
+    { companyId: enquiry.companyId }, enquiry, { ...key, productName },
+  );
+  if (ready.ok) return { ok: true };
+  return {
+    ok: false,
+    reason: ready.reason === lineReadiness.REASON.LINE_NOT_FOUND
+      ? "QUANTITY_NOT_CONFIRMED"
+      : ready.reason,
+    message: ready.reason === lineReadiness.REASON.LINE_NOT_FOUND
+      ? "Confirm the commercial quantity before setting the selling price."
+      : ready.message,
+  };
+}
+
 // stage used to keep this in — see the model's `costLedger` comment.
 //
 // Upsert by product name. Sending only one of the two leaves the other alone:
 // keying a cost and deciding a price are separate acts, minutes or days apart,
 // and a partial save must not blank the half that is already right.
+/**
+ * PATCH /api/cms/crm/enquiries/:id/cost-ledger/line
+ *
+ * THE SELLING PRICE FOR ONE COMMERCIAL LINE.
+ *
+ * ── WHY THIS EXISTS BESIDE THE NAMED ROUTE ──────────────────────────────────
+ * The route below addresses a ledger row by PRODUCT NAME, and the stored row is
+ * keyed by that name. Two colourways of one garment therefore shared a single
+ * row: pricing the second overwrote the first, and the floor each was judged
+ * against came from whichever commercial line happened to match first.
+ *
+ * This addresses the row by the pair the commercial line itself is keyed by —
+ * the permanent `productLineRef` and the `sampleStyleId`. Additive: the named
+ * route is untouched and historical rows keep working, so nothing stored before
+ * this becomes unreadable. A row written here carries the pair, and is found by
+ * it next time.
+ */
+router.patch("/:id/cost-ledger/line", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productLineRef = String(req.body?.productLineRef || "").trim();
+    const sampleStyleId = String(req.body?.sampleStyleId || "").trim();
+    if (!productLineRef || !sampleStyleId) {
+      return res.status(400).json({
+        success: false,
+        message: "Name the product line and the style this price is for.",
+        code: "LINE_KEY_REQUIRED",
+      });
+    }
+
+    /* ── THE LINE MUST BE ONE THIS ENQUIRY HAS ──────────────────────────
+       A reference this enquiry does not carry is NOT FOUND rather than
+       created: a ledger row for a line nobody is quoting is a number that
+       can never be reconciled. */
+    const product = (enquiry.products || [])
+      .find((p) => String(p.productLineRef || "") === productLineRef) || null;
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "That product line is not on this enquiry.",
+        code: "LINE_NOT_FOUND",
+      });
+    }
+
+    const parse = (v) => {
+      if (v === null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : undefined;
+    };
+    const cost = "cost" in req.body ? parse(req.body.cost) : undefined;
+    const price = "price" in req.body ? parse(req.body.price) : undefined;
+    if (cost === undefined && price === undefined) {
+      return res.status(400).json({ success: false, message: "Send a cost, a price, or both." });
+    }
+    /* Sales sets the PRICE and never the cost — a writable field they cannot
+       read is a field they can only corrupt, and it would let the floor be
+       moved by the person the floor constrains. */
+    if (cost !== undefined && !canSeeCost(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Cost is set from the costing sheet, not here. You can set the quoted price.",
+      });
+    }
+
+    /* The same gate the named route applies, asked with the exact pair — so
+       a price is judged against THIS line's floor and never a namesake's. */
+    if (price !== undefined && price !== null) {
+      const gate = await sellingPriceGateFor(enquiry, String(product.product || ""), {
+        productLineRef, sampleStyleId,
+      });
+      if (!gate.ok) {
+        return res.status(409).json({
+          success: false,
+          error: { code: "SELLING_PRICE_NOT_READY", message: gate.message, details: { reason: gate.reason } },
+          message: gate.message,
+        });
+      }
+    }
+
+    enquiry.costLedger = enquiry.costLedger || [];
+    let row = enquiry.costLedger.find((l) => String(l.productLineRef || "") === productLineRef
+      && String(l.sampleStyleId || "") === sampleStyleId);
+    if (!row) {
+      /* ── ADOPTING A HISTORICAL ROW, ONCE, AND ONLY WHEN IT IS SAFE ───
+         A row written before the pair existed has only a name. Where the
+         enquiry has exactly ONE line for that name, that row is
+         unambiguously this line's and is stamped with the pair rather than
+         left behind as a second price for the same garment. Where there are
+         two, it is ambiguous by construction and a fresh row is started —
+         the historical figure stays where it is and is not reassigned to a
+         colourway nobody said it belonged to. */
+      const name = String(product.product || "");
+      const sameName = (enquiry.products || []).filter((p) => String(p.product || "") === name);
+      const legacy = sameName.length === 1
+        ? enquiry.costLedger.find((l) => l.productName === name && !l.productLineRef)
+        : null;
+      if (legacy) {
+        legacy.productLineRef = productLineRef;
+        legacy.sampleStyleId = sampleStyleId;
+        row = legacy;
+      } else {
+        enquiry.costLedger.push({ productName: name, productLineRef, sampleStyleId });
+        row = enquiry.costLedger[enquiry.costLedger.length - 1];
+      }
+    }
+    if (cost !== undefined) row.cost = cost === null ? undefined : cost;
+    if (price !== undefined) row.price = price === null ? undefined : price;
+    row.updatedBy = actor(req);
+    row.updatedAt = new Date();
+
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    /* ── AND THE COSTING IS RE-DRIVEN WITH THE NEW PRICE ────────────────
+       The commercial review decides on the figures a version FROZE. A price
+       typed after a version was frozen is not on it, so approving that
+       version would approve a number the approver never saw — and the
+       proforma, which binds to the approval, would stamp a price nobody
+       decided. Re-briefing makes the new price part of the record that gets
+       reviewed.
+
+       Reported rather than thrown: the price IS saved by this point, and
+       failing the request would tell somebody their price did not stick. */
+    let repriced = null;
+    if (price !== undefined && price !== null) {
+      repriced = await commercialLine.repriceLine(
+        { companyId: enquiry.companyId },
+        {
+          enquiryId: String(enquiry._id),
+          productLineRef, sampleStyleId,
+          actor: actor(req),
+        },
+      );
+    }
+
+    res.json({
+      success: true,
+      costLedger: reduceCostLedger(enquiry.costLedger, canSeeCost(req.user), await markupPercent()),
+      ...(repriced ? { costing: repriced } : {}),
+    });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
+    console.error("[enquiries] PATCH cost-ledger/line", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.params.productName || "").trim();
@@ -1979,6 +3116,33 @@ router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, re
       });
     }
 
+    /* ── A PRICE BEFORE A FLOOR IS A PRICE AGAINST NOTHING ──────────────
+       The floor is the company's minimum for this garment AT THIS QUANTITY.
+       Setting a selling price before the costing for the confirmed quantity
+       has completed means quoting a number nobody can say is above or below
+       anything — and the below-floor exception, which exists so that going
+       under is a decision somebody takes deliberately, has nothing to
+       measure against.
+
+       The screen hides the editor until the floor is ready. This is the same
+       rule on the write path, because a UI gate is not a rule: a stale tab, a
+       replayed request or a direct call would otherwise walk straight past
+       it.
+
+       Clearing a price (`null`) is always allowed — withdrawing a number is
+       not quoting one — and a cost write is Store's own path, already gated
+       above. */
+    if (price !== undefined && price !== null) {
+      const gate = await sellingPriceGateFor(enquiry, productName);
+      if (!gate.ok) {
+        return res.status(409).json({
+          success: false,
+          error: { code: "SELLING_PRICE_NOT_READY", message: gate.message, details: { reason: gate.reason } },
+          message: gate.message,
+        });
+      }
+    }
+
     enquiry.costLedger = enquiry.costLedger || [];
     let row = enquiry.costLedger.find((l) => l.productName === productName);
     if (!row) {
@@ -2001,6 +3165,7 @@ router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, re
       costLedger: reduceCostLedger(enquiry.costLedger, canSeeCost(req.user), await markupPercent()),
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH cost-ledger", err);
     res.status(500).json({ success: false, message: err.message });
   }
@@ -2014,7 +3179,7 @@ router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, re
 router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
     const product = (enquiry.products || []).find((p) => p.product === productName);
@@ -2026,11 +3191,11 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
     if (!(price > 0)) {
       return res.status(400).json({ success: false, message: "This product has no price yet — set one before sending it to the customer." });
     }
-    const customerEmail = await customerEmailFor(enquiry);
+    const customerEmail = await customerEmailFor(enquiry, req);
     if (!customerEmail) {
       return res.status(400).json({ success: false, message: "This customer's account has no email on file — add one before sending." });
     }
-    const customerName = await customerNameFor(enquiry);
+    const customerName = await customerNameFor(enquiry, req);
 
     const plainToken = crypto.randomBytes(32).toString("base64url");
     const entry = findOrCreateLifecycle(enquiry, productName);
@@ -2084,6 +3249,7 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/products/:productName/send-to-customer", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2101,7 +3267,7 @@ router.get("/costing-approval/:token", async (req, res) => {
     const { enquiry, entry } = found;
     const product = (enquiry.products || []).find((p) => p.product === entry.productName);
     const price = (enquiry.costLedger || []).find((l) => l.productName === entry.productName)?.price;
-    const customerName = await customerNameFor(enquiry);
+    const customerName = await customerNameFor(enquiry, req);
     const decided = entry.customerApproved != null;
     return res.json({
       success: true,
@@ -2118,6 +3284,7 @@ router.get("/costing-approval/:token", async (req, res) => {
       },
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /costing-approval/:token", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2136,7 +3303,7 @@ router.post("/costing-approval/:token/decide", async (req, res) => {
     }
     const { enquiry, entry } = found;
     const note = String(req.body?.note || "").trim();
-    const customerName = await customerNameFor(enquiry);
+    const customerName = await customerNameFor(enquiry, req);
 
     const now = new Date();
     entry.customerApprovalLog = entry.customerApprovalLog || [];
@@ -2150,10 +3317,16 @@ router.post("/costing-approval/:token/decide", async (req, res) => {
     entry.customerApprovalTokenExpiresAt = undefined;
     await enquiry.save();
 
-    if (req.body.approved) {
-      const price = (enquiry.costLedger || []).find((l) => l.productName === entry.productName)?.price;
-      await syncApprovedPriceToStockItem(enquiry, entry.productName, price);
-    }
+    /* ── THE APPROVAL IS RECORDED, AND NOTHING ELSE MOVES ──────────────
+       It used to read a ledger price by NAME and write it across the linked
+       stock item's variants. Two colourways share a name, so the wrong price
+       could be chosen and then fanned over the others — and the PI read it
+       back as its unit price.
+
+       A customer's decision is a fact about THIS enquiry line. It is already
+       stored above, on the line's own `costingLifecycle` entry. The catalogue
+       is not a record of what one customer agreed, and the PI resolves its
+       price from the approved costing version instead. */
 
     recordChange(req, {
       departmentSlug: "sales",
@@ -2184,6 +3357,7 @@ router.post("/costing-approval/:token/decide", async (req, res) => {
 
     return res.json({ success: true });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /costing-approval/:token/decide", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2201,7 +3375,7 @@ router.post("/costing-approval/:token/decide", async (req, res) => {
 router.post("/:id/products/:productName/customer-approval", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
     if (!(enquiry.products || []).some((p) => p.product === productName)) {
@@ -2258,7 +3432,7 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
-      const customerName = await customerNameFor(enquiry);
+      const customerName = await customerNameFor(enquiry, req);
       await notifyEvent("customer_decision_recorded", {
         heading: `Customer ${req.body.approved ? "approved" : "rejected"}: ${productName}`,
         bodyHtml: `<p><strong>${escapeHtml(who.name || "Sales")}</strong> recorded that the customer <strong>${req.body.approved ? "approved" : "rejected"}</strong> this quote.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
@@ -2277,6 +3451,7 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2295,7 +3470,7 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
 router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
     const row = (enquiry.products || []).find((p) => p.product === productName);
@@ -2331,6 +3506,7 @@ router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => 
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/products/:productName/remove", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2349,6 +3525,7 @@ router.get("/:id/products/:productName/removed-snapshot", salesAuth, async (req,
     const match = entries.find((e) => e.action === "delete" && e.before?.product === productName);
     return res.json({ success: true, snapshot: match?.before || null });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/products/:productName/removed-snapshot", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2362,7 +3539,7 @@ router.get("/:id/products/:productName/removed-snapshot", salesAuth, async (req,
 router.post("/:id/products/:productName/request-stock-item", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
     if (!(enquiry.products || []).some((p) => p.product === productName)) {
@@ -2391,7 +3568,7 @@ router.post("/:id/products/:productName/request-stock-item", salesAuth, async (r
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
-      const customerName = await customerNameFor(enquiry);
+      const customerName = await customerNameFor(enquiry, req);
       await notifyEvent("stock_item_requested", {
         heading: `Stock item requested: ${productName}`,
         bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> asked for this product to be added to inventory.</p>`,
@@ -2410,6 +3587,7 @@ router.post("/:id/products/:productName/request-stock-item", salesAuth, async (r
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/products/:productName/request-stock-item", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2431,10 +3609,10 @@ router.get("/stock-item-requests", salesAuth, async (req, res) => {
   try {
     const status = String(req.query?.status || "pending").trim();
     const statusFilter = status === "all" ? { $ne: "none" } : status;
-    const enquiries = await Enquiry.find({
+    const enquiries = await Enquiry.find(await scoped(req, {
       isActive: true,
       costingLifecycle: { $elemMatch: { stockItemRequestStatus: statusFilter } },
-    })
+    }))
       .select("enquiryId accountId products costingLifecycle")
       .populate("accountId", "companyName displayName")
       .lean();
@@ -2466,6 +3644,7 @@ router.get("/stock-item-requests", salesAuth, async (req, res) => {
     rows.sort((a, b) => new Date(b.stockItemRequestedAt || 0) - new Date(a.stockItemRequestedAt || 0));
     return res.json({ success: true, requests: rows });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /stock-item-requests", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2478,7 +3657,7 @@ router.get("/stock-item-requests", salesAuth, async (req, res) => {
 router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
     const productName = decodeURIComponent(req.params.productName);
     const decision = String(req.body?.decision || "").trim();
@@ -2514,7 +3693,7 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
-      const customerName = await customerNameFor(enquiry);
+      const customerName = await customerNameFor(enquiry, req);
       await notifyEvent("stock_item_request_decided", {
         heading: `Stock item request ${decision === "approve" ? "approved" : "rejected"}: ${productName}`,
         bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Merchandising")}</strong> <strong>${decision === "approve" ? "approved" : "rejected"}</strong> the request to add this product to inventory.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
@@ -2533,6 +3712,7 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/products/:productName/stock-item-request/decide", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2564,7 +3744,7 @@ const productSheetCanWrite = (role) => role === "owner" || role === "editor";
 router.post("/:id/product-sheet", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -2604,6 +3784,7 @@ router.post("/:id/product-sheet", salesAuth, async (req, res) => {
 
     return res.status(201).json({ success: true, productSheet: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/product-sheet", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2615,7 +3796,7 @@ router.post("/:id/product-sheet", salesAuth, async (req, res) => {
 router.patch("/:id/product-sheet/members", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -2650,6 +3831,7 @@ router.patch("/:id/product-sheet/members", salesAuth, async (req, res) => {
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/product-sheet/members", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2663,7 +3845,7 @@ router.patch("/:id/product-sheet/members", salesAuth, async (req, res) => {
 router.get("/:id/product-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productSheets").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).select("productSheets").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -2689,6 +3871,7 @@ router.get("/:id/product-sheet/:productName/data", salesAuth, async (req, res) =
       canEdit: productSheetCanWrite(mine?.role),
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/product-sheet/:productName/data", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2701,7 +3884,7 @@ router.get("/:id/product-sheet/:productName/data", salesAuth, async (req, res) =
 router.patch("/:id/product-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productSheets").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).select("productSheets").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -2735,6 +3918,7 @@ router.patch("/:id/product-sheet/:productName/data", salesAuth, async (req, res)
       throw err;
     }
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/product-sheet/:productName/data", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2756,7 +3940,7 @@ const coworkService = require("../../../services/cowork.service");
 router.post("/:id/product-thread", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -2797,6 +3981,7 @@ router.post("/:id/product-thread", salesAuth, async (req, res) => {
 
     return res.status(201).json({ success: true, productThread: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/product-thread", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2807,7 +3992,7 @@ router.post("/:id/product-thread", salesAuth, async (req, res) => {
 router.patch("/:id/product-thread/members", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = String(req.body?.productName || "").trim();
@@ -2842,6 +4027,7 @@ router.patch("/:id/product-thread/members", salesAuth, async (req, res) => {
 
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/product-thread/members", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2851,7 +4037,7 @@ router.patch("/:id/product-thread/members", salesAuth, async (req, res) => {
 router.get("/:id/product-thread/:productName/messages", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productThreads").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).select("productThreads").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -2861,6 +4047,7 @@ router.get("/:id/product-thread/:productName/messages", salesAuth, async (req, r
     const messages = await coworkService.getGroupMessages(thread.groupId, req.query.limit || 60);
     return res.json({ success: true, groupId: thread.groupId, members: thread.members || [], messages });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/product-thread/:productName/messages", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2870,7 +4057,7 @@ router.get("/:id/product-thread/:productName/messages", salesAuth, async (req, r
 router.post("/:id/product-thread/:productName/messages", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productThreads").lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).select("productThreads").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -2893,6 +4080,7 @@ router.post("/:id/product-thread/:productName/messages", salesAuth, async (req, 
 
     return res.status(201).json({ success: true, message });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/product-thread/:productName/messages", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2906,56 +4094,79 @@ router.post("/:id/product-thread/:productName/messages", salesAuth, async (req, 
 // is made of and, importantly, for the one thing it refuses to draw.
 const { buildProductionView } = require("../../../services/productionView");
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
-const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
-const PortalCustomer = require("../../../models/Customer_Models/Customer");
 
-/**
- * The CustomerRequest this enquiry's production hangs off.
+/* ── WHICH ORDER THIS ENQUIRY IS — PROVED, OR NOT AT ALL (G02) ──────────────
  *
- * Prefers the stored link. Falls back to matching the portal customer by name —
- * the same guess the PI panel makes — and PERSISTS the result, so the guess
- * happens at most once and every later read is exact.
+ * This used to be `resolveRequestId`: the stored link if any, otherwise the
+ * portal customer matched by NAME, then that customer's NEWEST order — and the
+ * guess was WRITTEN onto the enquiry, so every later read treated it as fact.
+ * Production, Shipment, early-dispatch asks and the commercial ladder all read
+ * through it, and none of them could tell a guess from the deal's own order.
+ *
+ * They now read the order only when services/orderBookLink.js proves it is
+ * this deal's exact order, and otherwise say why not in the resolver's words
+ * (`orderLink.message`). Nothing here writes a link. The salesperson settles
+ * an unproved one through /sales-journeys/:journeyId/order-link.
  */
-async function resolveRequestId(enquiry, customerName) {
-  if (enquiry.customerRequestId) return { id: enquiry.customerRequestId, resolved: "stored" };
-  const name = String(customerName || "").trim();
-  if (!name) return { id: null, resolved: "none" };
+async function orderLinkCtxFor(req) {
+  const { createServiceContext } = require("../../../services/companyContext/serviceScope.service");
+  const scope = await salesScopeFor(req);
+  return createServiceContext({ companyId: scope.companyId, reason: "sales order link", legacyAware: true });
+}
 
-  const customers = await PortalCustomer.find({
-    $or: [{ name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
-          { "profile.companyName": new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }],
-  }).select("_id").limit(2).lean();
-  // Two matches is not a match. Guessing between them would attach a journey to
-  // another customer's production, which is worse than showing nothing.
-  if (customers.length !== 1) return { id: null, resolved: customers.length ? "ambiguous" : "none" };
-
-  const req = await CustomerRequest.findOne({ customerId: customers[0]._id })
-    .sort({ createdAt: -1 }).select("_id").lean();
-  if (!req) return { id: null, resolved: "no-request" };
-
-  await Enquiry.updateOne({ _id: enquiry._id }, { $set: { customerRequestId: req._id } });
-  return { id: req._id, resolved: "matched" };
+/** @returns {Promise<{customerRequestId:string|null, orderLink:object}>} */
+async function provedOrderForEnquiry(req, enquiry) {
+  const { provedOrderFor } = require("../../../services/orderBookLink");
+  return provedOrderFor(await orderLinkCtxFor(req), enquiry);
 }
 
 // PATCH /api/cms/crm/enquiries/:id/link-request
-// Record which CustomerRequest this enquiry's quotation lives on. Called the
-// first time the quotation engine opens, so production never has to guess.
+// Called (fire-and-forget) when the quotation engine opens a request.
+//
+// ── IT NO LONGER WRITES THE BROWSER'S CHOICE (G02) ──────────────────────────
+// This used to write ANY existing CustomerRequest id the browser sent onto the
+// enquiry — no company proof, no customer proof — and the screen sends the
+// first row of a search by customer NAME. That made it a second "newest order
+// for this customer" guess, and a way to point one company's enquiry at
+// another's order.
+//
+// Now the id sent is only a hint that a proforma was opened. The link is
+// resolved exactly as the PO path resolves it (services/orderBookLink.js): an
+// empty link is filled only with the single order raised from THIS enquiry;
+// anything else is reported back as `orderLink` and settled by a salesperson
+// through POST /sales-journeys/:journeyId/order-link.
 router.patch("/:id/link-request", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
     const requestId = String(req.body?.requestId || "").trim();
     if (!isObjectId(requestId)) return res.status(400).json({ success: false, message: "A valid requestId is required." });
-    const exists = await CustomerRequest.exists({ _id: requestId });
-    if (!exists) return res.status(404).json({ success: false, message: "No such customer request." });
 
-    const enquiry = await Enquiry.findOneAndUpdate(
-      { _id: req.params.id, isActive: true },
-      { $set: { customerRequestId: requestId, updatedBy: actor(req) } },
-      { new: true },
-    );
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
-    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
+
+    const { resolveOrderLink, STATUS: ORDER_LINK } = require("../../../services/orderBookLink");
+    const orderLink = await resolveOrderLink(await orderLinkCtxFor(req), enquiry, { write: true });
+
+    /* ── AND THE JOURNEY HEARS ABOUT IT HERE TOO ──────────────────────
+       Opening the proforma is the other moment at which the fact "this deal
+       has an invoice" reaches the server — for a document raised before the
+       command started recording it, the only moment. Only for the order this
+       enquiry is PROVED to be: the link is already set by then, so this
+       cannot write one. Never fatal. */
+    if (orderLink.status === ORDER_LINK.LINKED && orderLink.customerRequestId === requestId) {
+      try {
+        const linked = await Enquiry.findOne(await scoped(req, { _id: enquiry._id }));
+        if (linked?.customerRequestId) {
+          await proformaRequest.recordProforma(await costingCtxFor(req), linked, { _id: requestId });
+        }
+      } catch (e) {
+        /* A stage state is not worth failing the response over. */
+      }
+    }
+    const fresh = await Enquiry.findOne(await scoped(req, { _id: enquiry._id }));
+    return res.json({ success: true, enquiry: await decorate(fresh || enquiry, req), orderLink });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] PATCH /:id/link-request", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -2968,21 +4179,14 @@ router.patch("/:id/link-request", salesAuth, async (req, res) => {
 router.get("/:id/production", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-    const decorated = await decorate(enquiry, req);
-    const { id: requestId, resolved } = await resolveRequestId(enquiry, decorated.customerName);
+    /* Only the order this deal is PROVED to be. An unproved link shows no
+       production at all rather than another order's. */
+    const { customerRequestId: requestId, orderLink } = await provedOrderForEnquiry(req, enquiry);
     if (!requestId) {
-      return res.json({
-        success: true,
-        linked: false,
-        reason: resolved === "ambiguous"
-          ? `More than one portal customer matches “${decorated.customerName}”, so this journey cannot be tied to a specific order.`
-          : resolved === "no-request"
-            ? "This customer has no order in the portal yet, so nothing has been released to production."
-            : "This enquiry is not linked to a customer order yet — production starts from one.",
-      });
+      return res.json({ success: true, linked: false, reason: orderLink.message, orderLink });
     }
 
     const workOrders = await WorkOrder.find({ customerRequestId: requestId })
@@ -3004,6 +4208,7 @@ router.get("/:id/production", salesAuth, async (req, res) => {
       view: buildProductionView(workOrders),
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/production", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -3023,18 +4228,12 @@ const DispatchChallan = require("../../../models/CMS_Models/Manufacturing/Dispat
 router.get("/:id/shipment", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-    const decorated = await decorate(enquiry, req);
-    const { id: requestId, resolved } = await resolveRequestId(enquiry, decorated.customerName);
+    const { customerRequestId: requestId, orderLink } = await provedOrderForEnquiry(req, enquiry);
     if (!requestId) {
-      return res.json({
-        success: true, linked: false,
-        reason: resolved === "ambiguous"
-          ? `More than one portal customer matches “${decorated.customerName}”, so this journey cannot be tied to a specific order.`
-          : "This enquiry is not linked to a customer order yet — nothing can be dispatched against it.",
-      });
+      return res.json({ success: true, linked: false, reason: orderLink.message, orderLink });
     }
 
     const [workOrders, challans] = await Promise.all([
@@ -3062,6 +4261,7 @@ router.get("/:id/shipment", salesAuth, async (req, res) => {
       view: buildShipmentView(workOrders, challans, enquiry.earlyDispatchRequests || []),
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/shipment", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -3076,7 +4276,7 @@ router.get("/:id/shipment", salesAuth, async (req, res) => {
 router.post("/:id/early-dispatch", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const pieces = Number(req.body?.pieces);
@@ -3089,20 +4289,29 @@ router.post("/:id/early-dispatch", salesAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "Give dispatch the reason in your own words — one line is enough." });
     }
 
+    /* An early-dispatch ask is about THIS deal's pieces, so it needs this
+       deal's order proved. It used to go through without one — and with a
+       guessed order, it was checked against another order's packed stock. */
+    const { customerRequestId: requestId, orderLink } = await provedOrderForEnquiry(req, enquiry);
+    if (!requestId) {
+      return res.status(409).json({
+        success: false,
+        code: "order_not_linked",
+        message: `Early dispatch can only be asked for against this deal's confirmed order. ${orderLink.message}`,
+        orderLink,
+      });
+    }
+
     // Cannot ask for more than is actually packed and still here.
-    const decorated = await decorate(enquiry, req);
-    const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
-    if (requestId) {
-      const workOrders = await WorkOrder.find({ customerRequestId: requestId })
-        .select("quantity dispatchedQuantity productionCompletion.operationCompletion").lean();
-      const view = buildShipmentView(workOrders, [], []);
-      if (pieces > view.totals.ready) {
-        return res.status(400).json({
-          success: false,
-          message: `Only ${view.totals.ready} piece${view.totals.ready === 1 ? " is" : "s are"} packed and still here. `
-                 + `Ask for that many or fewer.`,
-        });
-      }
+    const workOrders = await WorkOrder.find({ customerRequestId: requestId })
+      .select("quantity dispatchedQuantity productionCompletion.operationCompletion").lean();
+    const view = buildShipmentView(workOrders, [], []);
+    if (pieces > view.totals.ready) {
+      return res.status(400).json({
+        success: false,
+        message: `Only ${view.totals.ready} piece${view.totals.ready === 1 ? " is" : "s are"} packed and still here. `
+               + `Ask for that many or fewer.`,
+      });
     }
 
     const neededBy = req.body?.neededBy ? new Date(req.body.neededBy) : null;
@@ -3122,6 +4331,7 @@ router.post("/:id/early-dispatch", salesAuth, async (req, res) => {
 
     return res.status(201).json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] POST /:id/early-dispatch", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -3141,14 +4351,15 @@ const { buildCommercialLadder } = require("../../../services/commercialLadder");
 router.get("/:id/commercial-ladder", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).lean();
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true })).lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     // The quoted total, when a quotation exists on the linked order. Read from
     // the order rather than recomputed from the costing sheet: the quotation is
     // the number that was actually put in front of the customer.
-    const decorated = await decorate(enquiry, req);
-    const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
+    /* The "actual" rung is this deal's PROVED order or nothing — a guessed
+       order's total would be another deal's number on this deal's ladder. */
+    const { customerRequestId: requestId, orderLink } = await provedOrderForEnquiry(req, enquiry);
     const order = requestId
       ? await CustomerRequestModel.findById(requestId)
           .select("requestId grandTotal totalPaidAmount updatedAt quotations.grandTotal").lean()
@@ -3160,8 +4371,10 @@ router.get("/:id/commercial-ladder", salesAuth, async (req, res) => {
     return res.json({
       success: true,
       ...buildCommercialLadder({ enquiry, quotedTotal, order }),
+      orderLink,
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/commercial-ladder", err);
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -3175,38 +4388,38 @@ router.get("/:id/commercial-ladder", salesAuth, async (req, res) => {
 // half (the costing-sheet estimate) the client joins, because the reader for a
 // CoWork workbook already lives there.
 const { buildClosingReport } = require("../../../services/closingReport");
+const { proveOrderLink, closingFactsFor } = require("../../../services/closingVerdict");
 const CustomerRequestModel = require("../../../models/Customer_Models/CustomerRequest");
 
 // GET /api/cms/crm/enquiries/:id/closing-report
 router.get("/:id/closing-report", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }));
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const decorated = await decorate(enquiry, req);
-    const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
-    if (!requestId) {
-      return res.json({
-        success: true, linked: false,
-        reason: "This enquiry is not linked to a customer order, so there is nothing to close.",
-      });
-    }
 
-    const [workOrders, challans, request] = await Promise.all([
-      WorkOrder.find({ customerRequestId: requestId })
-        .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity assignedDeadline "
-              + "dispatchedQuantity estimatedCost actualCost rawMaterials.quantityIssued rawMaterials.unitCost "
-              + "productionCompletion.operationCompletion productionCompletion.timeMetrics "
-              + "productionCompletion.invalidScansCount")
-        .lean(),
-      DispatchChallan.find({ manufacturingOrderId: requestId })
-        .select("challanNumber dispatchType totalUnits totalPersons createdAt "
-              + "persons.employeeName persons.department persons.totalUnits")
-        .lean(),
-      CustomerRequestModel.findById(requestId)
-        .select("requestId grandTotal paymentSchedule quotations.grandTotal").lean(),
-    ]);
+    /* ── THE SAME ORDER THE GATE WILL JUDGE (G03) ─────────────────────────
+       This used to resolve the order through `resolveRequestId`, which falls
+       back to matching the customer's NAME and writing the match onto the
+       enquiry, then read that order's work orders, challans and money with no
+       proof they belonged to this company. A mis-matched or forged link showed
+       one customer another customer's closing facts.
+
+       It now reads the STORED link only and proves it exactly as the close
+       gate does (services/closingVerdict.js): the request was raised from
+       this enquiry, or — with no origin recorded — its customer is linked by
+       this company's account and by no other company's. Unproved means
+       nothing about that order is disclosed — and the screen and the gate can
+       never disagree about which order is being closed. */
+    const proof = await proveOrderLink({ enquiry, scope: (selector) => scoped(req, selector) });
+    if (!proof.ok) {
+      return res.json({ success: true, linked: false, blockedBy: proof.code, reason: proof.message });
+    }
+    const requestId = enquiry.customerRequestId;
+    const request = proof.request;
+    const { workOrders, challans } = await closingFactsFor(requestId);
 
     if (!workOrders.length) {
       return res.json({
@@ -3255,6 +4468,7 @@ router.get("/:id/closing-report", salesAuth, async (req, res) => {
       report,
     });
   } catch (err) {
+    if (answeredTenantRefusal(res, err)) return;
     console.error("[enquiries] GET /:id/closing-report", err);
     return res.status(500).json({ success: false, message: err.message });
   }

@@ -71,8 +71,21 @@ async function call(path = "", { method = "GET", body, user = SALES_USER } = {})
 
 const dueDate = "2026-09-15T09:00:00.000Z";
 
+/* ── UPDATED FOR THE PROSPECT FORM SIMPLIFICATION CHUNK ────────────────────
+   Submission readiness no longer asks a Prospect to forecast itself. The
+   commercial fields below are KEPT in this fixture on purpose — they still
+   exist on the model, they are still written by these tests, and several
+   assertions still read them back. They are simply no longer a gate.
+
+   What the gate asks for now is added alongside: contact details, an interest
+   signal and note, and — supplied by `readyProspect` because it needs a real
+   Activity — one completed interaction. */
 const SUBMISSION_FIELDS = {
   source: "referral",
+  phone: "9876500099",
+  interestSignal: "requested_sample",
+  interestNote: "Asked for a sample of the poly-cotton twill.",
+  // Still written, still preserved, no longer required:
   industry: "corporate",
   pursuitJustification: "Large annual uniform program — strong fit.",
   estimatedAnnualQuantity: 5000,
@@ -93,6 +106,15 @@ async function createProspect(over = {}, user = SALES_USER) {
 async function readyProspect(over = {}, user = SALES_USER) {
   const lead = await createProspect(over, user);
   await call(`/${lead._id}`, { method: "PATCH", body: SUBMISSION_FIELDS, user });
+  /* One SUCCESSFUL interaction — the bar asks that the customer actually
+     engaged, which a PATCH cannot express. The outcome is what carries that:
+     without it this is a call that may well have rung out. */
+  const Activity = require("../../models/CMS_Models/Sales/Activity");
+  await Activity.create({
+    leadId: lead._id, activityType: "call", subject: "Intro call",
+    status: "completed", completedAt: new Date(), outcome: "replied_connected",
+    ownerId: user.id, ownerName: user.name,
+  });
   return lead._id;
 }
 
@@ -105,6 +127,20 @@ async function submittedProspect(over = {}, user = SALES_USER) {
 }
 
 /* ══════════════════ 1. A new Prospect begins "researching" ═══════════════ */
+
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3A) ─────────────────────
+ * SalesJourney creation now refuses unless the actor's company is provable.
+ * These suites are not about tenancy, so they seed the simplest thing that
+ * makes ownership provable: a single company, which is the documented
+ * deployment fallback. Without it every journey-creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
 
 describe("A new Prospect begins Researching and is separate from qualification", () => {
   test("reviewStatus defaults to researching; qualificationState is independent 'new'", async () => {
@@ -129,24 +165,50 @@ describe("POST /:id/submit — submission readiness + state", () => {
     const { status, body } = await call(`/${lead._id}/submit`, { method: "POST" });
     expect(status).toBe(400);
     expect(body.checks).toBeTruthy();
+    /* The bar a Prospect is now held to. `segment`, `justification`,
+       `annualQuantity`, `annualRevenue` and `evidence` are deliberately NOT
+       here any more — a Prospect is not asked to forecast itself. Those checks
+       moved to the Active Lead's qualification, where the answers are known. */
     const missing = body.checks.filter((c) => !c.met).map((c) => c.key);
-    expect(missing).toEqual(expect.arrayContaining(["source", "segment", "justification", "annualQuantity", "annualRevenue", "evidence", "firstAction"]));
+    expect(missing).toEqual(expect.arrayContaining([
+      "source", "contact", "interaction", "interestSignal", "interestNote", "firstAction",
+    ]));
+    expect(missing).not.toContain("segment");
+    expect(missing).not.toContain("annualQuantity");
+    expect(missing).not.toContain("evidence");
     const stored = await Lead.findById(lead._id).lean();
     expect(stored.reviewStatus).toBe("researching"); // not persisted
   });
 
-  test("requires confidence for BOTH estimates and at least one evidence URL/ref", async () => {
+  test("commercial estimates and their confidences no longer gate a Prospect", async () => {
+    /* This used to assert the opposite: that a Prospect could not be submitted
+       without a confidence level on BOTH estimates and at least one evidence
+       URL. That bar asked a salesperson to research a possible customer before
+       finding out whether they wanted anything, and the estimates it produced
+       were guesses indistinguishable from facts.
+
+       Everything it asked for is still on the model and still written here —
+       it is simply no longer a gate. What gates now is contact, a real
+       interaction, and an observed interest signal. */
     const lead = await createProspect();
-    // Everything except the two confidences and evidence.
     await call(`/${lead._id}`, { method: "PATCH", body: {
-      source: "referral", industry: "corporate", pursuitJustification: "why",
-      estimatedAnnualQuantity: 100, estimatedAnnualRevenue: 100,
+      source: "referral", phone: "9876500077",
+      interestSignal: "requested_catalogue", interestNote: "Asked for the winter catalogue.",
       pendingFirstAction: { subject: "call", dueDate },
+      // No confidences, no evidence — deliberately.
+      estimatedAnnualQuantity: 100, estimatedAnnualRevenue: 100,
     } });
-    const r1 = await call(`/${lead._id}/submit`, { method: "POST" });
-    expect(r1.status).toBe(400);
-    const missing = r1.body.checks.filter((c) => !c.met).map((c) => c.key);
-    expect(missing).toEqual(expect.arrayContaining(["annualQuantityConfidence", "annualRevenueConfidence", "evidence"]));
+    await Activity.create({
+      leadId: lead._id, activityType: "call", subject: "Rang them",
+      status: "completed", completedAt: new Date(), outcome: "replied_connected",
+      ownerId: SALES_USER.id,
+    });
+    const r = await call(`/${lead._id}/submit`, { method: "POST" });
+    expect(r.status).toBe(200);
+
+    // and the figures written above survived
+    const stored = await Lead.findById(lead._id).lean();
+    expect(stored.estimatedAnnualQuantity).toBe(100);
   });
 
   test("submits a ready Prospect: reviewStatus -> submitted, captureStatus still draft", async () => {
@@ -204,7 +266,10 @@ describe("POST /:id/approve — HOD only, and the only path to Active Lead", () 
     expect(new Date(body.lead.nextFollowUpAt).toISOString()).toBe(dueDate);
     expect(body.activity.activityType).toBe("follow_up");
     expect(body.activity.status).toBe("planned");
-    expect(await Activity.countDocuments({ leadId: id })).toBe(1);
+    /* Follow-ups only. `readyProspect` now seeds one completed call, because
+       the readiness bar requires that somebody actually made contact — so a
+       bare count of every Activity no longer measures what this asserts. */
+    expect(await Activity.countDocuments({ leadId: id, activityType: "follow_up" })).toBe(1);
   });
 
   test("approval cannot be applied to a Prospect that isn't submitted", async () => {
@@ -226,8 +291,10 @@ describe("POST /:id/approve — HOD only, and the only path to Active Lead", () 
     const { body } = await call(`/${id}/approve`, { method: "POST", body: { assignedTo: OTHER_SALES_USER.id, assignedToName: "Spoofed" }, user: HOD_USER });
     expect(body.lead.assignedTo).toBe(OTHER_SALES_USER.id);
     expect(body.lead.assignedToName).toBe(OTHER_SALES_USER.name); // NOT "Spoofed"
-    // The first Activity is owned by the new owner too.
-    const activity = await Activity.findOne({ leadId: id }).lean();
+    // The FOLLOW-UP the approval created is owned by the new owner too. Named
+    // explicitly rather than "the first Activity": `readyProspect` now seeds a
+    // completed call first, so "first" is no longer the one this is about.
+    const activity = await Activity.findOne({ leadId: id, activityType: "follow_up" }).lean();
     expect(activity.ownerId.toString()).toBe(OTHER_SALES_USER.id);
   });
 
@@ -247,7 +314,7 @@ describe("POST /:id/approve — HOD only, and the only path to Active Lead", () 
     const stored = await Lead.findById(id).lean();
     expect(stored.captureStatus).toBe("draft");
     expect(stored.reviewStatus).toBe("submitted"); // never persisted the approval
-    expect(await Activity.countDocuments({ leadId: id })).toBe(0);
+    expect(await Activity.countDocuments({ leadId: id, activityType: "follow_up" })).toBe(0);
   });
 
   test("there is no direct-activation path any more — POST /:id/activate is gone (404)", async () => {

@@ -144,6 +144,12 @@ async function createSpendRequest({
   plannedItem = null,
   historyNote = "",
   now = new Date(),
+  /* ── AN OPTIONAL SESSION, SO A CALLER CAN MAKE TWO REQUESTS ONE ACT ────
+     Absent on every existing caller and absent by default, so nothing that
+     already works changes. The costing handoff creates a Product draft and a
+     Service draft as one decision: without a shared session, a failure on the
+     second leaves the first written and the screen saying both were raised. */
+  session = undefined,
 }) {
   /* Committed against the figure that will actually be paid. A commitment
      raised on the pre-tax subtotal under-reserves the head by the tax, and the
@@ -181,7 +187,9 @@ async function createSpendRequest({
     ? vocabulary.SERVICE_CLASSIFICATION_POLICY
     : undefined;
 
-  const created = await SpendRequest.create({
+  /* `create` takes its options as a trailing argument; `[doc], { session }`
+     is the form that accepts one, and it returns an array. */
+  const [created] = await SpendRequest.create([{
     title,
     requestType,
     /* Server-controlled. Never read from the caller's payload — a request that
@@ -256,7 +264,7 @@ async function createSpendRequest({
     history: [
       { at: now, by: emp._id, byName: actorName, action: "submitted", note: historyNote },
     ],
-  });
+  }], session ? { session } : {});
 
   return { request: created };
 }

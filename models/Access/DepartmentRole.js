@@ -63,6 +63,22 @@ const departmentRoleSchema = new mongoose.Schema(
 
     role: { type: String, enum: ROLE_KEYS, required: true },
 
+    /* Company-scoped grants live on the existing role row so deployments at
+       their collection limit can adopt them without creating another MongoDB
+       collection. `role` and `isActive` above remain the legacy global grant;
+       a company entry, including an inactive tombstone, overrides it for apps
+       that have cut over. */
+    companyGrants: [{
+      companyId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Company", required: true },
+      role: { type: String, enum: ROLE_KEYS, required: true },
+      isActive: { type: Boolean, default: true },
+      reason: { type: String, trim: true, required: true },
+      grantedBy: { type: mongoose.Schema.Types.ObjectId },
+      grantedAt: { type: Date },
+      revokedBy: { type: mongoose.Schema.Types.ObjectId },
+      revokedAt: { type: Date },
+    }],
+
     /* ── WHICH BUDGET DEPARTMENTS THIS GRANT COVERS ───────────────────────────
      * Only meaningful on the `budget` grant, and the whole point of it: giving
      * somebody the Budget app used to say nothing about WHOSE budget they may

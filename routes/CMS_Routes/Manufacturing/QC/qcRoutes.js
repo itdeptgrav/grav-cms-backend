@@ -111,6 +111,31 @@ const getMasterOperations = async () => {
 };
 
 /**
+ * The operations THIS PIECE'S work order was routed through.
+ *
+ * ── THE WORK ORDER, NOT THE PRODUCT ─────────────────────────────────────────
+ * The route is frozen onto the work order when it is created. The product's
+ * Operations tab is where that route came FROM, and it can be edited
+ * afterwards — so reading it now can show an inspector operations that were
+ * added after the garment in their hand was made, and hide ones that were
+ * removed. The piece was routed through what the work order says.
+ */
+const getWorkOrderOperations = async (workOrderId) => {
+  if (!workOrderId) return null;
+  const wo = await WorkOrder.findById(workOrderId).select("operations").lean().catch(() => null);
+  const rows = wo?.operations;
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  /* The work order's own field names, mapped to the shape the catalogue
+     below reads. */
+  return rows.map((op) => ({
+    operationCode: op.operationCode || "",
+    type: op.operationType || "",
+    totalSeconds: op.plannedTimeSeconds,
+    machineType: op.machineType || "",
+  }));
+};
+
+/**
  * The operations THIS product is actually built from.
  *
  * QC was listing the entire master operation sheet — 259 rows for a shirt whose
@@ -292,7 +317,10 @@ router.post("/lookup-piece", async (req, res) => {
       EmployeeProductionProgress.findOne({
         workOrderId: workOrder._id, unitStart: { $lte: unitNumber }, unitEnd: { $gte: unitNumber },
       }).lean(),
-      getProductOperations(workOrder.stockItemId),
+      /* The piece's own frozen route first; the product's tab only as the
+         source it came from, for a work order made before routes were
+         frozen. Never the master sheet — see the refusal below. */
+      getWorkOrderOperations(workOrder._id).then((rows) => rows || getProductOperations(workOrder.stockItemId)),
       // Only the fields resolveProductImage needs — this product's own images
       // run to full-size URLs across many variants, so fetching the rest of
       // the StockItem document here would be its own bandwidth mistake.
@@ -425,16 +453,27 @@ router.post("/lookup-piece", async (req, res) => {
       }
     }
 
+    /* ── AND NEVER THE WHOLE FACTORY'S VOCABULARY ──────────────────────
+       This fell back to the master operation sheet, reasoned as "a
+       data-entry gap must not stop the line". What it actually did was show
+       an inspector all 259 operations this company has ever defined for a
+       piece whose work order was routed through none of them — a list in
+       which every row is wrong, presented exactly like a correct one.
+
+       An unrouted piece cannot be inspected, because there is nothing to
+       inspect it against. That is a refusal with a remedy, not a list. */
     if (!opSource) {
-      opSource = masterOps;
-      operationScope = {
-        source: "master",
-        reason: !workOrder.stockItemId
-          ? "This work order is not linked to a product."
+      return res.status(409).json({
+        success: false,
+        code: "WORK_ORDER_NOT_ROUTED",
+        message: !workOrder.stockItemId
+          ? `${workOrder.workOrderNumber || "This work order"} is not linked to a product, so this piece has no operation route to inspect against.`
           : !productOps
-            ? "This product has no operations on its Operations tab."
-            : "This product's operations have no operation codes.",
-      };
+            ? `${workOrder.workOrderNumber || "This work order"} has no operation route, so there is nothing to inspect this piece against. Record the product's operations in R&D, then re-plan the order.`
+            : `${workOrder.workOrderNumber || "This work order"}'s operations have no operation codes, so a defect could not be recorded against any of them. Add the codes on the product's Operations tab.`,
+        workOrderNumber: workOrder.workOrderNumber || "",
+        remedy: "RECORD_OPERATIONS_IN_RND",
+      });
     }
 
     const operations = opSource.map(op => {
@@ -1980,7 +2019,22 @@ router.get("/report", async (req, res) => {
  *  the extra StockItem batch only where a card actually shows a photo (the
  *  per-MO work-order list), not the MO rollup, which never does. */
 async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } = {}) {
-  const workOrders = await WorkOrder.find({ status: { $ne: "cancelled" }, ...extraQuery })
+  /* ── AN UNROUTED ORDER IS NOT A QC CANDIDATE ──────────────────────────
+     QC listed every non-cancelled work order, so an order created before its
+     product had any operations appeared as ready to inspect — and looking up
+     one of its pieces then showed the entire company operation master,
+     because there was no route to scope to.
+
+     A piece routed through nothing cannot be inspected against anything. The
+     piece lookup now refuses it by name, so listing it here would be offering
+     an action that always fails. Excluded in the query, not filtered after,
+     so the counts a card shows are counts of orders that can actually be
+     worked on. */
+  const workOrders = await WorkOrder.find({
+    status: { $ne: "cancelled" },
+    "operations.0": { $exists: true },
+    ...extraQuery,
+  })
     .select("workOrderNumber quantity stockItemName stockItemReference stockItemId variantAttributes customerName status createdAt customerRequestId assignedDeadline")
     .sort({ createdAt: -1 })
     .lean();

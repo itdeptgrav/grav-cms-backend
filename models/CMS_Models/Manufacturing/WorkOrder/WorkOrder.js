@@ -228,6 +228,89 @@ const workOrderSchema = new mongoose.Schema(
   {
     workOrderNumber: { type: String, unique: true, trim: true },
     customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
+
+    /* ── THE STYLE THIS ORDER IS MAKING (IE Chunk 1D) ─────────────────────
+     *
+     * The canonical, ORDER-SPECIFIC link from a work order to the exact
+     * SampleStyle it was created from. It is written as part of the work
+     * order's original creation, by every live creation path, and never
+     * appended afterwards by a second best-effort write.
+     *
+     * ── WHY IT LIVES HERE AND NOT ONLY ON THE STYLE ──────────────────────
+     * `SampleStyle.production.workOrderIds[]` already exists and stays as a
+     * legacy compatibility reference — but it is the wrong authority. It is
+     * written from the style's side, after the fact, so a work order created
+     * without it looks identical to one whose style was never linked; and two
+     * writers on opposite ends of the same relationship drift. The fact "this
+     * order makes that style" belongs to the ORDER, is known at the moment the
+     * order is built, and is one value rather than an array somebody appends
+     * to.
+     *
+     * ── AND WHY IT HAS NO DEFAULT AT ALL ────────────────────────────────
+     * Not even `null`. 147 existing work orders do not have the field and no
+     * backfill is approved, so absence must stay genuinely ABSENT: a
+     * `default: null` writes a null onto every legacy document the moment an
+     * unrelated field is saved, which fabricates a claim ("this order was
+     * considered and has no style") that nothing supports, and puts those
+     * documents into a sparse index built to exclude them.
+     *
+     * No live writer stores `null` either. Since the Chunk 1D correction,
+     * every creation path proves an ObjectId or refuses before writing — there
+     * is no third outcome.
+     *
+     * Sparse index: the IE order boundary looks orders up BY style, and the
+     * field is absent on most rows today, so a sparse index covers the read
+     * without indexing the absent ones. */
+    sampleStyleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SampleStyle",
+      index: true,
+      sparse: true,
+    },
+    /* ── THE CONFIRMED SALES LINE THIS ORDER MAKES ────────────────────────
+     *
+     * `customerRequestId` names the order, not the line, and one order holds
+     * several lines — the same product twice among them. This names exactly
+     * ONE permanent Sales line (`CustomerRequest.items[].lineRef`) and the
+     * ONE company it was proved to belong to, so PPC can join a planned line
+     * to its WorkOrders without guessing by product, style, size or number.
+     *
+     * Written by the creation path in the order's original save, from the
+     * stored request line and the server-proved company — never from a
+     * request body — and never changed afterwards (see the hook below).
+     * services/production/salesLineWorkOrderLink.service.js is the one place
+     * that builds it.
+     *
+     * `basis` says how the line was reached: the Sales line itself, a split
+     * inheriting its parent's line, or a return/remake naming its OWN return
+     * line (with `origin` recording the source WorkOrders and their lines,
+     * without claiming to be them).
+     *
+     * NO DEFAULT, like `sampleStyleId`: historical WorkOrders have no provable
+     * line, and absence must stay absent — read as `unlinked`, never filled. */
+    salesLineLink: {
+      type: new mongoose.Schema({
+        companyId: { type: mongoose.Schema.Types.ObjectId, required: true },
+        customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", required: true },
+        lineRef: { type: String, trim: true, required: true, match: /^LN-[0-9a-f]{12}$/ },
+        basis: { type: String, enum: ["sales_line", "split_parent", "return_line"], required: true },
+        parentWorkOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: undefined },
+        origin: {
+          type: new mongoose.Schema({
+            returnRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+            originalCustomerRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+            sourceWorkOrderIds: [{ type: mongoose.Schema.Types.ObjectId }],
+            sourceLines: [new mongoose.Schema({
+              customerRequestId: { type: mongoose.Schema.Types.ObjectId },
+              lineRef: { type: String, trim: true },
+            }, { _id: false })],
+          }, { _id: false }),
+          default: undefined,
+        },
+        linkedAt: { type: Date },
+      }, { _id: false }),
+      default: undefined,
+    },
     stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
     stockItemName: { type: String, trim: true },
     stockItemReference: { type: String, trim: true },
@@ -255,6 +338,38 @@ const workOrderSchema = new mongoose.Schema(
         "delayed", "partial_allocation", "forwarded",
       ],
       default: "pending",
+    },
+
+    /* ── WHY IT WAS CANCELLED, KEPT ──────────────────────────────────────
+       `cancelled` was already an allowed status and already excluded from
+       QC's listing, but nothing recorded WHY — and "there is a manufacturing
+       order here that never produced anything" is a question somebody asks
+       six months later, which a status alone does not answer.
+
+       A cancelled order stays exactly where it was, with its cutting records
+       and its history. This is the account beside it.
+
+       An explicit sub-schema rather than a bare nested path: assigning a
+       whole object to a nested path leaves mongoose to infer the shape, and
+       a key it does not recognise is dropped silently — which is how the
+       account of why can go missing while the status saves. */
+    cancellation: {
+      type: new mongoose.Schema({
+        at: { type: Date },
+        byActorId: { type: String, trim: true, default: "" },
+        byName: { type: String, trim: true, default: "" },
+        reason: { type: String, trim: true, default: "", maxlength: 1000 },
+        /* The facts that made cancelling permissible, frozen at the moment
+           it was permitted — so a later re-route cannot make the decision
+           look wrong in hindsight. */
+        operationsAtCancellation: { type: Number, default: null },
+        productionScansAtCancellation: { type: Number, default: null },
+        qcInspectionsAtCancellation: { type: Number, default: null },
+        /* Cutting already done belongs to the cancelled attempt. Recorded
+           here so the replacement order does not silently inherit it. */
+        cuttingRecorded: { type: Boolean, default: false },
+      }, { _id: false }),
+      default: undefined,
     },
 
     /*
@@ -424,6 +539,16 @@ const workOrderSchema = new mongoose.Schema(
 // order screens on every load and neither was indexed.
 workOrderSchema.index({ status: 1, createdAt: -1 });
 workOrderSchema.index({ customerRequestId: 1, status: 1 });
+// The Sales-line bridge is always read within one company. Partial, so the
+// historical WorkOrders that carry no link are not indexed at all.
+workOrderSchema.index(
+  { "salesLineLink.companyId": 1, "salesLineLink.lineRef": 1 },
+  { partialFilterExpression: { "salesLineLink.lineRef": { $type: "string" } } },
+);
+workOrderSchema.index(
+  { "salesLineLink.companyId": 1, "salesLineLink.origin.sourceLines.lineRef": 1 },
+  { partialFilterExpression: { "salesLineLink.basis": "return_line" } },
+);
 
 // ── Identity ────────────────────────────────────────────────────────────────
 //
@@ -483,7 +608,24 @@ workOrderSchema.statics.canonicalNumber = canonicalWorkOrderNumber;
  * independent — and keeping them in one function is how that stays visible.
  */
 workOrderSchema.pre("validate", function assignNewWorkOrderInvariants(next) {
-  if (!this.isNew) return next();
+  if (!this.isNew) {
+    /* The Sales-line link is part of the order's creation, not an edit: an
+       existing order may neither gain one (that would be a backfill nobody
+       proved) nor change or lose the one it was created with. */
+    if (this.isModified("salesLineLink")) {
+      this.invalidate("salesLineLink",
+        "A work order's Sales line link is set when it is created and cannot be added or changed afterwards.");
+    }
+    return next();
+  }
+
+  /* A new order's link must describe the order it sits on — for a return,
+     its own return request, never the original. */
+  if (this.salesLineLink
+    && String(this.salesLineLink.customerRequestId) !== String(this.customerRequestId)) {
+    this.invalidate("salesLineLink.customerRequestId",
+      "The Sales line link names a different customer request from this work order's.");
+  }
 
   if (!String(this.workOrderNumber ?? "").trim()) {
     this.workOrderNumber = canonicalWorkOrderNumber(this._id);

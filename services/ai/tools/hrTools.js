@@ -70,7 +70,32 @@ function yearFromMessage(message) {
 }
 
 // The account is authorised for HR tools when the shared resolver said so.
-const hrAuthorised = (user) => Boolean(user && user.hrAccess && user.hrAccess.allowed === true);
+/* ── The tools answer to the SAME contract as the routes ─────────────────────
+ *
+ * `hrAuthorised` was the whole gate: any account that could open HR could ask
+ * the assistant anything HR knows, including one person's salary. That made the
+ * assistant a way around the endpoint permissions rather than a view onto them
+ * — a CEO refused compensation at /api/hr/payslip could simply ask for it here.
+ *
+ * Each tool now names the capability its DATA needs, and the check is the same
+ * capability set services/access/hrAuthorization.js hands the mounted routes.
+ * `user.hrActor` is attached by gravAssistant.ensureAccess before any tool is
+ * offered or run; an unresolved actor holds nothing, so this fails closed.
+ */
+const { CAPABILITIES } = require("../../access/hrCapabilities");
+
+const heldBy = (user) => (user && user.hrActor && user.hrActor.capabilities) || new Set();
+
+/** Application access alone — the floor every HR tool sits on. */
+const hrAuthorised = (user) =>
+  Boolean(user && user.hrActor && user.hrActor.hasHrApplicationAccess === true);
+
+/** Application access AND every capability the tool's data needs. */
+const hrCan = (...capabilities) => (user) => {
+  if (!hrAuthorised(user)) return false;
+  const held = heldBy(user);
+  return capabilities.every((cap) => held.has(cap));
+};
 
 // Deterministic department extraction: "how is the Cutting department doing" →
 // "Cutting". Anything not clearly named falls back to all departments.
@@ -232,7 +257,7 @@ registerTool({
   name: "hr_overview",
   description:
     "Aggregate HR overview: headcount, department distribution, today/monthly attendance, pending leave & regularisation counts, upcoming holidays, alerts.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ANALYTICS_WORKFORCE),
   matches: (msg) => HR_OVERVIEW_KEYWORDS.test(msg),
   provideContext: async () => ({ hrOverview: await buildHrOverviewContext() }),
 });
@@ -241,7 +266,7 @@ registerTool({
   name: "hr_daily_attendance",
   description:
     "The WHOLE day's attendance across all employees (or a department): counts of present/absent/on-leave and who they are, for a given date. Do NOT use this to check ONE specific named person — use hr_employee for that. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
   parameters: { type: "object", properties: { ...P_DATE, ...P_DEPARTMENT } },
   matches: (msg) =>
     DAILY_ATTENDANCE_KEYWORDS.test(msg) ||
@@ -310,7 +335,7 @@ registerTool({
   name: "hr_leave",
   description:
     "Leave & regularisation for authorised HR: pending leave requests, pending regularisations, upcoming approved leaves, and a named person's CL/SL/PL balance. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.LEAVE_READ),
   parameters: { type: "object", properties: { ...P_DEPARTMENT, ...P_EMPLOYEE } },
   matches: (msg) => LEAVE_KEYWORDS.test(msg),
   provideContext: async ({ message, args }) => {
@@ -329,7 +354,7 @@ registerTool({
   name: "hr_employee",
   description:
     "Everything about ONE specific named person (or employee ID): whether they were present / absent / on leave / late on a given date, their profile (department, designation, joining date, status), current-year leave balance and last-30-day attendance. Use this whenever the question is about a single named individual. No salary. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
   parameters: { type: "object", properties: { ...P_EMPLOYEE, ...P_DATE }, required: ["employeeName"] },
   matches: (msg) =>
     EMPLOYEE_BIO.test(msg) || EMPLOYEE_KEYWORDS.test(msg) || PERSON_ATTENDANCE.test(msg) || PERSON_POSSESSIVE.test(msg),
@@ -346,7 +371,7 @@ registerTool({
   name: "hr_directory",
   description:
     "Employee directory for authorised HR: total/active headcount, headcount by department, and a department's members. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
   parameters: { type: "object", properties: { ...P_DEPARTMENT } },
   matches: (msg) =>
     /\b(directory|how many (employees|people|staff|workers)|total (employees|staff|headcount)|head\s?count|number of (employees|staff)|list .*(employees|staff)|employees? in|team size|workforce|staff strength|who works (in|at))\b/i.test(msg),
@@ -360,7 +385,7 @@ registerTool({
   name: "hr_departments",
   description:
     "The organisation's departments for authorised HR: each department's status, live headcount and designations. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
   matches: (msg) =>
     /\b(departments\b|list .*departments?|department list|how many departments|which departments|org structure|organ[a-z]* structure|designations?)\b/i.test(msg),
   provideContext: async () => ({ departments: await buildDepartmentsContext() }),
@@ -370,7 +395,7 @@ registerTool({
   name: "hr_overtime",
   description:
     "Overtime for authorised HR: recent overtime (hours), pending overtime approvals, filterable by department. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
   parameters: { type: "object", properties: { ...P_DEPARTMENT } },
   matches: (msg) => /\b(over\s?time|\bot\b|extra hours|stay\s?over|worked late|late sitting)\b/i.test(msg),
   provideContext: async ({ message, args }) => {
@@ -382,7 +407,7 @@ registerTool({
 registerTool({
   name: "hr_holidays",
   description: "Company holidays for authorised HR: upcoming and this-year holidays with dates and type. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.LEAVE_READ),
   matches: (msg) => /\b(holidays?|public holiday|festival holiday|next holiday|day off|leave calendar|holiday list)\b/i.test(msg),
   provideContext: async () => ({ holidays: await buildHolidaysContext() }),
 });
@@ -391,7 +416,7 @@ registerTool({
   name: "hr_policies",
   description:
     "HR policies & settings for authorised HR: shift timings, late/half-day thresholds, working days, leave entitlements (CL/SL/PL per year), payroll settings and active SOP policies. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.COMPLIANCE_READ),
   matches: (msg) =>
     /polic(y|ies)|shift\s*(timing|timings|time|times|start|end|hour|hours)|(office|work(ing)?)\s*(timing|timings|hour|hours|time|times|day|days)|what time does (office|work|the shift)|when does (office|work|the shift)|entitlement|(company|hr|leave|attendance)\s*(rule|rules|policy|policies|setting|settings)|\bsettings\b/i.test(
       msg,
@@ -403,7 +428,7 @@ registerTool({
   name: "hr_payroll",
   description:
     "COMPANY-LEVEL payroll runs for authorised HR: whole-company monthly totals (total gross, total deductions, total net pay, total PF/ESIC) and run status across all employees. For ONE person's salary use hr_salary instead. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PAYROLL_READ, CAPABILITIES.COMPENSATION_READ),
   matches: (msg) => /\b(payroll (run|total|summary)|total (net pay|payroll|salary bill)|company.*(payroll|salary)|salary (bill|expense|cost))\b/i.test(msg),
   provideContext: async () => ({ payroll: await buildPayrollContext() }),
 });
@@ -412,7 +437,7 @@ registerTool({
   name: "hr_salary",
   description:
     "SALARY / payslip for authorised HR & CEO. Works for a NAMED employee's monthly pay (basic, gross, allowances, deductions, net pay) AND for the signed-in user's OWN pay when they ask about themselves ('how much did I earn', 'my salary') — leave employeeName EMPTY for a self-question. For a whole-year total ('this year', 'annual'), it returns the year's total across all months. Bank details excluded. Sensitive; read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.COMPENSATION_READ),
   parameters: {
     type: "object",
     properties: {

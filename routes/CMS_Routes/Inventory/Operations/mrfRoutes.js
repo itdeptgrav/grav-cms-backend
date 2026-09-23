@@ -6,6 +6,8 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const Warehouse = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
+const locStock = require("../../../../services/storePurchase/locationStock.service");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Employee = require("../../../../models/Employee");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -31,9 +33,13 @@ const tenantContext = require("../../../../services/storePurchase/tenantContext.
 const mrfAuthority = require("../../../../services/storePurchase/mrfAuthority.service");
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
-const idempotencyService = require("../../../../services/storePurchase/idempotency.service");
 const documentSequence = require("../../../../services/storePurchase/documentSequence.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
+// Chunk 9A — stock reservations & picking. The reservation record/projection
+// live here; the CONTROLLED ISSUE reuses this file's own adjustStock engine.
+const reservationSvc = require("../../../../services/storePurchase/reservation.service");
+const StockReservation = require("../../../../models/CMS_Models/Inventory/Operations/StockReservation");
+const { resolveConversion } = require("../../../../services/storePurchase/goodsReceipt.service");
 
 const MRF_ENTITY = "MRF";
 
@@ -106,22 +112,42 @@ const noteInThread = (req, mrf, text, who) => mrfChat.systemMessage(mrf, text, w
  * history so a retry recovers rather than repeats. Every governed mutation
  * goes through here, so none of them can drift back to the old shape.
  */
-const commitMrf = (req, mrf, entry) =>
+const commitMrf = (req, mrf, entry, { beforeSave = null, applyTargets = null } = {}) =>
   unitOfWork.run(req.tenant, {
     idempotencyRecord: req.idempotent?.record,
+    /* The entity identity, so unitOfWork.run owns the marker ordering: stamped
+       INSIDE the transaction (transactional — rolls back with a failure) or
+       BEFORE the mutation (standalone — at-most-once). */
+    entityType: MRF_ENTITY,
+    entityId: mrf._id,
     mutate: async (session) => {
-      await mrf.save(session ? { session } : {});
+      /* When `applyTargets` is given, the caller's changes are applied to a
+         FRESH document loaded in THIS session, so a `withTransaction` retry
+         reruns them against the rolled-back state and lands once. Legacy callers
+         (no applyTargets) save the document they mutated in the handler. */
+      let doc = mrf;
+      if (applyTargets) {
+        doc = await MRF.findById(mrf._id).session(session || null);
+        if (!doc) throw new Error(`MRF ${mrf._id} disappeared mid-commit`);
+        await applyTargets(doc, session);
+      }
+      /* Any domain writes that must share the MRF's transaction run here, with
+         the SAME session — e.g. the fulfilment decision's stock issue. */
+      if (beforeSave) await beforeSave(session);
+      await doc.save(session ? { session } : {});
+      // `entry` may be a function so it can read state produced by applyTargets.
+      const resolvedEntry = typeof entry === "function" ? entry(doc) : entry;
       return {
         entityType: MRF_ENTITY,
-        entityId: mrf._id,
-        result: true,
+        entityId: doc._id,
+        result: doc,
         entry: {
           entityType: MRF_ENTITY,
-          entityId: mrf._id,
-          documentNumber: mrf.mrfNumber,
+          entityId: doc._id,
+          documentNumber: doc.mrfNumber,
           requestId: req.id || "",
           idempotencyKey: req.idempotent?.key || "",
-          ...entry,
+          ...resolvedEntry,
         },
       };
     },
@@ -191,10 +217,23 @@ function getActorId(req) {
 // conversion to the catalogue base unit happens only where stock is touched.
 const convertQty = mrfUnits.convertQty;
 
-async function adjustStock(rawItemId, variantId, variantCombination, delta, txnMeta) {
-  const raw = await RawItem.findById(rawItemId);
+async function adjustStock(rawItemId, variantId, variantCombination, delta, txnMeta, loc = null, session = null) {
+  /* Warehouse Stock V1 (atomicity): every write below takes the caller's
+     `session`, so on a transaction-capable deployment the RawItem save, the
+     guarded location-balance change, the assigned-total change and the
+     LocationMovement all commit — or roll back — together with the MRF save in
+     the same unit of work. On a standalone the session is null and the marker-
+     first ordering in the route is what keeps the effect at-most-once. */
+  const raw = await RawItem.findById(rawItemId).session(session || null);
   if (!raw) throw new Error(`RawItem ${rawItemId} not found`);
   const prevQty = raw.quantity || 0;
+
+  /* When a location is chosen, an OUTflow is guarded BEFORE any stock moves so
+     the location can't go below zero and a refusal leaves nothing applied. */
+  if (loc && loc.location && delta < 0) {
+    const ok = await locStock.decLocationGuarded(session, loc.companyId, rawItemId, variantId, loc.warehouse._id, loc.location._id, Math.abs(delta));
+    if (!ok) throw fail("VALIDATION", `${loc.location.code} does not hold ${Math.abs(delta)} of this item.`, { reason: "INSUFFICIENT_AT_LOCATION" });
+  }
 
   let matchedVariant = null;
   if (variantId && raw.variants?.length) matchedVariant = raw.variants.id(variantId);
@@ -221,8 +260,52 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
     previousQuantity: prevQty,
     newQuantity: raw.quantity,
     ...(matchedVariant ? { variantId, variantCombination } : {}),
+    ...(loc && loc.location ? locStock.txLocationSnapshot(loc.warehouse, loc.location) : {}),
   });
-  await raw.save();
+  await raw.save(session ? { session } : {});
+
+  if (loc && loc.location) {
+    const common = {
+      companyId: loc.companyId, siteId: loc.siteId || null,
+      item: raw, variantId: variantId || null,
+      warehouse: loc.warehouse, location: loc.location, quantity: Math.abs(delta),
+      type: loc.type, source: loc.source || {},
+      actor: loc.actor || {}, note: txnMeta.reason || "",
+      // Per-line movement key (deploy-compatible identity); the originating
+      // operation key kept separately for audit/recovery.
+      idempotencyKey: loc.idempotencyKey || "",
+      operationKey: loc.operationKey || "",
+    };
+    if (delta < 0) {
+      // the location was already guarded+decremented above; finish the pair
+      await locStock.incAssignedTotal(session, loc.companyId, rawItemId, variantId, -Math.abs(delta), null);
+      await locStock.writeMovement(session, locStock.buildMovement({ ...common, direction: "out" }));
+    } else {
+      await locStock.applyLocationIn(session, { ...common, intent: "receive" });
+    }
+  }
+}
+
+/**
+ * Warehouse Stock V1 — resolve and validate the EXPLICIT source/destination
+ * location a store person chose for an MRF line. `line` may carry its own
+ * warehouseId/locationId; otherwise the request's top-level pair is the
+ * fallback. Returns a lean `{ warehouse, location }`, or null when none was
+ * named. A named-but-unusable location (inactive, foreign to the company, or
+ * not in that warehouse) throws — a source is never guessed.
+ */
+async function resolveMrfLocation(req, line) {
+  const wid = line?.warehouseId || req.body?.warehouseId || null;
+  const lid = line?.locationId || req.body?.locationId || null;
+  if (!wid || !lid) {
+    if (wid || lid) throw fail("VALIDATION", "A location needs both a warehouse and a location.", { reason: "LOCATION_INCOMPLETE" });
+    return null;
+  }
+  const warehouse = await Warehouse.findOne({ _id: wid, ...tenantContext.tenantFilter(req.tenant) }).lean();
+  const location = locStock.findLocation(warehouse, lid);
+  const err = locStock.usableLocationError(warehouse, location, req.tenant.companyId);
+  if (err) throw fail("VALIDATION", err.message, { reason: err.reason });
+  return { warehouse, location };
 }
 
 const buildUnitConversions = mrfUnits.buildUnitConversions;
@@ -1834,17 +1917,43 @@ router.post(
       });
     }
 
-    let issuedLines = [];
-    if (planned.length) {
-      /* Before the first deduction, for the reason given on the Issue route:
-         the marker is what makes the stock movement at-most-once. */
-      if (req.idempotent?.record) {
-        await idempotencyService.markEffectApplied({
-          record: req.idempotent.record, entityType: MRF_ENTITY, entityId: mrf._id,
+    /* Warehouse Stock V1: the source location for each issued line, taken from
+       the SAME confirmation step (the request's `lines`), not a separate flow.
+       A location-tracked item cannot be auto-fulfilled from Unassigned — it is
+       blocked with LOCATION_REQUIRED. All checked BEFORE the marker so a refusal
+       leaves nothing applied. */
+    const sourceByItem = new Map(
+      (Array.isArray(b.lines) ? b.lines : []).map((l) => [String(l.itemId), l]),
+    );
+    for (const p of planned) {
+      p.loc = await resolveMrfLocation(req, sourceByItem.get(String(p.mrfItem._id)) || {});
+      if (!p.loc && await locStock.isLocationTracked(req.tenant.companyId, p.mrfItem.rawItem, p.mrfItem.variantId || null)) {
+        return res.status(400).json({
+          success: false,
+          reason: "LOCATION_REQUIRED",
+          message: `"${p.mrfItem.rawItemName}" is tracked by location — choose the warehouse and location to issue it from before completing fulfilment.`,
         });
       }
-      issuedLines = await applyIssue({ mrf, planned, actorId, storeNotes: "" });
+      if (p.loc) {
+        const deductQty = await convertQty(p.issuedQty, p.mrfItem.unit, p.mrfItem.baseUnit);
+        const onHand = await locStock.locationOnHand(
+          null, req.tenant.companyId, p.mrfItem.rawItem, p.mrfItem.variantId,
+          p.loc.warehouse._id, p.loc.location._id,
+        );
+        if (deductQty > onHand + 0.001) {
+          return res.status(409).json({
+            success: false,
+            message: `${p.mrfItem.rawItemName}: ${p.loc.location.code} holds ${onHand} ${p.mrfItem.baseUnit}, cannot issue ${deductQty} ${p.mrfItem.baseUnit}.`,
+          });
+        }
+      }
     }
+
+    let issuedLines = [];
+    /* No marker is written before the transaction. commitMrf passes the entity
+       identity to unitOfWork.run, which stamps the marker INSIDE the transaction
+       (transactional — rolled back on failure) or BEFORE the mutation
+       (standalone — at-most-once). */
 
     /* ── THE HALF THAT HAS TO BE BOUGHT ───────────────────────────────── */
     let spend = null;
@@ -1992,31 +2101,24 @@ router.post(
       spend.sourceMrfId = mrf._id;
       spend.sourceMrfNumber = mrf.mrfNumber;
       await spend.save();
-
-      mrf.spendRequestId = spend._id;
-      mrf.spendRequestNumber = spend.requestNumber;
-      buying.forEach((l) => {
-        const item = mrf.items.id(l.itemId);
-        if (item) item.buyQty = l.buyQty;
-      });
     }
 
-    /* ── RECORD THE DECISION ──────────────────────────────────────────── */
-    mrf.fulfilmentDecision = decision;
-    mrf.fulfilmentDecidedAt = now;
-    mrf.fulfilmentDecidedBy = actorId;
-    mrf.fulfilmentDecidedByName = who;
-    mrf.fulfilmentNote = String(b.note || "").trim().slice(0, 500);
-    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = now;
+    /* PLAN the issue once (no MRF mutation, no DB writes) — its absolute item
+       targets and IDEMPOTENT ledger writes are applied to a FRESH MRF inside the
+       transactional callback below. */
+    let stockPlans = [];
+    let itemTargets = [];
+    if (planned.length) {
+      const applied = await applyIssue({
+        mrf, planned, actorId, storeNotes: "",
+        operationKey: req.idempotent?.key || "", tenant: req.tenant,
+      });
+      issuedLines = applied.issuedLines;
+      stockPlans = applied.stockPlans;
+      itemTargets = applied.itemTargets;
+    }
 
-    /* Status follows what actually moved, by the same rule the Issue button
-       uses. A request whose whole balance went to finance keeps its status —
-       nothing has been issued and nothing is settled until the goods arrive. */
-    const live = mrf.items.filter((i) => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus));
-    const allIssued = live.length > 0 && live.every((i) => i.itemStatus === "ISSUED");
-    const someIssued = mrf.items.some((i) => (i.issuedQty || 0) > 0);
-    mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
-
+    const fulfilmentNote = String(b.note || "").trim().slice(0, 500);
     const detail =
       fulfilment.DECISION_LABEL[decision] +
       (issuedLines.length
@@ -2027,26 +2129,59 @@ router.post(
           ? ` — ${spend.requestNumber} sent to finance`
           : ` — ${spend.requestNumber} approved for purchase`
         : "");
-    mrf.logEvent({ action: "STORE_FULFILMENT_DECISION", actorName: who, actorRole: "store", detail });
 
-    await commitMrf(req, mrf, {
-      action: "STORE_FULFILMENT_DECISION",
-      previousState: stateBeforeDecision,
-      resultingState: mrf.status,
-      changes: issuedLines.map((l) => ({ field: l.name, from: null, to: `${l.issuedQty} ${l.unit}` })),
-      metadata: {
-        decision,
-        issuedLines: issuedLines.length,
-        spendRequest: spend ? spend.requestNumber : null,
+    /* Every MRF change is applied to a FRESH document inside the transactional
+       callback (so a `withTransaction` retry lands once), and the shelf
+       deduction runs with the same session. The marker is written inside the
+       transaction by unitOfWork.run — a rollback rolls it back too. */
+    const { result: committed } = await commitMrf(
+      req, mrf,
+      (doc) => ({
+        action: "STORE_FULFILMENT_DECISION",
+        previousState: stateBeforeDecision,
+        resultingState: doc.status,
+        changes: issuedLines.map((l) => ({ field: l.name, from: null, to: `${l.issuedQty} ${l.unit}` })),
+        metadata: {
+          decision,
+          issuedLines: issuedLines.length,
+          spendRequest: spend ? spend.requestNumber : null,
+        },
+      }),
+      {
+        applyTargets: (doc) => {
+          if (spend) {
+            doc.spendRequestId = spend._id;
+            doc.spendRequestNumber = spend.requestNumber;
+            buying.forEach((l) => {
+              const item = doc.items.id(l.itemId);
+              if (item) item.buyQty = l.buyQty;
+            });
+          }
+          doc.fulfilmentDecision = decision;
+          doc.fulfilmentDecidedAt = now;
+          doc.fulfilmentDecidedBy = actorId;
+          doc.fulfilmentDecidedByName = who;
+          doc.fulfilmentNote = fulfilmentNote;
+          if (!doc.storeReviewedAt) doc.storeReviewedAt = now;
+
+          applyItemIssueTargets(doc, itemTargets);
+          // A request whose whole balance went to finance keeps its status —
+          // nothing is issued or settled until the goods arrive.
+          doc.status = issueStatusOf(doc).status;
+          doc.logEvent({ action: "STORE_FULFILMENT_DECISION", actorName: who, actorRole: "store", detail });
+        },
+        beforeSave: async (session) => {
+          await applyStockPlans(stockPlans, session);
+        },
       },
-    });
+    );
 
-    await noteInThread(req, mrf, detail, who);
+    await noteInThread(req, committed, detail, who);
     if (issuedLines.length) {
-      mrfNotify.issued(mrf, issuedLines).catch((e) => console.error("[fulfilment issue notify]", e.message));
+      mrfNotify.issued(committed, issuedLines).catch((e) => console.error("[fulfilment issue notify]", e.message));
     }
 
-    const obj = mrf.toObject();
+    const obj = committed.toObject();
     const decisionPayload = {
       success: true,
       message: spend
@@ -2103,48 +2238,143 @@ router.post(
  * moving, because the two callers refuse for different reasons and in
  * different words.
  *
- * Does not save. The caller decides what else changes in the same write.
+ * Pure PLANNER: it neither saves nor touches the database, and it does NOT
+ * mutate the MRF. It computes, ONCE, the immutable business plan for the issue:
+ *   · `stockPlans` — the ledger writes (applied later with a session);
+ *   · `itemTargets` — DETERMINISTIC absolute target values for each line
+ *     (targetIssuedQty, targetItemStatus, the one history entry to append);
+ *   · `issuedLines` — for the response and notifications.
+ * The caller applies `itemTargets` to a FRESH MRF loaded inside each
+ * transactional attempt (see applyIssueTargets), so a `withTransaction` retry —
+ * which reruns the whole callback against the rolled-back state — lands the
+ * same result exactly once. Nothing here uses `+=` against a captured document.
  */
-async function applyIssue({ mrf, planned, actorId, storeNotes = "" }) {
+async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey = "", tenant = null }) {
   const issuedLines = [];
+  const stockPlans = [];
+  const itemTargets = [];
+  const recordedAt = new Date(); // stamped once, so every retry writes the same
 
-  for (const { mrfItem, issuedQty, notes } of planned) {
+  for (const { mrfItem, issuedQty, notes, loc } of planned) {
     // The only place a requester-unit quantity is converted to the
     // catalogue's base unit: the stock ledger.
     const deductQty = await convertQty(issuedQty, mrfItem.unit, mrfItem.baseUnit);
-    await adjustStock(
-      mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, -deductQty,
-      {
+
+    /* Warehouse Stock V1: when a source location was chosen, the issue also
+       writes a location-OUT movement — sharing ONE source identity with the
+       canonical RawItem deduction (the MRF), and a per-line movement key so a
+       replay cannot duplicate it. adjustStock guards the location BEFORE any
+       stock change, so an over-issue refuses with nothing applied. */
+    const adjustLoc = loc && loc.location
+      ? {
+          companyId: tenant?.companyId, siteId: tenant?.siteId || null,
+          warehouse: loc.warehouse, location: loc.location,
+          type: "issue",
+          source: { kind: "mrf_issue", id: mrf._id, reference: mrf.mrfNumber },
+          actor: { id: actorId, name: "" },
+          idempotencyKey: locStock.movementLineKey(operationKey, mrfItem._id, "issue"),
+          operationKey,
+        }
+      : null;
+
+    stockPlans.push({
+      rawItemId: mrfItem.rawItem,
+      variantId: mrfItem.variantId,
+      variantCombination: mrfItem.variantCombination,
+      delta: -deductQty,
+      txnMeta: {
         type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
         quantity: deductQty,
         reason: `MRF Issue — ${mrf.mrfNumber}`,
         notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
         performedBy: actorId,
-      }
-    );
-    mrfItem.issuedQty += issuedQty;
-    mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
-    mrfItem.itemStatus = mrfItem.issuedQty >= mrfItem.requestedQty - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED";
-    // Issuing settles the availability question for what just went out.
-    if (mrfItem.itemStatus === "ISSUED") mrfItem.availability = "AVAILABLE";
-    if (notes) mrfItem.storeNotes = notes;
-    mrfItem.issueHistory = mrfItem.issueHistory || [];
-    mrfItem.issueHistory.push({
-      issuedQty,
-      notes: notes || storeNotes || "",
-      recordedBy: actorId,
-      recordedAt: new Date(),
+      },
+      loc: adjustLoc,
+    });
+
+    // Absolute targets, computed from the base value read at validation time.
+    const targetIssuedQty = (mrfItem.issuedQty || 0) + issuedQty;
+    itemTargets.push({
+      mrfItemId: String(mrfItem._id),
+      targetIssuedQty,
+      targetItemStatus: targetIssuedQty >= (mrfItem.requestedQty || 0) - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED",
+      storeNote: notes || "",
+      issueHistoryEntry: {
+        issuedQty,
+        notes: notes || storeNotes || "",
+        recordedBy: actorId,
+        recordedAt,
+      },
     });
 
     issuedLines.push({
       name: mrfItem.rawItemName,
       unit: mrfItem.unit,
       issuedQty,
-      remaining: Math.max(0, (mrfItem.requestedQty || 0) - mrfItem.issuedQty),
+      remaining: Math.max(0, (mrfItem.requestedQty || 0) - targetIssuedQty),
     });
   }
 
-  return issuedLines;
+  return { issuedLines, stockPlans, itemTargets };
+}
+
+/**
+ * Apply issue `itemTargets` to the lines of a FRESH MRF document. Absolute sets
+ * and a single history append — deterministic and idempotent per attempt,
+ * because the document is reloaded fresh in each transactional callback.
+ */
+function applyItemIssueTargets(doc, itemTargets) {
+  for (const t of itemTargets) {
+    const it = doc.items.id(t.mrfItemId);
+    if (!it) continue;
+    it.issuedQty = t.targetIssuedQty;
+    it.consumedQty = it.issuedQty - (it.returnedQty || 0);
+    it.itemStatus = t.targetItemStatus;
+    if (t.targetItemStatus === "ISSUED") it.availability = "AVAILABLE";
+    if (t.storeNote) it.storeNote = t.storeNote;
+    it.issueHistory = it.issueHistory || [];
+    it.issueHistory.push(t.issueHistoryEntry);
+  }
+}
+
+// The whole-request rule the Issue button and the fulfilment decision share:
+// fully issued only when every LIVE line is done. UNFULFILLED/REJECTED lines are
+// settled and must not hold the request open, nor fake completion.
+function issueStatusOf(doc) {
+  const live = doc.items.filter(i => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus));
+  const allIssued = live.length > 0 && live.every(i => i.itemStatus === "ISSUED");
+  const someIssued = doc.items.some(i => (i.issuedQty || 0) > 0);
+  return { allIssued, status: allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : doc.status };
+}
+
+/**
+ * The Issue-button flavour: item targets + store review + status + the
+ * FULLY/PARTIALLY_ISSUED log event, on a fresh document. Returns whether the
+ * request is now fully issued.
+ */
+function applyIssueTargets(doc, itemTargets, { storeNotes, reviewedAt, who, detail }) {
+  applyItemIssueTargets(doc, itemTargets);
+  if (storeNotes) doc.storeNotes = storeNotes;
+  if (!doc.storeReviewedAt) doc.storeReviewedAt = reviewedAt;
+  const { allIssued, status } = issueStatusOf(doc);
+  doc.status = status;
+  doc.logEvent({
+    action: allIssued ? "FULLY_ISSUED" : "PARTIALLY_ISSUED",
+    actorName: who, actorRole: "store", detail,
+  });
+  return allIssued;
+}
+
+/**
+ * Apply prepared stock plans (from applyIssue, or a single return credit) to the
+ * ledger with the caller's session. Every write reloads the RawItem fresh and
+ * sets absolute values, so this is safe to REPLAY — a transaction retry re-runs
+ * it against the rolled-back state and lands the same result.
+ */
+async function applyStockPlans(stockPlans, session) {
+  for (const sp of stockPlans) {
+    await adjustStock(sp.rawItemId, sp.variantId, sp.variantCombination, sp.delta, sp.txnMeta, sp.loc, session);
+  }
 }
 
 router.post(
@@ -2241,7 +2471,19 @@ router.post(
           message: `Cannot issue ${issuedQty} ${mrfItem.unit} of "${mrfItem.rawItemName}" — only ${remaining} ${mrfItem.unit} is still owed on this request.`,
         });
 
-      planned.push({ mrfItem, issuedQty, notes: line.storeNotes || "" });
+      /* Warehouse Stock V1: the EXPLICIT source location for this line. When the
+         item is location-tracked, a valid source is REQUIRED — never silently
+         issue from Unassigned. A named-but-unusable location throws (→ 400). */
+      const loc = await resolveMrfLocation(req, line);
+      if (!loc && await locStock.isLocationTracked(req.tenant.companyId, mrfItem.rawItem, mrfItem.variantId || null)) {
+        return res.status(400).json({
+          success: false,
+          reason: "LOCATION_REQUIRED",
+          message: `"${mrfItem.rawItemName}" is tracked by location — choose the warehouse and location to issue it from.`,
+        });
+      }
+
+      planned.push({ mrfItem, issuedQty, notes: line.storeNotes || "", loc });
     }
 
     if (!planned.length)
@@ -2257,6 +2499,20 @@ router.post(
         short.push(`${p.mrfItem.rawItemName}: trying to issue ${p.issuedQty} ${p.mrfItem.unit} but only ${live.available} ${p.mrfItem.unit} is in stock right now`);
       }
     });
+    /* And, for a chosen location, that the LOCATION itself holds enough — refused
+       here, BEFORE the effect marker, so an over-issue at a location leaves every
+       stock record untouched and does not lock the key into recovery. */
+    for (const p of planned) {
+      if (!p.loc) continue;
+      const deductQty = await convertQty(p.issuedQty, p.mrfItem.unit, p.mrfItem.baseUnit);
+      const onHand = await locStock.locationOnHand(
+        null, req.tenant.companyId, p.mrfItem.rawItem, p.mrfItem.variantId,
+        p.loc.warehouse._id, p.loc.location._id,
+      );
+      if (deductQty > onHand + 0.001) {
+        short.push(`${p.mrfItem.rawItemName}: ${p.loc.location.code} holds ${onHand} ${p.mrfItem.baseUnit}, cannot issue ${deductQty} ${p.mrfItem.baseUnit}`);
+      }
+    }
     if (short.length)
       return res.status(409).json({
         success: false,
@@ -2266,75 +2522,65 @@ router.post(
 
     const who = actorName(req);
     const previousState = mrf.status;
+    const reviewedAt = new Date();
 
-    /* ── THE MARKER GOES BEFORE THE FIRST STOCK WRITE ───────────────────────
-     * `applyIssue` deducts item by item, outside any transaction on a
-     * standalone deployment. Marking the effect first makes the deduction
-     * at-most-once: any failure from here on routes the retry into recovery
-     * above, which never re-runs it. */
-    if (req.idempotent?.record) {
-      await idempotencyService.markEffectApplied({
-        record: req.idempotent.record, entityType: MRF_ENTITY, entityId: mrf._id,
-      });
-    }
-
-    const issuedLines = await applyIssue({
+    /* PLAN the issue once — no MRF mutation, no DB writes. The MRF is mutated
+       only on a FRESH document loaded inside the transactional callback below,
+       so a `withTransaction` retry that reruns the callback lands the same
+       result exactly once and never persists a doubly-incremented quantity. */
+    const { issuedLines, stockPlans, itemTargets } = await applyIssue({
       mrf, planned, actorId: getActorId(req), storeNotes,
+      operationKey: req.idempotent?.key || "", tenant: req.tenant,
     });
-
-    if (storeNotes) mrf.storeNotes = storeNotes;
-    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = new Date();
-
-    // Fully issued only when every live line is done; UNFULFILLED lines are
-    // settled and must not hold the request open, but must not fake completion
-    // either — the status stays PARTIALLY_ISSUED if anything is still owed.
-    const live = mrf.items.filter(i => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus));
-    const allIssued = live.length > 0 && live.every(i => i.itemStatus === "ISSUED");
-    const someIssued = mrf.items.some(i => (i.issuedQty || 0) > 0);
-    mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
 
     const detail = issuedLines
       .map(l => `${l.issuedQty} ${l.unit} of ${l.name}${l.remaining > 0 ? ` (${l.remaining} ${l.unit} still pending)` : ""}`)
       .join("; ");
-    mrf.logEvent({
-      action: allIssued ? "FULLY_ISSUED" : "PARTIALLY_ISSUED",
-      actorName: who, actorRole: "store", detail,
-    });
 
-    /* Request state, its history entry and the idempotency completion as one
-       unit — transactional where the deployment supports it. */
-    await unitOfWork.run(req.tenant, {
+    /* No marker is written out here. unitOfWork.run stamps it INSIDE the
+       transaction (transactional) — so a rollback rolls the marker back and a
+       retry is a clean first attempt — or BEFORE the mutation (standalone),
+       given the entity identity passed below, for at-most-once. */
+    const { result: committed } = await unitOfWork.run(req.tenant, {
       idempotencyRecord: req.idempotent?.record,
+      entityType: MRF_ENTITY,
+      entityId: mrf._id,
       mutate: async (session) => {
-        await mrf.save(session ? { session } : {});
+        const doc = await MRF.findById(mrf._id).session(session || null);
+        if (!doc) throw new Error(`MRF ${mrf._id} disappeared mid-issue`);
+        const fullyIssued = applyIssueTargets(doc, itemTargets, { storeNotes, reviewedAt, who, detail });
+        await applyStockPlans(stockPlans, session);
+        await doc.save(session ? { session } : {});
         return {
           entityType: MRF_ENTITY,
-          entityId: mrf._id,
-          result: true,
+          entityId: doc._id,
+          result: doc,
           entry: {
             entityType: MRF_ENTITY,
-            entityId: mrf._id,
-            documentNumber: mrf.mrfNumber,
+            entityId: doc._id,
+            documentNumber: doc.mrfNumber,
             action: "ISSUED",
             previousState,
-            resultingState: mrf.status,
+            resultingState: doc.status,
             requestId: req.id || "",
             idempotencyKey: req.idempotent?.key || "",
             changes: issuedLines.map((l) => ({ field: l.name, from: null, to: `${l.issuedQty} ${l.unit}` })),
-            metadata: { lineCount: issuedLines.length, fullyIssued: allIssued },
+            metadata: { lineCount: issuedLines.length, fullyIssued },
           },
         };
       },
     });
 
+    const allIssued = committed.status === "ISSUED";
+
     /* Only after the authoritative effect is committed. A notification sent
        before the save can announce an issue that then fails to persist, and a
        replay must not send a second one — which is why this sits past the
        recovery branch, on the path a replay never reaches. */
-    await noteInThread(req, mrf, `Store issued ${detail}.`, who);
-    mrfNotify.issued(mrf, issuedLines).catch(e => console.error("[issue notify]", e.message));
+    await noteInThread(req, committed, `Store issued ${detail}.`, who);
+    mrfNotify.issued(committed, issuedLines).catch(e => console.error("[issue notify]", e.message));
 
-    const obj = mrf.toObject();
+    const obj = committed.toObject();
     const issueBody = {
       success: true,
       message: allIssued
@@ -2347,7 +2593,10 @@ router.post(
     return req.idempotent
       ? await req.idempotent.succeed(200, issueBody, { entityType: MRF_ENTITY, entityId: mrf._id })
       : res.json(issueBody);
-  } catch (e) { console.error("[MRF issue]", e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    console.error("[MRF issue]", e); res.status(500).json({ success: false, message: e.message });
+  }
 },
 );
 
@@ -2412,67 +2661,100 @@ router.post(
     if (qty > maxReturn + 0.001)
       return res.status(400).json({ success: false, message: `Cannot return ${qty} — max returnable is ${maxReturn.toFixed(3)} ${mrfItem.unit}` });
 
-    /* Marker before the stock is credited, for the same reason as the issue:
-       any failure afterwards must recover, never repeat. */
-    if (req.idempotent?.record) {
-      await idempotencyService.markEffectApplied({
-        record: req.idempotent.record, entityType: MRF_ENTITY, entityId: mrf._id,
+    /* Warehouse Stock V1: the EXPLICIT "Return to" destination. A location-in
+       movement, linked to this MRF (and so to the original issue), preserves
+       item/variant/quantity/unit identity. A location-tracked item must name a
+       destination — never credited silently to Unassigned. Resolved and
+       validated BEFORE the marker so a bad destination leaves nothing applied. */
+    const loc = await resolveMrfLocation(req, req.body);
+    if (!loc && await locStock.isLocationTracked(req.tenant.companyId, mrfItem.rawItem, mrfItem.variantId || null)) {
+      return res.status(400).json({
+        success: false,
+        reason: "LOCATION_REQUIRED",
+        message: `"${mrfItem.rawItemName}" is tracked by location — choose the warehouse and location to return it to.`,
       });
     }
 
     const creditQty = await convertQty(qty, mrfItem.unit, mrfItem.baseUnit);
-    await adjustStock(
-      mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, +creditQty,
-      {
-        type: mrfItem.variantId ? "VARIANT_ADD" : "ADD",
-        quantity: creditQty,
-        reason: `MRF Return — ${mrf.mrfNumber}`,
-        notes: notes || `Return from ${mrf.requestedForName}. MRF: ${mrf.mrfNumber}`,
-        performedBy: getActorId(req),
-      }
-    );
+    const who = actorName(req);
+    const mrfItemId = String(mrfItem._id);
+    const returnedAt = new Date();
+    const returnDetail = `${qty} ${mrfItem.unit} of ${mrfItem.rawItemName} returned${notes ? ` — ${notes}` : ""}`;
 
-    mrfItem.returnedQty += qty;
-    mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
-    mrfItem.returnHistory.push({
+    /* PLAN once — deterministic absolute targets, computed from the base values
+       read at validation time. NO MRF mutation here; the document is mutated
+       only on a fresh copy inside the transactional callback. */
+    const targetReturnedQty = (mrfItem.returnedQty || 0) + qty;
+    const fullyReturned = targetReturnedQty >= (mrfItem.issuedQty || 0) - 0.001;
+    const returnHistoryEntry = {
       returnedQty: qty, notes,
       recordedBy: getActorId(req), recordedByModel: "ProjectManager",
       // The schema field is `returnedAt`. This used to push `recordedAt`,
       // which Mongoose stripped as unknown — the timestamp only survived
       // because `returnedAt` has a Date.now default, and anything reading
       // `recordedAt` (the store's own activity log) got undefined.
-      returnedAt: new Date(),
-    });
+      returnedAt,
+    };
 
-    const fullyReturned = mrfItem.returnedQty >= mrfItem.issuedQty - 0.001;
-    mrfItem.itemStatus = fullyReturned ? "RETURNED" : "PARTIALLY_RETURNED";
+    const returnPlan = {
+      rawItemId: mrfItem.rawItem, variantId: mrfItem.variantId, variantCombination: mrfItem.variantCombination,
+      delta: +creditQty,
+      txnMeta: {
+        type: mrfItem.variantId ? "VARIANT_ADD" : "ADD",
+        quantity: creditQty,
+        reason: `MRF Return — ${mrf.mrfNumber}`,
+        notes: notes || `Return from ${mrf.requestedForName}. MRF: ${mrf.mrfNumber}`,
+        performedBy: getActorId(req),
+      },
+      loc: loc && loc.location
+        ? {
+            companyId: req.tenant.companyId, siteId: req.tenant.siteId || null,
+            warehouse: loc.warehouse, location: loc.location,
+            type: "return",
+            source: { kind: "mrf_return", id: mrf._id, reference: mrf.mrfNumber },
+            actor: { id: getActorId(req), name: who },
+            idempotencyKey: locStock.movementLineKey(req.idempotent?.key || "", mrfItem._id, "return"),
+            operationKey: req.idempotent?.key || "",
+          }
+        : null,
+    };
 
-    const allReturned = mrf.items.every(i => ["RETURNED", "REJECTED"].includes(i.itemStatus));
-    const someReturned = mrf.items.some(i => ["RETURNED", "PARTIALLY_RETURNED"].includes(i.itemStatus));
-    mrf.status = allReturned ? "COMPLETED" : someReturned ? "PARTIALLY_RETURNED" : mrf.status;
-
-    const who = actorName(req);
-    mrf.logEvent({
-      action: allReturned ? "FULLY_RETURNED" : "RETURNED",
-      actorName: who, actorRole: "store",
-      detail: `${qty} ${mrfItem.unit} of ${mrfItem.rawItemName} returned${notes ? ` — ${notes}` : ""}`,
-    });
-
-    await unitOfWork.run(req.tenant, {
+    /* The credit and its location-in movement (idempotent — RawItem reloaded
+       fresh, absolute values) plus the request save happen INSIDE one unit of
+       work, on a FRESH MRF loaded in the session, so a `withTransaction` retry
+       lands the return exactly once, and the marker is written (transactional)
+       inside the transaction — rolling back with the credit if it aborts. */
+    const { result: committed } = await unitOfWork.run(req.tenant, {
       idempotencyRecord: req.idempotent?.record,
+      entityType: MRF_ENTITY,
+      entityId: mrf._id,
       mutate: async (session) => {
-        await mrf.save(session ? { session } : {});
+        const doc = await MRF.findById(mrf._id).session(session || null);
+        if (!doc) throw new Error(`MRF ${mrf._id} disappeared mid-return`);
+        const it = doc.items.id(mrfItemId);
+        it.returnedQty = targetReturnedQty;
+        it.consumedQty = (it.issuedQty || 0) - it.returnedQty;
+        it.itemStatus = fullyReturned ? "RETURNED" : "PARTIALLY_RETURNED";
+        it.returnHistory.push(returnHistoryEntry);
+
+        const allReturned = doc.items.every(i => ["RETURNED", "REJECTED"].includes(i.itemStatus));
+        const someReturned = doc.items.some(i => ["RETURNED", "PARTIALLY_RETURNED"].includes(i.itemStatus));
+        doc.status = allReturned ? "COMPLETED" : someReturned ? "PARTIALLY_RETURNED" : doc.status;
+        doc.logEvent({ action: allReturned ? "FULLY_RETURNED" : "RETURNED", actorName: who, actorRole: "store", detail: returnDetail });
+
+        await applyStockPlans([returnPlan], session);
+        await doc.save(session ? { session } : {});
         return {
           entityType: MRF_ENTITY,
-          entityId: mrf._id,
-          result: true,
+          entityId: doc._id,
+          result: doc,
           entry: {
             entityType: MRF_ENTITY,
-            entityId: mrf._id,
-            documentNumber: mrf.mrfNumber,
+            entityId: doc._id,
+            documentNumber: doc.mrfNumber,
             action: "RETURNED",
             previousState: previousReturnState,
-            resultingState: mrf.status,
+            resultingState: doc.status,
             reason: notes || "",
             requestId: req.id || "",
             idempotencyKey: req.idempotent?.key || "",
@@ -2483,23 +2765,26 @@ router.post(
       },
     });
 
+    const committedItem = committed.items.id(mrfItemId);
+    const allReturned = committed.status === "COMPLETED";
+
     // A return was the one movement that told nobody. The requester needs to
     // know their return was recorded (it clears what they owe), and the TL
     // needs it because the request may now be complete.
     await noteInThread(
-      req, mrf,
+      req, committed,
       `${who} recorded a return of ${qty} ${mrfItem.unit} of ${mrfItem.rawItemName}.${notes ? ` Note: ${notes}` : ""}`,
       who,
     );
-    mrfNotify.returned(mrf, {
+    mrfNotify.returned(committed, {
       name: mrfItem.rawItemName,
       unit: mrfItem.unit,
       returnedQty: qty,
-      outstanding: Math.max(0, (mrfItem.issuedQty || 0) - (mrfItem.returnedQty || 0)),
+      outstanding: Math.max(0, (committedItem?.issuedQty || 0) - (committedItem?.returnedQty || 0)),
       complete: allReturned,
     }).catch(e => console.error("[return notify]", e.message));
 
-    const returnBody = { success: true, message: `${qty} ${mrfItem.unit} returned & stock credited`, mrf };
+    const returnBody = { success: true, message: `${qty} ${mrfItem.unit} returned & stock credited`, mrf: committed };
     return req.idempotent
       ? await req.idempotent.succeed(200, returnBody, { entityType: MRF_ENTITY, entityId: mrf._id })
       : res.json(returnBody);
@@ -2715,5 +3000,528 @@ router.patch("/:id/chat/read", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CHUNK 9A — STOCK RESERVATIONS, PICKING & CONTROLLED ISSUE
+//
+// An approved demand is not issued directly. It is checked, reserved from chosen
+// usable locations (a live record; on-hand never changes), picked, then issued
+// through THIS file's own adjustStock engine. Reservations never appear in the
+// movement ledger.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const sameIdLocal = (a, b) => String(a ?? "") === String(b ?? "");
+
+// The company's active warehouses (with their embedded locations).
+const companyWarehouses = (req) =>
+  Warehouse.find({ ...tenantContext.tenantFilter(req.tenant), status: "Active" }).lean();
+
+// Freeze the business→base conversion for a line, failing closed on a missing
+// path (never treating unlike units as equal).
+async function lineConversion(line, raw) {
+  const baseUnit = line.baseUnit || (raw && (raw.customUnit || raw.unit)) || line.unit;
+  const conv = await resolveConversion({ quantity: 1, fromUnit: line.unit, toUnit: baseUnit });
+  return { baseUnit, factor: conv.factor };
+}
+
+// Why a line cannot be reserved — a matched physical item is required; a service
+// / buy line follows the Service Order workflow, not inventory reservation.
+function reservableRefusal(mrf, line) {
+  if (!line) return { code: "UNKNOWN_LINE", message: "That line is not part of this request." };
+  if (["REJECTED", "UNFULFILLED"].includes(line.itemStatus)) return { code: "LINE_CLOSED", message: "This line is closed and cannot be reserved." };
+  if (!line.rawItem) {
+    if (mrf.fulfilmentDecision === "buy_or_service") {
+      return { code: "SERVICE_NOT_RESERVABLE", message: "This line follows the Service Order / purchase workflow, not inventory reservation." };
+    }
+    return { code: "LINE_NOT_MATCHED", message: "Match this line to a catalogue item before reserving stock." };
+  }
+  return null;
+}
+
+// Shape one reservation for the API (business-unit figures + derived state).
+function reservationView(r) {
+  const factor = Number(r.conversionFactor) || 1;
+  const activeReserved = reservationSvc.r4(Math.max(0, (r.reservedQty || 0) - (r.issuedQty || 0) - (r.releasedQty || 0)));
+  return {
+    id: String(r._id), mrfId: String(r.mrfId), mrfNumber: r.mrfNumber, mrfLineId: String(r.mrfLineId),
+    requestedForName: r.requestedForName || "", requestedForDept: r.requestedForDept || "", neededBy: r.neededBy || null,
+    item: { rawItemId: String(r.rawItemId), name: r.itemName, sku: r.sku, variantId: r.variantId ? String(r.variantId) : null, variant: (r.variantCombination || []).join(" • ") },
+    unit: r.unit, baseUnit: r.baseUnit, conversionFactor: factor,
+    requestedQty: r.requestedQty, reservedQty: r.reservedQty, activeReservedQty: activeReserved,
+    pickedQty: r.pickedQty || 0, issuedQty: r.issuedQty || 0, releasedQty: r.releasedQty || 0, backorderedQty: r.backorderedQty || 0,
+    status: r.status, group: reservationSvc.queueGroup(r),
+    allocations: (r.allocations || []).map((a) => ({
+      id: String(a._id), warehouseId: String(a.warehouseId), warehouseName: a.warehouseName, warehouseShortName: a.warehouseShortName,
+      locationId: String(a.locationId), locationCode: a.locationCode, locationName: a.locationName,
+      reservedQty: a.reservedQty, issuedQty: a.issuedQty || 0, releasedQty: a.releasedQty || 0,
+      activeQty: reservationSvc.r4(Math.max(0, (a.reservedQty || 0) - (a.issuedQty || 0) - (a.releasedQty || 0))),
+    })),
+    reservedByName: r.reservedByName || "", reservedAt: r.reservedAt || null,
+    history: (r.history || []).map((h) => ({ action: h.action, qty: h.qty, at: h.at, byName: h.byName, reason: h.reason })),
+  };
+}
+
+// ── GET /:id/items/:itemId/availability — usable locations + on hand/reserved/available
+router.get("/:id/items/:itemId/availability", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const mrf = await loadMrf(req, req.params.id, { lean: true });
+    const line = (mrf.items || []).find((it) => String(it._id) === String(req.params.itemId));
+    const refuse = reservableRefusal(mrf, line);
+    if (refuse) return res.status(400).json({ success: false, ...refuse });
+
+    const raw = await RawItem.findById(line.rawItem).select("unit customUnit").lean();
+    const { baseUnit, factor } = await lineConversion(line, raw);
+    const warehouses = await companyWarehouses(req);
+    const rows = await reservationSvc.availabilityFor({
+      companyId: req.tenant.companyId, itemId: line.rawItem, variantId: line.variantId || null,
+      warehouses, preferredWarehouseId: line.warehouseId || null,
+    });
+    // Convert base figures to the requester's unit for display (never total across units).
+    const toBiz = (base) => (factor > 0 ? reservationSvc.r4(base / factor) : base);
+    res.json({
+      success: true,
+      line: { itemId: String(line._id), name: line.rawItemName, sku: line.rawItemSku, unit: line.unit, baseUnit, conversionFactor: factor, requestedQty: line.requestedQty, issuedQty: line.issuedQty || 0 },
+      locations: rows.map((r) => ({
+        warehouseId: r.warehouseId, warehouseName: r.warehouseName, warehouseShortName: r.warehouseShortName,
+        locationId: r.locationId, locationCode: r.locationCode, locationName: r.locationName,
+        onHand: toBiz(r.onHandBase), reserved: toBiz(r.reservedBase), available: toBiz(r.availableBase),
+        onHandBase: r.onHandBase, reservedBase: r.reservedBase, availableBase: r.availableBase,
+      })),
+      totals: {
+        available: reservationSvc.r4(rows.reduce((t, r) => t + toBiz(r.availableBase), 0)),
+        onHand: reservationSvc.r4(rows.reduce((t, r) => t + toBiz(r.onHandBase), 0)),
+      },
+    });
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── POST /:id/items/:itemId/reserve — reserve from explicit chosen locations ──
+router.post("/:id/items/:itemId/reserve",
+  requireCapability(CAPABILITIES.MRF_FULFIL), refuseLegacyWrite,
+  withIdempotency("MRF_RESERVE", { target: (req) => req.params.id }),
+  async (req, res) => {
+    try {
+      const mrf = await loadMrf(req, req.params.id);
+      const line = mrf.items.id(req.params.itemId);
+      const refuse = reservableRefusal(mrf, line);
+      if (refuse) return res.status(400).json({ success: false, ...refuse });
+
+      if (req.idempotent?.recovering) {
+        const existing = await StockReservation.findOne({ companyId: req.tenant.companyId, mrfLineId: line._id, idempotencyKey: req.idempotent.key }).lean();
+        if (existing) return await req.idempotent.succeed(200, { success: true, message: "This reservation was already recorded.", reservation: reservationView(existing) }, { entityType: MRF_ENTITY, entityId: mrf._id });
+        throw fail("LIFECYCLE_BLOCKED", "This reservation was interrupted. Re-check availability before reserving again.", { reason: "PARTIAL_RESERVATION_NEEDS_RECHECK" });
+      }
+
+      const raw = await RawItem.findById(line.rawItem).select("unit customUnit variants").lean();
+      if (!raw) return res.status(400).json({ success: false, reason: "ITEM_MISSING", message: "The matched catalogue item no longer exists." });
+      // Variant identity must match exactly (incl. null vs non-null).
+      if (line.variantId && !(raw.variants || []).some((v) => sameIdLocal(v._id, line.variantId))) {
+        return res.status(409).json({ success: false, reason: "VARIANT_MISMATCH", message: "The line's variant no longer exists on the item." });
+      }
+      const { baseUnit, factor } = await lineConversion(line, raw);
+
+      const reqAllocs = Array.isArray(req.body?.allocations) ? req.body.allocations : [];
+      if (reqAllocs.length === 0) return res.status(400).json({ success: false, reason: "NO_ALLOCATIONS", message: "Choose at least one location and quantity to reserve." });
+
+      const warehouses = await companyWarehouses(req);
+      const whById = new Map(warehouses.map((w) => [String(w._id), w]));
+      // Validate every chosen location up front (usable, active, in this company).
+      const resolved = [];
+      for (const a of reqAllocs) {
+        const qty = Number(a.qty);
+        if (!(qty > 0)) return res.status(400).json({ success: false, reason: "INVALID_QUANTITY", message: "Each allocation needs a positive quantity." });
+        const wh = whById.get(String(a.warehouseId));
+        const loc = locStock.findLocation(wh, a.locationId);
+        if (!wh || !loc || loc.status !== "Active" || loc.type !== reservationSvc.USABLE_TYPE) {
+          return res.status(400).json({ success: false, reason: "INVALID_LOCATION", message: "Reserve only from active usable-stock locations." });
+        }
+        resolved.push({ wh, loc, qty, baseQty: reservationSvc.r4(qty * factor) });
+      }
+
+      // Refuse a duplicate active reservation for a DIFFERENT item (substitution
+      // must release the old reservation first — never a silent rematch).
+      const current = await StockReservation.findOne({ companyId: req.tenant.companyId, mrfLineId: line._id, active: true });
+      if (current && !sameIdLocal(current.rawItemId, line.rawItem)) {
+        return res.status(409).json({ success: false, reason: "SUBSTITUTION_REQUIRES_RELEASE", message: "This line is reserved against a different item. Release that reservation before reserving a substitute." });
+      }
+
+      if (req.idempotent?.record) await require("../../../../services/storePurchase/idempotency.service").markEffectApplied({ record: req.idempotent.record, entityType: MRF_ENTITY, entityId: mrf._id });
+
+      let saved = null;
+      await unitOfWork.run(req.tenant, {
+        idempotencyRecord: req.idempotent?.record, entityType: MRF_ENTITY, entityId: mrf._id,
+        mutate: async (session) => {
+          const doc = current || new StockReservation({
+            companyId: req.tenant.companyId, siteId: req.tenant.siteId || null,
+            mrfId: mrf._id, mrfNumber: mrf.mrfNumber, mrfLineId: line._id,
+            requestedForName: mrf.requestedForName || "", requestedForDept: mrf.requestedForDept || "", neededBy: mrf.neededBy || null,
+            rawItemId: line.rawItem, variantId: line.variantId || null, variantCombination: line.variantCombination || [],
+            itemName: line.rawItemName, sku: line.rawItemSku,
+            unit: line.unit, requestedQty: line.requestedQty, baseUnit, conversionFactor: factor, requestedBaseQty: reservationSvc.r4(line.requestedQty * factor),
+            allocations: [], reservedBy: req.user?.id || null, reservedByName: actorName(req), reservedAt: new Date(),
+          });
+
+          const placed = [];
+          for (const rz of resolved) {
+            const onHand = await locStock.locationOnHand(session, req.tenant.companyId, line.rawItem, line.variantId || null, rz.wh._id, rz.loc._id);
+            // Atomic guard — the serialization point. Refuses more than availability.
+            const ok = await reservationSvc.reserveAtLocation({
+              session, companyId: req.tenant.companyId, itemId: line.rawItem, variantId: line.variantId || null,
+              warehouseId: rz.wh._id, locationId: rz.loc._id, requestedBase: rz.baseQty, onHand,
+            });
+            if (!ok) throw fail("VALIDATION", `${rz.loc.code} does not have ${rz.qty} ${line.unit} available to reserve.`, { reason: "INSUFFICIENT_AVAILABILITY", locationCode: rz.loc.code });
+            // Merge into an existing allocation for the same location, or add one.
+            const found = doc.allocations.find((x) => sameIdLocal(x.locationId, rz.loc._id));
+            if (found) { found.reservedQty = reservationSvc.r4(found.reservedQty + rz.qty); found.reservedBaseQty = reservationSvc.r4(found.reservedBaseQty + rz.baseQty); }
+            else doc.allocations.push({ warehouseId: rz.wh._id, warehouseName: rz.wh.name || "", warehouseShortName: rz.wh.shortName || "", locationId: rz.loc._id, locationCode: rz.loc.code || "", locationName: rz.loc.name || "", reservedQty: rz.qty, reservedBaseQty: rz.baseQty });
+            placed.push({ locationCode: rz.loc.code, qty: rz.qty, baseQty: rz.baseQty });
+          }
+
+          Object.assign(doc, reservationSvc.rollUp(doc));
+          doc.idempotencyKey = req.idempotent?.key || "";
+          doc.history.push({ action: "RESERVE", qty: reservationSvc.r4(placed.reduce((t, p) => t + p.qty, 0)), baseQty: reservationSvc.r4(placed.reduce((t, p) => t + p.baseQty, 0)), byId: req.user?.id || null, byName: actorName(req), reason: req.body?.reason || "", allocations: placed });
+          await doc.save(session ? { session } : {});
+          saved = doc.toObject();
+          return { entityType: MRF_ENTITY, entityId: mrf._id, result: doc, entry: { entityType: MRF_ENTITY, entityId: mrf._id, documentNumber: mrf.mrfNumber, action: "STOCK_RESERVED", requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { mrfLineId: String(line._id), reservedQty: reservationSvc.r4(placed.reduce((t, p) => t + p.qty, 0)) } } };
+        },
+      });
+
+      const body = { success: true, message: saved.backorderedQty > reservationSvc.TOL ? "Reserved what was available; the remainder is backordered." : "Stock reserved.", reservation: reservationView(saved) };
+      return req.idempotent ? await req.idempotent.succeed(201, body, { entityType: MRF_ENTITY, entityId: mrf._id }) : res.status(201).json(body);
+    } catch (e) {
+      if (e?.name === "StorePurchaseError") return sendError(res, e);
+      console.error("[mrf-reserve]", e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  });
+
+// Load one active reservation within the tenant, or 404.
+async function loadReservation(req, reservationId, { lean = false } = {}) {
+  const q = StockReservation.findOne({ _id: reservationId, companyId: req.tenant.companyId });
+  const doc = lean ? await q.lean() : await q;
+  if (!doc) throw fail("NOT_FOUND", "That reservation was not found.");
+  return doc;
+}
+
+// ── POST /:id/reservations/:reservationId/pick — record the gathered quantity ──
+// Pick = stock physically gathered and HELD against the reservation. It posts NO
+// movement and does not change on-hand — the reserved stock stays in its location
+// until issue. (pickedQty is a field on the record, never a false location balance.)
+router.post("/:id/reservations/:reservationId/pick",
+  requireCapability(CAPABILITIES.MRF_FULFIL), refuseLegacyWrite,
+  async (req, res) => {
+    try {
+      const r = await loadReservation(req, req.params.reservationId);
+      if (String(r.mrfId) !== String(req.params.id)) return res.status(404).json({ success: false, message: "That reservation is not part of this request." });
+      const active = reservationSvc.r4(Math.max(0, (r.reservedQty || 0) - (r.issuedQty || 0) - (r.releasedQty || 0)));
+      const qty = Number(req.body?.qty);
+      if (!(qty > 0)) return res.status(400).json({ success: false, reason: "INVALID_QUANTITY", message: "A positive picked quantity is required." });
+      if (qty > active + reservationSvc.TOL) return res.status(400).json({ success: false, reason: "OVER_PICK", message: `Only ${active} ${r.unit} is reserved and available to pick.` });
+      r.pickedQty = reservationSvc.r4(Math.max(r.pickedQty || 0, qty));
+      r.history.push({ action: "PICK", qty, byId: req.user?.id || null, byName: actorName(req), reason: req.body?.reason || "" });
+      await r.save();
+      res.json({ success: true, message: "Pick recorded (stock held against the reservation, not yet issued).", reservation: reservationView(r.toObject()) });
+    } catch (e) {
+      if (e?.name === "StorePurchaseError") return sendError(res, e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  });
+
+// ── POST /:id/reservations/:reservationId/release — release unissued reserved ──
+// Restores availability immediately; on-hand is unchanged; the record is never
+// deleted. Refuses releasing more than the unissued reserved balance.
+router.post("/:id/reservations/:reservationId/release",
+  requireCapability(CAPABILITIES.MRF_FULFIL), refuseLegacyWrite,
+  withIdempotency("MRF_RESERVE_RELEASE", { target: (req) => req.params.reservationId }),
+  async (req, res) => {
+    try {
+      const r = await loadReservation(req, req.params.reservationId);
+      if (String(r.mrfId) !== String(req.params.id)) return res.status(404).json({ success: false, message: "That reservation is not part of this request." });
+      const active = reservationSvc.r4(Math.max(0, (r.reservedQty || 0) - (r.issuedQty || 0) - (r.releasedQty || 0)));
+      if (active <= reservationSvc.TOL) return res.status(400).json({ success: false, reason: "NOTHING_TO_RELEASE", message: "This reservation has no unissued reserved quantity to release." });
+      const cancel = req.body?.cancel === true;
+      let want = cancel ? active : Number(req.body?.qty);
+      if (!cancel && !(want > 0)) return res.status(400).json({ success: false, reason: "INVALID_QUANTITY", message: "A positive release quantity is required." });
+      if (want > active + reservationSvc.TOL) return res.status(400).json({ success: false, reason: "OVER_RELEASE", message: `Only ${active} ${r.unit} can be released.` });
+      const factor = Number(r.conversionFactor) || 1;
+
+      if (req.idempotent?.record) await require("../../../../services/storePurchase/idempotency.service").markEffectApplied({ record: req.idempotent.record, entityType: MRF_ENTITY, entityId: r.mrfId });
+
+      let saved = null;
+      await unitOfWork.run(req.tenant, {
+        idempotencyRecord: req.idempotent?.record, entityType: MRF_ENTITY, entityId: r.mrfId,
+        mutate: async (session) => {
+          const doc = await StockReservation.findById(r._id).session(session || null);
+          let remaining = reservationSvc.r4(want);
+          const touched = [];
+          for (const a of doc.allocations) {
+            if (remaining <= reservationSvc.TOL) break;
+            const aActive = reservationSvc.r4(Math.max(0, (a.reservedQty || 0) - (a.issuedQty || 0) - (a.releasedQty || 0)));
+            if (aActive <= reservationSvc.TOL) continue;
+            const take = reservationSvc.r4(Math.min(aActive, remaining));
+            const takeBase = reservationSvc.r4(take * factor);
+            // Just decrement the reservation projection — LocationBalance is untouched.
+            await reservationSvc.reduceReservationAtLocation({ session, companyId: doc.companyId, itemId: doc.rawItemId, variantId: doc.variantId || null, warehouseId: a.warehouseId, locationId: a.locationId, baseQty: takeBase });
+            a.releasedQty = reservationSvc.r4((a.releasedQty || 0) + take);
+            remaining = reservationSvc.r4(remaining - take);
+            touched.push({ locationCode: a.locationCode, qty: take, baseQty: takeBase });
+          }
+          Object.assign(doc, reservationSvc.rollUp(doc));
+          doc.releasedBy = req.user?.id || null; doc.releasedByName = actorName(req); doc.releasedAt = new Date();
+          doc.history.push({ action: cancel ? "CANCEL" : "RELEASE", qty: reservationSvc.r4(touched.reduce((t, x) => t + x.qty, 0)), byId: req.user?.id || null, byName: actorName(req), reason: req.body?.reason || "", allocations: touched });
+          if (cancel && doc.status === "RELEASED") doc.status = "CANCELLED";
+          doc.active = doc.status === "RELEASED" || doc.status === "CANCELLED" || doc.status === "ISSUED" ? false : doc.active;
+          await doc.save(session ? { session } : {});
+          saved = doc.toObject();
+          return { entityType: MRF_ENTITY, entityId: r.mrfId, result: doc, entry: { entityType: MRF_ENTITY, entityId: r.mrfId, documentNumber: doc.mrfNumber, action: "RESERVATION_RELEASED", requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { reservationId: String(doc._id), releasedQty: want } } };
+        },
+      });
+      const body = { success: true, message: "Reservation released — availability restored, on-hand unchanged.", reservation: reservationView(saved) };
+      return req.idempotent ? await req.idempotent.succeed(200, body, { entityType: MRF_ENTITY, entityId: r.mrfId }) : res.json(body);
+    } catch (e) {
+      if (e?.name === "StorePurchaseError") return sendError(res, e);
+      console.error("[mrf-reserve-release]", e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  });
+
+// ── POST /:id/reservations/:reservationId/issue — controlled issue ────────────
+// Consumes the reservation and issues through THIS file's adjustStock engine:
+// one location deduction + one company on-hand reduction + one LocationMovement,
+// the reserved quantity reduced, the MRF line's issuedQty raised. Partial
+// supported; the remaining reservation/backorder stays visible.
+router.post("/:id/reservations/:reservationId/issue",
+  requireCapability(CAPABILITIES.STOCK_ISSUE), refuseLegacyWrite,
+  withIdempotency("MRF_RESERVE_ISSUE", { target: (req) => req.params.reservationId }),
+  async (req, res) => {
+    try {
+      const mrf = await loadMrf(req, req.params.id);
+      const r = await loadReservation(req, req.params.reservationId);
+      if (String(r.mrfId) !== String(mrf._id)) return res.status(404).json({ success: false, message: "That reservation is not part of this request." });
+      const line = mrf.items.id(r.mrfLineId);
+      if (!line) return res.status(409).json({ success: false, reason: "PROVENANCE_CONFLICT", message: "The reserved line is no longer on this request." });
+      // Never accept a client-supplied replacement item — issue the reserved item.
+      if (!sameIdLocal(line.rawItem, r.rawItemId) || !sameIdLocal(line.variantId, r.variantId)) {
+        return res.status(409).json({ success: false, reason: "SUBSTITUTION_REQUIRES_RELEASE", message: "The line's matched item/variant differs from the reservation. Release and reserve the correct item first." });
+      }
+      const active = reservationSvc.r4(Math.max(0, (r.reservedQty || 0) - (r.issuedQty || 0) - (r.releasedQty || 0)));
+      if (active <= reservationSvc.TOL) return res.status(400).json({ success: false, reason: "NOTHING_TO_ISSUE", message: "This reservation has no reserved quantity left to issue." });
+      const want = req.body?.qty != null ? Number(req.body.qty) : active;
+      if (!(want > 0)) return res.status(400).json({ success: false, reason: "INVALID_QUANTITY", message: "A positive issue quantity is required." });
+      if (want > active + reservationSvc.TOL) return res.status(400).json({ success: false, reason: "OVER_ISSUE", message: `Only ${active} ${r.unit} is reserved and available to issue.` });
+
+      if (req.idempotent?.recovering) {
+        // Idempotent replay is handled by the marker; recovery just surfaces state.
+        const fresh = await StockReservation.findById(r._id).lean();
+        return await req.idempotent.succeed(200, { success: true, message: "This issue was already recorded.", reservation: reservationView(fresh) }, { entityType: MRF_ENTITY, entityId: mrf._id });
+      }
+
+      // Resolve each allocation's warehouse/location for the movement snapshot.
+      const warehouses = await companyWarehouses(req);
+      const whById = new Map(warehouses.map((w) => [String(w._id), w]));
+      const factor = Number(r.conversionFactor) || 1;
+      // Plan issue across allocations, oldest first, up to `want`.
+      let remaining = reservationSvc.r4(want);
+      const plans = []; const consume = [];
+      for (const a of r.allocations) {
+        if (remaining <= reservationSvc.TOL) break;
+        const aActive = reservationSvc.r4(Math.max(0, (a.reservedQty || 0) - (a.issuedQty || 0) - (a.releasedQty || 0)));
+        if (aActive <= reservationSvc.TOL) continue;
+        const take = reservationSvc.r4(Math.min(aActive, remaining));
+        const takeBase = reservationSvc.r4(take * factor);
+        const wh = whById.get(String(a.warehouseId));
+        const loc = locStock.findLocation(wh, a.locationId);
+        if (!wh || !loc) return res.status(409).json({ success: false, reason: "LOCATION_MISSING", message: `The reserved location ${a.locationCode} no longer exists.` });
+        plans.push({
+          rawItemId: r.rawItemId, variantId: r.variantId || null, variantCombination: r.variantCombination || [],
+          delta: -takeBase,
+          txnMeta: { type: r.variantId ? "VARIANT_REDUCE" : "REDUCE", quantity: takeBase, reason: `MRF Issue — ${mrf.mrfNumber}`, performedBy: req.user?.id || null },
+          loc: {
+            companyId: req.tenant.companyId, siteId: req.tenant.siteId || null, warehouse: wh, location: loc, type: "issue",
+            source: { kind: "mrf_issue", id: mrf._id, reference: mrf.mrfNumber },
+            actor: { id: req.user?.id || null, name: actorName(req) },
+            idempotencyKey: locStock.movementLineKey(req.idempotent?.key || "", `${String(r._id)}:${String(a.locationId)}`, "issue"),
+            operationKey: req.idempotent?.key || "",
+          },
+        });
+        consume.push({ allocId: String(a._id), warehouseId: a.warehouseId, locationId: a.locationId, take, takeBase, locationCode: a.locationCode });
+        remaining = reservationSvc.r4(remaining - take);
+      }
+
+      if (req.idempotent?.record) await require("../../../../services/storePurchase/idempotency.service").markEffectApplied({ record: req.idempotent.record, entityType: MRF_ENTITY, entityId: mrf._id });
+
+      let savedRes = null;
+      await unitOfWork.run(req.tenant, {
+        idempotencyRecord: req.idempotent?.record, entityType: MRF_ENTITY, entityId: mrf._id,
+        mutate: async (session) => {
+          // 1) The ONE stock engine: deduct location + company on-hand + movement.
+          await applyStockPlans(plans, session);
+          // 2) Consume the reservation projection + record (same unit of work).
+          const doc = await StockReservation.findById(r._id).session(session || null);
+          for (const c of consume) {
+            await reservationSvc.reduceReservationAtLocation({ session, companyId: doc.companyId, itemId: doc.rawItemId, variantId: doc.variantId || null, warehouseId: c.warehouseId, locationId: c.locationId, baseQty: c.takeBase });
+            const a = doc.allocations.id(c.allocId);
+            if (a) a.issuedQty = reservationSvc.r4((a.issuedQty || 0) + c.take);
+          }
+          doc.pickedQty = reservationSvc.r4(Math.max(doc.pickedQty || 0, (doc.issuedQty || 0) + want));
+          Object.assign(doc, reservationSvc.rollUp(doc));
+          doc.history.push({ action: "ISSUE", qty: reservationSvc.r4(want - remaining), baseQty: reservationSvc.r4((want - remaining) * factor), byId: req.user?.id || null, byName: actorName(req), reason: req.body?.reason || "", allocations: consume.map((c) => ({ locationCode: c.locationCode, qty: c.take, baseQty: c.takeBase })) });
+          await doc.save(session ? { session } : {});
+          savedRes = doc.toObject();
+
+          // 3) The MRF line's issuedQty rises through the SAME status machinery.
+          const mrfDoc = await MRF.findById(mrf._id).session(session || null);
+          const it = mrfDoc.items.id(r.mrfLineId);
+          const targetIssued = reservationSvc.r4((it.issuedQty || 0) + (want - remaining));
+          const targetStatus = targetIssued >= (it.requestedQty || 0) - reservationSvc.TOL ? "ISSUED" : "PARTIALLY_ISSUED";
+          applyItemIssueTargets(mrfDoc, [{ mrfItemId: it._id, targetIssuedQty: targetIssued, targetItemStatus: targetStatus, issueHistoryEntry: { issuedQty: reservationSvc.r4(want - remaining), notes: `Issued from reservation`, recordedBy: req.user?.id || null, recordedAt: new Date() } }]);
+          mrfDoc.status = issueStatusOf(mrfDoc).status;
+          mrfDoc.logEvent({ action: "ISSUED", actorName: actorName(req), actorRole: "store", detail: `Issued ${reservationSvc.r4(want - remaining)} ${r.unit} from reservation` });
+          await mrfDoc.save(session ? { session } : {});
+
+          return { entityType: MRF_ENTITY, entityId: mrf._id, result: doc, entry: { entityType: MRF_ENTITY, entityId: mrf._id, documentNumber: mrf.mrfNumber, action: "ISSUED", requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { reservationId: String(r._id), issuedQty: reservationSvc.r4(want - remaining) } } };
+        },
+      });
+
+      const body = { success: true, message: "Stock issued from the reservation.", reservation: reservationView(savedRes) };
+      return req.idempotent ? await req.idempotent.succeed(201, body, { entityType: MRF_ENTITY, entityId: mrf._id }) : res.status(201).json(body);
+    } catch (e) {
+      if (e?.name === "StorePurchaseError") return sendError(res, e);
+      console.error("[mrf-reserve-issue]", e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  });
+
+// ── GET /:id/reservations — the reservations for one MRF ──────────────────────
+router.get("/:id/reservations", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const mrf = await loadMrf(req, req.params.id, { lean: true });
+    const rows = await StockReservation.find({ companyId: req.tenant.companyId, mrfId: mrf._id }).sort({ createdAt: 1 }).lean();
+    res.json({ success: true, reservations: rows.map(reservationView) });
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── GET /:id/reservations/:reservationId/pick-list — the pick list ────────────
+router.get("/:id/reservations/:reservationId/pick-list", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const r = await loadReservation(req, req.params.reservationId, { lean: true });
+    if (String(r.mrfId) !== String(req.params.id)) return res.status(404).json({ success: false, message: "That reservation is not part of this request." });
+    const view = reservationView(r);
+    res.json({
+      success: true,
+      pickList: {
+        mrfNumber: r.mrfNumber, requestedForName: r.requestedForName, requestedForDept: r.requestedForDept, neededBy: r.neededBy,
+        item: view.item, unit: r.unit, baseUnit: r.baseUnit, conversionFactor: r.conversionFactor,
+        // Lot-level picking is not available — location stock is not lot-controlled here.
+        lotPicking: { available: false, note: "Lot-level picking is not available for this stock record." },
+        lines: view.allocations.map((a) => ({
+          warehouseName: a.warehouseName, warehouseShortName: a.warehouseShortName, locationCode: a.locationCode, locationName: a.locationName,
+          reservedQty: a.reservedQty, activeQty: a.activeQty, issuedQty: a.issuedQty, unit: r.unit,
+        })),
+        reservedQty: view.reservedQty, pickedQty: view.pickedQty, issuedQty: view.issuedQty, remaining: view.activeReservedQty,
+      },
+    });
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── GET /reservations/queue — the Reservations & Picking workspace ────────────
+// Server-side filtered + paged. Rows are reservations (all groups) PLUS approved
+// stock lines with no active reservation ("Ready to reserve"). Bounded scan.
+router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const q = req.query || {};
+    const page = Math.max(1, parseInt(q.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 25));
+    const CAP = 500;
+
+    // 1) All reservations for the company (bounded, newest first).
+    const reservations = await StockReservation.find({ companyId: req.tenant.companyId }).sort({ updatedAt: -1 }).limit(CAP).lean();
+    const reservedLineIds = new Set(reservations.filter((r) => r.active).map((r) => String(r.mrfLineId)));
+
+    // 2) Approved stock lines with no active reservation → "Ready to reserve".
+    const mrfs = await MRF.find({
+      ...tenantContext.tenantFilter(req.tenant),
+      status: { $in: ["APPROVED", "PARTIALLY_ISSUED"] },
+    }).select("mrfNumber requestedForName requestedForDept neededBy status fulfilmentDecision items").sort({ neededBy: 1, createdAt: -1 }).limit(CAP).lean();
+
+    const rows = [];
+    for (const r of reservations) {
+      const v = reservationView(r);
+      rows.push({
+        kind: "reservation", reservationId: v.id, mrfId: v.mrfId, mrfNumber: v.mrfNumber, mrfLineId: v.mrfLineId,
+        requestedForName: v.requestedForName, requestedForDept: v.requestedForDept, neededBy: v.neededBy,
+        item: v.item, unit: v.unit, requestedQty: v.requestedQty, reservedQty: v.reservedQty, activeReservedQty: v.activeReservedQty,
+        issuedQty: v.issuedQty, backorderedQty: v.backorderedQty, status: v.status, group: v.group,
+        allocations: v.allocations.map((a) => ({ warehouseShortName: a.warehouseShortName, locationCode: a.locationCode, activeQty: a.activeQty })),
+      });
+    }
+    for (const m of mrfs) {
+      if (m.fulfilmentDecision === "buy_or_service") continue;
+      for (const it of (m.items || [])) {
+        if (!it.rawItem) continue;
+        if (["REJECTED", "UNFULFILLED", "ISSUED", "RETURNED"].includes(it.itemStatus)) continue;
+        if ((it.issuedQty || 0) >= (it.requestedQty || 0) - reservationSvc.TOL) continue;
+        if (reservedLineIds.has(String(it._id))) continue;
+        rows.push({
+          kind: "line", mrfId: String(m._id), mrfNumber: m.mrfNumber, mrfLineId: String(it._id),
+          requestedForName: m.requestedForName || "", requestedForDept: m.requestedForDept || "", neededBy: m.neededBy || null,
+          item: { rawItemId: String(it.rawItem), name: it.rawItemName, sku: it.rawItemSku, variantId: it.variantId ? String(it.variantId) : null, variant: (it.variantCombination || []).join(" • ") },
+          unit: it.unit, requestedQty: it.requestedQty, reservedQty: 0, activeReservedQty: 0, issuedQty: it.issuedQty || 0, backorderedQty: 0,
+          status: "UNRESERVED", group: "READY_TO_RESERVE", allocations: [],
+        });
+      }
+    }
+
+    // Filters (derived, in memory over the bounded set).
+    let filtered = rows;
+    if (q.group) filtered = filtered.filter((r) => r.group === q.group);
+    if (q.department) filtered = filtered.filter((r) => (r.requestedForDept || "").toLowerCase() === String(q.department).toLowerCase());
+    if (q.warehouse) filtered = filtered.filter((r) => (r.allocations || []).some((a) => (a.warehouseShortName || "").toLowerCase() === String(q.warehouse).toLowerCase()));
+    if (q.status) filtered = filtered.filter((r) => r.status === q.status);
+    if (q.requiredBy && !Number.isNaN(Date.parse(q.requiredBy))) { const by = new Date(q.requiredBy); filtered = filtered.filter((r) => r.neededBy && new Date(r.neededBy) <= by); }
+    const search = typeof q.search === "string" ? q.search.trim().toLowerCase() : "";
+    if (search) filtered = filtered.filter((r) => [r.mrfNumber, r.item.name, r.item.sku, r.requestedForName].filter(Boolean).some((s) => String(s).toLowerCase().includes(search)));
+
+    const groupOrder = reservationSvc.GROUPS;
+    filtered.sort((a, b) => {
+      const ga = (groupOrder[a.group]?.order || 99), gb = (groupOrder[b.group]?.order || 99);
+      if (ga !== gb) return ga - gb;
+      const na = a.neededBy ? new Date(a.neededBy).getTime() : Infinity;
+      const nb = b.neededBy ? new Date(b.neededBy).getTime() : Infinity;
+      if (na !== nb) return na - nb;
+      return String(a.mrfNumber).localeCompare(String(b.mrfNumber));
+    });
+
+    const total = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const start = (Math.min(page, totalPages) - 1) * pageSize;
+    const paged = filtered.slice(start, start + pageSize);
+    const counts = {};
+    for (const gk of Object.keys(groupOrder)) counts[gk] = filtered.filter((r) => r.group === gk).length;
+
+    res.json({
+      success: true,
+      queue: {
+        rows: paged,
+        groups: Object.fromEntries(Object.entries(groupOrder).map(([k, v]) => [k, v.label])),
+        counts,
+        pagination: { page: Math.min(page, totalPages), pageSize, total, totalPages, scope: "inspectedSet" },
+        coverage: { scannedReservations: reservations.length, scannedRequests: mrfs.length, scanCap: CAP, truncated: reservations.length >= CAP || mrfs.length >= CAP },
+      },
+    });
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    console.error("[mrf-reservation-queue]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
 
 module.exports = router;

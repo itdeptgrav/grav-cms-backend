@@ -19,19 +19,19 @@
 
 const mongoose = require("mongoose");
 
-const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
 const { resolveCapabilities, CAPABILITIES } = require("./capabilities");
 const { fail } = require("./errors");
 
-const MEMBERSHIP_SOURCES = Object.freeze({
-  MEMBERSHIP_RECORD: "MEMBERSHIP_RECORD",
-  SINGLE_COMPANY_DEPLOYMENT: "SINGLE_COMPANY_DEPLOYMENT",
-  SERVICE: "SERVICE",
-});
-
-/** Loaded lazily: the accountant master models are a large module and the
- *  Store routers should not pay for it at require time. */
-const companyModel = () => require("../../models/Accountant_model/Acc_MasterModels").Acc_Company;
+/* ── THE MEMBERSHIP RESOLUTION ITSELF MOVED, THE RULES DID NOT ──────────────
+ * Central Costing needs the same answer to "which company is this person
+ * acting for", and a second implementation is a second answer waiting to
+ * disagree with this one. So the ordered, fail-closed resolution now lives at
+ * a neutral path and both domains call it. Nothing about Store & Purchase's
+ * behaviour changes: the order, the error codes and the wording are the same,
+ * with the wording passed in rather than duplicated. */
+const {
+  MEMBERSHIP_SOURCES, resolveCompanyForActor,
+} = require("../companyContext/companyMembership.service");
 
 /**
  * Resolve the tenant context for an authenticated actor.
@@ -50,99 +50,13 @@ async function resolveForActor(user, { requestedCompanyId = null } = {}) {
     ? new mongoose.Types.ObjectId(user.id)
     : null;
 
-  /* ── 1. An explicit membership record decides ───────────────────────────
-   *
-   * ── WHY THIS IS NOT A `findOne` ────────────────────────────────────────
-   * The model permits an actor to hold memberships in several companies, and
-   * an earlier version took whichever one the database happened to return
-   * first. That is not a tenant boundary: the same person, on two identical
-   * requests, could be resolved into two different companies, and nothing
-   * about the request would say which. Selection has to be deterministic and
-   * it has to be the caller's stated, validated choice.
-   *
-   * So: read EVERY active membership. One is unambiguous. More than one
-   * requires the caller to name the company they are acting for — and that
-   * name is validated against the memberships, never trusted on its own. */
-  const or = [];
-  if (email) or.push({ email });
-  if (employeeRef) or.push({ employeeRef });
-
-  let memberships = [];
-  if (or.length) {
-    memberships = await SpCompanyMembership.find({ isActive: true, $or: or })
-      .select("companyId siteIds personName email employeeRef")
-      .sort({ companyId: 1 }) // stable order, so any diagnostic reads the same twice
-      .lean()
-      .catch(() => []);
-  }
-
-  /* Two rows naming the SAME company (one matched by email, one by
-     employeeRef) are one membership found twice, not a choice. */
-  const byCompany = new Map();
-  for (const m of memberships) byCompany.set(String(m.companyId), m);
-  const distinct = [...byCompany.values()];
-
-  let companyId;
-  let permittedSiteIds = [];
-  let membershipSource;
-  let membership = null;
-
-  if (distinct.length === 1) {
-    membership = distinct[0];
-    companyId = membership.companyId;
-    permittedSiteIds = (membership.siteIds || []).map(String);
-    membershipSource = MEMBERSHIP_SOURCES.MEMBERSHIP_RECORD;
-  } else if (distinct.length > 1) {
-    /* Multi-company: the caller must choose, and the choice must be one of
-       theirs. A requested company identifies WHICH authorised membership to
-       use; it is never authority by itself. */
-    const wanted = requestedCompanyId ? String(requestedCompanyId) : null;
-    if (!wanted) {
-      throw fail(
-        "COMPANY_SELECTION_REQUIRED",
-        "You belong to more than one company. Choose which one you are working in.",
-        { companies: distinct.map((m) => String(m.companyId)) },
-      );
-    }
-    membership = byCompany.get(wanted) || null;
-    if (!membership) {
-      /* Non-disclosing: naming a company they do not belong to is answered
-         the same way as naming one that does not exist. */
-      throw fail(
-        "TENANT_MEMBERSHIP_UNPROVEN",
-        "You do not have access to that company in Store & Purchase.",
-        {},
-      );
-    }
-    companyId = membership.companyId;
-    permittedSiteIds = (membership.siteIds || []).map(String);
-    membershipSource = MEMBERSHIP_SOURCES.MEMBERSHIP_RECORD;
-  } else {
-    /* ── 2. Single-company deployment ──────────────────────────────────────
-     * A DEPLOYMENT FACT, not an inference from this request: it reads neither
-     * the body, the query, nor the document being accessed. It is the same
-     * rule mrfRoutes.js already applies at the fulfilment decision, and it is
-     * what keeps the live single-company system working while memberships are
-     * populated. The moment a second company exists, or anybody is given an
-     * explicit membership, it stops applying — for everybody, at once. */
-    const Acc_Company = companyModel();
-    const anyMembershipExists = await SpCompanyMembership.exists({ isActive: true }).catch(() => null);
-    const companies = await Acc_Company.find({}).select("_id").limit(2).lean().catch(() => []);
-
-    if (!anyMembershipExists && companies.length === 1) {
-      companyId = companies[0]._id;
-      membershipSource = MEMBERSHIP_SOURCES.SINGLE_COMPANY_DEPLOYMENT;
-    } else {
-      /* ── 3. Fail closed ─────────────────────────────────────────────────── */
-      throw fail(
-        "TENANT_MEMBERSHIP_UNPROVEN",
-        companies.length === 0
-          ? "No company is set up in the books yet. Ask finance to create one before using Store & Purchase."
-          : "Your account is not linked to a company in Store & Purchase. Ask an administrator to grant you access.",
-        { companiesConfigured: companies.length, hasMembershipRecords: Boolean(anyMembershipExists) },
-      );
-    }
-  }
+  const {
+    companyId, permittedSiteIds, membershipSource, membership,
+  } = await resolveCompanyForActor(user, {
+    requestedCompanyId,
+    domainLabel: "Store & Purchase",
+    fail,
+  });
 
   const { capabilities, via, isAdmin } = await resolveCapabilities({
     email,
@@ -290,34 +204,39 @@ function tenantFilter(ctx) {
 }
 
 /**
- * The clause that keeps unowned (legacy) records OUT of a selection list.
+ * Fields every new operational record must carry, taken from context only.
  *
- * Some reads deliberately go further than tenantFilter and refuse legacy rows
- * outright — the supplier pickers on a purchase order, the services lists —
- * on the grounds that nobody can say whose an unowned record is, so nothing
- * new should be ordered against one. That is right once the data is migrated
- * and wrong before it: with 90 of 94 vendors still unowned, the PO screen
- * offered four suppliers and the raw-item supplier list offered none
- * (reported 10 Sep 2026).
+ * ── AND IT REFUSES RATHER THAN STAMPING NOTHING ─────────────────────────────
+ * This returned `{ companyId: undefined }` whenever the context carried no
+ * company, and mongoose simply left the field off — so the record was created
+ * UNOWNED. A supplier registered that way appeared instantly as "Not yet
+ * owned — this supplier predates company ownership", could not be edited, and
+ * could not be chosen in the quotation register: indistinguishable from a
+ * record migrated from before ownership existed, which it was not.
  *
- * So it is the same switch as LEGACY_READTHROUGH above, expressed for those
- * call sites: an empty predicate while the migration window is open (a valid
- * and always-true `$and` entry), the real exclusion once it closes.
+ * Legacy mode is a READ scope. It selects the records nobody has claimed so
+ * they can be looked at and migrated; creating a new one inside it would mint
+ * exactly the problem the migration exists to clear up. Both cases refuse,
+ * loudly, rather than producing a record nobody owns.
  */
-function ownedOnly() {
-  return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } };
-}
-
-/** True while the legacy migration window is open — i.e. while unowned records
- *  are still being treated as this company's. Exposed so a rule that only
- *  makes sense on migrated data can stand down for the same window, rather
- *  than each site inventing its own switch. */
-function legacyWindowOpen() {
-  return LEGACY_READTHROUGH;
-}
-
-/** Fields every new operational record must carry, taken from context only. */
 function stamp(ctx) {
+  if (!ctx) {
+    throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
+  }
+  if (ctx.legacyMode) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Legacy scope is for reading records nobody has claimed yet. A new record cannot be created in it.",
+      { reason: "LEGACY_SCOPE_IS_READ_ONLY" },
+    );
+  }
+  if (!ctx.companyId) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Your company could not be resolved, so a new record cannot be created. Nothing was saved.",
+      { reason: "COMPANY_CONTEXT_UNRESOLVED" },
+    );
+  }
   const out = { companyId: ctx.companyId };
   if (ctx.siteId) out.siteId = ctx.siteId;
   return out;

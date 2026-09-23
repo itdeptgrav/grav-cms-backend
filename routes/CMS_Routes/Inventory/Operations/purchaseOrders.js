@@ -14,6 +14,8 @@ const express = require("express");
 const router = express.Router();
 const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const Warehouse = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
+const locStock = require("../../../../services/storePurchase/locationStock.service");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
@@ -58,36 +60,10 @@ const generatePONumber = () => {
   return `${prefix}${year}${month}${randomNum}`;
 };
 
-// ── Convert quantity using Unit conversions ────────────────────────────────
-async function convertQuantity(quantity, fromUnit, toUnit) {
-  if (!fromUnit || !toUnit || fromUnit === toUnit) return quantity;
-  if (!quantity || isNaN(quantity)) return quantity;
-  try {
-    const fromDoc = await Unit.findOne({ name: fromUnit })
-      .populate("conversions.toUnit", "name")
-      .lean();
-    if (fromDoc) {
-      const direct = (fromDoc.conversions || []).find(
-        (c) => (c.toUnit?.name || c.toUnit) === toUnit,
-      );
-      if (direct?.quantity) return quantity * direct.quantity;
-    }
-    const toDoc = await Unit.findOne({ name: toUnit })
-      .populate("conversions.toUnit", "name")
-      .lean();
-    if (toDoc) {
-      const reverse = (toDoc.conversions || []).find(
-        (c) => (c.toUnit?.name || c.toUnit) === fromUnit,
-      );
-      if (reverse?.quantity) return quantity / reverse.quantity;
-    }
-    console.warn(`[PO convertQuantity] No path "${fromUnit}"→"${toUnit}".`);
-    return quantity;
-  } catch (err) {
-    console.error("[PO convertQuantity]", err.message);
-    return quantity;
-  }
-}
+// NOTE: the old inline `convertQuantity` was removed with the legacy receipt
+// engine. Unit conversion for receiving now lives ONLY in
+// services/storePurchase/goodsReceipt.service.js (`resolveConversion`), which —
+// unlike the old silent passthrough — refuses a missing conversion path.
 
 // ── NEW: Find a variant's nickname for a specific vendor ────────────────────
 // rawItemDoc: lean object with .variants[].vendorNicknames[]
@@ -400,6 +376,178 @@ router.get("/data/raw-items/:id/units", requireCapability(CAPABILITIES.READ), as
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /reports/exceptions — the company-wide Purchase Exceptions Register.
+//
+// A read-only, actionable reconciliation queue across every purchase order:
+// "which purchases need attention today, why, and where to resolve them?"
+//
+// Query cost is CONSTANT, never one reconciliation per order:
+//   1 count + 1 PO find (+ vendor populate) + 1 SpendRequest find
+//   + 1 BudgetCommitment find + 1 Voucher find — then buildReconciliation runs
+//   in memory per order. Stored filters (supplier, status, date, search) run at
+//   the DB; derived filters (exception group, unresolved-only) and the
+//   severity ordering run after reconciliation, so pagination counts describe
+//   the full DERIVED result, not just the DB page.
+//
+// Placed BEFORE `/:id` so "reports" is not read as an order id. Writes nothing.
+// ─────────────────────────────────────────────────────────────────────────────
+const REGISTER_SCAN_CAP = 1000; // bound the working set; truncation is disclosed
+
+router.get("/reports/exceptions", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const SpendRequest = require("../../../../models/CMS_Models/Requests/SpendRequest");
+    const Acc_BudgetCommitment = require("../../../../models/Accountant_model/Acc_BudgetCommitment");
+    const { Acc_Voucher } = require("../../../../models/Accountant_model/Acc_VoucherModels");
+    const register = require("../../../../services/storePurchase/poExceptionsRegister.service");
+
+    const q = req.query || {};
+    const page = Math.max(1, parseInt(q.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 25));
+    const group = typeof q.group === "string" && register.GROUPS[q.group] ? q.group : null;
+    const unresolvedOnly = q.scope !== "all";
+
+    // ── Stored filters → one DB query ──────────────────────────────────────
+    const filter = { ...tenantContext.tenantFilter(req.tenant) };
+    if (typeof q.status === "string" && q.status.trim()) filter.status = q.status.trim();
+    if (typeof q.vendorId === "string" && mongoose.isValidObjectId(q.vendorId)) filter.vendor = q.vendorId;
+    if (q.dateFrom || q.dateTo) {
+      filter.orderDate = {};
+      if (q.dateFrom && !Number.isNaN(Date.parse(q.dateFrom))) filter.orderDate.$gte = new Date(q.dateFrom);
+      if (q.dateTo && !Number.isNaN(Date.parse(q.dateTo))) filter.orderDate.$lte = new Date(q.dateTo);
+      if (!Object.keys(filter.orderDate).length) delete filter.orderDate;
+    }
+    const search = typeof q.q === "string" ? q.q.trim() : (typeof q.supplier === "string" ? q.supplier.trim() : "");
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ poNumber: rx }, { vendorName: rx }, { spendRequestNumber: rx }];
+    }
+
+    // Bounded scan for speed. The bound is disclosed honestly below, and is
+    // overridable (env) so coverage behaviour can be tested above and below it.
+    const cap = Math.max(1, parseInt(process.env.PO_REGISTER_SCAN_CAP, 10) || REGISTER_SCAN_CAP);
+
+    // storedMatchCount = every order matching the DB-level filters (the full
+    // population); inspectedCount = the orders we actually reconciled (≤ cap).
+    const storedMatchCount = await PurchaseOrder.countDocuments(filter);
+
+    const purchaseOrders = await PurchaseOrder.find(filter)
+      .populate("vendor", "companyName")
+      .sort({ orderDate: -1, _id: -1 })
+      .limit(cap)
+      .lean();
+    const inspectedCount = purchaseOrders.length;
+    const coverageComplete = inspectedCount >= storedMatchCount;
+
+    // ── Batched stored-ID joins (each ONE query for the whole page) ────────
+    const requestIds = [...new Set(purchaseOrders.map((p) => p.spendRequestId).filter(Boolean).map(String))];
+    const poIds = purchaseOrders.map((p) => p._id);
+
+    const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+    const GoodsReceiptInspection = require("../../../../models/CMS_Models/StorePurchase/GoodsReceiptInspection");
+    const GoodsReceiptDisposition = require("../../../../models/CMS_Models/StorePurchase/GoodsReceiptDisposition");
+    const [spendRequests, commitments, vouchers, goodsReceipts, inspections, dispositions] = await Promise.all([
+      requestIds.length ? SpendRequest.find({ _id: { $in: requestIds } }).lean() : [],
+      requestIds.length ? Acc_BudgetCommitment.find({ spendRequestId: { $in: requestIds } }).lean() : [],
+      poIds.length ? Acc_Voucher.find({ voucherType: "purchase", purchaseOrderId: { $in: poIds } })
+        .select("voucherNumber status referenceNumber voucherDate grandTotal purchaseOrderId inventoryEntries").lean() : [],
+      poIds.length ? GoodsReceipt.find({ companyId: req.tenant.companyId, purchaseOrderId: { $in: poIds } })
+        .select("receiptNumber status purchaseOrderId lines").lean() : [],
+      poIds.length ? GoodsReceiptInspection.find({ companyId: req.tenant.companyId, purchaseOrderId: { $in: poIds } })
+        .select("goodsReceiptId purchaseOrderId lines").lean() : [],
+      poIds.length ? GoodsReceiptDisposition.find({ companyId: req.tenant.companyId, purchaseOrderId: { $in: poIds } })
+        .select("goodsReceiptId purchaseOrderId poItemId dispositionType quantity").lean() : [],
+    ]);
+
+    // A company sanity check keeps a legacy cross-company reference from reading
+    // through, exactly as the single-order reconciliation route does.
+    const sameCo = (a, b) => !a || !b || String(a) === String(b);
+    const poCompanyByRequest = new Map();
+    for (const p of purchaseOrders) if (p.spendRequestId) poCompanyByRequest.set(String(p.spendRequestId), p.companyId);
+
+    const spendRequestsById = new Map();
+    for (const sr of spendRequests) if (sameCo(sr.companyId, poCompanyByRequest.get(String(sr._id)))) spendRequestsById.set(String(sr._id), sr);
+    const commitmentsByRequestId = new Map();
+    for (const c of commitments) if (sameCo(c.companyId, poCompanyByRequest.get(String(c.spendRequestId)))) commitmentsByRequestId.set(String(c.spendRequestId), c);
+    const vouchersByPoId = new Map();
+    for (const v of vouchers) {
+      const k = String(v.purchaseOrderId);
+      if (!vouchersByPoId.has(k)) vouchersByPoId.set(k, []);
+      vouchersByPoId.get(k).push(v);
+    }
+    const goodsReceiptsByPoId = new Map();
+    for (const g of goodsReceipts) {
+      const k = String(g.purchaseOrderId);
+      if (!goodsReceiptsByPoId.has(k)) goodsReceiptsByPoId.set(k, []);
+      goodsReceiptsByPoId.get(k).push(g);
+    }
+    const inspectionsByPoId = new Map();
+    for (const i of inspections) {
+      const k = String(i.purchaseOrderId);
+      if (!inspectionsByPoId.has(k)) inspectionsByPoId.set(k, []);
+      inspectionsByPoId.get(k).push(i);
+    }
+    const dispositionsByPoId = new Map();
+    for (const d of dispositions) {
+      const k = String(d.purchaseOrderId);
+      if (!dispositionsByPoId.has(k)) dispositionsByPoId.set(k, []);
+      dispositionsByPoId.get(k).push(d);
+    }
+
+    // ── Authoritative currency: the accounting company's base currency, read
+    //    (never written), with provenance. No per-order INR is invented. ─────
+    let currency = null, currencyBasis = "not_recorded", currencySymbol = null;
+    if (req.tenant && req.tenant.companyId) {
+      const { Acc_Company } = require("../../../../models/Accountant_model/Acc_MasterModels");
+      const co = await Acc_Company.findById(req.tenant.companyId).select("baseCurrency currencySymbol").lean();
+      if (co && co.baseCurrency) {
+        currency = co.baseCurrency; currencyBasis = "company_base_currency"; currencySymbol = co.currencySymbol || null;
+      }
+    }
+
+    const links = { reconciliation: (id) => `/store/dashboard/operations/purchase-order/${id}?tab=reconciliation` };
+    const asOf = new Date();
+
+    // ── Reconcile in memory, then derive → filter → sort → paginate ────────
+    const allRows = register.buildExceptionsRegister({ purchaseOrders, spendRequestsById, commitmentsByRequestId, vouchersByPoId, goodsReceiptsByPoId, inspectionsByPoId, dispositionsByPoId, links, asOf });
+    const filtered = register.sortRows(register.filterRows(allRows, { group, unresolvedOnly }));
+    const summary = register.summarize(filtered, { currency, currencyBasis, currencySymbol });
+    const paged = register.paginate(filtered, { page, pageSize });
+
+    const limitations = [];
+    if (!coverageComplete) limitations.push(`Reviewing the ${cap} most recent matching orders. Counts and exception filters apply to this inspected set; narrow the date or search filters to inspect the remaining orders.`);
+    limitations.push("Received quantity is a recorded figure, not an inspection or acceptance decision.");
+    limitations.push("An outstanding balance is \"past expected delivery\" only where a stored expected date has passed; otherwise \"still to receive\".");
+    if (currencyBasis !== "company_base_currency") limitations.push("No company base currency is recorded, so amounts are shown as recorded figures without a currency symbol and are not totalled across orders.");
+
+    res.json({
+      success: true,
+      register: {
+        rows: paged.rows,
+        // Pagination totals belong to the INSPECTED result set, not the full population.
+        pagination: { page: paged.page, pageSize: paged.pageSize, total: paged.total, totalPages: paged.totalPages, scope: "inspectedResultSet" },
+        coverage: {
+          storedMatchCount,                 // all orders matching DB filters
+          inspectedCount,                   // orders actually reconciled (≤ cap)
+          exceptionResultCount: filtered.length,  // matching rows within the inspected set
+          coverageComplete,                 // true only when every stored match was inspected
+          scanCap: cap,
+          asOf: asOf.toISOString(),
+        },
+        summary,
+        currency, currencyBasis, currencySymbol,
+        inspectedCount,
+        filters: { group, status: filter.status || null, vendorId: q.vendorId || null, search: search || null, scope: unresolvedOnly ? "unresolved" : "all", dateFrom: q.dateFrom || null, dateTo: q.dateTo || null },
+        groups: register.GROUPS,
+        limitations,
+      },
+    });
+  } catch (error) {
+    console.error("[po-exceptions-register]", error);
+    res.status(500).json({ success: false, message: "Server error while building the exceptions register" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET PO by ID
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
@@ -430,6 +578,70 @@ router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
       success: false,
       message: "Server error while fetching purchase order",
     });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/reconciliation — the read-only order/receipt/bill comparison.
+//
+// Resolves ONLY through stored identifiers (never by amount, name or position):
+//   PO (company-scoped) → SpendRequest via `spendRequestId`
+//                       → Acc_BudgetCommitment via `spendRequestId`
+//                       → purchase vouchers via `purchaseOrderId`
+//   and, inside buildReconciliation, PO line → allocation/request line via
+//   `spendLineId`, and a voucher entry → PO line via `poItemId`.
+// It writes nothing.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/:id/reconciliation", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const SpendRequest = require("../../../../models/CMS_Models/Requests/SpendRequest");
+    const Acc_BudgetCommitment = require("../../../../models/Accountant_model/Acc_BudgetCommitment");
+    const { Acc_Voucher } = require("../../../../models/Accountant_model/Acc_VoucherModels");
+    const { buildReconciliation } = require("../../../../services/storePurchase/poReconciliation.service");
+
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
+      .populate("vendor", "companyName")
+      .populate("items.rawItem", "name sku")
+      .lean();
+    if (!po) return res.status(404).json({ success: false, message: "Purchase order not found" });
+
+    // The PO's OWN stored spendRequestId is the join; a companyId sanity check
+    // guards against a legacy cross-company reference reading through.
+    let spendRequest = null;
+    let commitment = null;
+    if (po.spendRequestId) {
+      spendRequest = await SpendRequest.findOne({ _id: po.spendRequestId }).lean();
+      if (spendRequest && spendRequest.companyId && po.companyId && String(spendRequest.companyId) !== String(po.companyId)) {
+        spendRequest = null;
+      }
+      commitment = await Acc_BudgetCommitment.findOne({ spendRequestId: po.spendRequestId }).lean();
+      if (commitment && commitment.companyId && po.companyId && String(commitment.companyId) !== String(po.companyId)) {
+        commitment = null;
+      }
+    }
+
+    // Purchase vouchers linked to THIS order, company-scoped.
+    const vouchers = await Acc_Voucher.find({
+      companyId: po.companyId, voucherType: "purchase", purchaseOrderId: po._id,
+    }).select("voucherNumber status referenceNumber voucherDate grandTotal inventoryEntries").lean();
+
+    // Authoritative per-line evidence — GoodsReceipts (received), the immutable
+    // GoodsReceiptInspections (accepted/quarantined/rejected), and the quarantine
+    // dispositions (resolution) for THIS PO.
+    const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+    const GoodsReceiptInspection = require("../../../../models/CMS_Models/StorePurchase/GoodsReceiptInspection");
+    const GoodsReceiptDisposition = require("../../../../models/CMS_Models/StorePurchase/GoodsReceiptDisposition");
+    const [goodsReceipts, inspections, dispositions] = await Promise.all([
+      GoodsReceipt.find({ companyId: po.companyId, purchaseOrderId: po._id }).select("receiptNumber status lines").lean(),
+      GoodsReceiptInspection.find({ companyId: po.companyId, purchaseOrderId: po._id }).select("goodsReceiptId lines").lean(),
+      GoodsReceiptDisposition.find({ companyId: po.companyId, purchaseOrderId: po._id }).select("goodsReceiptId poItemId dispositionType quantity").lean(),
+    ]);
+
+    const reconciliation = buildReconciliation({ purchaseOrder: po, spendRequest, commitment, vouchers, goodsReceipts, inspections, dispositions });
+    res.json({ success: true, reconciliation });
+  } catch (error) {
+    console.error("[po-reconciliation]", error);
+    res.status(500).json({ success: false, message: "Server error while building the reconciliation" });
   }
 });
 
@@ -1091,110 +1303,22 @@ router.put(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RECORD PAYMENT
+// RECORD PAYMENT — RETIRED (Chunk 8)
 // ─────────────────────────────────────────────────────────────────────────────
-router.post(
-  "/:id/payment",
-  /* Chunk 8 removes Store's payment recording entirely (Accounting owns
-     settlement). Until then it is at least scoped and permissioned. */
-  requireCapability(CAPABILITIES.PO_APPROVE),
-  refuseLegacyWrite,
-  withIdempotency("PO_PAYMENT"),
-  async (req, res) => {
-  try {
-    const { amount, paymentMethod, referenceNumber, paymentDate, notes } =
-      req.body;
-
-    if (!amount || amount <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Valid payment amount is required" });
-    }
-    if (!paymentMethod) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Payment method is required" });
-    }
-
-    const purchaseOrder = await PurchaseOrder.findOne({
-      _id: req.params.id,
-      ...tenantContext.tenantFilter(req.tenant),
-    });
-    if (!purchaseOrder)
-      return res
-        .status(404)
-        .json({ success: false, message: "Purchase order not found" });
-
-    const totalPaid =
-      purchaseOrder.payments?.reduce(
-        (sum, payment) => sum + (payment.amount || 0),
-        0,
-      ) || 0;
-    const remainingAmount = purchaseOrder.totalAmount - totalPaid;
-
-    if (amount > remainingAmount) {
-      return res.status(400).json({
-        success: false,
-        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
-      });
-    }
-
-    const paymentRecord = {
-      amount: parseFloat(amount),
-      paymentMethod,
-      referenceNumber: referenceNumber || "",
-      paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
-      notes: notes || "",
-      recordedBy: req.user.id,
-    };
-
-    if (!purchaseOrder.payments) purchaseOrder.payments = [];
-    purchaseOrder.payments.unshift(paymentRecord);
-
-    const newTotalPaid = totalPaid + amount;
-    if (newTotalPaid >= purchaseOrder.totalAmount)
-      purchaseOrder.paymentStatus = "COMPLETED";
-    else if (newTotalPaid > 0) purchaseOrder.paymentStatus = "PARTIAL";
-    else purchaseOrder.paymentStatus = "PENDING";
-
-    await purchaseOrder.save();
-
-    const populatedPO = await PurchaseOrder.findById(
-      purchaseOrder._id,
-    ).populate("payments.recordedBy", "name email");
-    const latestPayment = populatedPO.payments[0];
-
-    await actionHistory.record(req.tenant, {
-      entityType: ENTITY,
-      entityId: purchaseOrder._id,
-      documentNumber: purchaseOrder.poNumber,
-      action: "PAYMENT_RECORDED",
-      requestId: req.id || "",
-      idempotencyKey: req.idempotent?.key || "",
-      metadata: { amount: Number(amount), paymentMethod, paymentStatus: purchaseOrder.paymentStatus },
-    });
-
-    const body = {
-      success: true,
-      message: `Payment of ₹${amount} recorded successfully`,
-      payment: latestPayment,
-      paymentStatus: purchaseOrder.paymentStatus,
-      totalPaid: newTotalPaid,
-      remainingAmount: purchaseOrder.totalAmount - newTotalPaid,
-    };
-    return req.idempotent
-      ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
-      : res.json(body);
-  } catch (error) {
-    if (error?.name === "StorePurchaseError") return sendError(res, error);
-    console.error("Error recording payment:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while recording payment",
-    });
-  }
-  },
-);
+// Accounting now owns payment truth: a supplier is paid by a posted PAYMENT
+// voucher against the bill, not by an editable figure on the order. This endpoint
+// no longer creates any Store payment record — it returns a clear retired-workflow
+// response directing the caller to Accounting. Historical `payments[]` remain
+// readable through GET /:id/payments (below); they are never mutated here.
+router.post("/:id/payment", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    retired: true,
+    reason: "STORE_PAYMENT_RETIRED",
+    message: "Recording payments on the purchase order has been retired. Payments are owned by Accounting — record a payment voucher against the supplier's bill in Accounting.",
+    accounting: { area: "purchase-vouchers", href: "/accountant/purchase-vouchers" },
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PO by vendor
@@ -1453,468 +1577,219 @@ router.patch(
   },
 );
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RECEIVE delivery (unchanged from your version — handles unit conversion)
-// ─────────────────────────────────────────────────────────────────────────────
-router.post(
-  "/:id/receive",
-  requireCapability(CAPABILITIES.RECEIPT_RECORD),
-  refuseLegacyWrite,
-  /* THE reason idempotency exists. Chunk 0's characterisation test proved a
-     re-posted receipt is accepted and silently books the whole delivery into
-     stock a second time as "surplus". A key makes the retry a replay. */
-  withIdempotency("PO_RECEIVE"),
-  async (req, res) => {
-  try {
-    const { deliveryDate, items, invoiceNumber, notes } = req.body;
-
-    if (!items?.length) {
-      return res
-        .status(400)
-        .json({ success: false, message: "At least one item is required" });
+// ── Canonicalise legacy receipt aliases into the ONE command shape ───────────
+// Runs BEFORE withIdempotency (which hashes req.body), so a legacy retry
+// (itemId / deliveryDate) and a canonical one (poItemId / receiptDate) of the
+// SAME receipt hash identically and replay instead of colliding as a key reuse.
+// It rewrites ONLY the recognised aliases and normalises valid numeric
+// quantities; it never sorts receipt lines and never repairs invalid business
+// input (an unparseable quantity is left for validation to refuse).
+function normalizeReceiptCommand(req, _res, next) {
+  const b = req.body;
+  if (b && typeof b === "object") {
+    if (b.deliveryDate !== undefined && b.receiptDate === undefined) b.receiptDate = b.deliveryDate;
+    delete b.deliveryDate;
+    if (Array.isArray(b.items)) {
+      b.items = b.items.map((it) => {
+        if (!it || typeof it !== "object") return it;
+        const line = { ...it };
+        if (line.itemId !== undefined && line.poItemId === undefined) line.poItemId = line.itemId;
+        delete line.itemId;
+        // A valid numeric quantity (number OR numeric string) is normalised to a
+        // Number so "5" and 5 hash alike; anything else is left untouched.
+        const q = line.quantity;
+        if ((typeof q === "number" || (typeof q === "string" && q.trim() !== "")) && Number.isFinite(Number(q))) {
+          line.quantity = Number(q);
+        }
+        return line; // variant, warehouse/location, and other fields preserved
+      });
     }
+  }
+  next();
+}
 
-    const purchaseOrder = await PurchaseOrder.findOne({
-      _id: req.params.id,
-      ...tenantContext.tenantFilter(req.tenant),
-    }).populate(
-      "items.rawItem",
-      "name sku unit customUnit variants quantity status minStock maxStock",
-    );
+// ─────────────────────────────────────────────────────────────────────────────
+// GOODS RECEIPT — the ONE receipt implementation.
+//
+// `handleGoodsReceipt` is the single orchestrator behind BOTH receiving URLs. It
+// holds no receipt engine of its own: line validation, unit conversion, RawItem/
+// variant stock, location movement, PO-line update, the numbered GoodsReceipt and
+// the PO's compatibility delivery reference ALL live in
+// services/storePurchase/goodsReceipt.service.js. V1 proves RECEIPT ONLY —
+// over-receipt is refused, and nothing is ever called "accepted".
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleGoodsReceipt(req, res, { includePurchaseOrder = false, successStatus = 201 } = {}) {
+  try {
+    const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+    const grn = require("../../../../services/storePurchase/goodsReceipt.service");
 
-    if (!purchaseOrder)
-      return res.status(404).json({ success: false, message: "PO not found" });
+    const purchaseOrder = await PurchaseOrder.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
+      .populate("items.rawItem", "name sku unit customUnit");
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "PO not found" });
 
-    /* ── RECOVERY ───────────────────────────────────────────────────────────
-     * A previous attempt with this key already moved the stock and saved the
-     * order; something after that failed. Re-running would receive the same
-     * delivery twice — the exact defect Chunk 0 pinned. So the work is not
-     * redone: the missing history entry is written if it is missing, and the
-     * caller is handed the order as it now stands. */
+    // The authoritative goodsReceipt is ALWAYS returned; a legacy caller also
+    // gets the populated order back for backward compatibility.
+    const withPO = async (extra) => includePurchaseOrder
+      ? {
+          ...extra,
+          purchaseOrder: await PurchaseOrder.findById(purchaseOrder._id)
+            .populate("vendor", "companyName contactPerson")
+            .populate("items.rawItem", "name sku unit customUnit")
+            .populate("deliveries.receivedBy", "name email"),
+        }
+      : extra;
+
+    // ── Replay/recovery: return the SAME GRN, never a second movement ──
     if (req.idempotent?.recovering) {
-      /* Did the order record the delivery, or did the previous attempt die
-         between moving stock and saving the order? The two need different
-         answers: one is a clean replay, the other needs a human. */
-      const deliveryRecorded = (purchaseOrder.deliveries || []).length > 0
-        && (purchaseOrder.totalReceived || 0) > 0;
-
+      const existing = await GoodsReceipt.findOne({ companyId: req.tenant.companyId, purchaseOrderId: purchaseOrder._id, idempotencyKey: req.idempotent.key });
       await unitOfWork.recover(req.tenant, {
-        entityType: ENTITY,
-        entityId: purchaseOrder._id,
-        idempotencyKey: req.idempotent.key,
+        entityType: ENTITY, entityId: purchaseOrder._id, idempotencyKey: req.idempotent.key,
         entry: {
           documentNumber: purchaseOrder.poNumber,
-          action: deliveryRecorded ? "RECEIVED" : "RECEIPT_RECONCILIATION_REQUIRED",
-          resultingState: purchaseOrder.status,
-          requestId: req.id || "",
-          idempotencyKey: req.idempotent.key,
-          reason: deliveryRecorded ? "" : "Stock moved but the order did not record the delivery.",
-          metadata: { recovered: true, totalReceived: purchaseOrder.totalReceived || 0 },
+          action: existing ? "RECEIVED" : "RECEIPT_RECONCILIATION_REQUIRED",
+          resultingState: purchaseOrder.status, requestId: req.id || "", idempotencyKey: req.idempotent.key,
+          reason: existing ? "" : "Stock effect marked but no goods receipt was written.",
+          metadata: { recovered: true, goodsReceiptNumber: existing?.receiptNumber || null },
         },
       });
-
-      if (!deliveryRecorded) {
-        /* Never re-run: the stock already moved. Say so plainly instead of
-           repeating it or pretending it succeeded. */
-        throw fail(
-          "LIFECYCLE_BLOCKED",
-          "This delivery was partly recorded before an error interrupted it. The stock has already been received, but the order was not updated. Check the item's stock and correct the order — do not record the delivery again.",
-          { reason: "PARTIAL_RECEIPT_NEEDS_RECONCILIATION", poNumber: purchaseOrder.poNumber },
-        );
+      if (!existing) {
+        throw fail("LIFECYCLE_BLOCKED",
+          "This receipt was interrupted after the stock effect was marked but before the goods receipt was written. Check the item's stock and reconcile — do not record it again.",
+          { reason: "PARTIAL_RECEIPT_NEEDS_RECONCILIATION", poNumber: purchaseOrder.poNumber });
       }
-      const recovered = await PurchaseOrder.findById(purchaseOrder._id)
-        .populate("vendor", "companyName contactPerson")
-        .populate("items.rawItem", "name sku unit customUnit")
-        .populate("deliveries.receivedBy", "name email");
-      return await req.idempotent.succeed(200, {
-        success: true,
-        message: "This delivery was already recorded.",
-        purchaseOrder: recovered,
-        processed: [],
-      }, { entityType: ENTITY, entityId: purchaseOrder._id });
+      return await req.idempotent.succeed(200, await withPO({ success: true, message: "This goods receipt was already recorded.", goodsReceipt: existing }), { entityType: ENTITY, entityId: purchaseOrder._id });
     }
+
+    if (purchaseOrder.status === "DRAFT") return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
+    if (purchaseOrder.status === "CANCELLED") return res.status(400).json({ success: false, message: "Cannot receive against a cancelled PO" });
 
     const previousState = purchaseOrder.status;
-    if (purchaseOrder.status === "DRAFT")
-      return res
-        .status(400)
-        .json({ success: false, message: "Cannot receive against a draft PO" });
-    if (purchaseOrder.status === "CANCELLED")
-      return res.status(400).json({
-        success: false,
-        message: "Cannot receive against a cancelled PO",
-      });
+    const { items, warehouseId, locationId, invoiceNumber, notes } = req.body;
+    // The legacy screen sends `deliveryDate`; accept it as the receipt date.
+    const receiptDate = req.body.receiptDate || req.body.deliveryDate;
 
-    const updates = [];
-    for (const ri of items) {
-      const poItem = purchaseOrder.items.find(
-        (it) => it._id.toString() === ri.itemId?.toString(),
-      );
-      if (!poItem) {
-        console.error(
-          `[receive] itemId ${ri.itemId} not matched in PO items:`,
-          purchaseOrder.items.map((it) => it._id.toString()),
-        );
-        return res.status(400).json({
-          success: false,
-          message: `Item not found in PO: ${ri.itemId}`,
-        });
-      }
-      const qty = parseFloat(ri.quantity) || 0;
-      if (qty <= 0) continue;
-
-      const pending = Math.max(
-        0,
-        +(poItem.quantity - poItem.receivedQuantity).toFixed(4),
-      );
-
-      // Extra delivery: cap received at ordered qty, record surplus separately in stock
-      const qtyToReceiveAgainstPO = Math.min(qty, pending);
-      const surplusQty = +(qty - qtyToReceiveAgainstPO).toFixed(4);
-
-      if (qtyToReceiveAgainstPO > 0) {
-        updates.push({
-          poItem,
-          rawItemId: poItem.rawItem?._id || poItem.rawItem,
-          variantId: ri.variantId || poItem.variantId,
-          variantCombination: ri.variantCombination?.length
-            ? ri.variantCombination
-            : poItem.variantCombination || [],
-          qtyInPoUnit: qtyToReceiveAgainstPO,
-          poUnit: poItem.unit,
-          unitPrice: poItem.unitPrice,
-          surplusQty: 0,
-        });
-      }
-
-      // Push any surplus as a stock-in-only entry (not counted against PO received qty)
-      if (surplusQty > 0.001) {
-        updates.push({
-          poItem,
-          rawItemId: poItem.rawItem?._id || poItem.rawItem,
-          variantId: ri.variantId || poItem.variantId,
-          variantCombination: ri.variantCombination?.length
-            ? ri.variantCombination
-            : poItem.variantCombination || [],
-          qtyInPoUnit: 0,         // not counted against PO
-          poUnit: poItem.unit,
-          unitPrice: poItem.unitPrice,
-          surplusQty,             // only added to stock
-          isSurplus: true,
-        });
-      }
+    // ── Destination (one per receipt), validated BEFORE any write ──
+    let warehouse = null, location = null;
+    if (warehouseId && locationId) {
+      warehouse = await Warehouse.findOne({ _id: warehouseId, ...tenantContext.tenantFilter(req.tenant) }).lean();
+      location = locStock.findLocation(warehouse, locationId);
+      const locErr = locStock.usableLocationError(warehouse, location, req.tenant.companyId);
+      if (locErr) return res.status(400).json({ success: false, message: locErr.message, reason: locErr.reason });
+    } else if (warehouseId || locationId) {
+      return res.status(400).json({ success: false, message: "A destination needs both a warehouse and a location.", reason: "LOCATION_INCOMPLETE" });
     }
 
-    if (!updates.length) {
-      return res
-        .status(400)
-        .json({ success: false, message: "No valid quantities to receive" });
-    }
+    // ── Validate every line (unknown/cancelled/foreign, positive qty,
+    //    over-receipt, UoM conversion) — throws with NOTHING mutated ──
+    const { plans } = await grn.validateReceiptLines({ purchaseOrder, items, tenant: req.tenant });
 
-    let totalReceivedInPoUnits = 0;
-    const processed = [];
-
-    /* ── THE MARKER GOES BEFORE THE FIRST STOCK WRITE ───────────────────────
-     * Stock moves item by item, outside any transaction on a standalone
-     * deployment. If the marker were written after the loop — or after the
-     * order save — a failure part-way through would release the key and the
-     * retry would move the SAME stock again. Marking first makes the effect
-     * at-most-once: any failure from here on sends the retry into recovery,
-     * which never re-runs the movement. The price is that a receipt can be
-     * left half-applied; that is surfaced for reconciliation below rather
-     * than silently repeated, which is the trade every stock system has to
-     * make without transactions. */
+    // Mark the effect at-most-once BEFORE the first stock write.
     if (req.idempotent?.record) {
-      await idempotencyService.markEffectApplied({
-        record: req.idempotent.record,
-        entityType: ENTITY,
-        entityId: purchaseOrder._id,
-      });
+      await idempotencyService.markEffectApplied({ record: req.idempotent.record, entityType: ENTITY, entityId: purchaseOrder._id });
     }
 
-    for (const u of updates) {
-      const {
-        poItem,
-        rawItemId,
-        variantId,
-        variantCombination,
-        qtyInPoUnit,
-        poUnit,
-        unitPrice,
-        surplusQty,
-        isSurplus,
-      } = u;
-
-      // Effective qty hitting stock = PO portion + any surplus
-      const effectiveQtyInPoUnit = qtyInPoUnit + (surplusQty || 0);
-
-      const rawItem = await RawItem.findById(rawItemId);
-      if (!rawItem) {
-        console.warn(`RawItem not found: ${rawItemId}`);
-        continue;
-      }
-
-      const registeredUnit = rawItem.customUnit || rawItem.unit;
-      const fromUnit = poUnit || registeredUnit;
-
-      let qtyInRegisteredUnit = effectiveQtyInPoUnit;
-      if (fromUnit !== registeredUnit) {
-        qtyInRegisteredUnit = await convertQuantity(
-          effectiveQtyInPoUnit,
-          fromUnit,
-          registeredUnit,
-        );
-      }
-
-      // Only advance PO received counter for non-surplus entries
-      if (!u.isSurplus) {
-        poItem.receivedQuantity += qtyInPoUnit;
-        poItem.pendingQuantity = Math.max(
-          0,
-          poItem.quantity - poItem.receivedQuantity,
-        );
-        poItem.status =
-          poItem.receivedQuantity >= poItem.quantity
-            ? "COMPLETED"
-            : poItem.receivedQuantity > 0
-              ? "PARTIALLY_RECEIVED"
-              : "PENDING";
-      }
-
-      
-
-      const previousBaseQty = rawItem.quantity;
-
-      if (variantId) {
-        let variant = null;
-        let variantIdx = -1;
-
-        for (let i = 0; i < rawItem.variants.length; i++) {
-          const v = rawItem.variants[i];
-          if (v._id?.toString() === variantId.toString()) {
-            variant = v;
-            variantIdx = i;
-            break;
-          }
-        }
-
-        if (!variant && variantCombination?.length) {
-          for (let i = 0; i < rawItem.variants.length; i++) {
-            const v = rawItem.variants[i];
-            if (
-              v.combination?.length === variantCombination.length &&
-              v.combination.every((val, idx) => val === variantCombination[idx])
-            ) {
-              variant = v;
-              variantIdx = i;
-              break;
-            }
-          }
-        }
-
-        if (variant) {
-          variant.quantity = (variant.quantity || 0) + qtyInRegisteredUnit;
-          variant.status =
-            variant.quantity === 0
-              ? "Out of Stock"
-              : variant.quantity <= (variant.minStock || rawItem.minStock || 0)
-                ? "Low Stock"
-                : "In Stock";
-          if (!variant.sku)
-            variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
-          rawItem.variants[variantIdx] = variant;
-        } else {
-          rawItem.variants.push({
-            combination: variantCombination || [],
-            quantity: qtyInRegisteredUnit,
-            minStock: rawItem.minStock || 0,
-            maxStock: rawItem.maxStock || 0,
-            sku: poItem.variantSku || `${rawItem.sku}-var-${Date.now()}`,
-            status: "In Stock",
-          });
-        }
-
-        rawItem.quantity = rawItem.variants.reduce(
-          (s, v) => s + (v.quantity || 0),
-          0,
-        );
-      } else {
-        rawItem.quantity = (rawItem.quantity || 0) + qtyInRegisteredUnit;
-      }
-
-      rawItem.status =
-        rawItem.quantity === 0
-          ? "Out of Stock"
-          : rawItem.quantity <= (rawItem.minStock || 0)
-            ? "Low Stock"
-            : "In Stock";
-
-      const conversionNote =
-        fromUnit !== registeredUnit
-          ? ` (received ${qtyInPoUnit} ${fromUnit} = ${qtyInRegisteredUnit.toFixed(4)} ${registeredUnit})`
-          : "";
-
-      rawItem.stockTransactions.unshift({
-        type: variantId ? "VARIANT_ADD" : "ADD",
-        quantity: qtyInRegisteredUnit,
-        variantId,
-        variantCombination,
-        previousQuantity: previousBaseQty,
-        newQuantity: rawItem.quantity,
-        reason: "Purchase Order Delivery",
-        supplier: purchaseOrder.vendorName,
-        supplierId: purchaseOrder.vendor,
-        unitPrice,
-        purchaseOrder: purchaseOrder.poNumber,
-        purchaseOrderId: purchaseOrder._id,
-        invoiceNumber,
-        notes: `Received from PO: ${purchaseOrder.poNumber}${conversionNote}`,
-        performedBy: req.user.id,
-      });
-
-      await rawItem.save();
-
-      processed.push({
-        itemName: poItem.itemName,
-        variant: variantCombination?.join(" • ") || null,
-        qtyInPoUnit,
-        poUnit: fromUnit,
-        qtyInRegisteredUnit,
-        registeredUnit,
-        converted: fromUnit !== registeredUnit,
-      });
-
-      totalReceivedInPoUnits += u.isSurplus ? 0 : qtyInPoUnit;
-      if (u.isSurplus) {
-        console.log(
-          `[receive] Surplus of ${u.surplusQty} ${poItem.unit} for ${poItem.itemName} — added to stock only, not counted against PO.`
-        );
-      }
-    }
-
-    purchaseOrder.deliveries.unshift({
-      deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
-      quantityReceived: totalReceivedInPoUnits,
-      invoiceNumber: invoiceNumber || "",
-      notes: notes || "",
-      receivedBy: req.user.id,
-    });
-
-    purchaseOrder.totalReceived += totalReceivedInPoUnits;
-    purchaseOrder.totalPending = purchaseOrder.items.reduce(
-      (s, it) => s + (it.pendingQuantity || 0),
-      0,
-    );
-
-    purchaseOrder.status =
-      purchaseOrder.totalPending === 0
-        ? "COMPLETED"
-        : purchaseOrder.totalReceived > 0
-          ? "PARTIALLY_RECEIVED"
-          : purchaseOrder.status;
-
-    /* The order save, the history entry and the idempotency effect marker as
-       one unit. On a replica set they commit together; on a standalone the
-       marker lands the instant the save does, so a later failure cannot let
-       a retry receive this delivery again. */
+    let created = null;
     await unitOfWork.run(req.tenant, {
       idempotencyRecord: req.idempotent?.record,
       mutate: async (session) => {
-        await purchaseOrder.save(session ? { session } : {});
+        const out = await grn.applyReceipt({
+          session, tenant: req.tenant, purchaseOrder, plans,
+          header: { warehouse, location, invoiceNumber, receiptDate, notes },
+          actor: { id: req.user.id, name: req.user.name },
+          idempotencyKey: req.idempotent?.key || "",
+        });
+        created = out.goodsReceipt;
         return {
-          entityType: ENTITY,
-          entityId: purchaseOrder._id,
-          result: true,
+          entityType: ENTITY, entityId: purchaseOrder._id, result: true,
           entry: {
-            entityType: ENTITY,
-            entityId: purchaseOrder._id,
-            documentNumber: purchaseOrder.poNumber,
-            action: "RECEIVED",
-            previousState,
-            resultingState: purchaseOrder.status,
-            requestId: req.id || "",
-            idempotencyKey: req.idempotent?.key || "",
-            metadata: {
-              quantityReceived: totalReceivedInPoUnits,
-              lineCount: processed.length,
-              invoiceNumber: invoiceNumber || "",
-            },
+            entityType: ENTITY, entityId: purchaseOrder._id, documentNumber: purchaseOrder.poNumber,
+            action: "RECEIVED", previousState, resultingState: purchaseOrder.status,
+            requestId: req.id || "", idempotencyKey: req.idempotent?.key || "",
+            metadata: { goodsReceiptNumber: created.receiptNumber, lineCount: plans.length, invoiceNumber: invoiceNumber || "" },
           },
         };
       },
     });
 
-    const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
-      .populate("vendor", "companyName contactPerson")
-      .populate("items.rawItem", "name sku unit customUnit")
-      .populate("deliveries.receivedBy", "name email");
-
-    const body = {
-      success: true,
-      message: `Delivery received. ${totalReceivedInPoUnits} unit(s) recorded.`,
-      purchaseOrder: populatedPO,
-      processed,
-    };
+    const body = await withPO({ success: true, message: `Goods receipt ${created.receiptNumber} recorded.`, goodsReceipt: created });
     return req.idempotent
-      ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: purchaseOrder._id })
-      : res.json(body);
+      ? await req.idempotent.succeed(successStatus, body, { entityType: ENTITY, entityId: purchaseOrder._id })
+      : res.status(successStatus).json(body);
   } catch (err) {
     if (err?.name === "StorePurchaseError") return sendError(res, err);
-    console.error("Error receiving delivery:", err);
+    console.error("[goods-receipt] error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
-  },
-);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UPDATE PAYMENT STATUS
+// POST /:id/receive — DEPRECATED compatibility adapter.
+//
+// It contains NO receipt engine any more (its independent RawItem mutation,
+// surplus calculation, unit conversion, location-stock write, PO delivery
+// insertion and recovery were removed). It translates the legacy request shape
+// (itemId / deliveryDate — already understood by the canonical command) and
+// delegates to the ONE implementation, returning the authoritative goodsReceipt
+// (with _id and receiptNumber) alongside a legacy purchaseOrder envelope and a
+// 200 for old callers. Prefer POST /:id/goods-receipts.
 // ─────────────────────────────────────────────────────────────────────────────
-router.patch(
-  "/:id/payment-status",
-  requireCapability(CAPABILITIES.PO_APPROVE),
+router.post(
+  "/:id/receive",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
   refuseLegacyWrite,
-  async (req, res) => {
-  try {
-    const { status } = req.body;
-    if (!status)
-      return res
-        .status(400)
-        .json({ success: false, message: "Payment status is required" });
-
-    const validStatuses = ["PENDING", "PARTIAL", "COMPLETED"];
-    if (!validStatuses.includes(status)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid payment status" });
-    }
-
-    const purchaseOrder = await PurchaseOrder.findOne({
-      _id: req.params.id,
-      ...tenantContext.tenantFilter(req.tenant),
-    });
-    if (!purchaseOrder)
-      return res
-        .status(404)
-        .json({ success: false, message: "Purchase order not found" });
-
-    purchaseOrder.paymentStatus = status;
-    await purchaseOrder.save();
-
-    res.json({
-      success: true,
-      message: `Payment status updated to ${status}`,
-      purchaseOrder,
-    });
-  } catch (error) {
-    if (error?.name === "StorePurchaseError") return sendError(res, error);
-    console.error("Error updating payment status:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating payment status",
-    });
-  }
-  },
+  // Canonicalise legacy aliases BEFORE hashing, then bind the fingerprint to
+  // THIS purchase order so a key cannot replay another PO's receipt.
+  normalizeReceiptCommand,
+  withIdempotency("PO_RECEIVE", { target: (req) => req.params.id }),
+  (req, res) => handleGoodsReceipt(req, res, { includePurchaseOrder: true, successStatus: 200 }),
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /:id/goods-receipts — GOODS RECEIPT V1 (authoritative, line-level).
+//
+// The canonical receiving URL. A thin wrapper over the ONE implementation
+// (`handleGoodsReceipt` above) — no receipt engine here. V1 proves RECEIPT ONLY:
+// it refuses over-receipt, and never calls a quantity "accepted".
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  "/:id/goods-receipts",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  // Same normalisation + same PO-bound target as /receive, so a retry across
+  // the two URLs for one PO replays, while reuse against another PO refuses.
+  normalizeReceiptCommand,
+  withIdempotency("PO_RECEIVE", { target: (req) => req.params.id }),
+  (req, res) => handleGoodsReceipt(req, res),
+);
+
+// GET /:id/goods-receipts — the authoritative receipts recorded against this PO.
+router.get("/:id/goods-receipts", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) }).select("_id").lean();
+    if (!po) return res.status(404).json({ success: false, message: "PO not found" });
+    const receipts = await GoodsReceipt.find({ companyId: req.tenant.companyId, purchaseOrderId: po._id }).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, goodsReceipts: receipts });
+  } catch (err) {
+    console.error("[goods-receipt] list-by-po error:", err);
+    res.status(500).json({ success: false, message: "Server error while loading goods receipts" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PAYMENT STATUS — RETIRED (Chunk 8)
+// ─────────────────────────────────────────────────────────────────────────────
+// The PO's payment status is no longer editable in Store; bill and payment truth
+// live in Accounting. This endpoint writes nothing and directs the caller there.
+router.patch("/:id/payment-status", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    retired: true,
+    reason: "STORE_PAYMENT_RETIRED",
+    message: "Editing the purchase order's payment status has been retired. Bill and payment state are owned by Accounting.",
+    accounting: { area: "purchase-vouchers", href: "/accountant/purchase-vouchers" },
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PAYMENT HISTORY
@@ -1940,8 +1815,13 @@ router.get("/:id/payments", requireCapability(CAPABILITIES.READ), async (req, re
       ) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
 
+    // These are HISTORICAL Store payment records only — payment truth is now
+    // owned by Accounting. They are preserved read-only and clearly labelled;
+    // they are never mutated (the recording endpoints are retired).
     res.json({
       success: true,
+      legacy: true,
+      legacyNote: "Legacy Store payment records. Payments are now recorded in Accounting; these historical figures are read-only.",
       payments: purchaseOrder.payments || [],
       totalPaid,
       remainingAmount,

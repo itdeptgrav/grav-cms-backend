@@ -1,0 +1,202 @@
+# deploy/mautic/docker-compose.yml
+#
+# ONE ISOLATED MAUTIC DEVELOPMENT INSTANCE.
+#
+# ── WHAT THIS IS AND IS NOT ─────────────────────────────────────────────────
+# This is a SEPARATE APPLICATION, deployed beside GRAV and talking to it only
+# over HTTP. ADR-004 is explicit that Mautic is not embedded, not forked, and
+# not read from its own database — so this file deploys Mautic's own PHP
+# runtime and its own MariaDB, and nothing in the GRAV Node backend ever opens
+# a connection to that database.
+#
+# It is a DEVELOPMENT topology. The mail transport is a sink that delivers
+# nowhere, the ports bind to localhost only, and the credentials come from an
+# untracked env file. It is not a production deployment and must not become one
+# by having its ports opened.
+#
+# ── WHY EVERY IMAGE IS PINNED BY DIGEST ─────────────────────────────────────
+# A tag is a pointer somebody else can move. `mautic:latest` and even
+# `mautic:7.2-apache` will one day mean a different build, and the first
+# symptom is an integration contract that changed without anybody editing this
+# repository — which is the single hardest class of failure to diagnose. The
+# version tag is kept beside the digest because a digest alone is unreadable;
+# the digest is what actually resolves.
+#
+# Verified against the official sources on 9 September 2026:
+#   · github.com/mautic/mautic  → 7.2.0 "Lynx Edition", 2026-09-02, the current
+#     stable 7.x (7.2.0-rc was a prerelease; 7.1.3 is the previous stable and is
+#     the documented fallback if 7.2.0 proves unstable in staging).
+#   · mautic/core-lib 7.x composer.json → PHP ~8.2, ext-iconv, imap, pdo, zip,
+#     zlib. The official image already carries them; a hand-built PHP runtime
+#     must be checked against that list.
+#
+# ── BRINGING IT UP ──────────────────────────────────────────────────────────
+#   cp mautic.env.example .env      # then fill in real values
+#   docker compose up -d
+#   docker compose ps               # every service must report healthy
+# See README.md for the API user, the round trip and the operational drills.
+
+name: grav-mautic-dev
+
+services:
+  # ── THE DATABASE MAUTIC OWNS ────────────────────────────────────────────
+  # Mautic's, not GRAV's. GRAV has no credentials for it and no route to it:
+  # it is on an internal network with no published port, so "do not read or
+  # write Mautic's database directly" is enforced by the topology rather than
+  # by everyone remembering.
+  mautic-db:
+    image: mariadb:11.4.13-noble@sha256:611a2fcc5fa7c6ceb8644c6f74b25ede004ff6c3a6b38c8f8c23d3bbf6c26430
+    container_name: grav-mautic-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MAUTIC_DB_ROOT_PASSWORD:?set MAUTIC_DB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: ${MAUTIC_DB_NAME:-mautic}
+      MARIADB_USER: ${MAUTIC_DB_USER:-mautic}
+      MARIADB_PASSWORD: ${MAUTIC_DB_PASSWORD:?set MAUTIC_DB_PASSWORD in .env}
+    volumes:
+      - mautic-db-data:/var/lib/mysql
+    networks: [mautic-internal]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  # ── MAUTIC ITSELF ───────────────────────────────────────────────────────
+  mautic:
+    image: mautic/mautic:7.2.0-20260902-apache@sha256:dea3bb71a5c5bf4c0c7d1764e58a32109898e7b2e6a710f14f50e2a913c03a0f
+    container_name: grav-mautic
+    restart: unless-stopped
+    depends_on:
+      mautic-db: { condition: service_healthy }
+      mailsink:  { condition: service_started }
+    environment:
+      MAUTIC_DB_HOST: mautic-db
+      MAUTIC_DB_PORT: "3306"
+      MAUTIC_DB_NAME: ${MAUTIC_DB_NAME:-mautic}
+      MAUTIC_DB_USER: ${MAUTIC_DB_USER:-mautic}
+      MAUTIC_DB_PASSWORD: ${MAUTIC_DB_PASSWORD:?set MAUTIC_DB_PASSWORD in .env}
+
+      # ── THE MAIL SINK ───────────────────────────────────────────────────
+      # Mailpit accepts every message and delivers none of them. A development
+      # instance holds real people's addresses copied from a campaign export
+      # more often than anybody admits, and "we were careful" is not a control.
+      # This is: there is no credentialed path off this machine.
+      MAUTIC_MAILER_DSN: smtp://mailsink:1025
+      MAUTIC_MESSENGER_DSN_EMAIL: sync://
+
+      MAUTIC_SITE_URL: ${MAUTIC_BASE_URL:-http://localhost:8088}
+      MAUTIC_ADMIN_EMAIL: ${MAUTIC_ADMIN_EMAIL:?set MAUTIC_ADMIN_EMAIL in .env}
+      MAUTIC_ADMIN_PASSWORD: ${MAUTIC_ADMIN_PASSWORD:?set MAUTIC_ADMIN_PASSWORD in .env}
+      MAUTIC_ADMIN_USERNAME: ${MAUTIC_ADMIN_USERNAME:-admin}
+      MAUTIC_RUN_CRON_JOBS: "true"
+    # ── NO PUBLISHED PORT. THIS IS THE CONTAINMENT. ──────────────────────
+    # Mautic used to publish 127.0.0.1:8088 and GRAV talked to it directly.
+    # That arrangement could not contain a stolen credential: Mautic 7.2.0
+    # treats `email:emails:view` as sufficient for POST /api/emails/{id}/send
+    # and for reading a form's submissions, so anything holding the content
+    # credential could send mail and read contact data, and pointing GRAV at a
+    # proxy would have changed nothing — the port was still there to bypass it.
+    #
+    # So the port is gone. Mautic is reachable only from inside this compose
+    # network, and the only member of that network with a published port is the
+    # gateway below. There is no second route to :80 for anything on the host.
+    expose:
+      - "80"
+    volumes:
+      - mautic-config:/var/www/html/config
+      - mautic-logs:/var/www/html/var/logs
+      - mautic-media:/var/www/html/docroot/media
+    networks: [mautic-internal, mautic-edge]
+    healthcheck:
+      # Mautic's own login page. Deliberately not an API call: a health check
+      # that needs credentials cannot distinguish "down" from "misconfigured",
+      # and those need different people to fix them. The GRAV-side check
+      # (services/marketing/mauticHealth.service.js) is what proves the API
+      # path, and it reports the two separately.
+      test: ["CMD-SHELL", "curl -fsS http://localhost/s/login >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  # ── THE ALLOWLIST GATEWAY ───────────────────────────────────────────────
+  # Every byte of GRAV-to-Mautic API traffic passes through here, because this
+  # is the only container on the network with a published port.
+  #
+  # ── WHY A GATEWAY AND NOT JUST NARROWER MAUTIC PERMISSIONS ──────────────
+  # Because Mautic cannot express the permission that is needed. Its API
+  # authorises `POST /api/emails/{id}/send` with the same `view` grant that
+  # authorises `GET /api/emails`, and it authorises a form's submissions — real
+  # contact identities — with the same grant that lists forms. There is no role
+  # that reads content and cannot send it. The gateway supplies the rule the
+  # provider cannot.
+  #
+  # ── AND WHY IT KEYS ON THE CREDENTIAL, NOT ON A PORT OR A HEADER ────────
+  # A port or a header is chosen by the caller, so neither contains a thief who
+  # already holds the content credential. The lane is selected by the
+  # Authorization header's value: the content credential CANNOT reach a send
+  # endpoint through this gateway no matter which port, path or header it
+  # presents, because there is no path through the gateway on which that
+  # credential is allowed to POST.
+  gateway:
+    image: nginx:1.27.3-alpine@sha256:41523187cf7d7a2f2677a80609d9caa14388bf5c1fbca9c410ba3de602aaaab4
+    container_name: grav-mautic-gateway
+    restart: unless-stopped
+    depends_on:
+      mautic:
+        condition: service_started
+    environment:
+      # Base64 of `user:password` for each lane, built by the deploy script from
+      # .env. The gateway compares the presented Authorization header against
+      # these; it never sees a plaintext password and never issues one.
+      GATEWAY_CONTENT_AUTH: ${GATEWAY_CONTENT_AUTH:?run deploy/mautic/build-gateway-auth.sh}
+      GATEWAY_OPERATIONAL_AUTH: ${GATEWAY_OPERATIONAL_AUTH:?run deploy/mautic/build-gateway-auth.sh}
+      GATEWAY_ADMIN_AUTH: ${GATEWAY_ADMIN_AUTH:?run deploy/mautic/build-gateway-auth.sh}
+    volumes:
+      # The official image runs envsubst over templates at start-up, so the
+      # credentials stay in the environment rather than being baked into a file.
+      - ./gateway/mautic-gateway.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./gateway/proxy-headers.inc:/etc/nginx/conf.d/proxy-headers.inc:ro
+    ports:
+      # The port Mautic used to own. Everything already configured to reach
+      # http://localhost:8088 now reaches the gateway instead, and nothing has
+      # a way to reach Mautic without it.
+      - "127.0.0.1:${MAUTIC_HTTP_PORT:-8088}:80"
+    networks: [mautic-internal, mautic-edge]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/gateway-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── THE MAIL SINK ───────────────────────────────────────────────────────
+  # SMTP in, web UI out, nothing forwarded. Open http://localhost:8025 to read
+  # what a campaign "sent".
+  mailsink:
+    image: axllent/mailpit:v1.31.1@sha256:98b916bd3c8d61f7633a52d3ea2f58d00620cb01ca57ab59edde68c347a95365
+    container_name: grav-mautic-mailsink
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "5000"
+    ports:
+      - "127.0.0.1:${MAILSINK_UI_PORT:-8025}:8025"
+    networks: [mautic-internal]
+
+networks:
+  # No published ports, no route to the host: what the database sits on.
+  mautic-internal:
+    driver: bridge
+  # Where the one thing GRAV talks to sits.
+  mautic-edge:
+    driver: bridge
+
+volumes:
+  mautic-db-data:
+  mautic-config:
+  mautic-logs:
+  mautic-media:

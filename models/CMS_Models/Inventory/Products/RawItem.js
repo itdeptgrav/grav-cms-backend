@@ -104,6 +104,17 @@ const stockTransactionSchema = new mongoose.Schema(
        not yet governed. */
     operationId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
 
+    /* ── WHERE IN THE WAREHOUSE THIS MOVEMENT LANDED / LEFT (Warehouse Stock V1)
+       A snapshot of the warehouse/location the paired LocationMovement records,
+       so Stock movements can show the real location without a fragile join.
+       Absent on legacy movements and on operations not yet location-aware —
+       those read as "Unassigned", never guessed onto a warehouse. */
+    warehouseId:   { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", default: null },
+    locationId:    { type: mongoose.Schema.Types.ObjectId, default: null },
+    warehouseName: { type: String, default: "" },
+    locationCode:  { type: String, default: "" },
+    locationName:  { type: String, default: "" },
+
     /* Mongoose's `timestamps` option does not run for an update written as an
        aggregation pipeline, and the stock movements are written that way so
        they can be atomic. The route sets these explicitly; declaring them here
@@ -149,6 +160,23 @@ const rawItemSchema = new mongoose.Schema(
     sku:  { type: String, required: true, trim: true },
 
     category:       { type: String, default: "" },
+
+    /* ── HOW CUSTOMS CLASSIFIES THESE GOODS ───────────────────────────────
+       The tariff heading an import of this item is entered under. A property
+       of the GOODS, so it is recorded once here rather than on every
+       quotation — two suppliers of one fabric do not classify it differently,
+       and storing it per offer would let them appear to.
+
+       ── AND IT IS NOT THE HSN ON A QUOTATION ─────────────────────────────
+       `SupplierOffer.hsnCode` is what the supplier wrote for GST. The two
+       derive from the same Harmonised System and are routinely different
+       lengths for the same goods — the GST code is what the seller charges
+       tax under, this is what the importer clears customs under. Reading one
+       as the other is how a duty is worked out against the wrong heading.
+
+       Empty means nobody has classified it. It is never defaulted, never
+       inferred from the category, and never read as "no duty". */
+    customsTariffCode: { type: String, trim: true, uppercase: true, maxlength: 20, default: "" },
 
     /* ── THIS ITEM'S OWN BUDGET HEAD, WHERE IT DIFFERS FROM ITS CATEGORY ───
        Normally empty. The head comes from the item's CATEGORY (see

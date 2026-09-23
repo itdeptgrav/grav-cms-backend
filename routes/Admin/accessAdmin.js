@@ -21,6 +21,8 @@
 
 const express = require("express");
 const router = express.Router();
+// Company-and-app grants share this administrator gate; never mount publicly.
+router.use("/company-access", require("./companyAccess"));
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const mongoose = require("mongoose");
@@ -65,13 +67,91 @@ function generateTempPassword(length = 14) {
 }
 
 /** Log every mutation with who did it. */
+/* ── Authorisation mutations, by action name ─────────────────────────────────
+ *
+ * Every one of these changes what somebody may DO, so the HR contract's
+ * resolved-actor cache has to forget what it knew before the next request. A
+ * revoked approver who keeps approving for another thirty seconds, or a freshly
+ * granted editor who is refused with no explanation, is the failure this
+ * prevents.
+ *
+ * Hooked here rather than at each of the eleven call sites: `audit()` is the one
+ * thing every successful mutation in this router already calls, so there is no
+ * early-return path that can quietly skip it. The list is explicit — a nav
+ * preference or a Cowork link changes nothing about authority and does not
+ * clear anything.
+ */
+const AUTHORISATION_ACTIONS = new Set([
+  "department-role",            // grant, change, revoke, incumbent-owner demotion
+  "employee.assign",            // access-department assignment
+  "employee.revoke",            // access-department removal
+  "employee.extra-departments", // additional application grants
+  "employee.bulk-assign",
+  "employee.set-email",         // moves the grants keyed on the address
+  "user.create",
+  "user.update",                // isAdmin, isActive — admin grant and deactivation
+  "department-login.remove",
+  "department.create",
+  "department.deactivate",
+  "department.delete",
+  "accountant.revoke",
+]);
+
 function audit(req, action, detail) {
   console.log(
     `[access-admin] ${action} by ${req.admin?.email || "unknown"} — ${detail}`,
   );
+  if (!AUTHORISATION_ACTIONS.has(action)) return;
+  try {
+    require("../../services/access/hrAuthorization").invalidateHrAuthorization(action);
+  } catch (err) {
+    /* Never fail a change that has already been written because the cache
+       could not be cleared. Worst case the old decision stands for the
+       thirty-second TTL. */
+    console.warn("[access-admin] HR cache invalidation skipped:", err.message);
+  }
 }
 
 const fail = (res, code, message) => res.status(code).json({ success: false, message });
+
+/* ── THE LAST USABLE ADMINISTRATOR ────────────────────────────────────────────
+ *
+ * Access Control is reachable only through `requirePlatformAdmin`, which admits
+ * an ACTIVE `DeptUser` with `isAdmin`. That account also has to be able to get a
+ * session: sign-in (routes/auth/deptAuth.js) refuses a DeptUser whose department
+ * is missing or inactive. So an administrator is USABLE only when all three
+ * hold — isAdmin, isActive, and an active department — and a change that leaves
+ * no usable administrator locks everybody out of the one screen that could
+ * repair it, with nothing seeded at boot to fall back on.
+ *
+ * Every path that can take an administrator out of that set asks this first:
+ * revoking the flag, deactivating the account, moving it to an inactive
+ * department, removing the login, and deactivating or deleting a department.
+ *
+ * `excludeUserId` / `excludeDepartmentId` describe the change being considered:
+ * the count is of administrators who would STILL be usable after it.
+ */
+async function usableAdminCount({ excludeUserId, excludeDepartmentId } = {}) {
+  const admins = await DeptUser.find({ isAdmin: true, isActive: true })
+    .select("_id departmentId")
+    .lean();
+  if (!admins.length) return 0;
+  const deptIds = [...new Set(admins.map((a) => String(a.departmentId)))];
+  const activeDepts = new Set(
+    (await AccessDepartment.find({ _id: { $in: deptIds }, isActive: true }).select("_id").lean())
+      .map((d) => String(d._id)),
+  );
+  return admins.filter(
+    (a) =>
+      String(a._id) !== String(excludeUserId || "") &&
+      String(a.departmentId) !== String(excludeDepartmentId || "") &&
+      activeDepts.has(String(a.departmentId)),
+  ).length;
+}
+
+const LAST_ADMIN_MESSAGE =
+  "This would leave no administrator able to sign in to Access Control. " +
+  "Make somebody else an administrator first — in an active department — and try again.";
 
 /**
  * Catch a near-duplicate department name before it becomes a live bug.
@@ -257,6 +337,17 @@ router.patch("/departments/:id", async (req, res) => {
     const dept = await AccessDepartment.findById(req.params.id);
     if (!dept) return fail(res, 404, "Department not found");
 
+    /* Switching a department off makes every account in it unable to sign in,
+       built-in departments included (isActive is editable on those). Refused —
+       before anything is written — when that would leave no usable
+       administrator. */
+    if (req.body?.isActive === false && dept.isActive !== false) {
+      if ((await usableAdminCount({ excludeDepartmentId: dept._id })) === 0) {
+        return fail(res, 409,
+          `${dept.name} holds the last administrator who can sign in. ${LAST_ADMIN_MESSAGE}`);
+      }
+    }
+
     const rejected = [];
 
     for (const [field, value] of Object.entries(req.body || {})) {
@@ -322,6 +413,12 @@ router.delete("/departments/:id", async (req, res) => {
       return fail(res, 400,
         `"${dept.name}" is a built-in department and cannot be removed. ` +
         `Deactivate it instead — its historical records reference its users.`);
+    }
+
+    /* Deleting deactivates the department AND every account in it. */
+    if (dept.isActive !== false && (await usableAdminCount({ excludeDepartmentId: dept._id })) === 0) {
+      return fail(res, 409,
+        `${dept.name} holds the last administrator who can sign in. ${LAST_ADMIN_MESSAGE}`);
     }
 
     dept.isActive = false;
@@ -399,7 +496,7 @@ router.get("/department-logins", async (req, res) => {
     const conn = mongoose.connection;
 
     const mirrors = await DeptUser.find({})
-      .select("_id email isAdmin isActive mustChangePassword departmentId")
+      .select("_id name email employeeId isAdmin isActive mustChangePassword departmentId lastLogin createdAt")
       .populate("departmentId", "name slug")
       .lean();
     const mirrorById = new Map(mirrors.map((m) => [String(m._id), m]));
@@ -408,6 +505,11 @@ router.get("/department-logins", async (req, res) => {
     const out = [];
 
     for (const dept of DEPARTMENTS) {
+      /* A department with no legacy collection has no legacy credentials to
+         list (its accounts are access-table accounts, listed below). Asking
+         the driver for `collection(null)` threw, and registered a collection
+         named null on the connection as it did. */
+      if (!dept.legacyCollection) continue;
       let rows = [];
       try {
         rows = await conn.collection(dept.legacyCollection).find({}).toArray();
@@ -444,6 +546,43 @@ router.get("/department-logins", async (req, res) => {
           departmentId: mirror?.departmentId || null,
         });
       }
+    }
+
+    /* ── ACCOUNTS THAT EXIST ONLY IN THE ACCESS TABLE ─────────────────────
+       Sign-in tries `dept_users` FIRST (routes/auth/deptAuth.js), so an
+       account created by POST /users — or an administrator made on the
+       server — signs in with no legacy credential at all. Listing only the
+       legacy collections left exactly those accounts invisible here: an
+       administrator created from this very tab vanished from it on reload,
+       with its admin flag and its access out of anybody's sight.
+
+       They are marked `collection: null`: there is no second credential to
+       delete, so the retirement action for them is deactivation (PATCH
+       /users/:id), which every update route already addresses. */
+    const listed = new Set(out.map((o) => o._id));
+    for (const m of mirrors) {
+      const id = String(m._id);
+      if (listed.has(id)) continue;
+      const isActive = m.isActive !== false;
+      if (!isActive && !includeInactive) continue;
+      out.push({
+        _id: id,
+        collection: null,
+        source: "access-table",
+        departmentKey: m.departmentId?.slug || "",
+        departmentName: m.departmentId?.name || "No department",
+        name: m.name || "",
+        email: m.email || "",
+        employeeId: m.employeeId || "",
+        role: "",
+        isActive,
+        lastLogin: m.lastLogin || null,
+        createdAt: m.createdAt || null,
+        mirrored: true,
+        isAdmin: Boolean(m.isAdmin),
+        mustChangePassword: Boolean(m.mustChangePassword),
+        departmentId: m.departmentId || null,
+      });
     }
 
     out.sort(
@@ -496,8 +635,7 @@ router.delete("/department-logins/:collection/:id", async (req, res) => {
        by anybody, with no way back in now that nothing is seeded at boot. */
     const mirror = await DeptUser.findById(oid).select("isAdmin isActive email").lean();
     if (mirror?.isAdmin) {
-      const admins = await DeptUser.countDocuments({ isAdmin: true, isActive: true });
-      if (admins <= 1) {
+      if ((await usableAdminCount({ excludeUserId: oid })) === 0) {
         return fail(
           res,
           400,
@@ -655,6 +793,13 @@ router.patch("/users/:id", async (req, res) => {
     if (req.body.departmentId && String(req.body.departmentId) !== String(user.departmentId)) {
       const dept = await AccessDepartment.findById(req.body.departmentId);
       if (!dept) return fail(res, 400, "That department does not exist");
+      /* An administrator moved into an inactive department can no longer sign
+         in — the same lockout as deactivating them, by another route. */
+      if (user.isAdmin && user.isActive && !dept.isActive &&
+          (await usableAdminCount({ excludeUserId: user._id })) === 0) {
+        return fail(res, 400,
+          `${dept.name} is not active, and this is the only active administrator who can sign in. ${LAST_ADMIN_MESSAGE}`);
+      }
       user.departmentId = dept._id;
       user.legacyModel = dept.legacyModel;
       user.legacyRole = dept.legacyRole || dept.slug;
@@ -663,6 +808,22 @@ router.patch("/users/:id", async (req, res) => {
     }
 
     if (req.body.isActive !== undefined) {
+      /* ── DEACTIVATION HAS THE SAME TWO GUARDS AS REMOVAL ────────────────
+         `requirePlatformAdmin` admits only an ACTIVE administrator, so
+         deactivating the last active one locks everybody out of Access
+         Control exactly as removing or demoting them would — and those two
+         paths were guarded while this one was not. Deactivating the account
+         you are signed in with is refused for the same reason DELETE refuses
+         it: the request that did it is the last one you would get to make. */
+      if (!req.body.isActive && user.isActive) {
+        if (String(req.admin?._id || req.admin?.id) === String(user._id)) {
+          return fail(res, 400, "You cannot deactivate the account you are signed in with.");
+        }
+        if (user.isAdmin && (await usableAdminCount({ excludeUserId: user._id })) === 0) {
+          return fail(res, 400,
+            "This is the only active administrator who can sign in. Make somebody else an administrator first.");
+        }
+      }
       user.isActive = Boolean(req.body.isActive);
       if (!user.isActive) user.tokenVersion += 1;   // sign them out now
       changes.push(user.isActive ? "activated" : "deactivated");
@@ -671,14 +832,12 @@ router.patch("/users/:id", async (req, res) => {
     if (req.body.isAdmin !== undefined) {
       // Guard against removing the last administrator and locking everyone out
       // of the console that grants administrators.
-      if (user.isAdmin && !req.body.isAdmin) {
-        const others = await DeptUser.countDocuments({
-          isAdmin: true, isActive: true, _id: { $ne: user._id },
-        });
-        if (others === 0) {
-          return fail(res, 400,
-            "This is the only active administrator. Promote someone else first.");
-        }
+      /* "Others" means administrators who can actually sign in — an admin in
+         an inactive department is not a way back in. */
+      if (user.isAdmin && !req.body.isAdmin &&
+          (await usableAdminCount({ excludeUserId: user._id })) === 0) {
+        return fail(res, 400,
+          "This is the only active administrator who can sign in. Promote someone else first.");
       }
       user.isAdmin = Boolean(req.body.isAdmin);
       user.tokenVersion += 1;
@@ -847,7 +1006,25 @@ router.get("/employees", async (req, res) => {
 /**
  * PATCH /api/admin/employees/:id — assign or revoke department access.
  *
- * Body: { accessDepartmentId: "<id>" | null }
+ * Body: { accessDepartmentId?: "<id>" | null, additionalDepartmentIds?: ["<id>"] }
+ *   accessDepartmentId  the primary; null revokes it; omitted leaves it alone
+ *   additionalDepartmentIds  the complete list of extras; [] clears them
+ * At least one of the two must be sent.
+ *
+ * ── ONE VALIDATED STATE, ONE WRITE ─────────────────────────────────────────
+ * This used to write the extras first and only then look up the primary, so a
+ * request whose primary was refused ("not active", "does not exist") had
+ * already changed the extras — and recorded that it had. Now the whole
+ * requested state is validated before anything is written, and both fields go
+ * to the database in a single `updateOne` on the one employee document (a
+ * single-document update is atomic in MongoDB). A refused request, or a write
+ * that fails, leaves both fields exactly as they were, and nothing is audited
+ * or recorded for it.
+ *
+ * Extras keep their long-standing tolerance: an id naming a department that is
+ * inactive or gone is dropped rather than refused, because the screen sends a
+ * person's current list back and a department switched off since must not make
+ * every later change to that person fail. A malformed id is refused.
  *
  * Takes effect on the employee's very next request, not when their token
  * expires: /api/auth/verify re-resolves the assignment from the database on
@@ -856,17 +1033,9 @@ router.get("/employees", async (req, res) => {
 router.patch("/employees/:id", async (req, res) => {
   try {
     // Read lean and write with updateOne rather than loading a document and
-    // calling .save().
-    //
-    // Employee has a pre-save hook that decrypts, recalculates and re-encrypts
-    // the whole salary block. On a document loaded with a partial .select()
-    // the salary path is present but empty, its toObject() returns undefined,
-    // and the hook died with "Cannot use 'in' operator to search for 'gross'
-    // in undefined" — an error about payroll, raised by a screen that only
-    // wanted to set one reference field.
-    //
-    // Assigning access has nothing to do with salary, so it should not be
-    // running salary code at all.
+    // calling .save(): Employee's pre-save hook re-encrypts the salary block
+    // and dies on a partially-selected document. Assigning access has nothing
+    // to do with salary, so it should not be running salary code at all.
     const employee = await Employee.findById(req.params.id)
       .select("firstName lastName email accessDepartmentId additionalDepartmentIds")
       .populate("accessDepartmentId", "name")
@@ -874,40 +1043,83 @@ router.patch("/employees/:id", async (req, res) => {
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
 
-    const { accessDepartmentId, additionalDepartmentIds } = req.body || {};
+    const body = req.body || {};
+    const sendsPrimary = Object.prototype.hasOwnProperty.call(body, "accessDepartmentId");
+    const sendsExtras = Object.prototype.hasOwnProperty.call(body, "additionalDepartmentIds");
+    /* An empty body used to fall through to the revoke branch and remove the
+       person's primary department. Nothing asked for, nothing changed. */
+    if (!sendsPrimary && !sendsExtras) {
+      return fail(res, 400, "Send accessDepartmentId, additionalDepartmentIds, or both.");
+    }
+    if (sendsExtras && !Array.isArray(body.additionalDepartmentIds)) {
+      return fail(res, 400, "additionalDepartmentIds must be a list.");
+    }
+
     const displayName = employee.firstName || employee.email;
+    const currentPrimaryId = employee.accessDepartmentId?._id ? String(employee.accessDepartmentId._id) : null;
+    const currentExtraIds = (employee.additionalDepartmentIds || []).map((d) => String(d._id));
     const oldPrimaryName = employee.accessDepartmentId?.name || null;
     const oldExtraNames = (employee.additionalDepartmentIds || []).map((d) => d.name);
 
-    // Extra departments, set independently of the primary. Sent as an array;
-    // an empty array clears them.
-    if (Array.isArray(additionalDepartmentIds)) {
-      const valid = await AccessDepartment.find({
-        _id: { $in: additionalDepartmentIds },
-        isActive: true,
-      }).select("_id name").lean();
+    /* ── 1. VALIDATE — nothing is written until every part is known good. ── */
+    let nextPrimary = null; // the AccessDepartment document, when one is set
+    if (sendsPrimary && body.accessDepartmentId) {
+      if (!mongoose.Types.ObjectId.isValid(String(body.accessDepartmentId))) {
+        return fail(res, 400, "That department does not exist");
+      }
+      nextPrimary = await AccessDepartment.findById(body.accessDepartmentId).select("_id name slug isActive").lean();
+      if (!nextPrimary) return fail(res, 400, "That department does not exist");
+      if (!nextPrimary.isActive) return fail(res, 400, `${nextPrimary.name} is not active`);
+    }
+    const nextPrimaryId = sendsPrimary ? (nextPrimary ? String(nextPrimary._id) : null) : currentPrimaryId;
 
-      // The primary is never duplicated into the extras — it is already granted.
-      const extras = valid
-        .map((d) => d._id)
-        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId?._id));
-      const extraNames = valid
-        .filter((d) => extras.some((id) => String(id) === String(d._id)))
-        .map((d) => d.name);
+    let extraDocs = null; // resolved only when the extras are being set
+    if (sendsExtras) {
+      const requested = body.additionalDepartmentIds.map(String);
+      const malformed = requested.filter((x) => !mongoose.Types.ObjectId.isValid(x));
+      if (malformed.length) {
+        return fail(res, 400, `Not a department: ${malformed.join(", ")}`);
+      }
+      const active = await AccessDepartment.find({ _id: { $in: requested }, isActive: true })
+        .select("_id name")
+        .lean();
+      // In the order they were asked for, once each, never the primary.
+      const byId = new Map(active.map((d) => [String(d._id), d]));
+      const seen = new Set();
+      extraDocs = [];
+      for (const x of requested) {
+        if (!byId.has(x) || seen.has(x) || x === nextPrimaryId) continue;
+        seen.add(x);
+        extraDocs.push(byId.get(x));
+      }
+    }
 
-      await Employee.updateOne(
-        { _id: employee._id },
-        { $set: { additionalDepartmentIds: extras } },
-      );
+    /* The new primary is never also an extra — including when only the primary
+       was sent and it was previously held as an extra. */
+    let nextExtraIds;
+    if (extraDocs) nextExtraIds = extraDocs.map((d) => String(d._id));
+    else nextExtraIds = currentExtraIds.filter((x) => x !== nextPrimaryId);
 
-      audit(req, "employee.extra-departments", `${employee.email} → ${extras.length} extra`);
+    /* ── 2. ONE WRITE ────────────────────────────────────────────────────── */
+    const $set = {};
+    const primaryChanged = sendsPrimary;
+    const extrasChanged =
+      sendsExtras || nextExtraIds.length !== currentExtraIds.length;
+    if (primaryChanged) $set.accessDepartmentId = nextPrimary ? nextPrimary._id : null;
+    if (extrasChanged) $set.additionalDepartmentIds = nextExtraIds.map((x) => new mongoose.Types.ObjectId(x));
 
-      // Who granted/revoked which "also" departments, and when — this is the
-      // record People & Roles' history panel reads. Kept on the employee's
-      // email as `entityId`, the same key department-role changes already use
-      // (see PUT /department-roles/:slug above), so a person's whole access
-      // history — primary, extras, and any module role — reads as one
-      // timeline instead of three that each need their own lookup.
+    await Employee.updateOne({ _id: employee._id }, { $set });
+
+    /* ── 3. RECORD — only what was actually written. ─────────────────────── */
+    if (extrasChanged) {
+      const extraNames = extraDocs
+        ? extraDocs.map((d) => d.name)
+        : (employee.additionalDepartmentIds || [])
+            .filter((d) => nextExtraIds.includes(String(d._id)))
+            .map((d) => d.name);
+      audit(req, "employee.extra-departments", `${employee.email} → ${nextExtraIds.length} extra`);
+      // Keyed on the employee's email, like department-role changes, so a
+      // person's whole access history reads as one timeline.
       await recordChange(req, {
         entity: "employee-department-extra",
         entityId: employee.email,
@@ -920,47 +1132,33 @@ router.patch("/employees/:id", async (req, res) => {
         after: { extra: extraNames },
       });
 
-      if (accessDepartmentId === undefined) {
+      if (!primaryChanged) {
         return res.json({
           success: true,
-          message: extras.length
-            ? `${employee.firstName || employee.email} can now also open ${valid.map((d) => d.name).join(", ")}.`
-            : `${employee.firstName || employee.email} no longer has any extra departments.`,
+          message: extraNames.length
+            ? `${displayName} can now also open ${extraNames.join(", ")}.`
+            : `${displayName} no longer has any extra departments.`,
         });
       }
     }
 
-    if (accessDepartmentId) {
-      const dept = await AccessDepartment.findById(accessDepartmentId);
-      if (!dept) return fail(res, 400, "That department does not exist");
-      if (!dept.isActive) return fail(res, 400, `${dept.name} is not active`);
-
-      await Employee.updateOne(
-        { _id: employee._id },
-        { $set: { accessDepartmentId: dept._id } },
-      );
-
-      audit(req, "employee.assign", `${employee.email} → ${dept.name}`);
+    if (nextPrimary) {
+      audit(req, "employee.assign", `${employee.email} → ${nextPrimary.name}`);
       await recordChange(req, {
         entity: "employee-department",
         entityId: employee.email,
         entityLabel: displayName,
         action: "update",
-        summary: `${displayName}'s primary department set to ${dept.name}`,
+        summary: `${displayName}'s primary department set to ${nextPrimary.name}`,
         before: { department: oldPrimaryName },
-        after: { department: dept.name },
+        after: { department: nextPrimary.name },
       });
       return res.json({
         success: true,
-        message: `${employee.firstName || employee.email} can now sign in to ${dept.name}.`,
-        accessDepartment: { _id: dept._id, name: dept.name, slug: dept.slug },
+        message: `${displayName} can now sign in to ${nextPrimary.name}.`,
+        accessDepartment: { _id: nextPrimary._id, name: nextPrimary.name, slug: nextPrimary.slug },
       });
     }
-
-    await Employee.updateOne(
-      { _id: employee._id },
-      { $set: { accessDepartmentId: null } },
-    );
 
     audit(req, "employee.revoke", employee.email);
     await recordChange(req, {
@@ -975,7 +1173,7 @@ router.patch("/employees/:id", async (req, res) => {
     res.json({
       success: true,
       message:
-        `${employee.firstName || employee.email} can no longer sign in to any department. ` +
+        `${displayName} can no longer sign in to any department. ` +
         `This applies immediately, including to anyone already signed in.`,
       accessDepartment: null,
     });
@@ -1388,6 +1586,13 @@ router.get("/department-roles/:slug", async (req, res) => {
  */
 router.put("/department-roles/:slug", async (req, res) => {
   try {
+    if (String(req.params.slug).toLowerCase() === "ppc") {
+      return res.status(409).json({
+        success: false,
+        code: "COMPANY_SCOPED_GRANT_REQUIRED",
+        message: "PPC roles must be granted for a named company in Company & app access.",
+      });
+    }
     const { email, name, role, password, budgetDepartments } = req.body || {};
     if (!email) return fail(res, 400, "An email address is required");
 

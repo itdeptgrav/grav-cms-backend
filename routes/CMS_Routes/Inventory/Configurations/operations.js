@@ -53,11 +53,89 @@ async function autoAssignToGroups(operation) {
    OPERATIONS
 ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   THE SALARY GROUPS AN OPERATION CAN BE MAPPED TO.
+   ─────────────────────────────────────────────────────────────────────────────
+   `services/operationCosting.js` turns an operation into money by looking up
+   the AVERAGE NET SALARY of the active employees in a department/designation
+   pair. Until now nothing offered those pairs for choosing, so the register's
+   `salaryDept` / `salaryDesig` could only be filled by import — and on live
+   data 0 of 259 registered operations carried one.
+
+   Derived from the employees themselves rather than from a separate master, so
+   the list can never drift from what the salary lookup will actually match.
+
+   ── AND NO SALARY LEAVES THIS ROUTE ──────────────────────────────────────────
+   Only names and a headcount. What a group is paid is exactly the figure the
+   costing screens are not allowed to show, and putting it in a dropdown would
+   publish the payroll to everyone who can configure an operation.
+───────────────────────────────────────────────────────────────────────────── */
+router.get("/operations/salary-groups", async (req, res) => {
+  try {
+    const rows = await Employee.find({ isActive: true })
+      .select("department designation").lean()
+
+    const byDept = new Map()
+    for (const r of rows) {
+      const dept = String(r.department || "").trim()
+      if (!dept) continue
+      if (!byDept.has(dept)) byDept.set(dept, { department: dept, headcount: 0, designations: new Map() })
+      const d = byDept.get(dept)
+      d.headcount += 1
+      const desig = String(r.designation || "").trim()
+      if (!desig) continue
+      d.designations.set(desig, (d.designations.get(desig) || 0) + 1)
+    }
+
+    const departments = [...byDept.values()]
+      .map((d) => ({
+        department: d.department,
+        headcount: d.headcount,
+        designations: [...d.designations.entries()]
+          .map(([designation, headcount]) => ({ designation, headcount }))
+          .sort((a, b) => a.designation.localeCompare(b.designation)),
+      }))
+      .sort((a, b) => a.department.localeCompare(b.department))
+
+    res.json({ success: true, departments })
+  } catch (err) {
+    console.error("[operations] GET /operations/salary-groups", err)
+    res.status(500).json({ success: false, message: "Failed to read salary groups" })
+  }
+})
+
 // GET all operations
 router.get("/operations", async (req, res) => {
   try {
     const operations = await Operation.find().sort({ createdAt: -1 })
-    res.json({ success: true, operations })
+
+    /* ── DUPLICATE CODES, REPORTED RATHER THAN RESOLVED ────────────────
+       The live register holds several operations sharing one code (TS008
+       among them). Nothing here merges or deletes them: two records with one
+       code may be two real operations somebody must reconcile, and choosing
+       between them is a production decision.
+
+       What this DOES is name them, so the configuration screen can warn and
+       the costing resolver can refuse rather than silently taking whichever
+       the database returned last. */
+    const byCode = new Map()
+    for (const op of operations) {
+      const code = String(op.operationCode || "").trim().toUpperCase()
+      if (!code) continue
+      if (!byCode.has(code)) byCode.set(code, [])
+      byCode.get(code).push(op)
+    }
+    const duplicateCodes = [...byCode.entries()]
+      .filter(([, list]) => list.length > 1)
+      .map(([code, list]) => ({
+        code,
+        count: list.length,
+        ids: list.map((o) => String(o._id)),
+        names: [...new Set(list.map((o) => o.name).filter(Boolean))],
+      }))
+      .sort((a, b) => a.code.localeCompare(b.code))
+
+    res.json({ success: true, operations, duplicateCodes })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to fetch operations" })
   }

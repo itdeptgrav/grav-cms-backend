@@ -7,12 +7,15 @@ const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
 const CustomerEmailService = require('../../../services/CustomerEmailService');
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const workOrderStyleLink = require("../../../services/industrialEngineering/workOrderStyleLink.service");
+const salesLineLink = require("../../../services/production/salesLineWorkOrderLink.service");
 const Measurement = require("../../../models/Customer_Models/Measurement");
 const EmployeeProductionProgress = require("../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const mongoose = require("mongoose");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 const StockIssuance = require("../../../models/CMS_Models/Inventory/Operations/StockIssuance");
+const quotationPricing = require("../../../services/centralCosting/quotationPricing.service");
 const MeasurementSizeConfig = require("../../../models/CMS_Models/Inventory/Configurations/MeasurementSizeConfig");
 
 router.use(EmployeeAuthMiddleware);
@@ -297,35 +300,10 @@ async function resolveMeasurementRequestItems(request) {
 
       // 1) Try every size config configured for this product until one of
       //    them has a real measured value that falls inside a rule's range.
-      let resolvedVariant = null;
+      //    The rule lives in the Sales-line bridge so the release check and
+      //    this view resolve a person's size identically.
       const candidateConfigs = configsByProduct.get(pid) || [];
-      for (const cfg of candidateConfigs) {
-        const measField = (measuredProduct.measurements || []).find(
-          (m) =>
-            m.measurementName?.trim().toLowerCase() ===
-            cfg.measurementParameter?.trim().toLowerCase(),
-        );
-        const val = parseFloat(measField?.value);
-        if (measField?.value === undefined || measField.value === "" || Number.isNaN(val))
-          continue;
-        const rule = (cfg.rules || []).find((r) => val >= r.fromValue && val < r.toValue);
-        if (!rule) continue;
-
-        if (rule.variantId) {
-          resolvedVariant = (si.variants || []).find(
-            (v) => v._id.toString() === rule.variantId.toString(),
-          );
-        }
-        if (!resolvedVariant) {
-          const normSize = String(rule.sizeValue || "").trim().toLowerCase();
-          resolvedVariant = (si.variants || []).find((v) =>
-            (v.attributes || []).some(
-              (a) => String(a.value || "").trim().toLowerCase() === normSize,
-            ),
-          );
-        }
-        if (resolvedVariant) break;
-      }
+      const resolvedVariant = salesLineLink.measuredVariantFor(si, measuredProduct, candidateConfigs);
 
       // 2) No config / no matching rule / resolved variant not found on the
       //    product anymore — fall back to whatever convert-to-po already
@@ -994,7 +972,74 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const existingQuotation = request.quotations.length > 0 ? request.quotations[0] : null;
     const quotationNumber = existingQuotation ? existingQuotation.quotationNumber : `QT-${request.requestId}-001`;
 
-    const itemsWithCalculations = await Promise.all(quotationData.items.map(async (item) => {
+    /* ── APPROVED-COSTING LINES ARE PRICED BY THE SERVER ────────────────
+       The browser sends an INTENT — which style, which of the three approved
+       tiers — and never a version, a price or a provenance. Anything it did
+       send in those slots is stripped here, so a forged `costingSource` can
+       never reach a stored field or a calculation. What replaces it is read
+       from the approved version.
+
+       Every refusal is collected, not the first: being told about line 1,
+       fixing it, and then being told about line 3 is how a save takes five
+       attempts. */
+    let pricingCtx = null;
+    /* ── NOT "DID THE CLIENT ASK TO BE CHECKED" ───────────────────────
+       This used to read `.some(readIntent)`, so a client could skip the
+       whole pass — and with it the confirmed-quantity check — by omitting
+       `costingIntent`. Any line naming a style now brings the save through
+       it; whether that style is governed is decided from the enquiry. */
+    /* ── A SALES-ORIGIN REQUEST ALWAYS COMES THROUGH THE PASS ──────────
+       Its lines carry a commercial decision the enquiry's review already
+       settled, and that decision — not a tier and not a typed figure — is
+       what prices them. Asking `needsPricingPass` alone would let a client
+       skip it by sending no intent, and the line would fall through to the
+       manual path it must never take. */
+    const salesOrigin = quotationPricing.isSalesOrigin(request);
+    const needsCosting = salesOrigin || quotationPricing.needsPricingPass(quotationData.items);
+    if (needsCosting) {
+      try {
+        pricingCtx = await quotationPricing.contextFor(req.user);
+      } catch (err) {
+        return res.status(403).json({
+          success: false,
+          message: "Your account is not linked to a company, so the confirmed quantity and approved price for "
+            + "this style cannot be read.",
+          code: "QUOTATION_COSTING_CONTEXT_REQUIRED",
+        });
+      }
+    }
+    const priced = pricingCtx
+      ? await quotationPricing.priceLines(pricingCtx, quotationData.items, {
+        currency: quotationData.currency || "INR",
+        /* The request itself, so a governed line is priced from the decision
+           frozen on it rather than from anything in the body. */
+        request,
+      })
+      /* No intent anywhere: still stripped, so a line cannot arrive carrying a
+         provenance nobody resolved. */
+      : { items: (quotationData.items || []).map(quotationPricing.stripClientProvenance), errors: [] };
+
+    /* ── A FOREIGN COMPANY IS TOLD WHAT A STRANGER IS TOLD ─────────────
+       The enquiry behind this request could not be read under the acting
+       company. That is the same answer as a request that does not exist, and
+       deliberately so: an answer that varies would let anyone confirm that
+       another company's order is real. */
+    if (priced.errors.some((e) => e.notFound)) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+
+    if (priced.errors.length) {
+      /* ── THE STATUS IS PART OF THE ANSWER ─────────────────────────────
+         A line that disagrees with the confirmed commercial quantity is a
+         CONFLICT with current state, not a malformed request: the fix is to
+         re-read what Sales confirmed. A missing tier or an inapplicable
+         costing stays unprocessable-entity. Decided in one place so the two
+         save doors cannot answer differently. */
+      const refusal = quotationPricing.refusalFor(priced.errors);
+      return res.status(refusal.status).json(refusal.body);
+    }
+
+    const itemsWithCalculations = await Promise.all(priced.items.map(async (item) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
       // The floor a price can never go below — a sales person can price up
@@ -1016,6 +1061,9 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
       return {
+        /* `item` is the SERVER-RESOLVED row: the client's provenance was
+           stripped and, for a sourced line, replaced from the approved
+           version. */
         ...item, unitPrice, basePrice, gstPercentage,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
@@ -1043,6 +1091,34 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const resolvedStatus = isQuotationRegression(previousStatus, requestedStatus)
       ? previousStatus
       : requestedStatus;
+
+    /* ── SAVING STRAIGHT TO SENT IS THE SAME DOOR ───────────────────────
+       The popup can post `status: 'sent_to_customer'` and skip the Send
+       route entirely. Guarding only Send would be a guard with a way round
+       it, so the same check runs here — against the items about to be
+       written, and BEFORE anything is written. */
+    if (resolvedStatus === 'sent_to_customer' && previousStatus !== 'sent_to_customer'
+        && itemsWithCalculations.some((i) => i.costingSource && i.costingSource.source)) {
+      let verdict;
+      try {
+        const ctx = pricingCtx || await quotationPricing.contextFor(req.user);
+        verdict = await quotationPricing.verifyBeforeSend(ctx, { items: itemsWithCalculations });
+      } catch (err) {
+        return res.status(503).json({
+          success: false,
+          code: "QUOTATION_SOURCE_UNVERIFIABLE",
+          message: "The approved costings behind this quotation could not be checked. Try again.",
+          retryable: true,
+        });
+      }
+      if (!verdict.ok) {
+        /* The envelope now follows the actual finding — superseded, changed,
+           or could-not-be-checked — because the client acts on the code, and
+           the three need three different actions. */
+        const refusal = quotationPricing.sendRefusalFor(verdict);
+        return res.status(refusal.status).json(refusal.body);
+      }
+    }
 
     const quotation = {
       ...quotationData, items: itemsWithCalculations, customAdditionalCharges,
@@ -1076,6 +1152,9 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const currentQuotation = existingQuotation || request.quotations[request.quotations.length - 1];
     request.currentQuotation = currentQuotation._id;
 
+    /* The same door, reached by saving with a status of `sent_to_customer`
+       rather than by pressing Send. A guard on only one of them is a guard
+       with a way round it. */
     if (resolvedStatus === 'sent_to_customer' && previousStatus !== 'sent_to_customer') {
       currentQuotation.sentToCustomerAt = new Date();
       currentQuotation.sentBy = req.user.id;
@@ -1134,6 +1213,10 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const removedItems = [];
       request.items = request.items.filter(reqItem => {
         const iSid = (reqItem.stockItemId?._id || reqItem.stockItemId)?.toString();
+        /* A governed line is never removed by a document edit: it is the
+           record of a confirmed quantity and an approved price, and dropping
+           it here would delete the commercial decision along with it. */
+        if (reqItem?.commercialDecision?.unitPriceMinor != null) return true;
         // Keep if still present in quotation
         if (qItemSids.has(iSid)) return true;
         // Keep if it was never part of this quotation flow (e.g. measurement items)
@@ -1156,6 +1239,18 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
           return iSid === qSid;
         });
  
+        if (reqItem?.commercialDecision?.unitPriceMinor != null) {
+          /* ── THE ONE THING A PROFORMA MAY NOT DO ────────────────────────
+             This block exists so an edit in the document keeps the request in
+             step with it. On a Sales-origin line that is backwards: the
+             request's quantity is what Sales CONFIRMED and its price is what a
+             reviewer APPROVED — the proforma is downstream of both. Left in,
+             it wrote the GST-inclusive total over the approved base amount and
+             would have let a typed quantity replace the confirmed one, through
+             a flag the browser sets. */
+          continue;
+        }
+
         if (reqItem) {
           // Find matching variant by attributes, fall back to first
           const variant = qAttrs.length > 0
@@ -1212,6 +1307,20 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
 
     res.json({ success: true, message: existingQuotation ? "Quotation updated successfully" : "Quotation created successfully", quotation: currentQuotation, request });
   } catch (error) {
+    /* ── TWO TABS SAVING ONE DOCUMENT ──────────────────────────────────
+       Mongoose's own version check refuses the second write, which is the
+       right outcome — one draft, not two — but it arrived as an opaque 500
+       telling somebody their proforma had broken. It is a conflict, it is
+       retryable, and the fix is to reload the document the other save
+       produced. Said in those words. */
+    if (error?.name === "VersionError") {
+      return res.status(409).json({
+        success: false,
+        code: "QUOTATION_CONCURRENT_SAVE",
+        retryable: true,
+        message: "This proforma was saved somewhere else a moment ago. Reload it and make your change again.",
+      });
+    }
     console.error("Error saving quotation:", error);
     res.status(500).json({ success: false, message: "Server error while saving quotation" });
   }
@@ -1324,7 +1433,74 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
     if (!quotation) return res.status(404).json({ success: false, message: "Quotation not found" });
     if (quotation.status !== 'draft') return res.status(400).json({ success: false, message: "Only draft quotations can be updated" });
 
-    const itemsWithCalculations = await Promise.all(quotationData.items.map(async (item) => {
+    /* ── APPROVED-COSTING LINES ARE PRICED BY THE SERVER ────────────────
+       The browser sends an INTENT — which style, which of the three approved
+       tiers — and never a version, a price or a provenance. Anything it did
+       send in those slots is stripped here, so a forged `costingSource` can
+       never reach a stored field or a calculation. What replaces it is read
+       from the approved version.
+
+       Every refusal is collected, not the first: being told about line 1,
+       fixing it, and then being told about line 3 is how a save takes five
+       attempts. */
+    let pricingCtx = null;
+    /* ── NOT "DID THE CLIENT ASK TO BE CHECKED" ───────────────────────
+       This used to read `.some(readIntent)`, so a client could skip the
+       whole pass — and with it the confirmed-quantity check — by omitting
+       `costingIntent`. Any line naming a style now brings the save through
+       it; whether that style is governed is decided from the enquiry. */
+    /* ── A SALES-ORIGIN REQUEST ALWAYS COMES THROUGH THE PASS ──────────
+       Its lines carry a commercial decision the enquiry's review already
+       settled, and that decision — not a tier and not a typed figure — is
+       what prices them. Asking `needsPricingPass` alone would let a client
+       skip it by sending no intent, and the line would fall through to the
+       manual path it must never take. */
+    const salesOrigin = quotationPricing.isSalesOrigin(request);
+    const needsCosting = salesOrigin || quotationPricing.needsPricingPass(quotationData.items);
+    if (needsCosting) {
+      try {
+        pricingCtx = await quotationPricing.contextFor(req.user);
+      } catch (err) {
+        return res.status(403).json({
+          success: false,
+          message: "Your account is not linked to a company, so the confirmed quantity and approved price for "
+            + "this style cannot be read.",
+          code: "QUOTATION_COSTING_CONTEXT_REQUIRED",
+        });
+      }
+    }
+    const priced = pricingCtx
+      ? await quotationPricing.priceLines(pricingCtx, quotationData.items, {
+        currency: quotationData.currency || "INR",
+        /* The request itself, so a governed line is priced from the decision
+           frozen on it rather than from anything in the body. */
+        request,
+      })
+      /* No intent anywhere: still stripped, so a line cannot arrive carrying a
+         provenance nobody resolved. */
+      : { items: (quotationData.items || []).map(quotationPricing.stripClientProvenance), errors: [] };
+
+    /* ── A FOREIGN COMPANY IS TOLD WHAT A STRANGER IS TOLD ─────────────
+       The enquiry behind this request could not be read under the acting
+       company. That is the same answer as a request that does not exist, and
+       deliberately so: an answer that varies would let anyone confirm that
+       another company's order is real. */
+    if (priced.errors.some((e) => e.notFound)) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+
+    if (priced.errors.length) {
+      /* ── THE STATUS IS PART OF THE ANSWER ─────────────────────────────
+         A line that disagrees with the confirmed commercial quantity is a
+         CONFLICT with current state, not a malformed request: the fix is to
+         re-read what Sales confirmed. A missing tier or an inapplicable
+         costing stays unprocessable-entity. Decided in one place so the two
+         save doors cannot answer differently. */
+      const refusal = quotationPricing.refusalFor(priced.errors);
+      return res.status(refusal.status).json(refusal.body);
+    }
+
+    const itemsWithCalculations = await Promise.all(priced.items.map(async (item) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
       const unitPrice = parseFloat(item.unitPrice) || 0;
@@ -1840,7 +2016,26 @@ function replanUnitRange(progress, newQty, woMaxUnitEnd, woNumber) {
 // Build a work order for a single product/variant that the PO did not carry
 // before. Same shape as the ones createWorkOrdersAndProgress emits, so the
 // shop floor cannot tell them apart.
-async function createWorkOrderForVariant(request, stockItem, variantData, quantity, userId) {
+async function createWorkOrderForVariant(request, stockItem, variantData, quantity, userId, actingCompanyId = null) {
+  /* ── IE CHUNK 1D ──────────────────────────────────────────────────────
+     Same rule as the main generator, and proved before anything is built:
+     this order's style is the one on the request line for THIS product. A
+     product the request does not carry, or carries twice with different
+     styles, refuses rather than guessing. */
+  const sampleStyleId = workOrderStyleLink.styleFromRequestLine(
+    request, stockItem._id, { label: stockItem.name || "this product" },
+  );
+  /* ── THE EXACT SALES LINE, NOT THE FIRST ONE CARRYING THE PRODUCT ──────
+     Selected by product AND size; two lines that both fit refuse. The line
+     is then given a stored permanent reference before anything points at
+     it, and the company is the proved owner of its style. */
+  const line = salesLineLink.requireLineForProductVariant(
+    request, stockItem._id, variantData._id, { label: stockItem.name || "this product" },
+  );
+  const { linkFor } = await salesLineLink.proveReleaseLines(
+    request, [sampleStyleId], { expectedCompanyId: actingCompanyId, lines: [line] },
+  );
+
   const operations = (stockItem.operations || []).map((op) => ({
     operationType: op.type || op.name || op.operationType,
     operationCode: op.operationCode || op.code || "",
@@ -1867,6 +2062,8 @@ async function createWorkOrderForVariant(request, stockItem, variantData, quanti
 
   const workOrder = new WorkOrder({
     customerRequestId: request._id,
+    salesLineLink: linkFor(line),
+    sampleStyleId,
     stockItemId: stockItem._id,
     stockItemName: stockItem.name,
     stockItemReference: stockItem.reference || "",
@@ -2119,6 +2316,13 @@ router.get("/requests/:requestId/person/:employeeId/edit-context", async (req, r
 
 router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
   try {
+    /* ── IE CHUNK 1D — WHOSE PRODUCTION IS THIS? ────────────────────────
+       Resolved from the actor's own membership through the shared company
+       context service — the same one Store, Central Costing and the IE
+       boundary use. The header only SELECTS among memberships they hold; a
+       multi-company actor who names none is refused rather than defaulted,
+       and a non-member is refused non-disclosingly. */
+    const actingCompanyId = await workOrderStyleLink.resolveActingCompany(req, "production release");
     const { requestId, employeeId } = req.params;
     const { person, products } = req.body || {};
 
@@ -2241,7 +2445,14 @@ router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
       // one be created instead. Reductions still see every order, so an existing
       // progress row is always found and reported against honestly.
       const findWO = (pid, vid, { liveOnly = false } = {}) => {
-        const pool = liveOnly ? allWOs.filter((w) => !DEAD_WO_STATUSES.includes(w.status)) : allWOs;
+        let pool = liveOnly ? allWOs.filter((w) => !DEAD_WO_STATUSES.includes(w.status)) : allWOs;
+        /* A WorkOrder proved to belong to ANOTHER line of this order is never
+           the right one, however well its product and size match. Historical
+           unlinked orders stay eligible exactly as before. */
+        const { line } = salesLineLink.selectLineForProductVariant(request, pid, vid);
+        if (line?.lineRef) {
+          pool = pool.filter((w) => !w.salesLineLink?.lineRef || w.salesLineLink.lineRef === line.lineRef);
+        }
         const byVariant = vid ? pool.find((w) => w.stockItemId?.toString() === pid && w.variantId === vid) : null;
         if (byVariant) return byVariant;
         return pool.find((w) => w.stockItemId?.toString() === pid) || null;
@@ -2251,7 +2462,20 @@ router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
       // variant when the person is being moved onto a product the PO doesn't
       // carry yet.
       const resolveRequestSlot = async (pid, vid, wo) => {
-        let item = request.items.find((i) => (i.stockItemId?._id || i.stockItemId)?.toString() === pid);
+        /* The exact line: the one this person's WorkOrder is linked to, else
+           the one line carrying this product in this size — never simply the
+           first line that carries the product. */
+        let item = null;
+        if (wo?.salesLineLink?.lineRef) {
+          item = request.items.find((i) => i.lineRef === wo.salesLineLink.lineRef) || null;
+          if (!item) return { error: "the order line this work order belongs to is no longer on the order" };
+        } else {
+          const picked = salesLineLink.selectLineForProductVariant(request, pid, vid);
+          if (picked.reason === "ambiguous") {
+            return { error: "this product appears on several order lines and nothing says which one these units belong to" };
+          }
+          item = picked.line;
+        }
         let stockItem = null;
 
         if (!item) {
@@ -2326,9 +2550,17 @@ router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
           if (!variantData) { blocked.push({ key, product: label, reason: "product has no variant to manufacture" }); continue; }
           // Built at the final quantity, so its BOM snapshot is scaled correctly
           // from the outset — the delta pass below must therefore skip it.
-          wo = await createWorkOrderForVariant(request, stockItem, variantData, newQty, req.user?.id);
+          wo = await createWorkOrderForVariant(request, stockItem, variantData, newQty, req.user?.id, actingCompanyId);
           allWOs.push(wo);
           woIsNew = true;
+        }
+
+        /* Which order line these units belong to must be answerable BEFORE
+           any progress row or quantity is touched below. */
+        if (!wo?.salesLineLink?.lineRef
+          && salesLineLink.selectLineForProductVariant(request, pid, vid).reason === "ambiguous") {
+          blocked.push({ key, product: label, reason: "this product appears on several order lines and nothing says which one these units belong to" });
+          continue;
         }
 
         // ── Guard rails on the work order ──────────────────────────────────
@@ -2537,6 +2769,10 @@ router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
       priceMovement,
     });
   } catch (err) {
+    /* IE Chunk 1D: typed linkage/company refusals keep their status and code. */
+    if (err && err.name === "StorePurchaseError") {
+      return workOrderStyleLink.sendTypedError(res, err, "");
+    }
     console.error("change person error:", err);
     res.status(500).json({
       success: false,
@@ -2639,6 +2875,37 @@ router.post("/requests/:requestId/quotation/send", async (req, res) => {
     if (!['draft', 'rejected', 'expired'].includes(quotation.status)) {
       return res.status(400).json({ success: false, message: `Quotation is already '${quotation.status}' and cannot be re-sent` });
     }
+    /* ── NOTHING REACHES A CUSTOMER WITHOUT RE-CHECKING ITS SOURCE ──────
+       A stamp records what was true when the line was priced. Between then
+       and now the costing can have been revised and re-approved, or the line
+       edited. Sending is the moment the number leaves the building, so it is
+       the moment to look again — and nothing is repaired silently, because a
+       quotation is an offer and sending a different price from the one on
+       screen is worse than refusing. Manual lines are unaffected. */
+    const sourced = (quotation.items || []).some((i) => i.costingSource && i.costingSource.source);
+    if (sourced) {
+      let verdict;
+      try {
+        const ctx = await quotationPricing.contextFor(req.user);
+        verdict = await quotationPricing.verifyBeforeSend(ctx, quotation);
+      } catch (err) {
+        /* The check itself failed. "Still current" is not a conclusion this
+           earned, so it refuses and says the attempt can be repeated. */
+        return res.status(503).json({
+          success: false,
+          code: "QUOTATION_SOURCE_UNVERIFIABLE",
+          message: "The approved costings behind this quotation could not be checked. Try again.",
+          retryable: true,
+        });
+      }
+      if (!verdict.ok) {
+        /* Same three answers, same shape, from the same helper — the two send
+           doors cannot disagree about what a refusal means. */
+        const refusal = quotationPricing.sendRefusalFor(verdict);
+        return res.status(refusal.status).json(refusal.body);
+      }
+    }
+
     quotation.status = 'sent_to_customer'; quotation.sentToCustomerAt = new Date(); quotation.sentBy = req.user.id; quotation.updatedAt = new Date();
     syncRequestStatusFromQuotation(request, quotation); request.updatedAt = new Date();
     request.quotationNotifications.push({ type: 'customer_approval', message: 'Quotation sent to customer for approval', actionRequired: false, createdAt: new Date() });
@@ -2671,7 +2938,7 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
 // SHARED HELPER — WO + EmployeeProductionProgress creation
 // Used by both sales-approve and mark-internal-order
 // ═══════════════════════════════════════════════════════════════════════════════
-async function createWorkOrdersAndProgress(request, userId) {
+async function createWorkOrdersAndProgress(request, userId, actingCompanyId = null) {
   const isMeasurementOrder = !!(request.requestType === "measurement_conversion" || request.measurementId);
   const orderType = isMeasurementOrder ? "measurement_conversion" : "customer_request";
 
@@ -2682,31 +2949,53 @@ async function createWorkOrdersAndProgress(request, userId) {
       .lean();
   }
 
-  // Measurement-PO orders: WOs get created here, one per stockItem/variant in
-  // request.items — but request.items was built at convert-to-po time by
-  // dumping every person onto whichever variant they already had (defaulting
-  // to stockItem.variants[0], "any random/common variant" per the product
-  // owner). That means every WO — and its BOM snapshot — got created against
-  // the WRONG size. Re-resolve the real per-person variant via the Settings
-  // size config right here, BEFORE any WO exists, so the WO itself (not just
-  // a later display) is correct. request.items itself (pricing/summary,
-  // already saved to the customer) is left untouched — only the LOCAL loop
-  // below uses the corrected breakdown.
-  let effectiveItems = request.items;
-  let employeeVariantMap = null;
-  if (isMeasurementOrder && request.measurementId) {
-    try {
-      const resolved = await resolveMeasurementRequestItems(request);
-      if (resolved.items?.length) {
-        effectiveItems = resolved.items;
-        employeeVariantMap = resolved.employeeVariantMap;
-      }
-    } catch (resolveErr) {
-      console.error("[createWorkOrdersAndProgress] Measurement size-config resolution (non-fatal):", resolveErr.message);
-    }
-  }
+  /* ── ONE WORK ORDER, ONE CONFIRMED SALES LINE ────────────────────────
+     Measurement-PO lines were built at convert-to-po from each person's
+     stored size (variants[0] when unset). This factory used to regroup every
+     person by their MEASURED size across lines, so one WorkOrder could mix
+     people from two Sales lines and no WorkOrder could name its line.
+
+     Now the confirmed line comes first: people are grouped by the line they
+     are on, then by size, and a person whose measured size disagrees with
+     their line — or a line whose people do not add up to its quantity — is
+     refused with the correction Sales must make. Nobody is moved silently and
+     the commercial order is never changed here. Nothing is written when this
+     throws. */
+  const effectiveItems = request.items;
+  const lineMembers = isMeasurementOrder && measurement
+    ? await salesLineLink.planMeasurementRelease(request)
+    : null;
+
+  /* ── IE CHUNK 1D — PROVE EVERY STYLE BEFORE THE FIRST WRITE ───────────
+     Each work order below must carry the exact style its customer-request
+     line names. Resolving that inside the loop would leave the first two
+     orders saved and the third refused, so the whole batch is proved HERE and
+     the release refuses as a whole if any line cannot answer. Nothing is
+     written — no work order, no progress row, no reverse link, no
+     notification — when this throws.
+
+     No company context exists on this legacy Sales route (it resolves none
+     today), so no acting company is passed; `assertStylesUsable` still refuses
+     a release whose lines reach two companies. */
+  const styleByProduct = await workOrderStyleLink.preflightRequestLines(
+    request,
+    effectiveItems.map((i) => ({ stockItemId: i.stockItemId, label: i.stockItemName || "this product" })),
+    /* The acting company, proved from the actor's own membership by the caller
+       and passed in. A style outside it refuses non-disclosingly. */
+    { expectedCompanyId: actingCompanyId },
+  );
+
+  /* Every line gets a stored permanent reference and the release a proved
+     company, still before the first write. */
+  const { linkFor } = await salesLineLink.proveReleaseLines(
+    request, [...styleByProduct.values()], { expectedCompanyId: actingCompanyId },
+  );
 
   const createdWorkOrders = [];
+  /* Products that reached production with no operation route. Collected
+     rather than thrown on the first one, so somebody fixing three products
+     is told about three. */
+  const unroutedProducts = [];
   const skippedVariants = [];
   const createdProgressDocs = [];
 
@@ -2743,12 +3032,40 @@ async function createWorkOrdersAndProgress(request, userId) {
         continue;
       }
 
-      const operations = stockItem.operations.map(op => ({
+      /* ── THE ROUTE COMES FROM THE PRODUCT, AND IT HAS TO EXIST ────────
+         A work order's operations are its route: what has to be done to the
+         garment, in order. They are read from the registered product, which
+         is where R&D records them.
+
+         ── AND ZERO IS NOT A ROUTE ──────────────────────────────────────
+         A sample style can reach production before its product has any
+         operations, and this used to create the work order anyway. What came
+         out was a job with `Operations: 0`, `Barcodes needed: 0` and
+         `Production: 0%` — a work order that could be planned, scanned
+         against and marked complete while never being able to progress,
+         because there was nothing to progress THROUGH. Six production scans
+         were accepted against exactly such an order and moved it from 0/6 to
+         0/6.
+
+         So it is refused here, where the fact is known, and the refusal names
+         the product and the action that fixes it. Nothing is invented: an
+         operation picked from the global master would be a route nobody
+         designed. */
+      const operations = (stockItem.operations || []).map(op => ({
         operationType: op.type || op.name || op.operationType,
         operationCode: op.operationCode || op.code || "",
         plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
         status: "pending",
-      }));
+      })).filter((op) => String(op.operationType || "").trim());
+
+      if (!operations.length) {
+        unroutedProducts.push({
+          stockItemId: String(item.stockItemId),
+          productName: stockItem.name || item.stockItemName || "this product",
+          reference: stockItem.reference || item.stockItemReference || "",
+        });
+        continue;
+      }
 
       let rawMaterials = [];
       if (variantData.rawItems?.length > 0) {
@@ -2771,8 +3088,21 @@ async function createWorkOrdersAndProgress(request, userId) {
       const variantAttributes = variant.attributes || [];
       if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
 
-      const workOrder = new WorkOrder({
+      /* A release retried after a partial failure (some orders saved, the
+         request not) finds the order it already made for this exact line and
+         size and carries on with it, rather than making a second one. */
+      const alreadyReleased = await salesLineLink.existingReleaseWorkOrder(
+        request._id, item.lineRef, variantData._id,
+      );
+
+      const workOrder = alreadyReleased || new WorkOrder({
         customerRequestId: request._id, stockItemId: item.stockItemId,
+        /* The one confirmed Sales line this order makes, and its proved
+           company — written in this original save, never afterwards. */
+        salesLineLink: linkFor(item),
+        /* IE Chunk 1D: the exact line's style, proved in the pre-flight above
+           and written as part of this order's original save. */
+        sampleStyleId: styleByProduct.get(String(item.stockItemId)),
         stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
         variantId: variantData._id.toString(), variantAttributes,
         quantity: variant.quantity, customerId: request.customerId,
@@ -2783,7 +3113,7 @@ async function createWorkOrdersAndProgress(request, userId) {
         estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
         actualCost: 0, createdBy: userId,
       });
-      await workOrder.save();
+      if (!alreadyReleased) await workOrder.save();
 
       createdWorkOrders.push({
         _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
@@ -2791,47 +3121,14 @@ async function createWorkOrdersAndProgress(request, userId) {
         variantId: variantData._id.toString(),
         quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
         autoSelectedVariant: usedFallback,
+        lineRef: item.lineRef,
+        ...(alreadyReleased ? { reusedExisting: true } : {}),
       });
 
       if (isMeasurementOrder && measurement) {
-        const stockIdStr = item.stockItemId.toString();
-        const woVariantIdStr = variantData._id.toString();
-        const employeeEntries = [];
-
-        for (const empM of measurement.employeeMeasurements || []) {
-          // Prefer the size-config resolution's own map — it knows each
-          // person's REAL resolved variant. Falls back to the old
-          // productId/variantId heuristic only when resolution didn't run
-          // (e.g. no size config exists yet for this product).
-          let productEntry;
-          if (employeeVariantMap) {
-            const resolvedVariantId = employeeVariantMap.get(`${empM.employeeId?.toString()}_${stockIdStr}`);
-            if (resolvedVariantId !== woVariantIdStr) continue;
-            productEntry = (empM.products || []).find(p => {
-              const pIdMatch = p.productId?.toString() === stockIdStr;
-              return pIdMatch || (!p.productId && p.productName === item.stockItemName);
-            });
-          } else {
-            productEntry = (empM.products || []).find(p => {
-              const pIdMatch = p.productId?.toString() === stockIdStr;
-              if (!pIdMatch) {
-                if (p.productId) return false;
-                if (p.productName !== item.stockItemName) return false;
-                if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-                return true;
-              }
-              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-              if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
-              return true;
-            });
-          }
-          if (!productEntry) continue;
-          employeeEntries.push({
-            employeeId: empM.employeeId, employeeName: empM.employeeName,
-            employeeUIN: empM.employeeUIN, gender: empM.gender,
-            quantity: productEntry.quantity || variant.quantity,
-          });
-        }
+        /* Exactly the people on THIS line in THIS size, as proved by the
+           release plan above — no product-name or size heuristics. */
+        const employeeEntries = lineMembers?.get(item)?.get(String(variant.variantId)) || [];
 
         if (employeeEntries.length > 0) {
           const woNumber = workOrder.workOrderNumber;
@@ -2899,14 +3196,41 @@ async function createWorkOrdersAndProgress(request, userId) {
     console.error("[createWorkOrdersAndProgress] production notify dispatch failed:", err.message);
   }
 
-  return { createdWorkOrders, skippedVariants, createdProgressDocs };
+  /* Named so the caller can tell the person what to fix and where. */
+  return { createdWorkOrders, skippedVariants, createdProgressDocs, unroutedProducts };
 }
+
+/**
+ * The refusal a product with no operation route earns.
+ *
+ * ── WHY IT NAMES THE R&D ACTION ─────────────────────────────────────────────
+ * "No work orders were created" is true and useless. The thing that is
+ * missing is the product's operation route, the place it is recorded is the
+ * R&D technical record, and a message that does not say so leaves somebody
+ * clicking Approve again.
+ */
+const unroutedRefusal = (unroutedProducts) => ({
+  success: false,
+  code: "PRODUCTION_ROUTE_MISSING",
+  message: unroutedProducts.length === 1
+    ? `${unroutedProducts[0].productName} has no operation route, so it cannot go to production. Record its operations on the technical record in R&D first.`
+    : `${unroutedProducts.length} products have no operation route, so they cannot go to production. Record their operations on the technical record in R&D first.`,
+  unroutedProducts,
+  remedy: "RECORD_OPERATIONS_IN_RND",
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SALES APPROVAL — now delegates WO creation to shared helper
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
+    /* ── IE CHUNK 1D — WHOSE PRODUCTION IS THIS? ────────────────────────
+       Resolved from the actor's own membership through the shared company
+       context service — the same one Store, Central Costing and the IE
+       boundary use. The header only SELECTS among memberships they hold; a
+       multi-company actor who names none is refused rather than defaulted,
+       and a non-member is refused non-disclosingly. */
+    const actingCompanyId = await workOrderStyleLink.resolveActingCompany(req, "production release");
     const { requestId } = req.params;
     // acknowledgeNoCustomerApproval — the sales person has been shown the
     // "no customer approval, no advance payment" warning and chose to push the
@@ -2984,7 +3308,16 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     request.updatedAt = new Date();
     request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== "sales_approval_required");
 
-    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
+    const {
+      createdWorkOrders, skippedVariants, createdProgressDocs, unroutedProducts,
+    } = await createWorkOrdersAndProgress(request, req.user.id, actingCompanyId);
+
+    /* ── A PRODUCT WITH NO ROUTE STOPS THE RELEASE ────────────────────
+       Refused before `request.save()`, so nothing is recorded as released
+       to production when part of it could not be. */
+    if (unroutedProducts.length) {
+      return res.status(409).json(unroutedRefusal(unroutedProducts));
+    }
 
     await request.save();
 
@@ -3005,8 +3338,9 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
-    console.error("Error processing sales approval:", error);
-    res.status(500).json({ success: false, message: "Server error while processing approval" });
+    /* IE Chunk 1D: a typed linkage or company refusal keeps its registered
+       status, code and actionable message. Anything else is still a 500. */
+    return workOrderStyleLink.sendTypedError(res, error, "Server error while processing approval");
   }
 });
 
@@ -3015,6 +3349,13 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
   try {
+    /* ── IE CHUNK 1D — WHOSE PRODUCTION IS THIS? ────────────────────────
+       Resolved from the actor's own membership through the shared company
+       context service — the same one Store, Central Costing and the IE
+       boundary use. The header only SELECTS among memberships they hold; a
+       multi-company actor who names none is refused rather than defaulted,
+       and a non-member is refused non-disclosingly. */
+    const actingCompanyId = await workOrderStyleLink.resolveActingCompany(req, "production release");
     const { requestId } = req.params;
 
     const request = await CustomerRequest.findById(requestId);
@@ -3042,7 +3383,15 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
     if (!request.salesPersonAssigned) request.salesPersonAssigned = req.user.id;
 
     // Run the exact same WO + employee progress creation as a normal sales-approve
-    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
+    const {
+      createdWorkOrders, skippedVariants, createdProgressDocs, unroutedProducts,
+    } = await createWorkOrdersAndProgress(request, req.user.id, actingCompanyId);
+
+    /* Same refusal on this door: an internal order is still production, and
+       a product with no route cannot be produced. Before `request.save()`. */
+    if (unroutedProducts.length) {
+      return res.status(409).json(unroutedRefusal(unroutedProducts));
+    }
 
     request.notes = request.notes || [];
     request.notes.push({
@@ -3063,8 +3412,9 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
-    console.error("Error marking internal order:", error);
-    res.status(500).json({ success: false, message: "Server error while marking internal order" });
+    /* IE Chunk 1D: a typed linkage or company refusal keeps its registered
+       status, code and actionable message. Anything else is still a 500. */
+    return workOrderStyleLink.sendTypedError(res, error, "Server error while marking internal order");
   }
 });
 

@@ -16,6 +16,64 @@ const Employee = require("../../../../models/Employee");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 
 const EmbroideryRecord = require("../../../../models/CMS_Models/Manufacturing/Embroidery/EmbroideryRecord");
+const SpCompanyMembership = require("../../../../models/CMS_Models/StorePurchase/SpCompanyMembership");
+
+/* Who may use Embroidery's floor, and whose work it is — see
+   embroideryAccess.js. Reading needs viewer, recording a scan needs editor.
+   The manufacturing-order read is shared with the project manager's
+   Embroidery tab, so it is company-scoped without the department gate. */
+const emb = require("./embroideryAccess");
+const canRead = [emb.embroideryDepartment("viewer"), emb.embroideryCompany];
+const canRecord = [emb.embroideryDepartment("editor"), emb.embroideryCompany];
+const stageTargets = require("../../../../services/production/embroideryStageTarget.service");
+
+/* PPC's published embroidery targets, answered by Embroidery. Declared before
+   the ":moId" route below so "stage-targets" is never read as an order id. */
+router.use("/stage-targets", require("./stageTargetRoutes"));
+
+/**
+ * The operator who did the embroidery, resolved from employee records.
+ *
+ * The floor screen sends a biometric id — the number on the badge — and
+ * nothing else is believed: the name, identity id, department and designation
+ * are read from the employee record, so a browser cannot record a piece under
+ * somebody else's name. An unknown or inactive badge is refused.
+ *
+ * Their OWN company cannot be proved from an employee record (it carries
+ * none), so when membership rows exist for them one must match the acting
+ * company; when none exist the scan is allowed and says `unproven` rather
+ * than assigning a company by department or name.
+ */
+async function resolveOperator(biometricId, companyId) {
+  const id = String(biometricId ?? "").trim();
+  if (!id) return { error: { status: 400, message: "Biometric ID is required" } };
+
+  const employee = await Employee.findOne({ biometricId: id })
+    .select("firstName middleName lastName biometricId identityId department designation isActive status email")
+    .lean();
+  if (!employee) return { error: { status: 404, message: `No employee found with ID "${id}".` } };
+  if (employee.isActive === false || employee.status === "inactive") {
+    return { error: { status: 403, message: "This employee account is inactive." } };
+  }
+
+  const memberships = await SpCompanyMembership.find({
+    isActive: true,
+    $or: [
+      { employeeRef: employee._id },
+      ...(employee.email ? [{ email: String(employee.email).toLowerCase() }] : []),
+    ],
+  }).select("companyId").lean();
+  if (memberships.length && !memberships.some((m) => String(m.companyId) === String(companyId))) {
+    /* Their memberships are known, and this company is not one of them. */
+    return { error: { status: 404, message: `No employee found with ID "${id}".` } };
+  }
+
+  return {
+    employee,
+    companyProof: memberships.length ? "membership" : "unproven",
+    name: [employee.firstName, employee.middleName, employee.lastName].filter(Boolean).join(" ").trim() || id,
+  };
+}
 
 // ─── Helpers (same semantics as qcRoutes.js) ─────────────────────────────────
 
@@ -41,13 +99,15 @@ const shortIdOf = (id) => String(id).slice(16, 24);
 const barcodeFor = (woId, unit) =>
   `WO-${shortIdOf(woId)}-${String(unit).padStart(3, "0")}`;
 
-const findWorkOrderByShortId = async (shortId) => {
+const findWorkOrderByShortId = async (shortId, companyId) => {
   const matches = await WorkOrder.aggregate([
     {
       $match: {
         $expr: {
           $eq: [{ $substrCP: [{ $toString: "$_id" }, 16, 8] }, shortId],
         },
+        /* The printed barcode is unchanged; what it may reach is not. */
+        ...emb.workOrderScope(companyId),
       },
     },
     { $limit: 1 },
@@ -62,6 +122,7 @@ const findWorkOrderByShortId = async (shortId) => {
         status: 1,
         variantAttributes: 1,
         customerRequestId: 1,
+        salesLineLink: 1,
       },
     },
   ]);
@@ -88,6 +149,32 @@ const resolveImage = (wo, stockItem) => {
   return stockItem.images?.[0] || null;
 };
 
+/**
+ * The embroidery records this company may read.
+ *
+ * Rows written since the scan started stamping a company are matched on it.
+ * A row from before that carries none: rather than hiding it from everybody
+ * or showing it to everybody, its work order is asked — the Sales-line link
+ * is authoritative, and a row whose work order cannot prove this company is
+ * not this company's to read.
+ */
+const scopeRecordsToCompany = async (rows, companyId) => {
+  const mine = [];
+  const unproven = [];
+  for (const r of rows) {
+    if (r.companyId && String(r.companyId) === String(companyId)) mine.push(r);
+    else if (!r.companyId) unproven.push(r);
+  }
+  if (!unproven.length) return mine;
+  const woIds = [...new Set(unproven.map((r) => String(r.workOrderId || "")).filter(Boolean))];
+  const linked = woIds.length
+    ? await WorkOrder.find({ _id: { $in: woIds }, ...emb.workOrderScope(companyId) }).select("_id").lean()
+    : [];
+  const ours = new Set(linked.map((w) => String(w._id)));
+  return [...mine, ...unproven.filter((r) => ours.has(String(r.workOrderId || "")))]
+    .sort((a, b) => new Date(b.scannedAt || 0) - new Date(a.scannedAt || 0));
+};
+
 // Which piece numbers on this work order still have no record.
 const pendingUnitsFor = (total, doneUnits) => {
   const done = new Set(doneUnits);
@@ -99,51 +186,23 @@ const pendingUnitsFor = (total, doneUnits) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /signin
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/signin", async (req, res) => {
+router.post("/signin", ...canRead, async (req, res) => {
   try {
-    const { biometricId } = req.body;
-    if (!biometricId || !String(biometricId).trim())
-      return res
-        .status(400)
-        .json({ success: false, message: "Biometric ID is required" });
-
-    const id = String(biometricId).trim();
-
-    const employee = await Employee.findOne({ biometricId: id })
-      .select(
-        "firstName middleName lastName biometricId identityId department designation isActive status",
-      )
-      .lean();
-
-    if (!employee)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `No employee found with ID "${id}".`,
-        });
-
-    if (employee.isActive === false || employee.status === "inactive")
-      return res
-        .status(403)
-        .json({
-          success: false,
-          message: "This employee account is inactive.",
-        });
-
-    const name =
-      [employee.firstName, employee.middleName, employee.lastName]
-        .filter(Boolean)
-        .join(" ")
-        .trim() || id;
+    const resolved = await resolveOperator(req.body?.biometricId, req.embroidery.companyId);
+    if (resolved.error) {
+      return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
+    }
+    const { employee, name, companyProof } = resolved;
 
     const today = istDateString();
+    const scope = { companyId: req.embroidery.companyId };
     const [mine, dept] = await Promise.all([
       EmbroideryRecord.countDocuments({
+        ...scope,
         date: today,
         operatorBiometricId: employee.biometricId,
       }),
-      EmbroideryRecord.countDocuments({ date: today }),
+      EmbroideryRecord.countDocuments({ ...scope, date: today }),
     ]);
 
     res.json({
@@ -154,6 +213,8 @@ router.post("/signin", async (req, res) => {
         identityId: employee.identityId || "",
         department: employee.department || "",
         designation: employee.designation || "",
+        /* Whether this operator's own company could be proved. */
+        companyProof,
       },
       today: { date: today, piecesDone: mine, departmentTotal: dept },
     });
@@ -171,19 +232,28 @@ router.post("/signin", async (req, res) => {
 // Look up the piece AND mark it complete in the same round trip. If a record
 // already exists we do not create a second one; we return what's already there.
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/scan", async (req, res) => {
+router.post("/scan", ...canRecord, async (req, res) => {
   try {
-    const { barcode, operatorName, operatorBiometricId, operatorIdentityId } =
-      req.body;
+    /* The barcode and the badge are the only things believed from the body:
+       the operator's name and identity are read from their employee record,
+       and the work order's details from the work order. */
+    const { barcode, operatorBiometricId } = req.body;
 
     if (!barcode)
       return res
         .status(400)
         .json({ success: false, message: "barcode is required" });
-    if (!operatorName || !operatorBiometricId)
+    if (!operatorBiometricId)
       return res
         .status(400)
         .json({ success: false, message: "Operator is not signed in" });
+
+    const resolved = await resolveOperator(operatorBiometricId, req.embroidery.companyId);
+    if (resolved.error) {
+      return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
+    }
+    const operator = resolved.employee;
+    const operatorName = resolved.name;
 
     const trimmed = String(barcode).trim();
     const parsed = parseBarcode(trimmed);
@@ -196,7 +266,11 @@ router.post("/scan", async (req, res) => {
 
     const { workOrderShortId, unitNumber } = parsed;
 
-    const workOrder = await findWorkOrderByShortId(workOrderShortId);
+    /* This company's work only. A work order of another company, and a
+       historical one whose company cannot be proved from its Sales-line link,
+       are the same answer as a barcode nobody has — and neither can be
+       scanned. Nothing is matched by style, buyer, number or product name. */
+    const workOrder = await findWorkOrderByShortId(workOrderShortId, req.embroidery.companyId);
     if (!workOrder)
       return res.status(404).json({
         success: false,
@@ -266,9 +340,18 @@ router.post("/scan", async (req, res) => {
             manufacturingOrderId: piece.moNumber,
             productName: piece.productName,
             variantLabel: piece.variantLabel,
+            /* Read from the employee record, never from the body. */
             operatorName,
-            operatorBiometricId: String(operatorBiometricId).trim(),
-            operatorIdentityId: operatorIdentityId || "",
+            operatorBiometricId: operator.biometricId,
+            operatorIdentityId: operator.identityId || "",
+            operatorEmployeeId: operator._id,
+            operatorCompanyProof: resolved.companyProof,
+            /* And the signed-in user or station that sent it — on a shared
+               terminal, not the person who did the work. */
+            submittedBy: { id: req.user?.id, name: req.user?.name || "", email: req.user?.email || "" },
+            /* Whose work it is, from the work order's own Sales-line link. */
+            companyId: req.embroidery.companyId,
+            orderLineRef: workOrder.salesLineLink?.lineRef || "",
             scannedAt: new Date(),
           })
         ).toObject();
@@ -288,10 +371,11 @@ router.post("/scan", async (req, res) => {
         .select("unitNumber")
         .lean(),
       EmbroideryRecord.countDocuments({
+        companyId: req.embroidery.companyId,
         date: istDateString(),
-        operatorBiometricId: String(operatorBiometricId).trim(),
+        operatorBiometricId: operator.biometricId,
       }),
-      EmbroideryRecord.countDocuments({ date: istDateString() }),
+      EmbroideryRecord.countDocuments({ companyId: req.embroidery.companyId, date: istDateString() }),
     ]);
 
     const doneUnits = doneRows.map((r) => r.unitNumber);
@@ -325,7 +409,7 @@ router.post("/scan", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /records — ?from= &to= &operator= &search= &limit=
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/records", async (req, res) => {
+router.get("/records", ...canRead, async (req, res) => {
   try {
     const { from, to, operator, search } = req.query;
     const limit = Math.min(parseInt(req.query.limit, 10) || 500, 2000);
@@ -357,20 +441,18 @@ router.get("/records", async (req, res) => {
 
     const dateScope = q.date ? { date: q.date } : {};
 
-    const [records, operators] = await Promise.all([
-      EmbroideryRecord.find(q).sort({ scannedAt: -1 }).limit(limit).lean(),
-      EmbroideryRecord.aggregate([
-        { $match: dateScope },
-        {
-          $group: {
-            _id: "$operatorBiometricId",
-            name: { $first: "$operatorName" },
-            count: { $sum: 1 },
-          },
-        },
-        { $sort: { count: -1 } },
-      ]),
-    ]);
+    /* Read wide, then keep only what this company can prove is its own —
+       and count the operators from exactly those rows. */
+    void dateScope;
+    const found = await EmbroideryRecord.find(q).sort({ scannedAt: -1 }).limit(limit).lean();
+    const records = await scopeRecordsToCompany(found, req.embroidery.companyId);
+    const byOperator = new Map();
+    for (const r of records) {
+      const key = r.operatorBiometricId || "";
+      if (!byOperator.has(key)) byOperator.set(key, { _id: key, name: r.operatorName || "", count: 0 });
+      byOperator.get(key).count += 1;
+    }
+    const operators = [...byOperator.values()].sort((a, b) => b.count - a.count);
 
     res.json({
       success: true,
@@ -395,7 +477,7 @@ router.get("/records", async (req, res) => {
 // Hour buckets are computed in JS rather than with $hour + timezone, so this
 // works on any MongoDB version regardless of tz database availability.
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/overview", async (req, res) => {
+router.get("/overview", ...canRead, async (req, res) => {
   try {
     const date = req.query.date || istDateString();
     const days = Math.min(parseInt(req.query.days, 10) || 14, 90);
@@ -410,13 +492,17 @@ router.get("/overview", async (req, res) => {
     }
     const previousDay = dayKeys[dayKeys.length - 2] || null;
 
-    const [dayRecords, trendRows] = await Promise.all([
-      EmbroideryRecord.find({ date }).sort({ scannedAt: -1 }).lean(),
-      EmbroideryRecord.aggregate([
-        { $match: { date: { $in: dayKeys } } },
-        { $group: { _id: "$date", pieces: { $sum: 1 } } },
-      ]),
+    const [dayRecords, trendRecords] = await Promise.all([
+      EmbroideryRecord.find({ date }).sort({ scannedAt: -1 }).lean()
+        .then((rows) => scopeRecordsToCompany(rows, req.embroidery.companyId)),
+      EmbroideryRecord.find({ date: { $in: dayKeys } })
+        .select("date companyId workOrderId scannedAt").lean()
+        .then((rows) => scopeRecordsToCompany(rows, req.embroidery.companyId)),
     ]);
+    /* Counted from this company's rows only. */
+    const trendCounts = new Map();
+    for (const r of trendRecords) trendCounts.set(r.date, (trendCounts.get(r.date) || 0) + 1);
+    const trendRows = [...trendCounts.entries()].map(([_id, pieces]) => ({ _id, pieces }));
 
     const trendMap = new Map(trendRows.map((r) => [r._id, r.pieces]));
     const trend = dayKeys.map((d) => ({
@@ -525,11 +611,16 @@ router.get("/overview", async (req, res) => {
 // flag. It mirrors cuttingMasterRoutes.js: every work order that has left
 // "pending", grouped under its MO, with embroidery progress layered on top.
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/queue", async (req, res) => {
+router.get("/queue", ...canRead, async (req, res) => {
   try {
     const search = (req.query.search || "").trim().toLowerCase();
 
-    const workOrders = await WorkOrder.find({ status: { $ne: "pending" } })
+    /* This company's linked work orders only — a historical one whose company
+       cannot be proved is in no company's queue. */
+    const workOrders = await WorkOrder.find({
+      status: { $ne: "pending" },
+      ...emb.workOrderScope(req.embroidery.companyId),
+    })
       .select(
         "workOrderNumber stockItemName stockItemId stockItemReference quantity status variantAttributes customerRequestId createdAt",
       )
@@ -545,6 +636,11 @@ router.get("/queue", async (req, res) => {
       });
 
     const woIds = workOrders.map((w) => w._id);
+    /* PPC's target in force for each of this company's work orders — read
+       only; Embroidery answers them on its own door. */
+    const targetByWorkOrder = await stageTargets.targetsByWorkOrder(
+      req.embroidery.companyId, woIds.map(String),
+    );
     const crIds = [
       ...new Set(
         workOrders
@@ -615,6 +711,10 @@ router.get("/queue", async (req, res) => {
         nextUnit: pending[0] ?? null,
         nextBarcode: pending[0] != null ? barcodeFor(wo._id, pending[0]) : null,
         lastScan: c?.lastScan || null,
+        /* PPC's published target for this work order, if it has one. One
+           target covers the whole Sales line: several work orders of that
+           line show the same one, and it is answered once. */
+        ppcTarget: targetByWorkOrder.get(String(wo._id)) || null,
         state:
           done === 0
             ? "not_started"
@@ -641,6 +741,10 @@ router.get("/queue", async (req, res) => {
       }
       const group = orderMap.get(key);
       group.workOrders.push(row);
+      if (row.ppcTarget) {
+        group.ppcTargets = group.ppcTargets || new Map();
+        group.ppcTargets.set(row.ppcTarget.publicationId, row.ppcTarget);
+      }
       group.total += row.total;
       group.done += row.done;
       group.pending += row.pending;
@@ -648,6 +752,9 @@ router.get("/queue", async (req, res) => {
 
     let orders = [...orderMap.values()].map((g) => ({
       ...g,
+      /* The order's distinct targets, and how many still await an answer. */
+      ppcTargets: [...(g.ppcTargets?.values() || [])],
+      awaitingPpcTargetCount: [...(g.ppcTargets?.values() || [])].filter((t) => t.awaitingResponse).length,
       percent: g.total ? Math.round((g.done / g.total) * 100) : 0,
       state:
         g.done === 0
@@ -703,6 +810,11 @@ router.get("/queue", async (req, res) => {
 
     res.json({
       success: true,
+      /* What this signed-in person may do with a published target, decided by
+         the server from their live Embroidery grant — so the screen offers
+         Accept and Refuse only to somebody who may use them. The answer
+         routes enforce it regardless. */
+      access: { canRespond: await emb.canAnswerTargets(req) },
       orders,
       totals: {
         orders: orders.length,
@@ -723,16 +835,21 @@ router.get("/queue", async (req, res) => {
 // for the Project Manager's per-MO "Embroidery" tab: WO-wise done/pending,
 // operator leaderboard, and a day-wise trend across this MO's work orders.
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/manufacturing-orders/:moId", async (req, res) => {
+/* Shared with the project manager's Embroidery tab, so it is company-scoped
+   without the Embroidery-only guard. */
+router.get("/manufacturing-orders/:moId", emb.embroideryCompany, async (req, res) => {
   try {
     const { moId } = req.params;
     if (!mongoose.Types.ObjectId.isValid(moId)) {
       return res.status(400).json({ success: false, message: "Invalid MO id" });
     }
 
+    /* Another company's order, and one whose work orders cannot prove a
+       company, are answered exactly like an order that does not exist. */
     const workOrders = await WorkOrder.find({
       customerRequestId: moId,
       status: { $ne: "pending" },
+      ...emb.workOrderScope(req.embroidery.companyId),
     })
       .select("workOrderNumber stockItemName stockItemReference quantity variantAttributes stockItemId")
       .lean();

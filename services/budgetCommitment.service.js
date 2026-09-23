@@ -40,11 +40,94 @@ const money = (v) => {
 async function committedByLine(lineIds = []) {
   const ids = lineIds.filter(Boolean);
   if (!ids.length) return new Map();
-  const rows = await Commitment.aggregate([
-    { $match: { budgetLineId: { $in: ids }, status: "committed" } },
+
+  /* ── TWO SHAPES, COUNTED ONCE EACH ────────────────────────────────────────
+   * A commitment written before line-wise allocation has one head and one
+   * top-level `amount`. One written since carries `allocations[]`, and its
+   * top-level `amount` is the WHOLE request — which may span several heads and
+   * must never be charged to any single one of them.
+   *
+   * So the two paths are mutually exclusive by construction: the legacy branch
+   * requires `allocations` to be absent or empty, and the line-wise branch
+   * requires it to exist. A document can satisfy exactly one, which is what
+   * stops a new commitment being counted through both.
+   *
+   * `status: "committed"` on both: a released promise no longer blocks a line,
+   * and an unbudgeted one never had a line to block.
+   */
+  const legacyRows = await Commitment.aggregate([
+    {
+      $match: {
+        budgetLineId: { $in: ids },
+        /* A legacy document is whole-document: `committed` or nothing. It can
+           never be `partially_released`, which only line-wise rows produce. */
+        status: "committed",
+        /* Absent, null, or an empty array — every shape a pre-B3A document
+           can have. A `$size: 0` alone would miss the ones with no field. */
+        $or: [
+          { allocations: { $exists: false } },
+          { allocations: null },
+          { allocations: { $size: 0 } },
+        ],
+      },
+    },
     { $group: { _id: "$budgetLineId", total: { $sum: "$amount" } } },
   ]);
-  return new Map(rows.map((r) => [String(r._id), money(r.total)]));
+
+  const lineWiseRows = await Commitment.aggregate([
+    {
+      $match: {
+        /* ── PARTIALLY RELEASED IS STILL LIVE ───────────────────────────
+           A four-line request with one line billed is not a released
+           commitment: three heads are still promised. Matching only
+           `committed` here would drop the whole document the moment its first
+           bill posted — the same bug B3B exists to fix, moved one level up. */
+        status: { $in: ["committed", "partially_released"] },
+        allocations: { $exists: true, $ne: null, $not: { $size: 0 } },
+        "allocations.budgetLineId": { $in: ids },
+      },
+    },
+    { $unwind: "$allocations" },
+    /* After unwinding, only the rows for the lines actually asked about.
+       An unbudgeted allocation is already excluded by the id match — it
+       carries a null `budgetLineId`, which is what actually keeps it from
+       reducing anything. The status filter beside it is defensive rather than
+       load-bearing today, and is kept because B3B will write per-allocation
+       release, at which point it becomes the thing that matters. */
+    {
+      $match: {
+        "allocations.budgetLineId": { $in: ids },
+        /* A fully released row blocks nothing; a partially released one still
+           blocks what is left of it. */
+        "allocations.status": { $in: ["committed", "partially_released"] },
+      },
+    },
+    /* ── WHAT IS STILL PROMISED, NOT WHAT WAS ───────────────────────────
+       `amount` is the approved figure and never changes — summing it would
+       keep a line blocking its head in full after the bill for it posted.
+       `remainingAmount` is the live number. It is absent on rows written
+       before B3B, which have released nothing, so it falls back to `amount`
+       rather than reading as zero and quietly freeing the head. */
+    {
+      $addFields: {
+        "allocations.live": {
+          $cond: [
+            { $eq: [{ $type: "$allocations.remainingAmount" }, "missing"] },
+            "$allocations.amount",
+            "$allocations.remainingAmount",
+          ],
+        },
+      },
+    },
+    { $group: { _id: "$allocations.budgetLineId", total: { $sum: "$allocations.live" } } },
+  ]);
+
+  const out = new Map();
+  for (const r of [...legacyRows, ...lineWiseRows]) {
+    const key = String(r._id);
+    out.set(key, money((out.get(key) || 0) + money(r.total)));
+  }
+  return out;
 }
 
 /**
@@ -166,21 +249,49 @@ async function dormantLineFor({ companyId, department, ledgerId }) {
  * two approvals arriving together would both find nothing and both insert.
  * `upsert` with that index is the one thing that cannot double-count.
  */
-async function commit({ request, actor, expectedPaymentDate = null }) {
+async function commit({ request, actor, expectedPaymentDate = null, allocations = null }) {
   const existing = await Commitment.findOne({ spendRequestId: request._id }).lean();
   if (existing) return { commitment: existing, created: false };
 
   const matched = request.budgetMatchStatus === "matched" && request.budgetLineId;
+
+  /* ── ONE HEAD OR SEVERAL ──────────────────────────────────────────────────
+   * `allocations` arrives already validated from the finance decision — every
+   * row's head checked against this department's approved lines, every group
+   * checked cumulatively. This function does not re-decide any of that; it
+   * decides only what the DOCUMENT looks like.
+   *
+   * The distinct heads, counted from what actually consumes budget. Two lines
+   * on Raw Materials are one head, not two. */
+  const rows = Array.isArray(allocations) && allocations.length ? allocations : null;
+  const heads = rows
+    ? [...new Set(rows.filter((a) => a.budgetLineId).map((a) => String(a.budgetLineId)))]
+    : [];
+  /* Line-wise the moment there is more than one head, OR more than one line —
+     two lines on one head still need their own rows, because B3B has to map a
+     voucher line back to the allocation it releases. */
+  const lineWise = !!rows && (heads.length > 1 || rows.length > 1);
+
   const doc = {
     spendRequestId: request._id,
     spendRequestNumber: request.requestNumber,
     companyId: request.companyId,
-    budgetId: matched ? request.budgetCycleId : undefined,
-    budgetLineId: matched ? request.budgetLineId : undefined,
-    financialYear: request.budgetFinancialYear || undefined,
+    /* ── NO FAKE PRIMARY HEAD ─────────────────────────────────────────────
+       On a single-head commitment these stay exactly as they always were, so
+       every existing reader, report and compatibility path is untouched.
+
+       On a line-wise one they are deliberately ABSENT. With fabric on Raw
+       Materials, freight on Freight and a repair on Repairs, naming one of
+       them at the top would be a figure every report reads and no human ever
+       chose — and picking "the biggest" or "the first" is an invention that
+       looks like a decision. `allocations[]` carries the real answer and
+       `headCount` says how many there are. */
+    budgetId: lineWise ? undefined : (matched ? request.budgetCycleId : undefined),
+    budgetLineId: lineWise ? undefined : (matched ? request.budgetLineId : undefined),
+    financialYear: lineWise ? undefined : (request.budgetFinancialYear || undefined),
     department: request.budgetDepartment || request.department,
-    ledgerId: request.ledgerId,
-    ledgerName: request.ledgerName,
+    ledgerId: lineWise ? undefined : request.ledgerId,
+    ledgerName: lineWise ? undefined : request.ledgerName,
     /* ── THE FIGURE THAT WILL ACTUALLY LEAVE THE BANK ────────────────────
        `totalAmount` is the SUBTOTAL. Committing that under-reserved the head
        by the tax on every request that carried any — a ₹1,416 purchase
@@ -195,9 +306,26 @@ async function commit({ request, actor, expectedPaymentDate = null }) {
         ? request.grandTotal
         : request.totalAmount,
     ),
-    /* An unbudgeted promise is still a promise. It has no line to reduce,
-       which is precisely why finance has to be able to total them. */
-    status: matched ? "committed" : "unbudgeted",
+    /* ── COMMITTED IF ANY PART OF IT CONSUMES A BUDGET ────────────────────
+       An unbudgeted promise is still a promise: it has no line to reduce,
+       which is precisely why finance has to be able to total them. With
+       allocations, the document is `committed` when at least one row consumes
+       an approved line and `unbudgeted` only when none does — a request that
+       is half budgeted is not an unbudgeted request. */
+    status: rows
+      ? (rows.some((a) => a.status === "committed") ? "committed" : "unbudgeted")
+      : (matched ? "committed" : "unbudgeted"),
+
+    /* ── REMAINING STARTS AT THE FULL AMOUNT ────────────────────────────
+       Set here rather than left for the first release to compute, so a
+       commitment nobody has billed still answers "how much is outstanding?"
+       — the reconciliation screen reads it, and an absent value would show
+       as a blank on every unbilled commitment. */
+    allocations: rows
+      ? rows.map((r) => ({ ...r, releasedAmount: 0, remainingAmount: money(r.amount) }))
+      : undefined,
+    allocationMode: rows ? (lineWise ? "line_wise" : "single_head") : undefined,
+    headCount: rows ? heads.length : undefined,
     /* ── WHEN THE MONEY IS EXPECTED TO LEAVE ────────────────────────────
        Cash timing, and NOT the request's `neededBy`. One is when the
        department needs the thing; this is when the company expects to pay.
@@ -213,7 +341,10 @@ async function commit({ request, actor, expectedPaymentDate = null }) {
     committedBy: actor?.email || "",
     committedByName: actor?.name || "",
     committedAt: new Date(),
-    snapshot: request.budgetSnapshot
+    /* On a line-wise commitment the top-level snapshot could only ever
+       describe one of the heads, so it is left off and each allocation
+       carries its own. */
+    snapshot: lineWise ? undefined : (request.budgetSnapshot
       ? {
           approved: request.budgetSnapshot.approved,
           committedBefore: request.budgetSnapshot.committedBefore,
@@ -221,7 +352,7 @@ async function commit({ request, actor, expectedPaymentDate = null }) {
           availableBefore: request.budgetSnapshot.availableBefore,
           availableAfter: request.budgetSnapshot.availableAfter,
         }
-      : undefined,
+      : undefined),
   };
 
   try {

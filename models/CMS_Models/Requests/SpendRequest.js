@@ -225,6 +225,56 @@ const lineSchema = new mongoose.Schema(
       default: undefined,
     },
 
+    /* ── WHERE THIS DEMAND CAME FROM, WHEN IT CAME FROM A COSTING ──────────
+       A line raised from an approved costing's procurement projection carries
+       the exact record it was derived from: which costing, which frozen
+       version, which quantity scenario, and which line of that version.
+
+       ── WHY THE FIGURES ARE STORED AGAIN HERE ──────────────────────────────
+       `quantity`, `unit`, `rate` and `amount` above are the REQUEST's — they
+       are what Store and finance act on, and Store may legitimately revise
+       them during sourcing. These are what the COSTING projected, frozen at
+       handoff. Keeping both is what makes "Store ordered 750 m against a
+       projection of 700 m" a question somebody can ask; storing one would
+       silently overwrite the other's answer.
+
+       ── AND IT IS PROVENANCE, NOT AUTHORITY ────────────────────────────────
+       Nothing here lets a request alter the costing. It is a backward
+       reference for tracing and for duplicate-demand detection, which is why
+       the duplicate check reads THESE fields rather than matching on a name.
+
+       Additive and absent everywhere else: every request raised by hand, by
+       intake classification or before this existed has no such block and
+       behaves exactly as it did. */
+    costingDemandSource: {
+      type: new mongoose.Schema(
+        {
+          source: { type: String, trim: true, enum: ["APPROVED_COSTING_PROJECTION"], required: true },
+          costingId: { type: mongoose.Schema.Types.ObjectId, ref: "Costing", required: true },
+          costingVersionId: { type: mongoose.Schema.Types.ObjectId, ref: "CostingVersion", required: true },
+          costingVersionNumber: { type: Number, default: null },
+          scenarioKey: { type: String, trim: true, required: true },
+          /* The frozen version's own key for the cost line. Stable across
+             versions, which is what makes "what happened to the lining
+             requirement" answerable. */
+          costingLineKey: { type: String, trim: true, required: true },
+          /* The projection's own handle for this requirement, so a later
+             reader can line the request up against a regenerated projection
+             without re-deriving the pairing. */
+          projectionRequirementId: { type: String, trim: true, default: "" },
+          projectedAt: { type: Date, default: null },
+          /* Strings: a projected quantity is a decimal, and storing it as a
+             float is the drift the costing engine spends its life avoiding. */
+          projectedQuantity: { type: String, trim: true, default: "" },
+          projectedUnit: { type: String, trim: true, default: "" },
+          projectedAmountMinor: { type: Number, default: null },
+          currency: { type: String, trim: true, default: "" },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
+
 
     /* ── THE QUOTE THIS LINE WAS PRICED FROM ────────────────────────────────
        Commercial terms used to live only on the request, on the reasoning that
@@ -320,6 +370,42 @@ const spendRequestSchema = new mongoose.Schema(
 
     title: { type: String, required: true, trim: true },
     requestType: { type: String, enum: REQUEST_TYPES, required: true },
+
+    /* ── THE COSTING THIS WHOLE REQUEST WAS RAISED FROM ────────────────────
+       A compact summary of what every line's `costingDemandSource` already
+       says, so "which requests came out of this approved version" is one
+       indexed query rather than a scan through line arrays.
+
+       `handoffKey` is the idempotency key the creation ran under. It is the
+       join between the Product draft and the Service draft raised by the same
+       action — the two are one decision, and without it a reader cannot tell
+       a pair from two unrelated requests that happen to share a costing.
+
+       Additive and absent on every request that was not raised this way. */
+    costingSource: {
+      type: new mongoose.Schema(
+        {
+          source: { type: String, trim: true, enum: ["APPROVED_COSTING_PROJECTION"], required: true },
+          costingId: { type: mongoose.Schema.Types.ObjectId, ref: "Costing", required: true },
+          costingVersionId: { type: mongoose.Schema.Types.ObjectId, ref: "CostingVersion", required: true },
+          costingVersionNumber: { type: Number, default: null },
+          scenarioKey: { type: String, trim: true, required: true },
+          handoffKey: { type: String, trim: true, default: "" },
+          /* ── BOTH DATES, AND WHY THEY DIFFER ────────────────────────────
+             The projection's date is the CUSTOMER's, from Sales. Purchasing
+             may legitimately need a different one — material has to land
+             before it can be cut — but overwriting the first with the second
+             loses the fact that somebody disagreed with it, and with it the
+             ability to ask who was right. Both are kept, with the reason. */
+          sourceRequiredDate: { type: Date, default: null },
+          requestedRequiredDate: { type: Date, default: null },
+          requiredDateReason: { type: String, trim: true, default: "" },
+          createdAt: { type: Date, default: null },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
 
     /* Who asked. `requestedById` is the biometricId, which is what approver
        routing keys on everywhere else in this app — see mrfApprover.service. */
@@ -669,6 +755,14 @@ const spendRequestSchema = new mongoose.Schema(
 
 spendRequestSchema.index({ requestedBy: 1, createdAt: -1 });
 spendRequestSchema.index({ status: 1, createdAt: -1 });
+/* ── DUPLICATE DEMAND IS FOUND BY STORED IDENTITY, NEVER BY NAME ───────────
+   "Has this requirement already been requested" is answered from the costing
+   provenance the handoff wrote. Sparse, so the millions of requests that
+   carry no costing source are not in it. */
+spendRequestSchema.index(
+  { "costingSource.costingVersionId": 1, "costingSource.scenarioKey": 1, status: 1 },
+  { sparse: true },
+);
 /* The approvals queue's own read: what is addressed to me and still waiting. */
 spendRequestSchema.index({ approverBiometricId: 1, status: 1, createdAt: 1 });
 spendRequestSchema.index({ approverAltIds: 1, status: 1 });
@@ -681,9 +775,16 @@ spendRequestSchema.pre("validate", async function (next) {
     const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, "0");
     const prefix = `SPR-${yy}${mm}-`;
+    /* ── READ IN THIS DOCUMENT'S OWN SESSION ──────────────────────────
+       Without it, two requests created inside one transaction both read the
+       state before either was written, both compute the same sequence, and
+       the unique index rejects the second — so an atomic pair of drafts
+       could never be created at all. `$session()` is undefined outside a
+       transaction, which is exactly the previous behaviour. */
     const last = await mongoose
       .model("SpendRequest")
       .findOne({ requestNumber: { $regex: `^${prefix}` } })
+      .session(this.$session() || null)
       .sort({ requestNumber: -1 })
       .lean();
     const seq = last ? parseInt(last.requestNumber.slice(-4), 10) + 1 : 1;

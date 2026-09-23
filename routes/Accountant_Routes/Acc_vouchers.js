@@ -18,7 +18,24 @@ const {
   Acc_Group,
   Acc_StockItem,
 } = require("../../models/Accountant_model/Acc_MasterModels");
-const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const accAuth = require("../../Middlewear/AccountantAuthMiddleware");
+const { accountantAuth } = accAuth;
+
+/* These five endpoints are GETs that CREATE. `findOrRestoreLedger` below
+   resolves a ledger by name and, when it is missing, creates it — and when it
+   exists but is deactivated, reactivates it. The verb says read; the effect is
+   a new or revived accounting object, so the permission has to be the one that
+   describes the effect. `canEdit`, not `canView`: an Editor building a voucher
+   still triggers exactly what it always did, and a Viewer is refused before
+   anything is written. The URLs are unchanged. */
+// Resolved per request rather than at module load. The guard has ONE
+// implementation — `requireCapability` on the façade — and this keeps it that
+// way while still loading under the partial `jest.mock`s that several suites
+// use for this router. A mock that omits it fails loudly on the first request
+// to one of these five routes, which is the correct signal, instead of
+// silently skipping the check.
+const canEditLedgers = (req, res, next) =>
+  accAuth.requireCapability("canEdit")(req, res, next);
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
@@ -45,16 +62,19 @@ const auth = accountantAuth;
  * ────────────────────────────────────────────────────────────────────────── */
 const budgetControl = require("../../services/budgetControl.service");
 
-/* The bill-matching rules used by the four /match routes near the bottom of
-   this file. This import was missing: the routes referenced `billMatching`
-   directly, so every one of them threw "billMatching is not defined" the
-   moment it was called. Locally a nodemon reload masked it often enough to
-   look intermittent; on the server it failed every time. */
-const billMatching = require("../../services/billMatching.service");
-const { settlementOf } = require("../../services/poSettlement.service");
-const {
-  applyDefaultNarration,
-} = require("../../services/voucherNarration.service");
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 
 /**
  * Run work inside a transaction, retrying the ones Mongo says to retry.
@@ -70,6 +90,32 @@ const {
  * errors the driver itself labels transient (or the lock-timeout that carries
  * no label): anything else is a real failure and is thrown straight out.
  */
+/* ══ AFTER THE TRANSACTION, NEVER INSIDE IT ═════════════════════════════════
+ *
+ * A `post("save")` hook fires while a transactional save's transaction is
+ * still open, and a reread outside that session sees the PRE-transaction
+ * document — so a cancellation reread as `posted` and left its commitment
+ * released. The hook now stands aside for any save carrying a session, and
+ * every route that owns a voucher transaction calls this once
+ * `commitTransaction()` has returned.
+ *
+ * ── AND WHY A FAILURE HERE IS VISIBLE, NOT SWALLOWED ────────────────────────
+ * The accounting has committed and must stand. A reconciliation that could
+ * not run leaves the commitment exactly as it was — which is the truthful
+ * state, repairable by reposting — and says so on the response rather than
+ * being reported as reconciled.
+ */
+async function reconcileAfterCommit(voucherId, actor) {
+  if (!voucherId) return null;
+  try {
+    const release = require("../../services/commitmentRelease.service");
+    return await release.reconcileVoucher({ voucherId, actor });
+  } catch (e) {
+    console.error("[voucher] reconciliation after commit failed:", e.message);
+    return { reconciled: false, why: "error", message: e.message };
+  }
+}
+
 async function inTransaction(work, { attempts = 3 } = {}) {
   let lastError;
   for (let i = 0; i < attempts; i += 1) {
@@ -412,7 +458,176 @@ function loadCMSStockItem() {
   }
 }
 
-router.get("/stock-items", auth, async (req, res) => {
+
+/* ══ PROVENANCE AND LINE IDENTITY, DERIVED ON THE SERVER ═════════════════════
+ *
+ * ── THE GAP THIS CLOSES ─────────────────────────────────────────────────────
+ * Service Order billing already derived `spendRequestId` and
+ * `budgetCommitmentId` from the order and overwrote whatever the client sent.
+ * A PO-linked purchase voucher did not: it carried whatever provenance the
+ * form happened to include, which in practice was none — so a bill for goods
+ * had no link to the request it was paying for, and the commitment behind it
+ * could never be released correctly.
+ *
+ * ── AND WHY THE LINE IDS ARE NEVER THE CLIENT'S ─────────────────────────────
+ * `spendLineId` decides which budget allocation a bill line discharges. A
+ * client that could set it could point a bill at whichever allocation had the
+ * most budget left. So every one is re-derived here from the authoritative
+ * order, matched by the ORDER LINE the entry names — and an entry naming no
+ * order line simply gets none, which is what makes it release nothing.
+ */
+
+/* ══ THE PROMISE MEETS THE ACTUAL ═══════════════════════════════════════════
+ *
+ * Posting a bill discharges the part of the commitment its lines cover — and
+ * only that part. Before this, release was whole-document: a bill for one line
+ * of a four-line request freed the budget on all four, and three heads got
+ * money back that nothing had been billed against.
+ *
+ * ── POSTING IS NEVER BLOCKED BY THIS ────────────────────────────────────────
+ * The voucher IS the actual. If the commitment cannot be resolved — no link,
+ * no mapped lines, a commitment from another company — the posting stands and
+ * the commitment stays live carrying a visible reason. Refusing a real
+ * supplier bill because a promise could not be reconciled would be a far worse
+ * failure than an unreleased commitment somebody can see and fix.
+ */
+/* ── THE RELEASE LIVES IN THE MODEL HOOK ────────────────────────────────────
+ * Three helpers stood here — a release, a restore and a summary — and none of
+ * them is called any more. They are deleted rather than left: a second
+ * implementation of "which part of the promise does this discharge" is a
+ * second answer waiting for somebody to wire it back up, and the whole point
+ * of this correction is that there is exactly one.
+ *
+ * See `commitmentRelease.orchestrate`, reached from the voucher's post-save
+ * hook — the one chokepoint every posting path passes through.
+ */
+
+/**
+ * Stamp `spendLineId` on service bill lines, from the linked Service Order.
+ *
+ * The service chain already carried `ServiceOrder.lines[].spendLineId`; what
+ * it lacked was a way for a BILL line to say which order line it is. The form
+ * now returns `serviceOrderLineId`, and this resolves it — the client's own
+ * `spendLineId` is deleted first, exactly as on the goods path.
+ */
+async function applyServiceOrderLineIdentity(body) {
+  if (!body?.serviceOrderId) return { applied: false };
+
+  const ServiceOrder = require("../../models/CMS_Models/Inventory/Operations/ServiceOrder");
+  const so = await ServiceOrder.findById(body.serviceOrderId)
+    .select("_id companyId lines").lean().catch(() => null);
+  if (!so) return { applied: false };
+  if (body.companyId && so.companyId && String(body.companyId) !== String(so.companyId)) {
+    return { applied: false, why: "different_company" };
+  }
+
+  const byLine = new Map();
+  for (const l of so.lines || []) {
+    if (l.spendLineId) byLine.set(String(l._id), String(l.spendLineId));
+  }
+
+  let mapped = 0;
+  for (const e of Array.isArray(body.inventoryEntries) ? body.inventoryEntries : []) {
+    delete e.spendLineId;
+    if (e.serviceOrderLineId && byLine.has(String(e.serviceOrderLineId))) {
+      e.spendLineId = byLine.get(String(e.serviceOrderLineId));
+      mapped += 1;
+    }
+  }
+  return { applied: true, mappedLines: mapped, orderLines: byLine.size };
+}
+
+async function applyPurchaseOrderProvenance(body) {
+  if (!body?.purchaseOrderId) return { applied: false };
+
+  const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  const Commitment = require("../../models/Accountant_model/Acc_BudgetCommitment");
+
+  const po = await PurchaseOrder.findById(body.purchaseOrderId)
+    .select("_id poNumber spendRequestId spendRequestNumber companyId items")
+    .lean()
+    .catch(() => null);
+  if (!po) return { applied: false };
+
+  /* One company's bill must never carry another's request or commitment. */
+  if (body.companyId && po.companyId && String(body.companyId) !== String(po.companyId)) {
+    return { applied: false, why: "different_company" };
+  }
+
+  if (po.spendRequestId) {
+    body.spendRequestId = String(po.spendRequestId);
+    body.spendRequestNumber = po.spendRequestNumber || body.spendRequestNumber || "";
+
+    const commitment = await Commitment.findOne({
+      spendRequestId: po.spendRequestId,
+      ...(po.companyId ? { companyId: po.companyId } : {}),
+    }).select("_id companyId spendRequestId").lean().catch(() => null);
+
+    /* Defence in depth: anything that somehow crossed either boundary is
+       dropped rather than attached. */
+    if (commitment
+      && (!po.companyId || String(commitment.companyId) === String(po.companyId))
+      && String(commitment.spendRequestId) === String(po.spendRequestId)) {
+      body.budgetCommitmentId = String(commitment._id);
+    }
+  }
+
+  /* ── THE LINE IDS ────────────────────────────────────────────────────────
+     `poItemId` is the key, because it is the only one that is unique. Two PO
+     lines can name the SAME raw item — two rolls of the same fabric bought
+     against two different request lines — and item, amount and position tell
+     them apart in none of those cases.
+
+     A raw-item fallback exists ONLY for orders raised before the form carried
+     `poItemId`, and only where exactly one line matches. Where several do, the
+     entry stays unmapped and says so: releasing the wrong allocation would be
+     worse than releasing none, and it would look entirely correct. */
+  const byOrderLine = new Map();
+  const rawItemCounts = new Map();
+  for (const it of po.items || []) {
+    if (!it.spendLineId) continue;
+    byOrderLine.set(String(it._id), String(it.spendLineId));
+    if (it.rawItem) {
+      const k = String(it.rawItem);
+      const seen = rawItemCounts.get(k) || { count: 0, spendLineId: null };
+      seen.count += 1;
+      seen.spendLineId = String(it.spendLineId);
+      rawItemCounts.set(k, seen);
+    }
+  }
+
+  let mapped = 0;
+  let ambiguous = 0;
+  for (const e of Array.isArray(body.inventoryEntries) ? body.inventoryEntries : []) {
+    /* Whatever the client sent is discarded first — including a plausible id.
+       A client that could set `spendLineId` could point a bill at whichever
+       allocation had the most budget left. */
+    delete e.spendLineId;
+
+    if (e.poItemId && byOrderLine.has(String(e.poItemId))) {
+      e.spendLineId = byOrderLine.get(String(e.poItemId));
+      mapped += 1;
+      continue;
+    }
+
+    const rawKey = e.rawItem || e.stockItemId ? String(e.rawItem || e.stockItemId) : null;
+    const seen = rawKey ? rawItemCounts.get(rawKey) : null;
+    if (seen && seen.count === 1) {
+      e.spendLineId = seen.spendLineId;
+      mapped += 1;
+    } else if (seen && seen.count > 1) {
+      /* Several order lines carry this item. Unmapped, deliberately. */
+      ambiguous += 1;
+    }
+  }
+
+  return {
+    applied: true, mappedLines: mapped, ambiguousLines: ambiguous,
+    orderLines: byOrderLine.size,
+  };
+}
+
+router.get("/stock-items", auth, companyScope, async (req, res) => {
   try {
     const { companyId, q, limit = 500 } = req.query;
     if (!companyId)
@@ -491,7 +706,7 @@ router.get("/stock-items", auth, async (req, res) => {
   }
 });
 
-router.get("/cash-bank-ledgers", auth, async (req, res) => {
+router.get("/cash-bank-ledgers", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId) {
@@ -574,7 +789,7 @@ router.get("/cash-bank-ledgers", auth, async (req, res) => {
 /* List & filter                                                       */
 /* ------------------------------------------------------------------ */
 
-router.get("/", auth, async (req, res) => {
+router.get("/", auth, companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -784,7 +999,7 @@ async function resolveSalesReturnsLedger(companyId) {
 }
 
 /* GET /invoice-lookup — list sales invoices to credit against         */
-router.get("/invoice-lookup", auth, async (req, res) => {
+router.get("/invoice-lookup", auth, companyScope, async (req, res) => {
   try {
     const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
       req.query;
@@ -993,7 +1208,7 @@ router.get("/cn-reason-codes", auth, (req, res) => {
 });
 
 /* GET /sales-returns-ledger — resolve or auto-create                  */
-router.get("/sales-returns-ledger", auth, async (req, res) => {
+router.get("/sales-returns-ledger", auth, companyScope, canEditLedgers, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1007,7 +1222,7 @@ router.get("/sales-returns-ledger", auth, async (req, res) => {
 });
 
 /* GET /gst-output-ledgers — CGST/SGST/IGST Payable                    */
-router.get("/gst-output-ledgers", auth, async (req, res) => {
+router.get("/gst-output-ledgers", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1149,7 +1364,7 @@ async function resolveSalesLedger(companyId, kind) {
   return findOrRestoreLedger({ companyId, nameRx, name, build: buildSales });
 }
 
-router.get("/sales-ledgers", auth, async (req, res) => {
+router.get("/sales-ledgers", auth, companyScope, canEditLedgers, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1220,7 +1435,7 @@ async function resolvePurchaseLedger(companyId, kind) {
   return findOrRestoreLedger({ companyId, nameRx, name, build: buildPurchase });
 }
 
-router.get("/purchase-ledgers", auth, async (req, res) => {
+router.get("/purchase-ledgers", auth, companyScope, canEditLedgers, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1239,7 +1454,7 @@ router.get("/purchase-ledgers", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /gst-input-ledgers — CGST/SGST/IGST INPUT ledgers               */
 /* ------------------------------------------------------------------ */
-router.get("/gst-input-ledgers", auth, async (req, res) => {
+router.get("/gst-input-ledgers", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1315,7 +1530,7 @@ async function resolvePurchaseReturnsLedger(companyId) {
   return led;
 }
 
-router.get("/purchase-returns-ledger", auth, async (req, res) => {
+router.get("/purchase-returns-ledger", auth, companyScope, canEditLedgers, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1342,7 +1557,7 @@ router.get("/dn-reason-codes", auth, (req, res) => {
 });
 
 /* GET /bill-lookup — list posted purchase bills to debit against      */
-router.get("/bill-lookup", auth, async (req, res) => {
+router.get("/bill-lookup", auth, companyScope, async (req, res) => {
   try {
     const { companyId, partyLedgerId, q, limit = 50 } = req.query;
     if (!companyId)
@@ -1414,7 +1629,7 @@ router.get("/bill-lookup", auth, async (req, res) => {
 });
 
 /* GET /unpaid-invoices                                                 */
-router.get("/unpaid-invoices", auth, async (req, res) => {
+router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
   try {
     const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
       req.query;
@@ -1532,7 +1747,7 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
 });
 
 /* GET /unpaid-bills                                                    */
-router.get("/unpaid-bills", auth, async (req, res) => {
+router.get("/unpaid-bills", auth, companyScope, async (req, res) => {
   try {
     const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
       req.query;
@@ -1803,7 +2018,7 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
  * Only an ACCEPTED order may be billed — a completion-reported, cancelled or
  * unaccepted one is a clear business refusal, never an empty prefill.
  * ═════════════════════════════════════════════════════════════════════════ */
-router.get("/service-order/:id/billable", auth, async (req, res) => {
+router.get("/service-order/:id/billable", auth, companyScopeOptional, async (req, res) => {
   try {
     const companyId = req.query.companyId || req.body?.companyId;
 
@@ -1848,6 +2063,13 @@ router.get("/service-order/:id/billable", auth, async (req, res) => {
         lines: (so.lines || []).map((l) => ({
           isCharge: true,
           stockItemId: null,
+          /* ── THE ORDER LINE, CARRIED THROUGH THE FORM ──────────────────
+             The form returns this on submit and the server resolves it back
+             to the order to stamp `spendLineId`. The AUTHORITATIVE spend line
+             is sent too, read-only — for the screen, never as the value the
+             server trusts. */
+          serviceOrderLineId: String(l._id),
+          spendLineId: l.spendLineId ? String(l.spendLineId) : null,
           description: l.description || l.serviceName || "",
           serviceCode: l.serviceCode || "",
           billingUnit: l.billingUnit || "",
@@ -2255,7 +2477,7 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
 
 /* GET /po-match-candidates/:poId — unlinked purchase vouchers for this PO   */
 /* MUST be declared BEFORE router.get("/:id").                               */
-router.get("/po-match-candidates/:poId", auth, async (req, res) => {
+router.get("/po-match-candidates/:poId", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -2376,7 +2598,7 @@ router.get("/po-match-candidates/:poId", auth, async (req, res) => {
 
 /* POST /:id/link-po — attach an existing voucher to a purchase order        */
 /* Body: { purchaseOrderId, purchaseOrderNumber }  — pass null to UNLINK.    */
-router.post("/:id/link-po", auth, async (req, res) => {
+router.post("/:id/link-po", auth, companyScopeOptional, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
@@ -2521,7 +2743,7 @@ router.post("/:id/link-po", auth, async (req, res) => {
 });
 
 /* GET /raw-materials                                                   */
-router.get("/raw-materials", auth, async (req, res) => {
+router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
   try {
     const { companyId, q, limit = 500 } = req.query;
     const lim = parseInt(limit);
@@ -2618,7 +2840,7 @@ router.get("/raw-materials", auth, async (req, res) => {
 });
 
 /* GET /roundoff-ledger                                                 */
-router.get("/roundoff-ledger", auth, async (req, res) => {
+router.get("/roundoff-ledger", auth, companyScope, canEditLedgers, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -2661,7 +2883,7 @@ router.get("/roundoff-ledger", auth, async (req, res) => {
 
 /* GET /payment-match-candidates — purchase vouchers a payment can settle    */
 /* MUST be declared BEFORE router.get("/:id") — it's a literal path.         */
-router.get("/payment-match-candidates", auth, async (req, res) => {
+router.get("/payment-match-candidates", auth, companyScope, async (req, res) => {
   try {
     const { companyId, q, partyLedgerId } = req.query;
     if (!companyId)
@@ -2700,7 +2922,7 @@ router.get("/payment-match-candidates", auth, async (req, res) => {
 /* POST /:id/match-payment — link a PAYMENT voucher to a purchase voucher,    */
 /* inheriting that bill's PO so the PO's paymentStatus updates.               */
 /* Body: { purchaseVoucherId }  — pass null to UNLINK.                        */
-router.post("/:id/match-payment", auth, async (req, res) => {
+router.post("/:id/match-payment", auth, companyScopeOptional, async (req, res) => {
   try {
     const payment = await Acc_Voucher.findById(req.params.id);
     if (!payment) return res.status(404).json({ error: "Voucher not found" });
@@ -3045,7 +3267,23 @@ router.get("/:id", auth, async (req, res) => {
       voucher = await Acc_Voucher.findById(req.params.id).lean();
     }
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
-    res.json(voucher);
+
+    /* ── THE RECONCILIATION, READ FROM WHAT IS STORED ────────────────────
+       It used to ride back only on the response to voucher CREATION, so it
+       appeared once and was gone on the next page load. Reconstructed here
+       from the commitment's own release rows, so reopening this voucher
+       tomorrow shows exactly what it showed today.
+
+       Never fatal: a voucher reads perfectly well without it. */
+    let commitmentRelease = null;
+    try {
+      commitmentRelease = await require("../../services/commitmentRelease.service")
+        .reconciliationFor(voucher);
+    } catch (relErr) {
+      console.warn("[voucher/:id] reconciliation unavailable:", relErr.message);
+    }
+
+    res.json({ ...voucher, ...(commitmentRelease ? { commitmentRelease } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -3055,7 +3293,7 @@ router.get("/:id", auth, async (req, res) => {
 /* Get next voucher number (used by frontend on form open)             */
 /* ------------------------------------------------------------------ */
 
-router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
+router.get("/next-number/:companyId/:voucherType", auth, companyScope, async (req, res) => {
   try {
     const { companyId, voucherType } = req.params;
     const { prefix } = req.query;
@@ -3074,7 +3312,7 @@ router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
 /* Create                                                              */
 /* ------------------------------------------------------------------ */
 
-router.post("/", auth, async (req, res) => {
+router.post("/", auth, companyScope, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.companyId)
@@ -3202,6 +3440,13 @@ router.post("/", auth, async (req, res) => {
       body.sourceId = r.provenance.sourceId;
       body.sourceReference = r.provenance.sourceReference;
     }
+
+    /* Service lines: the same rule, on the order this bill belongs to. */
+    await applyServiceOrderLineIdentity(body);
+
+    /* The same for GOODS. A PO-linked bill carried no request link at all,
+       so the commitment behind it could never be released correctly. */
+    await applyPurchaseOrderProvenance(body);
 
     // Resolve partyLedgerName if missing. Accept both legacy `partyLedger`
     // and current `partyLedgerId` field names.
@@ -3381,8 +3626,19 @@ router.post("/", auth, async (req, res) => {
       await writePaymentToPO(voucher).catch((e) =>
         console.error("[PO payment writeback]", e.message),
       );
+      /* ── THE RELEASE IS NOT CALLED HERE ────────────────────────────────
+         It happens in the voucher's post-save hook, which is the one
+         chokepoint every posting path passes through. Calling it here as well
+         gave two competing releases on one transition, and the hook — running
+         first, on the legacy whole-document path — freed commitments this
+         path was about to release correctly. */
     }
 
+    /* ── THE RECONCILIATION IS READ, NOT RETURNED ────────────────────────
+       It used to ride back on this one response, so it appeared once and
+       vanished on the next page load. It is now stored on the commitment and
+       read by `GET /vouchers/:id`, which is the only way somebody reopening
+       the voucher tomorrow sees the same thing. */
     res.status(201).json(voucher);
   } catch (e) {
     // Friendly message for the unique-index race (should be rare now that we
@@ -3406,7 +3662,7 @@ router.post("/", auth, async (req, res) => {
  * voucher) keeps every ledger correct. Cancelled/void vouchers can't be
  * edited (re-create instead).
  */
-router.put("/:id", auth, async (req, res) => {
+router.put("/:id", auth, companyScope, async (req, res) => {
   try {
     const existing = await Acc_Voucher.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: "Voucher not found" });
@@ -3702,6 +3958,12 @@ router.post("/:id/post", auth, async (req, res) => {
       return voucher;
     });
 
+    /* ── AFTER THE COMMIT, NOT INSIDE IT ────────────────────────────────
+       `inTransaction` has returned, so the posting is durable and reading the
+       voucher is finally evidence of something. The post-save hook stood
+       aside for this save because it carried a session. */
+    await reconcileAfterCommit(voucher._id, req.user);
+
     await writePaymentToPO(voucher).catch((e) =>
       console.error("[PO payment writeback]", e.message),
     );
@@ -3711,7 +3973,7 @@ router.post("/:id/post", auth, async (req, res) => {
   }
 });
 
-router.post("/:id/cancel", auth, async (req, res) => {
+router.post("/:id/cancel", auth, companyScope, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
@@ -3786,7 +4048,18 @@ router.post("/:id/cancel", auth, async (req, res) => {
       await removePaymentFromPO(v).catch((e) =>
         console.error("[PO payment reversal]", e.message),
       );
-      res.json(v);
+      /* ── ONLY NOW IS THE CANCELLATION REAL ─────────────────────────────
+         The post-save hook stood aside because the save carried a session.
+         This is the first moment at which reading the voucher tells the
+         truth, and the restore has to happen after it — not before, when the
+         database still said `posted`. */
+      const reconciliation = await reconcileAfterCommit(v._id, req.user);
+      res.json({
+        ...v.toObject(),
+        ...(reconciliation && reconciliation.reconciled === false && reconciliation.why === "error"
+          ? { commitmentReconciliationWarning: reconciliation.message }
+          : {}),
+      });
     } catch (e) {
       await session.abortTransaction();
       throw e;
@@ -3798,7 +4071,7 @@ router.post("/:id/cancel", auth, async (req, res) => {
   }
 });
 
-router.post("/:id/void", auth, async (req, res) => {
+router.post("/:id/void", auth, companyScope, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
@@ -3932,6 +4205,12 @@ router.post("/:id/approve", auth, async (req, res) => {
       return voucher;
     });
 
+    /* ── AFTER THE COMMIT, NOT INSIDE IT ────────────────────────────────
+       `inTransaction` has returned, so the posting is durable and reading the
+       voucher is finally evidence of something. The post-save hook stood
+       aside for this save because it carried a session. */
+    await reconcileAfterCommit(voucher._id, req.user);
+
     await writePaymentToPO(voucher).catch((e) =>
       console.error("[PO payment writeback]", e.message),
     );
@@ -3996,7 +4275,7 @@ router.delete("/:id", auth, async (req, res) => {
 /* Bulk summary by type for a date range — for dashboards              */
 /* ------------------------------------------------------------------ */
 
-router.get("/summary/by-type", auth, async (req, res) => {
+router.get("/summary/by-type", auth, companyScope, async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
     if (!companyId)

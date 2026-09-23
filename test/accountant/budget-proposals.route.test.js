@@ -18,6 +18,19 @@ const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalMod
 const { Acc_BudgetDepartment } = require("../../models/Accountant_model/Acc_BudgetDepartment");
 const Employee = require("../../models/Employee");
 
+/* Lane A Chunk 3A mounted the canonical company-scope guard on the routers under
+   test. Everything else in that module stays REAL — only the two company guards
+   are pass-throughs, because these suites are about budget, ledger and forecast
+   behaviour and their auth doubles do not build an organisation that owns the
+   fixture company. Company isolation has its own suite,
+   test/accountant/company-isolation.route.test.js, which exercises the real
+   guard against real routers. */
+jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  ...jest.requireActual("../../Middlewear/AccountantOrgAuthMiddleware"),
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
+}));
+
 let server;
 let base;
 let seq = 0;

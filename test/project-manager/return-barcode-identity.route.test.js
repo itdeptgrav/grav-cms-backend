@@ -39,6 +39,9 @@ const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../models/Customer_Models/Customer");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
+const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
+const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
 const EmployeeProductionProgress = require("../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const { __scanBarcodeFor: scanBarcodeFor } = require("../../routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes");
 
@@ -79,6 +82,13 @@ const parseBarcode = (barcodeId) => {
 };
 
 /** The resolver rule, verbatim from productionCompletionRoutes.js:46. */
+/* ── SCOPING THE LOOKUPS (IE Chunk 1D) ──────────────────────────────────────
+   The fixture now holds the SOURCE work order a remake inherits its style
+   from — a real return always has one — so "the work orders in the database"
+   is no longer the same set as "the work orders the remake route created".
+   Every lookup below means the second, and says so. */
+const REMADE = { workOrderNumber: { $not: /^WO-RBI-SRC-/ } };
+
 const resolveWorkOrder = (allWOs, shortId) =>
   allWOs.find((w) => w._id.toString().slice(-8) === shortId) || null;
 
@@ -97,9 +107,34 @@ async function personWiseReturn({ qtyA = 2, qtyB = 3 } = {}) {
     operations: [{ type: "Stitch", operationCode: "ST-1", totalSeconds: 60 }],
   });
 
+  /* ── IE CHUNK 1D — A REMAKE INHERITS ITS SOURCE'S STYLE ──────────────
+     A return names the work order its units came back from, and since Chunk 1D
+     the remake's style is proved from that exact source: a remake may no
+     longer be created unlinked. The fixture therefore carries the source order
+     a real return always has. Barcode identity — what this suite measures — is
+     unaffected. */
+  const co = (await Acc_Company.findOne({}).lean())
+    || await Acc_Company.create({ companyName: "RBI Co", booksFromDate: new Date("2026-04-01") });
+  const journey = await SalesJourney.create({
+    journeyId: `SJ-RBI-${n}`, companyId: co._id, accountId: new mongoose.Types.ObjectId(),
+    ownerId: new mongoose.Types.ObjectId(), ownerName: "O", name: "J", isActive: true,
+  });
+  const sourceStyle = await SampleStyle.create({
+    sampleStyleId: `SS-RBI-${n}`, productName: stockItem.name, styleCode: `ST-RBI-${n}`,
+    journeyId: journey._id,
+    materials: { status: "pending", rawItems: [] },
+    techSheet: { technical: { status: "draft" } },
+  });
+  const sourceWo = await WorkOrder.create({
+    workOrderNumber: `WO-RBI-SRC-${n}`, customerRequestId: originalMo._id,
+    stockItemId: stockItem._id, sampleStyleId: sourceStyle._id,
+    quantity: qtyA + qtyB, status: "completed",
+  });
+
   const products = (qty) => [{
     stockItemId: stockItem._id, variantId: "", productName: stockItem.name,
     productRef: stockItem.reference, variantAttributes: [], returnQuantity: qty,
+    workOrderId: sourceWo._id,
   }];
 
   const rr = await ReturnRequest.create({
@@ -113,7 +148,7 @@ async function personWiseReturn({ qtyA = 2, qtyB = 3 } = {}) {
       { employeeId: new mongoose.Types.ObjectId(), employeeName: "Bharat", employeeUIN: `U${n}B`, gender: "male", products: products(qtyB) },
     ],
   });
-  return { rr, stockItem, customer, originalMo };
+  return { rr, stockItem, customer, originalMo, sourceWo, sourceStyle };
 }
 
 /* ── A LIMIT THIS SUITE CANNOT STEP OVER, STATED PLAINLY ────────────────────
@@ -147,7 +182,7 @@ describe("return/rework scan barcodes — helper-level", () => {
     const res = await call(`/${rr._id}/create-mo`);
     expect(res.status).toBe(200);
 
-    const workOrders = await WorkOrder.find({}).lean();
+    const workOrders = await WorkOrder.find(REMADE).lean();
     expect(workOrders).toHaveLength(1);
     const wo = workOrders[0];
 
@@ -163,7 +198,7 @@ describe("return/rework scan barcodes — helper-level", () => {
   test("the canonical number would NOT have resolved — the defect, pinned", async () => {
     const { rr } = await personWiseReturn({ qtyA: 1, qtyB: 1 });
     await call(`/${rr._id}/create-mo`);
-    const workOrders = await WorkOrder.find({}).lean();
+    const workOrders = await WorkOrder.find(REMADE).lean();
     const wo = workOrders[0];
 
     // What the route used to build.
@@ -181,7 +216,7 @@ describe("return/rework scan barcodes — helper-level", () => {
   test("the barcodes use the established scan format", async () => {
     const { rr } = await personWiseReturn({ qtyA: 1, qtyB: 1 });
     await call(`/${rr._id}/create-mo`);
-    const [wo] = await WorkOrder.find({}).lean();
+    const [wo] = await WorkOrder.find(REMADE).lean();
 
     for (const unit of [1, 7, 42, 999]) {
       expect(scanBarcodeFor(wo._id, unit)).toMatch(/^WO-[0-9a-f]{8}-\d{3}$/);
@@ -191,7 +226,7 @@ describe("return/rework scan barcodes — helper-level", () => {
   test("the scan segment is the short id, NOT the canonical number", async () => {
     const { rr } = await personWiseReturn({ qtyA: 1, qtyB: 1 });
     await call(`/${rr._id}/create-mo`);
-    const [wo] = await WorkOrder.find({}).lean();
+    const [wo] = await WorkOrder.find(REMADE).lean();
 
     const barcode = scanBarcodeFor(wo._id, 1);
     expect(parseBarcode(barcode).woShortId).toBe(wo._id.toString().slice(-8));
@@ -205,7 +240,7 @@ describe("return/rework scan barcodes — helper-level", () => {
   test("the unit number survives the round trip", async () => {
     const { rr } = await personWiseReturn({ qtyA: 2, qtyB: 3 });
     await call(`/${rr._id}/create-mo`);
-    const [wo] = await WorkOrder.find({}).lean();
+    const [wo] = await WorkOrder.find(REMADE).lean();
 
     for (const unit of [1, 2, 3, 4, 5]) {
       expect(parseBarcode(scanBarcodeFor(wo._id, unit)).unitNumber).toBe(unit);
@@ -217,7 +252,7 @@ describe("return/rework scan barcodes — helper-level", () => {
     // workOrderNumber was empty on every work order.
     const { rr } = await personWiseReturn({ qtyA: 2, qtyB: 2 });
     await call(`/${rr._id}/create-mo`);
-    const [wo] = await WorkOrder.find({}).lean();
+    const [wo] = await WorkOrder.find(REMADE).lean();
 
     const barcode = scanBarcodeFor(wo._id, 1);
     expect(barcode).not.toContain("undefined");
@@ -238,7 +273,7 @@ describe("return/rework scan barcodes — helper-level", () => {
 
     // Every unit in each range yields a barcode that resolves to that person's
     // work order.
-    const workOrders = await WorkOrder.find({}).lean();
+    const workOrders = await WorkOrder.find(REMADE).lean();
     for (const p of progress) {
       for (let u = p.unitStart; u <= p.unitEnd; u++) {
         const parsed = parseBarcode(scanBarcodeFor(p.workOrderId, u));
@@ -266,7 +301,7 @@ describe("return/rework scan barcodes — helper-level", () => {
     const { rr } = await personWiseReturn({ qtyA: 1, qtyB: 1 });
     await call(`/${rr._id}/create-mo`);
 
-    for (const wo of await WorkOrder.find({}).lean()) {
+    for (const wo of await WorkOrder.find(REMADE).lean()) {
       expect(wo.workOrderNumber).toBe(`WO-${wo._id.toString()}`);
       expect(wo.workOrderNumber).toMatch(/^WO-[0-9a-f]{24}$/);
     }
@@ -320,7 +355,7 @@ describe("return/rework scan barcodes — route wiring", () => {
     // The interception saw the real calls, one per person.
     expect(captured).toHaveLength(2);
 
-    const workOrders = await WorkOrder.find({}).lean();
+    const workOrders = await WorkOrder.find(REMADE).lean();
     expect(workOrders).toHaveLength(1);
 
     for (const c of captured) {
@@ -361,7 +396,7 @@ describe("return/rework scan barcodes — route wiring", () => {
     const { rr } = await personWiseReturn({ qtyA: 2, qtyB: 2 });
     const { captured } = await captureCreateMo(rr);
 
-    const [wo] = await WorkOrder.find({}).lean();
+    const [wo] = await WorkOrder.find(REMADE).lean();
     const fullId = wo._id.toString();
 
     const all = captured.flatMap((c) => c.set.assignedBarcodeIds);
@@ -403,7 +438,7 @@ describe("return/rework scan barcodes — route wiring", () => {
     // would resolve to nothing.
     const { rr } = await personWiseReturn({ qtyA: 1, qtyB: 1 });
     const { captured } = await captureCreateMo(rr);
-    const workOrders = await WorkOrder.find({}).lean();
+    const workOrders = await WorkOrder.find(REMADE).lean();
     const [wo] = workOrders;
 
     const wouldHaveBeen = `${wo.workOrderNumber}-001`;

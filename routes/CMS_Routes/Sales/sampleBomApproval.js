@@ -61,10 +61,12 @@ const crypto = require("crypto");
 const router = express.Router();
 
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
+const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const {
   notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL, escapeHtml,
 } = require("../../../services/departmentNotify.service");
 const { styleEmailContext, imageGalleryHtml, bomTableHtml } = require("../../../services/sampleStyleEmail.service");
+const { createServiceContext } = require("../../../services/companyContext/serviceScope.service");
 
 const DECISIONS = { approve: "approved", reject: "rejected" };
 
@@ -163,6 +165,21 @@ async function loadByToken(styleId, token) {
   return style;
 }
 
+// The token is a capability for this one stored style. Its journey is the
+// authoritative owner for the customer and enquiry facts rendered on the
+// public page; never take a company id from the URL or form submission.
+async function publicStyleEmailScope(style) {
+  if (!style?.journeyId) return null;
+  const journey = await SalesJourney.findById(style.journeyId).select("companyId").lean();
+  if (!journey?.companyId) {
+    throw new Error("The style's journey has no company context.");
+  }
+  return createServiceContext({
+    companyId: journey.companyId,
+    reason: "public BOM approval link",
+  });
+}
+
 const expired = (res) =>
   res.status(410).send(page({
     title: "This approval link is no longer valid",
@@ -180,7 +197,7 @@ const expired = (res) =>
  * so a replay is a no-op that shows the truth, not an error.
  */
 async function statusPage(style, { justDecided = false } = {}) {
-  const c = await styleEmailContext(style);
+  const c = await styleEmailContext(style, await publicStyleEmailScope(style));
   const approved = style.bomApproval.status === "approved";
   return page({
     title: justDecided
@@ -222,7 +239,7 @@ router.get("/:styleId/:token", async (req, res) => {
 
     const decision = req.query.d === "reject" ? "reject" : "approve";
     const rejecting = decision === "reject";
-    const c = await styleEmailContext(style);
+    const c = await styleEmailContext(style, await publicStyleEmailScope(style));
 
     return res.send(page({
       title: rejecting ? "Reject this BOM?" : "Approve this BOM?",
@@ -266,7 +283,7 @@ router.post("/:styleId/:token", express.urlencoded({ extended: false }), async (
     const decision = req.body?.decision === "reject" ? "reject" : "approve";
     const note = String(req.body?.note || "").trim().slice(0, 2000);
     if (decision === "reject" && !note) {
-      const c = await styleEmailContext(style);
+      const c = await styleEmailContext(style, await publicStyleEmailScope(style));
       return res.status(400).send(page({
         title: "A reason is required",
         tone: "negative",
@@ -305,7 +322,7 @@ router.post("/:styleId/:token", express.urlencoded({ extended: false }), async (
     // wording). Fire-and-forget: the manager's decision is already saved,
     // and a mail failure must not turn their confirmation into an error.
     (async () => {
-      const c = await styleEmailContext(style);
+      const c = await styleEmailContext(style, await publicStyleEmailScope(style));
       const salesPerson = style.bomApproval?.requestedBy?.name || "Sales";
       const eventKey = decision === "approve" ? "sample_bom_approved" : "sample_bom_rejected";
       await notifyEvent(eventKey, {

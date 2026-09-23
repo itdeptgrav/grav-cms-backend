@@ -107,6 +107,25 @@ const inventoryEntrySchema = new mongoose.Schema(
     // ─── Charge line (courier, freight, packing etc.) ───────────────────────
     // A charge is a non-stock line: no quantity, posts a Cr to its own ledger
     // (NOT to Sales). isCharge:true distinguishes it from a product row.
+    /* ── WHICH ORDER LINE THIS BILL LINE IS ─────────────────────────────
+       The form carries this from the PO prefill through editing and back on
+       submit, and the server resolves it against the linked order to stamp
+       `spendLineId`. It is the only reliable key: two PO lines can name the
+       SAME raw item — two rolls of the same fabric, charged to two different
+       request lines — and nothing about the item, the amount or the position
+       tells them apart. */
+    poItemId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+    /* The Service Order line, for the service half of the same chain. */
+    serviceOrderLineId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+
+    /* ── WHICH REQUEST LINE THIS BILL LINE DISCHARGES ───────────────────
+       Server-derived from the linked Purchase Order or Service Order — never
+       from the client, which could otherwise point a bill at whichever
+       allocation had the most budget left. Absent on an ordinary voucher that
+       is not billing an approved request, and its absence is what tells the
+       release engine it has nothing to discharge. */
+    spendLineId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+
     isCharge: { type: Boolean, default: false },
     chargeLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
     chargeDescription: { type: String, trim: true },
@@ -814,11 +833,21 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
  * next month would silently not release at all. This is the chokepoint they
  * all pass through.
  *
- * ── WHY IT RE-READS BEFORE ACTING ───────────────────────────────────────────
- * Two of those paths save inside a transaction that can still abort. A hook
- * that trusted the document in front of it would release a commitment for a
- * voucher that never posted. So it asks the database what is actually stored
- * before changing anything, and a rolled-back save finds nothing to act on.
+ * ── AND WHY IT STANDS ASIDE FOR A TRANSACTION ───────────────────────────────
+ * A `post("save")` hook is NOT an after-commit hook. For `save({ session })`
+ * it fires while the transaction is still open, and a reread outside that
+ * session sees the PRE-transaction document. A cancellation reread as
+ * `posted`, took the posted branch, did nothing, and then committed — leaving
+ * a cancelled voucher whose commitment was still released.
+ *
+ * An earlier comment here claimed the reread proved the write was durably
+ * committed. That was false and has been removed.
+ *
+ * So: a save carrying a session is left alone. The route that owns that
+ * transaction calls the shared reconciler once `commitTransaction()` has
+ * returned, which is the only moment at which reading the voucher's state is
+ * evidence of anything. This hook now covers exactly the non-transactional
+ * saves, which have no such moment and need one here.
  *
  * ── AND WHY IT NEVER THROWS ─────────────────────────────────────────────────
  * A failure here must not unpost a voucher that is correctly posted. It is
@@ -826,39 +855,42 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
  * are not.
  */
 tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
+  /* ── A TRANSACTIONAL SAVE IS NOT THIS HOOK'S BUSINESS ──────────────────
+     `$session()` is the session this document was saved with. Its presence
+     means a transaction is still open around us: nothing here is committed
+     yet, a reread would see the old state, and the transaction may still
+     abort. The route reconciles after it commits. */
+  if (typeof doc?.$session === "function" && doc.$session()) return;
+
   const status = String(doc?.status || "");
-  if (status !== "posted" && status !== "cancelled") return;
+  if (status !== "posted" && status !== "cancelled" && status !== "void") return;
   /* Nothing to do for the overwhelming majority of vouchers, and this check
      costs nothing — the link is on the document already. */
   if (status === "posted" && !doc.spendRequestId && !doc.budgetCommitmentId &&
-      !doc.referenceNumber) return;
+      !doc.referenceNumber && !doc.purchaseOrderId && !doc.serviceOrderId) return;
 
   try {
-    const commitments = require("../../services/budgetCommitment.service");
-    const Model = doc.constructor;
+    /* ── ONE ORCHESTRATOR, NOT TWO COMPETING RELEASES ──────────────────────
+       This called the legacy WHOLE-DOCUMENT release directly. Once a
+       commitment could carry per-line allocations that was wrong twice over:
+       it freed every head when only one had been billed, and it raced the
+       route-level partial release that had been added beside it — whichever
+       ran first won, and the hook usually did.
 
-    /* What is actually stored, not what this document believes. */
-    const fresh = await Model.findById(doc._id)
-      .select("_id status companyId voucherType voucherNumber grandTotal referenceNumber spendRequestId budgetCommitmentId updatedBy")
-      .lean();
-    if (!fresh) return;
-
-    if (fresh.status === "posted") {
-      const commitment = await commitments.commitmentForVoucher(fresh);
-      if (commitment) {
-        await commitments.releaseForVoucher({
-          commitment,
-          voucher: fresh,
-          actor: { id: fresh.updatedBy },
-          reason: "voucher_posted",
-        });
-      }
-      return;
-    }
-
-    if (fresh.status === "cancelled") {
-      await commitments.restoreForVoucher({ voucher: fresh });
-    }
+       Both are gone. `orchestrate` is the single entry point; it decides
+       legacy versus line-wise from the COMMITMENT, because that is a property
+       of the promise and not of the call site. */
+    /* ── ONE SHARED OPERATION, WHICHEVER DOOR REACHED IT ───────────────────
+       The same `reconcileVoucher` the transactional routes call after they
+       commit. It reads the stored voucher itself — which outside a
+       transaction IS the committed state — so there is one implementation of
+       "what does this voucher's current state mean for its commitment". */
+    const release = require("../../services/commitmentRelease.service");
+    await release.reconcileVoucher({
+      voucherId: doc._id,
+      actor: { id: doc.updatedBy },
+      model: doc.constructor,
+    });
   } catch (e) {
     console.error("[budget commitment] voucher hook failed:", e.message);
   }

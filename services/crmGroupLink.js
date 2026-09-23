@@ -30,6 +30,7 @@
 // a row, it returns or throws. Nothing here reads the request.
 
 "use strict";
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 
 const { assertNoAccountCycle, HierarchyError } = require("./crmHierarchy");
 
@@ -73,23 +74,34 @@ function resolveGroupEdge(rel) {
  * connection, and validating first is what keeps the two stores consistent
  * without one.
  */
-async function assertGroupEdgeApplicable(Account, rel) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function assertGroupEdgeApplicable(Account, rel, ctx) {
   const edge = resolveGroupEdge(rel);
   if (!edge) return null;
 
-  const child = await Account.findById(edge.childId).select("companyName parentAccountId").lean();
+  const child = await Account.findOne(serviceFilter(ctx, { _id: edge.childId })).select("companyName parentAccountId").lean();
   if (!child) throw new HierarchyError("That account no longer exists.");
 
   const existing = child.parentAccountId ? String(child.parentAccountId) : null;
   if (existing && existing !== edge.parentId) {
-    const current = await Account.findById(existing).select("companyName accountId").lean();
+    const current = await Account.findOne(serviceFilter(ctx, { _id: existing })).select("companyName accountId").lean();
     throw new HierarchyError(
       `${child.companyName} already belongs to ${current?.companyName || "another group"}` +
         `${current?.accountId ? ` (${current.accountId})` : ""}. An account has one parent — end that link first.`,
     );
   }
 
-  await assertNoAccountCycle(Account, edge.childId, edge.parentId);
+  /* The walk gets the SAME service-context clause the reads above used — it
+     may not climb out of this company to prove a cycle, and a parent it
+     cannot load is refused exactly as a missing one is. */
+  await assertNoAccountCycle(
+    (id) => Account.findOne(serviceFilter(ctx, { _id: id })).select("parentAccountId").lean(),
+    edge.childId, edge.parentId,
+  );
   return edge;
 }
 
@@ -97,10 +109,15 @@ async function assertGroupEdgeApplicable(Account, rel) {
  * Write the group edge onto the child. Assumes assertGroupEdgeApplicable has
  * already passed; idempotent, so re-running it changes nothing.
  */
-async function applyGroupLink(Account, rel, actor) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function applyGroupLink(Account, rel, actor, ctx) {
   const edge = resolveGroupEdge(rel);
   if (!edge) return null;
-  await Account.findByIdAndUpdate(edge.childId, {
+  await Account.findOneAndUpdate(serviceFilter(ctx, { _id: edge.childId }), {
     parentAccountId: edge.parentId,
     ...(actor ? { updatedBy: actor } : {}),
   });
@@ -115,12 +132,17 @@ async function applyGroupLink(Account, rel, actor) {
  * group, ending the old, now-irrelevant row must not detach it from the new
  * one.
  */
-async function clearGroupLink(Account, rel, actor) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function clearGroupLink(Account, rel, actor, ctx) {
   const edge = resolveGroupEdge(rel);
   if (!edge) return null;
-  const child = await Account.findById(edge.childId).select("parentAccountId").lean();
+  const child = await Account.findOne(serviceFilter(ctx, { _id: edge.childId })).select("parentAccountId").lean();
   if (!child || String(child.parentAccountId || "") !== edge.parentId) return null;
-  await Account.findByIdAndUpdate(edge.childId, {
+  await Account.findOneAndUpdate(serviceFilter(ctx, { _id: edge.childId }), {
     $unset: { parentAccountId: "" },
     ...(actor ? { $set: { updatedBy: actor } } : {}),
   });

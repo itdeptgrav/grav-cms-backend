@@ -30,6 +30,20 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const gstPortal = require("../../services/gstPortal.service");
 const party = require("../../services/partyGstVerification.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 
 /* ── ONE GATE, APPLIED HERE, NOT ASSUMED ───────────────────────────────────
@@ -85,7 +99,7 @@ router.get("/report", async (req, res) => {
  * somebody should be able to read BEFORE agreeing to it, not discover in the
  * result afterwards.
  */
-router.post("/scope", async (req, res) => {
+router.post("/scope", companyScopeOptional, async (req, res) => {
   try {
     const { onlyStale = true, staleDays = 90 } = req.body || {};
     const found = await party.scope({ companyId: companyOf(req), onlyStale, staleDays });
@@ -130,7 +144,7 @@ router.post("/ledgers/:id/verify", async (req, res) => {
 /* ══ POST /sweep ═══════════════════════════════════════════════════════════
  * The only endpoint here that spends money.
  */
-router.post("/sweep", async (req, res) => {
+router.post("/sweep", companyScope, async (req, res) => {
   try {
     if (!gstPortal.isConfigured()) {
       return res.status(409).json({

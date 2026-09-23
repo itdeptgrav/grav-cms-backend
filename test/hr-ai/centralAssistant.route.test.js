@@ -17,6 +17,11 @@
  *   • route context neither grants nor removes permission
  */
 
+/* Employee's pre-save hook encrypts salary fields and throws without a key —
+   the same two lines test/access/department-role-cache.test.js opens with. */
+process.env.SALARY_ENCRYPTION_KEY =
+  process.env.SALARY_ENCRYPTION_KEY || "0".repeat(64);
+
 const express = require("express");
 const mongoose = require("mongoose");
 
@@ -76,17 +81,39 @@ afterAll(async () => {
 });
 
 async function seed() {
-  const dep = (slug, name, path) => AccessDepartment.create({ slug, name, dashboardPath: path, isActive: true });
+  /* `key` is required on AccessDepartment and this fixture never set it, so
+     every test in this file failed at seed time with a validation error long
+     before it reached an assertion. The slug is the right value: it is the
+     stable machine key the model documents, and the two are identical for all
+     twelve seeded departments. */
+  const dep = (slug, name, path) =>
+    AccessDepartment.create({ key: slug, slug, name, dashboardPath: path, isActive: true });
   const hr = await dep("hr", "HR", "/hr/dashboard");
   const sales = await dep("sales", "Sales", "/sales/dashboard");
   const ceo = await dep("ceo", "CEO", "/ceo/dashboard");
 
-  const emp = (bio, extra) => Employee.create({ biometricId: bio, ...extra });
+  /* `gender` is declared `default: ""` against an enum that does not contain
+     "", so a fixture that omits it fails validation on save. Set explicitly
+     here rather than changed in the model — the default is a real defect, but
+     relaxing an enum is a production behaviour change and does not belong in a
+     test fixture's way. */
+  const emp = (bio, extra) => Employee.create({ biometricId: bio, gender: "Other", ...extra });
   const hrEmp = await emp("GRHR1", { accessDepartmentId: hr._id });
   const salesEmp = await emp("GRS1", { accessDepartmentId: sales._id });
   const multiEmp = await emp("GRM1", { accessDepartmentId: sales._id, additionalDepartmentIds: [hr._id] });
   const ceoEmp = await emp("GRC1", { accessDepartmentId: ceo._id });
-  await DeptUser.create({ email: "admin@grav.in", passwordHash: "x", name: "Admin", isAdmin: true, isActive: true });
+  /* `departmentId` is required on DeptUser. A platform administrator belongs to
+     the admin department rather than to HR — which is the point of the test
+     below: their access comes from `isAdmin`, not from any HR grant. */
+  const adminDept = await dep("platform-admin", "Platform Admin", "/admin");
+  await DeptUser.create({
+    email: "admin@grav.in",
+    passwordHash: "x",
+    name: "Admin",
+    departmentId: adminDept._id,
+    isAdmin: true,
+    isActive: true,
+  });
 
   return {
     // x-test-user payloads
