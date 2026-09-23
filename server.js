@@ -1512,6 +1512,12 @@ app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/tna
    Note what is NOT here: no route writes a department's status, and accepting
    a pack is PPC's, mounted separately below. */
 app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/handoverPackRoute"));
+/* Pre-Production Meeting — Merchandising's record of what was reviewed, what
+   was agreed and what is still open, before PPC decides whether the order can
+   be planned. Same mount, same access implementation; it books no capacity,
+   allocates no line and releases nothing. PPC's own doors are mounted
+   separately below and stay PPC's. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/ppmRoute"));
 
 /* ── PPC RECEIVES THE HANDOVER ───────────────────────────────────────────
    Its own mount, its own live `ppc` department grant, its own record. A
@@ -1525,6 +1531,26 @@ app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
    here and writes nothing into `ie_releases`. There is no outbox between them
    because the queue reads IE's immutable record directly. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/ieReleasesRoute"));
+
+/* ── AND PPC'S OWN PLANNING FOUNDATION ───────────────────────────────────
+   Same mount, same live `ppc` grant, PPC's own planning records. The order
+   book is a JOIN over published contracts — Merchandising's order lines,
+   packs and minutes, IE's releases, PPC's own receipts — held together by the
+   permanent order-line reference, so there is no copy inside PPC and nothing
+   to reconcile.
+
+   It books no capacity, allocates no line, promises no start date and
+   releases nothing to Production: those are later PPC chunks and this router
+   has no verb that could reach one. `PLANNED` here means PPC has finished
+   stating its planning assumptions, and every answer says so on its face. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/orderBookRoute"));
+
+/* ── AND PPC'S CAPACITY PLANNING ─────────────────────────────────────────
+   Same mount, same live `ppc` grant. PPC's own calendars, its own planning
+   lines, a read-only preview, and an explicit, proved, idempotent booking of a
+   PLANNED plan's time on a line. It releases nothing to Production, creates no
+   work order and writes nothing into IE, Merchandising or Store. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/capacityRoute"));
 
 /* Change control and the enterprise operations — the M7 surface: Sales-
    authorised change intake, impact coordination, acknowledgements, bulk tools,
