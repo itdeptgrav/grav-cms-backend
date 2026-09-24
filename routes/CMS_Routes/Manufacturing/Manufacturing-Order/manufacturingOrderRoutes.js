@@ -28,13 +28,6 @@ const {
 const {
   summariseManufacturingOrder,
 } = require("../../../../services/manufacturing/moSummary.service");
-/* Every work order in the database has an empty `workOrderNumber` — the model
-   only assigns one to NEW records — so screens printing it raw showed a blank.
-   Resolved at the boundary; see services/manufacturing/workOrderNumber.js. */
-const {
-  withWorkOrderNumbers,
-  displayWorkOrderNumber,
-} = require("../../../../services/manufacturing/workOrderNumber");
 
 router.use(EmployeeAuthMiddleware);
 

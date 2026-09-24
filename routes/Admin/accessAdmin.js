@@ -45,6 +45,7 @@ const EDITABLE = [
   "name", "description", "iconUrl", "iconAlt", "accentColor",
   "dashboardPath", "loginRedirect", "showOnOnboarding", "sortOrder",
   "capabilities", "isActive", "externalBaseUrl", "budgetEnabled",
+  "cctvEnabled",
 ];
 
 /** Additionally editable, but only on departments this system did not seed. */
@@ -312,6 +313,7 @@ router.post("/departments", async (req, res) => {
       showOnOnboarding: req.body.showOnOnboarding !== false,
       sortOrder: req.body.sortOrder ?? 500,
       capabilities: Array.isArray(req.body.capabilities) ? req.body.capabilities : [],
+      cctvEnabled: req.body.cctvEnabled === true,
       isSystem: false,
       isActive: true,
       // No legacy literal exists, so the role IS the slug. It therefore matches
