@@ -28,13 +28,9 @@ const {
 const {
   summariseManufacturingOrder,
 } = require("../../../../services/manufacturing/moSummary.service");
-/* Every work order in the database has an empty `workOrderNumber` — the model
-   only assigns one to NEW records — so screens printing it raw showed a blank.
-   Resolved at the boundary; see services/manufacturing/workOrderNumber.js. */
-const {
-  withWorkOrderNumbers,
-  displayWorkOrderNumber,
-} = require("../../../../services/manufacturing/workOrderNumber");
+/* The workOrderNumber import that stood here was a byte-identical duplicate of
+   the one above (merge fdeea4a, 23 Sep 2026). `const` in the same scope twice
+   is a SyntaxError, so the whole backend refused to start. */
 
 router.use(EmployeeAuthMiddleware);
 

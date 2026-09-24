@@ -509,6 +509,16 @@ const workOrderSchema = new mongoose.Schema(
         employeeNames: [{ type: String }],
         notes: { type: String, trim: true, default: "" },
         unitNumbers: [{ type: Number }], // ← ADD
+        /* The carton these units went into (24 Sep 2026). Packing is
+           carton-wise now — see models/.../Packaging/PackingCarton.js — and
+           this record is kept in step so every screen reading
+           packagedQuantity keeps working while the carton is one hop away.
+           Absent on records written before cartons existed. */
+        cartonId: { type: mongoose.Schema.Types.ObjectId, ref: "PackingCarton" },
+        cartonNumber: { type: String, trim: true },
+        /* `packagedBy` above is a display name. This is the session user id,
+           so "who packed this" resolves to a person, not a string. */
+        packedByUserId: { type: String, trim: true },
       },
     ],
 

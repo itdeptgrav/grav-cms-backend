@@ -31,6 +31,11 @@ const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const access = require("./packagingAccess");
+/* 143 of 152 work orders have no stored number (the model only assigns one to
+   NEW records), so every WO number leaving this file is the display form. */
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
+const { resolvePhotos } = require("../../../../services/manufacturing/workOrderPhoto");
+const shift = require("../../../../services/manufacturing/shiftHours");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -175,18 +180,13 @@ router.get("/manufacturing-orders/:id", ...canRead, async (req, res) => {
       .lean();
     if (!mo) return access.notFound(res, "manufacturing order");
 
+    /* Search runs over the DISPLAY values below, not the stored fields: most
+       work orders store no number, so "WO-7dc8c1d3" could never match in the
+       database. Every work order of the order is loaded here anyway. */
     const woFilter = access.scoped(companyOf(req), { customerRequestId: id });
-    if (search) {
-      const re = new RegExp(search.trim(), "i");
-      woFilter.$or = [
-        { stockItemName: re },
-        { workOrderNumber: re },
-        { stockItemReference: re },
-      ];
-    }
 
     const allWOs = await WorkOrder.find(woFilter)
-      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
+      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantId variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
       .lean();
 
     // Resolve gender/category
@@ -196,8 +196,10 @@ router.get("/manufacturing-orders/:id", ...canRead, async (req, res) => {
       const meta = wo.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
       return {
         _id: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
+        stockItemId: wo.stockItemId || null,
+        variantId: wo.variantId || "",
         quantity: wo.quantity,
         stockItemName: wo.stockItemName || meta?.name || "—",
         stockItemReference: wo.stockItemReference || meta?.reference || "",
@@ -214,10 +216,21 @@ router.get("/manufacturing-orders/:id", ...canRead, async (req, res) => {
     // Sort by product name alphabetically (groups related products together)
     transformedAll.sort((a, b) => a.stockItemName.localeCompare(b.stockItemName));
 
+    const needle = String(search || "").trim().toLowerCase();
+    const matched = needle
+      ? transformedAll.filter((w) => [w.stockItemName, w.stockItemReference, w.workOrderNumber,
+        ...(w.variantAttributes || []).map((v) => v.value)]
+        .some((v) => String(v || "").toLowerCase().includes(needle)))
+      : transformedAll;
+
     // Paginate
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.max(1, parseInt(limit, 10));
-    const paged = transformedAll.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+    const paged = matched.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+    /* Photos for the page on screen only — see workOrderPhoto.js for why the
+       variant image comes first. */
+    const photos = await resolvePhotos(paged);
+    paged.forEach((w, i) => { w.productImage = photos[i]; });
 
     const isMeasurement = mo.requestType === "measurement_conversion";
 
@@ -242,8 +255,8 @@ router.get("/manufacturing-orders/:id", ...canRead, async (req, res) => {
       pagination: {
         page: pageNum,
         limit: limitNum,
-        total: transformedAll.length,
-        totalPages: Math.ceil(transformedAll.length / limitNum),
+        total: matched.length,
+        totalPages: Math.max(1, Math.ceil(matched.length / limitNum)),
       },
     });
   } catch (err) {
@@ -322,7 +335,7 @@ router.get("/manufacturing-orders/:id/employees", ...canRead, async (req, res) =
       rec.products.push({
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.gender || "",
@@ -391,20 +404,13 @@ router.get("/manufacturing-orders/:id/bulk", ...canRead, async (req, res) => {
     const { visible } = await access.moScope(companyOf(req), id);
     if (!visible) return access.notFound(res, "manufacturing order");
 
+    /* Search over display values, after resolution — see the detail route. */
     const filter = access.scoped(companyOf(req), {
       customerRequestId: new mongoose.Types.ObjectId(id),
     });
-    if (search) {
-      const re = new RegExp(search.trim(), "i");
-      filter.$or = [
-        { stockItemName: re },
-        { workOrderNumber: re },
-        { stockItemReference: re },
-      ];
-    }
 
     const wos = await WorkOrder.find(filter)
-      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
+      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantId variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
       .lean();
 
     const metaMap = await resolveStockItemMeta(wos.map((w) => w.stockItemId));
@@ -416,7 +422,7 @@ router.get("/manufacturing-orders/:id/bulk", ...canRead, async (req, res) => {
       const dispatchedQty = wo.dispatchedQuantity || 0;
       return {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
         productName: wo.stockItemName || meta?.name || "—",
         productRef: wo.stockItemReference || meta?.reference || "",
@@ -432,6 +438,19 @@ router.get("/manufacturing-orders/:id/bulk", ...canRead, async (req, res) => {
     });
 
     workOrders.sort((a, b) => a.productName.localeCompare(b.productName));
+
+    const photos = await resolvePhotos(wos.map((w) => ({ key: String(w._id), ...w })));
+    const photoById = new Map(wos.map((w, i) => [String(w._id), photos[i]]));
+    workOrders.forEach((w) => { w.productImage = photoById.get(String(w.workOrderId)) || null; });
+
+    const needle = String(search || "").trim().toLowerCase();
+    if (needle) {
+      const keep = workOrders.filter((w) => [w.productName, w.productRef, w.workOrderNumber,
+        ...(w.variantAttributes || []).map((v) => v.value)]
+        .some((v) => String(v || "").toLowerCase().includes(needle)));
+      workOrders.length = 0;
+      workOrders.push(...keep);
+    }
 
     const totals = workOrders.reduce((acc, wo) => {
       acc.totalQty      += wo.totalQuantity;
@@ -482,7 +501,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", ...canRead, async (req,
           employeeName: null,
           employeeUIN: null,
           products: [{
-            workOrderNumber: wo.workOrderNumber,
+            workOrderNumber: displayWorkOrderNumber(wo),
             productName: wo.stockItemName || meta?.name || "—",
             productRef: wo.stockItemReference || meta?.reference || "",
             gender: meta?.genderCategory || meta?.gender || "",
@@ -509,7 +528,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", ...canRead, async (req,
       const wo = woMap.get(ep.workOrderId.toString());
       const meta = wo?.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
       const product = {
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         gender: meta?.genderCategory || meta?.gender || "",
@@ -552,9 +571,10 @@ router.get("/manufacturing-orders/:id/dispatch-history", ...canRead, async (req,
     // ── Apply date filter ──────────────────────────────────────────────────
     let filtered = events;
     if (startDate || endDate) {
-      const start = startDate ? new Date(startDate) : null;
-      const end = endDate ? new Date(endDate) : null;
-      if (end) end.setHours(23, 59, 59, 999); // include full end day
+      /* IST calendar days — see the note on packagingRoutes' /logs-by-mo. */
+      const DAY = /^\d{4}-\d{2}-\d{2}$/;
+      const start = DAY.test(String(startDate)) ? shift.istDayWindow(startDate).start : null;
+      const end = DAY.test(String(endDate)) ? new Date(shift.istDayWindow(endDate).end.getTime() - 1) : null;
 
       filtered = filtered.filter((ev) => {
         const t = new Date(ev.dispatchedAt);
@@ -752,7 +772,7 @@ router.post("/manufacturing-orders/:id/lookup-by-barcodes", ...canRead, async (r
       return {
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.genderCategory || meta?.gender || "",
@@ -836,7 +856,7 @@ router.get("/manufacturing-orders/:id/remaining-employees", ...canRead, async (r
       rec.products.push({
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.genderCategory || meta?.gender || "",
@@ -954,7 +974,7 @@ router.get("/manufacturing-orders/:id/employees/:employeeId/products", ...canRea
       return {
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.gender || "",
@@ -1164,7 +1184,7 @@ router.post("/dispatch/bulk", ...canRecord, async (req, res) => {
       message: `Dispatched ${qty} unit(s)`,
       workOrder: {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         dispatchedQuantity: wo.dispatchedQuantity,
         totalQuantity: wo.quantity,
       },

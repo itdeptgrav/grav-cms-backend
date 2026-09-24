@@ -2344,6 +2344,10 @@ app.use(
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
+/* Trimming and Ironing — the two finishing stages before packing. One router,
+   `/:stage/…`; see routes/CMS_Routes/Manufacturing/Finishing/finishingRoutes.js. */
+const finishingRoutes = require("./routes/CMS_Routes/Manufacturing/Finishing/finishingRoutes");
+app.use("/api/cms/manufacturing/finishing", finishingRoutes);
 
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
