@@ -28,6 +28,15 @@ const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCom
 const Enquiry = require("../../models/CMS_Models/Sales/Enquiry");
 const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
 const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
+const IeStyleFile = require("../../models/CMS_Models/IndustrialEngineering/IeStyleFile");
+const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering/IeBulletinVersion");
+/* Lazy: requiring the IE service at module scope pulls `Enquiry.js` into
+   evaluation before `constants/crm.js` has finished, and the enum it reads is
+   not defined yet. The same cycle is why `approvedTechnicalSource.service.js`
+   requires this service lazily too. */
+const technicalRevisionKeyOf = (...a) =>
+  require("../../services/industrialEngineering/ieBulletinVersion.service")
+    .technicalRevisionKeyOf(...a);
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const Operation = require("../../models/CMS_Models/Inventory/Configurations/Operation");
@@ -141,7 +150,106 @@ const rawItem = async (name, co) => {
  * `styleOver` shapes the technical record under test; `journeyCompany` exists
  * so a style can be given a parent belonging to somebody else.
  */
-async function world({ styleOver = {}, journeyCompany = null, extraStyles = [], briefed = true } = {}) {
+/**
+ * THE TWO APPROVALS A COSTING NOW NEEDS BEFORE IT MAY READ R&D AT ALL.
+ *
+ * ── WHY EVERY STYLE IN THIS FILE GETS THEM ──────────────────────────────────
+ * These tests are about MERGE RULES — planned versus measured, an allowance
+ * applied once, a basis nothing establishes. They were written when R&D's own
+ * approval was enough to make a figure costable. It is not any more:
+ * Merchandising must have approved the selection, and Industrial Engineering
+ * must have confirmed the exact R&D revision, before a single consumption
+ * reaches a preview.
+ *
+ * So the authority is granted here, once, rather than asserted 51 times — and
+ * a test that is ABOUT an authority being absent says so by passing
+ * `confirm: false` or by leaving the style with no approved revision, which is
+ * what several of them already do.
+ *
+ * Built from whatever revision the style actually ended up with, so a fixture
+ * that overrides `techSheet` still gets a confirmation OF THAT revision rather
+ * than of one this helper invented.
+ */
+async function confirmTechnically(co, styleDoc) {
+  const style = await SampleStyle.findById(styleDoc._id)
+    .select("techSheet materials bomApproval").lean();
+
+  /* Merchandising's pre-order selection authority: the approved BOM. Only
+     added when the style has materials to select — a style with none is a
+     fixture about something else. */
+  if (String(style.bomApproval?.status || "") !== "approved") {
+    await SampleStyle.updateOne({ _id: styleDoc._id }, {
+      $set: {
+        bomApproval: {
+          status: "approved", round: 1,
+          decidedAt: new Date("2026-08-04"),
+          decidedByName: "Merch Lead", decidedByEmail: "merch@grav.test",
+        },
+      },
+    });
+  }
+
+  const revisions = style.techSheet?.technicalRevisions || [];
+  const approved = revisions.filter((r) => r.outcome === "approved");
+  if (!approved.length) return null;   // nothing for IE to have confirmed
+  const rev = approved.reduce((best, r) => (r.revision > (best?.revision ?? -1) ? r : best), null);
+
+  const file = await IeStyleFile.create({
+    companyId: co._id, sampleStyleId: styleDoc._id, openedFromOrderId: null,
+    source: {
+      technicalRevision: rev.revision, submittedAt: rev.submittedAt,
+      approvedAt: rev.decidedAt, snapshot: rev.snapshot,
+      operationCount: (rev.snapshot?.operations || []).length,
+    },
+    status: "DRAFT", revision: 1, bulletin: { rows: [] },
+  });
+
+  /* IE's own authored route, one row per operation the snapshot carried, each
+     with an approved standard time. */
+  const rows = (rev.snapshot?.operations || []).map((o, i) => ({
+    rowId: `r${i + 1}`, sequence: i + 1,
+    ieOperationId: new mongoose.Types.ObjectId(), ieOperationRevision: 1,
+    operationCode: o.operationCode || `OP-${i + 1}`,
+    operationName: o.name || o.operationCode || `Operation ${i + 1}`,
+    machineType: o.machineType || "SNLS",
+    proposedSamMinutes: (Number(o.minutes) || 0) + (Number(o.seconds) || 0) / 60,
+    standardTimeMinutes: (Number(o.minutes) || 0) + (Number(o.seconds) || 0) / 60,
+  }));
+
+  const version = await IeBulletinVersion.create({
+    companyId: co._id, ieStyleFileId: file._id, sampleStyleId: styleDoc._id,
+    versionNo: 1, state: "APPROVED", revision: 1, fileRevisionAtSubmit: 1,
+    rows,
+    totals: {
+      garmentSamMinutes: rows.reduce((a, r) => a + (r.standardTimeMinutes || 0), 0),
+      samRowCount: rows.length,
+    },
+    sourceFingerprint: "fp", sourceApprovalDigest: "ad", sourceRequirementDigest: "",
+    technicalSource: {
+      sampleStyleId: styleDoc._id,
+      technicalRevision: rev.revision,
+      technicalRevisionKey: technicalRevisionKeyOf({
+        revision: rev.revision, submittedAt: rev.submittedAt,
+        decidedAt: rev.decidedAt, outcome: "approved",
+      }),
+      submittedAt: rev.submittedAt, approvedAt: rev.decidedAt,
+      snapshot: rev.snapshot,
+      materialCount: (rev.snapshot?.materials || []).length,
+      operationCount: (rev.snapshot?.operations || []).length,
+      fileSourceRevision: rev.revision, frozenAt: new Date(),
+    },
+    submittedBy: new mongoose.Types.ObjectId(), submittedByName: "Maker",
+    submittedAt: new Date("2026-08-10"),
+    approvedBy: new mongoose.Types.ObjectId(), approvedByName: "Checker",
+    approvedAt: new Date("2026-08-11"),
+  });
+  await IeStyleFile.updateOne({ _id: file._id }, {
+    $set: { currentApprovedBulletinVersionId: version._id, currentApprovedVersionNo: 1 },
+  });
+  return { file, version };
+}
+
+async function world({ styleOver = {}, journeyCompany = null, extraStyles = [], briefed = true, confirm = true } = {}) {
   const co = await company("Tech");
   const me = await actor([co]);
   await call("/policy/current", { method: "PUT", token: me.token, company: co._id, body: POLICY });
@@ -173,6 +281,12 @@ async function world({ styleOver = {}, journeyCompany = null, extraStyles = [], 
       productName: PRODUCT, journeyId: journey._id, enquiryId: enquiry._id, accountId,
       variantKey: `v${seq}`, ...over,
     }));
+  }
+
+  /* Merchandising's approval and IE's confirmation, before anything is costed. */
+  if (confirm) {
+    await confirmTechnically(co, style);
+    for (const sib of siblings) await confirmTechnically(co, sib);
   }
 
   const made = await call("/", {

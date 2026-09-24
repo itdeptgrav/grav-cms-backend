@@ -417,13 +417,20 @@ describe("the complete Merchandising journey works as one product", () => {
       ...at(w, c.owner), method: "POST", body: {},
     })).status).toBe(404);
 
+    /* The release names the exact approved revision the panel showed. Sales
+       authorises a SELECTION, not "whatever this file currently points at" —
+       delivery is asynchronous, and without the binding a revision approved
+       in the gap would reach R&D unreviewed. */
     const released = await sdev(`/${requestRef}/authorise-release`, {
-      ...at(w, c.salesApprover), method: "POST", body: { releaseReference: "BUYER-OK-1" },
+      ...at(w, c.salesApprover), method: "POST",
+      body: { releaseReference: "BUYER-OK-1", expectedBomRevisionNo: bomRevision },
     });
     expect(released.status).toBe(200);
+    expect(released.body.bomRevisionNo).toBe(bomRevision);
 
     devFile = await DevelopmentFile.findById(devFileId).lean();
     expect(devFile.lifecycleStatus).toBe(LIFECYCLE.RELEASED_TO_RND);
+    expect(devFile.releasedBomRevisionNo).toBe(bomRevision);
 
     /* ── 5. R&D READS THE APPROVED SELECTION FIRST ────────────────────── */
 

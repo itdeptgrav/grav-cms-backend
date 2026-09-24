@@ -89,6 +89,7 @@ const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const Customer = require("../../models/Customer_Models/Customer");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+const CustomerChangeRequest = require("../../models/CMS_Models/Sales/CustomerChangeRequest");
 const Costing = require("../../models/CMS_Models/Costing/Costing");
 const CostingVersion = require("../../models/CMS_Models/Costing/CostingVersion");
 const Employee = require("../../models/Employee");
@@ -439,6 +440,38 @@ describe("the confirmed quantity is the only one a proforma may carry", () => {
     const r = await raise(w, { items: [item(w, "sand")] });
     expect(r.status).toBe(201);
     expect((await storedLines(r.body._id))[0].quantity).toBe(750);
+  });
+});
+
+describe("customer-requested changes are a purchase-invoice hold", () => {
+  test("an open routed change blocks the entire enquiry until it is resolved", async () => {
+    const w = await world();
+    await confirm(w, "sand", 750);
+    await giveFloor(w, "sand", 750, 59000);
+    await CustomerChangeRequest.create({
+      companyId: w.co._id,
+      journeyId: w.journey._id,
+      enquiryId: w.enquiry._id,
+      productLineRef: w.navy.ref,
+      productName: "The other colourway",
+      sampleStyleId: w.navy.style._id,
+      categories: ["SAMPLE_ROUND"],
+      customerFeedback: "Please revise it.",
+      suggestedDestination: "SAMPLE_ROUND",
+      destination: "SAMPLE_ROUND",
+      owner: "r&d",
+      status: "OPEN",
+    });
+
+    const blocked = await raise(w, { items: [item(w, "sand")] });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe("PROFORMA_CUSTOMER_CHANGE_OPEN");
+    expect(blocked.body.changes[0].owner).toBe("r&d");
+    expect(await CustomerRequest.countDocuments({ "salesOrigin.enquiryId": w.enquiry._id })).toBe(0);
+
+    await CustomerChangeRequest.updateMany({}, { $set: { status: "RESOLVED" } });
+    const allowed = await raise(w, { items: [item(w, "sand")] });
+    expect(allowed.status).toBe(201);
   });
 });
 
@@ -938,6 +971,10 @@ describe("the Accountant proforma is not this proforma", () => {
     expect(files).toContain("services/sales/proformaRequest.service.js");
 
     const writers = files.filter((f) => {
+      /* A test's own fixture is not a writer of production code — the rule
+         here is about which SERVICE may assign the block. Without this the
+         scan counts any suite that builds one in a fixture. */
+      if (/\.test\.js$/.test(f)) return false;
       const text = bare(fs.readFileSync(f, "utf8"));
       /* `commercialDecision:` (an object literal being built) or
          `commercialDecision =` (an assignment). `==`/`===` are comparisons. */
@@ -1520,7 +1557,7 @@ describe("what a raised proforma tells the rest of the journey", () => {
     expect(foreign.body.proforma).toBeUndefined();
   });
 
-  test("the journey records Cost & Invoicing as in progress — through its own authority", async () => {
+  test("the journey records Purchase Invoice as in progress — through its own authority", async () => {
     /* ── NOT A BROWSER'S INFERENCE ────────────────────────────────────
        The lifecycle strip read "Not Started" beside an existing proforma
        because nothing ever told the journey. The command that raises the
@@ -1528,19 +1565,23 @@ describe("what a raised proforma tells the rest of the journey", () => {
        writer of stage states — and only ever lifts `notStarted`. */
     const w = await world();
     await ready(w);
-    expect((await SalesJourney.findById(w.journey._id).lean()).stageStates.costQuote).toBe("notStarted");
+    expect((await SalesJourney.findById(w.journey._id).lean()).stageStates.purchaseInvoice).toBe("notStarted");
 
     await proformaRequest.createForEnquiry(w.ctx, String(w.enquiry._id), {
       customerId: String(w.customer._id), items: [item(w, "sand")], actionKey: "k", actor,
     });
 
     const j = await SalesJourney.findById(w.journey._id).lean();
-    expect(j.stageStates.costQuote).toBe("inProgress");
+    /* Purchase Invoice, not Cost & Invoicing: the two stages were folded into
+       one on 24 Sep 2026, and raising the proforma is that stage's own work.
+       Recording it against the retired stage is what used to leave a journey
+       reading "Purchase Invoice: not started" with its invoice already out. */
+    expect(j.stageStates.purchaseInvoice).toBe("inProgress");
     /* And nothing else moved: no stage was marked complete on the way past,
        and the pointer stayed where the people using it left it. */
     expect(j.currentStage).toBe((await SalesJourney.findById(w.journey._id).lean()).currentStage);
     expect(j.stageStates.styleSample).toBe("notStarted");
-    expect(j.stageStates.purchaseInvoice).toBe("notStarted");
+    expect(j.stageStates.costQuote).toBe("notStarted");
 
     /* The enquiry now knows its own request without a browser having opened
        it — which is what Production and the PI workbench both read. */
@@ -1581,7 +1622,7 @@ describe("what a raised proforma tells the rest of the journey", () => {
     expect(linked.status).toBe(200);
 
     const j = await SalesJourney.findById(w.journey._id).lean();
-    expect(j.stageStates.costQuote).toBe("inProgress");
+    expect(j.stageStates.purchaseInvoice).toBe("inProgress");
     expect(String((await Enquiry.findById(w.enquiry._id).lean()).customerRequestId))
       .toBe(String(created.body._id));
 

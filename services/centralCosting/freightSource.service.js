@@ -22,7 +22,6 @@
 const mongoose = require("mongoose");
 
 const Enquiry = require("../../models/CMS_Models/Sales/Enquiry");
-const Account = require("../../models/CMS_Models/Sales/Account");
 const {
   resolveShippingDestination, REASON: SHIPPING_REASON,
 } = require("./shippingDestination.service");
@@ -69,27 +68,26 @@ async function readFreightSource(ctx, { enquiryId, style = null, asOf = new Date
 
   const freight = enquiry.freight || {};
 
-  /* The account's standing term, as the fallback the enquiry may override.
+  /* ── THE ENQUIRY'S OWN TERMS, AND ONLY THOSE ──────────────────────────
+     This used to load `Account.freightArrangement` and fall back to it when
+     the enquiry said nothing. That made the customer's standing term a live
+     input to every costing run: editing the account in November changed the
+     arrangement an existing draft had been built on, retrospectively, with
+     nothing recorded to say it had happened — the very thing `paymentTerms`
+     was designed to prevent one record earlier.
 
-     ── WHY THIS ONE CARRIES A MARKER ─────────────────────────────────────
-     `CRMAccount` has no `companyId` — an account is reached through the
-     journey or enquiry that belongs to a company, which is the ownership
-     rule `technicalSource.ownershipProofFor` already implements. There is
-     no field on this model to scope by, and the id being read here came out
-     of an enquiry that was ITSELF found under the company clause above. */
-  /* ── SCOPED, BECAUSE THE ACCOUNT DOES CARRY A COMPANY ────────────────
-     It comes from `companyOwnershipFields()` — an earlier note here said
-     otherwise and marked this query as unscopable, which was wrong. The
-     clause is in the same query as the id. */
-  const account = enquiry.accountId
-    ? await Account.findOne({ _id: enquiry.accountId, ...companyClause })
-      .select("freightArrangement gstTreatment defaultIncoterm").lean()
-    : null;
-
-  const arrangement = resolveArrangement({
-    enquiryFreight: freight,
-    accountFreight: account?.freightArrangement,
-  });
+     The account's terms are now OFFERED to Sales on the enquiry screen and
+     COPIED onto the enquiry when saved, with their provenance
+     (services/sales/deliveryTermsResolution.service.js). So this reads the
+     snapshot: an enquiry nobody has answered is unanswered, and the gap below
+     names Sales rather than borrowing a term nobody applied to this order. */
+  const arrangement = resolveArrangement({ enquiryFreight: freight });
+  if (arrangement.arrangement && str(freight.source) === "ACCOUNT") {
+    /* Saved from the customer's standing terms rather than agreed for this
+       order — a different claim, and the costing freezes which was made. */
+    arrangement.source = "ACCOUNT";
+    arrangement.sourceLabel = "The customer's usual terms, applied to this enquiry";
+  }
   let treatment = arrangement.arrangement ? TREATMENT[arrangement.arrangement] : null;
   /* ── THE ANSWERED PREPAID QUESTION CHANGES THE OUTCOME ──────────────
      Asking Sales which it is and then treating both alike would make the
@@ -194,7 +192,9 @@ async function readFreightSource(ctx, { enquiryId, style = null, asOf = new Date
     origin,
     destination,
     shipment,
-    incoterm: account?.defaultIncoterm || null,
+    /* Copied onto the enquiry when its delivery terms were saved, for the
+       same reason the arrangement is. */
+    incoterm: str(freight.incoterm) || null,
     missing,
   };
 }

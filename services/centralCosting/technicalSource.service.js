@@ -40,6 +40,9 @@ const enquiryModel = () => require("../../models/CMS_Models/Sales/Enquiry");
 const rawItemModel = () => require("../../models/CMS_Models/Inventory/Products/RawItem");
 const serviceModel = () => require("../../models/CMS_Models/Inventory/Services/Service");
 const operationCosting = () => require("../operationCosting");
+/* Lazy, and required here rather than at the top because the binding service
+   requires THIS one back for its ownership proof. */
+const approvedSource = () => require("./approvedTechnicalSource.service");
 
 const CODES = Object.freeze({
   NOT_FOUND: "NOT_FOUND",
@@ -223,6 +226,19 @@ const BLOCKER = Object.freeze({
   AMBIGUOUS_CODE: "More than one registered operation shares this code, so the salary group cannot be resolved. Reconcile the duplicate in Store → Registered operations.",
   NO_CARTON_CONVERSION: "This packaging is costed per carton and the sample does not say how many garments a carton holds. R&D records it once on the shipment, where freight reads it too — it is never assumed.",
   NO_SERVICE: "This row names no service in the Service Master.",
+  /* ── EVIDENCE IS NOT AN AUTHORITY ──────────────────────────────────────
+     The planned pick and the measured sample consumption are how the answer
+     was reached; neither is the answer. A costing reads consumption from the
+     revision Industrial Engineering confirmed, so these rows are shown with
+     their own numbers and can no longer be taken. Saying so on the row is the
+     point: `importable: true` on something nothing can import is a promise the
+     screen cannot keep. */
+  PLANNED_NOT_COSTABLE:
+    "This is Merchandising's planned pick, kept as history. A costing reads how much a style uses "
+    + "from the technical revision Industrial Engineering confirmed.",
+  MEASURED_NOT_COSTABLE:
+    "This is what one sample round consumed, kept as evidence. A costing reads how much a style "
+    + "uses from the technical revision Industrial Engineering confirmed.",
   NO_CHARGE_TYPE: "This row names no configured company development charge.",
   SERVICE_INACTIVE: "That service is no longer active in the Service Master.",
 });
@@ -443,8 +459,12 @@ function plannedRow(r) {
      nothing pretends to. */
   base.basis = quantity === null ? BASIS.UNKNOWN : BASIS.PLANNED;
   base.basisLabel = BASIS_LABEL[base.basis];
-  base.blockers = materialBlockers(base);
-  base.importable = base.blockers.length === 0;
+  base.blockers = [
+    { code: "PLANNED_NOT_COSTABLE", message: BLOCKER.PLANNED_NOT_COSTABLE },
+    ...materialBlockers(base),
+  ];
+  /* Never importable, whatever else is or is not recorded on it. */
+  base.importable = false;
   /* The canonical consumption, attached where the row is built so every
      reader downstream gets the same number by construction. */
   return withEffectiveConsumption(base);
@@ -537,8 +557,12 @@ function measuredRow(r, { sampleApproved }) {
      round may have made three garments. Shown, not divided, not importable. */
   else base.basis = BASIS.UNKNOWN;
   base.basisLabel = BASIS_LABEL[base.basis];
-  base.blockers = materialBlockers(base);
-  base.importable = base.blockers.length === 0;
+  base.blockers = [
+    { code: "MEASURED_NOT_COSTABLE", message: BLOCKER.MEASURED_NOT_COSTABLE },
+    ...materialBlockers(base),
+  ];
+  /* Never importable, whatever else is or is not recorded on it. */
+  base.importable = false;
   /* The canonical consumption, attached where the row is built so every
      reader downstream gets the same number by construction. */
   return withEffectiveConsumption(base);
@@ -859,9 +883,31 @@ async function readStyleFacts(ctx, styleId) {
      The other two lists are still returned. They are the history of how the
      answer was reached: what Merchandising selected, and what one sample
      round actually consumed. Only this one is costable. */
-  const approvedRevision = technicalRecord.approvedRevisionOf(style.techSheet || {});
-  const engineered = (approvedRevision?.snapshot?.materials || []).map(engineeredRow);
+  /* ── THE ONE AUTHORITATIVE READ ────────────────────────────────────────
+     `bindFor` proves company, style, Merchandising's approved selection, the
+     IE-approved bulletin version the file points at, and that the version
+     confirms the revision R&D currently stands behind. It returns the frozen
+     snapshot IE reviewed, or a NAMED state with the department that owns it.
 
+     Nothing below reads `style.techSheet` for a costable figure any more. */
+  const binding = await approvedSource().bindFor(ctx, { styleId });
+  const confirmed = binding.bound ? binding.technical : null;
+
+  /* ── COSTABLE MATERIALS COME FROM THE CONFIRMED SNAPSHOT, OR NOWHERE ────
+     `null`, not `[]`. An empty list is a claim — "this style uses no
+     materials" — and no department has made it. A consumer that treats an
+     unconfirmed style as a style with nothing to cost would publish a floor
+     price built on nothing. */
+  const engineered = confirmed
+    ? (confirmed.materials || []).map(engineeredRow)
+    : null;
+
+  /* ── AND THESE TWO ARE HISTORY, NOT SOURCES ────────────────────────────
+     `planned` is what Merchandising selected and `measured` is what one
+     sample round consumed. Both are shown so a reader can see how the answer
+     was reached; neither is importable, and `mergeMaterial` costs only the
+     engineered side. They are read from the live style deliberately — they
+     are evidence ABOUT the record, not values IN it. */
   const planned = (style.materials?.rawItems || []).map(plannedRow);
   const measured = (style.sample?.consumptionRawItems || [])
     .map((r) => measuredRow(r, { sampleApproved: approval.sample.approved }));
@@ -870,57 +916,103 @@ async function readStyleFacts(ctx, styleId) {
      every costing read so the technical source reflects the current mapping
      and payroll basis. The central costing labour engine still owns the final
      policy-derived rate; this enrichment supplies facts, not the answer. */
-  /* ── OPERATIONS: R&D'S APPROVED SAM WHERE THERE IS ONE ─────────────────
-     The approved technical record carries the operations R&D engineered and
-     the times they measured. The sample's own list stays as the fallback for
-     styles developed before the record existed — the shape is the same, so
-     one enrichment pass serves both. */
-  const engineeredOperations = (approvedRevision?.snapshot?.operations || []).map((o) => ({
-    type: o.name,
-    operationCode: o.operationCode,
-    machineType: o.machineType,
-    minutes: o.minutes,
-    seconds: o.seconds,
-    totalSeconds: (Number(o.minutes) || 0) * 60 + (Number(o.seconds) || 0),
-    operationId: o.operationId,
-    notes: o.notes,
-  }));
-  const sampleOperations = engineeredOperations.length
-    ? engineeredOperations
-    : (style.sample?.operations || []);
-  const resolvedOperations = await operationCosting().costOperations(sampleOperations);
-  const operations = sampleOperations.map((sampleOperation, index) => {
-    const resolved = resolvedOperations[index] || sampleOperation;
-    const matchedCurrentMaster = Boolean(resolved.operationId);
-    const ambiguousOperationCode = str(resolved.ambiguousOperationCode);
+  /* ── OPERATIONS AND SAM: THE APPROVED IE BULLETIN, AND NOTHING ELSE ────
+     This used to read R&D's approved operations and, where that list was
+     empty, FALL BACK to `style.sample.operations` — the route one sample run
+     happened to use, which nobody engineered and nobody approved. A style
+     whose approved revision carried no route was therefore costed from a
+     sample.
 
-    /* Import current master/payroll facts only when the resolver proved a
-       registered operation (or proved its code ambiguous). Keep the sample's
-       own operatorCost untouched: it is legacy fallback evidence, while the
-       central labour engine derives the current policy rate independently. */
-    const enriched = matchedCurrentMaster || ambiguousOperationCode
-      ? {
-          ...sampleOperation,
-          operationId: resolved.operationId || null,
-          machineType: resolved.machineType,
-          salaryDept: resolved.salaryDept,
-          salaryDesig: resolved.salaryDesig,
-          operatorSalary: resolved.operatorSalary,
-          ambiguousOperationCode,
-        }
-      : sampleOperation;
-    return operationRow(enriched);
-  });
-  /* Excluded rows are kept in the record and dropped from the COSTING: "we
+     The route and its times are IE's own authored content now: rows two
+     people signed, each carrying an APPROVED method study's standard time.
+     There is no fallback, and `null` means the question is unanswered rather
+     than answered with nothing. */
+  /* ── IE GIVES THE ROUTE AND THE TIME; PRODUCTION GIVES THE RATE ────────
+     The two are different authorities and always were. A bulletin row carries
+     the operation, its revision and the APPROVED standard time — it does not
+     carry a salary basis, because what an operator is paid is Production's
+     record, resolved from the registered Operation master.
+
+     Dropping this enrichment when the route moved to IE left every operation
+     with no resolvable rate, so every costing blocked on
+     `operation:...  is not mapped to a salary group` — a Production gap
+     reported against a route IE had just approved. */
+  const ieOperations = confirmed ? confirmed.operations : null;
+  const resolvedIeOperations = ieOperations
+    ? await operationCosting().costOperations(ieOperations.map((o) => ({
+        type: o.operationName || o.operationCode,
+        operationCode: o.operationCode,
+        machineType: o.machineType,
+        minutes: o.standardTimeMinutes === null ? null : Math.floor(o.standardTimeMinutes),
+        seconds: o.standardTimeMinutes === null
+          ? null : Math.round((o.standardTimeMinutes % 1) * 60),
+        totalSeconds: o.standardTimeMinutes === null
+          ? null : Math.round(o.standardTimeMinutes * 60),
+      })))
+    : null;
+
+  const operations = confirmed
+    ? confirmed.operations.map((o, i) => operationRow({
+        type: o.operationName || o.operationCode,
+        operationCode: o.operationCode,
+        machineType: o.machineType,
+        /* IE's approved standard time, in minutes. Converted to the seconds
+           the row shape carries WITHOUT inventing a value: null stays null. */
+        minutes: o.standardTimeMinutes === null ? null : Math.floor(o.standardTimeMinutes),
+        seconds: o.standardTimeMinutes === null
+          ? null : Math.round((o.standardTimeMinutes % 1) * 60),
+        totalSeconds: o.standardTimeMinutes === null
+          ? null : Math.round(o.standardTimeMinutes * 60),
+        ieOperationId: o.ieOperationId,
+        ieOperationRevision: o.ieOperationRevision,
+        methodStudyId: o.methodStudyId,
+        standardTimeMinutes: o.standardTimeMinutes,
+        /* Production's own facts, resolved from the registered master as it
+           stands NOW. A zero salary with no department and no designation is
+           MISSING, not free — `operationRow` reports it as a blocker and the
+           labour engine derives nothing from it. */
+        operationId: resolvedIeOperations?.[i]?.operationId || null,
+        salaryDept: resolvedIeOperations?.[i]?.salaryDept,
+        salaryDesig: resolvedIeOperations?.[i]?.salaryDesig,
+        operatorSalary: resolvedIeOperations?.[i]?.operatorSalary,
+        ambiguousOperationCode: str(resolvedIeOperations?.[i]?.ambiguousOperationCode),
+      }))
+    : null;
+
+  /* ── PACKAGING AND SERVICES: THE CONFIRMED SNAPSHOT ONLY ───────────────
+     These read `style.sample.packagingRequirements` and
+     `style.sample.serviceRequirements` live. R&D could therefore add a
+     packaging line and have it priced with nobody confirming it was
+     manufacturable or that its quantity was right.
+
+     Excluded rows are kept in the RECORD and dropped from the COSTING: "we
      considered a hang tag and decided against it" is a fact worth having, and
      it is not a cost. */
-  const packaging = (style.sample?.packagingRequirements || [])
-    .map((r) => packagingRow(r, {
-      garmentsPerCarton: style.sample?.shipment?.garmentsPerCarton ?? null,
-    }))
-    .filter((r) => r.included);
-  const services = (style.sample?.serviceRequirements || [])
-    .map(serviceRow).filter((r) => r.included);
+  /* ── PACKAGING COMES FROM MERCHANDISING, NOT FROM THE IE SNAPSHOT ──────
+     `confirmed.packaging` was read off the frozen technical snapshot, which
+     has never carried a packaging key. The approved packaging identity and the
+     buyer-facing specification are Merchandising's versioned record, and how
+     many garments a carton holds is its approved pack configuration — so both
+     arrive through `binding.packagingSource`, with provenance of their own. */
+  const packagingSource = binding?.packagingSource || null;
+  const packaging = Array.isArray(packagingSource?.rows)
+    ? packagingSource.rows.map((r) => packagingRow(r, {
+        garmentsPerCarton: binding?.packingFacts?.garmentsPerCarton ?? null,
+      })).filter((r) => r.included)
+    : null;
+
+  /* ── OUTSIDE SERVICES AND DEVELOPMENT/TOOLING ──────────────────────────
+     Both families live in the frozen requirements now, under their own family
+     names, and `serviceRow` tells them apart by `purpose` exactly as it did
+     when they arrived as one list. Kept as one costing pass over both so a
+     style requiring a wash AND the screens to print with still produces two
+     lines rather than one of them being filtered away. */
+  const frozenServiceRows = (confirmed?.services || confirmed?.development)
+    ? [...(confirmed.services || []), ...(confirmed.development || [])]
+    : null;
+  const services = frozenServiceRows
+    ? frozenServiceRows.map(serviceRow).filter((r) => r.included)
+    : null;
 
   /* ── THE ITEM MASTER READ IS COMPANY-SCOPED ────────────────────────────
      SKU, unit and variant label are what a costing line needs and the sample
@@ -937,7 +1029,7 @@ async function readStyleFacts(ctx, styleId) {
      master, and a second query for the same question would be a second place
      to forget the company clause. */
   const wantedIds = [...new Set(
-    [...planned, ...measured, ...packaging].map((r) => r.rawItemId).filter(Boolean),
+    [...planned, ...measured, ...(packaging || [])].map((r) => r.rawItemId).filter(Boolean),
   )];
   const itemsById = new Map();
   if (wantedIds.length) {
@@ -952,7 +1044,7 @@ async function readStyleFacts(ctx, styleId) {
       .select("name sku unit customUnit variants._id variants.combination variants.sku").lean();
     for (const d of docs) itemsById.set(String(d._id), d);
   }
-  for (const r of [...planned, ...measured, ...packaging]) {
+  for (const r of [...planned, ...measured, ...(packaging || [])]) {
     const master = r.rawItemId ? itemsById.get(r.rawItemId) : null;
     if (!master) {
       /* Named an item this company's register does not have — withdrawn, or
@@ -997,7 +1089,7 @@ async function readStyleFacts(ctx, styleId) {
   /* Internal charges name no service, so there is nothing to resolve for
      them — asking would be asking about an empty id. */
   const wantedServiceIds = [...new Set(
-    services.filter((r) => r.developmentSource !== "COMPANY_POLICY")
+    (services || []).filter((r) => r.developmentSource !== "COMPANY_POLICY")
       .map((r) => r.serviceId).filter(Boolean),
   )];
   if (wantedServiceIds.length) {
@@ -1005,7 +1097,7 @@ async function readStyleFacts(ctx, styleId) {
       .find({ companyId: ctx.companyId, _id: { $in: wantedServiceIds } })
       .select("serviceCode name billingUnit sacCode status").lean();
     const byId = new Map(docs.map((d) => [String(d._id), d]));
-    for (const r of services) {
+    for (const r of (services || [])) {
       if (r.developmentSource === "COMPANY_POLICY") continue;
       const master = r.serviceId ? byId.get(r.serviceId) : null;
       if (!master) {
@@ -1054,20 +1146,80 @@ async function readStyleFacts(ctx, styleId) {
        Named on the facts so a costing screen can say "R&D has not submitted
        a technical record for this style" rather than reporting an absence of
        materials it cannot explain. */
+    /* ── WHAT R&D'S OWN RECORD SAYS, FOR CONTEXT ONLY ─────────────────
+       Kept so a screen can explain an absence, and deliberately no longer the
+       thing a costing reads. `usable` now means "IE has confirmed it", not
+       "R&D approved it" — those were the same sentence and are not. */
     technicalRecord: {
       status: style.techSheet?.technical?.status || "not_started",
       currentRevision: style.techSheet?.technical?.revision || 0,
-      approvedRevision: approvedRevision?.revision ?? null,
-      approvedAt: approvedRevision?.decidedAt || null,
-      /* Exactly one approved revision is what a costing may read. */
-      usable: Boolean(approvedRevision),
-      blocker: approvedRevision ? null : {
-        owner: "RND",
-        message: style.techSheet?.technical?.status === "submitted"
-          ? "R&D's technical record is with Sales and has not been approved yet."
-          : "R&D has not submitted an approved technical record for this style yet.",
+      /* Which revision IE CONFIRMED — not which one R&D last approved. Those
+         were the same sentence while costing read R&D directly, and the whole
+         point of the split is that they are not. Null until a confirmation
+         exists, and never a number standing in for one. */
+      approvedRevision: confirmed?.technicalRevision ?? null,
+      approvedAt: confirmed?.approvedAt || null,
+      /* Only a CONFIRMED revision is costable, and the owner of the wait is
+         whichever desk the binding named — R&D only while the revision has
+         not yet entered the IE chain. */
+      usable: binding.bound,
+      blocker: binding.bound ? null : {
+        owner: binding.owner?.department || "Industrial Engineering",
+        ownerSlug: binding.owner?.departmentSlug || "ie",
+        state: binding.state,
+        message: binding.message,
       },
     },
+
+    /* ── THE COMPLETE SOURCE PROVENANCE THIS READ USED ────────────────
+       Frozen with the version, so a costing can say exactly which approvals
+       produced it — and so `sourceFingerprint` can detect any of them being
+       replaced. Identities only: no consumption, no rate, no SAM. */
+    approvedSource: binding.bound
+      ? {
+          state: binding.state,
+          bound: true,
+          technical: {
+            ieStyleFileId: confirmed.ieStyleFileId,
+            bulletinVersionId: confirmed.bulletinVersionId,
+            bulletinVersionNo: confirmed.bulletinVersionNo,
+            technicalRevision: confirmed.technicalRevision,
+            technicalRevisionKey: confirmed.technicalRevisionKey,
+            approvedAt: confirmed.approvedAt,
+            approvedByName: confirmed.approvedByName,
+            garmentSamMinutes: confirmed.garmentSamMinutes,
+            operationCount: confirmed.operationCount,
+          },
+          selection: binding.selection,
+          /* ── PUBLISHED SO THE FREEZE CAN NAME THEM SEPARATELY ─────────
+             Provenance only: which approved packaging revision, and which
+             approved weighing and pack-out, this estimate was built on. The
+             rows themselves are already published as costing lines, and the
+             fingerprint needs the identities — so what travels here is enough
+             to COMPARE and not a second copy of the facts. */
+          packagingSource: {
+            form: binding.packagingSource?.form || null,
+            state: binding.packagingSource?.state || null,
+            provenance: binding.packagingSource?.provenance || null,
+            unapproved: binding.packagingSource?.unapproved || [],
+          },
+          packingFacts: {
+            packedWeightGrams: binding.packingFacts?.packedWeightGrams ?? null,
+            garmentsPerCarton: binding.packingFacts?.garmentsPerCarton ?? null,
+            provenance: binding.packingFacts?.provenance || null,
+            gaps: binding.packingFacts?.gaps || [],
+          },
+        }
+      : {
+          state: binding.state,
+          bound: false,
+          owner: binding.owner,
+          message: binding.message,
+          technical: null,
+          selection: binding.selection || null,
+          packagingSource: null,
+          packingFacts: null,
+        },
     engineered,
     planned,
     measured,
@@ -1088,10 +1240,24 @@ async function readStyleFacts(ctx, styleId) {
        per-kilogram rate needs the packed weight and a per-carton one needs
        the capacity. Published because they MOVE the estimate, so a change to
        either has to be detectable — see `sourceFingerprint.service`. */
-    shipment: {
-      packedWeightGrams: num(style.sample?.shipment?.packedWeightGrams),
-      garmentsPerCarton: num(style.sample?.shipment?.garmentsPerCarton),
-    },
+    /* ── SHIPMENT: TWO FACTS, TWO OWNERS, NEITHER IE'S ────────────────
+       This read `confirmed.shipment` off the frozen technical snapshot, a key
+       that snapshot has never carried — so a real style's freight always saw
+       nothing, and a fixture-built one saw a figure IE was credited with
+       confirming. They are separate facts with separate owners:
+
+         · `packedWeightGrams` is R&D's MEASURED evidence;
+         · `garmentsPerCarton` is Merchandising's APPROVED pack configuration.
+
+       Both now arrive frozen, through `binding.packingFacts`, each with its
+       own provenance. `null` is not zero: a zero packed weight would price
+       freight at nothing. */
+    shipment: binding.bound
+      ? {
+          packedWeightGrams: num(binding.packingFacts?.packedWeightGrams),
+          garmentsPerCarton: num(binding.packingFacts?.garmentsPerCarton),
+        }
+      : null,
     applicability: {
       /* Merchandising: is this style packed at all? */
       packaging: styleApplicability.decisionView(style.materials?.packagingDecision),

@@ -236,6 +236,34 @@ async function buildPreview(ctx, styleId, { asOf = new Date() } = {}) {
   const facts = await technicalSource.readStyleFacts(ctx, styleId);
   const sampleApproved = facts.approval.sample.approved;
 
+  /* ── UNCONFIRMED IS NOT EMPTY ──────────────────────────────────────────
+     `readStyleFacts` publishes `null` for every costable list when Industrial
+     Engineering has not confirmed this style's technical record — never `[]`,
+     because an empty list is a claim nobody made and would produce a preview
+     of a garment with nothing in it. The preview says WHO is waited on and
+     offers nothing to import. */
+  if (!facts.approvedSource?.bound) {
+    return {
+      style: facts.style,
+      approval: facts.approval,
+      technicalRecord: facts.technicalRecord,
+      approvedSource: facts.approvedSource,
+      /* The history is still shown: what Merchandising selected and what the
+         sample consumed explain how the record got where it is. Neither is
+         importable, and `mergeMaterial` is not run over them. */
+      planned: facts.planned,
+      measured: facts.measured,
+      materials: null,
+      operations: null,
+      packaging: null,
+      services: null,
+      shipment: null,
+      applicability: facts.applicability,
+      capturedAt: facts.capturedAt,
+      importable: false,
+    };
+  }
+
   const byIdentity = new Map();
   const put = (row, side) => {
     const key = identityOf(row);
@@ -284,8 +312,19 @@ async function buildPreview(ctx, styleId, { asOf = new Date() } = {}) {
     /* Carried through with a stable identity, the same way an operation is:
        the key is what matches an assembled row back to the requirement it
        came from, and it has to survive a rename. */
-    packaging: facts.packaging.map((p) => ({ ...p, sourceKey: p.requirementKey })),
-    services: facts.services.map((sv) => ({ ...sv, sourceKey: sv.requirementKey })),
+    /* ── NULL SURVIVES THE MAP ──────────────────────────────────────────
+       Both used to arrive as `[]` whenever the style was bound, because the
+       read defaulted them. They are owned answers now: packaging is `null`
+       when MERCHANDISING has approved none, and services are `null` when the
+       frozen revision recorded no requirements at all. Mapping over that
+       crashed, and defaulting it to `[]` would be worse — an empty list is the
+       claim "this style needs none", which only its owner may make. */
+    packaging: Array.isArray(facts.packaging)
+      ? facts.packaging.map((p) => ({ ...p, sourceKey: p.requirementKey }))
+      : null,
+    services: Array.isArray(facts.services)
+      ? facts.services.map((sv) => ({ ...sv, sourceKey: sv.requirementKey }))
+      : null,
     /* The three department-owned applicability decisions, passed straight
        through. The preview reports them; it does not interpret them, and it
        certainly does not make one. */
@@ -297,6 +336,23 @@ async function buildPreview(ctx, styleId, { asOf = new Date() } = {}) {
        re-prices the freight. Published so a change to either is detectable
        rather than invisible. */
     technicalRecord: facts.technicalRecord,
+    /* ── THE EVIDENCE, BESIDE THE ANSWER ──────────────────────────────
+       What Merchandising selected and what one sample round consumed. Neither
+       is costable and neither reaches a line — `mergeMaterial` costs only the
+       confirmed side — but both explain how the record got where it is, and a
+       screen that showed the answer without them would make a confirmed figure
+       look like the only number anybody ever wrote down.
+
+       Published on this path as well as the unconfirmed one: the history does
+       not stop being history once Industrial Engineering has confirmed. */
+    planned: facts.planned,
+    measured: facts.measured,
+    /* ── THE THREE APPROVALS THIS PREVIEW WAS BUILT ON ───────────────
+       Merchandising's selection, IE's confirmed technical revision, and the
+       bulletin version that confirmed it. Carried so the freeze can record
+       them and `sourceFingerprint` can detect any one being replaced.
+       Identities only — no consumption, no rate, no SAM. */
+    approvedSource: facts.approvedSource,
     shipment: facts.shipment,
     capturedAt: facts.capturedAt,
     /* ── WHY THIS COSTING CANNOT YET BE CALLED COMPLETE ──────────────────

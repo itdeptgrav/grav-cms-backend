@@ -122,11 +122,122 @@ const METHODOLOGY = Object.freeze({
   basis: "SUBTOTAL_BEFORE_FINANCING",
   advanceTreatment: "REDUCES_FINANCED_AMOUNT",
   dayCountBasis: 365,
+  /* When the company's money goes out. A rate and a day count say what a day
+     of waiting costs and nothing about when the waiting began — so this is a
+     decision the Board makes, not a field with a sensible default. This is
+     THIS FIXTURE'S declared choice; the tests below prove the service has no
+     default of its own. */
+  startEvent: "MATERIAL_COMMITMENT",
 });
 
 const draft = (me, co, financing = METHODOLOGY, over = {}) => call("/FINANCING/drafts", {
   method: "POST", token: me.token, company: co._id,
   body: { financing, rationale: "Working-capital line at 12%.", ...over },
+});
+
+/* ═══ 0 · WHEN THE WAITING STARTS ═════════════════════════════════════════ */
+
+describe("the event financing is measured from", () => {
+  const { FINANCING_START_EVENTS } = require("../../models/CMS_Models/Board/BoardPolicy");
+
+  const approveWith = async (me, co, financing, effectiveFrom = "2026-07-01") => {
+    const made = await draft(me, co, financing);
+    if (made.status !== 201) return made;
+    return call(`/FINANCING/drafts/${made.body.version._id}/approve`, {
+      method: "POST", token: me.token, company: co._id,
+      body: { effectiveFrom },
+    });
+  };
+
+  test("an approved policy freezes the event the Board chose", async () => {
+    const co = await company("StartEvent");
+    const maker = await actor({ companies: [co], grants: { board: "editor" } });
+    const checker = await actor({ companies: [co], grants: { board: "owner" } });
+
+    const made = await draft(maker, co, METHODOLOGY);
+    expect(made.status).toBe(201);
+    const approved = await call(`/FINANCING/drafts/${made.body.version._id}/approve`, {
+      method: "POST", token: checker.token, company: co._id,
+      body: { effectiveFrom: "2026-07-01" },
+    });
+    expect(approved.status).toBe(200);
+    expect(approved.body.version.financing.startEvent).toBe("MATERIAL_COMMITMENT");
+
+    /* And it is readable from the effective policy, which is what a costing
+       resolves — not only from the approval response. */
+    const read = await call("/FINANCING", { token: checker.token, company: co._id });
+    const effective = read.body.versions.find((v) => String(v._id) === String(made.body.version._id));
+    expect(effective.financing.startEvent).toBe("MATERIAL_COMMITMENT");
+  });
+
+  test("omitting it is INCOMPLETE — the service supplies no default", async () => {
+    /* ── THE WHOLE POINT OF THE FIXTURE'S DEFAULT BEING THE FIXTURE'S ──
+       If the service quietly chose an event, every company's financing would
+       carry a decision nobody made — and two companies with genuinely
+       different commitment points would be costed identically. */
+    const co = await company("NoStartEvent");
+    const me = await actor({ companies: [co], grants: { board: "owner" } });
+    const { startEvent, ...withoutEvent } = METHODOLOGY;
+    void startEvent;
+
+    const r = await approveWith(me, co, withoutEvent);
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect(r.body.error.code).toBe("BOARD_POLICY_INCOMPLETE");
+    const gaps = JSON.stringify(r.body.error.details);
+    expect(gaps).toMatch(/startEvent/);
+    expect(gaps).toMatch(/when the company's money goes out/i);
+  });
+
+  test("an event outside the agreed list is refused, and says which are allowed", async () => {
+    const co = await company("BadStartEvent");
+    const me = await actor({ companies: [co], grants: { board: "owner" } });
+
+    const r = await draft(me, co, { ...METHODOLOGY, startEvent: "WHENEVER" });
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    const said = JSON.stringify(r.body);
+    expect(said).toMatch(/VALUE_NOT_ALLOWED/);
+    for (const allowed of FINANCING_START_EVENTS) expect(said).toMatch(allowed);
+  });
+
+  test("each supported event can be chosen deliberately", async () => {
+    /* Four real operational moments, and the Board picks one. Committing to
+       fabric and invoicing are months apart on the same order. */
+    for (const event of FINANCING_START_EVENTS) {
+      const co = await company(`Event-${event}`);
+      const me = await actor({ companies: [co], grants: { board: "owner" } });
+      const r = await approveWith(me, co, { ...METHODOLOGY, startEvent: event });
+      expect(r.status).toBe(200);
+      expect(r.body.version.financing.startEvent).toBe(event);
+    }
+  });
+
+  test("a later policy choosing a different event does not rewrite the earlier one", async () => {
+    /* A frozen version is a record of a moment. A company that moves its
+       financing start must not have its past quotations re-explained. */
+    const co = await company("EventSupersede");
+    const me = await actor({ companies: [co], grants: { board: "owner" } });
+
+    const first = await approveWith(me, co, { ...METHODOLOGY, startEvent: "MATERIAL_COMMITMENT" });
+    expect(first.status).toBe(200);
+    const firstId = first.body.version._id;
+
+    /* A second policy from the same day is not a change of mind, it is two
+       answers to one question — refused before it can be resolved. */
+    const sameDay = await approveWith(me, co, { ...METHODOLOGY, startEvent: "DISPATCH" });
+    expect(sameDay.status).toBe(409);
+    expect(sameDay.body.error.code).toBe("BOARD_POLICY_EFFECTIVE_DATE_TAKEN");
+
+    /* Moved from a date of its own, it takes over from there. */
+    const second = await approveWith(
+      me, co, { ...METHODOLOGY, startEvent: "DISPATCH" }, "2026-10-01",
+    );
+    expect(second.status).toBe(200);
+    expect(second.body.version.financing.startEvent).toBe("DISPATCH");
+
+    const read = await call("/FINANCING", { token: me.token, company: co._id });
+    const earlier = read.body.versions.find((v) => String(v._id) === String(firstId));
+    expect(earlier.financing.startEvent).toBe("MATERIAL_COMMITMENT");
+  });
 });
 
 /* ═══ 1 · NOTHING IS AVAILABLE BY DEFAULT ═════════════════════════════════ */
@@ -249,7 +360,7 @@ describe("the lifecycle", () => {
 
     const list = await call("/FINANCING", { token: me.token, company: co._id });
     expect(list.body.gaps[made.body.version._id].map((g) => g.field).sort())
-      .toEqual(["advanceTreatment", "annualRatePercent", "basis", "dayCountBasis"]);
+      .toEqual(["advanceTreatment", "annualRatePercent", "basis", "dayCountBasis", "startEvent"]);
 
     const edited = await call(`/FINANCING/drafts/${made.body.version._id}`, {
       method: "PUT", token: me.token, company: co._id,
@@ -343,7 +454,7 @@ describe("the lifecycle", () => {
     expect(r.status).toBe(400);
     expect(r.body.error.code).toBe("BOARD_POLICY_INCOMPLETE");
     expect(r.body.error.details.gaps.map((g) => g.field).sort())
-      .toEqual(["advanceTreatment", "basis", "dayCountBasis"]);
+      .toEqual(["advanceTreatment", "basis", "dayCountBasis", "startEvent"]);
   });
 
   test("an approval with no effective date is refused", async () => {

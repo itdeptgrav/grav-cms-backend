@@ -237,19 +237,27 @@ Each row shows:
 
 ## 6. Merchandising Execution File
 
-The file is the permanent order-level coordination record.
+The file is the permanent order-level coordination record. Its everyday UI is
+organised around five questions a merchandiser asks, not around the underlying
+record types:
 
 ```text
-Summary
-Sales Handover
-Materials & Trims
-Packaging
-Development Requirements
-Approvals
-Time & Action
-Department Status & Handover
+Order Brief
+Product Requirements
+Approvals & PP Meeting
+Schedule & Handover
 Changes & History
 ```
+
+These are presentation groups, not merged ownership or storage boundaries.
+Each group may contain compact subsections backed by the separate versioned
+records described below. Existing deep links to the earlier individual tabs
+must continue to open the corresponding subsection during migration.
+
+Every group begins with a short position summary: current state, next move,
+owning person or department, blocker, and the most important date. Detail is
+progressively disclosed so the file remains scannable even when its audit
+history and source references are large.
 
 ### 6.1 Summary
 
@@ -325,7 +333,19 @@ Shows this file's baseline, forecast, and actual milestone dates and their
 dependencies. The full cross-file calendar is available from the primary
 Time & Action section.
 
-### 6.8 Department Status & Handover
+### 6.8 Pre-Production Meeting
+
+Records the controlled minutes of the cross-functional pre-production review:
+attendees, source versions reviewed, observations, decisions, unresolved
+clarifications, and the issued minutes version.
+
+Merchandising coordinates and records the meeting. The meeting does not mark
+another department ready, replace the execution pack, create a second task
+system, or release production. Issued minutes are immutable; a later meeting
+creates a successor version. PPC reads the issued minutes as evidence and
+retains ownership of its planning and production-release decisions.
+
+### 6.9 Department Status & Handover
 
 Shows minimal read-only status from Product Development, Supply Chain, Store,
 IE, PPC, Quality, Production, and Logistics. Merchandising may confirm only its
@@ -340,7 +360,7 @@ own execution pack is complete and submit that version downstream.
 
 Merchandising coordinates visibility; it cannot mark another department ready.
 
-### 6.9 Changes & History
+### 6.10 Changes & History
 
 Sales records and authorises commercial/buyer changes. Merchandising records
 the internal execution impact, sends the versioned change to affected apps,
@@ -392,6 +412,11 @@ The permanent rule is:
 > defines or coordinates how the confirmed requirement is executed internally,
 > Merchandising owns it. Each specialist app still owns its technical or
 > operational result.
+
+A buyer-stated target-price ceiling may cross from Sales into a Development
+File only as a read-only material-selection constraint. Sales remains its
+owner; Merchandising cannot edit, approve or replace it, and it is not a
+costing or quotation.
 
 The same employee may hold more than one departmental role, especially at a
 small company. That does not merge the records or permissions.

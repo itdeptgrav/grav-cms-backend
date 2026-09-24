@@ -989,3 +989,126 @@ evidence.
 They are the only two for which a hand-entered figure is still the answer the
 screen offers, and the coverage row says so per family rather than offering the
 same blank box to all of them.
+
+---
+
+# Which record is authoritative for each costing family
+
+Added 24 Sep 2026, after Central Costing was bound exclusively to Industrial
+Engineering's approved technical version and three families quietly stopped
+having a source.
+
+## The defect this replaced
+
+`approvedTechnicalSource.bindFor()` read `snapshot.packaging`,
+`snapshot.services` and `snapshot.shipment` off the IE-frozen R&D revision.
+`technicalRecord.snapshotOf()` — the one function an R&D submit freezes a
+revision through — has **never written any of those three keys**. Its output is
+exactly:
+
+```
+["revision", "materials", "operations", "requirements", "file"]
+```
+
+The test fixture `authorityChain.frozenRevision` invented them, so packaging,
+outside services and shipment were populated for fixture-built styles and `null`
+for every style whose revision came through R&D's own routes. Freight was the
+worst case: `packedWeightGrams` and `garmentsPerCarton` were always absent, so
+`FREIGHT_PACKED_WEIGHT_MISSING` and `FREIGHT_CARTON_CAPACITY_MISSING` would fire
+on every real order and outbound freight could never be costed.
+
+A fixture is not allowed to describe a world production cannot produce, so
+`frozenRevision` now calls `technicalRecord.snapshotOf()` and a key missing
+there is missing here.
+
+## The ownership split
+
+Central Costing joins **independently owned** facts. Industrial Engineering
+confirms the R&D-derived manufacturing facts and does not become the approver of
+a weighing or a buyer agreement merely because a costing needs all three.
+
+| Family | Authoritative model | Revision identity frozen |
+|---|---|---|
+| Materials — consumption, allowance | `SampleStyle.techSheet.technicalRevisions[].snapshot.materials`, confirmed by `IeBulletinVersion.technicalSource` | `ie:version` = `<bulletinVersionId>:<versionNo>`; `ie:technicalRevision` = `<revision>:<technicalRevisionKey>` |
+| Materials — selection | pre-order `SampleStyle.bomApproval` (`round` + `decidedAt`); post-order `MaterialTrimRevision` (`fileId` + `revisionNo`) | `merch:selection` |
+| Operations — route, SAM | `IeBulletinVersion.rows` (IE's own authored content) | `ie:version` |
+| Outside services | `snapshot.requirements` where `family === "SERVICE"` | `ie:technicalRevision` |
+| Development / tooling | `snapshot.requirements` where `family === "DEVELOPMENT_TOOLING"` | `ie:technicalRevision` |
+| Packaging — identity, specification | pre-order `SampleStyle.materials.packagingSelections` (`status: "approved"`, with `materials.packagingDecision` as the approving act); post-order `PackagingRevision` (`fileId` + `revisionNo`) | `merch:packaging` |
+| Packaging — quantity, basis | `SampleStyle.sample.packagingRequirements`, joined to the approved selection by `sourceSelectionRowId` | carried on the packaging line |
+| Packaging / freight — carton capacity | `SampleStyle.materials.packingConfiguration` (pre-order) or `PackagingRevision.packingInstruction.garmentsPerCarton` (post-order) | `merch:packConfiguration` = `<revision>:<decidedAt>` |
+| Freight — packed weight | `SampleStyle.sample.packingMeasurement` (approved) | `rnd:packingMeasurement` = `<revision>:<approvedAt>` |
+| Rates for all of the above | Store / Purchase `SupplierOffer` | the existing quotation parts |
+
+### Why services live in `requirements` and carry identity
+
+There were two R&D records and only one could be costed.
+`techSheet.technical.requirements` is R&D's generic list and carries no row
+identity and no Service Master reference, so a row from it cannot be matched to a
+supplier quotation or keyed as a stable costing line.
+`sample.serviceRequirements` is the record Central Costing has always read: it
+carries `rowId`, `serviceId`, `purpose`, the development source and the
+include/exclude decision.
+
+`snapshotOf()` now freezes the **authoritative** rows, expressed in the `family`
+vocabulary the generic list uses. A style that has only the generic list still
+freezes that — stated precedence, never a silent merge, because including both
+would cost one requirement twice. A consequence worth stating: unchanged
+requirement rows carry forward into a new revision automatically, because the
+revision freezes the record that owns them.
+
+### Why packaging and shipment left the technical snapshot
+
+* Packaging identity and the buyer-facing packing specification are a **buyer
+  agreement**. `PACKAGING` is deliberately absent from the R&D requirement enum
+  (`technicalRecord.RETIRED_FAMILIES`) and is not restored.
+* `packedWeightGrams` is R&D's **measured evidence**.
+* `garmentsPerCarton` is Merchandising's **approved pack configuration** — a
+  decision, not a measurement.
+* Booking a shipment, the carrier and the freight contract are Logistics'.
+
+`SampleStyle.sample.shipment` remains as R&D's **working note** for the sampling
+screens. Costing never reads it: a costing built from it froze a figure that
+could change underneath it with nothing recording that it had.
+
+### The two records added to make this possible
+
+Neither existed, and both are the smallest explicit versioned form of a fact
+that was previously only available from a mutable record:
+
+* `SampleStyle.sample.packingMeasurement` — `{revision, packedWeightGrams,
+  measuredBy, measuredAt, approvedBy, approvedAt}`. R&D's, approved by a second
+  person. A later weighing is a new revision, not an edit of the one somebody
+  costed.
+* `SampleStyle.materials.packingConfiguration` — `{revision, garmentsPerCarton,
+  decidedBy, decidedAt}`. Merchandising's pre-order form of the pack-out;
+  `PackagingRevision.packingInstruction.garmentsPerCarton` is the post-order one.
+
+### Failing closed, per family
+
+Each family blocks on its own owner and nothing else — a style with no approved
+packaging still has a costable garment, it just has no packaging cost. The named
+states are `approvedTechnicalSource.FAMILY_STATE`:
+`AWAITING_MERCHANDISING_PACKAGING`, `PACKAGING_SELECTION_UNAPPROVED`,
+`AWAITING_RND_PACKING_MEASUREMENT`,
+`AWAITING_MERCHANDISING_PACK_CONFIGURATION`. None of them returns `[]`: an empty
+packaging list is a claim that the garment is packed in nothing, and only
+Merchandising's applicability decision may make it.
+
+## Open follow-ups — deliberately NOT part of this change
+
+1. **`bomApproval` and `approvedMaterialShortlist.service.js` disagree about what
+   "Merchandising approved the materials" means.** Central Costing's binding uses
+   `SampleStyle.bomApproval`. The shortlist service, which gates R&D's own
+   technical submit, reads the finished good, then an approved Development BOM,
+   then legacy `materials.rawItems` — and never looks at `bomApproval`. Both are
+   real records of the same decision and nothing reconciles them, so a style can
+   be costable by one definition and unsubmittable by the other.
+
+2. **The `Operation` master has no `companyId`.** `models/CMS_Models/Inventory/
+   Configurations/Operation.js` declares no company field, so it is a global
+   register: `Operation.create({companyId, ...})` silently drops the value and a
+   company-scoped query matches nothing. `costOperations` resolves an operation's
+   salary basis from it by `operationCode` alone, which means two companies
+   cannot hold the same operation code with different salary groups. Whether this
+   register should be company-owned is a product decision, not a rename.

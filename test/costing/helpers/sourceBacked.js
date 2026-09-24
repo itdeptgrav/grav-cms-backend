@@ -50,6 +50,9 @@ const SupplierOffer = require("../../../models/CMS_Models/Inventory/Sourcing/Sup
 const ServiceSupplierOffer = require("../../../models/CMS_Models/Inventory/Sourcing/ServiceSupplierOffer");
 const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
 
+const Employee = require("../../../models/Employee");
+const authority = require("./authorityChain");
+
 let seq = 0;
 
 /* ── WHAT STORE SAID ABOUT WHERE A QUOTED INPUT COMES FROM ─────────────────
@@ -129,6 +132,13 @@ const EXPECTED = Object.freeze({
  */
 async function seedSourceBacked(companyId, {
   product = null,
+  /* ── RETIRED, AND LOUD ABOUT IT ───────────────────────────────────────
+     `withOperation: false` built a garment with no route. That is no longer a
+     costable state: Industrial Engineering cannot approve an empty bulletin,
+     so such a style has no confirmed technical source and every costing on it
+     is refused with AWAITING_IE_TECHNICAL_CONFIRMATION. Six suites passed it
+     only to keep the world small, and were silently building an uncostable
+     one. Accepting and ignoring it would hide that, so it is refused. */
   withOperation = true,
   withMaterial = true,
   withQuotation = true,
@@ -187,10 +197,48 @@ async function seedSourceBacked(companyId, {
 
      `null` opts out, for a suite about a costing nobody has briefed. */
   brief = { quantities: [{ key: "q500", quantity: "500", isPrimary: true }], quantityUom: "Pieces" },
+  /* ── WHETHER IE HAS CONFIRMED THE TECHNICAL RECORD ───────────────────
+     True by default, because a costing cannot read a single R&D figure
+     without it and almost every suite here is about what happens AFTER that
+     point. `false` leaves the style awaiting confirmation, which is the state
+     a real style is in until IE approves a bulletin version for it. */
+  confirmIe = true,
   samSeconds = 90,
   salary = 18000,
   rateMinor = 10000,
   consumption = "1",
+  /* ── THE ALLOWANCE R&D RECORDED, BESIDE THE CONSUMPTION ───────────────
+     Separate fields on the engineered row, deliberately: R&D states the base
+     consumption and the allowance, and the allowance is applied on top rather
+     than already being inside the figure. That is the distinction the measured
+     path could not make.
+
+     Here rather than in each suite because the alternative — a fixture
+     overwriting `techSheet.technicalRevisions` AFTER the builder has had IE
+     confirm it — silently replaces the revision IE approved with one carrying
+     no `submittedAt` and no `decidedAt`. Same revision NUMBER, different
+     identity, so the confirmation reads as stale and the style stops being
+     costable. Stating it up front is what keeps the chain intact. */
+  /* ── THREE STATES, AND NONE COLLAPSES INTO ANOTHER ───────────────────
+     `null`  — nobody has stated an allowance. Not zero: "not recorded" and
+               "explicitly none" are different claims, and a costing that
+               showed one as the other would be inventing an authority's
+               answer.
+     `0`     — the authority states there is no additional allowance.
+     `n > 0` — applied once, on top of the base consumption.
+
+     Never coerced. `Number(null)` is 0, which is exactly the collapse this
+     guards against. */
+  allowancePercent = 0,
+  materialSpecification = "Fixture specification",
+  /* ── SEVERAL MATERIALS, EACH WITH ITS OWN IDENTITY ────────────────────
+     `[{ name, consumption, allowancePercent, unit, specification, rateMinor }]`.
+     Each row gets its own RawItem and its own quotation, so the permanent
+     raw-item id is what a Costing line keys on and two rows can carry
+     different allowances without either leaking into the other.
+
+     `null` seeds the single-material shape the rest of this folder uses. */
+  materials = null,
   secondStyle = false,
 } = {}) {
   const n = ++seq;
@@ -234,6 +282,7 @@ async function seedSourceBacked(companyId, {
      wants a costing to exist. */
   let item = existingItem;
   let offer = null;
+  const extraMaterials = [];
   if (withMaterial) {
     if (!item) {
       await Unit.create({ companyId, name: uom, symbol: "m", status: "Active" }).catch(() => null);
@@ -247,6 +296,43 @@ async function seedSourceBacked(companyId, {
         ...(customsTariffCode ? { customsTariffCode } : {}),
       });
     }
+    /* ── THE EXTRA MATERIALS, EACH A REAL ITEM WITH A REAL QUOTATION ───
+       Built here so every row has a PERMANENT raw-item id of its own: that id
+       is what the Costing `lineKey` is made from, and two rows sharing one
+       would be two claims about the same material rather than two materials. */
+    for (const [i, m] of (materials || []).entries()) {
+      const extraUom = m.unit || uom;
+      await Unit.create({ companyId, name: extraUom, symbol: extraUom.slice(0, 3), status: "Active" }).catch(() => null);
+      const extraItem = await RawItem.create({
+        companyId, name: m.name || `Trim ${n}-${i + 1}`, sku: `RAW-SB-${n}-${i + 1}`,
+        unit: extraUom, quantity: 0, minStock: 0, maxStock: 100, variants: [],
+      });
+      const extraSupplier = await Vendor.create({
+        companyId, companyName: `Mill ${n}-${i + 1}`, vendorType: "Supplier", status: "Active",
+      });
+      const extraOffer = await SupplierOffer.create({
+        companyId, supplierId: extraSupplier._id, supplierName: extraSupplier.companyName,
+        itemId: extraItem._id, purchaseUom: extraUom, currency: "INR",
+        unitPriceMinor: m.rateMinor ?? rateMinor, priceBasis: "TAX_EXCLUSIVE", gstRatePercent: 12,
+        freightTerms: "INCLUSIVE_LANDED", quotationReference: `Q-${n}-${i + 1}`,
+        sourcing: { type: "DOMESTIC" },
+        status: "ACTIVE", effectiveFrom: new Date("2026-01-01"),
+      });
+      extraMaterials.push({
+        item: extraItem, offer: extraOffer,
+        row: {
+          rawItemId: extraItem._id, rawItemName: extraItem.name,
+          rawItemSku: extraItem.sku,
+          consumptionPerPiece: Number(m.consumption),
+          /* Carried through EXACTLY as given — `undefined` means the fixture
+             did not state one, `null` means nobody recorded one. */
+          ...(m.allowancePercent === undefined ? {} : { allowancePercent: m.allowancePercent }),
+          unit: extraUom,
+          specification: m.specification || `Specification for ${extraItem.name}`,
+        },
+      });
+    }
+
     if (withQuotation) {
       const supplier = await Vendor.create({
         companyId, companyName: `Mill ${n}`, vendorType: "Supplier", status: "Active",
@@ -287,6 +373,12 @@ async function seedSourceBacked(companyId, {
     : []
   ).map((d) => ({ ...d, rowId: d.rowId || new mongoose.Types.ObjectId().toString() }));
 
+  /* Stable row identities for the packaging pair, minted once per world so
+     Merchandising's approved selection and R&D's measurement of it can be
+     joined by row — which is how production joins them. */
+  const PKG_SELECTION_ROW_ID = `pkgsel-${n}`;
+  const PKG_ROW_ID = `pkgreq-${n}`;
+
   const styleFor = (variantKey, variantLabel) => ({
     sampleStyleId: `SS-SB-${n}${variantKey}`,
     styleCode: `SC-SB-${n}${variantKey}`,
@@ -298,7 +390,40 @@ async function seedSourceBacked(companyId, {
     productName: name,
     variantKey,
     variantLabel,
-    materials: { rawItems: [] },
+    materials: {
+      rawItems: [],
+      /* ── MERCHANDISING'S APPROVED PACKAGING, WHICH COSTING BINDS TO ────
+         What the garment is packed in, and the buyer-facing specification for
+         it, is Merchandising's decision — not R&D's and not IE's. Costing
+         reads THIS record and joins R&D's measurement to it by row. */
+      ...(packaging && packagingItem
+        ? {
+          packagingSelections: [{
+            rowId: PKG_SELECTION_ROW_ID,
+            rawItemId: packagingItem._id,
+            rawItemName: packagingItem.name,
+            rawItemSku: packagingItem.sku || "",
+            specification: packaging.specification || "Printed poly bag, 300x400mm",
+            status: "approved",
+            selectedBy: { id: new mongoose.Types.ObjectId(), name: "A Merchandising Fixture" },
+            selectedAt: new Date("2026-07-10"),
+          }],
+        }
+        : {}),
+      /* ── AND THE PACK-OUT, WHICH IS A DECISION AND NOT A MEASUREMENT ──
+         How many garments a carton holds. It also exists on `sample.shipment`
+         as R&D's working note; costing reads the approved one. */
+      ...(packaging?.garmentsPerCarton
+        ? {
+          packingConfiguration: {
+            revision: 1,
+            garmentsPerCarton: packaging.garmentsPerCarton,
+            decidedBy: { id: new mongoose.Types.ObjectId(), name: "A Merchandising Fixture" },
+            decidedAt: new Date("2026-07-11"),
+          },
+        }
+        : {}),
+    },
     sample: {
       consumptionRawItems: withMaterial
         ? [{ rawItemId: item._id, rawItemName: item.name, quantity: Number(consumption), unit: uom, allowancePercent: 0 }]
@@ -318,8 +443,16 @@ async function seedSourceBacked(companyId, {
       ...(packaging?.garmentsPerCarton
         ? { shipment: { garmentsPerCarton: packaging.garmentsPerCarton } }
         : {}),
+      /* ── R&D MEASURES WHAT MERCHANDISING APPROVED ─────────────────────
+         `sourceSelectionRowId` names the approved `packagingSelections` row
+         this measurement answers. Costing joins the two by ROW, so a
+         measurement of a component nobody approved is a record and not a
+         cost — which is why the fixture states the link rather than leaving
+         the row floating. */
       packagingRequirements: packaging && packagingItem
         ? [{
+          rowId: PKG_ROW_ID,
+          sourceSelectionRowId: PKG_SELECTION_ROW_ID,
           rawItemId: packagingItem._id, rawItemName: packagingItem.name,
           specification: packaging.specification || "Printed poly bag, 300x400mm",
           quantity: packaging.quantity,
@@ -330,49 +463,24 @@ async function seedSourceBacked(companyId, {
           evidence: packaging.evidence || "SAMPLE_MEASURED",
         }]
         : [],
-      serviceRequirements: [
-        ...(service && serviceMaster ? [{
-          serviceId: serviceMaster._id,
-          serviceCode: serviceMaster.serviceCode, serviceName: serviceMaster.name,
-          specification: service.specification || "Enzyme wash, two cycles",
-          quantity: service.quantity,
-          billingUnit: service.unit || "Piece",
-          basis: service.basis || "PER_GARMENT",
-          owner: service.owner || "RND",
-          evidence: service.evidence || "SAMPLE_MEASURED",
-          purpose: "OUTSIDE_PROCESS",
-        }] : []),
-        /* ── ONE-TIME SETUP, FROM EITHER SOURCE ────────────────────────
-           `development.internal` names a configured company charge; anything
-           else is bought outside and priced from its own quotation. */
-        ...(developmentRows.map((d) => ({
-          /* The row's own identity, as the sample submit mints it — so two
-             rows naming the same charge stay two rows. */
-          rowId: d.rowId,
-          ...(d.internal
-            ? {
-              developmentSource: "COMPANY_POLICY",
-              developmentChargeKey: d.chargeKey || "pattern",
-              /* How many of what the charge is priced per. A flat charge is
-                 not a quantity of anything, and carries none. */
-              ...(d.quantity === null ? {} : { quantity: d.quantity ?? 1 }),
-              ...(d.unit ? { billingUnit: d.unit } : {}),
-            }
-            : {
-              developmentSource: "SUPPLIER_QUOTATION",
-              serviceId: devServiceMaster?._id,
-              serviceCode: devServiceMaster?.serviceCode,
-              serviceName: devServiceMaster?.name,
-              billingUnit: d.unit || "Lot",
-              quantity: d.quantity ?? 1,
-            }),
-          specification: d.specification || "Pattern and marker development",
-          basis: "FIXED_PER_RUN",
-          purpose: "DEVELOPMENT_TOOLING",
-          owner: d.owner || "RND",
-          evidence: d.evidence || "SAMPLE_MEASURED",
-        }))),
-      ],
+
+      /* ── THE APPROVED WEIGHING — R&D'S, AND VERSIONED ─────────────────
+         `shipment` above is R&D's working record and nothing about it is
+         versioned. A costing reads the approved measurement, so the fixture
+         approves one wherever it asks for a packed weight. */
+      ...(packaging?.packedWeightGrams
+        ? {
+          packingMeasurement: {
+            revision: 1,
+            packedWeightGrams: packaging.packedWeightGrams,
+            measuredBy: { id: new mongoose.Types.ObjectId(), name: "An R&D Fixture" },
+            measuredAt: new Date("2026-07-20"),
+            approvedBy: { id: new mongoose.Types.ObjectId(), name: "A Second R&D Fixture" },
+            approvedAt: new Date("2026-07-21"),
+          },
+        }
+        : {}),
+      serviceRequirements: sampleServiceRows,
       status: "approved",
       approvedAt: new Date("2026-08-01"),
     },
@@ -382,20 +490,59 @@ async function seedSourceBacked(companyId, {
        APPROVED — the frozen revision, not the live record R&D may still be
        drafting. `techSheet.status` alone never proved that.
 
-       The snapshot is deliberately EMPTY: `engineered` rows come from it and
-       outrank the measured and planned lists, so a fixture that filled it in
-       would silently re-source every material figure in this folder. Empty
-       means the existing precedence — measured, then planned — is unchanged,
-       and every figure these suites assert stays what it was. */
+       ── THE SNAPSHOT NOW CARRIES THE CONTENT ─────────────────────────
+       It used to be deliberately EMPTY, so that the measured-then-planned
+       precedence these suites were written against stayed in force. Both of
+       those are retired as cost-bearing authorities: a planned pick and a
+       measured sample consumption are planning history and evidence, and
+       neither contributes a quantity, a time, a packaging line, a service, a
+       shipment fact or a freight input to a costing.
+
+       So the same figures live HERE, in the revision R&D froze and Industrial
+       Engineering then confirms — which is the only place a costing reads
+       them from. The `sample.*` lists below are unchanged and stay visible as
+       what they now are. */
     techSheet: {
       status: "approved",
       technical: { status: "approved", revision: 1 },
-      technicalRevisions: [{
-        revision: 1, outcome: "approved",
-        submittedAt: new Date("2026-07-01"), submittedBy: { name: "R&D Fixture" },
-        decidedAt: new Date("2026-07-02"), decidedByName: "Sales Fixture",
-        snapshot: { materials: [] },
-      }],
+      technicalRevisions: [authority.frozenRevision({
+        revision: 1,
+        materials: withMaterial
+          ? [
+            {
+              rawItemId: item._id, rawItemName: item.name,
+              consumptionPerPiece: Number(consumption),
+              /* NOT `Number(allowancePercent)`: that turns `null` into 0 and
+                 loses the difference between "not recorded" and "none". */
+              allowancePercent,
+              unit: uom, specification: materialSpecification,
+              rawItemSku: item.sku || "",
+            },
+            ...extraMaterials.map((x) => x.row),
+          ]
+          : [],
+        operations: withOperation
+          ? [{
+            operationCode: `OP-SB-${n}`, name: "Assembly", machineType: "SNLS",
+            minutes: Math.floor(samSeconds / 60), seconds: samSeconds % 60,
+          }]
+          : [],
+        packaging: packaging && packagingItem
+          ? [{
+            rawItemId: packagingItem._id, rawItemName: packagingItem.name,
+            specification: packaging.specification || "Printed poly bag, 300x400mm",
+            quantity: packaging.quantity,
+            unit: packaging.unit || "Piece",
+            basis: packaging.basis || "PER_GARMENT",
+            evidence: packaging.evidence || "SAMPLE_MEASURED",
+            included: packaging.included !== false,
+          }]
+          : [],
+        services: sampleServiceRows,
+        shipment: packaging?.garmentsPerCarton
+          ? { garmentsPerCarton: packaging.garmentsPerCarton }
+          : null,
+      })],
     },
   });
 
@@ -531,8 +678,116 @@ async function seedSourceBacked(companyId, {
     }
   }
 
+  /* ── ONE DEFINITION OF THE SERVICE ROWS ────────────────────────────────
+     Read by the frozen technical revision (where a costing gets them) and by
+     the sample's own list (where they stay visible as evidence). Two spellings
+     of the same fact is two things to keep in step. */
+  const sampleServiceRows = [
+        ...(service && serviceMaster ? [{
+          serviceId: serviceMaster._id,
+          serviceCode: serviceMaster.serviceCode, serviceName: serviceMaster.name,
+          specification: service.specification || "Enzyme wash, two cycles",
+          quantity: service.quantity,
+          billingUnit: service.unit || "Piece",
+          basis: service.basis || "PER_GARMENT",
+          owner: service.owner || "RND",
+          evidence: service.evidence || "SAMPLE_MEASURED",
+          purpose: "OUTSIDE_PROCESS",
+        }] : []),
+        /* ── ONE-TIME SETUP, FROM EITHER SOURCE ────────────────────────
+           `development.internal` names a configured company charge; anything
+           else is bought outside and priced from its own quotation. */
+        ...(developmentRows.map((d) => ({
+          /* The row's own identity, as the sample submit mints it — so two
+             rows naming the same charge stay two rows. */
+          rowId: d.rowId,
+          ...(d.internal
+            ? {
+              developmentSource: "COMPANY_POLICY",
+              developmentChargeKey: d.chargeKey || "pattern",
+              /* How many of what the charge is priced per. A flat charge is
+                 not a quantity of anything, and carries none. */
+              ...(d.quantity === null ? {} : { quantity: d.quantity ?? 1 }),
+              ...(d.unit ? { billingUnit: d.unit } : {}),
+            }
+            : {
+              developmentSource: "SUPPLIER_QUOTATION",
+              serviceId: devServiceMaster?._id,
+              serviceCode: devServiceMaster?.serviceCode,
+              serviceName: devServiceMaster?.name,
+              billingUnit: d.unit || "Lot",
+              quantity: d.quantity ?? 1,
+            }),
+          specification: d.specification || "Pattern and marker development",
+          basis: "FIXED_PER_RUN",
+          purpose: "DEVELOPMENT_TOOLING",
+          owner: d.owner || "RND",
+          evidence: d.evidence || "SAMPLE_MEASURED",
+        }))),
+  ];
+
+  /* ── PRODUCTION'S OWN RECORD OF WHAT AN OPERATION PAYS ────────────────
+     The salary basis used to travel inline on the sample operation row, which
+     is where `costOperations` found it. The route is IE's now, and an IE
+     bulletin row carries no payroll fact — so the rate is resolved where it
+     actually belongs: the registered Operation master, by code. Without this
+     every confirmed style blocks with "not mapped to a salary group", which
+     is a true statement about a register the fixture never wrote. */
+  if (withOperation) {
+    const Operation = require("../../../models/CMS_Models/Inventory/Configurations/Operation");
+    /* `totalSam` and `durationSeconds` are required by the master, and are
+       Production's own record of the operation — not the approved standard
+       time, which is IE's and comes from the bulletin. Never swallowed: a
+       fixture that silently failed to register the salary basis is a fixture
+       whose every costing blocks for a reason nobody can see. */
+    await Operation.create({
+      companyId,
+      name: "Assembly",
+      operationCode: `OP-SB-${n}`,
+      machineType: "SNLS",
+      totalSam: samSeconds / 60,
+      durationSeconds: samSeconds,
+      salaryDept: "Production",
+      salaryDesig: "Operator",
+    });
+
+    /* ── AND SOMEBODY WHO IS ACTUALLY PAID THAT ──────────────────────
+       `avgSalaryFor` averages ACTIVE employees in the salary group. The
+       figure used to travel inline on the sample operation row
+       (`operatorSalary`), which bypassed Production's payroll entirely —
+       a short-circuit the retired path allowed and the authority chain does
+       not. One operator, at the rate these suites have always asserted
+       against, so the labour figures are unchanged. */
+    await seedOperatorPayroll({ n, expectedNet: salary });
+  }
+
+  if (withOperation === false) {
+    throw new Error(
+      "withOperation: false is retired. A garment with no route cannot be costed — IE has no "
+      + "bulletin to approve, so the style never becomes a confirmed technical source. A suite "
+      + "that is ABOUT an unconfirmed style should pass `confirmIe: false`, which leaves a real "
+      + "route awaiting a real confirmation.",
+    );
+  }
+
   const style = await SampleStyle.create(styleFor("", ""));
   const sibling = secondStyle ? await SampleStyle.create(styleFor("alt", "Alternate")) : null;
+
+  /* ── AND INDUSTRIAL ENGINEERING CONFIRMS IT ────────────────────────────
+     The step this folder never had. Nothing R&D recorded is costable until IE
+     has approved the exact revision it belongs to — so the fixture performs
+     that approval the way the department does: open the engineering file from
+     the style, author the bulletin, have a method study approved for every row
+     by a second person, submit, and have a third approve the version.
+
+     `confirmIe: false` opts out, for a suite that is ABOUT the absence — a
+     style awaiting confirmation is a real state and has to stay reachable. */
+  let ieConfirmation = null;
+  let siblingConfirmation = null;
+  if (confirmIe) {
+    ieConfirmation = await authority.confirmWithIe(companyId, style._id);
+    if (sibling) siblingConfirmation = await authority.confirmWithIe(companyId, sibling._id);
+  }
 
   /* ── AND WHAT THE THREE DEPARTMENTS SAID ABOUT APPLICABILITY ──────────
      Written straight onto the style, the way each department's own service
@@ -582,6 +837,17 @@ async function seedSourceBacked(companyId, {
   }
 
   return {
+    /* What IE approved, for a suite that needs to name the version or make it
+       stale. `null` when `confirmIe: false`, or when the style carried no
+       approved revision for IE to confirm. */
+    ieConfirmation,
+    siblingConfirmation,
+    /* Every extra material's permanent item, its quotation, and the costing
+       line key a caller should assert against. */
+    extraMaterials: extraMaterials.map((x) => ({
+      item: x.item, offer: x.offer,
+      materialLineKey: `mat:${String(x.item._id)}::`,
+    })),
     context: { type: "ENQUIRY_STYLE", primaryId: String(enquiry._id), externalKey: name },
     styleId: String(style._id),
     briefId: seededBrief?.briefId || null,
@@ -597,7 +863,13 @@ async function seedSourceBacked(companyId, {
     developmentLineKey: developmentRows.length ? `dev:dev:${developmentRows[0].rowId}` : null,
     developmentLineKeys: developmentRows.map((d) => `dev:dev:${d.rowId}`),
     developmentRowIds: developmentRows.map((d) => d.rowId),
-    packagingLineKey: packagingItem ? `pkg:pkg:${packagingItem._id}::` : null,
+    /* ── KEYED ON THE ROW, BECAUSE THE ROW NOW HAS AN IDENTITY ─────────
+       This was `pkg:pkg:<rawItemId>::`, which is the key `packagingRow` falls
+       back to for a LEGACY row that has no `rowId`. The fixture's requirement
+       carries one now — as every row written since `rowId` existed does — so
+       its key is the row's, and two approved components naming the same poly
+       bag stay two lines instead of colliding into one. */
+    packagingLineKey: packagingItem ? `pkg:pkg:${PKG_ROW_ID}` : null,
     serviceLineKey: serviceMaster ? `svc:svc:${serviceMaster._id}` : null,
     enquiry, style, sibling, account, journey, item, offer, product: name,
   };
@@ -622,6 +894,138 @@ async function seedSourceBacked(companyId, {
  * `overhead: null` opts out, for a suite that is specifically about a company
  * whose Board has NOT decided.
  */
+/**
+ * THE OPERATOR RATE, THROUGH THE REAL SALARY MODEL.
+ *
+ * ── WHY NOT JUST WRITE THE NUMBER ───────────────────────────────────────────
+ * `operationCosting.avgSalaryFor` averages the NET salary of active employees
+ * in the operation's salary group, and net is DERIVED: `Employee`'s pre-save
+ * hook runs `computeSalary(gross, SalaryConfig, employmentType)` and recomputes
+ * the whole block. A fixture that wrote `netSalary` directly had it recomputed
+ * to 0 — which surfaced, three layers away, as "No operator rate could be
+ * resolved for this operation" on every costing in this folder.
+ *
+ * So the gross is what is seeded, and the model derives the rest. With the
+ * default configuration:
+ *
+ *     gross 19,227  −  EPF 1,154  −  employee ESI 73  =  net 18,000
+ *
+ * ── AND WHY THE CONFIG IS PINNED ────────────────────────────────────────────
+ * `SalaryConfig.getSingleton()` is memoised for 15 seconds, and `test/setup.js`
+ * empties every collection after each test — so a later test can be handed a
+ * config document that no longer exists. The row is created explicitly and the
+ * memo dropped, so the derivation is the same on every run.
+ *
+ * ── THE ASSERTION IS THE POINT ──────────────────────────────────────────────
+ * It is checked HERE, before any costing runs, so a change to the payroll rules
+ * fails with one clear sentence about the operator rate instead of cascading
+ * through thirty-three Costing suites as unexplained money differences.
+ */
+/* ── THE GROSS THAT DERIVES EACH NET RATE THE COSTING FOLDER IS BUILT ON ──
+   `netSalary` is DERIVED: `Employee`'s pre-save hook runs `computeSalary(gross,
+   SalaryConfig, employmentType)`, so only the gross is an input and writing a
+   net directly would bypass the payroll rules these figures are supposed to
+   come from. Each entry below was obtained from that same function against the
+   model's own default config, and the guard in `seedOperatorPayroll` re-derives
+   it on every run — so a change to the statutory rules or to the SalaryConfig
+   defaults is reported as a payroll change rather than reaching the Costing
+   suites as unexplained money differences. */
+const OPERATOR_GROSS_FOR_NET = Object.freeze({
+  18000: 19227,
+  24000: 25635,
+});
+
+/**
+ * Approve the two packing facts a freight line is built from, each as its owner.
+ *
+ * ── WHY A SUITE CANNOT JUST WRITE `sample.shipment` ANY MORE ────────────────
+ * That record is R&D's working note and nothing about it is versioned, so a
+ * costing built from it froze a figure that could change underneath it. Costing
+ * reads an APPROVED weighing (R&D) and an APPROVED pack-out (Merchandising),
+ * which are two records with two owners and two revision numbers.
+ *
+ * The working note is written too, because it is still real and the sampling
+ * screens use it — and because a suite proving that costing ignores it needs it
+ * to be there and to disagree.
+ *
+ * `null` for either fact leaves that record absent, which is how a suite asks
+ * for the gap: absent is absent, and no default is supplied.
+ */
+async function approvePackingFacts(styleId, {
+  packedWeightGrams = null, garmentsPerCarton = null, alsoWorkingNote = true,
+} = {}) {
+  const set = {};
+  if (alsoWorkingNote) {
+    set["sample.shipment"] = {
+      ...(packedWeightGrams === null ? {} : { packedWeightGrams }),
+      ...(garmentsPerCarton === null ? {} : { garmentsPerCarton }),
+    };
+  }
+  if (packedWeightGrams !== null) {
+    set["sample.packingMeasurement"] = {
+      revision: 1,
+      packedWeightGrams,
+      measuredBy: { id: new mongoose.Types.ObjectId(), name: "An R&D Fixture" },
+      measuredAt: new Date("2026-07-20"),
+      approvedBy: { id: new mongoose.Types.ObjectId(), name: "A Second R&D Fixture" },
+      approvedAt: new Date("2026-07-21"),
+    };
+  }
+  if (garmentsPerCarton !== null) {
+    set["materials.packingConfiguration"] = {
+      revision: 1,
+      garmentsPerCarton,
+      decidedBy: { id: new mongoose.Types.ObjectId(), name: "A Merchandising Fixture" },
+      decidedAt: new Date("2026-07-11"),
+    };
+  }
+  if (Object.keys(set).length) await SampleStyle.updateOne({ _id: styleId }, { $set: set });
+}
+
+async function seedOperatorPayroll({ n, expectedNet }) {
+  const gross = OPERATOR_GROSS_FOR_NET[expectedNet];
+  if (!gross) {
+    throw new Error(
+      `no gross is recorded for an operator netting ${expectedNet}. Derive it with `
+      + "`computeSalary({ gross }, SalaryConfig, \"employee\")` and add it to "
+      + "OPERATOR_GROSS_FOR_NET — do not write netSalary directly.",
+    );
+  }
+  const SalaryConfig = require("../../../models/Salaryconfig");
+  const { invalidate } = require("../../../services/memo");
+  const { decryptSalaryFields } = require("../../../utils/salaryEncryption");
+
+  /* Pinned, not inherited: created explicitly and the memo dropped, so the
+     15-second cache cannot serve a config from a wiped collection. */
+  invalidate("settings:salary");
+  if (!(await SalaryConfig.findOne())) await SalaryConfig.create({});
+  invalidate("settings:salary");
+
+  const employee = await Employee.create({
+    firstName: "Line", lastName: `Operator ${n}`,
+    email: `operator-${n}@grav.test`, biometricId: `OPR-${n}`,
+    isActive: true, gender: "Other",
+    department: "Production", designation: "Operator",
+    /* GROSS only. Every other figure is the model's to derive. */
+    salary: { gross },
+  });
+
+  /* Read back through the same decryption path Production uses, so this
+     asserts what `avgSalaryFor` will actually see — not what was sent. */
+  const stored = await Employee.findById(employee._id).select("salary").lean();
+  const net = parseFloat(decryptSalaryFields(stored.salary || {}).netSalary) || 0;
+  if (net !== expectedNet) {
+    throw new Error(
+      `expected net operator rate changed: seeding gross ${gross} derived a net salary of `
+      + `${net}, and this folder's costings are built on ${expectedNet}. The payroll rules or the `
+      + "SalaryConfig defaults have moved. Re-derive the gross that nets to "
+      + `${expectedNet}, or update the expected rate deliberately — do not let this reach the `
+      + "Costing suites as unexplained money differences.",
+    );
+  }
+  return employee;
+}
+
 const configureProduction = async (companyId, {
   overhead = {}, labour = {}, gst = {}, development = null, contingency = null,
   margin = {}, ...over
@@ -798,6 +1202,18 @@ async function approveFinancingPolicy(companyId, {
   basis = "SUBTOTAL_BEFORE_FINANCING",
   advanceTreatment = "REDUCES_FINANCED_AMOUNT",
   dayCountBasis = 365,
+  /* ── WHEN THE COMPANY'S MONEY GOES OUT ────────────────────────────────
+     A rate and a day count say what a day of waiting costs; they say nothing
+     about when the waiting began. Committing to fabric in January and shipping
+     in March is two months of financing that committing on the cutting day does
+     not carry, and no other field tells those two companies apart — so
+     `boardPolicy.service` refuses a financing policy without it.
+
+     THIS DEFAULT IS THE FIXTURE'S OWN DECLARED DECISION, and deliberately not a
+     production default: the Board decides when its money goes out, and a
+     service that guessed would put an unmade decision inside every company's
+     financing. A suite that needs a different event passes one. */
+  startEvent = "MATERIAL_COMMITMENT",
   effectiveFrom = new Date(Date.now() - 365 * 24 * 3600 * 1000),
   rationale = "Fixture policy.",
   actorName = "Board Fixture",
@@ -806,7 +1222,7 @@ async function approveFinancingPolicy(companyId, {
   const ctx = { companyId, actorId: "fixture", actorName };
   const draft = await boardPolicy.createDraft(ctx, {
     policyKey: "FINANCING",
-    financing: { annualRatePercent, basis, advanceTreatment, dayCountBasis },
+    financing: { annualRatePercent, basis, advanceTreatment, dayCountBasis, startEvent },
     rationale,
   });
   return boardPolicy.approve(ctx, draft._id, { effectiveFrom });
@@ -1404,6 +1820,7 @@ async function prepareForCosting(costingId, {
   });
 }
 
+
 /**
  * THE ASSEMBLY ITSELF, FOR THE CLAIMS SALES IS NOT ALLOWED TO SEE.
  *
@@ -1551,6 +1968,7 @@ async function prepareWithLines(costingId, lines = [], { actionKey = null, door 
 }
 
 module.exports = {
+  approvePackingFacts,
   /* Exported so a suite can pin the baseline shape itself — see
      `board-duty-costing`. */
   sourcingFor,

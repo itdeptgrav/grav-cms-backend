@@ -45,6 +45,13 @@ const mongoose = require("mongoose");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
+const CustomerChangeRequest = require("../../../models/CMS_Models/Sales/CustomerChangeRequest");
+const customerChangeRouting = require("../../../services/sales/customerChangeRouting.service");
+const {
+  brandingRequirementsOf,
+  sanitizeBrandingRequirements,
+  ARTWORK_IS_CUSTOMER_REFERENCE,
+} = require("../../../models/CMS_Models/Sales/enquiryBrandingRequirement");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Customer = require("../../../models/Customer_Models/Customer");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
@@ -271,6 +278,31 @@ const briefFromProduct = (p) => ({
   sizeRange: p.sizeRange || "",
   branding: [p.logo && "Logo", p.embroidery && "Embroidery", p.printing && "Printing"].filter(Boolean).join(", "),
   brandingPlacement: p.brandingPlacement || "",
+  /* ── EACH DECORATION, WITH ITS OWN ARTWORK ─────────────────────────────
+     The `branding` sentence above is a summary of three booleans and cannot
+     say that the chest logo is embroidered 8 cm wide in Pantone 280 C while
+     the back print is something else entirely — nor carry the file the
+     customer sent for either. This does.
+
+     `brandingRequirementsOf` returns the structured rows when the enquiry has
+     them, and projects the old booleans into the same shape when it does not,
+     so R&D reads one shape for every record. The artwork is the BUYER'S
+     reference material, never an approved production file — see the schema
+     comment on SampleStyle.brief.brandingRequirements. */
+  brandingRequirements: brandingRequirementsOf(p).map((r) => ({
+    ref: r.ref || undefined,
+    type: r.type || "",
+    placement: r.placement || "",
+    width: r.width ?? undefined,
+    height: r.height ?? undefined,
+    unit: r.unit || "",
+    colourNotes: r.colourNotes || "",
+    notes: r.notes || "",
+    artworkState: r.artworkState || "",
+    artwork: (r.artwork || []).map((i) => ({ fileId: i.fileId, publicId: i.publicId, name: i.name, url: i.url })),
+    legacy: Boolean(r.legacy),
+  })),
+  artworkIsCustomerReference: ARTWORK_IS_CUSTOMER_REFERENCE,
   trims: p.trims || "",
   specialConstruction: p.specialConstruction || "",
   // Dropped before 19 Aug 2026: the enquiry product row always carried this
@@ -304,8 +336,15 @@ const briefFromProduct = (p) => ({
 
 const decorate = (styleDoc, journey, account, enquiry) => {
   const o = styleDoc.toObject ? styleDoc.toObject() : styleDoc;
+  const enquiryProduct = enquiry && o.enquiryProductId
+    ? (enquiry.products || []).find((p) => String(p?._id || "") === String(o.enquiryProductId))
+    : null;
   return {
     ...o,
+    /* The permanent enquiry-line identity travels with the style response so
+       a customer-change request can be tied to the product line, never only
+       to a renameable product name. */
+    productLineRef: enquiryProduct?.productLineRef || null,
     // The BOM decision secret NEVER leaves the server (28 Aug 2026). It is
     // `select: false` on the schema, so a plain read already omits it — but
     // the request route ASSIGNS it before saving, which puts it on the
@@ -394,7 +433,7 @@ async function withJourney(styleDoc, req) {
     styleDoc.accountId ? Account.findOne(await scoped(req, { _id: styleDoc.accountId })).select("accountId companyName displayName").lean() : null,
     styleDoc.enquiryId
       ? Enquiry.findOne(await scoped(req, { _id: styleDoc.enquiryId }))
-        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate")
+        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate products._id products.productLineRef")
         .lean()
       : null,
     startingSalesPricesFor([styleDoc]),
@@ -449,6 +488,12 @@ router.post("/house", salesAuth, async (req, res) => {
       embroidery: b.embroidery,
       printing: b.printing,
       brandingPlacement: b.brandingPlacement,
+      /* The house form shares the Enquiry product form, so it sends the same
+         structured rows. Sanitised here rather than trusted: this is a request
+         body, and the brief is a snapshot — it has no identity of its own to
+         reconcile, so the references it carries are simply dropped. */
+      brandingRequirements: (sanitizeBrandingRequirements(b.brandingRequirements) || [])
+        .map(({ ref, ...rest }) => rest),
       trims: b.trims,
       specialConstruction: b.specialConstruction,
       existingUniform: b.existingUniform,
@@ -630,11 +675,36 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
       })(),
     });
 
+    /* Complete the second half of BRIEF_NEW_VERSION. Removing the rejected
+       enquiry row moves its change request to IN_PROGRESS; provisioning the
+       replacement now links the request to the new permanent line and style.
+       It remains open until the customer approves that replacement. */
+    const scope = await salesScopeFor(req);
+    const replacementCandidates = await CustomerChangeRequest.find({
+      companyId: scope.companyId,
+      enquiryId: enquiry?._id,
+      destination: "BRIEF_NEW_VERSION",
+      status: "IN_PROGRESS",
+      "result.replacementSampleStyleId": { $exists: false },
+    });
+    for (const request of replacementCandidates) {
+      const replacement = styles.find((s) => s.isActive !== false && s.productName === request.productName
+        && String(s._id) !== String(request.sampleStyleId));
+      if (!replacement) continue;
+      const row = (enquiry?.products || []).find(
+        (p) => String(p?._id || "") === String(replacement.enquiryProductId || ""),
+      );
+      request.result = request.result || {};
+      request.result.replacementSampleStyleId = replacement._id;
+      request.result.replacementProductLineRef = row?.productLineRef || undefined;
+      await request.save();
+    }
+
     const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
       created, renamed, backfilled, waived,
-      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account, enquiry), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] POST /by-journey/:journeyRef/provision", err);
@@ -739,15 +809,18 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
     // and in the journey's own stage transition — a GET that creates records
     // meant a style existed only once someone opened the journey, and any
     // prefetch or double-render wrote to the database.
-    const [styles, account] = await Promise.all([
+    const [styles, account, enquiry] = await Promise.all([
       SampleStyle.find({ journeyId: journey._id, isActive: true }).sort({ createdAt: 1 }),
       journey.accountId ? Account.findOne(await scoped(req, { _id: journey.accountId })).select("accountId companyName displayName").lean() : null,
+      Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true }))
+        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate products._id products.productLineRef")
+        .lean(),
     ]);
 
     const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
-      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account, enquiry), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] GET /by-journey", err);
@@ -1858,7 +1931,11 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
           submittedAt: technical.submittedAt,
           submittedBy: actor(req),
           file: style.techSheet.file,
-          snapshot: technicalRecord.snapshotOf(technical, style.techSheet.file),
+          /* The sample record too: the outside-service and development rows
+             Central Costing reads live on `sample.serviceRequirements`, and a
+             revision that froze only `techSheet.technical` left every one of
+             them outside the frozen basis. */
+          snapshot: technicalRecord.snapshotOf(technical, style.techSheet.file, style.sample),
           outcome: "submitted",
         },
       ];
@@ -1892,6 +1969,68 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       // production route before R&D can release the sample MO/WO.  The work
       // order later freezes this route in the established Production flow.
       await syncApprovedTechnicalRoute(style, req.user?.id);
+    } else if (action === "revise") {
+      /* ══ OPENING A SECOND TECHNICAL REVISION ═══════════════════════════
+       *
+       * ── WHAT WAS MISSING ──────────────────────────────────────────────
+       * `approved` was a terminal tech-sheet state, and the technical record
+       * is only editable in DRAFT or REWORK. So once Sales approved revision
+       * 1 there was no mounted route — none — by which R&D could record that
+       * the garment had changed. Everything downstream inherited that dead
+       * end: Industrial Engineering could not re-base onto a revision nobody
+       * could create, and Central Costing's IE_TECHNICAL_APPROVAL_STALE named
+       * a state with no way out of it.
+       *
+       * ── IT IS A DECISION, NOT AN EDIT ─────────────────────────────────
+       * The approved record is what a costing may already have been built on,
+       * so reopening it is Sales' call and it costs a reason — the same
+       * authority and the same price as sending a submitted record back. R&D
+       * then edits, submits and is approved again through the paths that
+       * already exist; this adds no second way to approve anything.
+       *
+       * ── AND NOTHING FROZEN IS TOUCHED ─────────────────────────────────
+       * `technicalRevisions[]` is append-only and every earlier entry keeps
+       * its outcome, its snapshot, its decision and its decider. Revision 1
+       * still says it was approved, because it was. What changes is only
+       * which record is CURRENT. */
+      if (!(await canApprove(req.user))) {
+        return res.status(403).json({ success: false, message: "Only Sales can reopen an approved tech sheet." });
+      }
+      /* Company ownership, proved through the style's own Sales parents —
+         the same proof the technical PUT makes before it writes a fact. */
+      const reviseScope = await salesScopeFor(req);
+      if (!(await ownershipProofFor(style, reviseScope.companyId))) {
+        return res.status(404).json({ success: false, message: "Style not found." });
+      }
+      if (cur !== "approved" || style.techSheet.technical?.status !== technicalRecord.STATUS.APPROVED) {
+        return res.status(409).json({
+          success: false,
+          code: "TECHNICAL_RECORD_NOT_APPROVED",
+          message: "Only an approved technical record is reopened for a new revision.",
+          status: String(style.techSheet.technical?.status || "") || technicalRecord.STATUS.NOT_STARTED,
+          techSheetStatus: cur,
+        });
+      }
+      const reviseReason = String(req.body.note || req.body.reason || "").trim();
+      if (!reviseReason) {
+        return res.status(400).json({
+          success: false,
+          code: "TECHNICAL_REVISION_REASON_REQUIRED",
+          message: "Say why this approved technical record is being reopened.",
+          field: "note",
+        });
+      }
+
+      style.techSheet.status = "in_progress";
+      style.techSheet.revisions.push({ note: reviseReason, at: new Date(), by: actor(req) });
+      /* REWORK, which is what the record's own editable set already names.
+         The revision NUMBER is not touched here: submitting is what mints the
+         next one, so a reopened record that is never resubmitted does not
+         leave a number nobody used. */
+      style.techSheet.technical.status = technicalRecord.STATUS.REWORK;
+      style.techSheet.technical.reopenedAt = new Date();
+      style.techSheet.technical.reopenedBy = actor(req);
+      style.techSheet.technical.reopenReason = reviseReason;
     } else if (action === "changes") {
       if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can request changes." });
       if (!can("changes")) return invalid("changes");
@@ -1916,7 +2055,10 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "Unknown tech-sheet action." });
     }
 
-    const tsKind = { submit: "tech_submitted", approve: "tech_approved", changes: "tech_changes" }[action];
+    const tsKind = {
+      submit: "tech_submitted", approve: "tech_approved", changes: "tech_changes",
+      revise: "tech_reopened",
+    }[action];
     if (tsKind) logHistory(style, { kind: tsKind, note: req.body.note || "" }, req);
     style.updatedBy = actor(req);
     await style.save();
@@ -2448,11 +2590,385 @@ router.post("/:id/sample/send-whatsapp-approval", salesAuth, async (req, res) =>
 // already approved the sample internally; APPENDS to `log`, never
 // overwrites, same append-only discipline as every other decision log in
 // this codebase.
+/* ─────────────────────────────────────────────────────────────────────────
+   ROUTE CUSTOMER CHANGES — what happens after the customer says no.
+
+   POST /api/cms/crm/sample-styles/:id/customer-changes
+   GET  /api/cms/crm/sample-styles/:id/customer-changes
+
+   ── WHY THE SERVER DECIDES ──────────────────────────────────────────────
+   The old recovery was two buttons, and one of them ("Change Product Design")
+   did nothing at all on the server — it navigated. So what a rejection MEANT
+   was decided by whichever button somebody pressed, and the invalidation that
+   should follow it happened, or did not, depending on the screen.
+
+   Routing is a decision about work that other departments will do, against
+   approvals this system granted. It is applied here: the categories are
+   checked, the destination is checked against the dependency chain, the
+   reopening is performed, and the record is written in one place.
+
+   ── WHAT IT REFUSES ─────────────────────────────────────────────────────
+   · a style whose parent belongs to another company (SampleStyle carries no
+     companyId of its own — ownership is proved through journey/enquiry, and
+     the customer-decision handler beside this one has never done it)
+   · a product the customer has not rejected
+   · a decision that has moved since the screen loaded
+   · a destination downstream of what the categories require
+   · a retry of a request already made (idempotency key)
+   ───────────────────────────────────────────────────────────────────────── */
+router.post("/:id/customer-changes", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) {
+      return res.status(403).json({ success: false, message: "Only Sales can route a customer's changes." });
+    }
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const scope = await salesScopeFor(req);
+    const proof = await ownershipProofFor(style, scope.companyId);
+    if (!proof) return res.status(404).json({ success: false, message: "Style not found." });
+
+    /* Only a rejection is routed. Routing an approved sample would reopen work
+       nobody asked to have redone. */
+    const approval = style.customerApproval || {};
+    if (approval.approved !== false) {
+      return res.status(400).json({
+        success: false,
+        code: "NOT_REJECTED",
+        message: "This product has not been rejected by the customer, so there are no changes to route.",
+      });
+    }
+
+    /* ── STALENESS ────────────────────────────────────────────────────
+       The screen states which decision it is answering. If the customer has
+       since changed their mind, or a later rejection replaced this one, the
+       person is looking at something that is no longer true. */
+    const expected = String(req.body?.expectedDecisionAt || "").trim();
+    const actualAt = approval.decidedAt ? new Date(approval.decidedAt).toISOString() : "";
+    if (expected && expected !== actualAt) {
+      return res.status(409).json({
+        success: false,
+        code: "DECISION_CHANGED",
+        message: "The customer's decision has changed since this screen loaded. Reload and look again.",
+      });
+    }
+
+    const categories = customerChangeRouting.normaliseCategories(req.body?.categories);
+    if (!categories.length) {
+      return res.status(400).json({
+        success: false, code: "CATEGORY_REQUIRED",
+        message: "Say what the customer asked to change.",
+      });
+    }
+    const feedback = String(req.body?.customerFeedback || "").trim();
+    if (!feedback) {
+      return res.status(400).json({
+        success: false, code: "FEEDBACK_REQUIRED",
+        message: "Record the customer's own words — they are what the department has to work from.",
+      });
+    }
+
+    const suggested = customerChangeRouting.destinationFor(categories);
+    const chosen = String(req.body?.destination || suggested || "").toUpperCase();
+    const verdict = customerChangeRouting.validateDestination(chosen, categories);
+    if (!verdict.ok) {
+      return res.status(400).json({ success: false, code: verdict.code, message: verdict.message, suggested: verdict.suggested });
+    }
+    const destination = verdict.destination;
+    const plan = customerChangeRouting.invalidationFor(destination);
+
+    /* ── IDEMPOTENCY ──────────────────────────────────────────────────
+       Checked before anything is applied, so a retry cannot open a second
+       sample round on its way to discovering it was a retry. The unique index
+       is the real guard; this is the friendly path. */
+    const idempotencyKey = String(req.body?.idempotencyKey || "").trim() || undefined;
+    if (idempotencyKey) {
+      const already = await CustomerChangeRequest.findOne({ companyId: scope.companyId, idempotencyKey }).lean();
+      if (already) {
+        return res.json({ success: true, changeRequest: already, replayed: true, sampleStyle: await withJourney(style, req) });
+      }
+    }
+
+    const who = actor(req);
+    const now = new Date();
+    /* Captured BEFORE anything is reopened — every branch below moves the
+       stage, and reading it afterwards would record where the product went
+       rather than where it came from. */
+    const previousStage = style.stage || "";
+    const previousState = {
+      materialsStatus: style.materials?.status || "",
+      bomApprovalStatus: style.bomApproval?.status || "",
+      techSheetStatus: style.techSheet?.status || "",
+      sampleStatus: style.sample?.status || "",
+      sampleRounds: (style.sample?.rounds || []).length,
+    };
+
+    /* ── APPLY THE INVALIDATION ───────────────────────────────────────
+       Forward-only in every branch: a previous approval stays on the record as
+       what was true at the time, and no round, revision or log entry is ever
+       removed. */
+    const result = {};
+    if (destination === "MATERIALS_BOM") {
+      /* The approved BOM stays readable as history — `bomApproval` keeps its
+         round number and its decision, and the round is incremented when the
+         next approval is requested, exactly as it always was. What reopens is
+         the selection and the approval state. */
+      style.materials = style.materials || {};
+      style.materials.status = "pending";
+      if (style.bomApproval) {
+        style.bomApproval.status = "none";
+        style.bomApproval.token = undefined;
+      }
+      style.stage = "materials";
+      /* Downstream needs doing again on the new materials. Statuses move back
+         to their "not done yet" values; the revisions and rounds that produced
+         them are untouched. */
+      if (style.techSheet) style.techSheet.status = "pending";
+      if (style.sample) style.sample.status = "not_started";
+      result.bomApprovalRound = (style.bomApproval?.round || 0) + 1;
+    } else if (destination === "TECH_SHEET") {
+      /* The BOM stays approved. A returned technical revision is how R&D is
+         told to open the next one — the same mechanism the tech-sheet
+         "changes" action uses, so there is one way to reopen a tech sheet. */
+      if (style.techSheet) {
+        style.techSheet.status = "changes";
+        style.techSheet.revisions = style.techSheet.revisions || [];
+        style.techSheet.revisions.push({ note: feedback, at: now, by: who });
+        if (style.techSheet.technical) style.techSheet.technical.status = "rework";
+        const open = (style.techSheet.technicalRevisions || [])
+          .filter((r) => r.outcome === "submitted")
+          .reduce((best, r) => (r.revision > (best?.revision ?? -1) ? r : best), null);
+        if (open) {
+          open.outcome = "returned";
+          open.decidedAt = now;
+          open.decidedBy = who;
+          open.decisionNote = feedback;
+        }
+        result.techSheetRevision = (style.techSheet.technical?.revision || 0) + 1;
+      }
+      if (style.sample) style.sample.status = "not_started";
+      style.stage = "rnd";
+    } else if (destination === "SAMPLE_ROUND") {
+      /* The BOM and the tech sheet are both untouched. The existing "reject"
+         action already numbers and supersedes rounds correctly, so this uses
+         the same shape rather than a second numbering scheme. */
+      style.sample = style.sample || {};
+      style.sample.rounds = style.sample.rounds || [];
+      style.sample.revisions = style.sample.revisions || [];
+      const latest = style.sample.rounds[style.sample.rounds.length - 1];
+      if (latest && latest.outcome === "pending") {
+        latest.outcome = "rejected";
+        latest.feedback = feedback;
+        latest.judgedAt = now;
+        latest.judgedBy = who;
+      }
+      style.sample.status = "rejected";
+      style.sample.revisions.push({ note: feedback, roundId: latest?._id, at: now, by: who });
+      style.stage = "rnd";
+      /* The NEXT round's number, which R&D will raise. Not created here: a
+         round is a thing somebody made, and inventing an empty one would put a
+         sample on the record that nobody has sewn. */
+      result.sampleRoundNo = style.sample.rounds.length + 1;
+    } else if (destination === "BRIEF_NEW_VERSION") {
+      /* Nothing on this style is reopened. The rejected product is kept whole
+         and a replacement is raised on the Enquiry — Sales does that with the
+         product editor, which already prefills from the removed row. This
+         request is what links the two. */
+      style.status = "completed";
+    }
+
+    /* The style is no longer waiting on the customer — it is waiting on
+       whoever this was routed to. The verdict itself stays on the record. */
+    style.updatedBy = who;
+    logHistory(style, {
+      kind: "customer_changes_routed",
+      from: previousState.sampleStatus,
+      to: destination,
+      note: customerChangeRouting.summarise({ categories, destination }),
+    }, req);
+    await style.save();
+
+    let changeRequest;
+    try {
+      changeRequest = await CustomerChangeRequest.create({
+        companyId: scope.companyId,
+        journeyId: style.journeyId,
+        /* `ownershipProofFor` answers WHETHER this company owns the style, not
+           which enquiry it belongs to — the style carries that itself. */
+        enquiryId: style.enquiryId,
+        productLineRef: String(req.body?.productLineRef || "").trim() || undefined,
+        productName: style.productName,
+        sampleStyleId: style._id,
+        sourceDecision: {
+          approved: false,
+          decidedAt: approval.decidedAt || null,
+          decidedBy: approval.decidedBy || null,
+          note: approval.note || "",
+        },
+        categories,
+        customerFeedback: feedback,
+        internalInstructions: String(req.body?.internalInstructions || "").trim(),
+        attachments: sanitizeImages(req.body?.attachments),
+        suggestedDestination: suggested,
+        destination,
+        owner: customerChangeRouting.ownerFor(destination),
+        previousStage,
+        previousState,
+        status: "OPEN",
+        result,
+        idempotencyKey,
+        createdBy: who,
+        routedAt: now,
+        routedBy: who,
+      });
+    } catch (err) {
+      /* Two retries racing: the unique index caught the second. Answer with
+         the one that won rather than with a duplicate-key error. */
+      if (err?.code === 11000 && idempotencyKey) {
+        const winner = await CustomerChangeRequest.findOne({ companyId: scope.companyId, idempotencyKey }).lean();
+        if (winner) {
+          return res.json({ success: true, changeRequest: winner, replayed: true, sampleStyle: await withJourney(style, req) });
+        }
+      }
+      throw err;
+    }
+
+    /* ── TELL WHOEVER HAS IT NOW ──────────────────────────────────────
+       Fire-and-forget, like every other notification in this file: the routing
+       is committed, and a mail server being down must not undo it. */
+    (async () => {
+      const EVENT_BY_DESTINATION = {
+        MATERIALS_BOM: "customer_changes_to_materials",
+        TECH_SHEET: "customer_changes_to_rnd",
+        SAMPLE_ROUND: "customer_changes_to_rnd",
+        BRIEF_NEW_VERSION: "customer_changes_to_sales",
+      };
+      const key = EVENT_BY_DESTINATION[destination];
+      if (!key) return;
+      /* ── THE CONTEXT IS A GARNISH, NOT A PRECONDITION ─────────────────
+         `styleEmailContext` reads the account, the customer and the style's
+         photos to make the mail readable. If any of that is unavailable the
+         DEPARTMENT STILL HAS TO BE TOLD — a missing customer name is not a
+         reason for Merchandising never to learn the BOM reopened. Caught
+         separately so the outer catch only ever sees a genuine send failure. */
+      let c = {};
+      try {
+        c = await styleEmailContext(style, await sampleEmailScope(req)) || {};
+      } catch {
+        c = {};
+      }
+      await notifyEvent(key, {
+        vars: {
+          product: style.productName || "",
+          customer: c.customerName || "",
+          salesPerson: who.name || "Sales",
+          destination: (customerChangeRouting.CHANGE_DESTINATIONS.find((d) => d.code === destination) || {}).label || destination,
+          feedback,
+        },
+        heading: `Customer changes on ${style.productName || "a product"}`,
+        ctaUrl: c.viewUrl || `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+        ctaLabel: "Open the style",
+      });
+    })().catch(() => {});
+
+    return res.status(201).json({
+      success: true,
+      changeRequest: changeRequest.toObject(),
+      explanation: plan,
+      sampleStyle: await withJourney(style, req),
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] POST /:id/customer-changes", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/** Every customer change routed on this product, newest first. */
+router.get("/:id/customer-changes", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+    const changeRequests = await CustomerChangeRequest
+      .find({
+        companyId: scope.companyId,
+        $or: [
+          { sampleStyleId: style._id },
+          { "result.replacementSampleStyleId": style._id },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ success: true, changeRequests });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] GET /:id/customer-changes", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* Explicit repair/admin door for a request that has genuinely completed.
+   Normal same-style rework closes automatically when the customer approves
+   the revised sample below. This endpoint exists so a lost client response or
+   an imported decision cannot strand the commercial hold forever. */
+router.post("/:id/customer-changes/:changeRef/resolve", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) {
+      return res.status(403).json({ success: false, message: "Only Sales can resolve customer changes." });
+    }
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+    const request = await CustomerChangeRequest.findOne({
+      companyId: scope.companyId,
+      changeRef: String(req.params.changeRef || "").trim(),
+      sampleStyleId: style._id,
+    });
+    if (!request) return res.status(404).json({ success: false, message: "Customer change request not found." });
+    if (!["OPEN", "IN_PROGRESS"].includes(request.status)) {
+      return res.json({ success: true, changeRequest: request.toObject(), replayed: true });
+    }
+    const decidedAt = style.customerApproval?.decidedAt
+      ? new Date(style.customerApproval.decidedAt).getTime() : 0;
+    const sourceAt = request.sourceDecision?.decidedAt
+      ? new Date(request.sourceDecision.decidedAt).getTime() : 0;
+    if (style.customerApproval?.approved !== true || decidedAt <= sourceAt) {
+      return res.status(409).json({
+        success: false,
+        code: "REVISED_SAMPLE_NOT_APPROVED",
+        message: "The revised product must be approved by the customer before this change can be resolved.",
+      });
+    }
+    request.status = "RESOLVED";
+    request.resolvedAt = new Date();
+    request.resolvedBy = actor(req);
+    request.resolutionNote = String(req.body?.note || "Customer approved the revised product.").trim();
+    await request.save();
+    return res.json({ success: true, changeRequest: request.toObject() });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] POST /:id/customer-changes/:changeRef/resolve", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
   try {
     if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can record the customer's decision." });
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
 
     if (!isSampleSettled(style)) {
       return res.status(400).json({ success: false, message: "Sales must approve the sample internally before asking the customer." });
@@ -2480,6 +2996,32 @@ router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
     logHistory(style, { kind: approved ? "customer_sample_approved" : "customer_sample_rejected", note }, req);
     style.updatedBy = who;
     await style.save();
+
+    /* A routed change remains a hard Purchase Invoice hold until the customer
+       accepts a later result. Close every open request on this style in the
+       same command that records that acceptance; rejecting again leaves the
+       existing request open and can be routed as a new append-only request. */
+    if (approved) {
+      await CustomerChangeRequest.updateMany(
+        {
+          companyId: scope.companyId,
+          $or: [
+            { sampleStyleId: style._id },
+            { "result.replacementSampleStyleId": style._id },
+          ],
+          status: { $in: ["OPEN", "IN_PROGRESS"] },
+          "sourceDecision.decidedAt": { $lt: now },
+        },
+        {
+          $set: {
+            status: "RESOLVED",
+            resolvedAt: now,
+            resolvedBy: who,
+            resolutionNote: note || "Customer approved the revised product.",
+          },
+        },
+      );
+    }
 
     return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {

@@ -109,7 +109,7 @@ async function world(seedOpts = {}, { charges = null } = {}) {
      to do. */
   if (charges) await approveDevelopmentPolicy(co._id, charges);
 
-  const seeded = await seedSourceBacked(co._id, { withMaterial: false, withOperation: false, ...seedOpts });
+  const seeded = await seedSourceBacked(co._id, { withMaterial: false, ...seedOpts });
   /* ── NO OVERHEAD IN THIS WORLD ────────────────────────────────────────
      Every figure this suite asserts is stated to the paisa, so a 12% company
      overhead on top would be counted into all of them. Overhead's own

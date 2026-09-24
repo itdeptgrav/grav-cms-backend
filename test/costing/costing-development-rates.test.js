@@ -218,7 +218,7 @@ const inForce = (res) => {
 const readPolicy = (w) => call("/policy/current", { token: w.token, company: w.co._id });
 
 async function costingFor(w, development) {
-  const seeded = await seedSourceBacked(w.co._id, { withMaterial: false, withOperation: false, development });
+  const seeded = await seedSourceBacked(w.co._id, { withMaterial: false, development });
   await configureProduction(w.co._id);
   const made = await call("/", {
     method: "POST", token: w.token, company: w.co._id,

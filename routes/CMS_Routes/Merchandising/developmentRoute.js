@@ -33,6 +33,7 @@ const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
 const development = require("../../../services/merchandising/development.service");
+const materialCatalogue = require("../../../services/merchandising/materialCatalogue.service");
 const adoption = require("../../../services/merchandising/developmentAdoption.service");
 const legacy = require("../../../services/merchandising/developmentLegacy.service");
 
@@ -56,6 +57,28 @@ const ctx = (req) => ({ ...req.merchandising, actorEmail: req.user?.email || "" 
 const idempotencyKey = (req) => String(
   req.get("Idempotency-Key") || req.body?.idempotencyKey || "",
 ).trim();
+
+/* ═══ STORE'S CATALOGUE, THROUGH A KEYHOLE ════════════════════════════════
+   Mounted at `/catalogue/...` and not under `/development/...` for a reason
+   that is not taste: `/development/:fileId` would swallow any sibling added
+   beside it, and this is not a property of one file in any case.
+
+   Behind `selection.write` rather than `file.read`. Reading a development
+   file does not require a way to enumerate Store's item master, and the only
+   thing this list is for is writing a selection — so the grant that opens it
+   is the grant to write one. A viewer sees every row already chosen and no
+   way to browse the catalogue, which is exactly their authority.
+
+   It is NOT Store's `/api/cms/raw-items`, and the service header says why at
+   length: that endpoint needs a Store grant and answers with stock balances,
+   vendors and prices. */
+router.get("/catalogue/materials", requireCompany, canSelect, handle(async (req, res) => {
+  const out = await materialCatalogue.search(ctx(req), {
+    q: req.query.q, category: req.query.category,
+    cursor: req.query.cursor, limit: req.query.limit,
+  });
+  return res.json({ success: true, ...out });
+}));
 
 /* ═══ THE REGISTER ═════════════════════════════════════════════════════════
    Before the `/:fileId` patterns, so `overview` is never read as a file id. */

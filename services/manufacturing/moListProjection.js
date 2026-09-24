@@ -375,6 +375,17 @@ function buildListPipeline(q) {
               // still be read as internal/sampling rather than silently badged
               // as a customer order.
               orderOrigin: 1,
+              // Product-wise Job Work summary. The exact classification stays
+              // on each item; this count only drives the register badge.
+              jobWorkProductCount: {
+                $size: {
+                  $filter: {
+                    input: { $ifNull: ["$items", []] },
+                    as: "item",
+                    cond: { $eq: ["$$item.fulfilmentModel", "JOB_WORK"] },
+                  },
+                },
+              },
               isInternalOrder: 1,
               sampleStyleId: 1,
             },
@@ -501,6 +512,9 @@ function projectRow(r) {
     // services/orderOrigin.js for why older rows are inferred rather than
     // read straight off the field.
     orderOrigin: resolveOrderOrigin(r),
+    // Exact per-line data remains on CustomerRequest.items. This summary is
+    // additive and cannot mislabel a mixed order as wholly Job Work.
+    jobWorkProductCount: Math.max(0, Number(r.jobWorkProductCount) || 0),
   };
 }
 

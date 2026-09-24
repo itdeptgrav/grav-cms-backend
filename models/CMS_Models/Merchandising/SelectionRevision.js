@@ -249,6 +249,16 @@ const packingInstructionSchema = new mongoose.Schema(
     assortmentInstruction: { type: String, trim: true, default: "", maxlength: 2000 },
     ratioDescription: { type: String, trim: true, default: "", maxlength: 2000 },
     cartonMarks: { type: String, trim: true, default: "", maxlength: 2000 },
+    /* ── HOW MANY GARMENTS ONE CARTON HOLDS ──────────────────────────────
+       The numeric half of the pack-out the prose above describes, and the one
+       a costing needs: freight and per-carton packaging are charged by the
+       carton, with ceiling division, so 250 garments at 40 a carton is seven
+       cartons and the seventh is paid for in full.
+
+       Here rather than on a row, for the same reason the folding method is —
+       it is a property of the pack-out, not of the polybag. Absent, never
+       zero: a carton holding no garments is not a pack configuration. */
+    garmentsPerCarton: { type: Number, min: 1, default: undefined },
     additionalInstruction: { type: String, trim: true, default: "", maxlength: 4000 },
   },
   { _id: false },

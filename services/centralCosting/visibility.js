@@ -510,6 +510,27 @@ function serializeVersion(version, ctx, withheld) {
           financedSharePercent: v.financingProvenance.financedSharePercent ?? null,
           effectivePercent: v.financingProvenance.effectivePercent ?? null,
           formula: v.financingProvenance.formula || null,
+          /* Which arithmetic produced the figure, and — for a plan — every
+             tranche of it. A reader entitled to the build-up is entitled to
+             see that the total is a sum of parts and what each part was. */
+          method: v.financingProvenance.method || null,
+          /* Where the company's money went out on this order, and when. */
+          startEvent: v.financingProvenance.startEvent || null,
+          startDate: v.financingProvenance.startDate || null,
+          tranches: Array.isArray(v.financingProvenance.tranches)
+            ? v.financingProvenance.tranches.map((t) => ({
+              name: t.name || "",
+              percentage: t.percentage ?? null,
+              dueEvent: t.dueEvent || null,
+              offsetDirection: t.offsetDirection || null,
+              offsetDays: t.offsetDays ?? null,
+              /* The date it fell due, and the calendar days from the start
+                 to it — the two numbers the contribution is built from. */
+              dueDate: t.dueDate || null,
+              financedDays: t.financedDays ?? null,
+              effectivePercent: t.effectivePercent ?? null,
+            }))
+            : null,
           asOf: v.financingProvenance.asOf || null,
         },
       } : {}),

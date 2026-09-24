@@ -54,7 +54,17 @@ const OWNER = Object.freeze({
   MERCHANDISING: "Merchandising",
   STORE: "Store / Purchase",
   BOARD: "Board",
+  /* The desk that confirms R&D's record before any of it may be priced. */
+  IE: "Industrial Engineering",
 });
+
+/* Whose date an operational event is. The schedule service owns the mapping;
+   this translates its department name into the vocabulary above, so a
+   financing part reads with the same owner as every other part. */
+function ownerOfEvent(event) {
+  const department = require("../sales/orderSchedule.service").gapFor(event)?.owner?.department;
+  return Object.values(OWNER).includes(department) ? department : (department || OWNER.SALES);
+}
 
 /** One comparable fact. `token` is compared; `label` is shown. */
 const part = (key, token, label, owner) => ({ key, token: str(token), label, owner });
@@ -117,6 +127,99 @@ function partsFor({ brief = null, preview = null, assembled = null, policy = {},
   /* ── THE APPROVED TECHNICAL REVISION ─────────────────────────────────
      R&D may already be drafting the next one; what matters is which
      revision Sales approved, because that is what the costing reads. */
+  /* ── THE APPROVED AUTHORITIES, BY IDENTITY ──────────────────────────────
+     R&D's revision number alone was never enough. A costing is built on THREE
+     approvals, and any of them being replaced makes it stale:
+
+       · the IE bulletin version that confirmed the technical record — and the
+         engineering file it belongs to, because a version reached through a
+         different file is a different decision;
+       · the exact R&D revision that version froze, by its KEY rather than its
+         number: a revision re-approved under the same number is a different
+         decision and a number would miss it;
+       · Merchandising's approved selection, in whichever of its two forms
+         applies — the form travels too, so a style moving from a BOM approval
+         to an execution-file revision is itself a change.
+
+     Identities only, never contents. A consumption, a rate and a SAM are the
+     owning desks' to know; what travels here is enough to COMPARE and not
+     enough to READ BACK. */
+  const binding = preview?.approvedSource || assembled?.approvedSource;
+  if (binding?.technical) {
+    const t = binding.technical;
+    out.push(part(
+      "ie:file",
+      id(t.ieStyleFileId),
+      "The engineering file this style's standard belongs to",
+      OWNER.IE,
+    ));
+    out.push(part(
+      "ie:version",
+      `${id(t.bulletinVersionId)}:${str(t.bulletinVersionNo)}`,
+      "The approved engineering version behind this estimate",
+      OWNER.IE,
+    ));
+    out.push(part(
+      "ie:technicalRevision",
+      `${str(t.technicalRevision)}:${str(t.technicalRevisionKey)}`,
+      "The technical revision Industrial Engineering confirmed",
+      OWNER.IE,
+    ));
+  }
+  /* ── PACKAGING: MERCHANDISING'S, WITH ITS OWN IDENTITY ────────────────
+     Separate from `merch:selection` on purpose. A style whose packaging
+     specification is revised has not had its bill of materials revised, and
+     one part moving must not report the other as changed — that is the whole
+     reason these are parts rather than one hash of everything. */
+  if (binding?.packagingSource?.provenance) {
+    const p = binding.packagingSource.provenance;
+    out.push(part(
+      "merch:packaging",
+      [
+        str(p.form),
+        id(p.executionFileId), id(p.packagingRevisionId),
+        str(p.revisionNo), str(p.approvedAt),
+      ].join(":"),
+      "Merchandising's approved packaging specification for this style",
+      OWNER.MERCHANDISING,
+    ));
+  }
+
+  /* ── THE PACKED WEIGHT, AND WHO APPROVED THE WEIGHING ─────────────────
+     R&D's, and its own part: a re-weighed garment changes the freight line and
+     nothing else. */
+  if (binding?.packingFacts?.provenance) {
+    const p = binding.packingFacts.provenance;
+    out.push(part(
+      "rnd:packingMeasurement",
+      `${str(p.packingMeasurementRevision)}:${str(p.packingMeasurementApprovedAt)}`,
+      "The approved packed weight this estimate's freight was built on",
+      OWNER.RND,
+    ));
+    /* And the pack-out, which is Merchandising's decision rather than a
+       measurement — so it is a third part, not folded into either. */
+    out.push(part(
+      "merch:packConfiguration",
+      `${str(p.packConfigurationRevision)}:${str(p.packConfigurationDecidedAt)}`,
+      "Merchandising's approved carton capacity for this style",
+      OWNER.MERCHANDISING,
+    ));
+  }
+
+  if (binding?.selection) {
+    const sel = binding.selection;
+    out.push(part(
+      "merch:selection",
+      [
+        str(sel.form),
+        id(sel.executionFileId), str(sel.revisionNo),
+        str(sel.bomApprovalRound), str(sel.approvedAt),
+      ].join(":"),
+      "Merchandising's approved selection for this style",
+      OWNER.MERCHANDISING,
+    ));
+  }
+
   const technical = preview?.technicalRecord || preview?.technical?.technicalRecord;
   if (technical) {
     out.push(part(
@@ -253,6 +356,36 @@ function partsFor({ brief = null, preview = null, assembled = null, policy = {},
       `${str(decision.decidedAt ? new Date(decision.decidedAt).toISOString() : "")}`,
       `${str(decision.ownerDepartment) || "A department"} decided ${family} does not apply`,
       str(decision.ownerDepartment) || OWNER.MERCHANDISING,
+    ));
+  }
+
+  /* ── THE TIMELINE THE FINANCING FIGURE RESTS ON ──────────────────────
+     Financing is a calendar distance: from the day the company's money goes
+     out to the day each payment falls due. So dispatch slipping a month, or
+     the invoice moving, makes this order genuinely more expensive to finance
+     — and a costing built on the old dates has to read as stale rather than
+     quietly standing.
+
+     The DATES travel, not the rate: a reader is entitled to know the
+     timeline moved, and what money costs is the Board's. Each part is owned
+     by the department whose date it is, because the fix is their job. */
+  const financingLine = (assembled?.lines || []).find((l) => l?.financingProvenance);
+  const financingProv = financingLine?.financingProvenance || null;
+  if (financingProv?.startEvent) {
+    out.push(part(
+      "financing:start",
+      `${str(financingProv.startEvent)}:${financingProv.startDate ? new Date(financingProv.startDate).toISOString().slice(0, 10) : ""}`,
+      "When the company's money goes out on this order",
+      ownerOfEvent(financingProv.startEvent),
+    ));
+  }
+  for (const tranche of financingProv?.tranches || []) {
+    if (!tranche?.dueEvent) continue;
+    out.push(part(
+      `financing:due:${str(tranche.dueEvent)}:${str(tranche.percentage)}`,
+      `${tranche.dueDate ? new Date(tranche.dueDate).toISOString().slice(0, 10) : ""}:${str(tranche.financedDays)}`,
+      `When ${str(tranche.percentage)}% of this order falls due`,
+      ownerOfEvent(tranche.dueEvent),
     ));
   }
 
