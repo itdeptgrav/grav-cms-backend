@@ -182,6 +182,72 @@ const versionEventSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/**
+ * THE R&D RECORD THIS VERSION WAS REVIEWED AGAINST, FROZEN.
+ *
+ * ── WHY THIS EXISTS, AND WHY THE NAME IS `technicalSource` ──────────────────
+ * The three `source*` digests below are over the BULLETIN ROWS — IE's own
+ * authored content. This is a different source entirely: R&D's approved
+ * technical revision, which is what the bulletin was engineered FROM.
+ *
+ * Central Costing may read no R&D value until IE has confirmed the exact
+ * revision it belongs to. "The exact revision" has to be a fact on the
+ * APPROVED version, not a live re-read: R&D can approve a newer revision the
+ * minute after this one is approved, and a costing that re-read R&D would
+ * silently re-base onto a record nobody reviewed.
+ *
+ * So approving a version IS the confirmation, and this is what it confirms.
+ *
+ * ── AND WHY THE SNAPSHOT TRAVELS WITH IT ────────────────────────────────────
+ * Not the identity alone. The snapshot is the technical content IE actually
+ * read — materials and their consumption, allowances, operations, packaging,
+ * services, shipment facts. Costing reads consumption from HERE, so the figure
+ * it costs is the figure a named reviewer approved, and stays that figure for
+ * ever. `Mixed`, exactly as `technicalRevisions[].snapshot` is: a frozen record
+ * keeps the shape it had rather than being re-validated against a schema that
+ * has moved on.
+ *
+ * ── IDENTITY IS A NUMBER PLUS A KEY ─────────────────────────────────────────
+ * `SampleStyle.techSheet.technicalRevisions[]` is declared `{ _id: false }`, so
+ * a revision has no document id to name. `technicalRevision` is R&D's own
+ * number and is what people say out loud; `technicalRevisionKey` is a server
+ * digest over the revision's identity fields, so a revision re-approved under
+ * the same number is a DIFFERENT key and is detected rather than assumed
+ * identical.
+ *
+ * Absent on versions submitted before this existed. A reader must treat absent
+ * as "this version confirms no R&D revision" and refuse to cost from it —
+ * never as "revision 0".
+ */
+const technicalSourceSchema = new mongoose.Schema(
+  {
+    sampleStyleId: { type: mongoose.Schema.Types.ObjectId, ref: "SampleStyle", required: true },
+    technicalRevision: { type: Number, required: true, min: 0 },
+    technicalRevisionKey: { type: String, required: true, trim: true },
+    /* R&D's own moments, copied so a reader can date the record without a join. */
+    submittedAt: { type: Date, default: null },
+    approvedAt: { type: Date, default: null },
+    snapshot: { type: mongoose.Schema.Types.Mixed, default: null },
+    /* Read off the snapshot once at submit, so "did the source carry materials
+       at all" is answerable without walking Mixed data. Counts, never totals:
+       a total would be a figure this record is not the authority for. */
+    materialCount: { type: Number, default: 0, min: 0 },
+    operationCount: { type: Number, default: 0, min: 0 },
+    /* Which `IeStyleFile.source` this was copied from, and when the reviewer
+       had it in front of them. */
+    fileSourceRevision: { type: Number, default: null },
+    /* ── AND WHICH CYCLE OF THAT SOURCE ──────────────────────────────────
+       1 is the revision the file was opened from; 2 and up are successors it
+       was deliberately moved onto after R&D approved a newer revision. No
+       default: a version frozen before successor cycles existed was frozen
+       against the opening revision, and writing 1 onto it would be a claim
+       made on its behalf by a schema rather than by the freeze. */
+    sourceCycleNo: { type: Number, min: 1 },
+    frozenAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const ieBulletinVersionSchema = new mongoose.Schema(
   {
     companyId: {
@@ -229,6 +295,12 @@ const ieBulletinVersionSchema = new mongoose.Schema(
        because a file may carry no policy at all. */
     allowancePolicyId: { type: mongoose.Schema.Types.ObjectId, default: null },
     allowancePolicyRevision: { type: Number, default: null, min: 1 },
+
+    /* ── THE R&D REVISION THIS VERSION CONFIRMS ──────────────────────────
+       Frozen at submit from the file's own `source`, immutable thereafter, and
+       the ONLY thing that makes an R&D figure costable. See the schema above
+       for why it is not a live read. Absent on pre-existing versions. */
+    technicalSource: { type: technicalSourceSchema, default: undefined },
 
     /* ── SERVER-COMPUTED, NEVER ACCEPTED FROM A CLIENT ────────────────────
        The same three digests Chunk 6A computes over a layout's bound rows, from

@@ -64,6 +64,10 @@ const CHANGE_KIND_VALUES = Object.freeze([
   "sales.development_request.superseded",
   "sales.development_request.cancelled",
   "sales.development_release.authorised",
+  /* Sales reviewed the approved selection against the customer requirement
+     and asked Merchandising to change it. The counterpart of the release:
+     the same decision point, answered the other way. */
+  "sales.development_changes.requested",
 ]);
 
 const auditSchema = new mongoose.Schema(
@@ -157,6 +161,20 @@ const outboxSchema = new mongoose.Schema(
       journeyId: { type: mongoose.Schema.Types.ObjectId, default: null },
       productLineRef: { type: String, trim: true, default: undefined },
       releaseReference: { type: String, trim: true, default: undefined },
+      /* ── WHAT A RELEASE BINDS ────────────────────────────────────────
+         A release names one exact approved material revision, and the
+         identity of one is `{companyId, developmentFileId, revisionNo}`.
+         Carried on the event rather than looked up by the receiver: delivery
+         is asynchronous, and a receiver that resolves "the current revision"
+         for itself will resolve a different one if Merchandising approved
+         another in the gap. Both are listed in OUTBOX_REQUIRED below, so an
+         unbound release cannot become a deliverable event at all. */
+      developmentFileId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      bomRevisionNo: { type: Number, default: null },
+      /* True when Sales took back a release rather than reviewing an approved
+         revision. The receiver's ordinary handler refuses a released file, and
+         refuses it correctly — this says the refusal has been answered. */
+      reopenReleased: { type: Boolean, default: false },
       reason: { type: String, trim: true, default: "" },
     },
 
@@ -194,7 +212,18 @@ const OUTBOX_REQUIRED = Object.freeze({
   "sales.development_request.issued": ["requestRef", "journeyId", "productLineRef"],
   "sales.development_request.superseded": ["requestRef", "journeyId", "productLineRef"],
   "sales.development_request.cancelled": ["requestRef", "journeyId", "productLineRef"],
-  "sales.development_release.authorised": ["requestRef", "journeyId", "productLineRef"],
+  /* A release carries the binding as well as the line: without it the
+     receiver would have to choose a revision, which is the whole defect. */
+  "sales.development_release.authorised": [
+    "requestRef", "journeyId", "productLineRef", "developmentFileId", "bomRevisionNo",
+  ],
+  /* And so does a request for changes — it is a decision ABOUT a revision,
+     and a receiver that had to guess which one could reopen the wrong
+     selection. The reason travels too: Merchandising cannot act on
+     "Sales wants something different". */
+  "sales.development_changes.requested": [
+    "requestRef", "journeyId", "productLineRef", "developmentFileId", "bomRevisionNo", "reason",
+  ],
 });
 
 outboxSchema.pre("validate", function requirePayloadForKind(next) {

@@ -391,8 +391,14 @@ describe("a file is created from the approved technical version and nothing else
     expect(after.body.file.source.technicalRevision).toBe(2);
     expect(after.body.file.source.operations.map((o) => o.operationCode)).toEqual(["SEW-1"]);
     const gap = after.body.file.readiness.gaps.find((g) => g.code === "IE_SOURCE_VERSION_SUPERSEDED");
+    /* ── THE ACTION NAMES A VERB THAT NOW EXISTS ──────────────────────
+       It read REVIEW_NEW_TECHNICAL_VERSION, which was the honest name while
+       there was nothing to do about a superseded source but look at it: the
+       file could not be moved and every future submission was refused. The
+       successor cycle is that action, so the gap names it. The CODE is
+       unchanged — the gap is the same gap, about the same state. */
     expect(gap).toMatchObject({
-      owner: "RESEARCH_DEVELOPMENT", action: "REVIEW_NEW_TECHNICAL_VERSION",
+      owner: "RESEARCH_DEVELOPMENT", action: "REBASE_ONTO_NEW_TECHNICAL_VERSION",
       fileSourceRevision: 2, approvedRevision: 3,
     });
   });

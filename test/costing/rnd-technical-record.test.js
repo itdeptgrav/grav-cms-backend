@@ -1079,3 +1079,84 @@ describe("the merchandising style boundary", () => {
     });
   });
 });
+
+/* ══ A STALE MATERIAL SELECTION BLOCKS THE SUBMISSION ══════════════════════
+
+   Most shortlist blockers answer "why is there nothing to work on?", so they
+   only matter when the form is empty. A STALE one is different: the record can
+   be complete and perfectly good and still describe materials that have been
+   replaced since Sales released them. Submitting it would record engineering
+   against a selection nobody is going to use, and the person doing it would
+   have no way to know. */
+
+describe("a superseded material selection is refused whatever the form holds", () => {
+  const technicalRecord = require("../../services/centralCosting/technicalRecord.service");
+
+  const STALE = Object.freeze({
+    owner: "SALES",
+    field: "materials",
+    code: "DEVELOPMENT_MATERIALS_STALE",
+    releasedBomRevisionNo: 1,
+    currentBomRevisionNo: 2,
+    message: "Development MDV-2026-0001 revision 2 has been approved by Merchandising, replacing "
+      + "revision 1, which is the one released to R&D. Sales reviews and releases the new revision "
+      + "before any further technical work is recorded against these materials.",
+  });
+
+  const full = () => ({
+    materials: [{
+      name: "Pique 180gsm", consumption: 1.4, unit: "m", allowance: 5,
+      status: "completed",
+    }],
+    operations: [{ name: "Attach collar", sam: 1.2 }],
+    requirements: [],
+  });
+
+  test("a complete record is still refused while the selection is stale", () => {
+    const clean = technicalRecord.completeness(full(), { shortlistBlocker: null });
+    const blocked = technicalRecord.completeness(full(), { shortlistBlocker: STALE });
+
+    /* The ONLY difference is the stale blocker — the record itself is the
+       same, which is the point. */
+    expect(blocked.complete).toBe(false);
+    expect(blocked.gaps.some((g) => g.code === "DEVELOPMENT_MATERIALS_STALE")).toBe(true);
+    expect(clean.gaps.some((g) => g.code === "DEVELOPMENT_MATERIALS_STALE")).toBe(false);
+  });
+
+  test("the outstanding step is named as SALES, not as an R&D omission", () => {
+    const gate = technicalRecord.completeness(full(), { shortlistBlocker: STALE });
+    const stale = gate.gaps.find((g) => g.code === "DEVELOPMENT_MATERIALS_STALE");
+    expect(stale.owner).toBe("SALES");
+    expect(stale.releasedBomRevisionNo).toBe(1);
+    expect(stale.currentBomRevisionNo).toBe(2);
+    /* Telling R&D their own record is incomplete would send them looking for
+       work that is not theirs. */
+    expect(stale.message).toMatch(/Sales reviews and releases/);
+  });
+
+  test("an empty record reports BOTH the stale selection and the empty form", () => {
+    /* They are two different true things, and collapsing them would hide
+       whichever one was reported second. */
+    const gate = technicalRecord.completeness(
+      { materials: [], operations: [], requirements: [] },
+      { shortlistBlocker: STALE },
+    );
+    const materialGaps = gate.gaps.filter((g) => g.field === "materials");
+    expect(materialGaps.some((g) => g.code === "DEVELOPMENT_MATERIALS_STALE")).toBe(true);
+    expect(materialGaps.some((g) => g.owner === "RND")).toBe(true);
+  });
+
+  test("an ordinary shortlist blocker still behaves as it did", () => {
+    /* The nobody-has-selected-anything blocker replaces the empty-form gap
+       rather than joining it: there is one outstanding step, and it is
+       Merchandising's. */
+    const ordinary = { owner: "MERCHANDISING", field: "materials", message: "Nobody has selected materials." };
+    const gate = technicalRecord.completeness(
+      { materials: [], operations: [], requirements: [] },
+      { shortlistBlocker: ordinary },
+    );
+    const materialGaps = gate.gaps.filter((g) => g.field === "materials");
+    expect(materialGaps).toHaveLength(1);
+    expect(materialGaps[0].owner).toBe("MERCHANDISING");
+  });
+});

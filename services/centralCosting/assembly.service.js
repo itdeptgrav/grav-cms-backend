@@ -196,6 +196,41 @@ async function assemble(ctx, costing, { styleId = null, lines = [] } = {}) {
 
   const preview = await technicalPreview.buildPreview(ctx, chosen);
 
+  /* ── AND THE ASSEMBLY REFUSES WHAT THE AUTHORITY HAS NOT CONFIRMED ───────
+     `buildPreview` already returns nulls for every costable list when
+     Industrial Engineering has not confirmed this style's technical record.
+     Nulls are not enough on their own: a caller that iterated `?? []` would
+     assemble a costing of no materials and no operations and call it complete,
+     and a stale confirmation would keep producing versions from a revision
+     R&D has since replaced.
+
+     So the state is named and returned, with the owner, and nothing is
+     assembled. This is the fail-closed half of the rule — the other half is
+     that the technical read publishes no figures at all. */
+  if (!preview?.approvedSource?.bound) {
+    const src = preview?.approvedSource || {};
+    return {
+      state: STATE.NOT_SOURCE_BACKED,
+      technical: preview,
+      candidates,
+      styleId: String(chosen),
+      policy: policySection(policy, configured, contingency),
+      approvedSource: src,
+      missing: [
+        {
+          key: `authority:${src.state || "UNKNOWN"}`,
+          message: src.message
+            || "This style's technical record has not been confirmed, so nothing can be costed from it.",
+          owner: src.owner
+            ? { department: src.owner.department, system: "Engineering file" }
+            : OWNER.RND,
+          blocking: true,
+        },
+        ...policyMissing(policy, configured, contingency),
+      ],
+    };
+  }
+
   /* ── WHICH FAMILIES THEIR OWNERS SAY DO NOT APPLY ─────────────────────────
      Read, never received. Three of them come from the style's own record —
      published by the same read that built the preview, so the assembly and
@@ -1596,9 +1631,21 @@ async function applyFreight(ctx, lines, {
   /* Only a source-backed enquiry costing has delivery terms to read. */
   if (costing?.context?.type !== "ENQUIRY_STYLE") return { lines, missing };
 
-  const style = styleId
-    ? await sampleStyleModel().findById(styleId).select("sample.shipment").lean()
-    : null;
+  /* ── THE SHIPMENT FACTS COME CONFIRMED, OR NOT AT ALL ──────────────────
+     This read `style.sample.shipment` live, so a packed weight typed after IE
+     confirmed the technical record moved the freight line with nobody
+     reviewing it — and a per-kilogram rate multiplied by an unreviewed weight
+     is a price.
+
+     `readStyleFacts` publishes the confirmed shipment, or `null` when IE has
+     not confirmed the record. Null reaches `readFreightSource` as an absent
+     fact, which already reports a missing-weight blocker rather than
+     inventing a zero. */
+  let style = null;
+  if (styleId) {
+    const facts = await technicalSource.readStyleFacts(ctx, styleId);
+    style = facts.shipment ? { sample: { shipment: facts.shipment } } : null;
+  }
 
   const source = await freightSource.readFreightSource(ctx, {
     enquiryId: costing.context.primaryId, style, asOf,
@@ -2104,7 +2151,9 @@ async function applyFinancing(ctx, lines, { costing, policy = {}, asOf = new Dat
     enquiryId: costing.context.primaryId,
     asOf,
   });
-  const result = financing.compute({ policy: source.policy, terms: source.terms });
+  /* The order's own dates travel with the terms: a plan is priced on the
+     calendar, from the Board's start event to each tranche's due date. */
+  const result = financing.compute({ policy: source.policy, terms: source.terms, dates: source.dates });
 
   for (const m of result.missing) {
     missing.push({

@@ -245,6 +245,12 @@ describe("what Merchandising publishes for Costing to consume", () => {
     const [published] = pub.project(file, receipt, [approved]).selectedMaterials;
     expect(Object.keys(published).sort()).toEqual([
       "appliesTo", "category", "colourOrShade", "finish", "name", "placement", "reference",
+      /* Merchandising's own sentence about why this material was chosen.
+         Sales reviews the selection against a customer requirement, and the
+         reason for the choice is the half of it that answers that. It is
+         still Merchandising's text about Merchandising's decision — it names
+         nothing Costing, R&D, Supply Chain or Store owns. */
+      "selectionNote",
     ]);
   });
 

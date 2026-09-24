@@ -156,6 +156,11 @@ const AUDIT_ACTIONS = Object.freeze([
   "DEVELOPMENT_BOM_SUPERSEDED",
   /* Sales releases; Merchandising records that they did. */
   "DEVELOPMENT_RELEASED_BY_SALES",
+  /* And the other answer: Sales reviewed the approved selection against the
+     customer requirement and asked for it to change. Recorded here, sourced
+     to Sales, with their reason — it is the thing the next revision exists
+     to answer, so it belongs in Merchandising's own history of the file. */
+  "DEVELOPMENT_CHANGES_REQUESTED_BY_SALES",
   "DEVELOPMENT_BOM_ADOPTED_INTO_ORDER",
 ]);
 

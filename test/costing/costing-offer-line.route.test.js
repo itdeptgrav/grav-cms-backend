@@ -333,7 +333,7 @@ async function priced(name = "P", offerOver = {}, {
      the quotation under test are about the same thing. No operation: this
      suite is about how a material is priced. */
   const seeded = await seedSourceBacked(w.co._id, {
-    item: w.item, withQuotation: false, withOperation: false, consumption, uom,
+    item: w.item, withQuotation: false, consumption, uom,
     ...(development ? { development } : {}),
   });
   /* ── THE TREATMENT IS A BOARD POLICY NOW ──────────────────────────────

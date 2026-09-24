@@ -45,8 +45,19 @@ const actorRef = () => ({
 const { decisionSchemaFields } = require("../../../services/styleApplicability");
 const applicabilityDecision = () => decisionSchemaFields(mongoose);
 
+/* `publicId` is not optional decoration: enquiry images have been uploaded to
+   Cloudinary since 19 Aug 2026 and are stored as {publicId, name, url}, while
+   older ones are Drive's {fileId, name, url}. Mongoose strips anything not
+   declared here, so a brief built from a Cloudinary image used to arrive at
+   R&D with its publicId silently removed — the thumbnail transform in the
+   frontend's driveImage.js keys on exactly that field. */
 const imageSchema = new mongoose.Schema(
-  { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
+  {
+    fileId: { type: String, trim: true }, // Drive (legacy)
+    publicId: { type: String, trim: true }, // Cloudinary
+    name: { type: String, trim: true },
+    url: { type: String, trim: true },
+  },
   { _id: false },
 );
 
@@ -279,6 +290,44 @@ const sampleStyleSchema = new mongoose.Schema(
         ),
       ],
       images: [imageSchema],
+      /* ── WHAT IS TO BE EMBROIDERED OR PRINTED, AND WHERE ────────────────
+         One row per decoration, carried from the enquiry product line and
+         refreshed on every provision, exactly like the rest of this brief.
+
+         Rows projected from a pre-structured enquiry (the old logo/embroidery/
+         printing booleans) arrive here too, marked `legacy`, so R&D reads one
+         shape for both.
+
+         ── THIS ARTWORK IS THE BUYER'S, NOT AN APPROVED FILE ───────────────
+         Everything in `artwork` came from the customer: a logo off an email, a
+         photo of a uniform they already wear. None of it has been digitised,
+         colour-separated or approved by anyone. The approved asset for this
+         style is `techSheet.file`, which has an approver and a date; a screen
+         showing both must say which is which. `artworkIsCustomerReference`
+         below is that statement, in the data rather than in a comment only. */
+      brandingRequirements: [
+        new mongoose.Schema(
+          {
+            /* The enquiry requirement this came from — stable across edits,
+               so a screen can point back at one decoration rather than at
+               "the second row". */
+            ref: { type: String, trim: true },
+            type: { type: String, trim: true },
+            placement: { type: String, trim: true },
+            width: { type: Number },
+            height: { type: Number },
+            unit: { type: String, trim: true },
+            colourNotes: { type: String, trim: true },
+            notes: { type: String, trim: true },
+            artworkState: { type: String, trim: true },
+            artwork: [imageSchema],
+            legacy: { type: Boolean, default: false },
+          },
+          { _id: false },
+        ),
+      ],
+      /** Always true today. Read it rather than assuming from a field name. */
+      artworkIsCustomerReference: { type: Boolean, default: true },
     },
 
     // ── Materials — the Merchandiser's upstream input. R&D can't start the
@@ -360,6 +409,29 @@ const sampleStyleSchema = new mongoose.Schema(
          what was selected; they do not get to decide that a selected
          component is unnecessary. */
       packagingDecision: applicabilityDecision(),
+
+      /* ══ HOW THE GOODS ARE PACKED OUT — MERCHANDISING'S CONFIGURATION ══
+         How many finished garments go in one carton is a PACK CONFIGURATION,
+         agreed with the buyer alongside the folding and the carton marks. It
+         is not a measurement, so it is not R&D's, and it is not a route, so it
+         is not IE's — it belongs with the packaging specification, here.
+
+         It also already exists as `sample.shipment.garmentsPerCarton`, which
+         is R&D's unversioned working record. That one stays, for the sampling
+         screens that use it; a costing reads THIS one, because a carton
+         capacity that changes has to change as an approved decision with a
+         number attached rather than as an edit nobody can point to.
+
+         Post-order the same fact is carried by the in-force PACKAGING
+         `SelectionRevision` on the Execution File, which is versioned by
+         construction. This is the pre-order form of the same decision. */
+      packingConfiguration: {
+        revision: { type: Number, min: 0, default: 0 },
+        garmentsPerCarton: { type: Number, min: 1, default: undefined },
+        decidedBy: actorRef(),
+        decidedAt: { type: Date },
+        notes: { type: String, trim: true, default: "", maxlength: 500 },
+      },
 
       selectedBy: actorRef(),
       selectedAt: { type: Date },
@@ -497,6 +569,17 @@ const sampleStyleSchema = new mongoose.Schema(
         submittedBy: actorRef(),
         approvedAt: { type: Date },
         approvedBy: actorRef(),
+        /* ── AND WHEN AN APPROVED RECORD WAS REOPENED ──────────────────
+           Set by the tech sheet's `revise` action, which is the only way an
+           approved technical record becomes editable again. Recorded on the
+           record itself rather than only in the sheet's note list, because
+           "this approved record was deliberately reopened, by whom, and why"
+           is a fact about the record — and without it a reader seeing status
+           `rework` on a style that has an approved revision behind it has to
+           infer how it got there. Absent on every record nobody reopened. */
+        reopenedAt: { type: Date },
+        reopenedBy: actorRef(),
+        reopenReason: { type: String, trim: true },
 
         /* ── ONE ROW PER APPROVED MATERIAL ──────────────────────────────
            The identity half (rawItemId, name, sku, variant) is COPIED from
@@ -809,6 +892,35 @@ const sampleStyleSchema = new mongoose.Schema(
            the seventh is charged in full. */
         garmentsPerCarton: { type: Number, min: 1, default: undefined },
         /* What was actually weighed or counted, in R&D's words. */
+        notes: { type: String, trim: true, default: "", maxlength: 500 },
+      },
+
+      /* ══ THE PACKED WEIGHT, APPROVED AND FROZEN — R&D'S EVIDENCE ═══════
+         `shipment` above is a WORKING record: R&D edits it while sampling,
+         and nothing about it is versioned. Central Costing froze a figure read
+         from it, so a weight typed after a costing was built silently changed
+         what the freight line had been calculated from, with nothing recording
+         that it had happened.
+
+         A costing may only read an APPROVED revision of this measurement. The
+         revision number is what makes two readings comparable: a costing
+         freezes `{revision, approvedAt}`, and a later measurement is a new
+         revision rather than an edit of the one somebody costed.
+
+         This is deliberately NOT part of the R&D technical revision and NOT
+         part of the IE bulletin: Industrial Engineering confirms the route and
+         the consumption a garment is MADE by, and does not become the approver
+         of a weighing merely because a costing needs both. */
+      packingMeasurement: {
+        /* Never reset, never reused. 0 means nothing has been approved. */
+        revision: { type: Number, min: 0, default: 0 },
+        /* Grams, for the same reason the working record says so. */
+        packedWeightGrams: { type: Number, min: 0, default: undefined },
+        measuredBy: actorRef(),
+        measuredAt: { type: Date },
+        /* Approved by a second person, as every costable fact here is. */
+        approvedBy: actorRef(),
+        approvedAt: { type: Date },
         notes: { type: String, trim: true, default: "", maxlength: 500 },
       },
 
@@ -1183,7 +1295,14 @@ const sampleStyleSchema = new mongoose.Schema(
 // non-partial index keeps rejecting the second house sample.
 sampleStyleSchema.index(
   { journeyId: 1, productName: 1, variantKey: 1 },
-  { unique: true, partialFilterExpression: { journeyId: { $type: "objectId" } } },
+  {
+    unique: true,
+    /* A rejected design that Sales replaces stays in history but no longer
+       owns the live product-name slot. This lets the enquiry raise a new
+       version with the same customer-facing name without deleting the old
+       style or any of its rounds and decisions. */
+    partialFilterExpression: { journeyId: { $type: "objectId" }, isActive: true },
+  },
 );
 
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old

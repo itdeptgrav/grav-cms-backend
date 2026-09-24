@@ -1175,3 +1175,186 @@ describe("the M6 surface imports no other department's authority", () => {
     expect(bare).not.toMatch(/pack\.declaration\s*=/);
   });
 });
+
+/* ══ 5 — THE APPROVAL POSITION IS RESOLVED, NEVER READ OFF THE ROW ═══════
+ *
+ * A Merchandising-owned approval requirement carries no stored decision: the
+ * register resolves it from the revision that answers it, on every read, and
+ * never writes the answer back. The pack used to count the STORED value, which
+ * is only ever the one written when the row was created — so a file with all
+ * three revisions approved reported three outstanding approvals, the Approvals
+ * tab said "Approved" while the handover said "outstanding", and the pack could
+ * never be submitted.
+ *
+ * These tests hold the two surfaces to the same answer, through the routes.
+ */
+
+describe("the pack reads the approval register's own resolution", () => {
+  /** The three requirements Merchandising owns, added the way a person adds them. */
+  async function addInternalRequirements(w, who) {
+    for (const category of ["MATERIAL_TRIM_CARD", "PACKAGING_SPEC", "DEVELOPMENT_SCHEDULE"]) {
+      const before = await call(`/files/${w.fileId}/approvals`, at(w, who));
+      // eslint-disable-next-line no-await-in-loop
+      const res = await call(`/files/${w.fileId}/approvals`, {
+        ...at(w, who), method: "POST", key: uniq(),
+        body: { category, expectedRevision: before.body.revision },
+      });
+      expect(res.status).toBe(201);
+    }
+  }
+
+  test("the three Merchandising-owned requirements are on the register", async () => {
+    const w = await world();
+    const c = await cast(w.co);
+    await addInternalRequirements(w, c.editor);
+
+    const res = await call(`/files/${w.fileId}/approvals`, at(w, c.viewer));
+    const internal = res.body.rows.filter((r) => r.internallyOwned);
+    expect(internal.map((r) => r.category).sort()).toEqual(
+      ["DEVELOPMENT_SCHEDULE", "MATERIAL_TRIM_CARD", "PACKAGING_SPEC"],
+    );
+    expect(internal.every((r) => r.owningApplication === "MERCHANDISING")).toBe(true);
+  });
+
+  test("the stored observation is not the truth — the approved revision is", async () => {
+    const w = await world();
+    const c = await cast(w.co);
+    await addInternalRequirements(w, c.editor);
+    await makeSubmittable(w);
+
+    /* What the row STORES is what it was created with. */
+    const { ApprovalRegister } = require("../../models/CMS_Models/Merchandising/ApprovalRegister");
+    const stored = await ApprovalRegister.findOne({ companyId: w.co._id, fileId: w.fileId }).lean();
+    const storedInternal = stored.rows.filter((r) => r.owningApplication === "MERCHANDISING");
+    expect(storedInternal).toHaveLength(3);
+    for (const row of storedInternal) {
+      expect(row.observation.status).toBe("NOT_STARTED");
+      expect(row.observation.decidedAt).toBeFalsy();
+    }
+
+    /* What the register ANSWERS is read from the approved revisions. */
+    const read = await call(`/files/${w.fileId}/approvals`, at(w, c.viewer));
+    for (const row of read.body.rows.filter((r) => r.internallyOwned)) {
+      expect(row.status).toBe("APPROVED");
+      expect(row.observedSourceVersion).toMatch(/revision \d+/);
+    }
+  });
+
+  test("each family's status comes from its own approved revision", async () => {
+    const w = await world();
+    const c = await cast(w.co);
+    await addInternalRequirements(w, c.editor);
+
+    /* Nothing approved yet: three requirements, none of them settled. */
+    const before = await call(`/files/${w.fileId}/approvals`, at(w, c.viewer));
+    for (const row of before.body.rows.filter((r) => r.internallyOwned)) {
+      expect(row.status).toBe("NOT_STARTED");
+    }
+
+    await makeSubmittable(w);
+
+    const after = await call(`/files/${w.fileId}/approvals`, at(w, c.viewer));
+    const byCategory = Object.fromEntries(after.body.rows.map((r) => [r.category, r]));
+    expect(byCategory.MATERIAL_TRIM_CARD.status).toBe("APPROVED");
+    expect(byCategory.PACKAGING_SPEC.status).toBe("APPROVED");
+    expect(byCategory.DEVELOPMENT_SCHEDULE.status).toBe("APPROVED");
+    /* And the summary the Overview reads agrees with the register. */
+    const summary = await call(`/files/${w.fileId}/approvals/summary`, at(w, c.viewer));
+    expect(summary.body.counts.approved).toBe(3);
+    expect(summary.body.counts.outstanding).toBe(0);
+  });
+
+  test("preview reports zero outstanding Merchandising approvals, and submission succeeds", async () => {
+    const w = await world();
+    const c = await cast(w.co);
+    await addInternalRequirements(w, c.editor);
+    await makeSubmittable(w);
+
+    const preview = await call(`/files/${w.fileId}/pack/preview`, at(w, c.viewer));
+    expect(preview.status).toBe(200);
+    expect(preview.body.contents.approvalRegister.outstandingCount).toBe(0);
+    expect(preview.body.contents.approvalRegister.position).toBe("COMPLETE");
+    /* The recorded entries say the same thing as the count. */
+    const entries = preview.body.contents.approvalRegister.entries
+      .filter((e) => e.owningApplication === "MERCHANDISING");
+    expect(entries).toHaveLength(3);
+    for (const entry of entries) expect(entry.state).toBe("APPROVED");
+    expect(preview.body.completeness.gates.find((g) => g.key === GATE.APPROVALS_SETTLED).passed).toBe(true);
+
+    await call(`/files/${w.fileId}/pack`, { ...at(w, c.approver), method: "POST", key: uniq() });
+    const draft = await call(`/files/${w.fileId}/pack`, at(w, c.viewer));
+    const sent = await call(`/files/${w.fileId}/pack/submit`, {
+      ...at(w, c.approver), method: "POST", key: uniq(),
+      body: { declarationAcknowledged: true, expectedRevision: draft.body.pack.revision },
+    });
+    expect(sent.status).toBe(200);
+    expect(sent.body.state).toBe(PACK_STATE.SUBMITTED);
+    const held = await call(`/files/${w.fileId}/pack`, at(w, c.viewer));
+    expect(held.body.pack.state).toBe(PACK_STATE.SUBMITTED);
+    expect(held.body.pack.contents.approvalRegister.outstandingCount).toBe(0);
+    for (const entry of held.body.pack.contents.approvalRegister.entries
+      .filter((e) => e.owningApplication === "MERCHANDISING")) {
+      expect(entry.state).toBe("APPROVED");
+    }
+    /* PPC has not answered, and no receipt exists for them to have answered with. */
+    expect(await DownstreamHandoverReceipt.countDocuments({ fileId: w.fileId })).toBe(0);
+  });
+
+  test("a missing approved revision is named outstanding, and submission is refused", async () => {
+    const w = await world();
+    const c = await cast(w.co);
+    await addInternalRequirements(w, c.editor);
+    await makeSubmittable(w);
+    /* One family's approval is taken away — the case the old code could not
+       see, and the case a gate exists for. */
+    await PackagingRevision.deleteMany({ fileId: w.fileId });
+
+    const register = await call(`/files/${w.fileId}/approvals`, at(w, c.viewer));
+    const packaging = register.body.rows.find((r) => r.category === "PACKAGING_SPEC");
+    expect(packaging.status).toBe("NOT_STARTED");
+
+    const preview = await call(`/files/${w.fileId}/pack/preview`, at(w, c.viewer));
+    expect(preview.body.contents.approvalRegister.outstandingCount).toBe(1);
+    expect(preview.body.contents.approvalRegister.position).toBe("OUTSTANDING");
+    const entry = preview.body.contents.approvalRegister.entries
+      .find((e) => e.category === "PACKAGING_SPEC");
+    expect(entry.state).toBe("NOT_STARTED");
+    const gates = preview.body.completeness.gates;
+    expect(gates.find((g) => g.key === GATE.APPROVALS_SETTLED).passed).toBe(false);
+    expect(gates.find((g) => g.key === GATE.PACKAGING_APPROVED).passed).toBe(false);
+
+    await call(`/files/${w.fileId}/pack`, { ...at(w, c.approver), method: "POST", key: uniq() });
+    const draft = await call(`/files/${w.fileId}/pack`, at(w, c.viewer));
+    const refused = await call(`/files/${w.fileId}/pack/submit`, {
+      ...at(w, c.approver), method: "POST", key: uniq(),
+      body: { declarationAcknowledged: true, expectedRevision: draft.body.pack.revision },
+    });
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(refused.body)).toMatch(/approval/i);
+    const held = await call(`/files/${w.fileId}/pack`, at(w, c.viewer));
+    expect(held.body.pack.state).toBe(PACK_STATE.DRAFT);
+  });
+
+  test("there is one approval-status algorithm, and the pack calls it", () => {
+    const pack = fs.readFileSync(
+      path.join(__dirname, "../../services/merchandising/executionPack.service.js"), "utf8",
+    );
+    const bare = pack.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
+    /* It asks the register. */
+    expect(bare).toMatch(/approvalRegister\.resolveInternal\(file, row\.category, session\)/);
+    /* And it does not re-derive one: no second lookup of an approved revision
+       against a category, and no local map from category to family. */
+    expect(bare).not.toMatch(/INTERNAL_SOURCE/);
+    expect(bare).not.toMatch(/MATERIAL_TRIM_CARD/);
+    expect(bare).not.toMatch(/PACKAGING_SPEC/);
+    expect(bare).not.toMatch(/DEVELOPMENT_SCHEDULE/);
+  });
+
+  test("the resolver reads in the snapshot's own session", () => {
+    const register = fs.readFileSync(
+      path.join(__dirname, "../../services/merchandising/approvalRegister.service.js"), "utf8",
+    );
+    expect(register).toMatch(/async function resolveInternal\(file, category, session = null\)/);
+    expect(register).toMatch(/const inSession = \(q\) => \(session \? q\.session\(session\) : q\);/);
+  });
+});

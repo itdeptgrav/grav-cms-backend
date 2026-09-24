@@ -48,6 +48,27 @@ const {
 // Ordered stage codes — index IS the lifecycle position. Mirrors the frontend
 // STAGE_KEYS in lib/salesJourney/stageConfig.js (both files move together).
 const STAGE_ORDER = SALES_JOURNEY_STAGES.map((s) => s.code);
+
+/* ── STAGES THAT ARE NO LONGER PART OF THE LIFECYCLE ─────────────────────
+   A retired stage keeps its code — journeys store it, the schema enum
+   validates it, and nothing is migrated destructively — but the machine no
+   longer walks through it, and a journey sitting on one is treated as
+   standing where its work went.
+
+     · `account`   retired 13 Aug 2026, customer setup moved to the Active Lead
+     · `costQuote` retired 24 Sep 2026, folded whole into `purchaseInvoice`
+
+   Mirrors RETIRED_STAGE_FORWARDS in the frontend's stageConfig.js. Both files
+   move together, the same way STAGE_ORDER mirrors STAGE_KEYS. */
+const RETIRED_STAGE_FORWARDS = Object.freeze({
+  account: "enquiry",
+  costQuote: "purchaseInvoice",
+});
+
+/** Where a stage code actually stands. Current codes pass straight through. */
+function resolveStage(code) {
+  return RETIRED_STAGE_FORWARDS[code] || code;
+}
 const STAGE_LABEL = Object.fromEntries(SALES_JOURNEY_STAGES.map((s) => [s.code, s.label]));
 const STATE_LABEL = Object.fromEntries(SALES_JOURNEY_STAGE_STATES.map((s) => [s.code, s.label]));
 
@@ -105,10 +126,20 @@ function readStates(stageStates) {
   return out;
 }
 
-/** Index of the next stage after `from` whose state is not notApplicable, or -1. */
+/**
+ * Index of the next stage after `from` that this journey should actually move
+ * to: not `notApplicable`, and not a stage that has been retired.
+ *
+ * Skipping the retired ones is what makes Style & Sample advance straight to
+ * Purchase Invoice. Without it, `advance` would park the journey on
+ * `costQuote` — a stage with no screen, no navigation entry and no way out
+ * except advancing again.
+ */
 function nextApplicableIndex(fromIdx, states) {
   for (let i = fromIdx + 1; i < STAGE_ORDER.length; i++) {
-    if (states[STAGE_ORDER[i]] !== "notApplicable") return i;
+    const code = STAGE_ORDER[i];
+    if (RETIRED_STAGE_FORWARDS[code]) continue;
+    if (states[code] !== "notApplicable") return i;
   }
   return -1;
 }
@@ -586,6 +617,8 @@ function planStageTransition(journey = {}, input = {}) {
 }
 
 module.exports = {
+  resolveStage,
+  RETIRED_STAGE_FORWARDS,
   JourneyTransitionError,
   planStageTransition,
   STAGE_ORDER,

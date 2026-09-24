@@ -40,6 +40,7 @@ const {
   MerchandisingAuditEvent, MerchandisingOutboxEvent, MerchandisingCommandLedger, OUTBOX_KIND,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 const { stockItemBom } = require("../sampleStyleEmail.service");
+const catalogue = require("./materialCatalogue.service");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
@@ -144,6 +145,40 @@ function assertWorkable(file) {
   }
 }
 
+/**
+ * RELEASED WORK IS NOT REOPENED FROM INSIDE MERCHANDISING.
+ *
+ * `assertWorkable` lets a RELEASED_TO_RND file be edited, and until now the
+ * whole BOM workflow ran on it: a merchandiser could open a successor draft,
+ * submit it and approve it, and `approveBom` would set the file back to
+ * APPROVED — silently undoing a release that Sales authorised and that R&D is
+ * already building against.
+ *
+ * The material selection at that point is not Merchandising's own business
+ * any more. Sales committed the development spend against one exact revision,
+ * and the customer's approval rests on it. Reopening it is a commercial
+ * decision with downstream cost, so it is Sales' to take, through the reopen
+ * on their own surface — which records WHY, and leaves the release readable
+ * as the historical decision it was.
+ *
+ * Refused by name, naming the department that can. Nothing is lost by the
+ * refusal: the draft the merchandiser wanted is opened for them the moment
+ * Sales reopens the line.
+ */
+function assertNotReleased(file, what) {
+  if (file.lifecycleStatus === LIFECYCLE.RELEASED_TO_RND) {
+    throw fail("DEVELOPMENT_RELEASE_IS_SALES",
+      `${file.developmentNumber} has been released to R&D against revision ${file.releasedBomRevisionNo ?? file.currentBomRevisionNo}. `
+      + `${what} would change materials R&D is already working from. Sales reopens the line when the `
+      + "customer asks for a change, and a new revision starts from there.",
+      {
+        lifecycleStatus: file.lifecycleStatus,
+        releasedBomRevisionNo: file.releasedBomRevisionNo ?? null,
+        reopenedBy: "sales",
+      });
+  }
+}
+
 const auditRow = ({ file, recordType, recordId, action, actor, at, correlationId,
   details, reason = "", previousState = "", resultingState = "" }) => ({
   companyId: file.companyId,
@@ -185,6 +220,10 @@ const fileView = (f) => (f ? {
   currentBomRevisionNo: f.currentBomRevisionNo ?? null,
   releasedToRndAt: f.releasedToRndAt || null,
   releasedByName: str(f.releasedBy?.name),
+  /* The revision Sales actually released, which is not the same fact as the
+     one currently in force: a later revision can be approved after a release,
+     and reading `currentBomRevisionNo` as "what R&D has" would be wrong. */
+  releasedBomRevisionNo: f.releasedBomRevisionNo ?? null,
   releaseReference: str(f.releaseReference),
   coordinationNote: str(f.coordinationNote),
   archived: f.archived === true,
@@ -227,6 +266,7 @@ const bomView = (b) => (b ? {
   approvedAt: b.approvedAt || null,
   changesRequestedByName: str(b.changesRequestedBy?.name),
   changesRequestedAt: b.changesRequestedAt || null,
+  changesRequestedSource: str(b.changesRequestedSource) || null,
   changeReason: str(b.changeReason),
   supersededByRevisionNo: b.supersededByRevisionNo ?? null,
   revision: b.revision ?? 0,
@@ -412,6 +452,15 @@ async function getFile(ctx, { fileId } = {}) {
       referenceImages: (request.referenceImages || [])
         .map((i) => ({ url: str(i.url), caption: str(i.caption) })),
       requiredByDate: request.requiredByDate || null,
+      /* Sales owns this commercial fact. Merchandising receives it only as a
+         visible material-selection constraint and has no write for it. */
+      targetPriceCeiling: Number.isFinite(request.targetPriceCeiling?.amount)
+        ? {
+          amount: request.targetPriceCeiling.amount,
+          currency: str(request.targetPriceCeiling.currency),
+          basis: str(request.targetPriceCeiling.basis),
+        }
+        : null,
       requestedByName: str(request.requestedBy?.name),
       requestedAt: request.requestedAt || null,
       productName: str(request.productName),
@@ -790,6 +839,74 @@ function shapeRow(body, existingRef = "") {
   };
 }
 
+/**
+ * THE CATALOGUE IS THE AUTHORITY ON WHAT ITS ITEMS ARE CALLED.
+ *
+ * A row may name a registered raw item, and when it does the client sends two
+ * ids. It also sends the name and code it was showing, because that is what a
+ * form does — and those are DISCARDED. What is stored is what the catalogue
+ * says right now, read inside the same transaction that writes the row.
+ *
+ * A row may equally name nothing registered: "describe an unregistered
+ * material" is a real and supported case, because Store's catalogue is not
+ * finished and a development sample is often where a new material first
+ * appears. Then there is no id, the merchandiser's own words are the identity,
+ * and the row says so by carrying no `rawItemId` rather than by carrying a
+ * plausible-looking one.
+ */
+async function resolveIdentity(ctx, shaped, session) {
+  /* No id: an unregistered material, whose identity is the words the
+     merchandiser wrote. `shapeRow` has already refused a row that says
+     neither, so reaching here with no id means there IS a name. A variant
+     reference without an item to hang it on is dropped rather than stored
+     pointing at nothing. */
+  if (!isId(shaped.rawItemId)) return { ...shaped, rawItemId: null, variantId: null };
+  const resolved = await catalogue.resolve(
+    ctx, { rawItemId: shaped.rawItemId, variantId: shaped.variantId }, session,
+  );
+  return {
+    ...shaped,
+    rawItemId: resolved.rawItemId,
+    rawItemName: resolved.rawItemName,
+    rawItemSku: resolved.rawItemSku,
+    variantId: resolved.variantId,
+    variantCombination: resolved.variantCombination,
+  };
+}
+
+/** Same material, same variant, same place on the garment. */
+const placementKey = (row) => [
+  str(row?.placement).toLowerCase(), str(row?.appliesTo).toLowerCase(),
+].join("::");
+
+/**
+ * ONE MATERIAL, ONE PLACE — twice is a mistake, and twice elsewhere is not.
+ *
+ * The same reflective tape at the back yoke AND at the cuffs is two rows of a
+ * real bill of materials: R&D engineers a consumption for each. The same tape
+ * twice at the back yoke is a merchandiser who added it and forgot, and if it
+ * survives to R&D it is sourced twice.
+ *
+ * So the rule is not "this item is already here" — it is "this item is already
+ * here for the same placement", and the refusal says which row it collided
+ * with so the answer ("put a placement on it") is obvious.
+ */
+function assertNotDuplicate(draft, candidate, { ignoreRowRef = "" } = {}) {
+  if (!isId(candidate.rawItemId)) return;
+  const clash = (draft.rows || []).find((r) => (
+    str(r.rowRef) !== str(ignoreRowRef)
+    && str(r.rawItemId) === str(candidate.rawItemId)
+    && str(r.variantId) === str(candidate.variantId)
+    && placementKey(r) === placementKey(candidate)
+  ));
+  if (!clash) return;
+  const where = str(clash.placement) || str(clash.appliesTo);
+  throw fail("DEVELOPMENT_ROW_DUPLICATE",
+    `${str(clash.rawItemName) || "That material"} is already in this draft${
+      where ? ` for ${where}` : ""}. Say where this one goes if it is a second use of it.`,
+    { rowRef: str(clash.rowRef), field: "placement" });
+}
+
 /** The draft in force, or a refusal saying why there is none. */
 async function loadDraft(ctx, file, session) {
   const draft = await DevelopmentBomRevision.findOne({
@@ -821,6 +938,7 @@ async function nextRevisionNo(ctx, fileId, session) {
 async function createDraft(ctx, { fileId, body = {}, actor = null, idempotencyKey } = {}) {
   const file = await loadFile(ctx, fileId);
   assertWorkable(file);
+  assertNotReleased(file, "Starting a new revision");
 
   return once(ctx, {
     scope: `dev:bom:draft:${str(file._id)}`,
@@ -976,11 +1094,15 @@ async function adoptRegisteredProductBom(ctx, { fileId, body = {}, actor = null,
 async function addRow(ctx, { fileId, body = {}, actor = null } = {}) {
   const file = await loadFile(ctx, fileId);
   assertWorkable(file);
-  const row = shapeRow(body);
+  const shaped = shapeRow(body);
 
   return withTxn(async (session) => {
     const draft = await loadDraft(ctx, file, session);
     assertExpected(draft, body?.expectedRevision, "draft selection");
+    /* Read inside the transaction, so the name stored is the name the
+       catalogue held at the moment the row was written. */
+    const row = await resolveIdentity(ctx, shaped, session);
+    assertNotDuplicate(draft, row);
     draft.rows.push({ ...row, source: { kind: "MERCHANDISING_SELECTION", observedAt: new Date() } });
     draft.revision += 1;
     await draft.save({ session });
@@ -1011,7 +1133,9 @@ async function updateRow(ctx, { fileId, rowRef, body = {}, actor = null } = {}) 
     const row = (draft.rows || []).find((r) => str(r.rowRef) === str(rowRef));
     if (!row) throw fail("NOT_FOUND", "That material is not in this draft.");
 
-    for (const f of ROW_FIELDS) row[f] = shaped[f];
+    const resolved = await resolveIdentity(ctx, shaped, session);
+    assertNotDuplicate(draft, resolved, { ignoreRowRef: str(rowRef) });
+    for (const f of ROW_FIELDS) row[f] = resolved[f];
     draft.revision += 1;
     await draft.save({ session });
 
@@ -1020,7 +1144,7 @@ async function updateRow(ctx, { fileId, rowRef, body = {}, actor = null } = {}) 
       action: "DEVELOPMENT_BOM_ROW_UPDATED", actor, at: new Date(),
       correlationId: crypto.randomUUID(),
       details: {
-        revisionNo: draft.revisionNo, rowRef: str(rowRef), materialName: shaped.rawItemName,
+        revisionNo: draft.revisionNo, rowRef: str(rowRef), materialName: row.rawItemName,
       },
     })], { session, ordered: true });
 
@@ -1245,6 +1369,7 @@ async function requestChanges(ctx, { fileId, body = {}, actor = null } = {}) {
     submitted.state = BOM_STATE.DRAFT;
     submitted.changesRequestedBy = actor || undefined;
     submitted.changesRequestedAt = at;
+    submitted.changesRequestedSource = "MERCHANDISING";
     submitted.changeReason = reason.slice(0, 2000);
     submitted.submittedBy = undefined;
     submitted.submittedAt = null;
@@ -1270,7 +1395,7 @@ async function requestChanges(ctx, { fileId, body = {}, actor = null } = {}) {
 
 module.exports = {
   DEFAULT_LIMIT, MAX_LIMIT, FILE_VIEWS, isFileView,
-  assertContext, withTxn, once, loadFile, assertExpected, assertWorkable, auditRow,
+  assertContext, withTxn, once, loadFile, assertExpected, assertWorkable, assertNotReleased, auditRow,
   fileView, rowView, bomView, receiptView,
   listFiles, developmentOverview, getFile, fileHistory, registeredProductBom,
   acceptRequest, clarifyRequest, assignFile, moveLifecycle,

@@ -18,6 +18,12 @@ const {
   CUSTOMER_TYPE_CODES,
   GST_TREATMENT_CODES,
   FREIGHT_ARRANGEMENT_CODES,
+  /* The enquiry's own vocabularies, so a default and a per-order answer are
+     comparable rather than merely similar. */
+  TRANSPORT_MODE_CODES,
+  PREPAID_TREATMENT_CODES,
+  PAYMENT_DUE_FROM,
+  PAYMENT_TERM_SHAPE_CODES,
   CREDIT_STATUS_CODES,
   BUSINESS_MODEL_CODES,
   PRODUCT_CATEGORY_CODES,
@@ -35,6 +41,10 @@ const {
   normalizeRoleList,
 } = require("../../../constants/crm");
 const { normalizeName } = require("../../../services/crmDuplicates");
+/* One definition, shared with the enquiry's copy of the same plan. */
+const { paymentPlanRow } = require("./paymentPlanRow");
+
+const PAYMENT_DUE_FROM_CODES = PAYMENT_DUE_FROM.map((p) => p.code);
 
 const actorRef = () => ({
   id: { type: mongoose.Schema.Types.ObjectId },
@@ -251,10 +261,78 @@ const accountSchema = new mongoose.Schema(
     // Unset (not 0) means "no advance agreed" and gates nothing. 0 is a real,
     // deliberately-recorded answer meaning the same thing; both pass.
     advancePercent: { type: Number, min: 0, max: 100 },
+    /* ── WHAT THE CREDIT DAYS ARE COUNTED FROM ───────────────────────────
+       `creditDays` has carried no anchor since it was added, so the customer's
+       standing term could not be offered to an enquiry in full: the enquiry
+       asks for the anchor (PAYMENT_DUE_FROM) and the suggestion had to leave
+       it blank for Sales to re-answer every time. Thirty days from the invoice
+       and thirty from the bill of lading differ by the whole shipping time, so
+       this is the customer's usual answer, recorded once.
+
+       Unset means the customer has no agreed anchor — never a silent
+       "INVOICE", which would be an agreement nobody made. */
+    creditDaysFrom: { type: String, enum: PAYMENT_DUE_FROM_CODES },
+    /* ── THE CUSTOMER'S USUAL AGREEMENT, IN ITS OWN WORDS ────────────────
+       The same vocabulary an enquiry answers in (`Enquiry.paymentTerms.shape`),
+       so a default and the deal that inherits it are the same kind of thing
+       and can be compared rather than merely resembling one another.
+
+       It carries the distinction the figures cannot: a balance due BEFORE
+       dispatch and one due ON dispatch are both zero days from dispatch.
+
+       Optional, and additive. An account recorded before this existed derives
+       its choice from the figures it already carries — no migration. */
+    paymentTermsShape: { type: String, enum: PAYMENT_TERM_SHAPE_CODES },
+    /* ── THE CUSTOMER'S USUAL PAYMENT PLAN, TRANCHE BY TRANCHE ───────────
+       "60% on order confirmation, 20% on dispatch, 20% 45 days after the
+       invoice." What the two figures above can hold is a single advance and a
+       single balance; a plan holds as many instalments as the customer
+       actually agreed, each against the event it hangs off.
+
+       RELATIVE, never dated: these rows outlive every order this customer
+       places. An enquiry copies them and resolves the dates against its own
+       order (`Enquiry.paymentTerms.plan`).
+
+       Additive. An account with no plan is read through its figures exactly
+       as before, and the shape chooser writes the rows a named term means
+       (`services/sales/paymentPlan.service.js` — `planForShape`), so the two
+       can never hold different answers. */
+    paymentPlan: { type: [paymentPlanRow()], default: undefined },
     gstTreatment: { type: String, enum: GST_TREATMENT_CODES },
+    /* The customer's USUAL delivery arrangement. Per-order answers live on the
+       enquiry (`Enquiry.freight`) and are copied there, never read back
+       through — see services/sales/deliveryTermsResolution.service.js. */
     freightArrangement: { type: String, enum: FREIGHT_ARRANGEMENT_CODES },
     negotiatedTerms: { type: String, trim: true }, // free-text: special rates / standing agreements
     defaultIncoterm: { type: String, trim: true },
+
+    /* ── THE REST OF THE CUSTOMER'S USUAL DELIVERY TERMS ─────────────────
+       Defaults, in the same vocabulary the enquiry answers in, so "is this the
+       customer's usual lane?" is a comparison rather than a guess.
+
+       DELIBERATELY NOT HERE, because they are facts about one deal and not
+       about the customer: the dispatch warehouse (which of OUR sites this
+       order leaves from), the number of deliveries, and any freight amount or
+       transporter rate — those stay on the enquiry and in Store's freight
+       quotation register.
+
+       Every one is optional. Blank means "no default agreed", and nothing
+       turns a blank into a zero or into a guessed code. */
+    defaultShippingAddressId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CRMAddress",
+      /* An untouched picker posts "", which would cast-fail. */
+      set: (v) => (v === "" ? undefined : v),
+    },
+    defaultTransportMode: { type: String, enum: TRANSPORT_MODE_CODES },
+    /* Only meaningful beside a `prepaid` arrangement: the company pays the
+       carrier either way, and this says whether that sits in the garment price
+       or is billed on at cost. */
+    defaultPrepaidTreatment: { type: String, enum: PREPAID_TREATMENT_CODES },
+    /* Standing instructions that travel with every delivery to this customer —
+       gate passes, delivery windows, a nominated transporter. Read by people,
+       never parsed. */
+    deliveryInstructions: { type: String, trim: true, maxlength: 1000 },
     creditStatus: { type: String, enum: CREDIT_STATUS_CODES, default: "not_checked" }, // restricted
     creditLimit: { type: Number, min: 0 }, // restricted
     annualRevenue: { type: Number, min: 0 },

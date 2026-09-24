@@ -80,7 +80,7 @@ const { createWithRef } = require("../../../services/salesJourneyRef");
 const { closingVerdictForJourney } = require("../../../services/closingVerdict");
 const { assertLeadConvertible, deriveLegacyStage } = require("../../../services/leadQualification");
 const { promoteLeadContacts } = require("../../../services/leadContactPromotion");
-const { planStageTransition, JourneyTransitionError } = require("../../../services/salesJourneyProgress");
+const { planStageTransition, JourneyTransitionError, resolveStage } = require("../../../services/salesJourneyProgress");
 const { isSalesManager } = require("../../../services/salesAccess");
 const { journeyAttention } = require("../../../services/journeyAttention");
 const {
@@ -170,7 +170,18 @@ const nextActionDto = (a) =>
 function summaryDto(j) {
   const stageStates = j.stageStates ? { ...(j.stageStates.toObject?.() ?? j.stageStates) } : {};
   delete stageStates._id;
-  const currentStageState = stageStates[j.currentStage] || "notStarted";
+  /* ── A RETIRED STAGE IS REPORTED WHERE ITS WORK WENT ─────────────────
+     A journey stored on `costQuote` stands, in every sense a person cares
+     about, on Purchase Invoice — that is where its costing, its price and its
+     proforma are now. Resolved on READ rather than migrated: the stored code
+     stays exactly as it was written, and nothing is rewritten under a running
+     system. The state travels with it, so a journey mid-costing does not
+     report itself as "not started".
+     See services/salesJourneyProgress.js RETIRED_STAGE_FORWARDS. */
+  const currentStage = resolveStage(j.currentStage);
+  const currentStageState = stageStates[currentStage] !== undefined && currentStage !== j.currentStage
+    ? (stageStates[j.currentStage] || stageStates[currentStage] || "notStarted")
+    : (stageStates[j.currentStage] || "notStarted");
   return {
     id: j.journeyId,
     reference: j.journeyId,
@@ -178,7 +189,7 @@ function summaryDto(j) {
     businessType: j.businessType,
     requirementRef: j.requirementRef || null,
     customer: accountDto(j.accountId),
-    currentStage: j.currentStage,
+    currentStage,
     currentStageState,
     stageStates,
     risk: j.risk,

@@ -445,9 +445,67 @@ router.get("/orders/:orderId/styles/:styleId/engineering-file", requireCompany, 
   return res.json({ success: true, ...out });
 }));
 
+/* ── THE SAME FILE, OPENED BEFORE THERE IS AN ORDER ────────────────────────
+ * Engineering used to be reachable only through an order, which put IE after
+ * the sale — and nothing may be quoted until IE has confirmed the technical
+ * facts a price is built on. These two reach the SAME file by the same unique
+ * key; the only difference is how the style is proved to be this company's.
+ * An order opened later attaches itself to the file that already exists. */
+
+/** OPEN (or return) the engineering file for a style, with no order. */
+router.post("/styles/:styleId/engineering-file", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieStyleFile.createFileForStyle(req.ie, {
+    styleId: req.params.styleId,
+    body: req.body,
+    actor: actorOf(req),
+  });
+  return res.status(out.created ? 201 : 200).json({ success: true, ...out });
+}));
+
+/** READ the engineering file for a style, with no order. */
+router.get("/styles/:styleId/engineering-file", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieStyleFile.readFileForOwnedStyle(req.ie, { styleId: req.params.styleId });
+  return res.json({ success: true, ...out });
+}));
+
 /** REPLACE the draft bulletin — one PATCH, one revision, one audit entry set. */
 router.patch("/engineering-files/:fileId/bulletin", requireCompany, canWrite, handle(async (req, res) => {
   const out = await ieStyleFile.updateBulletin(req.ie, {
+    fileId: req.params.fileId,
+    body: req.body,
+    actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/* ══ THE SUCCESSOR CYCLE ════════════════════════════════════════════════════
+ *
+ * R&D approving a newer technical revision used to leave this file unable to
+ * submit anything ever again, and Central Costing reporting an approval that
+ * was stale with no action that could clear it. These two verbs are the way
+ * forward, and both are deliberate: one moves the file, the other records that
+ * somebody looked at what moving it changed.
+ *
+ * ── WHY RE-BASING IS AN EDITOR AND NOT AN APPROVER ─────────────────────────
+ * It authors: it changes what the draft is being engineered against and what
+ * still has to be looked at. It approves nothing and it clears no approval —
+ * the standing approved version keeps standing until a new one is submitted
+ * and approved by somebody other than its author, through the routes above.
+ */
+
+/** RE-BASE the draft onto R&D's newer approved revision. Refused if none. */
+router.post("/engineering-files/:fileId/rebase-source", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieStyleFile.rebaseSource(req.ie, {
+    fileId: req.params.fileId,
+    body: req.body,
+    actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/** RECORD the review the move requires — by row, and of the basis itself. */
+router.post("/engineering-files/:fileId/rebase-review", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieStyleFile.confirmRebaseReview(req.ie, {
     fileId: req.params.fileId,
     body: req.body,
     actor: actorOf(req),

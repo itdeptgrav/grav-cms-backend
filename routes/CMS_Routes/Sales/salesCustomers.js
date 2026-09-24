@@ -12,7 +12,11 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
-const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
+const {
+  scopedFilter: scoped, scopeFor: salesScopeFor,
+} = require("../../../services/companyContext/salesScope.service");
+/* One customer, as far as a salesperson is concerned — see the service. */
+const customerAccountLink = require("../../../services/sales/customerAccountLink.service");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Customer = require("../../../models/Customer_Models/Customer");
@@ -203,6 +207,42 @@ router.post("/", salesAuth, async (req, res) => {
       salesAssignedByName: req.user?.name || "Sales Team",
     });
 
+    /* ── AND THE COMMERCIAL RECORD THAT GOES WITH THEM ──────────────────
+       THE BUG THIS FIXES: this route created the portal customer and nothing
+       else. Their commercial terms live on a sales account, so every
+       customer Sales has ever created this way had nowhere to put them — and
+       the terms screen, which edits that account, told the person their
+       customer "is not linked to a sales account yet" and sent them to
+       another page to fix a relationship they had never heard of.
+
+       It is established HERE, with the customer, in one act. A salesperson
+       creates a customer; the system keeps whatever records it needs.
+
+       If it cannot be established the customer is removed again rather than
+       left half-created: a customer that exists without one is precisely the
+       state this fixes, and it is better to fail loudly at the moment
+       somebody is looking at the form. Nothing else references the record
+       yet — it was created two lines ago and no email has gone out. */
+    let account = null;
+    try {
+      const scope = await salesScopeFor(req);
+      const established = await customerAccountLink.ensure({
+        scope,
+        customerId: customer._id,
+        customer: customer.toObject(),
+        actor: { id: req.user?.id, name: req.user?.name || "Sales" },
+      });
+      if (!established.ok) throw new Error(established.message);
+      account = established.account;
+    } catch (linkErr) {
+      await Customer.deleteOne({ _id: customer._id }).catch(() => {});
+      console.error("[salesCustomers] POST / — could not establish the commercial record", linkErr);
+      return res.status(500).json({
+        success: false,
+        message: "The customer could not be set up completely, so nothing was saved. Please try again.",
+      });
+    }
+
     // Send welcome email (non-blocking — never fails the request)
     sendCustomerEmail("welcome", customer.email, {
       name: customer.name,
@@ -221,6 +261,9 @@ router.post("/", salesAuth, async (req, res) => {
       success: true,
       message: "Customer account created successfully",
       customer: safe,
+      /* The record their commercial terms are kept on, established with them.
+         Returned so a caller never has to go looking for it. */
+      account: account ? { _id: String(account._id), accountId: account.accountId || null } : null,
       tempPassword,
     });
   } catch (err) {
@@ -623,7 +666,7 @@ router.get("/:id/orders", salesAuth, async (req, res) => {
     const orders = await CustomerRequest.find({ customerId: custObjectId })
       .sort({ createdAt: -1 })
       .select(
-        "requestId status priority requestType measurementName measurementId " +
+        "requestId status priority requestType fulfilmentModel measurementName measurementId " +
           "customerInfo items finalOrderPrice totalPaidAmount totalDueAmount " +
           "quotations.quotationNumber quotations.grandTotal quotations.status " +
           "quotations.paymentSchedule quotations.paymentSubmissions " +

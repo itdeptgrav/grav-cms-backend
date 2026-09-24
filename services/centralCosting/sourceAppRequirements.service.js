@@ -147,7 +147,15 @@ function styleFacts(style) {
     outsideProcessDecision,
     developmentDecision,
     development: serviceRows.filter((s) => s.purpose === "DEVELOPMENT_TOOLING"),
-    packedWeightGrams: style.sample?.shipment?.packedWeightGrams ?? null,
+    /* ── THE APPROVED WEIGHING, NOT THE WORKING NOTE ──────────────────
+       This read `sample.shipment`, which is R&D's scratch record and is not
+       versioned. A costing reads `sample.packingMeasurement` once it has been
+       approved, so readiness has to ask the same record — otherwise this panel
+       reports freight as ready while the costing refuses it for want of an
+       approved weight, which is the disagreement readiness exists to prevent. */
+    packedWeightGrams: style.sample?.packingMeasurement?.approvedAt
+      ? (style.sample.packingMeasurement.packedWeightGrams ?? null)
+      : null,
   };
 }
 
@@ -553,6 +561,11 @@ function resolveRequirement(requirement, facts) {
           return answer(STATUS.NOT_APPLICABLE,
             pt.notApplicableReason || "Financing does not apply to this order.");
         case "CONFIRMED": {
+          /* ── THE PLAN, WHERE THERE IS ONE ────────────────────────────
+             Its own sentence, instalment by instalment. Collapsing it to
+             "60% advance" would report one tranche of a three-tranche
+             agreement as the whole of it. */
+          if (pt.planSummary) return answer(STATUS.READY, pt.planSummary);
           const advance = pt.advancePercent;
           const days = pt.creditDays;
           const tail = days > 0 && pt.creditDaysFromLabel

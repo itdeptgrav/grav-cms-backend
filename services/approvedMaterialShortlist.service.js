@@ -96,7 +96,30 @@ async function approvedShortlistFor(style) {
       stockItemId: stockItemId ? String(stockItemId) : null,
       developmentNumber: development.developmentNumber,
       developmentBomRevisionNo: development.revisionNo,
-      blocker: null,
+      /* ── A SUPERSEDED RELEASE CANNOT AUTHORISE NEW WORK ───────────────
+         The rows above are the ones Sales RELEASED, so existing technical
+         work still lines up with what it was built against and nothing R&D
+         has recorded is disturbed. What the blocker stops is NEW work being
+         added as current: Merchandising has approved a newer selection and
+         Sales has not reviewed it, so anything engineered now would be
+         engineered against materials that are already out of date.
+
+         Named rather than silent, and owned by SALES — the outstanding step
+         is a review, and telling R&D that their own record is incomplete
+         would send them looking for work that is not theirs. */
+      blocker: development.stale
+        ? {
+          owner: "SALES",
+          field: "materials",
+          code: "DEVELOPMENT_MATERIALS_STALE",
+          releasedBomRevisionNo: development.releasedRevisionNo,
+          currentBomRevisionNo: development.currentRevisionNo,
+          message: `Development ${development.developmentNumber} revision ${development.currentRevisionNo} `
+            + `has been approved by Merchandising, replacing revision ${development.releasedRevisionNo}, `
+            + "which is the one released to R&D. Sales reviews and releases the new revision before "
+            + "any further technical work is recorded against these materials.",
+        }
+        : null,
     };
   }
 
@@ -172,19 +195,37 @@ async function approvedDevelopmentSelectionFor(style) {
   if (!styleId) return null;
 
   const file = await DevelopmentFile.findOne({ sampleStyleId: styleId })
-    .select("_id developmentNumber currentBomRevisionNo companyId").lean().catch(() => null);
+    .select("_id developmentNumber currentBomRevisionNo releasedBomRevisionNo companyId")
+    .lean().catch(() => null);
   if (!file?.currentBomRevisionNo) return null;
+
+  /* ── WHICH REVISION R&D IS ENTITLED TO READ ───────────────────────────
+     The RELEASED one when there is a release, and the approved one otherwise.
+     Both numbers come from this one file, so the comparison can never reach
+     across companies or files — a revision belonging to somebody else's file
+     is not read here because it is never looked up here.
+
+     Reading the newest approved revision unconditionally, which is what this
+     used to do, hands R&D a selection Sales has never seen the moment
+     Merchandising approves a successor. */
+  const released = Number(file.releasedBomRevisionNo);
+  const hasRelease = Number.isInteger(released) && released >= 1;
+  const stale = hasRelease && released !== Number(file.currentBomRevisionNo);
+  const wanted = hasRelease ? released : Number(file.currentBomRevisionNo);
 
   const revision = await DevelopmentBomRevision.findOne({
     companyId: file.companyId,
     developmentFileId: file._id,
-    state: BOM_STATE.APPROVED,
-  }).select("revisionNo rows").lean().catch(() => null);
+    revisionNo: wanted,
+  }).select("revisionNo rows state").lean().catch(() => null);
   if (!revision?.rows?.length) return null;
 
   return {
     developmentNumber: String(file.developmentNumber || ""),
     revisionNo: revision.revisionNo,
+    stale,
+    releasedRevisionNo: hasRelease ? released : null,
+    currentRevisionNo: Number(file.currentBomRevisionNo),
     rows: revision.rows.map((r) => ({
       rawItemId: r.rawItemId,
       rawItemName: r.rawItemName,

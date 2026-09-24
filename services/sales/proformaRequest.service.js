@@ -35,6 +35,8 @@ const mongoose = require("mongoose");
 const lineReadiness = require("./lineReadiness.service");
 const { nextRequestId } = require("../requestId");
 const { planStageTransition } = require("../salesJourneyProgress");
+const { resolveOrderFulfilmentModel } = require("../../constants/orderFulfilment");
+const CustomerChangeRequest = require("../../models/CMS_Models/Sales/CustomerChangeRequest");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -44,6 +46,7 @@ const CODES = Object.freeze({
   NOT_FOUND: "NOT_FOUND",
   LINE_REFUSED: "PROFORMA_LINE_REFUSED",
   STYLE_UNVERIFIED: "PROFORMA_STYLE_UNVERIFIED",
+  CUSTOMER_CHANGE_OPEN: "PROFORMA_CUSTOMER_CHANGE_OPEN",
   /* A proforma already exists for this enquiry and the commercial state has
      MOVED since. Not an error in the request — a decision the caller has to
      make deliberately, by naming the document being superseded. */
@@ -94,6 +97,7 @@ function claimOf(companyId, enquiryId, lines) {
     .map((l) => [
       str(l.productLineRef),
       str(l.sampleStyleId),
+      resolveOrderFulfilmentModel(l.fulfilmentModel),
       String(Number(l.quantity)),
       String(Number(l.unitPriceMinor)),
       str(l.costingVersionId),
@@ -117,6 +121,7 @@ function claimOfStored(companyId, enquiryId, request) {
   const lines = (request?.items || []).map((it) => ({
     productLineRef: it.productLineRef,
     sampleStyleId: it.sampleStyleId,
+    fulfilmentModel: resolveOrderFulfilmentModel(it.fulfilmentModel),
     quantity: it.totalQuantity,
     unitPriceMinor: Math.round(Number(it.commercialDecision?.unitPriceMinor ?? NaN)),
     costingVersionId: it.commercialDecision?.costingVersionId,
@@ -186,6 +191,7 @@ async function currentProformaFor(ctx, enquiryOrId) {
     return {
       productLineRef: str(it.productLineRef),
       sampleStyleId: str(it.sampleStyleId),
+      fulfilmentModel: resolveOrderFulfilmentModel(it.fulfilmentModel),
       quantity,
       unitPriceMinor: Number.isFinite(unitPriceMinor) ? unitPriceMinor : null,
       totalMinor: Number.isFinite(unitPriceMinor) ? unitPriceMinor * quantity : null,
@@ -243,7 +249,7 @@ async function recordProforma(ctx, enquiry, request, { superseding = false } = {
       _id: enquiry.journeyId, companyId: ctx.companyId,
     }).select("currentStage stageStates outcome");
     if (!journey) return;
-    const plan = planStageTransition(journey, { action: "recordWork", stage: "costQuote" });
+    const plan = planStageTransition(journey, { action: "recordWork", stage: "purchaseInvoice" });
     if (plan.noop || !Object.keys(plan.set).length) return;
     await SalesJourney().updateOne({ _id: journey._id }, { $set: plan.set });
   } catch (err) {
@@ -299,6 +305,38 @@ async function createForEnquiry(ctx, enquiryId, {
     _id: enquiryId, companyId: ctx.companyId, isActive: true,
   }).lean();
   if (!enquiry) throw fail(CODES.NOT_FOUND, "That enquiry was not found.");
+
+  /* ── A ROUTED CUSTOMER CHANGE IS A COMMERCIAL HOLD ──────────────────
+     The Style & Sample page is not the security boundary. A caller can post
+     to this command directly, so the hold belongs here, immediately after
+     the company-scoped enquiry has been proved. The hold is enquiry-wide: a
+     replacement brief gets a new line identity, and limiting this query to
+     the requested line would let that new identity bypass the still-open
+     customer request. */
+  const openChanges = await CustomerChangeRequest.find({
+    companyId: ctx.companyId,
+    enquiryId: enquiry._id,
+    status: { $in: ["OPEN", "IN_PROGRESS"] },
+  }).select("changeRef productLineRef productName sampleStyleId destination owner status customerFeedback").lean();
+  if (openChanges.length) {
+    throw fail(
+      CODES.CUSTOMER_CHANGE_OPEN,
+      "A purchase invoice cannot be raised while customer-requested product changes are still open.",
+      {
+        reason: "CUSTOMER_CHANGES_UNRESOLVED",
+        changes: openChanges.map((change) => ({
+          changeRef: change.changeRef,
+          productLineRef: str(change.productLineRef),
+          productName: str(change.productName),
+          sampleStyleId: str(change.sampleStyleId),
+          destination: change.destination,
+          owner: change.owner,
+          status: change.status,
+          customerFeedback: change.customerFeedback,
+        })),
+      },
+    );
+  }
 
   const customer = await Customer().findById(customerId)
     .select("name email phone profile customerId").lean();
@@ -449,6 +487,11 @@ async function createForEnquiry(ctx, enquiryId, {
       stockItemName: stockItem.name,
       stockItemReference: stockItem.reference,
       productLineRef,
+      // The line is authoritative. The enquiry-level fallback exists only
+      // for records saved by the earlier order-wide implementation.
+      fulfilmentModel: resolveOrderFulfilmentModel(
+        row.fulfilmentModel || enquiry.fulfilmentModel,
+      ),
       variants: [{
         variantId: variant?._id || null,
         attributes: variant?.attributes || [],
@@ -501,6 +544,7 @@ async function createForEnquiry(ctx, enquiryId, {
   const claim = claimOf(ctx.companyId, enquiry._id, validated.map((v) => ({
     productLineRef: v.productLineRef,
     sampleStyleId: v.sampleStyleId,
+    fulfilmentModel: v.fulfilmentModel,
     quantity: v.totalQuantity,
     unitPriceMinor: v.commercialDecision.unitPriceMinor,
     costingVersionId: v.commercialDecision.costingVersionId,
@@ -579,6 +623,12 @@ async function createForEnquiry(ctx, enquiryId, {
       items: validated,
       status: "pending",
       priority: "medium",
+      // Compatibility summary for older order-level readers. Product lines
+      // above remain the source of truth, including for mixed orders.
+      fulfilmentModel: validated.length > 0
+        && validated.every((line) => line.fulfilmentModel === "JOB_WORK")
+        ? "JOB_WORK"
+        : "FULL_PACKAGE",
       createdBySales: true,
       createdBySalesId: actor?.id || ctx.actorId || undefined,
       /* Where it came from, the key that makes a retry replay, the commercial
@@ -624,6 +674,7 @@ async function createForEnquiry(ctx, enquiryId, {
     lines: validated.map((v) => ({
       productLineRef: v.productLineRef,
       sampleStyleId: String(v.sampleStyleId),
+      fulfilmentModel: v.fulfilmentModel,
       quantity: v.totalQuantity,
     })),
   };

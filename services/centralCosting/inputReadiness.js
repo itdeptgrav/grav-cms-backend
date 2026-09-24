@@ -66,6 +66,26 @@ const DESTINATIONS = Object.freeze({
     description: "R&D records what the style is made of and how much of it is used.",
     requires: { departmentSlug: "research-development", minimumRole: "editor" },
   },
+  /* ── WHERE A TECHNICAL CONFIRMATION IS ACTUALLY MADE ──────────────────
+     The engineering file, not the technical record: R&D's screen is where the
+     record is AUTHORED, and sending somebody there to confirm it would send
+     them to a desk that cannot. */
+  IE_ENGINEERING_FILE: {
+    id: "IE_ENGINEERING_FILE",
+    label: "Open the engineering file",
+    description:
+      "Industrial Engineering confirms the technical revision it reviewed, and approves the "
+      + "operation route and SAM built from it.",
+    requires: { departmentSlug: "ie", minimumRole: "approver" },
+  },
+  /* Merchandising's own selection record — the execution file's approved
+     revision after an order, the BOM approval before one. */
+  MERCHANDISING_SELECTION: {
+    id: "MERCHANDISING_SELECTION",
+    label: "Open the material selection",
+    description: "Merchandising decides which fabric, trim or packaging item this style is made with.",
+    requires: { departmentSlug: "merchandiser", minimumRole: "approver" },
+  },
   STORE_MATERIAL_QUOTATIONS: {
     id: "STORE_MATERIAL_QUOTATIONS",
     label: "Open the supplier quotation register",
@@ -198,10 +218,91 @@ const OWNER = Object.freeze({
      signpost naming a grant the app does not actually require sends people to
      ask an administrator for the wrong thing. */
   BOARD: { department: "Board", departmentSlug: "board", minimumRole: "approver" },
+  /* ── THE TWO DESKS BETWEEN R&D AND A PRICE ───────────────────────────────
+     Merchandising decides WHICH item; Industrial Engineering confirms the
+     R&D-derived manufacturing facts by approving the exact revision it
+     reviewed. Neither existed here while costing read R&D directly, and their
+     absence is why every technical gap was addressed to R&D — including the
+     ones R&D had already answered and could do nothing about. */
+  MERCHANDISING: { department: "Merchandising", departmentSlug: "merchandiser", minimumRole: "approver" },
+  IE: { department: "Industrial Engineering", departmentSlug: "ie", minimumRole: "approver" },
   /* Named so the row can say the truth: nobody in this repository owns it
      yet, and the fix is a decision about records rather than a data entry. */
   UNASSIGNED: { department: "Not yet assigned", unassigned: true },
 });
+
+/* ══ THE AUTHORITY STATES, AND THE DESK THAT CLEARS EACH ═══════════════════
+ *
+ * Stable strings. They are stored in frozen provenance, shown on a Sales
+ * screen, and routed to a department — renaming one is a migration.
+ *
+ * ── WHY THEY ARE NOT ONE "MISSING COSTING DATA" ─────────────────────────────
+ * Because they are not one problem and they are not one desk's. "Awaiting IE
+ * technical confirmation" and "Merchandising has not approved the selection"
+ * send different people to different screens, and a reader told only that
+ * something is missing has to go and find out which — which is what a
+ * readiness projection exists to spare them.
+ *
+ * ── AND WHY R&D APPEARS ONLY ONCE ───────────────────────────────────────────
+ * R&D owns exactly one of these: the state before a revision has entered the
+ * IE chain at all. Once it has, the answer belongs to IE, and naming R&D would
+ * send somebody to a desk with nothing left to do.
+ */
+const AUTHORITY_STATE = Object.freeze({
+  AWAITING_RND_TECHNICAL_SUBMISSION: {
+    id: "AWAITING_RND_TECHNICAL_SUBMISSION",
+    label: "Technical details not submitted",
+    owner: OWNER.RND,
+    destination: "RND_TECHNICAL_RECORD",
+  },
+  AWAITING_IE_TECHNICAL_CONFIRMATION: {
+    id: "AWAITING_IE_TECHNICAL_CONFIRMATION",
+    label: "Awaiting IE technical confirmation",
+    owner: OWNER.IE,
+    destination: "IE_ENGINEERING_FILE",
+  },
+  IE_TECHNICAL_APPROVAL_STALE: {
+    id: "IE_TECHNICAL_APPROVAL_STALE",
+    label: "IE technical approval is stale",
+    owner: OWNER.IE,
+    destination: "IE_ENGINEERING_FILE",
+  },
+  TECHNICAL_SOURCE_MISMATCH: {
+    id: "TECHNICAL_SOURCE_MISMATCH",
+    label: "Technical source does not match the selected style",
+    owner: OWNER.IE,
+    destination: "IE_ENGINEERING_FILE",
+  },
+  AWAITING_MERCHANDISING_SELECTION: {
+    id: "AWAITING_MERCHANDISING_SELECTION",
+    label: "Material not selected",
+    owner: OWNER.MERCHANDISING,
+    destination: "MERCHANDISING_SELECTION",
+  },
+  SELECTION_MISMATCH: {
+    id: "SELECTION_MISMATCH",
+    label: "Store decision does not match the approved material selection",
+    owner: OWNER.MERCHANDISING,
+    destination: "MERCHANDISING_SELECTION",
+  },
+  AWAITING_STORE_SOURCING: {
+    id: "AWAITING_STORE_SOURCING",
+    label: "Supplier quotation not selected or available",
+    owner: OWNER.STORE,
+    destination: "STORE_MATERIAL_QUOTATIONS",
+  },
+  STORE_DECISION_MISMATCH: {
+    id: "STORE_DECISION_MISMATCH",
+    label: "Store decision does not match the approved material selection",
+    owner: OWNER.STORE,
+    destination: "STORE_MATERIAL_QUOTATIONS",
+  },
+});
+
+/** The state a binding refusal maps to, by its own name. One vocabulary. */
+function authorityStateFor(bindingState) {
+  return AUTHORITY_STATE[String(bindingState || "")] || null;
+}
 
 /* ── THE EIGHT NON-PACKAGING FAMILIES ───────────────────────────────────────
  * Keys are `costCoverage.FAMILIES` keys, deliberately — one vocabulary, so a
@@ -754,6 +855,7 @@ function forVersion({ completeness = null, version = null, policySnapshot = null
 }
 
 module.exports = {
+  AUTHORITY_STATE, authorityStateFor,
   DESTINATIONS, CONTRACT, OWNER,
   FAMILIES, FAMILY_KEYS, FAMILY_BY_KEY, EXCLUDED_FAMILY_KEYS,
   READINESS, READINESS_LABEL, BLOCKING,

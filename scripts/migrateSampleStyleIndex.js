@@ -14,9 +14,10 @@
 // name would be rejected as a duplicate of the first.
 //
 // The model now declares the same index with
-// `partialFilterExpression: { journeyId: { $type: "objectId" } }`, which
-// constrains exactly the rows the rule was written for and leaves house
-// samples alone. But Mongo will NOT re-spec an index in place: `createIndex`
+// `partialFilterExpression: { journeyId: { $type: "objectId" }, isActive: true }`,
+// which constrains the rule to live journey styles, leaves house samples alone,
+// and lets a retired rejected design keep its history without occupying the
+// replacement's name. But Mongo will NOT re-spec an index in place: `createIndex`
 // with different options on an existing name fails (IndexOptionsConflict, 85)
 // rather than replacing it, and Mongoose's autoIndex silently swallows that.
 // So the old index has to be dropped explicitly first.
@@ -37,7 +38,7 @@ const mongoose = require("mongoose");
 
 const TARGET_KEY = { journeyId: 1, productName: 1, variantKey: 1 };
 const TARGET_NAME = "journeyId_1_productName_1_variantKey_1";
-const TARGET_PARTIAL = { journeyId: { $type: "objectId" } };
+const TARGET_PARTIAL = { journeyId: { $type: "objectId" }, isActive: true };
 
 const sameKey = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -51,7 +52,7 @@ const sameKey = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
   if (!existing) {
     console.log("No { journeyId, productName, variantKey } index found — creating the partial one.");
-  } else if (existing.partialFilterExpression) {
+  } else if (sameKey(existing.partialFilterExpression || {}, TARGET_PARTIAL)) {
     console.log("Already partial:", JSON.stringify(existing.partialFilterExpression));
     console.log("Nothing to do.");
     await mongoose.disconnect();

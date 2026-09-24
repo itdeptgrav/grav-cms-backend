@@ -972,6 +972,43 @@ const costingVersionSchema = new mongoose.Schema(
         effectivePercent: { type: String, trim: true, default: null },
         formula: { type: String, trim: true, default: null },
 
+        /* ── WHICH ARITHMETIC, AND EVERY PART OF IT ──────────────────
+           `TRANCHE` — Sales agreed a payment plan and each instalment was
+           financed on its own. `LEGACY_SIMPLE` — the record predates plans
+           and carries one advance and one credit period, priced exactly as
+           it always was. The same total can come out of both, and they are
+           not the same statement about what was agreed.
+
+           The tranches are frozen BY VALUE for the same reason as everything
+           else here: a year later the enquiry has moved, and "why is the
+           financing this much" has to be answerable from the version. */
+        method: { type: String, trim: true, default: null },
+        /* ── WHERE THE WAITING STARTED ────────────────────────────────
+           The Board's chosen event and the date this order reached it.
+           Every tranche's financed days is the calendar distance from here
+           to that tranche's own due date, so without these two the figure
+           can be read but not checked. */
+        startEvent: { type: String, trim: true, default: null },
+        startDate: { type: Date, default: null },
+        tranches: {
+          type: [new mongoose.Schema({
+            name: { type: String, trim: true, default: "" },
+            percentage: { type: String, trim: true, default: null },
+            dueEvent: { type: String, trim: true, default: null },
+            offsetDirection: { type: String, trim: true, default: null },
+            offsetDays: { type: Number, default: null },
+            /* When this tranche fell due on this order — its event's date,
+               plus or minus its agreed offset. */
+            dueDate: { type: Date, default: null },
+            /* And the calendar days from the financing start to that date.
+               An offset says how to DERIVE a due date; it is never itself a
+               duration, which is the correction this field records. */
+            financedDays: { type: String, trim: true, default: null },
+            effectivePercent: { type: String, trim: true, default: null },
+          }, { _id: false })],
+          default: undefined,
+        },
+
         asOf: { type: Date },
       }, { _id: false }),
       default: undefined,

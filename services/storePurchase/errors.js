@@ -566,6 +566,60 @@ const CODES = {
   DEVELOPMENT_SELF_APPROVAL: { status: 409, code: "DEVELOPMENT_SELF_APPROVAL" },
   DEVELOPMENT_NOT_APPROVED: { status: 409, code: "DEVELOPMENT_NOT_APPROVED" },
   DEVELOPMENT_RELEASE_IS_SALES: { status: 403, code: "DEVELOPMENT_RELEASE_IS_SALES" },
+
+  /* ── A SELECTION POINTS AT STORE'S CATALOGUE, AND THE POINTER IS CHECKED ──
+   * A development row may name a registered raw item. The server resolves the
+   * id rather than trusting the name beside it, so these two say the pointer
+   * did not resolve.
+   *
+   * `ITEM_NOT_FOUND` is deliberately the answer for BOTH an id that exists
+   * nowhere and one that belongs to another company. Separating them would
+   * make this a way to ask whether a competitor's books hold a given id, and
+   * the caller's next step is identical either way: choose from the list.
+   *
+   * `ROW_DUPLICATE` is not a validation failure — the request is well formed
+   * and the item is real. It says this exact material, in this exact variant,
+   * is already in the draft for the same place on the garment, so adding it
+   * again would tell R&D to source one thing twice. The same material for a
+   * DIFFERENT placement is an ordinary, allowed thing, which is why the
+   * refusal names the placement it collided with. */
+  DEVELOPMENT_CATALOGUE_ITEM_NOT_FOUND: { status: 404, code: "DEVELOPMENT_CATALOGUE_ITEM_NOT_FOUND" },
+  DEVELOPMENT_CATALOGUE_VARIANT_NOT_FOUND: { status: 404, code: "DEVELOPMENT_CATALOGUE_VARIANT_NOT_FOUND" },
+  DEVELOPMENT_ROW_DUPLICATE: { status: 409, code: "DEVELOPMENT_ROW_DUPLICATE" },
+
+  /* ── RELEASING BINDS ONE EXACT REVISION ──────────────────────────────────
+   * Sales authorises a specific approved selection, not "whatever the file
+   * says when the click lands". These four are the ways that binding can fail,
+   * and they are registered rather than left to fall through to VALIDATION —
+   * which is what an unlisted key silently becomes — because a screen has to
+   * tell "Merchandising approved a newer revision while you were reading"
+   * apart from "this line is not ready" and from "you already released it".
+   *
+   * 409 for the three that are STATES the caller lost to or has to re-read;
+   * 400 for the one thing the request itself failed to say. */
+  DEVELOPMENT_BOM_REVISION_CHANGED: { status: 409, code: "DEVELOPMENT_BOM_REVISION_CHANGED" },
+  DEVELOPMENT_NOT_AWAITING_SALES: { status: 409, code: "DEVELOPMENT_NOT_AWAITING_SALES" },
+  DEVELOPMENT_ALREADY_RELEASED: { status: 409, code: "DEVELOPMENT_ALREADY_RELEASED" },
+  DEVELOPMENT_BOM_REVISION_REQUIRED: { status: 400, code: "DEVELOPMENT_BOM_REVISION_REQUIRED" },
+  /* ── THE OTHER HALF OF THE SAME DECISION ─────────────────────────────────
+   * Sales either approves the selection and releases it, or asks for changes.
+   * Both answer one revision, and the two cannot both be answered: a request
+   * for changes against a line Sales has already released is refused rather
+   * than quietly reopening work R&D has started. */
+  DEVELOPMENT_CHANGES_ALREADY_REQUESTED: { status: 409, code: "DEVELOPMENT_CHANGES_ALREADY_REQUESTED" },
+  DEVELOPMENT_MATERIALS_NOT_EDITABLE: { status: 422, code: "DEVELOPMENT_MATERIALS_NOT_EDITABLE" },
+  /* Asked to take back a release that was never made. Distinct from the
+     refusals above: nothing about the request is wrong and no permission is
+     missing — the line is simply not in the state the command is for. */
+  DEVELOPMENT_NOT_RELEASED: { status: 409, code: "DEVELOPMENT_NOT_RELEASED" },
+  /* ── A RELEASE THAT NO LONGER DESCRIBES THE APPROVED SELECTION ───────────
+     Merchandising has approved a revision newer than the one Sales released,
+     so the release is history rather than authority. Named rather than left
+     to a generic refusal, because every downstream reader — R&D, IE,
+     Costing — has to tell "not approved yet" apart from "approved, and
+     superseded since", and only the second one has a Sales decision
+     outstanding. */
+  DEVELOPMENT_MATERIALS_STALE: { status: 409, code: "DEVELOPMENT_MATERIALS_STALE" },
   PRODUCT_LINE_NOT_FOUND: { status: 404, code: "PRODUCT_LINE_NOT_FOUND" },
   /* ── IE CHUNK 1D — A WORK ORDER MUST KNOW ITS STYLE ─────────────────────
    * Registered rather than left to fall through to VALIDATION, which is what
@@ -641,9 +695,24 @@ const CODES = {
    * and the fix is an approval R&D has not made (or has made twice). */
   IE_FILE_NOT_FOUND: { status: 404, code: "IE_FILE_NOT_FOUND" },
   IE_STYLE_NOT_ON_ORDER: { status: 404, code: "IE_STYLE_NOT_ON_ORDER" },
+  /* Opening an engineering file from the style itself, with no order to prove
+     it. One answer for absent, foreign and malformed alike — the same 404 the
+     order door gives, so neither can be used to discover which style ids are
+     real. */
+  IE_STYLE_NOT_FOUND: { status: 404, code: "IE_STYLE_NOT_FOUND" },
   IE_SOURCE_VERSION_REQUIRED: { status: 409, code: "IE_SOURCE_VERSION_REQUIRED" },
   IE_SOURCE_VERSION_AMBIGUOUS: { status: 409, code: "IE_SOURCE_VERSION_AMBIGUOUS" },
   IE_FILE_REVISION_CONFLICT: { status: 409, code: "IE_FILE_REVISION_CONFLICT" },
+  /* ── MOVING A FILE ONTO A NEWER APPROVED REVISION ────────────────────────
+     409 for all four: nothing about the request is malformed. There is no
+     newer revision to move onto, the newer one is behind rather than ahead,
+     the caller named a revision R&D does not stand behind, or the file was
+     never moved and so has no review to record. Each is a state of the
+     record, and re-reading it is the fix. */
+  IE_SOURCE_REBASE_NOT_REQUIRED: { status: 409, code: "IE_SOURCE_REBASE_NOT_REQUIRED" },
+  IE_SOURCE_REBASE_NOT_NEWER: { status: 409, code: "IE_SOURCE_REBASE_NOT_NEWER" },
+  IE_SOURCE_REBASE_REVISION_MISMATCH: { status: 409, code: "IE_SOURCE_REBASE_REVISION_MISMATCH" },
+  IE_SOURCE_NOT_REBASED: { status: 409, code: "IE_SOURCE_NOT_REBASED" },
   /* A declared process route that cannot be stored: an unknown process, an
      applicability nobody stated, a predecessor that is later, missing or does
      not apply. 400, naming every entry at once. */

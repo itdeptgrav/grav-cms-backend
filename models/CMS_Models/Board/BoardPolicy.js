@@ -113,6 +113,29 @@ const ADVANCE_TREATMENTS = Object.freeze(["REDUCES_FINANCED_AMOUNT", "IGNORED"])
 const DAY_COUNT_BASES = Object.freeze([365, 360]);
 
 /**
+ * WHEN THE COMPANY'S MONEY GOES OUT.
+ *
+ * Financing is what it costs to wait, and waiting has to start somewhere. The
+ * company that commits to fabric in January and ships in March finances that
+ * order for two months longer than the one that buys on the day it cuts, and
+ * nothing in a rate, a basis or a day-count says which company this is.
+ *
+ * It was implicit before, and implicit is what this record exists to end: the
+ * duration came from Sales' own anchor, so the Board's methodology silently
+ * inherited whatever event a salesperson had picked for the balance. Now the
+ * Board states it, in the operational events the order actually has.
+ *
+ * No default. An unstated start is an unanswered question and blocks
+ * approval, exactly like an unstated rate.
+ */
+const FINANCING_START_EVENTS = Object.freeze([
+  "MATERIAL_COMMITMENT",
+  "PRODUCTION_START",
+  "DISPATCH",
+  "INVOICE",
+]);
+
+/**
  * THE FINANCING METHODOLOGY.
  *
  * Every field is required for an APPROVAL and none has a default. A partially
@@ -133,6 +156,11 @@ const financingMethodologySchema = new mongoose.Schema(
     basis: { type: String, enum: BASIS_KEYS, default: undefined },
     advanceTreatment: { type: String, enum: ADVANCE_TREATMENTS, default: undefined },
     dayCountBasis: { type: Number, enum: DAY_COUNT_BASES, default: undefined },
+    /* The operational event the company's money is out FROM. Every tranche's
+       financed days is a calendar difference measured from this date to the
+       date that tranche falls due — see
+       `services/centralCosting/financing.service.js`. */
+    startEvent: { type: String, enum: FINANCING_START_EVENTS, default: undefined },
   },
   { _id: false },
 );
@@ -684,5 +712,6 @@ module.exports.DEVELOPMENT_CALCULATIONS = DEVELOPMENT_CALCULATIONS;
 module.exports.STORED_STATUSES = STORED_STATUSES;
 module.exports.LIFECYCLE = LIFECYCLE;
 module.exports.ADVANCE_TREATMENTS = ADVANCE_TREATMENTS;
+module.exports.FINANCING_START_EVENTS = FINANCING_START_EVENTS;
 module.exports.DAY_COUNT_BASES = DAY_COUNT_BASES;
 module.exports.CONTINGENCY_MODES = CONTINGENCY_MODES;
