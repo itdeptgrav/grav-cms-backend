@@ -244,6 +244,33 @@ function legacyWindowOpen() {
 }
 
 /**
+ * Restrict to records that ARE company-owned — i.e. exclude the legacy
+ * `companyId: null` / missing rows that tenantFilter() still admits during the
+ * LEGACY_READTHROUGH window.
+ *
+ * Always combined with tenantFilter() via `$and`, never used alone: tenantFilter's
+ * read-through `$or` lets legacy-global rows through so old screens keep working,
+ * and a lookup that must resolve to THIS company's own record (a vendor/product/
+ * PO reference) ANDs this on top to drop those legacy rows again. It takes no
+ * context and only asserts "has an owner"; the paired tenantFilter decides which
+ * company. On its own it would match every company's owned rows, which is why
+ * callers always pair the two (see the note at services.js `resolveVendor`).
+ */
+function ownedOnly() {
+  return { companyId: { $exists: true, $ne: null } };
+}
+
+/**
+ * Whether the legacy read-through window is still open (STORE_PURCHASE_STRICT_
+ * TENANCY !== "1"). While open, unowned (companyId:null) records remain visible
+ * and actionable so pre-tenancy data keeps working; routes call `!legacyWindowOpen()`
+ * to switch on the strict checks that must wait until the backfill has run.
+ */
+function legacyWindowOpen() {
+  return LEGACY_READTHROUGH;
+}
+
+/**
  * Fields every new operational record must carry, taken from context only.
  *
  * ── AND IT REFUSES RATHER THAN STAMPING NOTHING ─────────────────────────────
