@@ -172,7 +172,11 @@ function assertMatchable(voucher) {
  * ₹1,48,000, which is worse than refusing it: half a receipt allocated looks
  * exactly like a whole one.
  */
-function partyEntriesOf(voucher, liabilityLedgerIds = null) {
+function partyEntriesOf(
+  voucher,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
   const entries = voucher.ledgerEntries || [];
   const wantSide = PARTY_SIDE[voucher.voucherType] || "Cr";
   const flagged = entries.filter((e) => e.isPartyLedger && e.type === wantSide);
@@ -204,11 +208,24 @@ function partyEntriesOf(voucher, liabilityLedgerIds = null) {
      party for 66 of 139 receipts that have none — see the note above. A
      ledger's nature is a fact about the account; line count is a coincidence. */
   if (liabilityLedgerIds && OBLIGATION_TYPES.has(voucher.voucherType)) {
-    return entries.filter(
+    const owed = entries.filter(
       (e) =>
         e.type === wantSide &&
         e.ledgerId &&
         liabilityLedgerIds.has(String(e.ledgerId)),
+    );
+    if (owed.length) return owed;
+  }
+
+  /* Neither the flag nor the header id named a party, so ask what the ledger
+     itself is — see partyAccountIdsFor. This is what makes a credit note
+     whose customer line was never flagged matchable again. */
+  if (partyAccountIds) {
+    return entries.filter(
+      (e) =>
+        e.type === wantSide &&
+        e.ledgerId &&
+        partyAccountIds.has(String(e.ledgerId)),
     );
   }
   return [];
@@ -221,6 +238,64 @@ function partyEntriesOf(voucher, liabilityLedgerIds = null) {
  * summarises up to 500 at a time, and a lookup per voucher there is 500 round
  * trips to Mumbai for a fact that fits in a single `$in`.
  */
+/**
+ * Which ledgers on these vouchers are actual PARTY accounts?
+ *
+ * A voucher says who it is against in three places, and they do not always
+ * agree: the `isPartyLedger` flag on the line, the denormalised
+ * `partyLedgerId` on the header, and the ledger the line actually points at.
+ * The first two are written by whatever created the voucher — an import, a
+ * copy, a ledger merge — and one of CN/002/26-27's kind arrives with neither,
+ * even though its credit side plainly names a Sundry Debtor for the full
+ * amount. The matcher then reported "not against a customer or supplier
+ * account" about a voucher whose customer was sitting right there, while the
+ * register beside it displayed that customer's name from a third field again.
+ *
+ * So ask the chart of accounts instead of the voucher. A line on the settling
+ * side pointing at a ledger under Sundry Debtors or Sundry Creditors IS the
+ * party line; that is what those groups mean.
+ *
+ * This is the same principle the liability lookup below already applies, and
+ * for the same stated reason: a ledger's nature is a fact about the account.
+ * It is NOT the old "if there is only one line on that side, use it" guess —
+ * that claimed a party for bank interest, director's loans and inter-bank
+ * transfers. Those sit under income, liabilities and assets, so none of them
+ * are reachable here. Measured against this database: it resolves one extra
+ * credit note and one extra receipt, and leaves all 29 party-less receipts
+ * and 237 party-less payments exactly as they were.
+ *
+ * One query for the whole page, like its neighbour — `/unmatched` summarises
+ * up to 500 vouchers at a time.
+ */
+async function partyAccountIdsFor(vouchers) {
+  const list = Array.isArray(vouchers) ? vouchers : [vouchers];
+  const ids = new Set();
+  for (const v of list) {
+    if (!v) continue;
+    const wantSide = PARTY_SIDE[v.voucherType] || "Cr";
+    for (const e of v.ledgerEntries || []) {
+      if (e.type === wantSide && e.ledgerId) ids.add(String(e.ledgerId));
+    }
+  }
+  if (!ids.size) return new Set();
+
+  const { Acc_Ledger } = require("../models/Accountant_model/Acc_MasterModels");
+  const rows = await Acc_Ledger.find({
+    _id: { $in: [...ids] },
+    $or: [
+      // The two groups that mean "a party owes us / we owe them".
+      { groupName: { $in: [/^sundry debtors$/i, /^sundry creditors$/i] } },
+      // A ledger wired to a CRM customer or vendor is a party whatever its
+      // group is called — charts get renamed, the link does not.
+      { linkedCustomerId: { $ne: null } },
+      { linkedVendorId: { $ne: null } },
+    ],
+  })
+    .select("_id")
+    .lean();
+  return new Set(rows.map((r) => String(r._id)));
+}
+
 async function liabilityLedgerIdsFor(vouchers) {
   const list = Array.isArray(vouchers) ? vouchers : [vouchers];
   const ids = new Set();
@@ -249,8 +324,13 @@ async function liabilityLedgerIdsFor(vouchers) {
  * `partyLedgerId` picks a leg on a voucher that settles several parties; with
  * one party it is ignored, so every existing caller behaves as before.
  */
-function findPartyEntry(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
-  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
+function findPartyEntry(
+  voucher,
+  partyLedgerId = null,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds, partyAccountIds);
   if (partyLedgerId) {
     return parties.find((e) => String(e.ledgerId) === String(partyLedgerId)) || null;
   }
@@ -288,8 +368,18 @@ function settlementRows(entry) {
  * `unallocated` is the headline: it is what the matching screen offers, and
  * zero means this voucher is fully matched and must be left alone.
  */
-function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
-  const entry = findPartyEntry(voucher, partyLedgerId, liabilityLedgerIds);
+function matchStateOf(
+  voucher,
+  partyLedgerId = null,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
+  const entry = findPartyEntry(
+    voucher,
+    partyLedgerId,
+    liabilityLedgerIds,
+    partyAccountIds,
+  );
   if (!entry) {
     return {
       matchable: false,
@@ -306,7 +396,7 @@ function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) 
   const allocated = money(rows.reduce((s, a) => s + (Number(a.amount) || 0), 0));
   const total = money(entry.amount);
 
-  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds, partyAccountIds);
   return {
     matchable: true,
     /* Every party this voucher settles, so a screen can offer a choice
@@ -346,10 +436,28 @@ function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) 
  * this receipt already settled is still offered, at its pre-settlement figure,
  * rather than vanishing.
  */
-async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedgerId = null, liabilityLedgerIds = null } = {}) {
+async function openBillsForVoucher(
+  voucher,
+  {
+    excludeVoucherId = null,
+    partyLedgerId = null,
+    liabilityLedgerIds = null,
+    partyAccountIds = null,
+  } = {},
+) {
   const liabilities =
     liabilityLedgerIds || (await liabilityLedgerIdsFor(voucher));
-  const state = matchStateOf(voucher, partyLedgerId, liabilities);
+  /* Resolved here as well, and not optional: this recomputes the state rather
+     than taking the caller's, so without it a voucher the screen just decided
+     WAS matchable gets an empty bill list — matchable, with nothing to match. */
+  const partyAccounts =
+    partyAccountIds || (await partyAccountIdsFor(voucher));
+  const state = matchStateOf(
+    voucher,
+    partyLedgerId,
+    liabilities,
+    partyAccounts,
+  );
   if (!state.matchable || !state.partyLedgerId) return [];
 
   const folded = await openItems.billsByLedger(voucher.companyId, [
@@ -689,7 +797,13 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
      be refused at the write with "no single party ledger line" — the screen
      offering bills it cannot then accept. */
   const liabilities = await liabilityLedgerIdsFor(voucher);
-  const entry = findPartyEntry(voucher, partyLedgerId, liabilities);
+  const partyAccounts = await partyAccountIdsFor(voucher);
+  const entry = findPartyEntry(
+    voucher,
+    partyLedgerId,
+    liabilities,
+    partyAccounts,
+  );
   if (!entry) {
     const e = new Error(
       "This voucher has no single party ledger line, so there is nothing to match it against.",
@@ -844,6 +958,7 @@ module.exports = {
   SOURCE_TYPE,
   OBLIGATION_TYPES,
   liabilityLedgerIdsFor,
+  partyAccountIdsFor,
   openJournalObligations,
   partyEntriesOf,
   unbilledInvoicesForParty,

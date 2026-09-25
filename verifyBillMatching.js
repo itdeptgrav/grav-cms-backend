@@ -77,6 +77,84 @@ async function putBack() {
   ] };
   check("and the Dr side of a payment", bm.matchStateOf(payment).partyLedgerName === "A Supplier");
 
+  /* ── A PARTY LINE NOBODY LABELLED ──────────────────────────────────────
+     A voucher names its party in three places and they do not always agree:
+     the `isPartyLedger` flag on the line, `partyLedgerId` on the header, and
+     the ledger the line actually points at. One credit note in these books
+     arrived with the first two missing — its credit side named a Sundry
+     Debtor for the whole amount and nothing said so — and the matcher replied
+     "not against a customer or supplier account" while the register beside it
+     displayed that customer's name from a third field.
+
+     The chart of accounts is the tie-breaker: a line on the settling side
+     pointing at a Sundry Debtor or Sundry Creditor IS the party line. */
+  const unlabelled = {
+    ...fake,
+    voucherType: "credit_note",
+    partyLedgerId: null,
+    ledgerEntries: [
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Sales Returns", type: "Dr", amount: 900 },
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Output IGST", type: "Dr", amount: 100 },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        ledgerId: new mongoose.Types.ObjectId(),
+        ledgerName: "A Customer",
+        type: "Cr",
+        amount: 1000,
+        isPartyLedger: false, // never written
+        billAllocations: [],
+      },
+    ],
+  };
+  const custLedgerId = String(unlabelled.ledgerEntries[2].ledgerId);
+
+  check(
+    "unlabelled party line: still refused when nothing says it is a party",
+    bm.matchStateOf(unlabelled).matchable === false,
+  );
+  const labelledByChart = bm.matchStateOf(
+    unlabelled,
+    null,
+    null,
+    new Set([custLedgerId]),
+  );
+  check(
+    "but matchable once the chart says that ledger is a customer account",
+    labelledByChart.matchable === true &&
+      labelledByChart.partyLedgerName === "A Customer" &&
+      labelledByChart.total === 1000,
+    JSON.stringify({
+      matchable: labelledByChart.matchable,
+      party: labelledByChart.partyLedgerName,
+      total: labelledByChart.total,
+    }),
+  );
+
+  /* The guard that keeps this from becoming the old "only line on that side"
+     guess, which claimed a party for bank interest and inter-bank transfers.
+     A ledger that is NOT a party account stays unmatched however alone it is
+     on its side. */
+  const interest = {
+    ...fake,
+    voucherType: "receipt",
+    partyLedgerId: null,
+    ledgerEntries: [
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Bank", type: "Dr", amount: 250 },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        ledgerId: new mongoose.Types.ObjectId(),
+        ledgerName: "Bank Interest Received",
+        type: "Cr",
+        amount: 250,
+        billAllocations: [],
+      },
+    ],
+  };
+  check(
+    "bank interest is still not a customer, even alone on the Cr side",
+    bm.matchStateOf(interest, null, null, new Set([custLedgerId])).matchable === false,
+  );
+
   check("a sales voucher is refused outright", (() => {
     try { bm.assertMatchable({ voucherType: "sales", status: "posted" }); return false; }
     catch (e) { return e.status === 400 && /can be matched to bills/.test(e.message); }
