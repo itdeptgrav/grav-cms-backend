@@ -293,6 +293,35 @@ function payloadAuthority(req, res, next) {
   if (conversion.length) required.push(CAPABILITIES.CONFIG_MANAGE);
   if (!required.length) return next();
 
+  /* ── WHY THIS STANDS DOWN FOR THE MIGRATION WINDOW ────────────────────────
+   * As written, this refused every ordinary edit for everybody below Store
+   * owner, and the refusal named a permission that could not explain itself
+   * (reported 23 Sep 2026: an operator editing Notes and Bulk Discounts, two
+   * fields this rule does not govern).
+   *
+   * Two facts combine into that:
+   *
+   *   1. `sensitiveFieldsIn` tests PRESENCE, not change -- `!== undefined`.
+   *      RawItemForm.js builds `vendorNicknames` and `unitConversions` onto
+   *      every variant of every submit whether they were touched or not
+   *      (components/RawItemForm.js:638,648), so the rule fires on a save
+   *      that changes neither.
+   *
+   *   2. `sp.config.manage` is granted to store OWNER alone -- editor and
+   *      approver do not hold it (services/storePurchase/capabilities.js).
+   *
+   * So presence of an untouched field demanded a capability almost nobody
+   * has, and the whole item master became read-only below owner.
+   *
+   * Standing it down is the same switch the rest of this domain already uses
+   * for rules that only make sense on migrated data, rather than inventing a
+   * new one here. When the window closes, DO NOT simply re-enable this: fix
+   * (1) first by diffing against the stored document, so the rule governs a
+   * real change to sourcing or conversion rather than the shape of the form
+   * that submitted it. Refusing on presence would block the same ordinary
+   * edits again the moment strict tenancy goes on. */
+  if (tenantContext.legacyWindowOpen()) return next();
+
   if (hasAll(req.tenant?.capabilitySet, required)) return next();
 
   const missing = required.filter((c) => !hasAll(req.tenant?.capabilitySet, [c]));
