@@ -42,6 +42,13 @@ const { fail, sendError } = require("../../../../services/storePurchase/errors")
    through the unit of work below, together with the change it describes. */
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const SpActionHistory = require("../../../../models/CMS_Models/StorePurchase/SpActionHistory");
+/* The physical shape of a location (kind, layout, capacity, QR token) — one
+   validator shared with the store-location routes, 25 Sep 2026. */
+/* Warehouses created before the location layer carry no structureVersion at
+   all; version 0 must match that absence or their first location can never be
+   added (found 25 Sep 2026 on WH-MAIN). */
+const versionGuard = (field, seen) => (seen ? { [field]: seen } : { $or: [{ [field]: 0 }, { [field]: { $exists: false } }] });
+const storeLoc = require("../../../../services/storePurchase/storeLocations.service");
 
 const ENTITY = "WAREHOUSE";
 
@@ -335,6 +342,14 @@ const publicLocation = (l) => ({
   parent: l.parent ? String(l.parent) : null,
   status: l.status,
   barcode: l.barcode || "",
+  /* The physical shape (25 Sep 2026): kind, order among siblings, the QR
+     token a printed location label carries, the layout box in cm and the
+     optional capacity. See models/.../Warehouse.js. */
+  kind: l.kind || "AREA",
+  sequence: typeof l.sequence === "number" ? l.sequence : 0,
+  qrToken: l.qrToken || "",
+  layout: l.layout || {},
+  capacity: l.capacity || {},
   description: l.description || "",
   archivedAt: l.archivedAt || null,
   archiveReason: l.archiveReason || "",
@@ -379,6 +394,7 @@ const publicWarehouse = (w) => ({
   description: w.description || "",
   locations: (w.locations || []).map(publicLocation),
   locationCount: (w.locations || []).filter((l) => l.status !== "Archived").length,
+  floorPlan: w.floorPlan || {},
   archivedAt: w.archivedAt || null,
   archiveReason: w.archiveReason || "",
   createdAt: w.createdAt || null,
@@ -1700,7 +1716,7 @@ router.post(
           scoped(req, {
             _id: w._id,
             status: { $ne: "Archived" },
-            structureVersion: seenVersion,
+            ...versionGuard("structureVersion", seenVersion),
             "locations.code": { $ne: code },
           }),
           {
@@ -1711,6 +1727,10 @@ router.post(
                 status: "Active",
                 barcode: text(req.body.barcode),
                 description: text(req.body.description),
+                /* The physical shape (25 Sep 2026) — validated by the
+                   store-location service; absent means "an area, unplaced". */
+                ...storeLoc.physicalFieldsFromBody(req.body),
+                qrToken: storeLoc.mintQrToken(),
                 createdBy: actor,
               },
             },
@@ -1848,6 +1868,11 @@ router.put(
       for (const f of ["barcode", "description"]) {
         if (req.body[f] !== undefined) $set[`locations.$[l].${f}`] = text(req.body[f]);
       }
+      /* The physical shape (25 Sep 2026): kind, sequence, layout, capacity —
+         each only when sent, each validated by the shared service. */
+      for (const [path, value] of Object.entries(storeLoc.physicalSetFromBody(req.body, "locations.$[l]."))) {
+        $set[path] = value;
+      }
 
       /* ── THE RENAME RACE ───────────────────────────────────────────────
          Create had an atomic duplicate guard; rename had only the snapshot
@@ -1857,7 +1882,7 @@ router.put(
       const guard = {
         _id: w._id,
         status: { $ne: "Archived" },
-        structureVersion: seenVersion,
+        ...versionGuard("structureVersion", seenVersion),
         ...(renamedTo && renamedTo !== current.code ? { "locations.code": { $ne: renamedTo } } : {}),
       };
 
@@ -2004,7 +2029,7 @@ router.patch(
         const doc = await Warehouse.findOneAndUpdate(
           /* Pinned to the snapshot the descendant check was decided against,
              so a child appearing in between cannot be orphaned. */
-          scoped(req, { _id: w._id, status: { $ne: "Archived" }, structureVersion: seenVersion }),
+          scoped(req, { _id: w._id, status: { $ne: "Archived" }, ...versionGuard("structureVersion", seenVersion) }),
           {
             $inc: { structureVersion: 1 },
             $set: {

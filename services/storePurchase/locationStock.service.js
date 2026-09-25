@@ -87,7 +87,14 @@ function findLocation(warehouse, locationId) {
 // readable in history but are refused for new movements.
 function usableLocationError(warehouse, location, companyId) {
   if (!warehouse) return { reason: "WAREHOUSE_NOT_FOUND", message: "Warehouse not found in this company." };
-  if (String(warehouse.companyId || "") !== String(companyId || "")) {
+  /* While the TEMPORARY legacy read-through is on, a warehouse that predates
+     company scoping (companyId absent — WH-MAIN is one, 25 Sep 2026) is
+     visible to every read, and refusing it here made every write onto it fail
+     with "not found in this company" although the page had just listed it.
+     The movements written are stamped with the caller's company regardless. */
+  const unowned = warehouse.companyId === undefined || warehouse.companyId === null;
+  const legacyOk = unowned && require("./tenantContext.service").legacyWindowOpen();
+  if (!legacyOk && String(warehouse.companyId || "") !== String(companyId || "")) {
     return { reason: "WAREHOUSE_NOT_FOUND", message: "Warehouse not found in this company." };
   }
   if (warehouse.status !== "Active") {
@@ -118,8 +125,13 @@ function movementLineKey(operationKey, lineIdentity, discriminator) {
 function buildMovement({
   companyId, siteId, item, variantId, warehouse, location,
   direction, quantity, type, source, transferId, actor, note, idempotencyKey, operationKey,
+  barcodeId, barcodeLabel,
 }) {
   return {
+    /* The lot sticker the stock moved under, when the caller knows it (the
+       physical store, 25 Sep 2026). Optional: an item-grain move carries null. */
+    barcodeId: barcodeId || null,
+    barcodeLabel: barcodeLabel || "",
     companyId,
     siteId: siteId || null,
     itemId: item._id,

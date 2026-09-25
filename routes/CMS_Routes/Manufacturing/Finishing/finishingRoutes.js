@@ -482,7 +482,7 @@ router.get("/:stage/daily", ...canRead, async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // The book of orders, with how much of each this stage has done. Which orders
 // exist follows Packaging's rule exactly: an order is this company's when one
-// of its work orders is; a `pending` order (nothing planned yet) is left out.
+// of its work orders is; a `pending` order (nothing planned yet) is listed too.
 router.get("/:stage/orders", ...canRead, async (req, res) => {
   try {
     const { page = 1, limit = 12, search = "" } = req.query;
@@ -524,7 +524,9 @@ router.get("/:stage/orders", ...canRead, async (req, res) => {
       else if (statuses.some((s) => ["in_progress", "paused", "scheduled", "ready_to_start"].includes(s))) derivedStatus = "in_production";
       else if (statuses.every((s) => s === "pending")) derivedStatus = "pending";
       else if (statuses.some((s) => s === "planned")) derivedStatus = "planning";
-      if (derivedStatus === "pending") continue;
+      /* Every order with a work order is listed, including ones nothing has
+         been planned for yet (25 Sep 2026: "once the MO is created it should
+         show"). Its status still says "pending". */
 
       const row = {
         _id: mo._id,

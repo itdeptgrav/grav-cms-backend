@@ -50,6 +50,14 @@ const locationMovementSchema = new mongoose.Schema(
     locationCode: { type: String, trim: true, default: "" },
     locationName: { type: String, trim: true, default: "" },
 
+    // Which printed marking (Barcode sticker) the moved stock belongs to, when
+    // the movement was made by scanning one (25 Sep 2026). Optional: stock can
+    // still be placed by item. A marking's per-location balance is DERIVED by
+    // replaying rows that carry its id; the guarded LocationBalance projection
+    // stays at item/variant/location grain, which is the inventory's own grain.
+    barcodeId: { type: mongoose.Schema.Types.ObjectId, ref: "Barcode", default: null },
+    barcodeLabel: { type: String, trim: true, default: "" }, // e.g. "MK-…" / sticker qty+unit, for display
+
     // How much, which way. Quantity is always positive and in the base unit;
     // direction carries the sign.
     direction: { type: String, enum: DIRECTIONS, required: true },
@@ -100,6 +108,9 @@ const locationMovementSchema = new mongoose.Schema(
 // Balance derivation reads by item (+ variant) and by location.
 locationMovementSchema.index({ companyId: 1, itemId: 1, variantId: 1 });
 locationMovementSchema.index({ companyId: 1, warehouseId: 1, locationId: 1 });
+// A marking's journey, and the movement history pages (newest first).
+locationMovementSchema.index({ companyId: 1, barcodeId: 1 }, { partialFilterExpression: { barcodeId: { $type: "objectId" } } });
+locationMovementSchema.index({ companyId: 1, createdAt: -1 });
 
 // Defence-in-depth against a replayed operation writing a duplicate leg: one
 // (type, location) per idempotency key. The withIdempotency middleware already

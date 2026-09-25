@@ -1177,7 +1177,7 @@ const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // the bulk of every document and a list never needs them.
 router.get("/cartons", ...canRead, async (req, res) => {
   try {
-    const { q = "", from, to } = req.query;
+    const { q = "", from, to, weight = "all" } = req.query;
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
 
@@ -1201,19 +1201,28 @@ router.get("/cartons", ...canRead, async (req, res) => {
       if (!Object.keys(filter.packedAt).length) delete filter.packedAt;
     }
 
-    const [total, cartons] = await Promise.all([
+    /* Weighed / not weighed. The counts are for the same search and dates
+       WITHOUT the weight filter, so the two tabs always add up to the total. */
+    const baseFilter = { ...filter };
+    if (weight === "pending") filter.weightKg = null;
+    else if (weight === "done") filter.weightKg = { $ne: null };
+
+    const [total, cartons, weighedCount, allCount] = await Promise.all([
       PackingCarton.countDocuments(filter),
       PackingCarton.find(filter)
-        .select("-lines.unitNumbers")
+        .select("-lines.unitNumbers -weightHistory")
         .sort({ packedAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
+      PackingCarton.countDocuments({ ...baseFilter, weightKg: { $ne: null } }),
+      PackingCarton.countDocuments(baseFilter),
     ]);
 
     return res.json({
       success: true,
-      cartons,
+      cartons: cartons.map(withWeightState),
+      weightSummary: { weighed: weighedCount, pending: allCount - weighedCount, total: allCount },
       pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
     });
   } catch (err) {
@@ -1242,6 +1251,71 @@ async function describeCartonLines(lines) {
   });
 }
 
+/* A weight recorded before the carton's last packing session no longer
+   describes the box — pieces went in after it was on the scale. */
+function withWeightState(c) {
+  const last = c.lastPackedAt || c.packedAt;
+  const needsReweigh = c.weightKg != null && c.weighedAt && last && new Date(c.weighedAt) < new Date(last);
+  return { ...c, needsReweigh: Boolean(needsReweigh) };
+}
+
+const MAX_CARTON_KG = 500;
+
+// PUT /cartons/:cartonNumber/weight   { weightKg }
+// Record (or correct) a carton's gross weight. Who and when come from the
+// session; a correction keeps the previous value in weightHistory. A carton
+// that has been dispatched may be weighed if it never was, but its recorded
+// weight is not changed after it left.
+router.put("/cartons/:cartonNumber/weight", ...canRecord, async (req, res) => {
+  try {
+    const cartonNumber = normaliseCartonNumber(req.params.cartonNumber);
+    const raw = req.body?.weightKg;
+    const kg = typeof raw === "string" ? Number(raw.trim()) : Number(raw);
+    if (raw === "" || raw == null || !Number.isFinite(kg) || kg <= 0) {
+      return res.status(400).json({ success: false, message: "Enter the carton's weight in kg — a number above 0." });
+    }
+    if (kg > MAX_CARTON_KG) {
+      return res.status(400).json({ success: false, message: `${kg} kg is more than a carton can weigh (limit ${MAX_CARTON_KG} kg). Check the scale reading.` });
+    }
+    const weightKg = Math.round(kg * 1000) / 1000;
+
+    const carton = await PackingCarton.findOne({ companyId: companyOf(req), cartonNumber });
+    if (!carton) return res.status(404).json({ success: false, message: `Carton ${cartonNumber} was not found.` });
+    if (carton.status === "dispatched" && carton.weightKg != null) {
+      return res.status(409).json({ success: false, code: "CARTON_DISPATCHED", message: `Carton ${cartonNumber} has been dispatched; its recorded weight (${carton.weightKg} kg) can no longer be changed.` });
+    }
+
+    const by = {
+      userId: access.str(req.user?.id),
+      name: access.str(req.user?.name) || access.str(req.user?.employeeId) || "Packaging Dept",
+      employeeId: access.str(req.user?.employeeId),
+      email: access.str(req.user?.email).toLowerCase(),
+      role: access.str(req.user?.role),
+    };
+    const now = new Date();
+    const previous = carton.weightKg;
+    if (previous != null) carton.weightHistory.push({ weightKg: previous, at: carton.weighedAt || now, by: carton.weighedBy || {} });
+    carton.weightKg = weightKg;
+    carton.weighedAt = now;
+    carton.weighedBy = by;
+    await carton.save();
+
+    return res.json({
+      success: true,
+      message: previous != null && previous !== weightKg
+        ? `Carton ${cartonNumber}: weight corrected from ${previous} kg to ${weightKg} kg.`
+        : `Carton ${cartonNumber}: ${weightKg} kg recorded.`,
+      carton: withWeightState({
+        cartonNumber: carton.cartonNumber, weightKg: carton.weightKg, weighedAt: carton.weighedAt, weighedBy: carton.weighedBy,
+        weightHistory: carton.weightHistory, lastPackedAt: carton.lastPackedAt, packedAt: carton.packedAt,
+      }),
+    });
+  } catch (err) {
+    console.error("Carton weight error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
 // GET /cartons/:cartonNumber — one carton, complete. What the QR code opens.
 router.get("/cartons/:cartonNumber", ...canRead, async (req, res) => {
   try {
@@ -1262,7 +1336,7 @@ router.get("/cartons/:cartonNumber", ...canRead, async (req, res) => {
     ]);
     carton.lines = lines;
     carton.poNumber = String(order?.poProof?.poNumber || "").trim() || carton.poNumber || "";
-    return res.json({ success: true, carton });
+    return res.json({ success: true, carton: withWeightState(carton) });
   } catch (err) {
     console.error("Carton read error:", err);
     return res.status(500).json({ success: false, message: "Server error", error: err.message });
@@ -1554,7 +1628,7 @@ router.get("/report", ...canRead, async (req, res) => {
         ? CustomerRequest.find({ _id: { $in: moIds.map(access.oid) } }).select("requestId requestType customerInfo.name poProof.poNumber").lean()
         : [],
       PackingCarton.find({ companyId, ...(window.all ? {} : { "additions.at": { $gte: window.start, $lt: window.end } }) })
-        .select("cartonNumber manufacturingOrderId moNumber customerName poNumber totalQuantity workOrderCount status packedAt lastPackedAt dispatchedAt additions.at additions.packedBy additions.quantity")
+        .select("cartonNumber manufacturingOrderId moNumber customerName poNumber totalQuantity workOrderCount status packedAt lastPackedAt dispatchedAt weightKg weighedAt additions.at additions.packedBy additions.quantity")
         .sort({ packedAt: 1 })
         .lean(),
     ]);
@@ -1609,6 +1683,7 @@ router.get("/report", ...canRead, async (req, res) => {
         packers: [...new Set(inPeriod.map((a) => a.packedBy?.name).filter(Boolean))],
         openedInPeriod: first ? inWin(new Date(first.at)) : inWin(c.packedAt ? new Date(c.packedAt) : null),
         status: c.status, openedAt: c.packedAt, lastPackedAt: c.lastPackedAt || c.packedAt, dispatchedAt: c.dispatchedAt || null,
+        weightKg: c.weightKg ?? null, needsReweigh: withWeightState(c).needsReweigh,
       };
     });
     report.summary.cartonsOpened = cartons.filter((c) => c.openedInPeriod).length;

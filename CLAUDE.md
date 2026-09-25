@@ -272,7 +272,99 @@ LiveKit (meetings, audio calls, `livekit-server-sdk` token minting), Gemini via 
 - **Timer-SOP** applies daily "bleach" penalties for SOP violations (`services/timerSop.service.js`), finalized by the ~00:15 IST cron. All SOP and attendance date logic is IST-based, computed as `Date.now() + 5.5h` and then read with `getUTC*` — follow that pattern rather than introducing a timezone library.
 - **Salary fields are encrypted at rest** via `utils/salaryEncryption.js` keyed on `SALARY_ENCRYPTION_KEY`; rotating the key without re-encrypting orphans existing payroll records.
 
-## Finishing stages (Printing, Washing, Trimming, Ironing) and the shift clock — 24 Sep 2026
+## PPC order targets — 24 Sep 2026
+
+`PpcOrderTarget` (`ppc_order_targets`) is the piece-completion number PPC asks
+a department for on ONE manufacturing order — per day, per hour (between two
+clock times) or a total by a date, over working days. Against the whole order's
+quantity, never a work order. One active target per order + department; a new
+one marks the old `replaced`, nothing is deleted.
+
+`services/ppc/orderTargets.evaluate.js` is the arithmetic (pure, tested):
+expected vs done per day, today's figure (an hourly target's expectation grows
+with the clock), short days/hours, the pace needed to recover, one sentence of
+advice. `orderTargets.service.js` reads what each department actually DID from
+that department's own book — cutting records, finishing scans, the production
+mark-done ledger, passed QC inspections, `WorkOrder.packagingRecords`,
+dispatch challans — so nothing is ever typed in. Routes:
+`routes/CMS_Routes/PPC/orderTargetsRoute.js` (PPC doors need a PPC role +
+company; `GET /targets/department/:dept` needs only a session and is what
+every department overview shows). This is NOT the planning-file stage
+schedule/publication chain; it sits beside it.
+
+**IE department standards** (`IeDepartmentStandard`, `ie_department_standards`;
+`services/industrialEngineering/departmentStandards.service.js`; routes on
+`/api/cms/ie/department-standards`): per department, SAM minutes a piece,
+operators, hours a day and planned efficiency → capacity a day. The evaluator's
+`assessTarget` uses it for the PPC form's feasibility check (minimum working
+days, over-capacity, generous dates, other commitments on the same dates) and
+`efficiencyOf` for the overview's efficiency (earned = pieces × SAM, available
+= operators × elapsed hours). The assessment is snapshotted onto the target at
+save time. The per-style technical standard IE freezes into a release
+(`processRoute.schema.js`) is a different, richer thing — do not merge them.
+
+## PPC control center — 25 Sep 2026
+
+PPC is the production control center: every production-management READ
+(orders, work orders, bulk and person-wise, departments, hour by hour, day by
+day, target vs achievement, efficiency, delays, eleven reports, search, the
+assistant) lives in `services/ppc/control/` behind
+`routes/CMS_Routes/PPC/controlRoute.js` (`/api/cms/ppc/control/*`, PPC
+PLANNING_READ + company, read-only; writes stay on the targets router).
+
+- `ledger.service.js` is the ONE read of "done": `woIndex(companyId)` (the
+  company's order-linked work orders, via `packagingAccess.findWorkOrders`;
+  a stored `WO-<24 hex>` number is shown as `WO-<last 8>` because that is the
+  barcode form) and `readEvents(index, {start, end})` → per department
+  `{at, qty, moId, woId, unit, personKey, personName, beyond}` from the same
+  six books `orderTargets.service.doneEvents` reads. Two rules the department
+  screens also follow: a unit is distinct PER WORK ORDER, and a unit numbered
+  above the work order's quantity is `beyond` — counted apart, never as done.
+  A production barcode is accepted in both printed forms (8 and 24 hex).
+- `orders.service.js` is the normalised view: `snapshot()` (one read of the
+  company), `summariseOrders`, `listOrders` (server-side filters), `orderDetail`
+  (header → products → variants → work orders → per-department, targets, IE
+  standard), `listWorkOrders`, `workOrderDetail`, `personWise` (each person's
+  unit range on a WO, per department, from EmployeeProductionProgress + the
+  ledger's units), `search`. The header resolves PO from
+  `quotations[].poProof.poNumber`, delivery from `customerInfo.deliveryDeadline`
+  and the type from `requestType === "measurement_conversion" || measurementId`.
+  "Furthest stage" = last applicable department with activity; "earliest stage
+  still short" = first applicable one below the quantity; a finishing stage is
+  applicable only if it has events or a target on that order.
+- `reports.service.js`: `hourly` (shift buckets; a per-day target is spread
+  over its window, rounded on the cumulative line), `daily`, `departmentPage`,
+  `range` (a precise date-time window), `achievement`, `efficiency` (IE
+  standards), `delays` (furthest-behind stage, never a "cause"),
+  `productVariant`, and `report(type)` for the catalogue `REPORTS`.
+- `assistant/intents.js` (pure, tested) + `engine.js`: deterministic
+  question → `{intent, entities}` → the services above → structured blocks.
+  No model is called; a model later produces the same intent shape.
+
+Parity (25 Sep 2026, live data): sewing, QC, packing and dispatch counts equal
+the department portals' own endpoints for every order. Cutting is read from
+`CuttingMasterRecord` entries, which agree with `WorkOrder.cuttingProgress` on
+bulk orders and differ where the desktop sync or `update-cutting` wrote only
+the work order — the work-order detail shows both.
+
+The Production Manager portal folded into PPC the same day: its planning
+pages moved under `/ppc/planning`, `/ppc/schedule`, `/ppc/requests`,
+`/ppc/approvals`, `/ppc/settings`; `routes/login.js` and `deptAuth.js` now
+send `project_manager` to `/ppc`. NOT changed, deliberately: the
+`departmentWrites("project-manager")` gates on work orders, manufacturing
+orders, production dashboard, schedule and closeout, `productionTargetAccess`,
+and the `project-manager` `access_departments` row — re-homing those to the
+`ppc` grant changes who may write and is the owner's call. The scanner floor
+routers (`Production/Scanner/*`, assistant, targets) were re-mounted in
+`server.js`: the merge `fdeea4a` had dropped the block and the whole
+supervisor floor answered 404.
+
+## Finishing stages (Embroidery, Printing, Washing, Trimming, Ironing) and the shift clock — 24 Sep 2026
+
+Embroidery is a finishing stage too (first in order), recording into
+`finishingscans` like the rest. Its department row predates this and is not
+re-seeded; its older routes (`routes/CMS_Routes/Manufacturing/Embroidery/`) are
+still mounted for the design catalogue, but no page records pieces through them.
 
 `routes/CMS_Routes/Manufacturing/Finishing/finishingRoutes.js` serves both
 departments under `/api/cms/manufacturing/finishing/:stage/…`
@@ -297,3 +389,81 @@ IN PRODUCTION ORDER to `finishingStages.js` (Find Piece walks that order), seed
 it, mirror it in the CMS's `lib/finishing/stages.js`, and give it a glyph in
 `components/finishing/DeptMark.js`. People reach them through a
 DepartmentRole grant or an employee's department assignment.
+
+## The physical store — racks, bins, location QR, put/transfer, 3D (25 Sep 2026)
+
+An extension of Warehouse Stock V1, not a second inventory. `RawItem`
+on-hand stays the only company truth; `LocationBalance` (guarded projection
++ the assigned-total sentinel) and the immutable `LocationMovement` ledger
+say WHERE it sits; located + unallocated = on hand, always. Every existing
+line started UNALLOCATED — the migration placed nothing.
+
+- `Warehouse.locations[]` gained a structural `kind` (AREA ZONE AISLE RACK
+  BAY LEVEL SHELF DRAWER BIN SLOT FLOOR — `LOCATION_KINDS`), `sequence`,
+  `qrToken` (`LOC-` + 8 chars, no 0/O/1/I), `layout` (cm; x/z are the MIN
+  CORNER in the PARENT's frame, rotation about it) and `capacity`; the
+  warehouse gained `floorPlan` (size, walls, fixtures, `layoutVersion`).
+  Racks/shelves/bins are `type: USABLE_STOCK` — reservation and put-away
+  only accept that type — with `kind` telling them apart. A container kind
+  (ZONE AISLE RACK BAY LEVEL) never holds stock; `holdsStockError` refuses it.
+- `LocationMovement` gained `barcodeId`/`barcodeLabel`: the Product Marking
+  sticker the stock moved under. Marking-grain balances are DERIVED from the
+  ledger (`markingBalances`, `markingsAt`), never a second projection; the
+  item-grain guards stay the atomic ones.
+- `services/storePurchase/storeLocations.service.js` is the domain: scan
+  parsing (`parseScan` — a `loc=` label vs an `itemid=` sticker; the client
+  `storeLocations.mjs` mirrors it), addresses, the tree, world boxes,
+  `rackPlan` (R04-L01-B01[-P01], ≤16 chars), `putStock` / `unassignStock` /
+  `transferStock` (all through `locationStock.service`'s guards) and
+  `assertMarkingAt`.
+- `routes/CMS_Routes/Inventory/Operations/storeLocationRoutes.js` on
+  `/api/cms/inventory/store-locations`: reads (dashboard, tree, resolve,
+  location, find, item/marking positions, unallocated, put-away queue,
+  reconciliation, movements, 8 reports) and writes (rack wizard = ONE
+  structural `$push` under the structure version; layout save = ONE write
+  under `floorPlan.layoutVersion`, never a movement; QR mint/backfill; `/put`,
+  `/remove` (back to Unassigned), `/transfer`, `/transfer-all`). Writes use
+  the full chain (capability → refuseLegacyWrite → withIdempotency →
+  unitOfWork). New capability `LOCATION_OPERATE` (store editor+). A TAKE that
+  CONSUMES is NOT here — it is `stock-adjustments /issue` (which now accepts
+  an optional per-line `barcodeId` and guards the sticker's balance at that
+  shelf) and MRF issue (item grain only, unchanged).
+- Two guards learned that version 0 also means "absent": a warehouse created
+  before the location layer has no `structureVersion`/`floorPlan` on disk, and
+  `structureVersion: 0` matched nothing (`versionGuard` in both routers).
+  `usableLocationError` accepts a `companyId:null` warehouse while the
+  TEMPORARY legacy read-through is on — reads already showed it, writes
+  refused it.
+- Migration: `scripts/migrations/store-location-qr-tokens.js` (dry run by
+  default, `--apply` writes) mints tokens/kinds and the defaults. Tests:
+  `storeLocations.service.test.js`, `storeLocationRoutes.test.js` (node:test,
+  no DB).
+
+## Cutting seasons — 25 Sep 2026
+
+`CuttingSeason` (`models/CMS_Models/Manufacturing/CuttingMaster/CuttingSeason.js`,
+collection `cutting_seasons`) is the fabric a cutting master was given and the
+pieces cut from it: `draft` (stickers scanned in) → `active` (Start froze the
+list and opened one `Barcode.cuttingSessions` entry per sticker) → `closed`
+(Close settled each session's `endQty`/`barcode.quantity` from the leftover
+the person entered, blank = 0, and summarised pieces per work order with
+photos). Stock consumption is still recorded on the sticker's own session, as
+the old tracker did — the season only remembers which session it opened.
+Routes: `routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingSeasonRoutes.js`
+mounted inside `cuttingMasterRoutes` before the `:moId` routes
+(`/seasons/*` and `/find-piece`, Cutting department guard + company). A piece
+resolves against this company's work orders by short id exactly as the
+finishing router does; a duplicate within a season is refused, one scanned in
+another season is accepted with a warning. `/find-piece` answers the finishing
+router's shape plus a leading `cutting` step.
+
+**The cluster is at its 500-collection cap** (across all databases; this
+database reports 409). Creating `cutting_seasons` failed with
+"already using 500 collections of 500", so the empty, model-less orphan
+`vehicles` collection was RENAMED to `cutting_seasons` (rename keeps the
+count). Any further new collection needs a drop first — the owner's call.
+Offline batches: `POST /seasons/:id/raw-items/batch` and `/pieces/batch` take
+`{scans:[{code|barcode, at}]}` and answer every input by name (saved / already
+/ invalid) with the device's `at` bounds-checked like the finishing scans;
+`GET /seasons/ping` is what the device queue probes. Declared before
+`/seasons/:id` so "ping" is never read as an id.

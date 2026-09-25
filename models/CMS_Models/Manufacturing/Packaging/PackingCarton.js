@@ -140,6 +140,24 @@ const packingCartonSchema = new mongoose.Schema(
 
     additions: { type: [additionSchema], default: [] },
 
+    /* THE CARTON'S GROSS WEIGHT (24 Sep 2026) — weighed on the scale after
+       sealing and recorded on the Cartons screen, then printed on the A4 label.
+       Null until someone weighs it, so "not weighed" is a query, not a guess.
+       A correction keeps the old value in `weightHistory`; a carton topped up
+       AFTER it was weighed reads as needing a re-weigh (weighedAt < lastPackedAt),
+       worked out at read time rather than stored. */
+    weightKg: { type: Number, default: null, min: 0 },
+    weighedAt: { type: Date, default: null },
+    weighedBy: { type: packedBySchema, default: null },
+    weightHistory: {
+      type: [new mongoose.Schema({
+        weightKg: { type: Number, required: true },
+        at: { type: Date, required: true },
+        by: { type: packedBySchema, default: () => ({}) },
+      }, { _id: false })],
+      default: [],
+    },
+
     status: { type: String, enum: ["packed", "dispatched"], default: "packed" },
     dispatchedAt: { type: Date, default: null },
     dispatchChallanId: { type: mongoose.Schema.Types.ObjectId, ref: "DispatchChallan", default: null },

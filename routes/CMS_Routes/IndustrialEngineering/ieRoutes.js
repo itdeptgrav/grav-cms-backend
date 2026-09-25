@@ -1113,4 +1113,27 @@ router.get("/releases/:releaseId/impact", requireCompany, canRead, handle(async 
    approved standard time to another department or writes it into a bulletin
    row. Both are later decisions, and neither has a door here. */
 
+/* ══ DEPARTMENT STANDARDS (24 Sep 2026) ═════════════════════════════════════
+   The floor-level planning figure per department — SAM a piece, operators,
+   hours a day, planned efficiency — that PPC's targets and every department
+   overview read. See services/industrialEngineering/departmentStandards.service.js. */
+const deptStandards = require("../../../services/industrialEngineering/departmentStandards.service");
+
+router.get("/department-standards", requireCompany, canRead, handle(async (req, res) => {
+  res.json({ success: true, standards: await deptStandards.list(req.ie.companyId) });
+}));
+
+router.put("/department-standards/:department", requireCompany, canWrite, async (req, res) => {
+  try {
+    const row = await deptStandards.upsert(req.ie.companyId, String(req.params.department || "").toLowerCase(), req.body, {
+      userId: String(req.user?.id || ""), name: String(req.user?.name || ""), email: String(req.user?.email || "").toLowerCase(),
+    });
+    res.json({ success: true, message: `${row.label}: ${row.samMinutesPerPiece} min a piece · ${row.operators} operators × ${row.hoursPerDay} h at ${row.efficiencyPct}% → about ${row.capacity.perDay} pieces a day.`, standard: row });
+  } catch (err) {
+    if (err instanceof deptStandards.StandardError) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[ie department-standards]", err);
+    res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
 module.exports = router;

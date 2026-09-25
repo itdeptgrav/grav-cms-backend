@@ -21,6 +21,10 @@ const stageTargets = require("../../../../services/production/cuttingStageTarget
    ":moId" routes below so "stage-targets" is never read as an order id. */
 router.use("/stage-targets", require("./stageTargetRoutes"));
 
+/* Cutting seasons and Find piece (25 Sep 2026) — "seasons" and "find-piece"
+   are literal segments, so they too must be declared before ":moId". */
+router.use(require("./cuttingSeasonRoutes"));
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper — compute unit-wise + person-wise progress for a measurement order
 // (used by the listing endpoint to power the per-MO progress bar)
@@ -245,7 +249,7 @@ router.get("/manufacturing-orders", cutting.cuttingDepartment("viewer"), cutting
             {
               $match: {
                 $expr: { $eq: ["$customerRequestId", "$$reqId"] },
-                status: { $ne: "pending" },
+                /* Pending (unplanned) work orders are listed too — 25 Sep 2026. */
                 /* This company's WorkOrders and historical unlinked ones —
                    never another company's. */
                 ...cutting.workOrderScope(req.cutting.companyId),
@@ -539,7 +543,6 @@ router.get("/manufacturing-orders/:moId", cutting.cuttingCompany, async (req, re
 
     const workOrders = await WorkOrder.find({
       customerRequestId: moId,
-      status: { $ne: "pending" },
       ...cutting.workOrderScope(req.cutting.companyId),
     })
       .select(

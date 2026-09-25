@@ -173,7 +173,8 @@ function legacyModel(userType) {
 const LEGACY_REDIRECTS = {
   hr_manager: "/hr/dashboard",
   ceo: "/ceo/dashboard",
-  project_manager: "/project-manager/dashboard",
+  /* Production Manager folded into PPC, 25 Sep 2026 */
+  project_manager: "/ppc",
   sales: "/sales/dashboard",
   "mpc-measurement": "/mpc-measurement/dashboard",
   cutting_master: "/cutting-master/dashboard",
@@ -189,7 +190,7 @@ const LEGACY_REDIRECTS = {
 const LEGACY_REDIRECTS_BY_TYPE = {
   hr: "/hr/dashboard",
   ceo: "/ceo/dashboard",
-  project_manager: "/project-manager/dashboard",
+  project_manager: "/ppc",
   sales: "/sales/dashboard",
   "mpc-measurement": "/mpc-measurement/dashboard",
   "cutting-master": "/cutting-master/dashboard",

@@ -121,8 +121,7 @@ router.get("/manufacturing-orders", ...canRead, async (req, res) => {
         derivedStatus = "in_production";
       else if (statuses.every((s) => s === "pending")) derivedStatus = "pending";
       else if (statuses.some((s) => s === "planned")) derivedStatus = "planning";
-
-      if (derivedStatus === "pending") continue;
+      /* Pending orders are listed too (25 Sep 2026) — see finishingRoutes. */
 
       const totalQty       = wos.reduce((s, w) => s + (w.quantity || 0), 0);
       const packagedQty    = wos.reduce((s, w) => s + (w.packagedQuantity || 0), 0);

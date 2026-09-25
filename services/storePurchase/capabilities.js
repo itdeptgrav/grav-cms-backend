@@ -58,6 +58,11 @@ const CAPABILITIES = Object.freeze({
   STOCK_ISSUE: "sp.stock.issue",
   STOCK_RETURN: "sp.stock.return",
   STOCK_ADJUST: "sp.stock.adjust",
+  /* Physical PUT / TRANSFER / REMOVE-from-position of stock the company
+     already holds (25 Sep 2026). These move stock between positions and never
+     change company on-hand, so they are an EDITOR's daily work — unlike
+     STOCK_ADJUST, which changes what the company holds and is an approver's. */
+  LOCATION_OPERATE: "sp.location.operate",
   MASTER_MAINTAIN: "sp.master.maintain",
   CONFIG_MANAGE: "sp.config.manage",
   LEGACY_READ: "sp.legacy.read",
@@ -89,12 +94,14 @@ const GRANTS = {
       C.RECEIPT_RECORD, C.STOCK_ISSUE, C.STOCK_RETURN, C.MASTER_MAINTAIN,
       /* Fulfilling material requests is the Store editor's daily job. */
       C.MRF_FULFIL,
+      /* So is putting stock on racks and moving it between them. */
+      C.LOCATION_OPERATE,
     ],
     approver: [
       C.READ, C.HISTORY_READ, C.SOURCING_MANAGE, C.PO_CREATE, C.PO_APPROVE,
       C.PO_ISSUE, C.PO_CANCEL, C.RECEIPT_RECORD, C.STOCK_ISSUE, C.STOCK_RETURN,
       C.STOCK_ADJUST, C.MASTER_MAINTAIN, C.REQUISITION_REVIEW, C.LEGACY_READ,
-      C.MRF_FULFIL,
+      C.MRF_FULFIL, C.LOCATION_OPERATE,
     ],
     owner: ADMIN_SET,
   },

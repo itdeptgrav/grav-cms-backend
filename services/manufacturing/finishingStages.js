@@ -2,7 +2,7 @@
 //
 // THE FINISHING STAGES A GARMENT PASSES THROUGH BEFORE PACKING.
 //
-// Printing, washing, trimming and ironing — each a department with its own
+// Embroidery, printing, washing, trimming and ironing — each a department with its own
 // portal, its own people and its own book of scans, but the same shape of
 // work: a piece is scanned, and that piece is DONE at that stage, by that
 // person, at that moment. So one model, one access rule and one set of routes
@@ -18,6 +18,23 @@
 "use strict";
 
 const STAGES = Object.freeze({
+  /* Embroidery (24 Sep 2026) joined this shape on request — "exactly as like
+     trimming/ironing". It is first because it is done on cut panels, before
+     anything else here. Its department already existed (with a legacy
+     EmbroideryDepartment collection, legacy role "embroidery") and is NOT
+     re-seeded; its old per-piece book, `embroideryrecords`, held no rows when
+     it was retired, so no history moved. The design catalogue
+     (`embroiderydesigns`, routes/…/Embroidery) is unaffected. */
+  embroidery: Object.freeze({
+    slug: "embroidery",
+    name: "Embroidery",
+    doneLabel: "Embroidered",
+    action: "Mark embroidered",
+    description: "Machine embroidery on panels and garments, piece by piece.",
+    legacyRoles: Object.freeze(["embroidery"]),
+    dashboardPath: "/embroidery/dashboard",
+    sortOrder: 90,
+  }),
   printing: Object.freeze({
     slug: "printing",
     name: "Printing",

@@ -1208,6 +1208,14 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/locationStockRoutes"),
 );
 
+/* The physical store (25 Sep 2026): racks, bins, location QR, put/transfer,
+   the locator, put-away queue, reconciliation and the 3D layout. Sits on the
+   same guarded LocationBalance/LocationMovement layer as the mount above. */
+app.use(
+  "/api/cms/inventory/store-locations",
+  require("./routes/CMS_Routes/Inventory/Operations/storeLocationRoutes"),
+);
+
 /* =====================
     HR CHANGE HISTORY
   =====================
@@ -1862,6 +1870,14 @@ app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/orderBookRoute"));
    PLANNED plan's time on a line. It releases nothing to Production, creates no
    work order and writes nothing into IE, Merchandising or Store. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/capacityRoute"));
+/* PPC's piece-completion targets per order and department (24 Sep 2026), and
+   the door each department's overview reads them through. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/orderTargetsRoute"));
+/* The PPC control center (25 Sep 2026): every production-management READ —
+   orders, work orders, person-wise, departments, hourly/daily, targets vs
+   achievement, efficiency, delays, reports, search and the assistant — all
+   counted from the departments' own books through services/ppc/control/. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/controlRoute"));
 
 /* Change control and the enterprise operations — the M7 surface: Sales-
    authorised change intake, impact coordination, acknowledgements, bulk tools,
@@ -2327,6 +2343,44 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionSupervisorWrites("machine layout"), productionMachineLayout);
+
+/* ---------------------------------------------------------------------
+ * The scanner floor's READ routers (restored 25 Sep 2026).
+ *
+ * This block existed in commit c3c5025d and was dropped by the merge
+ * fdeea4a/3c220b9. Without it every page of the Production Supervisor floor
+ * (floor summary, scan records, devices, config barcodes, wall board, the
+ * tracker's targets and its assistant) answered 404.
+ *
+ * Below the `app.use("/api/cms", productOperations)` line on purpose — the
+ * mirror image of the ingest mount. These are read by a person in a browser
+ * with a session, so picking up that router's EmployeeAuthMiddleware on the
+ * way past is exactly what should happen. Each router also states its own
+ * `router.use(EmployeeAuthMiddleware)` rather than inheriting it silently,
+ * so moving a mount cannot quietly open them.
+ *
+ *   /supervisor/*              floor overview, device health, drill-down
+ *   /dashboard/work-orders     what was made today, per work order
+ *   /dashboard/operator/:id    one operator's whole shift
+ *   /dashboard/overview-summary the floor day: MOs, people, machines, SAM
+ *   /scanner/*                 QR generation, pipeline health, manual rollup
+ *
+ * The dashboard routers mount at the SAME path as productionDashboardRoutes
+ * and after it, so they can only add endpoints, never shadow one.
+ * --------------------------------------------------------------------- */
+const S_ROUTES = "./routes/CMS_Routes/Production/Scanner";
+app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/supervisorFloorRoutes.js`));
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/scannerDashboardRoutes.js`));
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/overviewSummaryRoutes.js`));
+app.use("/api/cms/production/dashboard", require(`${S_ROUTES}/productionReportRoutes.js`));
+app.use("/api/cms/production/scanner", require(`${S_ROUTES}/scannerAdminRoutes.js`));
+/* Machine intelligence — mounted on the supervisor prefix AFTER
+   supervisorFloorRoutes, so it can only ADD /machine-intelligence paths. */
+app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/machineIntelligenceRoutes.js`));
+/* The floor's own assistant and its machine/operator targets: narrow prefixes
+   of their own, each router carrying its own EmployeeAuthMiddleware. */
+app.use("/api/cms/production/assistant", require("./routes/CMS_Routes/Production/Assistant/productionAssistantRoutes.js"));
+app.use("/api/cms/production/targets", require("./routes/CMS_Routes/Production/Targets/productionTargetRoutes.js"));
 
 /* Packaging & Dispatch answers PPC's packing target here — its own door, with
    its own company scope and `packaging-dispatch` role rules.

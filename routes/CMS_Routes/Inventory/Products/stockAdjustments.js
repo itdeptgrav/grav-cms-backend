@@ -7,6 +7,10 @@ const mongoose = require("mongoose");
 const RawItem         = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Warehouse       = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
 const locStock        = require("../../../../services/storePurchase/locationStock.service");
+/* The physical store (25 Sep 2026): an issue may name the lot sticker the
+   stock is taken under, so the shelf's per-sticker balance follows it. */
+const storeLoc        = require("../../../../services/storePurchase/storeLocations.service");
+const Barcode         = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const StockItem       = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const Unit            = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const StockIssuance   = require("../../../../models/CMS_Models/Inventory/Operations/StockIssuance");
@@ -573,10 +577,20 @@ router.post(
         throw fail("VALIDATION", "A location needs both a warehouse and a location.", { reason: "LOCATION_INCOMPLETE", rawItemId: String(rawItemId) });
       }
 
+      /* Optional lot sticker: must exist and be printed for THIS item (and
+         variant, when the sticker names one). Only meaningful with a location. */
+      let barcode = null;
+      if (incoming.barcodeId) {
+        const bid = objectId(incoming.barcodeId);
+        barcode = bid ? await Barcode.findById(bid).lean() : null;
+        if (!barcode || String(barcode.rawItem) !== String(oid)) throw fail("VALIDATION", "That sticker is not one of this item's.", { reason: "BARCODE_MISMATCH", rawItemId: String(rawItemId) });
+        if (barcode.variantId && variant && String(barcode.variantId) !== String(variant._id)) throw fail("VALIDATION", "That sticker is for a different variant.", { reason: "BARCODE_VARIANT_MISMATCH", rawItemId: String(rawItemId) });
+      }
+
       plan.push({
         rawItem, variant, oid, qty, issuedUnit: issuedUnit || nativeUnit, nativeUnit,
         nativeQty, conversion, itemNotes, currentTotal, currentVariant,
-        warehouse, location,
+        warehouse, location, barcode,
       });
     }
 
@@ -656,8 +670,12 @@ router.post(
               warehouse: p.warehouse, location: p.location, quantity: p.nativeQty,
               actor: { id: req.user?.id, name: req.user?.name },
               note: reasonText, idempotencyKey: req.idempotent?.key || "",
+              barcodeId: p.barcode ? p.barcode._id : null,
+              barcodeLabel: p.barcode ? `${p.barcode.quantity} ${p.barcode.unit}${p.barcode.purchaseOrderNumber ? ` · ${p.barcode.purchaseOrderNumber}` : ""}` : "",
             };
             if (direction === "debit") {
+              /* Under a sticker, the shelf must hold that much of THAT lot. */
+              if (p.barcode) await storeLoc.assertMarkingAt(session, req.tenant.companyId, p.barcode, p.warehouse, p.location, p.nativeQty);
               const out = await locStock.applyLocationOut(session, {
                 ...common, type: "issue",
                 source: { kind: "stock_issue", id: issuanceId, reference: String(issuanceId) },
