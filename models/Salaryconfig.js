@@ -22,10 +22,22 @@ const salaryConfigSchema = new mongoose.Schema(
             min: [0], max: [100],
             comment: "Employee PF % of Basic. Statutory: 12%.",
         },
+        epfWageCeiling: {
+            type: Number, default: 15000,
+            min: [0],
+            comment:
+                "The Basic that EPF % is charged on stops here. Statutory: ₹15,000. " +
+                "EDLI and admin charges have had their own ceiling since they were " +
+                "written; EPF's was implied by the ₹1,800 cap and could not be moved.",
+        },
         epfCapAmount: {
             type: Number, default: 1800,
             min: [0],
-            comment: "Monthly rupee cap on EPF. = 12% of ₹15,000 PF wage ceiling. Default: ₹1,800.",
+            comment:
+                "A hard rupee maximum on EPF, applied after the wage ceiling. " +
+                "Normally epfWageCeiling × eepfPct (₹15,000 × 12% = ₹1,800); the " +
+                "settings screen keeps it in step when the ceiling moves, unless " +
+                "somebody has deliberately set it to something else.",
         },
         edliPct: {
             type: Number, default: 0.5,

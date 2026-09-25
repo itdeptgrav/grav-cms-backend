@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const multer = require("multer");
+const { monthlyLeaveCap } = require("../../services/leaveHomeState.service");
 // Push notifications — every leave event goes through utils/notifyEmployee.js,
 // which fans out to the mobile app (Expo) and the CMS (FCM) in one call and
 // never throws, never rejects and never blocks the response.
@@ -261,8 +262,14 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
     const id = req.user.id,
       year = Number(req.query.year) || new Date().getFullYear();
     const config = await LeaveConfig.getConfig();
+    /* `address` is here for the monthly cap, which is judged on the permanent
+       state. The app used to work that out itself from the two caps this
+       endpoint returned, which meant the rule existed twice and the screen
+       could promise a number the server would not honour. The server decides
+       and says so; both caps stay in the payload only so an older build of the
+       app keeps working. */
     const emp = await Employee.findById(id)
-      .select("biometricId dateOfJoining")
+      .select("biometricId dateOfJoining address")
       .lean();
     const bal = await ensureBalance(id, year, emp?.biometricId, config);
     const wd = workingDaysSinceJoining(emp?.dateOfJoining);
@@ -314,6 +321,21 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
           maxLeaveDaysPerMonth: config.maxLeaveDaysPerMonth,
           maxLeaveDaysPerMonthOdisha: config.maxLeaveDaysPerMonthOdisha,
         },
+        /* The cap that actually applies to THIS employee, already resolved.
+           `source` says which address it came from, so the app can tell
+           somebody that their permanent address is missing rather than
+           silently judging them on the room they rent. */
+        monthlyCap: (() => {
+          const c = monthlyLeaveCap(emp || {}, config);
+          return {
+            days: c.cap,
+            state: c.state,
+            source: c.source,
+            usedFallback: c.usedFallback,
+            sameAsCurrent: c.sameAsCurrent,
+            isHomeState: c.isHomeState,
+          };
+        })(),
         eligibility: {
           waitingComplete: wc,
           plComplete: pc,
@@ -1711,17 +1733,13 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       effectiveAvailable = Math.min(availableBalance, clRemainingThisMonth);
     }
 
-    const empState = (
-      emp.address?.current?.state ||
-      emp.address?.permanent?.state ||
-      ""
-    )
-      .toLowerCase()
-      .trim();
-    const isOdisha = ["odisha", "orissa"].includes(empState);
-    const monthlyCap = isOdisha
-      ? config.maxLeaveDaysPerMonthOdisha || 7
-      : config.maxLeaveDaysPerMonth || 10;
+    /* The cap follows the PERMANENT address. This read `current` first, which
+       inverted the rule it was written for: the bigger allowance exists for
+       somebody whose home is in another state, and that person is very often
+       the one renting a room in Bhubaneswar. They were being capped at 7.
+       See services/leaveHomeState.service.js. */
+    const capInfo = monthlyLeaveCap(emp, config);
+    const monthlyCap = capInfo.cap;
     const { used: totalMonthUsed } = await countMonthlyUsage(
       req.user.id,
       fromDate,
