@@ -4416,3 +4416,60 @@ Verification: `verifyLeaveHomeState.js` — 35 checks, PURE tier.
 Full safe suite: 20 harnesses. Pre-existing failures unchanged —
 `verifyPayrollLadder` and `verifyManagerChain` (the dev `employees` collection
 is empty) and `verifyPartyLinkSafety` (known Rourkela mislink).
+
+---
+
+## Leave: the type the employee picked, and a split that survives an edit (25 Sep 2026)
+
+Reported as a mobile UI bug — "they applied for PL, the edit screen shows CL".
+It was that, three times over, and the data underneath was worse.
+
+### The type was derived from the split
+
+`split.CL >= split.PL ? "CL" : "PL"` is `"CL"` when both are zero, and zero is
+common: `maxPL` is 0 whenever the employee is not PL-eligible, has no PL left,
+or has used the month's cap.
+
+| where | was | now |
+|---|---|---|
+| apply payload | `leaveType: primaryType` | `form.leaveType` |
+| edit modal | CL row always, PL row only if `editMaxPL > 0`, whole block hidden from primary managers | one row, for `editTarget.leaveType`, whichever manager is acting |
+| edit reset effect | filled CL first whatever the type | opens in the bucket applied under |
+| edit payload | `leaveType: editPrimaryType` | not sent (the server pins the type) |
+| editor bounds | `avail` / `maxCLPerMonth` — the MANAGER's balance | `applicantBalance`, new on `/manager/pending` |
+
+### The split was being discarded
+
+`PUT /manager/:id/edit` never read `paidDays` and set `paidDays = totalDays,
+lwpDays = 0` for every non-LOP type. So the split editor saved nothing — and
+any edit at all reset the split, turning 3 paid + 2 LWP into 5 paid because
+somebody fixed a typo in the reason. Payroll reads `paidDays`.
+
+`PUT /:id` (employee self-edit) had the mirror bug: it updated `totalDays` and
+left `paidDays` alone, so shortening a 5-day leave to 2 left 3 paid days on a
+2-day row. Both now keep the split consistent with the dates.
+
+### Also
+
+The MANAGER APPROVE header comment had the quick-apply roles backwards — the
+**primary** classifies via `/quick-apply/:id/resolve` (the route 403s anyone
+else), then the secondary approves. Corrected.
+
+A withdraw-request card read `paidDays ?? totalDays` under a "days" label, so a
+fully-unpaid five-day leave showed as "PL · 0 days". It now shows the length
+and how much of it is unpaid.
+
+### Verification
+
+`verifyLeaveEditSplit.js` — 28 checks, PURE tier. It lifts the route's split
+block and evaluates it, so it tests the arithmetic that ships. Backend safe
+suite: 21 harnesses, only the three known failures (empty `employees`
+collection × 2, Rourkela party mislink).
+
+App side: its own `npm run verify` — 10 checks green (refs, regularize, OT,
+lockfile, updates, palette, web pitfalls, parity, payslip template identical
+across all three repos, boot) and `expo export --platform android` bundles
+clean.
+
+Production build: EAS `production` profile, versionCode 57 → 58, app-bundle,
+remote Android credentials (Build Credentials O36CqMUsjU).
