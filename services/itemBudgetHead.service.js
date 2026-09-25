@@ -45,7 +45,8 @@ const classification = require("./budgetClassification.service");
    they are re-exported here so every existing caller is unaffected. */
 const vocabulary = require("./budgetAllocationVocabulary");
 const {
-  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL, SOURCE_NONE,
+  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD, SOURCE_NONE,
   RESOLUTION_SOURCES,
   STATUS_RESOLVED, STATUS_UNRESOLVED, STATUS_MANUAL_REQUIRED, RESOLUTION_STATUSES,
 } = vocabulary;
@@ -631,6 +632,7 @@ module.exports = {
   SOURCE_CATEGORY,
   SOURCE_SERVICE,
   SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD,
   SOURCE_NONE,
   RESOLUTION_SOURCES,
   STATUS_RESOLVED,

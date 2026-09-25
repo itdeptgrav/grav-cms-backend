@@ -30,6 +30,7 @@ const chain = require("./spendApproval.service");
 const fulfilment = require("./storeFulfilment.service");
 const budgetMatch = require("./budgetCommitment.service");
 const itemBudgetHead = require("./itemBudgetHead.service");
+const lineAllocation = require("./lineAllocation.service");
 const mongoose = require("mongoose");
 
 /** Service lines only. A product is received into stock and has no service. */
@@ -373,6 +374,357 @@ function applyServiceAllocations({ request, classification, actor, body }) {
   }
 }
 
+/* ══ LINE-WISE BUDGET ALLOCATION ═════════════════════════════════════════════
+ *
+ * ── THE PROBLEM ─────────────────────────────────────────────────────────────
+ * One request buys fabric, packaging, freight and a repair. Those come out of
+ * four different budgets, and the only thing a commitment could express was
+ * ONE head — so finance either split the request into four or charged three of
+ * them somewhere they do not belong. The budget report was then wrong about
+ * all four, in a way nobody could see from the report.
+ *
+ * ── WHAT THIS DECIDES, AND WHAT IT DOES NOT ─────────────────────────────────
+ * It resolves a head PER LINE, validates each against this department's
+ * approved budget lines, splits the approved grand total across the lines to
+ * the paise, groups lines sharing a head, and checks each GROUP once.
+ *
+ * It does NOT decide whether finance may approve past a head. That is the
+ * existing policy — finance can always say yes, and the request records which
+ * KIND of yes it was — and applying it at the grouped level is the whole
+ * point. A second framework that blocked an over-budget group would be a
+ * different rule for line-wise requests than for every other one.
+ */
+
+/** Finance's per-line instruction, keyed by line id. */
+function selectionMap(body) {
+  const out = new Map();
+  for (const l of Array.isArray(body?.lines) ? body.lines : []) {
+    if (l && l.spendLineId) out.set(String(l.spendLineId), l);
+  }
+  return out;
+}
+
+/**
+ * Resolve, validate, split and group.
+ *
+ * `body` is finance's answer:
+ *   { lines: [{ spendLineId, budgetLineId, reason, unbudgeted }], reason }
+ */
+async function planLineAllocations({ request, body = null, actor = null } = {}) {
+  const RawItem = require("../models/CMS_Models/Inventory/Products/RawItem");
+  const Service = require("../models/CMS_Models/Inventory/Services/Service");
+
+  /* ── WHAT THIS DEPARTMENT MAY ACTUALLY SPEND AGAINST ──────────────────────
+     Approved BUDGET LINES, from the same matcher the request header already
+     uses. A ledger being classifiable as spend says nothing about whether this
+     department has money on it, and accepting one because it exists in the
+     chart of accounts is exactly what must not happen. */
+  const { heads: approvedHeads } = await budgetMatch.approvedHeadsFor({
+    companyId: request.companyId,
+    department: request.budgetDepartment || request.department || "",
+  }).catch(() => ({ heads: [] }));
+
+  const byLedger = new Map(approvedHeads.map((h) => [String(h.ledgerId), h]));
+  const byLine = new Map(approvedHeads.map((h) => [String(h.budgetLineId), h]));
+
+  /* ── THE SPLIT ────────────────────────────────────────────────────────────
+     Refused outright rather than approximated: a commitment whose parts do not
+     equal the approved total is a figure nobody can reconcile. */
+  const split = lineAllocation.allocateLines({
+    lines: request.items || [],
+    grandTotal: typeof request.grandTotal === "number" && request.grandTotal > 0
+      ? request.grandTotal
+      : request.totalAmount,
+  });
+  if (!split.ok) {
+    return { ok: false, status: 400, code: split.code, message: split.message };
+  }
+
+  const serviceRequest = isServiceRequest(request);
+
+  /* One category map for the whole request, and only for a PRODUCT request.
+     A service never consults it — `headForService` takes no map at all. */
+  const categoryMap = serviceRequest
+    ? new Map()
+    : await itemBudgetHead.categoryMap(request.companyId);
+
+  const itemIds = (request.items || []).map((l) => l.rawItem).filter(Boolean);
+  const items = itemIds.length
+    ? new Map((await RawItem.find({ _id: { $in: itemIds } })
+      .select("_id name sku category budgetLedgerId budgetLedgerName").lean())
+      .map((i) => [String(i._id), i]))
+    : new Map();
+
+  const serviceIds = (request.items || []).map((l) => l.service).filter(Boolean);
+  const services = serviceIds.length
+    ? new Map((await Service.find({ _id: { $in: serviceIds }, companyId: request.companyId })
+      .select("_id serviceCode name category budgetLedgerId budgetLedgerName status").lean())
+      .map((s) => [String(s._id), s]))
+    : new Map();
+
+  const selections = selectionMap(body);
+  const blanketReason = String(body?.reason || "").trim();
+
+  /* The head the request itself was approved against, when it has one. */
+  const requestHead = request.budgetMatchStatus === "matched" && request.budgetLineId
+    ? byLine.get(String(request.budgetLineId)) || null
+    : null;
+  /* And whether it deliberately has none — the existing exception path. */
+  const requestUnbudgeted = request.budgetMatchStatus !== "matched";
+
+  const rows = [];
+  const problems = [];
+
+  for (const [index, line] of (request.items || []).entries()) {
+    const lineId = String(line._id);
+    const amounts = split.allocations[index];
+    const choice = selections.get(lineId) || null;
+
+    /* ── THE SUGGESTION ───────────────────────────────────────────────────
+       Product: its own override, then its category's mapping, then nothing.
+       Service: the Service Master default and nothing else — no category
+       fallback, enforced by `headForService` taking no map. */
+    const svc = line.service ? services.get(String(line.service)) : null;
+    const item = line.rawItem ? items.get(String(line.rawItem)) : null;
+    const suggestion = serviceRequest
+      ? itemBudgetHead.headForService(svc || {})
+      : itemBudgetHead.headForItem(item || { category: line.category }, categoryMap);
+
+    const suggestedLedgerId = suggestion.budgetLedgerId ? String(suggestion.budgetLedgerId) : null;
+    const suggestedHead = suggestedLedgerId ? byLedger.get(suggestedLedgerId) : null;
+
+    /* ── WHAT FINANCE CHOSE, IF ANYTHING ──────────────────────────────────
+       An explicit `unbudgeted: true` is a real decision and is honoured; a
+       named `budgetLineId` must be one of this department's approved lines. */
+    let head = null;
+    let source = suggestion.source;
+    let reason = "";
+    let unbudgeted = false;
+
+    if (choice && choice.unbudgeted === true) {
+      unbudgeted = true;
+      source = itemBudgetHead.SOURCE_MANUAL;
+      reason = String(choice.reason || blanketReason || "").trim();
+    } else if (choice && choice.budgetLineId) {
+      const picked = byLine.get(String(choice.budgetLineId));
+      if (!picked) {
+        /* Not this department's, not approved, or not live. One message for
+           all three: naming which would tell a caller that a budget line they
+           cannot use exists somewhere. */
+        problems.push({
+          spendLineId: lineId, name: line.name, code: "HEAD_NOT_APPROVED",
+          message: "That budget head is not an approved line for this department.",
+        });
+        continue;
+      }
+      head = picked;
+      /* Manual only where it DIFFERS from what the rule suggested. Choosing
+         the suggestion by hand is still the suggestion. */
+      const same = suggestedHead && String(suggestedHead.budgetLineId) === String(picked.budgetLineId);
+      source = same ? suggestion.source : itemBudgetHead.SOURCE_MANUAL;
+      reason = String(choice.reason || blanketReason || "").trim();
+
+      /* ── OVERRIDING A CONFIGURED DEFAULT OWES A REASON ─────────────────
+         Only where there WAS a default to contradict. A line whose rule
+         produced nothing has nothing to have departed from, and demanding a
+         reason for that teaches people to type "n/a". */
+      if (!same && suggestedLedgerId && !reason) {
+        problems.push({
+          spendLineId: lineId, name: line.name, code: "REASON_REQUIRED",
+          suggestedLedgerName: suggestion.budgetLedgerName || null,
+          selectedLedgerName: picked.name,
+          message: `${line.name} normally comes out of ${suggestion.budgetLedgerName || "another head"}. `
+            + "Say why it is being charged elsewhere.",
+        });
+        continue;
+      }
+    } else if (suggestedHead) {
+      head = suggestedHead;
+    } else if (!suggestedLedgerId && requestHead) {
+      /* ── THE REQUEST'S OWN HEAD, WHERE NOTHING ELSE SPEAKS ────────────
+         Before line-wise allocation this WAS the only authority, and it is
+         still a real decision: the requester picked it from their own
+         department's approved lines and finance is approving the request on
+         it. A line whose own rule produces nothing falls back to it rather
+         than being refused — refusing would make every request that predates
+         item-wise mapping unapprovable.
+
+         Recorded as `request_head`, never as a line-level source, so nobody
+         can later mistake "nothing else said otherwise" for "somebody
+         classified this line". */
+      head = requestHead;
+      source = itemBudgetHead.SOURCE_REQUEST_HEAD;
+    } else if (!suggestedLedgerId && requestUnbudgeted) {
+      /* The request itself has no approved head — the explicit unbudgeted
+         path. Its lines are unbudgeted too: still promises, reducing nothing,
+         and visible as such. */
+      unbudgeted = true;
+      source = itemBudgetHead.SOURCE_NONE;
+    } else if (suggestedLedgerId) {
+      /* The rule produced a head this department has no approved budget on.
+         Not silently unbudgeted, and not silently charged: finance must say
+         which head they mean. */
+      problems.push({
+        spendLineId: lineId, name: line.name, code: "SUGGESTED_HEAD_UNAVAILABLE",
+        suggestedLedgerName: suggestion.budgetLedgerName || null,
+        message: `${suggestion.budgetLedgerName || "The suggested head"} is not an approved `
+          + "budget head for this department. Choose one, or mark the line unbudgeted.",
+      });
+      continue;
+    } else {
+      /* ── UNRESOLVED IS NOT AN APPROVAL ────────────────────────────────
+         Nothing resolved it and finance chose nothing. Refused rather than
+         quietly recorded against the request header's head, which is how a
+         line ends up charged somewhere nobody picked. */
+      problems.push({
+        spendLineId: lineId, name: line.name, code: "LINE_UNRESOLVED",
+        message: `${line.name} has no budget head. Choose one, or mark it unbudgeted.`,
+      });
+      continue;
+    }
+
+    rows.push({
+      spendLineId: lineId,
+      name: line.name || "",
+      itemId: item?._id || line.rawItem || undefined,
+      itemSku: item?.sku || line.rawItemSku || "",
+      serviceId: svc?._id || line.service || undefined,
+      serviceCode: svc?.serviceCode || line.serviceCode || "",
+
+      budgetId: unbudgeted ? null : head.budgetId,
+      budgetLineId: unbudgeted ? null : head.budgetLineId,
+      financialYear: unbudgeted ? null : head.financialYear,
+      ledgerId: unbudgeted ? null : head.ledgerId,
+      ledgerName: unbudgeted ? "" : head.name,
+
+      amount: amounts.amount,
+      adjustment: amounts.adjustment,
+      lineAmount: amounts.lineAmount,
+      status: unbudgeted ? "unbudgeted" : "committed",
+
+      resolutionSource: unbudgeted ? itemBudgetHead.SOURCE_MANUAL : source,
+      resolutionReason: reason,
+      selectedByName: (choice ? (actor?.name || "") : ""),
+      selectedAt: choice ? new Date() : undefined,
+
+      /* What the SUGGESTION was, carried for the screen. Not stored on the
+         commitment — the commitment records what was decided, not what was
+         proposed. */
+      suggested: {
+        budgetLedgerId: suggestedLedgerId,
+        budgetLedgerName: suggestion.budgetLedgerName || null,
+        source: suggestion.source,
+        available: !!suggestedHead,
+      },
+    });
+  }
+
+  if (problems.length) {
+    return {
+      ok: false,
+      status: 409,
+      code: "LINE_ALLOCATION_UNRESOLVED",
+      message: `${problems.length} line${problems.length === 1 ? "" : "s"} need a budget head `
+        + "before this can be approved.",
+      problems,
+      totals: split.totals,
+    };
+  }
+
+  /* ── GROUPED, THEN CHECKED ONCE ───────────────────────────────────────────
+     Two lines on one head are ONE claim on its headroom. Checking them
+     separately lets each read the same starting availability and each conclude
+     it fits — so ₹6,000 and ₹5,000 both pass against ₹10,000 and the head goes
+     ₹1,000 over on two individually correct approvals. */
+  const grouped = lineAllocation.groupByBudgetLine(rows);
+  const availability = new Map(approvedHeads.map((h) => [String(h.budgetLineId), {
+    approved: h.approved, committed: h.committed, actual: h.actual, available: h.available,
+  }]));
+  const checked = lineAllocation.checkGroups({ groups: grouped.heads, availability });
+
+  /* Each allocation carries the state of ITS head at the moment of the
+     promise. A single top-level snapshot could only describe one of them. */
+  const byLineId = new Map(checked.map((g) => [String(g.budgetLineId), g]));
+  for (const r of rows) {
+    if (!r.budgetLineId) continue;
+    const g = byLineId.get(String(r.budgetLineId));
+    if (!g || !g.known) continue;
+    r.snapshot = {
+      approved: g.approved,
+      committedBefore: g.committedBefore,
+      actual: g.actual,
+      availableBefore: g.availableBefore,
+      availableAfter: g.availableAfter,
+    };
+  }
+
+  return {
+    ok: true,
+    allocations: rows,
+    groups: checked,
+    unbudgeted: grouped.unbudgeted,
+    totals: split.totals,
+    /* The existing vocabulary, applied at the grouped level. Finance is not
+       blocked by any of these — the request records which kind of yes it was. */
+    approvalKind: !rows.some((r) => r.status === "committed")
+      ? "unbudgeted"
+      : checked.some((g) => g.status === "insufficient" || !g.known)
+        ? "over_budget"
+        : "within_budget",
+    headCount: checked.length,
+  };
+}
+
+/** The plan, shaped for a screen: per line, per head, and the totals. */
+function allocationSummary(plan) {
+  if (!plan || !plan.ok) return null;
+  return {
+    mode: plan.headCount > 1 || (plan.allocations || []).length > 1 ? "line_wise" : "single_head",
+    headCount: plan.headCount,
+    approvalKind: plan.approvalKind,
+    lines: (plan.allocations || []).map((a) => ({
+      spendLineId: a.spendLineId,
+      name: a.name,
+      itemSku: a.itemSku || null,
+      serviceCode: a.serviceCode || null,
+      /* The line's own figure, the header adjustment it absorbed, and the
+         committed amount — all three, so "why is this less than quoted" has
+         an answer on the screen rather than in somebody's head. */
+      lineAmount: a.lineAmount,
+      adjustment: a.adjustment,
+      amount: a.amount,
+      budgetLineId: a.budgetLineId ? String(a.budgetLineId) : null,
+      ledgerId: a.ledgerId ? String(a.ledgerId) : null,
+      ledgerName: a.ledgerName || null,
+      status: a.status,
+      resolutionSource: a.resolutionSource,
+      resolutionReason: a.resolutionReason || "",
+      selectedByName: a.selectedByName || "",
+      suggested: a.suggested || null,
+      snapshot: a.snapshot || null,
+    })),
+    /* Grouped, because two lines on one head are ONE claim on its headroom. */
+    heads: (plan.groups || []).map((g) => ({
+      budgetLineId: g.budgetLineId,
+      ledgerId: g.ledgerId ? String(g.ledgerId) : null,
+      ledgerName: g.ledgerName,
+      financialYear: g.financialYear || null,
+      lineCount: g.lineCount,
+      amount: g.amount,
+      known: g.known,
+      approved: g.approved ?? null,
+      committedBefore: g.committedBefore ?? null,
+      actual: g.actual ?? null,
+      availableBefore: g.availableBefore ?? null,
+      availableAfter: g.availableAfter ?? null,
+      shortfall: g.shortfall ?? 0,
+      status: g.status,
+    })),
+    unbudgeted: plan.unbudgeted,
+    totals: plan.totals,
+  };
+}
+
 /** Statuses at which finance is the one being asked. */
 const AT_FINANCE = [chain.PENDING_FINANCE];
 
@@ -399,6 +751,10 @@ async function decide({
      an ordinary approval, and absent is the common case — a request whose
      every line already agrees needs no answer. */
   lineDecisions = null,
+  /* Finance's per-line budget heads:
+     `{ lines: [{ spendLineId, budgetLineId, reason, unbudgeted }], reason }`.
+     Absent when every line resolves on its own, which is the common case. */
+  lineAllocations = null,
 } = {}) {
   if (!request) return fail(404, "NOT_FOUND", "Request not found.");
 
@@ -461,6 +817,18 @@ async function decide({
     classification = gate.classification;
   }
 
+  /* ── AND EVERY LINE NEEDS A BUDGET HEAD ────────────────────────────────
+     Resolved per line, validated against this department's approved lines,
+     split to the paise and checked in GROUPS. An unresolved line is refused
+     rather than quietly charged to the request header's head — which is how a
+     line ends up on a budget nobody chose. Over-budget is NOT refused here:
+     that is the existing policy's call, and it is recorded below. */
+  let plan = null;
+  if (outcome !== "rejected") {
+    plan = await planLineAllocations({ request, body: lineAllocations, actor });
+    if (!plan.ok) return plan;
+  }
+
   const now = new Date();
   const who = actor?.name || "";
 
@@ -485,13 +853,20 @@ async function decide({
        can always say yes: within the envelope, past it, or against no envelope
        at all. A blanket "approved" would lose the one distinction that matters
        when somebody later asks how the year went over. */
+    /* ── THE SAME THREE WORDS, NOW ASKED OF THE GROUPS ──────────────────
+       `within_budget` / `over_budget` / `unbudgeted` are unchanged, and so is
+       the rule that finance can always say yes. What changed is what they
+       describe: with several heads on one request, the request-header snapshot
+       could only ever have described one of them. The plan answers for every
+       head, and a request is over budget if ANY group is. */
     const snap = request.budgetSnapshot;
-    request.budgetApprovalKind =
-      request.budgetMatchStatus !== "matched"
+    request.budgetApprovalKind = plan
+      ? plan.approvalKind
+      : (request.budgetMatchStatus !== "matched"
         ? "unbudgeted"
         : snap && Number(snap.availableAfter) < 0
           ? "over_budget"
-          : "within_budget";
+          : "within_budget");
 
     /* ── WHAT EACH SERVICE LINE IS ON THE RECORD AS ────────────────────
        Written from the classification the gate above has already validated,
@@ -517,6 +892,9 @@ async function decide({
           request,
           actor: { email: actor?.email, name: who },
           expectedPaymentDate: expected,
+          /* One document, one row per approved line. Already validated above;
+             `commit` decides the document's SHAPE, not the allocation. */
+          allocations: plan ? plan.allocations : null,
         });
         if (commitment) {
           request.commitmentId = commitment._id;
@@ -545,10 +923,14 @@ async function decide({
   });
   await request.save();
 
-  return { ok: true };
+  /* The plan travels back so the decision response can show what was
+     committed, per line and per head, without recomputing it. */
+  return { ok: true, plan };
 }
 
 module.exports = {
   decide, AT_FINANCE, serviceClassification, isServiceRequest,
+  planLineAllocations,
+  allocationSummary,
   serviceApprovalGate, applyServiceAllocations,
 };

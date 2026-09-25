@@ -398,18 +398,236 @@ describe("approving from the books", () => {
     expect(await Commitment.countDocuments({ spendRequestId: s.spend._id })).toBe(1);
   });
 
+  /* ══ THE ALLOCATION, THROUGH THE ACCOUNTANT DOOR ═══════════════════════
+   * Payables and the Request Desk are different sessions against different
+   * routes, and the allocation review was mounted on neither. These pin that
+   * the accountant door reads the SAME plan and forwards it into the SAME
+   * `financeDecision.decide`, because a commitment written from one door and
+   * a commitment written from the other must not be able to disagree.
+   */
+
+  /**
+   * A SECOND approved head for the same department.
+   *
+   * Without one, "the accountant forwards the allocation" cannot be proved:
+   * every line resolves to the only head there is, so dropping the forwarding
+   * entirely produces the identical commitment. The choice has to be able to
+   * differ from the default before choosing it means anything.
+   */
+  async function secondHead(s) {
+    const freight = await Acc_Ledger.create({
+      companyId: s.company._id, name: `Freight ${seq++}`,
+      groupId: s.consumables.groupId, groupName: s.consumables.groupName, nature: "expense",
+    });
+    await Acc_Budget.updateOne({ _id: s.budget._id }, {
+      $push: { items: {
+        ledgerId: freight._id, ledgerName: freight.name, nature: "expense",
+        department: "Tech", allocatedAmount: 100000,
+      } },
+    });
+    const fresh = await Acc_Budget.findById(s.budget._id).lean();
+    const item = fresh.items.find((i) => String(i.ledgerId) === String(freight._id));
+    return { freight, budgetLineId: String(item._id) };
+  }
+
+  test("the accountant door previews the allocation on its own session", async () => {
+    const s = await seed();
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/line-allocations`);
+
+    expect(r.status).toBe(200);
+    expect(r.body.allocation.lines.length).toBeGreaterThan(0);
+    expect(r.body.allocation.heads.length).toBeGreaterThan(0);
+    /* The heads an accountant may choose are this department's approved
+       budget LINES, not the chart of accounts. */
+    expect(r.body.heads.length).toBeGreaterThan(0);
+    expect(r.body.heads[0]).toHaveProperty("budgetLineId");
+    expect(r.body.heads[0]).toHaveProperty("available");
+  });
+
+  test("an editor cannot read it — the write gate covers the preview too", async () => {
+    const s = await seed();
+    const r = await call(EDITOR, `/spend-approvals/${s.spend._id}/line-allocations`);
+    /* `orgAuth` + the module's own gate; an editor may enter vouchers, not
+       read what somebody is about to promise. */
+    expect([401, 403]).toContain(r.status);
+  });
+
+  test("approval forwards the exact line allocations, the note and the date", async () => {
+    const s = await seed();
+    /* Deliberately NOT the head this line resolves to on its own — otherwise
+       dropping the forwarding produces the identical commitment and the test
+       proves nothing. */
+    const { freight, budgetLineId } = await secondHead(s);
+    const doc = await SpendRequest.findById(s.spend._id).lean();
+    const lineId = String(doc.items[0]._id);
+    expect(String(s.budget.items[0]._id)).not.toBe(budgetLineId);
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, {
+      method: "POST",
+      body: {
+        note: "Approved for the Q3 run.",
+        expectedPaymentDate: "2026-11-30",
+        lineAllocations: { lines: [{
+          spendLineId: lineId, budgetLineId,
+          reason: "Inbound carriage, not consumables.",
+        }] },
+      },
+    });
+
+    expect(r.status).toBe(200);
+    const commitment = await Commitment.findOne({ spendRequestId: s.spend._id }).lean();
+    /* The allocation reached the shared decision — on the head the accountant
+       chose, not the one the request header carried. */
+    expect(commitment.allocations).toHaveLength(1);
+    expect(String(commitment.allocations[0].budgetLineId)).toBe(budgetLineId);
+    expect(commitment.allocations[0].ledgerName).toBe(freight.name);
+    expect(commitment.allocations[0].resolutionSource).toBe("manual_selection");
+    expect(commitment.allocations[0].resolutionReason).toMatch(/Inbound carriage/);
+    /* And the two fields the accountant screen owns survived the trip. */
+    expect(commitment.expectedPaymentDate).toBeInstanceOf(Date);
+    expect(commitment.expectedPaymentDate.toISOString()).toMatch(/^2026-11-30/);
+    const after = await SpendRequest.findById(s.spend._id).lean();
+    expect(after.history.some((h) => /Approved for the Q3 run/.test(h.note || ""))).toBe(true);
+  });
+
+  test("an unresolvable line is refused, with the reason, and promises nothing", async () => {
+    const s = await seed();
+    const doc = await SpendRequest.findById(s.spend._id).lean();
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, {
+      method: "POST",
+      body: {
+        lineAllocations: { lines: [{
+          spendLineId: String(doc.items[0]._id),
+          /* A budget line that is not this department's approved one. */
+          budgetLineId: String(new mongoose.Types.ObjectId()),
+          reason: "because",
+        }] },
+      },
+    });
+
+    expect(r.status).toBe(409);
+    expect(r.body.code).toBe("LINE_ALLOCATION_UNRESOLVED");
+    expect(r.body.problems[0].code).toBe("HEAD_NOT_APPROVED");
+    expect(await Commitment.countDocuments({ spendRequestId: s.spend._id })).toBe(0);
+    expect((await SpendRequest.findById(s.spend._id).lean()).status).toBe("pending_finance");
+  });
+
+  test("rejection needs no allocation at all", async () => {
+    const s = await seed();
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/reject`, {
+      method: "POST", body: { note: "Not this quarter." },
+    });
+
+    /* Refusing a request nobody has allocated is a perfectly good answer. */
+    expect(r.status).toBe(200);
+    expect((await SpendRequest.findById(s.spend._id).lean()).status).toBe("rejected");
+    expect(await Commitment.countDocuments({ spendRequestId: s.spend._id })).toBe(0);
+  });
+
+  test("a single-head approval still reads as one head", async () => {
+    const s = await seed();
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, { method: "POST" });
+
+    expect(r.status).toBe(200);
+    expect(r.body.allocation.headCount).toBe(1);
+    /* The message names the head, because there is exactly one to name. */
+    expect(r.body.message).toMatch(/committed against/i);
+    const c = await Commitment.findOne({ spendRequestId: s.spend._id }).lean();
+    expect(c.allocationMode).toBe("single_head");
+    expect(c.ledgerName).toBeTruthy();
+  });
+
+  test("a multi-head approval names no single head in its message", async () => {
+    const s = await seed();
+    const { budgetLineId } = await secondHead(s);
+    /* A second line, so two heads genuinely apply. */
+    await SpendRequest.updateOne({ _id: s.spend._id }, {
+      $push: { items: {
+        name: "Inbound carriage", whyNeeded: "delivery", quantity: 1, unit: "trip",
+        rate: 500, amount: 500, lineTotal: 500,
+      } },
+      $set: { grandTotal: 2270, totalAmount: 2000 },
+    });
+    const doc = await SpendRequest.findById(s.spend._id).lean();
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, {
+      method: "POST",
+      body: { lineAllocations: { lines: [{
+        spendLineId: String(doc.items[1]._id), budgetLineId,
+        reason: "Carriage.",
+      }] } },
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.body.allocation.headCount).toBe(2);
+    /* Naming one of two would be a sentence an accountant reconciles against
+       and finds untrue. */
+    expect(r.body.message).toMatch(/across 2 heads/i);
+    expect(r.body.message).not.toMatch(/committed against/i);
+
+    const c = await Commitment.findOne({ spendRequestId: s.spend._id }).lean();
+    expect(c.allocationMode).toBe("line_wise");
+    expect(c.ledgerName).toBeUndefined();
+    expect(c.allocations).toHaveLength(2);
+  });
+
+  test("two lines sharing a head are assessed together", async () => {
+    const s = await seed();
+    /* One head, 100,000 approved. Two lines of 1,770 and 60,000 → 61,770
+       against it, checked ONCE. */
+    await SpendRequest.updateOne({ _id: s.spend._id }, {
+      $push: { items: {
+        name: "Bulk consumables", whyNeeded: "run", quantity: 1, unit: "lot",
+        rate: 60000, amount: 60000, lineTotal: 60000,
+      } },
+      $set: { grandTotal: 61770, totalAmount: 61500 },
+    });
+
+    const r = await call(OWNER, `/spend-approvals/${s.spend._id}/line-allocations`);
+
+    expect(r.status).toBe(200);
+    const heads = r.body.allocation.heads;
+    expect(heads).toHaveLength(1);
+    expect(heads[0].lineCount).toBe(2);
+    expect(heads[0].amount).toBe(61770);
+  });
+
+  test("approving twice does not write a second commitment", async () => {
+    const s = await seed();
+    await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, { method: "POST" });
+    await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, { method: "POST" });
+    expect(await Commitment.countDocuments({ spendRequestId: s.spend._id })).toBe(1);
+  });
+
   test("an over-budget approval is allowed and goes on the record as one", async () => {
     /* Finance may always say yes. What changes is what it is recorded as —
        the distinction that matters when somebody asks how the year went over. */
     const s = await seed();
-    await SpendRequest.updateOne(
-      { _id: s.spend._id },
-      { $set: { "budgetSnapshot.availableAfter": -500 } },
+    /* ── OVER BUDGET FOR REAL, NOT BY POKING THE SNAPSHOT ─────────────────
+       This used to set `budgetSnapshot.availableAfter` on the request header
+       and expect the approval to read it. Since line-wise allocation, the
+       verdict is computed per HEAD from live availability — which is the
+       point: a header snapshot taken when Store priced the quote can be
+       stale by the time finance answers, and with several heads it could only
+       ever describe one of them.
+
+       So the head is genuinely too small. ₹1,770 approved against ₹1,000. */
+    const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
+    await Acc_Budget.updateOne(
+      { _id: s.budget._id, "items._id": s.spend.budgetLineId },
+      { $set: { "items.$.allocatedAmount": 1000 } },
     );
+
     const r = await call(OWNER, `/spend-approvals/${s.spend._id}/approve`, { method: "POST" });
     expect(r.status).toBe(200);
     const doc = await SpendRequest.findById(s.spend._id).lean();
     expect(doc.budgetApprovalKind).toBe("over_budget");
+    /* And it says by how much, per head. */
+    expect(r.body.allocation.heads[0].shortfall).toBeGreaterThan(0);
   });
 });
 
