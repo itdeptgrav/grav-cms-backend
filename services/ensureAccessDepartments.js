@@ -126,6 +126,29 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: "ppcdepartments",
     legacyUserType: "ppc", dashboardPath: "/ppc",
     description: "Confirmed-order planning, engineering release receipts and capacity booking." },
+  /* Trimming and Ironing (24 Sep 2026): the two finishing stages between
+     sewing and packing, each its own portal with its own people. No legacy
+     collection — nobody ever signed in to them before this — so, like
+     Merchandising and IE, this registers the department and nothing else.
+     People reach them through a DepartmentRole grant or an employee's
+     department assignment, exactly as any other department. Their config
+     (names, labels, paths) is services/manufacturing/finishingStages.js. */
+  { key: "printing", slug: "printing", name: "Printing", sortOrder: 93,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "printing", dashboardPath: "/printing/dashboard",
+    description: "Screen and transfer printing, piece by piece." },
+  { key: "washing", slug: "washing", name: "Washing", sortOrder: 94,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "washing", dashboardPath: "/washing/dashboard",
+    description: "Garment washing and drying, piece by piece." },
+  { key: "trimming", slug: "trimming", name: "Trimming", sortOrder: 95,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "trimming", dashboardPath: "/trimming/dashboard",
+    description: "Thread trimming and finishing checks, piece by piece." },
+  { key: "ironing", slug: "ironing", name: "Ironing", sortOrder: 96,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "ironing", dashboardPath: "/ironing/dashboard",
+    description: "Pressing and folding, piece by piece." },
   { key: "packaging", slug: "packaging-dispatch", name: "Packaging & Dispatch", sortOrder: 120,
     legacyModel: "PackagingDispatchDepartment", legacyCollection: "packagingdispatchdepartments",
     legacyUserType: "packaging-dispatch", dashboardPath: "/packaging-dispatch/dashboard",

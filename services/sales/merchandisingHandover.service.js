@@ -65,6 +65,7 @@ const processRequirement = require("./lineProcessRequirement");
    for why this moved out of the Central Costing module. */
 const { ownershipProofFor } = require("../integration/styleOwnershipProof.service");
 const { fail } = require("../storePurchase/errors");
+const { resolveOrderFulfilmentModel } = require("../../constants/orderFulfilment");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -223,6 +224,9 @@ function lineView(item, style, currentVersion) {
     styleId: str(item.sampleStyleId),
     styleRef: style ? (str(style.styleCode) || str(style.sampleStyleId)) : "",
     productName: style ? str(style.productName) : str(item.stockItemName),
+    fulfilmentModel: resolveOrderFulfilmentModel(
+      item.fulfilmentModel || p.fulfilmentModel,
+    ),
     variantLabel: style ? str(style.variantLabel) : "",
     currentVersion: currentVersion
       ? {
@@ -386,6 +390,9 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
   const executionProjection = {
     orderRef: handoverRef,
     orderLineRef: handoverLineRef,
+    fulfilmentModel: resolveOrderFulfilmentModel(
+      item.fulfilmentModel || request.fulfilmentModel,
+    ),
     styleRef: str(style.styleCode) || str(style.sampleStyleId),
     /* The stable identity behind that display code. See the projection. */
     ...(style?._id ? { sampleStyleId: style._id } : {}),

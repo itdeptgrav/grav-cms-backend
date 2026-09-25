@@ -74,8 +74,16 @@ async function unavailableOnFailure(fail, what, runQuery) {
 const MEMBERSHIP_SOURCES = Object.freeze({
   MEMBERSHIP_RECORD: "MEMBERSHIP_RECORD",
   SINGLE_COMPANY_DEPLOYMENT: "SINGLE_COMPANY_DEPLOYMENT",
+  /* The deployment's own company (`Acc_Company.isPrimary`), used for an actor
+     with no membership while the legacy migration window is open. */
+  PRIMARY_COMPANY_LEGACY: "PRIMARY_COMPANY_LEGACY",
   SERVICE: "SERVICE",
 });
+
+/* The same switch services/storePurchase/tenantContext.service.js defines as
+   LEGACY_READTHROUGH, read here directly because that module requires this
+   one (a require cycle otherwise). One env var, one meaning everywhere. */
+const legacyWindowOpen = () => process.env.STORE_PURCHASE_STRICT_TENANCY !== "1";
 
 /** Loaded lazily: the accountant master models are a large module and no
  *  caller should pay for it at require time. */
@@ -189,7 +197,7 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
   const anyMembershipExists = await unavailableOnFailure(fail, "membership existence check", () =>
     SpCompanyMembership.exists({ isActive: true }));
   const companies = await unavailableOnFailure(fail, "company lookup", () =>
-    Acc_Company.find({}).select("_id").limit(2).lean());
+    Acc_Company.find({}).select("_id isPrimary isActive").limit(20).lean());
 
   if (!anyMembershipExists && companies.length === 1) {
     return {
@@ -198,6 +206,34 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
       membershipSource: MEMBERSHIP_SOURCES.SINGLE_COMPANY_DEPLOYMENT,
       membership: null,
     };
+  }
+
+  /* ── 2b. The deployment's own company, for the migration window ──────────
+   *
+   * The rule above stopped applying on 21 Sep 2026 — not because anybody was
+   * given a membership, but because the IE demo seeder created two more
+   * companies and a dozen demo memberships. From that moment every GRAV
+   * employee without a membership row (which was all of them) fell through to
+   * "not linked to a company" in Store, Merchandising, Packaging and the
+   * finishing portals, and screens that swallowed the 403 showed empty floors.
+   *
+   * `Acc_Company.isPrimary` is set on the GRAV Clothing record itself and on
+   * nothing else — it names the company this deployment IS. While the legacy
+   * migration window is open, an actor with no membership resolves to that
+   * one company, and only if exactly one active company is marked primary. A
+   * person who HAS memberships is never affected (they returned above), and
+   * the demo companies are never reachable this way. Closes with the window:
+   * set STORE_PURCHASE_STRICT_TENANCY=1 once memberships are populated. */
+  if (legacyWindowOpen()) {
+    const primary = companies.filter((c) => c.isPrimary && c.isActive !== false);
+    if (primary.length === 1) {
+      return {
+        companyId: primary[0]._id,
+        permittedSiteIds: [],
+        membershipSource: MEMBERSHIP_SOURCES.PRIMARY_COMPANY_LEGACY,
+        membership: null,
+      };
+    }
   }
 
   /* ── 3. Fail closed ───────────────────────────────────────────────────── */

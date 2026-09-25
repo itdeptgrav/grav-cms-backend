@@ -157,20 +157,30 @@ async function loadRegister(file, session = null) {
  * copy here would be a second place for it to live and a first place for it to
  * go stale — a register saying "approved" beside a family whose approval was
  * superseded an hour ago.
+ *
+ * ── THE ONE RESOLVER, AND WHY IT TAKES A SESSION ──────────────────────────
+ * The execution pack asks this same function when it snapshots the approval
+ * position, rather than carrying a second copy of the rule. That call happens
+ * inside the pack's own transaction, and the pack's other revision reads are
+ * already session-bound, so this one takes the session too: two reads of the
+ * same revisions, one inside the transaction's snapshot and one outside it,
+ * could answer differently and the pack would record a position no single
+ * moment ever had. Callers that are not in a transaction pass nothing.
  */
-async function resolveInternal(file, category) {
+async function resolveInternal(file, category, session = null) {
   const family = selection.FAMILIES[INTERNAL_SOURCE[category]];
   if (!family) {
     return { status: OBSERVED_STATUS.AWAITING_SOURCE_RECORD, reason: "No Merchandising record answers this category." };
   }
+  const inSession = (q) => (session ? q.session(session) : q);
   const [approved, working] = await Promise.all([
-    family.model.findOne({
+    inSession(family.model.findOne({
       companyId: file.companyId, fileId: file._id, state: REVISION_STATE.APPROVED,
-    }).lean(),
-    family.model.findOne({
+    })).lean(),
+    inSession(family.model.findOne({
       companyId: file.companyId, fileId: file._id,
       state: { $in: [REVISION_STATE.DRAFT, REVISION_STATE.SUBMITTED] },
-    }).lean(),
+    })).lean(),
   ]);
 
   if (approved) {

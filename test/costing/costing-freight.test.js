@@ -37,7 +37,7 @@ const CostingVersion = require("../../models/CMS_Models/Costing/CostingVersion")
 
 const freight = require("../../services/centralCosting/freight.service");
 const SupplierOffer = require("../../models/CMS_Models/Inventory/Sourcing/SupplierOffer");
-const { seedSourceBacked, configureProduction, approveGstPolicy, prepareForCosting, assembleForCosting } = require("./helpers/sourceBacked");
+const { approvePackingFacts, seedSourceBacked, configureProduction, approveGstPolicy, prepareForCosting, assembleForCosting } = require("./helpers/sourceBacked");
 
 let server, base, seq = 0;
 
@@ -160,7 +160,7 @@ async function world({
   /* A real material line, so a costing exists even when freight produces
      none — the "nobody has said" case would otherwise fail for having no
      lines at all, which is a different refusal. */
-  const seeded = await seedSourceBacked(w.co._id, { withOperation: false, freight: null });
+  const seeded = await seedSourceBacked(w.co._id, { freight: null });
   await configureProduction(w.co._id);
 
   const account = await Account.create({
@@ -174,7 +174,17 @@ async function world({
   await Enquiry.updateOne({ _id: seeded.enquiry._id }, { $set: { accountId: account._id } });
 
   const built = await lane(w, { accountId: account._id });
-  if (shipment) await SampleStyle.updateOne({ _id: seeded.style._id }, { $set: { "sample.shipment": shipment } });
+  /* ── THE APPROVED FACTS, NOT THE WORKING NOTE ────────────────────────
+     This wrote `sample.shipment`, which is R&D's unversioned working record.
+     A costing reads an APPROVED weighing (R&D's) and an APPROVED pack-out
+     (Merchandising's), so the fixture approves whichever the test states and
+     leaves the other absent — which is how these tests ask for the gap. */
+  if (shipment) {
+    await approvePackingFacts(seeded.style._id, {
+      packedWeightGrams: shipment.packedWeightGrams ?? null,
+      garmentsPerCarton: shipment.garmentsPerCarton ?? null,
+    });
+  }
 
   const terms = {
     ...(arrangement ? { arrangement } : {}),
@@ -281,19 +291,49 @@ describe("the delivery arrangement decides whether there is a cost at all", () =
     expect(v.cost.freightProvenance.arrangement).toBe("to_pay");
   });
 
-  test("the enquiry outranks the customer's standing term, and the record says which was used", async () => {
-    /* A customer who normally collects may ask for ONE order delivered.
-       Costing that order at the standing term puts freight on a garment
-       nobody is shipping — or leaves it off one we are. */
+  test("the customer's standing term is not applied to an enquiry nobody answered", async () => {
+    /* ── IT USED TO BE READ LIVE, AND THAT WAS THE BUG ─────────────────
+       The costing loaded `Account.freightArrangement` and fell back to it, so
+       editing the customer's standing term in November changed the
+       arrangement an existing draft had been built on — retrospectively, with
+       nothing recorded to say so. The account's terms are now offered to
+       Sales on the enquiry and copied when saved; an enquiry nobody answered
+       is unanswered, and the costing names Sales rather than borrowing a term
+       nobody applied to this order. */
     const standing = await world({ arrangement: null, accountFreight: "ex_works" });
-    const fromAccount = (await calc(standing)).body.versions[0];
+    const unanswered = (await calc(standing)).body.versions[0];
+    expect(unanswered.cost.freightProvenance).toBeUndefined();
+    expect(familyOf(unanswered, "freight").state).toBe("NEEDS_INPUT");
+  });
+
+  test("the record says whether the terms are the customer's usual ones or this deal's", async () => {
+    /* Applying the customer's usual terms and agreeing something for this
+       order are different claims, and the costing freezes which was made. */
+    const applied = await world({
+      arrangement: "ex_works", accountFreight: "ex_works", enquiryFreight: { source: "ACCOUNT" },
+    });
+    const fromAccount = (await calc(applied)).body.versions[0];
     expect(fromAccount.cost.freightProvenance.arrangement).toBe("ex_works");
     expect(fromAccount.cost.freightProvenance.arrangementSource).toBe("ACCOUNT");
 
-    const asked = await world({ arrangement: "to_pay", accountFreight: "ex_works" });
+    const asked = await world({
+      arrangement: "to_pay", accountFreight: "ex_works", enquiryFreight: { source: "ENQUIRY" },
+    });
     const fromEnquiry = (await calc(asked)).body.versions[0];
     expect(fromEnquiry.cost.freightProvenance.arrangement).toBe("to_pay");
     expect(fromEnquiry.cost.freightProvenance.arrangementSource).toBe("ENQUIRY");
+  });
+
+  test("a later change to the customer's standing terms cannot restate a saved enquiry", async () => {
+    const x = await world({
+      arrangement: "to_pay", accountFreight: "to_pay", enquiryFreight: { source: "ACCOUNT" },
+    });
+    /* The customer renegotiates: everything they ship from now on is
+       delivered. The order already agreed stays as it was agreed. */
+    await Account.updateOne({ _id: x.seeded.accountId || undefined }, { $set: { freightArrangement: "delivered" } });
+    await Account.updateMany({}, { $set: { freightArrangement: "delivered" } });
+    const after = (await calc(x)).body.versions[0];
+    expect(after.cost.freightProvenance.arrangement).toBe("to_pay");
   });
 
   test("prepaid is a commercial decision nobody in this codebase has made", async () => {
@@ -1038,7 +1078,7 @@ describe("whether a material rate already included getting it here", () => {
   /* A world with a real material line, so there is a quotation to ask of. */
   const material = async (freightTerms) => {
     const w = await company();
-    const seeded = await seedSourceBacked(w.co._id, { withOperation: false, freight: null });
+    const seeded = await seedSourceBacked(w.co._id, { freight: null });
     await configureProduction(w.co._id);
     if (freightTerms === null) {
       await SupplierOffer.collection.updateOne(

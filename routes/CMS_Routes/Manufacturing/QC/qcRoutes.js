@@ -17,6 +17,8 @@ const qcStages                   = require("../../../../services/qcStages");
 const qcViewer                   = require("../../../../services/qcViewer");
 const QCDefectType               = require("../../../../models/CMS_Models/Manufacturing/QC/QCDefectType");
 const QCOperationDefectMap       = require("../../../../models/CMS_Models/Manufacturing/QC/QCOperationDefectMap");
+const qcOperators                = require("../../../../services/qcOperators");
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const istDateString = (d = new Date()) => {
@@ -930,57 +932,88 @@ router.post("/save-inspection-offline", async (req, res) => {
   }
 });
 
-// ─── GET /piece-operators ──────────────────────────────────────────────────────
-// On-demand: given a barcode, returns every operator + machine + scan time
-// from ProductionTracking. Used by the QC overview "Fetch Operator" button.
+// ─── GET /piece-operators?barcode= ────────────────────────────────────────────
+// On demand — the "View operator" control on a defect. Every scan of this piece
+// from the scanners' own events (services/qcOperators.js says why not the
+// tracking read model), oldest first, with the operator's real name resolved by
+// either badge field, the machine, the operations active at that scan and the
+// time. The response shape predates the rewrite; only its source changed.
 router.get("/piece-operators", async (req, res) => {
   try {
-    const { barcode } = req.query;
+    const barcode = String(req.query.barcode || "").trim();
     if (!barcode) return res.status(400).json({ success: false, message: "barcode required" });
 
-    const scans = await ProductionTracking.aggregate([
-      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
-      { $unwind: "$machines" },
-      { $unwind: "$machines.operators" },
-      { $unwind: "$machines.operators.barcodeScans" },
-      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
-      { $lookup: { from: "machines", localField: "machines.machineId", foreignField: "_id", as: "_m" } },
-      { $project: {
-        _id:          0,
-        operatorId:   "$machines.operators.operatorIdentityId",
-        operatorName: "$machines.operators.operatorName",
-        activeOps:    "$machines.operators.barcodeScans.activeOps",
-        timeStamp:    "$machines.operators.barcodeScans.timeStamp",
-        machineName:  { $arrayElemAt: ["$_m.name", 0] },
-      }},
-      { $sort: { timeStamp: 1 } },
-    ]);
-
-    // Resolve names from Employee if operatorName is blank in the tracking doc
-    const missingIds = [...new Set(
-      scans.filter(s => !s.operatorName && s.operatorId).map(s => s.operatorId)
-    )];
-    let empNameMap = new Map();
-    if (missingIds.length) {
-      const emps = await Employee.find({ identityId: { $in: missingIds } })
-        .select("identityId firstName middleName lastName").lean();
-      empNameMap = new Map(emps.map(e => [
-        e.identityId,
-        [e.firstName, e.middleName, e.lastName].filter(Boolean).join(" ").trim() || e.identityId,
-      ]));
-    }
-
-    const operators = scans.map(s => ({
-      operatorId:   s.operatorId,
-      operatorName: s.operatorName || empNameMap.get(s.operatorId) || s.operatorId || "Unknown",
-      activeOps:    Array.isArray(s.activeOps) ? s.activeOps : [],
-      timeStamp:    s.timeStamp,
-      machineName:  s.machineName || "—",
-    }));
-
-    res.json({ success: true, barcode, operators });
+    const scans = (await qcOperators.scansForBarcodes([barcode])).get(barcode) || [];
+    res.json({
+      success: true,
+      barcode,
+      source: "scanner",
+      operators: scans.map((s) => ({
+        operatorId:   s.operatorId,
+        operatorName: s.operatorName,
+        activeOps:    s.activeOps,
+        timeStamp:    s.scanTime,
+        machineName:  s.machineName || "—",
+      })),
+    });
   } catch (err) {
     console.error("[QC piece-operators]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /operator-defects?date=YYYY-MM-DD ────────────────────────────────────
+// (or ?from=&to=, at most 92 days)
+//
+// THE DAY'S DEFECTS BY THE OPERATOR WHO MADE THEM. Loaded only when asked for —
+// the overview shows a button, not the table — because it joins every defect
+// of the period against the scanner events for those pieces, and most visits
+// to the page never need it.
+//
+// Scoped exactly as /inspections is: an inspector sees the defects they
+// recorded, the QC owner sees the department's.
+router.get("/operator-defects", async (req, res) => {
+  try {
+    const DAY = /^\d{4}-\d{2}-\d{2}$/;
+    const date = DAY.test(req.query.date || "") ? req.query.date : null;
+    const from = DAY.test(req.query.from || "") ? req.query.from : null;
+    const to   = DAY.test(req.query.to   || "") ? req.query.to   : null;
+    let period;
+    if (date) period = { from: date, to: date };
+    else if (from || to) period = { from: from || to, to: to || from };
+    else { const t = istDateString(); period = { from: t, to: t }; }
+    if (period.from > period.to) [period.from, period.to] = [period.to, period.from];
+    const spanDays = Math.round((Date.parse(period.to) - Date.parse(period.from)) / 86400000) + 1;
+    if (spanDays > 92) {
+      return res.status(400).json({ success: false, message: "Choose a period of at most 92 days." });
+    }
+
+    const [viewer, deptConfigured] = await Promise.all([qcViewer.resolveViewer(req), qcViewer.departmentConfigured()]);
+    const filter = {
+      status: { $ne: "passed" },
+      date: period.from === period.to ? period.from : { $gte: period.from, $lte: period.to },
+    };
+    qcViewer.applyViewerFilter(filter, qcViewer.viewerFilter(viewer, { departmentConfigured: deptConfigured }));
+
+    const inspections = await QCInspection.find(filter)
+      .select("barcodeId date status defects workOrderId workOrderShortId manufacturingOrderId moRequestId stageName inspectedAt inspectedByQCName")
+      .sort({ inspectedAt: 1 })
+      .lean();
+
+    const woIds = [...new Set(inspections.map((i) => i.workOrderId).filter(Boolean).map(String))];
+    const moIds = [...new Set(inspections.map((i) => i.manufacturingOrderId).filter(Boolean).map(String))];
+    const [scansByBarcode, wos, mos] = await Promise.all([
+      qcOperators.scansForBarcodes(inspections.map((i) => i.barcodeId)),
+      woIds.length ? WorkOrder.find({ _id: { $in: woIds } }).select("workOrderNumber stockItemName").lean() : [],
+      moIds.length ? CustomerRequest.find({ _id: { $in: moIds } }).select("requestId customerInfo.name").lean() : [],
+    ]);
+    const workOrderById = new Map(wos.map((w) => [String(w._id), { workOrderNumber: displayWorkOrderNumber(w), stockItemName: w.stockItemName || "" }]));
+    const orderById = new Map(mos.map((m) => [String(m._id), { moNumber: m.requestId ? `MO-${m.requestId}` : "", customerName: m.customerInfo?.name || "" }]));
+
+    const report = qcOperators.buildOperatorDefectReport({ inspections, scansByBarcode, workOrderById, orderById });
+    res.json({ success: true, period, ...report });
+  } catch (err) {
+    console.error("[QC operator-defects]", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });

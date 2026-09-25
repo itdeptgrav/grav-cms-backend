@@ -32,7 +32,8 @@ const developmentChargePolicy = require("../../../services/centralCosting/develo
 const contingencyPolicy = require("../../../services/centralCosting/contingencyPolicy.service");
 const marginPolicy = require("../../../services/centralCosting/marginPolicy.service");
 const {
-  POLICY_KEYS, ADVANCE_TREATMENTS, DAY_COUNT_BASES, MACHINE_BURDEN_TREATMENTS,
+  POLICY_KEYS, ADVANCE_TREATMENTS,
+  FINANCING_START_EVENTS, DAY_COUNT_BASES, MACHINE_BURDEN_TREATMENTS,
   GST_TREATMENTS, DEVELOPMENT_CALCULATIONS, CONTINGENCY_MODES,
   PAYLOAD_FIELD: BOARD_PAYLOAD_FIELD,
 } = require("../../../models/CMS_Models/Board/BoardPolicy");
@@ -147,6 +148,8 @@ router.get("/vocabulary", requireCompany, requireBoard, handle(async (req, res) 
   policyKeys: [...POLICY_KEYS],
   bases: [...BASIS_KEYS],
   advanceTreatments: [...ADVANCE_TREATMENTS],
+  /* The operational events the Board can measure financing from. */
+  financingStartEvents: [...FINANCING_START_EVENTS],
   dayCountBases: [...DAY_COUNT_BASES],
   machineBurdenTreatments: [...MACHINE_BURDEN_TREATMENTS],
   gstTreatments: [...GST_TREATMENTS],

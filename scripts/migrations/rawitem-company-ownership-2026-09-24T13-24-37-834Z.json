@@ -1,0 +1,32 @@
+{
+  "at": "2026-09-24T13:24:37.834Z",
+  "companyId": "6a08040a1fecacc9bb7149c2",
+  "companyName": "GRAV CLOTHING PVT LTD",
+  "applied": true,
+  "before": {
+    "total": 304,
+    "unowned": 301,
+    "ownedByTarget": 3,
+    "ownedByOthers": 0,
+    "collidesWithTarget": [],
+    "duplicatesWithinUnowned": [],
+    "withoutCode": [],
+    "wouldUpdate": 301,
+    "safe": true
+  },
+  "after": {
+    "total": 304,
+    "unowned": 0,
+    "ownedByTarget": 304,
+    "ownedByOthers": 0,
+    "collidesWithTarget": [],
+    "duplicatesWithinUnowned": [],
+    "withoutCode": [],
+    "wouldUpdate": 0,
+    "safe": true
+  },
+  "result": {
+    "matchedCount": 301,
+    "modifiedCount": 301
+  }
+}

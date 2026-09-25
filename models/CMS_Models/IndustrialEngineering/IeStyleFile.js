@@ -61,6 +61,15 @@ const EVENT_TYPES = [
      applies. Its own event so the trail never records a route decision as a
      bulletin row edit. */
   "PROCESS_ROUTE_EDITED",
+  /* ── THE FILE RE-BASED ONTO A NEWER R&D REVISION ──────────────────────
+     R&D approving a newer technical revision used to be the end of the road:
+     the file stayed frozen against the revision it was opened from, every
+     submission was refused as superseded, and the costing side said
+     IE_TECHNICAL_APPROVAL_STALE for ever. These two events are the explicit
+     way forward — somebody opened a successor cycle against the newer
+     revision, and somebody reviewed what the move changed. */
+  "SOURCE_REBASED",
+  "SOURCE_REBASE_REVIEWED",
 ];
 
 const LIMITS = Object.freeze({
@@ -236,6 +245,63 @@ const ieStyleFileSchema = new mongoose.Schema(
       /* Read off the snapshot once, so a reader does not have to walk Mixed
          data to answer "did the source have a route at all". */
       operationCount: { type: Number, default: 0, min: 0 },
+    },
+
+    /* ── THE SUCCESSOR CYCLE, WHEN THERE IS ONE ──────────────────────────
+       `source` above is the revision this file was OPENED from, and it is
+       never rewritten: it is the provenance of the file itself and of every
+       version already approved against it. When R&D approves a newer revision
+       and IE deliberately moves onto it, the new basis is recorded HERE, as a
+       second fact beside the first, and the pair reads as the history it is.
+
+       Absent on every file that has never been re-based — and absent is the
+       truth, not cycle 1 written out: a `default` would assert that every
+       legacy file had been considered and left alone.
+
+       Why not a second file: `{companyId, sampleStyleId}` is unique by
+       design, and the index is what makes opening a file idempotent under two
+       simultaneous requests. Re-basing does not need a second file — it needs
+       a second SOURCE, and the versions frozen against the first one are
+       already immutable documents of their own. */
+    sourceCycle: {
+      /* 2 for the first successor. Cycle 1 is `source` and is never written
+         here, so the number cannot disagree with which field is in force. */
+      cycleNo: { type: Number, min: 2 },
+      technicalRevision: { type: Number, min: 0 },
+      submittedAt: { type: Date },
+      approvedAt: { type: Date },
+      snapshot: { type: mongoose.Schema.Types.Mixed },
+      operationCount: { type: Number, min: 0 },
+
+      openedAt: { type: Date },
+      openedBy: { type: mongoose.Schema.Types.ObjectId },
+      openedByName: { type: String, trim: true },
+      reason: { type: String, trim: true, maxlength: LIMITS.NOTE },
+
+      /* What this cycle succeeded, so the chain is readable without inferring
+         it from timestamps. The predecessor VERSION keeps its own state — it
+         is superseded by the approval of the next one, exactly as any other
+         successor version is, and never by this. */
+      predecessorTechnicalRevision: { type: Number, min: 0 },
+      predecessorVersionId: { type: mongoose.Schema.Types.ObjectId, ref: "IeBulletinVersion" },
+      predecessorVersionNo: { type: Number, min: 1 },
+
+      /* ── WHAT MOVED, AND WHAT HAS TO BE LOOKED AT AGAIN ────────────────
+         The draft rows carry forward by their own `rowId` — they are IE's
+         work and R&D's numbers do not author them. What R&D's change DOES do
+         is put specific rows back in question, and those are named here
+         rather than left to a reader to work out. A submission is refused
+         while any of them stands, so "carried forward" can never quietly mean
+         "approved again". */
+      review: {
+        materialsChanged: { type: Boolean },
+        operationsChanged: { type: Boolean },
+        requiredRowIds: { type: [String], default: undefined },
+        changes: { type: mongoose.Schema.Types.Mixed },
+        acknowledgedAt: { type: Date },
+        acknowledgedBy: { type: mongoose.Schema.Types.ObjectId },
+        acknowledgedByName: { type: String, trim: true },
+      },
     },
 
     status: { type: String, enum: FILE_STATUS, default: "DRAFT", required: true },

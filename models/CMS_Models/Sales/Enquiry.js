@@ -22,8 +22,19 @@
 // fields — nothing here needs migrating when they do.
 
 const mongoose = require("mongoose");
+const { ORDER_FULFILMENT_MODELS } = require("../../../constants/orderFulfilment");
 
 const { ensureProductLineIdentities } = require("./enquiryProductLineIdentity");
+/* One definition, shared with the Account's standing plan. */
+const { paymentPlanRow } = require("./paymentPlanRow");
+const {
+  BRANDING_TYPES,
+  ARTWORK_STATES,
+  SIZE_UNITS,
+  DEFAULT_SIZE_UNIT,
+  LEGACY_BRANDING_SOURCES,
+  ensureBrandingRequirementIdentities,
+} = require("./enquiryBrandingRequirement");
 const {
   ENQUIRY_STATUS_CODES,
   ENQUIRY_SOURCE_CODES,
@@ -35,7 +46,10 @@ const {
   /* The same four codes the Account carries. One vocabulary, so an enquiry's
      answer and the customer's standing term are comparable. */
   FREIGHT_ARRANGEMENT_CODES,
+  TRANSPORT_MODE_CODES,
+  PREPAID_TREATMENT_CODES,
   PAYMENT_DUE_FROM,
+  PAYMENT_TERM_SHAPE_CODES,
 } = require("../../../constants/crm");
 
 const actorRef = () => ({
@@ -115,6 +129,44 @@ const enquirySchema = new mongoose.Schema(
     // Salesperson-facing title, e.g. "New staff uniforms for ITC Bhubaneswar".
     title: { type: String, trim: true },
 
+    // Commercial classification only. In this first slice it is a persistent
+    // tag; costing, procurement, inventory and accounting behavior are
+    // deliberately unchanged.
+    fulfilmentModel: {
+      type: String,
+      enum: ORDER_FULFILMENT_MODELS,
+      default: "FULL_PACKAGE",
+      index: true,
+    },
+
+    /* ── THIS ORDER'S OPERATIONAL TIMELINE ──────────────────────────────
+       When each event is expected to happen for THIS order. Two things read
+       it and neither can work without it:
+
+         · the payment plan, whose every step is "so many days before or
+           after" one of these events;
+         · financing, which is the calendar distance from the Board's chosen
+           start event to each of those due dates.
+
+       Every field is optional and NONE is defaulted. An undated event is a
+       named gap with an owner — Store commits the fabric, Production
+       schedules the line, Accounts raises the invoice — and a costing waits
+       for them rather than inventing a date on their behalf. A financing
+       figure built on an invented date is a price nobody can defend.
+
+       Dates are EXPECTED until the event happens; a caller that knows the
+       real one passes it in (`services/sales/orderSchedule.service.js`). */
+    schedule: {
+      orderConfirmation: { type: Date },
+      proforma: { type: Date },
+      materialCommitment: { type: Date },
+      productionStart: { type: Date },
+      dispatch: { type: Date },
+      billOfLading: { type: Date },
+      invoice: { type: Date },
+      delivery: { type: Date },
+    },
+
     // ── Dates & source ──────────────────────────────────────────────────────
     enquiryDate: { type: Date, default: Date.now },
     source: { type: String, enum: ENQUIRY_SOURCE_CODES },
@@ -174,6 +226,39 @@ const enquirySchema = new mongoose.Schema(
          anchor cannot be turned into a financing cost. */
       creditDaysFrom: { type: String, enum: PAYMENT_DUE_FROM.map((p) => p.code) },
 
+      /* ── THE AGREEMENT'S SHAPE, IN THE CUSTOMER'S OWN TERMS ─────────
+         "Half up front, the rest when it ships" is what was agreed; the three
+         fields above are what it MEANS, and they remain the only thing a
+         financing cost is worked out from. The shape is carried because the
+         figures cannot hold every distinction: a balance due BEFORE dispatch
+         and one due ON dispatch are both zero days from dispatch, and no
+         customer would call those the same agreement.
+
+         Optional. A record saved before this existed derives its shape from
+         the figures it already carries — see the resolver's `deriveShape`. */
+      shape: { type: String, enum: PAYMENT_TERM_SHAPE_CODES },
+
+      /* ── THE PLAN THIS ORDER IS PAID IN ─────────────────────────────
+         The tranches, copied from the customer's standing plan when Sales
+         applied it and editable for this one deal. Each row carries the
+         event it is due against and how far from it — and, once this order
+         knows the date of that event, what date that actually falls on.
+
+         An expected date is RESOLVED, never typed: the order's own canonical
+         date plus or minus the agreed offset, recomputed whenever the
+         order's dates move, and absent while the order has not dated that
+         event yet. It is shown and printed; it is never what the financing
+         charge is worked out from — that is the agreed offset, so a price
+         cannot move because somebody filled in a field.
+
+         Absent on every record written before plans existed. Those are
+         priced from the two figures above, and their calculation says so
+         (LEGACY_SIMPLE). */
+      plan: {
+        type: [paymentPlanRow({ expectedDate: { type: Date } })],
+        default: undefined,
+      },
+
       /* ── WHERE THESE NUMBERS CAME FROM ──────────────────────────────
          `ACCOUNT` — copied from the customer's standing terms unchanged.
          `ENQUIRY` — Sales agreed something different for this order.
@@ -186,6 +271,16 @@ const enquirySchema = new mongoose.Schema(
       accountDefaultAtConfirmation: {
         advancePercent: { type: Number, min: 0, max: 100 },
         creditDays: { type: Number, min: 0 },
+        creditDaysFrom: { type: String, enum: PAYMENT_DUE_FROM.map((p) => p.code) },
+        /* The agreement the customer's standing terms named at the time. The
+           figures alone cannot carry it: "balance before dispatch" and
+           "balance on dispatch" are 40% and no outstanding days either way,
+           so without this an override against one reads as agreement with
+           the other. */
+        shape: { type: String, enum: PAYMENT_TERM_SHAPE_CODES },
+        /* And the plan it stood on, row for row. An override is only legible
+           as a difference if what it differs FROM is kept. */
+        plan: { type: [paymentPlanRow()], default: undefined },
       },
 
       /* ── FINANCING GENUINELY NOT APPLICABLE ─────────────────────────
@@ -206,12 +301,21 @@ const enquirySchema = new mongoose.Schema(
 
     freight: {
       /* `prepaid | to_pay | ex_works | delivered`, the codes already in
-         `constants/crm.js`. Absent means "ask the account". */
+         `constants/crm.js`.
+
+         ── ABSENT NO LONGER MEANS "ASK THE ACCOUNT" ─────────────────────
+         It used to: the costing read `Account.freightArrangement` live and
+         fell back to it, so editing the customer's standing term changed what
+         an existing draft costing had been built on, retrospectively and
+         silently. The account's terms are now OFFERED to Sales and copied
+         here when saved (services/sales/deliveryTermsResolution.service.js).
+         Absent means nobody has answered, which the costing names as a gap
+         owned by Sales. */
       arrangement: { type: String, enum: FREIGHT_ARRANGEMENT_CODES },
       /* How it travels. There was nowhere to record this before, and a
          quotation is quoted for a mode — road and air on one lane are
          different rates and different transporters. */
-      mode: { type: String, enum: ["ROAD", "RAIL", "AIR", "SEA", "COURIER"] },
+      mode: { type: String, enum: TRANSPORT_MODE_CODES },
       /* ── THE SHIPPING ADDRESS, CHOSEN, NEVER ASSUMED ────────────────
          A `CRMAddress` of this account. Billing and shipping are already
          separate records precisely because they differ, so nothing here
@@ -228,8 +332,32 @@ const enquirySchema = new mongoose.Schema(
       deliveryCount: { type: Number, min: 1 },
       /* Answering the one thing the arrangement codes cannot: whether
          freight the company prepays is inside the price or billed on. */
-      prepaidTreatment: { type: String, enum: ["IN_PRICE", "RECOVERED_SEPARATELY"] },
+      prepaidTreatment: { type: String, enum: PREPAID_TREATMENT_CODES },
       notes: { type: String, trim: true, maxlength: 1000 },
+
+      /* ── WHERE THESE TERMS CAME FROM ────────────────────────────────
+         The same two answers `paymentTerms.source` carries, for the same
+         reason: `ACCOUNT` is the customer's standing terms applied unchanged,
+         `ENQUIRY` is something agreed for this order. Stored rather than
+         derived, because the Account may since have moved and the claim is
+         about what was agreed THEN. */
+      source: { type: String, enum: ["ACCOUNT", "ENQUIRY"] },
+      /* What the Account said at the moment of saving, so an override stays
+         legible as a difference after the Account changes again. */
+      accountDefaultAtSave: {
+        arrangement: { type: String, enum: FREIGHT_ARRANGEMENT_CODES },
+        mode: { type: String, enum: TRANSPORT_MODE_CODES },
+        shippingAddressId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMAddress" },
+        prepaidTreatment: { type: String, enum: PREPAID_TREATMENT_CODES },
+      },
+      /* The customer's incoterm as it read when these terms were saved. Free
+         text everywhere in this system and never parsed — copied so the
+         costing has no reason to read the Account live. */
+      incoterm: { type: String, trim: true },
+      /* Saving is the deliberate act for delivery, as confirming is for
+         payment. An enquiry nobody has saved is unanswered. */
+      savedAt: { type: Date },
+      savedBy: actorRef(),
     },
 
     // ── Products (Chunk 2) + per-product garment spec (Chunk 3) ─────────────
@@ -253,6 +381,15 @@ const enquirySchema = new mongoose.Schema(
        enquiryProductLineIdentity.js for how it is minted and why a client can
        name one but never invent one. */
     productLineRef: { type: String, trim: true, index: true },
+
+          // This classification belongs to the product line, because one
+          // enquiry may mix full-package garments and customer-supplied Job
+          // Work. Historical rows may omit it; readers first honour the
+          // short-lived order-wide tag, then fall back to FULL_PACKAGE.
+          fulfilmentModel: {
+            type: String,
+            enum: ORDER_FULFILMENT_MODELS,
+          },
 
           product: { type: String, trim: true, required: true },
           /**
@@ -320,11 +457,74 @@ const enquirySchema = new mongoose.Schema(
           fit: { type: String, trim: true },
           sizeRange: { type: String, trim: true },
 
-          // Branding / decoration
+          /* ── BRANDING / DECORATION — THE OLD SHAPE ───────────────────────
+             Three booleans and one placement string. They cannot express what
+             a customer actually asks for: a left-chest embroidered logo AND a
+             back print are two jobs, with two artworks, two placements and two
+             sizes, and the customer's artwork had nowhere to live at all.
+
+             KEPT, NOT REMOVED. Every enquiry raised before `brandingRequirements`
+             holds its branding here and nowhere else, and these four fields are
+             what the R&D brief email, the costing workbook and two PDF
+             generators read. A save that carries structured requirements now
+             re-derives them from that list (see `legacyMirror`), so an old
+             reader keeps telling the truth about a product captured the new
+             way. Nothing reads them back into the structured list. */
           logo: { type: Boolean, default: false },
           embroidery: { type: Boolean, default: false },
           printing: { type: Boolean, default: false },
           brandingPlacement: { type: String, trim: true },
+
+          /* ── BRANDING / DECORATION — WHAT THE CUSTOMER ACTUALLY ASKED FOR ──
+             One row per decoration: what it is, where it goes, how big, in
+             which colours, and the customer's own artwork for THAT decoration.
+
+             `ref` is the row's identity and is minted server-side, for the same
+             reason `productLineRef` is one level up: sanitizeProducts() rebuilds
+             every product row on save, so a subdocument `_id` is new each time
+             and anything matched by position or by `_id` loses its artwork the
+             moment another row is deleted. See enquiryBrandingRequirement.js.
+
+             `artwork` is deliberately not called `images`: the product's
+             `images` are photographs of the GARMENT, and one word for both is
+             how a logo file ends up in the garment gallery. Nothing here is an
+             approved production file — it is the buyer's own reference
+             material, and downstream screens must say so. */
+          brandingRequirements: [
+            new mongoose.Schema(
+              {
+                ref: { type: String, trim: true, index: true },
+                type: { type: String, enum: BRANDING_TYPES },
+                placement: { type: String, trim: true },
+                // Approximate, as the customer describes it — never a digitised
+                // dimension. Optional: an enquiry often predates the decision.
+                width: { type: Number, min: 0 },
+                height: { type: Number, min: 0 },
+                unit: { type: String, enum: SIZE_UNITS, default: DEFAULT_SIZE_UNIT },
+                colourNotes: { type: String, trim: true },
+                notes: { type: String, trim: true },
+                // Whether the customer's artwork is in hand. None of these
+                // states means "approved for production".
+                artworkState: { type: String, enum: ARTWORK_STATES },
+                artwork: [
+                  new mongoose.Schema(
+                    {
+                      fileId: { type: String, trim: true }, // Drive (legacy)
+                      publicId: { type: String, trim: true }, // Cloudinary
+                      name: { type: String, trim: true },
+                      url: { type: String, trim: true },
+                    },
+                    { _id: false },
+                  ),
+                ],
+                /* Set only on a row that came from one of the old booleans.
+                   It is what stops an old record becoming two requirements
+                   when it is opened and saved twice. */
+                legacyKey: { type: String, enum: LEGACY_BRANDING_SOURCES.map((x) => x.legacyKey) },
+              },
+              { _id: true },
+            ),
+          ],
 
           // Construction & context
           trims: { type: String, trim: true },
@@ -1152,6 +1352,10 @@ const enquirySchema = new mongoose.Schema(
 enquirySchema.pre("validate", function ensureEnquiryProductLineIdentities(next) {
   try {
     ensureProductLineIdentities(this.products);
+    /* Same chokepoint, one level down: every branding requirement gets a
+       reference, unique across the whole enquiry, so no two product lines can
+       ever point at one requirement. */
+    ensureBrandingRequirementIdentities(this.products);
     next();
   } catch (err) {
     next(err);

@@ -117,7 +117,17 @@ const LIFECYCLE = Object.freeze({
 
 const developmentFileSchema = new mongoose.Schema(
   {
-    developmentNumber: { type: String, required: true, unique: true, immutable: true, trim: true },
+    /* ── THE NUMBER IS UNIQUE INSIDE A COMPANY, NOT ACROSS ALL OF THEM ───
+       It is allocated per company — `MDV-<year>-0001` is every company's first
+       file of the year — so a global unique index made the SECOND company's
+       first file of each year impossible to create. The index below matches
+       how the number is actually minted.
+
+       Nothing reads a file by this number alone: every lookup in the codebase
+       is company-scoped, and the number travels only as a denormalised label
+       for people to quote. It is a display identity, and a display identity
+       is unique within the tenant that displays it. */
+    developmentNumber: { type: String, required: true, immutable: true, trim: true },
     companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
 
     /* ── THE GRAIN, AND IT IS IMMUTABLE ──────────────────────────────────
@@ -172,6 +182,14 @@ const developmentFileSchema = new mongoose.Schema(
     releasedToRndAt: { type: Date, default: null },
     releasedBy: actorRef(),
     releaseReference: { type: String, trim: true, default: "" },
+    /* ── THE REVISION SALES ACTUALLY RELEASED ────────────────────────────
+       `currentBomRevisionNo` is the selection in force and it moves on when
+       Merchandising approves another. This one does not: it is the revision
+       named in the release Sales authorised, and it is what R&D is working
+       against. Keeping them apart is the point — read together they say
+       "R&D has revision 3, and revision 4 is now approved", which is exactly
+       the sentence a later chunk needs in order to call a release stale. */
+    releasedBomRevisionNo: { type: Number, default: null },
 
     coordinationNote: { type: String, trim: true, default: "", maxlength: 4000 },
     archived: { type: Boolean, default: false, index: true },
@@ -187,6 +205,14 @@ const developmentFileSchema = new mongoose.Schema(
    impossible. */
 developmentFileSchema.index(
   { companyId: 1, journeyId: 1, productLineRef: 1 }, { unique: true },
+);
+/* ── AND ONE NUMBER PER COMPANY ──────────────────────────────────────────
+   Replaces a global unique index on `developmentNumber`. A deployed database
+   still carries that old index and will keep rejecting the second company's
+   first file until it is dropped; `scripts/repair/development-number-scope.js`
+   does that, deliberately by hand rather than on boot. */
+developmentFileSchema.index(
+  { companyId: 1, developmentNumber: 1 }, { unique: true, name: "one_number_per_company" },
 );
 /* The register's own reads. */
 developmentFileSchema.index({ companyId: 1, archived: 1, lifecycleStatus: 1, updatedAt: -1, _id: -1 });
@@ -296,6 +322,19 @@ const bomRevisionSchema = new mongoose.Schema(
     changesRequestedBy: actorRef(),
     changesRequestedAt: { type: Date, default: null },
     changeReason: { type: String, trim: true, default: "", maxlength: 2000 },
+    /* ── WHICH DEPARTMENT SENT IT BACK ───────────────────────────────────
+       Two different refusals wear the same shape and mean different things. A
+       MERCHANDISING return is a checker telling a maker the selection is not
+       right yet — an internal correction, same revision number, before anyone
+       outside has seen it. A SALES return is a department that read the
+       approved selection and said it does not answer what the customer asked
+       for, which opens a NEW revision and means the previous one is already
+       on the record as approved.
+       Recorded rather than inferred: a merchandiser reading "sent back" needs
+       to know whose question they are answering. */
+    changesRequestedSource: {
+      type: String, enum: ["MERCHANDISING", "SALES"], default: null,
+    },
 
     supersededByRevisionNo: { type: Number, default: null },
     supersededAt: { type: Date, default: null },
@@ -334,17 +373,50 @@ bomRevisionSchema.index(
    revision, and the old one is superseded and kept. */
 const FROZEN_AFTER_DRAFT = ["rows", "clonedFromRevisionNo"];
 
+/* ── WHAT THE DATABASE HELD BEFORE THIS SAVE ──────────────────────────────
+   The freeze has to be decided on the state the revision was ALREADY in, not
+   the state it is moving to, and Mongoose exposes no supported reading of the
+   loaded value. So it is remembered when the document arrives from the
+   database, and again after every save that persists a new one. `$locals` is
+   per-document scratch space and is never written to the collection. */
+function rememberPersistedState() {
+  this.$locals.persistedBomState = this.state;
+}
+bomRevisionSchema.post("init", rememberPersistedState);
+bomRevisionSchema.post("save", rememberPersistedState);
+
 bomRevisionSchema.pre("save", function freezeApproved(next) {
   if (this.isNew) return next();
-  const wasDraft = this.$__.originalState?.state === BOM_STATE.DRAFT
-    || (this.state === BOM_STATE.DRAFT && !this.isModified("state"))
-    || this.isModified("state");
-  if (wasDraft) return next();
+
+  /* ── FROZEN IS DECIDED BY WHERE THE REVISION WAS, NOT WHERE IT IS GOING ──
+     An earlier reading of this counted `isModified("state")` as evidence that
+     the revision was still a draft, which inverted the guard: a single save
+     that changed state could carry new rows past it. APPROVED → SUPERSEDED
+     was the live example — the selection R&D engineered and Costing priced
+     could be rewritten on the way out, leaving nothing to show it had ever
+     said anything else. The same reading also consulted
+     `this.$__.originalState`, which Mongoose does not define, so that clause
+     was `undefined` on every save and never protected anything.
+
+     A revision is editable only while the DATABASE still holds it as a draft.
+     Once it has left that state its rows and its provenance are settled, and
+     a change is a new revision. */
+  const persisted = this.$locals.persistedBomState;
+  const wasEditable = persisted === undefined
+    /* Neither loaded nor previously saved through this instance, so there is
+       nothing to trust — take the conservative reading. */
+    ? this.state === BOM_STATE.DRAFT && !this.isModified("state")
+    : persisted === BOM_STATE.DRAFT;
+  if (wasEditable) return next();
 
   const touched = this.modifiedPaths().filter((p) => FROZEN_AFTER_DRAFT.includes(p.split(".")[0]));
   if (touched.length) {
+    /* Named for the state it was frozen IN, not the one this save is moving
+       it to: "an approved development BOM is frozen" is the fact the reader
+       needs, even when the same save is superseding it. */
+    const frozenAs = String(persisted || this.state).toLowerCase();
     const err = new Error(
-      `A ${this.state.toLowerCase()} development BOM is frozen. ${touched.join(", ")} cannot `
+      `A ${frozenAs} development BOM is frozen. ${touched.join(", ")} cannot `
       + "change — start a new revision, so what R&D and Costing worked against stays what it was.",
     );
     err.name = "DevelopmentBomImmutable";

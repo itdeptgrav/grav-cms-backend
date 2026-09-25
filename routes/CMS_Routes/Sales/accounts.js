@@ -47,6 +47,7 @@ function answeredTenantRefusal(res, err) {
   res.status(err.status).json(err.toResponse());
   return true;
 }
+const mongoose = require("mongoose");
 const router = express.Router();
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
@@ -54,6 +55,8 @@ const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Site = require("../../../models/CMS_Models/Sales/Site");
 const Department = require("../../../models/CMS_Models/Sales/Department");
 const Address = require("../../../models/CMS_Models/Sales/Address");
+const commercialDefaults = require("../../../services/sales/accountCommercialDefaults.service");
+const customerAccountLink = require("../../../services/sales/customerAccountLink.service");
 const Relationship = require("../../../models/CMS_Models/Sales/AccountRelationship");
 const Team = require("../../../models/CMS_Models/Sales/AccountTeam");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
@@ -107,6 +110,7 @@ router.get("/", salesAuth, async (req, res) => {
       role,
       lifecycleStage,
       tier,
+      linkedCustomer,
       owner,
       includeArchived,
       sortBy = "createdAt",
@@ -123,6 +127,27 @@ router.get("/", salesAuth, async (req, res) => {
     if (lifecycleStage && lifecycleStage !== "all") filter.lifecycleStage = lifecycleStage;
     if (tier && tier !== "all") filter.customerTier = tier;
     if (owner && owner !== "all") filter.assignedTo = owner;
+    /* ── WHICH ACCOUNT IS THIS CUSTOMER ────────────────────────────────
+       The one lookup the sales customer profile needs, so its commercial
+       terms are edited on the record that actually holds them rather than
+       copied into a second store beside it. Company scope still applies
+       below; this only narrows.
+
+       A MALFORMED ID IS REFUSED, NOT IGNORED. Skipping an unparseable filter
+       would answer with every account this user can see, and the caller —
+       which asked "which account is this customer" — would read the first
+       row of that list as the answer. */
+    if (linkedCustomer !== undefined && String(linkedCustomer).trim() !== "") {
+      const linked = String(linkedCustomer).trim();
+      if (!mongoose.Types.ObjectId.isValid(linked)) {
+        return res.status(400).json({
+          success: false,
+          code: "LINKED_CUSTOMER_INVALID",
+          message: "That is not a customer reference this system issued.",
+        });
+      }
+      filter.linkedCustomer = new mongoose.Types.ObjectId(linked);
+    }
     if (search) {
       const re = new RegExp(search, "i");
       filter.$or = [
@@ -215,6 +240,112 @@ router.post("/duplicate-check", salesAuth, async (req, res) => {
 });
 
 // POST /api/cms/crm/accounts
+/* ── WHICH COMMERCIAL RECORD IS THIS CUSTOMER'S ────────────────────────────
+ *
+ * The sales customer page asks this to show their payment terms. It answers
+ * with the account, or with what is genuinely in the way — never with the
+ * shape of the database.
+ *
+ * Read-only: establishing a relationship is the POST below, because creating
+ * a record is not something a page should do by being opened.
+ * ═════════════════════════════════════════════════════════════════════════ */
+/* What the terms screen opens on: the record, and the terms themselves.
+   Narrow on purpose — this route answers "which record, and what is agreed",
+   never "everything on it". Nothing restricted (credit limit, credit status,
+   tax registration) is in this projection at all, so there is nothing for a
+   stripper to have to remember to remove. */
+const TERMS_FIELDS = "accountId companyName displayName paymentPlan paymentTermsShape "
+  + "advancePercent creditDays creditDaysFrom paymentTermsCode negotiatedTerms";
+
+async function termsRecord(scope, accountId) {
+  if (!accountId) return null;
+  const account = await Account.findOne({ $and: [scope.clause, { _id: accountId }] })
+    .select(TERMS_FIELDS).lean();
+  return account ? { ...account, _id: String(account._id) } : null;
+}
+
+router.get("/for-customer/:customerId", salesAuth, async (req, res) => {
+  try {
+    const scope = await salesScopeFor(req);
+    const found = await customerAccountLink.resolve({ scope, customerId: req.params.customerId });
+    return res.json({
+      success: true,
+      state: found.state,
+      /* The record AND the terms on it, so the editor opens on what is
+         agreed rather than on an empty form beside a saved plan. */
+      account: await termsRecord(scope, found.account?._id),
+      /* Present only where the state is one a person has to settle. */
+      candidates: found.candidates || null,
+      archived: found.archived || null,
+      reason: found.reason || "",
+      /* True when opening the terms screen would need one act first. */
+      setupRequired: found.state === customerAccountLink.STATE.ABSENT
+        || found.state === customerAccountLink.STATE.REPAIRABLE,
+    });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return undefined;
+    console.error("[accounts] GET /for-customer/:customerId", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ── SET THE CUSTOMER UP, IN ONE ACT ───────────────────────────────────────
+ *
+ * Idempotent by construction — the claim's `_id` is the customer's own id, so
+ * two clicks are one insert and one read of it. Never matches by name, never
+ * creates a second account, and refuses rather than choosing when two records
+ * already claim one customer.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.post("/for-customer/:customerId", salesAuth, async (req, res) => {
+  try {
+    const scope = await salesScopeFor(req);
+    const Customer = require("../../../models/Customer_Models/Customer");
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.customerId))) {
+      return res.status(400).json({ success: false, message: "That is not a customer reference this system issued." });
+    }
+    const customer = await Customer.findById(req.params.customerId)
+      .select("name profile.companyName businessInfo.companyName isActive").lean();
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found." });
+
+    const result = await customerAccountLink.ensure({
+      scope,
+      customerId: req.params.customerId,
+      customer,
+      actor: actor(req),
+      dryRun: req.query.dryRun === "true",
+    });
+    if (!result.ok) {
+      return res.status(409).json({
+        success: false, code: result.code, message: result.message,
+        candidates: result.candidates || null, archived: result.archived || null,
+      });
+    }
+    if (result.created && result.account?._id) {
+      await recordChange(req, {
+        departmentSlug: "sales",
+        entity: "crm-account",
+        entityId: result.account._id,
+        entityLabel: result.account.companyName,
+        action: "create",
+        summary: `Set up commercial terms for ${result.account.companyName}`,
+      });
+    }
+    return res.status(result.created ? 201 : 200).json({
+      success: true,
+      /* Read back through the same projection the screen opens on, so the
+         editor appears in place with whatever is already agreed. */
+      account: await termsRecord(scope, result.account?._id),
+      establishedBy: result.establishedBy,
+      created: Boolean(result.created),
+      dryRun: Boolean(result.dryRun),
+    });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return undefined;
+    console.error("[accounts] POST /for-customer/:customerId", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/", salesAuth, async (req, res) => {
   try {
     /* One company decision for the whole request: the parent-account check,
@@ -225,6 +356,26 @@ router.post("/", salesAuth, async (req, res) => {
     delete data.excludeId;
     if (data.garmentSalesProfile) {
       await assertValidGarmentProfileRefs(Account, data.garmentSalesProfile);
+    }
+    /* ── THE CUSTOMER'S USUAL COMMERCIAL TERMS ────────────────────────────
+       Refused here by the same rules the enquiry applies, so a default nobody
+       could ever apply is never stored. A new account has no addresses yet,
+       so a default shipping address can only be chosen on a later edit. */
+    if (commercialDefaults.touches(data)) {
+      const checked = commercialDefaults.validate(data, { existing: null });
+      if (!checked.ok) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+          field: checked.field, message: checked.message,
+        });
+      }
+      if (checked.values.defaultShippingAddressId) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID", field: "defaultShippingAddressId",
+          message: "Add the customer's shipping address first, then set it as their default.",
+        });
+      }
+      Object.assign(data, checked.values);
     }
     /* A parent from another company is not a parent. Validated BEFORE the
        create, so an invalid relationship writes nothing at all. */
@@ -434,11 +585,47 @@ router.patch("/:id", salesAuth, async (req, res) => {
     const update = stripCompanyOwnershipInput(stripRestrictedUpdates({ ...req.body }, req.user));
     update.updatedBy = actor(req);
 
+    /* ── THE CUSTOMER'S USUAL COMMERCIAL TERMS ────────────────────────────
+       Judged against the account's RESULTING state, not the keystroke: a save
+       that sends only `creditDays` still has to answer for the anchor the
+       account already holds (or does not). */
+    if (commercialDefaults.touches(update)) {
+      const checked = commercialDefaults.validate(update, { existing: before });
+      if (!checked.ok) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+          field: checked.field, message: checked.message,
+        });
+      }
+      const chosenAddress = checked.values.defaultShippingAddressId;
+      if (chosenAddress) {
+        /* The account was read under this company's clause above, so an
+           address on somebody else's account is refused exactly as one that
+           does not exist. */
+        const owned = await commercialDefaults.assertShippingAddress(Address, {
+          accountId: account._id, addressId: chosenAddress,
+        });
+        if (!owned.ok) {
+          return res.status(400).json({
+            success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+            field: owned.field, message: owned.message,
+          });
+        }
+      }
+      Object.assign(update, checked.values);
+    }
+
     for (const [key, value] of Object.entries(update)) {
       // Merge (not replace) the nested profile so a partial save doesn't wipe
       // sibling fields the caller didn't send.
       if (key === "garmentSalesProfile" && value && typeof value === "object") {
         account.garmentSalesProfile = { ...(before.garmentSalesProfile || {}), ...value };
+      } else if (value === undefined) {
+        /* Clearing a default is a real act — "we have no standing advance any
+           more". Assigning `undefined` to a loaded document is a no-op, so the
+           path is unset explicitly. */
+        account.set(key, undefined);
+        account.markModified(key);
       } else {
         account[key] = value;
       }

@@ -652,6 +652,103 @@ const PAYMENT_DUE_FROM = [
   pair("INVOICE", "Invoice date"),
   pair("DISPATCH", "Dispatch from our warehouse"),
   pair("BILL_OF_LADING", "Bill of lading / shipment"),
+  /* Added with the terms shapes below: "balance on delivery" is a term
+     customers actually agree, and it was the one milestone this list could not
+     express — an order left the warehouse and the clock was said to start
+     there, which is a different date from the one the customer means. Nothing
+     branches on the code (costing reads the DURATION and prints the label), so
+     this is additive for every existing record. */
+  pair("DELIVERY", "Delivery to the customer"),
+];
+
+/* ── THE SHAPE OF AN AGREEMENT, IN THE WORDS IT WAS AGREED IN ───────────────
+ *
+ * Sales agrees a SHAPE — "half up front, the rest when it ships", "45 days
+ * after the invoice" — and the structured fields are what that shape means:
+ * an advance percentage, a number of days, and what the days count from.
+ * Those three stay exactly as they were, because they are what a financing
+ * cost is worked out from and nothing may parse prose for them.
+ *
+ * What the shape adds is the distinction the numbers cannot hold: a balance
+ * due BEFORE dispatch and one due ON dispatch are both "zero days from
+ * dispatch", and a customer would not call them the same agreement.
+ *
+ * Optional everywhere. A record saved before this existed derives its shape
+ * from the figures it already has. */
+const PAYMENT_TERM_SHAPES = [
+  pair("FULL_ADVANCE", "100% advance"),
+  pair("PART_BEFORE_DISPATCH", "Part advance, balance before dispatch"),
+  pair("PART_ON_DISPATCH", "Part advance, balance on dispatch"),
+  pair("PART_ON_DELIVERY", "Part advance, balance on delivery"),
+  pair("CREDIT_INVOICE", "Credit after invoice"),
+  pair("CREDIT_DISPATCH", "Credit after dispatch"),
+  pair("CREDIT_BILL_OF_LADING", "Credit after bill of lading / shipment"),
+  pair("CUSTOM", "Custom terms"),
+];
+
+/* ── WHEN EACH PART OF THE MONEY FALLS DUE ─────────────────────────────────
+ *
+ * A payment plan is a list of tranches, and a tranche says three things: how
+ * much, against which event, and how far from it. "60% on order confirmation,
+ * 20% on dispatch, 20% 45 days after the invoice" is three sentences a
+ * customer agreed and three dates an order will actually see.
+ *
+ * ── WHY THE EVENTS ARE NOT `PAYMENT_DUE_FROM` ─────────────────────────────
+ * They nearly are, and the four above are all here. What that list could not
+ * express is the moment an advance is agreed AGAINST — the order being
+ * confirmed, or the proforma being raised — because it was only ever the
+ * anchor for a BALANCE. A plan needs both ends.
+ *
+ * ── AND WHY THE DIRECTION IS ITS OWN FIELD ────────────────────────────────
+ * "Before dispatch" and "on dispatch" are different agreements and always
+ * were — it is the distinction the shapes were added for. A signed offset
+ * would collapse them the moment somebody typed 0, so the direction is
+ * recorded as itself and ON carries no days at all. */
+const PAYMENT_DUE_EVENTS = [
+  pair("ORDER_CONFIRMATION", "Order confirmation"),
+  pair("PROFORMA", "Proforma invoice"),
+  pair("PRODUCTION_START", "Production start"),
+  pair("DISPATCH", "Dispatch from our warehouse"),
+  pair("BILL_OF_LADING", "Bill of lading / shipment"),
+  pair("INVOICE", "Invoice date"),
+  pair("DELIVERY", "Delivery to the customer"),
+];
+
+/* Which side of the event the money is due, and never as a signed number of
+   days: `0 days after dispatch` and `0 days before dispatch` are the same
+   arithmetic and not the same promise. */
+const PAYMENT_OFFSET_DIRECTIONS = [
+  pair("BEFORE", "before"),
+  pair("ON", "on"),
+  pair("AFTER", "after"),
+];
+
+/* ── HOW AN ORDER TRAVELS ───────────────────────────────────────────────────
+ *
+ * One vocabulary, because two already existed and they disagreed: the enquiry
+ * recorded `["ROAD","RAIL","AIR","SEA","COURIER"]` inline on its own schema,
+ * while `garmentSalesProfile.preferredFreightMode` used lowercase FREIGHT_MODES
+ * (with a `mixed` the enquiry cannot express). A customer's DEFAULT mode and
+ * the mode agreed for one order have to be comparable — otherwise "is this the
+ * customer's usual lane?" cannot be answered — so the enquiry's codes are the
+ * ones promoted here, unchanged, and the Account's new default uses them too.
+ * `FREIGHT_MODES` is left exactly as it is: it belongs to the buying-house
+ * profile and nothing reads the two together. */
+const TRANSPORT_MODES = [
+  pair("ROAD", "Road"),
+  pair("RAIL", "Rail"),
+  pair("AIR", "Air"),
+  pair("SEA", "Sea"),
+  pair("COURIER", "Courier"),
+];
+
+/* Whether freight the company prepays sits inside the garment price or is
+   billed on at cost. The enquiry has asked this since freight costing existed
+   (`Enquiry.freight.prepaidTreatment`); the Account can now carry the usual
+   answer, in the same two codes. */
+const PREPAID_TREATMENTS = [
+  pair("IN_PRICE", "Absorbed into the garment price"),
+  pair("RECOVERED_SEPARATELY", "Billed to the customer separately, at cost"),
 ];
 
 const COUNTRIES = [
@@ -753,6 +850,15 @@ const SALES_JOURNEY_STAGES = [
   pair("account", "Account"),
   pair("enquiry", "Enquiry/RFQ"),
   pair("styleSample", "Style & Sample"),
+  /* RETIRED 24 Sep 2026 — folded whole into `purchaseInvoice`, which now
+     carries the costing, the pricing, the commercial approval and the
+     proforma. The CODE STAYS: journeys store it as `currentStage`, the
+     `stageStates` sub-schema is built from this list, and dropping it would
+     fail validation on every existing record. It is skipped by `advance` and
+     resolved forward on read — see RETIRED_STAGE_FORWARDS in
+     services/salesJourneyProgress.js and in the frontend's stageConfig.js.
+     The label keeps its historical wording so old audit entries and
+     notifications still read as what they were. */
   pair("costQuote", "Cost & Invoicing"),
   // The customer's proforma invoices for this journey's account — raising
   // one, sending it, and recording the customer's approval against their PO
@@ -760,6 +866,9 @@ const SALES_JOURNEY_STAGES = [
   // costQuote so the stored codes keep lifecycle order; `poContract` stays
   // where it is because existing journeys carry it and the enum below is
   // what validates them.
+  //
+  // THE SINGLE COMMERCIAL STAGE since 24 Sep 2026: Style & Sample advances
+  // straight here.
   pair("purchaseInvoice", "Purchase Invoice"),
   pair("poContract", "PO/Contract"),
   pair("production", "Production"),
@@ -1167,6 +1276,12 @@ module.exports = {
      serves the CRM's own picker. */
   COUNTRIES,
   PAYMENT_DUE_FROM,
+  PAYMENT_TERM_SHAPES,
+  PAYMENT_TERM_SHAPE_CODES: codes(PAYMENT_TERM_SHAPES),
+  PAYMENT_DUE_EVENTS,
+  PAYMENT_DUE_EVENT_CODES: codes(PAYMENT_DUE_EVENTS),
+  PAYMENT_OFFSET_DIRECTIONS,
+  PAYMENT_OFFSET_DIRECTION_CODES: codes(PAYMENT_OFFSET_DIRECTIONS),
   ACCOUNT_ROLES,
   ACCOUNT_STATUSES,
   LIFECYCLE_STAGES,
@@ -1258,6 +1373,10 @@ module.exports = {
   CUSTOMER_TYPE_CODES: codes(CUSTOMER_TYPES),
   GST_TREATMENT_CODES: codes(GST_TREATMENTS),
   FREIGHT_ARRANGEMENT_CODES: codes(FREIGHT_ARRANGEMENTS),
+  TRANSPORT_MODES,
+  TRANSPORT_MODE_CODES: codes(TRANSPORT_MODES),
+  PREPAID_TREATMENTS,
+  PREPAID_TREATMENT_CODES: codes(PREPAID_TREATMENTS),
   ENQUIRY_STATUS_CODES: codes(ENQUIRY_STATUSES),
   COSTING_REQUEST_STATUSES,
   COSTING_REQUEST_STATUS_CODES: codes(COSTING_REQUEST_STATUSES),
@@ -1360,6 +1479,9 @@ module.exports = {
     currency: CURRENCIES,
     country: COUNTRIES,
     payment_due_from: PAYMENT_DUE_FROM,
+    payment_term_shape: PAYMENT_TERM_SHAPES,
+    transport_mode: TRANSPORT_MODES,
+    prepaid_treatment: PREPAID_TREATMENTS,
     business_model: BUSINESS_MODELS,
     product_category: PRODUCT_CATEGORIES,
     construction_type: CONSTRUCTION_TYPES,

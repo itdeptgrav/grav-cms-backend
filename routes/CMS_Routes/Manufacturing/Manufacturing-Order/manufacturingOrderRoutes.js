@@ -28,6 +28,9 @@ const {
 const {
   summariseManufacturingOrder,
 } = require("../../../../services/manufacturing/moSummary.service");
+/* The workOrderNumber import that stood here was a byte-identical duplicate of
+   the one above (merge fdeea4a, 23 Sep 2026). `const` in the same scope twice
+   is a SyntaxError, so the whole backend refused to start. */
 
 router.use(EmployeeAuthMiddleware);
 
@@ -168,7 +171,7 @@ router.get("/:id", async (req, res) => {
     // OPTIMIZED: Only select fields actually used on frontend
     const customerRequest = await CustomerRequest.findById(id)
       .select(
-        "requestId customerInfo finalOrderPrice priority status estimatedCompletion deliveryDeadline createdAt requestType measurementName",
+        "requestId customerInfo finalOrderPrice priority status estimatedCompletion deliveryDeadline createdAt requestType measurementName items.stockItemName items.stockItemReference items.lineRef items.fulfilmentModel",
       )
       .lean();
 
@@ -301,6 +304,13 @@ router.get("/:id", async (req, res) => {
       deliveryDeadline: customerRequest.deliveryDeadline,
       createdAt: customerRequest.createdAt,
       requestType: customerRequest.requestType || "customer_request",
+      jobWorkProductCount: (customerRequest.items || [])
+        .filter((item) => item.fulfilmentModel === "JOB_WORK").length,
+      productClassifications: (customerRequest.items || []).map((item) => ({
+        lineRef: item.lineRef || null,
+        productName: item.stockItemName || item.stockItemReference || "Product",
+        fulfilmentModel: item.fulfilmentModel || "FULL_PACKAGE",
+      })),
       measurementName: customerRequest.measurementName || null,
       specialInstructions: customerRequest.customerInfo?.description,
 
@@ -345,7 +355,7 @@ router.get("/:id/detailed", async (req, res) => {
     // Get customer request
     const customerRequest = await CustomerRequest.findById(id)
       .select(
-        "requestId customerInfo finalOrderPrice priority status estimatedCompletion deliveryDeadline createdAt requestType measurementName",
+        "requestId customerInfo finalOrderPrice priority status estimatedCompletion deliveryDeadline createdAt requestType measurementName items.stockItemName items.stockItemReference items.lineRef items.fulfilmentModel",
       )
       .lean();
 
@@ -565,6 +575,13 @@ router.get("/:id/detailed", async (req, res) => {
       deliveryDeadline: customerRequest.deliveryDeadline,
       createdAt: customerRequest.createdAt,
       requestType: customerRequest.requestType || "customer_request",
+      jobWorkProductCount: (customerRequest.items || [])
+        .filter((item) => item.fulfilmentModel === "JOB_WORK").length,
+      productClassifications: (customerRequest.items || []).map((item) => ({
+        lineRef: item.lineRef || null,
+        productName: item.stockItemName || item.stockItemReference || "Product",
+        fulfilmentModel: item.fulfilmentModel || "FULL_PACKAGE",
+      })),
       measurementName: customerRequest.measurementName || null,
       specialInstructions: customerRequest.customerInfo?.description,
 

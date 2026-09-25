@@ -239,7 +239,7 @@ async function world({ policy = {} } = {}) {
      style (no operation) priced at ₹200.00 a metre with one metre a garment,
      so the assembled cost is 20000 with nothing typed by the test and no
      overhead rule in this suite's policy to add to it. */
-  const seeded = await seedSourceBacked(co._id, { withOperation: false, rateMinor: 20000 });
+  const seeded = await seedSourceBacked(co._id, { rateMinor: 20000 });
   /* ── NO OVERHEAD IN THIS WORLD ────────────────────────────────────────
      Every figure this suite asserts is stated to the paisa, so a 12% company
      overhead on top would be counted into all of them. Overhead's own

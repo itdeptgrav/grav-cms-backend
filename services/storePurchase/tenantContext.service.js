@@ -203,6 +203,46 @@ function tenantFilter(ctx) {
   return { companyId: ctx.companyId };
 }
 
+/* ── RESTORED AFTER THE MERGE OF 23 SEP 2026 ────────────────────────────────
+ * These two were defined on NEW_CMS_BRANCH and absent from MAIN_SUB_BRANCH.
+ * The merge (fdeea4a) took the union of the two export lists but only one
+ * side's function bodies, so `module.exports` named two identifiers that no
+ * longer existed and the whole backend died on require with
+ * "ReferenceError: ownedOnly is not defined" -- before a single route loaded.
+ *
+ * They are restored rather than dropped from the exports because six route
+ * files in the MERGED tree still call them (purchaseOrders, rawItems,
+ * warehouses, stockAdjustments, services, vendor). Removing the exports would
+ * have swapped a boot crash for six runtime crashes.
+ */
+
+/**
+ * The clause that keeps unowned (legacy) records OUT of a selection list.
+ *
+ * Some reads deliberately go further than tenantFilter and refuse legacy rows
+ * outright — the supplier pickers on a purchase order, the services lists —
+ * on the grounds that nobody can say whose an unowned record is, so nothing
+ * new should be ordered against one. That is right once the data is migrated
+ * and wrong before it: with 90 of 94 vendors still unowned, the PO screen
+ * offered four suppliers and the raw-item supplier list offered none
+ * (reported 10 Sep 2026).
+ *
+ * So it is the same switch as LEGACY_READTHROUGH above, expressed for those
+ * call sites: an empty predicate while the migration window is open (a valid
+ * and always-true `$and` entry), the real exclusion once it closes.
+ */
+function ownedOnly() {
+  return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } };
+}
+
+/** True while the legacy migration window is open — i.e. while unowned records
+ *  are still being treated as this company's. Exposed so a rule that only
+ *  makes sense on migrated data can stand down for the same window, rather
+ *  than each site inventing its own switch. */
+function legacyWindowOpen() {
+  return LEGACY_READTHROUGH;
+}
+
 /**
  * Restrict to records that ARE company-owned — i.e. exclude the legacy
  * `companyId: null` / missing rows that tenantFilter() still admits during the

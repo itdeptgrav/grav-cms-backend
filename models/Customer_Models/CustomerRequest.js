@@ -2,6 +2,7 @@
 
 const mongoose = require("mongoose");
 const { ensureLineIdentities } = require("./customerRequestLineIdentity");
+const { ORDER_FULFILMENT_MODELS } = require("../../constants/orderFulfilment");
 
 // ========== REQUEST ITEM SCHEMAS ==========
 const requestItemVariantSchema = new mongoose.Schema(
@@ -108,6 +109,12 @@ const requestItemSchema = new mongoose.Schema(
     productLineRef: {
       type: String,
       trim: true,
+    },
+    // Copied from the exact enquiry product line. This is the canonical Job
+    // Work tag downstream; an order can contain a mixture of line types.
+    fulfilmentModel: {
+      type: String,
+      enum: ORDER_FULFILMENT_MODELS,
     },
     stockItemName: {
       type: String,
@@ -1069,6 +1076,15 @@ const customerRequestSchema = new mongoose.Schema(
       type: String,
       enum: ["customer", "sampling", "internal", "testing"],
       default: "customer",
+      index: true,
+    },
+
+    // Orthogonal to orderOrigin and requestType: this says whether the
+    // customer is buying a full-package garment or has placed Job Work.
+    fulfilmentModel: {
+      type: String,
+      enum: ORDER_FULFILMENT_MODELS,
+      default: "FULL_PACKAGE",
       index: true,
     },
 

@@ -58,6 +58,10 @@ const {
   MerchandisingAuditEvent, MerchandisingOutboxEvent, MerchandisingCommandLedger, OUTBOX_KIND,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 const { fail } = require("../storePurchase/errors");
+/* The approval register, for the one question the snapshot asks it below.
+   No cycle: the register reads selection revisions and knows nothing about
+   packs. */
+const approvalRegister = require("./approvalRegister.service");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -213,10 +217,37 @@ async function snapshot(ctx, file, session = null) {
      else's work through the back door. Every row is still LISTED, so the pack
      records the whole position — the count is what is narrowed, not the
      record. */
+  /* ── READ THE MERCHANDISING ROWS THE WAY THE REGISTER READS THEM ───────
+     A Merchandising-owned row carries no stored decision: the register
+     RESOLVES it from the revision that answers it, every time it is read,
+     and never writes the answer back (see `resolveInternal`). Counting the
+     stored `observation` here therefore counted a value that is only ever
+     the one written when the row was created — so a file whose trim card,
+     packaging and development requirements were all approved still reported
+     three outstanding approvals, and the screen said "Approved" on the
+     Approvals tab and "outstanding" on the handover in the same breath.
+
+     The pack asks the register the same question the register answers for
+     itself. External rows keep their stored observation, which is right:
+     that one IS the last thing the source said. */
   const rows = (register?.rows || []);
-  const outstanding = rows.filter((r) => (
+  /* One reading per row, used by both the count and the entries below. */
+  const resolved = await Promise.all(rows.map(async (row) => {
+    if (row.owningApplication !== APPROVAL_OWNER.MERCHANDISING) {
+      return {
+        status: str(row.observation?.status),
+        decidedAt: row.observation?.decidedAt || null,
+      };
+    }
+    /* The register's own resolver, in the snapshot's own session — see the
+       note above `resolveInternal`. */
+    const seen = await approvalRegister.resolveInternal(file, row.category, session);
+    return { status: str(seen?.status), decidedAt: seen?.decidedAt || null };
+  }));
+
+  const outstanding = rows.filter((r, i) => (
     r.owningApplication === APPROVAL_OWNER.MERCHANDISING
-    && r.observation?.status !== OBSERVED_STATUS.APPROVED
+    && resolved[i].status !== OBSERVED_STATUS.APPROVED
   ));
 
   const asOf = new Date();
@@ -236,12 +267,15 @@ async function snapshot(ctx, file, session = null) {
     approvalRegister: {
       position: outstanding.length ? "OUTSTANDING" : "COMPLETE",
       outstandingCount: outstanding.length,
-      entries: rows.map((r) => ({
+      /* The listed position and the count come from the SAME reading. A pack
+         that recorded "0 outstanding" beside three rows reading NOT_STARTED
+         would be two answers to one question inside one snapshot. */
+      entries: rows.map((r, i) => ({
         approvalRef: str(r.approvalRequirementRef),
         category: str(r.category),
         owningApplication: str(r.owningApplication),
-        state: str(r.observation?.status) || OBSERVED_STATUS.AWAITING_SOURCE_RECORD,
-        decidedAt: r.observation?.decidedAt || null,
+        state: resolved[i].status || OBSERVED_STATUS.AWAITING_SOURCE_RECORD,
+        decidedAt: resolved[i].decidedAt,
       })),
     },
     timeAndAction: {

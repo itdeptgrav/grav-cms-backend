@@ -209,13 +209,26 @@ function completeness(technical = {}, { file = null, approvedMaterialCount = nul
 
   const gaps = [];
 
+  /* ── A BLOCKER THAT IS NOT ABOUT AN EMPTY FORM ──────────────────────────
+     Most shortlist blockers answer "why is there nothing to work on?", so
+     they only matter when the form is empty. A STALE one is different: the
+     form may be complete and perfectly good, and still describe materials
+     that have been replaced since. Submitting it would record engineering
+     against a selection nobody is going to use.
+
+     So it is raised whatever the form holds — and raised WITHOUT displacing
+     the ordinary empty-form blocker, because both can be true at once. */
+  const staleBlocker = shortlistBlocker?.code === "DEVELOPMENT_MATERIALS_STALE"
+    ? shortlistBlocker : null;
+  if (staleBlocker) gaps.push(staleBlocker);
+
   if (!materials.length) {
     /* ── WHOSE STEP IS ACTUALLY OUTSTANDING ────────────────────────────
        "No approved material has a technical record yet" reads as R&D not
        having done their work. When nobody has SELECTED the materials, the
        step belongs to Merchandising and the blocker says so — an empty form
        is not an R&D failure. */
-    gaps.push(shortlistBlocker || { field: "materials", owner: "RND",
+    gaps.push((!staleBlocker && shortlistBlocker) || { field: "materials", owner: "RND",
       message: "No approved material has a technical record yet." });
   }
   /* Every approved material must be accounted for — completed OR sent back.
@@ -346,7 +359,66 @@ function mergeOntoApproved(approved = [], submitted = []) {
  * A plain object, deliberately: it must keep the shape it had at submission
  * rather than being re-validated against a schema that has since moved on.
  */
-function snapshotOf(technical = {}, file = null) {
+/**
+ * The authoritative outside-service and development/tooling rows, frozen.
+ *
+ * ── WHY THESE COME FROM `sample.serviceRequirements` ────────────────────────
+ * There are two R&D records here and only one of them can be costed.
+ * `techSheet.technical.requirements` is R&D's GENERIC list and carries
+ * `family`, `name`, `specification`, `quantity`, `basis`, `unit` — no row
+ * identity and no Service Master reference, so a row from it cannot be matched
+ * to a supplier quotation or keyed as a stable costing line.
+ * `sample.serviceRequirements` is the record Central Costing has always read:
+ * it carries `rowId`, `serviceId`, `purpose`, the development source and the
+ * include/exclude decision.
+ *
+ * So the frozen revision carries the AUTHORITATIVE rows, expressed in the
+ * `family` vocabulary the generic list uses, and a style that has only the
+ * generic list still freezes that — stated precedence, never a silent merge,
+ * because including both would cost one requirement twice.
+ */
+function frozenRequirements(technical = {}, sample = null) {
+  const authoritative = Array.isArray(sample?.serviceRequirements) ? sample.serviceRequirements : [];
+  if (authoritative.length) {
+    return authoritative.map((r) => ({
+      family: r.purpose === "DEVELOPMENT_TOOLING" ? "DEVELOPMENT_TOOLING" : "SERVICE",
+      /* The row's own identity, which is what the costing line is keyed on. */
+      rowId: str(r.rowId),
+      serviceId: r.serviceId ? String(r.serviceId) : null,
+      serviceCode: str(r.serviceCode),
+      serviceName: str(r.serviceName),
+      /* Carried verbatim: `serviceRow` reads `purpose` rather than `family`. */
+      purpose: r.purpose === "DEVELOPMENT_TOOLING" ? "DEVELOPMENT_TOOLING" : "OUTSIDE_PROCESS",
+      developmentSource: str(r.developmentSource) || null,
+      developmentChargeKey: str(r.developmentChargeKey),
+      name: str(r.serviceName),
+      specification: str(r.specification),
+      quantity: num(r.quantity),
+      basis: str(r.basis),
+      unit: str(r.billingUnit),
+      billingUnit: str(r.billingUnit),
+      owner: str(r.owner),
+      evidence: str(r.evidence),
+      /* The decision NOT to buy something is a fact worth freezing: it is
+         kept in the record and dropped from the cost. */
+      included: r.included !== false,
+      excludedReason: str(r.excludedReason),
+      notes: str(r.notes),
+      rationale: "",
+    }));
+  }
+  return (technical.requirements || []).map((r) => ({
+    family: str(r.family),
+    name: str(r.name),
+    specification: str(r.specification),
+    quantity: num(r.quantity),
+    basis: str(r.basis),
+    unit: str(r.unit),
+    rationale: str(r.rationale),
+  }));
+}
+
+function snapshotOf(technical = {}, file = null, sample = null) {
   return {
     revision: technical.revision ?? 0,
     materials: (technical.materials || []).map((m) => ({
@@ -376,15 +448,7 @@ function snapshotOf(technical = {}, file = null) {
       samMinutes: samMinutesOf(o),
       notes: str(o.notes),
     })),
-    requirements: (technical.requirements || []).map((r) => ({
-      family: str(r.family),
-      name: str(r.name),
-      specification: str(r.specification),
-      quantity: num(r.quantity),
-      basis: str(r.basis),
-      unit: str(r.unit),
-      rationale: str(r.rationale),
-    })),
+    requirements: frozenRequirements(technical, sample),
     file: file ? { name: str(file.name), url: str(file.url), uploadedAt: file.uploadedAt || null } : null,
   };
 }
@@ -415,5 +479,6 @@ module.exports = {
   identityKey,
   mergeOntoApproved,
   snapshotOf,
+  frozenRequirements,
   approvedRevisionOf,
 };

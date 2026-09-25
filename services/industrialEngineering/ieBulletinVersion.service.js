@@ -162,6 +162,10 @@ const REFUSED_FIELDS = Object.freeze({
   supersededByVersionNo: "a supersession, which only the approval transaction writes",
   fileRevisionAtSubmit: "which file revision was snapshotted, which the server reads",
   allowancePolicyId: "the allowance policy, which the server reads from the approved studies",
+  /* The whole point of it: a caller who could send this could make a version
+     confirm an R&D revision nobody reviewed. It is copied from the file the
+     server read, inside the submit transaction, and never again. */
+  technicalSource: "the R&D revision this version confirms, which the server freezes from the file",
 });
 
 function refuseUnknown(body, allowed, what) {
@@ -296,16 +300,44 @@ async function readinessGapsFor(ctx, file, { bound, timeGaps }) {
     }
   }
 
-  /* 5 — the file's R&D source version is still the approved one. */
+  /* 5 — the file's R&D source version is still the approved one. Read from
+     the source IN FORCE, so a file that has been moved onto the newer revision
+     passes the gate it was failing — which is the whole point of the move. */
+  const inForce = styleFiles.currentSourceOf(file);
   const currentApproved = await styleFiles.currentApprovedRevisionOf(file.sampleStyleId);
   if (currentApproved !== null
-    && Number(currentApproved) !== Number(file.source?.technicalRevision)) {
-    gaps.push(gap("IE_SOURCE_VERSION_SUPERSEDED", "REVIEW_NEW_TECHNICAL_VERSION",
-      `This file was engineered from technical revision ${file.source?.technicalRevision}, and revision `
-      + `${currentApproved} has since been approved. Nothing has been rewritten — review the difference.`,
+    && Number(currentApproved) !== Number(inForce.technicalRevision)) {
+    gaps.push(gap("IE_SOURCE_VERSION_SUPERSEDED", "REBASE_ONTO_NEW_TECHNICAL_VERSION",
+      `This file is engineered from technical revision ${inForce.technicalRevision}, and revision `
+      + `${currentApproved} has since been approved. Nothing has been rewritten — open a successor `
+      + "cycle against the newer revision and review what moved.",
       {
-        fileSourceRevision: file.source?.technicalRevision ?? null,
+        fileSourceRevision: inForce.technicalRevision ?? null,
+        sourceCycleNo: inForce.cycleNo,
         approvedRevision: Number(currentApproved),
+      }));
+  }
+
+  /* 6 — and a move that has not been reviewed is not submittable. Carrying a
+     row forward is not the same as confirming it still holds against the
+     revision it is now being costed under; without this gate "carried
+     forward" would quietly become "approved again". */
+  const outstanding = styleFiles.outstandingRebaseReview(file);
+  if (outstanding) {
+    gaps.push(gap("IE_SOURCE_REBASE_REVIEW_OUTSTANDING", "REVIEW_REBASED_ROWS",
+      outstanding.rowIds.length
+        ? `This file was moved onto technical revision ${outstanding.technicalRevision}. `
+          + `${outstanding.rowIds.length} row${outstanding.rowIds.length === 1 ? "" : "s"} the change `
+          + "reaches must be reviewed again before this bulletin can be submitted."
+        : `This file was moved onto technical revision ${outstanding.technicalRevision}. Confirm the `
+          + "technical basis before submitting it.",
+      {
+        rowIds: outstanding.rowIds,
+        sourceCycleNo: outstanding.cycleNo,
+        technicalRevision: outstanding.technicalRevision,
+        predecessorTechnicalRevision: outstanding.predecessorTechnicalRevision,
+        materialsChanged: outstanding.materialsChanged,
+        operationsChanged: outstanding.operationsChanged,
       }));
   }
 
@@ -320,6 +352,80 @@ const notReady = (what, gaps) => fail("IE_BULLETIN_VERSION_NOT_READY",
   `This bulletin cannot be ${what}: ${gaps.length} thing${gaps.length === 1 ? "" : "s"} `
   + `need${gaps.length === 1 ? "s" : ""} attention.`,
   { gaps, gapCodes: gaps.map((g) => g.code) });
+
+/* ═══ THE R&D SOURCE, FROZEN ═══════════════════════════════════════════════ */
+
+/**
+ * A stable key for one R&D technical revision.
+ *
+ * `SampleStyle.techSheet.technicalRevisions[]` is `{ _id: false }`, so there is
+ * no document id to name. The number alone is not identity either: it is R&D's
+ * own counter, and a record re-approved under the same number is a different
+ * decision. So the key digests the revision's identity fields — the number, the
+ * two moments and the outcome — and any of them moving produces a different
+ * key, which is what lets a later reader say "not the revision that was
+ * confirmed" rather than "same number, must be the same thing".
+ *
+ * Exported so the costing side computes it from exactly this rule rather than
+ * a second spelling of it.
+ */
+function technicalRevisionKeyOf(revision) {
+  if (!revision) return "";
+  const at = (v) => (v ? new Date(v).toISOString() : "");
+  return crypto.createHash("sha256").update([
+    "rev", String(revision.revision ?? ""),
+    "submitted", at(revision.submittedAt),
+    "decided", at(revision.decidedAt),
+    "outcome", str(revision.outcome),
+  ].join("|")).digest("hex").slice(0, 32);
+}
+
+/**
+ * What this submission confirms about R&D's record.
+ *
+ * Copied from the FILE, which froze it at creation and never re-reads it — the
+ * gates above have already refused to submit when R&D has approved a newer
+ * revision since, so what the file holds is what the reviewer is being asked
+ * about.
+ *
+ * Counts are read off the snapshot once. They are counts and never totals: a
+ * total consumption or a total SAM would be a figure this record is not the
+ * authority for.
+ */
+function technicalSourceOf(file) {
+  /* ── THE SOURCE IN FORCE, NOT THE ONE THE FILE WAS OPENED FROM ────────
+     A file that has been moved onto a newer approved revision is engineered
+     against THAT one, and the version being frozen has to say so — freezing
+     the opening revision here would stamp a version with a key the gates had
+     just finished checking a different one of, and the costing side would
+     read it as stale the moment it was approved. `currentSourceOf` is the one
+     resolver both sides ask. */
+  const source = styleFiles.currentSourceOf(file);
+  const snapshot = source.snapshot || null;
+  const materials = Array.isArray(snapshot?.materials) ? snapshot.materials : [];
+  const operations = Array.isArray(snapshot?.operations) ? snapshot.operations : [];
+  return {
+    sampleStyleId: file.sampleStyleId,
+    technicalRevision: Number(source.technicalRevision ?? 0),
+    technicalRevisionKey: technicalRevisionKeyOf({
+      revision: source.technicalRevision,
+      submittedAt: source.submittedAt,
+      decidedAt: source.approvedAt,
+      outcome: "approved",
+    }),
+    submittedAt: source.submittedAt || null,
+    approvedAt: source.approvedAt || null,
+    snapshot,
+    materialCount: materials.length,
+    operationCount: operations.length,
+    fileSourceRevision: Number(source.technicalRevision ?? 0),
+    /* Which cycle of this file's technical source the version was frozen
+       against. 1 is the revision the file was opened from; 2 and up are
+       successors it was deliberately moved onto. */
+    sourceCycleNo: Number(source.cycleNo || 1),
+    frozenAt: new Date(),
+  };
+}
 
 /* ═══ THE SNAPSHOT ═════════════════════════════════════════════════════════ */
 
@@ -545,6 +651,27 @@ function publishVersion(doc, { withRows = true, withHistory = false } = {}) {
       requirementDigest: doc.sourceRequirementDigest || "",
     },
 
+    /* ── WHAT THIS VERSION CONFIRMS ABOUT R&D ─────────────────────────────
+       Identity and counts. The SNAPSHOT itself is deliberately not published
+       here: this projection is read by IE screens and by order listings, and
+       R&D's full technical content is not theirs to hand out. Central Costing
+       reads the snapshot from the stored document, having proved the version
+       is the current approved one.
+
+       `null` on a version submitted before this existed — which a reader must
+       treat as "confirms no revision", never as revision 0. */
+    technicalSource: doc.technicalSource
+      ? {
+          sampleStyleId: String(doc.technicalSource.sampleStyleId || ""),
+          technicalRevision: doc.technicalSource.technicalRevision ?? null,
+          technicalRevisionKey: doc.technicalSource.technicalRevisionKey || "",
+          approvedAt: doc.technicalSource.approvedAt
+            ? new Date(doc.technicalSource.approvedAt).toISOString() : null,
+          materialCount: doc.technicalSource.materialCount ?? 0,
+          operationCount: doc.technicalSource.operationCount ?? 0,
+        }
+      : null,
+
     submittedByName: doc.submittedByName || "",
     submittedAt: doc.submittedAt ? new Date(doc.submittedAt).toISOString() : null,
     reviewedByName: doc.reviewedByName || "",
@@ -668,6 +795,10 @@ async function submitVersion(ctx, { fileId, body = {}, actor } = {}) {
       sourceFingerprint: fingerprint,
       sourceApprovalDigest: digests.approval,
       sourceRequirementDigest: digests.requirement,
+      /* What this version confirms about R&D. Frozen here, inside the same
+         transaction that mints the version, so a version can never exist
+         without saying which technical revision it was reviewed against. */
+      technicalSource: technicalSourceOf(file),
       submittedBy: submitter,
       submittedByName: actorName(actor),
       submittedAt,
@@ -1111,6 +1242,7 @@ async function classifyMiss(ctx, current, expected, verb, session) {
 }
 
 module.exports = {
+  technicalRevisionKeyOf,
   STATE, LIMITS,
   SUBMIT_FIELDS, RETURN_BODY_FIELDS, APPROVE_FIELDS, REFUSED_FIELDS,
   publishVersion, publishRow, publishEvent, readinessGapsFor, snapshotOf, totalsOf,

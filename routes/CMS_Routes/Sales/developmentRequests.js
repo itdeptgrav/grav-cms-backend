@@ -145,4 +145,21 @@ router.post("/:requestRef/authorise-release", requireCompany, canIssue, handle(a
   return res.json({ success: true, ...out, downstream: carried });
 }));
 
+/**
+ * ASK MERCHANDISING TO CHANGE THE SELECTION.
+ *
+ * The same decision point as the release, answered the other way, so it sits
+ * behind the same authority: whoever may commit the development budget is
+ * whoever may decline to. It is not a Merchandising route — a Sales judgement
+ * about whether the selection answers the customer does not belong on a
+ * Merchandising screen, and Merchandising has no route that takes it.
+ */
+router.post("/:requestRef/request-material-changes", requireCompany, canIssue, handle(async (req, res) => {
+  const out = await requests.requestMaterialChanges(req.merchandising, {
+    requestRef: req.params.requestRef, body: req.body || {}, actor: actor(req),
+  });
+  const carried = await announce(req.merchandising, out.correlationId);
+  return res.json({ success: true, ...out, downstream: carried });
+}));
+
 module.exports = router;

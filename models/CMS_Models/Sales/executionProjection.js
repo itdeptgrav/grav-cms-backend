@@ -33,6 +33,7 @@
 "use strict";
 
 const mongoose = require("mongoose");
+const { ORDER_FULFILMENT_MODELS } = require("../../../constants/orderFulfilment");
 
 /** One confirmed split of the line — a colourway / attribute / size tuple. */
 const breakdownSchema = new mongoose.Schema(
@@ -183,6 +184,10 @@ function executionProjectionSchema() {
          may legitimately appear on two commercial lines of one order. */
       orderRef: { type: String, trim: true, required: true },
       orderLineRef: { type: String, trim: true, required: true },
+
+      // Optional for historical handovers. New issues always stamp it from
+      // the confirmed CustomerRequest; the receiver never guesses it.
+      fulfilmentModel: { type: String, enum: ORDER_FULFILMENT_MODELS },
 
       styleRef: { type: String, trim: true, required: true },
       buyerStyleRef: { type: String, trim: true },

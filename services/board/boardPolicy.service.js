@@ -35,7 +35,7 @@ const mongoose = require("mongoose");
 
 const BoardPolicy = require("../../models/CMS_Models/Board/BoardPolicy");
 const {
-  ADVANCE_TREATMENTS, DAY_COUNT_BASES, MACHINE_BURDEN_TREATMENTS, GST_TREATMENTS,
+  ADVANCE_TREATMENTS, DAY_COUNT_BASES, FINANCING_START_EVENTS, MACHINE_BURDEN_TREATMENTS, GST_TREATMENTS,
   DEVELOPMENT_CALCULATIONS, CONTINGENCY_MODES, PAYLOAD_FIELD,
 } = require("../../models/CMS_Models/Board/BoardPolicy");
 /* `BASES` as well as the key list: the contingency contract classifies a
@@ -213,6 +213,19 @@ function financingGaps(financing = {}) {
   if (!financing.dayCountBasis) {
     out.push({ field: "dayCountBasis", message: "State how many days the annual rate is spread over." });
   }
+  /* ── AND WHEN THE WAITING STARTS ──────────────────────────────────────
+     A rate and a day-count say what a day of waiting costs; they say nothing
+     about when the company began waiting. Committing to fabric in January
+     and shipping in March is two months of financing that committing on the
+     cutting day does not carry, and no other field on this record can tell
+     those two companies apart. */
+  if (!financing.startEvent) {
+    out.push({
+      field: "startEvent",
+      message: "State when the company's money goes out — financing is measured from that event to each "
+        + "payment's due date.",
+    });
+  }
   return out;
 }
 
@@ -255,6 +268,16 @@ function validateFinancing(patch = {}, existing = {}) {
         field: "advanceTreatment", reason: "VALUE_NOT_ALLOWED", allowed: ADVANCE_TREATMENTS, value: v,
       });
     } else out.advanceTreatment = v;
+  }
+
+  if (has("startEvent")) {
+    const v = str(patch.startEvent);
+    if (!v) out.startEvent = undefined;
+    else if (!FINANCING_START_EVENTS.includes(v)) {
+      throw bad("That is not an event this company's orders record.", {
+        field: "startEvent", reason: "VALUE_NOT_ALLOWED", allowed: [...FINANCING_START_EVENTS], value: v,
+      });
+    } else out.startEvent = v;
   }
 
   if (has("dayCountBasis")) {

@@ -271,3 +271,29 @@ LiveKit (meetings, audio calls, `livekit-server-sdk` token minting), Gemini via 
 - **C1 / C2 / PMP** are employee scoring systems (`services/c1Service.js`, `services/pmpService.js`, `routes/task_routes/c1Routes.js`, `c2Band.routes.js`). Band thresholds live in Firestore `bandconfigs`, not in code — the interactive testers load config from Firestore at startup.
 - **Timer-SOP** applies daily "bleach" penalties for SOP violations (`services/timerSop.service.js`), finalized by the ~00:15 IST cron. All SOP and attendance date logic is IST-based, computed as `Date.now() + 5.5h` and then read with `getUTC*` — follow that pattern rather than introducing a timezone library.
 - **Salary fields are encrypted at rest** via `utils/salaryEncryption.js` keyed on `SALARY_ENCRYPTION_KEY`; rotating the key without re-encrypting orphans existing payroll records.
+
+## Finishing stages (Printing, Washing, Trimming, Ironing) and the shift clock — 24 Sep 2026
+
+`routes/CMS_Routes/Manufacturing/Finishing/finishingRoutes.js` serves both
+departments under `/api/cms/manufacturing/finishing/:stage/…`
+(`services/manufacturing/finishingStages.js` names the stages). One model,
+`FinishingScan` (`finishingscans` — one collection for both, the cluster is near
+its 500-collection cap), unique on `{stage, workOrderId, unitNumber}`, so
+`POST /:stage/done` is idempotent and safe to receive an offline queue's retry.
+`doneAt` is the device's scan moment, bounds-checked (nothing from the future,
+nothing older than 30 days → server time); `doneBy` is the session, never the
+body. Access: `finishingAccess.js` — the stage's own DepartmentRole grant to
+record; Production Supervisor / PM / CEO may read; work-order scoping is
+Packaging's, reused (including the legacy-window stand-down).
+
+`services/manufacturing/shiftHours.js` is the ONE definition of the factory's
+hours (09:30–18:30 IST, nine buckets plus before/after). Packaging's `/hourly`
+and the finishing `/overview` both bucket with it. Do not add another
+hour-bucketing helper.
+
+The departments are seeded by `ensureAccessDepartments.js` (slugs `printing`,
+`washing`, `trimming`, `ironing`; no legacy collection). Adding a stage: add it
+IN PRODUCTION ORDER to `finishingStages.js` (Find Piece walks that order), seed
+it, mirror it in the CMS's `lib/finishing/stages.js`, and give it a glyph in
+`components/finishing/DeptMark.js`. People reach them through a
+DepartmentRole grant or an employee's department assignment.

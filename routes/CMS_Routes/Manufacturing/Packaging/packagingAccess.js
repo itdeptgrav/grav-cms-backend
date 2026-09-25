@@ -51,6 +51,9 @@ const departmentRoles = require("../../../../services/departmentRoles");
 const { merchandisingCompanyMiddleware } = require("../../../../services/companyContext/merchandisingScope.service");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+/* Only for `legacyWindowOpen()` — the one switch every module uses to stand a
+   tenancy rule down while unlinked records are still being migrated. */
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
 
 const SLUG = "packaging-dispatch";
 /* The legacy session shapes that ARE this department, from before grants. */
@@ -195,13 +198,35 @@ async function canRecord(req) {
    Every read and every write goes through one of them, and an unlinked or
    foreign order simply is not in the answer. */
 
-/** The WorkOrders this company's Packaging may see: its own linked ones. */
+/** The WorkOrders this company's Packaging may see: its own linked ones —
+ *  and, while the legacy migration window is open, the unlinked ones too.
+ *
+ *  ── WHY UNLINKED WORK IS VISIBLE FOR NOW (24 Sep 2026) ──────────────────
+ *  `salesLineLink` was introduced by the Sales-line ↔ WorkOrder bridge and is
+ *  written only by creation paths that came after it. On the dev database
+ *  EVERY work order that has ever been packed — 48 of them — predates it and
+ *  carries no link at all. With the strict scope alone, /fetch-order answered
+ *  "Work order 7dc8c1d3 not found" for a real POLO T SHIRT piece that had
+ *  already been packed, so the packaging screen could not pack, the Overview
+ *  showed nothing, and the hourly report was empty against 54 packing records.
+ *
+ *  This is the same situation the Store had (records with no companyId), and
+ *  the same remedy: the strict rule stands down for the migration window that
+ *  services/storePurchase/tenantContext.service.js already defines, and comes
+ *  back — for everybody, at once — when STORE_PURCHASE_STRICT_TENANCY=1 is set
+ *  after the links are backfilled. A work order linked to ANOTHER company is
+ *  still never visible; only ownerless work is let through, and only for now. */
 function workOrderScope(companyId) {
-  return { "salesLineLink.companyId": oid(companyId) };
+  const own = { "salesLineLink.companyId": oid(companyId) };
+  if (!tenantContext.legacyWindowOpen()) return own;
+  /* `{ field: null }` matches both an absent field and an explicit null. */
+  return { $or: [own, { "salesLineLink.companyId": null }] };
 }
 
-/** `filter`, narrowed to this company. The scope is applied last, always. */
-const scoped = (companyId, filter = {}) => ({ ...filter, ...workOrderScope(companyId) });
+/** `filter`, narrowed to this company. The scope is applied last, always.
+ *  `$and` rather than a spread, so a caller's own `$or` is never overwritten
+ *  by the scope's. */
+const scoped = (companyId, filter = {}) => ({ $and: [filter, workOrderScope(companyId)] });
 
 /** This company's WorkOrders matching `filter`. */
 function findWorkOrders(companyId, filter = {}, select = null) {

@@ -18,13 +18,29 @@
 
 const mongoose = require("mongoose");
 const crypto = require("crypto");
+const { ORDER_FULFILMENT_MODELS } = require("../../../constants/orderFulfilment");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
 const { reconcileProductLineIdentities } = require("../../../models/CMS_Models/Sales/enquiryProductLineIdentity");
+const {
+  sanitizeBrandingRequirements,
+  reconcileBrandingRequirements,
+  carryForwardOmittedBranding,
+  legacyMirror,
+} = require("../../../models/CMS_Models/Sales/enquiryBrandingRequirement");
+const {
+  evaluateEnquiryReadiness,
+  readinessRefusal,
+} = require("../../../services/sales/enquiryProductReadiness.service");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 /* Structured payment terms — the duration half of financing, which the
    company rate has never had. Sales agrees them; Costing reads them. */
 const paymentTermsResolution = require("../../../services/sales/paymentTermsResolution.service");
+const orderSchedule = require("../../../services/sales/orderSchedule.service");
+const paymentPlan = require("../../../services/sales/paymentPlan.service");
+const financing = require("../../../services/centralCosting/financing.service");
+const boardPolicy = require("../../../services/board/boardPolicy.service");
+const deliveryTermsResolution = require("../../../services/sales/deliveryTermsResolution.service");
 /* What Sales asks Central Costing to price. Read by the costing engine,
    written only here. */
 const costingBrief = require("../../../services/sales/costingBrief.service");
@@ -54,6 +70,7 @@ const CRMSettings = require("../../../models/CMS_Models/Sales/CRMSettings");
 const { canSeeCost, costingTier, visibleParts, reduceCostLedger } = require("../../../services/crmCostVisibility");
 const { costingTotals } = require("../../../services/costingTotals");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
+const CustomerChangeRequest = require("../../../models/CMS_Models/Sales/CustomerChangeRequest");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
 const CustomerEmailService = require("../../../services/CustomerEmailService");
@@ -521,7 +538,7 @@ async function unlinkRemovedEnquiryProducts({ accountId, removedStockItemIds, ex
 // A client-supplied products array, cleaned to what the schema accepts: drop
 // blank rows, coerce quantity to a non-negative number, validate the gender
 // enum, and carry the garment-spec fields through trimmed.
-function sanitizeProducts(input) {
+function sanitizeProducts(input, legacyFulfilmentModel = "FULL_PACKAGE") {
   if (!Array.isArray(input)) return undefined;
   return input
     .filter((p) => p && String(p.product || "").trim())
@@ -538,6 +555,13 @@ function sanitizeProducts(input) {
            (as this function used to) made every save re-mint every line, and
            orphaned the Development Files rooted on the old references. */
         productLineRef: String(p.productLineRef || "").trim() || undefined,
+        // Product-wise by design: mixed enquiries are valid. Invalid or old
+        // values resolve safely to the regular full-package lane.
+        fulfilmentModel: ORDER_FULFILMENT_MODELS.includes(p.fulfilmentModel)
+          ? p.fulfilmentModel
+          : ORDER_FULFILMENT_MODELS.includes(legacyFulfilmentModel)
+            ? legacyFulfilmentModel
+            : "FULL_PACKAGE",
         product: String(p.product).trim(),
         stockItemId: validSid,
         stockItemReference: String(p.stockItemReference || "").trim() || undefined,
@@ -579,6 +603,48 @@ function sanitizeProducts(input) {
           }));
         if (imgs.length) out.images = imgs;
       }
+      /* ── BRANDING, EMBROIDERY AND PRINT ────────────────────────────────
+         One row per decoration, each with its own placement, size, colour
+         notes and the customer's artwork. Sanitised in its own module, which
+         also caps the list and drops a blank editor row.
+
+         The three old booleans and `brandingPlacement` are re-derived from
+         this list so every screen still reading them — the R&D brief email,
+         the costing workbook, two PDF generators — keeps telling the truth
+         about a product captured the new way. The mirror runs ONLY when the
+         payload actually carries requirements: an absent or empty list is not
+         a statement that this product has no branding, it is an old row
+         nobody opened, and mirroring over it would erase the only branding
+         the record has. */
+      /* `sanitizeBrandingRequirements` answers `undefined` when the field was
+         not sent at all, and `[]` when it was sent empty. The two mean
+         different things and are handled differently — see
+         carryForwardOmittedBranding, which restores an omitted row's stored
+         branding once the product lines are settled. */
+      const requirements = sanitizeBrandingRequirements(p.brandingRequirements);
+      if (requirements) {
+        out.brandingRequirements = requirements;
+        const mirror = legacyMirror(requirements);
+        if (mirror) {
+          out.logo = mirror.logo;
+          out.embroidery = mirror.embroidery;
+          out.printing = mirror.printing;
+          if (mirror.brandingPlacement) out.brandingPlacement = mirror.brandingPlacement;
+        } else {
+          /* AN EXPLICIT CLEAR. Somebody opened this product and removed every
+             requirement, so the old mirrors are reset with the rows. Leaving
+             them set would be worse than untidy: `brandingRequirementsOf`
+             projects the booleans whenever there are no structured rows, so
+             the requirement just deleted would be read straight back on the
+             next load — and would come back again on every reload after
+             that. */
+          out.logo = false;
+          out.embroidery = false;
+          out.printing = false;
+          delete out.brandingPlacement;
+        }
+      }
+
       // Salesperson-defined specification (label + answer). A row with no
       // label is dropped — an answer to an unnamed question tells R&D
       // nothing, and it is the label that makes this readable downstream.
@@ -909,7 +975,7 @@ router.get("/by-journey/:journeyRef/pending-approvals", salesAuth, async (req, r
       approvals.push({
         key: `costing-${entry._id}`,
         type: "costing",
-        stage: "costQuote",
+        stage: "purchaseInvoice",
         productName: entry.productName,
         label: `${PART_LABEL[entry.part || "combined"] || entry.part} costing for "${entry.productName}"`,
         submittedByName: entry.submittedBy?.name || "Someone",
@@ -1283,6 +1349,14 @@ router.post("/:id/proforma-request", salesAuth, async (req, res) => {
         ...(err.details || {}),
       });
     }
+    if (err?.code === proformaRequest.CODES.CUSTOMER_CHANGE_OPEN) {
+      return res.status(409).json({
+        success: false,
+        code: err.code,
+        message: err.message,
+        ...(err.details || {}),
+      });
+    }
     if (err?.code === proformaRequest.CODES.NOT_FOUND) {
       return res.status(404).json({ success: false, message: err.message });
     }
@@ -1538,6 +1612,186 @@ router.get("/:id/delivery-options", salesAuth, async (req, res) => {
   }
 });
 
+/* ── THE CUSTOMER'S USUAL TERMS, OFFERED AND NEVER APPLIED ──────────────────
+ *
+ * Both halves of the Commercial terms section read this: the customer's
+ * standing payment terms and their usual delivery terms, as SUGGESTIONS.
+ *
+ * It writes nothing. Opening an enquiry must not record an agreement — a
+ * default silently saved is a default nobody agreed to, and afterwards it
+ * reads as one that was. Applying them is a deliberate act on the screen,
+ * which sends them back through PATCH /:id like any other answer.
+ *
+ * `suggestionFor` on both resolvers has existed since the enquiry terms were
+ * built and had no route serving it; this is that route.
+ */
+router.get("/:id/commercial-defaults", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }))
+      .select("accountId").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    /* Scoped: the account is reached only through this company's clause, and
+       only its DEFAULTS are selected. No credit limit, no credit status, no
+       rate — none of which is any business of an enquiry screen. */
+    const account = enquiry.accountId
+      ? await Account.findOne(await scoped(req, { _id: enquiry.accountId }))
+        .select("paymentTermsShape paymentPlan advancePercent creditDays creditDaysFrom paymentTermsCode negotiatedTerms "
+          + "freightArrangement defaultShippingAddressId defaultTransportMode "
+          + "defaultPrepaidTreatment deliveryInstructions defaultIncoterm").lean()
+      : null;
+
+    return res.json({
+      success: true,
+      /* False when the customer has no standing terms at all, so the screen
+         can point at the Account instead of offering an empty suggestion. */
+      accountId: enquiry.accountId ? String(enquiry.accountId) : null,
+      payment: paymentTermsResolution.suggestionFor(account),
+      delivery: deliveryTermsResolution.suggestionFor(account),
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[enquiries] GET /:id/commercial-defaults", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ── WHAT A CUSTOMER-FACING DOCUMENT MAY SAY ABOUT PAYMENT ────────────────
+   GET /:id/document-payment-terms
+
+   A quotation, proforma or PDF that prints payment terms must print the terms
+   AGREED FOR THAT DEAL. Until now they printed a hardcoded sentence — "60%
+   advance, 40% before delivery" — from three separate frontend constants that
+   did not even agree with each other, on documents that leave the building
+   and contradict the confirmed terms on the same order.
+
+   This answers with the FROZEN, CONFIRMED snapshot and nothing else:
+     · `state: "CONFIRMED"` with the figures, when Sales has confirmed them;
+     · `state` of NOT_STARTED / DRAFT / NOT_APPLICABLE otherwise, with no
+       figures at all, so the document says the terms are missing rather than
+       inventing an agreement nobody made.
+
+   Read-only, and deliberately narrow: no account fallback (that is a default,
+   not this deal's agreement) and no prose parsing. It is the same projection
+   Central Costing reads, so a customer's document and the company's costing
+   can never describe two different deals. */
+router.get("/:id/document-payment-terms", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }))
+      .select("paymentTerms enquiryId").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const projection = paymentTermsResolution.projectionFor(enquiry);
+    return res.json({
+      success: true,
+      enquiryRef: enquiry.enquiryId || null,
+      /* The projection already blanks every figure unless the terms are
+         confirmed — see paymentTermsResolution.projectionFor. */
+      terms: projection,
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[enquiries] GET /:id/document-payment-terms", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ── THE PLAN, WITH EVERY TRANCHE'S WORKING ─────────────────────────────────
+ *
+ * What Sales needs in front of them BEFORE confirming: each instalment, the
+ * event it is due against, when that is expected to fall for this order, how
+ * many days the money is out, and which tranche is carrying the cost.
+ *
+ * ── WHY THERE IS NO RUPEE FIGURE HERE ──────────────────────────────────────
+ * A financing amount is the Board's annual rate times a basis, and the rate
+ * is deliberately not shown to Sales — `services/centralCosting/visibility.js`
+ * gates it behind `costing.cost.read`, and a per-tranche amount would hand it
+ * back by division. What IS shown is the exposure SHARE: which instalment
+ * accounts for what proportion of the financing on this order. It answers
+ * "which of these is expensive" exactly, and reveals no rate.
+ *
+ * Unlike the projection, this reports a DRAFT plan too — the whole point is
+ * to be read before anybody confirms one. */
+router.get("/:id/payment-plan", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne(await scoped(req, { _id: req.params.id, isActive: true }))
+      .select("paymentTerms enquiryId schedule expectedOrderDate expectedClosingDate requirementDeadline").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const stored = Array.isArray(enquiry.paymentTerms?.plan) ? enquiry.paymentTerms.plan : [];
+    const { dates } = orderSchedule.scheduleFor(enquiry);
+    /* Re-resolved rather than read: the order's dates move, and a date shown
+       beside a tranche has to be the one that is true now. */
+    const resolved = paymentPlan.resolvePlan(stored, dates);
+
+    /* ── THE DAYS CENTRAL COSTING WILL ACTUALLY USE ───────────────────
+       Not an approximation of them, and not the agreed offsets: the same
+       calendar distance the engine measures, from the Board's own start
+       event to each tranche's due date. The RATE stays the Board's — no
+       money figure is returned here — but the duration a price is built on
+       is something the person agreeing the terms has to be able to see.
+
+       A policy that has not stated its start event, or an order missing a
+       date, is reported as exactly that. */
+    const policy = await boardPolicy.resolveEffective(
+      (await salesScopeFor(req)).companyId, "FINANCING", new Date(),
+    ).catch(() => null);
+    const startEvent = policy?.financing?.startEvent || null;
+    const timeline = startEvent && stored.length
+      ? financing.timelineFor({ plan: stored, startEvent, dates })
+      : null;
+
+    return res.json({
+      success: true,
+      enquiryRef: enquiry.enquiryId || null,
+      state: paymentTermsResolution.stateOf(enquiry.paymentTerms || {}),
+      shape: paymentPlan.shapeOf(stored) || null,
+      summary: paymentPlan.summarise(stored),
+      /* Where the company's money goes out, and when this order reaches it. */
+      financingStart: startEvent
+        ? {
+          event: startEvent,
+          label: orderSchedule.labelFor(startEvent),
+          date: timeline?.startDate || null,
+          missing: timeline && !timeline.startDate ? orderSchedule.gapFor(startEvent) : null,
+        }
+        : { event: null, label: "", date: null, missing: null, policy: "The Board has not said when the company's money goes out." },
+      tranches: resolved.map((row, i) => {
+        const at = timeline?.tranches?.[i] || null;
+        const days = at?.dueDate && timeline?.startDate
+          ? orderSchedule.daysBetween(timeline.startDate, at.dueDate) : null;
+        return {
+          name: row.name,
+          percentage: row.percentage,
+          dueEvent: row.dueEvent,
+          dueEventLabel: paymentPlan.EVENT_LABEL[row.dueEvent] || row.dueEvent,
+          offsetDirection: row.offsetDirection,
+          offsetDays: row.offsetDays,
+          phrase: paymentPlan.phraseFor(row),
+          /* The date this order expects this step to fall. */
+          expectedDate: row.expectedDate || null,
+          /* Named, with the sentence that says who can fix it. */
+          undatedEvent: row.unknownDate || null,
+          undatedReason: row.unknownDate ? orderSchedule.gapFor(row.unknownDate).message : "",
+          /* Nil rather than zero when it cannot be measured: "financed for
+             no days" and "nobody can say" are different answers. */
+          financedDays: days === null ? null : Math.max(0, days),
+        };
+      }),
+      undatedEvents: paymentPlan.undatedEvents(resolved),
+      /* Every date still owed, with the department that owes it. */
+      blocking: (timeline?.missing || []).map((m) => ({ code: m.code, owner: m.owner, message: m.message })),
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[enquiries] GET /:id/payment-plan", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.patch("/:id", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
@@ -1553,10 +1807,15 @@ router.patch("/:id", salesAuth, async (req, res) => {
 
     // Enforce the status machine: a status change must be a legal transition.
     // A no-op (same status, e.g. saving other fields) always passes.
-    if (typeof body.status === "string" && ENQUIRY_STATUS_CODES.includes(body.status) && body.status !== enquiry.status) {
+    const movingTo = typeof body.status === "string"
+      && ENQUIRY_STATUS_CODES.includes(body.status)
+      && body.status !== enquiry.status
+      ? body.status
+      : null;
+    if (movingTo) {
       const allowed = ENQUIRY_STATUS_TRANSITIONS[enquiry.status] || [];
-      if (!allowed.includes(body.status)) {
-        return res.status(400).json({ success: false, message: `Can't move an enquiry from "${enquiry.status}" to "${body.status}".` });
+      if (!allowed.includes(movingTo)) {
+        return res.status(400).json({ success: false, message: `Can't move an enquiry from "${enquiry.status}" to "${movingTo}".` });
       }
     }
 
@@ -1580,33 +1839,22 @@ router.patch("/:id", salesAuth, async (req, res) => {
        whether the company recovers it. The rate comes from Store's register. */
     if ("freight" in body) {
       const f = body.freight || {};
-      const next = {};
-      /* Absent means "leave it alone"; an explicit empty string is not a
-         value either. Nothing here is defaulted into a claim. */
-      const present = (v) => v !== null && v !== undefined && v !== "";
+      const scope = await salesScopeFor(req);
 
-      if (present(f.arrangement)) {
-        if (!FREIGHT_ARRANGEMENT_CODES.includes(f.arrangement)) {
-          return res.status(400).json({ success: false, message: "That is not a delivery arrangement this system recognises." });
-        }
-        next.arrangement = f.arrangement;
-      }
-      if (present(f.mode)) {
-        if (!["ROAD", "RAIL", "AIR", "SEA", "COURIER"].includes(String(f.mode).toUpperCase())) {
-          return res.status(400).json({ success: false, message: "That is not a freight mode this system recognises." });
-        }
-        next.mode = String(f.mode).toUpperCase();
-      }
-      if (present(f.shippingAddressId)) {
+      /* ── THE TWO IDENTITIES, PROVED AGAINST THIS COMPANY'S RECORDS ────
+         An address on somebody else's account and a warehouse in another
+         company must be indistinguishable from ones that do not exist. Done
+         here rather than in the resolver because both need the database; the
+         resolver stays pure and is exercised without one. */
+      let shippingAddressId = "";
+      if (String(f.shippingAddressId || "").trim()) {
         if (!isObjectId(f.shippingAddressId)) {
           return res.status(400).json({ success: false, message: "Invalid delivery address." });
         }
-        /* ── A SHIPPING ADDRESS, ON A COMPANY-OWNED ACCOUNT ──────────
-           Billing and shipping are separate records precisely because they
+        /* Billing and shipping are separate records precisely because they
            differ, and delivering garments to the accounts department is a
            mistake nobody notices until the lorry arrives. The type is
            required; nothing here converts or falls back. */
-        const scope = await salesScopeFor(req);
         const { destination, reason, addressType } = await resolveShippingDestination(
           scope.companyId, { addressId: f.shippingAddressId, accountId: enquiry.accountId },
         );
@@ -1618,37 +1866,51 @@ router.patch("/:id", salesAuth, async (req, res) => {
               : "That delivery address is not on this customer's account.",
           });
         }
-        next.shippingAddressId = destination.addressId;
+        shippingAddressId = String(destination.addressId);
       }
-      if (present(f.originWarehouseId)) {
+
+      let originWarehouseId = "";
+      if (String(f.originWarehouseId || "").trim()) {
         if (!isObjectId(f.originWarehouseId)) {
           return res.status(400).json({ success: false, message: "Invalid dispatch warehouse." });
         }
-        const scope = await salesScopeFor(req);
         const warehouse = await Warehouse.findOne({
           _id: f.originWarehouseId, companyId: scope.companyId, status: "Active",
         }).select("_id").lean();
         if (!warehouse) {
           return res.status(400).json({ success: false, message: "That is not an active warehouse in this company." });
         }
-        next.originWarehouseId = warehouse._id;
+        originWarehouseId = String(warehouse._id);
       }
-      if (present(f.deliveryCount)) {
-        const n = Number(f.deliveryCount);
-        if (!Number.isInteger(n) || n < 1) {
-          return res.status(400).json({ success: false, message: "A delivery count is a whole number of deliveries, at least one." });
-        }
-        next.deliveryCount = n;
-      }
-      if (present(f.prepaidTreatment)) {
-        if (!["IN_PRICE", "RECOVERED_SEPARATELY"].includes(f.prepaidTreatment)) {
-          return res.status(400).json({ success: false, message: "Say whether prepaid freight sits inside the price or is recovered separately." });
-        }
-        next.prepaidTreatment = f.prepaidTreatment;
-      }
-      if (present(f.notes)) next.notes = String(f.notes).trim().slice(0, 1000);
 
-      enquiry.freight = { ...(enquiry.freight ? enquiry.freight.toObject?.() ?? enquiry.freight : {}), ...next };
+      /* ── SAVED WHOLE, WITH ITS PROVENANCE ─────────────────────────────
+         Delivery terms are one agreement, so they are replaced as one rather
+         than merged field by field. The old merge could never CLEAR anything:
+         switching a delivered order to ex-works left its destination, mode and
+         warehouse behind, and a later reader took those stale facts for
+         current ones. The resolver clears what the new arrangement has no lane
+         for, and records whether this is the customer's standing term or
+         something agreed for this order. */
+      const account = enquiry.accountId
+        ? await Account.findOne(await scoped(req, { _id: enquiry.accountId }))
+          .select("freightArrangement defaultShippingAddressId defaultTransportMode "
+            + "defaultPrepaidTreatment deliveryInstructions defaultIncoterm").lean()
+        : null;
+      const existingFreight = enquiry.freight?.toObject?.() ?? enquiry.freight ?? null;
+      const delivery = deliveryTermsResolution.validate(
+        { ...f, shippingAddressId, originWarehouseId },
+        { account, actor: actor(req), existing: existingFreight },
+      );
+      if (!delivery.ok) {
+        /* Named by field, so the screen marks the box rather than the person
+           hunting for what went wrong. */
+        return res.status(400).json({
+          success: false, code: "DELIVERY_TERMS_INVALID",
+          field: delivery.field, message: delivery.message,
+        });
+      }
+      enquiry.freight = delivery.terms;
+      enquiry.markModified("freight");
     }
 
     /* ── WHEN THIS ORDER GETS PAID ────────────────────────────────────────
@@ -1662,14 +1924,20 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if ("paymentTerms" in body) {
       const account = enquiry.accountId
         ? await Account.findOne(await scoped(req, { _id: enquiry.accountId }))
-          .select("advancePercent creditDays paymentTermsCode negotiatedTerms").lean()
+          .select("paymentTermsShape paymentPlan advancePercent creditDays creditDaysFrom paymentTermsCode negotiatedTerms").lean()
         : null;
       const existing = enquiry.paymentTerms?.toObject?.() ?? enquiry.paymentTerms ?? null;
+      /* ── THIS ORDER'S OWN DATES ───────────────────────────────────────
+         A plan is relative until an order makes it real. The expected date
+         of each tranche is resolved here, against what THIS enquiry records
+         — and left absent for an event it has not dated, rather than counted
+         forward from today onto a customer's proforma. */
       const result = paymentTermsResolution.validate(body.paymentTerms || {}, {
         account,
         confirm: body.paymentTerms?.confirm === true,
         actor: actor(req),
         existing,
+        dates: orderSchedule.scheduleFor(enquiry).dates,
       });
       if (!result.ok) {
         /* Named by field, so the screen marks the box rather than the person
@@ -1693,7 +1961,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
          save, so a refused request changes nothing on the enquiry. */
       const verdict = reconcileProductLineIdentities(
         enquiry.products,
-        sanitizeProducts(body.products) || [],
+        sanitizeProducts(body.products, enquiry.fulfilmentModel) || [],
         { removed: body.removedProductLineRefs },
       );
       if (!verdict.ok) {
@@ -1702,6 +1970,52 @@ router.patch("/:id", salesAuth, async (req, res) => {
           success: false, code: verdict.code, message: verdict.message, ...verdict.details,
         });
       }
+      /* ── AND EVERY BRANDING REQUIREMENT KEEPS ITS OWN ──────────────────
+         Runs after the lines are settled, so each row here already carries a
+         verified `productLineRef`. A requirement reference that belongs to a
+         DIFFERENT product line is refused rather than honoured: honouring it
+         is how the shirt's back-print artwork ends up attached to the cap. */
+      /* A row that said nothing about branding keeps what it has — the stored
+         requirements AND the legacy booleans. Done before the reference check
+         below, so the rows restored here are validated like any other. */
+      carryForwardOmittedBranding(enquiry.products, verdict.rows);
+      const branding = reconcileBrandingRequirements(enquiry.products, verdict.rows);
+      if (!branding.ok) {
+        const status = branding.code === "BRANDING_REF_UNKNOWN" ? 409 : 400;
+        return res.status(status).json({
+          success: false, code: branding.code, message: branding.message, ...branding.details,
+        });
+      }
+
+      /* The product-wise classification is frozen once a proforma/order has
+         copied it. Other product details retain their existing edit rules,
+         but silently changing this one field would make Sales disagree with
+         the confirmed order and every downstream handover. */
+      const raisedRequest = await CustomerRequestModel.findOne({
+        "salesOrigin.enquiryId": enquiry._id,
+      }).sort({ createdAt: -1 }).select("fulfilmentModel items.productLineRef items.fulfilmentModel").lean();
+      if (raisedRequest) {
+        for (const item of raisedRequest.items || []) {
+          const row = verdict.rows.find((candidate) => (
+            String(candidate.productLineRef || "") === String(item.productLineRef || "")
+          ));
+          if (!row) continue;
+          const storedModel = item.fulfilmentModel
+            || raisedRequest.fulfilmentModel
+            || "FULL_PACKAGE";
+          const nextModel = row.fulfilmentModel
+            || enquiry.fulfilmentModel
+            || "FULL_PACKAGE";
+          if (storedModel !== nextModel) {
+            return res.status(409).json({
+              success: false,
+              code: "PRODUCT_FULFILMENT_MODEL_LOCKED",
+              message: `${row.product || "This product"} cannot change between regular and Job Work after the order has been raised.`,
+            });
+          }
+        }
+      }
+
       enquiry.products = verdict.rows;
 
       // costingSheets is keyed by product NAME (see its own schema comment —
@@ -1744,6 +2058,32 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if (enquiry.status !== "lost") {
       enquiry.lostReason = undefined;
       enquiry.lostReasonNote = undefined;
+    }
+
+    /* ── START DEVELOPMENT IS DECIDED HERE, NOT IN THE BROWSER ──────────
+       Evaluated on `enquiry.products` as this request leaves them — after the
+       product block above has applied any rows sent in the same PATCH — so the
+       answer is about the enquiry that is ABOUT TO EXIST, never about a
+       readiness verdict the client claims. The browser's own copy of these
+       rules only greys out a button; anything that can reach this route can
+       skip it.
+
+       `movingTo` is the transition, so this runs only on the step that
+       actually hands the journey to Style & Sample. A second click sends the
+       status it is already in, which is not a transition at all — it falls
+       through here untouched and stays safe.
+
+       One implementation, one vocabulary: enquiryProductReadiness.service. */
+    if (movingTo === "development_started") {
+      const verdict = evaluateEnquiryReadiness(enquiry.products);
+      if (!verdict.ready) {
+        const refusal = readinessRefusal(verdict);
+        /* 422: the request is well-formed and permitted, the enquiry simply
+           is not ready. Nothing is saved — including any product edits sent
+           alongside — so the screen the person reloads is the one they were
+           looking at. */
+        return res.status(422).json({ success: false, ...refusal });
+      }
     }
 
     enquiry.updatedBy = actor(req);
@@ -3242,8 +3582,8 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
         ],
         image: product?.images?.[0],
         bodyText: `${actor(req).name || "Sales"} emailed pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
-        ctaLabel: "Open Cost & Invoicing",
-        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+        ctaLabel: "Open Purchase Invoice",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/purchase-invoice`,
       });
     })().catch(() => {});
 
@@ -3350,8 +3690,8 @@ router.post("/costing-approval/:token/decide", async (req, res) => {
         ],
         image: product?.images?.[0],
         bodyText: `The customer ${req.body.approved ? "approved" : "rejected"} "${entry.productName}" directly, by email — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
-        ctaLabel: "Open Cost & Invoicing",
-        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+        ctaLabel: "Open Purchase Invoice",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/purchase-invoice`,
       });
     })().catch(() => {});
 
@@ -3444,8 +3784,8 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
         ],
         image: product?.images?.[0],
         bodyText: `${who.name || "Sales"} recorded that ${customerName} ${req.body.approved ? "approved" : "rejected"} "${productName}" — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
-        ctaLabel: "Open Cost & Invoicing",
-        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+        ctaLabel: "Open Purchase Invoice",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/purchase-invoice`,
       });
     })().catch(() => {});
 
@@ -3481,6 +3821,44 @@ router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => 
     const who = actor(req);
     enquiry.updatedBy = who;
     await enquiry.save();
+
+    /* Retire, never delete, the style family raised from this exact enquiry
+       row. Without this, the unique live-style index refuses the replacement
+       version with the same name and provisioning keeps reviving the rejected
+       style. The full development history remains queryable with isActive:false. */
+    await SampleStyle.updateMany(
+      { journeyId: enquiry.journeyId, enquiryProductId: snapshot._id, isActive: true },
+      {
+        $set: { isActive: false, updatedBy: who },
+        $push: {
+          history: {
+            kind: "superseded_by_new_brief",
+            note: "Customer requested a new product version.",
+            by: who,
+            at: new Date(),
+          },
+        },
+      },
+    );
+
+    const retiredStyleIds = await SampleStyle.find({
+      journeyId: enquiry.journeyId,
+      enquiryProductId: snapshot._id,
+    }).distinct("_id");
+    const changeIdentity = [
+      ...(snapshot.productLineRef ? [{ productLineRef: snapshot.productLineRef }] : []),
+      ...(retiredStyleIds.length ? [{ sampleStyleId: { $in: retiredStyleIds } }] : []),
+    ];
+    if (changeIdentity.length) await CustomerChangeRequest.updateMany(
+      {
+        companyId: enquiry.companyId,
+        enquiryId: enquiry._id,
+        status: { $in: ["OPEN", "IN_PROGRESS"] },
+        destination: "BRIEF_NEW_VERSION",
+        $or: changeIdentity,
+      },
+      { $set: { status: "IN_PROGRESS" } },
+    );
 
     // The comment above this route has claimed "unlink that product from the
     // customer" since it was written — this call is what actually makes that
@@ -3705,8 +4083,8 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
         ],
         image: product?.images?.[0],
         bodyText: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}" (${customerName}) — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
-        ctaLabel: "Open Cost & Invoicing",
-        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+        ctaLabel: "Open Purchase Invoice",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/purchase-invoice`,
       });
     })().catch(() => {});
 

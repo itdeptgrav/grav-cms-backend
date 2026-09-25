@@ -74,7 +74,7 @@ router.use(EmployeeAuthMiddleware);
 router.get("/:id/persons", async (req, res) => {
   try {
     const { request } = await proveOrderOwned(req, req.params.id, {
-      select: "requestId requestType measurementId measurementName items status",
+      select: "requestId requestType fulfilmentModel measurementId measurementName items status",
     });
 
     let persons = personsOnOrder(request.items);
