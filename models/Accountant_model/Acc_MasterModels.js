@@ -358,6 +358,20 @@ const ACC_DEFAULT_GROUPS = [
     isReserved: true,
     parent: "Current Liabilities",
   },
+  /* Where a customer in credit is SHOWN. A customer who has paid ahead of
+     their invoices is money we owe back, so the figure belongs on this side of
+     the sheet — but the ledger itself stays under Sundry Debtors, because that
+     is where invoicing, bill matching and receivables ageing look for it, and a
+     balance that crosses zero with every invoice cannot drag its ledger between
+     groups as it goes. The chart tree and the balance sheet hang the line here
+     for as long as the balance is inverted; nothing is written. Mirror case
+     below, under Loans & Advances (Asset), for a supplier paid in advance. */
+  {
+    name: "Advance from Customers",
+    nature: "liability",
+    isReserved: true,
+    parent: "Current Liabilities",
+  },
   {
     name: "Suspense A/c",
     nature: "liability",
@@ -411,6 +425,14 @@ const ACC_DEFAULT_GROUPS = [
     nature: "asset",
     isReserved: true,
     parent: "Current Assets",
+  },
+  {
+    // Mirror of "Advance from Customers" — a supplier we have paid ahead of
+    // their bill owes us goods, which is an asset. See the note above.
+    name: "Advance to Suppliers",
+    nature: "asset",
+    isReserved: true,
+    parent: "Loans & Advances (Asset)",
   },
   {
     name: "Stock-in-Hand",

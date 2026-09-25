@@ -118,6 +118,23 @@ const PARTY_SIDE = {
  */
 const OBLIGATION_TYPES = new Set(["payment", "debit_note"]);
 
+/**
+ * The types that reduce what a bill was WORTH, rather than paying it off.
+ *
+ * This is the difference that makes a paid invoice creditable. A receipt
+ * settles what is owed, so once an invoice is paid there is nothing left for
+ * another receipt to do and offering it would be noise. A credit note is a
+ * different act: goods came back, or the price was wrong, and that is true
+ * whether or not the customer has paid. Refusing to credit a paid invoice
+ * left people with a credit note they could not attach to the invoice it
+ * plainly belonged to — the register even showed "Paid" beside it, which
+ * reads as "settled and closed" rather than "still creditable".
+ *
+ * So for these two types the bill list is not filtered by what is unpaid, and
+ * the cap is the invoice value less the notes already raised against it.
+ */
+const NOTE_TYPES = new Set(["credit_note", "debit_note"]);
+
 /** The document type a settlement of this voucher applies against. */
 const SOURCE_TYPE = {
   receipt: "sales",
@@ -477,16 +494,37 @@ async function openBillsForVoucher(
 
   const wantPositive = (PARTY_SIDE[voucher.voucherType] || "Cr") === "Cr";
 
+  const isNote = NOTE_TYPES.has(voucher.voucherType);
+
   const fromFold = [...folded.values()]
     .map((bill) => {
       const own = ownByBill.get(bill.billName) || 0;
       /* Undoing a settlement moves `remaining` AWAY from zero, in whichever
          direction this voucher type settles from. */
       const remaining = bill.remaining + (wantPositive ? own : -own);
+      const outstanding = money(Math.abs(remaining));
+
+      /* How much this voucher may put on the bill.
+
+         For a receipt or payment that is simply what is still unpaid. For a
+         note it is the bill's own value less the notes already raised against
+         it — you can credit an invoice the customer has paid, but you can
+         never credit more than the invoice was for. `own` is added back when
+         re-opening this voucher's own screen, exactly as `remaining` is. */
+      const creditedByOthers = money(
+        Math.max(0, (bill.creditedByNotes || 0) - (isNote ? own : 0)),
+      );
+      const allocatable = isNote
+        ? money(Math.max(0, money(bill.originalAmount) - creditedByOthers))
+        : outstanding;
+
       return {
         billName: bill.billName,
         originalAmount: money(bill.originalAmount),
-        outstanding: money(Math.abs(remaining)),
+        outstanding,
+        allocatable,
+        creditedByNotes: creditedByOthers,
+        settled: Math.abs(remaining) <= EPSILON,
         signedRemaining: money(remaining),
         alreadyOnThisVoucher: money(own),
         firstVoucherDate: bill.firstVoucherDate || null,
@@ -495,9 +533,14 @@ async function openBillsForVoucher(
       };
     })
     .filter((b) =>
-      wantPositive
-        ? b.signedRemaining > EPSILON
-        : b.signedRemaining < -EPSILON,
+      isNote
+        ? /* Settled or not, a bill is offered while any of its value remains
+             uncredited. A fully credited one is dropped — there is nothing
+             left of it to reduce. */
+          b.allocatable > EPSILON
+        : wantPositive
+          ? b.signedRemaining > EPSILON
+          : b.signedRemaining < -EPSILON,
     );
 
   /* Invoices that never established a bill. Without these the screen tells a
@@ -609,15 +652,27 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
     }
   }
 
+  const isNote = NOTE_TYPES.has(voucher.voucherType);
+
   return candidates
     .map((i) => {
       const face = Number(i.grandTotal) || 0;
       const credited = notedByInvoice.get(String(i._id)) || 0;
       const settled = settledByName.get(i.voucherNumber) || 0;
+      const outstanding = money(Math.max(0, face - credited - settled));
+      /* A note may reduce this invoice by whatever has not already been
+         credited, whether or not it has been paid — see NOTE_TYPES. For a
+         receipt the cap stays what is unpaid. */
+      const allocatable = isNote
+        ? money(Math.max(0, face - credited))
+        : outstanding;
       return {
         billName: i.voucherNumber,
         originalAmount: money(face),
-        outstanding: money(Math.max(0, face - credited - settled)),
+        outstanding,
+        allocatable,
+        creditedByNotes: money(credited),
+        settled: outstanding <= EPSILON,
         firstVoucherDate: i.voucherDate || null,
         dueDate: i.dueDate || null,
         voucherNumbers: [i.voucherNumber],
@@ -627,7 +682,7 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
         sourceVoucherId: i._id,
       };
     })
-    .filter((b) => b.outstanding > EPSILON);
+    .filter((b) => (isNote ? b.allocatable : b.outstanding) > EPSILON);
 }
 
 /**
@@ -851,6 +906,7 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
       excludeVoucherId: voucher._id,
       partyLedgerId: entry.ledgerId,
       liabilityLedgerIds: liabilities,
+      partyAccountIds: partyAccounts,
     });
     const byName = new Map(available.map((b) => [b.billName, b]));
 
@@ -873,9 +929,15 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
         e.status = 400;
         throw e;
       }
-      if (amount - bill.outstanding > EPSILON) {
+      /* The same figure the screen offered. Using `outstanding` here would
+         refuse every credit note against a paid invoice that the list had
+         just shown as available. */
+      const cap = bill.allocatable != null ? bill.allocatable : bill.outstanding;
+      if (amount - cap > EPSILON) {
         const e = new Error(
-          `"${billName}" has ₹${bill.outstanding.toFixed(2)} outstanding — you cannot allocate ₹${amount.toFixed(2)} to it.`,
+          NOTE_TYPES.has(voucher.voucherType)
+            ? `"${billName}" has ₹${cap.toFixed(2)} left to credit — you cannot allocate ₹${amount.toFixed(2)} to it.`
+            : `"${billName}" has ₹${cap.toFixed(2)} outstanding — you cannot allocate ₹${amount.toFixed(2)} to it.`,
         );
         e.status = 400;
         throw e;
@@ -941,10 +1003,13 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
     }
   }
 
-  /* The same liability set the leg was resolved with. Recomputing without it
+  /* The same sets the leg was resolved with. Recomputing without them
      reported `matchable: false, allocated: 0` for a payroll payment that had
-     just been allocated correctly — the write landed, the answer denied it. */
-  return matchStateOf(voucher, entry.ledgerId, liabilities);
+     just been allocated correctly — the write landed, the answer denied it.
+     The party-account set is here for the same reason: a credit note whose
+     party line was never flagged resolves only with it, so leaving it out
+     would deny a credit note its own successful match. */
+  return matchStateOf(voucher, entry.ledgerId, liabilities, partyAccounts);
 }
 
 /** Unmatch: drop this voucher's settlements, keeping everything else. */
@@ -957,6 +1022,7 @@ module.exports = {
   PARTY_SIDE,
   SOURCE_TYPE,
   OBLIGATION_TYPES,
+  NOTE_TYPES,
   liabilityLedgerIdsFor,
   partyAccountIdsFor,
   openJournalObligations,

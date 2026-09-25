@@ -155,6 +155,88 @@ async function putBack() {
     bm.matchStateOf(interest, null, null, new Set([custLedgerId])).matchable === false,
   );
 
+  /* ── A PAID INVOICE IS STILL CREDITABLE ────────────────────────────────
+     A receipt settles what is OWED, so once an invoice is paid there is
+     nothing left for another receipt to do. A credit note is a different
+     act — goods came back, or the price was wrong — and that is true whether
+     or not the customer has paid. The bill list used to filter on the unpaid
+     balance for every type alike, so a credit note could not be attached to
+     the invoice it plainly belonged to; the register showed "Paid" beside it,
+     which reads as closed rather than still creditable.
+
+     Driven against the real books rather than a fixture: the question is
+     whether the FOLD separates notes from payments, and a fixture cannot
+     answer that. */
+  console.log("\na paid invoice can still be credited");
+  {
+    const cns = await Acc_Voucher.find({
+      voucherType: "credit_note",
+      status: { $nin: ["cancelled", "void"] },
+    }).limit(20).lean();
+
+    let offeredPaid = 0;
+    let badCap = [];
+    for (const cn of cns) {
+      const liab = await bm.liabilityLedgerIdsFor(cn);
+      const party = await bm.partyAccountIdsFor(cn);
+      const st = bm.matchStateOf(cn, null, liab, party);
+      if (!st.matchable) continue;
+      const bills = await bm.openBillsForVoucher(cn, {
+        excludeVoucherId: cn._id,
+        partyLedgerId: st.partyLedgerId,
+        liabilityLedgerIds: liab,
+        partyAccountIds: party,
+      });
+      for (const b of bills) {
+        if (b.settled) offeredPaid += 1;
+        /* Whatever a bill's payment state, a note may never reduce it by more
+           than it was worth. */
+        if (b.allocatable - b.originalAmount > 0.01) {
+          badCap.push(`${cn.voucherNumber}/${b.billName}: creditable ${b.allocatable} > value ${b.originalAmount}`);
+        }
+        if (!(b.allocatable > 0)) {
+          badCap.push(`${cn.voucherNumber}/${b.billName}: offered with nothing creditable`);
+        }
+      }
+    }
+    check(
+      `credit notes are offered settled invoices (${offeredPaid} across ${cns.length} notes)`,
+      offeredPaid > 0,
+      "no paid invoice was offered — the filter is still on the unpaid balance",
+    );
+    check(
+      "and none may be credited for more than the invoice was worth",
+      badCap.length === 0,
+      badCap.slice(0, 3).join(" | "),
+    );
+
+    /* The other half: a receipt must NOT start seeing settled bills, or every
+       match screen fills with invoices that have nothing left to pay. */
+    const rcs = await Acc_Voucher.find({
+      voucherType: "receipt",
+      status: { $nin: ["cancelled", "void"] },
+    }).limit(20).lean();
+    let settledToReceipt = 0;
+    for (const r of rcs) {
+      const liab = await bm.liabilityLedgerIdsFor(r);
+      const party = await bm.partyAccountIdsFor(r);
+      const st = bm.matchStateOf(r, null, liab, party);
+      if (!st.matchable) continue;
+      const bills = await bm.openBillsForVoucher(r, {
+        excludeVoucherId: r._id,
+        partyLedgerId: st.partyLedgerId,
+        liabilityLedgerIds: liab,
+        partyAccountIds: party,
+      });
+      settledToReceipt += bills.filter((b) => b.settled).length;
+    }
+    check(
+      "a receipt is still offered only what is unpaid",
+      settledToReceipt === 0,
+      `${settledToReceipt} settled bills were offered to receipts`,
+    );
+  }
+
   check("a sales voucher is refused outright", (() => {
     try { bm.assertMatchable({ voucherType: "sales", status: "posted" }); return false; }
     catch (e) { return e.status === 400 && /can be matched to bills/.test(e.message); }

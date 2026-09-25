@@ -643,7 +643,57 @@ router.get("/balance-sheet", auth, async (req, res) => {
       } catch (fieldErr) {
         console.warn("[balance-sheet] new fields skipped:", fieldErr.message);
       }
-      if (nature === "asset") buckets.asset.push(line);
+      /* ── A PARTY WHOSE BALANCE IS THE WRONG WAY ROUND ──────────────────
+         A customer who has paid more than they have been billed is not a
+         receivable — the money is owed back to them. Bucketing purely by the
+         group's nature left that sitting in Assets as a NEGATIVE, which both
+         understates the two sides of the sheet and gives nowhere to see who
+         is in advance: ten of this company's thirty customers are in credit,
+         ₹22.7 lakh between them, and the only way to find them was to open
+         each ledger in turn.
+
+         So the LINE moves, and only the line. The ledger stays under Sundry
+         Debtors, where the invoices, the bill matching and the receivables
+         ageing all look for it; a balance that crosses zero with every
+         invoice and receipt cannot be allowed to drag the ledger between
+         groups as it goes. This is the regrouping Tally performs on the same
+         report, and because it is derived from the balance it can never drift
+         from it.
+
+         The mirror case is a supplier we have paid ahead of their bill — a
+         debit on a creditor, which is an asset. Thirty of them here. */
+      const subGroupLower = String(led.groupName || "").trim().toLowerCase();
+      const isDebtor = subGroupLower === "sundry debtors";
+      const isCreditor = subGroupLower === "sundry creditors";
+      const ADVANCE_EPSILON = 0.5; // rounding dust is not an advance
+
+      if (isDebtor && nature === "asset" && closing < -ADVANCE_EPSILON) {
+        buckets.liability.push({
+          ...line,
+          groupName: "Current Liabilities",
+          subGroupName: "Advance from Customers",
+          /* Kept SIGNED, not flipped. The liabilities total is computed as
+             `-sum(amount)`, so a credit balance belongs in this bucket as a
+             negative; flipping it here subtracted the advance from
+             liabilities instead of adding it and the sheet stopped
+             balancing by twice the amount. `closing` is already negative
+             for a customer in credit. */
+          amount: closing,
+          displayAmount: Math.abs(closing),
+          signedAmount: closing,
+          regroupedFrom: "Sundry Debtors",
+        });
+      } else if (isCreditor && nature === "liability" && closing > ADVANCE_EPSILON) {
+        buckets.asset.push({
+          ...line,
+          groupName: "Loans & Advances (Asset)",
+          subGroupName: "Advance to Suppliers",
+          amount: closing,
+          displayAmount: Math.abs(closing),
+          signedAmount: closing,
+          regroupedFrom: "Sundry Creditors",
+        });
+      } else if (nature === "asset") buckets.asset.push(line);
       else if (nature === "liability") buckets.liability.push(line);
       else if (nature === "equity") buckets.equity.push(line);
       else if (nature === "revenue") revenueNet += -closing;
