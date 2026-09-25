@@ -91,6 +91,18 @@ function normaliseCondition(cond) {
   };
 }
 
+/** A geometry reference, keeping the stable ids alongside the positions they used to be identified by. */
+function normaliseRef(r) {
+  return {
+    pathIdx: Number(r?.pathIdx ?? 0),
+    segIdx: Number(r?.segIdx ?? 0),
+    ...(r?.pathId ? { pathId: String(r.pathId) } : {}),
+    ...(r?.nodeId ? { nodeId: String(r.nodeId) } : {}),
+    ...(r?.legacyPathIdx != null ? { legacyPathIdx: Number(r.legacyPathIdx) } : {}),
+    ...(r?.legacySegIdx != null ? { legacySegIdx: Number(r.legacySegIdx) } : {}),
+  };
+}
+
 function normaliseGroup(g) {
   // Accept both old-style (clientId/name) and new-style (groupId/groupName)
   const id = String(g.groupId || g.clientId || g.id || "");
@@ -103,8 +115,16 @@ function normaliseGroup(g) {
     partKey: g.partKey || "chest",
     assignedSize: g.assignedSize || null,
     multiplier: Number(g.multiplier) || 1,
-    ref1: { pathIdx: Number(g.ref1?.pathIdx ?? 0), segIdx: Number(g.ref1?.segIdx ?? 0) },
-    ref2: { pathIdx: Number(g.ref2?.pathIdx ?? 0), segIdx: Number(g.ref2?.segIdx ?? 0) },
+    /*
+     * A BINDING'S STABLE IDENTITY HAS TO SURVIVE THE SAVE.
+     *
+     * These two lines rebuilt each reference as a bare pair of array positions, so the path and node ids a binding
+     * carries were dropped on every write — and position is exactly the identity that breaks when a connector or a
+     * node is deleted and the arrays re-index. The ids are what let a measurement still name the node it meant.
+     * They are written only when the group carries them, so older index-only data is unaffected.
+     */
+    ref1: normaliseRef(g.ref1),
+    ref2: normaliseRef(g.ref2),
     color: g.color || "#2563eb",
     targetFullInches: Number(g.targetFullInches) || 0,
     baseFullInches: Number(g.baseFullInches) || 0,
@@ -127,6 +147,24 @@ function normaliseGroup(g) {
     conditionsFollowLoosing: Boolean(g.conditionsFollowLoosing),
     nestedConditions: (g.nestedConditions || []).map(normaliseCondition),
     keyframes: (g.keyframes || []).map(normaliseKeyframe),
+    /*
+     * WHAT THE GROUP MEASURES HAS TO SURVIVE THE SAVE.
+     *
+     * This function rebuilds the group field by field, and for a long time it simply did not mention these three —
+     * so a group that declared itself a chord or a named arc went into the database as neither, and came back with
+     * the declaration gone. The schema has always had room for them; nothing but this list was dropping them.
+     *
+     * measureMode is not a substitute. "curve" says the measurement follows the outline, not WHICH of the two ways
+     * round the outline it goes, and on a closed piece the two answers differ by the whole rest of the perimeter.
+     * Only boundaryTraversal carries that, and only bindingBefore records what the group measured when it was drawn,
+     * which is how a later load can tell a re-interpreted route from an unchanged one.
+     *
+     * Each is written only when the group actually carries it, so a group that never declared a type is not given
+     * one here by accident.
+     */
+    ...(g.measurementType ? { measurementType: g.measurementType } : {}),
+    ...(g.boundaryTraversal ? { boundaryTraversal: g.boundaryTraversal } : {}),
+    ...(g.bindingBefore !== undefined ? { bindingBefore: g.bindingBefore } : {}),
   };
 }
 
@@ -459,8 +497,17 @@ router.post("/pattern-grading/stock-item/:stockItemId/size-pattern", async (req,
     const { stockItemId } = req.params;
     const { sizeName, sizeValue, svgFileUrl, svgPublicId, originalFilename, bytes, baseMeasurements, unitsPerInch } = req.body;
 
-    if (!sizeName || !sizeValue || !svgFileUrl)
-      return res.status(400).json({ success: false, message: "sizeName, sizeValue, and svgFileUrl are required" });
+    /*
+     * ONLY THE SIZE'S NAME IDENTIFIES THE ROW.
+     *
+     * This guard used to demand sizeValue and svgFileUrl as well, long after the schema stopped requiring either —
+     * a chart-only size legitimately has no drawing, and a size chart that names its sizes by letter has no numeric
+     * value to give. The mismatch was invisible from the editor, which queues its saves locally and reports success
+     * from the queue: the desk said "saved", the replay came back 400 for ever, and because the replay stops at the
+     * first rejection, every later save queued behind it — including authored measurement groups — was frozen too.
+     */
+    if (!sizeName)
+      return res.status(400).json({ success: false, message: "sizeName is required" });
 
     const doc = await saveWithRetry(
       async () => {
@@ -579,6 +626,7 @@ router.get("/pattern-grading/stock-item/:stockItemId/size-patterns-with-groups",
       basePatternSize: config.basePatternSize || null,
       patternEngineVersion: config.patternEngineVersion || null,
       garmentType: config.garmentType || null,
+      pieceRoles: config.pieceRoles || [],
     });
   } catch (error) {
     console.error("Error fetching size patterns with groups:", error);
@@ -614,7 +662,7 @@ router.get("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName", as
 router.put("/pattern-grading/stock-item/:stockItemId/v3-config", async (req, res) => {
   try {
     const { stockItemId } = req.params;
-    const { basePatternSize, garmentType, patternEngineVersion } = req.body || {};
+    const { basePatternSize, garmentType, patternEngineVersion, pieceRoles } = req.body || {};
 
     let doc = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
     if (!doc) doc = await PatternGradingConfig.create({ stockItemId, isActive: true, sizePatterns: [] });
@@ -625,6 +673,7 @@ router.put("/pattern-grading/stock-item/:stockItemId/v3-config", async (req, res
         if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
         if (garmentType !== undefined) config.garmentType = garmentType;
         if (patternEngineVersion !== undefined) config.patternEngineVersion = patternEngineVersion;
+        if (pieceRoles !== undefined) { config.pieceRoles = pieceRoles; config.markModified("pieceRoles"); }
       },
       5,
     );
@@ -633,6 +682,7 @@ router.put("/pattern-grading/stock-item/:stockItemId/v3-config", async (req, res
       basePatternSize: doc.basePatternSize || null,
       garmentType: doc.garmentType || null,
       patternEngineVersion: doc.patternEngineVersion || null,
+      pieceRoles: doc.pieceRoles || [],
     });
   } catch (error) {
     console.error("Error saving V3 config:", error);
