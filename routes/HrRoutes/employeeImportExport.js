@@ -1258,6 +1258,12 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
     const basicPct = (cfg.basicPct ?? 50) / 100;
     const hraPct = (cfg.hraPct ?? 50) / 100;
     const eepfPct = (cfg.eepfPct ?? 12) / 100;
+    /* EPF gets the same two steps as EDLI and admin charges below: the wage
+       ceiling first, the rupee maximum second. The sheet used to apply only
+       the maximum, which gives the same answer at the statutory settings
+       (₹15,000 × 12% = ₹1,800, so the cap binds first either way) and a
+       different one the moment the ceiling is moved. */
+    const epfCeil = cfg.epfWageCeiling ?? 15000;
     const epfCap = cfg.epfCapAmount ?? 1800;
     const esiLimit = cfg.esiWageLimit ?? 21000;
     const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
@@ -1278,7 +1284,7 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
     const formulasFor = (R) => ({
         [L.basic]: `IF(${L.gross}${R}="","",ROUND(${L.gross}${R}*${basicPct},0))`,
         [L.hra]: `IF(${L.gross}${R}="","",ROUND(${L.gross}${R}*${hraPct},0))`,
-        [L.epfEE]: `IF(${L.basic}${R}="","",ROUND(MIN(${L.basic}${R}*${eepfPct},${epfCap}),0))`,
+        [L.epfEE]: `IF(${L.basic}${R}="","",MIN(ROUND(MIN(${L.basic}${R},${epfCeil})*${eepfPct},0),${epfCap}))`,
         [L.esicEE]: `IF(${L.basic}${R}="","",IF(${L.basic}${R}<=${esiLimit},CEILING(${L.basic}${R}*${eeEsicPct},1),0))`,
         [L.totDed]: `IF(${L.epfEE}${R}="","",${L.epfEE}${R}+IF(${L.esicEE}${R}="",0,${L.esicEE}${R})+IF(${L.otherDed}${R}="",0,${L.otherDed}${R}))`,
         [L.net]: `IF(${L.gross}${R}="","",MAX(${L.gross}${R}-IF(${L.totDed}${R}="",0,${L.totDed}${R}),0))`,
