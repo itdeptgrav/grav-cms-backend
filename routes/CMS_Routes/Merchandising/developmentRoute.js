@@ -22,6 +22,7 @@
 // are the same authorities.
 "use strict";
 
+const crypto = require("crypto");
 const express = require("express");
 
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
@@ -36,6 +37,9 @@ const development = require("../../../services/merchandising/development.service
 const materialCatalogue = require("../../../services/merchandising/materialCatalogue.service");
 const adoption = require("../../../services/merchandising/developmentAdoption.service");
 const legacy = require("../../../services/merchandising/developmentLegacy.service");
+const {
+  MerchandisingAuditEvent,
+} = require("../../../models/CMS_Models/Merchandising/MerchandisingEvent");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -74,10 +78,108 @@ const idempotencyKey = (req) => String(
    vendors and prices. */
 router.get("/catalogue/materials", requireCompany, canSelect, handle(async (req, res) => {
   const out = await materialCatalogue.search(ctx(req), {
-    q: req.query.q, category: req.query.category,
+    q: req.query.q, category: req.query.category, section: req.query.section,
     cursor: req.query.cursor, limit: req.query.limit,
   });
   return res.json({ success: true, ...out });
+}));
+
+/** What the registration drawer's form may offer: Store's shelves, this
+    company's units, and the classifications a garment BOM uses. Behind the
+    same grant as the search, because it is only ever read to fill that form. */
+router.get("/catalogue/registration-options", requireCompany, canSelect,
+  handle(async (req, res) => {
+    const out = await materialCatalogue.registrationOptions(ctx(req));
+    return res.json({ success: true, ...out });
+  }));
+
+/* ── REGISTERING A MATERIAL STORE DOES NOT HAVE YET ────────────────────────
+   Behind `selection.write` — the SAME grant as browsing the catalogue, and
+   deliberately not Store's `sp.master.maintain`. The authority to choose
+   materials for a style is the authority to name one that is missing; the
+   service header states at length what this does NOT thereby grant, and the
+   shared creation service enforces it by section rather than by trust.
+
+   `fileId` is required, and not for authorisation — the grant is the caller's,
+   not the file's. It is required so the audit row can say WHY the item exists:
+   a Store catalogue with items appearing in it and no reason attached is how
+   nobody can later answer "who added this and what for". The file is loaded
+   through Merchandising's own scoped loader, so a file from another company
+   answers as one that does not exist.
+
+   ── ONE OPERATION, NOT TWO ────────────────────────────────────────────────
+   The item and the audit row that explains it are written in ONE transaction,
+   with the idempotency ledger row in the same commit. Three things follow, and
+   each one was wrong before:
+
+     · an audit write that fails cannot leave an item registered with no record
+       of who registered it or why — the item is rolled back with it;
+     · a retry of a request that already succeeded gets the FIRST answer back
+       verbatim, rather than a duplicate-material conflict for the item it
+       itself created a moment ago;
+     · two requests arriving together produce one item, because the loser meets
+       either the ledger's unique index or the catalogue's — never a second row.
+
+   The key comes from the `Idempotency-Key` header, as every other command on
+   this router takes it. */
+router.post("/catalogue/materials", requireCompany, canSelect, handle(async (req, res) => {
+  const context = ctx(req);
+  const who = actor(req);
+
+  const out = await development.onceAtomically(context, {
+    scope: `dev:material:register:${String(req.body?.fileId || "")}`,
+    idempotencyKey: idempotencyKey(req),
+    /* What "the same request" means. A different material under the same key is
+       a client bug and is refused rather than answered with the first one. */
+    request: {
+      fileId: String(req.body?.fileId || ""),
+      name: String(req.body?.name || "").trim(),
+      category: String(req.body?.category || ""),
+      unit: String(req.body?.unit || ""),
+      usedAs: String(req.body?.usedAs || ""),
+    },
+  }, async (session) => {
+    /* Loaded inside the transaction, so a file cancelled while this was in
+       flight is not written against. */
+    const file = await development.loadFile(context, req.body?.fileId, session);
+
+    /* The body goes through WHOLE, deliberately. Hand-picking the fields this
+       door accepts would DROP everything else on the way in — so a caller who
+       sent a purchase price would get a 201 and believe it was recorded. The
+       service decides what is permitted and refuses the rest by name. */
+    const made = await materialCatalogue.register(context, req.body, req.user?.id, session);
+
+    /* Recorded in MERCHANDISING's history, sourced to Merchandising, naming the
+       Store item in `details`. The item's own creation is Store's record; this
+       is the statement of why it was created and by whom, against the file that
+       needed it. In the same transaction, so neither can exist without the
+       other. */
+    await MerchandisingAuditEvent.create([development.auditRow({
+      file,
+      recordType: "DEVELOPMENT_FILE",
+      recordId: file._id,
+      action: "DEVELOPMENT_MATERIAL_REGISTERED",
+      actor: who,
+      at: new Date(),
+      correlationId: idempotencyKey(req) || crypto.randomUUID(),
+      details: {
+        rawItemId: made.item.rawItemId,
+        rawItemName: made.item.name,
+        rawItemSku: made.item.sku,
+        category: made.item.category,
+        unit: made.item.unit,
+        usedAs: made.item.usedAs,
+        sourceDepartment: "merchandising",
+        sourceScreen: "DEVELOPMENT_BOM",
+      },
+    })], { session, ordered: true });
+
+    return made;
+  });
+
+  /* A replay is the same answer, and says so, rather than pretending a second
+     item was created. */
+  return res.status(out.replayed ? 200 : 201).json({ success: true, ...out });
 }));
 
 /* ═══ THE REGISTER ═════════════════════════════════════════════════════════

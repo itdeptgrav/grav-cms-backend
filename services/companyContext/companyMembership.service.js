@@ -72,6 +72,8 @@ async function unavailableOnFailure(fail, what, runQuery) {
 }
 
 const MEMBERSHIP_SOURCES = Object.freeze({
+  /* GAC-AR1: the GRAV Clothing primary profile, resolved server-side. */
+  CANONICAL_GRAV_ORGANISATION: "CANONICAL_GRAV_ORGANISATION",
   MEMBERSHIP_RECORD: "MEMBERSHIP_RECORD",
   SINGLE_COMPANY_DEPLOYMENT: "SINGLE_COMPANY_DEPLOYMENT",
   SERVICE: "SERVICE",
@@ -98,6 +100,35 @@ const companyModel = () => require("../../models/Accountant_model/Acc_MasterMode
 async function resolveCompanyForActor(user, { requestedCompanyId = null, domainLabel, fail } = {}) {
   if (!user || !user.id) {
     throw fail("UNAUTHENTICATED", `Sign in to use ${domainLabel}.`);
+  }
+
+  /* ── 0. GAC-AR1: one organisation ─────────────────────────────────────────
+   * GRAV is one organisation. When the GRAV Clothing primary profile exists,
+   * every authenticated internal actor works in it — no membership row is
+   * needed, because application authorisation (services/access/
+   * appAccess.service.js) is the access decision and company is not. A
+   * requested company can only NAME the primary one; any other id (a demo
+   * company, a stale browser selection) is refused, never honoured.
+   *
+   * No primary row (in-memory test databases) keeps the legacy membership
+   * resolution below — which is itself fail-closed. A failed lookup is an
+   * outage (503), never a fallback to arbitrary data. */
+  const { getCanonicalCompany } = require("./canonicalCompany.service");
+  const canonical = await unavailableOnFailure(fail, "canonical company lookup", () => getCanonicalCompany());
+  if (canonical) {
+    if (requestedCompanyId && String(requestedCompanyId) !== String(canonical._id)) {
+      throw fail(
+        "TENANT_MEMBERSHIP_UNPROVEN",
+        `Only GRAV Clothing is available in ${domainLabel}.`,
+        {},
+      );
+    }
+    return {
+      companyId: canonical._id,
+      permittedSiteIds: [],
+      membershipSource: MEMBERSHIP_SOURCES.CANONICAL_GRAV_ORGANISATION,
+      membership: null,
+    };
   }
 
   const email = user.email ? String(user.email).toLowerCase().trim() : "";
@@ -230,6 +261,15 @@ async function resolveCompanyForActor(user, { requestedCompanyId = null, domainL
  */
 async function listMembershipCompanies(user) {
   const str = (v) => String(v ?? "").trim();
+
+  /* GAC-AR1: a company selector offers exactly one choice — GRAV Clothing —
+     to every signed-in internal user. Pickers then have nothing to ask. */
+  const { getCanonicalCompany } = require("./canonicalCompany.service");
+  const canonical = await getCanonicalCompany();
+  if (canonical) {
+    return { companies: [{ companyId: str(canonical._id), displayName: str(canonical.companyName) }] };
+  }
+
   const email = str(user?.email).toLowerCase();
   const or = [];
   if (email) or.push({ email });

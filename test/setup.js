@@ -5,6 +5,14 @@
 // database, no network, no fixtures to clean up.
 "use strict";
 
+/* SEC-0: config/jwt.js no longer falls back to a published literal, so a test
+   file that never set JWT_SECRET would verify against a random per-process
+   secret while its helpers sign with `process.env.JWT_SECRET || …`. One
+   test-only secret for every file that does not choose its own keeps signer
+   and verifier aligned. Files that set JWT_SECRET themselves still win: this
+   only fills the gap, and runs before any test file's own code. */
+if (!process.env.JWT_SECRET) process.env.JWT_SECRET = "test-only-jwt-secret-not-for-any-deployment";
+
 const mongoose = require("mongoose");
 const { MongoMemoryReplSet } = require("mongodb-memory-server");
 

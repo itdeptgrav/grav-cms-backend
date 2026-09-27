@@ -95,6 +95,21 @@ router.get("/tna/portfolio/counts", requireCompany, canRead, handle(async (req, 
   return res.json({ success: true, ...out });
 }));
 
+/* ── THE OVERVIEW'S CROSS-ORDER ATTENTION SECTION ─────────────────────────
+   Seven counts and the number of ORDERS behind the late ones, from one read
+   of the same milestones the register and each file's own plan read. There is
+   no second T&A store and no cached figure: this counts, now, in the
+   database, so a number here opens a list of exactly the rows it counted.
+
+   `canRead` — the same grant that opens the register. Seeing which of your
+   orders are late is reading, and the Overview offers no way to change a
+   date; every figure links into the file, where the plan's own governed
+   commands live. */
+router.get("/tna/portfolio/attention", requireCompany, canRead, handle(async (req, res) => {
+  const out = await portfolio.attention(ctx(req), { today: req.query.today });
+  return res.json({ success: true, ...out });
+}));
+
 /* ── BULK ──────────────────────────────────────────────────────────────────
    Preview reads and writes nothing; apply is `tna.execute`, the same
    authority a single forecast change needs. Doing forty at once is not a

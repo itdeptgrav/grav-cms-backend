@@ -33,7 +33,7 @@ const { requireDepartmentRole } = require("../services/departmentRoles");
 const { requireApproval } = require("../services/changeRequests");
 const { sectionForPath } = require("../services/auditSections");
 const describeChange = require("../services/changeRequestDescribe");
-const { SECRET, LEGACY_SECRETS, readToken } = require("../config/jwt");
+const { verifyCmsToken, readToken } = require("../config/jwt");
 
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
@@ -61,16 +61,9 @@ function seedIdentity(req) {
 
   let decoded = null;
   try {
-    decoded = jwt.verify(token, SECRET);
+    decoded = verifyCmsToken(token); // SEC-0: configured secret only
   } catch {
-    for (const legacy of LEGACY_SECRETS) {
-      try {
-        decoded = jwt.verify(token, legacy);
-        break;
-      } catch {
-        /* try the next */
-      }
-    }
+    decoded = null;
   }
   if (!decoded) return;
 

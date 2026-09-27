@@ -86,7 +86,16 @@ async function list() {
   };
 }
 
+/* GAC-2 correction: RETIRED FROM PRODUCTION. PUT /api/admin/company-access
+   returns 410 and no route calls this; GRAV is one organisation and grants
+   are not company-scoped. Kept (with the companyGrants data untouched) only so
+   the existing company-scope characterisation tests can still arrange rows
+   until GAC-5 removes company scoping; it refuses outside tests.
+   test/access/gac2-single-writer.contract.test.js fails if a route calls it. */
 async function change({ companyId, departmentSlug, email, role, reason, actor }) {
+  if (process.env.NODE_ENV !== "test") {
+    throw problem(410, "COMPANY_SCOPED_ACCESS_RETIRED", "Company-scoped access changes are retired. GRAV Clothing is the only organisation.");
+  }
   const mail = emailOf(email);
   const slug = String(departmentSlug || "").trim().toLowerCase();
   const why = String(reason || "").trim();

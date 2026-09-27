@@ -331,3 +331,88 @@ describe("cancellation", () => {
     expect(await inMovements(s)).toHaveLength(0);
   });
 });
+
+/* ═══ 5 · A SUPPLIER RETURN MAY NOT SEND A CUSTOMER'S MATERIAL TO A VENDOR ══ */
+
+// The returnable quantity is bounded by what this PO line received, so nothing
+// here can over-return against the PURCHASE. But the balance it physically draws
+// from is shared: the same item in the same rack may also hold customer-supplied
+// units that were never bought from anybody. Receive 20 from the supplier, hold 18
+// of a customer's, and a 5-unit return passes every purchase check while some of
+// those 5 walk out of the building as somebody else's property — the hardest loss
+// to recover, because the goods are now with a third party who has no claim on
+// them and no reason to look.
+
+describe("customer-owned material", () => {
+  const { CustomerMaterialLot } = require("../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+
+  /** Customer material physically at a rack, held for one order line. */
+  const heldAt = async (s, loc, quantity) => {
+    const n = ++seq;
+    return CustomerMaterialLot.create({
+      companyId: s.co._id, customerId: oid(),
+      customerLabel: `Buyer ${n}`, customerCode: `CUST-${n}`,
+      orderRef: `ORD-${n}`, orderLineRef: `LN-${String(n).padStart(12, "0")}`,
+      executionFileId: oid(), expectationId: oid(), documentRef: `CSM-2026-${n}`,
+      expectationRevisionNo: 1, expectationLineRef: `CML-${n}`,
+      rawItemId: s.raw._id, variantId: null, variantCombination: [],
+      itemName: s.raw.name, sku: s.raw.sku,
+      goodsReceiptId: oid(), goodsReceiptNumber: `GRN/2026-27/${n}`, goodsReceiptLineId: oid(),
+      warehouseId: s.wh._id, warehouseName: s.wh.name,
+      locationId: loc._id, locationCode: loc.code,
+      receiptUnit: "pcs", receiptQuantity: quantity,
+      baseUnit: "pcs", baseQuantity: quantity,
+      availableQuantity: quantity, issuedQuantity: 0, returnedQuantity: 0,
+      receivedAt: new Date(), receivedBy: { name: "St" },
+      movements: [{
+        type: "RECEIVED", quantity, baseUnit: "pcs", availableAfter: quantity, at: new Date(),
+      }],
+    });
+  };
+
+  test("is refused when the rack's quantity is only sufficient because of it", async () => {
+    /* 20 in rack A, 18 of them the customer's. Returning 5 to the vendor would
+       take 3 of theirs. */
+    const s = await seed({ received: 20, locQty: 20 });
+    await heldAt(s, s.locA, 18);
+
+    const r = await raise(s, { damagedQuantity: 5, locationId: String(s.locA._id) });
+
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(r.body)).toMatch(/CUSTOMER_OWNED_STOCK_NOT_AVAILABLE/);
+
+    /* Nothing left: not the rack, not the company balance, and no return request
+       was recorded against the purchase order. */
+    expect(await onHand(s, s.locA)).toBe(20);
+    expect(await outMovements(s)).toHaveLength(0);
+    const po = await PurchaseOrder.findById(s.po._id).lean();
+    expect(po.returnRequests || []).toHaveLength(0);
+  });
+
+  test("but the factory's own units still go back to the vendor", async () => {
+    /* The guard subtracts; it does not stop a legitimate return of goods the
+       factory actually bought. */
+    const s = await seed({ received: 20, locQty: 20 });
+    await heldAt(s, s.locA, 15);
+
+    const r = await raise(s, { damagedQuantity: 5, locationId: String(s.locA._id) });
+    expect(r.status).toBe(201);
+    expect(await onHand(s, s.locA)).toBe(15);
+
+    /* And what is left is exactly the customer's, so the next unit is refused. */
+    const again = await raise(s, { damagedQuantity: 1, locationId: String(s.locA._id) });
+    expect(JSON.stringify(again.body)).toMatch(/CUSTOMER_OWNED_STOCK_NOT_AVAILABLE/);
+    expect(await onHand(s, s.locA)).toBe(15);
+  });
+
+  test("a customer's material in another rack does not block the return", async () => {
+    const s = await seed({ received: 20, locQty: 20 });
+    await heldAt(s, s.locB, 18);
+
+    const r = await raise(s, { damagedQuantity: 5, locationId: String(s.locA._id) });
+    expect(r.status).toBe(201);
+    expect(await onHand(s, s.locA)).toBe(15);
+    /* Rack B untouched. */
+    expect(await onHand(s, s.locB)).toBe(0);
+  });
+});

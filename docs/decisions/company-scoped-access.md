@@ -2,7 +2,9 @@
 
 **Decision date:** 22 September 2026
 
-**Status:** Adopted product direction; PPC implementation in the working tree, other apps pending
+**Status:** Superseded on 25 September 2026 by
+`docs/decisions/single-organisation-access-control.md`. Retained as migration
+history because PPC company-scoped grants and membership data may still exist.
 **Scope:** CMS employee and department applications. Accountant's separate login remains an explicit adapter until its identity contract is reconciled.
 
 ## Decision

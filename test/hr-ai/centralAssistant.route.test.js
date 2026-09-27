@@ -129,7 +129,23 @@ async function seed() {
 
 beforeEach(async () => {
   chatJson.mockReset();
-  chatJson.mockResolvedValue({ model: "qwen3:8b", data: { reply: "Here is what I found." } });
+  chatJson.mockImplementation(async ({ schema, prompt }) => {
+    const properties = (schema && schema.properties) || {};
+    if (properties.choice) {
+      const parsed = JSON.parse(prompt);
+      const q = String(parsed.currentQuestion || "");
+      const choice = /overview|headcount/i.test(q)
+        ? "hr_overview"
+        : /present|absent|attendance/i.test(q)
+          ? "hr_daily_attendance"
+          : "conversation";
+      return { model: "qwen3:8b", data: { choice, clarification: null } };
+    }
+    if (properties.date && properties.department) {
+      return { model: "qwen3:8b", data: { date: "2026-08-08", department: "all" } };
+    }
+    return { model: "qwen3:8b", data: { reply: "Here is what I found." } };
+  });
   convo._clearAll();
   ids = await seed();
 });
@@ -171,10 +187,10 @@ describe("central assistant tool gating", () => {
   });
 
   test("HR manager: HR overview attached on an HR question", async () => {
-    const { status, body } = await message({ message: "How many staff are present today?" }, ids.HR);
+    const { status, body } = await message({ message: "Give me the HR workforce overview and headcount." }, ids.HR);
     expect(status).toBe(200);
     expect(body.meta.toolsUsed).toContain("hr_overview");
-    expect(chatJson.mock.calls[0][0].prompt).toContain("HR_OVERVIEW_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("HR_OVERVIEW_CONTEXT"))).toBe(true);
   });
 
   test("multi-department HR-in-Sales: same access as HR (tools attached)", async () => {
@@ -195,13 +211,13 @@ describe("central assistant tool gating", () => {
     expect(status).toBe(200);
     expect(body.meta.toolsUsed).not.toContain("hr_overview");
     expect(body.meta.toolsUsed).not.toContain("hr_daily_attendance");
-    expect(chatJson.mock.calls[0][0].prompt).not.toContain("HR_OVERVIEW_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("HR_OVERVIEW_CONTEXT"))).toBe(false);
   });
 
   test("Daily Attendance tool is selected for a day-attendance question", async () => {
     const { body } = await message({ message: "Who is absent today?" }, ids.HR);
     expect(body.meta.toolsUsed).toContain("hr_daily_attendance");
-    expect(chatJson.mock.calls[0][0].prompt).toContain("DAILY_ATT_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("DAILY_ATT_CONTEXT"))).toBe(true);
   });
 
   test("route context does NOT grant HR access to a Sales-only user", async () => {
@@ -218,7 +234,7 @@ describe("central assistant tool gating", () => {
       { message: "How many staff are present today?", routeContext: "/sales/dashboard" },
       ids.HR,
     );
-    expect(body.meta.toolsUsed).toContain("hr_overview");
+    expect(body.meta.toolsUsed).toContain("hr_daily_attendance");
   });
 
   test("conversation persists per-user and stays isolated", async () => {

@@ -288,33 +288,13 @@ router.get("/task/self-assign-debug/:employeeId", async (req, res) => {
     }
 });
 
-// ── DEBUG: dump the raw fields of one task ────────────────────────────────────
-router.get("/task/dump/:taskId", async (req, res) => {
-    try {
-        const { db } = require("../../config/firebaseAdmin");
-        const snap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
-        if (!snap.exists) return res.status(404).json({ error: "Not found" });
-        res.json(snap.data());
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-router.get("/task/dump/:taskId", async (req, res) => {
-    try {
-        const { db } = require("../../config/firebaseAdmin");
-        const snap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
-        if (!snap.exists) return res.status(404).json({ error: "Not found" });
-        res.json(snap.data());
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── DEBUG: dump one employee's raw fields ──────────────────────────────────
-router.get("/employee/dump/:employeeId", async (req, res) => {
-    try {
-        const { db } = require("../../config/firebaseAdmin");
-        const snap = await db.collection("cowork_employees").doc(req.params.employeeId).get();
-        if (!snap.exists) return res.status(404).json({ error: "Not found" });
-        res.json(snap.data());
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// ── DEBUG dumps — REMOVED (SEC-1, 25 Sep 2026) ────────────────────────────
+// `GET /task/dump/:taskId` (defined twice) and `GET /employee/dump/:employeeId`
+// returned raw Firestore documents with no authentication at all — the
+// employee dump included the stored Gmail refresh token and temporary
+// password. There is deliberately no replacement route, flag or parameter. If
+// diagnostic access is needed, it belongs in a local command with a safe field
+// projection, never on the HTTP surface.
 
 // ── Self-assign repair: fix old tasks missing approverId/visibleTo ───────────
 // Call: POST /cowork/task/self-assign-repair { taskId, approverId, approverName }

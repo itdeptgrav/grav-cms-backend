@@ -1,51 +1,83 @@
 // config/jwt.js
 //
-// One signing secret, one place.
+// One signing secret, one place, one verifier.
 //
-// The literal `"grav_clothing_secret_key"` appears as a fallback at 31 call
-// sites, and a second literal `"grav_clothing_secret_key_2024"` at 7 more. A
-// fallback secret is not a safety net — it is a published signing key, because
-// the source is the same everywhere the code is. Anyone with the repository can
-// mint a valid token for any role.
+// SEC-0 (25 Sep 2026): the two literal fallback secrets that used to be
+// accepted here as "legacy" keys were published in this repository, so anyone
+// holding a copy could mint a valid session for any identity — including one
+// claiming `isAdmin`. They are no longer accepted anywhere. Every CMS verifier
+// goes through `verifyCmsToken` below, which knows exactly one secret: the
+// configured JWT_SECRET.
 //
-// This module refuses to start without a real secret in production, and warns
-// loudly in development. New code imports SECRET from here; the existing call
-// sites are migrated in a follow-up sweep so this can ship on its own.
+// Consequence, deliberately accepted: a token that was signed with one of the
+// published values (only possible where JWT_SECRET was unset or set to one of
+// them) no longer verifies, and its holder has to sign in again.
+//
+// Production refuses to start without a real secret. Every environment refuses
+// a secret that is one of the values ever published in this repository. Outside production a
+// missing secret becomes a random per-process value — never a known string —
+// so a developer without JWT_SECRET gets sessions that die on restart rather
+// than sessions anybody can forge.
 
 "use strict";
 
-const FALLBACK_DEV_SECRET = "dev-only-insecure-secret-change-me";
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 
-function resolveSecret() {
-  const fromEnv = process.env.JWT_SECRET;
+/* SHA-256 fingerprints of secrets that have appeared in this repository.
+   This is a REJECTION check for configuration, not an acceptance list: no
+   token is ever verified against these values. Kept as fingerprints so the
+   published strings themselves are not re-published by this file. */
+const PUBLISHED_SECRET_FINGERPRINTS = new Set([
+  "37d6bb0fcf70291de9d953ae5c84fa8057b1a9ec28860eba6c5bafe0bf99e56b",
+  "a85aeaa3bf2345eaf699f8a9f3a3032be8a1585bcdecf71b591a93195db402dd",
+  "65795ca3364794b8d8afefb7ff3eb15124d8b4915016632385b931687e425af8",
+  "c3f502c755858951d6557c0a71aeff7f7d7bf37f5e53ace98afa5ae40cf20a85",
+]);
 
-  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+const fingerprint = (value) => crypto.createHash("sha256").update(String(value)).digest("hex");
 
-  if (process.env.NODE_ENV === "production") {
+/** Exported for the startup test; the module resolves once at require time. */
+function resolveSecret(env = process.env) {
+  const fromEnv = String(env.JWT_SECRET || "").trim();
+  const production = env.NODE_ENV === "production";
+
+  if (fromEnv && PUBLISHED_SECRET_FINGERPRINTS.has(fingerprint(fromEnv))) {
+    // In every environment: a known value is not a secret, and a server that
+    // starts with one silently accepts forged sessions.
     throw new Error(
-      "JWT_SECRET is not set. Refusing to start in production with a " +
-        "known signing key — every token would be forgeable by anyone " +
-        "holding a copy of this repository.",
+      "JWT_SECRET is set to a value that has been published in the source " +
+        "repository. Refusing to start: every token would be forgeable. " +
+        "Generate a new random secret.",
+    );
+  }
+
+  if (fromEnv) return fromEnv;
+
+  if (production) {
+    throw new Error(
+      "JWT_SECRET is not set. Refusing to start in production without a " +
+        "signing secret.",
     );
   }
 
   console.warn(
-    "\n[jwt] JWT_SECRET is not set. Falling back to a development-only secret.\n" +
-      "[jwt] Tokens signed now are NOT secure and will not verify once the\n" +
-      "[jwt] real secret is configured. Set JWT_SECRET in .env.\n",
+    "\n[jwt] JWT_SECRET is not set. Using a random per-process secret: every " +
+      "session ends when this process restarts. Set JWT_SECRET in .env.\n",
   );
-  return FALLBACK_DEV_SECRET;
+  return crypto.randomBytes(48).toString("hex");
 }
 
 const SECRET = resolveSecret();
 
-// The historical secret. Kept ONLY so tokens issued before this module existed
-// keep verifying through their remaining lifetime; remove once that window has
-// passed. Never used for signing.
-const LEGACY_SECRETS = [
-  "grav_clothing_secret_key",
-  "grav_clothing_secret_key_2024",
-].filter((s) => s !== SECRET);
+/**
+ * Verify a CMS session token against the configured secret — and only that.
+ * Throws exactly what `jwt.verify` throws, so callers keep their own
+ * expired-vs-invalid handling.
+ */
+function verifyCmsToken(token) {
+  return jwt.verify(token, SECRET);
+}
 
 const TOKEN_TTL = "7d";
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -110,15 +142,18 @@ function cookieOptions() {
 /**
  * The bearer of this request's session, wherever it was put.
  *
- * Order matters, and the header comes first on purpose. In production the
- * frontend and this API are different hosts, so the cookie below is a
- * third-party cookie: Safari blocks it outright, Chrome blocks it for anyone
- * who has changed the setting, and it is dropped entirely unless the response
- * carried SameSite=None; Secure. The frontend therefore also sends the token as
- * `Authorization: Bearer`, and that path has to be the one that wins — it is
- * the only one that works on every browser.
+ * GAC-AR2 (25 Sep 2026): the HttpOnly COOKIE comes first. The server sets it on
+ * every login, switch and password change, so when it is present it is the
+ * newest session this browser holds. The `Authorization: Bearer` copy lives in
+ * localStorage and is a compatibility bridge for browsers that block the
+ * third-party cookie; when both were sent and disagreed, reading the header
+ * first let a STALE local token override a newer session — a revoked or
+ * downgraded identity kept answering. The header is still read when there is
+ * no cookie (the cross-site production case the bridge exists for).
  *
- * The raw-header parse at the end covers routes mounted before cookie-parser.
+ * Bridge deletion condition: once the API is served under the frontend's
+ * registrable domain with COOKIE_DOMAIN set (first-party cookie everywhere),
+ * the Bearer fallback and the frontend's cms_token copy can be removed.
  *
  * @param {import("express").Request} req
  * @param {string} [cookieName] override for modules with their own cookie
@@ -127,15 +162,10 @@ function cookieOptions() {
 function readToken(req, cookieName = COOKIE_NAME) {
   if (!req) return null;
 
-  const header = req.headers?.authorization || req.headers?.Authorization || "";
-  if (/^Bearer\s+/i.test(header)) {
-    const bearer = header.replace(/^Bearer\s+/i, "").trim();
-    if (bearer) return bearer;
-  }
-
   const fromCookie = req.cookies?.[cookieName];
   if (fromCookie) return fromCookie;
 
+  // Routes mounted before cookie-parser: parse the raw header.
   const raw = req.headers?.cookie || "";
   const match = raw.match(new RegExp(`(?:^|;\\s*)${cookieName}=([^;]+)`));
   if (match) {
@@ -146,12 +176,19 @@ function readToken(req, cookieName = COOKIE_NAME) {
     }
   }
 
+  const header = req.headers?.authorization || req.headers?.Authorization || "";
+  if (/^Bearer\s+/i.test(header)) {
+    const bearer = header.replace(/^Bearer\s+/i, "").trim();
+    if (bearer) return bearer;
+  }
+
   return null;
 }
 
 module.exports = {
   SECRET,
-  LEGACY_SECRETS,
+  verifyCmsToken,
+  resolveSecret,
   TOKEN_TTL,
   TOKEN_TTL_MS,
   COOKIE_NAME,

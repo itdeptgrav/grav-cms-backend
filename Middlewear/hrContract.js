@@ -47,7 +47,7 @@
 
 const jwt = require("jsonwebtoken");
 
-const { SECRET, LEGACY_SECRETS, readToken } = require("../config/jwt");
+const { verifyCmsToken, readToken } = require("../config/jwt");
 const { findDeclaration, extractParams } = require("../services/access/hrRouteContract");
 const {
   authorizeHr,
@@ -63,17 +63,10 @@ const { projectEmployee, projectEmployees, scrubResponse } = require("../service
 function verify(token) {
   if (!token) return null;
   try {
-    return jwt.verify(token, SECRET);
+    return verifyCmsToken(token); // SEC-0: configured secret only
   } catch {
-    for (const legacy of LEGACY_SECRETS) {
-      try {
-        return jwt.verify(token, legacy);
-      } catch {
-        /* try the next */
-      }
-    }
+    return null;
   }
-  return null;
 }
 
 /**

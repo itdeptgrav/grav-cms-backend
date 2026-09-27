@@ -25,6 +25,11 @@ const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const locStock = require("./locationStock.service");
 const tenantContext = require("./tenantContext.service");
 const { fail } = require("./errors");
+/* Required at module load, never inside the return transaction: a lazy require
+   there compiles `CustomerMaterialLot` inside the transaction, and Mongoose
+   schedules that model's index builds on compilation — which then land inside the
+   transaction and fail it with a lock timeout that mentions no index at all. */
+const customerOwnedReserve = require("./customerOwnedReserve.service");
 
 /* ── A NARROW SEAM FOR PROVING INTERLEAVINGS ────────────────────────────────
  * Each contested boundary announces itself so a test can hold one request there
@@ -347,6 +352,34 @@ async function raiseSupplierReturnStock({
     );
   }
   const before = returnableNow(updated, poItem._id);
+
+  /* ── A SUPPLIER RETURN MAY NOT SEND A CUSTOMER'S MATERIAL TO A VENDOR ─────
+     The returnable quantity is bounded by what this PO line received, so nothing
+     here over-returns against the PURCHASE. But the physical balance it draws
+     from is shared: the same item at the same location may also hold
+     customer-supplied units that were never bought from anybody. Receive 100 from
+     the supplier, hold 50 of the customer's, and a 100-unit return passes every
+     purchase check while 50 of them physically leave for a vendor who has no
+     claim on them — the hardest kind of loss to recover, because the goods have
+     left the building and belong to a third party.
+
+     Same guard as the ordinary issue paths, from one implementation. */
+  {
+    const guardItem = await RawItem.findById(poItem.rawItem)
+      .select("companyId quantity variants unit customUnit").session(session || null);
+    if (guardItem) {
+      await customerOwnedReserve.assertOrdinaryIssueAllowed({
+        companyId: tenant.companyId || guardItem.companyId,
+        rawItem: guardItem,
+        variantId: poItem.variantId || null,
+        warehouseId: loc?.warehouse?._id || null,
+        locationId: loc?.location?._id || null,
+        requested: takeQty,
+        unit: stockUnit || guardItem.customUnit || guardItem.unit || "",
+        session,
+      });
+    }
+  }
 
   await at("returnCreate:beforeStock", { poId: po._id, operationId });
   let moved;

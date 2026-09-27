@@ -33,7 +33,7 @@
 
 const jwt = require("jsonwebtoken");
 
-const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
+const { SECRET } = require("../config/jwt"); // SEC-0: configured secret only
 
 // Roles that are allowed to access the CRM (Leads / Contacts / Accounts)
 const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager", "merchandiser"];

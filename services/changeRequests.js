@@ -297,8 +297,9 @@ function requireApproval(departmentSlug, opts = {}) {
         return res.status(401).json({ success: false, message: "Not authenticated" });
       }
 
-      // Platform admins are not part of any department's approval chain.
-      if (req.user?.isAdmin || req.admin) return next();
+      // Platform admins are not part of any department's approval chain —
+      // as the database says, never on a token claim alone (GAC-AR1).
+      if (await require("./departmentRoles").isDatabaseVerifiedAdmin(req)) return next();
 
       // Same migration rule as requireDepartmentRole — see the header note.
       const assigned = await listRoles(slug);

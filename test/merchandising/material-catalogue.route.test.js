@@ -54,6 +54,7 @@ const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const {
   DevelopmentFile, DevelopmentBomRevision, BOM_STATE,
 } = require("../../models/CMS_Models/Merchandising/Development");
+const { classifyByCategory } = require("../../models/CMS_Models/Inventory/Products/usedAs");
 
 let server, base, salesBase, rs, seq = 0;
 
@@ -143,6 +144,10 @@ async function stock(co, over = {}) {
     sku: over.sku || `FAB-MESH-${n}`,
     category: over.category || "Fabric",
     customCategory: over.customCategory || "",
+    /* The classification these items would carry after the migration, so the
+       picker (now `usedAs`-gated) shows them. Explicit override where a test
+       needs a specific one. */
+    usedAs: over.usedAs || classifyByCategory(over.category || "Fabric", over.customCategory || ""),
     unit: over.unit || "Metre",
     attributes: over.attributes || [{ name: "GSM", values: ["135"] }, { name: "Color", values: ["Slate", "Black"] }],
     variants: over.variants || [
@@ -616,19 +621,26 @@ describe("finding one item among many", () => {
     const labels = await call("/catalogue/materials?category=LABEL", at(w, c.editor));
     expect(labels.body.rows.map((r) => r.name)).toEqual(["Woven label"]);
 
-    /* The chemical is reachable — it is simply under no development
-       category, and says so rather than being filed under a wrong one. */
+    /* The chemical is NOT_CLASSIFIED, so it is not a product-BOM candidate and
+       never appears — the picker is now gated on Store's "Used as", not on a
+       category-shelf heuristic. "All" is the four garment-component classes. */
     const all = await call("/catalogue/materials", at(w, c.editor));
-    const wash = all.body.rows.find((r) => r.name === "Enzyme wash");
-    expect(wash.suggestedCategory).toBeNull();
+    const names = all.body.rows.map((r) => r.name);
+    expect(names).not.toContain("Enzyme wash");
+    expect(names.sort()).toEqual(["Mesh", "Woven label", "Zip"]);
   });
 
-  test("a category that is not a development category is refused by name", async () => {
+  test("an unknown category cannot widen the picker — it clamps to the section", async () => {
     const w = await world();
     const c = await cast(w.co);
+    await stock(w.co, { name: "Enzyme wash", category: "Chemicals" });   // → NOT_CLASSIFIED
     const res = await call("/catalogue/materials?category=CHEMICALS", at(w, c.editor));
-    expect(res.status).toBe(400);
-    expect(res.body.error.details.allowed).toContain("FABRIC");
+    /* No longer a 400: a category outside the section narrows to nothing it may
+       widen to, so it clamps to the section's own allow-list and reveals no
+       excluded item. */
+    expect(res.status).toBe(200);
+    expect(res.body.usedAsAllowed).toEqual(["FABRIC", "TRIM", "LABEL", "GARMENT_ACCESSORY"]);
+    expect(res.body.rows.map((r) => r.name)).not.toContain("Enzyme wash");
   });
 
   test("paging returns every row once, and the search narrows the count", async () => {

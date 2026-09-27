@@ -93,7 +93,8 @@ router.post("/cron", async (req, res) => {
 // middleware, same as /cron. On success it stores the refresh token and tells
 // the popup to close.
 // ─────────────────────────────────────────────────────────────────────────
-const STATE_SECRET = process.env.JWT_SECRET || "grav-backup-oauth-state";
+// SEC-0: the configured secret only — the literal fallback was published.
+const { SECRET: STATE_SECRET } = require("../../config/jwt");
 
 function closePopupHtml(message) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>GRAV Backup</title></head>

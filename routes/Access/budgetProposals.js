@@ -39,7 +39,7 @@ const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 const router = express.Router();
 
-const { SECRET, LEGACY_SECRETS, readToken } = require("../../config/jwt");
+const { verifyCmsToken, readToken } = require("../../config/jwt");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Company, Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
 const { Acc_BudgetDepartment } = require("../../models/Accountant_model/Acc_BudgetDepartment");
@@ -66,20 +66,7 @@ function authenticate(req, res, next) {
   const token = readToken(req);
   if (!token) return res.status(401).json({ success: false, message: "Not authenticated" });
 
-  const verify = () => {
-    try {
-      return jwt.verify(token, SECRET);
-    } catch (err) {
-      for (const legacy of LEGACY_SECRETS) {
-        try {
-          return jwt.verify(token, legacy);
-        } catch {
-          /* try the next */
-        }
-      }
-      throw err;
-    }
-  };
+  const verify = () => verifyCmsToken(token); // SEC-0: configured secret only
 
   try {
     const decoded = verify();

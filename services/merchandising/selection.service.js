@@ -864,13 +864,35 @@ async function loadDraftForEdit(ctx, { fileId, family, expectedRevision }, sessi
 }
 
 /** ADD A ROW to the open draft. */
-async function addRow(ctx, { fileId, family: familyName, body = {}, actor = null } = {}) {
+/**
+ * @param sourceRef  WHERE THIS ROW CAME FROM, and a SERVER-ONLY parameter.
+ *
+ * It is deliberately not a body field and is not in `MATERIAL_TRIM_ROW_FIELDS`
+ * or `PACKAGING_ROW_FIELDS`: a client that could stamp its own lineage could
+ * claim a row came from an approved development revision that never mentioned
+ * it. The route does not pass it. `developmentAdoption.service.js` does,
+ * because it has just read the revision it is naming.
+ */
+async function addRow(ctx, {
+  fileId, family: familyName, body = {}, actor = null, sourceRef = null,
+} = {}) {
   const family = familyOf(familyName);
   const { expectedRevision, ...row } = body || {};
   return withTxn(async (session) => {
     const { file, draft } = await loadDraftForEdit(ctx, { fileId, family, expectedRevision }, session);
     const known = await unitRefsOf(file, session);
     const shaped = normaliseRow(family, row, { known, rowRef: mintRowRef(family.rowPrefix) });
+    if (sourceRef) {
+      shaped.sourceRef = {
+        app: str(sourceRef.app),
+        recordType: str(sourceRef.recordType),
+        ...(isId(sourceRef.recordId)
+          ? { recordId: new mongoose.Types.ObjectId(str(sourceRef.recordId)) } : {}),
+        recordRef: str(sourceRef.recordRef),
+        sourceVersion: str(sourceRef.sourceVersion),
+        sourceState: str(sourceRef.sourceState),
+      };
+    }
 
     draft.rows.push(shaped);
     draft.revision += 1;
@@ -900,6 +922,13 @@ async function updateRow(ctx, { fileId, family: familyName, rowRef, body = {}, a
     const known = await unitRefsOf(file, session);
     const shaped = normaliseRow(family, row, { known, rowRef: str(rowRef) });
     const before = draft.rows[index].toObject();
+    /* ── AN EDIT CHANGES THE ROW, NOT WHERE IT CAME FROM ────────────────
+       An update REPLACES the row with the fields the caller stated, and
+       `sourceRef` is not one a caller may state — so changing a colour on an
+       imported row used to erase the development revision it came from, and
+       the row silently became "added for this order". Provenance is not the
+       caller's to restate and not theirs to drop. */
+    if (before.sourceRef && !shaped.sourceRef) shaped.sourceRef = before.sourceRef;
     draft.rows.set(index, shaped);
     draft.revision += 1;
     draft.updatedBy = actor || undefined;

@@ -158,7 +158,10 @@ async function upsertIdentity(spec, { password, departmentId, companies, manifes
     }
   }
 
-  /* The real grant API. `setRole` is what the Access Control screen calls. */
+  /* A demo FIXTURE write (GAC-2 correction): Access Control now grants through
+     the canonical changeAppAccess(); setRole is fixture-only and refuses
+     unless this opt-in is set. Scoped to this demo seeder. */
+  process.env.ALLOW_FIXTURE_ROLE_WRITES = "1";
   await departmentRoles.setRole({
     departmentSlug: spec.dept, email, name: spec.name, role: spec.role,
   });

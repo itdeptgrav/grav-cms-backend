@@ -26,7 +26,24 @@ function getHistory(userId) {
 function append(userId, turn) {
   if (!userId) return;
   const arr = store.get(userId) || [];
-  arr.push({ role: turn.role, content: String(turn.content || "").slice(0, 4000) });
+  const stored = { role: turn.role, content: String(turn.content || "").slice(0, 4000) };
+  // Safe execution metadata lets a later constraint-only follow-up (for
+  // example, just a new date) retain the previously executed capability
+  // without asking a language model to infer state from its own prose.
+  if (turn.role === "assistant" && Array.isArray(turn.toolsUsed)) {
+    stored.toolsUsed = turn.toolsUsed
+      .filter((name) => typeof name === "string" && /^acc_[a-z_]+$/.test(name))
+      .slice(0, 3);
+  }
+  if (turn.role === "assistant" && turn.contextState && typeof turn.contextState === "object") {
+    const tool = turn.contextState.tool;
+    const args = turn.contextState.arguments;
+    if (typeof tool === "string" && /^acc_[a-z_]+$/.test(tool) && (!args || typeof args === "object")) {
+      const serialised = JSON.stringify({ tool, arguments: args || null });
+      if (serialised.length <= 2000) stored.contextState = JSON.parse(serialised);
+    }
+  }
+  arr.push(stored);
   while (arr.length > MAX_TURNS) arr.shift();
   store.set(userId, arr);
 }

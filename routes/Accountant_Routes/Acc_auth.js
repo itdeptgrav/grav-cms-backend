@@ -7,11 +7,11 @@ const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const router = express.Router();
 
-const {
-  Acc_Organization,
-  Acc_User,
-  Acc_Invite,
-} = require("../../models/Accountant_model/Acc_OrgModels");
+const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
+
+/* Company ownership: this router no longer attaches companies at all — the
+   sync-legacy auto-promotion that did so is retired (GAC-2 correction). The
+   one writer remains services/accountantCompanyOwnership.service.js. */
 
 const orgAuthModule = require("../../Middlewear/AccountantOrgAuthMiddleware");
 const {
@@ -72,8 +72,22 @@ router.post("/login", async (req, res) => {
         .json({ success: false, message: "Email and password are required" });
     }
 
+    /* GAC-2 correction — one person, one login. This door opens only for an
+       ACCOUNTING-ONLY person: somebody whose canonical identity is this
+       Acc_User (no DeptUser, no active Employee). A person with a GRAV login
+       signs in there; their Acc_User row is role storage and is refused here
+       by that fact — and by loginMode — never by the hash it happens to hold. */
+    const { classify } = require("../../services/access/canonicalIdentity.service");
+    const identity = await classify(String(email));
+    if (identity.kind !== "accountant") {
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid email or password" });
+    }
     const user = await Acc_User.findOne({
       email: String(email).toLowerCase(),
+      loginMode: { $ne: "none" },
+      isActive: true,
     });
     if (!user || !user.isActive) {
       return res
@@ -333,6 +347,14 @@ router.post("/change-password", orgAuth, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "User not found" });
+    // A role-only record has no password of its own (GAC-2 correction).
+    if (user.loginMode === "none") {
+      return res.status(400).json({
+        success: false,
+        code: "ROLE_ONLY_RECORD",
+        message: "You sign in with your GRAV login. Change your password there.",
+      });
+    }
 
     const ok = await user.checkPassword(currentPassword);
     if (!ok)
@@ -353,145 +375,32 @@ router.post("/change-password", orgAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /accept-invite — invitee uses a token to set their password
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/accept-invite", async (req, res) => {
-  try {
-    const { token, password } = req.body || {};
-    if (!token || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: "token and password are required" });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 8 characters",
-      });
-    }
-
-    const invite = await Acc_Invite.findOne({ token });
-    if (!invite)
-      return res
-        .status(404)
-        .json({ success: false, message: "Invalid invitation token" });
-    if (invite.consumedAt)
-      return res
-        .status(400)
-        .json({ success: false, message: "Invitation has already been used" });
-    if (invite.expiresAt < new Date())
-      return res
-        .status(400)
-        .json({ success: false, message: "Invitation has expired" });
-
-    const existing = await Acc_User.findOne({
-      organizationId: invite.organizationId,
-      email: invite.email,
-    });
-    if (existing) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "An account with this email already exists in the organization",
-      });
-    }
-
-    const user = new Acc_User({
-      organizationId: invite.organizationId,
-      name: invite.name,
-      email: invite.email,
-      role: invite.role,
-      invitedBy: invite.invitedBy,
-    });
-    await user.setPassword(password);
-    await user.save();
-
-    invite.consumedAt = new Date();
-    invite.consumedByUserId = user._id;
-    await invite.save();
-
-    const jwtToken = signOrgToken(user);
-    setAuthCookie(res, jwtToken);
-
-    res.status(201).json({
-      success: true,
-      token: jwtToken,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (e) {
-    console.error("[accountant/auth/accept-invite]", e);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to accept invite" });
-  }
+/* GAC-2 correction: RETIRED. Accepting an invite created a new Acc_User
+   login with its own password and an Accounting role — a second identity for
+   the person and an access grant made outside the canonical write. Accounting
+   access is now granted in Access Control to a person's existing GRAV login
+   (PUT /api/admin/app-access). The invite rows are kept, untouched. */
+router.post("/accept-invite", (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "ACCOUNTING_INVITES_RETIRED",
+    message: "Accounting invitations are no longer used. Ask an administrator to grant you Accounting in Access Control, then sign in with your GRAV login.",
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
 // POST /bootstrap — create the FIRST organization + owner user
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/bootstrap", async (req, res) => {
-  try {
-    const existing = await Acc_Organization.countDocuments({});
-    if (existing > 0) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "An organization already exists. Bootstrap is disabled. Use invite flow.",
-      });
-    }
-
-    const { organizationName, ownerName, email, password } = req.body || {};
-    if (!organizationName || !ownerName || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "organizationName, ownerName, email, and password are required",
-      });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 8 characters",
-      });
-    }
-
-    const org = await Acc_Organization.create({
-      name: organizationName,
-      tallyCompanyIds: [],
-      settings: {
-        requireApprovalForVouchers: true,
-        requireApprovalForLedgerEdits: true,
-      },
-    });
-
-    const user = new Acc_User({
-      organizationId: org._id,
-      name: ownerName,
-      email: String(email).toLowerCase(),
-      role: "owner",
-    });
-    await user.setPassword(password);
-    await user.save();
-
-    org.ownerUserId = user._id;
-    await org.save();
-
-    res.status(201).json({
-      success: true,
-      message: "Organization bootstrapped successfully. You can now log in.",
-      organizationId: org._id,
-      userId: user._id,
-      email: user.email,
-    });
-  } catch (e) {
-    console.error("[accountant/auth/bootstrap]", e);
-    res
-      .status(500)
-      .json({ success: false, message: e.message || "Bootstrap failed" });
-  }
+/* GAC-2 correction: RETIRED. Bootstrap created the Accounting organisation
+   together with a new password login holding the Owner role — an identity and
+   an access grant outside the canonical write. The organisation exists; the
+   Accounting Owner is assigned in Access Control. */
+router.post("/bootstrap", (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "ACCOUNTING_BOOTSTRAP_RETIRED",
+    message: "Accounting setup is complete. The Accounting Owner is assigned in Access Control.",
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -591,7 +500,6 @@ router.post("/sync-legacy", legacyBootstrapAuth, async (req, res) => {
     }
 
     const trustedEmail = acctDept.email.toLowerCase();
-    const trustedName = acctDept.name || "Accountant Admin";
 
     const emailRe = new RegExp(
       "^" + trustedEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
@@ -647,127 +555,17 @@ router.post("/sync-legacy", legacyBootstrapAuth, async (req, res) => {
       });
     }
 
-    let org = await Acc_Organization.findOne({});
-    if (!org) {
-      const fallbackOrgName = trustedEmail.includes("@")
-        ? trustedEmail.split("@")[1].split(".")[0].toUpperCase()
-        : "Organization";
-      org = await Acc_Organization.create({
-        name: fallbackOrgName,
-        tallyCompanyIds: [],
-        settings: {
-          requireApprovalForVouchers: true,
-          requireApprovalForLedgerEdits: true,
-        },
-      });
-    }
-
-    try {
-      const CompanyModel = mongooseRef.models.Acc_Company;
-      if (
-        CompanyModel &&
-        (!org.tallyCompanyIds || org.tallyCompanyIds.length === 0)
-      ) {
-        const companies = await CompanyModel.find({}).select("_id").lean();
-        if (companies.length > 0) {
-          org.tallyCompanyIds = companies.map((c) => c._id);
-          await org.save();
-        }
-      }
-    } catch (e) {
-      console.warn("[sync-legacy] auto-attach companies skipped:", e.message);
-    }
-
-    user = await Acc_User.findOne({
-      organizationId: org._id,
-      email: emailRe,
-    });
-    if (user) {
-      if (!user.isActive) {
-        return res.status(403).json({
-          success: false,
-          message: "Account is inactive — contact your owner.",
-        });
-      }
-      user.lastLoginAt = new Date();
-      await user.save();
-      const jwtToken = signOrgToken(user);
-      setAuthCookie(res, jwtToken);
-      return res.json({
-        success: true,
-        promoted: false,
-        message: "Existing account — session refreshed.",
-        // Returned in the body as well as the cookie. lib/api.js stores this
-        // and replays it as `Authorization: Bearer`, which is now the only
-        // cross-origin fallback there is — falling back to the CMS token buys
-        // the bootstrap flow and nothing else.
-        token: jwtToken,
-        user: {
-          id: user._id,
-          organizationId: user.organizationId,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          isOwner: user.role === "owner",
-        },
-      });
-    }
-
-    try {
-      user = new Acc_User({
-        organizationId: org._id,
-        name: trustedName,
-        email: trustedEmail,
-        role: "owner",
-      });
-      const placeholderPassword = require("crypto")
-        .randomBytes(24)
-        .toString("hex");
-      await user.setPassword(placeholderPassword);
-      user.lastLoginAt = new Date();
-      await user.save();
-    } catch (insertErr) {
-      if (insertErr && insertErr.code === 11000) {
-        user = await Acc_User.findOne({
-          organizationId: org._id,
-          email: emailRe,
-        });
-        if (!user) {
-          throw insertErr;
-        }
-        user.lastLoginAt = new Date();
-        await user.save();
-      } else {
-        throw insertErr;
-      }
-    }
-
-    if (!org.ownerUserId) {
-      org.ownerUserId = user._id;
-      await org.save();
-    }
-
-    const jwtToken = signOrgToken(user);
-    setAuthCookie(res, jwtToken);
-
-    return res.json({
-      success: true,
-      promoted: true,
-      message: "Legacy account promoted to organization owner.",
-      token: jwtToken,
-      user: {
-        id: user._id,
-        organizationId: user.organizationId,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        isOwner: true,
-      },
-      organization: {
-        id: org._id,
-        name: org.name,
-        tallyCompanyIds: org.tallyCompanyIds,
-      },
+    /* GAC-2 correction: the auto-promotion that used to follow here is
+       RETIRED. It created a new Acc_User holding the Accounting OWNER role for
+       any active legacy Accounting department account that had none (and the
+       organisation too, and attached every company to it) — an access grant
+       made outside the canonical write, with no reason, no audit event and no
+       administrator. A legacy account that holds no Accounting role is now
+       told to get one through Access Control. Nothing is created. */
+    return res.status(403).json({
+      success: false,
+      code: "ACCOUNTING_GRANT_REQUIRED",
+      message: "You have no Accounting role. Ask an administrator to grant Accounting in Access Control.",
     });
   } catch (e) {
     console.error(e);
@@ -789,7 +587,7 @@ router.get("/debug-token", (req, res) => {
     try {
       decoded = jwt.verify(
         token,
-        process.env.JWT_SECRET || "grav_clothing_secret_key",
+        require("../../config/jwt").SECRET,
       );
     } catch (e) {
       return res.json({

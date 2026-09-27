@@ -26,23 +26,38 @@ const validDate = (d) => (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)
 registerTool({
   name: "acc_financials",
   description:
-    "Company FINANCIAL SUMMARY for authorised accounting/CEO: profit & loss (total revenue, total expenses, net profit/loss) and balance-sheet totals (assets, liabilities, equity) for the current financial year, from the ledger balances. Read-only.",
+    "Company FINANCIAL METRICS for authorised accounting/CEO. Returns the exact requested figure: total revenue, total expenses, direct revenue, direct expenses/COGS, gross profit, gross-profit margin, net profit/loss, net-profit margin, assets, liabilities or equity; use the full summary only when explicitly requested. Read-only and calculated from posted accounting entries.",
   permission: accAuthorised,
-  parameters: { type: "object", properties: {} },
+  parameters: {
+    type: "object",
+    properties: {
+      metric: {
+        type: "string",
+        enum: [
+          "summary", "revenue", "expenses", "direct_revenue", "direct_expenses", "gross_profit",
+          "gross_profit_margin", "net_profit", "net_profit_margin", "assets", "liabilities", "equity",
+        ],
+      },
+    },
+    required: ["metric"],
+    additionalProperties: false,
+  },
   matches: (msg) =>
     /\b(profit|loss|p&l|p and l|revenue|turnover|income|expenses?|balance sheet|financials?|net worth|assets|liabilit|how are we doing financially|financial (position|health|summary))\b/i.test(
       msg,
     ),
-  provideContext: async () => ({ financials: await buildFinancials() }),
+  provideContext: async ({ args }) => ({ requestedMetric: args && args.metric, financials: await buildFinancials() }),
 });
 
 registerTool({
   name: "acc_ledger_balance",
   description:
-    "Balance of a specific LEDGER/ACCOUNT, or all accounts in an account GROUP (for 'top debtors', 'biggest creditors', etc.), for authorised accounting/CEO. " +
+    "Current closing balance of one ledger/account or a ranked account group. It does NOT answer total debit/credit, turnover or activity, which are sums of posted voucher lines and belong to the general accounting report. It cannot apply a date/financial-year filter or create an arbitrary grouped breakdown, which belongs to the general accounting report. " +
     "The standard account GROUPS are: Sundry Debtors (customers who owe us / receivables), Sundry Creditors (suppliers we owe / payables), Cash-in-Hand, Bank Accounts, " +
     "Current Assets, Fixed Assets, Investments, Loans & Advances, Duties & Taxes (GST etc.), Capital Account, Reserves & Surplus, Sales Accounts, Purchase Accounts, Direct/Indirect Expenses. " +
-    "Map the user's wording — even if mis-spelled or mis-heard (e.g. 'sundry daughters' means Sundry Debtors) — to the closest of these. Read-only.",
+    "Map the user's wording — even if mis-spelled or mis-heard (e.g. 'sundry daughters' means Sundry Debtors) — to the closest of these. " +
+    "This is a current closing-balance lookup; it cannot preserve a date/financial-year filter or an arbitrary group-by breakdown. " +
+    "Use the general accounting report for those combined dimensions. Read-only.",
   permission: accAuthorised,
   parameters: {
     type: "object",
@@ -100,4 +115,51 @@ registerTool({
   parameters: { type: "object", properties: {} },
   matches: (msg) => /\b(gstin|gst number|pan\b|company (name|details|registration)|financial year|which company|legal name)\b/i.test(msg),
   provideContext: async () => ({ company: await buildCompanyInfo() }),
+});
+
+registerTool({
+  name: "acc_party_reports",
+  description:
+    "Authoritative read-only CUSTOMER RECEIVABLE and SUPPLIER PAYABLE reports: outstanding balances and invoice/bill ageing, " +
+    "including ranked largest/smallest parties, optional party search, and an as-of date. Use for debtors ageing, creditors ageing, " +
+    "who owes us, whom we owe, overdue customer invoices, overdue supplier bills, receivables and payables summaries.",
+  permission: accAuthorised,
+  parameters: {
+    type: "object",
+    properties: {
+      report: {
+        type: "string",
+        enum: ["customer_outstanding", "customer_ageing", "supplier_outstanding", "supplier_ageing"],
+      },
+      asOf: { type: ["string", "null"], description: "As-of date YYYY-MM-DD, or null for today." },
+      search: { type: ["string", "null"], description: "Optional party-name search." },
+      ranking: { type: "string", enum: ["none", "largest", "smallest"] },
+      limit: { type: "integer", minimum: 1, maximum: 15 },
+    },
+    required: ["report", "asOf", "search", "ranking", "limit"],
+  },
+  matches: (msg) =>
+    /\b(receivables?|payables?|outstanding|ageing|aging|overdue|debtors?|creditors?|customers? owe|owe suppliers?|supplier bills?|customer invoices?)\b/i.test(msg),
+  provideContext: async ({ args }) => ({
+    partyReport: await require("../../accountingContext").buildPartyReport(args || {}),
+  }),
+});
+
+registerTool({
+  name: "acc_report_query",
+  description:
+    "General read-only accounting report for posted voucher-line turnover/activity and combined dimensions: the only capability that answers total debit/credit and preserves arbitrary grouping plus explicit date or financial-year filters, ranking and calculations over voucher lines. Use when the question combines or " +
+    "ranks companies, dates, financial years, voucher numbers/types/narrations, ledger names/groups, parties, debit, credit, " +
+    "signed amounts or GST classification, including filtered detail lists and grouped totals. This is the broad semantic " +
+    "catalogue for valid accounting questions not better answered by a specialist balance, financial, voucher or ageing tool.",
+  permission: accAuthorised,
+  parameters: require("../accountingReportQuery").parameters,
+  // Relevance for the ordinary non-Jev assistant. The hybrid accounting
+  // router receives every authorised tool definition directly and therefore
+  // does not depend on phrase matching.
+  matches: () => true,
+  provideContext: async ({ user, args }) => {
+    const result = await require("../accountingReportQuery").runAccountingReport({ user, query: args });
+    return { accountingReport: result.ok ? result.reply : null };
+  },
 });

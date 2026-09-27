@@ -479,7 +479,21 @@ describe("the complete Merchandising journey works as one product", () => {
     }).lean();
     expect(materials.length).toBeGreaterThan(0);
     for (const m of materials) expect(m.state).not.toBe("APPROVED");
-    expect(JSON.stringify(materials)).toMatch(/Adopted from development MDV-/);
+    /* ── THE LINEAGE IS A REFERENCE, NOT A SENTENCE IN THE NOTES ──────
+       It used to be appended to each row's `notes` as prose, where the only
+       way to ask "which development revision is this row from" was to parse
+       a string. It is `sourceRef` now — the field both row schemas already
+       declared — so a screen can render it and this can assert it. */
+    for (const m of materials) {
+      for (const row of m.rows) {
+        expect(row.sourceRef.recordType).toBe("DEVELOPMENT_BOM_ROW");
+        expect(row.sourceRef.recordRef).toMatch(/^MDV-\d{4}-\d{4} · Revision \d+ · DR-/);
+        expect(row.sourceRef.sourceState).toBe("APPROVED");
+        /* And the note is the development's own selection note, or empty —
+           never this service's commentary about itself. */
+        expect(row.notes).not.toMatch(/Adopted from development/);
+      }
+    }
 
     /* ── 7b. THE ORDER'S OWN APPROVER SETTLES EACH FAMILY ─────────────
        Adoption filled two drafts and approved neither. This is where the

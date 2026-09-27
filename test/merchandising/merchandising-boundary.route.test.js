@@ -144,7 +144,10 @@ async function world(label = "B") {
      about it: stock on hand, a variant, and a vendor price on that variant. */
   const item = await RawItem.create({
     companyId: co._id, name: `${label} poly bag`, sku: `PB-${label}-${n}`,
-    unit: "Piece", category: "Packing", createdBy: new mongoose.Types.ObjectId(),
+    /* Classified as sample packaging — the only class the packaging picker
+       shows now that it is gated on Store's "Used as". */
+    unit: "Piece", category: "Packing", usedAs: "SAMPLE_PACKAGING",
+    createdBy: new mongoose.Types.ObjectId(),
     quantity: 4200,
     variants: [{
       sku: `PBV-${label}-${n}`, combination: ["Clear"], quantity: 4200,
@@ -267,8 +270,11 @@ describe("the packaging-item lookup", () => {
     const res = await items(w, who);
     expect(res.status).toBe(200);
     expect(res.body.items).toHaveLength(1);
-    expect(Object.keys(res.body.items[0]).sort()).toEqual(["id", "name", "sku"]);
+    /* Identity, plus the small Store-owned "Used as" label the picker now shows
+       on each result. Still no balance, vendor, price, variant or unit. */
+    expect(Object.keys(res.body.items[0]).sort()).toEqual(["id", "name", "sku", "usedAs", "usedAsLabel"]);
     expect(res.body.items[0].name).toBe(`${w.label} poly bag`);
+    expect(res.body.items[0].usedAs).toBe("SAMPLE_PACKAGING");
   });
 
   test("no price, supplier, stock, variant or unit crosses it", async () => {

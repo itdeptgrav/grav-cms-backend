@@ -38,6 +38,7 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
    names a companyId is checked against req.organization.tallyCompanyIds by
    one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
 const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+const { computeLedgerBalances } = require("../../services/accountingContext");
 /* Resolved per request, not at module load. The guard has ONE implementation —
    `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
    that way while still loading under the partial `jest.mock`s several suites
@@ -107,7 +108,8 @@ router.get("/", auth, companyScope, async (req, res) => {
         ],
       })
         .select(
-          "_id name groupName nature gstin panNumber currentBalance balanceType " +
+          "_id name groupName nature gstin panNumber openingBalance balanceFromTrialBalance " +
+            "currentBalance currentBalanceType " +
             "contactDetails.address contactDetails.city contactDetails.state",
         )
         .limit(8)
@@ -149,7 +151,24 @@ router.get("/", auth, companyScope, async (req, res) => {
         .lean(),
     ]);
 
-    res.json({ ledgers, vouchers, stockItems });
+    // Search and the assistant must display the same traceable balance. Keep
+    // the cached master value only as reconciliation evidence; never return it
+    // as if it were the authoritative answer.
+    const balances = await computeLedgerBalances(companyId, ledgers);
+    const reconciledLedgers = ledgers.map((ledger) => {
+      const truth = balances.get(String(ledger._id));
+      if (!truth) return ledger;
+      return {
+        ...ledger,
+        currentBalance: truth.abs,
+        currentBalanceType: truth.drCr,
+        // Legacy clients read `balanceType`; keep it aligned while they migrate.
+        balanceType: truth.drCr,
+        balanceReconciliation: truth.reconciliation,
+      };
+    });
+
+    res.json({ ledgers: reconciledLedgers, vouchers, stockItems });
   } catch (e) {
     console.error("[search]", e);
     res.status(500).json({ error: e.message });

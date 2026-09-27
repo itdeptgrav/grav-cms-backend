@@ -25,6 +25,11 @@ const mongoose = require("mongoose");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const LocationBalance = require("../../models/CMS_Models/Inventory/Operations/LocationBalance");
 const locStock = require("./locationStock.service");
+/* Required at module load, never inside the posting transaction: requiring a model
+   there compiles it inside the transaction, and Mongoose schedules that model's
+   index builds on compilation — which then land in the transaction and fail it with
+   a lock timeout whose error text mentions no index at all. */
+const customerOwnedReserve = require("./customerOwnedReserve.service");
 
 const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
 const QTY_TOL = 1e-6;
@@ -272,7 +277,46 @@ async function applyLineCorrection(session, {
       { reason: "BALANCE_CHANGED", lineId: String(line._id), rawItemId: String(itemId), expected, current: currentLoc });
   }
 
-  // 2 · COMPANY ON-HAND — atomic, guarded so a negative result is refused, and
+  // 2 · SOME OF WHAT WAS COUNTED MAY NOT BE OURS
+  //
+  // ── WHY A COUNT IS THE MOST DANGEROUS PLACE FOR THIS ──────────────────────
+  // A stock-take counts what is on the shelf, and a customer's fabric is on the
+  // shelf. Count 18 metres of somebody else's poplin as 18 of ours, find 20 where
+  // the system said 22, and a −2 correction writes the difference off against the
+  // company's own balance. The physical total falls, the location balance falls,
+  // and the CustomerMaterialLot goes on claiming its full held quantity — so the
+  // books now say the customer has material the shelf cannot produce, and the
+  // discrepancy is invisible because a count is exactly the operation people trust
+  // to REMOVE discrepancies.
+  //
+  // So the same guard every ordinary issue path uses runs here too, inside this
+  // transaction, before the first write — and it is scoped to the counted
+  // location, because that is the shelf whose quantity is about to change.
+  //
+  // ── AND THE LOT IS NOT TOUCHED ────────────────────────────────────────────
+  // Deliberately. If a customer's material really is short, that is a loss of
+  // somebody else's property and it needs a named operation with a reason, an
+  // owner and a conversation — not a silent decrement buried in a count.
+  if (signed < 0) {
+    const owned = await RawItemModel
+      .findById(itemId).select("name unit customUnit quantity").session(session).lean();
+    if (owned) {
+      await customerOwnedReserve.assertOrdinaryIssueAllowed({
+        companyId,
+        /* `locationOnHand` is the physical basis for a location-scoped check, so
+           the lean read above is all the item detail this needs. */
+        rawItem: { _id: itemId, name: owned.name, quantity: owned.quantity },
+        variantId,
+        warehouseId: count.warehouseId,
+        locationId: count.locationId,
+        requested: qty,
+        unit: owned.customUnit || owned.unit || "",
+        session,
+      });
+    }
+  }
+
+  // 3 · COMPANY ON-HAND — atomic, guarded so a negative result is refused, and
   // so a value that moved under us matches nothing (a conflict, not a clobber).
   const guard = signed < 0 ? { quantity: { $gte: qty - QTY_TOL } } : {};
   const variantGuard = variantId
@@ -303,7 +347,7 @@ async function applyLineCorrection(session, {
   const variantAfter = uv ? round4(uv.quantity) : null;
   const variantBefore = uv ? round4(variantAfter - signed) : null;
 
-  // 3 · LOCATION LEDGER + PROJECTION — the immutable movement and its guard.
+  // 4 · LOCATION LEDGER + PROJECTION — the immutable movement and its guard.
   const warehouse = { _id: count.warehouseId, name: count.warehouseName, shortName: count.warehouseShortName };
   const location = { _id: count.locationId, code: count.locationCode, name: count.locationName };
   const common = {
@@ -334,7 +378,7 @@ async function applyLineCorrection(session, {
   }
   const locationAfter = round4(expected + signed);
 
-  // 4 · CANONICAL STOCK HISTORY / VALUATION INPUT — one stockTransaction row,
+  // 5 · CANONICAL STOCK HISTORY / VALUATION INPUT — one stockTransaction row,
   // in the exact shape the valuation replay and the movement history already
   // read. Positive variance is an ADD, negative a REDUCE (variant-scoped when a
   // variant was counted).

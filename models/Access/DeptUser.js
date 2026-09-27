@@ -110,6 +110,23 @@ const deptUserSchema = new mongoose.Schema(
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "DeptUser" },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "DeptUser" },
+
+    /* GAC-AR2: this login is a TRANSITIONAL DUPLICATE of another person's
+       canonical login (one person, one login). Informational only — it grants
+       and removes nothing. It records which canonical identity supersedes it
+       and that it may be deactivated once that identity is verified and the
+       last-active-administrator rule still holds (see
+       scripts/migrations/gac-ar2-canonical-admin.js). */
+    identityTransition: {
+      type: new mongoose.Schema({
+        supersededByEmail: { type: String, lowercase: true, trim: true },
+        supersededById: { type: mongoose.Schema.Types.ObjectId, ref: "DeptUser" },
+        eligibleForDeactivation: { type: Boolean, default: false },
+        reason: { type: String, trim: true },
+        markedAt: { type: Date },
+      }, { _id: false }),
+      default: undefined,
+    },
   },
   { timestamps: true },
 );

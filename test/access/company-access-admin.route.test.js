@@ -24,7 +24,13 @@ beforeAll(async () => {
 });
 afterAll(async () => { await new Promise((resolve) => server.close(resolve)); });
 
-test("only a live platform administrator can grant a company-specific PPC role", async () => {
+/* GAC-2 (25 Sep 2026): this test used to pin "only a live platform
+   administrator can grant a company-specific PPC role". Company-scoped grants
+   are retired — GRAV Clothing is the only organisation — so it now pins the
+   replacement: the company write answers 410 and writes nothing, and PPC is an
+   ordinary application role granted through the canonical write (reason +
+   idempotency key), with no companyGrants and no company membership. */
+test("company-scoped grants are retired; PPC is granted as an ordinary application role", async () => {
   await ensureAccessDepartments(mongoose.connection);
   const dept = await AccessDepartment.findOne({ slug: "ceo" });
   const company = await Acc_Company.create({ companyName: "Route Co", booksFromDate: new Date("2026-04-01") });
@@ -43,7 +49,7 @@ test("only a live platform administrator can grant a company-specific PPC role",
   });
   const token = (user) => jwt.sign({
     v: 2, id: String(user._id), deptId: String(dept._id), deptSlug: dept.slug,
-    tv: user.tokenVersion || 0,
+    subject: "dept_user", tv: user.tokenVersion || 0,
   }, process.env.JWT_SECRET, { expiresIn: "10m" });
   const body = JSON.stringify({
     companyId: String(company._id), departmentSlug: "ppc", email,
@@ -56,16 +62,16 @@ test("only a live platform administrator can grant a company-specific PPC role",
   });
   expect((await put()).status).toBe(401);
   expect((await put(token(nonAdmin))).status).toBe(403);
-  const legacyWrite = await fetch(`${base}/api/admin/department-roles/ppc`, {
+  const retired = await put(token(admin));
+  expect(retired.status).toBe(410);
+  expect((await retired.json()).code).toBe("COMPANY_SCOPED_ACCESS_RETIRED");
+  expect(await roleForCompany({ companyId: company._id, email })).toBeNull();
+
+  const granted = await fetch(`${base}/api/admin/department-roles/ppc`, {
     method: "PUT", headers: {
       "Content-Type": "application/json", Authorization: `Bearer ${token(admin)}`,
-    }, body: JSON.stringify({ email, role: "owner" }),
+    }, body: JSON.stringify({ email, role: "editor", reason: "Approved planner assignment", idempotencyKey: "car1-ppc-editor-1" }),
   });
-  expect(legacyWrite.status).toBe(409);
-  expect((await legacyWrite.json()).code).toBe("COMPANY_SCOPED_GRANT_REQUIRED");
-  expect(await roleForCompany({ companyId: company._id, email })).toBeNull();
-  const result = await put(token(admin));
-  expect(result.status).toBe(200);
-  expect((await result.json()).grant.role).toBe("editor");
-  expect(await roleForCompany({ companyId: company._id, email })).toBe("editor");
+  expect(granted.status).toBe(200);
+  expect((await granted.json()).effective).toMatchObject({ allowed: true, role: "editor" });
 });

@@ -166,7 +166,7 @@ router.post("/login", async (req, res) => {
         email: employee.email || "",
         type: "employee",
       },
-      process.env.JWT_SECRET,
+      require("../../config/jwt").SECRET,
       { expiresIn },
     );
 
@@ -217,7 +217,7 @@ router.get("/verify", async (req, res) => {
         .status(401)
         .json({ success: false, message: "Not authenticated" });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, require("../../config/jwt").SECRET);
     const responseData = await getFormattedEmployee(decoded.id);
     if (!responseData)
       return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -242,7 +242,7 @@ router.get("/profile", async (req, res) => {
         .status(401)
         .json({ success: false, message: "Not authenticated" });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, require("../../config/jwt").SECRET);
     const responseData = await getFormattedEmployee(decoded.id);
     if (!responseData)
       return res
@@ -277,7 +277,7 @@ router.post("/change-password", async (req, res) => {
         .status(401)
         .json({ success: false, message: "Not authenticated" });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, require("../../config/jwt").SECRET);
     const { oldPassword, newPassword, currentPassword } = req.body;
     const oldPw = oldPassword || currentPassword;
 

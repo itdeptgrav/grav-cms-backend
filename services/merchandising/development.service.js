@@ -115,6 +115,89 @@ async function once(ctx, { scope, idempotencyKey, request }, run) {
   return { replayed: false, ...result };
 }
 
+/**
+ * `once`, BUT THE LEDGER IS WRITTEN INSIDE THE TRANSACTION.
+ *
+ * ── WHY A SECOND VARIANT AND NOT A CHANGE TO THE FIRST ──────────────────────
+ * `once` above checks the ledger, runs the command, and records the key
+ * afterwards. That is enough for the commands it guards, whose work is a
+ * revision on a record it already holds and re-reads inside its own
+ * transaction. It is NOT enough for a command that CREATES something, because
+ * two answers it gives are wrong:
+ *
+ *   · the ledger row is written after the transaction commits, so a crash
+ *     between the two leaves the thing created and the key unrecorded — and the
+ *     retry, being a legitimate retry, creates a second one;
+ *   · nothing re-reads the ledger inside the transaction, so two requests
+ *     arriving together both find no key and both run.
+ *
+ * Here the check happens twice — once cheaply outside, once inside the
+ * transaction — and the ledger row is part of the same commit as the work. So
+ * the key and the thing it describes exist together or neither does, and a
+ * replay is the FIRST answer read back verbatim rather than a reconstruction
+ * of it.
+ *
+ * Retrofitting the existing commands is a separate change with its own risk;
+ * this is the variant a creating command uses.
+ */
+async function onceAtomically(ctx, { scope, idempotencyKey, request }, run) {
+  assertContext(ctx);
+  const key = str(idempotencyKey);
+  if (!key) {
+    throw fail("IDEMPOTENCY_KEY_REQUIRED",
+      "Send an idempotency key with this command, so a retry cannot take the decision twice.",
+      { field: "idempotencyKey" });
+  }
+  const requestHash = hashRequest(request);
+  const where = { companyId: ctx.companyId, scope, idempotencyKey: key };
+
+  const replayOf = (held) => {
+    /* The same key for a DIFFERENT request is a client bug, not a retry, and
+       answering it with the first request's result would be the worst outcome:
+       silently ignoring the second thing somebody asked for. */
+    if (held.requestHash !== requestHash) {
+      throw fail("IDEMPOTENCY_KEY_REUSED",
+        "That idempotency key was already used for a different request.",
+        { field: "idempotencyKey" });
+    }
+    return { replayed: true, ...(held.payload || held.result) };
+  };
+
+  const held = await MerchandisingCommandLedger.findOne(where).lean();
+  if (held) return replayOf(held);
+
+  try {
+    return await withTxn(async (session) => {
+      const inFlight = await MerchandisingCommandLedger.findOne(where).session(session).lean();
+      if (inFlight) return replayOf(inFlight);
+
+      const result = await run(session);
+      await MerchandisingCommandLedger.create([{
+        ...where,
+        requestHash,
+        /* The summary every other command writes… */
+        result: { revisionNo: null, state: "", note: "" },
+        /* …and the reply itself, so a retry gets back the first answer rather
+           than a differently-shaped reconstruction of it. */
+        payload: result,
+        at: new Date(),
+      }], { session, ordered: true });
+      return { replayed: false, ...result };
+    });
+  } catch (err) {
+    /* Two requests with ONE key, arriving together: the loser hits the unique
+       ledger index. Usually the driver retries it as a write conflict and the
+       retry finds the winner's row above — but if the winner committed first it
+       is a plain 11000, and that is a successful retry of a completed command,
+       not a failure to report. Read the winner's answer and give it. */
+    if (err?.code === 11000) {
+      const winner = await MerchandisingCommandLedger.findOne(where).lean();
+      if (winner) return replayOf(winner);
+    }
+    throw err;
+  }
+}
+
 async function loadFile(ctx, fileId, session = null) {
   assertContext(ctx);
   if (!isId(fileId)) throw fail("DEVELOPMENT_FILE_NOT_FOUND", "Development file not found.");
@@ -1395,7 +1478,7 @@ async function requestChanges(ctx, { fileId, body = {}, actor = null } = {}) {
 
 module.exports = {
   DEFAULT_LIMIT, MAX_LIMIT, FILE_VIEWS, isFileView,
-  assertContext, withTxn, once, loadFile, assertExpected, assertWorkable, assertNotReleased, auditRow,
+  assertContext, withTxn, once, onceAtomically, loadFile, assertExpected, assertWorkable, assertNotReleased, auditRow,
   fileView, rowView, bomView, receiptView,
   listFiles, developmentOverview, getFile, fileHistory, registeredProductBom,
   acceptRequest, clarifyRequest, assignFile, moveLifecycle,

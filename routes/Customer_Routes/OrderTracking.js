@@ -43,7 +43,7 @@ const verifyCustomerToken = async (req, res, next) => {
     }
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+      require("../../config/jwt").SECRET,
     );
     req.customerId = decoded.id;
     next();

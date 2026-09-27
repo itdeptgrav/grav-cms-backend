@@ -89,7 +89,7 @@
 
 const jwt = require("jsonwebtoken");
 
-const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
+const { SECRET } = require("../config/jwt"); // SEC-0: configured secret only
 const DEV_BYPASS = process.env.ACCOUNTANT_AUTH_BYPASS === "true";
 
 const ACCOUNTANT_COOKIE = "accountant_token";

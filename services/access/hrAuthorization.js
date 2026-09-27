@@ -256,6 +256,10 @@ function invalidateHrActor(user) {
  * Never throws: an invalidation that fails must not fail the grant that
  * succeeded — that is the shape of bug `test/access/department-role-cache.test.js`
  * exists to pin, where the write landed and the response said otherwise.
+ *
+ * GAC-2 correction: this clear is now an optimisation, not the guarantee. The
+ * guarantee is the shared grant revision every cache hit is checked against
+ * (services/access/grantRevision.js), which also covers other processes.
  */
 function invalidateHrAuthorization(reason) {
   try {
@@ -488,13 +492,16 @@ function employeeIsActive(employee) {
 /** Is HR configured with roles at all? Cached with the actor TTL. */
 let rolesConfigured = { value: null, at: 0 };
 async function hrRolesConfigured() {
-  if (rolesConfigured.value !== null && Date.now() - rolesConfigured.at < ACTOR_TTL_MS) {
+  const { cacheEntryIsCurrent, revisionForNewEntry } = require("./grantRevision");
+  if (rolesConfigured.value !== null && Date.now() - rolesConfigured.at < ACTOR_TTL_MS
+      && await cacheEntryIsCurrent(rolesConfigured)) {
     return rolesConfigured.value;
   }
+  const revision = await revisionForNewEntry();
   try {
     const { listRoles } = require("../departmentRoles");
     const rows = await listRoles("hr");
-    rolesConfigured = { value: rows.length > 0, at: Date.now() };
+    rolesConfigured = { value: rows.length > 0, at: Date.now(), revision: revision === null ? undefined : revision };
   } catch {
     /* Unreadable is treated as CONFIGURED, i.e. the strict side. A database
        blip must not silently promote every HR user to owner. */
@@ -534,7 +541,15 @@ async function resolveHrActor(user) {
 
   const key = cacheKey(user);
   const hit = actorCache.get(key);
-  if (hit && Date.now() - hit.at < ACTOR_TTL_MS) return hit.actor;
+  /* GAC-2 correction: a cached answer is used only while the shared grant
+     revision is the one it was computed under — so a grant change made in any
+     process, or one whose local clear failed, still takes effect on the very
+     next request. An unreadable revision is a miss (services/access/grantRevision.js). */
+  const { cacheEntryIsCurrent, revisionForNewEntry } = require("./grantRevision");
+  if (hit && Date.now() - hit.at < ACTOR_TTL_MS && await cacheEntryIsCurrent(hit)) return hit.actor;
+  // Read BEFORE resolving: a grant committed mid-resolution leaves this entry
+  // stamped with the older revision, so it is never served.
+  const revision = await revisionForNewEntry();
 
   const { emails, employee, deptUser } = await gatherIdentity(user);
   const compatibility = [];
@@ -714,7 +729,7 @@ async function resolveHrActor(user) {
     compatibility,
   };
 
-  actorCache.set(key, { actor, at: Date.now() });
+  if (revision !== null) actorCache.set(key, { actor, at: Date.now(), revision });
   return actor;
 }
 

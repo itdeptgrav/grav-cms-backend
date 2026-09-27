@@ -21,7 +21,7 @@
  * user, never used as a fact and never used to grant access.
  */
 
-const { openJevConfig } = require("./config");
+const { openJevConfig, isJevOnlyAccounts, isJevQwenAccounts } = require("./config");
 
 // HR capabilities the pilot's read needs: see the person in the directory AND
 // read their attendance. The same pair the mounted attendance routes demand.
@@ -92,12 +92,45 @@ async function executeRoutedIntent({ user, message, intent, ports, now, staleMin
  * @param {object} [deps]   test/evaluation seams: { config, fetchImpl, ports, now, log }
  * @returns {Promise<null | {reply:string, model:string, toolsUsed:string[], pilot:object}>}
  */
-async function tryOpenJevPilot({ user, message, ensureAccess }, deps = {}) {
+async function tryOpenJevPilot({ user, message, history = [], ensureAccess }, deps = {}) {
   const cfg = deps.config || openJevConfig();
   if (!cfg.enabled) return null;
   const log = deps.log || logRoute;
   try {
     if (typeof ensureAccess === "function") await ensureAccess(user);
+
+    // The Accounts pilot is a MODE, not an extra branch of the HR one: when it
+    // is on it owns the request, and it never hands a supported question back
+    // to the Ollama round or the regex fallback. See accountsPilot.js.
+    if (isJevOnlyAccounts(cfg) || isJevQwenAccounts(cfg)) {
+      const { runAccountsPilot } = require("./accountsPilot");
+      const result = await runAccountsPilot({ user, message, history }, cfg, deps);
+      if (result) {
+        log(
+          {
+            status: result.diagnostics.jevStatus,
+            reason: result.diagnostics.jevReason,
+            accepted: result.diagnostics.result === "answered",
+            intent: result.diagnostics.chosenTool,
+            probability: result.diagnostics.probability,
+            margin: result.diagnostics.margin,
+            latencyMs: result.diagnostics.jevLatencyMs,
+            provenance: result.diagnostics.provenance,
+          },
+          {
+            mode: result.diagnostics.mode,
+            grav: result.diagnostics.result,
+            gravReason: result.diagnostics.resultReason,
+            gravLatencyMs: result.diagnostics.accountingReadLatencyMs,
+            qwenRouteReview: result.diagnostics.qwenInvoked === true,
+            qwenArgumentRetry: result.diagnostics.qwenArgumentsInvoked === true,
+            qwenArgumentStatus: result.diagnostics.qwenArgumentsStatus || null,
+            qwenArgumentLatencyMs: result.diagnostics.qwenArgumentsLatencyMs,
+          },
+        );
+      }
+      return result;
+    }
 
     const offer = await offerFor(user);
     const { routeIntent } = require("./intentRouter");

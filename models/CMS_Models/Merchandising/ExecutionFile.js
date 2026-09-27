@@ -179,6 +179,20 @@ const executionFileSchema = new mongoose.Schema(
       developmentNumber: { type: String, trim: true, default: "" },
       bomRevisionNo: { type: Number, default: null },
       releaseReference: { type: String, trim: true, default: "" },
+      /* ── WHEN THE SELECTION WAS IMPORTED, AND FROM WHICH REVISION ─────
+         Stamped once, by the import that ran on acceptance. It is what
+         makes the import idempotent: a retried acceptance, a replayed
+         message or a second click finds this already set for the same
+         revision and writes nothing, rather than starting a second draft
+         or appending the same rows twice.
+
+         A LATER development revision is a different fact and does not
+         replay — it would be a new import, and the merchandiser decides
+         whether the order takes it. */
+      importedRevisionNo: { type: Number, default: null },
+      importedAt: { type: Date, default: null },
+      importedBy: actorRef(),
+      importedRowCount: { type: Number, default: null },
     },
 
     archived: { type: Boolean, default: false, index: true },

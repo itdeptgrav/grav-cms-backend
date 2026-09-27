@@ -1,0 +1,15 @@
+{
+  "id": "runpod-rtx-pro-4500-blackwell-32gb",
+  "display_name": "NVIDIA RTX PRO 4500 Blackwell (32 GB)",
+  "note": "Identity = accepted name AND compute capability 12.0 AND >= 31 GiB visible AND one GPU. Names are normalised (case, punctuation, a leading 'NVIDIA') so RunPod's display name and nvidia-smi's name both match. Laptop/mobile parts, RTX 4500 Ada, RTX A4500 and other Blackwell models are rejected.",
+  "accept_name_patterns": ["RTX PRO 4500 BLACKWELL", "RTX PRO 4500 BLACKWELL GENERATION", "RTX PRO 4500", "RTX PRO 4500 SE", "RTX PRO 4500 SERVER EDITION"],
+  "reject_name_tokens": ["ADA", "A4500", "LAPTOP", "MOBILE", "MAX Q", "MAXQ", "SFF", "EMBEDDED"],
+  "compute_capability": "12.0",
+  "required_arch": "sm_120",
+  "min_vram_mib": 31744,
+  "min_driver": [570, 0],
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "transformers": "5.10.2",
+  "peft": "0.19.1"
+}

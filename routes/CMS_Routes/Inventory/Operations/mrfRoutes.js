@@ -35,6 +35,17 @@ const actionHistory = require("../../../../services/storePurchase/actionHistory.
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const documentSequence = require("../../../../services/storePurchase/documentSequence.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
+/* ── REQUIRED AT THE TOP, AND THAT IS NOT A STYLE PREFERENCE ─────────────────
+   This was a lazy `require` inside `adjustStock`, which runs INSIDE the issue
+   transaction. Requiring it there compiled the `CustomerMaterialLot` model for the
+   first time inside the transaction, and Mongoose schedules a model's declared
+   index builds the moment it is compiled — so the builds landed in the
+   transaction, took the collection lock, hit the 5 ms transaction lock timeout and
+   surfaced as a transient failure that rolled the whole issue back. Three MRF
+   suites went red with assertions about stock that had not moved and nothing in
+   the error mentioning an index. Requiring it at module load means the model is
+   compiled, and any build scheduled, long before a transaction opens. */
+const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
 // Chunk 9A — stock reservations & picking. The reservation record/projection
 // live here; the CONTROLLED ISSUE reuses this file's own adjustStock engine.
 const reservationSvc = require("../../../../services/storePurchase/reservation.service");
@@ -230,6 +241,35 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
 
   /* When a location is chosen, an OUTflow is guarded BEFORE any stock moves so
      the location can't go below zero and a refusal leaves nothing applied. */
+  /* ── SOME OF WHAT IS ON THE SHELF MAY NOT BE OURS ─────────────────────────
+     On a job-work order the customer sends the fabric. It sits on our rack and a
+     stock-take finds it, so it is correctly part of `raw.quantity` — which means
+     an ordinary MRF issue reading that figure would hand a customer's material to
+     somebody else's order, and nobody would notice until the wrong garment was
+     cut.
+
+     Checked HERE, in the shared helper every MRF stock movement funnels through
+     (explicit issue, partial fulfilment, reservation draw-down), rather than in
+     each route: a rule that each caller must remember is a rule the next caller
+     will forget.
+
+     Inside the transaction and before the guarded location decrement, so a
+     concurrent customer-material issue that takes the quantity first makes this
+     one fail rather than both succeeding. It only ever SUBTRACTS: a company with
+     no job-work lots is untouched. */
+  if (delta < 0) {
+    await customerOwnedReserve.assertOrdinaryIssueAllowed({
+      companyId: loc?.companyId || raw.companyId,
+      rawItem: raw,
+      variantId: variantId || null,
+      warehouseId: loc?.warehouse?._id || null,
+      locationId: loc?.location?._id || null,
+      requested: Math.abs(delta),
+      unit: raw.customUnit || raw.unit || "",
+      session,
+    });
+  }
+
   if (loc && loc.location && delta < 0) {
     const ok = await locStock.decLocationGuarded(session, loc.companyId, rawItemId, variantId, loc.warehouse._id, loc.location._id, Math.abs(delta));
     if (!ok) throw fail("VALIDATION", `${loc.location.code} does not hold ${Math.abs(delta)} of this item.`, { reason: "INSUFFICIENT_AT_LOCATION" });

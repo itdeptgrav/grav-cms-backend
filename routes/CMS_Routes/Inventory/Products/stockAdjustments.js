@@ -7,6 +7,11 @@ const mongoose = require("mongoose");
 const RawItem         = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Warehouse       = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
 const locStock        = require("../../../../services/storePurchase/locationStock.service");
+/* Required at module load, not inside the request: a first compile of
+   `CustomerMaterialLot` while a transaction is open schedules that model's index
+   builds inside it, which fails the transaction with a lock timeout that says
+   nothing about indexes. */
+const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
 const StockItem       = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const Unit            = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const StockIssuance   = require("../../../../models/CMS_Models/Inventory/Operations/StockIssuance");
@@ -536,6 +541,22 @@ router.post(
             `That variant holds ${currentVariant} ${nativeUnit}; ${nativeQty} ${nativeUnit} cannot be issued. Negative stock is not permitted.`,
             { reason: "INSUFFICIENT_STOCK", available: currentVariant, requested: nativeQty, unit: nativeUnit });
         }
+
+        /* ── AND SOME OF WHAT IS ON THE SHELF MAY NOT BE OURS ────────────────
+           One shared guard, called from every ordinary stock-out path rather than
+           written out in each of them. See its own service for why it is
+           location-scoped and why it only ever subtracts.
+
+           This is an EARLY refusal for a clean message; the same guard runs again
+           inside the transaction from the shared helper, which is where the
+           guarantee lives. */
+        await customerOwnedReserve.assertOrdinaryIssueAllowed({
+          companyId: req.tenant.companyId,
+          rawItem,
+          variantId: variant ? variant._id : null,
+          requested: nativeQty,
+          unit: nativeUnit,
+        });
       }
 
       /* ── WAREHOUSE STOCK V1: which location this moves to/from ─────────────

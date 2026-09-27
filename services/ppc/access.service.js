@@ -38,7 +38,6 @@
 "use strict";
 
 const { roleAtLeast } = require("../departmentRoles");
-const { roleForCompany } = require("../companyContext/companyAccess.service");
 const { listMembershipCompanies } = require("../companyContext/companyMembership.service");
 const { fail, sendError } = require("../storePurchase/errors");
 
@@ -141,37 +140,39 @@ const REFUSAL_WORDS = Object.freeze({
     + "and it needs a PPC role that allows it.",
 });
 
-/** The live grant, read on every request. Never a token claim. */
+/**
+ * The live PPC role, read on every request. Never a token claim.
+ *
+ * GAC-AR1: PPC is opened by the canonical application-access resolver
+ * (services/access/appAccess.service.js) — a database-verified platform
+ * administrator is owner, everybody else holds their PPC application role.
+ * `companyGrants[]` and company membership no longer decide whether PPC can be
+ * opened or what the person may do in it; the company every PPC record keys
+ * on is the canonical GRAV Clothing profile, resolved separately.
+ */
 async function livePpcRole(req) {
-  const email = req.user?.email;
-  const actorId = req.user?.id;
-  const companyId = req.merchandising?.companyId;
-  if (companyId) return roleForCompany({ companyId, email, actorId });
-
-  // The company picker is reached before one company has been selected. It
-  // must be open only if at least one *effective* PPC company grant exists.
-  return bestPpcRoleForUser(req.user);
+  const { resolveAppAccess } = require("../access/appAccess.service");
+  const access = await resolveAppAccess(req.user, DEPARTMENT, { requireCatalogueEntry: false, allowLegacyAssignment: false });
+  if (access.denialCode === "ACCESS_CHECK_UNAVAILABLE") {
+    throw fail("COMPANY_CONTEXT_UNAVAILABLE", "Your PPC access could not be checked just now. Try again in a moment.");
+  }
+  return access.allowed ? access.role : null;
 }
 
+/** Kept for callers that ask by user rather than request. */
 async function bestPpcRoleForUser(user) {
-  const { companies } = await listMembershipCompanies(user);
-  let best = null;
-  for (const company of companies) {
-    const role = await roleForCompany({ companyId: company.companyId, email: user.email, actorId: user.id });
-    if (role && (!best || roleAtLeast(role, best))) best = role;
-  }
-  return best;
+  return livePpcRole({ user });
 }
 
+/**
+ * The companies the PPC picker offers: the canonical GRAV Clothing profile
+ * (listMembershipCompanies now returns exactly that) when the person may open
+ * PPC at all, otherwise none.
+ */
 async function authorizedPpcCompanies(user) {
+  if (!(await livePpcRole({ user }))) return [];
   const { companies } = await listMembershipCompanies(user);
-  const allowed = [];
-  for (const company of companies) {
-    if (await roleForCompany({ companyId: company.companyId, email: user.email, actorId: user.id })) {
-      allowed.push(company);
-    }
-  }
-  return allowed;
+  return companies;
 }
 
 async function requirePpcCapability(req, capability) {
