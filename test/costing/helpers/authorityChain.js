@@ -233,6 +233,10 @@ async function confirmWithIe(companyId, styleId, { maker = null, checker = null 
         machineType: op.machineType || "SNLS",
       },
     });
+    if (![200, 201].includes(created.status) || !created.body?.operation) {
+      throw new Error(`authorityChain: the library operation ${op.operationCode} was refused `
+        + `(${created.status}) ${JSON.stringify(created.body?.error || created.body)}`);
+    }
     const minutes = (Number(op.minutes) || 0) + (Number(op.seconds) || 0) / 60;
     rows.push({
       ieOperationId: created.body.operation.operationId,

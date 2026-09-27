@@ -14,6 +14,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const { isUsedAs, DEFAULT_USED_AS, USED_AS_VALUES } = require("../../../../models/CMS_Models/Inventory/Products/usedAs");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -40,15 +41,23 @@ const {
 } = require("../../../../Middlewear/storePurchaseTenant");
 const { CAPABILITIES, hasAll } = require("../../../../services/storePurchase/capabilities");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
-const { fail, sendError } = require("../../../../services/storePurchase/errors");
+const { fail, sendError, StorePurchaseError } = require("../../../../services/storePurchase/errors");
 const stockAccountability = require("../../../../services/stockAccountability.service");
 
-const RAW_ITEM_CATEGORIES = [
-  "Fabric", "Thread", "Fasteners", "Elastic", "Interlining",
-  "Trims", "Chemicals", "Patterns", "Labels", "Packaging",
-  "Accessories", "Dyes", "Buttons", "Zippers", "Laces",
-  "Ribbons", "Cords", "Tapes", "Piping", "Webbing"
-];
+/* ── SHARED WITH THE NARROW MERCHANDISING DOOR ──────────────────────────────
+   These were defined here. They are now in the inventory service layer,
+   because the Development BOM's inline creation must judge a payload by the
+   same rules and a second copy of them would drift. */
+const {
+  SUPPLIER_NOT_SELECTABLE, supplierScope, resolveSuppliers, supplierIdentityMap,
+  validateEmbeddedConversions, validateEmbeddedVendors,
+  escapeRegex, normaliseVariantNicknames, normaliseUnitConversion,
+} = require("../../../../services/inventory/rawItemPayload.service");
+const rawItemCreation = require("../../../../services/inventory/rawItemCreation.service");
+
+/* One list, shared with the narrow Merchandising door so the two cannot
+   accept different words for the same shelf. */
+const { RAW_ITEM_CATEGORIES } = rawItemCreation;
 
 router.use(EmployeeAuthMiddleware);
 /* Every route below is tenant-resolved. A caller whose company cannot be
@@ -345,88 +354,7 @@ function payloadAuthority(req, res, next) {
   ));
 }
 
-/**
- * A conversion target must be a unit this company actually has.
- *
- * `unitConversions` name units as STRINGS, so nothing stopped a factor
- * referring to a unit that does not exist, or to another company's. And
- * `normaliseUnitConversion` accepted a factor of exactly 0 — `qty < 0` is
- * rejected, 0 is not — which stores arithmetic that turns any quantity into
- * nothing.
- */
-async function validateEmbeddedConversions(req, body) {
-  const rows = [];
-  (Array.isArray(body?.variants) ? body.variants : []).forEach((v, i) => {
-    (Array.isArray(v?.unitConversions) ? v.unitConversions : []).forEach((uc, j) => {
-      rows.push({ where: `variants[${i}].unitConversions[${j}]`, uc });
-    });
-  });
-  /* The product-level fields reach the same stored factors. */
-  if (body?.unitConversion) rows.push({ where: "unitConversion", uc: body.unitConversion });
-  (Array.isArray(body?.unitConversions) ? body.unitConversions : []).forEach((uc, j) => {
-    rows.push({ where: `unitConversions[${j}]`, uc });
-  });
-  if (!rows.length) return { ok: true };
 
-  for (const { where, uc } of rows) {
-    const qty = Number(uc?.quantity);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      return {
-        ok: false,
-        message: `${where} needs a conversion factor greater than zero.`,
-        details: { field: where, reason: "INVALID_FACTOR" },
-      };
-    }
-    const name = String(uc?.toUnit || "").trim();
-    if (!name) {
-      return { ok: false, message: `${where} names no target unit.`, details: { field: where, reason: "TARGET_MISSING" } };
-    }
-    const known = await Unit.findOne(scoped(req, {
-      name: new RegExp(`^${escapeRegex(name)}$`, "i"),
-    })).select("_id").lean();
-    if (!known) {
-      /* Another company's unit answers exactly as one that does not exist. */
-      return {
-        ok: false,
-        message: `${where} refers to a unit this company does not have: "${name}".`,
-        details: { field: where, reason: "TARGET_NOT_FOUND" },
-      };
-    }
-  }
-  return { ok: true };
-}
-
-/**
- * A supplier reference submitted with an item.
- *
- * This used to check that the id existed — `Vendor.find({_id: {$in: ids}})`.
- * Existence is not ownership: every id in that global table "exists" for every
- * company, so the check confirmed only that somebody, somewhere, had a
- * supplier by that id. Until Vendor records say whose they are, a reference
- * cannot be established at all, and the honest answer is that the dependency
- * is missing — not that the supplier was not found.
- */
-async function validateEmbeddedVendors(req, body) {
-  const named = [];
-  const ids = [];
-  (Array.isArray(body?.variants) ? body.variants : []).forEach((v, i) => {
-    (Array.isArray(v?.vendorNicknames) ? v.vendorNicknames : []).forEach((vn, j) => {
-      named.push(`variants[${i}].vendorNicknames[${j}]`);
-      if (vn?.vendor) ids.push(vn.vendor);
-    });
-  });
-  if (!named.length) return { ok: true };
-
-  /* Existence was never the question — every id in a global table "exists"
-     for everybody. This asks whether the supplier is THIS company's, and
-     whether it is in a state that may be newly assigned. */
-  const resolved = await resolveSuppliers(req, ids);
-  if (!resolved.ok) return { ok: false, ...resolved, fields: named };
-  return { ok: true }
-}
-
-/** A user's search text is data, not a pattern. */
-const escapeRegex = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -535,19 +463,6 @@ async function buildUnitConversionsMap(req) {
   }
 }
 
-// Normalise unitConversion input → returns object or null
-const normaliseUnitConversion = (uc) => {
-  if (!uc || !uc.toUnit || uc.quantity === undefined || uc.quantity === null || uc.quantity === "") {
-    return null;
-  }
-  const qty = parseFloat(uc.quantity);
-  if (isNaN(qty) || qty < 0) return null;
-  return {
-    fromUnit: (uc.fromUnit || "").toString().trim(),
-    toUnit: (uc.toUnit || "").toString().trim(),
-    quantity: qty
-  };
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET all raw items (pagination, search, filter)
@@ -558,6 +473,7 @@ router.get("/", canRead, async (req, res) => {
       search = "",
       status,
       category,
+      usedAs,
       page = 1,
       limit = 20
     } = req.query;
@@ -585,6 +501,11 @@ router.get("/", canRead, async (req, res) => {
     }
     if (category) {
       clauses.push({ $or: [{ category }, { customCategory: category }] });
+    }
+    /* Filter by the Store-owned "Used as" classification. Only recognised
+       values narrow; an unknown value is ignored rather than returning nothing. */
+    if (usedAs && isUsedAs(usedAs)) {
+      clauses.push({ usedAs: String(usedAs).trim().toUpperCase() });
     }
 
     const filter = { ...tenantContext.tenantFilter(req.tenant) };
@@ -718,6 +639,20 @@ router.get("/data/categories", canRead, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET "Used as" options — the Store-owned classification vocabulary for the
+// create/edit form and the list filter. One source of truth: the same module
+// the model, the migration and the Merchandising pickers read.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/data/used-as", canRead, async (req, res) => {
+  const { USED_AS_VALUES: values, USED_AS_LABELS: labels } = require("../../../../models/CMS_Models/Inventory/Products/usedAs");
+  res.json({
+    success: true,
+    options: values.map((value) => ({ value, label: labels[value] })),
+    defaultValue: DEFAULT_USED_AS,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /data/budget-classification — which budget head an item is expected to
 // come out of, for the Store screens that must SHOW it.
 //
@@ -765,7 +700,7 @@ function financeSurfaceReachable(req) {
     if (!raw) return false;
     const decoded = jwt.verify(
       decodeURIComponent(raw),
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../../../../config/jwt").SECRET,
     );
     const role = String(decoded?.role || "");
     /* The same four roles `financeOnly` accepts, plus the same permission
@@ -1001,178 +936,42 @@ router.get("/:id", canRead, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CREATE
-// ─────────────────────────────────────────────────────────────────────────────
+/* ── CREATE ────────────────────────────────────────────────────────────────
+   The rule itself now lives in `services/inventory/rawItemCreation.service`,
+   because the Development BOM's inline drawer registers the same master record
+   and a second copy of two hundred lines of validation, SKU minting and
+   opening-stock refusal would drift from this one without anybody noticing.
+
+   Nothing about this door's behaviour changed. It passes every section, so a
+   Store maintainer may still state supplier aliases, conversion factors,
+   discounts, attributes, variants and re-order levels — gated, as before, by
+   `payloadAuthority` on what the payload actually changes. And it passes
+   `onDuplicate: "allow"`, which is what this screen has always done: a
+   storekeeper can see the near-match in front of them and may have a reason to
+   register a second row. The near-match is now REPORTED alongside the created
+   item rather than discovered later. */
 router.post("/", ...canMaintain, payloadAuthority, async (req, res) => {
   try {
-    const {
-      name,
-      category,
-      customCategory,
-      customsTariffCode,
-      unit,
-      customUnit,
-      minStock,
-      maxStock,
-      discounts,
-      attributes,
-      variants,
-      description,
-      notes
-    } = req.body;
-
-    // Validation
-    if (!name || !name.trim()) {
-      return res.status(400).json({ success: false, message: "Item name is required" });
-    }
-    if (!category && !customCategory) {
-      return res.status(400).json({ success: false, message: "Category is required" });
-    }
-    if (!unit && !customUnit) {
-      return res.status(400).json({ success: false, message: "Unit of measurement is required" });
-    }
-    if (minStock === undefined || isNaN(minStock) || minStock < 0) {
-      return res.status(400).json({ success: false, message: "Valid minimum stock is required" });
-    }
-    if (maxStock === undefined || isNaN(maxStock) || maxStock < 0) {
-      return res.status(400).json({ success: false, message: "Valid maximum stock is required" });
-    }
-    if (parseFloat(minStock) >= parseFloat(maxStock)) {
-      return res.status(400).json({ success: false, message: "Maximum stock must be greater than minimum stock" });
-    }
-
-    if (attributes && Array.isArray(attributes)) {
-      for (let attr of attributes) {
-        if (!attr.name || !attr.name.trim()) {
-          return res.status(400).json({ success: false, message: "Attribute name is required" });
-        }
-        if (!attr.values || !Array.isArray(attr.values) || attr.values.length === 0) {
-          return res.status(400).json({ success: false, message: `Attribute "${attr.name}" must have at least one value` });
-        }
-      }
-    }
-
-    // Generate SKU
-    const nameWords = name.trim().split(' ');
-    const nameCode = nameWords.map(word => word.substring(0, 3).toUpperCase()).join('');
-    const finalCategory = customCategory?.trim() || category;
-    const categoryCode = finalCategory.substring(0, 3).toUpperCase();
-    const randomNum = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
-    const sku = `RAW-${categoryCode}-${nameCode}-${randomNum}`;
-
-    /* Company-scoped: two companies may legitimately hold the same code. */
-    const existingItem = await RawItem.findOne(scoped(req, { sku }));
-    if (existingItem) {
-      return res.status(400).json({ success: false, message: "An item with similar SKU already exists. Please try again." });
-    }
-
-    const convCheck = await validateEmbeddedConversions(req, req.body);
-    if (!convCheck.ok) {
-      return sendError(res, fail("VALIDATION", convCheck.message, convCheck.details));
-    }
-    const vendorCheck = await validateEmbeddedVendors(req, req.body);
-    if (!vendorCheck.ok) {
-      /* Refused whole. Silently dropping the supplier fields would save an
-         item the caller believes has a supplier on it. */
-      return res.status(vendorCheck.status).json({
-        success: false, code: vendorCheck.code, message: vendorCheck.message,
-        fields: vendorCheck.fields, ...(vendorCheck.details || {}),
-      });
-    }
-
-    // Process variants — accept image + per-variant vendorNicknames
-    let processedVariants = [];
-    if (variants && Array.isArray(variants)) {
-      processedVariants = variants.map(variant => {
-        const out = {
-          combination: variant.combination || [],
-          quantity: parseFloat(variant.quantity) || 0,
-          minStock: parseFloat(variant.minStock) || parseFloat(minStock) || 0,
-          maxStock: parseFloat(variant.maxStock) || parseFloat(maxStock) || 0,
-          sku: variant.sku || "",
-          image: variant.image || "",
-          unitConversions: (Array.isArray(variant.unitConversions) ? variant.unitConversions : [])
-            .map(uc => normaliseUnitConversion(uc)).filter(Boolean)
-        };
-        const nks = normaliseVariantNicknames(variant.vendorNicknames);
-        if (nks) out.vendorNicknames = nks;
-        return out;
-      });
-    }
-
-    /* ── AN ITEM IS CREATED EMPTY ─────────────────────────────────────────
-     * This used to sum the variants' quantities into an opening balance and
-     * save it with no stock transaction (S12): stock existed with nothing
-     * anywhere explaining where it came from, and it could never be
-     * reconciled because there was no movement to reconcile against.
-     *
-     * The quantity is REFUSED rather than dropped. Silently ignoring it would
-     * leave the operator looking at a form they filled in, a success message,
-     * and a shelf that never changed — the worst of the three options. Opening
-     * stock is a stock adjustment, and it goes through the path that records
-     * one. */
-    const openingQuantities = processedVariants
-      .map((v, i) => ({ i, q: Number(v.quantity) || 0 }))
-      .filter((x) => x.q > 0);
-    if (openingQuantities.length || (Number(req.body.quantity) || 0) > 0) {
-      return sendError(res, fail(
-        "VALIDATION",
-        "An item is created with no stock. Record the opening balance as a stock adjustment, so the movement is on the record.",
-        {
-          reason: "OPENING_QUANTITY_NOT_ACCEPTED",
-          variantRows: openingQuantities.map((x) => x.i + 1),
-        },
-      ));
-    }
-    processedVariants.forEach((v) => { v.quantity = 0; });
-
-    const newRawItem = new RawItem({
-      /* Ownership from the resolved context ONLY — never from the payload. */
-      ...tenantContext.stamp(req.tenant),
-      name: name.trim(),
-      sku: sku.toUpperCase(),
-      category: customCategory ? "" : (category || ""),
-      customCategory: customCategory || "",
-      /* A property of the GOODS, recorded once here rather than on every
-         quotation. Distinct from the supplier's GST HSN — see the model. */
-      customsTariffCode: tariffCode(customsTariffCode),
-      unit: customUnit ? "" : (unit || ""),
-      customUnit: customUnit || "",
-      quantity: 0,
-      minStock: parseFloat(minStock),
-      maxStock: parseFloat(maxStock),
-      discounts: discounts && Array.isArray(discounts)
-        ? discounts
-            .filter(d => d.minQuantity && d.price && !isNaN(d.minQuantity) && !isNaN(d.price))
-            .map(d => ({
-              minQuantity: parseFloat(d.minQuantity),
-              price: parseFloat(d.price)
-            }))
-        : [],
-      attributes: attributes && Array.isArray(attributes)
-        ? attributes
-            .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
-            .map(attr => ({
-              name: attr.name.trim(),
-              values: attr.values.filter(val => val && val.trim())
-            }))
-        : [],
-      variants: processedVariants,
-      description: description ? description.trim() : "",
-      notes: notes ? notes.trim() : "",
-      createdBy: req.user.id
+    const { rawItem, duplicate } = await rawItemCreation.createRawItem({
+      /* Company and actor from the resolved context only. */
+      tenant: req.tenant,
+      actorId: req.user.id,
+      payload: req.body,
+      sections: rawItemCreation.STORE_SECTIONS,
+      onDuplicate: "allow",
     });
-
-    await newRawItem.save();
 
     res.status(201).json({
       success: true,
       message: "Raw item registered successfully",
-      rawItem: newRawItem
+      rawItem,
+      /* Present only when this company already holds a material of the same
+         name, class and unit. The screen may say so; nothing was blocked. */
+      ...(duplicate ? { duplicate } : {}),
     });
 
   } catch (error) {
+    if (error instanceof StorePurchaseError) return sendError(res, error);
     console.error("Error creating raw item:", error);
     if (error.code === 11000) {
       return res.status(400).json({ success: false, message: "Item with this SKU already exists" });
@@ -1201,6 +1000,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       name,
       category,
       customCategory,
+      usedAs,
       customsTariffCode,
       unit,
       customUnit,
@@ -1295,6 +1095,13 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
         rawItem.category = category.trim();
         rawItem.customCategory = "";
       }
+    }
+
+    /* Store-owned classification. Assigned only when a recognised value is
+       sent; an unknown value leaves the current one alone rather than silently
+       resetting it to NOT_CLASSIFIED. */
+    if (usedAs !== undefined && isUsedAs(usedAs)) {
+      rawItem.usedAs = String(usedAs).trim().toUpperCase();
     }
 
     if (unit !== undefined || customUnit !== undefined) {

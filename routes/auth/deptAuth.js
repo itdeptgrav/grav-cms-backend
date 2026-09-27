@@ -35,7 +35,7 @@ const router = express.Router();
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
-const { SECRET, LEGACY_SECRETS, TOKEN_TTL, COOKIE_NAME, cookieOptions } = require("../../config/jwt");
+const { SECRET, verifyCmsToken, TOKEN_TTL, COOKIE_NAME, cookieOptions } = require("../../config/jwt");
 const AccessDepartment = require("../../models/Access/AccessDepartment");
 const DeptUser = require("../../models/Access/DeptUser");
 const Employee = require("../../models/Employee");
@@ -116,11 +116,34 @@ async function resolveEmployeeDepartments(employee) {
   return allowed;
 }
 
-async function deptUserMayOpenPpc(user) {
-  if (!user?.email) return false;
-  return Boolean(await require("../../services/ppc/access.service")
-    .bestPpcRoleForUser({ id: user._id, email: user.email }));
+/**
+ * The applications an EMPLOYEE session may open — the launcher and the
+ * session check (GAC-AR1). A projection of the canonical application-access
+ * resolver: an app appears only if services/access/appAccess.service.js would
+ * open it for this person. Company membership and PPC company grants are not
+ * inputs. Assignment order is kept so the primary department stays first.
+ *
+ * `resolveEmployeeDepartments` above is unchanged on purpose: Fulfilment,
+ * Marketing and face sign-in read it as "which departments is this person
+ * ASSIGNED to", which is a different question.
+ */
+async function resolveEmployeeLauncher(employee) {
+  const { listAccessibleApps } = require("../../services/access/appAccess.service");
+  const out = await listAccessibleApps({ id: employee._id, email: employee.email, subject: "employee" });
+  if (!out.ok) return [];
+  const apps = out.apps.map((a) => a.department);
+  const order = [employee.accessDepartmentId, ...(employee.additionalDepartmentIds || [])]
+    .filter(Boolean).map(String);
+  const rank = (d) => { const i = order.indexOf(String(d._id)); return i === -1 ? order.length : i; };
+  return apps.map((d, i) => ({ d, i })).sort((x, y) => rank(x.d) - rank(y.d) || x.i - y.i).map((x) => x.d);
 }
+
+/** The resolver's answer for a department session — one place, used below. */
+async function accessFor(user, slug, tv) {
+  const { resolveAppAccess } = require("../../services/access/appAccess.service");
+  return resolveAppAccess({ id: user._id, email: user.email, subject: "dept_user", tv }, slug);
+}
+
 
 /* What a session check needs from the employee record: identity, status and
    department pointers. Not the encrypted salary, the documents, the bank
@@ -274,22 +297,14 @@ function signToken(payload) {
 }
 
 /**
- * Verify against the current secret, then any historical one.
+ * Verify against the configured secret — and only that.
  *
- * The old code inlined `process.env.JWT_SECRET || "grav_clothing_secret_key"`
- * at 31 sites. Tokens minted under that fallback are still in circulation for
- * up to seven days, so they must keep verifying — but nothing new is ever
- * signed with it.
+ * SEC-0 (25 Sep 2026): this used to fall back to two historical secrets that
+ * were published in the repository, which made every session forgeable. They
+ * are no longer accepted; see config/jwt.js.
  */
 function verifyToken(token) {
-  try {
-    return jwt.verify(token, SECRET);
-  } catch (err) {
-    for (const legacy of LEGACY_SECRETS) {
-      try { return jwt.verify(token, legacy); } catch { /* try the next */ }
-    }
-    throw err;
-  }
+  return verifyCmsToken(token);
 }
 
 /**
@@ -388,6 +403,9 @@ function buildTokenPayload(user, dept, { adoptDeptRole = false } = {}) {
     name: user.name || "",
     email: user.email || "",
     isAdmin: Boolean(user.isAdmin),
+    // GAC-AR2: every session names its identity kind explicitly. Unlabelled
+    // tokens are no longer issued (older ones still verify until they expire).
+    subject: "dept_user",
     tv: user.tokenVersion || 0,
   };
 }
@@ -396,397 +414,147 @@ function buildTokenPayload(user, dept, { adoptDeptRole = false } = {}) {
 /* POST /api/auth/login                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * GAC-AR2: the session one canonical identity gets.
+ *
+ * Applications come from listAccessibleApps (never a hardcoded list); the
+ * application the session opens in is the requested tile if the resolver
+ * allows it, otherwise the person's home application, otherwise their first
+ * allowed one. Every session carries an explicit subject and current tv.
+ */
+async function canonicalSession(identity, requestedSlug) {
+  const { listAccessibleApps } = require("../../services/access/appAccess.service");
+  const rec = identity.record;
+  let actor;
+  let homeId = null;
+  if (identity.subject === "dept_user") {
+    actor = { id: rec._id, email: rec.email, subject: "dept_user", tv: rec.tokenVersion || 0 };
+    homeId = String(rec.departmentId);
+  } else if (identity.subject === "employee") {
+    actor = { id: rec._id, email: rec.email, subject: "employee", tv: 0 };
+    homeId = rec.accessDepartmentId ? String(rec.accessDepartmentId) : null;
+  } else {
+    actor = { id: rec._id, email: rec.email, subject: "accountant", tv: rec.tokenVersion || 0 };
+  }
+
+  const out = await listAccessibleApps(actor);
+  if (!out.ok) return { refusal: { status: out.denialCode === "ACCESS_CHECK_UNAVAILABLE" ? 503 : 403, code: out.denialCode } };
+  let apps = out.apps.map((a) => a.department);
+  if (identity.subject === "employee") {
+    // Keep the employee's assignment order so their primary stays first.
+    const order = [rec.accessDepartmentId, ...(rec.additionalDepartmentIds || [])].filter(Boolean).map(String);
+    const rank = (d) => { const i = order.indexOf(String(d._id)); return i === -1 ? order.length : i; };
+    apps = apps.map((d, i) => ({ d, i })).sort((x, y) => rank(x.d) - rank(y.d) || x.i - y.i).map((x) => x.d);
+  }
+  if (!apps.length) {
+    return { refusal: { status: 403, code: "NO_DEPARTMENT", message: "No application has been assigned to this account yet. Ask an administrator." } };
+  }
+
+  let dept;
+  if (requestedSlug) {
+    dept = apps.find((d) => d.slug === requestedSlug) || null;
+    if (!dept) {
+      return { refusal: { status: 403, code: "WRONG_DEPARTMENT", message: `You do not have access to that application. Yours: ${apps.map((d) => d.name).join(", ")}.` } };
+    }
+  } else {
+    dept = apps.find((d) => String(d._id) === homeId) || apps[0];
+  }
+
+  let payload;
+  if (identity.subject === "dept_user") {
+    payload = buildTokenPayload(rec, dept, { adoptDeptRole: String(dept._id) !== String(rec.departmentId) });
+  } else if (identity.subject === "employee") {
+    payload = {
+      v: 2, id: String(rec._id), role: dept.legacyRole || dept.slug, userType: dept.legacyUserType || dept.slug,
+      deptId: String(dept._id), deptSlug: dept.slug, employeeId: rec.biometricId || "",
+      name: `${rec.firstName || ""} ${rec.lastName || ""}`.trim(), email: rec.email || "",
+      isAdmin: false, subject: "employee", tv: 0,
+    };
+  } else {
+    payload = {
+      v: 2, id: String(rec._id), role: dept.legacyRole || "accountant", userType: dept.legacyUserType || "accountant",
+      deptId: String(dept._id), deptSlug: dept.slug, employeeId: "", name: rec.name || "", email: rec.email,
+      isAdmin: false, subject: "accountant", tv: rec.tokenVersion || 0,
+    };
+  }
+  return { dept, apps, payload, isAdmin: Boolean(out.isPlatformAdmin) };
+}
+
+/** The shared failure answer for a canonical-identity refusal. */
+function sendIdentityRefusal(res, result) {
+  const { REFUSAL_MESSAGES, CODES } = require("../../services/access/canonicalIdentity.service");
+  const status = result.status || 401;
+  // INVALID_CREDENTIALS carries no code: it must look identical to "no such account".
+  if (result.code === CODES.INVALID_CREDENTIALS) {
+    return res.status(401).json({ success: false, message: REFUSAL_MESSAGES[result.code] });
+  }
+  return res.status(status).json({ success: false, code: result.code, message: REFUSAL_MESSAGES[result.code] || "Sign-in refused." });
+}
+
 router.post("/login", async (req, res) => {
   try {
     const { email, password, slug } = req.body || {};
-
     if (!email || !password) {
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
 
-    const normalisedEmail = String(email).toLowerCase().trim();
-
-    // Deliberately identical for every failure below. Distinguishing "no such
-    // user" from "wrong password" from "deactivated" tells an attacker which
-    // addresses are real.
-    const reject = () =>
-      res.status(401).json({ success: false, message: "Invalid email or password" });
-
-    /* ---- department account --------------------------------------- */
-    //
-    // ONE EMAIL CAN NAME TWO DIFFERENT ACCOUNTS.
-    //
-    // dept_users.email and Employee.email are separately unique, so the same
-    // address can exist as both a department login and an employee record —
-    // they are different identities with independent access grants.
-    //
-    // This block used to `return reject()` the moment the department account
-    // was inactive or its password did not match, which meant a disabled
-    // department login permanently shadowed a perfectly valid employee account
-    // sharing that address. The employee was told "invalid email or password"
-    // for credentials that were entirely correct.
-    //
-    // Now each candidate identity is TRIED IN TURN, and the request is only
-    // refused once every one of them has failed.
-    const user = await DeptUser.findOne({ email: normalisedEmail });
-    let deptUserFailed = null;   // remembered so lockout is only counted once
-
-    if (user) {
-      if (user.isLocked()) {
-        return res.status(429).json({
-          success: false,
-          message: "Too many failed attempts. Try again in a few minutes.",
-        });
+    /* GAC-AR2: ONE canonical identity per person. The service decides which
+       record this email signs in as and whether this password opens it — the
+       same decision /resolve makes. An administrator's DeptUser never falls
+       through to a weaker legacy, employee or accounting-only session. */
+    const { authenticateLogin } = require("../../services/access/canonicalIdentity.service");
+    const identity = await authenticateLogin(email, password);
+    if (!identity.ok) {
+      if (identity.countFailure && identity.record?.registerFailedLogin) {
+        await identity.record.registerFailedLogin().catch(() => {});
       }
-
-      const dept = await AccessDepartment.findById(user.departmentId);
-      const usable = user.isActive && dept && dept.isActive;
-      const passwordOk = usable ? await user.verifyPassword(password) : false;
-
-      if (!usable) {
-        // Fall through to the employee path rather than rejecting outright.
-        deptUserFailed = "inactive";
-      } else if (!passwordOk) {
-        deptUserFailed = "password";
-      } else if (slug && dept.slug !== slug) {
-        // Authenticated, but picked the wrong tile. That IS a definitive
-        // answer — no other identity is going to change it.
-        return reject();
-      } else {
-        await user.registerSuccessfulLogin(req.ip);
-
-        const payload = buildTokenPayload(user, dept);
-        const token = signToken(payload);
-        res.cookie(COOKIE_NAME, token, cookieOptions());
-
-        // Accounting also needs its own module session — see
-        // attachAccountantSession. No issuedAt: the CMS token was minted a
-        // line ago, so it is by definition newer than any revocation stamp.
-        // Signing in again is exactly how you come back after "sign out of all
-        // devices".
-        const accSession = await attachAccountantSession(res, dept, user.email);
-
-        return res.status(200).json({
-          success: true,
-          message: "Login successful",
-          redirectTo: dept.resolveRedirect(),
-          token,
-          userType: payload.userType,
-          mustChangePassword: user.mustChangePassword,
-          department: {
-            slug: dept.slug,
-            name: dept.name,
-            iconUrl: dept.iconUrl || "",
-            dashboardPath: dept.dashboardPath,
-          },
-          user: {
-            id: user._id,
-            name: user.name,
-            email: user.email,
-            role: payload.role,
-            department: dept.name,
-            employeeId: user.employeeId || "",
-            isAdmin: user.isAdmin,
-          },
-        });
-      }
-
-      if (deptUserFailed) {
-        console.warn(
-          `[auth] "${normalisedEmail}" has a department login that could not be ` +
-          `used (${deptUserFailed}); trying the employee record with the same address.`,
-        );
-      }
+      return sendIdentityRefusal(res, identity);
     }
 
-    /* ---- employee accounts ---------------------------------------- */
-    // Employees sign in with the credentials already on their HR record. What
-    // they may REACH is decided here, on the server, from accessDepartmentId —
-    // never from anything the browser sent. A tile greyed out in the UI is a
-    // courtesy; this is the actual gate, and it holds even if someone re-enables
-    // the control in devtools or posts to /api/auth/login directly.
-    // NO PROJECTION — deliberately.
-    //
-    // This used to be .select("+password firstName lastName …"). Mixing a
-    // `+field` into an otherwise INCLUSIVE projection makes mongoose drop that
-    // field entirely: the document came back with password === undefined, every
-    // comparison failed, and the user was told "invalid email or password" for
-    // a password that was demonstrably correct. `password` is not select:false
-    // on this schema, so the `+` bought nothing and cost everything.
-    //
-    // One document per login attempt; the bytes saved were never worth it.
-    const employee = await Employee.findOne({ email: normalisedEmail });
-
-    if (employee) {
-      if (employee.isActive === false || employee.status === "inactive") return reject();
-
-      // Every way an employee credential can legitimately be valid — bcrypt,
-      // legacy plaintext, and the two derived defaults. Checking only bcrypt
-      // told people their correct password was wrong while the employee app
-      // accepted the very same string.
-      const match = await matchesEmployeePassword(employee, password);
-      if (!match.ok) return reject();
-
-      // Convert a legacy or derived password to a real hash on first use, so
-      // these paths drain away instead of living forever.
-      if (match.needsUpgrade) {
-        await upgradeEmployeePassword(Employee, employee._id, password);
-        console.log(
-          `[auth] upgraded ${normalisedEmail} from ${match.via} to a bcrypt hash`,
-        );
-      }
-
-      const allowed = await resolveEmployeeDepartments(employee);
-
-      // Which one they end up in: the tile they picked if they picked one,
-      // otherwise their primary. The slug is validated against `allowed`
-      // below — the browser never gets to choose a department for them.
-      const dept = slug
-        ? allowed.find((d) => d.slug === slug) || null
-        : allowed[0] || null;
-
-      if (!allowed.length) {
-        // Authenticated, but deliberately given nowhere to go. Distinct from a
-        // credential failure because it is actionable — and it leaks nothing,
-        // since they have already proven who they are.
-        return res.status(403).json({
-          success: false,
-          code: "NO_DEPARTMENT",
-          message:
-            "Your account is not assigned to a department yet. " +
-            "Ask an administrator to assign you before signing in.",
-        });
-      }
-
-      // A slug that is not in `allowed` resolves to null here. This is the
-      // gate: it holds whether the request came from the portal, from devtools,
-      // or from curl.
-      if (!dept) {
-        return res.status(403).json({
-          success: false,
-          code: "WRONG_DEPARTMENT",
-          message:
-            allowed.length === 1
-              ? `You are assigned to ${allowed[0].name}. Choose that department to sign in.`
-              : `You do not have access to that department. Yours: ${allowed
-                  .map((d) => d.name)
-                  .join(", ")}.`,
-        });
-      }
-
-      if (!dept.isActive) {
-        return res.status(403).json({
-          success: false,
-          code: "DEPARTMENT_INACTIVE",
-          message: `${dept.name} is not currently active.`,
-        });
-      }
-
-      const payload = {
-        v: 2,
-        id: String(employee._id),
-        // The department's own role, so the dashboard it lands on actually
-        // works. NOTE: this gives an employee the same reach as the shared
-        // department login they would otherwise have used — no worse than
-        // today, where that password is passed around, but worth knowing.
-        role: dept.legacyRole || dept.slug,
-        userType: dept.legacyUserType || dept.slug,
-        deptId: String(dept._id),
-        deptSlug: dept.slug,
-        employeeId: employee.biometricId || "",
-        name: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
-        email: employee.email || "",
-        isAdmin: false,
-        // Marks the subject as an Employee document rather than a DeptUser, so
-        // /verify looks it up in the right collection.
-        subject: "employee",
-        tv: 0,
-      };
-
-      const token = signToken(payload);
-      res.cookie(COOKIE_NAME, token, cookieOptions());
-
-      const accSession = await attachAccountantSession(res, dept, employee.email);
-
-      return res.status(200).json({
-        success: true,
-        message: "Login successful",
-        // With no tile chosen and more than one department available, send
-        // them to the picker rather than deciding for them. Choosing a tile
-        // (slug set) always goes straight to that dashboard.
-        redirectTo:
-          !slug && allowed.length > 1 ? "/onboarding" : dept.resolveRedirect(),
-        token,
-        userType: payload.userType,
-        // Every department this person may open, so the portal can show the
-        // real set instead of asking again.
-        departments: allowed.map((d) => d.toPublicTile()),
-        // Present only when signing in to Accounting: which of owner /
-        // approver / editor / viewer they hold there, plus that module's own
-        // token. The accountant client sends localStorage.acc_token as a Bearer
-        // header, and storing the CMS token there is what made the sidebar read
-        // "HR_MANAGER" — the header outranked the accountant_token cookie.
-        accountantRole: accSession?.role || null,
-        accountantToken: accSession?.token || null,
-        department: {
-          slug: dept.slug,
-          name: dept.name,
-          iconUrl: dept.iconUrl || "",
-          dashboardPath: dept.dashboardPath,
-        },
-        user: {
-          id: employee._id,
-          name: payload.name,
-          email: employee.email,
-          role: payload.role,
-          department: dept.name,
-          employeeId: employee.biometricId || "",
-          isAdmin: false,
-        },
-      });
+    const session = await canonicalSession(identity, slug || null);
+    if (session.refusal) {
+      return res.status(session.refusal.status).json({ success: false, code: session.refusal.code, message: session.refusal.message || "Sign-in refused." });
     }
 
-    /* ---- accounting-only users ------------------------------------ */
-    //
-    // An external accountant, an auditor, a bookkeeper — someone who needs the
-    // accounting module but is not on the payroll and has no Employee record.
-    // They exist ONLY as an Acc_User, so without this they could be created in
-    // Access Control and then find no way to sign in.
-    const accOnly = await (async () => {
-      try {
-        const { findAccountantUser } = require("../../services/accountantAccess");
-        return await findAccountantUser(normalisedEmail);
-      } catch { return null; }
-    })();
-
-    if (accOnly && accOnly.isActive) {
-      const ok = await accOnly.checkPassword(password);
-      if (ok) {
-        const dept = await AccessDepartment.findOne({ slug: "accountant", isActive: true });
-        if (!dept) {
-          return res.status(403).json({
-            success: false,
-            code: "DEPARTMENT_INACTIVE",
-            message: "Accounting is not currently active.",
-          });
-        }
-        if (slug && slug !== "accountant") {
-          return res.status(403).json({
-            success: false,
-            code: "WRONG_DEPARTMENT",
-            message: "You have access to Accounting only.",
-          });
-        }
-
-        const payload = {
-          v: 2,
-          id: String(accOnly._id),
-          role: dept.legacyRole || "accountant",
-          userType: dept.legacyUserType || "accountant",
-          deptId: String(dept._id),
-          deptSlug: dept.slug,
-          employeeId: "",
-          name: accOnly.name || "",
-          email: accOnly.email,
-          isAdmin: false,
-          subject: "accountant",
-          tv: accOnly.tokenVersion || 0,
-        };
-
-        const token = signToken(payload);
-        res.cookie(COOKIE_NAME, token, cookieOptions());
-        const accSession = await attachAccountantSession(res, dept, accOnly.email);
-
-        return res.status(200).json({
-          success: true,
-          message: "Login successful",
-          redirectTo: dept.resolveRedirect(),
-          token,
-          userType: payload.userType,
-          departments: [dept.toPublicTile()],
-          accountantRole: accSession?.role || accOnly.role,
-          // Without this the browser stores the CMS token under acc_token, and
-          // that Bearer header outranks the accountant_token cookie — which is
-          // exactly what made an Owner's sidebar read the wrong role.
-          accountantToken: accSession?.token || null,
-          department: {
-            slug: dept.slug,
-            name: dept.name,
-            iconUrl: dept.iconUrl || "",
-            dashboardPath: dept.dashboardPath,
-          },
-          user: {
-            id: accOnly._id,
-            name: accOnly.name,
-            email: accOnly.email,
-            role: payload.role,
-            department: dept.name,
-            employeeId: "",
-            isAdmin: false,
-          },
-        });
-      }
+    const rec = identity.record;
+    if (identity.subject === "dept_user") {
+      await rec.registerSuccessfulLogin(req.ip);
+    } else if (identity.subject === "employee" && identity.needsUpgrade) {
+      // Convert a legacy or derived password to a real hash on first use.
+      await upgradeEmployeePassword(Employee, rec._id, password);
+      console.log(`[auth] upgraded ${String(email).toLowerCase().trim()} from ${identity.via} to a bcrypt hash`);
     }
 
-    /* ---- legacy fallback (removed at rollout step 8) --------------- */
-    const { user: legacyUser, userType } = await findLegacyUser(normalisedEmail);
-
-    if (!legacyUser || legacyUser.isActive === false) {
-      // Every identity has now been tried. Only count the failed attempt
-      // against the department account here — doing it earlier would lock out
-      // a department login because somebody's employee password was wrong.
-      if (user && deptUserFailed === "password") {
-        await user.registerFailedLogin();
-      }
-      return reject();
-    }
-
-    const legacyOk = await bcrypt.compare(String(password), legacyUser.password || "");
-    if (!legacyOk) return reject();
-
-    console.warn(
-      `[auth] "${normalisedEmail}" authenticated through the LEGACY fallback ` +
-      `(${userType}). They are absent from dept_users — re-run the migration ` +
-      `before removing the fallback or this account will lose access.`,
-    );
-
-    const dept = await AccessDepartment.findOne({ legacyUserType: userType });
-
-    const payload = {
-      v: 2,
-      id: String(legacyUser._id),
-      // A legacy collection id is not a DeptUser id. Verification must look
-      // it up in the collection that authenticated the password.
-      subject: "legacy_department",
-      role: legacyUser.role || "",
-      userType,
-      deptId: dept ? String(dept._id) : null,
-      deptSlug: resolveSlug(dept, userType),
-      employeeId: legacyUser.employeeId || "",
-      name: legacyUser.name || "",
-      email: legacyUser.email || "",
-      isAdmin: false,
-      tv: 0,
-    };
-
-    const token = signToken(payload);
+    const token = signToken(session.payload);
     res.cookie(COOKIE_NAME, token, cookieOptions());
+    // No issuedAt: this token was minted a line ago, so it is newer than any
+    // "sign out of all devices" stamp by definition.
+    const accSession = await attachAccountantSession(res, session.dept, rec.email);
 
     return res.status(200).json({
       success: true,
       message: "Login successful",
-      // Never bare "/" — see resolveLegacyRedirect. A correct password that
-      // lands on the homepage is indistinguishable from a rejected one.
-      redirectTo: resolveLegacyRedirect(dept, legacyUser.role, userType),
+      // More than one application and no tile chosen: the launcher, not a guess.
+      redirectTo: !slug && session.apps.length > 1 ? "/onboarding" : session.dept.resolveRedirect(),
       token,
-      userType,
+      subject: identity.subject,
+      identityId: String(rec._id),
+      userType: session.payload.userType,
+      mustChangePassword: Boolean(rec.mustChangePassword),
+      departments: session.apps.map((d) => d.toPublicTile()),
+      accountantRole: accSession?.role || null,
+      // The accounting client stores this under acc_token; null means clear it.
+      accountantToken: accSession?.token || null,
+      department: session.dept.toPublicTile(),
       user: {
-        id: legacyUser._id,
-        name: legacyUser.name,
-        email: legacyUser.email,
-        role: legacyUser.role,
-        department: legacyUser.department,
-        employeeId: legacyUser.employeeId,
+        id: rec._id,
+        name: session.payload.name,
+        email: rec.email,
+        role: session.payload.role,
+        department: session.dept.name,
+        employeeId: session.payload.employeeId,
+        isAdmin: session.isAdmin,
+        subject: identity.subject,
       },
     });
   } catch (error) {
@@ -875,12 +643,20 @@ router.post("/verify", async (req, res) => {
         });
       }
 
-      const dept = await AccessDepartment.findOne({ slug: "accountant", isActive: true });
+      /* GAC-AR2: the application list is the resolver's, never a hardcoded
+         [Accounting]. An Acc_User role opens Accounting; any other app needs
+         its own grant. The session's current app is honoured only while the
+         resolver still allows it. */
+      const { listAccessibleApps } = require("../../services/access/appAccess.service");
+      const out = await listAccessibleApps({ id: accUser._id, email: accUser.email, subject: "accountant", tv: decoded.tv || 0 });
+      const apps = out.ok ? out.apps.map((a) => a.department) : [];
+      const dept = apps.find((d) => String(d._id) === String(decoded.deptId))
+        || apps.find((d) => d.slug === "accountant") || null;
       if (!dept) {
         return res.status(403).json({
           success: false,
           code: "NO_DEPARTMENT",
-          message: "The Accounting department is not active.",
+          message: "No application is open to this account any more.",
         });
       }
 
@@ -898,7 +674,7 @@ router.post("/verify", async (req, res) => {
           email: accUser.email,
           role: dept.legacyRole || "accountant",
           accountantRole: accUser.role,
-          deptRole: accUser.role,
+          deptRole: out.apps.find((a) => a.department.slug === dept.slug)?.access.role || null,
           employeeId: "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -907,9 +683,10 @@ router.post("/verify", async (req, res) => {
           subject: "accountant",
         },
         department: dept.toPublicTile(),
-        departments: [dept.toPublicTile()],
-        accountantRole: accSession?.role || accUser.role,
+        departments: apps.map((d) => d.toPublicTile()),
+        accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
+        sessionToken: token,
       });
     }
 
@@ -924,7 +701,7 @@ router.post("/verify", async (req, res) => {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
 
-      const allowed = await resolveEmployeeDepartments(employee);
+      const allowed = await resolveEmployeeLauncher(employee);
 
       if (!allowed.length) {
         return res.status(403).json({
@@ -959,9 +736,9 @@ router.post("/verify", async (req, res) => {
          of two. Each is a cross-region query on the most-called route. */
       const [accSession, deptRole] = await Promise.all([
         attachAccountantSession(res, dept, employee.email, decoded.iat),
-        dept.slug === "ppc"
-          ? require("../../services/ppc/access.service").bestPpcRoleForUser({ id: employee._id, email: employee.email })
-          : require("../../services/departmentRoles").getRole(dept.slug, employee.email),
+        require("../../services/access/appAccess.service")
+          .resolveAppAccess({ id: employee._id, email: employee.email, subject: "employee" }, dept.slug)
+          .then((a) => (a.allowed ? a.role : null)),
       ]);
 
       return res.status(200).json({
@@ -988,6 +765,10 @@ router.post("/verify", async (req, res) => {
         // browser MUST clear its stored token in that case rather than fall
         // back to the CMS one.
         accountantToken: accSession?.token || null,
+        // GAC-AR2 bridge: the token this answer verified (the cookie when one
+        // was sent), so the browser's localStorage copy is re-synced to it and
+        // a stale Bearer can never outlive a newer cookie.
+        sessionToken: token,
       });
     }
 
@@ -1009,7 +790,11 @@ router.post("/verify", async (req, res) => {
       // tokenVersion, which kills every outstanding session immediately rather
       // than leaving it valid for the remaining days of the token's life.
       if ((user.tokenVersion || 0) !== (decoded.tv || 0)) {
-        return res.status(401).json({ success: false, message: "Session expired" });
+        return res.status(401).json({
+          success: false,
+          code: "SESSION_REVOKED",
+          message: "Your session has ended. Please sign in again.",
+        });
       }
 
       // An admin's session may be pointed at a department other than the one
@@ -1019,7 +804,9 @@ router.post("/verify", async (req, res) => {
       let dept = own;
       if (decoded.deptId && String(decoded.deptId) !== String(user.departmentId)) {
         const requested = await AccessDepartment.findById(decoded.deptId);
-        if (user.isAdmin || (requested?.slug === "ppc" && await deptUserMayOpenPpc(user))) {
+        // GAC-AR1: the resolver decides (database-verified administrator, or
+        // an application grant) — never the token's isAdmin claim.
+        if (requested && (await accessFor(user, requested.slug, decoded.tv || 0)).allowed) {
           dept = requested;
         }
       }
@@ -1048,9 +835,8 @@ router.post("/verify", async (req, res) => {
             (String(dept._id) !== String(user.departmentId)
               ? null
               : user.legacyRole) || dept.legacyRole || dept.slug,
-          deptRole: dept.slug === "ppc"
-            ? await require("../../services/ppc/access.service").bestPpcRoleForUser({ id: user._id, email: user.email })
-            : await require("../../services/departmentRoles").getRole(dept.slug, user.email),
+          // GAC-AR1: the canonical resolver's role for this application.
+          deptRole: await accessFor(user, dept.slug, decoded.tv || 0).then((a) => (a.allowed ? a.role : null)),
           employeeId: user.employeeId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -1072,17 +858,15 @@ router.post("/verify", async (req, res) => {
         // The legacy row may still exist in a live database, so it is filtered
         // here rather than deleted; Access Control lives inside the Executive
         // Office and an admin reaches it there.
-        departments: user.isAdmin
-          ? (await AccessDepartment.find({
-              isActive: true,
-              slug: { $ne: "platform-admin" },
-            }).sort({ sortOrder: 1, name: 1 }))
-              .map((d) => d.toPublicTile())
-          : [own, ...((own?.slug !== "ppc" && await deptUserMayOpenPpc(user))
-            ? [await AccessDepartment.findOne({ slug: "ppc", isActive: true })]
-            : [])].filter((d) => d?.isActive).map((d) => d.toPublicTile()),
+        // GAC-AR1: every application the canonical resolver opens for this
+        // person. A database-verified platform administrator gets every
+        // active internal application; everybody else gets their grants.
+        departments: await require("../../services/access/appAccess.service")
+          .listAccessibleApps({ id: user._id, email: user.email, subject: "dept_user", tv: decoded.tv || 0 })
+          .then((out) => out.apps.map((a) => a.department.toPublicTile())),
         accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
+        sessionToken: token,
       });
     }
 
@@ -1095,7 +879,13 @@ router.post("/verify", async (req, res) => {
       ? res.status(200).json(view)
       : res.status(401).json({ success: false, message: "Unauthorized" });
   } catch (error) {
-    return res.status(401).json({ success: false, message: "Invalid or expired token" });
+    /* A token that no longer verifies — expired, or signed with a secret
+       SEC-0 retired — is a session to replace, not an error to retry. */
+    return res.status(401).json({
+      success: false,
+      code: "SESSION_INVALID",
+      message: "Your session is no longer valid. Please sign in again.",
+    });
   }
 });
 
@@ -1124,75 +914,24 @@ router.post("/resolve", async (req, res) => {
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
 
-    const normalised = String(email).toLowerCase().trim();
-    const deny = () =>
-      res.status(401).json({ success: false, message: "Invalid email or password" });
+    /* GAC-AR2: the SAME canonical decision /login makes — same subject, same
+       record, same application list — without issuing a session. */
+    const { authenticateLogin } = require("../../services/access/canonicalIdentity.service");
+    const identity = await authenticateLogin(email, password);
+    if (!identity.ok) return sendIdentityRefusal(res, identity);
 
-    /* department accounts */
-    const deptUser = await DeptUser.findOne({ email: normalised });
-    if (deptUser) {
-      if (!deptUser.isActive || deptUser.isLocked()) return deny();
-      if (!(await deptUser.verifyPassword(password))) return deny();
-
-      const dept = await AccessDepartment.findById(deptUser.departmentId);
-      return res.json({
-        success: true,
-        isAdmin: deptUser.isAdmin,
-        // An administrator goes to the console, not the department picker.
-        adminRedirect: deptUser.isAdmin ? "/ceo/dashboard/access" : null,
-        departments: dept && dept.isActive ? [dept.toPublicTile()] : [],
-      });
-    }
-
-    /* employees */
-    // No projection — see the note in /login. A `+field` inside an inclusive
-    // projection silently drops it, which is what made correct passwords fail.
-    const employee = await Employee.findOne({ email: normalised });
-    if (employee) {
-      if (employee.isActive === false || employee.status === "inactive") return deny();
-
-      // Same matcher as /login — the two must never disagree about whether a
-      // password is valid, or the portal would show a department and then
-      // refuse the sign-in.
-      const match = await matchesEmployeePassword(employee, password);
-      if (!match.ok) return deny();
-
-      const allowed = await resolveEmployeeDepartments(employee);
-      return res.json({
-        success: true,
-        isAdmin: false,
-        adminRedirect: null,
-        departments: allowed.map((d) => d.toPublicTile()),
-        message: allowed.length
-          ? undefined
-          : "You are not assigned to a department yet. Ask an administrator to assign you.",
-      });
-    }
-
-    /* accounting-only users */
-    // An external bookkeeper or auditor with no HR record. /login accepts them,
-    // so /resolve has to as well — the portal calls this FIRST, and without it
-    // they were turned away with "invalid email or password" before the sign-in
-    // that would have worked was ever attempted.
-    const accOnly = await (async () => {
-      try {
-        const { findAccountantUser } = require("../../services/accountantAccess");
-        return await findAccountantUser(normalised);
-      } catch { return null; }
-    })();
-
-    if (accOnly && accOnly.isActive && (await accOnly.checkPassword(password))) {
-      const dept = await AccessDepartment.findOne({ slug: "accountant", isActive: true });
-      return res.json({
-        success: true,
-        isAdmin: false,
-        adminRedirect: null,
-        departments: dept ? [dept.toPublicTile()] : [],
-        message: dept ? undefined : "Accounting is not currently active.",
-      });
-    }
-
-    return deny();
+    const session = await canonicalSession(identity, null);
+    const apps = session.refusal ? [] : session.apps;
+    return res.json({
+      success: true,
+      subject: identity.subject,
+      identityId: String(identity.record._id),
+      isAdmin: Boolean(session.isAdmin),
+      // The launcher shows an administrator every application; no console detour.
+      adminRedirect: null,
+      departments: apps.map((d) => d.toPublicTile()),
+      message: apps.length ? undefined : "No application has been assigned to this account yet. Ask an administrator.",
+    });
   } catch (error) {
     console.error("[auth] resolve error:", error);
     res.status(500).json({ success: false, message: "Server error" });
@@ -1233,6 +972,65 @@ router.post("/switch-department", async (req, res) => {
     const deny = () =>
       res.status(403).json({ success: false, message: "You do not have access to that department." });
 
+    /* ---- accounting-only session --------------------------------- */
+    // Accounting-only people have a real CMS launcher session too. The
+    // launcher has always called this endpoint before navigating, including
+    // when Accounting is already the current application. Previously this
+    // subject fell through to the DeptUser branch below; its Acc_User id could
+    // not be found there, so the only tile on screen answered "Unauthorized".
+    //
+    // Keep the boundary explicit: an Acc_User role authorises Accounting, not
+    // every application. Other app grants still belong to a normal person
+    // identity and are handled by the shared resolver migration separately.
+    if (decoded.subject === "accountant") {
+      const { findAccountantUser } = require("../../services/accountantAccess");
+      const accUser = await findAccountantUser(decoded.email);
+      if (!accUser || !accUser.isActive) {
+        return res.status(401).json({ success: false, message: "Unauthorized" });
+      }
+      if ((accUser.tokenVersion || 0) !== (decoded.tv || 0)) {
+        return res.status(401).json({
+          success: false,
+          code: "SESSION_REVOKED",
+          message: "Your session has ended. Please sign in again.",
+        });
+      }
+      // GAC-AR2: the resolver decides. The Acc_User role opens Accounting;
+      // another application needs its own grant — never implied.
+      const dept = await AccessDepartment.findOne({ slug, isActive: true });
+      if (!dept) return deny();
+      const { resolveAppAccess } = require("../../services/access/appAccess.service");
+      const access = await resolveAppAccess({ id: accUser._id, email: accUser.email, subject: "accountant", tv: decoded.tv || 0 }, slug);
+      if (!access.allowed) return deny();
+
+      const payload = {
+        v: 2,
+        id: String(accUser._id),
+        role: dept.legacyRole || "accountant",
+        userType: dept.legacyUserType || "accountant",
+        deptId: String(dept._id),
+        deptSlug: dept.slug,
+        employeeId: "",
+        name: accUser.name || "",
+        email: accUser.email,
+        isAdmin: false,
+        subject: "accountant",
+        tv: accUser.tokenVersion || 0,
+      };
+      const fresh = signToken(payload);
+      res.cookie(COOKIE_NAME, fresh, cookieOptions());
+      const accSession = await attachAccountantSession(res, dept, accUser.email, decoded.iat);
+
+      return res.json({
+        success: true,
+        redirectTo: dept.resolveRedirect(),
+        department: dept.toPublicTile(),
+        token: fresh,
+        accountantRole: accSession?.role || null,
+        accountantToken: accSession?.token || null,
+      });
+    }
+
     /* ---- employee session ---- */
     if (decoded.subject === "employee") {
       const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
@@ -1240,7 +1038,7 @@ router.post("/switch-department", async (req, res) => {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
 
-      const allowed = await resolveEmployeeDepartments(employee);
+      const allowed = await resolveEmployeeLauncher(employee);
       const dept = allowed.find((d) => d.slug === slug);
       if (!dept) return deny();
 
@@ -1284,14 +1082,23 @@ router.post("/switch-department", async (req, res) => {
     if (!user || !user.isActive) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
+    // GAC-AR1: a revoked session cannot re-mint itself here (SEC-0 found this
+    // branch skipped the tokenVersion check that /verify performs).
+    if ((user.tokenVersion || 0) !== (decoded.tv || 0)) {
+      return res.status(401).json({
+        success: false,
+        code: "SESSION_REVOKED",
+        message: "Your session has ended. Please sign in again.",
+      });
+    }
 
     const own = await AccessDepartment.findById(user.departmentId);
 
-    // An administrator may open any active department — the route guard and
-    // every /api/admin route already admit them anywhere, so refusing here
-    // just meant the portal showed a tile that then would not open.
-    const dept = user.isAdmin || (slug === "ppc" && await deptUserMayOpenPpc(user))
-      ? await AccessDepartment.findOne({ slug, isActive: true })
+    // GAC-AR1: any active application the canonical resolver opens for this
+    // person — every one for a database-verified administrator.
+    const requested = await AccessDepartment.findOne({ slug, isActive: true });
+    const dept = requested && (await accessFor(user, slug, decoded.tv || 0)).allowed
+      ? requested
       : own;
 
     if (!dept || dept.slug !== slug || !dept.isActive) return deny();
@@ -1324,7 +1131,10 @@ router.post("/switch-department", async (req, res) => {
 
 router.post("/logout", async (req, res) => {
   try {
-    const token = req.cookies?.[COOKIE_NAME];
+    // GAC-AR2: the cookie, or — where a browser blocks the cookie — the
+    // Bearer copy. Logging out must revoke whichever one the browser holds.
+    const token = req.cookies?.[COOKIE_NAME] ||
+      (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
 
     // Server-side revocation, not just a cleared cookie. Six dashboard layouts
     // currently "log out" by deleting localStorage, which leaves the token
@@ -1333,7 +1143,15 @@ router.post("/logout", async (req, res) => {
       try {
         const decoded = verifyToken(token);
         if (decoded?.v === 2 && decoded.id) {
-          await DeptUser.updateOne({ _id: decoded.id }, { $inc: { tokenVersion: 1 } });
+          if (decoded.subject === "accountant") {
+            const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
+            await Acc_User.updateOne({ _id: decoded.id }, { $inc: { tokenVersion: 1 } });
+          } else if (decoded.subject !== "employee" && decoded.subject !== "legacy_department") {
+            await DeptUser.updateOne({ _id: decoded.id }, { $inc: { tokenVersion: 1 } });
+          }
+          // Employee sessions carry no token version to bump (tv is fixed at
+          // 0); they end with the cookie and the 7-day expiry. Recorded as a
+          // remaining risk in the GAC-AR2 handoff.
         }
       } catch { /* an unverifiable token needs no revoking */ }
     }
@@ -1568,7 +1386,7 @@ router.post("/cowork-sso", async (req, res) => {
     /* The grant is checked against the department actually being opened, so
        holding Material Requests does not open CoWork and holding CoWork does
        not open Material Requests. Each tile is its own decision. */
-    const holdsIt = (await resolveEmployeeDepartments(employee))
+    const holdsIt = (await resolveEmployeeLauncher(employee))
       .some((d) => String(d._id) === String(coworkDept._id));
     if (!holdsIt) {
       return res.status(403).json({

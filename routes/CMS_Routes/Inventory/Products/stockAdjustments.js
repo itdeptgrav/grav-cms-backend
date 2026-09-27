@@ -557,6 +557,22 @@ router.post(
             `That variant holds ${currentVariant} ${nativeUnit}; ${nativeQty} ${nativeUnit} cannot be issued. Negative stock is not permitted.`,
             { reason: "INSUFFICIENT_STOCK", available: currentVariant, requested: nativeQty, unit: nativeUnit });
         }
+
+        /* ── AND SOME OF WHAT IS ON THE SHELF MAY NOT BE OURS ────────────────
+           One shared guard, called from every ordinary stock-out path rather than
+           written out in each of them. See its own service for why it is
+           location-scoped and why it only ever subtracts.
+
+           This is an EARLY refusal for a clean message; the same guard runs again
+           inside the transaction from the shared helper, which is where the
+           guarantee lives. */
+        await customerOwnedReserve.assertOrdinaryIssueAllowed({
+          companyId: req.tenant.companyId,
+          rawItem,
+          variantId: variant ? variant._id : null,
+          requested: nativeQty,
+          unit: nativeUnit,
+        });
       }
 
       /* ── WAREHOUSE STOCK V1: which location this moves to/from ─────────────

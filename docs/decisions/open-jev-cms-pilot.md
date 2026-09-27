@@ -48,14 +48,37 @@ a defined outcome without weakening refusals.
 
 ## Runtime and deployment gate
 
-The public Open-Jev repository describes its completed 2B/9B releases as LoRA
-adapters plus a decision head requiring pinned upstream Qwen weights and its
-loader. Its documented trained-checkpoint workflow targets Linux/CUDA. GRAV's
-current development host is Darwin arm64. Therefore no claim of local speed,
-production suitability or zero cost follows from its open-source license.
-Benchmark on an explicitly provisioned compatible host before connecting a CMS
-route. Keep model traffic within the approved deployment boundary and do not
-log employee names or attendance packets in model diagnostics.
+**Corrected 25 September 2026.** An earlier version of this section said the
+documented workflow targets Linux/CUDA and left the impression that CUDA is
+required to run the model at all. That was wrong, and it is worth being precise
+about what was wrong, because the mistake shaped a whole evaluation as
+"blocked".
+
+The repository's own `docker-compose.yml` ships **two** services:
+
+```
+docker compose up -d --build                  # GPU (NVIDIA Container Toolkit)
+docker compose up -d --build open-jev-cpu     # CPU only
+```
+
+The CPU service passes `TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu`
+and sets `JEV_DEVICE: cpu`. Its healthcheck allows a 900-second start period
+against the GPU service's 300, and the file's own comment calls a first CPU load
+"far slower". So:
+
+- **CUDA is not an absolute inference requirement.** A CPU-only container is an
+  officially supported deployment.
+- **CUDA is still what speed measurements need.** A CPU run tells you the
+  integration works and roughly what it costs; it does not tell you what the
+  model's latency is on hardware anyone would deploy.
+- **Darwin-native execution remains unproven.** Nothing here says the model runs
+  outside a Linux container on macOS, and this pilot has not tried.
+
+Therefore: **CPU results and GPU results must be reported separately and never
+averaged, compared or presented as one number.** A P95 from a CPU container is
+not a slower version of the GPU figure; it is a different measurement of a
+different deployment. Keep model traffic within the approved deployment boundary
+and do not log employee names or attendance packets in model diagnostics.
 
 ## Implementation status (22 September 2026)
 
@@ -72,8 +95,10 @@ Order of authority:
 4. GRAV reads one employee-day and answers from a versioned evidence packet
    (`grav.hr.attendance-today.evidence/1`).
 
-Live Open-Jev inference is **blocked**: there is no Linux/CUDA host. The Ollama baseline is also **blocked**: no model
-is installed. Results and findings are in
+Live Open-Jev inference was recorded as **blocked** on the grounds that there is no Linux/CUDA host. That reason is
+**superseded**: the repository ships a supported CPU-only container, so integration evidence does not need a GPU. See
+the corrected runtime gate above and [open-jev-accounts-pilot.md](open-jev-accounts-pilot.md) for what has since been
+attempted. The Ollama baseline is still **blocked**: no model is installed. Results and findings are in
 [open-jev-pilot-evaluation.md](../audits/open-jev-pilot-evaluation.md).
 
 ## Not in this pilot

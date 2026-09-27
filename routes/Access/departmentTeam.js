@@ -131,84 +131,31 @@ router.get("/:slug", async (req, res) => {
 /* ------------------------------------------------------------------ */
 
 router.put("/:slug", async (req, res) => {
+  /* GAC-2 COMPATIBILITY ADAPTER — no permission logic of its own.
+     Consumer: grav-cms app/hr/dashboard/team/page.js (the HR team screen).
+     Every rule (Owner authority, self-change, last Owner, reason,
+     idempotency, audit, cache invalidation, re-read) lives in
+     services/access/accessGrantAdmin.service.js.
+     Deletion condition: the HR team screen calls PUT /api/admin/app-access
+     (or a department-owner equivalent of it) directly. */
+  const { changeAppAccess, sendGrantError } = require("../../services/access/accessGrantAdmin.service");
   try {
-    const slug = slugOf(req);
-    const myRole = await roleFor(req, slug);
-    if (myRole !== "owner") {
-      return res.status(403).json({
-        success: false,
-        code: "OWNER_ONLY",
-        message: "Only an owner can change who is on this team.",
-      });
-    }
-
-    const email = String(req.body?.email || "").toLowerCase().trim();
-    const role = req.body?.role || null; // null revokes
-    if (!email) {
-      return res.status(400).json({ success: false, message: "An email address is required." });
-    }
-    if (role && !deptRoles.ROLE_KEYS.includes(role)) {
-      return res.status(400).json({ success: false, message: `Unknown role "${role}".` });
-    }
-
-    if (email === req.user.email && !req.user.isAdmin) {
-      return res.status(400).json({
-        success: false,
-        code: "SELF_CHANGE",
-        message:
-          "You cannot change your own role. Ask another owner, so a department " +
-          "can never be left without one by accident.",
-      });
-    }
-
-    // Removing or demoting the last owner leaves nobody who can grant a role
-    // here, and getting out of that needs a platform administrator — the exact
-    // dependency this screen exists to remove.
-    if (role !== "owner") {
-      const owners = (await deptRoles.listRoles(slug)).filter((h) => h.role === "owner");
-      const isLastOwner =
-        owners.length === 1 && String(owners[0].email).toLowerCase() === email;
-      if (isLastOwner) {
-        return res.status(400).json({
-          success: false,
-          code: "LAST_OWNER",
-          message: "This is the only owner. Make somebody else an owner first.",
-        });
-      }
-    }
-
-    const name = String(req.body?.name || "").trim();
-    const result = await deptRoles.setRole({
-      departmentSlug: slug,
-      email,
-      name,
-      role,
-      actor: req.user,
+    const out = await changeAppAccess({
+      actor: { id: req.user.id, email: req.user.email, name: req.user.name, subject: req.user.subject, tv: req.user.tv },
+      body: req.body,
+      headers: req.headers,
+      defaults: { application: slugOf(req) },
+      via: "department-team",
     });
-
-    // Into the same log every department reads, with the same shape Access
-    // Control writes — one history, whichever door the change came through.
-    await recordChange(req, {
-      departmentSlug: slug,
-      entity: "department-role",
-      entityId: email,
-      entityLabel: name || email,
-      action: role ? (result.created ? "create" : "update") : "delete",
-      summary: role
-        ? `${email} set to ${role} in ${slug}`
-        : `${email} removed from ${slug}`,
-      before: { role: result.previous ?? null },
-      after: { role: role || null },
-    }).catch(() => {});
-
+    const email = out.target.email;
     res.json({
       success: true,
-      role: result.role,
-      message: role ? `${email} is now ${role}.` : `${email} no longer has a role here.`,
+      ...out,
+      role: out.after.role,
+      message: out.after.role ? `${email} is now ${out.after.role}.` : `${email} no longer has a role here.`,
     });
   } catch (err) {
-    console.error("[department-team] set role:", err.message);
-    res.status(400).json({ success: false, message: err.message });
+    sendGrantError(res, err);
   }
 });
 

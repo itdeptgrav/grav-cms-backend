@@ -130,7 +130,7 @@ router.post("/login", async (req, res) => {
         // Include email so sync-legacy can identify the user without a DB lookup
         email: user.email || "",
       },
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
       { expiresIn: "7d" },
     );
 
@@ -210,7 +210,7 @@ router.post("/verify", async (req, res) => {
 
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
     );
     let user = null;
 

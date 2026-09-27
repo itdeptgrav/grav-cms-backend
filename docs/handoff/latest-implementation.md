@@ -1,3 +1,2834 @@
+# Latest implementation — the blank horizontal report repairs itself (26 Sep 2026)
+
+Frontend repo `grav-cms` only. **No backend file changed.** **Not committed.**
+
+## The defect
+
+Headings across the top, nothing underneath, a blank worksheet, and the only
+explanation on screen was **"Add a number to Values to see figures"** — the
+internal name of a shelf, in an instruction with no control attached.
+
+The question existed. It was returned by `moveTo`, held in the designer's
+`useState`, and rendered inside the menu that had just been clicked. Every one
+of those is a link in a chain that only holds if the user took one particular
+route. Drag onto "Make horizontal headings", move the field from the sentence,
+undo into the state, open a layout already in it — no question anywhere.
+
+## The fix
+
+`missingHorizontalFigure(layout, fieldsById)` — pure, derived, no state. A
+report with `columns.length > 0 && values.length === 0` **is** the question,
+so the blank state cannot be reached without its own repair arriving with it.
+Rendered inline immediately above the worksheet, answered in one click.
+
+Also: `whatIsMissing` no longer says anything about that state; `Add chart` is
+withdrawn while it holds; "Data freshness unknown" no longer appears under a
+sheet with no rows; the count column is headed **"Voucher count"**, not
+"Count of Debit"; "Choose another amount" opens a chooser built from the
+catalogue's own `placements`/`calculations`.
+
+## Two defects found while verifying
+
+- **The toast was swallowing drops.** Real-Chrome drag onto "Make horizontal
+  headings": the target lit up, the app announced *"Month over Columns"*, the
+  pointer released — and nothing happened. The toast confirming the PREVIOUS
+  action is `bottom-4 z-50`; the landings are `bottom-0 z-40`. The drop was
+  never refused, it was never delivered. The toast is now hidden during a drag.
+  Pinned by a test that asserts the overlap really exists.
+- **`Add a number to Values`** was still quoted in my own replacement comment,
+  which the regression test caught. The check strips comments now — the note
+  is worth keeping.
+
+## Mutation checks (all five, plus one I had missed)
+
+| Restored defect | Tests that fail |
+|---|---|
+| question only opens from the menu click handler | **8** |
+| `Add a number to Values` returns | 2 |
+| Count vouchers → Count of Debit | 1 |
+| Add chart stays active | 1 |
+| the panel is not rendered | `THE PANEL IS RENDERED, IMMEDIATELY ABOVE THE WORKSHEET` |
+
+The last one initially failed **nothing** — every derivation test passed while
+the user would still have seen a blank worksheet. Added an assertion that the
+designer renders the panel, above `<ReportSheet>`.
+
+## Browser acceptance
+
+1–8 on the live books: question appears immediately with the exact title and
+four answers; `Add chart` gone; no freshness line; Count vouchers gives full
+month headings with counts and the sentence **"Showing Voucher count across
+Month"**; **undo returns to the question, redo completes the report**; Total
+debit with Ledger Group down the sheet gives the ledger-by-month report.
+
+9 — a genuine real-Chrome drag onto "Make horizontal headings" now raises the
+question and answers it (`drag.browser.test.mjs`, second test).
+
+10 — **not applicable as written.** The layout does not survive a refresh:
+every visit starts as a new blank report, which was an explicit requirement two
+slices ago, and persisting it is Saved Reports work that is out of scope. The
+derived design is what item 10 protects against — a layout *loaded* in this
+state asks the question, covered by the "a layout opened already in this state"
+route test.
+
+Mobile 390px: stacked card above the worksheet, four full-width buttons, no
+overflow. Desktop and tablet clean.
+
+Tests: **12,101 / 12,107 pass, 0 skipped** (12,101 + 6 = 12,107). The 6 are
+pre-existing and unrelated. Reporting subset **490 / 490**.
+
+---
+
+# Latest implementation — B6: a preview has a budget, a deadline and a ceiling (26 Sep 2026)
+
+Backend repo `grav-cms-backend`. **Not committed.** The frontend was not
+touched. Slice B6 of
+`docs/audits/accounting-custom-report-semantic-contract-audit.md`; §21 carries
+the constants, the rationale, the response examples and the measured evidence.
+
+## What was wrong
+
+A summary is a plan of separate aggregate queries, so judging a report by its
+shelves said almost nothing about what it cost. Legal layouts reached **12
+sequential queries with a 1.76 MB response** and **22 sequential queries** —
+and each of those queries received the engine's full 30-second timeout *of its
+own*, so the clock restarted twelve times inside one request. Nothing refused
+any of it.
+
+## The four bounds
+
+| Constant | Value | Why |
+|---|---|---|
+| `maxQueries` | 11 | the heaviest plan that behaved well (5 levels: 1.5 s, 82 KB); the two that did not are 12 and 22 |
+| `maxLayoutUnits` | 24 | the other axis — the 12-query layout is one query over the line but 120 units over it |
+| `maxResponseBytes` | 1,500,000 | 7× the largest accepted body measured (207 KB), and **below** the 1.76 MB case so both gates agree |
+| `previewDeadlineMs` | 20,000 | 7× the slowest legal preview measured (2.8 s), under the engine's per-call 30 s |
+
+`layoutUnits = max(rows,1) × max(columns,1) × (values + comparisons)`. **The
+per-shelf limits were not reduced** — five row levels is still a legal report
+and still previews.
+
+## How it works
+
+- `services/reporting/previewBudget.js` gets `queryCount` by compiling the real
+  plan and counting it — not from a hand-written formula that would drift. The
+  compile uses **placeholder field ids**, so the estimator makes no network
+  call and an over-budget report is refused with the engine never contacted
+  (measured live: 3–5 ms, 231 bytes).
+- `services/reporting/deadline.js` is one injectable clock per request. Each
+  call gets what is **left** of it, and the plan checks **before** starting the
+  next query. Expiry → 504 `REPORTING_UNAVAILABLE` with actionable text, and
+  nothing partial. A client disconnect stops the plan and is recorded as
+  `cancelled`, never as a crash.
+- The byte ceiling is measured on the finished body and refuses the **whole**
+  result; a preview trimmed to fit would be the exact failure B4 exists to
+  prevent.
+- One structured log line per request: outcome, counts, bytes, ms. No report
+  name, filter value, ledger name, figure, query or engine identifier.
+
+Refusal, as the browser receives it:
+
+```json
+{"ok":false,"code":"REPORTING_INVALID_SPEC",
+ "message":"This report is too large to preview. Remove a grouping or calculated amount, or add a filter.",
+ "report":{"rowGroupings":5,"columnGroupings":3,"calculations":8,"comparisons":0}}
+```
+
+## The order, which is the security property
+
+authentication → organisation from the session → every company all-or-nothing →
+`canView` → layout validation → **complexity** → the engine. An unowned or
+mixed-company request answers **403 with zero engine calls and no hint that its
+layout was expensive**.
+
+## Verification
+
+- Offline: **394 passed, 12 suites** — two new suites (`reporting-bounds.test.js`, 23 tests; `reporting-bounds.route.test.js`, 20 tests) with **eight mutation checks**, four of them against a mutated copy of the route module mounted on its own port: cost guessed from the shelves, a fresh deadline per query, execution after expiry, the ceiling raised, complexity after the engine, the company check after the gate, an oversized body trimmed, and the layout logged.
+- Live: **48 passed, 2 suites**.
+
+| Layout | Queries | Units | Live |
+|---|---:|---:|---|
+| detail list | 2 | 4 | 200 · 574 ms · 37 KB |
+| Ledger Group × Month, Debit + Credit | 4 | 2 | 200 · 396 ms · 10 KB |
+| 4 rows × 2 columns × 3 values (boundary) | 10 | 24 | 200 · 1,107 ms · 207 KB |
+| 5 rows | 11 | 5 | 200 · 1,012 ms · 82 KB |
+| 5 rows × 5 values | 11 | 25 | **422** · 3 ms |
+| 5 rows + 3 columns + 8 values | 12 | 120 | **422** · 5 ms *(was 2,443 ms / 1.76 MB)* |
+| 5 rows + 1 comparison | 22 | 10 | **422** · 3 ms *(was 2,770 ms)* |
+
+B3 ordering, B4 counts and B5 exports are unchanged, and the export's
+100,000-row ceiling is untouched.
+
+## Still open
+
+Slice B7: the five-column detail list cap, `tax.classification` advertised and
+empty, the twelve unlisted view columns, and `GET /custom-reports` ignoring an
+unapproved `companyId`. The 100-row preview cap also remains — no longer
+silent since B4.
+
+---
+
+# Latest implementation — wide reports explained, truncation told honestly (26 Sep 2026)
+
+Frontend repo `grav-cms` only. **No backend file changed.** **Not committed.**
+
+## ⚠ Lane B's B4 contract is NOT live on the dev service
+
+Probed four shapes against `POST /preview` (company `6a08040a…`): summary with
+a total, summary with a grand total at `limit 10`, detail at `limit 20`, and a
+non-additive average. **None returned `groupCount` or `omitted`.** What it
+returns today:
+
+| | `previewRowCount` | `totalRowCount` | rows sent |
+|---|---|---|---|
+| summary, 333 ledgers | **333** | 333 | 100 |
+| detail | 20 | 5,604 | 20 |
+
+So `previewRowCount` is the group count in a summary and the returned count in
+a list — one field, two meanings, which is exactly why it cannot be the total.
+
+The consumer is built and is forward-compatible: `groupCount` and `omitted`
+are read the moment they arrive. **Until they do, a truncated chart is
+refused** rather than drawn, because without `omitted.values` there is no
+honest way to show the missing part. That is the safe direction, and it is
+what the live app does today — verified.
+
+## What changed
+
+- **`lib/reporting/truncation.js`** — the whole contract in one place:
+  `completeCount` (never `previewRowCount`), `shownCount` (data rows only),
+  `omittedValue` (the service's figure or `null` — never derived),
+  `chartTruncation` (one "Other" bucket, or a refusal), `hasGrandTotal`.
+- **Status**: `Showing 100 of 333 groups` / `Showing 100 of 5,604 rows`.
+  Subtotals and totals are not counted.
+- **Charts**: additive → a final `Other (233)` from `omitted.values` with
+  *"100 categories shown individually; 233 combined as Other."*; non-additive,
+  time-series and multi-dimensional → refused with filter or date-range
+  guidance. A share chart refuses a negative Other.
+- **Blank grand totals** are no longer drawn. Nothing is calculated to replace
+  one.
+- **Voucher Date** now offers *Spread by month across the top — Recommended*,
+  using the catalogue's own `date.month`; no month is derived in the browser.
+  *Spread every date* is allowed behind a confirmation.
+- **Above 50 headings**, a compact notice: *"This report has 351 headings
+  across the top."* with **Keep them / Move this field down the sheet / Add a
+  filter**. Keeping is a real answer; the report is never changed silently.
+
+## Two defects found while doing it
+
+- **`isTimeAxis` had quietly broken.** It sniffed label shapes, and the
+  presenter now renders `July 2025` where the pattern expected `Jul 2025`. It
+  reads the semantic first — which is what makes the time-series refusal fire.
+- **The reconciliation constant in my own test was wrong** (104,950, not
+  105,150). Caught by the test failing.
+
+## Mutation checks (all six the brief asked for)
+
+| Restored defect | Tests that fail |
+|---|---|
+| `groupCount` ignored | `GROUP COUNT AND ROW COUNT ARE DIFFERENT NUMBERS` |
+| `previewRowCount` as the complete count | **6** |
+| Other derived from the grand total | `THE OTHER BAR IS THE SERVICE'S NUMBER, NOT A SUBTRACTION` |
+| `null` omitted read as zero | **3** |
+| omitted months combined into a fake period | **2** |
+| blank grand-total row restored | `A GRAND TOTAL OF NOTHING IS NOT DRAWN` |
+
+The first one initially failed **nothing** — the fixture had `groupCount ===
+totalRowCount`, so the fallback gave the same answer. Added a case where 333
+groups arrive as 340 rows; it now fails.
+
+## Browser acceptance
+
+Live books (1–3, 7–10): month recommended for Voucher Date; every-date needs
+confirmation; Month across stays chronological with full names; Ledger Group ×
+Month × Total Debit unchanged; **`Showing 100 of 333 groups`**; **`Showing 100
+of 5,604 rows`**; no blank grand-total row; no overflow at 1440×900 / 1024×768
+/ 390×844. A chart of the truncated 333-ledger report is **refused**, table
+still usable.
+
+Harness with `?truncate=` (4–6), because the dev service sends no `omitted`:
+`Other (4)` as the final category; **13,42,150 visible + 18,21,350 Other =
+31,63,500**, which is exactly the uncapped report's grand total; and with
+`null` omitted values the chart refuses.
+
+Tests: **12,086 / 12,092 pass, 0 skipped** (12,086 + 6 = 12,092). The 6 are
+pre-existing and unrelated. Reporting subset **475 / 475**.
+
+---
+
+# Latest implementation — B5: the workbook reads like a report (26 Sep 2026)
+
+Backend repo `grav-cms-backend`. **Not committed.** The frontend was not
+touched. Slice B5 of
+`docs/audits/accounting-custom-report-semantic-contract-audit.md`; §20 carries
+the contract and the evidence, and
+`docs/decisions/metabase-pivot-export-capability.md` carries the ownership
+line.
+
+## What was wrong
+
+The downloaded file was Metabase's own: headings `Period Month`, `Group Name`,
+`Period Month: Day`, `Sum of Debit`; a month printed as "August 1, 2025"; money
+as an unformatted number. The engine's vocabulary was reaching the one artefact
+that leaves the building and gets attached to an email.
+
+## The architecture line
+
+| Owner | Responsibility |
+|---|---|
+| **Metabase** | filtering, grouping, calculation, comparison, and the ORDER of the result. Every figure in the file is one it computed. |
+| **GRAV** | the heading a person reads, the cell type, the number format, and basic worksheet usability. |
+
+`services/reporting/workbook.js` writes the rows of the **same compiled export
+plan**, row for row, in the engine's order. It adds, totals, averages, pivots,
+compares, re-sorts and drops nothing — a mutation check fails if it starts.
+**The file is still the flat aggregation and still says so**
+(`X-Reporting-Layout: flat-aggregation`); pivoted-workbook generation remains
+the open decision and B5 did not take it.
+
+## What the file looks like now
+
+Month → Excel date `mmmm yyyy`; Voucher Date → `dd mmm yyyy` (built from the
+ISO date *part*, so a UTC process cannot slide August into July); Financial
+Year and Quarter → text; money → a **number** with `₹#,##,##0.00;-₹#,##,##0.00`
+so it stays sortable and summable; count → `#,##0` with no rupee sign;
+percentage/GST rate → the engine's own `18` with `0.00"%"` so Excel cannot turn
+it into 1800%; boolean → Yes/No; a coded value → its label; `00531` → text;
+blank → an **empty cell**, never zero. Frozen headings, autofilter, bounded
+column widths (narration capped at 60), the report's name as the sheet name.
+
+A calculated column keeps a heading the user typed and otherwise qualifies the
+field label with its calculation — `Total Debit`, `Count of Debit`.
+
+## Transport
+
+Built from `POST /api/dataset` rows and streamed out through ExcelJS's
+`WorkbookWriter`: no workbook is held in memory on either side. Measured at the
+100,000-row ceiling before implementing — 3.5 MB out, RSS peaking ~197 MB from
+a 72 MB baseline, 0.71 s. `/api/dataset` caps at 2,000 bare rows by default
+(measured: 2,000 of 5,604 on the pilot), so the export passes explicit
+constraints one above the 100,000-row ceiling and refuses an oversized report
+rather than trimming it silently.
+
+## Verification
+
+- Offline: **351 passed, 10 suites**, including the new 29-test `reporting-workbook.test.js` — every workbook written with the real streaming writer and **opened again with ExcelJS** — with **seven mutation checks** (engine headings restored, `mmmm d, yyyy`, voucher number as a number, money as text, a multiplying percentage, a null as zero, rows re-sorted), each required to die of the assertion rather than a crash.
+- Live: `npm run test:reporting:live` → **45 passed, 2 suites**, four workbooks opened and reconciled against `reporting.v_general_ledger`:
+
+| Workbook | Headings | Rows | Total | Mart |
+|---|---|---:|---:|---:|
+| August detail | Voucher Number · Voucher Date · Party · Debit · Credit | 215 | 7,823,251.17 | 7,823,251.17 |
+| Month summary | Month · Total Debit | 3 | 21,024,380.25 | 21,024,380.25 |
+| Ledger Group × Month | Ledger Group · Month · Total Debit | 49 | 21,024,380.25 | 21,024,380.25 |
+| Count and money | Ledger Group · Count of Debit · Total Debit | 19 | 21,024,380.25 | 21,024,380.25 |
+
+Representative cells: `"1"` String · `2025-08-12T00:00:00.000Z` Date `dd mmm yyyy` ·
+empty Party · `2000` Number `₹#,##,##0.00;-₹#,##,##0.00` · `7` Number `#,##0`.
+Also live: `00531` stays text; an unowned and a mixed company are refused 403
+before any export runs; and no cell, sheet name, workbook property or header
+carries a mart column name, MBQL vocabulary, "metabase" or a credential.
+
+## Still open
+
+The 100-row preview cap (B6), the five-column detail list cap, the 22-query
+heavy layout, and `GET /custom-reports` ignoring an unapproved `companyId`
+(B7). A genuinely pivoted workbook remains a separate, deliberate decision.
+
+---
+
+# Latest implementation — field-level placement, and the end of the five boxes (26 Sep 2026)
+
+Frontend repo `grav-cms` only. **No backend file changed.** **Not committed.**
+
+## What was removed
+
+`OptionsInspector.js` and `ShelfBar.js` are **deleted**. Together they were a
+right-hand drawer holding five narrow boxes — Down the left / Across the top /
+Numbers / Filters / Compare with — introduced to the reader as *"the same five
+areas a PivotTable has"*. It took half the worksheet, named the model rather
+than the report, and still did not make horizontal placement discoverable:
+nothing about a box tells you that dragging a chip into it turns each month
+into a heading. The `Advanced` control that opened it is gone too.
+
+## What replaced it
+
+- **`lib/reporting/placement.js`** — four places named after the sheet:
+  *Show down the sheet*, *Spread across the top*, *Calculate a total*,
+  *Use as a filter*, plus *Remove from report*. Offered only where the
+  catalogue's `placements` allow, so a menu never ends in a refusal.
+- **`FieldMenu.js`** — a small menu anchored to the field, in "In this report"
+  and on every pill in the bar. A bottom sheet below 640px.
+- **`UnderneathPanel.js`** — the one question spreading a field can leave open:
+  *"What should appear below each month?"* with `Count vouchers`,
+  `Total debit`, `Total credit` and `Choose another amount`. It is not asked
+  when an amount is already chosen — that amount is the answer.
+- **The bar is a sentence**: `Showing Ledger Group · Total of Debit · across
+  Month`. Every noun opens its own menu.
+- **Two drop targets** replace the five: *Add as a vertical column* and
+  *Make horizontal headings*, now shown in **every** mode — a list is exactly
+  where "make this a heading" cannot otherwise be discovered.
+
+## Defects found while verifying
+
+- **Column headings were not formatted.** A month spread across the top arrived
+  as `Jul 2025`, so one report said `July 2025` down the side and `Jul 2025`
+  along the top. `presenter.heading(value, depth)` now formats them, leaving
+  the service's own `Total` column and the figure-name level alone.
+- **Two vocabularies had drifted.** The panel said "Broken down by" about the
+  very field whose menu said "Across the top". `chosenFields` now reads
+  `useOf`, so there is one list of words.
+- **The chosen answer was renamed.** Picking `Count vouchers` produced a column
+  headed `Count of Debit`. The column now carries the words the user picked.
+- **A TDZ crash.** `placeAt` named `doUndo` above its declaration, which took
+  the whole route down; caught by the browser drag test.
+- **The mobile drawer had no placement controls** — the one workflow that
+  cannot be dragged, missing from the only device with no drag.
+
+## The three corrections from the previous review
+
+All three were already in place and are re-proved by restoring each:
+
+| Restored defect | Tests that fail |
+|---|---|
+| `.allowed` instead of `.available` | `AN INCOMPATIBLE FIELD CANNOT BE CHOSEN` |
+| `e.field?.id` against a string id | **7**, incl. `A FIELD IS FOUND WHEREVER IT ACTUALLY SITS`, `THE SECOND AND THIRD CHOSEN FIELDS OPEN THEIR OWN SETTINGS` |
+| hard-coded "as a column" | `THE ADD CONTROL SAYS WHAT WILL ACTUALLY HAPPEN` |
+| *(new)* menu offers shelves it cannot deliver | `ONLY WHAT THE CATALOGUE ALLOWS FOR THAT FIELD` |
+| *(new)* spreading stops asking what goes underneath | `and asks exactly one question when there is no number` + 1 |
+
+## Browser acceptance (real books, company 6a08040a…, signed in)
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Voucher Date added normally | `17 Jul 2025` … vertically down column A |
+| 2 | → Spread across the top | date headings run horizontally, counts underneath |
+| 3 | Month + Debit across the top | `July 2025 … September 2026`, chronological, no question asked |
+| 4 | Ledger Group down + Month across + Total Debit | a conventional ledger-by-month report |
+| 5 | Month back to down the sheet | vertical again, **all three fields kept** |
+| 6 | Undo | reverses each orientation change, in order |
+| 7 | five-box panel | `0` on every screen |
+| 8 | worksheet while changing placement | menu covers **7.4%**, 87 cells still visible |
+| 9 | 1440×900 / 1024×768 / 390×844 | no document-level horizontal overflow |
+| 10 | mobile | full-width bottom sheet, only that field's four actions |
+
+Tests: **12,066 / 12,072 pass, 0 skipped** (12,066 + 6 = 12,072). The 6 are
+pre-existing and unrelated (PPC ×3, store valuation, nav, service master).
+Reporting subset **455 / 455**, including the real-browser drag.
+
+---
+
+# Latest implementation — B4: the response says how much of the report it is showing (26 Sep 2026)
+
+Backend repo `grav-cms-backend`. **Not committed.** The frontend was not
+touched. Slice B4 of
+`docs/audits/accounting-custom-report-semantic-contract-audit.md`; §19 carries
+the contract and the evidence.
+
+## What was wrong
+
+A summary of 333 ledger groups returned 100 rows and answered
+`previewRowCount: 333` — "showing 333 of 333". The 233 missing groups were
+worth ₹12.3 crore of the ₹14.5 crore total, and nothing in the payload said so
+beyond `truncated: true`. A chart built from that response draws 15.4% of the
+money and names the wrong top ledger.
+
+## The contract, additive
+
+```jsonc
+{
+  "previewRowCount": 100,   // data rows actually in `rows` — never the group count
+  "groupCount": 333,        // every distinct group before the limit (null in a list)
+  "totalRowCount": 333,     // unchanged: the COMPLETE count
+  "truncated": true,
+  "omitted": { "rows": 233, "values": { "[]::amount.debit:total": 123008184.55 } }
+}
+```
+
+`omitted` is `null` when nothing was left out. `omitted.values` is keyed by the
+stable public leaf ids the response already publishes, and holds `null` —
+present, not absent — for a column no honest sum exists for: average, minimum,
+maximum, percentage change. Signs are the cells' own. In detail mode
+`groupCount` is `null` and `omitted.values` is `null`, because a list is not
+aggregated and inventing figures for records it did not fetch would be a lie
+with decimals on it.
+
+The figure is summed **from the omitted rows themselves**, which are the tail
+of the B3 order — not `grandTotal − visible`, which always reconciles and would
+absorb a disagreement between two queries into a plausible number (and is
+impossible anyway when row totals are off and `grandTotal`'s cells are null).
+That is the one place `matrix.js` adds anything up, and its header now records
+the exception.
+
+## Verification
+
+- Offline: **322 passed, 9 suites**, including the new 28-test `reporting-counts.test.js` with **six mutation checks** (previewRowCount back to the group count, subtotals counted as rows, the tail taken before sorting, omitted values dropped, the visible rows summed instead of the omitted ones, signs stripped) — all caught.
+- Live: `npm run test:reporting:live` → **39 passed, 2 suites**.
+- The audit's own case, GRAV, every ledger, limit 100 — `previewRowCount 100 · groupCount 333 · omitted.rows 233`, reconciled against `reporting.v_general_ledger`:
+
+| Series | Visible | Omitted | Sum | Mart |
+|---|---:|---:|---:|---:|
+| Debit | 22,394,406.44 | 123,008,184.55 | 145,402,590.99 | 145,402,590.99 |
+| Credit | 29,921,564.06 | 115,481,026.93 | 145,402,590.99 | 145,402,590.99 |
+| Signed | −7,527,157.62 | +7,527,157.62 | 0.00 | 0.00 |
+
+## What Lane A must still decide
+
+B4 makes truncation **measurable**, not smaller. The 100-row cap is unchanged,
+the omitted groups' identities are still not listed, and the frontend must
+decide whether to draw an "Other" bucket from `omitted.values`, annotate the
+chart with what is missing, or refuse to draw an incomplete chart. The backend
+now supplies the figures for any of the three; it does not choose.
+
+## Files
+
+`services/reporting/matrix.js` (`shapeSummary` cuts before it counts, new
+`omittedValues`, `shapeDetail`), and five test files. No route, no engine call,
+no figure on any existing row changed.
+
+---
+
+# Latest implementation — a report an accountant makes without learning anything (26 Sep 2026)
+
+Frontend repo `grav-cms` only. **No backend file changed.** **Not committed.**
+
+## Four wiring defects, each fixed and each proved by restoring it
+
+| # | Defect | Effect | Test that fails when restored |
+|---|---|---|---|
+| 1 | `DataPanel` read `availability.get(id).allowed`; `compatibility.js` writes `available` | `undefined !== false` is true, so an incompatible field was never disabled — only a tooltip said why, on a button that combined it anyway | `AN INCOMPATIBLE FIELD CANNOT BE CHOSEN` |
+| 2 | `whereIs()` compared `e.field?.id`; entries store `field` as a **string** | nothing ever matched, every lookup fell through to `rows[0]`, so clicking the 2nd or 3rd chosen field opened the 1st one's settings | `A FIELD IS FOUND WHEREVER IT ACTUALLY SITS`, `THE SECOND AND THIRD CHOSEN FIELDS OPEN THEIR OWN SETTINGS` |
+| 3 | the `+` hard-coded "Add as a column" | in a summary it announced a column while adding the field **up**; `placementHint` was already imported and unused | `THE ADD CONTROL SAYS WHAT WILL ACTUALLY HAPPEN` |
+| 4 | the real-browser drag test skipped when the dev server was down | the suite went green with the words "skipped" and no drag evidence | a missing dev server is now a **failure**; `GRAV_REQUIRE_BROWSER=1` removes the last skip |
+
+`whereIs` was deleted in favour of `locateField` in `reportLayout.js`, beside
+`shelfOf`, which compares the shape entries actually have.
+
+## Two more found while verifying
+
+- **A resize re-lit an old column.** The new-column highlight reads the column
+  plan and the viewport to know where to scroll, so both are dependencies —
+  and both change on resize. Turning a phone sideways highlighted a column
+  added minutes earlier. Now keyed on the addition's timestamp.
+- **Collapsed actions had no accessible name.** Below `sm` the labels are
+  hidden to fit the bar, leaving bare icons whose accessible name was the
+  empty string.
+
+## The beginner default
+
+- Blank report: catalogue and sheet only, one sentence — *"Choose information
+  from the left to add it to your report."* The four-step floating guide
+  (`FirstUseGuide.js`) is **deleted**; so are the three specimen reports,
+  which read as templates nobody can click.
+- **"In this report"** at the top of the left panel: the chosen fields in the
+  report's own order, each saying where it is (Column / Added up / Broken down
+  by), each opening its own settings.
+- A new column **scrolls into view and tints** for 1.1s.
+- Progressive disclosure: `Add information` is the only action until there are
+  figures; then `Add chart`, `Show totals`, `Filter`.
+- Renames: Summarize → **Show totals** (bar, confirmation panel and the
+  guidance sentence), Filters → **Filter**, the bare gear → **Advanced**.
+- The chart asks at most **three** plain choices and never asks a chart type;
+  `measureChoices` and `comparisonChoices` are capped.
+
+## Verification (real books, company 6a08040a…, signed in)
+
+| Acceptance check | Result |
+|---|---|
+| 1. click Voucher Number, Ledger Name, Debit | **3 clicks, 0 dialogs**, real data (`00531`, `Plant & Machinery`, `₹1,12,000.00`) |
+| 2. click the 2nd chosen field | opens **Ledger Name**; 3rd opens Debit; 1st opens Voucher Number |
+| 3. incompatible field | disabled, `opacity: 0.5`, `cursor: not-allowed`, explained, report unchanged (live catalogue declares **no** incompatible pair, so checked on `/preview/reporting`) |
+| 4. Month + Debit → Show totals | `July 2025 … September 2026`, chronological across the FY boundary |
+| 5. Add chart | **1 click, 0 dialogs, 1 preview request, table byte-identical** (58 cells) |
+| 6. drag reorder | playwright + real Chrome, 9.0s, passes |
+| 7. same report without dragging | check 1 is click-only |
+| 8. 1440×900 / 1024×768 / 390×844 | `scrollWidth === clientWidth` at all three |
+
+Click counts: three-column report **3**, monthly summary **4**, chart **3**
+from blank (**1** from an existing report).
+
+Tests: **12,053 / 12,059 pass, 0 skipped**; 12,053 + 6 = 12,059. The 6 failures
+are pre-existing and unrelated (PPC ×3, store valuation, nav, service master).
+Reporting subset **442 / 442**, including the real-browser drag.
+
+---
+
+# Latest implementation — B3: a summary's sort means what it says (26 Sep 2026)
+
+Backend repo `grav-cms-backend`. **Not committed.** The frontend was not
+touched. Slice B3 of
+`docs/audits/accounting-custom-report-semantic-contract-audit.md`, whose §18
+now carries the full contract and evidence.
+
+## What was wrong
+
+A summary's `sort` was validated, stored and compiled — and then thrown away.
+`matrix.distinctTuples` re-sorted every group ascending by the field's own
+value whatever the query returned, and `compilePlan` forwarded only sorts
+naming a *row* field, so a sort by Total Debit never reached `order-by` at all.
+Descending was identical to ascending; months sorted by their English label.
+
+## What it does now
+
+1. A named row level goes in the direction asked for, ordered by its **semantic
+   key** (`periodKey` for month/quarter/financial year, dates as dates, money
+   as numbers, text with numeric-aware `localeCompare`) — never the label.
+2. A sort naming a **value** orders the deepest row level by that level's row
+   total; outer levels keep their own order, so nesting survives.
+3. Unnamed levels stay ascending.
+4. Ties break on the next level, then on the engine's order — stable, so two
+   runs are row-for-row identical.
+
+`(none)` stays last when ordering by a key, in either direction, and takes its
+earned place when ordering by a measure. Column levels are never re-ordered by
+a row sort. The aggregation is inserted into `order-by` **before** the deepest
+row level, which is what keeps the XLSX export (the engine's rows, written
+straight out) in the same order as the sheet.
+
+## The contract did not change
+
+`sort: [{ field, direction }]` already expressed this. The only thing it cannot
+express is *which* of two calculations of the same field to sort by; that is
+resolved by a documented "first matching value entry" rule applied identically
+in the matrix and the compiler, and the limit is recorded in §18.1 rather than
+fixed by adding a field.
+
+## Files
+
+`services/reporting/matrix.js` (`compareValues`, new `rowComparator`,
+`distinctTuples`, `shapeSummary`), `services/reporting/mbqlCompiler.js` (new
+`summaryOrderBy`, used by `compilePlan` and `compileChartQuery`), and five test
+files. No route, no response shape, no figure changed.
+
+## Verification
+
+- Offline: `npx jest test/accountant/reporting --testPathIgnorePatterns 'reporting-integration.route|reporting-chart-integration.route'` → **292 passed, 8 suites**, including the new 29-test `reporting-sorting.test.js` with **five mutation checks** (direction ignored, measure ordering disabled, `periodKey`→`periodText`, tie-break removed, measure dropped from the query) — all caught.
+- Live: `npm run test:reporting:live` → **37 passed, 2 suites**, every ordering compared against a **direct Postgres query on `reporting.v_general_ledger`**, not against another GRAV response: dimension asc/desc, measure desc/asc, months across the year boundary, a sorted pivot's group contiguity and column chronology, XLSX vs preview, and the Metabase bar chart's own rows.
+- Mart totals for the window used throughout (GRAV, 2025-08-01 – 2025-10-31): debit ₹21,024,380.25, credit ₹21,024,380.25, 921 lines — unchanged.
+- Live before/after: `ledger.group desc` was identical to asc and now starts Unsecured Loans, Sundry Debtors, Sundry Creditors; `amount.debit desc` was alphabetical and now starts Bank Accounts ₹7,552,307, Sundry Creditors ₹5,246,026, Sundry Debtors ₹2,261,500; `date.month desc` was always ascending and now starts September 2026 and ends July 2025.
+
+## Still open
+
+Findings 4–7 and 9–14: `previewRowCount`, the 100-row preview cap (which also
+truncates a sorted pivot's last group before its subtotal), the workbook's
+engine headings and month formatting, `Count`, and the five-column detail cap.
+B3 deliberately stopped short of all of them.
+
+---
+
+# Latest implementation — B1 and B2: every field says what it means
+
+Date: 2026-09-26. Backend repo `grav-cms-backend`. **Not committed.** The
+frontend repository was not touched — Lane A owns it and has concurrent work.
+
+Slices B1 and B2 of
+`docs/audits/accounting-custom-report-semantic-contract-audit.md`. **No
+accounting figure changed**: six live shapes were captured through the real
+route before and after, 1,515 figures, every one identical by position.
+
+## What it fixes
+
+The browser was inferring "this is a month" from the English word "Month", and
+a month cell carried nothing but `2025-07-01T00:00:00+05:30` tagged
+`display: "date"` — so every client rendered a month as a day, and a client
+outside IST would render it as the wrong day. Both are now said outright.
+
+## What shipped
+
+**New:** `services/reporting/semantics.js` — four closed vocabularies
+(`semanticType`, `display.format`, `display.sort`, `chart.role`), the rules
+that police them, and the key/label arithmetic. Keys are **sliced out of the
+ISO string**, never parsed into a `Date`: `new Date("2025-07-01T00:00:00+05:30")`
+is June in a UTC process.
+
+**Catalogue:** every field declares `semanticType`, `display` and `chart`;
+`field()` validates as the array is built, so a typo is a `require` that throws
+rather than a field that renders wrong for one customer months later. The
+catalogue also carries a `grain` block that says, in an accountant's words, why
+a voucher number repeats down a list.
+
+**Matrix:** `leafColumns[]` and `rowLevels[]` carry the semantics; period and
+coded cells carry `key`, `text` and `semanticType` beside the unchanged `value`
+and `display`; every summary row carries `keys[]` aligned with `rowLevels`.
+A calculated column's meaning is read from the FIELD and the CALCULATION — a
+count is `count`/`integer` even though its heading says "Debit", and a
+percentage comparison is `percentage`/`percent`.
+
+## The backward-compatibility decision, and what Lane A must do
+
+`cell.display` still says `"date"` for a month. The frontend switches on that
+string and has no `month` branch, so `display: "month"` would print the raw ISO
+value — worse than the `01 Jul 2025` this slice exists to fix. The meaning
+travels beside the hint instead.
+
+**Lane A: render `cell.text` when present, else `formatCell(value, display)`.**
+One line, and the month is right. Until that lands, a month still renders as
+`01 Aug 2025` — no worse than before, and no better.
+
+Three labels do change: `Jul 2025` → `July 2025`, `contra` → `Contra`,
+`2025-26` → `2025–26` (the key stays `2025-26`). The full contract, with
+payload examples, is §17 of the audit.
+
+## Tests
+
+**294 offline + 32 live + 65 mart, all passing.** New: 32 tests in
+`reporting-semantics.test.js`, five of them mutation tests that break the real
+module in a copy and require a test to die — removing Month's semantic type,
+using the formatted label as the month key, making a numeric-looking voucher
+number a number, leaking a source column through `publicCatalogue()`, and
+removing summary row keys. The two gaps the audit recorded and these slices
+closed are now PROPERTY tests.
+
+## Still open
+
+Slices B3–B7: a summary's `sort` still has no effect, `previewRowCount` is
+still the group count, the workbook still carries the engine's headings and a
+day-formatted month, and a list is still capped at five columns.
+
+---
+
+# Latest implementation — the report builder says what it means (26 Sep 2026)
+
+Frontend repo `grav-cms` only. **No backend file changed.** **Not committed.**
+Full write-up: `grav-cms/docs/accounting-reporting-field-contract.md`.
+
+## What was wrong
+
+`Month` rendered as `01 Jul 2025`. The cause is structural rather than
+cosmetic: the catalogue types `date.month` and `date.voucher` **identically**
+(`type: "date"`) and sends a month as `2025-07-01T00:00:00+05:30`, so anything
+formatting from the primitive type must render a day. Six more defects of the
+same kind were found by looking for the class rather than the instance:
+
+| Defect | Cause |
+|---|---|
+| `01 Jul 2025` for a month | `date.month` typed `date` |
+| `₹28.00` for 28 vouchers | a `count` calculation returns `type: "money"` |
+| the word **`money`** in every chart tooltip | `cell.display` is the type name; the chart read it as a formatted value |
+| `Jul 2025` on a chart vs `July 2025` in the table | the service pre-formats summary labels but not detail cells |
+| `contains` offered on a financial year | the catalogue advertises text operations for a period |
+| a renamed column changing the chart type | the recommender matched the English heading |
+| the status bar blank for a row-label cell | `"__label_0".split("_")[2]` is `"label"`, not `0` |
+
+All seven are fixed in `grav-cms`, keyed on the catalogue's opaque field **id**
+— never the heading, which the user can edit.
+
+## What Lane B is asked for (optional, additive, nothing breaks without it)
+
+1. **`semantic` on each catalogue field** — `{"id":"date.month","semantic":"month"}`.
+   21 allowed values; mapping for all 14 current fields is in the contract doc.
+   The frontend already prefers it and falls back to its own table.
+2. **`semantic` on each preview leaf column** — the frontend currently recovers
+   it by parsing the leaf id (`["contra"]::amount.debit:count`), which is a
+   structural dependency on an undocumented id format.
+3. `cell.display` carries the *type*, not a display value — worth renaming.
+4. Detail and summary send the same month two different ways.
+5. `filterOperations` advertises operations that cannot mean anything.
+
+## The Excel export is out of the frontend's reach
+
+`POST /export/xlsx` returns a workbook the frontend passes through unopened
+(`raw: true`). Every display rule above therefore **stops at the screen** — if
+the service renders a month from the same timestamp it sends us, the workbook
+still reads `01 Jul 2025`. Cross-surface consistency is proven for the thirteen
+surfaces the frontend owns and is **unverified for the export.** Either the
+service applies the same rules when writing the workbook (preferred), or the
+export returns raw values plus `semantic` per column.
+
+## One backend issue reported, not patched
+
+`POST /preview` with `showGrandTotal: true` **and** a column split returns a
+grand-total row whose cells are **all `null`** (reproduced: rows `[ledger.group]`,
+columns `[voucher.type]`, values `[debit:total, debit:count]` → 16 null cells).
+Every cell renders `—`. The browser will not compute a grand total — that is an
+accounting figure — so this is reported rather than worked around.
+
+## Verification
+
+- **Live field audit**, all 14 catalogue fields, 10 checks each, real previews:
+  **13 clean, 1 warning, 0 defects.** The warning is the `contains`-on-a-period
+  declaration above. Harness: `/preview/reporting/audit`, **404 in production**
+  (`app/preview/layout.js` now gates the whole `/preview` tree, which was
+  previously ungated for hr/marketing/merchandiser/shell too).
+- **The audit provably fails the old code**: run against the previous
+  type-based formatter it reports `month-shows-a-day` and `non-money-as-money`.
+- **Chart matrix**: 63 generated combinations — 51 draw, 12 ask one question,
+  **0 dead ends**.
+- **In the real app, signed in**: month cells `July 2025`; summary labels
+  `July 2025 … February 2026` (chronological across the FY boundary); tooltip
+  `November 2025 · Total debit · ₹90,17,067.25`, matching the table cell
+  exactly; count column `215`, `398`, `308` with no rupee sign.
+- **Request counts**: add Month → 1, add Debit → 1, Add chart → 1, **second
+  identical chart → 0**, aborts **0**. (Catalogue GETs still double under dev
+  StrictMode; that is the designer's catalogue effect, not the chart store, and
+  StrictMode does not double-invoke in production.)
+- **Tests**: `grav-cms` 12,031 / 12,037 pass. The 6 failures are pre-existing
+  and unrelated (PPC ×3, store valuation, nav, service master). Reporting:
+  **418 / 418**.
+
+---
+
+# Latest implementation — RTX PRO 4500 Blackwell bounded-experiment bundle (25 Sep 2026)
+
+Local only: no pod, no GPU work, no Stage 3, no full training, nothing committed.
+Unchanged: dataset/splits/locked set `d29e5f85…`, evaluator, gates, determinism safeguards, < 0.005, zero unsafe executable routes.
+
+- **New:** `train/runtime_attest.py` + `HARDWARE_PROFILE.json` (RTX PRO 4500 Blackwell only; one GPU; ≥ 31 GiB; cc 12.0; sm_120;
+  driver ≥ 570; pinned torch 2.8.0+cu128 / CUDA 12.8 / transformers 5.10.2 / peft 0.19.1; CUDA self-test; bound-field verify);
+  `train/budget.py` ($2.00 ceiling on pod age, explicitly approved 25 Sep 2026; fail-closed price/age, per-phase projections, timeouts);
+  `train/bounded_smoke.sh` (the only entry point); `train/collect.sh` + `snapshot_meta.py` (evidence, no weights);
+  `train/test_bounded_local.py`. Trainer: `--runtime-attestation` (bound into identity), `--preflight-only`,
+  Stage-1-bound baseline check, full-training approval guard.
+- **Removed from the bundle:** Ada stage scripts (now `train/legacy-ada/`), the Ada baseline, `full.json`.
+- **Tests:** trainer 14/14; bounded 15/15; resume equivalence 15/15 × 5 clean containers; dataset/evaluator/gate 34/34;
+  25/25 scripted stop scenarios (`tmp/jev-routing/verify/bounded_scenarios.sh`); clean Linux extraction verify.
+- **Bundle:** `tmp/jev-routing/bundle/grav-jev.tar.gz`, 1,548,391 bytes, SHA-256 `aa213e9c627afece2c9ec8d6b5b1fbcf3e32a2dbf76f62f5c989ff5bead76011`.
+- **Run:** `JEV_POD_HOURLY_USD=<price> bash /workspace/grav-jev/train/bounded_smoke.sh` — starts only if price ≤ $0.6985/h.
+- **Pod Python:** setup uses `/workspace/jev-venv` with `--system-site-packages`; this preserves the image's CUDA-enabled torch while avoiding Debian's PEP 668 system-pip refusal.
+- **Pinned model fetch:** Hugging Face offline mode is enabled only after setup downloads and verifies the pinned package/base-model revisions; all training and evaluation phases remain offline.
+- **Bundle test boundary:** the on-pod unit suite validates the shipped `smoke.json` only; `full.json` remains deliberately absent and full-training refusal is tested independently.
+
+---
+
+# Latest implementation — a chart bridge: a hidden question and a two-minute ticket
+
+Date: 2026-09-25. Backend repo `grav-cms-backend`. **Not committed.** No
+frontend file was touched — Lane A's spreadsheet and chart UI are untouched and
+the contract below is what the new endpoint offers them.
+
+## What it is
+
+GRAV keeps its designer, its spreadsheet and its Excel export. Metabase draws
+the chart. The browser is given an address and a signed token, and with them can
+render one chart and nothing else — no query builder, no collections, no
+navigation, no other question, and no credential.
+
+The chart runs **the report's own query**. Without comparisons it is byte for
+byte the query `POST /preview` runs; a test asserts the two objects are equal,
+because "the chart and the sheet disagree and nothing on screen says which is
+right" is the failure this design exists to prevent.
+
+## The gate, run first — and it did not fully pass
+
+Recorded in `docs/decisions/metabase-chart-embed-bridge.md`. Against the running
+v1.63.1:
+
+- Creating a hidden question with GRAV's MBQL, setting a visualization, signing
+  a token and rendering **with no API key**: all work.
+- Tenant restrictions are **immutable from the browser**: the question declares
+  no parameters, so `?company_id=…` and a signed `params:{company_id}` both
+  answer 400 "Unknown parameter".
+- The question **cannot be opened as a SQL editor**: anonymous `/api/card/:id`
+  and `/api/dataset` → 401; native SQL with the query key → 403.
+- **`enable_embedding` is superuser-only** and the query-builder key gets 403.
+  So the bridge holds a second credential used for **exactly one call** on a
+  freshly created question, guarded at runtime by `assertKeyUse` and pinned by a
+  test that asserts the source has one call site. The flag persists across
+  updates, so it is touched once per question and never again. An Enterprise
+  token with the `embedding` feature would remove the need for it.
+- **Token expiry has about a minute of leeway**: `exp` 45 s in the past was
+  accepted, 60 s in the past refused. A two-minute token is therefore usable for
+  up to about three.
+
+## Which layouts can be one chart
+
+| | |
+|---|---|
+| detail; rows + one value; rows + columns + several values | **yes** |
+| previous-period, previous-year and other-company comparisons of a **total** or a **count** | **yes** — conditional aggregations (`sum-where`, `count-where`) in one query |
+| difference and percentage difference | **yes** — `((current − prior) ÷ \|prior\|) × 100`, null on a zero base, identical to `matrix.js` |
+| a comparison of an **average, minimum or maximum** | **no** — `avg-where`/`min-where` answer HTTP 500 and `offset()` is unsupported here |
+
+The last row is answered `chartSupported: false` with a sentence, and the
+spreadsheet still shows it. Verified live: a percentage-difference chart and the
+sheet beside it both read `2706.0469488452277`, and both read `null` where the
+prior period is zero.
+
+## Files
+
+**New:** `services/reporting/{chartCapability,vizSettings.validate,metabaseCharts.service,chartRegistry}.js`,
+`migrations/reporting/V004__report_charts.sql`, `scripts/reporting/chart-cleanup.js`,
+`docs/decisions/metabase-chart-embed-bridge.md`, three test suites.
+**Changed:** `mbqlCompiler.js` (`compileChartQuery`, in the same module as
+everything else that emits MBQL), `Acc_reporting.js` (the route and the saved-
+report lifecycle), `Acc_CustomReport.js` (approved chart settings),
+`deploy/metabase-pilot/bootstrap.sh` (embedding, reproducibly), `package.json`.
+
+## Two decisions worth knowing about
+
+**The pointers live in Postgres, not Mongo.** The shared development cluster is
+at its limit — *"cannot create a new collection -- already using 500 collections
+of 500"* — so a new Mongo collection was not available to take. It is also the
+better home: a question id must never reach a browser, and there is now no model
+for it and no presenter that could spread it into a response.
+
+**A saved report's question is created lazily, on first chart view, and updated
+eagerly on every save.** Creating one per saved report would make an
+administrator-credentialled call on behalf of every user who never opens a
+chart. What matters — that no chart ever shows a layout its report no longer
+has — is kept by the update.
+
+## Tests
+
+- **270 offline** across eight suites (`reporting-chart` 37, `reporting-chart.route` 29,
+  layout 76, route 49, mutation 14, mart 65).
+- **29 live**, serially: `npm run test:reporting:live`. Both live suites talk to
+  one Metabase; run in parallel they starve each other — nineteen minutes and a
+  failure, against twenty-four seconds and a pass in band. Written down in both
+  suite headers.
+- The mutation suite now covers the chart path: dropping either tenant filter,
+  or widening the company filter in the comparison query, fails a test.
+
+## Still open
+
+- **Drill-through does not work** in this embed mode and is not claimed to.
+  Tooltips, legends, formatting and CSV/XLSX downloads do.
+- Alerts, subscriptions and dashboard editing are not exposed; each needs an
+  authenticated Metabase *user* (SSO, an Enterprise feature) rather than a
+  signed token.
+- The Metabase embed page fetches its own card inside the iframe, so a person
+  with devtools can read the MBQL for a chart they may already see. No
+  credential is exposed and no other tenant's data is reachable.
+
+---
+
+# Latest implementation — corrected smoke-rerun bundle prepared (25 Sep 2026)
+
+Local only: no pod created, started or connected; no full training; no CMS
+integration; nothing committed. Dataset, splits, gates and the < 0.005 resume gate unchanged.
+
+- **Verified present:** strict deterministic algorithms, `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+  deterministic cuDNN, TF32 off, math-only SDPA, Python/NumPy/torch-CPU/CUDA RNG in
+  snapshots, optimizer restore, recorded + checked data cursor, determinism settings
+  in the snapshot identity, three-pass bit-identical GPU gradient preflight.
+- **Added this pass:** stage-2 stop guards (bundle re-hash, GPU/build match against
+  `train/EXPECTED_RUNTIME.json`, $0.70 spend projection from `/proc` pod age with
+  per-call `timeout`, explicit preflight / unsupported-op / divergence stops);
+  stage 3 stops on any executable unsafe route; `bundle.sh` strips and refuses Apple
+  metadata, caches, weights, credentials and previous-run files.
+- **Tests:** trainer unit 14/14 (host and torch image); resume equivalence 14/14 in
+  five clean containers; dataset/evaluator/gate 34/34; stage-2 stop scenarios 8/8.
+- **Evidence:** `tmp/jev-routing/pod-results/results.tgz` unchanged,
+  SHA-256 `cb619591af45d3524dcf8529942989f13f33b7ae3746643b8eb96bff04a020d5`.
+- **Bundle:** `tmp/jev-routing/bundle/grav-jev.tar.gz`, 2,231,995 bytes,
+  SHA-256 `b5ceb1635494ec3afd14f931c8694a1e923c9410c33a89a7bdb30be66f64186e`.
+  Commands and stop conditions: `scripts/jev-routing/RUNBOOK-runpod.md`, "Exact rerun".
+
+---
+
+# Latest implementation — Jev smoke resume failure: diagnosed and fixed locally (25 Sep 2026)
+
+Status: fixed and proven locally on CPU; **no pod started, no full training, no CMS
+integration, nothing committed.** Evidence `tmp/jev-routing/pod-results/results.tgz`
+(SHA-256 `cb619591…`) was extracted to a scratch copy and not modified.
+
+- **First divergence:** backward pass of step 51 — loss bit-identical
+  (1.2293725465424359), gradient norm not (14.524821 vs 14.518844); data order
+  identical on every step.
+- **Cause:** no deterministic CUDA execution (SDPA flash/mem-efficient backward,
+  cuBLAS workspace). Checkpoint restored weights, AdamW, Python/torch/CUDA RNG and
+  the data cursor; no scheduler or scaler exist; NumPy RNG was missing (unused).
+- **Fix:** new `scripts/jev-routing/train/train_core.py` (strict determinism, math
+  SDPA, cuBLAS workspace, NumPy RNG, settings bound into identity, data-cursor
+  check, on-GPU determinism preflight); `grav_jev_train.py` now uses it;
+  `stage2_smoke_train.sh` reuses the verified stage-1 baseline and checks both
+  preflights; `bundle.sh` ships the core, the new test and the baseline.
+- **Tests:** `test_resume_equivalence.py` 14/14 in five fresh containers
+  (`docker run --rm -v "$PWD/scripts/jev-routing/train":/t:ro -w /t open-jev:2b-cpu python -m unittest test_resume_equivalence`);
+  bitwise equality mid-epoch, across an epoch boundary, and with two interruptions;
+  negative controls detected. `test_grav_jev_train.py` 14/14. Threshold unchanged (< 0.005).
+- **Rerun (needs approval):** `bash /workspace/grav-jev/train/setup_pod.sh && bash /workspace/grav-jev/train/stage2_smoke_train.sh`
+  — ≈ 0.85–1.3 h ($0.24–0.36), ceiling $0.70.
+
+---
+
+# Latest implementation — Jev 2B routing package v2: Accounts + Custom Report Builder (25 Sep 2026)
+
+Status: package ready; **stopped before any paid GPU run, awaiting approval.** No
+RunPod pod, no billing, no production data, no live database, no change to the
+assistant or any runtime path, nothing committed. `docs/tasks/current-task.md`
+still describes GAC-2 and was not changed; this work was requested directly in chat.
+
+Decision: [docs/decisions/jev-tool-routing-training.md](../decisions/jev-tool-routing-training.md).
+Audit and statistics: [docs/audits/jev-routing-dataset-v2-2026-09-25.md](../audits/jev-routing-dataset-v2-2026-09-25.md).
+Runbook: [scripts/jev-routing/RUNBOOK-runpod.md](../../scripts/jev-routing/RUNBOOK-runpod.md).
+
+## What exists
+
+- Tool schema 2.0.0: five Accounts tools (four registered, `acc_overdue_bills`
+  proposed) and seven report tools grounded in the real report builder
+  (`describe_report_capabilities`, `draft_custom_report`, `modify_report_draft`,
+  `validate_report_draft`, `preview_custom_report`, `save_custom_report`,
+  `export_report`), all offered to nobody at runtime (test-pinned).
+  `run_saved_report`, update/delete of saved reports, charts, formulas,
+  post-aggregation and exclusion filters, CSV/PDF are recorded as unavailable.
+- Dataset v2: 15,312 rows, 1,687 scenario groups, frozen locked manifest
+  `d29e5f8562edd64b265a191138c4a94301382e7b121a9436e95249e7d27a70bc`.
+- Evaluator scoring tool selection, arguments, draft modifications, new-draft
+  columns, clarification, refusal and unauthorised access separately, per intent.
+- Release gate (with report checks) and a pre-registered smoke → full gate.
+- Single-GPU LoRA trainer warm-starting from the released Open-Jev-2B package;
+  resume; compact export. Seven-stage RunPod scripts.
+
+## Files (all new, all untracked)
+
+`scripts/jev-routing/`: `README.md`, `RUNBOOK-runpod.md`, `schema/grav-acc-tools.v1.json`,
+`schema/grav-acc-tools.v2.json`, `argumentCandidates.js`, `lexicon.js`, `reportLexicon.js`,
+`generate.js`, `reportGenerate.js`, `audit.js`, `evaluate.js`, `metrics.js`, `gate.js`,
+`bundle.sh`, `test/jevRouting.test.js`, `train/grav_jev_train.py`, `train/test_grav_jev_train.py`,
+`train/requirements-train.txt`, `train/setup_pod.sh`, `train/serve_eval.sh`,
+`train/stage1_baseline.sh`, `train/stage2_smoke_train.sh`, `train/stage3_smoke_eval.sh`,
+`train/stage5_full.sh`, `train/stage6_collect.sh`, `train/LOCKED_MANIFEST_SHA256`,
+`train/configs/smoke.json`, `train/configs/full.json`;
+`docs/decisions/jev-tool-routing-training.md`; `docs/audits/jev-routing-dataset-v2-2026-09-25.md`.
+Generated, gitignored: `tmp/jev-routing/data/grav-acc-routing-v{1,2}/`, `tmp/jev-routing/bundle/`,
+`tmp/jev-routing/reports/DIAGNOSTIC-INCOMPLETE-…` (partial v1 CPU run, 20/218 rows, not a baseline).
+
+## Tests
+
+- New: `node --test scripts/jev-routing/test/jevRouting.test.js` 34/34;
+  `python3 -m unittest discover -s scripts/jev-routing/train -p 'test_*.py'` 14/14.
+- Existing, unchanged: `npm run test:openjev` 48/48; `npm test` 2007/2007;
+  `npx jest test/accountant/reporting test/reporting --runInBand` 217/217;
+  `npx jest test/hr-ai --runInBand` 61/61 with the **pre-existing** Jest failure
+  "must contain at least one test" for the node:test file `openJevAccountsPilot.test.js`.
+
+## Incident to know about
+
+While freeing CPU for the (now withdrawn) Mac baseline, a `pkill -f node_modules/jest-worker`
+pattern also ended some worker processes of **another session's** long-running
+`npx jest` (started ≈ 16:52 IST). Jest respawns workers, but that session's run may
+show spurious "worker terminated" failures for files in flight around 18:08 IST.
+Re-run it before trusting any failure it reported.
+
+## Next (needs approval; costs money)
+
+Upload `tmp/jev-routing/bundle/grav-jev.tar.gz`, run `setup_pod.sh`, then stage 1:
+`bash /workspace/grav-jev/train/stage1_baseline.sh`. Expected all stages 2.3–6.0 h
+($0.64–1.68); ceiling 10 h ($2.80) at $0.28/h.
+
+---
+
+# Latest implementation — GAC-2 correction: review defects fixed (25 Sep 2026)
+
+Status: corrected and tested. Not committed. No shared database was read or
+written; the one new migration script was run only against the in-memory
+test database. GAC-3 not started. Stopped for review.
+
+Review found six defects in the first GAC-2 implementation, and each is fixed below. The first GAC-2 section further down has its wrong statements corrected in place, marked **[corrected]**.
+
+## Defects and fixes
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | Live bypasses of `changeAppAccess()` | `Acc_team.js`: `PATCH /:userId` (role) and `POST /:userId/{deactivate,activate}` are now adapters over the canonical write, with a reason and a key. `DELETE /:userId` and `POST /invites` return 410. `Acc_auth.js`: `/accept-invite` and `/bootstrap` return 410, and sync-legacy no longer auto-creates an Owner, an organisation or company attachments (403 `ACCOUNTING_GRANT_REQUIRED`). `DELETE /api/admin/accountant-users/:email` returns 410. `accountantAccess.setAccountantRole`, `revokeAccountantRole` and `deleteAccountantUser` are removed. `departmentRoles.setRole` and `companyAccess.change` are fixture-only: they refuse outside `NODE_ENV=test` (setRole also accepts an explicit `ALLOW_FIXTURE_ROLE_WRITES=1` for the demo seeder), and setRole always refuses Accounting. |
+| 2 | Accounting grants created an identity with a random password | New `Acc_User.loginMode` (`"password"` default \| `"none"`). A canonical grant for a DeptUser or Employee creates a `loginMode:"none"` row with no hash. `checkPassword` is always false for it and `setPassword` throws. Canonical identity excludes such rows from candidates and ambiguity, and the resolver refuses an accountant-subject session on one. The books login (`/api/accountant/auth/login`) now requires the person's canonical identity to BE the Acc_User, so an OLD random-hash row for someone with a GRAV login is refused by identity rather than by its hash. |
+| 3 | Audit was a mutable `change_logs` row | New append-only `models/Access/AccessGrantEvent.js` (`access_grant_events`). Every Mongoose update, replace, delete, bulkWrite and re-save path throws `ACCESS_AUDIT_IMMUTABLE`. Events are hash-chained through `access_grant_head`, and `verifyChain()` reports a raw-driver edit or delete. `change_logs` keeps a display copy only. |
+| 4 | Idempotency was findOne-then-create | The event's `_id` IS the idempotency key, so MongoDB enforces uniqueness across applications without an index build. All grant writes serialise on the one head document. A duplicate-key race is answered as a replay or as `IDEMPOTENCY_KEY_REUSED`. |
+| 5 | A demoted Accounting Owner kept their sessions | The demotion `updateMany` now also runs `$inc: { tokenVersion: 1 }`, and the side effect is recorded as `sessionsEnded: true`. Role change, revoke and reactivation already bumped `tokenVersion`. |
+| 6 | Cache invalidation was best-effort | Shared grant revision (`services/access/grantRevision.js`): the grant transaction, and the administrator write in the same transaction as its save, advance `access_grant_head.revision`. Every hit in the HR actor cache, the HR roles-configured cache, the QC viewer cache and the QC configured cache is checked against it; a mismatch or an unreadable revision is a miss. A failed local cache clear is now logged and cannot leave stale authority, including in another process. |
+
+A bug found while verifying: `PATCH /api/admin/users/:id` called `doc.save()` inside `withTransaction`. When the transaction retried, Mongoose had already cleared the modified flags, so the retry committed no change and still answered 200. It now computes the update once (`getChanges()`) and applies it with `updateOne`, which is safe to retry. A forced-retry test pins this.
+
+## Direct-writer search (after the fix; includes untracked files)
+
+These searches use `git grep --untracked`. Plain `git grep` misses the new, untracked GAC files.
+
+- **DepartmentRole writes:**
+  - the canonical service;
+  - `departmentRoles.setRole` (fixture-only, guarded);
+  - `departmentRoles.followEmailChange` (renames the `email` field only);
+  - `companyAccess.change` (fixture-only, guarded, retired from HTTP).
+- **Acc_User writes outside the canonical service:** none touch `role`, `isActive`, `loginMode` or `organizationId`. They are:
+  - logout-all `tokenVersion` and `sessionsRevokedAt`;
+  - push-token `fcmTokens`;
+  - team name;
+  - `hiddenNavItems`;
+  - CMS logout `tokenVersion`;
+  - notification `fcmTokens`;
+  - `followEmailChange` email.
+- **Acc_User creation:** only in the canonical service.
+- **`isAdmin` assignment:** only in `routes/Admin/accessAdmin.js` `PATCH /users/:id`.
+- **Audit collection mutation:** none.
+
+`test/access/gac2-single-writer.contract.test.js` enforces all of the above against the production tree (routes, services, Middlewear, middleware, utils, config and server.js), so any new writer fails it. Each exception is recorded with its reason and deletion condition. Synthetic bypass cases prove the scanner still matches.
+
+## What still prevents an unqualified "one write" claim
+
+1. **Legacy application assignments are not routed.** The resolver still treats `Employee.accessDepartmentId` / `additionalDepartmentIds` and `DeptUser.departmentId` as `editor` for an app with no role rows. These are written by:
+   - `POST /api/admin/users`
+   - `PATCH /api/admin/users/:id` (department)
+   - `PATCH /api/admin/employees/:id`
+   - `POST /api/admin/employees/bulk-assign`
+
+   The contract test pins exactly these four, so no new one can appear. Routing or retiring them is the legacy-bridge retirement, which belongs with the guard cutover, not GAC-2.
+2. **The audit is not immutable at the database level.** Mongoose refuses mutation and the hash chain detects raw tampering, but the application's MongoDB user can still update or remove documents in `access_grant_events`. This needs a deployment change: a DB role with insert/find only on that collection.
+3. **Existing Accounting role rows keep their old random hashes.** They are already refused at the books login by identity. `scripts/migrations/gac2-accounting-role-only.js` is a DRY-RUN-by-default script that marks them `loginMode:"none"` and removes the hash. It has **not** been run against any shared database. It needs a dry-run report and explicit approval.
+4. **Reactivating an accounting-only person** (whose Acc_User IS their login) is identity administration. The canonical write refuses it (409 `IDENTITY_INACTIVE`), and no route replaces it yet.
+5. **The fixture writers still exist.** `departmentRoles.setRole` and `companyAccess.change` refuse in production. They are deleted once test fixtures stop using them (companyAccess.change: GAC-5).
+
+## Behaviour changes
+
+Backend:
+- **Accounting Team page:**
+  - A role change, removal or reactivation needs a reason, sent via prompt.
+  - "Remove" is now a revoke that keeps the record; the hard delete is gone.
+  - Invites are gone.
+- **Accounting login:**
+  - Pending invite links return 410.
+  - The books login admits only accounting-only people.
+  - A legacy Accounting account with no role is told to get one through Access Control.
+- **Access Control:** the Accounting row has no "delete member".
+
+Frontend (`grav-cms`):
+- `app/accountant/team/page.js`: sends `reason` and `idempotencyKey`; the delete and invite UI is removed.
+- `lib/accessApi.js`: `deleteAccountantUser` removed.
+- `components/access/moduleRoles.js`: no `deleteMember`.
+
+## Files (this correction)
+
+Backend:
+- New:
+  - `models/Access/AccessGrantEvent.js`
+  - `services/access/grantRevision.js`
+  - `scripts/migrations/gac2-accounting-role-only.js`
+  - `test/access/gac2-corrections.test.js`
+  - `test/access/gac2-single-writer.contract.test.js`
+- Changed:
+  - `services/access/accessGrantAdmin.service.js`
+  - `models/Accountant_model/Acc_OrgModels.js`
+  - `services/access/canonicalIdentity.service.js`
+  - `services/access/appAccess.service.js`
+  - `services/access/hrAuthorization.js`
+  - `services/qcViewer.js`
+  - `services/accountantAccess.js`
+  - `services/departmentRoles.js`
+  - `services/companyContext/companyAccess.service.js`
+  - `routes/Accountant_Routes/Acc_team.js`
+  - `routes/Accountant_Routes/Acc_auth.js`
+  - `routes/Admin/accessAdmin.js`
+  - `routes/Access/departmentTeam.js`
+  - `scripts/ie/ieDemoScenario.js`
+- Tests updated:
+  - `test/access/gac2-grant-administration.test.js`: asserts the append-only event.
+  - `test/accountant/legacy-auth-bootstrap.route.test.js`: sync-legacy upgrade needs an existing role; the no-role case is refused.
+  - `test/accountant/company-ownership-sync-legacy.route.test.js`: the retired promotion creates and attaches nothing, and an upgrade leaves ownership untouched.
+
+Frontend (`grav-cms`):
+- `app/accountant/team/page.js`
+- `lib/accessApi.js`
+- `components/access/moduleRoles.js`
+- `components/access/moduleRoles.test.mjs`
+- `components/access/grantWrite.test.mjs`
+
+## Tests (exact commands and results)
+
+```
+npx jest test/access/gac2-corrections.test.js --forceExit            → 29/29
+npx jest test/access/gac2-single-writer.contract.test.js --forceExit → 15/15
+npx jest test/access/gac2-corrections.test.js test/access/gac2-single-writer.contract.test.js \
+  test/access/gac2-grant-administration.test.js test/access/gac-ar1-app-access.test.js \
+  test/access/gac-ar2-canonical-identity.test.js test/access/gac0-access-characterization.test.js \
+  test/access/gac0-session-launcher.route.test.js test/access/access-admin-safeguards.route.test.js \
+  test/security test/auth test/hr-access test/accountant/legacy-auth-bootstrap.route.test.js \
+  test/accountant/company-ownership-sync-legacy.route.test.js --forceExit --maxWorkers=4
+  → 34 suites, 663/663
+```
+
+What `gac2-corrections` covers, by defect:
+
+| Defect | Tests |
+|---|---|
+| 1 | team role change without a reason is refused; with a reason, lands with an event and a `tokenVersion` bump; a name-only edit; deactivate/activate; accounting-only reactivation refused; owner cannot be deactivated; delete, invites, accept-invite and bootstrap return 410; admin delete returns 410; sync-legacy creates nothing; fixture writers refuse |
+| 2 | role-only row has no hash; DeptUser and Employee targets; every password path refused; an old password row is refused at the books login; control: accounting-only login works; migration plan/apply in memory |
+| 3 | 11 Mongoose mutation paths refused; a raw edit and a raw delete break the chain; no production code mutates the collection |
+| 4 | concurrent same-key requests for different apps give one 200 and one 409, with one event; a duplicate `_id` is refused by storage |
+| 5 | demoted Owner: `tokenVersion` +1 and the old accountant token gets 401 |
+| 6 | QC and HR with the local clear failing still see the change; the administrator write advances the revision and persists; a forced transaction retry still persists; an unreadable revision is a miss; a grant advances the revision |
+
+**Broad regression.** I ran the same 106 files on this tree and on a clean HEAD worktree:
+
+```
+test/access test/security test/auth test/hr-access test/accountant
+test/costing/board-{access-endpoint,department-split,role-assignment}.test.js
+test/marketing/marketing-access.route.test.js
+test/ppc/ppc-app-entry.test.js
+test/industrial-engineering/ie-department-registration.test.js
+```
+
+The result was 2,770 tests: 2,502 passed and 268 failed.
+- **264 failures are pre-existing.** They fail identically on HEAD: Budget suites 224, company-identity 17, voucher-line-release 10, Board 5, QC cache 3, ppc-app-entry 3, and one each in files-folders and voucher-due-date.
+- **2 failures are regressions against HEAD.** They are in `marketing-access.route.test.js`, the "legacy CEO login" tests, and are **caused by GAC-AR2, not this correction**. Login answers 403 `LEGACY_ACCOUNT_NOT_MIGRATED`, which is GAC-AR2's deliberate refusal of legacy-only accounts. These tests pin a legacy-only CEO login that the "one person, one login" rule retires; they need a product decision, so they were left unchanged.
+- **2 failures were an artefact.** The contract test raced with `reporting-mutation.test.js`'s transient `__mutant_*.js` files. It now skips those files and passes when run alongside that suite (27/27).
+
+**Frontend.** `node --test` on every `*.test.mjs` file gave 11,597 tests: 11,591 passed and 6 failed. The 6 are the same pre-existing failures as before, identical on clean HEAD, in ppcAppEntry, ppcEngineeringReleases, valuation, nav and service-master. The access suites pass 81/81.
+
+`git diff --check` is clean in both repositories, and untracked new files were checked too.
+
+## GAC-AR2 acceptance (corrected)
+
+Live browser acceptance for `ray@grav.in` has **passed**, as reported by the user:
+- the launcher showed all 24 applications;
+- Accounting opened;
+- Access Control identified Full System Administrator.
+
+Only the optional retirement of the transitional `ceo@grav.in` remains undecided.
+
+## Next-chunk boundary (unchanged; not started)
+
+GAC-3 is a people-first Access Control screen on `/app-access` that uses only `PUT /api/admin/app-access`. The Accounting and HR team screens would move onto it, after which the `department-roles`, `accountant-role`, `department-team` and Acc_team adapters could be deleted.
+
+The legacy-assignment writers listed above belong with the guard cutover, where the resolver's legacy bridge is retired.
+
+---
+
+# Latest implementation — GAC-2: canonical grant administration (25 Sep 2026)
+
+Status: implemented, then CORRECTED after review (see "GAC-2 correction" above;
+statements below that the review found wrong are fixed in place and marked
+**[corrected]**). Not committed. No shared database was read or written.
+
+## The one write
+
+`changeAppAccess({ actor, body, headers, defaults })` in
+`services/access/accessGrantAdmin.service.js`, exposed as
+`PUT /api/admin/app-access`:
+
+```
+{ email, application, role: "viewer"|"editor"|"approver"|"owner"|null,
+  reason, idempotencyKey }          (key may also come as Idempotency-Key)
+→ { success, replayed, changed, application, target, before, after, effective, auditId }
+```
+
+The order is fixed. Each step fails closed.
+
+1. **Authority first.** It checks the caller before reading the body. The caller must be the application's Owner, according to `resolveAppAccess`. A database-verified administrator is Owner of every app. Anyone else gets 403 `NOT_APPLICATION_OWNER`, even when the body is invalid or the app is unknown. Only a verified admin is told `APP_NOT_FOUND` (404) or `APP_INACTIVE` (409).
+2. **Contract.** The allowed keys are email, application, role, reason, idempotencyKey, name, and budgetDepartments (Budget app only).
+   - Company-like keys (companyId, membership, companyGrants and similar) are refused with 400 `COMPANY_SCOPE_NOT_ACCEPTED`.
+   - Authority fields are refused with 400 `FIELD_NOT_ACCEPTED`. These are isAdmin, capabilities, currentRole, previousRole, source, subject, identityId and password.
+   - Tenant headers are refused: x-company-id, x-costing-company, x-store-purchase-company and x-tenant-id.
+   - The reason must be 10 to 500 characters with at least 3 letters, and must not be filler (`REASON_REQUIRED` / `REASON_NOT_MEANINGFUL`).
+   - The key must be 8 to 128 characters of `[A-Za-z0-9._:-]`.
+3. **Target.** The target is resolved by `canonicalIdentity.classify`. A missing target gets 404 `IDENTITY_NOT_FOUND`, an ambiguous one 409 `AMBIGUOUS_IDENTITY`, and an inactive one 409 `IDENTITY_INACTIVE`. No identity is created. **[corrected]** The original claim was false: an Accounting grant created an active `Acc_User` with a generated password hash. It now creates a `loginMode: "none"` role-only row with no hash, which is never an identity or a login. A non-admin cannot change their own role (403 `SELF_CHANGE`).
+4. **Transaction.** It runs as one Mongo transaction:
+   - **[corrected]** Writers are serialised on the single `access_grant_head` document, not per application. Per-application serialisation did not protect one key used for two applications.
+   - The idempotency lookup finds an earlier change with the same key. **[corrected]** The key is now the audit event's `_id`, so storage enforces it across applications. A matching request fingerprint replays the original result; a different request with the same key gets 409 `IDEMPOTENCY_KEY_REUSED`.
+   - Then read, then the last-Owner check (409 `LAST_APPLICATION_OWNER`), then the write, then the audit.
+   - Granting Owner demotes the incumbent to Approver, and the demotion is recorded in `sideEffects`.
+5. **Audit.** **[corrected]** A `change_logs` row is NOT immutable: that model has no update or delete protection, and scripts delete from it. The audit is now an append-only, hash-chained `access_grant_events` document, described in the correction section. A `change_logs` row is still written as a display copy with entity `access-grant`, section `access:grant` and `critical: true`. The audit records:
+   - the actor and the target (email and subject)
+   - the application
+   - before `{role}` and after `{role}`
+   - the reason, the idempotency key and the fingerprint
+   - any side effects
+   - the timestamp
+6. **After commit.** It invalidates the HR authorization, QC viewer and memo caches. **[corrected]** That invalidation was best-effort and swallowed failures. The guarantee is now the shared grant revision, which is advanced in the transaction and checked on every cache hit; the local clear only speeds things up, and a failure in it is logged. It then re-reads the result through `resolveAppAccess(target, app)` and returns that as `effective`. Any unexpected error becomes 503 `ACCESS_GRANT_UNAVAILABLE` with nothing written.
+
+**Storage.** Ordinary apps use DepartmentRole. Accounting uses an adapter over Acc_User, never a DepartmentRole row.
+- Revoking sets `isActive: false` and increments `tokenVersion`, so the revoke takes effect immediately.
+- An Owner grant demotes the organisation's other owners. **[corrected]** It now also increments their `tokenVersion`; before the fix, a demoted Owner's Accounting sessions survived.
+- Revoking the active Accounting owner is refused with `ACCOUNTING_OWNER_REQUIRED`, which keeps maker/checker intact.
+- **[corrected]** A new Acc_User row for a DeptUser or Employee target is `loginMode: "none"` with no password hash. The earlier "unusable random hash" was not a security boundary.
+
+**Admin status is separate.** Application grants never set `isAdmin`, and `PATCH /users/:id` never creates grant rows. **[corrected]** That route now saves and advances the shared grant revision in one transaction. The last-active-admin protection is unchanged.
+
+## Compatibility routes (adapters: no permission logic of their own)
+
+| Route | Consumer | Deletion condition |
+|---|---|---|
+| `PUT /api/admin/department-roles/:slug` | grav-cms `components/access/moduleRoles.js` via `lib/accessApi.js` `setDepartmentRole` | client calls `/app-access` (GAC-3) |
+| `PUT /api/admin/accountant-role` | grav-cms `lib/accessApi.js` `setAccountantRole` | client calls `/app-access` (GAC-3) |
+| `PUT /api/department-team/:slug` | grav-cms `app/hr/dashboard/team/page.js` | HR team screen moves to `/app-access` (GAC-3) |
+| `PUT /api/admin/company-access` | none; returns 410 `COMPANY_SCOPED_ACCESS_RETIRED` (GET stays read-only) | GAC-5 |
+
+## Old writers — superseded
+
+**[corrected]** The table that stood here listed live bypasses as acceptable:
+- `Acc_team.js` role and activation writes;
+- `setAccountantRole` and `revokeAccountantRole`;
+- the sync-legacy owner auto-create;
+- the admin hard delete.
+
+All of them are now routed or retired. See "GAC-2 correction → Direct-writer search" above.
+
+## Behaviour changes a reviewer should know
+
+- `PUT /api/admin/accountant-role` no longer creates logins or accepts a password. The target must already be a canonical person.
+- `budgetDepartments` on a non-Budget app is now refused with 400. It used to be silently ignored.
+- The PPC special case was removed. PPC is an ordinary application role.
+- The company-access PUT returns 410.
+- Every write needs a reason. Access Control's confirm dialog has a reason box, and one idempotency key is generated per dialog. The HR team page asks for the reason with `window.prompt`, as a stopgap until GAC-3.
+
+## Files
+
+Backend:
+
+- New:
+  - `services/access/accessGrantAdmin.service.js`
+  - `test/access/gac2-grant-administration.test.js`
+- Changed:
+  - `routes/Admin/accessAdmin.js`
+  - `routes/Admin/companyAccess.js`
+  - `routes/Access/departmentTeam.js`
+  - `services/cmsSession.js` (`req.user` carries `subject` and `tv`)
+- Tests updated for the new contract:
+  - `test/access/company-access-admin.route.test.js`: the company write is retired, and PPC is granted through the adapter.
+  - `test/access/department-role-cache.test.js`: seeds a database-verified admin and canonical targets; writes carry a reason and key.
+  - `test/accountant/budget-access-grant.route.test.js`: seeds a real admin, the canonical people and the Budget app. The non-Budget departments test now expects 400 with nothing stored.
+
+Frontend (`grav-cms`):
+
+- Changed:
+  - `lib/accessApi.js`
+  - `components/access/AccessConfirm.js`
+  - `components/access/accessModel.js`
+  - `components/access/moduleRoles.js`
+  - `components/access/ModuleRoleRow.js`
+  - `app/hr/dashboard/team/page.js`
+  - `components/access/moduleRoles.test.mjs`
+- New: `components/access/grantWrite.test.mjs`
+
+## Tests (exact commands and results)
+
+```
+npx jest test/access/gac2-grant-administration.test.js --forceExit
+→ 33/33 pass
+```
+
+This suite covers:
+- round trips, role change, revoke, and the Accounting adapter
+- reason validation, forged fields, and company headers
+- missing, inactive and ambiguous targets
+- unauthorised callers denied, and a verified admin admitted
+- authority checked before the body
+- the admin and grant split, last admin, and last Owner
+- idempotent replay, concurrent retries, and concurrent Owner grants
+- cache invalidation and immediate revoke
+- database failure mid-write, and lookup failure
+
+```
+npx jest test/access test/security test/auth test/hr-access \
+  test/costing/board-role-assignment.test.js \
+  test/accountant/budget-access-grant.route.test.js --forceExit --maxWorkers=4
+→ 36 suites; 620 pass, 30 fail
+```
+
+All 30 failures are pre-existing and fail the same way on a clean HEAD worktree: QC cache 3, Board role assignment 4, and Budget `open-cycles` resolution 23. The GAC-AR1, GAC-AR2, SEC-0 and SEC-1 suites are all green.
+
+```
+cd ../grav-cms && node --test <every *.test.mjs>
+→ 11565 tests; 11559 pass, 6 fail
+```
+
+The 6 failures are pre-existing and fail identically on a clean HEAD worktree:
+
+| File | Failures |
+|---|---|
+| `ppcAppEntry` | 1 |
+| `ppcEngineeringReleases` | 2 |
+| inventory `valuation` | 1 |
+| store `nav` | 1 |
+| `service-master` | 1 |
+
+None of those files was touched. The access suites, including `grantWrite` and `moduleRoles`, pass.
+
+`git diff --check` is clean in both repositories.
+
+Pre-existing failures noted in earlier chunks and not re-run here:
+- `ppc-app-entry` 3
+- `stand-in-login` 3
+- `ie-demo-seeder`, which needs an untracked file
+
+## Still pending (not part of GAC-2)
+
+- **[corrected]** GAC-AR2 live browser acceptance has PASSED (reported by the user). The launcher showed all 24 applications, Accounting opened, and Access Control identified `ray@grav.in` as Full System Administrator.
+- Only the optional retirement (deactivation) of the transitional `ceo@grav.in` is undecided.
+
+## Proposed next chunk — GAC-3: people-first Access Control
+
+Scope:
+- Rebuild `/app-access` around a person: pick a canonical person, see their effective access per app (read through the resolver), and change it through `PUT /api/admin/app-access` alone.
+- Move the HR team screen to the same write, replacing its `window.prompt` reason.
+- Then delete the `department-roles/:slug`, `accountant-role` and `department-team` PUT adapters, and remove the company tab from the UI.
+
+Out of scope:
+- Module-guard cutover (GAC-4)
+- Company field and membership removal (GAC-5)
+- The Accounting internal writers (GAC-8)
+
+---
+
+# Latest implementation — Open-Jev Accounts: live CPU evaluation complete
+
+Date: 25 September 2026. Backend only. **Not committed.** Pilot still off by
+default and not exposed to users.
+
+**Full report: `docs/audits/open-jev-accounts-cpu-evaluation.md`.**
+
+**Headline: 0 of 72 live routing calls reached the pre-registered `p >= 0.80`
+threshold (max observed 0.753), so the pilot abstained on 100% of questions that
+should have routed.** Margin was not the constraint (40/72 cleared 0.30);
+probability alone was.
+
+- `acc_ledger_balance` **0/38** — every ledger question, every phrasing, chose
+  `clarify`. The main case is the one tool Jev never selects.
+- `acc_vouchers` 14/16 (87.5%), `acc_company` 2/4, `acc_financials` 2/6.
+- No high-confidence wrong routes — vacuously, since nothing was confident.
+- Deterministic: 36/36 cases chose identically across two runs.
+- Permission-limited cases 4/4 correct **without calling the model at all**.
+- CPU latency ~21.3 s P50 / 25.6 s P95, cold and warm indistinguishable. Peak
+  RAM 2.56 GiB of 5.77 GiB.
+
+**Two runs were voided first, and the cause is a deployment property worth
+keeping:** Open-Jev does not cancel work on client abort. At ~21 s per call
+against the old 30 s transport ceiling, one overrun orphaned a computation, the
+next call queued behind it, and the backlog compounded. Raised
+`GRAV_OPEN_JEV_TIMEOUT_MS`'s ceiling 30 s → 5 min (transport bound only;
+`minProbability`/`minMargin` untouched and printed every run).
+
+**Changed this session:** `services/ai/openJev/config.js` (timeout ceiling +
+docs). **New:** `scripts/open-jev-pilot/analyse-accounts.js` (separate per-case
+analysis; `evaluate-accounts.js` deliberately untouched),
+`scripts/open-jev-pilot/accounts-rows-cpu.json` (raw rows),
+`docs/audits/open-jev-accounts-cpu-evaluation.md`.
+
+**Not done, deliberately:** thresholds not lowered, model not fine-tuned, pilot
+not exposed, evaluator not altered. GPU numbers still require a Linux NVIDIA
+host with >=8 GB VRAM; CPU and GPU results are kept separate throughout.
+
+---
+
+# Latest implementation — GAC-AR2: one person, one login
+
+Date: 2026-09-25. Repositories `grav-cms-backend` and `grav-cms`, with unrelated uncommitted work
+preserved. **Not committed.**
+
+- **Not started:** broad company-field removal and the next access-control chunk.
+- **Migration:** applied with explicit user approval. `ray@grav.in` is now the
+  canonical active `DeptUser` platform administrator; its Accounting Owner row
+  is preserved. `ceo@grav.in` remains active and transitional until browser
+  acceptance proves the replacement login.
+- **Status: live acceptance PASSED** (reported by the user, 25 Sep 2026): launcher showed
+  all 24 applications, Accounting opened, Access Control identified `ray@grav.in` as Full
+  System Administrator. Only the optional retirement of `ceo@grav.in` remains undecided.
+
+## What changed (files)
+
+### Backend
+
+| File | Change |
+|---|---|
+| `services/access/canonicalIdentity.service.js` (new) | `authenticateLogin(email, password)` and `classify(email)`: the one canonical identity per address (rules below) |
+| `routes/auth/deptAuth.js` | see the list below this table |
+| `config/jwt.js` | `readToken` is now **cookie-first**; Bearer only when no cookie, so a stale local token cannot outvote a newer cookie |
+| `models/Access/DeptUser.js` | optional `identityTransition` subdocument (informational; grants nothing) |
+| `scripts/migrations/gac-ar2-canonical-admin.js` (new) | dry-run-first administrator migration, with a separate gated deactivation step |
+| `test/access/gac-ar2-canonical-identity.test.js` (new) | 19 regression tests |
+
+`routes/auth/deptAuth.js` changes:
+- **`/login` and `/resolve`:** both go through the canonical identity service and one shared
+  `canonicalSession()`. The application list always comes from `listAccessibleApps`.
+- **Tokens:** every new session carries `subject` (now also `dept_user`) and the current `tv`.
+- **`/verify`:**
+  - Returns `sessionToken`, the token it verified (the cookie when sent), so the browser can
+    re-sync its copy.
+  - Accounting-only verify uses the resolver's list and role, not a hardcoded `[Accounting]`.
+- **`/switch-department`:** an accounting-only session may switch to any app the resolver allows
+  (Accounting by `Acc_User` role; others only with a grant).
+- **`/logout`:** reads cookie or Bearer, and revokes the identity that signed in (`DeptUser` or
+  `Acc_User` `tokenVersion`).
+
+### Frontend
+
+| File | Change |
+|---|---|
+| `lib/session.js` | `adoptSession` (CMS + Accounting token together; absent Accounting token clears), `syncVerifiedSession`, `clearBrowserSession`, and the bridge deletion condition |
+| `components/access/useDeptRole.js` | `verifySession` sends the Bearer copy, re-syncs local copies from what the server verified, and clears them on 401 |
+| `lib/signOut.js` | sends the Bearer copy for revocation; clears every copy |
+| `components/onboarding/DepartmentPortal.js` | uses the shared sign-out and `adoptSession`; launcher caption "Full system administrator — all N active applications…" |
+| `components/shell/DepartmentRail.js`, `components/shell/useMyApps.js` | `adoptSession` after a switch |
+| `components/Hr_ProfilePopup.js` | shared sign-out |
+| `components/accountant/AuthProvider.js` | captures the Bearer before clearing it, clears every copy |
+| `components/access/sessionVerify.test.mjs` | harness extended, plus 1 new test |
+| `lib/sessionBridge.test.mjs` (new) | 5 tests |
+
+### Documentation
+
+`docs/decisions/single-organisation-access-control.md` ("One person, one login"),
+`docs/tasks/current-task.md`, this handoff.
+
+### Emergency fixes preserved
+
+- Accounting-only `switch-department` (now generalised through the resolver).
+- Persisting the refreshed `accountantToken` on launcher verify.
+- Direct navigation when already scoped to the selected app.
+- The same-`_id`-and-email legacy credential, now inside the canonical service.
+- The GAC-AR1 suite: **23/23**.
+
+## Canonical identity rule
+
+1. **`DeptUser` is canonical whenever one exists.** There is no fallthrough: a wrong password or
+   inactive account is a refusal. Accepted credentials are its own hash, or the legacy row that
+   provably *is* it (same `_id` and email).
+2. **Otherwise exactly one active `Employee`.**
+3. **Otherwise exactly one active `Acc_User`.**
+4. **Legacy-only:** refused as `LEGACY_ACCOUNT_NOT_MIGRATED`, and only after the password
+   matched.
+
+Two active candidates of the same kind give `AMBIGUOUS_IDENTITY` (409), again only after a
+password matched. Every other pre-password outcome is the same generic 401. Other codes:
+`ACCOUNT_LOCKED`, `IDENTITY_INACTIVE`, `HOME_APPLICATION_INACTIVE`, `IDENTITY_LOOKUP_FAILED` (503).
+
+## Identity resolution — before and after
+
+Read-only snapshot of the configured development database; counts and flags only.
+
+| Account | Before GAC-AR2 | After this code (no migration) | After `--apply` (planned) |
+|---|---|---|---|
+| ray@grav.in | `Acc_User` owner only, giving an accounting-only session with 1 app (the "RISHEE RAY" screenshot) | the same accounting-only identity; opening Accounting works (tested), and it is **not** an administrator | canonical **`DeptUser`**, `isAdmin: true`, home Executive Office, the same bcrypt credential copied from `Acc_User`; every active app as Owner; `Acc_User` owner role unchanged for Accounting |
+| ceo@grav.in | active admin `DeptUser` (bcrypt hash present), legacy `ceodepartments` row with the same `_id`, `Acc_User` approver | canonical `DeptUser` admin; the legacy row only verifies the password; never a legacy session | unchanged and active; marked `identityTransition` (superseded by ray, not yet eligible) |
+| 6 IE/PPC demo department logins | `DeptUser` | `DeptUser` (unchanged) | unchanged |
+| one legacy `accountantdepartments` row | legacy row, with a matching `Acc_User` | accounting-only identity; the legacy row is credential compatibility only | unchanged |
+
+## Migration dry run (counts only; no writes)
+
+```bash
+node -r dotenv/config scripts/migrations/gac-ar2-canonical-admin.js
+```
+
+- **Actions:** `CREATE_CANONICAL_DEPT_USER_REUSING_ACC_USER_BCRYPT`, `MARK_DUPLICATE_TRANSITIONAL`
+- **Blockers:** none
+
+| Count | Value |
+|---|---|
+| targetAccUsers | 1 |
+| targetActiveAccUsers | 1 |
+| targetAccountingOwner | 1 |
+| targetDeptUserExists | 0 |
+| duplicateDeptUserExists | 1 |
+| activeAdminsBefore | 1 |
+| activeAdminsAfter | 2 |
+| recordsToDelete | 0 |
+
+**Rollback:** documented in the script header.
+- Deactivate or remove the created canonical `DeptUser`.
+- `$unset` `identityTransition`.
+- `Acc_User` is never modified.
+- The later deactivation step refuses until ray has signed in after the migration and another
+  active administrator remains.
+
+## Tests (exact commands and results)
+
+```bash
+npx jest test/access/gac-ar2-canonical-identity.test.js --forceExit
+```
+**Result:** 19/19 passed.
+
+```bash
+npx jest test/access test/security test/auth test/hr-access test/industrial-engineering/ie-demo-seeder.test.js test/accountant/legacy-auth-bootstrap.route.test.js test/accountant/legacy-route-auth-facade.route.test.js test/accountant/accounting-auth-inventory.test.js test/ppc/ppc-app-entry.test.js test/requests/stand-in-login.route.test.js --forceExit --maxWorkers=4
+```
+**Result:** 35 suites passed, 4 failed; 703 tests passed, 10 failed. None of the 10 failures come
+from this chunk:
+
+| Suite | Failures | Cause |
+|---|---|---|
+| `department-role-cache` | 3 | fails the same way on a clean `HEAD` |
+| `ppc-app-entry` | 3 | expects `/ppc/order-book`, seed says `/ppc`; fails on clean `HEAD` |
+| `stand-in-login` | 3 | fails the same way on a clean `HEAD` |
+| `ie-demo-seeder` "lane boundary" | 1 | an unrelated untracked file, `scripts/ie/seed-grav-company-demo.js`, sits in the directory it pins |
+
+```bash
+node --test lib/sessionBridge.test.mjs components/access/*.test.mjs lib/marketing/ceoMarketingAccess.test.mjs components/shell/*.test.mjs
+```
+**Result:** 268/268 passed. A further 8 related frontend files: 409/409 passed.
+
+**The 13 required cases, all in `gac-ar2-canonical-identity.test.js` unless noted:**
+1. A migrated admin with a broken modern hash gets a `DeptUser` admin session with every app.
+2. A same-email legacy row with a different `_id` opens nothing.
+3. `/resolve` and `/login` return the same subject, id and apps for all three kinds.
+4. Accounting-only owner: login, switch into Accounting and verify all answer 200, never
+   "Unauthorized".
+5. The same user gets 403 on Sales and Executive Office without a grant, and a real grant is
+   honoured.
+6. An Accounting owner is not an administrator.
+7. A verified administrator gets every active app as Owner.
+8. A stale `tv` is rejected by verify and by switch, for both `DeptUser` and accounting-only
+   sessions.
+9. A stale Bearer cannot outvote a newer cookie (verify and the shared reader).
+10. Logout clears both cookies and revokes the session server-side. Browser-side clearing is
+    tested in `sessionBridge`.
+11. Ambiguous employees or `Acc_User` rows get 409, but only after the password matches.
+12. A lookup failure gets 503 and no cookie.
+13. Migration:
+    - the dry run is idempotent and writes nothing;
+    - apply keeps the same credential, and a re-run plans nothing;
+    - last-admin and verified-sign-in gates block deactivation.
+
+**`git diff --check`:** see the final report.
+
+## Live browser acceptance — PASSED (reported by the user, 25 Sep 2026)
+
+After a fresh sign-in as `ray@grav.in` (password entered by the user):
+
+- the launcher showed all 24 applications;
+- Accounting opened successfully (no "Unauthorized");
+- Access Control identified `ray@grav.in` as **Full System Administrator**.
+
+Only the optional retirement (deactivation) of the transitional `ceo@grav.in`
+remains undecided; it needs the user's decision and is not performed.
+
+### Applied recovery evidence
+
+- Canonical-admin migration completed transactionally with no blockers and no
+  deletions: active administrators changed from 1 to 2.
+- A post-apply resolver read returns `ray@grav.in` as a platform administrator
+  with Owner access to all 24 active internal applications; its Accounting
+  role remains Owner.
+- Pre-migration Accounting-only sessions for `ray@grav.in` were revoked by one
+  `Acc_User.tokenVersion` increment so a stale one-app session cannot survive
+  the cutover. A fresh sign-in is required once.
+- `People & roles` now merges the canonical effective-access projection. A
+  DeptUser with no HR record is labelled **Full system administrator**, says
+  Owner in all active applications, and can expand the complete application
+  list instead of being misrepresented as “Accounting only”.
+- Frontend session regression tests: 13/13 passed; both local services respond.
+
+## Remaining risks
+
+- **Credential copies can diverge.** The canonical `DeptUser` for ray reuses the `Acc_User` hash
+  as a copy. A later password change on one does not update the other, and
+  `/api/accountant/auth/login` would still accept the old `Acc_User` password. The canonical CMS
+  sign-in is the supported path; converge Accounting's own login in a later chunk.
+- **No fallthrough past a department login.** A person whose email has both a `DeptUser` and an
+  `Employee` can no longer sign in with the employee password. That is intentional (one person,
+  one login), but any such pair in production must know its department-login password.
+- **Employee sessions cannot be revoked by token version.** `tv` is fixed at 0, so logout ends
+  them only by clearing the cookie and the 7-day expiry.
+- **Competing backend supervisors.** Two `nodemon` supervisors in `grav-cms-backend` (PIDs 82519
+  and 88858) race for port 5050 after every file change. See the live acceptance step.
+- **Unrelated test drift.** `ie-demo-seeder` fails its lane-boundary check because of an
+  unrelated untracked file.
+
+---
+
+# Latest implementation — Accounts pilot: voucher executor, corrected runtime gate, live CPU run
+
+Date: 25 September 2026. Backend only. **Not committed.** Still off by default.
+
+**1. `acc_vouchers` now has a deterministic executor** and is offered dynamically
+beside the other three. `buildVouchers` does all counting, totalling and ranking
+— the pilot adds no accounting calculation. New
+`services/ai/openJev/voucherAnswer.js`; `accountingContext.js` now exports
+`normVoucherType` and `VOUCHER_ALIASES` so the pilot resolves a voucher type the
+same way the module does rather than keeping a second alias list.
+
+Two arguments are resolved without a model:
+- **Type** — via the shared table. Its one blind spot is handled here: a question
+  naming two types ("sales and purchase totals") would silently become sales
+  only, so it is asked about.
+- **Dates** — only when written out in full (`2026-04-01`). "Last month", "this
+  quarter", "Q1", "April 2026" all need a boundary neither the pilot nor the
+  service defines, so they clarify rather than guess. An impossible date
+  (`2026-02-30`) clarifies too — dropping it would answer for all time.
+  **No date at all is not ambiguous** (means all), and **"recent"/"latest" are
+  rankings, not periods** — an earlier draft clarified those, turning ordinary
+  questions with exact answers into questions back.
+
+Zero preserved: "No payment vouchers were recorded between X and Y."
+
+**2. Runtime gate corrected** in `docs/decisions/open-jev-cms-pilot.md`. The
+earlier "targets Linux/CUDA" framing was wrong and had marked a whole evaluation
+blocked. The repository ships `docker compose up -d --build open-jev-cpu`, an
+officially supported CPU-only service. **CUDA is not an absolute inference
+requirement**, though it is what a meaningful speed number needs.
+Darwin-native remains unproven and untried. CPU and GPU results are recorded as
+separate measurements and must never be averaged or compared as one number; the
+evaluator prints the device on every routing table.
+
+**3. Tests:** `npm run test:openjev` — 48 pass (new script; these node:test files
+sit under `test/`, which `npm test` does not cover and Jest cannot run correctly,
+since requiring node:test shadows Jest's globals. The HR pilot file beside it IS
+a Jest file: `npx jest test/hr-ai/openJevPilot.test.js`, 37 pass).
+`npm test` 2007 pass / 0 fail.
+
+**4. Evaluation (`--router=oracle`): 43/43**, clarification 30.2%, unsupported
+4.7%. `--router=absent`: 34/34 supported questions refused, 0 rescued.
+
+**Tooling note:** `docker buildx` was missing and the official build needs
+BuildKit (`RUN --mount=type=secret`). Installed via `brew install docker-buildx`
+and symlinked into `~/.docker/cli-plugins/`.
+
+---
+
+# Latest implementation — Jev-only Accounts pilot (`jev_only_accounts`)
+
+Date: 25 September 2026. Backend only. **Not committed.** Off by default; not
+exposed to ordinary users.
+
+**New:** `services/ai/openJev/{accountsCandidates,accountsPilot,ledgerAnswer,diagnosticsVisibility}.js`,
+`scripts/open-jev-pilot/{accounts-cases.json,accounts-fixtures.js,evaluate-accounts.js}`,
+`test/hr-ai/openJevAccountsPilot.test.js`, `docs/decisions/open-jev-accounts-pilot.md`.
+**Changed:** `services/ai/openJev/{config,pilot}.js`, `services/ai/gravAssistant.js`,
+`routes/ai/assistant.js` (diagnostics passthrough, dev/admin-gated).
+
+**Switches.** `GRAV_OPEN_JEV_PILOT_ENABLED=true` AND
+`GRAV_OPEN_JEV_MODE=jev_only_accounts`. Either alone does nothing; a misspelled
+mode is off, never some other mode. With the mode unset every existing path is
+unchanged.
+
+**Candidates are derived, not duplicated.** `authorizedTools(user)` ∩ the tools
+the pilot can answer deterministically (`acc_ledger_balance`, `acc_financials`,
+`acc_company`) plus `clarify`/`unsupported`. `acc_vouchers` is authorised for the
+same people and deliberately not offered — no deterministic executor yet.
+
+**No fallback.** Jev unavailable, low-confidence or invalid → "Jev could not
+confidently route this question." No regex, no Gemini, no Ollama for a supported
+question in this mode.
+
+**Ledger answers** carry the exact matched name, exact amount, currency (read
+from the company profile, never assumed), Dr/Cr and effective time. A fuzzy
+match, several matches or a group is asked about, naming the candidates — never
+picked silently. A genuine zero is reported as zero.
+
+**Measured:**
+
+| | |
+|---|---|
+| GRAV's half (`--router=oracle`) | 36/36 cases as expected, clarification rate 10/36 |
+| No-fallback (`--router=absent`) | 34/34 supported questions refused, 0 rescued |
+| Jev routing accuracy, P50/P95, high-confidence wrong routes | **NOT MEASURED** |
+
+**Routing is unmeasured and the evaluator refuses to fake it.** Same blocker as
+the HR pilot: the published 2B release needs pinned Qwen weights and a CUDA
+loader; this host is Darwin arm64 with no torch, no CUDA and nothing on `:8791`.
+`--router=live` against a provisioned host is the only run whose routing numbers
+mean anything, and the script prints "ROUTING METRICS WITHHELD" for any other.
+
+**Tests:** `test/hr-ai/openJevAccountsPilot.test.js` 31 pass. Full `npm test`
+2007 pass / 0 fail. Four structural proofs — cannot reach MongoDB, cannot
+execute an unoffered tool, cannot widen a permission, cannot write — are driven
+against the real code with a hostile model, not argued from the design.
+
+**Two evaluation-set corrections found by running it:** a "bank" question was
+expected to answer when the fixture had one bank ledger; with two (truer to a
+chart of accounts) it correctly asks which. And the outage cases needed the
+transport fault injected rather than the router's judgement.
+
+---
+
+# Latest implementation — SEC-1: CoWork credential exposure closed
+
+Date: 2026-09-25. Backend `grav-cms-backend` (HEAD `8a5a2ffa`), with unrelated uncommitted work
+preserved. **Not committed.**
+
+- **Not started:** GAC-1, and no company scoping was changed.
+- **Frontend:** no frontend repository was changed (`../grav-cms`, and the CoWork app at
+  `~/Desktop/Cowork` was only read).
+- **`/api/google`:** stays administrator-only, and OAuth responses still carry no token material.
+- **Data:** no database or Firestore data changed.
+
+## 1. Public debug dumps removed
+
+`routes/task_routes/taskTree.routes.js` no longer defines these routes. There is no replacement
+route, flag or parameter; a comment records why.
+- both definitions of `GET /task/dump/:taskId`;
+- `GET /employee/dump/:employeeId`, which returned the raw employee document including
+  `gmailToken.refresh_token` and `tempPassword`.
+
+### Sweep of every mounted `/cowork` router: reported, not fixed
+
+None of these exposes credentials or authentication material.
+
+| Endpoint | Auth | Returns |
+|---|---|---|
+| `GET /task/self-assign-debug/:employeeId` (`taskTree.routes.js:269`, and a duplicate at `taskForward.js:737`) | none | task id, title and assignment fields of any employee |
+| `GET /task/force-repair-self-assign` (`taskTree.routes.js:226`, `taskForward.js:694`) | none | scans every task and **writes repairs**; a data-integrity and cost risk |
+| `GET /audio/test-gemini` (`meetingSummary.routes.js:938`) | none | spends Gemini quota; the key is not returned |
+| `GET /media/view/:fileId` (`mediaUpload.js:93`) | none | streams a Drive file (GAC-0 S-12) |
+| `GET /deadline-availability/blocked-dates` (`deadlineAvailability.routes.js:17`) | none | blocked dates |
+
+- **Raw documents returned directly, not employee records:**
+  - meeting transcripts (`meetingTranscript.routes.js:236`, `meetingSummary.routes.js:1468`);
+  - meeting summaries (`meetingSummary.routes.js:988`, and `:1021` public by share token);
+  - C1/C2 score documents (`c1Routes.js:55`, `c2Band.routes.js:153`).
+- **Public by design:** password reset (`coworkPasswordReset.js`), QR redeem (`coworkQrSignIn.js`),
+  guest share (`coworkExternalShare.routes.js`), guest meeting (`livekit.routes.js`) and the
+  guest-finalize beacon.
+- **Non-CoWork debug routes found by the same search:**
+  - `Acc_auth.js:823 /debug-token` (public; decodes the caller's own token);
+  - `Acc_invoices.js:56 /:id/debug-dispatch`;
+  - `TasksEmployee.js:545,570 /debug/*` and `pushToken.js:212 /push-token/debug` (mobile-app
+    session);
+  - `patternGradingRoutes.js:1935 /pattern-grading/debug-svg-headers/:stockItemId`.
+
+## 2. Employee-list credential leakage closed with one allowlist
+
+**New `services/coworkEmployeeProjection.js`:** `toDirectoryEmployee()` and
+`directoryEntryFromSnapshot()`.
+- It keeps only `id`, `employeeId`, `name`, `email`, `mobile`, `city`, `department`, `role`,
+  `profilePicUrl`, `passwordChanged`, plus `isActive` and `status` when they are a boolean or
+  string.
+- Values of the wrong type are dropped, and every other field, including any future field, is
+  private by default.
+- **How the fields were chosen:** the CMS CoWork pages (`create-employee`, `create-group`,
+  `schedule-meet`, `lib/mediaUploadApi.js`) read `employeeId`, `name`, `email`, `mobile`, `city`
+  and `department`. The CoWork app (`lib/legacy/employees.ts`) reads those plus `role`,
+  `profilePicUrl` and `passwordChanged`.
+- **`authUid`:** the CoWork app maps it into a nullable field that no screen uses, so it is now
+  always `null` in the directory. The self `/me` response still carries it.
+
+**Applied to every employee and member-list response:**
+
+| Where | Change |
+|---|---|
+| `services/cowork.service.js` `listCoworkEmployees()` | serves `/employee/list-members` and `/employee/list`; its 5-minute cache now holds projected rows |
+| `services/cowork.service.js` `getCoworkGroup()` members | served by `/group/:groupId` |
+| `routes/task_routes/cowork.js` `/employee/:id` | returned **another employee's raw record** (`gmailToken`, `tempPassword`, `authUid`, `fcmTokens`) to any employee; now projected. No frontend consumer was found. |
+| `routes/task_routes/cowork.js` `/employee/list-members` | the ad-hoc denylist, which missed `gmailToken`, is removed |
+| `services/coworkEnhanced.service.js` `listAllEmployees()` | exported but not routed; projected as a guard |
+
+The authenticated self `/me` contract is unchanged, and a test confirms it carries no other
+person's data.
+
+## 3. CEO bootstrap recovery removed
+
+`scripts/cowork/bootstrap-ceo.js`:
+- The recovery mode, `--recover` and `COWORK_BOOTSTRAP_RECOVERY` are removed.
+- It **always** refuses when any CEO exists: either an `E000` record with an `authUid`, or any
+  `cowork_employees` row with role `ceo`.
+- An unknown CEO state is treated as "exists", so the script fails closed.
+- The comment claiming a replaced CEO's sessions restart is gone.
+- The header now states that **CEO replacement requires a separately reviewed, audited recovery
+  procedure** that identifies the old account, removes its `ceo` claim and revokes its sessions
+  before promoting anyone else.
+- It stays password-free, local-only and audited.
+
+## Tests and results
+
+```bash
+npx jest test/security --forceExit
+```
+**Result:** 4 suites passed; **92 tests passed**.
+
+**New `test/security/sec1-cowork-credential-exposure.route.test.js` (15 tests):**
+- **Dump paths:**
+  - All three former paths answer **404** both anonymously and with an ordinary CoWork session.
+  - Nothing leaks, and they read **no** Firestore document.
+  - No `/dump` route is declared on the mounted router or in any router file.
+- **Directory responses:**
+  - `/employee/list-members`, `/employee/list` (TL and CEO), `/employee/:id`, group members and
+    `listAllEmployees` all carry the required public fields.
+  - They carry none of 15 planted keys: `gmailToken` (refresh and access), `googleTokens`,
+    `tempPassword`, `password`, `passwordHash`, `passwordResetOtp`, `resetToken`, `authUid`,
+    `customClaims`, `fcmTokens`, `webPushSubscription`, `sessionToken`, `apiKey`,
+    `secretConfig`, and an unknown `someFutureField`.
+  - None of their values appears anywhere in the response text.
+- **Projector:** it only ever emits allowlisted keys, and drops a secret smuggled under an
+  allowlisted name with the wrong type.
+- **`/me`:** unchanged.
+
+**Why the dump tests use a child process:** `taskTree.routes.js` declares `_addWorkingSecsIST`
+twice (lines 1097 and 1145; already in `HEAD`). Node accepts that, but Jest's Babel parser refuses
+the file. So those tests load the real router in a plain Node child process,
+`test/security/helpers/sec1-tasktree-harness.js`, with a Firebase fake injected into
+`require.cache`. Production code was not touched for this.
+
+**Updated `test/security/sec0-cowork-seed-ceo.route.test.js` (still 11 tests):**
+- With no CEO and an existing account, promotion succeeds; there is no `recovery` field.
+- Any existing CEO, or an unknown CEO state, causes refusal under every combination of `--recover`,
+  `--force`, `COWORK_BOOTSTRAP_RECOVERY` and an unrelated force variable.
+- A refused run writes no claim and no employee record, and is audited.
+- The audit record and result contain no password or token.
+
+The other SEC-0 suites are unchanged: `sec0-jwt-secrets` 26 and `sec0-google-containment` 40.
+
+```bash
+npx jest test/access/gac0-access-characterization.test.js test/access/gac0-session-launcher.route.test.js --forceExit
+```
+**Result:** 2 suites passed; **26 tests passed**.
+
+```bash
+npx jest test/auth/cowork-sso-apps.route.test.js test/store-purchase/mrf-cowork-door.route.test.js --forceExit
+```
+**Result:** `mrf-cowork-door` passes. `cowork-sso-apps` has 11 passing and **4 failing**; those 4
+are the same failures confirmed on a clean `HEAD` during SEC-0.
+
+```bash
+node --test services/httpCache.test.js services/coworkPunchOutOffline.test.js services/coworkAttachmentResumable.test.js
+```
+**Result:** 47 passed.
+
+```bash
+git diff --check
+```
+**Result:** exit 0. The new untracked files were separately scanned for trailing whitespace.
+
+## Remaining occurrences (searched after implementation)
+
+| Pattern | Remaining | Classification |
+|---|---|---|
+| `/task/dump`, `/employee/dump` | the removal comment, the SEC-1 tests and harness, and docs | test fixture and documentation; **no route** |
+| `/dump` or `/debug` route declarations | CoWork: the two `self-assign-debug` routes (reported in §1). Non-CoWork: the five listed in §1 | reported, not credential material |
+| raw `cowork_employees` documents in responses | none. `getCoworkEmployee()` still returns the raw document, but its only route projects it; `workloadroutes.js` builds explicit objects | — |
+| `gmailToken`, `refresh_token`, `access_token`, `tempPassword`, `authUid`, `fcmTokens` in employee-list responses | none (allowlist; tested) | — |
+| `COWORK_BOOTSTRAP_RECOVERY`, `--recover` | only in the SEC-0 test that proves they are inert, and in historical handoff text | test fixture and documentation |
+
+## Remaining risks
+
+1. **Client-side Firestore reads.** `grav-cms/lib/mediaUploadApi.js` and the CoWork app read
+   `cowork_employees` directly with the Firebase client SDK. Whether a signed-in client can read
+   another employee's `gmailToken` or `tempPassword` depends on Firestore security rules. **No rules
+   file exists in any repository checked, so this is unverified.** Recommended next step: move
+   `gmailToken` and `tempPassword` out of `cowork_employees`, or confirm the deployed rules deny
+   those fields.
+2. **Bootstrap coverage.** The script only detects a CEO through Firestore. An account holding a
+   `ceo` custom claim with no Firestore record is not detected, and `coworkAuth` auto-provisions
+   such an account as `E000` on sign-in.
+3. **Script not run for real.** The bootstrap script has never run against the real Firebase
+   project.
+4. **Group and employee read authorisation.** `/group/:groupId` and `/employee/:id` let any CoWork
+   employee read any group or employee's **directory** fields. That is unchanged and now safe of
+   credentials; whether it should be narrower is a product decision.
+5. **Unauthenticated CoWork routes:** the §1 table, plus everything left from SEC-0.
+
+## Files
+
+- **Changed:**
+  - `routes/task_routes/taskTree.routes.js`, `routes/task_routes/cowork.js`
+  - `services/cowork.service.js`, `services/coworkEnhanced.service.js`
+  - `scripts/cowork/bootstrap-ceo.js`
+  - `test/security/sec0-cowork-seed-ceo.route.test.js`
+  - `docs/handoff/latest-implementation.md`
+- **New:**
+  - `services/coworkEmployeeProjection.js`
+  - `test/security/sec1-cowork-credential-exposure.route.test.js`
+  - `test/security/helpers/sec1-tasktree-harness.js`
+
+---
+
+# Latest implementation — SEC-0: emergency security containment
+
+Date: 2026-09-25. Backend `grav-cms-backend` (HEAD `8a5a2ffa`), with unrelated uncommitted work
+preserved. **Not committed.**
+
+- **Scope:** exactly three exposures, S1–S3 from the GAC-0 audit, plus the GAC-0 documentation
+  correction.
+- **Not started:** GAC-1 and the company-scope migration.
+- **Frontend:** `../grav-cms` was not changed.
+- **Data:** no database data changed.
+
+## GAC-0 documentation correction
+
+The audit and the GAC-0 handoff section below conflated two different counts:
+
+| Count | Meaning |
+|---|---|
+| **35** | active `DepartmentRole` rows with no matching identity |
+| **36** | active global roles whose holder has no active company membership |
+
+Corrected in the audit (headline 6, §2A table plus a disambiguation note, §2A unresolved, H17)
+and in the GAC-0 handoff section.
+
+In the manifest, only `hazards[H-18].summary` changed, because the manifest's own source proves 35:
+`databaseInventory.departmentRoles.activeRolesWithNoMatchingIdentity.total = 35`, and its by-slug
+counts also sum to 35. A `correction` field records the change.
+
+## 1. Published JWT secrets (S1)
+
+**`config/jwt.js`**
+- `LEGACY_SECRETS` is removed, and one central `verifyCmsToken(token)` verifies against the
+  configured secret only.
+- `resolveSecret()` refuses in these cases:
+  - a missing or blank `JWT_SECRET` in production;
+  - in **every** environment, a secret equal to any value ever published in the repository. These
+    are held only as SHA-256 fingerprints, so this is a rejection check, not an acceptance list.
+- Outside production, a missing secret becomes a random per-process value instead of a known
+  string.
+
+**Verifiers moved to the central reader**
+- Session and guard layer:
+  - `services/cmsSession.js`
+  - `routes/auth/deptAuth.js` (`verifyToken`, which `requirePlatformAdmin` and Marketing use)
+  - `Middlewear/departmentWriteGuard.js` (department write and approval)
+  - `Middlewear/hrContract.js` (HR)
+  - `services/qcViewer.js`, `routes/CMS_Routes/Manufacturing/QC/qcTeamRoutes.js` (QC)
+  - `routes/Access/files.js` (Files)
+  - `routes/Access/budgetProposals.js` (Budget)
+- CMS middlewares: `EmployeeAuthMiddlewear.js`, `SalesAuthMiddlewear.js`,
+  `AllEmployeeAppMiddleware.js`, `AccountantOrgAuthMiddleware.js`.
+- Route-local verifiers:
+  - all 11 `routes/CEO_Routes/*` guards;
+  - `requestsSettingsRoutes.js`, `productionSettingsRoutes.js`, `rawItems.js:704`;
+  - `Acc_auth.js:830` (the debug-token route);
+  - `Acc_backup.js` (its OAuth-state secret had its own published fallback);
+  - `server.js:1422` (the customer department-rules mount);
+  - the dead `routes/login.js` and the mobile `routes/Employee_Routes/login.js`.
+- Non-CMS audiences, for the same reason:
+  - `CustomerAuthMiddleware.js`, `VendorAuthMiddleware.js`;
+  - `models/Customer_Models/Customer.js` (signer);
+  - 7 `routes/Customer_Routes/*` files, `routes/Vendor_Routes/vendorAuthRoutes.js`.
+
+In `rawItems.js`, `Acc_auth.js` and `server.js`, which already held uncommitted work, only the one
+secret line changed.
+
+**Administrator claim.** `services/cmsSession.js` no longer trusts `isAdmin` from the token.
+- A claimed administrator is re-read from `dept_users` on every request: the account must be
+  active, still an administrator, and its `tokenVersion` must match.
+- Otherwise the session continues as an ordinary one (`isAdmin: false`).
+- A failed lookup returns **503**, never an elevation.
+- This covers every administrative and role-management router that trusted the claim:
+  - `/api/department-team` (owner of every team; role grants);
+  - `/api/change-requests` (approve-all and self-approval);
+  - `/api/dev` (developer console).
+- `/api/admin` was already database-verified by `requirePlatformAdmin`.
+
+**Tests:** `test/setup.js` now gives test files that don't set their own a test-only
+`JWT_SECRET`, so existing helpers that sign with `process.env.JWT_SECRET || …` still match the
+verifiers.
+
+### Session-invalidation consequence
+
+Any token signed with one of the published values stops verifying, and its holder must sign in
+again. This only exists where a deployment ran with `JWT_SECRET` unset or set to a published value.
+
+The configured development secret is **not** a published value (checked by fingerprint, never
+printed), so development sessions signed with it are unaffected. A server whose `JWT_SECRET` *is*
+a published value will now refuse to start: rotate it, and every session ends.
+
+Development servers without `JWT_SECRET` now lose all sessions on restart.
+
+## 2. CoWork CEO bootstrap (S2)
+
+- **Route removed.** `POST /cowork/setup/seed-ceo` is gone from `routes/task_routes/cowork.js`; a
+  comment records why. There is no HTTP replacement. Nothing in `grav-cms` called it.
+- **New `scripts/cowork/bootstrap-ceo.js`** (local only, not mounted by Express):
+  - It needs `COWORK_BOOTSTRAP_CEO_EMAIL`, `COWORK_BOOTSTRAP_CEO_NAME`, and
+    `COWORK_BOOTSTRAP_CONFIRM` repeating the email.
+  - It only promotes an **existing** Firebase account; it never creates accounts or handles
+    passwords.
+  - It refuses while a CEO exists. *(At SEC-0 a recovery mode existed, using `--recover` plus a
+    recovery variable. **SEC-1 removed it**: see the SEC-1 section above.)*
+  - It writes a `cowork_security_audit` record for every attempt, including refused ones.
+  - It prints a result with a masked email and no secret.
+  - The script's guard logic is tested with fakes; it has **not** been run against the real
+    Firebase project.
+
+## 3. Google Workspace (S3)
+
+- **Gate:** `routes/googleWorkspaceRoutes.js` applies `router.use(requirePlatformAdmin)` to the
+  whole router. That means an active, database-verified platform administrator on every request;
+  401 without a session, 403 without an administrator record.
+- **OAuth callback:** `/auth/callback` now answers `{ success, refreshTokenIssued, stored: false,
+  message }`. It never returns `tokens`, `refresh_token` or `access_token`, and error messages no
+  longer echo Google's error text.
+- **Stored tokens:** existing server-side Gmail token storage (Firestore, per employee) is
+  unchanged.
+- **Dormant copy:** the unmounted and unloadable `routes/task_routes/googleWorkspaceRoutes.js` got
+  the same gate and callback fix, so reviving it cannot reopen the leak.
+
+### Temporary limitation, recorded
+
+Google Workspace is **administrator-only** until an employee-level authorisation design is
+reviewed. That design needs an employee identity source, and the configured database has no
+`employees` collection.
+
+Consequences:
+- The `grav-cms` pages `/workspace/google-panel` and `/google-task` call `/api/google` with **no
+  credentials**, so they now receive 401 for everyone.
+- The Sales CRM Gmail connect flow lands on `/api/google/employee-gmail/callback`, so
+  non-administrators cannot complete it.
+- Rotating `GOOGLE_REFRESH_TOKEN` is now an out-of-band operator task.
+
+## Tests and results
+
+```bash
+npx jest test/security --forceExit
+```
+**Result:** 3 suites passed; **77 tests passed**, 77 total.
+- `sec0-jwt-secrets` 26: published secrets refused by the verifiers and the admin and
+  role-management endpoints; the configured secret works; forged `isAdmin` refused in 4 forms;
+  lookup failure gives 503; production startup refuses a missing or published secret, including
+  in a child process; source scan finds no published secret.
+- `sec0-google-containment` 40: 17 representative endpoints across tasks, calendar, Drive, Gmail,
+  employee Gmail, Chat, mutations and OAuth give 401 when anonymous and 403 for a normal CMS user;
+  forged or non-admin/deactivated claims are refused; an active administrator reaches every area;
+  OAuth responses carry no token material.
+- `sec0-cowork-seed-ceo` 11: anonymous, Firebase-authenticated and CMS-authenticated callers all
+  get 404 with the CEO untouched; `change-role` cannot promote; no route declares seed-ceo; the
+  bootstrap script's guards.
+
+```bash
+npx jest test/access/gac0-access-characterization.test.js test/access/gac0-session-launcher.route.test.js --forceExit
+```
+**Result:** 2 suites passed; **26 tests passed**. GAC-0 test A3 is flipped: a token signed with a
+published secret is now **rejected**, and the test comment explains SEC-0.
+
+```bash
+npx jest test/access test/auth test/hr-access test/requests/stand-in-login.route.test.js test/accountant/legacy-auth-bootstrap.route.test.js test/accountant/legacy-route-auth-facade.route.test.js test/accountant/accounting-auth-inventory.test.js test/ppc/ppc-app-entry.test.js --forceExit
+```
+**Result:** 28 suites passed, 4 failed (32); 530 tests passed, 13 failed (543).
+
+**All 13 failures were already failing before SEC-0.** The two new ones were checked by running
+them on a clean detached `HEAD` worktree (since removed), where they fail identically:
+
+| Suite | Failures | Cause |
+|---|---|---|
+| `department-role-cache` | 3 | the removed QC cache call |
+| `ppc-app-entry` | 3 | expects `/ppc/order-book`; the committed code seeds `/ppc` |
+| `cowork-sso-apps` | 4 | fail identically on clean `HEAD` |
+| `stand-in-login` | 3 | fail identically on clean `HEAD` |
+
+A cross-module sample (IE, Merchandising, Store MRF tenancy, Costing hardening, Board roles,
+Production cutting, Accounting isolation, PM access boundary) ran 266 tests: 249 passed and 17
+failed. The 17 failing tests are **exactly** the set that fails on clean `HEAD`, with no
+difference either way.
+
+```bash
+node --test services/face-biometric/faceSignin.test.js
+```
+**Result:** 11 passed.
+
+```bash
+git diff --check
+```
+**Result:** exit 0, no output. New untracked files (`test/security/*`,
+`scripts/cowork/bootstrap-ceo.js`, the GAC-0 audit, manifest and tests) have no trailing
+whitespace, and the manifest parses as JSON.
+
+## Remaining occurrences (searched after implementation)
+
+| Pattern | Remaining | Classification |
+|---|---|---|
+| `grav_clothing_secret_key` (and `_2024`) in application code (`config`, `Middlewear`, `middleware`, `routes`, `services`, `models`, `lib`, `utils`, `server.js`) | **none** (the SEC-0 test enforces this) | — |
+| same literals in `test/**` (about 200 files: `process.env.JWT_SECRET \|\| "…"` signers), the two SEC-0/GAC-0 tests that prove rejection, and `scripts/` | yes | **test fixture**; inert, because `test/setup.js` sets `JWT_SECRET` |
+| same literals in `docs/**` | yes | **migration documentation** |
+| `LEGACY_SECRETS` | test comments and assertions only (`gac0-access-characterization`, `sec0-jwt-secrets`, `pm-access-boundary` comment, a `faceSignin.test.js` mock) | **test fixture** |
+| `/setup/seed-ceo` | the removal comment in `cowork.js`, the script header, the SEC-0 test | **migration documentation / test fixture**; no route |
+| unprotected `/api/google` mounts | **none**: `server.js:2246` mounts a router that gates itself; the dormant copy is unmounted and gated | — |
+| HTTP responses with Google refresh or access tokens | **one, unresolved**: `GET /cowork/employee/dump/:employeeId` (`routes/task_routes/taskTree.routes.js:310`) has **no auth** and returns the raw `cowork_employees` document, including the stored `gmailToken.refresh_token` (and `tempPassword`) | **unresolved exposure, outside the three SEC-0 items; fix next** |
+
+## Remaining known exposure (not fixed in SEC-0)
+
+1. **Google refresh-token leak via the CoWork debug route.** `/cowork/employee/dump/:employeeId`
+   and `/cowork/task/dump/:taskId` (`taskTree.routes.js:292-317`) are unauthenticated. Recommend
+   deleting both debug routes immediately (SEC-0b). **Closed in SEC-1.**
+2. **Token-claim operational bypasses.** `requireDepartmentRole`, `requireApproval`, `salesAccess`
+   and the IE/QC/production guards still trust a *validly signed* `isAdmin` claim.
+   - After SEC-0 a forger needs the real secret, so the remaining risk is a stale claim during the
+     7-day token life.
+   - These are operational bypasses scheduled for GAC-4; GAC-0 tests A1 and E3 still pin them.
+3. **No audience separation.** Customer, vendor and CMS tokens share one secret and have no
+   audience claim, so a customer token still passes employee middlewares (GAC-0 S7).
+4. The other GAC-0 findings S4–S10 (manifest S-02…S-22) are unchanged.
+5. The Google limitations listed in §3.
+
+## Rollback considerations
+
+- **Code:** revert the listed files. There are no migrations, index changes or data writes, so
+  rollback is code-only.
+- **Rolling back S1** re-opens forged admin sessions; do it only together with rotating
+  `JWT_SECRET`.
+- **Deploying S1** requires `JWT_SECRET` to be set to a non-published value in every environment,
+  or the server will not start. Check the Render configuration before deploying.
+- **Rolling back S3** re-exposes company Gmail, Drive, Calendar, Tasks, Chat and the refresh token.
+  If the frontend Google pages are needed, the forward fix is to send the CMS Bearer token from
+  `lib/googleWorkspaceApi.js` (administrators only), not to reopen the router.
+- **CoWork CEO recovery:** use the script. The removed route must not be restored.
+
+## Files
+
+- **Changed:**
+  - `config/jwt.js`, `services/cmsSession.js`, `services/qcViewer.js`
+  - `Middlewear/`: `EmployeeAuthMiddlewear.js`, `SalesAuthMiddlewear.js`,
+    `AllEmployeeAppMiddleware.js`, `AccountantOrgAuthMiddleware.js`, `departmentWriteGuard.js`,
+    `hrContract.js`, `CustomerAuthMiddleware.js`, `VendorAuthMiddleware.js`
+  - `routes/auth/deptAuth.js`, `routes/Access/files.js`, `routes/Access/budgetProposals.js`
+  - `routes/CMS_Routes/`: `Manufacturing/QC/qcTeamRoutes.js`,
+    `Configurations/requestsSettingsRoutes.js`, `Manufacturing/productionSettingsRoutes.js`,
+    `Inventory/Products/rawItems.js`
+  - `routes/CEO_Routes/*` (11 files)
+  - `routes/Accountant_Routes/Acc_auth.js`, `routes/Accountant_Routes/Acc_backup.js`
+  - `routes/Customer_Routes/*` (7 files), `routes/Vendor_Routes/vendorAuthRoutes.js`
+  - `routes/Employee_Routes/login.js`, `routes/login.js`, `models/Customer_Models/Customer.js`
+  - `server.js` (one line)
+  - `routes/googleWorkspaceRoutes.js`, `routes/task_routes/googleWorkspaceRoutes.js`,
+    `routes/task_routes/cowork.js`
+  - `test/setup.js`, `test/access/gac0-access-characterization.test.js`
+  - `docs/audits/single-organisation-access-gac0-2026-09-25.md`,
+    `docs/audits/single-organisation-access-gac0-manifest.json` (H-18 text only)
+  - `docs/handoff/latest-implementation.md`
+- **New:**
+  - `scripts/cowork/bootstrap-ceo.js`
+  - `test/security/sec0-jwt-secrets.test.js`
+  - `test/security/sec0-google-containment.route.test.js`
+  - `test/security/sec0-cowork-seed-ceo.route.test.js`
+
+---
+
+# Latest implementation — GAC-0: single-organisation access inventory and safety net
+
+Date: 2026-09-25. Repositories `grav-cms-backend` (HEAD `8a5a2ffa`) and `../grav-cms`
+(HEAD `5bb251a0`), both with unrelated uncommitted work that was preserved. **Not committed.**
+
+**No production code changed, and no shared data changed.** The only database access was one
+read-only inventory of the configured development database.
+
+GAC-1 has **not** been started. This chunk now waits for review.
+
+## Files added or changed
+
+| File | Change |
+|---|---|
+| `docs/audits/single-organisation-access-gac0-2026-09-25.md` | new: the readable audit, with evidence labels [V]/[T]/[S]/[B]/[D]/[U] |
+| `docs/audits/single-organisation-access-gac0-manifest.json` | new: the machine-readable manifest (valid JSON) |
+| `test/access/gac0-access-characterization.test.js` | new: 18 characterization tests |
+| `test/access/gac0-session-launcher.route.test.js` | new: 8 characterization tests over HTTP |
+| `docs/handoff/latest-implementation.md` | this section prepended; everything below it is unchanged |
+
+The `../grav-cms` repository was read only; nothing in it changed.
+
+## Inventory totals (manifest)
+
+| Collection | Count |
+|---|---|
+| Applications | 29 |
+| Authorities | 30 |
+| Hazards | 20 |
+| Security findings | 22 |
+| Unresolved questions | 18 |
+| Characterization tests | 26 |
+| `companyContextEntries` | **656** |
+
+`companyContextEntries` by classification:
+
+| Class | Entries |
+|---|---|
+| 1 access/tenant plumbing | 305 |
+| 2 redundant GRAV partition key | 222 |
+| 3 legal/statutory | 64 |
+| 4 counterparty | 27 |
+| 5 demo/test | 24 |
+| 6 unresolved | 14 |
+
+- **By repository:** backend 547, frontend 109.
+- **By layer:** model 205, route 151, service 124, script 20, migration 19, export 16,
+  middleware 10, test 3, frontend component 84, frontend lib 24.
+- **By verification:** source-inventory 605, verified-read 32, characterization-test 6,
+  unresolved 13.
+- **Cross-check:** the model inventory lists 204 model×field rows (17/158/21/6/0/2). The manifest
+  model layer has 205 (18/158/21/6/0/2); the extra class-1 entry is the shared
+  `models/CMS_Models/Sales/companyOwnership.js` fragment. No entries were invented to match totals.
+
+## Database read: fresh, read-only, 25 Sep 2026 06:45 UTC
+
+The script ran against the configured development database `test` (409 collections). It printed and
+recorded only counts and company ids and names.
+
+| Area | Observation |
+|---|---|
+| Companies | **3** `acc_companies`: GRAV CLOTHING PVT LTD (`isPrimary`) plus IE Demo Garments and IE Demo Textiles. **1** accounting organisation owns all 3. |
+| `SpCompanyMembership` | **12** (10 active, 2 inactive). GRAV 3 active; Garments 6 active + 1 inactive; Textiles 1 active + 1 inactive. |
+| `DepartmentRole` | **65** (64 active), 19 slugs. Active roles by the holder's number of memberships: none 36, one 26, more than one 2. |
+| `companyGrants[]` | 3 active (GRAV approver + owner, Garments approver) and **2 tombstones**, **both on rows whose legacy role is still active**. |
+| Identity | **The `employees` collection is absent.** 35 of 64 active roles match no identity in the collections that exist; this overstates true orphans. (Corrected in SEC-0: an earlier revision wrote 36, which is a different count, the active roles with no active membership.) |
+| Duplicate emails | 0 inside `dept_users` and inside `acc_users`. |
+| Accounting | 0 accounting users in more than one organisation. |
+| Demo-company dependencies | ids referenced in **16 collections**, including sales `enquiries` and `salesjourneys` as well as IE collections. |
+
+The 22 Sep C0 counts are cited only as baseline [B], not as current fact.
+
+## Tests (exact commands and results)
+
+```bash
+npx jest test/access/gac0-access-characterization.test.js test/access/gac0-session-launcher.route.test.js
+```
+**Result:** Test Suites 2 passed, 2 total; Tests **26 passed**, 26 total.
+
+```bash
+npx jest test/access test/ppc/ppc-app-entry.test.js
+```
+**Result:** Test Suites 6 passed, 2 failed, 8 total; Tests 78 passed, 6 failed, 84 total. That run
+includes the 26 GAC-0 tests. The neighbouring suites alone come to 52 passed and 6 failed out of 58.
+
+**The two known neighbouring baseline failures** were already failing before GAC-0. Neither the test
+files nor the code they exercise has any uncommitted change, and GAC-0 did not touch them:
+
+1. `test/access/department-role-cache.test.js`: 3 QC tests ("assigning / revoking a QC role
+   invalidates…", "a broken QC cache cannot fail a grant…").
+   - They expect `setRole` to call `qcViewer.invalidateViewer`.
+   - The committed `services/departmentRoles.js` no longer does; its comment records the removed
+     `dropRoleCaches` call.
+2. `test/ppc/ppc-app-entry.test.js`: 3 tests expecting the PPC tile's `dashboardPath` to be
+   `/ppc/order-book`. The committed `services/ensureAccessDepartments.js:127` seeds `/ppc`.
+
+No environment restriction prevented any run; all tests used the in-memory MongoDB.
+
+**Validation**
+
+```bash
+node -e "JSON.parse(require('fs').readFileSync('docs/audits/single-organisation-access-gac0-manifest.json','utf8'))"
+```
+**Result:** parses.
+
+```bash
+git diff --check
+```
+**Result:** exit 0, no output.
+
+`git diff --check` does not cover untracked files, so the four new files were also scanned for
+trailing whitespace; none was found. The manifest's classification totals add up to its 656 entries.
+
+## Security findings to handle before GAC-1 (recorded, not fixed)
+
+These are live security defects, outside the access redesign.
+
+- **S1 [T+V]:** `config/jwt.js:45-48` `LEGACY_SECRETS` (hard-coded in the repo) are accepted in every
+  environment. `services/cmsSession.js` then trusts the forged token's `isAdmin`, which reaches
+  department-team role grants and change-request approval.
+- **S2 [V]:** `POST /cowork/setup/seed-ceo` (`routes/task_routes/cowork.js:18`) is unauthenticated.
+  It sets a Firebase `ceo` claim and overwrites `E000`.
+- **S3 [V]:** `/api/google` (`server.js:2246`, 41 routes) is unauthenticated. It returns the Google
+  refresh token and reads any mailbox.
+
+**Recommendation:** a separate emergency security chunk before GAC-1. The other 19 findings
+(S-02…S-22 in the manifest) are listed in the audit's §11.
+
+## Unresolved questions
+
+1. Why the configured development database has no `employees` collection, and which database holds
+   authoritative employee identities (blocks identity-keyed migration and live parity).
+2. Should the PPC grant for IE Demo Garments count, and should the 2 tombstones beside active legacy
+   roles become explicit revocations?
+3. Is the identity key email (as today) or a person reference? What is the rule for ambiguity?
+4. Accounting: is the multi-organisation model needed? What is the future of the request-`companyId`
+   contract?
+5. `BoardPolicy`: class 2 or class 3?
+6. Marketing company source: `MARKETING_COMPANY_ID` versus membership.
+7. The `companyOwnership` subdoc, `SpCompanyMembership.siteIds` (the only site hook) and the
+   content-plan `owner.membershipId`.
+8. Company fields other than `companyId`, `companyIds`, `tallyCompanyIds` and
+   `companyGrants.companyId` that might reference the demo companies.
+
+The full list (Q-01…Q-18) is in the manifest.
+
+## Proposed exact file list for GAC-1 (not started)
+
+**New**
+- `services/access/appAccess.service.js`: `resolveAppAccess(actor, appSlug)`. Read-only; adapts
+  `DepartmentRole` and `Acc_User`; PPC tombstone means deny; no `isAdmin`; stable denial and outage
+  codes.
+- `services/access/appAccessCodes.js`: denial and outage codes, plus role-to-capability mapping.
+- `services/access/appCatalogue.js`: app slug catalogue and each app's role storage.
+- `test/access/app-access-resolver.test.js`
+- `test/access/app-access-parity.test.js`: resolver versus the current guards, with expected
+  disagreements recorded.
+
+**Read, not modified**
+
+`models/Access/DepartmentRole.js`, `models/Access/DeptUser.js`, `models/Employee.js`,
+`models/Accountant_model/Acc_OrgModels.js`, `services/departmentRoles.js`,
+`services/accountantAccess.js`, `services/companyContext/companyAccess.service.js`,
+`routes/auth/deptAuth.js`.
+
+**Documentation**
+
+`docs/handoff/latest-implementation.md`, plus optionally a short addition to
+`docs/decisions/single-organisation-access-control.md` naming the reviewed codes.
+
+---
+
+# Latest implementation — Custom Reports becomes a workspace, not a page
+
+Date: 2026-09-25. Frontend repo `grav-cms` only. **Not committed.** No backend
+route, catalogue rule, MBQL compilation, matrix response or reporting-mart file
+was touched; this is the screen on top of the contract Lane B shipped earlier
+today.
+
+## What changed in kind
+
+The report designer now takes the window. Under the Accounting chrome there is
+a toolbar, the five shelves in one strip, and a spreadsheet that runs to the
+bottom of the screen and keeps going past the last figure. It was a report
+inside a short rounded card with margins around it; that reads as a picture of a
+report rather than the report.
+
+**New:** `lib/reporting/sheetModel.js` (the sheet as arithmetic),
+`lib/reporting/dragState.js` (where a field may land and what to say about it),
+`components/accountant/reporting/SheetStatusBar.js`, `FirstUseGuide.js`.
+**Rewritten:** `ReportSheet.js` (virtualised, frozen, zoomable, droppable),
+`ShelfBar.js`, `DataPointPanel.js`, `ReportToolbar.js`, `ReportDesigner.js`.
+**Touched:** `app/accountant/custom-reports/page.js` (a frame, not a column),
+`lib/reporting/reportLayout.js` (insertion index, `whatIsMissing`),
+`app/accountant-ui.css` (one keyframe).
+
+## The sheet only looks endless
+
+The blank part is not made of cells: it is a width, a height, two CSS gradients
+and one thin element per real column. Rows exist only while they are near the
+viewport, and scrolling towards the edge unlocks another screenful of surface.
+Measured on the live screen with a 100-row × 32-column pivot: **27 row elements,
+864 cells, 2,405 DOM nodes for the whole page**, and those numbers do not move
+when you scroll from the top to the bottom of a 4,800px surface.
+
+## Three defects the browser found that the tests could not
+
+1. **"27 of 26 rows."** The status bar counted every row the server sent, and
+   the server's `rows` include its subtotal and total lines while
+   `totalRowCount` counts only data rows. Both halves of the sentence now count
+   the same thing. A live pivot capped at a hundred rows also answers
+   `previewRowCount: 333` beside a hundred rows, so the count is taken from the
+   rows themselves rather than from the field.
+2. **A red banner for doing the second step of three.** Rows and Columns
+   arranged with Values still empty is a state every user passes through, and
+   the server refuses it (`A summary report needs at least one field in Values`,
+   422). The sheet now says "Add a number to Values to see figures" and asks for
+   nothing.
+3. **The grand total appeared twice.** The matrix carries `grandTotal` beside
+   the rows and also emits a `total` row when column totals are on; for a
+   one-level report those hold identical figures, and drawing both put two
+   identical bottom lines on the sheet. The grand total is now appended only
+   when nothing else is already totalling the bottom — and never dropped.
+
+## What a drag says now
+
+One piece of state describes whatever is in the air, and every surface reads it:
+the shelves light up or dim with a sentence, the sheet divides into five
+labelled regions over the part of itself each one affects, an insertion line
+appears in the gap the pointer is aiming at with the chips moving apart to leave
+it, and a live region says the same thing out loud. Escape puts everything back.
+A refused drop bounces the chip home, says why in the user's words, and leaves
+the layout untouched.
+
+Verified in the browser against the live backend: dragstart carries the
+catalogue's opaque id, an invalid shelf refuses the cursor (`dropEffect: none`)
+and reads "This cannot be calculated", a valid one reads "Drop to add as a row",
+the insertion index honours the pointer (a field dropped at the left edge of the
+first chip lands first), reorder within a shelf, move between shelves, Escape,
+and the bounce.
+
+## Verified at four sizes, against GRAV CLOTHING's own figures
+
+| | |
+|---|---|
+| 1440×900 | rail + five shelves across + sheet; workspace 776px of 900 |
+| 1024×768 | shelves in one row (77px, was 246 when they wrapped), sheet 403px |
+| 768×1024 | panel becomes a resizable drawer, shelves scroll sideways |
+| 390×844 | tap-to-add is the route in, sheet scrolls inside itself |
+
+`document.documentElement.scrollWidth === window.innerWidth` at every one of
+them: nothing pushes the page sideways.
+
+## Still true, and still said out loud
+
+The workbook holds the same figures and totals as the sheet **as a flat list,
+not the arranged grid** — Lane B's capability gate found the engine's pivoted
+export broken on the pinned version. That sentence is under the Download Excel
+button at every width, phones included, and is attached to the button for a
+screen reader. No spreadsheet writer was added to either repo.
+
+## Tests
+
+`npm test` → **11,606 tests, 11,599 pass, 7 fail**. The seven are in
+`components/ppc/`, `components/store/` and `components/merchandiser/`, none of
+which imports anything under `reporting`; they were failing before this work.
+
+The reporting suites: **176 tests** — 84 pure layout, 29 new for the sheet model
+and the drag model (`lib/reporting/sheet.test.mjs`), 58 source-level for the
+route and its boundary, 5 in the client contract. Two of the existing checks
+were tightened rather than re-pointed: the vocabulary ban now reads copy held in
+constants as well as copy between tags (it was blind to `{EXCEL_NOTE}`), and the
+diagnostics check uses word boundaries after "browser" matched as "rows".
+
+---
+
+# Latest implementation — Lane B: the reporting backend answers the blank PivotTable contract
+
+Date: 2026-09-25. Backend repo `grav-cms-backend`. **Not committed.** No
+frontend code was touched; the only file changed in `grav-cms` is the shared
+contract document, corrected where it described the backend wrongly.
+
+## The capability gate came first, and it did not fully pass
+
+Before rewriting anything, the pinned engine (Metabase v1.63.1) was asked
+whether it can do the job. Recorded in full in
+`docs/decisions/metabase-pivot-export-capability.md`.
+
+- **PASS** — nested row breakouts, a column breakout with `temporal-unit`,
+  several aggregations, filters and deterministic ordering all work through
+  `/api/dataset` in legacy MBQL. The preview matrix is genuinely buildable.
+- **FAIL** — the **pivoted XLSX export does not work at all**: `pivot_results=true`
+  answers HTTP 500 (`java.lang.NullPointerException`) in all three documented
+  forms. MBQL `offset` is also unsupported on this version
+  (`Assert failed: (= (count clause) 4)`), so period comparisons are computed
+  as separate shifted queries instead.
+- **Consequence, stated and not papered over:** the downloaded workbook holds
+  the same figures as the preview, to the paisa, but as the FLAT aggregation —
+  one row per row/column combination — **not** the pivoted matrix on screen.
+  The response says so itself in `X-Reporting-Layout: flat-aggregation` and
+  `X-Reporting-Layout-Note`. **No spreadsheet generator was added**, per the
+  instruction to stop and report rather than fill the gap quietly. Adding
+  ExcelJS is the decision now available to take, and it is a decision, not a
+  gap.
+
+## What changed
+
+| File | |
+|---|---|
+| `services/reporting/fieldCatalogue.js` | rewritten flat: 14 fields, one voucher-line grain, opaque semantic ids |
+| `services/reporting/reportLayout.validate.js` | new — replaces `reportSpec.validate.js` (deleted) |
+| `services/reporting/mbqlCompiler.js` | new — layout → the plan of MBQL queries |
+| `services/reporting/matrix.js` | new — query results → the exact matrix the browser renders |
+| `services/reporting/metabaseEngine.js` | rewritten around the plan; `runPreview`, `runExport` |
+| `routes/Accountant_Routes/Acc_reporting.js` | rewritten — multi-company scope, 8 routes |
+| `models/Accountant_model/Acc_CustomReport.js` | `companyIds[]`, `schemaVersion: 2`, `layoutSummary` |
+| `migrations/reporting/R__curated_views.sql` | `v_general_ledger` now resolves the ledger through `dim_ledger` |
+| `test/accountant/reporting-layout.test.js` | 76 pure tests |
+| `test/accountant/reporting.route.test.js` | 49 route tests, fake engine |
+| `test/accountant/reporting-integration.route.test.js` | 15 tests against the LIVE mart + Metabase |
+| `test/accountant/reporting-mutation.test.js` | 12 tests that break the guards on purpose |
+
+## The catalogue
+
+One flat `{ fields: [] }`. Ids are opaque and semantic and are never mart
+columns: `company.name`, `date.voucher`, `date.month`, `date.financial_year`,
+`voucher.number`, `voucher.type`, `voucher.narration`, `ledger.name`,
+`ledger.group`, `party.name`, `amount.debit`, `amount.credit`, `amount.signed`,
+`tax.classification`.
+
+Comparison modes advertised: `previous_period`, `previous_year`,
+`other_company` — and deliberately **not** `other_field`, which the compiler
+cannot build. A mode that fails on refresh reads as our bug, not as a missing
+feature.
+
+Fields at other grains (voucher totals, opening balances) are **withheld**
+rather than offered and then refused, and the `WITHHELD` array in the catalogue
+says which and why. The compatibility mechanism is implemented in full and
+checked symmetrically, so a second grain can be added without redesign.
+
+## A real defect the live suite caught
+
+`v_general_ledger` read `group_name` from the fact line. The source usually does
+not write a group on the LINE — 4,581 of GRAV CLOTHING's posted lines had none —
+while the ledger master has one for every ledger. Grouping by Ledger Group
+therefore put **more than half the money in an unnamed bucket**, silently, and
+only in this view: `v_trial_balance` had always resolved it through
+`dim_ledger`. Two curated views disagreeing about which group a ledger is in is
+worse than either answer, so the general ledger view now resolves the ledger
+name and group through `dim_ledger` the same way, with the voucher's own
+spelling kept as `ledger_name_on_voucher`.
+
+After the fix: 5,604 of 5,604 lines carry a group, 26 distinct groups; row count
+(5,604) and totals (₹14,54,02,590.99 Dr = Cr) unchanged, so the grain and the
+reconciliation are untouched. `LEFT JOIN` on the `dim_ledger` primary key, so a
+hard-deleted ledger keeps its money in the view and no line can be duplicated.
+
+## Verification, live, against GRAV CLOTHING
+
+Walked all fourteen steps against the real dev MongoDB, the real Postgres mart
+and the real Metabase pilot:
+
+1–5. Blank catalogue (14 fields, no subjects), Ledger Group → Rows,
+   Month → Columns, Debit + Credit → Values, 1 Aug – 31 Oct 2025 filter.
+6. Matrix: 20 rows × 8 leaf columns in 708 ms; every row, subtotal and the
+   grand total aligned to `leafColumns`.
+7. `Aug 2025 | Sep 2025 | Oct 2025 | Total` — chronological, not alphabetical.
+8. **19 groups compared against the mart, 0 mismatched.** Grand total
+   ₹2,10,24,380.25 Dr and Cr, preview = mart exactly.
+9. `Debit — % change vs previous period`, computed server-side; the 18 groups
+   with no comparable base return `null`, never `Infinity`.
+10. Saved and reopened at `schemaVersion: 2`; list row is
+    `{id, name, companyIds, companyNames, updatedAt, layoutSummary}` —
+    "Ledger Group by Month"; the reopened layout re-runs to the same 20 rows.
+11. XLSX: 49 data rows, `Group Name | Period Month: Day | Sum of Debit | Sum of
+    Credit`, totals ₹2,10,24,380.25 Dr and Cr — **equal to the preview to the
+    paisa, flat rather than pivoted**, and the headers say so.
+12. Detail mode from Date / Voucher No. / Party / Debit / Credit: 5 of 215
+    records, `truncated: true`.
+13. A company outside the organisation is refused alone AND when mixed with a
+    permitted one — proven in the integration suite, because the dev database
+    now has exactly one organisation owning all three companies, so real data
+    cannot express a forbidden company.
+14. Crafted payloads refused 422 `REPORTING_INVALID_SPEC`: an unknown field, a
+    raw column name (`group_name`), an `sql` property, and money in Rows —
+    each with a sentence a person can act on and no column name in it.
+
+## Tests
+
+`npx jest test/accountant/reporting` → **4 suites, 152 tests, all passing**
+(76 pure + 49 route + 15 live integration + 12 mutation).
+
+The mutation suite is the one worth keeping honest. It copies a module, breaks
+one guarantee in the copy, and FAILS if the assertion that should catch it still
+passes. The mutants it kills include: dropping both tenant filters; dropping
+only the company filter (the organisation filter alone is not enough); scoping
+only the first query so the totals row is another company's money; making
+everything compatible; checking compatibility in one direction only; accepting
+any shelf for any field; allowing money to be grouped by; and taking the field
+descriptor from the request instead of the catalogue.
+
+## The boundary
+
+No response carries an engine URL, API key, database/table/field/question id,
+MBQL, SQL, Postgres credentials or a raw mart column name — asserted
+structurally (a walk for forbidden keys at any depth) rather than by scanning
+text for digits, because the first draft of that test failed on a rupee figure
+that happened to contain an engine id.
+
+## Still open
+
+- Old saved reports come back `schemaVersion: 1`, `needsRecreation: true`, with
+  no `layout`, and are never reinterpreted.
+- The flat workbook is a product decision to take, not a bug to fix.
+- `other_field` comparisons and a second grain need catalogue entries, not a
+  redesign.
+
+---
+
+# Latest implementation — Custom Reports rebuilt as a blank PivotTable designer (frontend only)
+
+Date: 2026-09-25. Frontend repo `grav-cms` only. **Not committed.** Lane B's
+backend, reporting mart, Metabase adapter, migrations and deployment files were
+not touched.
+
+**What changed in kind:** the template/subject model is gone. `/accountant/custom-reports`
+now opens a BLANK report designer — Available data on the left, five shelves
+(Rows · Columns · Values · Filters · Compare) across the top, an Excel-like
+sheet in the middle. No report type, no Voucher Register / General Ledger /
+Trial Balance templates, no subject cards, no Advanced Builder, no existing
+report to choose. Saved Reports is a secondary link only.
+
+**New:** `lib/reporting/{reportLayout,history,compatibility}.js`;
+`components/accountant/reporting/{ShelfBar,FieldSettings,FilterEditor,ComparePanel}.js`.
+**Rewritten:** `fixtures.js` (flat catalogue + matrix builder), `fieldCatalog.js`,
+`reportingClient.js` (contract), `DataPointPanel.js`, `ReportSheet.js`,
+`ReportToolbar.js`, `ReportDesigner.js`.
+**Deleted:** `reportSpec.js`, `ColumnSettings.js`, `ReportColumnHeader.js`,
+`ReportFilters.js`.
+
+**LANE B MUST CHANGE THREE THINGS** — full contract in
+`grav-cms/docs/accounting-reporting-api-contract.md`:
+
+1. `GET /catalog` returns ONE FLAT `fields` array, not `subjects`. Each field
+   gains `placements`, `calculations`, `comparisons` ({modes, displays} or null)
+   and `compatibleWith` (checked symmetrically — list a pairing on both sides).
+2. `POST /preview` takes a LAYOUT (`rows`/`columns`/`values`/`filters`/
+   `comparisons`/`showRowTotals`/`showColumnTotals`/`showGrandTotal`) and returns
+   a MATRIX (`columnLevels`, `leafColumns`, `rowLevels`, `rows` with
+   `kind: data|subtotal|total`, `grandTotal`). Every row's `cells` must align to
+   `leafColumns`. Comparisons are expanded server-side into leaf columns —
+   the browser computes none of them. Columns come back in the field's own
+   order, not alphabetically.
+   Detail mode is not a flag: empty `values` AND empty `columns` means one row
+   per record, with `rows` as its columns.
+3. `POST /export/xlsx` and the `/custom-reports` CRUD take the same layout.
+
+**Verified:** `npm test` 11547 pass / 6 fail — all six in `components/ppc/` and
+`components/store/`, none in the Custom Reports path.
+`lib/reporting/reporting.test.mjs` 84 pass, `customReports.test.mjs` 39 pass.
+Visual checks at 1440 / 1024 / 768 / 390 against fixtures (harness deleted
+afterwards): blank canvas, click-to-add via destination menus, two-level row
+nesting with subtotals and grand total, month columns across the top with a
+Total column, Indian currency, detail mode, incompatible field greyed out with
+its plain explanation, preview-unavailable state, drawer below 1024.
+
+**Two bugs found by looking:**
+1. With fields placed and the preview service down, the sheet fell back to the
+   blank "Add data from the left" canvas — telling a user with a full report to
+   add data they had already added, and hiding their work. The blank state is
+   now about the LAYOUT being empty, not the matrix being absent.
+2. The data panel vanished entirely below 1024px with no way to reach it. The
+   drawer is back.
+
+**Blocked until Lane B's endpoints change:** live preview, save, reopen, delete
+and XLSX download. The current backend returns the old `subjects` catalogue, so
+against it the builder shows its shelves with the preview marked unavailable —
+which is the specified behaviour, not a regression.
+
+**Not verified:** the signed-in click-through. It needs an Accounting session in
+the browser and I did not enter credentials.
+
+---
+
+# Latest implementation — Custom Reports connected to Lane B's live endpoints (frontend only)
+
+Date: 2026-09-25. Frontend repo `grav-cms` only. **Not committed.** No backend
+route, reporting mart, Metabase adapter or database record was touched. No UI
+redesign.
+
+**The bug:** `REPORTING_BASE` was `"/api/accountant/reporting"` — a RELATIVE
+url, therefore the Next frontend's own origin. Every request went to
+`localhost:3001/...`, hit no route, and returned 404; the screen then said "the
+reporting service is being connected" about a service that was up and
+answering on `localhost:5050`. A test asserted that bare path, so it pinned the
+bug rather than catching it. That test is gone.
+
+**Changed:**
+- `lib/api.js` — exports `API_BASE_URL` (the backend origin, trailing slash
+  stripped) so nothing recomputes it and drifts.
+- `lib/reporting/reportingClient.js` — `REPORTING_BASE = ${API_BASE_URL}${REPORTING_PATH}`;
+  failures now carry `diagnostics` (url, status, server code — never the token,
+  cookies or body); 404 maps to a new `REPORTING_NOT_FOUND` instead of being
+  called "not built yet".
+- `app/accountant/custom-reports/page.js` — companies now come from
+  `useCompany()` (`CompanyProvider`), not from the auth object, which is not the
+  Accounting company authority and was simply empty. Gates in order: session →
+  `Loading your companies…` → no-company notice → designer, keyed on
+  `activeCompanyId`.
+- `components/accountant/reporting/ReportDesigner.js` — starts from
+  `emptySpec({ companyId: activeCompanyId })`, refuses to request a catalogue
+  without a company, hands a company change to the page (keyed remount = clean
+  reset, nothing carried across), and renders dev-only Technical details.
+- **New:** `lib/reporting/companies.js` (`normaliseCompanies`, reading `_id` /
+  `companyName`), moved out of the page module so Next's reserved page exports
+  stay reserved.
+
+**Verified without a session:**
+
+    old  http://localhost:3001/api/accountant/reporting/catalog  ->  404
+    new  http://localhost:5050/api/accountant/reporting/catalog  ->  401
+         {"ok":false,"code":"REPORTING_UNAUTHORISED"}
+
+401 with a contract code means the route exists and only the session is
+missing. Runtime check of the built URL:
+`http://localhost:5050/api/accountant/reporting/catalog?companyId=<id>`, with
+`Authorization: Bearer …`, `credentials: "include"`, `cache: "no-store"`.
+
+**Tests:** `lib/reporting/reporting.test.mjs` 62 pass, `customReports.test.mjs`
+35 pass. Full `npm test`: 11481 pass, 20 fail — all in `components/merchandiser/`,
+`components/ppc/` and `components/store/`, none in the Custom Reports path, and
+they reproduce in isolation against files this work did not touch. (Earlier runs
+this session reported 6 failures; the merchandiser ones were evidently not
+surfacing then. I have not explained that discrepancy and am not claiming they
+are new or old — only that none are in files changed here.)
+
+**Not verified:** the signed-in click-through. Steps 1-12 of the live
+verification all need an Accounting session in the browser, and I did not enter
+credentials. Live preview rows, Save Report and Download Excel therefore remain
+unconfirmed end to end.
+
+---
+
+# Latest implementation — Custom Reports replaced with a native GRAV report designer (frontend only)
+
+Date: 2026-09-25. Frontend repo `grav-cms` only. **Not committed.** Lane B's
+backend, PostgreSQL mart, migrations, sync services and `deploy/**` were not
+touched.
+
+**Removed from the browser entirely:** the Metabase SDK UI. Deleted
+`components/accountant/reporting/{CustomReportsWorkspace,SimpleReportBuilder,DataSourceBadge}.js`,
+`lib/metabasePilot.js`, `lib/reportTemplates.js` and the
+`app/api/accountant/metabase-pilot-config/` endpoint that handed the browser an
+API key. `@metabase/embedding-sdk-react` is now **unused** by this repository —
+left installed, as instructed, but nothing imports it.
+
+**New:** `components/accountant/reporting/{ReportDesigner,ReportToolbar,DataPointPanel,ReportSheet,ReportColumnHeader,ColumnSettings,ReportFilters,SavedReports}.js`
+and `lib/reporting/{reportSpec,format,fieldCatalog,reportingClient,fixtures}.js`.
+**Rewritten:** `app/accountant/custom-reports/page.js`.
+
+**THE CONTRACT LANE B IMPLEMENTS:** `grav-cms/docs/accounting-reporting-api-contract.md`,
+and the same contract in the header of `lib/reporting/reportingClient.js` so the
+two cannot drift. In short, under `/api/accountant/reporting`, behind the
+existing organisation-aware Accounting auth and company scoping:
+
+    GET  /catalog?companyId=<id>     safe field ids, labels, types, permissions
+    POST /preview                    report spec in, labelled columns + rows out
+    POST /export/xlsx                the same spec in, an XLSX file out
+    GET/POST/PUT/DELETE /custom-reports[/:id]
+
+The browser sends only identifiers the catalogue issued — no SQL, no MBQL, no
+engine URL, key, question, collection or table id, no database column names.
+Validate every field id, operation and summary against the catalogue before
+running AND before storing. The service generates the workbook; the frontend has
+no spreadsheet writer.
+
+**Until those exist:** the route shows "The reporting service is being
+connected". It does not fall back to Metabase and does not show sample data.
+Fixtures live in `lib/reporting/fixtures.js`, are imported by tests only, carry
+`isSample: true`, and anything rendering them shows "Sample data — not your
+accounts."
+
+**Verified:** `npm test` in `grav-cms` — 11479 pass, 6 fail, the same six
+pre-existing `components/ppc/` and `components/store/` failures as before this
+work. New suites: `lib/reporting/reporting.test.mjs` (46) and
+`components/accountant/reporting/customReports.test.mjs` (30), all passing.
+Visual checks at 1440 / 1024 / 768 / 390 through a temporary fixture harness
+(deleted afterwards): catalogue, click-to-add, column settings, rename, reorder,
+sort, Total, filter chip, Indian currency, 100-row preview, saved-reports
+unavailable state, and the drawer below 1024.
+
+**Two bugs found by looking, both fixed:**
+1. At 390px the whole PAGE scrolled sideways (document 691px in a 390px
+   viewport) because the sheet's grid item had the default `min-width: auto`.
+   `min-w-0` keeps the overflow inside the sheet.
+2. Choosing a company and then immediately a report type silently discarded the
+   report type: the company change awaits a catalogue fetch and rebuilt the spec
+   from the closure captured before the await. It now reads the current spec
+   through a ref, with a sequence guard against two rapid company changes.
+
+**Blocked until Lane B's endpoints exist:** live preview, saving, reopening,
+deleting and XLSX download. None of these were claimed to work. The signed-in
+click-through on `/accountant/custom-reports` also remains unperformed — it
+needs an Accounting session and I did not enter credentials.
+
+**Left behind in the local pilot Metabase:** three cards in collection 8 named
+`GL fixture — …`, `TB fixture — …`, `VR fixture — …` (ids 136-138), created for
+the previous iteration and now unused. Safe to delete.
+
+---
+
+# Latest implementation — Custom Reports, redesigned for accountants (frontend only)
+
+Date: 2026-09-25. Frontend repo `grav-cms` only. **Not committed.** Lane B's
+backend, reporting migrations, `deploy/metabase-pilot/**` and seed files were
+not touched.
+
+**Changed:** `app/accountant/custom-reports/page.js` (plain-English loading and
+failure copy, working retry, refusal codes moved behind a `Technical details`
+disclosure), `components/accountant/reporting/CustomReportsWorkspace.js`
+(rewritten as three states: home, builder, saved reports),
+`app/api/accountant/metabase-pilot-config/route.js` (+`dataSource` in the
+payload), `lib/metabasePilot.js` (+`normaliseDataSource`,
+`describeRefusalForUser`), and the three `*.test.mjs` suites.
+**New:** `components/accountant/reporting/DataSourceBadge.js`.
+
+**THE SWITCH LANE B NEEDS:** the interface says "Connected to Accounting data"
+only when the server sends `dataSource.mode === "real"`, which comes from one
+environment variable read by the config route:
+
+    METABASE_PILOT_DATA_SOURCE=real             # exactly this string
+    METABASE_PILOT_DATA_UPDATED_AT=<ISO date>   # optional, from the last sync
+
+Anything else — unset, `true`, `REAL`, `production` — is synthetic, and the page
+keeps its "Sample data — not your accounts" warning. `..._UPDATED_AT` is echoed
+only if it parses as a date; the UI shows no freshness rather than a guess, and
+never derives one from the clock. Reachability is not evidence: nothing in the
+UI infers real data from Metabase being up.
+
+**Behaviour change:** the narrow permanent `CollectionBrowser` sidebar is gone.
+Saved reports are now a full-width view of their own, and opening one takes over
+the page. The builder is `InteractiveQuestion` with `questionId="new"` — the
+visual editor; `"new-native"` (SQL) is still never used, and `isSaveEnabled`,
+`withDownloads` and `targetCollection` are unchanged, so saving and XLSX remain
+Metabase's.
+
+**Verified:** `npm test` in `grav-cms` — 11501 pass, 6 fail, the same six
+pre-existing `components/ppc/` and `components/store/` failures as before this
+work. The three pilot suites: 42 + 23 + 34, all passing. Visually checked at
+1440, 1024 and 390 through a temporary harness that mounted the real components
+(deleted afterwards).
+
+**Found by testing, worth knowing:** the first version of "Try again" re-keyed
+`MetabaseProvider` to force a remount. Watching the network showed it issued no
+request at all — the SDK memoises its bundle fetch at module scope, so a remount
+replays the cached rejection. It now reloads the page, which was measured to
+re-request the bundle.
+
+**Not verified:** the builder against the live pilot Metabase. The route is
+behind Accounting authentication and I did not sign in. The four props that
+drive it are unchanged from the previously verified version, but the click
+path itself has not been re-walked since the redesign.
+
+---
+
 # Latest implementation — Confirmed Sales line ↔ WorkOrder bridge (Production/WorkOrder lane)
 
 Date: 2026-09-22. Requested directly by the user (option A: one WorkOrder = one
@@ -3917,3 +6748,1261 @@ The decision and the Lane B contract are in `docs/decisions/marketing-indiamart-
   - The scheduler heartbeat now upserts its row, so a cycle that errors on a fresh deployment is no longer lost.
   - `indiamartSync.service.js` had literal control bytes in its `clean` regex, which made grep and git treat the file as binary. They are now escape sequences, with the same behaviour.
 - **Tests.** `indiamart-status-contract.test.js`, 11/11. Focused IndiaMART, enquiries and access: 127/127.
+
+---
+
+## Accounting dashboard — the company list is now the organisation's (24 Sep 2026)
+
+Fixes `/accountant` failing every request with **"This company is not available
+to your organization."**
+
+### The cause, confirmed
+
+`GET /api/accountant/tally/companies` answered `Acc_Company.find({ isActive:
+true })` — every active company in the deployment, to any authenticated
+organisation user.
+
+Nothing else was wrong. `resolveCompanyScope` correctly refuses a company
+outside `Acc_Organization.tallyCompanyIds` with 403 `COMPANY_FORBIDDEN`, and
+did. The two simply disagreed: the picker offered companies the guard would
+then refuse, `CompanyProvider` selected one and wrote it to localStorage, and
+every subsequent request 403'd. Reloading did not help, because the same list
+offered the same company back.
+
+### Files changed
+
+**Backend**
+
+- `routes/Accountant_Routes/Acc_companies.js` — `GET /` now filters on
+  `_id: { $in: req.organization.tallyCompanyIds }` alongside `isActive: true`.
+  One source of truth: the list is drawn from the same record the guard checks,
+  so the picker cannot offer what the guard will refuse. An organisation with
+  nothing assigned gets `[]` and a 200.
+- `services/accountingReportGuard.js` — untouched. The company ownership model,
+  the Metabase work, company creation and `sync-legacy` are all untouched.
+
+The one exemption is a developer-bypass session (`ACCOUNTANT_AUTH_BYPASS=true`),
+which sees everything as it already does in `resolveCompanyScope` and
+`requireCompanyAccess`. It is checked as `req.user.isDev` and **not** as "has no
+organisation" — a real session that arrives without an organisation is a broken
+session and is refused with `NO_ORGANIZATION_CONTEXT`, because the other
+spelling would reintroduce the same hole through the exemption.
+
+**Frontend**
+
+- `components/accountant/companySelection.js` (new) — the selection rule, pure.
+  A stored id is a HINT, honoured only while it is still on the accessible list:
+  present → keep; absent or malformed → primary, else first; **list empty → no
+  selection, and the stored key is erased**. `selectCompany` applies that to an
+  injected storage, so the storage branches are tested rather than buried in a
+  `useEffect`.
+- `components/accountant/CompanyProvider.js` — delegates to it and sets the
+  active id **unconditionally, including to `""`**. Every accountant page guards
+  on `if (!activeCompanyId) return;` before fetching, so clearing is what stops
+  a request going out under a previous organisation's id. A failed load leaves
+  the previous answer alone rather than guessing in either direction.
+
+### Tests
+
+| Suite | Tests |
+|---|---|
+| `test/accountant/company-list-scoping.route.test.js` (new) | 12 |
+| `test/accountant/company-list-dev-bypass.route.test.js` (new) | 4 |
+| `test/accountant/company-list-no-organisation.route.test.js` (new) | 5 |
+| `components/accountant/companySelection.test.mjs` (new) | 24 |
+| `components/accountant/companyProviderWiring.test.mjs` (new) | 6 |
+
+The route suites run the REAL router and REAL middleware with signed
+organisation tokens. Beyond "A cannot see B's companies", they assert the thing
+that actually broke: **every company the list returns is accepted by the scope
+guard, and the one it withholds is exactly the one that 403s.** A test that only
+checked the list for foreign names would pass on a list scoped by some second
+rule that happened to differ from `tallyCompanyIds` — the same bug one layer
+down.
+
+Also covered: inactive companies excluded even while the org still holds the id;
+an org with no assignment, and one with no `tallyCompanyIds` field at all, both
+get an empty 200; the org's own companies keep their order, `isPrimary` and
+`stats`; a session is still required.
+
+Each suite was verified by reintroducing the bug — unscoping the query fails 7
+of 12; making the empty list keep its stored id fails 7 of 24; putting the
+selection logic back in the provider fails 3 of 6.
+
+### Results
+
+- New backend suites: **21/21**. With the six adjacent company suites (isolation,
+  mutating GETs, default-credit-days, and the concurrent ownership pair):
+  **139/139**.
+- Frontend `components/accountant` + `app/accountant`: **404/404**.
+- `test/accountant/company-identity.route.test.js` fails **17/18** — pre-existing
+  and not from this change: it is 401 at the router's auth gate, and it fails
+  identically with this change stashed.
+- **No lint ran.** `npm run lint` is `eslint .`, there is no `eslint.config.*`
+  in the repo and no local eslint binary. Instead the provider's whole import
+  graph was bundled with esbuild and loaded, which resolves `@/lib/api` and
+  parses the JSX: exports resolve and `CompanyProvider`, `useCompany` and
+  `selectCompany` are all functions.
+
+### Known adjacent hole, deliberately NOT fixed here
+
+`GET /api/accountant/tally/companies/:id` is still unscoped — it answers
+`findById` with no ownership check, so a company id from another organisation
+returns its record including GSTIN, PAN, CIN, address and contacts. It is
+outside this task's scope (the brief was the list endpoint) and needs its own
+change; `PUT /:id` and `DELETE /:id` are worth checking at the same time.
+
+### The deployment needs an ownership repair
+
+A read-only inspection of the dev database (`test`) found **one** organisation,
+`GRAV` (`6a073de21fecacc9bb714481`), with **`tallyCompanyIds: []`**. All three
+companies — `GRAV CLOTHING PVT LTD` (`6a08040a1fecacc9bb7149c2`), `IE Demo
+Garments`, `IE Demo Textiles` — are unassigned.
+
+So this fix changes the symptom, not the outcome: `/accountant` will stop
+showing the 403 and will show an **empty** company picker instead, which is the
+honest state. It will not select a company, because there is none to select.
+`POST /api/accountant/auth/sync-legacy` already auto-attaches every company when
+an organisation holds none (see its ownership-slice note), so the repair likely
+amounts to triggering that path — but assigning ownership is a separate task and
+nothing was written here.
+
+---
+
+## Accounting — local development ownership repair (24 Sep 2026)
+
+The previous entry scoped the company list to `Acc_Organization.tallyCompanyIds`
+and found the reason the dashboard was empty: the only organisation, `GRAV`,
+owned **nothing**. All three companies were unassigned. This assigns them.
+
+### The script
+
+`scripts/migrations/accounting-organization-company-repair.js` (new).
+
+The write goes through `attachCompaniesToOrganization` in
+`services/accountantCompanyOwnership.service.js` — the existing operation, which
+is all-or-nothing in one `$addToSet … $each`, refuses a company another
+organisation holds, and is idempotent for companies already owned. The script
+does not touch `tallyCompanyIds` itself; a second ownership path is the one that
+does not get the next fix.
+
+```
+node -r dotenv/config scripts/migrations/accounting-organization-company-repair.js \
+  --organization=<orgId>                       # dry run, the default
+
+node -r dotenv/config scripts/migrations/accounting-organization-company-repair.js \
+  --organization=<orgId> --expect-db=<name> --apply
+```
+
+`--companies=<a,b,c>` narrows the target set; the default is every ACTIVE
+company no organisation currently owns.
+
+It refuses, before writing anything, when: `NODE_ENV=production`; the database
+name looks production-ish; `--organization` is missing or malformed; the
+organisation does not exist; **more than one organisation exists**; any target
+company belongs to another organisation; or an ownership conflict already exists
+anywhere in the database. After applying it re-reads the document and checks
+every requested id is stored exactly once with no new conflict.
+
+**`--apply` also requires `--expect-db`.** Development and production are both
+on hosted Atlas clusters here, so the connection target does not tell them
+apart — naming the database you believe you are writing to is the only check
+that does, and it costs one flag. Each refusal was exercised before the real
+run.
+
+### Dry run, then apply
+
+Dry run on `test`: organisation `GRAV` (`6a073de21fecacc9bb714481`) owned none;
+the ownership index `acc_org_company_ownership_unique` was present; three
+unassigned active companies were listed as `→ WILL ASSIGN`. Nothing written.
+
+Applied, assigning all three:
+
+| Company | Id |
+|---|---|
+| GRAV CLOTHING PVT LTD | `6a08040a1fecacc9bb7149c2` |
+| IE Demo Garments | `6ab1459d11fca003ca6f6062` |
+| IE Demo Textiles | `6ab1459f11fca003ca6f60ab` |
+
+Re-running the identical command, and re-running with an explicit
+already-owned `--companies` list, both report "Nothing to do" and write nothing.
+
+### Verification
+
+- **Stored ownership** — `tallyCompanyIds` holds exactly 3 ids, no duplicates,
+  `GRAV CLOTHING PVT LTD` present exactly once.
+- **`GET /api/accountant/tally/companies`** — 200, count 3, with
+  `GRAV CLOTHING PVT LTD` flagged `isPrimary` and carrying 43 groups.
+- **The company-scope guard** — all three companies answer 200 with no
+  `COMPANY_FORBIDDEN`; GRAV CLOTHING resolves 391 ledgers. A company id the
+  organisation does not own still answers 403 `COMPANY_FORBIDDEN`, so the guard
+  was not loosened.
+- **Against the RUNNING backend on `:5050`** (the one the dev frontend calls,
+  which is where `NEXT_PUBLIC_API_URL` points): five real dashboard reads —
+  chart of accounts, groups, customer outstanding, vendor outstanding, company
+  detail — all 200, **zero `COMPANY_FORBIDDEN`**. Unauthenticated still 401.
+- **Selection** — `selectCompany` fed that exact live response picks
+  `GRAV CLOTHING PVT LTD` (reason `primary`) both for a browser with nothing
+  stored and for one still holding a stale foreign id, and persists it.
+
+Tests: backend ownership + company-list suites **59/59**; frontend selection
+suites **30/30**.
+
+**Not verified in a browser.** The built-in browser pane has its own profile and
+no accountant session, and signing in is not something to do on the user's
+behalf. Everything above the rendering layer is verified against live data and
+the live server.
+
+### The zero-company state was left alone
+
+Requirement was to improve it *only if necessary*. It was not:
+
+- Topbar button: **"No company"**; its menu: **"No companies yet. Create one"**.
+- Pages render `NoCompanySelected` — **"No company selected — Pick a company
+  from the topbar to see this page, or create a company first"**, with a
+  "Manage companies" link.
+
+No generic application error, and no ownership-bypass control. One wording
+nuance worth knowing: "No companies yet" says none *exist* when the real cause
+can be that none are *assigned to your organisation*. That is a copy change, not
+a correctness one, and it was out of scope here.
+
+### Files changed
+
+- `scripts/migrations/accounting-organization-company-repair.js` (new)
+- `docs/handoff/latest-implementation.md`
+
+No application code, no Metabase, no reporting data, no company-creation flow.
+The only data written was `acc_organizations.tallyCompanyIds` for `GRAV`.
+
+---
+
+## Merchandising Overview — T&A planner, third visual pass (frontend only)
+
+Twelve named mismatches against
+`grav-cms/docs/design-references/tna-calendar-reference.png`, corrected
+together. No backend, data, routing or permission change: the planner still
+makes the same two portfolio reads, over the same window, with the same views
+and the same deep links.
+
+### What moved, and what the measurement says
+
+The acceptance criterion this round was visual similarity, so each shape was
+measured against the reference rather than judged by eye.
+
+| Shape | Reference | Was | Now |
+|---|---|---|---|
+| Date tile | 201 × 125 px (h/w **0.622**) | 141 × 128 (0.91) | 141 × 88 (**0.624**) |
+| Tile radius / gutter | rectangular, tight | 16 px / 6 px | 9 px / 5 px |
+| Count bar | ~86% of tile width | ~86% | 86%, and 76% tone (was 62%) |
+| Empty tile | warm near-white | `--surface-sunken` grey | `#8a7f6a 5%` on white |
+| Active tile tint | clearly tinted | 14% tone | 30% tone |
+| Sidebar ground | light warm inset | `#8a7f6a 9%` on sunken | `#8a7f6a 7%` on white |
+| Sidebar card | white, raised | **228,228,230** — darker than its inset | **255,255,255** |
+| Month heading | medium, modest | 22 px semibold | 17 px medium |
+| Weekday bar | low warm strip | 12 px radius, `py-2.5` | 7 px radius, `py-[7px]` |
+
+The sidebar card is the defect worth naming: `.grav-ui .bg-white` in
+`app/grav-ui.css:1151` remaps the `bg-white` utility to a raised **grey**
+surface, so every card in that column measured 228 on an inset of 248 — darker
+than the ground it was meant to float on. That is what made the panel read as a
+compressed grey list. The card now states its own white through an inline
+`--planner-canvas` background, where no utility rule reaches it. This is the
+second time that rule has silently inverted a surface here; the calendar card
+hit it in the previous pass.
+
+### The other corrections
+
+- **Tile content**: date upper-right and nothing else beside it — the SEPT/OCT
+  boundary labels are gone, the month row already says it. One 2 px rail, the
+  milestone name centred at 11 px and no longer bold, and no second metadata
+  line at rest. Order and buyer live in the hover preview and the Upcoming
+  panel, which is where they were already stated.
+- **Selection**: a soft shadow lift, not a black rectangle. Today keeps its
+  filled disc, which is now the one hard mark on the grid.
+- **Toolbar**: one segmented control (All / At risk / Blocked) beside the
+  title; My orders and Waiting on others moved into an icon-button popover;
+  one primary "Open schedule" action on the right. The wide "More filters"
+  dropdown and the summary capsule are gone from the silhouette.
+- **Upcoming panel**: centred heading, group labels outside the cards, sentence
+  case, larger cards with more separation, and a card that carries a line-icon
+  status mark, the milestone, an icon'd date row, an icon'd order row and a
+  full-width "Open order T&A" button with a contrasting ground and a hover that
+  moves — rather than three facts compressed into one sentence.
+
+### Verification
+
+- `components/merchandiser/*.test.mjs` — **812 pass, 0 fail**. The pins in
+  `calendarSurface.test.mjs` and `merchandisingOverview.test.mjs` were rewritten
+  to the measured shapes; they had been encoding the old look.
+- Full frontend suite — **11,485 tests, 11,479 pass, 6 fail**. All six are other
+  lanes' in-progress work (`moduleRoles.js` has no `ppc` entry; Store's Masters
+  nav, valuation and tour targets). None touch Merchandising.
+- `tsc --noEmit` — no new errors.
+- Rendered and measured at 1440 in the isolated in-memory showroom
+  (loopback MongoMemoryReplSet, no `.env`, disposable): no horizontal overflow,
+  card background 255,255,255, five weeks in the grid.
+- Side-by-side at `grav-cms/docs/design-references/tna-calendar-comparison-v2.png`
+  — reference above, implementation below, both cropped to their outer white
+  card and both scaled to exactly 1600 px wide.
+
+### Files changed (all in `grav-cms`)
+
+- `components/merchandiser/OverviewTnaCalendar.js`
+- `components/merchandiser/UpcomingMilestones.js`
+- `components/merchandiser/calendarSurface.test.mjs`
+- `components/merchandiser/merchandisingOverview.test.mjs`
+- `docs/design-references/tna-calendar-comparison-v2.png` (new)
+
+---
+
+## Accounting reporting mart — real data in the Metabase pilot (24 Sep 2026)
+
+`/accountant/custom-reports` now queries **real Accounting data** from MongoDB
+through a PostgreSQL reporting mart. The synthetic dataset the pilot began with
+has been dropped from the active database.
+
+Slices 1–3 of `docs/decisions/accounting-metabase-self-service-reporting.md` §8.
+Full refresh only: no scheduler, no change streams, no deletion tombstones.
+
+### The mart
+
+Schema `reporting`, PostgreSQL 16, in the pilot's `postgres-reporting`
+container. Every dimension and fact row carries `organization_id`, `company_id`,
+`source_id`, `source_updated_at` and `synced_at`.
+
+| Object | Grain |
+|---|---|
+| `dim_company` | one company |
+| `dim_group` | one chart-of-accounts group |
+| `dim_ledger` | one ledger |
+| `fact_voucher` | one voucher header |
+| `fact_voucher_line` | **one `ledgerEntries[]` element** |
+| `mart_sync_run` | one company per sync attempt |
+| `v_general_ledger` | posted, live lines only |
+| `v_trial_balance` | posted movement per ledger per month |
+
+`fact_voucher_line` is the table that earns the project: every report an
+accountant wants is a group-by over it, and the flattening is what a visual
+query builder cannot do against an embedded array.
+
+**Money is `numeric(18,2)`, never float.** Summing this company's posted lines
+in double precision gives a company-wide imbalance of −1.31e-10 — which is
+zero, but is not *equal* to zero, and "do the books balance" is a question the
+mart has to answer with a straight yes. In the mart `SUM(signed_amount) = 0`
+is **exactly true**.
+
+**Two foreign keys, and only two:** facts and dims → `dim_company`, and
+`fact_voucher_line` → `fact_voucher`. Not declared: `dim_ledger.group_id`,
+`fact_voucher_line.ledger_id`, `dim_group.parent_group_id` — ledgers and groups
+are HARD DELETED elsewhere in the product (`Acc_import.js`, `Acc_merge.js`,
+`Acc_chartOfAccounts.js`), so a historical line can legitimately point at a
+ledger that no longer exists. A key there would fail the sync on data that is
+already in the books. `v_trial_balance` LEFT JOINs `dim_ledger` for the same
+reason: an inner join would silently drop that money out of a trial balance.
+
+### A correctness finding: voucher dates are stored two different ways
+
+`voucherDate` is UTC midnight in some documents and **IST midnight in others** —
+`2025-08-03T18:30:00Z` IS 4 August in Kolkata. **530 of this company's 1,868
+vouchers** are of the second kind. Read in UTC they fall on the previous day and
+some fall in the previous MONTH, so a UTC reading would have put real vouchers
+in the wrong period and no total would have tied out.
+
+Every mart date is therefore resolved in the business timezone
+(`ACCOUNTING_UTC_OFFSET_MINUTES`, default +330), and the reconciliation passes
+the same timezone to `$dateTrunc`. Had the two sides disagreed about what a
+month is, the gate would have failed on correct data.
+
+### The reconciliation gate
+
+Run **inside the transaction, before the commit** — reconciling afterwards
+would mean the wrong data had already been visible to Metabase.
+
+1. **row counts** — companies, groups, ledgers, vouchers, flattened lines
+2. **tenant stamping** — every row carries the expected organisation and company
+3. **lines per voucher** — each voucher has exactly as many mart lines as its
+   `ledgerEntries[]` had elements
+4. **period totals** — posted debit and credit agree per company and month
+5. **balance** — `SUM(signed_amount)` is zero to the paisa per company/period
+6. **trial balance per ledger** — equals the existing calculation in
+   `routes/Accountant_Routes/Acc_books.js:103-131`, field for field
+
+Tolerance is **one paisa halved (0.005)**, which is tight enough to catch any
+real difference (the smallest is 0.01) and loose enough to ignore the float
+artefact that made the numeric column necessary. An unbalanced source is
+reported with the company, the period and the exact difference — never rounded
+away to let a sync pass.
+
+Failure rolls the company back, marks the run `failed`, and **leaves the
+previous successful dataset current**. The run row is written OUTSIDE the data
+transaction so a rollback cannot erase the evidence that it was attempted.
+
+**A known divergence, surfaced rather than resolved:** `Acc_books.js`'s trial
+balance does NOT exclude `isOptional` vouchers; the Lane B party reports DO. The
+mart matches `Acc_books.js`, because that is the calculation the gate must match
+— and `reconcileCompany` raises `posted_optional_vouchers` the moment a posted
+optional voucher exists, since at that point the mart cannot match both reports
+and a person has to decide which is right. There are currently **zero**.
+
+### Security
+
+Three connections, three privilege levels, never substituted for one another:
+`REPORTING_ADMIN_URL` (owner, migrations only), `REPORTING_SYNC_URL`
+(`reporting_sync`, DML on schema `reporting` only, no DDL), `REPORTING_READONLY_URL`
+(`metabase_reader`, SELECT on named objects only). No credential is in a
+committed file.
+
+`npm run reporting:verify-roles` proves the boundary by **attempting** each
+forbidden action — a grant matrix read by eye is how a misconfiguration survives
+review. **24/24 checks pass.** The probe list lives in
+`services/reporting/readOnlyProbes.js` and is shared with the CI test so the two
+cannot drift.
+
+**It found two real problems, both fixed:**
+
+- `metabase_reader` could **connect to the `postgres` maintenance database** —
+  PostgreSQL ships it with no ACL, so PUBLIC may connect. Closed by
+  `REVOKE CONNECT ON DATABASE postgres FROM PUBLIC`.
+- And one of my own checks was wrong: a `GRANT` issued by a role without grant
+  option raises a **WARNING, not an error** — the statement completes and grants
+  nothing. The check now asserts the privilege did not move, which is the
+  question worth asking.
+
+**One operational caveat, verified rather than assumed:** a database created
+later is NOT automatically closed to the reader. `CREATE DATABASE` does not copy
+the template's ACL — a new database comes up with `datacl = NULL`, meaning
+PUBLIC may connect. This surfaced as a race between the two test suites. Re-run
+`reporting:roles` after adding a database, or revoke where it is created (the
+integration suite does).
+
+### Files changed
+
+**Backend, new**
+
+- `migrations/reporting/V001__reporting_mart.sql` — schema, constraints, indexes
+- `migrations/reporting/V002__drop_synthetic_pilot_schema.sql` — retires the synthetic dataset
+- `migrations/reporting/R__curated_views.sql` — `v_general_ledger`, `v_trial_balance`
+- `migrations/reporting/roles/R__roles.sql` — `reporting_sync`, `metabase_reader`
+- `services/reporting/pgClient.js`, `martMigrate.service.js`, `martSync.service.js`,
+  `martReconcile.service.js`, `readOnlyProbes.js`
+- `scripts/reporting/migrate.js`, `roles.js`, `sync.js`, `verify-roles.js`
+- `test/reporting/mart-sync-unit.test.js`, `mart-sync-integration.test.js`,
+  `readonly-role.test.js`
+
+**Backend, edited** — `package.json` (`pg@8.23.0`; four `reporting:*` scripts).
+
+**Pilot, edited** — `compose.yaml` (the reporting DB is now an empty server;
+healthcheck is `pg_isready`), `bootstrap.sh` (repoints the connection at schema
+`reporting` as `metabase_reader`, then rescans), `verify.sh`, `Makefile`,
+`README.md`. `seed/{10-schema,15-data,90-validate}.sql` and the old role script
+moved to `seed/synthetic/`, which the Postgres entrypoint does not recurse into
+— that is what stops them re-seeding on `make reset`.
+
+**Frontend** — no code change. `app/accountant/custom-reports/page.js` had one
+stale comment corrected. The data-source badge was already server-driven, so
+declaring the data real is two lines in `grav-cms/.env.local`
+(`METABASE_PILOT_DATA_SOURCE=real`, `METABASE_PILOT_DATA_UPDATED_AT=…`).
+
+### Results
+
+**Source and mart row counts per company — identical, which is check 1:**
+
+| Company | Groups | Ledgers | Vouchers | Lines |
+|---|---:|---:|---:|---:|
+| GRAV CLOTHING PVT LTD | 43 | 469 | 1,868 | 5,889 |
+| IE Demo Garments | 0 | 0 | 0 | 0 |
+| IE Demo Textiles | 0 | 0 | 0 | 0 |
+
+Voucher lifecycle retained in the fact and excluded from the views: 1,776
+posted (5,604 lines), 59 cancelled (157), 30 void (122), 3 pending_approval (6).
+**285 lines are correctly kept out of `v_general_ledger`.**
+
+- **Reconciliation: all 6 checks passed for all 3 companies, zero warnings, no
+  imbalance found.** `SUM(signed_amount)` is exactly `0.00`; debits = credits =
+  **145,402,590.99**.
+- **Data as of:** 2026-09-24T18:21:35.101Z (23:51:35 IST).
+- **Synthetic rows: absent.** Zero tables remain in schema `accounting`; the
+  schema is dropped, the legacy `metabase_readonly` role is dropped, and
+  Metabase's metadata lists exactly the 8 real mart objects and no synthetic
+  table.
+- **Metabase reader is read-only:** 24/24, plus 25 CI assertions.
+- **`/accountant/custom-reports` can build and export a real question.** A
+  query-builder (MBQL) aggregation over `v_trial_balance` returned real ledgers
+  — INDIAN BANK (CA-3512) 35,467,731.01 Dr, Raw Materials 12,839,102.76 Dr — and
+  `POST /api/dataset/xlsx` produced a 4,678-byte OOXML workbook whose money
+  cells are numbers. Native SQL as the Accounting identity is refused with
+  `missing-required-permissions`. `./verify.sh` passes all seven sections,
+  including save / reopen / list / edit / XLSX in the pilot collection.
+
+**Tests: 65/65** (`npx jest test/reporting`) — unit 25, integration 15,
+read-only role 25. Verified by reintroducing bugs: loosening the balance
+tolerance fails 3; removing the views' status filter fails 1; making the
+flattening drop a line fails 21. Stable across three consecutive parallel runs.
+
+### Not done, deliberately
+
+- **Not verified in a browser.** The built-in browser has no accountant session
+  and signing in is not something to do on the user's behalf. Everything below
+  the rendering layer is verified against the live mart and the live Metabase.
+  The data-source badge flips on the next dev-server start; that was not done.
+- Incremental sync, schedulers, change streams, deletion tombstones.
+- The remaining facts: invoices, expenses, bank transactions, budgets, bill
+  allocations, cost centres, `dim_party`, `dim_date`.
+- Metabase sandboxing / row-level security — needs the Pro licence (D1). Every
+  row carries `organization_id` ready for it, but today one organisation owns
+  every company, so there is nothing to separate yet.
+- JWT SSO. The pilot still authenticates with a browser-readable API key and
+  refuses to initialise when `NODE_ENV=production`.
+- **`METABASE_PILOT_DATA_UPDATED_AT` is a static env var** and will go stale.
+  The freshness endpoint in §6 of the decision doc is a later slice.
+
+---
+
+## Merchandising Overview — restructured onto Marketing Overview's skeleton
+
+The T&A work was following the external calendar reference for the whole PAGE,
+which gave Merchandising Overview a shape no other GRAV screen has. The
+reference now decides only the inside of a date cell. The page skeleton is
+`app/marketing/page.js`.
+
+Frontend only. No backend, data, routing or permission change: the same two
+portfolio reads, the same views, the same window arithmetic, the same deep
+links, the same attention read.
+
+### The silhouette, measured at 1440
+
+| | Marketing Overview | Merchandising Overview |
+|---|---|---|
+| Heading + Refresh | `MarketingPage` | `MarketingPage` |
+| KPI strip | 6 figures, one panel | 6 figures, one panel |
+| Primary row | `deck:grid-cols-12` | identical class string |
+| Large visual, left | chart panel — x 32, **w 913** | T&A calendar — x 32, **w 913** |
+| Card stack, right | x 957, **w 451** | x 957, **w 451** |
+| Below | full-width table, then panel | full-width Follow-ups, then the rest |
+
+The two class strings are not merely similar — `merchandisingOverview.test.mjs`
+now asserts each of the three (`grid-cols-12`, `col-span-8`, the right-column
+stack) against **`app/marketing/page.js` itself**, so if Marketing's own row
+ever moves, Merchandising fails rather than quietly becoming the odd one out.
+
+### What changed
+
+- **The calendar is an ordinary panel.** It was a full-width white canvas with
+  its own inline background, its own shadow and its own sidebar. It is now
+  `Panel` on the kit's own frost surface, with `MarketingChartPanel`'s header
+  shape — 20 px bold title, one-line explanation, controls on the right — read
+  off that component in the test rather than described.
+- **Compact, for the graph slot.** A date cell went 141×88 → **120×64**, radius
+  9 → 8, gutter 5 → 3 px. Five weeks now occupy about the height of Marketing's
+  plot, which is what lets it stand in that slot at all.
+- **Month and navigation moved into the panel header**, on their own
+  hairline-separated row above the grid.
+- **`+N more`, and only when there is more.** `countLabel` returned
+  "1 milestone" for a single-milestone date — the same fact as the milestone
+  printed above it, costing every such date a row of height. It now returns
+  nothing below two, and `+2 more` above.
+- **Colour comes from the application.** `--planner-canvas` is removed from
+  `app/grav-ui.css` (the file is back to unmodified), tints are state tokens
+  mixed into `--frost-panel` at 18% (cell) and 55% (band) rather than 30/76 on
+  an invented white, and the hover card is `--frost-bar` + `rounded-panel`.
+  The calendar source now contains **no hex at all**; a test asserts it.
+- **Right column: two compact cards.** A new `TnaAttentionCard` — Overdue,
+  Orders at risk, Blocked, Due today — in Marketing's `AttentionPanel` shape,
+  plus the existing `HandoverAction`. The card **counts nothing of its own**:
+  every figure is the attention read the section below already made, and every
+  row links to that section filtered to the bucket it named, built by the same
+  code path as `chooseTnaBucket`. A figure GRAV could not read says so; it is
+  never rendered as 0.
+- **`UpcomingMilestones.js` is deleted**, not left unreferenced — its column
+  inside the card was what forced the card to be full width. The dead rules it
+  fed (`upcomingGroups`, `upcomingCount`, `UPCOMING_GROUPS`, and `monthStarts`
+  from the removed in-cell month labels) went with it.
+- **Follow-ups moved below the primary row**, full width.
+- **The register link is no longer conditional.** It rendered only when
+  something was wrong — no undated milestones, nothing outside the window,
+  nothing truncated — so on healthy data the panel had no route to the full
+  schedule at all.
+
+### Verification
+
+- Merchandising suites — **878 pass, 0 fail**. `calendarSurface.test.mjs` was
+  rewritten against the Marketing structure; `merchandisingOverview.test.mjs`
+  updated for the 8/4 row.
+- Full frontend suite — **11,507 tests, 11,501 pass, 6 fail**. All six are
+  other lanes' in-progress work (`moduleRoles.js` has no `ppc` entry; Store's
+  Masters nav, valuation and tour targets). None touch Merchandising.
+- `tsc --noEmit` — no new errors.
+- Rendered in the isolated in-memory showroom (loopback MongoMemoryReplSet, no
+  `.env`, disposable). At 1440: no horizontal overflow, 4 attention rows, the
+  register link present. At 390: calendar first (week strip at y 697), then the
+  T&A card (994), then handovers (1266), no horizontal overflow.
+- Hover opens the date's overlay and the grid height does not change; arrow
+  keys still move the roving focus between cells. Focus-to-open could not be
+  exercised — `document.hasFocus()` is false in the headless page, so no native
+  focus event fires at all; that handler is unchanged.
+- Side by side at
+  `grav-cms/docs/design-references/overview-marketing-vs-merchandising.png`
+  — Marketing Overview left, Merchandising Overview right, same viewport, same
+  scale.
+
+### Files changed (all in `grav-cms`)
+
+- `app/merchandiser/dashboard/page.js`
+- `app/grav-ui.css` (reverted to unmodified)
+- `components/merchandiser/OverviewTnaCalendar.js`
+- `components/merchandiser/overviewCalendar.js`
+- `components/merchandiser/UpcomingMilestones.js` (deleted)
+- `components/merchandiser/calendarSurface.test.mjs`
+- `components/merchandiser/merchandisingOverview.test.mjs`
+- `docs/design-references/overview-marketing-vs-merchandising.png` (new)
+
+---
+
+## Merchandising Overview — the calendar's colour is now Marketing's
+
+The structure was right; the colour was still the calendar's own. It used the
+muted `--state-*` BADGE tokens — #5f8a72, #a35f5f, #b08a63 — as cell washes.
+At badge size those are correct. Filling thirty-five cells with them produced
+dusty green, beige and pink: a palette belonging to no other screen, which at a
+glance read as grey.
+
+There is no calendar palette now. Frontend only; no backend, data, routing or
+permission change.
+
+### The grammar, taken whole from `MarketingChartPanel`
+
+| State | Token | Light value | Where |
+|---|---|---|---|
+| Scheduled — **the default** | `--c1` | `#00b26b` | wash, rail, `+N more` |
+| Due soon | `--c2` | `#c3d02e` | wash, rail, band |
+| Blocked | `--c3` | `#c22a9e` | wash, rail, band |
+| Overdue / forecast late | `--state-overdue` | `#a35f5f` | wash, rail, band |
+| Completed | — | — | neutral cell, `--c1` check, muted text |
+| Empty | `--control` | — | no tint, no rail |
+
+`scheduled` is deliberately the DEFAULT mark, and ordinary scheduled work is
+most of any month — which is what makes the grid read as Marketing's green
+rather than as a wash of everything. On the showroom's data: **17 of 27
+occupied cells are green**, 5 red, 2 magenta, 1 lime, 2 completed.
+
+The wash is one twelfth of the accent over `--frost-panel`; the rail, the dot
+and the `+N more` band are the accent **itself**, undiluted. Mixing those
+toward the panel is exactly what produced the pastel look.
+
+### Text on an accent is measured, not chosen
+
+`--slab` is dark in both themes and `--slab-ink` light in both, which is the
+only reason either can sit on a fill whose own lightness barely moves between
+them:
+
+| Fill | Ink | Ratio |
+|---|---|---|
+| `--c1` | `--slab` | 5.5:1 |
+| `--c2` | `--slab` | 8.7:1 |
+| `--c3` | `--slab-ink` | 5.1:1 |
+| `--state-overdue` | `--slab-ink` | 4.8:1 |
+
+One rule for all four would fail on half of them.
+
+### Controls
+
+Every control in the calendar is now the kit's own `Button` (`ghost`,
+`secondary`, `primary`) or `MarketingSegmentedControl` — month navigation,
+Today, retry, the mobile strip arrows and the filter chooser. Nothing is
+hand-rolled, so they carry the kit's hover, focus ring and disabled opacity. A
+test asserts that each `data-cal-*` control is preceded by `<Button tone=`.
+
+**On the black `All` pill:** that is `MarketingSegmentedControl`'s own active
+styling, not a local override. Measured on both pages at 1440, the active
+option computes identically — `rgb(10,10,10)` on `rgb(212,212,214)` — for
+Merchandising's **All** and Marketing's **30 days**. Changing it would make
+Merchandising diverge from Marketing, so it is left alone.
+
+### Verified by computed style, not by eye
+
+Read off the rendered page at 1440:
+
+| | Merchandising | Marketing |
+|---|---|---|
+| Panel surface | `rgb(238,238,240)`, r18, border `rgb(227,230,234)` | identical |
+| Active segmented option | `rgb(10,10,10)` / `rgb(212,212,214)` | identical |
+| Scheduled rail + band | `rgb(0,178,107)` = `--c1` | attention dot `rgb(0,178,107)` |
+| Late rail + band | `rgb(163,95,95)` = `--state-overdue` | attention dot `rgb(163,95,95)` |
+| Blocked | `rgb(194,42,158)` = `--c3` | — |
+| Due soon | `rgb(195,208,46)` = `--c2` | — |
+| Empty / completed cell | `rgba(10,10,10,0.06)` = `--control` | — |
+
+**Dark mode**, same page with `data-theme="dark"`: panel `rgb(32,32,37)`;
+scheduled band `rgb(16,196,124)` (dark `--c1`) on `rgb(18,18,21)` (dark
+`--slab`); blocked `rgb(217,74,180)` (dark `--c3`) on `rgb(247,247,248)` (dark
+`--slab-ink`); empty `rgba(255,255,255,0.08)` (dark `--control`). Every value
+moved with the theme because every value is a token.
+
+The calendar source contains **no hex at all** — asserted, along with the
+absence of `--state-rework`, `--state-positive` and `--surface-sunken`.
+
+### Right-hand card
+
+Each row wears the accent its meaning earns: red for Overdue and Orders at
+risk, `--c3` for Blocked, `--c2` for Due today. It was four shades of the same
+muted red, which made the whole column read as one alarm.
+
+### A showroom-data bug found on the way
+
+The scratch seeder that thickens the showroom's T&A wrote `forecastDate` as a
+`Date`. `dateOnly()` stores **"YYYY-MM-DD" strings**, so every seeded row was
+silently excluded from the portfolio's range queries and the calendar was
+drawing only the demo server's own 17 milestones. Scratch tooling only — no
+repository seeder writes dates that way.
+
+### Verification
+
+- Merchandising suites — **879 pass, 0 fail**. The tone vocabulary moved from
+  `overdue/rework/positive/neutral` to `late/blocked/dueSoon/done/scheduled`,
+  so `overviewCalendar.test.mjs`, `calendarSurface.test.mjs` and
+  `merchandisingOverview.test.mjs` were updated with it.
+- Full frontend suite — **11,527 tests, 11,521 pass, 6 fail**. The same six
+  other-lane failures as before (`moduleRoles.js` has no `ppc` entry; Store's
+  Masters nav, valuation and tour targets). Two unrelated files
+  (`activeApplication`, `ieSharedKit`) each flaked once under the full parallel
+  run and pass in isolation.
+- `tsc --noEmit` — no new errors.
+- Side by side at
+  `grav-cms/docs/design-references/overview-marketing-vs-merchandising.png`.
+
+### Files changed (all in `grav-cms`)
+
+- `components/merchandiser/OverviewTnaCalendar.js`
+- `components/merchandiser/overviewCalendar.js`
+- `app/merchandiser/dashboard/page.js`
+- `components/merchandiser/overviewCalendar.test.mjs`
+- `components/merchandiser/calendarSurface.test.mjs`
+- `components/merchandiser/merchandisingOverview.test.mjs`
+- `docs/design-references/overview-marketing-vs-merchandising.png` (updated)
+
+---
+
+## Custom Reports — the native designer, connected to the real mart (25 Sep 2026)
+
+`/accountant/custom-reports` now runs real Accounting queries. Metabase is
+entirely server-side; the browser sees GRAV APIs and safe identifiers only.
+
+```
+native GRAV designer ──▶ /api/accountant/reporting ──▶ MBQL ──▶ Metabase ──▶ mart
+        safe field ids          validated spec                   read-only role
+```
+
+### Contract compliance, and the one conflict found
+
+Implemented exactly as `grav-cms/docs/accounting-reporting-api-contract.md` and
+`grav-cms/lib/reporting/reportingClient.js` specify — all seven routes, the
+preview response shape key for key, the four refusal codes, `rows` as arrays in
+`columns` order, raw values, the 100-row preview cap, `dataAsOf` or null.
+
+**One conflict, resolved in favour of the rule over the example.** The contract's
+table says a field `id` is "Opaque, stable, safe. **Not** a database column
+name" — and its illustrative JSON then shows `"id": "voucher_date"`, which IS a
+mart column name. Following the example would mean a caller guessing `gstin` was
+guessing a real identifier, with only a lookup miss between them and it.
+
+So the ids are `vr.date`, `gl.ledger`, `tb.period` — opaque, and demonstrably
+not columns. Nothing in the frontend breaks: `reportSpec.js` passes ids through
+untouched and no component keys off a specific one (only `fixtures.js`, sample
+data the route never serves). **No frontend code was changed** beyond one stale
+comment.
+
+### The security model, in one paragraph
+
+`services/reporting/fieldCatalogue.js` is the only mapping from a field id to a
+column, and permission travels with the descriptor, never with the request. The
+tenant columns `organization_id` and `company_id` are **not in the catalogue at
+all**, so there is no field id that names them — which is why no specification
+can filter on, select or replace them. The compiler builds
+`organization_id = <session>` and `company_id = <scope-guard approved>` FIRST and
+appends the user's filters after. `{"type":"query"}`, always; the API key belongs
+to a query-builder-only Metabase group, so even a compiler bug could not run SQL.
+
+### Files changed
+
+**Backend, new**
+- `migrations/reporting/V003__voucher_register_view.sql` — `v_voucher_register`,
+  one row per posted voucher. `total_amount` is the debit side, **not** debit +
+  credit: adding both sides is the easiest way to double a revenue figure.
+- `services/reporting/fieldCatalogue.js` — 3 subjects, 33 fields
+- `services/reporting/reportSpec.validate.js` — validation, bounds, unknown-key refusal
+- `services/reporting/metabaseEngine.js` — metadata cache, MBQL compiler, dataset + XLSX, error translation
+- `services/reporting/martFreshness.service.js` — `dataAsOf` from the last SUCCEEDED sync
+- `models/Accountant_model/Acc_CustomReport.js` — saved reports, compound indexes
+- `routes/Accountant_Routes/Acc_reporting.js` — the seven endpoints
+- `test/accountant/reporting-mbql.test.js` (53), `reporting.route.test.js` (59),
+  `reporting-integration.route.test.js` (13)
+
+**Backend, edited** — `server.js` (one mount line),
+`deploy/metabase-pilot/bootstrap.sh` (rescan threshold 7 → 9).
+
+**Frontend** — none, bar a stale comment in `app/accountant/custom-reports/page.js`.
+
+### Honest labels in the Trial Balance
+
+The mart carries no running balance, so it cannot compute a period opening or
+closing balance. Rather than print a real figure under a wrong name:
+
+- `net_movement` is offered as **"Net Movement (month)"**, never "Closing
+  Balance" — the figure is real, it is just the answer to a different question,
+  and the wrong label would look right.
+- `opening_balance` is **"Ledger Opening Balance (as configured)"**, and
+  `canTotal: false` because it repeats on every month's row; summing it across
+  twelve months would multiply it by twelve.
+
+### Results
+
+**Tests: 125/125** across the three suites; the eight company/mart suites still
+pass (124/124) and the pure service suite is 2007/2007.
+
+Verified by reintroducing holes: **removing the tenant filters fails 10 tests**;
+making the validator ignore unknown keys fails 4; making field ids equal column
+names fails 76.
+
+**Live, against the real mart (GRAV CLOTHING: 1,776 posted vouchers / 5,604 GL
+lines / 1,468 trial-balance rows):**
+
+| Check | Result |
+|---|---|
+| Catalog | 200 — Voucher Register (11 fields), General Ledger (12), Trial Balance (10) |
+| Voucher Register, 5 fields | 200 — 3 of **1,776**, `truncated: true`, real parties |
+| General Ledger, date + ledger filter | 200 — 53 matching rows for INDIAN BANK in Aug 2025 |
+| Trial Balance | 200 — 1,468 rows |
+| Grouping + total | `INDIAN BANK (CA-3512)` 35,467,731.01 Dr / 35,416,462.67 Cr — matches the mart to the paisa |
+| Saved reports | create 201 → list → open (`staleProblems: null`) → update → duplicate → delete, all clean |
+| XLSX | 8,052 bytes, correct content type, `attachment; filename="august-general-ledger-2026-09-25.xlsx"`, 216 rows, money cells are numbers |
+| `dataAsOf` | `2026-09-24T18:21:34.520Z` — the last succeeded `mart_sync_run`, not a clock |
+| Unowned company | **403 `REPORTING_FORBIDDEN`** |
+| Crafted payloads | all six **422 `REPORTING_INVALID_SPEC`**, none reached the engine |
+
+The crafted payloads tried: a `sql` key, a `native` MBQL block, a raw column as
+a field id, a `company_id` filter to override the tenant scope, a table name as
+the subject, and a `source-table` injection.
+
+### Not done, and why
+
+- **Not verified in a browser.** The route is live on the backend the dev
+  frontend calls (`:5050` answers `REPORTING_UNAUTHORISED` unauthenticated), and
+  the contract shape is asserted end to end — but the built-in browser has no
+  accountant session and signing in is not something to do on the user's behalf.
+  The rendered sheet is the one layer not exercised.
+- **The engine cannot trigger a Metabase rescan.** `sync_schema` needs an
+  administrator, and an admin key can run native SQL. The key stays
+  least-privilege and the refusal says to run `bootstrap.sh` instead. A new
+  subject therefore needs that one step after its migration.
+- No JWT SSO, no sandboxing, no incremental sync — all later slices.
+
+---
+
+## Order Execution — rebuilt on the Development file's information hierarchy
+
+Three screens of one workflow were three different screens. The Development
+file had a standing band, an 8/4 workspace and a rail; the Sales handover
+review had a slab titled after the ACTIVITY and a flat two-column read; the
+Order Execution file had a stack of four full-width forms with no conclusion
+anywhere on it — a merchandiser had to assemble "what is happening" out of
+twenty fields.
+
+They now share one anatomy and keep three different jobs. Frontend only: no
+backend contract, no permission, no mutation and no URL changed.
+
+### Measured at 1440, on all three
+
+| | Development file | Handover review | Execution file |
+|---|---|---|---|
+| Standing band | y 434, w 1376 | y 440, w 1376 | y 487, w 1376 |
+| Wide column | **913** | **913** | **913** |
+| Sticky rail | **451** | **451** | **451** |
+| Section navigator | 6 tabs | 5 tabs | 6 tabs + area selector |
+| Image treatment | `DevelopmentGallery` | same | same |
+
+The three class strings (`deck:grid-cols-12`, `deck:col-span-8`,
+`deck:col-span-4 deck:sticky deck:top-3`) are asserted against
+`app/merchandiser/development/[fileId]/page.js` itself, so the family cannot
+drift apart one screen at a time.
+
+### The rules are values
+
+`components/merchandiser/orderWorkspace.js` is new and has no React in it, so
+every derived sentence is a value a test can assert — the same reason
+`developmentWorkspace.js` exists. It holds `handoverStanding`,
+`executionStanding`, `handoverOpenItems`, `selectionCards`, `approvalPath`,
+`tnaPreview`, `departmentRows`, `orderSnapshot` and the handover's sections.
+Every standing branch names a person or a department, and none says "in
+progress".
+
+### Sales handover review
+
+- **The product leads.** It was titled "Review Sales Handover" — the name of
+  the task, on a screen whose subject is one garment. The slab now carries the
+  product name, with "Sales handover review · Order … · Style … · Buyer" as the
+  subtitle, an `Awaiting review` status chip, version and line pills, the
+  confirmed quantity as the hero figure, and delivery window / buyer / whose
+  move beside it. Accept and Ask Sales are unchanged.
+- **Five URL-addressable sections** — Summary, Order & Delivery, Product
+  Requirements, Commercial, Source & History — through the same `FileTabs` the
+  files use, so keyboard arrows, one tab stop and scroll-into-view come with
+  it. `?tab=commercial` opens Commercial and survives a refresh.
+- **No execution record is promised.** There is no Time & Action tab and no
+  department handover: neither exists until acceptance, and a tab opening onto
+  nothing would be worse than its absence.
+- **Summary**: standing band, then Confirmed order / Quantity and delivery /
+  Product requirements / What acceptance creates in the wide column, and
+  references → handover facts → open items → source and version in the rail.
+- **Open items are real absences**, counted against what exists: "1 of 2 drops
+  carry no ex-factory date", each with whose it is to supply. A version that
+  states everything its contract carries shows none.
+- Nothing is editable, and there is still no decline.
+
+### Accepted Order Execution file
+
+- **Header**: the product leads, `MEF-… · Order Execution file · Buyer`
+  underneath. The image slot is wired and currently always empty — see below.
+  Lifecycle, quantity, delivery, responsible, next move and blocker are
+  unchanged; one primary action, the rest behind `Actions`.
+- **Sections unchanged** — the six question-based sections and the quieter
+  area selector stay exactly as they were, and every legacy `?tab=` value still
+  resolves.
+- **Summary is the control centre**: standing band linking to the record where
+  the act happens, then Confirmed order → Product selections → Approvals and PP
+  meeting → Time & Action → Department status → Procurement demand, with the
+  rail beside it.
+- **Department status now shows each department's own line.** The register was
+  already returning `rows` and the page was discarding them, so the Summary
+  showed a count and a merchandiser had to open a tab to learn nothing had
+  changed. The words are the register's own; a silent department is still
+  silent, not late.
+- **A step nobody read is not a step nobody did.** The pre-production meeting
+  has its own read, which the Summary does not make. Its step on the approval
+  path says "not checked here" rather than drawing as not-done, which would be
+  the screen claiming no meeting had happened.
+
+### Three things the brief asked for that the codebase refuses
+
+1. **"Product readiness"** — `merchandisingShell.test.mjs` bans that
+   vocabulary absolutely: Merchandising records no production preparedness at
+   any milestone. The cards carry exactly what the brief listed (revision,
+   state, item count, approval state, missing, Open) and are named **Product
+   selections**, after the register that holds them.
+2. **A Commercial section with commercial fields** —
+   `SalesHandoverVersion.js` refuses commercial terms *by name* and the
+   projection schema has nowhere to put one. The section states that boundary
+   in one sentence, says where the answer lives, and lists what the version
+   *does* carry. It does not enumerate the refused terms, because naming
+   another department's vocabulary on a Merchandising screen is what the shell
+   test scans for.
+3. **A large product image** — neither `SalesHandoverVersion` nor
+   `ExecutionFile` carries a reference image. Both screens use the same
+   gallery as Development and say *which record would* carry one rather than
+   borrowing a picture from a development file that may be a different style.
+   The slab's image slot is wired, so the day the contract carries one it
+   appears without a second change.
+
+### A defect the browser caught that `tsc` could not
+
+The Execution page used `Panel` without importing it. `checkJs` is off, so
+`tsc --noEmit` passed clean and every source-scanning test passed; the page
+threw `Panel is not defined` at runtime. Found by rendering it. This is the
+fifth time in this workstream that the preview has caught a class of defect
+the test suite structurally cannot.
+
+### Verification
+
+- Merchandising suites — **900 pass, 0 fail**, including 21 new assertions in
+  `orderWorkspace.test.mjs`. Six existing suites were updated where they pinned
+  the old Summary's internals; each kept its guarantee and moved its anchor.
+- Full frontend suite — **11,466 tests, 11,441 pass, 25 fail**. All 25 are
+  other lanes' in-progress work: 18 in the accountant custom-reports route
+  (`lib/reporting/reportSpec.js` does not exist yet), 3 PPC, 3 Store, and the
+  `activeApplication` route test that flakes under the parallel run.
+- `tsc --noEmit` — no new errors.
+- Rendered all three at 1440 in the isolated in-memory showroom: no horizontal
+  overflow on any. At 390: the tab track scrolls inside itself, the page does
+  not; the rail stacks below the wide column; `?tab=commercial` opens
+  Commercial.
+- Side by side at
+  `grav-cms/docs/design-references/merchandising-workflow-family.png`.
+
+### Files changed (all in `grav-cms`)
+
+- `components/merchandiser/orderWorkspace.js` (new)
+- `components/merchandiser/orderWorkspace.test.mjs` (new)
+- `app/merchandiser/execution/handovers/[handoverId]/page.js`
+- `app/merchandiser/execution/[fileId]/page.js`
+- `components/merchandiser/ExecutionFileHeader.js`
+- `components/merchandiser/orderIdentity.js`
+- `components/merchandiser/DevelopmentGallery.js`
+- six existing merchandiser test suites, re-anchored
+- `docs/design-references/merchandising-workflow-family.png` (new)
+
+---
+
+## Sales handover review — the Summary now answers the order, not the record
+
+The Summary described the RECORD. It led with a style reference and a line id,
+said "Splits: 2" where the two colour quantities were sitting in the same
+response, and printed `NOT_REQUIRED` at a merchandiser. Frontend only: no
+backend contract, no permission, no API call and no acceptance behaviour
+changed, and every value below is derived from the handover response.
+
+### The eight questions, answered above the fold
+
+| Question | Where it is answered now |
+|---|---|
+| Enough to accept? | **Ready to accept** card, first, with two lists and one sentence |
+| What is the buyer ordering? | **What Sales confirmed** — 8 facts, no identifiers |
+| How many pieces? | 600, in the card and the brief |
+| Which colours, how many? | **Colour and quantity plan** — Deep navy 360, Cloud blue 240 |
+| When does each lot move? | **Delivery plan** — 2 cards, leave factory / buyer delivery |
+| Where is it made? | Production unit, in the brief and on every delivery card |
+| What special work? | **What makes this product** — embroidery, approved by buyer |
+| What does accepting create? | **What acceptance creates**, unchanged |
+
+### What changed, and why
+
+- **`colourPlan`** replaces "Splits: 2" with the rows. The group's identity is
+  its attribute VALUES ("Deep navy"); the axis ("Colour") is stated once, not
+  on every row. It also reports when the groups' sum and Sales' total disagree
+  rather than quietly printing one of them.
+- **`deliveryPlan`** turns the table into two cards with the quantity as the
+  anchor, and names which colour group each delivery carries — from the
+  `allocations` the order already states, never inferred from quantities that
+  happen to match.
+- **`productWork`** separates work from not-work. A handover names every
+  process Sales was asked about and most come back not needed; those are one
+  quiet sentence at the foot instead of rows of equal weight.
+  `processState` renders the stored constants as **Required / Not needed /
+  Still to be confirmed / Approved by buyer**, and an unrecognised one appears
+  as itself rather than disappearing.
+- **`acceptanceCheck`** is two tiers, and that is the point. Without a
+  quantity, a delivery date or a production unit coordination cannot start —
+  those block, and the card recommends Ask Sales. A size curve, a reference
+  photograph or a packing instruction is chased *during* coordination; noting
+  those as blocking would put "Ask Sales" on every handover, and a
+  recommendation that never changes is one nobody reads. **The card
+  recommends; it gates nothing.** Both buttons stay exactly as they were, and
+  a test asserts no control is disabled from it.
+- **Vocabulary, on every tab, not just this one.** Drop → Delivery, Ex-factory
+  → Leave factory, Split → Colour group, Factory → Production unit. The
+  Execution file's delivery lines were changed too, so the review, the file
+  and the register do not each teach a different word for one fact.
+- **Status language**: "Sales has confirmed this order. Merchandising has not
+  accepted it." stated two facts and asked nothing. It now says what is being
+  decided — whether to take responsibility for coordinating the order. "Whose
+  move" → **Waiting for: Merchandising review**; "Next owner" → **Who acts
+  next**.
+- **Identifiers relocated, not deleted.** The style and line references are
+  behind a *System references* disclosure on the Summary and in full on Source
+  & History. The slab subtitle now reads "Sales handover review · Harbor & Co ·
+  Northline Active"; the version pill reads **Sales brief · Version 1**.
+
+### Two things the page was saying twice
+
+The band printed a count of what was missing, the card listed it in full, and
+the rail said "This version states everything its contract carries" while the
+card listed two missing items. The card is now the single verdict; the rail
+renders only when there is field-level detail behind it, and is titled after
+what it holds.
+
+The rail's source panel printed the stored record type and a raw ISO
+source-version string, which reads as a fault rather than a fact. It now says
+which version is in force and how many came before, and links to Source &
+History.
+
+### A correction to the previous pass
+
+Last pass I wrote that neither a handover nor an execution file carries a
+reference image. That was wrong: `developmentReferences` in
+`services/merchandising/execution.service.js` reads the linked development
+file's request and projects its images onto both, each attributed to that
+development file. The gallery's empty state now says *this order is not linked
+to a development file*, and the attribution is the server's rather than a
+fabricated "Sales' handover".
+
+### Verification
+
+- Merchandising suites — **959 pass, 0 fail**, including 6 new assertions
+  covering the colour plan, the delivery plan, the constant translation, the
+  two-tier acceptance check, the relocated identifiers and the
+  single-answer rule.
+- Full frontend suite — **11,674 tests, 11,668 pass, 6 fail**; the same six
+  other-lane failures (PPC role, Store valuation, tour targets, Masters nav).
+- `tsc --noEmit` — no new errors. A runtime `FOCUS is not defined` was caught
+  by rendering, as `Panel` was last pass; `checkJs` is off, so neither is
+  visible to `tsc`.
+- Rendered at 1440 against a handover shaped like the PPC walkthrough one
+  (seeded into the disposable in-memory showroom, not into any configured
+  database). Read off the page: buyer Harbor & Co, product Performance
+  embroidered polo, 600 pieces, Deep navy 360 / Cloud blue 240, 360 by
+  20 Nov and 240 by 04 Dec, GRAV Unit 01, embroidery approved by buyer,
+  missing size-wise breakdown, verdict "Ready for Merchandising review".
+- At 390: check → brief → colours → deliveries → gallery, stacked in that
+  order; the tab track scrolls inside itself; no horizontal page overflow.
+
+### Files changed (all in `grav-cms`)
+
+- `app/merchandiser/execution/handovers/[handoverId]/page.js`
+- `components/merchandiser/orderWorkspace.js`
+- `app/merchandiser/execution/[fileId]/page.js` (vocabulary only)
+- `components/merchandiser/orderWorkspace.test.mjs`
+- `components/merchandiser/handoverReviewPage.test.mjs`
+- `app/merchandiser/merchandisingShell.test.mjs`
+
+---
+
+## Materials & Trims — the order now starts from what Development settled
+
+The screen said the order came from Development with four materials and one
+packaging item, then said "Nothing selected yet" and offered a button to start
+an empty draft. So the commonest path through it was retyping a selection the
+company had already approved — which is exactly how a transcription error
+reaches a factory.
+
+Acceptance imports it now.
+
+### The root cause was a link that was never written
+
+`ExecutionFile.developmentReference` has always been documented as "copied from
+the accepted handover version". **Nothing ever copied it.** The link was only
+ever re-derived afterwards by matching `styleRef` — a display code somebody can
+edit, wrong the moment two orders share a style or one is renamed. Sales states
+the release it confirmed against; that is now carried onto the file at the
+moment of acceptance, so the order never has to guess.
+
+### What acceptance does
+
+1. Resolves the approved Development revision from the link Sales stated.
+2. Creates the order's Materials & Trims and Packaging **drafts** from it.
+3. Copies identity, SKU, colour, finish and placement.
+4. Leaves them `DRAFT`. A development selection was approved to be *sampled*;
+   an order's BOM is an instruction to a factory, approved on a commercial
+   commitment that did not exist when the sample was chosen.
+5. Stamps `importedRevisionNo / importedAt / importedBy / importedRowCount`.
+
+It runs **outside the transaction and is swallowed**: the acceptance is the
+commercial fact, the import is a convenience over it. Nobody is told their
+order was not accepted because a draft could not be started.
+
+### Lineage is structured, and a client cannot forge it
+
+It was appended to each row's `notes` as prose, so the only way to ask "which
+revision is this row from" was to parse a string. It is `sourceRef` now — the
+field both row schemas already declared:
+
+```
+{ app: "merchandising", recordType: "DEVELOPMENT_BOM_ROW",
+  recordRef: "MDF-2026-0001 · Revision 9 · DR-body",
+  sourceVersion: "9", sourceState: "APPROVED" }
+```
+
+`sourceRef` is a **server-only parameter** of `selection.addRow` and is in
+neither family's accepted body fields — the route does not pass it. A row that
+could stamp its own provenance could claim an approval nobody gave it. A client
+that tries is refused by name.
+
+### Idempotent, and the second call answers instead of writing
+
+The file's own stamp is the guard. A retried acceptance, a replayed message, a
+second click or the backfill over an already-imported order all return
+`replayed: true` and write nothing. Skipping families that already had a draft
+stopped a duplicate *draft*; it did not stop a second set of rows landing in
+somebody's open one.
+
+### Three defects the new test found
+
+- **An empty array is truthy.** `changedFrom` answers with a list, and
+  `changedFrom(...) ? …` made every carried row read as "Changed for this
+  order".
+- **An edit erased provenance.** `updateRow` replaces the row with the fields
+  the caller stated, and `sourceRef` is not one a caller may state — so
+  changing a colour on an imported row silently turned it into "added for this
+  order". Provenance is not the caller's to restate and not theirs to drop.
+- **A field the target row does not have is not a change.** A packaging row has
+  no `finish`; comparing it against a development row that stated one marked
+  every imported packaging item changed — a claim about a decision nobody made.
+
+### The screen
+
+- The band reads **"Development selections imported"** with the source
+  (`MDF-… · Revision N`), the material and packaging counts, imported on/by
+  (or "System, on acceptance" for a backfill), the current order BOM version,
+  and **View Development selections**.
+- "Bring them into a draft" and "Adopting starts DRAFT revisions…" are gone.
+  The button survives only where the import has not run — an order accepted
+  before it existed — because for those it is the only way across.
+- The table says **Used for** rather than "Placement", **Colour / variant**
+  rather than "Colour / finish", and carries a **From development** column with
+  the source reference and one of: *Carried from Development*, *Changed for
+  this order* (with which fields), *Added for this order*. Rows development
+  states that the order dropped are reported on the band as *Removed*.
+- The empty state never says "Nothing selected yet" when importable selections
+  exist; it says they are waiting to be imported.
+
+### The existing demo order
+
+`scripts/migrations/order-bom-development-import-backfill.js` — dry-run by
+default, scoped by company or file, uses the same service as acceptance so
+there is no second import to drift. Attribution is deliberately empty: an order
+accepted before the import existed was not imported *by* anybody.
+
+Applied to the dev database after showing the dry run. Verified there
+afterwards: `PPC-WALKTHROUGH-2026-EF-001` now carries 5 rows — 4 materials and
+trims, 1 packaging — both families `DRAFT` revision 1, every row bearing
+`DEMO-ORDER-DEV-001 · Revision 1 · <row>`, all reading *Carried from
+Development*. The Development revision is still `APPROVED` with its 5 rows
+unchanged, and a re-run answered `replayed: true` with no duplicates.
+
+### Verification
+
+- **New**: `test/merchandising/development-import-on-acceptance.test.js` — 13
+  tests driving the real acceptance path against a real database: one populated
+  draft, every identity/colour/placement, `DRAFT` not approved, structured
+  lineage, a client's forgery refused, the development revision and its rows
+  untouched, a re-run creating nothing, the stamp, the carried/changed/added
+  comparison, a removed row reported, an unlinked order unaffected, and a
+  never-approved revision not treated as a source.
+- **All 34 `test/merchandising` suites pass in isolation.** A parallel run of
+  the whole directory reported 166 failures; every one was mongod contention
+  (34 suites each starting their own in-memory replica set), and each suite
+  passes on its own. One genuine failure was found and fixed:
+  `production-closure.journey` pinned the lineage as prose in `notes` and now
+  asserts the structured `sourceRef`, which is a stronger claim.
+  *(`order-demand-release.integration` was still running at hand-off; it was
+  untouched by this change and passed before it.)*
+- Backend `npm test` — **2007 pass, 0 fail**.
+- Frontend merchandiser suites — **985 pass, 0 fail**; `tsc --noEmit` clean.
+
+### Not verified: the rendered screen
+
+I could not complete a browser check of the new BOM screen. The showroom's
+Next middleware gates on an `auth_token` cookie, and in this split-origin dev
+topology the backend's `Set-Cookie` is not stored by the browser — which
+`CLAUDE.md` already documents ("Chrome refuses to store cross-origin cookies
+for `localhost:3000` → `localhost:5000`"). That is harness plumbing, not the
+product: the same backend answers a Bearer-token request correctly, and the
+whole flow was driven through the real HTTP routes instead — accept → import →
+preview returned the five rows with the right statuses, lineage and "used for"
+values. The UI changes themselves are covered by the frontend source tests, but
+nobody has looked at the page.
+
+### Files changed
+
+`grav-cms-backend`
+- `models/CMS_Models/Merchandising/ExecutionFile.js` (import stamp fields)
+- `services/merchandising/execution.service.js` (copy the link; import on accept)
+- `services/merchandising/developmentAdoption.service.js`
+- `services/merchandising/selection.service.js` (server-only `sourceRef`; preserve it on edit)
+- `scripts/migrations/order-bom-development-import-backfill.js` (new)
+- `test/merchandising/development-import-on-acceptance.test.js` (new)
+- `test/merchandising/production-closure.journey.test.js` (re-anchored)
+
+`grav-cms`
+- `components/merchandiser/DevelopmentAdoptionBand.js`
+- `components/merchandiser/SelectionTab.js`
+- `app/merchandiser/execution/[fileId]/page.js`
+- `components/merchandiser/preorderDevelopment.test.mjs` (re-anchored)

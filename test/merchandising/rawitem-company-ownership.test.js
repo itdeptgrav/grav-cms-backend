@@ -52,11 +52,18 @@ const company = (name) => Acc_Company.create({
   companyName: name, booksFromDate: new Date("2026-04-01"),
 });
 
-/* An item as the legacy data holds one: no companyId at all. */
+/* An item as the legacy data holds one: no companyId at all.
+
+   `usedAs` is Store's own classification of what an item is FOR, and the
+   Merchandising picker will not show an item that is not classified as a
+   garment component — so the fixtures carry it. Ownership and classification
+   are two different gaps: this migration closes the first, and an item that
+   is owned but unclassified is still (correctly) absent from the picker. */
 const unowned = (over = {}) => RawItem.collection.insertOne({
   name: over.name || `Legacy item ${++seq}`,
   sku: over.sku === undefined ? `LEG-${seq}` : over.sku,
   category: over.category || "Fabric",
+  usedAs: over.usedAs || "FABRIC",
   variants: [], attributes: [],
   createdAt: new Date(), updatedAt: new Date(),
 });

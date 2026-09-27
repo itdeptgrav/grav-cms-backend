@@ -215,6 +215,82 @@ async function findSimilarDepartments(name) {
 }
 
 /* ================================================================== */
+/* EFFECTIVE ACCESS (GAC-AR1)                                          */
+/* ================================================================== */
+
+/**
+ * GET /api/admin/effective-access
+ *
+ * One row per person, one cell per active application: the canonical
+ * resolver's answer (No access / Viewer / Editor / Approver / Owner) and where
+ * it came from. Read-only — it is a projection of services/access/
+ * appAccess.service.js, so this screen and the launcher and the API guards
+ * cannot disagree. A platform administrator is reported as a full-system
+ * administrator holding every active application. Company membership is not
+ * part of the answer and is not shown.
+ *
+ * People: every department login and every employee with an address. The
+ * person's own current token version is used, i.e. "what a fresh session of
+ * theirs would get".
+ */
+router.get("/effective-access", async (req, res) => {
+  try {
+    const { NON_APPLICATION_SLUGS } = require("../../services/access/appAccess.service");
+    const Employee = require("../../models/Employee");
+    const apps = (await AccessDepartment.find({ isActive: true }).sort({ sortOrder: 1, name: 1 }).lean())
+      .filter((d) => !NON_APPLICATION_SLUGS.has(d.slug))
+      .map((d) => ({ slug: d.slug, name: d.name }));
+
+    const [logins, employees] = await Promise.all([
+      DeptUser.find({}).select("name email isActive isAdmin tokenVersion").sort({ name: 1 }).lean(),
+      Employee.find({ email: { $nin: [null, ""] } })
+        .select("firstName lastName email isActive status").limit(2000).lean(),
+    ]);
+
+    const people = [
+      ...logins.map((u) => ({
+        kind: "dept_user", id: String(u._id), name: u.name, email: u.email,
+        isActive: u.isActive !== false,
+        actor: { id: u._id, email: u.email, subject: "dept_user", tv: u.tokenVersion || 0 },
+      })),
+      ...employees.map((e) => ({
+        kind: "employee", id: String(e._id),
+        name: [e.firstName, e.lastName].filter(Boolean).join(" ") || e.email, email: e.email,
+        isActive: e.isActive !== false && e.status !== "inactive",
+        actor: { id: e._id, email: e.email, subject: "employee" },
+      })),
+    ];
+
+    const { listAccessibleApps } = require("../../services/access/appAccess.service");
+    const rows = [];
+    for (const p of people) {
+      // One identity read and one catalogue read per person.
+      const out = await listAccessibleApps(p.actor);
+      if (!out.ok && out.denialCode === "ACCESS_CHECK_UNAVAILABLE") {
+        return fail(res, 503, "Access could not be checked just now. Try again in a moment.");
+      }
+      const granted = new Map(out.apps.map((x) => [x.department.slug, x.access]));
+      const cells = {};
+      for (const app of apps) {
+        const a = granted.get(app.slug);
+        cells[app.slug] = a ? { role: a.role, source: a.source } : { role: null, denialCode: out.ok ? "NO_APP_GRANT" : out.denialCode };
+      }
+      rows.push({
+        kind: p.kind, id: p.id, name: p.name, email: p.email, isActive: p.isActive,
+        fullSystemAdministrator: Boolean(out.ok && out.isPlatformAdmin),
+        grantedCount: granted.size,
+        access: cells,
+      });
+    }
+
+    res.json({ success: true, applications: apps, people: rows });
+  } catch (error) {
+    console.error("[access-admin] effective access:", error);
+    fail(res, 500, "Could not load effective access.");
+  }
+});
+
+/* ================================================================== */
 /* DEPARTMENTS                                                        */
 /* ================================================================== */
 
@@ -847,7 +923,38 @@ router.patch("/users/:id", async (req, res) => {
     }
 
     user.updatedBy = req.admin._id;
-    await user.save();
+
+    /* GAC-2: administrator status and activation are authorisation facts.
+       This is the separate write for them (an application grant never sets
+       isAdmin, and this never creates a grant row).
+
+       GAC-2 correction: the save and the shared grant revision advance commit
+       TOGETHER, so every authorization cache — in every process — misses on
+       its next check (services/access/grantRevision.js). Neither can land
+       without the other. The local clear afterwards is only an optimisation. */
+    const { bumpGrantRevision } = require("../../services/access/grantRevision");
+    // The change as an explicit update, computed ONCE: withTransaction may run
+    // the callback again after a transient error, and a document save() inside
+    // it would find nothing modified the second time (Mongoose clears the
+    // flags after the first attempt) and silently commit no change.
+    await user.validate();
+    const delta = user.getChanges();
+    const txn = await mongoose.startSession();
+    try {
+      await txn.withTransaction(async () => {
+        if (Object.keys(delta).length) {
+          await DeptUser.updateOne({ _id: user._id }, delta, { session: txn });
+        }
+        await bumpGrantRevision(txn);
+      });
+    } finally {
+      await txn.endSession();
+    }
+    try {
+      require("../../services/access/hrAuthorization").invalidateHrAuthorization("admin/activation change");
+    } catch (err) {
+      console.error("[access-admin] local HR cache clear failed (the grant revision still invalidates it):", err?.message || err);
+    }
 
     audit(req, "user.update", `${user.email}: ${changes.join(", ") || "no change"}`);
     res.json({ success: true, user: user.toSafeJSON(), changes });
@@ -1495,13 +1602,10 @@ router.post("/employees/:id/cowork-account", async (req, res) => {
 const {
   ROLES: ACCOUNTANT_ROLES,
   findAccountantUser,
-  setAccountantRole,
   resetAccountantPassword,
   setAccountantPassword,
   getAccountantNavPrefs,
   setAccountantNavPrefs,
-  revokeAccountantRole,
-  deleteAccountantUser,
 } = require("../../services/accountantAccess");
 
 /* ================================================================== */
@@ -1582,56 +1686,61 @@ router.get("/department-roles/:slug", async (req, res) => {
   }
 });
 
+/* ================================================================== */
+/* GAC-2 — THE CANONICAL ACCESS WRITE                                  */
+/* ================================================================== */
+
+/** The DB-verified administrator requirePlatformAdmin attached, as a resolver actor. */
+const grantActor = (req) => ({
+  id: req.admin._id, email: req.admin.email, name: req.admin.name, subject: "dept_user", tv: req.admin.tokenVersion || 0,
+});
+
+/**
+ * PUT /api/admin/app-access
+ * body: { email, application, role: "viewer"|"editor"|"approver"|"owner"|null,
+ *         reason, idempotencyKey }  (or header Idempotency-Key)
+ *
+ * The one write for application access. See
+ * services/access/accessGrantAdmin.service.js for every rule it applies.
+ */
+router.put("/app-access", async (req, res) => {
+  const { changeAppAccess, sendGrantError } = require("../../services/access/accessGrantAdmin.service");
+  try {
+    const out = await changeAppAccess({ actor: grantActor(req), body: req.body, headers: req.headers });
+    audit(req, "app-access", `${out.application}: ${out.target.email} ${out.before.role || "none"} -> ${out.after.role || "none"}${out.replayed ? " (replay)" : ""}`);
+    res.json({ success: true, ...out });
+  } catch (err) {
+    sendGrantError(res, err);
+  }
+});
+
 /**
  * PUT /api/admin/department-roles/:slug
- * body: { email, name?, role, password? }   role: null revokes
+ * body: { email, name?, role, reason, idempotencyKey, budgetDepartments? }  role: null revokes
+ *
+ * GAC-2 COMPATIBILITY ADAPTER — no permission logic of its own.
+ * Consumer: grav-cms components/access/moduleRoles.js (setDepartmentRole) via
+ * lib/accessApi.js. Deletion condition: that client calls /app-access.
+ * PPC is no longer special-cased: its role is an ordinary application role
+ * (company-scoped grants are not accepted — GRAV is one organisation).
  */
 router.put("/department-roles/:slug", async (req, res) => {
+  const { changeAppAccess, sendGrantError } = require("../../services/access/accessGrantAdmin.service");
   try {
-    if (String(req.params.slug).toLowerCase() === "ppc") {
-      return res.status(409).json({
-        success: false,
-        code: "COMPANY_SCOPED_GRANT_REQUIRED",
-        message: "PPC roles must be granted for a named company in Company & app access.",
-      });
-    }
-    const { email, name, role, password, budgetDepartments } = req.body || {};
-    if (!email) return fail(res, 400, "An email address is required");
-
-    const result = await deptRoles.setRole({
-      departmentSlug: req.params.slug,
-      email, name, role: role || null, password,
-      /* Which departments a Budget grant covers. Ignored on every other slug,
-         so this stays one route for every department. */
-      budgetDepartments,
-      actor: req.admin,
+    const out = await changeAppAccess({
+      actor: grantActor(req), body: req.body, headers: req.headers,
+      defaults: { application: String(req.params.slug || "").toLowerCase() },
+      via: "admin:department-roles",
     });
-
-    audit(req, "department-role", `${req.params.slug}: ${email} -> ${role || "none"}`);
-
-    // The same change, in the log every department will read from.
-    await recordChange(req, {
-      departmentSlug: req.params.slug,
-      entity: "department-role",
-      entityId: email,
-      entityLabel: name || email,
-      action: role ? (result.created ? "create" : "update") : "delete",
-      summary: role
-        ? `${email} set to ${role} in ${req.params.slug}`
-        : `${email} removed from ${req.params.slug}`,
-      before: { role: result.previous ?? null },
-      after: { role: role || null },
-    });
-
+    audit(req, "department-role", `${out.application}: ${out.target.email} -> ${out.after.role || "none"}`);
     res.json({
       success: true,
-      role: result.role,
-      message: role
-        ? `${email} is now ${role}.`
-        : `${email} no longer has a role here.`,
+      ...out,
+      role: out.after.role,
+      message: out.after.role ? `${out.target.email} is now ${out.after.role}.` : `${out.target.email} no longer has a role here.`,
     });
-  } catch (error) {
-    fail(res, 400, error.message);
+  } catch (err) {
+    sendGrantError(res, err);
   }
 });
 
@@ -1793,84 +1902,51 @@ router.put("/accountant-users/:email/nav-prefs", async (req, res) => {
 /**
  * DELETE /api/admin/accountant-users/:email
  *
- * Hard delete, and only for people with no employee record. "Remove access"
- * for somebody whose entire account is this row has to actually remove them —
- * deactivating leaves a permanently dead entry cluttering the People list.
+ * GAC-2 correction: RETIRED (410). It hard-deleted an Acc_User — removing that
+ * person's Accounting access outside the canonical, audited write. Remove
+ * access with PUT /api/admin/app-access { application: "accountant", role: null }.
+ * Deleting an identity is not an access change and is out of GAC-2's scope.
  */
-router.delete("/accountant-users/:email", async (req, res) => {
-  try {
-    const email = String(req.params.email).toLowerCase().trim();
-
-    if (await Employee.exists({ email })) {
-      return fail(
-        res,
-        400,
-        "This person is an employee. Set their accounting role to none instead — " +
-          "deleting the row would not remove their employee account.",
-      );
-    }
-
-    const removed = await deleteAccountantUser(email);
-    audit(req, "accountant.delete", email);
-
-    res.json({
-      success: true,
-      message: removed
-        ? `${email} was deleted. They can no longer sign in anywhere.`
-        : `${email} had no accounting account.`,
-    });
-  } catch (error) {
-    fail(res, 400, error.message);
-  }
+router.delete("/accountant-users/:email", (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "ACCOUNTING_DELETE_RETIRED",
+    message: "Deleting Accounting users is retired. Set their Accounting access to none instead; the record and its history are kept.",
+  });
 });
 
 /**
  * PUT /api/admin/accountant-role
- * body: { email, name?, role, password? }
+ * body: { email, name?, role, reason, idempotencyKey }   role: null revokes
  *
- * `role: null` revokes. A password is required only when creating a brand-new
- * accountant login — an existing user keeps the one they already have, so
- * changing somebody from editor to approver never disturbs their sign-in.
+ * GAC-2 COMPATIBILITY ADAPTER — no permission logic of its own. The Accounting
+ * role (Acc_User) is written by the canonical service's Accounting adapter.
+ * Consumer: grav-cms components/access/moduleRoles.js (setAccountantRole).
+ * Deletion condition: that client calls /app-access with application
+ * "accountant".
+ *
+ * Behaviour change: this route no longer CREATES a new external accounting
+ * login with a password. A grant needs an existing canonical person; creating
+ * an identity is a separate operation (not part of GAC-2).
  */
 router.put("/accountant-role", async (req, res) => {
+  const { changeAppAccess, sendGrantError } = require("../../services/access/accessGrantAdmin.service");
   try {
-    const { email, name, role, password } = req.body || {};
-    if (!email) return fail(res, 400, "An email address is required");
-
-    if (!role) {
-      const revoked = await revokeAccountantRole(email);
-      audit(req, "accountant.revoke", email);
-      return res.json({
-        success: true,
-        role: null,
-        message: revoked
-          ? `${email} no longer has accounting access. Existing sessions were ended.`
-          : `${email} had no accounting access.`,
-      });
-    }
-
-    const { user, created } = await setAccountantRole({
-      email,
-      name,
-      role,
-      password,
-      actorId: req.admin?._id,
+    const out = await changeAppAccess({
+      actor: grantActor(req), body: req.body, headers: req.headers, defaults: { application: "accountant" },
+      via: "admin:accountant-role",
     });
-
-    audit(req, created ? "accountant.create" : "accountant.role", `${email} → ${role}`);
-
+    audit(req, out.after.role ? "accountant.role" : "accountant.revoke", `${out.target.email} → ${out.after.role || "none"}`);
     res.json({
       success: true,
-      role: user.role,
-      created,
-      message: created
-        ? `Accounting login created for ${email} as ${user.role}.`
-        : `${email} is now ${user.role} in Accounting.`,
+      ...out,
+      role: out.after.role,
+      message: out.after.role
+        ? `${out.target.email} is now ${out.after.role} in Accounting.`
+        : `${out.target.email} no longer has accounting access. Existing sessions were ended.`,
     });
-  } catch (error) {
-    // These are operator-facing messages ("owner cannot be removed", "password
-    // required"), not internal faults — 400 so the UI shows them as guidance.
-    fail(res, 400, error.message);
+  } catch (err) {
+    sendGrantError(res, err);
   }
 });
 

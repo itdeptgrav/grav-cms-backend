@@ -7,9 +7,22 @@
 //   GET    /invites         — list pending invites
 //   POST   /invites         — create an invite (owner only)
 //   DELETE /invites/:id     — revoke a pending invite (owner only)
-//   PATCH  /:userId         — update name / role (owner only; cannot demote owner)
-//   POST   /:userId/deactivate — soft-disable login (owner only)
-//   POST   /:userId/activate   — re-enable (owner only)
+//   PATCH  /:userId         — update name; a ROLE change goes through the
+//                              canonical access write (GAC-2)
+//   POST   /:userId/deactivate — revoke Accounting access (canonical write)
+//   POST   /:userId/activate   — restore Accounting access (canonical write)
+//
+// GAC-2 correction (25 Sep 2026): every change to WHO MAY USE ACCOUNTING, or
+// with WHICH ROLE, goes through services/access/accessGrantAdmin.service.js —
+// mandatory reason, idempotency key, one transaction, append-only audit event,
+// tokenVersion bumps, re-read through the canonical resolver. These routes are
+// COMPATIBILITY ADAPTERS with no permission logic of their own:
+//   consumer:  grav-cms app/accountant/team/page.js
+//   deletion:  when that screen manages Accounting access through Access
+//              Control (/api/admin/app-access) — proposed GAC-3.
+// POST /invites and DELETE /:userId are RETIRED (410): an invite created a
+// second login with its own password, and delete removed an access record
+// outside the audited write.
 //   POST   /:userId/reset-password — owner forces a new password
 //
 // Note: this round does not send invitation emails. The owner reads the
@@ -17,7 +30,6 @@
 // manually. Adding email is a one-function swap when that's wired up.
 
 const express = require("express");
-const crypto = require("crypto");
 const router = express.Router();
 
 const {
@@ -33,6 +45,39 @@ const { setAccountantPassword } = require("../../services/accountantAccess");
 const { recordChange } = require("../../services/changeLog");
 
 router.use(orgAuth);
+
+/**
+ * The one way this router changes Accounting access: the canonical write.
+ * The actor is the canonical identity behind the signed-in Accounting session
+ * (by email); whether they may do this is decided by changeAppAccess — the
+ * Accounting Owner or a platform administrator — not here.
+ */
+async function canonicalAccountingChange(req, res, { email, role, via }) {
+  const {
+    changeAppAccess,
+    canonicalActorForEmail,
+    sendGrantError,
+  } = require("../../services/access/accessGrantAdmin.service");
+  try {
+    const actor = await canonicalActorForEmail(req.user?.email);
+    const out = await changeAppAccess({
+      actor,
+      body: {
+        email,
+        role,
+        reason: req.body?.reason,
+        idempotencyKey: req.body?.idempotencyKey,
+      },
+      headers: req.headers,
+      defaults: { application: "accountant" },
+      via,
+    });
+    return res.json({ success: true, ...out });
+  } catch (e) {
+    return sendGrantError(res, e);
+  }
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // GET / — list users in the org
@@ -99,106 +144,15 @@ router.get("/invites", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /invites — owner invites a new sub-account
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/invites", requireRole("owner"), async (req, res) => {
-  try {
-    const { name, email, role } = req.body || {};
-    if (!name || !email || !role) {
-      return res
-        .status(400)
-        .json({ success: false, message: "name, email, role required" });
-    }
-    if (!["approver", "editor", "viewer"].includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: "role must be approver, editor, or viewer",
-      });
-    }
-
-    const lowerEmail = String(email).toLowerCase();
-
-    // Reject if the email is already a user in this org
-    const existingUser = await Acc_User.findOne({
-      organizationId: req.user.organizationId,
-      email: lowerEmail,
-    });
-    if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: "A user with this email already exists in your organization",
-      });
-    }
-
-    // Reject if there's already a live (unconsumed, unexpired) invite
-    const liveInvite = await Acc_Invite.findOne({
-      organizationId: req.user.organizationId,
-      email: lowerEmail,
-      consumedAt: null,
-      expiresAt: { $gt: new Date() },
-    });
-    if (liveInvite) {
-      return res.status(409).json({
-        success: false,
-        message: "An active invite already exists for this email",
-        invite: liveInvite,
-      });
-    }
-
-    const token = crypto.randomBytes(32).toString("hex");
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-
-    const invite = await Acc_Invite.create({
-      organizationId: req.user.organizationId,
-      name,
-      email: lowerEmail,
-      role,
-      token,
-      expiresAt,
-      invitedBy: req.user.id,
-    });
-
-    // Compose the accept URL. The invite link must point at the FRONTEND
-    // (where /accountant/accept-invite lives), not the backend that
-    // generated it. Priority:
-    //   1. FRONTEND_URL env var — set this in production
-    //   2. The request's Origin header — present whenever a browser
-    //      calls this endpoint cross-origin (i.e. always in this app)
-    //   3. The Referer header — fallback for clients that strip Origin
-    //   4. http://localhost:3000 — last resort for tests/curl from CLI
-    function resolveFrontendBase() {
-      if (process.env.FRONTEND_URL) {
-        return process.env.FRONTEND_URL.replace(/\/+$/, "");
-      }
-      const origin = req.headers.origin;
-      if (origin && /^https?:\/\//.test(origin)) {
-        return origin.replace(/\/+$/, "");
-      }
-      const referer = req.headers.referer;
-      if (referer && /^https?:\/\//.test(referer)) {
-        try {
-          const u = new URL(referer);
-          return `${u.protocol}//${u.host}`;
-        } catch {
-          /* fall through */
-        }
-      }
-      return "http://localhost:3000";
-    }
-    const frontendBase = resolveFrontendBase();
-    const acceptUrl = `${frontendBase}/accountant/accept-invite?token=${token}`;
-
-    res.status(201).json({
-      success: true,
-      invite,
-      acceptUrl,
-      message: "Invite created. Share the accept URL with the invitee.",
-    });
-  } catch (e) {
-    console.error("[team] create invite:", e);
-    res.status(500).json({
-      success: false,
-      message: e.message || "Failed to create invite",
-    });
-  }
+/* GAC-2 correction: RETIRED. An invite produced a new Acc_User login with
+   its own password and a role — a second identity and an unaudited grant.
+   Existing invite rows are untouched (DELETE /invites/:id still clears them). */
+router.post("/invites", requireRole("owner"), (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "ACCOUNTING_INVITES_RETIRED",
+    message: "Invitations are retired. Grant Accounting to the person's GRAV login in Access Control.",
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -244,24 +198,22 @@ router.patch("/:userId", requireRole("owner"), async (req, res) => {
         .status(404)
         .json({ success: false, message: "User not found" });
 
-    if (user.role === "owner" && req.body.role && req.body.role !== "owner") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot demote the owner. Transfer ownership first.",
-      });
-    }
+    const body = req.body || {};
+    const roleRequested = body.role !== undefined && body.role !== user.role;
 
-    if (req.body.name) user.name = req.body.name;
-    if (
-      req.body.role &&
-      ["approver", "editor", "viewer"].includes(req.body.role)
-    ) {
-      user.role = req.body.role;
+    // The name is a label, not access — written directly.
+    if (body.name && body.name !== user.name) {
+      await Acc_User.updateOne({ _id: user._id }, { $set: { name: String(body.name).trim() } });
     }
-    await user.save();
-    res.json({
-      success: true,
-      user: { ...user.toObject(), passwordHash: undefined },
+    if (!roleRequested) {
+      const fresh = await Acc_User.findById(user._id).lean();
+      return res.json({ success: true, user: { ...fresh, passwordHash: undefined } });
+    }
+    // A role change is access: the canonical write, and nothing else.
+    return canonicalAccountingChange(req, res, {
+      email: user.email,
+      role: body.role,
+      via: "accountant-team:patch",
     });
   } catch (e) {
     console.error("[team] patch user:", e);
@@ -272,23 +224,25 @@ router.patch("/:userId", requireRole("owner"), async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /:userId/deactivate  /  /:userId/activate
 // ─────────────────────────────────────────────────────────────────────────
+async function teamMember(req) {
+  return Acc_User.findOne({
+    _id: req.params.userId,
+    organizationId: req.user.organizationId,
+  }).lean();
+}
+
 router.post("/:userId/deactivate", requireRole("owner"), async (req, res) => {
   try {
-    const user = await Acc_User.findOne({
-      _id: req.params.userId,
-      organizationId: req.user.organizationId,
-    });
+    const user = await teamMember(req);
     if (!user)
       return res
         .status(404)
         .json({ success: false, message: "User not found" });
-    if (user.role === "owner")
-      return res
-        .status(400)
-        .json({ success: false, message: "Cannot deactivate the owner" });
-    user.isActive = false;
-    await user.save();
-    res.json({ success: true });
+    return canonicalAccountingChange(req, res, {
+      email: user.email,
+      role: null,
+      via: "accountant-team:deactivate",
+    });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -296,17 +250,17 @@ router.post("/:userId/deactivate", requireRole("owner"), async (req, res) => {
 
 router.post("/:userId/activate", requireRole("owner"), async (req, res) => {
   try {
-    const user = await Acc_User.findOne({
-      _id: req.params.userId,
-      organizationId: req.user.organizationId,
-    });
+    const user = await teamMember(req);
     if (!user)
       return res
         .status(404)
         .json({ success: false, message: "User not found" });
-    user.isActive = true;
-    await user.save();
-    res.json({ success: true });
+    // Restores the role the record last held.
+    return canonicalAccountingChange(req, res, {
+      email: user.email,
+      role: user.role,
+      via: "accountant-team:activate",
+    });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -392,34 +346,15 @@ router.post(
 // Hard delete (not deactivate). The owner cannot be deleted, and you cannot
 // delete your own account. Past vouchers/approvals keep the stored name
 // snapshot, so the books are unaffected.
-router.delete("/:userId", requireRole("owner"), async (req, res) => {
-  try {
-    const user = await Acc_User.findOne({
-      _id: req.params.userId,
-      organizationId: req.user.organizationId,
-    });
-    if (!user)
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found" });
-    if (user.role === "owner")
-      return res
-        .status(400)
-        .json({ success: false, message: "Cannot delete the owner" });
-    if (String(user._id) === String(req.user.id))
-      return res.status(400).json({
-        success: false,
-        message: "You cannot delete your own account",
-      });
-    await Acc_User.deleteOne({
-      _id: user._id,
-      organizationId: req.user.organizationId,
-    });
-    res.json({ success: true });
-  } catch (e) {
-    console.error("[team] delete user:", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
+/* GAC-2 correction: RETIRED. A hard delete removed an Accounting access
+   record outside the audited write. Removing somebody's Accounting access is
+   POST /:userId/deactivate (a canonical revoke); the row is kept for history. */
+router.delete("/:userId", requireRole("owner"), (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "ACCOUNTING_DELETE_RETIRED",
+    message: "Deleting team members is retired. Remove their Accounting access instead (it keeps the history).",
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────

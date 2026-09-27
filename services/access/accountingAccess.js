@@ -25,7 +25,44 @@ async function resolveAccountingAccess(user) {
   if (!user) return { allowed: false, via: null };
 
   const role = user.role ? String(user.role).toLowerCase().trim() : "";
-  if (ACC_ROLES.has(role)) return { allowed: true, via: ACC_ROLES.get(role) };
+  const privilegedVia = ACC_ROLES.get(role) || null;
+
+  // Resolve the accounting scope at the same time as access. The assistant's
+  // general reporting capability must never fall back to "the first company"
+  // or accept an organisation/company id from model output. These ids come
+  // only from the verified Accounting role row and its active organisation.
+  // Older callers read only `allowed`/`via`; the additional fields are a
+  // backwards-compatible tightening for scoped assistant reads.
+  const email = user.email ? String(user.email).toLowerCase().trim() : "";
+  if (email) {
+    try {
+      const { Acc_User, Acc_Organization } = require("../../models/Accountant_model/Acc_OrgModels");
+      const accUser = await Acc_User.findOne({ email, isActive: true })
+        .select("_id organizationId role email")
+        .lean();
+      if (accUser) {
+        const organization = await Acc_Organization.findOne({
+          _id: accUser.organizationId,
+          isActive: true,
+        }).select("_id tallyCompanyIds").lean();
+        if (organization) {
+          return {
+            allowed: true,
+            via: privilegedVia || "accountant",
+            accountingUserId: String(accUser._id),
+            organizationId: String(organization._id),
+            companyIds: (organization.tallyCompanyIds || []).map(String),
+            accountingRole: accUser.role,
+          };
+        }
+      }
+    } catch {
+      // Existing privileged/read-only paths remain available below. A scoped
+      // report will fail closed when the scope is absent.
+    }
+  }
+
+  if (privilegedVia) return { allowed: true, via: privilegedVia };
 
   // Platform administrator — the authoritative signal (the CEO account is an
   // isAdmin DeptUser whose JWT role can be anything). HR access already honoured
@@ -44,7 +81,6 @@ async function resolveAccountingAccess(user) {
   }
 
   // Otherwise: an accountant-module user, matched by email (case-insensitive).
-  const email = user.email ? String(user.email).toLowerCase().trim() : "";
   if (email) {
     try {
       const rx = new RegExp(`^${email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");

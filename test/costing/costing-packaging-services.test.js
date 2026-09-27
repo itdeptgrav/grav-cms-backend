@@ -567,13 +567,14 @@ describe("an unfinished technical row blocks the costing rather than vanishing",
   });
 
   test("a required service with no billing unit is R&D's row to finish", async () => {
+    /* ── THE UNFINISHED ROW IS WHAT THE REVISION FROZE ─────────────────
+       This patched the style after the world was built. The costing reads the
+       frozen technical revision now, which was already taken — so the patch
+       changed the working record and nothing the costing looks at. R&D's row
+       is stated unfinished from the start, which is also the real sequence. */
     const w = await world({
-      service: { quantity: 1, unit: "Piece", basis: "PER_GARMENT", rateMinor: 800 },
+      service: { quantity: 1, unit: "Piece", basis: "PER_GARMENT", rateMinor: 800, billingUnit: "" },
     });
-    await SampleStyle.updateOne(
-      { _id: w.seeded.style._id },
-      { $set: { "sample.serviceRequirements.0.billingUnit": "" } },
-    );
     const r = await calc(w, ONE);
     expect(r.status).toBe(409);
     expect(r.body.error.message).toMatch(/No unit was recorded/i);
@@ -648,11 +649,11 @@ describe("an inactive, expired, withdrawn or foreign source is refused by name",
        A service billing unit is deliberately outside the Unit Master. There
        is no factor between "per piece" and "per lot" to look up, and
        inventing one is a hundredfold error. */
-    const w = await world({ service: { quantity: 1, unit: "Piece", basis: "PER_GARMENT", rateMinor: 800 } });
-    await SampleStyle.updateOne(
-      { _id: w.seeded.style._id },
-      { $set: { "sample.serviceRequirements.0.billingUnit": "Lot" } },
-    );
+    /* Quoted per piece, measured per lot — stated on the row the revision
+       freezes, for the same reason as above. */
+    const w = await world({
+      service: { quantity: 1, unit: "Piece", basis: "PER_GARMENT", rateMinor: 800, billingUnit: "Lot" },
+    });
     const r = await calc(w, ONE);
     /* Named precisely rather than as a generic block: the register considered
        the quotation and excluded it because the units do not meet, and the

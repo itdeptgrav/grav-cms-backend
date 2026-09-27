@@ -615,12 +615,30 @@ describe("guard coverage across the mounted routers", () => {
     // function's own source, which a comment cannot fake into existence
     // because a comment is not a call.
     const GUARDS = new Set([requireCompanyScope, scopeCompanyIfPresent]);
+    const bodyOf = (fn) =>
+      String(fn).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     const delegatesToGuard = (fn) =>
       typeof fn === "function" &&
-      /\b(requireCompanyScope|scopeCompanyIfPresent)\s*\(/.test(
-        String(fn).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, ""),
-      );
-    const isGuard = (fn) => GUARDS.has(fn) || delegatesToGuard(fn);
+      /\b(requireCompanyScope|scopeCompanyIfPresent)\s*\(/.test(bodyOf(fn));
+
+    /* A guard that does the work ITSELF rather than delegating.
+       `Acc_reporting.js` needs one: a report may name SEVERAL companies, every
+       one has to be checked, one failure refuses the whole request rather than
+       running over the subset that passed, and the refusal has to carry one of
+       the four codes the designer understands — none of which the shared guard
+       does. Recognising it by name would be exactly the hole this test exists
+       to close, so what is checked is that the handler reads the session
+       organisation's OWN list of permitted companies and refuses on it. That
+       is the permission data itself; a comment cannot fake a read of it. */
+    const enforcesScopeItself = (fn) => {
+      if (typeof fn !== "function") return false;
+      const src = bodyOf(fn);
+      return /\btallyCompanyIds\b/.test(src)
+        && /\b(403|FORBIDDEN)\b/.test(src)
+        && /\breq\.organization\b/.test(src);
+    };
+
+    const isGuard = (fn) => GUARDS.has(fn) || delegatesToGuard(fn) || enforcesScopeItself(fn);
     const unguarded = [];
 
     // Lane B owns these two and they carry their own report guard

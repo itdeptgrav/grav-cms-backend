@@ -1,0 +1,6 @@
+# Exact versions Open-Jev commit 3308a15 pins for training (pyproject [train]).
+# torch>=2.8 with CUDA comes from the RunPod PyTorch image and is checked by setup_pod.sh.
+transformers==5.10.2
+peft==0.19.1
+accelerate==1.13.0
+safetensors

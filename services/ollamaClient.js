@@ -109,8 +109,23 @@ function extractJsonObject(text) {
  * @returns {Promise<{ data: object, model: string }>}
  * @throws {OllamaError}
  */
-async function chatJson({ system, prompt, schema, temperature = 0.2, numPredict, timeoutMs, fetchImpl } = {}) {
-  const { baseUrl, model, timeoutMs: cfgTimeout, keepAlive } = config();
+async function chatJson({
+  system,
+  prompt,
+  schema,
+  temperature = 0.2,
+  numPredict,
+  timeoutMs,
+  fetchImpl,
+  baseUrl: baseUrlOverride,
+  model: modelOverride,
+  keepAlive: keepAliveOverride,
+} = {}) {
+  const configured = config();
+  const baseUrl = String(baseUrlOverride || configured.baseUrl).replace(/\/+$/, "");
+  const model = String(modelOverride || configured.model);
+  const cfgTimeout = configured.timeoutMs;
+  const keepAlive = keepAliveOverride ?? configured.keepAlive;
   const doFetch = fetchImpl || globalThis.fetch;
   const budget = Number(timeoutMs) || cfgTimeout;
 

@@ -1,4 +1,268 @@
-# ACTIVE TASK — IMAGE STUDIO / PHOTOPEA, SLICE 0.5: NATIVE GRAV PRESENTATION (21 Sep 2026)
+# ACTIVE TASK — ACCOUNTING ASSISTANT UNIFIED SEMANTIC READ CATALOGUE (27 Sep 2026)
+
+> User explicitly approved connecting every authorised Accounting capability.
+> “All” means the signed-in person’s real Accounting permissions, never raw
+> database/SQL access and never an unconfirmed mutation.
+
+## Reliability correction — authoritative semantics and fail-closed balances
+
+The first live semantic-report proof exposed two correctness defects: imported
+voucher lines could carry stale/null ledger groups and financial-year labels,
+and cached ledger balances could disagree materially with balances reconstructed
+from posted vouchers. A stale cache must not override a complete traceable
+calculation, while structurally incomplete books must still fail closed.
+
+Implemented:
+
+- The financial read is now a typed metric catalogue instead of one fixed
+  summary blob. The closed metrics are revenue, expenses, direct revenue,
+  direct expenses/COGS, gross profit, gross-profit margin, net profit,
+  net-profit margin, assets, liabilities and equity, plus an explicit full
+  summary choice. The deterministic renderer returns only the requested metric.
+- Gross profit is computed from the chart-of-accounts hierarchy: Sales
+  Accounts + Direct Incomes + Closing Stock, less Purchase Accounts + Direct
+  Expenses + Opening Stock. It is not inferred from user wording or unrelated
+  CRM/purchase-order dashboard data.
+- Financial amounts retain two-decimal accounting precision; the assistant no
+  longer rounds the report's paise away before answering.
+
+- Native assistant reports now resolve ledger name/group through the current
+  ledger master (voucher-line copies are legacy fallback only).
+- Indian financial year is derived from `voucherDate` using the April–March
+  boundary; the optional imported `financialYear` label is not authoritative.
+- A result-verification gate checks bounded row count, result shape, numeric
+  measures, requested ordering and resolved ledger dimensions before formatting.
+- Closing balances now carry a reconciliation result comparing the traceable
+  opening-plus-posted-voucher calculation with the cached ledger master value.
+  A differing cache is labelled `cache_stale` and does not suppress the
+  authoritative calculation. A zero-opening account with settlement-side
+  movement but no normal-side posting is labelled `source_incomplete` and is
+  refused.
+- Accounting omnisearch uses the same calculated balance and exposes the
+  reconciliation metadata, so Search and the assistant no longer knowingly
+  use different formulas.
+- Accounting omnisearch renders `Needs reconciliation` only for structurally
+  incomplete balances; stale cache alone does not hide a complete calculation.
+- The language contract explicitly separates posted debit/credit turnover from
+  closing debit/credit balance. Total debit/credit routes to the semantic report
+  universe and must not be rewritten as closing balance.
+
+Evidence:
+
+- 103/103 focused backend accounting assistant tests and the focused frontend
+  reconciliation presentation contract pass.
+- Live browser acceptance: “expenses for this year” returns only the requested
+  metric, and “gross profit for this year” returns the separately computed
+  gross-profit metric rather than the generic P&L/balance-sheet paragraph.
+- Live FY 2026–27 top-five debit turnover after correction: Raw Materials
+  ₹58,30,028.04; INDIAN BANK (CA-3512) ₹51,14,242.90; Sales Returns
+  ₹50,14,054.00; MAYFAIR Lagoon ₹27,97,484.00; Debidutt Mangilall
+  ₹23,00,000.00.
+- Live Salary Payable reconciliation correctly detects calculated
+  ₹28,21,068 Dr versus cached ₹37,822 Cr (difference ₹28,58,890) and therefore
+  blocks a definitive closing-balance answer.
+- Live Debidutt Mangilall has a complete FY calculation: opening ₹17,28,852 Dr,
+  debits ₹23,00,000, credits ₹59,28,095 and closing ₹18,99,243 Cr. Its stale
+  cached master value is diagnostic only and does not block the answer.
+- Browser acceptance confirms that Search shows `Needs reconciliation` and the
+  exact request “balance of Salary Payable” produces the single-ledger
+  reconciliation refusal rather than a fabricated number or a broad ranking.
+
+The data mismatch is not repaired automatically. Finance must supply/correct
+the missing opening or accrual entries (or a verified trial-balance authority)
+through an auditable accounting workflow; overwriting a cache would hide the
+problem rather than reconcile the books.
+
+## Implemented in this slice
+
+- Added one broad `acc_report_query` capability backed by the server-owned
+  semantic field catalogue rather than phrase rules.
+- Qwen may emit only typed semantic field ids, calculations, filters, sorting
+  and a bounded limit. It cannot emit collection paths, SQL, tenant ids,
+  company ids or credentials.
+- GRAV resolves the Accounting role row and active organisation, injects every
+  owned company id, validates the layout, re-authorises the tool and executes a
+  posted-voucher-line aggregation through a closed server mapping.
+- Chat does not depend on the optional local Metabase process. The custom-report
+  UI can continue to use Metabase independently.
+- Existing specialist reads remain available for closing balances, financial
+  summary, vouchers, company profile and receivable/payable ageing/outstanding.
+
+## Evidence
+
+- 86/86 focused Open-Jev/Qwen/accounting-query tests pass.
+- Live Qwen route + argument proof selected `acc_report_query` for “show top
+  five ledger groups by total debit in financial year 2026-27” and preserved
+  the grouping, measure, FY filter, descending sort and limit.
+- Live company-scoped execution resolved `ray@grav.in` through its Accounting
+  organisation (three owned companies) and returned the deterministic top-five
+  report from posted voucher lines.
+- Unknown semantic ids, operations/calculations, missing Accounting scope and
+  unowned companies fail closed before a read.
+
+## Still required before “every Accounting tool” is a truthful claim
+
+The semantic voucher-line universe is broad but it is not every Accounting
+domain. Dedicated typed adapters remain necessary for GST returns/deadlines,
+cash-flow and forecasts, budgets, banking/reconciliation, approvals, cost
+centres, saved statements/reports and documents. Mutations require a separate
+draft → preview → explicit-confirm contract; no model may directly execute a
+write. Do not describe those capabilities as connected until their adapters and
+permission tests exist.
+
+---
+
+# PREVIOUS ACTIVE TASK — ACCOUNTING ASSISTANT READ CATALOGUE, PARTY REPORT SLICE (27 Sep 2026)
+
+> User-authorised priority change. GAC-2 remains preserved below and is not
+> silently modified by this slice.
+
+## Scope of this slice
+
+Expand the existing Jev + Qwen accounting pilot through one generic typed
+capability backed by the existing deterministic customer/supplier services:
+
+- customer outstanding / ranked receivables;
+- customer invoice ageing;
+- supplier outstanding / ranked payables;
+- supplier bill ageing.
+
+Qwen may select the capability and emit only its closed fields (`report`,
+`asOf`, optional party search, ranking and bounded limit). GRAV owns company
+scope, permissions, real-data lookup, accounting calculations and answer
+formatting. No raw database access, model-generated query language or write
+capability is in scope.
+
+## Exit evidence
+
+- `acc_party_reports` is registered and dynamically offered only to authorised
+  accounting users.
+- 82/82 focused Open-Jev/Qwen/accounting-answer tests pass.
+- Live local proof: “show top five largest customer receivables” produced the
+  typed `customer_outstanding` plan with `ranking=largest`, `limit=5`, then the
+  existing company-scoped service returned the ranked answer.
+- Backend and frontend development services were restarted. Browser acceptance
+  is waiting on a valid Accounting session; the current `ceo@grav.in` legacy
+  session resolves as merchandiser and is correctly refused by Accounting.
+
+## Not yet complete
+
+This is not the complete accounting catalogue. GST, cash flow, budgets, cost
+centres, statements, the custom-report semantic catalogue and other approved
+read-only domains still need their own typed capability adapters and tests.
+
+---
+
+# PREVIOUS ACTIVE TASK — GRAV ACCESS CONTROL, GAC-2: CANONICAL GRANT ADMINISTRATION (25 Sep 2026)
+
+> Read the GAC-2 section at the top of `docs/handoff/latest-implementation.md`.
+
+## Scope of this slice
+
+One authoritative backend write for application access: canonical person +
+application slug + Viewer/Editor/Approver/Owner or revoke + mandatory reason +
+idempotency key. Target resolved through the canonical identity service; no
+identities created. DepartmentRole for ordinary apps, an Acc_User adapter for
+Accounting. Company-scoped input refused. Immutable audit, idempotent retries,
+serialised concurrent writes, last-admin and last-Owner protection, cache
+invalidation, and a re-read through `resolveAppAccess()` before answering. Old
+routes become thin adapters over the one write, each with its consumer and
+deletion condition documented.
+
+Out of scope: redesigning Access Control, cutting over module guards,
+removing company fields/memberships/legacy collections, destructive cleanup.
+
+## Review correction (25 Sep 2026) — implemented; stopped for review
+
+Review found six defects in the first GAC-2 implementation; this task now
+includes correcting them (not GAC-3):
+
+1. Live bypasses (Accounting team role/activation writes, invites, bootstrap,
+   sync-legacy auto-owner, admin hard delete, old service writers) — route
+   through `changeAppAccess()` or retire.
+2. Accounting role rows for a DeptUser/Employee get explicit non-login
+   semantics (`loginMode: "none"`, no hash), never an unknown password.
+3. An actually append-only access audit (`access_grant_events`).
+4. Idempotency enforced by storage across applications.
+5. `tokenVersion` incremented for every affected Accounting user, including
+   automatically demoted Owners.
+6. Stale-authority prevention that does not depend on a best-effort clear.
+Plus source-contract tests that fail on any new direct writer.
+
+## Exit evidence
+
+- `services/access/accessGrantAdmin.service.js` and `PUT /api/admin/app-access`.
+- `test/access/gac2-grant-administration.test.js` 33/33; GAC-AR1, GAC-AR2,
+  SEC-0 and SEC-1 suites green; remaining failures identical on clean HEAD.
+- Frontend sends reason and idempotency key; no password or company field.
+- Stop for review. (GAC-AR2 live browser acceptance has passed; only the
+  optional retirement of `ceo@grav.in` is undecided.)
+
+---
+
+# PRECEDING TASK — GAC-AR2: ONE PERSON, ONE LOGIN (25 Sep 2026)
+
+> Read `docs/decisions/single-organisation-access-control.md` (the "One person,
+> one login" rule) and the GAC-AR2 section of `docs/handoff/latest-implementation.md`.
+
+## Scope of this slice
+
+One canonical login identity per person across DeptUser, Employee, Acc_User and
+legacy rows; login, resolve, verify, switch and logout agree; the browser's
+session copies follow the HttpOnly cookie; `ray@grav.in` becomes the canonical
+full-system administrator through a dry-run-first migration; `ceo@grav.in` is
+marked transitional (not deleted, not deactivated in this chunk). Do not start
+company-field removal or the next access-control chunk.
+
+## Exit evidence
+
+- Canonical identity service and cut-over endpoints, with regression tests.
+- Migration dry run reviewed; `--apply` only with explicit user approval.
+- Live browser acceptance as `ray@grav.in` (the user enters the password):
+  every active app, Accounting without "Unauthorized", sign-out ends the
+  session, an ordinary user sees only granted apps.
+
+## Applied state
+
+The canonical administrator migration has been applied with explicit approval.
+`ray@grav.in` resolves to all 24 active internal applications as Owner and keeps
+its Accounting Owner role. Its pre-migration Accounting-only sessions were
+revoked. Live browser acceptance PASSED (reported by the user): the launcher
+showed all 24 applications, Accounting opened, and Access Control identified
+`ray@grav.in` as Full System Administrator. Only the optional retirement of
+the transitional `ceo@grav.in` remains undecided.
+
+---
+
+# SUPERSEDED — GRAV ACCESS SIMPLIFICATION, GAC-0: INVENTORY AND SAFETY NET (25 Sep 2026)
+
+> Product direction changed to a single internal organisation: GRAV Clothing.
+> Read `docs/decisions/single-organisation-access-control.md`,
+> `docs/tasks/single-organisation-access-roadmap.md`, and Prompt 0 in
+> `docs/handoff/single-organisation-access-prompts.md`. Implement GAC-0 only.
+
+## Scope of this slice
+
+Inspect both repositories and the current dirty worktrees. Produce the
+read-only access/company-context manifest and only the narrowly necessary
+characterization tests described by GAC-0. Classify company references rather
+than globally deleting them. Do not change application behaviour, database
+data, grants, memberships, indexes or company records. Preserve unrelated work,
+do not commit, update the handoff with exact evidence, and stop for review.
+
+## Exit evidence
+
+- Every app has a mapped identity source, launcher check, frontend guard,
+  backend/API guard, role authority, admin bypass and company-context path.
+- Company references are classified as tenant plumbing, redundant GRAV
+  partition key, legal/statutory fact, counterparty data, demo/test-only or
+  unresolved.
+- Current high-risk access interactions are pinned by focused tests.
+- No production behaviour or shared data changed.
+
+---
+
+# PAUSED TASK — IMAGE STUDIO / PHOTOPEA, SLICE 0.5: NATIVE GRAV PRESENTATION (21 Sep 2026)
 
 > Codex review accepted the Slice 0 synthetic-file integration proof. The user has asked to improve the native GRAV feel before backend file integration. This is a frontend presentation slice only. Read `docs/product/image-studio-photopea.md`, `docs/decisions/image-studio-photopea-boundary.md`, and `docs/tasks/image-studio-photopea.md` first.
 
@@ -5006,3 +5270,43 @@ No full regression suite and no production build were run, per the brief.
   the Lead edit surfaces render the Prospect form's own sections.
 - Whatever else Chunk 2 is scoped to cover once that scoping happens —
   nothing below this line should be treated as decided until it is.
+# ACTIVE TASK — QWEN-ONLY TYPED HR ASSISTANT (27 Sep 2026)
+
+## User outcome
+
+Make the central GRAV assistant understand HR questions without adding a phrase
+rule for every wording, while keeping HR records and actions reliable.
+
+## Implemented
+
+- Replaced the live central assistant's mixed Ollama function-call + regex
+  fallback with one generic two-stage Qwen planner: authorised capability first,
+  then the selected capability's typed arguments.
+- Removed Open-Jev from the live central-assistant call path. Its files remain as
+  evaluation evidence only.
+- Preserved the eleven existing HR read capabilities covering overview,
+  attendance, leave, employee, directory, departments, overtime, holidays,
+  policies, aggregate payroll and authorised salary/payslip reads.
+- Preserved server-owned HR permission filtering and added an independent
+  permission re-check after Qwen selects a capability.
+- Added closed-schema validation that rejects missing required fields, invalid
+  dates/types, unknown fields and unoffered capability names.
+- Added structured conversation state so contextual follow-ups reuse the last
+  validated tool/arguments without feeding prior HR answer prose back into the
+  planner.
+
+## Safety boundary
+
+This slice is read-only. HR mutations remain unavailable until each action has
+a typed draft, deterministic preview, explicit confirmation, idempotent server
+execution and audit event. The model has no raw MongoDB access.
+
+## Verification
+
+- 67/67 focused Qwen planner, central assistant, HR permission parity and legacy
+  pilot-isolation tests pass.
+- Syntax and diff checks pass.
+
+Durable architecture: `docs/decisions/qwen-typed-cms-assistant.md`.
+
+---

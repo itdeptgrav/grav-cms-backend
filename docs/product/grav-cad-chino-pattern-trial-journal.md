@@ -393,3 +393,69 @@ Cutting, grading publication, marker making and production. Unchanged, and uncha
 approved master, no toile, no fitting, no one-to-one measured printout, no sewn garment. The chino is not wearable
 and is not industry-approved. The acceptance list under "Acceptance evidence required before production ready"
 stands in full.
+
+
+---
+
+## Session 4 — 25 September 2026 · The review package, and one inventory behind it
+
+Continued from revision `86224e6125c7a6ed`, still `REVIEW_REQUIRED`. Nothing here approves anything.
+
+### 22. The back pocket welt: it is part of the chino
+
+Answered from the recipe rather than from the validation. `CHINO_FEATURES` declares `pockets.back_welt` — a 5.5"
+welt mouth on the back panel, anchored below the dart apex. A men's regular-fit chino has back welt pockets, so
+the piece stays and its geometry is now complete: 6.5" × 2.5" cut (mouth plus 0.5" extension each end, by four
+0.25" lips and their turnings), three fold lines, two mouth drills, grain running **across** the mouth so the
+opening does not gape, cut 2 as an `IDENTICAL_PAIR`, anchored by stable id to `back.dart.1.apex`.
+
+The empty placeholder is gone, and not by exception: nothing in the validation is excused for it.
+
+### 23. Why the welt went missing — three copies of one fact
+
+The discrepancy in §20 was not one list being wrong. It was **three separate answers** to "which components does
+this garment have":
+
+| where | what it said |
+|---|---|
+| `trouserTemplate.js` `TEMPLATE_FEATURES` | a generic trouser, no back pocket — and the workflow built the "chino" from it |
+| `create-master-pattern.mjs` `CHINO_FEATURES` | the chino, with a back pocket |
+| `masterValidation.js` check 11 | a literal of five component types, no welt |
+
+plus a fourth in `draftMasterPieces`, which created placeholders for six types whatever the recipe said.
+
+All four are replaced by `masterInventory.js`, which derives components from the recipe. The chino is defined once
+in `chinoStyle.js`; the workflow panel and the headless journey build from it and produce identical block, recipe
+and style-master revisions (`cc35cbf84739d86a`, `a2c51af32d7c6ee0`).
+
+### 24. A unit error the measurement checks could not see
+
+While drawing the pieces at true size for the review package, the welt reported 0.26" × 0.10". Every constructed
+component was emitting its inch dimensions as path coordinates, where paths are in millimetres — so the fly, the
+shield, both pocket pieces, the welt and the belt-loop strip were all a twenty-fifth of their size, beside legs
+that were correct.
+
+No check caught it, and none could have: no measurement station maps to a component, so nothing ever compared
+one against a number. It surfaced the first time something drew them to scale. They are now 1.5"×7", 2"×7.25",
+3"×6.5", 6.25"×11.5", 6.5"×2.5" and 17.5"×1.75".
+
+### 25. The review package
+
+`docs/review-packages/MSTR-CHINO-REG-34.<rev>.review.html` — every piece with its stable id, cut quantity,
+pairing rule, dimensions, grainline, internal lines, drills, construction relationship, seam allowance and
+provisional reason; a fitted overview for reading the shape and a separate true-size sheet for measuring it, with
+a 100 mm calibration bar and a page count for anything larger than A4.
+
+The four disputed stations each get their candidate refs, the caution on that candidate, the front/back
+comparison, and an empty decision block. **Nothing is preselected.** A test asserts the document contains no
+ticked control and no recommendation, and that there are exactly ten decision blocks — six pieces, four stations.
+
+### 26. What is still absent
+
+The approval adapter. `docs/approval-adapter-contract.md` specifies it — the five fields a client may send, the
+seven the server must supply, the six checks before a write, the audit record, and the five guarantees — and
+states plainly that **no implementation exists**. Local review notes may be saved; they carry
+`isDisposition: false` and `DURABILITY.LOCAL_PROTOTYPE_ONLY`, and a note cannot become a disposition.
+
+Stopping point: **`REVIEW_REQUIRED`**, 10 blockers. Cutting, grading publication, marker making and production
+remain refused.

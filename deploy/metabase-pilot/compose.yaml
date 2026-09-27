@@ -1,0 +1,124 @@
+# deploy/metabase-pilot/compose.yaml
+#
+# LOCAL DEVELOPMENT PILOT — SYNTHETIC DATA ONLY. NOT FOR DEPLOYMENT.
+#
+# Three containers, all bound to 127.0.0.1 so nothing is reachable from the
+# network:
+#
+#   postgres-app        Metabase's own application database. Not H2 — H2 is a
+#                       single file that corrupts under load and cannot be
+#                       backed up while running, and Metabase itself warns
+#                       against it for anything but a first look.
+#   postgres-reporting  The synthetic Accounting dataset Metabase reports on.
+#                       A SEPARATE server, not a second database in the same
+#                       one, so the read-only reporting role has no path to
+#                       Metabase's application data even if it were mis-granted.
+#   metabase            Pinned. `latest` would silently change the SDK
+#                       compatibility contract under us.
+#
+# Nothing here reads MONGODB_URI or talks to any GRAV service.
+
+name: grav-metabase-pilot
+
+services:
+  postgres-app:
+    image: postgres:16-alpine
+    container_name: grav-mb-pilot-app-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: metabase_app
+      POSTGRES_USER: metabase_app
+      POSTGRES_PASSWORD: ${PILOT_APP_DB_PASSWORD:?set PILOT_APP_DB_PASSWORD in .env}
+    # No host port at all. Only Metabase needs this, and it reaches it over the
+    # compose network.
+    expose:
+      - "5432"
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metabase_app -d metabase_app"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-reporting:
+    # The REAL Accounting reporting mart. An empty PostgreSQL server: its
+    # schema, its roles and its data all arrive from the backend, so that the
+    # thing Metabase reports on is built by the same versioned migrations in
+    # every environment rather than by a container init script that runs once
+    # and can never be re-run.
+    #
+    #   npm run reporting:migrate -- --apply     schema + curated views
+    #   npm run reporting:roles   -- --apply     reporting_sync, metabase_reader
+    #   npm run reporting:sync    -- --full      real data from MongoDB
+    #
+    # It used to seed a SYNTHETIC dataset here. That is retired — see
+    # seed/synthetic/README.md and migrations/reporting/V002.
+    image: postgres:16-alpine
+    container_name: grav-mb-pilot-reporting-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: reporting
+      POSTGRES_USER: reporting_owner
+      POSTGRES_PASSWORD: ${PILOT_REPORTING_OWNER_PASSWORD:?set PILOT_REPORTING_OWNER_PASSWORD in .env}
+    # Loopback only, and on a non-default port so it cannot be confused with a
+    # real local Postgres. Exposed at all only so the verification script and a
+    # developer's psql can reach it.
+    ports:
+      - "127.0.0.1:15433:5432"
+    volumes:
+      - reporting-db-data:/var/lib/postgresql/data
+      # No init scripts. Nothing is seeded into this database by the container
+      # any more; `seed/synthetic/` is kept for throwaway databases only and is
+      # deliberately not mounted.
+    healthcheck:
+      # The server accepting connections IS the whole readiness condition now.
+      # It used to check for seeded rows, because the seed ran after the port
+      # opened — with no seed, waiting for data would wait forever on a fresh
+      # volume, before the migrations have had a chance to run.
+      test: ["CMD-SHELL", "pg_isready -U reporting_owner -d reporting"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  metabase:
+    image: metabase/metabase-enterprise:v1.63.1
+    container_name: grav-mb-pilot-metabase
+    restart: unless-stopped
+    depends_on:
+      postgres-app:
+        condition: service_healthy
+      postgres-reporting:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase_app
+      MB_DB_PORT: 5432
+      MB_DB_USER: metabase_app
+      MB_DB_PASS: ${PILOT_APP_DB_PASSWORD}
+      MB_DB_HOST: postgres-app
+      # The SDK refuses to load against an instance that has not enabled it.
+      MB_ENABLE_EMBEDDING_SDK: "true"
+      # The CMS dev server's origin. The SDK is XHR, not an iframe, so this is
+      # a CORS allow-list rather than a frame-ancestors one.
+      # The CMS dev server's origin, and only that. `grav-cms/package.json`
+      # runs `next dev -p 3001`; ports 3000 and 3005 were added while chasing a
+      # free port during development and are not this project's.
+      MB_EMBEDDING_APP_ORIGINS_SDK: "http://localhost:3001 http://127.0.0.1:3001"
+      MB_SITE_URL: "http://localhost:3100"
+      JAVA_TIMEZONE: Asia/Kolkata
+    ports:
+      - "127.0.0.1:3100:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+volumes:
+  app-db-data:
+  reporting-db-data:
+  metabase-data:

@@ -261,7 +261,103 @@ router.get("/:id", async (req, res) => {
     // it back would be the largest thing in the response and is never read.
     if (barcode.rawItem) delete barcode.rawItem.variants;
 
-    return res.json({ success: true, barcode });
+    /* ── A SCAN MUST SAY WHOSE MATERIAL THIS IS ──────────────────────────────
+       A customer-supplied roll scans exactly like our own, and until now the
+       answer looked exactly like our own too — at which point somebody cuts a
+       customer's fabric for a different order and nothing warned them.
+
+       So a customer-owned label answers with an explicit ownership block and a
+       banner. Every existing label is untouched: without `customerMaterial.lotId`
+       the response is byte-for-byte what it has always been, which is what keeps
+       the product-marking and purchase-receipt paths working unchanged. */
+    const cm = barcode.customerMaterial || {};
+    if (cm.lotId) {
+      /* ── AND REFUSED ACROSS COMPANIES ────────────────────────────────────
+         A customer-owned label carries the company that printed it, precisely so
+         this can be refused. Scanning another tenant's label would disclose their
+         customer, their order and their quantities to somebody with no
+         relationship to them.
+
+         This router carries no tenant middleware — it never needed one, because
+         an ordinary label discloses nothing about anybody else — so the company
+         is resolved HERE, and only for a customer-owned label. Two consequences,
+         both deliberate: every existing scan is untouched, and a caller whose
+         company cannot be resolved at all is refused rather than allowed through
+         on the grounds that there was nothing to compare.
+
+         Answered as NOT FOUND rather than forbidden, because the existence of the
+         label is itself part of what is being protected: "you may not see this"
+         confirms that another company holds material for a customer. */
+      let scanning = req.tenant?.companyId || null;
+      if (!scanning) {
+        try {
+          const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+          const resolved = await tenantContext.resolveForActor(req.user, {});
+          scanning = resolved?.companyId || null;
+        } catch {
+          scanning = null;
+        }
+      }
+      const owner = String(barcode.companyId || "");
+      if (!scanning || !owner || owner !== String(scanning)) {
+        return res.status(404).json({ success: false, message: "Barcode not found" });
+      }
+      const labels = require("../../../../services/storePurchase/customerMaterialLabel.service");
+      const { CustomerMaterialLot } = require("../../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+      const lot = await CustomerMaterialLot.findById(cm.lotId)
+        .select("availableQuantity issuedQuantity returnedQuantity status baseUnit receivedAt")
+        .lean();
+
+      return res.json({
+        success: true,
+        barcode,
+        /* First in the payload and impossible to miss. A screen that rendered
+           only `barcode` would still be wrong, but it could not be wrong by
+           accident about ownership. */
+        ownership: {
+          kind: "CUSTOMER_OWNED",
+          banner: labels.OWNERSHIP_BANNER,
+          customer: {
+            id: String(cm.customerId || ""),
+            label: String(cm.customerLabel || ""),
+            code: String(cm.customerCode || ""),
+          },
+          orderRef: String(cm.orderRef || ""),
+          orderLineRef: String(cm.orderLineRef || ""),
+          documentRef: String(cm.documentRef || ""),
+          againstRevisionNo: cm.expectationRevisionNo ?? null,
+          expectationLineRef: String(cm.expectationLineRef || ""),
+          lot: {
+            id: String(cm.lotId),
+            goodsReceiptNumber: String(cm.goodsReceiptNumber || ""),
+            receivedAt: lot?.receivedAt || null,
+            availableQuantity: lot?.availableQuantity ?? null,
+            issuedQuantity: lot?.issuedQuantity ?? null,
+            returnedToCustomerQuantity: lot?.returnedQuantity ?? null,
+            status: String(lot?.status || ""),
+            baseUnit: String(lot?.baseUnit || ""),
+          },
+          where: {
+            warehouseName: String(cm.warehouseName || ""),
+            locationCode: String(cm.locationCode || ""),
+          },
+          /* The one sentence a picker needs. */
+          usableFor: `Only order ${String(cm.orderRef || "")}`
+            + `${cm.orderLineRef ? `, line ${cm.orderLineRef}` : ""}.`,
+          /* Said explicitly so nothing downstream treats it as free stock. */
+          availableAsGeneralStock: false,
+        },
+      });
+    }
+
+    /* An ordinary label. The response shape is unchanged, and `ownership` says so
+       rather than being absent — a reader that checks for it gets an answer on
+       every scan instead of having to treat "missing" as "ours". */
+    return res.json({
+      success: true,
+      barcode,
+      ownership: { kind: "COMPANY_OWNED", banner: "", availableAsGeneralStock: true },
+    });
   } catch (error) {
     console.error("Error fetching barcode:", error);
     return res.status(500).json({ success: false, message: "Server error" });

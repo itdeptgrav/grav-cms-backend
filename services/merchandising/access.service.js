@@ -177,6 +177,11 @@ function minimumRoleFor(capability) {
  * administrator did afterwards.
  */
 async function liveMerchandisingRole(req) {
+  /* GAC-AR1: a database-verified platform administrator is a full-system
+     administrator — owner here, as everywhere. Re-read from dept_users; the
+     token's claim alone never qualifies. Business approvals below still run
+     against that owner role exactly as for any other owner. */
+  if (await require("../departmentRoles").isDatabaseVerifiedAdmin(req)) return ROLE.OWNER;
   return (await getEffectiveRole(DEPARTMENT, req)) || null;
 }
 

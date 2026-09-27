@@ -16,7 +16,7 @@ const VendorAuthMiddleware = (req, res, next) => {
     // Verify token
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
     );
 
     // Check if it's a vendor token

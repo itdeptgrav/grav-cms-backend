@@ -1566,7 +1566,7 @@ app.use(
       }
       const decoded = jwt.verify(
         token,
-        process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+        require("./config/jwt").SECRET,
       );
       req.customerId = decoded.id;
       req.onBehalfActor = { id: decoded.id, name: decoded.name || "" };
@@ -1906,6 +1906,15 @@ app.use("/api/cms/sales/change-notices", require("./routes/CMS_Routes/Sales/chan
    and R&D and Costing read the approved selection. Sixth router on the
    Merchandising mount; the request itself is Sales', mounted below. */
 app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/developmentRoute"));
+/* Merchandising → customer-supplied material on a JOB WORK order. Its own
+   router beside the execution one, which is already the widest surface here.
+   Eligibility rests on the execution file's own stored fulfilment model and is
+   enforced in the service, not by which screens choose to render. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/customerMaterialRoute"));
+/* PPC / Production → customer-material availability for a production order or a
+   work order. READ ONLY, and offered only where the stored link is provable:
+   issuing customer material is Store's physical act against an exact lot. */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/customerMaterialRoute"));
 
 /* Sales owns the Journey and asks for the work. A Merchandising grant opens
    nothing here, and Sales has no handle on the Development File. */
@@ -2121,6 +2130,12 @@ app.use("/api/cms/store/products", storeProductsRoutes);
 // authoritative GoodsReceipt documents; creation lives on the PO route).
 const goodsReceiptsRoutes = require("./routes/CMS_Routes/StorePurchase/goodsReceipts");
 app.use("/api/cms/store/goods-receipts", goodsReceiptsRoutes);
+// Store → Customer-supplied material expectations (READ ONLY). Merchandising
+// states what a job-work customer is sending; Store reads it so a delivery can
+// be recognised. Nothing here records a receipt or moves stock — that arrives
+// with goods receipt and ownership lots.
+const storeCustomerMaterialsRoutes = require("./routes/CMS_Routes/StorePurchase/customerMaterials");
+app.use("/api/cms/store/customer-materials", storeCustomerMaterialsRoutes);
 
 // Operations Category
 /* Store & Purchase — Chunk 1. Tenant context, capabilities and the immutable
@@ -2791,6 +2806,14 @@ app.use(
 app.use(
   "/api/accountant/tally/companies",
   require("./routes/Accountant_Routes/Acc_companies"),
+);
+/* Custom Reports. The GRAV report designer's only backend: safe field ids in,
+   labelled columns out. Metabase lives entirely behind this router — the
+   browser never sees an engine URL, key, id, MBQL or SQL. Contract:
+   grav-cms/docs/accounting-reporting-api-contract.md */
+app.use(
+  "/api/accountant/reporting",
+  require("./routes/Accountant_Routes/Acc_reporting"),
 );
 /* GSTIN verification for the parties in the books — reads are free, the
    sweep is the only thing that spends. See the route file's header. */

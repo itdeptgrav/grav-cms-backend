@@ -688,7 +688,17 @@ async function seedSourceBacked(companyId, {
           serviceCode: serviceMaster.serviceCode, serviceName: serviceMaster.name,
           specification: service.specification || "Enzyme wash, two cycles",
           quantity: service.quantity,
-          billingUnit: service.unit || "Piece",
+          /* ── STATED UP FRONT, INCLUDING "NOT RECORDED" ──────────────
+             `billingUnit` is explicit and separate from `unit` because the
+             interesting cases are an EMPTY one (R&D has not finished the row)
+             and one that disagrees with the quotation's — and `unit || "Piece"`
+             cannot express either, since "" is falsy. Suites used to patch the
+             style after the world was built, which no longer reaches the
+             costing: the frozen revision is the basis, and it is frozen before
+             the patch lands. */
+          billingUnit: Object.hasOwn(service, "billingUnit")
+            ? service.billingUnit
+            : (service.unit || "Piece"),
           basis: service.basis || "PER_GARMENT",
           owner: service.owner || "RND",
           evidence: service.evidence || "SAMPLE_MEASURED",

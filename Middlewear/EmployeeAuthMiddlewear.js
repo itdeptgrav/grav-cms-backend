@@ -27,7 +27,7 @@ const EmployeeAuthMiddleware = (req, res, next) => {
 
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
     );
 
     req.user = {
@@ -47,6 +47,11 @@ const EmployeeAuthMiddleware = (req, res, next) => {
       deptId: decoded.deptId || null,
       deptSlug: decoded.deptSlug || "",
       isAdmin: Boolean(decoded.isAdmin),
+      // GAC-AR1: identifiers the canonical access resolver needs to re-read
+      // this session from the database (which identity kind, which token
+      // version). They grant nothing by themselves.
+      subject: decoded.subject || "",
+      tv: decoded.tv || 0,
       // Set only on the short-lived token services/changeRequests mints when an
       // approver's decision is replayed against this server. Carried through
       // because a ROUTE-level approval guard runs after this middleware has

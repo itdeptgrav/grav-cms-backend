@@ -373,3 +373,197 @@ test("the valuation replay sees the correction exactly once", async () => {
   const valued = valuation.valueItem(item);
   expect(valued.storedOnHand).toBe(8);
 });
+
+// ── Customer-owned material is not the company's to write off ────────────────
+//
+// A stock-take counts what is on the shelf, and a job-work customer's fabric is on
+// the shelf. Count 18 metres of somebody else's poplin among the 20 in the rack,
+// find 20 where the system expected 22, and a −2 correction writes the difference
+// off against the company's own balance. That much is fine — 2 of those 20 are
+// ours. A −3 is not: the third unit is the customer's, and taking it leaves the
+// physical total and the location down while the CustomerMaterialLot still claims
+// its full held quantity. The books then promise the customer material the shelf
+// cannot produce, and it is invisible precisely because a count is the operation
+// everybody trusts to REMOVE discrepancies.
+//
+// The lot is deliberately never adjusted here. A real shortfall of a customer's
+// property needs a named operation with a reason and an owner, not a silent
+// decrement buried in a count.
+
+describe("a stock count and customer-owned stock", () => {
+  const { CustomerMaterialLot } = require("../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+  const oid = () => new mongoose.Types.ObjectId();
+
+  /** Customer material physically at a location, held for one order line. */
+  const heldAt = (ctx, { quantity, location = null, variantId = null }) => {
+    const n = ++seq;
+    const loc = location || ctx.stock;
+    return CustomerMaterialLot.create({
+      companyId: ctx.c._id, customerId: oid(),
+      customerLabel: `Buyer ${n}`, customerCode: `CUST-${n}`,
+      orderRef: `ORD-${n}`, orderLineRef: `LN-${String(n).padStart(12, "0")}`,
+      executionFileId: oid(), expectationId: oid(), documentRef: `CSM-2026-${n}`,
+      expectationRevisionNo: 1, expectationLineRef: `CML-${n}`,
+      rawItemId: ctx.item._id, variantId, variantCombination: [],
+      itemName: ctx.item.name, sku: ctx.item.sku,
+      goodsReceiptId: oid(), goodsReceiptNumber: `GRN/2026-27/${n}`, goodsReceiptLineId: oid(),
+      warehouseId: ctx.wh._id, warehouseName: ctx.wh.name,
+      locationId: loc._id, locationCode: loc.code,
+      receiptUnit: "PCS", receiptQuantity: quantity,
+      baseUnit: "PCS", baseQuantity: quantity,
+      availableQuantity: quantity, issuedQuantity: 0, returnedQuantity: 0,
+      receivedAt: new Date(), receivedBy: { name: "St" },
+      movements: [{
+        type: "RECEIVED", quantity, baseUnit: "PCS", availableAfter: quantity, at: new Date(),
+      }],
+    });
+  };
+
+  const balanceAt = (ctx, loc, variantId = null) => LocationBalance
+    .findOne({ itemId: ctx.item._id, locationId: loc._id, variantId }).lean();
+
+  test("the company's own share of a counted shortfall still corrects", async () => {
+    /* 20 in the rack, 18 of them the customer's. Two are ours and a −2 is right. */
+    const ctx = await setup({ placed: 20, quantity: 20 });
+    await heldAt(ctx, { quantity: 18 });
+
+    const { id } = await reviewed(ctx, () => ({ countedQty: 18, reason: "two damaged" }));
+    const r = await post(ctx, id);
+
+    expect(r.status).toBe(200);
+    expect(r.body.outcome.discrepanciesPosted).toBe(1);
+    expect((await RawItem.findById(ctx.item._id).lean()).quantity).toBe(18);
+    expect((await balanceAt(ctx, ctx.stock)).onHand).toBe(18);
+  });
+
+  test("a shortfall that reaches into customer-owned quantity is refused, and writes nothing", async () => {
+    const ctx = await setup({ placed: 20, quantity: 20 });
+    const lot = await heldAt(ctx, { quantity: 18 });
+
+    const { id } = await reviewed(ctx, () => ({ countedQty: 17, reason: "three missing" }));
+    const r = await post(ctx, id);
+
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(r.body)).toMatch(/CUSTOMER_OWNED_STOCK_NOT_AVAILABLE/);
+
+    /* EVERY affected collection is untouched: the item, the location projection,
+       the movement ledger, the item's own stock history — and the lot, which this
+       operation must never adjust. */
+    const item = await RawItem.findById(ctx.item._id).lean();
+    expect(item.quantity).toBe(20);
+    expect((item.stockTransactions || []).filter((t) => /Stock count/.test(t.reason || "")))
+      .toHaveLength(0);
+    expect((await balanceAt(ctx, ctx.stock)).onHand).toBe(20);
+    expect(await LocationMovement.countDocuments({
+      itemId: ctx.item._id, "source.kind": "stock_count",
+    })).toBe(0);
+
+    const after = await CustomerMaterialLot.findById(lot._id).lean();
+    expect(after.availableQuantity).toBe(18);
+    expect(after.issuedQuantity).toBe(0);
+    expect(after.returnedQuantity).toBe(0);
+    expect(after.movements).toHaveLength(1);
+
+    /* And the count itself did not post, so it can be re-reviewed once somebody
+       has decided what to do about the customer's three units. */
+    const count = await StockCount.findById(id).lean();
+    expect(count.status).not.toBe("POSTED");
+  });
+
+  test("the refusal states the arithmetic, not just 'not enough'", async () => {
+    /* "Insufficient stock" would send somebody to look for units that are sitting
+       in front of them. */
+    const ctx = await setup({ placed: 20, quantity: 20 });
+    await heldAt(ctx, { quantity: 18 });
+    const { id } = await reviewed(ctx, () => ({ countedQty: 15, reason: "five missing" }));
+
+    const r = await post(ctx, id);
+    const detail = r.body?.error?.details || {};
+    expect(detail.reason).toBe("CUSTOMER_OWNED_STOCK_NOT_AVAILABLE");
+    expect(detail.physical).toBe(20);
+    expect(detail.customerHeld).toBe(18);
+    expect(detail.available).toBe(2);
+    expect(detail.requested).toBe(5);
+  });
+
+  test("a positive variance is never blocked by customer-owned stock", async () => {
+    /* Finding MORE than expected takes nothing from anybody. */
+    const ctx = await setup({ placed: 20, quantity: 20 });
+    await heldAt(ctx, { quantity: 18 });
+
+    const { id } = await reviewed(ctx, () => ({ countedQty: 23, reason: "found three" }));
+    const r = await post(ctx, id);
+    expect(r.status).toBe(200);
+    expect((await RawItem.findById(ctx.item._id).lean()).quantity).toBe(23);
+  });
+
+  test("it is variant-specific", async () => {
+    const ctx = await setup({
+      quantity: 20,
+      variants: [
+        { combination: ["Red"], quantity: 10, sku: "V-RED", place: 10 },
+        { combination: ["Blue"], quantity: 10, sku: "V-BLUE", place: 10 },
+      ],
+    });
+    const redId = String(ctx.item.variants[0]._id);
+    const blueId = String(ctx.item.variants[1]._id);
+    /* All ten Red are the customer's; Blue is entirely ours. */
+    await heldAt(ctx, { quantity: 10, variantId: redId });
+
+    /* Red short by one → refused. */
+    const red = await reviewed(ctx, (l) => (String(l.variantId) === redId
+      ? { countedQty: 9, reason: "one missing" }
+      : { countedQty: 10 }));
+    const refused = await post(ctx, red.id);
+    expect(JSON.stringify(refused.body)).toMatch(/CUSTOMER_OWNED_STOCK_NOT_AVAILABLE/);
+    expect((await balanceAt(ctx, ctx.stock, ctx.item.variants[0]._id)).onHand).toBe(10);
+
+    /* Blue short by one → allowed, because none of Blue is theirs.
+
+       Re-reviewed on the SAME count: the refused post left it open (which is the
+       point — somebody has to decide about the customer's unit), and a location may
+       only have one count open at a time. */
+    const doc = await StockCount.findById(red.id).lean();
+    const entries = doc.lines.map((l) => ({
+      lineId: String(l._id),
+      counted: true,
+      countedQty: String(l.variantId) === blueId ? 9 : 10,
+      varianceReason: String(l.variantId) === blueId ? "one missing" : "",
+    }));
+    const again = await call(`/api/cms/inventory/stock-counts/${red.id}/review`, {
+      method: "POST", token: ctx.token,
+      body: { entries, recordVersion: doc.recordVersion },
+    });
+    expect(again.status).toBe(200);
+
+    const ok = await post(ctx, red.id);
+    expect(ok.status).toBe(200);
+    expect((await balanceAt(ctx, ctx.stock, ctx.item.variants[1]._id)).onHand).toBe(9);
+  });
+
+  test("customer material in ANOTHER location does not block a correction here", async () => {
+    /* A guard that looked at the company total would refuse a correct count and
+       teach people to work around it. */
+    const ctx = await setup({ placed: 6, quantity: 10 });
+    const elsewhere = { _id: oid(), code: "OTHER" };
+    await heldAt(ctx, { quantity: 20, location: elsewhere });
+
+    const { id } = await reviewed(ctx, () => ({ countedQty: 4, reason: "two damaged" }));
+    const r = await post(ctx, id);
+    expect(r.status).toBe(200);
+    expect((await RawItem.findById(ctx.item._id).lean()).quantity).toBe(8);
+    expect((await balanceAt(ctx, ctx.stock)).onHand).toBe(4);
+  });
+
+  test("a lot already issued to production reserves nothing — it has left the shelf", async () => {
+    const ctx = await setup({ placed: 6, quantity: 10 });
+    const lot = await heldAt(ctx, { quantity: 6 });
+    await CustomerMaterialLot.updateOne({ _id: lot._id }, {
+      $set: { availableQuantity: 0, issuedQuantity: 6, status: "ISSUED" },
+    });
+
+    const { id } = await reviewed(ctx, () => ({ countedQty: 4, reason: "two damaged" }));
+    expect((await post(ctx, id)).status).toBe(200);
+    expect((await RawItem.findById(ctx.item._id).lean()).quantity).toBe(8);
+  });
+});

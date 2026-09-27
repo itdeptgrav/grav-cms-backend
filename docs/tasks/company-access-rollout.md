@@ -1,6 +1,9 @@
 # Company access rollout — person → company → application role
 
-**Status:** PPC implementation in the working tree; other applications still pending. The separate one-off CEO grant is in the configured development database. No migration or general data apply has run.
+**Status:** Stopped and superseded on 25 September 2026 by
+`docs/tasks/single-organisation-access-roadmap.md`. Do not continue C1-C4.
+Existing PPC scoped grants and the one-off CEO grant are migration inputs for
+GAC-0/GAC-5; do not delete or expand them without the new roadmap's dry run.
 
 **Decision:** `docs/decisions/company-scoped-access.md`
 **Do not replace:** `docs/tasks/current-task.md`, which belongs to the active Image Studio lane.

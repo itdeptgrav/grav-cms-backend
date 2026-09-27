@@ -75,6 +75,23 @@ const locationMovementSchema = new mongoose.Schema(
       returnId: { type: mongoose.Schema.Types.ObjectId, default: null },
       poLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
       receiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+      /* ── CUSTOMER-OWNED GOODS ─────────────────────────────────────────────
+         On a job-work order the customer sends the material. It moves through
+         this ledger like anything else — the shelf does not care who owns it —
+         but a movement that could not say WHOSE it was would be indistinguishable
+         from the factory's own stock the moment it left this screen.
+
+         Added here rather than in a second movement collection on purpose: a
+         warehouse report has to see every arrival in one place, and a parallel
+         ledger is how two places start disagreeing about what is on a shelf.
+         Null on every ordinary movement, which is all of them today. */
+      customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
+      customerMaterialLotId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      /* Which order and which line of it the goods were sent for — the two facts
+         that make customer stock unusable for anything else. */
+      orderRef: { type: String, trim: true, default: "" },
+      orderLineRef: { type: String, trim: true, default: "" },
     },
     transferId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
 

@@ -14,27 +14,13 @@ const { sendJsonCached } = require("../../services/httpCache");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
 const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
-// ── Seed CEO ──────────────────────────────────────────────
-router.post("/setup/seed-ceo", async (req, res) => {
-  try {
-    const { email, password, name, mobile = "", city = "" } = req.body;
-    if (!email || !password || !name) return res.status(400).json({ error: "email, password, name required" });
-    let ur;
-    try { ur = await auth.createUser({ email, password, displayName: name }); }
-    catch (e) { if (e.code === "auth/email-already-exists") ur = await auth.getUserByEmail(email); else throw e; }
-    await auth.setCustomUserClaims(ur.uid, { role: "ceo" });
-    await db.collection("cowork_employees").doc("E000").set({
-      employeeId: "E000", authUid: ur.uid, name, email, mobile, city,
-      department: "Management", role: "ceo", profilePicUrl: null, fcmTokens: [],
-      passwordChanged: true, tempPassword: null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
-    await db.collection("cowork_meta").doc("counters").set(
-      { employeeSeq: 0, groupSeq: 0, taskSeq: 0, meetSeq: 0 }, { merge: true }
-    );
-    res.json({ success: true, uid: ur.uid, employeeId: "E000", message: "CEO seeded. Login now." });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// ── Seed CEO — REMOVED (SEC-0, 25 Sep 2026) ──────────────────────────────
+// `POST /cowork/setup/seed-ceo` used to be public: anyone could create or
+// adopt a Firebase account, give it the `ceo` custom claim and overwrite the
+// E000 CEO record. There is deliberately no HTTP replacement. The one-time
+// bootstrap now lives in the local command-line script
+// scripts/cowork/bootstrap-ceo.js, which is not mounted by Express, never
+// handles a password, and refuses to run while a CEO already exists.
 
 // ── Me ────────────────────────────────────────────────────
 router.get("/me", verifyCoworkToken, verifyEmployeeToken, (req, res) => {
@@ -49,8 +35,10 @@ router.get("/me", verifyCoworkToken, verifyEmployeeToken, (req, res) => {
 
 router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const employees = await svc.listCoworkEmployees();
-    const safe = employees.map(({ tempPassword, authUid, fcmTokens, ...emp }) => emp);
+    // SEC-1: listCoworkEmployees() already returns the allowlist directory
+    // projection; the old per-route denylist (tempPassword/authUid/fcmTokens)
+    // missed gmailToken and is gone.
+    const safe = await svc.listCoworkEmployees();
     // ETag/304: the directory is byte-identical between reads far more often
     // than not (measured 99% duplicate). A client that revalidates gets a bare
     // 304; one that does not gets the full body, exactly as before. The data is
@@ -518,7 +506,9 @@ router.get("/employee/:id", verifyCoworkToken, verifyEmployeeToken, async (req, 
   try {
     const emp = await svc.getCoworkEmployee(req.params.id);
     if (!emp) return res.status(404).json({ error: "Not found" });
-    res.json({ employee: emp });
+    // SEC-1: any employee may read any other employee here, so only the
+    // directory projection — never gmailToken, tempPassword, authUid or tokens.
+    res.json({ employee: require("../../services/coworkEmployeeProjection").toDirectoryEmployee(emp) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

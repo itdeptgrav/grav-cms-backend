@@ -145,6 +145,12 @@ const AUDIT_ACTIONS = Object.freeze([
   "DEVELOPMENT_FILE_HELD",
   "DEVELOPMENT_FILE_RESUMED",
   "DEVELOPMENT_FILE_CLOSED",
+  /* A merchandiser registered a material in Store's catalogue so a BOM row
+     could reference it instead of holding their spelling of its name. It is
+     recorded in Merchandising's history because it happened while working a
+     development file, and the Store item it created is named in `details`. The
+     item's own creation is Store's record; this is the reason it exists. */
+  "DEVELOPMENT_MATERIAL_REGISTERED",
   "DEVELOPMENT_BOM_DRAFTED",
   "DEVELOPMENT_BOM_ROW_ADDED",
   "DEVELOPMENT_BOM_ROW_UPDATED",
@@ -162,6 +168,27 @@ const AUDIT_ACTIONS = Object.freeze([
      to answer, so it belongs in Merchandising's own history of the file. */
   "DEVELOPMENT_CHANGES_REQUESTED_BY_SALES",
   "DEVELOPMENT_BOM_ADOPTED_INTO_ORDER",
+  /* ── CUSTOMER-SUPPLIED MATERIAL ON A JOB-WORK ORDER ───────────────────
+     Merchandising states what the customer has undertaken to send. Every
+     action here is about the EXPECTATION — what was stated, by whom, and
+     when — and none of them is about goods arriving: nothing in this phase
+     observes an arrival, so no word here suggests one. Receipt has its own
+     vocabulary and will arrive with the path that can actually record it. */
+  "CUSTOMER_MATERIAL_DRAFTED",
+  "CUSTOMER_MATERIAL_LINE_ADDED",
+  "CUSTOMER_MATERIAL_LINE_UPDATED",
+  "CUSTOMER_MATERIAL_LINE_REMOVED",
+  "CUSTOMER_MATERIAL_INSTRUCTIONS_UPDATED",
+  "CUSTOMER_MATERIAL_ISSUED",
+  "CUSTOMER_MATERIAL_CANCELLED",
+  "CUSTOMER_MATERIAL_REVISED",
+  /* ── STORE'S TWO DECISIONS ABOUT ONE LINE ─────────────────────────────
+     Recorded in Merchandising's history because they happened to a
+     Merchandising record, with Store's actor on them and the sentence saying
+     so. Neither is a receipt: short closing says no more is expected, and it
+     changes no quantity and creates no stock. */
+  "CUSTOMER_MATERIAL_LINE_SHORT_CLOSED",
+  "CUSTOMER_MATERIAL_LINE_REOPENED",
 ]);
 
 /**
@@ -265,6 +292,7 @@ const auditEventSchema = new mongoose.Schema(
         "PRE_PRODUCTION_MEETING",
         "CHANGE_NOTICE", "CHANGE_IMPACT", "BULK_OPERATION", "CONFIGURATION",
         "DEVELOPMENT_REQUEST", "DEVELOPMENT_FILE", "DEVELOPMENT_BOM",
+        "CUSTOMER_MATERIAL_EXPECTATION",
       ],
       required: true,
     },

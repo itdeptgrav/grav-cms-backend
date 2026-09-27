@@ -684,9 +684,65 @@ router.post("/verify", async (req, res) => {
   }
 });
 
+/* ── THE LIST IS THE ORGANISATION'S, NOT THE DATABASE'S ─────────────────────
+ *
+ * This used to answer `Acc_Company.find({ isActive: true })` — every active
+ * company in the deployment, to any authenticated organisation user. The
+ * per-request guards were never the problem: `resolveCompanyScope` correctly
+ * refuses a company outside `tallyCompanyIds` with 403 COMPANY_FORBIDDEN. The
+ * problem was that this endpoint handed the picker companies it would then
+ * refuse, so the accountant dashboard selected one, stored it, and every
+ * subsequent request failed with "This company is not available to your
+ * organization" — an error the user could not clear, because the list it came
+ * from kept offering the same company back.
+ *
+ * So the list is now drawn from the SAME record the guards check:
+ * `Acc_Organization.tallyCompanyIds`, which
+ * services/accountantCompanyOwnership.service.js documents as the canonical
+ * and only ownership record. One source, so the picker cannot offer what the
+ * guard will refuse. Nothing about ownership is decided here — this reads it.
+ *
+ * An organisation holding no companies gets an empty list and a 200. That is
+ * the honest answer: there is nothing wrong with the request, there is simply
+ * nothing assigned, and the frontend's job in that case is to clear its
+ * selection rather than to keep a previous organisation's company id.
+ *
+ * ── THE ONE EXEMPTION ───────────────────────────────────────────────────────
+ * A developer-bypass session (`ACCOUNTANT_AUTH_BYPASS=true`, which attaches
+ * `isDev` and no organisation at all) still sees everything, exactly as
+ * `resolveCompanyScope` and `requireCompanyAccess` already exempt it. It is
+ * checked as `req.user.isDev` — the explicit marker that middleware sets —
+ * rather than as "has no organisation", because those two are not the same
+ * thing: a real session that somehow arrives without an organisation is a
+ * broken session, and must see NOTHING rather than everything.
+ */
 router.get("/", async (req, res) => {
   try {
-    const companies = await Acc_Company.find({ isActive: true })
+    const filter = { isActive: true };
+
+    if (!req.user?.isDev) {
+      if (!req.organization) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_ORGANIZATION_CONTEXT",
+          message: "No organization context.",
+        });
+      }
+      /* `$in: []` matches nothing, which is exactly right for an organisation
+         that has been assigned no companies — and is why this is one query
+         rather than an early return that would have to repeat the response
+         shape.
+
+         The ids are passed through as stored (they are typed ObjectIds on the
+         schema) with only nullish entries dropped. Stringifying them first
+         would turn a stray `null` into the string "null", which Mongoose
+         cannot cast to an _id — a 500 where an empty list is the answer. */
+      filter._id = {
+        $in: (req.organization.tallyCompanyIds || []).filter(Boolean),
+      };
+    }
+
+    const companies = await Acc_Company.find(filter)
       .sort({ isPrimary: -1, createdAt: -1 })
       .lean();
 

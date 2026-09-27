@@ -96,6 +96,8 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
   const SalesHandoverVersion = require("../../models/CMS_Models/Sales/SalesHandoverVersion");
   const ExecutionFile = require("../../models/CMS_Models/Merchandising/ExecutionFile");
   const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+  const { SalesDevelopmentRequest } = require("../../models/CMS_Models/Sales/DevelopmentRequest");
+  const { DevelopmentFile } = require("../../models/CMS_Models/Merchandising/Development");
 
   /* ── THE SALES ORDER THIS ALL HANGS OFF ────────────────────────────────
      The whole chain, because half of it is not enough: Sales proves that an
@@ -139,6 +141,82 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
   });
   const savedRequest = await CustomerRequest.findById(request._id).lean();
   const lineRef = String(savedRequest.items[0].lineRef);
+
+  /* ── THE PRODUCT REFERENCES THIS ORDER CAME WITH ──────────────────────
+     An Execution File never owns buyer reference images. It reads them from
+     the exact Development file Sales linked to the confirmed handover. Keep
+     that lineage real in the showroom too: the header thumbnail and the
+     Product references gallery below are therefore the same attributed
+     pictures a live order would show, not a page-level demo override. */
+  const developmentRequest = await SalesDevelopmentRequest.create({
+    companyId: company._id,
+    requestRef: "DEMO-DEV-UTILITY-OVERSHIRT",
+    versionNo: 1,
+    journeyId: journey._id,
+    journeyRef: journey.journeyId,
+    enquiryId: enquiry._id,
+    productLineRef: lineRef,
+    buyerDisplayLabel: ORDER.buyer,
+    productName: ORDER.productName,
+    styleRef: ORDER.styleRef,
+    sampleStyleId: style._id,
+    referenceImages: [
+      {
+        url: "/demo/merchandising/execution/utility-overshirt/front.png",
+        caption: "Buyer reference · Washed Indigo front view",
+      },
+      {
+        url: "/demo/merchandising/execution/utility-overshirt/back.png",
+        caption: "Buyer reference · Back construction and yoke",
+      },
+      {
+        url: "/demo/merchandising/execution/utility-overshirt/pocket-detail.png",
+        caption: "Construction reference · Pocket, snap and tonal patch",
+      },
+      {
+        url: "/demo/merchandising/execution/utility-overshirt/materials-and-trims.png",
+        caption: "Material reference · Twill colourways and approved trims",
+      },
+    ],
+    requirementSummary:
+      "Develop the repeat utility-overshirt body in washed indigo and washed olive cotton twill, "
+      + "with matte-black snaps, tonal chest branding, colourway-specific care labelling and "
+      + "recycled sample packaging. Preserve the relaxed workwear fit and the approved pocket shape.",
+    requestedCategories: ["FABRIC", "TRIMS", "LABELS", "ACCESSORIES", "SAMPLE_PACKAGING"],
+    requiredByDate: day(-40),
+    requestedBy: { name: "Meera Shah", email: "meera.shah@grav.local" },
+    requestedAt: new Date(`${day(-72)}T09:30:00Z`),
+  });
+  const developmentFile = await DevelopmentFile.create({
+    developmentNumber: "MDF-DEMO-UTILITY-001",
+    companyId: company._id,
+    journeyId: journey._id,
+    journeyRef: journey.journeyId,
+    productLineRef: lineRef,
+    currentRequestId: developmentRequest._id,
+    currentRequestVersionNo: 1,
+    requestHistory: [{
+      requestId: developmentRequest._id,
+      versionNo: 1,
+      event: "ACCEPTED",
+      at: new Date(`${day(-70)}T10:00:00Z`),
+      by: maker,
+    }],
+    productName: ORDER.productName,
+    styleRef: ORDER.styleRef,
+    buyerDisplayLabel: ORDER.buyer,
+    sampleStyleId: style._id,
+    requiredByDate: day(-40),
+    lifecycleStatus: "CLOSED",
+    lifecycleReason: "Order confirmed after the development review.",
+    responsibleMerchandiser: {
+      email: maker.email,
+      name: maker.name,
+      assignedAt: new Date(`${day(-70)}T10:00:00Z`),
+      assignedBy: checker,
+    },
+    createdBy: maker,
+  });
 
   const drops = [
     { dropRef: "DROP-1", committedDeliveryDate: new Date(`${day(38)}T12:00:00Z`), quantity: 380, nominatedFactoryRef: ORDER.factory, targetExFactoryDate: new Date(`${day(31)}T12:00:00Z`) },
@@ -243,6 +321,11 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
     },
     executionProjection: projection,
     publication: { state: "CURRENT" },
+    developmentReference: {
+      developmentFileId: developmentFile._id,
+      developmentNumber: developmentFile.developmentNumber,
+      releaseReference: "REL-NS-OS307-DEMO-001",
+    },
     issuedBy: { id: null, email: "meera.shah@grav.local", name: "Meera Shah" },
   });
 

@@ -362,8 +362,25 @@ describe("GET /auth/me with a legacy session", () => {
 /* ================================================================== */
 
 describe("POST /auth/sync-legacy", () => {
-  test("upgrades a valid Accounting department user to an org-aware session", async () => {
+  /* GAC-2 correction: sync-legacy no longer CREATES an Accounting Owner for a
+     legacy account that has no Acc_User (that was an access grant outside the
+     canonical write). It still upgrades a legacy account that already holds an
+     Accounting role — granted, as every role now is, through Access Control. */
+  test("refuses to create an Accounting role for a legacy account that holds none — nothing is created", async () => {
     const dept = await makeDepartment({ role: "admin" });
+    const res = await call("/api/accountant/auth/sync-legacy", {
+      method: "POST",
+      body: {},
+      cookies: { auth_token: legacyToken({ id: dept._id.toString(), role: "admin", name: dept.name }) },
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("ACCOUNTING_GRANT_REQUIRED");
+    expect(await Acc_User.countDocuments({ email: dept.email })).toBe(0);
+  });
+
+  test("upgrades a valid Accounting department user who already holds a role to an org-aware session", async () => {
+    const dept = await makeDepartment({ role: "admin" });
+    await makeUser(await makeOrg(), { email: dept.email, role: "owner" });
     const token = legacyToken({
       id: dept._id.toString(),
       role: "admin",
@@ -964,6 +981,8 @@ describe("POST /auth/sync-legacy with an organisation-aware session", () => {
 
   test("a legacy cookie still upgrades even when an unusable Bearer is present", async () => {
     const dept = await makeDepartment({ role: "admin" });
+    // GAC-2 correction: the upgrade needs an existing Accounting role.
+    await makeUser(await makeOrg(), { email: dept.email, role: "editor" });
     const res = await call("/api/accountant/auth/sync-legacy", {
       method: "POST",
       body: {},

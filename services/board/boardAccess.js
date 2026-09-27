@@ -144,6 +144,9 @@ async function holdsBoardDepartment(req) {
  * check that runs.
  */
 async function boardRole(req) {
+  // GAC-AR1: a database-verified platform administrator is owner (never a
+  // token claim). Everybody else still needs BOTH the Board grant and a role.
+  if (await require("../departmentRoles").isDatabaseVerifiedAdmin(req)) return "owner";
   const [granted, role] = await Promise.all([
     holdsBoardDepartment(req),
     getEffectiveRole(BOARD_DEPT_SLUG, req),

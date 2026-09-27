@@ -208,7 +208,10 @@ async function world(label) {
   });
   const item = await RawItem.create({
     companyId: co._id, name: `${label} poly bag`, sku: `PB-${label}-${n}`,
-    unit: "Piece", category: "Packing", createdBy: new mongoose.Types.ObjectId(),
+    /* Classified as sample packaging — the packaging picker is now gated on
+       Store's "Used as". */
+    unit: "Piece", category: "Packing", usedAs: "SAMPLE_PACKAGING",
+    createdBy: new mongoose.Types.ObjectId(),
   });
   await approveCharges(co._id, [{
     key: "pattern-development", label: "Pattern development", active: true,

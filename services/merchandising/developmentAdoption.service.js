@@ -215,20 +215,146 @@ async function preview(ctx, { fileId } = {}) {
     selectionNote: str(r.selectionNote),
   }));
 
+  /* ── AND WHERE THE ORDER HAS GOT TO WITH IT ───────────────────────────
+     The screen has to answer two things at once: what development settled,
+     and what this order has done with it since. Both come from here, so a
+     client cannot draw one without the other and cannot compute "changed"
+     from a guess. */
+  const ref = file.developmentReference || {};
+  const imported = ref.importedRevisionNo
+    ? {
+      revisionNo: Number(ref.importedRevisionNo),
+      at: ref.importedAt || null,
+      by: ref.importedBy?.name ? { name: str(ref.importedBy.name), email: str(ref.importedBy.email) } : null,
+      rowCount: Number(ref.importedRowCount) || 0,
+      /* Acceptance runs it with the accepting merchandiser as the actor. A
+         backfill over an order accepted before the import existed has no
+         actor at all, and says so rather than naming somebody. */
+      system: !ref.importedBy?.name,
+    }
+    : null;
+
+  const current = await orderState(ctx, fileId, rows);
+
   return {
     available: revision.state === BOM_STATE.APPROVED || revision.state === BOM_STATE.SUPERSEDED,
+    developmentFileId: str(devFile._id),
     developmentNumber: str(devFile.developmentNumber),
     bomRevisionNo: revision.revisionNo,
     revisionState: str(revision.state),
     materialTrimRows: rows.filter((r) => r.family === "MATERIAL_TRIM"),
     packagingRows: rows.filter((r) => r.family === "PACKAGING"),
     rows,
+    imported,
+    ...current,
     /* Said in the payload, so no client can render adoption as approval. */
     sentence: `Development ${devFile.developmentNumber} revision ${revision.revisionNo} settled `
       + `${rows.length} material identity(ies). Adopting starts DRAFT revisions for this order — `
       + "it approves nothing, because a sample selection is not a factory instruction.",
     note: "Nothing has been changed.",
   };
+}
+
+/**
+ * WHAT THE ORDER'S OWN SELECTION LOOKS LIKE AGAINST WHAT IT IMPORTED.
+ *
+ * ── THE COMPARISON IS MADE HERE, NOT IN A BROWSER ─────────────────────────
+ * "Carried from development" and "Changed for this order" are claims about
+ * two records, one of which is immutable. Computing them in a client would
+ * mean shipping the development revision to every screen that wants a badge,
+ * and two clients would drift. The development row is read live, so a badge
+ * cannot go stale against a revision that never changes anyway.
+ *
+ * ── AND A ROW IS NEVER DROPPED FOR BEING UNRESOLVABLE ─────────────────────
+ * An imported row whose catalogue item has since been deactivated keeps its
+ * development reference and is marked as needing a replacement. Omitting it
+ * would silently shorten a factory instruction.
+ */
+async function orderState(ctx, fileId, devRows) {
+  const selection = require("./selection.service");
+  const byDevRow = new Map(devRows.map((r) => [r.rowRef, r]));
+  const families = [];
+  const orderRows = [];
+
+  for (const family of ["MATERIAL_TRIM", "PACKAGING"]) {
+    let live = null;
+    try {
+      live = await selection.getCurrent(ctx, { fileId: str(fileId), family });
+    } catch { live = null; }
+    /* `working` is the draft or submitted revision somebody is editing;
+       `approved` is what is in force. The order's live selection is the
+       working one where it exists, because that is what a merchandiser is
+       reviewing — and the approved one once there is nothing open. */
+    const revision = live?.working || live?.approved || null;
+    families.push({
+      family,
+      revisionNo: revision?.revisionNo ?? null,
+      state: str(revision?.state),
+      rowCount: (revision?.rows || []).length,
+    });
+
+    for (const row of revision?.rows || []) {
+      const fromRef = row?.sourceRef?.recordType === "DEVELOPMENT_BOM_ROW"
+        ? str(row.sourceRef.recordRef) : "";
+      /* The reference ends with the development row it came from. */
+      const devRowRef = fromRef ? fromRef.split("·").pop().trim() : "";
+      const dev = devRowRef ? byDevRow.get(devRowRef) : null;
+
+      orderRows.push({
+        family,
+        rowRef: str(row.rowRef),
+        name: str(row.componentName),
+        code: str(row.componentCode),
+        group: str(row.group),
+        colourOrShade: str(row.colourOrShade),
+        finish: str(row.finish),
+        /* "Used for" — the development row's own placement, carried across
+           by the import and editable on the order afterwards. */
+        usedFor: str(row.placement),
+        catalogueRef: row.catalogueRef?.recordRef ? str(row.catalogueRef.recordRef) : "",
+        developmentSource: fromRef,
+        /* `changedFrom` answers with a LIST, and an empty list is truthy —
+           which made every carried row read as changed. */
+        status: !dev
+          ? (fromRef ? "CARRIED" : "ADDED")
+          : changedFrom(dev, row, family).length ? "CHANGED" : "CARRIED",
+        changes: dev ? changedFrom(dev, row, family) : [],
+      });
+    }
+  }
+
+  /* A development row nobody carried across — removed for this order, and
+     said rather than left as a gap somebody has to notice. */
+  const carried = new Set(orderRows
+    .map((r) => (r.developmentSource ? r.developmentSource.split("·").pop().trim() : ""))
+    .filter(Boolean));
+  const removed = devRows.filter((r) => !carried.has(r.rowRef)).map((r) => ({
+    rowRef: r.rowRef,
+    name: r.rawItemName || r.rawItemSku,
+    usedFor: r.placement,
+    status: "REMOVED",
+  }));
+
+  return { families, orderRows, removedFromDevelopment: removed };
+}
+
+/**
+ * WHICH FIELDS THIS ORDER STATES DIFFERENTLY FROM WHAT IT IMPORTED.
+ *
+ * ── ONLY FIELDS THE TARGET ROW ACTUALLY HAS ────────────────────────────────
+ * A packaging row has no `finish` — the field is not in its schema and the
+ * import never carried one. Comparing it against a development row that did
+ * state one marked every imported packaging item "changed for this order",
+ * which is a claim about a decision nobody made.
+ */
+function changedFrom(dev, row, family) {
+  const differs = [];
+  const same = (a, b) => str(a).toLowerCase() === str(b).toLowerCase();
+  if (!same(dev.rawItemName || dev.rawItemSku, row.componentName)) differs.push("Material");
+  if (!same(dev.colourOrShade, row.colourOrShade)) differs.push("Colour");
+  if (family === "MATERIAL_TRIM" && !same(dev.finish, row.finish)) differs.push("Finish");
+  if (!same(dev.placement, row.placement)) differs.push("Used for");
+  return differs;
 }
 
 /**
@@ -247,6 +373,27 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
   }
 
   const file = await ExecutionFile.findOne({ _id: fileId, companyId: ctx.companyId }).lean();
+
+  /* ── ONE IMPORT PER REVISION, AND THE SECOND CALL IS A NO-OP ──────────
+     The import now runs on acceptance, which means it runs wherever an
+     acceptance is retried: a replayed message, a double click, a backfill
+     over a file that already has it. The stamp on the file is what makes
+     the second run answer instead of writing. Families were already
+     skipped when a draft existed, which stopped a duplicate DRAFT — it did
+     not stop a second set of rows landing in somebody's open one. */
+  const already = file?.developmentReference || {};
+  if (Number(already.importedRevisionNo) === Number(shown.bomRevisionNo)) {
+    return {
+      replayed: true,
+      families: [], skipped: [],
+      adopted: Number(already.importedRowCount) || 0,
+      developmentNumber: shown.developmentNumber,
+      bomRevisionNo: shown.bomRevisionNo,
+      importedAt: already.importedAt || null,
+      note: `Development ${shown.developmentNumber} revision ${shown.bomRevisionNo} `
+        + "was already imported into this order. Nothing was changed.",
+    };
+  }
   const at = new Date();
   const correlationId = crypto.randomUUID();
   const outcome = { families: [], adopted: 0, skipped: [] };
@@ -306,18 +453,27 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
             ...(row.placement ? { placement: str(row.placement).slice(0, 200) } : {}),
             specification: [row.colourOrShade, row.finish, row.placement]
               .filter(Boolean).join(" · ").slice(0, 500),
-            /* `notes`, plural — the field both row shapes actually declare. */
-            notes: [
-              row.selectionNote,
-              /* ── LINEAGE ──────────────────────────────────────────────
-                 Which development revision and row this came from, so the
-                 order can always be traced back to what was sampled. */
-              `Adopted from development ${shown.developmentNumber} revision `
-              + `${shown.bomRevisionNo}, row ${row.rowRef}.`,
-            ].filter(Boolean).join(" ").slice(0, 1000),
+            /* `notes`, plural — the field both row shapes actually declare.
+               The development's own selection note, and nothing else: the
+               lineage sentence that used to be appended here is now
+               STRUCTURED, on `sourceRef` below, where a screen can render
+               it as a reference and a test can assert it. */
+            ...(row.selectionNote ? { notes: str(row.selectionNote).slice(0, 1000) } : {}),
             expectedRevision: revision,
           },
           actor,
+          /* ── LINEAGE, AS A REFERENCE RATHER THAN AS PROSE ─────────────
+             Which revision and which row this came from. Server-only — see
+             `addRow` — because a row that could claim its own provenance
+             could claim an approval nobody gave it. */
+          sourceRef: {
+            app: "merchandising",
+            recordType: "DEVELOPMENT_BOM_ROW",
+            recordId: shown.developmentFileId,
+            recordRef: `${shown.developmentNumber} · Revision ${shown.bomRevisionNo} · ${row.rowRef}`,
+            sourceVersion: String(shown.bomRevisionNo),
+            sourceState: shown.revisionState,
+          },
         });
         revision = res?.revision?.revision ?? revision + 1;
         added += 1;
@@ -348,10 +504,26 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
     },
   }]);
 
+  /* Stamped after the rows are in, so a run that fell over halfway is
+     retried rather than recorded as done. */
+  await ExecutionFile.updateOne(
+    { _id: file._id, companyId: ctx.companyId },
+    {
+      $set: {
+        "developmentReference.importedRevisionNo": shown.bomRevisionNo,
+        "developmentReference.importedAt": at,
+        "developmentReference.importedRowCount": outcome.adopted,
+        ...(actor ? { "developmentReference.importedBy": actor } : {}),
+      },
+    },
+  ).catch(() => {});
+
   return {
     ...outcome,
+    replayed: false,
     developmentNumber: shown.developmentNumber,
     bomRevisionNo: shown.bomRevisionNo,
+    importedAt: at,
     /* Said again on the way out. Nothing here approved anything. */
     note: `${outcome.adopted} identity(ies) adopted into draft revisions. Nothing is approved — `
       + "review them against this order and approve on each tab.",

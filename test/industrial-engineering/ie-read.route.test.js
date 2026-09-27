@@ -203,18 +203,30 @@ describe("access", () => {
     }
   });
 
-  test("a platform administrator follows the existing convention, not a new bypass", async () => {
-    /* Same branch every other department guard in the codebase uses: an
-       administrator is an owner. The COMPANY is still resolved from their own
-       membership — an admin without one reaches nothing. */
+  test("GAC-AR1: an administrator is owner only as the DATABASE says — a token claim alone reaches nothing", async () => {
+    /* This used to pin "a token isAdmin claim is owner". GAC-AR1 (25 Sep 2026)
+       made administrator authority the database-verified DeptUser record
+       (docs/decisions/single-organisation-access-control.md), so the same
+       claim on a non-administrator record is now refused, and a real
+       administrator session is owner. */
     const w = await world("Admin");
-    const a = await actor({ companies: [w.co], grants: {}, isAdmin: true });
-    expect((await call("/styles", { token: a.token, company: w.co._id })).status).toBe(200);
+    // The single-organisation path: this company is the GRAV primary profile,
+    // so no membership is needed by anybody who passes the role guard.
+    await Acc_Company.updateOne({ _id: w.co._id }, { $set: { isPrimary: true } });
+    const claimOnly = await actor({ companies: [w.co], grants: {}, isAdmin: true });
+    expect((await call("/styles", { token: claimOnly.token, company: w.co._id })).status).toBe(403);
 
-    const stranger = await actor({ companies: [], grants: {}, isAdmin: true });
-    const res = await call("/styles", { token: stranger.token });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(res.status).not.toBe(200);
+    const adminDept = new mongoose.Types.ObjectId();
+    const admin = await DeptUser.create({
+      name: "Admin", email: `ie-admin-${++seq}@grav.test`, passwordHash: "x",
+      isAdmin: true, isActive: true, departmentId: adminDept,
+    });
+    const adminToken = jwt.sign(
+      { v: 2, id: String(admin._id), deptId: String(adminDept), deptSlug: "ceo", email: admin.email,
+        name: "Admin", role: "ceo", isAdmin: true, tv: admin.tokenVersion || 0 },
+      process.env.JWT_SECRET, { expiresIn: "10m" },
+    );
+    expect((await call("/styles", { token: adminToken, company: w.co._id })).status).toBe(200);
   });
 
   test("no IE write route exists — this chunk adds no writer", async () => {

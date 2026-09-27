@@ -165,6 +165,17 @@ describe("the complete file is the order it says it is", () => {
     expect(file.lifecycleStatus).toBe("OPEN");
     expect(file.responsibleMerchandiser?.name).toBe("Aisha Demo");
     expect(file.coordinationNote.length).toBeGreaterThan(40);
+    expect(file.referenceImages).toHaveLength(4);
+    expect(file.referenceImages.map((image) => image.url)).toEqual(expect.arrayContaining([
+      "/demo/merchandising/execution/utility-overshirt/front.png",
+      "/demo/merchandising/execution/utility-overshirt/back.png",
+      "/demo/merchandising/execution/utility-overshirt/pocket-detail.png",
+      "/demo/merchandising/execution/utility-overshirt/materials-and-trims.png",
+    ]));
+    for (const image of file.referenceImages) {
+      expect(image.source).toBe("Development file MDF-DEMO-UTILITY-001");
+      expect(image.caption).toBeTruthy();
+    }
   });
 
   test("the drops, the colourways and the split-by-drop mapping all add to 640", async () => {

@@ -1,7 +1,7 @@
 "use strict";
 
 const express = require("express");
-const access = require("../../services/companyContext/companyAccess.service");
+const access = require("../../services/companyContext/companyAccess.service");  // list() only
 
 // Mounted by accessAdmin, which is itself guarded by requirePlatformAdmin.
 const router = express.Router();
@@ -15,18 +15,17 @@ router.get("/", async (_req, res) => {
   }
 });
 
-router.put("/", async (req, res) => {
-  try {
-    const out = await access.change({ ...req.body, actor: req.admin });
-    res.json({ success: true, grant: out });
-  } catch (err) {
-    if (!err.status) console.error("[company-access] change failed:", err);
-    res.status(err.status || (err.code === 11000 ? 409 : 503)).json({
-      success: false,
-      code: err.code === 11000 ? "GRANT_CONFLICT" : (err.code || "ACCESS_UNAVAILABLE"),
-      message: err.status ? err.message : "Company access could not be changed just now.",
-    });
-  }
+/* GAC-2: company-scoped grants are retired. GRAV Clothing is the only
+   organisation; application access is granted through PUT /api/admin/app-access
+   (person + application + role + reason + idempotency key). The GET above stays
+   as a read-only view of legacy companyGrants for the GAC-5 conversion review.
+   Nothing is written here any more. */
+router.put("/", (_req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "COMPANY_SCOPED_ACCESS_RETIRED",
+    message: "Company-scoped access has been retired. Grant the application role in Access Control instead.",
+  });
 });
 
 module.exports = router;

@@ -56,7 +56,26 @@ const PORTFOLIO_VIEWS = Object.freeze({
   blocked: [MILESTONE_STATUS.BLOCKED],
   "forecast-late": [MILESTONE_STATUS.FORECAST_LATE],
   completed: [MILESTONE_STATUS.COMPLETED],
+  /* ── WAITING ON SOMEBODY ELSE'S RECORD ───────────────────────────────
+     Not a stored status, and deliberately not one: nobody in Merchandising
+     is late. The milestone closes when ANOTHER department publishes the
+     record that closes it — an approval, an inspection, a shipment — so it
+     is defined by its completion authority and the absence of an actual
+     date, which is what the register's own `awaitingSource` flag has always
+     been derived from. Named as a view so the Overview can list the
+     population that flag describes instead of filtering a page of rows in
+     the browser and reporting a number that is only the first page's. */
+  "awaiting-source": null,
   all: null,
+});
+
+/* The views that are not a plain status filter, and the clause each adds. */
+const VIEW_CLAUSES = Object.freeze({
+  "awaiting-source": {
+    completionAuthority: "SOURCE_EVENT",
+    actualDate: null,
+    status: { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] },
+  },
 });
 
 const isPortfolioView = (key) => Object.keys(PORTFOLIO_VIEWS).includes(str(key));
@@ -123,7 +142,7 @@ async function milestoneMatch(ctx, {
   }
   const statuses = PORTFOLIO_VIEWS[str(view)];
 
-  const match = { companyId: ctx.companyId };
+  const match = { companyId: ctx.companyId, ...(VIEW_CLAUSES[str(view)] || {}) };
   if (statuses) match.status = { $in: statuses };
   if (str(owner)) match.ownerDepartment = str(owner).toUpperCase();
   if (undated) {
@@ -335,6 +354,112 @@ async function portfolioCounts(ctx) {
   return { counts, generatedAt: new Date() };
 }
 
+/* ═══ WHAT NEEDS ATTENTION, ACROSS EVERY ORDER ═════════════════════════════
+ *
+ * The Overview's cross-order T&A section. Seven questions a merchandiser asks
+ * before they open anything, answered in ONE read of the same collection the
+ * register and the file's own plan read — there is no second T&A store, and
+ * a number here always opens a list of exactly the rows it counted.
+ *
+ * ── WHY THIS IS COUNTED IN THE DATABASE ───────────────────────────────────
+ * The obvious alternative is to fetch a page of rows per bucket and count
+ * what came back, which reports "25" for every bucket that has more than 25
+ * in it and calls a crowded day a quiet one. Every figure below is a
+ * `$group` over the whole company.
+ *
+ * ── AND WHY "ORDERS AT RISK" IS NOT A MILESTONE COUNT ─────────────────────
+ * Eleven late milestones on two orders is a different problem from eleven
+ * late milestones on eleven orders, and a merchandiser plans their day by the
+ * second number. It is a count of DISTINCT FILES, which is why it cannot be
+ * derived from the milestone figures beside it.
+ */
+const ATTENTION_STATUSES = Object.freeze([
+  MILESTONE_STATUS.OVERDUE, MILESTONE_STATUS.FORECAST_LATE,
+  MILESTONE_STATUS.BLOCKED, MILESTONE_STATUS.DUE_SOON,
+]);
+
+/** The seven buckets, as the filter each one is. Used for the counts AND
+    published so the screen's links cannot describe a different population
+    from the one that was counted. */
+function attentionBuckets({ today, weekEnd, myFileIds }) {
+  const live = { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] };
+  return [
+    ["overdue", { status: MILESTONE_STATUS.OVERDUE }],
+    ["dueToday", { status: live, forecastDate: today }],
+    ["dueThisWeek", { status: live, forecastDate: { $gte: today, $lte: weekEnd } }],
+    ["blocked", { status: MILESTONE_STATUS.BLOCKED }],
+    ["atRisk", { status: { $in: AT_RISK_STATUSES } }],
+    /* Mine is the EXCEPTIONS on my orders, not every milestone on them: this
+       is an attention view, and "everything on your twelve orders" is not
+       something anybody can act on before lunch. */
+    ["mine", myFileIds === null
+      ? null
+      : { status: { $in: ATTENTION_STATUSES }, fileId: { $in: myFileIds } }],
+    ["awaitingOther", VIEW_CLAUSES["awaiting-source"]],
+  ];
+}
+
+async function attention(ctx, { today: askedToday } = {}) {
+  assertContext(ctx);
+  const today = str(askedToday) ? cal.assertDate(askedToday, "today") : cal.todayInZone();
+  /* Seven days INCLUDING today, so "this week" is a week from where the
+     reader is standing rather than a calendar week that is nearly over on a
+     Friday and says almost nothing on a Monday. */
+  const weekEnd = isoPlusDays(today, 6);
+
+  /* My orders, resolved once. Null — not an empty list — when the caller has
+     no email on the token: "we cannot tell which are yours" is a different
+     answer from "none of them are", and the screen says so. */
+  let myFileIds = null;
+  if (str(ctx.actorEmail)) {
+    const mine = await ExecutionFile.find({
+      companyId: ctx.companyId,
+      "responsibleMerchandiser.email": str(ctx.actorEmail).toLowerCase(),
+    }).select("_id").limit(2000).lean();
+    myFileIds = mine.map((f) => f._id);
+  }
+
+  const buckets = attentionBuckets({ today, weekEnd, myFileIds });
+  const facet = {};
+  for (const [key, clause] of buckets) {
+    if (!clause) continue;
+    facet[key] = [{ $match: clause }, { $count: "n" }];
+  }
+  /* The distinct ORDERS behind the at-risk milestones, in the same pass. */
+  facet.ordersAtRisk = [
+    { $match: { status: { $in: AT_RISK_STATUSES } } },
+    { $group: { _id: "$fileId" } },
+    { $count: "n" },
+  ];
+
+  const [out] = await TnaMilestone.aggregate([
+    { $match: { companyId: ctx.companyId } },
+    { $facet: facet },
+  ]);
+
+  const counts = {};
+  for (const [key] of buckets) {
+    counts[key] = facet[key] ? (out?.[key]?.[0]?.n || 0) : null;
+  }
+  counts.ordersAtRisk = out?.ordersAtRisk?.[0]?.n || 0;
+
+  return {
+    counts,
+    today,
+    weekEnd,
+    /* So the screen never has to guess why "mine" is blank. */
+    mineKnown: myFileIds !== null,
+    generatedAt: new Date(),
+  };
+}
+
+/** Local day arithmetic on an ISO date, with no timezone in it to get wrong. */
+function isoPlusDays(iso, n) {
+  const d = new Date(`${iso}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 /**
  * The next milestone on each of a set of files — for the Order Execution
  * register's one added column, and the file Summary.
@@ -523,5 +648,5 @@ async function bulkApply(ctx, { previewId, rows = [], actor = null } = {}) {
 module.exports = {
   PORTFOLIO_VIEWS, AT_RISK_STATUSES, isPortfolioView, MAX_BULK_ROWS, DEFAULT_LIMIT, MAX_LIMIT,
   encodeCursor, decodeCursor, boundedLimit,
-  portfolio, portfolioCounts, portfolioDays, milestoneMatch, MAX_DAY_RANGE, nextMilestoneFor, bulkPreview, bulkApply,
+  portfolio, portfolioCounts, portfolioDays, attention, attentionBuckets, milestoneMatch, MAX_DAY_RANGE, nextMilestoneFor, bulkPreview, bulkApply,
 };

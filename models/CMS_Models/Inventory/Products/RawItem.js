@@ -12,6 +12,7 @@
 // merge them in. This file matches what the routes file expects.
 
 const mongoose = require("mongoose");
+const { USED_AS_VALUES, DEFAULT_USED_AS } = require("./usedAs");
 
 // e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
 const unitConversionSchema = new mongoose.Schema(
@@ -178,6 +179,45 @@ const rawItemSchema = new mongoose.Schema(
        inferred from the category, and never read as "no duty". */
     customsTariffCode: { type: String, trim: true, uppercase: true, maxlength: 20, default: "" },
 
+    /* ── WHAT WOULD MAKE THIS THE SAME MATERIAL AS ANOTHER ──────────────────
+       The name, the shelf, the unit and the classification, with case, spacing
+       and punctuation removed, joined into one string.
+
+       It exists because the SKU cannot do this job. `RAW-FAB-POLMES-417` ends
+       in three random digits, so registering the same yarn twice a minute apart
+       mints two different codes and a uniqueness check on the SKU passes on
+       both — which is how a catalogue ends up holding one material under four
+       codes that no report can add together.
+
+       Stored rather than computed at query time so the check is an indexed
+       lookup and so "Poly mesh 135", "poly-mesh 135" and "POLY  MESH  135"
+       collide, which a regex on `name` cannot do. Empty on items created before
+       this field existed; the duplicate check falls back to an exact-name
+       comparison for those rather than pretending they have one. */
+    masterIdentityKey: { type: String, trim: true, default: "", index: false },
+
+    /* ── AND WHETHER THAT IDENTITY IS CLAIMED AS THE ONLY ONE ───────────────
+       True only on items registered through a door that REFUSES duplicates —
+       today, the Development BOM's narrow registration drawer. Those rows are
+       covered by a unique index on `{companyId, masterIdentityKey}` (declared
+       below), which is what makes two simultaneous registrations of the same
+       material produce one item rather than two: the second loses the index,
+       not a race that nobody notices.
+
+       Store's own item screen leaves it FALSE, deliberately. A storekeeper can
+       see the catalogue in front of them and may have a real reason to register
+       a second row for what looks like the same material — a different mill's
+       equivalent, a re-coded replacement, a row kept for history. Turning that
+       judgement into a database error nobody can act on would be the migration
+       equivalent of refusing to let a person do their job. So the flag is set
+       by the caller's DUPLICATE POLICY rather than by the field's existence, and
+       the two doors keep their different answers.
+
+       It lives on the item rather than in a separate claim table so that
+       deleting an item releases its claim. A claim outliving the row it
+       described would block re-registering a material that no longer exists. */
+    identityUnique: { type: Boolean, default: false },
+
     /* ── THIS ITEM'S OWN BUDGET HEAD, WHERE IT DIFFERS FROM ITS CATEGORY ───
        Normally empty. The head comes from the item's CATEGORY (see
        Acc_ItemCategoryBudget) because mapping 15 categories is a meeting and
@@ -197,6 +237,19 @@ const rawItemSchema = new mongoose.Schema(
     budgetLedgerSetByName: { type: String, trim: true, default: "" },
     budgetLedgerSetAt: { type: Date, default: null },
     customCategory: { type: String, default: "" },
+
+    /* ── WHAT PART THIS ITEM PLAYS, AND WHERE IT MAY BE SELECTED ───────────
+       Store-owned. `category` says what the item IS; `usedAs` says what it is
+       FOR — and it is what Merchandising reads to decide whether the item may
+       appear in a product BOM picker. Merchandising can never write it: its
+       routes carry no Store grant and expose no field for it. Defaults to
+       NOT_CLASSIFIED, which keeps an unclassified item OUT of every picker
+       until Store classifies it — the safe direction. */
+    usedAs: {
+      type: String,
+      enum: USED_AS_VALUES,
+      default: DEFAULT_USED_AS,
+    },
 
     unit:       { type: String, default: "" },
     customUnit: { type: String, default: "" },
@@ -261,7 +314,33 @@ rawItemSchema.add({
    within a company the code is the item's identity. */
 rawItemSchema.index({ companyId: 1, sku: 1 }, { unique: true });
 rawItemSchema.index({ companyId: 1, name: 1 });
+/* Duplicate detection at registration. NOT unique: Store's own screen may
+   deliberately register a near-duplicate, and a unique index would turn a
+   judgement the storekeeper is entitled to make into a database error nobody
+   can act on. Sparse, because items created before the field existed carry no
+   key and must not all collide on "". */
+rawItemSchema.index({ companyId: 1, masterIdentityKey: 1 }, { sparse: true });
+/* ── THE ONE PLACE A CONCURRENT DUPLICATE IS ACTUALLY STOPPED ───────────────
+   A duplicate check that reads and then writes cannot hold under concurrency:
+   two transactions both read "not there" and both insert, because snapshot
+   isolation only conflicts on documents they BOTH touch, and a row that does
+   not exist yet is not one of those.
+
+   So the constraint is an index. Partial, on `identityUnique: true`, so it
+   covers only the rows whose door promises uniqueness — Store's own screen keeps
+   its ability to register a deliberate near-duplicate, because its rows are not
+   in this index at all. See the field. */
+rawItemSchema.index(
+  { companyId: 1, masterIdentityKey: 1 },
+  {
+    unique: true,
+    name: "companyId_1_masterIdentityKey_1_claimed",
+    partialFilterExpression: { identityUnique: true },
+  },
+);
 rawItemSchema.index({ companyId: 1, category: 1 });
+/* The Merchandising picker reads this company's items of one `usedAs` set. */
+rawItemSchema.index({ companyId: 1, usedAs: 1 });
 rawItemSchema.index({ name: 1 });
 rawItemSchema.index({ category: 1 });
 rawItemSchema.index({ "variants.vendorNicknames.vendor": 1 });

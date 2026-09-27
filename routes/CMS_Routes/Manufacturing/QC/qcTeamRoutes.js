@@ -34,7 +34,7 @@ const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
 
-const { SECRET, LEGACY_SECRETS, readToken } = require("../../../../config/jwt");
+const { verifyCmsToken, readToken } = require("../../../../config/jwt");
 const { getRole, listRoles } = require("../../../../services/departmentRoles");
 
 const QCStage = require("../../../../models/CMS_Models/Manufacturing/QC/QCStage");
@@ -69,11 +69,9 @@ function qcAuth(req, res, next) {
 
   let decoded = null;
   try {
-    decoded = jwt.verify(token, SECRET);
+    decoded = verifyCmsToken(token); // SEC-0: configured secret only
   } catch {
-    for (const legacy of LEGACY_SECRETS) {
-      try { decoded = jwt.verify(token, legacy); break; } catch { /* next */ }
-    }
+    decoded = null;
   }
   if (!decoded) {
     return res.status(401).json({ success: false, message: "Your session has expired. Sign in again." });

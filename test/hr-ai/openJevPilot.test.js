@@ -26,7 +26,9 @@ jest.mock("../../services/ollamaClient", () => {
   const actual = jest.requireActual("../../services/ollamaClient");
   return {
     ...actual,
-    chatJson: jest.fn().mockResolvedValue({ data: { reply: "BASELINE_REPLY" }, model: "qwen3:8b" }),
+    chatJson: jest.fn(async ({ schema }) => schema && schema.properties && schema.properties.choice
+      ? { data: { choice: "conversation", clarification: null }, model: "qwen3:8b" }
+      : { data: { reply: "BASELINE_DIRECT" }, model: "qwen3:8b" }),
     chatWithTools: jest.fn().mockResolvedValue({ toolCalls: [], content: "BASELINE_DIRECT" }),
   };
 });
@@ -274,12 +276,14 @@ describe("gravAssistant integration", () => {
     expect(spy.mock.calls.filter(([u]) => String(u).includes("8791"))).toHaveLength(0);
   });
 
-  test("flag on + Open-Jev unreachable: chat still answers via the existing path", async () => {
+  test("flag on + Open-Jev unreachable: central chat remains Qwen-only", async () => {
     process.env.GRAV_OPEN_JEV_PILOT_ENABLED = "true";
     process.env.GRAV_OPEN_JEV_URL = "http://127.0.0.1:9/v1/systemone"; // discard port: refused
     jest.spyOn(console, "info").mockImplementation(() => {});
+    const spy = jest.spyOn(globalThis, "fetch");
     const { chat } = require("../../services/ai/gravAssistant");
     const out = await chat({ user: hrUser(), message: "hello" });
     expect(out.reply).toBe("BASELINE_DIRECT");
+    expect(spy.mock.calls.filter(([u]) => String(u).includes("8791"))).toHaveLength(0);
   });
 });

@@ -17,36 +17,22 @@
 
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const GoodsReceipt = require("../../models/CMS_Models/StorePurchase/GoodsReceipt");
-const Unit = require("../../models/CMS_Models/Inventory/Configurations/Unit");
 const Warehouse = require("../../models/CMS_Models/Inventory/Configurations/Warehouse");
-const locStock = require("./locationStock.service");
-const sequences = require("./documentSequence.service");
 const { fail } = require("./errors");
+/* ── THE PHYSICAL ACT, SHARED WITH CUSTOMER-SUPPLIED MATERIAL ────────────────
+   Unit conversion, over-receipt refusal, the RawItem stock-in, the warehouse
+   movement and the number sequence were all defined in this file, and a second
+   kind of arrival — a job-work customer sending fabric — needs every one of them
+   to behave identically. They moved to `receiptPosting.service`; this file keeps
+   what is specific to a PURCHASE: the purchase-order line state, the supplier
+   provenance, and the legacy delivery summary.
 
-const r4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
+   Nothing about the purchase path's behaviour changed, and the exports below are
+   unchanged, because the purchase route is the one caller that must not notice
+   this happened. */
+const posting = require("./receiptPosting.service");
 
-// ── Strict unit conversion — a MISSING path refuses, never silently passes ───
-// (The PO route's convertQuantity returns the input unchanged when no path
-// exists; for an authoritative receipt that is dishonest, so this throws.)
-async function resolveConversion({ quantity, fromUnit, toUnit, session = null }) {
-  if (!fromUnit || !toUnit || fromUnit === toUnit) {
-    return { baseQuantity: r4(quantity), factor: 1, note: "" };
-  }
-  const q = (m) => (session ? m.session(session) : m);
-  const fromDoc = await q(Unit.findOne({ name: fromUnit }).populate("conversions.toUnit", "name")).lean();
-  const direct = (fromDoc?.conversions || []).find((c) => (c.toUnit?.name || c.toUnit) === toUnit);
-  if (direct?.quantity) {
-    return { baseQuantity: r4(quantity * direct.quantity), factor: direct.quantity, note: `${quantity} ${fromUnit} = ${r4(quantity * direct.quantity)} ${toUnit}` };
-  }
-  const toDoc = await q(Unit.findOne({ name: toUnit }).populate("conversions.toUnit", "name")).lean();
-  const reverse = (toDoc?.conversions || []).find((c) => (c.toUnit?.name || c.toUnit) === fromUnit);
-  if (reverse?.quantity) {
-    return { baseQuantity: r4(quantity / reverse.quantity), factor: 1 / reverse.quantity, note: `${quantity} ${fromUnit} = ${r4(quantity / reverse.quantity)} ${toUnit}` };
-  }
-  throw fail("VALIDATION", `No unit conversion from "${fromUnit}" to "${toUnit}" is configured, so this receipt cannot be recorded.`, {
-    reason: "UOM_CONVERSION_MISSING", field: "unit", fromUnit, toUnit,
-  });
-}
+const { r4, resolveConversion, applyStockIn } = posting;
 
 /**
  * Validate every requested line against the PO and build immutable plans.
@@ -85,18 +71,16 @@ async function validateReceiptLines({ purchaseOrder, items, tenant, session = nu
     const ordered = Number(poItem.quantity) || 0;
     const previouslyReceived = Number(poItem.receivedQuantity) || 0;
     const pending = r4(Math.max(0, ordered - previouslyReceived));
-    // V1 over-receipt policy: refuse. No silent surplus without inspection.
-    if (r4(qty) > pending) {
-      throw fail("VALIDATION", `Cannot receive ${qty} ${poItem.unit} for "${poItem.itemName}": only ${pending} ${poItem.unit} remain outstanding.`, {
-        reason: "OVER_RECEIPT", poItemId: key, pending, requested: r4(qty),
-      });
-    }
+    /* V1 over-receipt policy: refuse. No silent surplus without inspection.
+       The refusal is the shared one, so "never book more than is outstanding"
+       cannot come to mean two different things at two different gates. */
+    posting.assertWithinPending({
+      requested: qty, pending, label: poItem.itemName, unit: poItem.unit,
+      details: { poItemId: key },
+    });
 
     const rawItemId = poItem.rawItem?._id || poItem.rawItem || null;
-    const unitDoc = rawItemId
-      ? await (session ? RawItem.findById(rawItemId).session(session) : RawItem.findById(rawItemId)).select("unit customUnit").lean()
-      : null;
-    const baseUnit = unitDoc ? (unitDoc.customUnit || unitDoc.unit) : (poItem.unit || "");
+    const baseUnit = await posting.baseUnitOf(rawItemId, poItem.unit || "", session);
     const conv = await resolveConversion({ quantity: qty, fromUnit: poItem.unit, toUnit: baseUnit, session });
 
     plans.push({
@@ -122,50 +106,6 @@ async function validateReceiptLines({ purchaseOrder, items, tenant, session = nu
   return { plans };
 }
 
-// The canonical RawItem stock-in — the SAME ledger the PO route uses. Mutates
-// the live RawItem doc and returns the created stockTransaction's id, so the
-// receipt can link the movement it caused.
-function applyStockIn(rawItem, plan, txMeta) {
-  const q = plan.baseQuantity;
-  const previousBaseQty = rawItem.quantity || 0;
-  if (plan.variantId) {
-    let variant = rawItem.variants.id(plan.variantId) || null;
-    if (!variant && plan.variantCombination?.length) {
-      variant = rawItem.variants.find(
-        (v) => v.combination?.length === plan.variantCombination.length
-          && v.combination.every((val, i) => val === plan.variantCombination[i]),
-      ) || null;
-    }
-    if (variant) {
-      variant.quantity = (variant.quantity || 0) + q;
-      variant.status = variant.quantity === 0 ? "Out of Stock"
-        : variant.quantity <= (variant.minStock || rawItem.minStock || 0) ? "Low Stock" : "In Stock";
-      if (!variant.sku) variant.sku = plan.variantSku || `${rawItem.sku}-var`;
-    } else {
-      rawItem.variants.push({
-        combination: plan.variantCombination || [], quantity: q,
-        minStock: rawItem.minStock || 0, maxStock: rawItem.maxStock || 0,
-        sku: plan.variantSku || `${rawItem.sku}-var-${rawItem.variants.length + 1}`, status: "In Stock",
-      });
-    }
-    rawItem.quantity = rawItem.variants.reduce((sm, v) => sm + (v.quantity || 0), 0);
-  } else {
-    rawItem.quantity = (rawItem.quantity || 0) + q;
-  }
-  rawItem.status = rawItem.quantity === 0 ? "Out of Stock"
-    : rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
-
-  rawItem.stockTransactions.unshift({
-    type: plan.variantId ? "VARIANT_ADD" : "ADD",
-    quantity: q,
-    ...(plan.variantId ? { variantId: plan.variantId, variantCombination: plan.variantCombination } : {}),
-    previousQuantity: previousBaseQty,
-    newQuantity: rawItem.quantity,
-    ...txMeta,
-  });
-  return rawItem.stockTransactions[0]._id;
-}
-
 /**
  * Apply a validated receipt atomically INSIDE the caller's unit-of-work session:
  * allocate the GRN, move stock + location balances, update PO lines, create the
@@ -178,54 +118,44 @@ function applyStockIn(rawItem, plan, txMeta) {
 async function applyReceipt({ session, tenant, purchaseOrder, plans, header, actor, idempotencyKey }) {
   const companyId = tenant.companyId;
   // allocate() returns the already-formatted number (e.g. "GRN/2026-27/0001").
-  const { number: receiptNumber } = await sequences.allocate({ companyId, documentType: "GOODS_RECEIPT", session, siteId: tenant.siteId || null });
+  const { number: receiptNumber } = await posting.allocateReceiptNumber({
+    companyId, session, siteId: tenant.siteId || null,
+  });
 
   const wh = header.warehouse || null;
   const loc = header.location || null;
-  const locSnap = loc ? locStock.txLocationSnapshot(wh, loc) : {};
-
   const grnLines = [];
-  // Group only the plans that move stock (have a rawItemId). A plan with no
-  // rawItemId still gets a GRN line + PO update in the build loop below, but no
-  // stock/location movement — never a malformed early entry.
-  const byRawItem = new Map();
-  for (const pl of plans) {
-    if (!pl.rawItemId) continue;
-    if (!byRawItem.has(pl.rawItemId)) byRawItem.set(pl.rawItemId, []);
-    byRawItem.get(pl.rawItemId).push(pl);
-  }
 
-  // Stock + location movement, per distinct RawItem (loaded once with session).
-  for (const [rawItemId, itemPlans] of byRawItem) {
-    const rawItem = session ? await RawItem.findById(rawItemId).session(session) : await RawItem.findById(rawItemId);
-    if (!rawItem) throw fail("VALIDATION", `Stock item for a receipt line no longer exists.`, { reason: "RAW_ITEM_MISSING", rawItemId });
-    for (const pl of itemPlans) {
-      const txId = applyStockIn(rawItem, pl, {
-        reason: "Goods Receipt", supplier: purchaseOrder.vendorName, supplierId: purchaseOrder.vendor,
-        unitPrice: pl.unitPrice, purchaseOrder: purchaseOrder.poNumber, purchaseOrderId: purchaseOrder._id,
-        invoiceNumber: header.invoiceNumber || "", notes: `GRN ${receiptNumber}${pl.conversionNote ? ` (${pl.conversionNote})` : ""}`,
-        performedBy: actor.id, ...locSnap,
-      });
-      pl.__txId = txId;
-    }
-    await rawItem.save(session ? { session } : {});
-    for (const pl of itemPlans) {
-      let mvId = null;
-      if (loc) {
-        const out = await locStock.applyLocationIn(session, {
-          companyId, siteId: tenant.siteId, item: rawItem, variantId: pl.variantId || null,
-          warehouse: wh, location: loc, quantity: pl.baseQuantity, type: "receipt", intent: "receive",
-          source: { kind: "po_receipt", id: purchaseOrder._id, reference: purchaseOrder.poNumber },
-          actor: { id: actor.id, name: actor.name },
-          note: `GRN ${receiptNumber}`,
-          idempotencyKey: locStock.movementLineKey(idempotencyKey || "", pl.poItemId, "grn"),
-          operationKey: idempotencyKey || "",
-        });
-        mvId = out?.movement?._id || null;
-      }
-      pl.__mvId = mvId;
-    }
-  }
+  /* ── THE PURCHASE SOURCE'S PROVENANCE ─────────────────────────────────────
+     Everything the shared posting cannot know: that these goods were bought,
+     from whom, at what price, against which order and under which invoice. The
+     movement itself is identical for a customer's goods; this is the part that
+     is not. */
+  const source = {
+    type: "PURCHASE_ORDER",
+    documentId: purchaseOrder._id,
+    documentNumber: purchaseOrder.poNumber,
+    stockMeta: (pl) => ({
+      reason: "Goods Receipt",
+      supplier: purchaseOrder.vendorName, supplierId: purchaseOrder.vendor,
+      unitPrice: pl.unitPrice,
+      purchaseOrder: purchaseOrder.poNumber, purchaseOrderId: purchaseOrder._id,
+      invoiceNumber: header.invoiceNumber || "",
+      notes: `GRN ${receiptNumber}${pl.conversionNote ? ` (${pl.conversionNote})` : ""}`,
+    }),
+    locationSource: () => ({
+      kind: "po_receipt", id: purchaseOrder._id, reference: purchaseOrder.poNumber,
+    }),
+  };
+
+  /* The movement idempotency key is per line, as it always was — the plan
+     carries the key under a source-neutral name so one posting implementation
+     can serve both kinds of line. */
+  for (const pl of plans) pl.lineKey = pl.poItemId;
+
+  await posting.postMovements({
+    session, tenant, plans, receiptNumber, header, actor, idempotencyKey, source,
+  });
 
   // Update PO line state and build GRN lines with resulting figures.
   for (const pl of plans) {
@@ -234,6 +164,10 @@ async function applyReceipt({ session, tenant, purchaseOrder, plans, header, act
     poItem.pendingQuantity = r4(Math.max(0, (Number(poItem.quantity) || 0) - poItem.receivedQuantity));
     poItem.status = poItem.receivedQuantity >= poItem.quantity ? "COMPLETED" : poItem.receivedQuantity > 0 ? "PARTIALLY_RECEIVED" : "PENDING";
     grnLines.push({
+      /* Both joins: the generic one every source fills, and the purchase-order
+         one this source has always filled. A reader that does not care which
+         kind of receipt this is can still name the line it discharges. */
+      sourceLineId: pl.poItemId,
       poItemId: pl.poItemId, spendLineId: pl.spendLineId, rawItemId: pl.rawItemId, variantId: pl.variantId,
       variantCombination: pl.variantCombination, itemName: pl.itemName, sku: pl.sku, variantSku: pl.variantSku,
       poUnit: pl.poUnit, receivedQuantity: pl.receivedQuantity, baseUnit: pl.baseUnit, baseQuantity: pl.baseQuantity,
@@ -262,6 +196,12 @@ async function applyReceipt({ session, tenant, purchaseOrder, plans, header, act
 
   const [goodsReceipt] = await GoodsReceipt.create([{
     companyId, siteId: tenant.siteId || null, receiptNumber,
+    /* Said rather than inferred. A receipt whose kind is deduced from which
+       other fields happen to be set is one schema change away from a customer's
+       goods appearing in procurement spend. */
+    sourceType: "PURCHASE_ORDER",
+    sourceDocumentId: purchaseOrder._id,
+    sourceDocumentNumber: purchaseOrder.poNumber || "",
     purchaseOrderId: purchaseOrder._id, poNumber: purchaseOrder.poNumber,
     supplierId: purchaseOrder.vendor || null, supplierName: purchaseOrder.vendorName || "",
     warehouseId: wh?._id || null, warehouseName: wh?.name || "",
@@ -292,4 +232,6 @@ async function applyReceipt({ session, tenant, purchaseOrder, plans, header, act
   return { goodsReceipt };
 }
 
+/* `applyStockIn` and `resolveConversion` are re-exported from their new home so
+   every existing caller and test is untouched by the extraction. */
 module.exports = { validateReceiptLines, applyReceipt, applyStockIn, resolveConversion };

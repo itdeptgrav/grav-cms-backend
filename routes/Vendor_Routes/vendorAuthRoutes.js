@@ -51,7 +51,7 @@ router.post("/login", async (req, res) => {
         contactPerson: vendor.contactPerson,
         category: vendor.category,
       },
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../../config/jwt").SECRET,
       { expiresIn: "24h" },
     );
 
@@ -112,7 +112,7 @@ router.get("/validate", async (req, res) => {
     const jwt = require("jsonwebtoken");
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../../config/jwt").SECRET,
     );
 
     // Check if it's a vendor token

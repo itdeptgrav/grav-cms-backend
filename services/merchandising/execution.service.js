@@ -22,13 +22,20 @@
 // clarification request Sales resolves commercially. Rejecting the order is
 // Sales' authority, expressed as supersession or cancellation.
 "use strict";
+const { resolveOrderFulfilmentModel } = require("../../constants/orderFulfilment");
 
 const crypto = require("crypto");
 const mongoose = require("mongoose");
 
 const SalesHandoverVersion = require("../../models/CMS_Models/Sales/SalesHandoverVersion");
+const {
+  SalesDevelopmentRequest,
+} = require("../../models/CMS_Models/Sales/DevelopmentRequest");
 const HandoverReceipt = require("../../models/CMS_Models/Merchandising/HandoverReceipt");
 const ExecutionFile = require("../../models/CMS_Models/Merchandising/ExecutionFile");
+const {
+  DevelopmentFile,
+} = require("../../models/CMS_Models/Merchandising/Development");
 const { TnaMilestone } = require("../../models/CMS_Models/Merchandising/TnaPlan");
 const tnaPortfolio = require("./tnaPortfolio.service");
 const { ExecutionPack } = require("../../models/CMS_Models/Merchandising/ExecutionPack");
@@ -136,7 +143,7 @@ function assertContext(ctx) {
 /* ═══ ALLOWLISTED VIEWS ════════════════════════════════════════════════════ */
 
 /** What Merchandising may be told about one handover version. */
-function handoverView(version, receipt) {
+function handoverView(version, receipt, { referenceImages = [] } = {}) {
   const p = version.executionProjection || {};
   const deliveries = (p.deliveries || []).map((d) => ({
     dropRef: str(d.dropRef),
@@ -159,6 +166,18 @@ function handoverView(version, receipt) {
     },
     orderRef: str(p.orderRef),
     orderLineRef: str(p.orderLineRef),
+    /* ── HOW THIS ORDER IS FULFILLED ─────────────────────────────────
+       Sales stamps it on the confirmed line and it is already stored on the
+       projection; it was simply never allowed out. Merchandising needs it
+       because a JOB_WORK order is one where the CUSTOMER supplies the
+       material, which changes what the file may be asked to do.
+
+       Resolved rather than passed through: a handover issued before Sales
+       began stamping it carries nothing, and the resolver's default is
+       FULL_PACKAGE — the model the company had before the distinction
+       existed. A legacy order therefore reads as what it actually was,
+       never as an empty string somebody downstream has to interpret. */
+    fulfilmentModel: resolveOrderFulfilmentModel(p.fulfilmentModel),
     styleRef: str(p.styleRef),
     buyerStyleRef: str(p.buyerStyleRef),
     productName: str(p.productName),
@@ -200,6 +219,11 @@ function handoverView(version, receipt) {
         })),
       }
       : null,
+    /* The immutable Sales projection deliberately carries no image. When
+       Sales linked this order to a released Development file, its request is
+       the attributed source of the garment references. These are joined at
+       read time rather than copied into the confirmed order. */
+    referenceImages,
     receiptState: computeReceiptState(version, receipt),
     clarification: receipt?.state === "CLARIFICATION_REQUESTED"
       ? {
@@ -229,7 +253,7 @@ function computeReceiptState(version, receipt) {
 }
 
 /** What Merchandising may be told about one Execution File. */
-function fileView(file, { units = null } = {}) {
+function fileView(file, { units = null, referenceImages = [] } = {}) {
   const p = file.currentExecutionProjection || {};
   const deliveries = (p.deliveries || []).map((d) => ({
     dropRef: str(d.dropRef),
@@ -244,6 +268,9 @@ function fileView(file, { units = null } = {}) {
     handoverRef: str(file.handoverRef),
     handoverLineRef: str(file.handoverLineRef),
     orderRef: str(p.orderRef),
+    /* The same fact the handover carries, on the file it opened, so a
+       screen reading the file never has to go back to the handover. */
+    fulfilmentModel: resolveOrderFulfilmentModel(p.fulfilmentModel),
     styleRef: str(p.styleRef),
     buyerStyleRef: str(p.buyerStyleRef),
     productName: str(p.productName),
@@ -265,6 +292,7 @@ function fileView(file, { units = null } = {}) {
     packingRequirement: str(p.packingRequirement),
     testingRequirement: str(p.testingRequirement),
     deliveryRequirement: str(p.deliveryRequirement),
+    referenceImages,
     lifecycleStatus: str(file.lifecycleStatus),
     lifecycleReason: str(file.lifecycleReason),
     executionPhase: str(file.executionPhase),
@@ -295,6 +323,37 @@ function fileView(file, { units = null } = {}) {
     updatedAt: file.updatedAt,
     ...(units ? { units: units.map(unitView) } : {}),
   };
+}
+
+/**
+ * Product references attached to the exact Development file named by the
+ * handover. No style-code fallback: a similarly named style is not evidence
+ * that the buyer attached these pictures to this order.
+ */
+async function developmentReferences(version) {
+  const developmentFileId = version?.developmentReference?.developmentFileId;
+  if (!developmentFileId) return [];
+
+  const file = await DevelopmentFile.findOne({
+    _id: developmentFileId,
+    companyId: version.companyId,
+  }).select("currentRequestId developmentNumber").lean();
+  if (!file?.currentRequestId) return [];
+
+  const request = await SalesDevelopmentRequest.findOne({
+    _id: file.currentRequestId,
+    companyId: version.companyId,
+  }).select("referenceImages").lean();
+
+  return (request?.referenceImages || [])
+    .filter((image) => str(image?.url))
+    .map((image) => ({
+      url: str(image.url),
+      caption: str(image.caption),
+      source: file.developmentNumber
+        ? `Development file ${str(file.developmentNumber)}`
+        : "Linked Development file",
+    }));
 }
 
 function unitView(unit) {
@@ -463,7 +522,7 @@ async function getHandover(ctx, { id } = {}) {
   const version = await SalesHandoverVersion.findOne({ _id: id, companyId: ctx.companyId }).lean();
   if (!version) throw fail("NOT_FOUND", "Handover not found.");
 
-  const [receipt, lineage, lineReceipts] = await Promise.all([
+  const [receipt, lineage, lineReceipts, referenceImages] = await Promise.all([
     HandoverReceipt.findOne({ companyId: ctx.companyId, handoverVersionId: version._id }).lean(),
     SalesHandoverVersion.find({
       companyId: ctx.companyId,
@@ -475,11 +534,12 @@ async function getHandover(ctx, { id } = {}) {
       handoverRef: version.handoverRef,
       handoverLineRef: version.handoverLineRef,
     }).lean(),
+    developmentReferences(version),
   ]);
   const receiptByVersion = new Map(lineReceipts.map((r) => [str(r.handoverVersionId), r]));
 
   return {
-    handover: handoverView(version, receipt),
+    handover: handoverView(version, receipt, { referenceImages }),
     lineage: lineage.map((v) => {
       const r = receiptByVersion.get(str(v._id));
       return {
@@ -560,6 +620,24 @@ async function acceptHandover(ctx, { id, actor = null } = {}) {
           event: "ACCEPTED", at: now, by: actor || undefined,
         }],
         currentExecutionProjection: version.executionProjection,
+        /* ── THE DEVELOPMENT JOB THIS ORDER CAME FROM ──────────────────
+           The model has always declared this as "copied from the accepted
+           handover version", and nothing ever copied it. The link was only
+           ever re-derived later by matching a style reference — which is a
+           display code somebody can edit, and which is wrong the moment two
+           orders share a style or one is renamed.
+
+           Sales states the release it confirmed against; that is the
+           authority, and it is carried here at the moment of acceptance so
+           the order never has to guess again. */
+        ...(version.developmentReference?.developmentFileId ? {
+          developmentReference: {
+            developmentFileId: version.developmentReference.developmentFileId,
+            developmentNumber: str(version.developmentReference.developmentNumber),
+            bomRevisionNo: version.developmentReference.bomRevisionNo ?? null,
+            releaseReference: str(version.developmentReference.releaseReference),
+          },
+        } : {}),
         lifecycleStatus: "OPEN",
         createdBy: actor || undefined,
         updatedBy: actor || undefined,
@@ -647,8 +725,39 @@ async function acceptHandover(ctx, { id, actor = null } = {}) {
     return { file: fileView(file), alreadyAccepted: false };
   });
 
+  /**
+   * ── THE DEVELOPMENT SELECTION COMES WITH THE ORDER ──────────────────────
+   * Materials are chosen during development. An order that came out of one
+   * opened with an empty Materials & Trims tab reading "Nothing selected
+   * yet" and a button asking the merchandiser to start a draft — so the
+   * commonest path through this screen was retyping a selection the company
+   * had already approved, which is exactly how a transcription error reaches
+   * a factory.
+   *
+   * So acceptance imports it. What arrives is a DRAFT, and that distinction
+   * is the whole boundary: development says "these are the materials the
+   * approved sample was made from", the order says "these are the materials
+   * the factory must use", and only a merchandiser reviewing the confirmed
+   * colours and quantities can turn the first into the second.
+   *
+   * ── AND IT CANNOT FAIL AN ACCEPTANCE ────────────────────────────────────
+   * Outside the transaction, after the file exists, and swallowed. The
+   * acceptance is the commercial fact; the import is a convenience over it.
+   * A file whose import did not run shows the ordinary "add materials"
+   * state and the band offers it again — nothing is lost, and nobody is
+   * told their order was not accepted because a draft could not be started.
+   */
+  const importDevelopment = async (result) => {
+    if (!result?.file?.id) return result;
+    try {
+      const adoption = require("./developmentAdoption.service");
+      await adoption.adopt(ctx, { fileId: result.file.id, actor });
+    } catch { /* see above: never fatal to an acceptance */ }
+    return result;
+  };
+
   try {
-    return await run();
+    return await importDevelopment(await run());
   } catch (err) {
     /* The concurrent duplicate: somebody else's acceptance committed between
        our read and our write. Their decision stands; answer with their file. */
@@ -660,7 +769,9 @@ async function acceptHandover(ctx, { id, actor = null } = {}) {
         const file = await ExecutionFile.findOne({
           _id: receipt.executionFileId, companyId: ctx.companyId,
         }).lean();
-        if (file) return { file: fileView(file), alreadyAccepted: true };
+        /* The loser of the race still runs the import. It is idempotent on
+           the winner's stamp, so it answers rather than writing. */
+        if (file) return importDevelopment({ file: fileView(file), alreadyAccepted: true });
       }
     }
     throw err;
@@ -841,6 +952,14 @@ async function listFiles(ctx, {
     limit: size,
     hasMore: files.length > size,
     nextCursor: files.length > size ? encodeCursor(page[page.length - 1]) : null,
+    /* ── THE DAY THE DATES ARE MEASURED AGAINST ───────────────────────
+       The register's Next-milestone column says how many days late or
+       left, and that arithmetic has to be done against the SAME day the
+       milestone statuses were computed against — the plan's own timezone,
+       not the reader's browser. Sent with the page so the column cannot
+       disagree with the file it opens for a merchandiser working from
+       another timezone, or at either end of a day. */
+    today: require("./tnaCalendar").todayInZone(),
   };
 }
 
@@ -903,8 +1022,15 @@ async function loadOwnedFile(ctx, id) {
 
 async function getFile(ctx, { id } = {}) {
   const file = await loadOwnedFile(ctx, id);
-  const units = await ExecutionUnit.find({ fileId: file._id }).sort({ unitDiscriminator: 1 }).lean();
-  return { file: fileView(file, { units }) };
+  const [units, version] = await Promise.all([
+    ExecutionUnit.find({ fileId: file._id }).sort({ unitDiscriminator: 1 }).lean(),
+    SalesHandoverVersion.findOne({
+      _id: file.currentHandoverVersionId,
+      companyId: ctx.companyId,
+    }).lean(),
+  ]);
+  const referenceImages = version ? await developmentReferences(version) : [];
+  return { file: fileView(file, { units, referenceImages }) };
 }
 
 /* ═══ FILE COMMANDS ════════════════════════════════════════════════════════ */

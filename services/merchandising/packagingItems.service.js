@@ -49,6 +49,7 @@ const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
 const model = (name, path) => (mongoose.models[name] || require(path));
 const SampleStyle = () => model("SampleStyle", "../../models/CMS_Models/Sales/SampleStyle");
 const RawItem = () => model("RawItem", "../../models/CMS_Models/Inventory/Products/RawItem");
+const { USED_AS, usedAsLabel } = require("../../models/CMS_Models/Inventory/Products/usedAs");
 
 /** Short enough that a stray keystroke is not a scan; the R&D picker uses the same. */
 const MIN_TERM = 2;
@@ -67,6 +68,8 @@ const itemView = (row) => ({
   id: str(row._id),
   name: str(row.name),
   sku: str(row.sku),
+  usedAs: str(row.usedAs) || USED_AS.SAMPLE_PACKAGING,
+  usedAsLabel: usedAsLabel(row.usedAs) || usedAsLabel(USED_AS.SAMPLE_PACKAGING),
 });
 
 /**
@@ -103,9 +106,14 @@ async function searchPackagingItems(ctx, { styleId, q } = {}) {
      syntax error the caller can trigger, and an unescaped `.*` is a scan
      somebody else pays for. */
   const rx = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  /* ── THE HARD GATE ────────────────────────────────────────────────────
+     Sample Packaging shows ONLY items Store classified as sample packaging.
+     This is the fix for the tab that used to load the whole catalogue because
+     it sent no category: MCB boards, cables, dies and pipes are excluded here
+     by the item's own `usedAs`, not by anything the client chooses to send. */
   const rows = await RawItem()
-    .find({ companyId: ctx.companyId, $or: [{ name: rx }, { sku: rx }] })
-    .select("_id name sku")
+    .find({ companyId: ctx.companyId, usedAs: USED_AS.SAMPLE_PACKAGING, $or: [{ name: rx }, { sku: rx }] })
+    .select("_id name sku usedAs")
     .sort({ name: 1 })
     .limit(MAX_RESULTS)
     .lean();

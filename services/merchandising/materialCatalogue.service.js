@@ -46,7 +46,10 @@ const mongoose = require("mongoose");
 
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const { ROW_CATEGORY } = require("../../models/CMS_Models/Merchandising/Development");
+const usedAsDef = require("../../models/CMS_Models/Inventory/Products/usedAs");
+const Unit = require("../../models/CMS_Models/Inventory/Configurations/Unit");
 const { fail } = require("../storePurchase/errors");
+const rawItemCreation = require("../../services/inventory/rawItemCreation.service");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -102,7 +105,7 @@ function suggestCategory(item) {
 /* ── THE ALLOW-LIST ────────────────────────────────────────────────────────
    Named field by field. `select` with a minus list would have been shorter
    and would have leaked every field added to RawItem afterwards. */
-const SAFE_SELECT = "name sku category customCategory unit customUnit attributes "
+const SAFE_SELECT = "name sku category customCategory usedAs unit customUnit attributes "
   + "variants._id variants.sku variants.combination companyId";
 
 /* ── AND AN ALLOW-LIST OF FIELDS IS NOT ENOUGH ─────────────────────────────
@@ -230,6 +233,10 @@ const safeItem = (item) => {
     category: str(item?.category),
     customCategory: str(item?.customCategory),
     unit: str(item?.unit) || str(item?.customUnit),
+    /* Store's own classification, shown as a small label on each result so a
+       merchandiser can see what part Store says this item plays. */
+    usedAs: str(item?.usedAs) || usedAsDef.DEFAULT_USED_AS,
+    usedAsLabel: usedAsDef.usedAsLabel(item?.usedAs) || usedAsDef.usedAsLabel(usedAsDef.DEFAULT_USED_AS),
     attributes: declared.filter(attributeIsSafe),
     variants,
     variantCount: variants.length,
@@ -256,9 +263,21 @@ function shelfClause(category) {
  * the set shifts under it. `total` is counted only on the first page, so
  * typing a query costs one count, not one per page.
  */
-async function search(ctx, { q = "", category = "", cursor = "", limit } = {}) {
+async function search(ctx, { q = "", category = "", section = "", cursor = "", limit } = {}) {
   if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Merchandising.");
   const size = Math.min(Number(limit) > 0 ? Number(limit) : DEFAULT_LIMIT, MAX_LIMIT);
+
+  /* ── THE HARD GATE ────────────────────────────────────────────────────
+     The section fixes the ONLY `usedAs` values this call may ever surface —
+     Materials & Trims sees the four garment-component classes, Sample
+     Packaging sees only sample packaging — and a `category` can narrow within
+     that but never widen it. Everything Store marked a factory consumable, a
+     machine spare, an electrical item, a tool, "not for product BOM" or "not
+     classified" is absent by construction: no section maps to it, so no
+     forged category or widened query can reveal it. Default is Materials, so a
+     caller that sends nothing gets the safe set rather than the whole catalogue. */
+  const sectionResolved = usedAsDef.SECTION[str(section).toUpperCase()] || usedAsDef.SECTION.MATERIALS;
+  const allowedUsedAs = usedAsDef.allowedUsedAs(sectionResolved, category);
 
   /* ── SAME COMPANY, FULL STOP ──────────────────────────────────────────
      Not Store's `tenantFilter`, which in legacy mode widens to the records
@@ -305,7 +324,9 @@ async function search(ctx, { q = "", category = "", cursor = "", limit } = {}) {
       ],
     });
   }
-  if (str(category)) clauses.push(shelfClause(str(category).toUpperCase()));
+  /* The hard gate, ANDed into every query — it cannot be turned off from the
+     client. `category` has already narrowed `allowedUsedAs` within the section. */
+  clauses.push({ usedAs: { $in: allowedUsedAs } });
 
   if (str(cursor)) {
     const [name, id] = str(cursor).split("|");
@@ -326,12 +347,16 @@ async function search(ctx, { q = "", category = "", cursor = "", limit } = {}) {
   const [found, total, catalogueSize] = await Promise.all([
     RawItem.find(filter).select(SAFE_SELECT).sort({ name: 1, _id: 1 }).limit(size + 1).lean(),
     str(cursor) ? Promise.resolve(null) : RawItem.countDocuments(filter),
-    /* What the company has AT ALL, so "nothing matched" can be told apart
-       from "Store has not registered anything here yet". They need different
-       words and lead to different places. */
-    str(cursor) || (!str(q) && !str(category))
+    /* How many items Store has CLASSIFIED FOR THIS SECTION at all, so "nothing
+       matched" can be told apart from "Store has not classified anything for
+       this section yet". They need different words and lead to different
+       places (the empty state asks Store to set an item's "Used as"). */
+    str(cursor)
       ? Promise.resolve(null)
-      : RawItem.countDocuments({ companyId: ctx.companyId }),
+      : RawItem.countDocuments({
+        companyId: ctx.companyId,
+        usedAs: { $in: usedAsDef.SECTION_USED_AS[sectionResolved] },
+      }),
   ]);
 
   const page = found.slice(0, size);
@@ -344,6 +369,10 @@ async function search(ctx, { q = "", category = "", cursor = "", limit } = {}) {
     hasMore: found.length > size,
     nextCursor: found.length > size && last ? `${str(last.name)}|${str(last._id)}` : null,
     categories: Object.keys(CATEGORY_SHELVES),
+    /* Which section this answered for, and the exact classifications it may
+       show — so the client cannot believe it is seeing more than it is. */
+    section: sectionResolved,
+    usedAsAllowed: allowedUsedAs,
   };
 }
 
@@ -399,7 +428,204 @@ async function resolve(ctx, { rawItemId, variantId } = {}, session = null) {
   };
 }
 
+/* ═══ REGISTERING A MATERIAL STORE DOES NOT HAVE YET ═══════════════════════
+   A merchandiser searches the catalogue for the lining the buyer specified and
+   it is not there — because nobody has bought it yet. Until now the only
+   answers were to describe it as unregistered text, which leaves R&D guessing,
+   or to stop, message Store, and come back tomorrow. Both of those are how a
+   BOM ends up holding spellings instead of references.
+
+   So there is a door. It is a KEYHOLE in the same sense as the search above:
+   it registers a material's IDENTITY and nothing else.
+
+   ── WHAT THIS DOOR IS NOT ────────────────────────────────────────────────
+   It is not `sp.master.maintain`. A merchandiser who walks through it does not
+   acquire the ability to set opening stock, adjust a balance, record a
+   purchase price, name a supplier or maintain a supplier alias — and does not
+   acquire it by omission either. The shared creation service is told which
+   SECTIONS this caller may supply, and a payload carrying anything else is
+   REFUSED rather than quietly stripped, so nobody is left believing they
+   recorded a price that was dropped on the way in.
+
+   It also does not create UNITS or CATEGORIES. Both are Store configuration —
+   a unit especially, since a conversion factor on one retroactively changes
+   what every stored quantity in it MEANS — so this door will only accept a
+   category from Store's own list and a unit from this company's unit master.
+   `customCategory` and `customUnit` are the fields that would invent them, and
+   they are refused by name rather than ignored.
+
+   ── WHY IT REFUSES A DUPLICATE INSTEAD OF REGISTERING ONE ────────────────
+   This is reached at exactly the moment a search failed to find something, and
+   a search fails for two quite different reasons: the material genuinely is
+   not there, or it is there under a name the merchandiser did not type. Store's
+   own screen may register a near-duplicate — a storekeeper can see the
+   catalogue in front of them and may have a reason. Here the honest answer is
+   to hand back the item that matched so the drawer can offer it, because a
+   second row for one yarn is a cost somebody pays for years. */
+
+/** A name that a person, and a duplicate check, can work with. */
+const MIN_NAME = 2;
+const MAX_NAME = 120;
+
+/**
+ * What the drawer's form may offer.
+ *
+ * Store's standard shelves, plus the words this company has actually filed
+ * items under, plus this company's active units. All three are needed to
+ * register an item at all, and none of them is a commercial fact — a unit is
+ * "Meter", a shelf is "Trims". Nothing here reveals a balance, a price or a
+ * supplier, which is the line this whole service exists to hold.
+ */
+async function registrationOptions(ctx, session = null) {
+  if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Merchandising.");
+
+  const [inUse, units] = await Promise.all([
+    RawItem.distinct("customCategory", { companyId: ctx.companyId }, { session }),
+    Unit.find({ companyId: ctx.companyId, status: "Active" })
+      .select("name").sort({ name: 1 }).session(session)
+      .lean(),
+  ]);
+
+  const standard = rawItemCreation.RAW_ITEM_CATEGORIES;
+  const known = new Set(standard.map((c) => c.toLowerCase()));
+  const companyOwn = [...new Set((inUse || []).map(str).filter(Boolean))]
+    .filter((c) => !known.has(c.toLowerCase()))
+    .sort((a, b) => a.localeCompare(b));
+
+  return {
+    /* Store's shelves first, then the company's own words, each marked so the
+       form can group them rather than present one undifferentiated list. */
+    categories: [
+      ...standard.map((name) => ({ name, source: "standard" })),
+      ...companyOwn.map((name) => ({ name, source: "company" })),
+    ],
+    units: (units || []).map((u) => ({ name: str(u.name) })),
+    /* Only the classifications a garment BOM can use. A merchandiser
+       registering a lining has no business filing it as a machine spare, and
+       offering the full list would invite exactly that. Store can reclassify it
+       later if the item turns out to be something else. */
+    usedAs: usedAsDef.PRODUCT_BOM_USED_AS.map((value) => ({
+      value, label: usedAsDef.usedAsLabel(value),
+    })),
+  };
+}
+
+/** The category this door will accept, or a refusal naming the alternative. */
+function acceptCategory(categories, wanted) {
+  const want = str(wanted).toLowerCase();
+  const match = categories.find((c) => c.name.toLowerCase() === want);
+  if (!match) {
+    throw fail("VALIDATION",
+      `"${str(wanted)}" is not a Store category. Choose one of Store's, or ask Store to add it.`,
+      { field: "category", reason: "CATEGORY_NOT_IN_STORE" });
+  }
+  return match.name;
+}
+
+/** The unit this door will accept. A unit it has not got is not one it invents. */
+function acceptUnit(units, wanted) {
+  const want = str(wanted).toLowerCase();
+  const match = units.find((u) => u.name.toLowerCase() === want);
+  if (!match) {
+    throw fail("VALIDATION",
+      `"${str(wanted)}" is not a unit this company has. Choose one of its units, or ask Store to add it.`,
+      { field: "unit", reason: "UNIT_NOT_IN_COMPANY" });
+  }
+  return match.name;
+}
+
+/**
+ * Register a material in this company's Store catalogue, identity only.
+ *
+ * @param {object} ctx     the Merchandising context — `companyId` is the ONLY
+ *                         source of ownership
+ * @param {object} body    `{ name, category, unit, usedAs, description }`
+ * @param {string} actorId the authenticated actor — the ONLY source of
+ *                         `createdBy`
+ * @returns {Promise<{item: object}>} the created item in the SAME shape a
+ *          search result has, so the drawer selects it with the code it already
+ *          has rather than a second, nearly identical path
+ */
+async function register(ctx, body = {}, actorId = null, session = null) {
+  if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Merchandising.");
+
+  /* Refused by name, not ignored: these are the two fields that would create
+     Store configuration through a Merchandising grant. */
+  const invents = ["customCategory", "customUnit"].filter((f) => str(body?.[f]));
+  if (invents.length) {
+    throw fail("FORBIDDEN",
+      "Store maintains its categories and units. Choose one that exists, or ask Store to add it. Nothing was saved.",
+      { reason: "STORE_CONFIGURATION_NOT_PERMITTED_HERE", fields: invents });
+  }
+
+  const name = str(body.name);
+  if (name.length < MIN_NAME) {
+    throw fail("VALIDATION", "Give the material a name R&D and Store will recognise.",
+      { field: "name" });
+  }
+  if (name.length > MAX_NAME) {
+    throw fail("VALIDATION", `A material name is at most ${MAX_NAME} characters.`, { field: "name" });
+  }
+
+  const options = await registrationOptions(ctx, session);
+  const category = acceptCategory(options.categories, body.category);
+  const unit = acceptUnit(options.units, body.unit);
+
+  /* An unstated classification is DERIVED from the category rather than left
+     unset, because an item that reaches the catalogue as NOT_CLASSIFIED is
+     invisible to the very picker this drawer was opened from — the merchandiser
+     would register a material and then fail to find it. A value the caller DID
+     state must be one a garment BOM can hold. */
+  const offered = new Set(options.usedAs.map((u) => u.value));
+  let usedAs = str(body.usedAs).toUpperCase();
+  if (usedAs && !offered.has(usedAs)) {
+    throw fail("VALIDATION",
+      "That is not a classification a garment's bill of materials uses.",
+      { field: "usedAs", allowed: [...offered] });
+  }
+  if (!usedAs) usedAs = usedAsDef.classifyByCategory(category) || "";
+  if (usedAs && !offered.has(usedAs)) usedAs = "";
+
+  /* Merchandising's own envelope fields. They say WHICH file this was done
+     from and how the request is de-duplicated — they are not facts about the
+     material, so they are removed rather than refused. Everything else the
+     caller sent travels on, where the shared service refuses whatever this
+     door may not supply. */
+  const { fileId, idempotencyKey, expectedRevision, ...material } = body || {};
+
+  const { rawItem } = await rawItemCreation.createRawItem({
+    /* Company from the resolved Merchandising context, actor from the session.
+       Neither is read from the payload, and a payload naming either is not
+       merged — it is ignored. */
+    tenant: { companyId: ctx.companyId },
+    actorId,
+    payload: {
+      ...material,
+      /* Read back from Store's own masters, so what is stored is Store's
+         spelling of the category and unit rather than the caller's casing. */
+      name, category, unit,
+      /* Empty means "Store decides later" — the model's own default — rather
+         than a guess this door is not entitled to make. */
+      ...(usedAs ? { usedAs } : {}),
+      description: body.description,
+    },
+    /* Identity and classification. Not stock levels, not variants, not
+       attributes, not conversions, not discounts, not suppliers. */
+    sections: rawItemCreation.MERCHANDISING_SECTIONS,
+    onDuplicate: "refuse",
+    /* Part of the caller's unit of work, not a write of its own. The item and
+       the audit row that says why it exists commit together or not at all. */
+    session,
+  });
+
+  /* Read back through the same keyhole the search uses. The drawer then holds
+     a row indistinguishable from a search result — same `variantChoice`, same
+     `suggestedCategory` — and selects it without a special case. */
+  return { item: safeItem(rawItem.toObject ? rawItem.toObject() : rawItem) };
+}
+
 module.exports = {
   search, resolve, suggestCategory, safeItem, variantChoiceOf,
+  registrationOptions, register,
   CATEGORY_SHELVES, SAFE_SELECT, DEFAULT_LIMIT, MAX_LIMIT,
 };

@@ -12,6 +12,14 @@ const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels"
 const { ensureAccessDepartments } = require("../../services/ensureAccessDepartments");
 const { invalidate } = require("../../services/memo");
 const { change } = require("../../services/companyContext/companyAccess.service");
+const { setRole } = require("../../services/departmentRoles");
+
+/* GAC-AR1 (25 Sep 2026): these two tests used to pin "a company PPC grant
+   creates the tile / the switch". The single-organisation cutover made the
+   canonical application-access resolver the only launcher input, and
+   companyGrants[] is no longer one of them. They now pin the replacement: a
+   company grant alone opens nothing; the PPC APPLICATION role does, and its
+   revocation removes the tile and the switch on the next request. */
 
 let server;
 let base;
@@ -24,7 +32,7 @@ beforeAll(async () => {
 });
 afterAll(async () => { await new Promise((resolve) => server.close(resolve)); });
 
-test("a company PPC grant creates a live launcher tile and revocation removes it", async () => {
+test("a company PPC grant alone creates no tile; the PPC application role does, and revoking it removes it", async () => {
   await ensureAccessDepartments(mongoose.connection);
   invalidate("access-departments:active");
   const home = await AccessDepartment.findOne({ slug: "hr" });
@@ -53,13 +61,15 @@ test("a company PPC grant creates a live launcher tile and revocation removes it
   expect((await verify()).departments.map((d) => d.slug)).not.toContain("ppc");
   await change({ companyId: company._id, departmentSlug: "ppc", email: employee.email,
     role: "viewer", reason: "PPC assignment", actor });
+  // The company grant writes an INACTIVE legacy row plus the scoped entry — no app role.
+  expect((await verify()).departments.map((d) => d.slug)).not.toContain("ppc");
+  await setRole({ departmentSlug: "ppc", email: employee.email, name: "PPC Launcher", role: "viewer" });
   expect((await verify()).departments.map((d) => d.slug)).toContain("ppc");
-  await change({ companyId: company._id, departmentSlug: "ppc", email: employee.email,
-    role: null, reason: "PPC assignment ended", actor });
+  await setRole({ departmentSlug: "ppc", email: employee.email, role: null });
   expect((await verify()).departments.map((d) => d.slug)).not.toContain("ppc");
 });
 
-test("a department login can switch into PPC only while its company grant is live", async () => {
+test("a department login can switch into PPC only while its PPC application role is live", async () => {
   await ensureAccessDepartments(mongoose.connection);
   invalidate("access-departments:active");
   const home = await AccessDepartment.findOne({ slug: "sales" });
@@ -82,6 +92,8 @@ test("a department login can switch into PPC only while its company grant is liv
   expect((await switchToPpc(token)).status).toBe(403);
   await change({ companyId: company._id, departmentSlug: "ppc", email: user.email,
     role: "viewer", reason: "PPC cover", actor });
+  expect((await switchToPpc(token)).status).toBe(403); // a company grant alone opens nothing
+  await setRole({ departmentSlug: "ppc", email: user.email, name: "Sales and PPC", role: "viewer" });
   const switched = await switchToPpc(token);
   expect(switched.status).toBe(200);
   const { token: ppcToken } = await switched.json();
@@ -90,8 +102,7 @@ test("a department login can switch into PPC only while its company grant is liv
   }).then((r) => r.json());
   expect(verified.user.deptSlug).toBe("ppc");
   expect(verified.user.deptRole).toBe("viewer");
-  await change({ companyId: company._id, departmentSlug: "ppc", email: user.email,
-    role: null, reason: "Cover ended", actor });
+  await setRole({ departmentSlug: "ppc", email: user.email, role: null });
   expect((await switchToPpc(token)).status).toBe(403);
   const after = await fetch(`${base}/api/auth/verify`, {
     method: "POST", headers: { Authorization: `Bearer ${ppcToken}` },

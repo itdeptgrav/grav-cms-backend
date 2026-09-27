@@ -133,7 +133,8 @@ async function requireCompany(req, res, next) {
  */
 const requireIe = (minimumRole, { code = "FORBIDDEN", message = "Manufacturing standards are Industrial Engineering's." } = {}) => async (req, res, next) => {
   try {
-    if (req.user?.isAdmin || req.admin) { req.ieRole = "owner"; return next(); }
+    // GAC-AR1: administrator as the database says, never the token claim alone.
+    if (await require("../../../services/departmentRoles").isDatabaseVerifiedAdmin(req)) { req.ieRole = "owner"; return next(); }
     const role = await getEffectiveRole(DEPARTMENT, req);
     if (!role || !roleAtLeast(role, minimumRole)) {
       return sendError(res, fail(code, message,
