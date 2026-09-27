@@ -2243,6 +2243,12 @@ app.use(
   packagingDispatchViewRoutes,
 );
 
+/* Dispatch by scanning sealed cartons (25 Sep 2026). The typed-quantity
+ * dispatch and the free-form challan under the view routes above now answer
+ * 410 — see the header of this file. */
+const cartonDispatchRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/cartonDispatchRoutes");
+app.use("/api/cms/manufacturing/carton-dispatch", cartonDispatchRoutes);
+
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 
@@ -2324,6 +2330,39 @@ app.use(
 // through those same prefixes, and guarding them as "project-manager" would
 // park a cutting master's save in a production approver's queue. Reads are
 // untouched, and nothing changes until the first Production role is assigned.
+/* ── INDUSTRIAL ENGINEERING OWNS THE FLOOR'S DEFINITION (27 Sep 2026) ──────
+ *
+ * Machines, the floor layout and the machine–operation assignment moved to
+ * the IE portal ("IE is responsible for doing the changes of layout, define
+ * the machines and all") while the supervisor keeps its own copies. The
+ * routes are the same ones, so their write gates must admit an IE editor as
+ * well as the department that owned them: an IE person saving the layout
+ * would otherwise be asked for a production-supervisor role they were never
+ * meant to hold. Reads are untouched. An IE editor (or owner/approver)
+ * commits directly, exactly as on IE's own routes; anyone else goes through
+ * the original department gate, approval queue and all. While IE has no
+ * roles configured at all, a session opened through the IE portal counts —
+ * the same fail-open rule every department guard applies to itself. */
+const ieOrDepartmentWrites = (inner) => async (req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return inner(req, res, next);
+  try {
+    departmentWrites.seedIdentity(req);
+    if (req.user?.email && !req.user.isAdmin) {
+      const departmentRoles = require("./services/departmentRoles");
+      const assigned = await departmentRoles.listRoles("ie");
+      if (assigned.length === 0) {
+        if (String(req.user.deptSlug || "").toLowerCase() === "ie") return next();
+      } else {
+        const role = await departmentRoles.getEffectiveRole("ie", req);
+        if (role && departmentRoles.roleAtLeast(role, "editor")) return next();
+      }
+    }
+  } catch (err) {
+    console.error("[ieOrDepartmentWrites]", err.message);
+  }
+  return inner(req, res, next);
+};
+
 const pmWrites = (entity, extra = {}) =>
   departmentWrites("project-manager", { entity, ...extra });
 
@@ -2334,7 +2373,7 @@ const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/w
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
-app.use("/api/cms/production/dashboard", pmWrites("production dashboard"), productionDashboardRoutes);
+app.use("/api/cms/production/dashboard", ieOrDepartmentWrites(pmWrites("production dashboard")), productionDashboardRoutes);
 
 // WAS pmWrites("machine layout") — wrong department. The Machine Position
 // Designer lives entirely on the production-supervisor dashboard
@@ -2350,8 +2389,9 @@ app.use("/api/cms/production/dashboard", pmWrites("production dashboard"), produ
 const productionSupervisorWrites = (entity, extra = {}) =>
   departmentWrites("production-supervisor", { entity, ...extra });
 
+
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
-app.use("/api/cms/production/canvas-layout", productionSupervisorWrites("machine layout"), productionMachineLayout);
+app.use("/api/cms/production/canvas-layout", ieOrDepartmentWrites(productionSupervisorWrites("machine layout")), productionMachineLayout);
 
 /* ---------------------------------------------------------------------
  * The scanner floor's READ routers (restored 25 Sep 2026).

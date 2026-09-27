@@ -1197,6 +1197,19 @@ const customerRequestSchema = new mongoose.Schema(
     // Quotation Management - ONLY ONE QUOTATION ALLOWED
     quotations: [quotationSchema],
 
+    /* The customer's PO on an order that has NO quotation to carry it (a
+       measurement conversion, an internal or walkthrough order). Same shape
+       as quotationSchema.poProof; services/customerRequestPo.js is the one
+       reader and writer, and prefers the quotation's when both exist. Added
+       26 Sep 2026 — before this, strict mode silently dropped the write. */
+    poProof: {
+      poNumber: { type: String, trim: true },
+      poDate: Date,
+      poValue: Number,
+      url: { type: String, trim: true },
+      name: { type: String, trim: true },
+    },
+
     /**
      * Superseded rounds, oldest first. Append-only.
      *

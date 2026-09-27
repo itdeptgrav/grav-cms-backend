@@ -136,6 +136,7 @@ router.get("/manufacturing-orders", ...canRead, async (req, res) => {
         measurementName: mo.measurementName || null,
         priority: mo.priority || "medium",
         createdAt: mo.createdAt,
+        deliveryDeadline: mo.customerInfo?.deliveryDeadline || null,
         derivedStatus,
         totalQuantity: totalQty,
         packagedQuantity: packagedQty,
@@ -497,6 +498,8 @@ router.get("/manufacturing-orders/:id/dispatch-history", ...canRead, async (req,
           dispatchedBy: rec.dispatchedBy,
           totalUnits: rec.dispatchedQuantity,
           notes: rec.notes || "",
+          cartonNumbers: rec.cartonNumbers || [],
+          challanNumber: rec.challanNumber || "",
           employeeName: null,
           employeeUIN: null,
           products: [{
@@ -1011,6 +1014,13 @@ router.get("/manufacturing-orders/:id/employees/:employeeId/products", ...canRea
 // Body: { items: [{ progressDocId, quantity?(optional, defaults to packagedUnits) }], notes? }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/dispatch/person-wise", ...canRecord, async (req, res) => {
+  /* RETIRED (25 Sep 2026): person-wise dispatch by progress id. Dispatch is a scan of a sealed carton —
+     POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     A typed quantity tied nothing to a box that left, so the same units could
+     be dispatched twice and a challan could name pieces still on the shelf. */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { items, notes = "" } = req.body;
     const dispatchedBy = req.user?.name || req.user?.employeeId || "Dispatch Dept";
@@ -1140,6 +1150,13 @@ router.post("/dispatch/person-wise", ...canRecord, async (req, res) => {
 // Body: { workOrderId, quantity, notes? }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/dispatch/bulk", ...canRecord, async (req, res) => {
+  /* RETIRED (25 Sep 2026): bulk dispatch by typed quantity. Dispatch is a scan of a sealed carton —
+     POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     A typed quantity tied nothing to a box that left, so the same units could
+     be dispatched twice and a challan could name pieces still on the shelf. */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { workOrderId, quantity, notes = "" } = req.body;
     const dispatchedBy = req.user?.name || req.user?.employeeId || "Dispatch Dept";

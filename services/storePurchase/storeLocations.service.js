@@ -204,8 +204,14 @@ function worldBoxOf(warehouse, location) {
     const L = l.layout || {};
     const r = (rot * Math.PI) / 180;
     const lx = L.x || 0, lz = L.z || 0;
-    x += lx * Math.cos(r) + lz * Math.sin(r);
-    z += -lx * Math.sin(r) + lz * Math.cos(r);
+    /* The plan's rotation is CLOCKWISE with z down (SVG `rotate`), so a child
+       offset (lx, lz) inside a parent turned by `rot` lands at
+       (lx·cos − lz·sin, lx·sin + lz·cos) — the same rule the CMS's
+       storeLocations.mjs `worldBox` and the 3D room use. It was the mirror
+       image of this until 25 Sep 2026, which put every shelf of a turned rack
+       on the wrong side of its posts. */
+    x += lx * Math.cos(r) - lz * Math.sin(r);
+    z += lx * Math.sin(r) + lz * Math.cos(r);
     y += L.y || 0;
     rot = (rot + (L.rotation || 0)) % 360;
   }
@@ -279,7 +285,7 @@ async function contentsOf(scope, companyId, warehouse, locationIds) {
   if (!ids.length) return [];
   const rows = await LocationBalance.find({ companyId: oid(companyId), warehouseId: warehouse._id, locationId: { $in: ids }, onHand: { $gt: loc.QTY_TOL } }).lean();
   const itemIds = [...new Set(rows.map((r) => String(r.itemId)))].map(oid);
-  const items = itemIds.length ? await RawItem.find({ _id: { $in: itemIds } }).select("name sku unit customUnit category variants._id variants.combination variants.sku variants.quantity quantity").lean() : [];
+  const items = itemIds.length ? await RawItem.find({ _id: { $in: itemIds } }).select("name sku unit customUnit category image variants._id variants.combination variants.sku variants.quantity variants.image quantity").lean() : [];
   const byItem = new Map(items.map((i) => [String(i._id), i]));
   /* last movement per (item, variant, location) — one aggregate, newest wins */
   const last = await LocationMovement.aggregate([
@@ -296,6 +302,7 @@ async function contentsOf(scope, companyId, warehouse, locationIds) {
     return {
       rawItemId: String(r.itemId), variantId: r.variantId ? String(r.variantId) : null,
       name: it?.name || "(item)", sku: v?.sku || it?.sku || "", variant: v ? (v.combination || []).join(" · ") : "", category: it?.category || "",
+      image: v?.image || it?.image || "",
       baseUnit: it ? (it.customUnit || it.unit || "") : "", onHand: round4(r.onHand),
       locationId: String(r.locationId), locationCode: location?.code || "", locationName: location?.name || "", locationKind: location?.kind || "AREA",
       lastAt: lm?.at || null, lastType: lm?.type || "", lastBy: lm?.actorName || "", placedAt: lm?.firstIn || null,
@@ -314,6 +321,28 @@ async function markingBalances(companyId, barcodeId) {
   }
   const balances = [...byLoc.values()].map((r) => ({ ...r, onHand: round4(r.onHand) })).filter((r) => r.onHand > loc.QTY_TOL);
   return { balances, located: round4(balances.reduce((n, b) => n + b.onHand, 0)), movements: rows.length };
+}
+/** Balances of MANY markings at once — Map<barcodeId, { balances, located }>,
+ *  the same shape markingBalances gives for one. One aggregate, not one query
+ *  per sticker: the locator used to loop markingBalances over 25 results,
+ *  25 round trips to Atlas (26 Sep 2026). */
+async function markingBalancesMany(companyId, barcodeIds) {
+  const ids = (barcodeIds || []).map(oid).filter(Boolean);
+  const out = new Map(ids.map((id) => [String(id), { balances: [], located: 0, movements: 0 }]));
+  if (!ids.length) return out;
+  const agg = await LocationMovement.aggregate([
+    { $match: { companyId: oid(companyId), barcodeId: { $in: ids }, applied: { $ne: false } } },
+    { $sort: { createdAt: 1 } },
+    { $group: { _id: { barcodeId: "$barcodeId", warehouseId: "$warehouseId", locationId: "$locationId" }, onHand: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$quantity", { $multiply: ["$quantity", -1] }] } }, firstAt: { $first: "$createdAt" }, lastAt: { $last: "$createdAt" }, warehouseName: { $last: "$warehouseName" }, locationCode: { $last: "$locationCode" }, locationName: { $last: "$locationName" }, n: { $sum: 1 } } },
+  ]);
+  for (const r of agg) {
+    const m = out.get(String(r._id.barcodeId)); if (!m) continue;
+    m.movements += r.n;
+    const onHand = round4(r.onHand); if (onHand <= loc.QTY_TOL) continue;
+    m.balances.push({ warehouseId: String(r._id.warehouseId), locationId: String(r._id.locationId), warehouseName: r.warehouseName, locationCode: r.locationCode, locationName: r.locationName, onHand, firstAt: r.firstAt, lastAt: r.lastAt });
+    m.located = round4(m.located + onHand);
+  }
+  return out;
 }
 /** Marking balances inside ONE location (for a location's contents view). */
 async function markingsAt(companyId, warehouseId, locationIds) {
@@ -446,7 +475,7 @@ module.exports = {
   physicalFieldsFromBody, physicalSetFromBody, validateLayout, validateCapacity, validateKind,
   mintQrToken, locationQrPayload, parseScan,
   byIdOf, childrenMapOf, pathOf, descendantsOf, addressOf, holdsStockError, worldBoxOf, treeOf, rackPlan,
-  warehouseByLocationId, warehouseByQrToken, locationIn, locationByToken, contentsOf, markingBalances, markingsAt, totalsByLocation,
+  warehouseByLocationId, warehouseByQrToken, locationIn, locationByToken, contentsOf, markingBalances, markingBalancesMany, markingsAt, totalsByLocation,
   resolveStock, resolveDestination, putStock, unassignStock, transferStock, assertMarkingAt,
   isId, oid, round4,
 };

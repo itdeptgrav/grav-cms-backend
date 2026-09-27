@@ -40,10 +40,37 @@ const {
  * @throws {StorePurchaseError} 401 when unauthenticated, 403 when membership
  *         cannot be proved
  */
-async function resolveForActor(user, { requestedCompanyId = null } = {}) {
+/* ── RESOLVED ONCE A MINUTE PER ACTOR, NOT ONCE PER REQUEST (26 Sep 2026) ──
+ * Resolving an actor is six or seven sequential reads (login row, employee,
+ * memberships, companies, department roles, capabilities). Against Atlas each
+ * is ~50 ms, so every Store request paid 300–400 ms before its own query ran,
+ * and a page that makes four calls waited well over a second for facts that
+ * had not changed since the last click. The answer is kept for
+ * STORE_TENANT_CACHE_MS (default 60 s; 0 disables) per actor and requested
+ * company. A membership or capability change therefore takes up to a minute
+ * to reach an open session — acceptable for a grant, and `invalidateActor`
+ * is there for the writers that want it immediate. Each hit hands back a
+ * COPY: the middleware writes legacyMode and siteId onto the context. */
+const TENANT_CACHE_MS = Number(process.env.STORE_TENANT_CACHE_MS ?? 60000);
+const actorCache = new Map();
+function invalidateActor(userId) { if (userId == null) actorCache.clear(); else for (const k of [...actorCache.keys()]) if (k.startsWith(`${userId}|`)) actorCache.delete(k); }
+
+async function resolveForActor(user, opts = {}) {
   if (!user || !user.id) {
     throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
   }
+  const key = `${user.id}|${opts.requestedCompanyId || ""}|${String(user.email || "").toLowerCase()}`;
+  if (TENANT_CACHE_MS > 0) {
+    const hit = actorCache.get(key);
+    if (hit && hit.until > Date.now()) return { ...hit.ctx };
+    if (actorCache.size > 500) actorCache.clear();
+  }
+  const ctx = await resolveForActorUncached(user, opts);
+  if (TENANT_CACHE_MS > 0) actorCache.set(key, { ctx, until: Date.now() + TENANT_CACHE_MS });
+  return { ...ctx };
+}
+
+async function resolveForActorUncached(user, { requestedCompanyId = null } = {}) {
 
   const email = user.email ? String(user.email).toLowerCase().trim() : "";
   const employeeRef = mongoose.Types.ObjectId.isValid(user.id)
@@ -398,6 +425,7 @@ function assertSameTenant(ctx, doc, label = "record") {
 }
 
 module.exports = {
+  invalidateActor,
   MEMBERSHIP_SOURCES,
   CAPABILITIES,
   resolveForActor,

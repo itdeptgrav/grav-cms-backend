@@ -219,3 +219,7 @@ function departmentWrites(slug, opts = {}) {
 
 module.exports = departmentWrites;
 module.exports.READ_SHAPED = READ_SHAPED;
+/* For a mount that admits a SECOND department's editors ahead of this guard
+   (server.js `ieOrDepartmentWrites`): the identity must be seeded the same
+   way, before any router auth has run. */
+module.exports.seedIdentity = seedIdentity;

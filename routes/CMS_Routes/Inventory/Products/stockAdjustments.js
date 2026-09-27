@@ -666,7 +666,10 @@ router.post(
           if (p.location) {
             const common = {
               companyId: req.tenant.companyId, siteId: req.tenant.siteId,
-              item: p.rawItem, variantId: p.variant?._id || null,
+              item: p.rawItem,
+              /* the key the shelf holds it under — item grain for stock put
+                 away before a variant was chosen on a one-variant item */
+              variantId: await locStock.locationVariantFor(session, req.tenant.companyId, p.rawItem, p.variant?._id || null, p.warehouse._id, p.location._id),
               warehouse: p.warehouse, location: p.location, quantity: p.nativeQty,
               actor: { id: req.user?.id, name: req.user?.name },
               note: reasonText, idempotencyKey: req.idempotent?.key || "",

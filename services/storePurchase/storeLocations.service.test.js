@@ -70,6 +70,12 @@ test("addressOf, pathOf, descendantsOf and holdsStockError walk the tree", () =>
   const box = S.worldBoxOf(w, shelf);
   assert.equal(box.rotation, 90);
   assert.equal(Math.round(box.x), 100); assert.equal(Math.round(box.z), 200); assert.equal(box.y, 70);
+  /* a bay 100 along a rack turned 90° (clockwise, z down) lies 100 further DOWN the plan, not up */
+  const bay = { _id: id(), code: "R04-L01-B02", kind: "SHELF", type: "USABLE_STOCK", status: "Active", parent: rack._id, layout: { x: 100, y: 0, z: 0, w: 70, h: 70, d: 50 } };
+  w.locations.push(bay);
+  const bb = S.worldBoxOf(w, bay);
+  assert.equal(Math.round(bb.x), 100); assert.equal(Math.round(bb.z), 300); assert.equal(bb.rotation, 90);
+  w.locations.pop();
   /* the tree orders siblings by sequence and aggregates leaf totals */
   const totals = new Map([[String(shelf._id), { lines: 2, onHand: 30, items: 2 }]]);
   const tree = S.treeOf(w, totals);

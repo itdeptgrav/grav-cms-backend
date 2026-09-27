@@ -22,25 +22,17 @@ const ev = require("../orderTargets.evaluate");
 const shift = require("../../manufacturing/shiftHours");
 const standards = require("../../industrialEngineering/departmentStandards.service");
 
-const { DEPARTMENTS, DEPARTMENT_META, FINISHING, isId, oid, sum, lastAt, firstAt, groupBy } = ledger;
+const { DEPARTMENTS, DEPARTMENT_META, OPTIONAL, isId, oid, sum, lastAt, firstAt, groupBy } = ledger;
 const DAY_MS = 86400000;
 const todayKey = () => shift.istDayWindow().label;
 const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
 
 /* ── the order header ────────────────────────────────────────────────────── */
 
-const MO_SELECT = "requestId customerId customerInfo.name customerInfo.email customerInfo.phone customerInfo.deliveryDeadline requestType measurementId measurementName status priority createdAt updatedAt estimatedCompletion actualCompletion items quotations.poProof quotations.salesApproval quotations.status quotations.quotationNumber quotations.date orderOrigin fulfilmentModel isInternalOrder";
+const MO_SELECT = "poProof requestId customerId customerInfo.name customerInfo.email customerInfo.phone customerInfo.deliveryDeadline requestType measurementId measurementName status priority createdAt updatedAt estimatedCompletion actualCompletion items quotations.poProof quotations.salesApproval quotations.status quotations.quotationNumber quotations.date orderOrigin fulfilmentModel isInternalOrder";
 
-/** PO from wherever Sales put it: the current quotation first, then any revision. */
-function poOf(mo) {
-  const qs = [...(mo.quotations || [])];
-  const withPo = qs.find((q) => q?.poProof?.poNumber) || null;
-  const q = withPo || qs[0] || null;
-  return {
-    poNumber: withPo?.poProof?.poNumber || "", poDate: withPo?.poProof?.poDate || null, poValue: withPo?.poProof?.poValue ?? null,
-    quotationNumber: q?.quotationNumber || "", salesApprovedAt: q?.salesApproval?.approvedAt || null,
-  };
-}
+/** PO from wherever Sales put it — the one reader every module uses (services/customerRequestPo.js). */
+const { poOf } = require("../../customerRequestPo");
 
 function orderTypeOf(mo) {
   return mo.requestType === "measurement_conversion" || Boolean(mo.measurementId) ? "person_wise" : "bulk";
@@ -77,9 +69,11 @@ async function headersFor(moIds) {
 
 /* ── progress arithmetic ─────────────────────────────────────────────────── */
 
-/** A finishing stage counts for an order only if the order used it. */
+/** An optional stage (embroidery, printing, washing) counts for an order
+    only if the order used it; every other stage — trimming and ironing
+    included — is always in the pipeline. */
 function applicable(department, doneEvents, targets) {
-  if (!FINISHING.has(department)) return true;
+  if (!OPTIONAL.has(department)) return true;
   return doneEvents.length > 0 || targets.some((t) => t.department === department);
 }
 
@@ -391,9 +385,9 @@ async function listWorkOrders(companyId, filters = {}) {
     const h = headers.get(w.moId) || {};
     const m = byWo.get(w.id) || new Map();
     const deps = DEPARTMENTS.map((d) => { const l = m.get(d) || []; const done = ledger.unitsOf(l); return { department: d, done, pct: pct(Math.min(done, w.quantity || done), w.quantity), today: sum(l.filter((e) => e.at >= day.start && e.at < day.end)), lastAt: lastAt(l) }; });
-    const withWork = deps.filter((x) => x.done > 0 && (!FINISHING.has(x.department) || true));
+    const withWork = deps.filter((x) => x.done > 0);
     const current = withWork.length ? withWork[withWork.length - 1] : null;
-    const core = deps.filter((x) => !FINISHING.has(x.department) || x.done > 0);
+    const core = deps.filter((x) => !OPTIONAL.has(x.department) || x.done > 0);
     const next = core.find((x) => x.done < w.quantity) || null;
     const prod = deps.find((x) => x.department === "production");
     return {
@@ -433,7 +427,7 @@ async function workOrderDetail(companyId, woId) {
     const done = ledger.unitsOf(l);
     const byDay = [...groupBy(l, (e) => shift.istDayKeyOf(e.at)).entries()].map(([date, x]) => ({ date, pieces: sum(x) })).sort((a, b) => a.date.localeCompare(b.date));
     const people = [...groupBy(l, (e) => e.personName || e.personKey || "").entries()].filter(([k]) => k).map(([name, x]) => ({ name, pieces: sum(x), lastAt: lastAt(x) })).sort((a, b) => b.pieces - a.pieces);
-    return { department: d, label: DEPARTMENT_META[d].label, doneWord: DEPARTMENT_META[d].done, applicable: !FINISHING.has(d) || l.length > 0, done, remaining: Math.max(0, w.quantity - done), pct: pct(Math.min(done, w.quantity || done), w.quantity), today: sum(l.filter((e) => e.at >= day.start && e.at < day.end)), firstAt: firstAt(l), lastAt: lastAt(l), byDay, people, units: unitLedger(w.quantity, l.filter((e) => e.unit != null || (e.units && e.units.length)).flatMap((e) => (e.units && e.units.length ? e.units.map((u) => ({ unit: u })) : [e]))) };
+    return { department: d, label: DEPARTMENT_META[d].label, doneWord: DEPARTMENT_META[d].done, applicable: !OPTIONAL.has(d) || l.length > 0, done, remaining: Math.max(0, w.quantity - done), pct: pct(Math.min(done, w.quantity || done), w.quantity), today: sum(l.filter((e) => e.at >= day.start && e.at < day.end)), firstAt: firstAt(l), lastAt: lastAt(l), byDay, people, units: unitLedger(w.quantity, l.filter((e) => e.unit != null || (e.units && e.units.length)).flatMap((e) => (e.units && e.units.length ? e.units.map((u) => ({ unit: u })) : [e]))) };
   });
   const active = departments.filter((x) => x.applicable);
   const withWork = active.filter((x) => x.done > 0);
@@ -488,7 +482,7 @@ async function personWise(companyId, moId) {
       if (d === "cutting") done = p.cutDone ? units.length : Math.min(units.length, wo ? Math.round((wo.recorded.cuttingCompleted / (wo.quantity || 1)) * units.length) : 0);
       else if (d === "dispatch") done = p.isDispatched ? units.length : 0;
       else { const set = m.get(d) || new Set(); done = units.filter((u) => set.has(u)).length; }
-      return { department: d, label: DEPARTMENT_META[d].label, done, total: units.length, pct: pct(done, units.length), applicable: !FINISHING.has(d) || (m.get(d)?.size || 0) > 0 };
+      return { department: d, label: DEPARTMENT_META[d].label, done, total: units.length, pct: pct(done, units.length), applicable: !OPTIONAL.has(d) || (m.get(d)?.size || 0) > 0 };
     });
     const active = deps.filter((x) => x.applicable);
     const withWork = active.filter((x) => x.done > 0);

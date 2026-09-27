@@ -4038,6 +4038,10 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
 
     const priority = ["low", "medium", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "medium";
     const deliveryDeadline = req.body?.deliveryDeadline ? new Date(req.body.deliveryDeadline) : null;
+    /* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
+    if (!deliveryDeadline || Number.isNaN(deliveryDeadline.getTime())) {
+      return res.status(400).json({ success: false, code: "DELIVERY_DEADLINE_REQUIRED", message: "Set the delivery deadline for this production run — every department plans against it." });
+    }
 
     const requestId = await nextRequestId(CustomerRequest);
     const request = new CustomerRequest({

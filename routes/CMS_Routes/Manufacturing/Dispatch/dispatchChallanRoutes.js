@@ -43,6 +43,13 @@ async function generateChallanNumber() {
 // }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
+  /* RETIRED (25 Sep 2026): the free-form challan ("Custom Bulk Receipt" / "Select & Generate Receipt"), which printed a challan for any figure without moving a box. Dispatch is a scan of a sealed carton —
+     POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     A typed quantity tied nothing to a box that left, so the same units could
+     be dispatched twice and a challan could name pieces still on the shelf. */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { manufacturingOrderId, dispatchType, persons, bulkProducts, notes } = req.body;
 

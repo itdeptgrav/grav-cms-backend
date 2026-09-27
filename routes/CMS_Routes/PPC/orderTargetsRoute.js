@@ -72,6 +72,30 @@ router.post("/targets/orders/:moId", requireCompany, canSet, wrap(async (req, re
   res.json({ success: true, message: `Target set — ${out.description}`, ...out });
 }));
 
+/* Record the customer's PO number on an order (26 Sep 2026). It is written
+   where Sales' upload writes it — the approved quotation's poProof — so the
+   carton label, the challan and every PPC screen read the same value. An
+   empty number clears it. PLANNING_WRITE, like a target. */
+router.post("/targets/orders/:moId/po", requireCompany, canSet, wrap(async (req, res) => {
+  if (!svc.isId(req.params.moId)) return res.status(400).json({ success: false, message: "Not an order id." });
+  const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
+  const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+  const { recordPo, poOf } = require("../../../services/customerRequestPo");
+  /* this company's order: at least one of its work orders is linked here */
+  const mine = await WorkOrder.exists({ customerRequestId: req.params.moId, "salesLineLink.companyId": companyOf(req) });
+  const legacy = !mine && await WorkOrder.exists({ customerRequestId: req.params.moId });
+  if (!mine && !legacy) return res.status(404).json({ success: false, message: "That order was not found." });
+  const mo = await CustomerRequest.findById(req.params.moId);
+  if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
+  const number = String(req.body?.poNumber || "").trim();
+  if (number.length > 80) return res.status(400).json({ success: false, message: "A PO number is at most 80 characters." });
+  const date = req.body?.poDate ? String(req.body.poDate) : null;
+  if (date && Number.isNaN(new Date(date).getTime())) return res.status(400).json({ success: false, message: "The PO date is not a date." });
+  const where = recordPo(mo, { poNumber: number, poDate: date });
+  await mo.save();
+  res.json({ success: true, message: number ? `PO ${number} recorded on ${where.on}.` : "PO number cleared.", po: poOf(mo.toObject()) });
+}));
+
 router.post("/targets/:targetId/cancel", requireCompany, canSet, wrap(async (req, res) => {
   if (!svc.isId(req.params.targetId)) return res.status(400).json({ success: false, message: "Not a target id." });
   const out = await svc.cancelTarget(companyOf(req), req.params.targetId, actor(req), req.body?.reason);

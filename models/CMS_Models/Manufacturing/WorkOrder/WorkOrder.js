@@ -205,6 +205,10 @@ const dispatchRecordSchema = new mongoose.Schema(
     },
     employeeIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" }],
     employeeNames: [{ type: String }],
+    /* Carton-wise dispatch (25 Sep 2026): which sealed cartons carried these
+       units, and the challan they left on. */
+    cartonNumbers: [{ type: String }],
+    challanNumber: { type: String, default: "" },
   },
   { _id: true },
 );

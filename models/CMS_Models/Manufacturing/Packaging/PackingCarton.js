@@ -161,6 +161,11 @@ const packingCartonSchema = new mongoose.Schema(
     status: { type: String, enum: ["packed", "dispatched"], default: "packed" },
     dispatchedAt: { type: Date, default: null },
     dispatchChallanId: { type: mongoose.Schema.Types.ObjectId, ref: "DispatchChallan", default: null },
+    /* The challan number and who dispatched it, copied at dispatch (25 Sep
+       2026) so the carton page and list can say "left on DC-… by …" without
+       a join. Set only by the carton-dispatch route. */
+    dispatchChallanNumber: { type: String, trim: true, default: "" },
+    dispatchedBy: { type: packedBySchema, default: null },
   },
   { timestamps: true },
 );

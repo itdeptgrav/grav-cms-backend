@@ -174,6 +174,28 @@ const locFilter = (companyId, itemId, variantId, warehouseId, locationId) => ({
 const sentinelFilter = (companyId, itemId, variantId) =>
   locFilter(companyId, itemId, variantId, null, null);
 
+/**
+ * THE VARIANT A SHELF ACTUALLY HOLDS THE STOCK UNDER (26 Sep 2026).
+ *
+ * Stock put away before a variant was chosen sits on the shelf at item grain
+ * (`variantId: null`). Every READ already treats such a balance on a
+ * one-variant item as that lone variant's (`variantKeyOf` in the location
+ * routes), so the Find page and the item's positions say "R01-L01-B01 holds
+ * 20 of Bhubaneswari Chemicals". The WRITES keyed strictly, so an issue of
+ * that variant from that shelf was refused with "does not hold" while the
+ * screen beside it said it did. This answers which key the location side
+ * must use: the exact variant when a balance exists under it, else the
+ * item-grain balance when the item has at most one variant, else the exact
+ * variant (and the guard will say so honestly).
+ */
+async function locationVariantFor(session, companyId, item, variantId, warehouseId, locationId) {
+  if (!variantId) return null;
+  const q = (v) => LocationBalance.exists(locFilter(companyId, item._id, v, warehouseId, locationId)).session(session || null);
+  if (await q(variantId)) return variantId;
+  if ((item.variants || []).length <= 1 && await q(null)) return null;
+  return variantId;
+}
+
 // Increase a location's projected on-hand (upsert). Never guarded.
 async function incLocation(session, companyId, itemId, variantId, warehouseId, locationId, delta) {
   await LocationBalance.updateOne(
@@ -333,6 +355,7 @@ async function rebuildProjection(session, companyId, itemId, variantId) {
 }
 
 module.exports = {
+  locationVariantFor,
   baseUnitOf,
   onHandOf,
   deriveLocationBalances,

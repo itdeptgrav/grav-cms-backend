@@ -45,6 +45,9 @@ const mongoose = require("mongoose");
 const departmentRoles = require("../../../../services/departmentRoles");
 const { merchandisingCompanyMiddleware } = require("../../../../services/companyContext/merchandisingScope.service");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+/* Only for `legacyWindowOpen()` — the one switch every module uses to stand
+   down the strict company check while pre-tenancy rows are still unlinked. */
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
 
 const SLUG = "cutting-master";
 const LEGACY_ROLE = "cutting_master";
@@ -95,9 +98,20 @@ function cuttingCompany(req, res, next) {
   });
 }
 
-/** The WorkOrders this company's Cutting may see: its own linked ones, and historical unlinked ones. */
+/** The WorkOrders this company's Cutting may see: its own linked ones, and
+ *  historical unlinked ones while the legacy window is open — the SAME rule
+ *  as Packaging's and Finishing's `workOrderScope`. Until 26 Sep 2026 this
+ *  admitted linked work only, although the comment above it said otherwise:
+ *  151 of the 152 work orders on the board carry no company link (company
+ *  scoping shipped with no backfill), so Cutting's queue listed ONE order
+ *  while Ironing, Packaging and PPC listed thirteen. Set
+ *  STORE_PURCHASE_STRICT_TENANCY=1 after the backfill and every department
+ *  tightens together. */
 function workOrderScope(companyId) {
-  return { "salesLineLink.companyId": new mongoose.Types.ObjectId(str(companyId)) };
+  const own = { "salesLineLink.companyId": new mongoose.Types.ObjectId(str(companyId)) };
+  if (!tenantContext.legacyWindowOpen()) return own;
+  /* `{ field: null }` matches both an absent field and an explicit null. */
+  return { $or: [own, { "salesLineLink.companyId": null }] };
 }
 
 /** "linked" (this company's), "unlinked" (no proof of any company), or "foreign". */

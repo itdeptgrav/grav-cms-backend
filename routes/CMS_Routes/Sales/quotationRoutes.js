@@ -1,6 +1,8 @@
 // routes/CMS_Routes/Sales/quotationRoutes.js
 
 const express = require("express");
+/* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
+const { requireDeliveryDeadline } = require("../../../services/sales/deliveryDeadlineGate");
 const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
@@ -3241,6 +3243,10 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
+    /* The deadline every department plans against — handed in the body or
+       already on the request; refused otherwise, before anything changes. */
+    const noDeadline = requireDeliveryDeadline(request, req.body);
+    if (noDeadline) return res.status(noDeadline.status).json(noDeadline.body);
 
     const quotation = request.quotations[0];
     const approvedWithoutCustomer =
@@ -3361,6 +3367,8 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.status !== "pending") return res.status(400).json({ success: false, message: "Only pending requests can be marked as internal orders" });
+    const noDeadline = requireDeliveryDeadline(request, req.body);
+    if (noDeadline) return res.status(noDeadline.status).json(noDeadline.body);
 
     // Mark as internal
     request.isInternalOrder = true;
@@ -4013,6 +4021,8 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
 
     if (request.quotations.length === 0)
       return res.status(400).json({ success: false, message: "No quotation found for this request" });
+    const noDeadline = requireDeliveryDeadline(request, req.body);
+    if (noDeadline) return res.status(noDeadline.status).json(noDeadline.body);
 
     const quotation = request.quotations[0];
 

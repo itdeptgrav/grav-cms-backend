@@ -504,7 +504,7 @@ router.get("/:stage/orders", ...canRead, async (req, res) => {
     const moIds = [...wosByMo.keys()].filter(access.isId).map(access.oid);
     const query = { _id: { $in: moIds }, status: "quotation_sales_approved" };
     const all = await CustomerRequest.find(query)
-      .select("requestId customerInfo.name createdAt requestType measurementName priority")
+      .select("requestId customerInfo.name customerInfo.deliveryDeadline createdAt requestType measurementName priority")
       .sort({ updatedAt: -1 }).lean();
 
     const agg = await FinishingScan.aggregate([
@@ -536,6 +536,7 @@ router.get("/:stage/orders", ...canRead, async (req, res) => {
         measurementName: mo.measurementName || null,
         priority: mo.priority || "medium",
         createdAt: mo.createdAt,
+        deliveryDeadline: mo.customerInfo?.deliveryDeadline || null,
         derivedStatus,
         workOrdersCount: wos.length,
         totalQuantity: wos.reduce((s, w) => s + (w.quantity || 0), 0),

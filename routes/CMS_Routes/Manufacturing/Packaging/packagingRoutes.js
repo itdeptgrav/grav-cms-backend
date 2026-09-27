@@ -29,6 +29,7 @@ const { displayWorkOrderNumber } = require("../../../../services/manufacturing/w
 const { resolvePhotos, resolveVariantAttributes, variantText } = require("../../../../services/manufacturing/workOrderPhoto");
 const { buildStageReport, reportWindow, compactRanges } = require("../../../../services/manufacturing/stageReport");
 const access = require("./packagingAccess");
+const { poOf, PO_SELECT } = require("../../../../services/customerRequestPo");
 
 
 router.use(EmployeeAuthMiddleware);
@@ -993,7 +994,7 @@ async function applyPackingSession({
       companyId,
       manufacturingOrderId: mo?._id || null,
       moNumber: mo ? `MO-${mo.requestId}` : "",
-      poNumber: mo?.poProof?.poNumber || "",
+      poNumber: poOf(mo).poNumber,
       customerName: mo?.customerInfo?.name || "",
       requestType: mo?.requestType || "",
       lines,
@@ -1069,7 +1070,7 @@ router.post("/done", ...canRecord, async (req, res) => {
     }
     const orderId = [...orderKeys][0] || "";
     const mo = orderId && access.isId(orderId)
-      ? await CustomerRequest.findById(orderId).select("requestId requestType customerInfo.name poProof.poNumber").lean()
+      ? await CustomerRequest.findById(orderId).select(`requestId requestType customerInfo.name ${PO_SELECT}`).lean()
       : null;
 
     await ensureCartonCollection();
@@ -1219,6 +1220,14 @@ router.get("/cartons", ...canRead, async (req, res) => {
       PackingCarton.countDocuments(baseFilter),
     ]);
 
+    /* A carton sealed before the PO was recorded carries a blank copy; the
+       list reads the order for those, as the carton page does (26 Sep 2026). */
+    const blankPo = [...new Set(cartons.filter((c) => !c.poNumber && c.manufacturingOrderId).map((c) => String(c.manufacturingOrderId)))];
+    if (blankPo.length) {
+      const orders = await CustomerRequest.find({ _id: { $in: blankPo.map(access.oid) } }).select(PO_SELECT).lean();
+      const poByMo = new Map(orders.map((o) => [String(o._id), poOf(o).poNumber]));
+      for (const c of cartons) if (!c.poNumber) c.poNumber = poByMo.get(String(c.manufacturingOrderId)) || "";
+    }
     return res.json({
       success: true,
       cartons: cartons.map(withWeightState),
@@ -1331,11 +1340,11 @@ router.get("/cartons/:cartonNumber", ...canRead, async (req, res) => {
     const [lines, order] = await Promise.all([
       describeCartonLines(carton.lines || []),
       carton.manufacturingOrderId && access.isId(String(carton.manufacturingOrderId))
-        ? CustomerRequest.findById(carton.manufacturingOrderId).select("poProof.poNumber").lean().catch(() => null)
+        ? CustomerRequest.findById(carton.manufacturingOrderId).select(PO_SELECT).lean().catch(() => null)
         : null,
     ]);
     carton.lines = lines;
-    carton.poNumber = String(order?.poProof?.poNumber || "").trim() || carton.poNumber || "";
+    carton.poNumber = poOf(order).poNumber || carton.poNumber || "";
     return res.json({ success: true, carton: withWeightState(carton) });
   } catch (err) {
     console.error("Carton read error:", err);
@@ -1625,7 +1634,7 @@ router.get("/report", ...canRead, async (req, res) => {
     const [resolved, mos, cartonDocs] = await Promise.all([
       resolveVariantAttributes(wos),
       moIds.length
-        ? CustomerRequest.find({ _id: { $in: moIds.map(access.oid) } }).select("requestId requestType customerInfo.name poProof.poNumber").lean()
+        ? CustomerRequest.find({ _id: { $in: moIds.map(access.oid) } }).select(`requestId requestType customerInfo.name ${PO_SELECT}`).lean()
         : [],
       PackingCarton.find({ companyId, ...(window.all ? {} : { "additions.at": { $gte: window.start, $lt: window.end } }) })
         .select("cartonNumber manufacturingOrderId moNumber customerName poNumber totalQuantity workOrderCount status packedAt lastPackedAt dispatchedAt weightKg weighedAt additions.at additions.packedBy additions.quantity")
@@ -1633,7 +1642,7 @@ router.get("/report", ...canRead, async (req, res) => {
         .lean(),
     ]);
     const moById = new Map(mos.map((m) => [String(m._id), {
-      moNumber: `MO-${m.requestId}`, customerName: m.customerInfo?.name || "", poNumber: m.poProof?.poNumber || "", requestType: m.requestType || "",
+      moNumber: `MO-${m.requestId}`, customerName: m.customerInfo?.name || "", poNumber: poOf(m).poNumber, requestType: m.requestType || "",
     }]));
     const sessionBy = new Map();
     for (const c of cartonDocs) for (const a of c.additions || []) sessionBy.set(`${c._id}|${new Date(a.at).getTime()}`, a.packedBy || {});

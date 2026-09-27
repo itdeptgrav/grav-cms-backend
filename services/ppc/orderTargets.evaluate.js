@@ -295,4 +295,4 @@ function describeTarget(t) {
   return `${dept}: ${t.pieces} pieces in total by ${t.to}, starting ${t.from} (${n} working day${n === 1 ? "" : "s"} → about ${Math.round(t.pieces / (n || 1))} a day).`;
 }
 
-module.exports = { DEPARTMENT_META, KIND_META, evaluateTarget, describeTarget, assessTarget, capacityAt, efficiencyOf, targetDays, expectedPerDay, dayOf, shiftDay, instant, windowHours };
+module.exports = { DEPARTMENT_META, KIND_META, evaluateTarget, describeTarget, assessTarget, capacityAt, efficiencyOf, targetDays, expectedPerDay, doneOn, dayOf, shiftDay, instant, windowHours };

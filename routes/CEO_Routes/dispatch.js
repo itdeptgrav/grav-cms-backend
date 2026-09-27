@@ -251,6 +251,8 @@ router.get("/dispatched", ceoAuth, async (req, res) => {
           dispatchedAt: rec.dispatchedAt,
           dispatchedBy: rec.dispatchedBy,
           dispatchType: rec.dispatchType || "bulk",
+          cartonNumbers: rec.cartonNumbers || [],
+          challanNumber: rec.challanNumber || "",
           employeeNames: rec.employeeNames || [],
           notes: rec.notes || "",
         });

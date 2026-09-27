@@ -49,8 +49,13 @@ const isId = (v) => mongoose.Types.ObjectId.isValid(String(v || "")) && /^[0-9a-
 /** Departments in production order — the same list targets are set against. */
 const DEPARTMENTS = Object.keys(DEPARTMENT_META).sort((a, b) => DEPARTMENT_META[a].order - DEPARTMENT_META[b].order);
 const FINISHING = new Set(["embroidery", "printing", "washing", "trimming", "ironing"]);
-/** Stages every order passes; a finishing stage only if the order uses it. */
-const CORE = new Set(["cutting", "production", "qc", "packaging", "dispatch"]);
+/** Stages every order passes. Trimming and Ironing joined them on 26 Sep 2026:
+    every garment is trimmed and ironed, so they are in the pipeline from the
+    start, like Cutting or QC, and never greyed. */
+const CORE = new Set(["cutting", "trimming", "ironing", "production", "qc", "packaging", "dispatch"]);
+/** The stages an order goes through only if it uses them: they count for an
+    order once it has recorded work there or holds a target there. */
+const OPTIONAL = new Set([...FINISHING].filter((d) => !CORE.has(d)));
 
 /* ── work orders, the spine everything hangs off ─────────────────────────── */
 
@@ -305,7 +310,7 @@ function groupBy(events, keyOf) {
 }
 
 module.exports = {
-  DEPARTMENTS, DEPARTMENT_META, FINISHING, CORE, isId, oid,
+  DEPARTMENTS, DEPARTMENT_META, FINISHING, CORE, OPTIONAL, isId, oid,
   woIndex, woNumberOf, variantOf, sizeOf, colourOf, resolveBarcode,
   readDepartment, readEvents, sum, unitsOf, beyondOf, lastAt, firstAt, groupBy,
 };

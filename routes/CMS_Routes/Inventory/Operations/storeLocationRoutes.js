@@ -97,6 +97,16 @@ async function loadWarehouse(req, id) {
   if (!w) throw fail("NOT_FOUND", "That warehouse was not found.", { reason: "WAREHOUSE_NOT_FOUND" });
   return w;
 }
+/* ── A STICKER WITHOUT A VARIANT, ON AN ITEM THAT HAS ONE ─────────────────
+ * Product Marking stickers printed before an item was given variants carry
+ * variantId null, and so do the balances they are put away under. The item
+ * page and the map read balances per variant, so that stock matched no scope
+ * and "20MM Pipe" on a shelf answered "nothing in this warehouse" (25 Sep
+ * 2026). A null-variant balance on a ONE-variant item can only be that
+ * variant, so it is attributed to it; on a multi-variant item it is kept as
+ * its own "no variant on the sticker" scope rather than guessed or dropped. */
+const variantKeyOf = (item, variantId) => { const v = variantId ? String(variantId) : null; if (v === null && (item.variants || []).length === 1) return String(item.variants[0]._id); return v; };
+const UNSPECIFIED_VARIANT = "no variant on the sticker";
 const publicLoc = (w, l) => ({ id: String(l._id), warehouseId: String(w._id), code: l.code, name: l.name, type: l.type, kind: l.kind || "AREA", status: l.status, sequence: l.sequence || 0, qrToken: l.qrToken || "", layout: l.layout || {}, capacity: l.capacity || {}, parent: l.parent ? String(l.parent) : null, address: S.addressOf(w, l), holds: !S.holdsStockError(w, l) });
 
 /* ── reads ──────────────────────────────────────────────────────────────── */
@@ -406,35 +416,60 @@ router.get("/find", requireCapability(CAPABILITIES.READ), async (req, res) => {
     const companyId = companyOf(req);
     const parsed = S.parseScan(q);
     const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    /* items: by name, sku, variant sku/combination, category */
-    const items = await RawItem.find(scoped(req, { $or: [{ name: rx }, { sku: rx }, { category: rx }, { "variants.sku": rx }, { "variants.combination": rx }] })).select("name sku category unit customUnit quantity variants._id variants.sku variants.combination variants.quantity").limit(25).lean();
+    /* The warehouses first: every position named below is resolved against
+       them, so an item row can say "R03-L03-B01 · 5" and link into the 3D
+       map, not only "1 position" (26 Sep 2026). */
+    /* markings: by sticker id, PO number, vendor, item name/sku */
+    const mq = { $or: [{ rawItemName: rx }, { rawItemSku: rx }, { variantSku: rx }, { purchaseOrderNumber: rx }, { vendorName: rx }] };
+    if (parsed.type === "item") mq.$or.push({ _id: objectId(parsed.barcodeId) });
+    /* three independent reads, side by side (26 Sep 2026) */
+    const [whs, items, marks] = await Promise.all([
+      Warehouse.find(scoped(req, { status: { $ne: "Archived" } })).lean(),
+      RawItem.find(scoped(req, { $or: [{ name: rx }, { sku: rx }, { category: rx }, { "variants.sku": rx }, { "variants.combination": rx }] })).select("name sku category unit customUnit quantity image variants._id variants.sku variants.combination variants.quantity variants.image").limit(25).lean(),
+      Barcode.find(mq).select("rawItem rawItemName rawItemSku variantId variantCombination variantSku quantity unit purchaseOrderNumber vendorName createdAt").sort({ createdAt: -1 }).limit(25).lean(),
+    ]);
+    const whById = new Map(whs.map((w) => [String(w._id), w]));
+    const totalsByWh = new Map();
+    const totalsFor = async (wid) => { if (!totalsByWh.has(wid)) totalsByWh.set(wid, await S.totalsByLocation(companyId, wid)); return totalsByWh.get(wid); };
+    const positionView = (warehouseId, locationId, onHand) => {
+      const w = whById.get(String(warehouseId)); const l = w ? S.locationIn(w, locationId) : null;
+      const addr = l && w ? S.addressOf(w, l) : null;
+      return { warehouseId: String(warehouseId), warehouseName: w?.name || "", locationId: String(locationId), code: l?.code || "", name: l?.name || "", kind: l?.kind || "", parent: l?.parent ? String(l.parent) : null, address: addr?.short || "", onHand: loc.round4(onHand) };
+    };
     const itemIds = items.map((i) => i._id);
-    const sentinels = itemIds.length ? await LocationBalance.find({ companyId: objectId(companyId), itemId: { $in: itemIds }, warehouseId: null, locationId: null }).lean() : [];
-    const locCounts = itemIds.length ? await LocationBalance.aggregate([{ $match: { companyId: objectId(companyId), itemId: { $in: itemIds }, locationId: { $type: "objectId" }, onHand: { $gt: loc.QTY_TOL } } }, { $group: { _id: { itemId: "$itemId", variantId: "$variantId" }, locations: { $sum: 1 } } }]) : [];
-    const sentMap = new Map(sentinels.map((s) => [`${s.itemId}:${s.variantId || ""}`, loc.round4(s.onHand)]));
-    const locMap = new Map(locCounts.map((c) => [`${c._id.itemId}:${c._id.variantId || ""}`, c.locations]));
+    const itemById = new Map(items.map((i) => [String(i._id), i]));
+    const ownedIds = new Set(itemIds.map(String));
+    const foreign = marks.filter((m) => !ownedIds.has(String(m.rawItem))).map((m) => m.rawItem);
+    const [sentinels, balRows, ownedRows, mbMap] = await Promise.all([
+      itemIds.length ? LocationBalance.find({ companyId: objectId(companyId), itemId: { $in: itemIds }, warehouseId: null, locationId: null }).lean() : [],
+      itemIds.length ? LocationBalance.find({ companyId: objectId(companyId), itemId: { $in: itemIds }, locationId: { $type: "objectId" }, onHand: { $gt: loc.QTY_TOL } }).select("itemId variantId warehouseId locationId onHand").lean() : [],
+      foreign.length ? RawItem.find(scoped(req, { _id: { $in: foreign } })).select("_id").lean() : [],
+      S.markingBalancesMany(companyId, marks.map((m) => m._id)),
+    ]);
+    for (const r of ownedRows) ownedIds.add(String(r._id));
+    const locCounts = []; { const m = new Map(); for (const r of balRows) { const k = `${r.itemId}|${r.variantId || ""}`; m.set(k, (m.get(k) || 0) + 1); } for (const [k, n] of m) { const [itemId, variantId] = k.split("|"); locCounts.push({ _id: { itemId, variantId: variantId || null }, locations: n }); } }
+    const posMap = new Map(); for (const r of balRows) { const k = `${r.itemId}:${variantKeyOf(itemById.get(String(r.itemId)) || {}, r.variantId) || ""}`; if (!posMap.has(k)) posMap.set(k, []); posMap.get(k).push(positionView(r.warehouseId, r.locationId, r.onHand)); }
+    const sentMap = new Map(); for (const s of sentinels) { const k = `${s.itemId}:${variantKeyOf(itemById.get(String(s.itemId)) || {}, s.variantId) || ""}`; sentMap.set(k, loc.round4((sentMap.get(k) || 0) + s.onHand)); }
+    const locMap = new Map(); for (const c of locCounts) { const k = `${c._id.itemId}:${variantKeyOf(itemById.get(String(c._id.itemId)) || {}, c._id.variantId) || ""}`; locMap.set(k, (locMap.get(k) || 0) + c.locations); }
     const itemRows = [];
     for (const it of items) {
       const scopes = (it.variants || []).length ? it.variants.filter((v) => !q || rx.test(it.name) || rx.test(it.sku || "") || rx.test(v.sku || "") || (v.combination || []).some((c) => rx.test(c))) : [null];
       for (const v of scopes) {
         const onHand = loc.onHandOf(it, v ? v._id : null); const assigned = sentMap.get(`${it._id}:${v ? v._id : ""}`) || 0;
-        itemRows.push({ rawItemId: String(it._id), variantId: v ? String(v._id) : null, name: it.name, sku: v?.sku || it.sku || "", variant: v ? (v.combination || []).join(" · ") : "", category: it.category || "", baseUnit: it.customUnit || it.unit || "", onHand, located: assigned, unallocated: loc.round4(onHand - assigned), locations: locMap.get(`${it._id}:${v ? v._id : ""}`) || 0 });
+        const positions = (posMap.get(`${it._id}:${v ? v._id : ""}`) || []).sort((a, b) => b.onHand - a.onHand);
+        itemRows.push({ rawItemId: String(it._id), variantId: v ? String(v._id) : null, name: it.name, sku: v?.sku || it.sku || "", variant: v ? (v.combination || []).join(" · ") : "", category: it.category || "", baseUnit: it.customUnit || it.unit || "", image: v?.image || it.image || "", onHand, located: assigned, unallocated: loc.round4(onHand - assigned), locations: locMap.get(`${it._id}:${v ? v._id : ""}`) || 0, positions });
       }
+      /* multi-variant item with stock put away under no variant: shown, not hidden */
+      if ((it.variants || []).length > 1 && locMap.get(`${it._id}:`)) { const assigned = sentMap.get(`${it._id}:`) || 0; itemRows.push({ rawItemId: String(it._id), variantId: null, name: it.name, sku: it.sku || "", variant: UNSPECIFIED_VARIANT, category: it.category || "", baseUnit: it.customUnit || it.unit || "", image: it.image || "", onHand: assigned, located: assigned, unallocated: 0, locations: locMap.get(`${it._id}:`) || 0, positions: (posMap.get(`${it._id}:`) || []).sort((a, b) => b.onHand - a.onHand) }); }
     }
-    /* markings: by sticker id, PO number, vendor, item name/sku */
-    const mq = { $or: [{ rawItemName: rx }, { rawItemSku: rx }, { variantSku: rx }, { purchaseOrderNumber: rx }, { vendorName: rx }] };
-    if (parsed.type === "item") mq.$or.push({ _id: objectId(parsed.barcodeId) });
-    const marks = await Barcode.find(mq).select("rawItem rawItemName rawItemSku variantId variantCombination variantSku quantity unit purchaseOrderNumber vendorName createdAt").sort({ createdAt: -1 }).limit(25).lean();
-    const owned = marks.length ? new Set((await RawItem.find(scoped(req, { _id: { $in: marks.map((m) => m.rawItem) } })).select("_id").lean()).map((i) => String(i._id))) : new Set();
     const markingRows = [];
-    for (const m of marks.filter((m) => owned.has(String(m.rawItem)))) { const mb = await S.markingBalances(companyId, m._id); markingRows.push({ barcodeId: String(m._id), rawItemId: String(m.rawItem), variantId: m.variantId ? String(m.variantId) : null, rawItemName: m.rawItemName, rawItemSku: m.rawItemSku, variant: (m.variantCombination || []).join(" · "), quantity: m.quantity, unit: m.unit, purchaseOrderNumber: m.purchaseOrderNumber, vendorName: m.vendorName, printedAt: m.createdAt, located: mb.located, unallocated: loc.round4(Math.max(0, m.quantity - mb.located)), locations: mb.balances.length }); }
-    /* locations: by code, name, token, address fragment */
-    const whs = await Warehouse.find(scoped(req, { status: { $ne: "Archived" } })).lean();
+    for (const m of marks.filter((m) => ownedIds.has(String(m.rawItem)))) { const mb = mbMap.get(String(m._id)) || { balances: [], located: 0 }; markingRows.push({ barcodeId: String(m._id), rawItemId: String(m.rawItem), variantId: m.variantId ? String(m.variantId) : null, rawItemName: m.rawItemName, rawItemSku: m.rawItemSku, variant: (m.variantCombination || []).join(" · "), quantity: m.quantity, unit: m.unit, purchaseOrderNumber: m.purchaseOrderNumber, vendorName: m.vendorName, printedAt: m.createdAt, located: mb.located, unallocated: loc.round4(Math.max(0, m.quantity - mb.located)), locations: mb.balances.length, positions: mb.balances.map((b) => positionView(b.warehouseId, b.locationId, b.onHand)) }); }
+    /* locations: by code, name, token, address fragment — each with what it holds */
     const locationRows = [];
     for (const w of whs) for (const l of w.locations || []) {
       if (l.status === "Archived") continue;
       const addr = S.addressOf(w, l);
-      if (rx.test(l.code) || rx.test(l.name) || (parsed.type === "location" && l.qrToken === parsed.token) || rx.test(addr.code) || rx.test(addr.short)) locationRows.push({ ...publicLoc(w, l), warehouseName: w.name });
+      if (rx.test(l.code) || rx.test(l.name) || (parsed.type === "location" && l.qrToken === parsed.token) || rx.test(addr.code) || rx.test(addr.short)) { const t = await totalsFor(String(w._id)); locationRows.push({ ...publicLoc(w, l), warehouseName: w.name, totals: t.get(String(l._id)) || { lines: 0, onHand: 0, items: 0 } }); }
       if (locationRows.length >= 25) break;
     }
     res.json({ success: true, q, items: itemRows.slice(0, 40), markings: markingRows, locations: locationRows });
@@ -453,11 +488,13 @@ router.get("/items/:rawItemId/locations", requireCapability(CAPABILITIES.READ), 
     const whById = new Map(whs.map((w) => [String(w._id), w]));
     const marks = await LocationMovement.aggregate([{ $match: { companyId: objectId(companyId), itemId: item._id, barcodeId: { $type: "objectId" }, applied: { $ne: false } } }, { $group: { _id: { barcodeId: "$barcodeId", locationId: "$locationId", variantId: "$variantId" }, onHand: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$quantity", { $multiply: ["$quantity", -1] }] } }, label: { $last: "$barcodeLabel" } } }, { $match: { onHand: { $gt: loc.QTY_TOL } } }]);
     const scopes = (item.variants || []).length ? item.variants.map((v) => ({ variantId: String(v._id), variant: (v.combination || []).join(" · "), sku: v.sku || "" })) : [{ variantId: null, variant: "", sku: item.sku || "" }];
+    const covered = new Set(scopes.map((sc) => sc.variantId));
+    if (scopes.length > 1 && rows.some((r) => !covered.has(variantKeyOf(item, r.variantId)))) scopes.push({ variantId: null, variant: UNSPECIFIED_VARIANT, sku: item.sku || "", unspecified: true });
     const out = scopes.map((sc) => {
-      const mine = rows.filter((r) => (r.variantId ? String(r.variantId) : null) === sc.variantId);
-      const onHand = loc.onHandOf(item, sc.variantId);
-      const balances = mine.map((r) => { const w = whById.get(String(r.warehouseId)); const l = w ? S.locationIn(w, r.locationId) : null; return { warehouseId: String(r.warehouseId), warehouseName: w?.name || "", locationId: String(r.locationId), location: l && w ? publicLoc(w, l) : null, onHand: loc.round4(r.onHand), markings: marks.filter((m) => String(m._id.locationId) === String(r.locationId) && (m._id.variantId ? String(m._id.variantId) : null) === sc.variantId).map((m) => ({ barcodeId: String(m._id.barcodeId), onHand: loc.round4(m.onHand), label: m.label })) }; });
+      const mine = rows.filter((r) => variantKeyOf(item, r.variantId) === sc.variantId);
+      const balances = mine.map((r) => { const w = whById.get(String(r.warehouseId)); const l = w ? S.locationIn(w, r.locationId) : null; return { warehouseId: String(r.warehouseId), warehouseName: w?.name || "", locationId: String(r.locationId), location: l && w ? publicLoc(w, l) : null, onHand: loc.round4(r.onHand), markings: marks.filter((m) => String(m._id.locationId) === String(r.locationId) && variantKeyOf(item, m._id.variantId) === sc.variantId).map((m) => ({ barcodeId: String(m._id.barcodeId), onHand: loc.round4(m.onHand), label: m.label })) }; });
       const located = loc.round4(balances.reduce((n, b) => n + b.onHand, 0));
+      const onHand = sc.unspecified ? located : loc.onHandOf(item, sc.variantId);
       return { ...sc, onHand, located, unallocated: loc.round4(onHand - located), balances };
     });
     res.json({ success: true, item: { rawItemId: String(item._id), name: item.name, sku: item.sku || "", category: item.category || "", baseUnit: loc.baseUnitOf(item), onHand: item.quantity || 0 }, scopes: out });
@@ -480,10 +517,13 @@ router.get("/markings/:barcodeId", requireCapability(CAPABILITIES.READ), async (
 
 async function reconciliationRows(req) {
   const companyId = companyOf(req);
-  const items = await RawItem.find(scoped(req, { status: { $ne: "Inactive" } })).select("name sku category unit customUnit quantity variants._id variants.sku variants.combination variants.quantity").lean();
-  const sentinels = await LocationBalance.find({ companyId: objectId(companyId), warehouseId: null, locationId: null }).lean();
+  const [items, sentinels, trackedIds] = await Promise.all([
+    RawItem.find(scoped(req, { status: { $ne: "Inactive" } })).select("name sku category unit customUnit quantity variants._id variants.sku variants.combination variants.quantity").lean(),
+    LocationBalance.find({ companyId: objectId(companyId), warehouseId: null, locationId: null }).lean(),
+    LocationMovement.distinct("itemId", { companyId: objectId(companyId) }),
+  ]);
   const sentMap = new Map(sentinels.map((s) => [`${s.itemId}:${s.variantId || ""}`, loc.round4(s.onHand)]));
-  const tracked = new Set((await LocationMovement.distinct("itemId", { companyId: objectId(companyId) })).map(String));
+  const tracked = new Set(trackedIds.map(String));
   const rows = [];
   for (const it of items) {
     const scopes = (it.variants || []).length ? it.variants.map((v) => ({ variantId: String(v._id), variant: (v.combination || []).join(" · "), sku: v.sku || it.sku || "" })) : [{ variantId: null, variant: "", sku: it.sku || "" }];
@@ -549,17 +589,18 @@ router.get("/movements", requireCapability(CAPABILITIES.READ), async (req, res) 
 router.get("/dashboard", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const companyId = companyOf(req);
-    const whs = await Warehouse.find(scoped(req, { status: { $ne: "Archived" } })).lean();
-    let positions = 0, blocked = 0, containers = 0, racks = 0, unplaced = 0;
-    for (const w of whs) for (const l of w.locations || []) { if (l.status === "Archived") continue; if (l.kind === "RACK") racks++; if (S.holdsStockError(w, l)) { containers++; continue; } if (l.status !== "Active") blocked++; else positions++; if (!(l.layout && l.layout.placed)) unplaced++; }
-    const occupiedRows = await LocationBalance.aggregate([{ $match: { companyId: objectId(companyId), locationId: { $type: "objectId" }, onHand: { $gt: loc.QTY_TOL } } }, { $group: { _id: "$locationId", lines: { $sum: 1 } } }]);
-    const rows = await reconciliationRows(req);
     const since = new Date(Date.now() - 7 * 86400000);
-    const [recent, transfers7d, puts7d] = await Promise.all([
+    /* every read here is independent of the others — side by side (26 Sep 2026) */
+    const [whs, occupiedRows, rows, recent, transfers7d, puts7d] = await Promise.all([
+      Warehouse.find(scoped(req, { status: { $ne: "Archived" } })).lean(),
+      LocationBalance.aggregate([{ $match: { companyId: objectId(companyId), locationId: { $type: "objectId" }, onHand: { $gt: loc.QTY_TOL } } }, { $group: { _id: "$locationId", lines: { $sum: 1 } } }]),
+      reconciliationRows(req),
       LocationMovement.find(scoped(req, {})).sort({ createdAt: -1 }).limit(12).lean(),
       LocationMovement.countDocuments(scoped(req, { type: "transfer_out", createdAt: { $gte: since } })),
       LocationMovement.countDocuments(scoped(req, { direction: "in", type: { $in: ["opening_assignment", "receipt"] }, createdAt: { $gte: since } })),
     ]);
+    let positions = 0, blocked = 0, containers = 0, racks = 0, unplaced = 0;
+    for (const w of whs) for (const l of w.locations || []) { if (l.status === "Archived") continue; if (l.kind === "RACK") racks++; if (S.holdsStockError(w, l)) { containers++; continue; } if (l.status !== "Active") blocked++; else positions++; if (!(l.layout && l.layout.placed)) unplaced++; }
     res.json({ success: true, warehouses: whs.map((w) => ({ id: String(w._id), name: w.name, code: w.shortName, hasFloorPlan: Boolean(w.floorPlan?.widthCm) })), kpis: { positions, occupied: occupiedRows.length, empty: Math.max(0, positions - occupiedRows.length), blocked, containers, racks, unplacedInLayout: unplaced, unallocatedLines: rows.filter((r) => r.unallocated > 0).length, unallocatedQuantityByUnit: Object.entries(rows.filter((r) => r.unallocated > 0).reduce((m, r) => { m[r.baseUnit || "?"] = loc.round4((m[r.baseUnit || "?"] || 0) + r.unallocated); return m; }, {})).map(([unit, qty]) => ({ unit, qty })), locationExcessLines: rows.filter((r) => r.excess > 0).length, matchedLines: rows.filter((r) => r.state === "matched").length, transfers7d, puts7d }, recent: (await withItemNames(recent.map(movementView))).movements });
   } catch (e) { handle(res, e, "dashboard"); }
 });
