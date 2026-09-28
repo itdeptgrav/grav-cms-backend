@@ -1903,7 +1903,39 @@ async function _announceQueueShifts({ moved, employeeId, causeTaskId, causeTitle
 // ═════════════════════════════════════════════════════════
 //  12. SUBMIT COMPLETION REQUEST (employee)
 // ═════════════════════════════════════════════════════════
-async function submitCompletionRequest({ taskId, employeeId, employeeName, message, imageUrls = [], pdfAttachments = [] }) {
+/**
+ * Files named at submit that have not arrived yet.
+ *
+ * **Reported 28 September 2026.** A submission is written the instant it is
+ * made — the timer stops there and lateness is judged there — while its files
+ * are still going up, and for a 3 GB video that gap is hours. Nothing outside
+ * the uploading browser could see that, so the attempt read "Submitted files
+ * (0) - No files on this attempt" at a reviewer who was free to approve it.
+ *
+ * Making the submission WAIT for the upload was the obvious alternative and is
+ * the wrong one: it would judge an on-time hand-over against the clock an hour
+ * later and mark somebody late for the size of their own file. So the record
+ * says what is coming instead, and the reviewer's decision waits on this list.
+ *
+ * Sanitised here rather than trusted: it arrives from a browser and it now
+ * gates somebody else's screen, so a malformed entry must not reach it. An
+ * unknown state reads as "uploading", never as "failed" - guessing "failed"
+ * would release a reviewer onto work still in flight.
+ */
+function _readPendingUploads(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((u) => u && typeof u === "object" && typeof u.name === "string" && u.name.trim())
+    .slice(0, 50)
+    .map((u) => ({
+      name: String(u.name).slice(0, 300),
+      sizeBytes: Number(u.sizeBytes) || 0,
+      startedAt: typeof u.startedAt === "string" ? u.startedAt : new Date().toISOString(),
+      state: u.state === "failed" ? "failed" : "uploading",
+    }));
+}
+
+async function submitCompletionRequest({ taskId, employeeId, employeeName, message, imageUrls = [], pdfAttachments = [], pendingUploads = [] }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1912,7 +1944,7 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
   if (["tl_approved", "ceo_approved", "tl_final_approved"].includes(task.completionStatus)) throw new Error("Already approved.");
 
   const flow = await _reviewFlow(task);
-  const submission = { submittedBy: employeeId, submittedByName: employeeName, message, imageUrls, pdfAttachments, submittedAt: new Date().toISOString() };
+  const submission = { submittedBy: employeeId, submittedByName: employeeName, message, imageUrls, pdfAttachments, submittedAt: new Date().toISOString(), pendingUploads: _readPendingUploads(pendingUploads) };
 
   await ref.update({ completionStatus: "submitted", completionSubmission: submission, reviewFlow: flow, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
@@ -4129,6 +4161,37 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
   }
 }
 
+/**
+ * Amend what is still uploading to the current submission.
+ *
+ * Called by the browser doing the uploading as each file settles: one that
+ * lands is dropped from the list, one that gives up is marked `failed`. Both
+ * matter to somebody else's screen - the first because the reviewer's decision
+ * is waiting on it, the second because a file that is never coming must
+ * release that decision rather than hold it for ever.
+ *
+ * **It cannot touch the submission itself.** Not the message, not the files
+ * that have arrived, not its time, not its status. One field, and the worst a
+ * wrong call can do is misdescribe what is still outstanding.
+ *
+ * The submitter only. Nobody else has an upload of their own to report on, and
+ * this field decides whether their reviewer may act.
+ */
+async function setSubmissionUploads({ taskId, employeeId, uploads }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const sub = doc.data().completionSubmission;
+  if (!sub || typeof sub !== "object") throw new Error("There is no submission to attach files to.");
+  if (sub.submittedBy !== employeeId) throw new Error("Only the person who submitted can report on its uploads.");
+
+  await ref.update({
+    "completionSubmission.pendingUploads": _readPendingUploads(uploads),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return { ok: true };
+}
+
 module.exports = {
   _closeRankGaps,
   _notifyP1Changed,
@@ -4159,6 +4222,7 @@ module.exports = {
   editTaskDeadline,
   deleteTask,
   submitCompletionRequest,
+  setSubmissionUploads,
   reviewCompletion,
   reworkTask,
   ceoReviewCompletion,
