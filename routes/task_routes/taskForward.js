@@ -2170,9 +2170,24 @@ router.post("/task/:taskId/reset-to-draft", verifyCoworkToken, verifyEmployeeTok
 // ── 15. SUBMIT COMPLETION ─────────────────────────────────────────────────────
 router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { message, imageUrls, pdfAttachments } = req.body;
-    const result = await svc.submitCompletionRequest({ taskId: req.params.taskId, employeeId: req.coworkUser.employeeId, employeeName: req.coworkUser.name, message: message || "", imageUrls: imageUrls || [], pdfAttachments: pdfAttachments || [] });
+    const { message, imageUrls, pdfAttachments, pendingUploads } = req.body;
+    const result = await svc.submitCompletionRequest({ taskId: req.params.taskId, employeeId: req.coworkUser.employeeId, employeeName: req.coworkUser.name, message: message || "", imageUrls: imageUrls || [], pdfAttachments: pdfAttachments || [], pendingUploads: pendingUploads || [] });
     res.status(201).json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── POST /task/:taskId/submission-uploads ────────────────────────────────────
+// What is still on its way to the current submission. The uploading browser
+// amends this as each file settles; the reviewer's decision waits on it. One
+// field, submitter only - see the service for why it can touch nothing else.
+router.post("/task/:taskId/submission-uploads", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const result = await svc.setSubmissionUploads({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      uploads: Array.isArray(req.body?.uploads) ? req.body.uploads : [],
+    });
+    res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
