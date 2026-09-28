@@ -282,6 +282,31 @@ router.get(
           .json({ error: "You do not have access to this file.", code: "PERMISSION_DENIED" });
       }
 
+      await sendAttachment(res, record);
+    } catch (e) {
+      console.error("[cowork/attachments download]", e.code || "", e.message);
+      if (e.code === "STORAGE_NOT_CONFIGURED") {
+        return res.status(503).json({
+          error: "Attachment storage is not configured on this server.",
+          code: "STORAGE_NOT_CONFIGURED",
+        });
+      }
+      res.status(404).json({
+        error: "File not found or not accessible.",
+        code: "DOWNLOAD_FAILED",
+      });
+    }
+  },
+);
+
+/**
+ * Stream one attachment to the response.
+ *
+ * Shared by the authenticated download and the ticketed one below, so the
+ * two cannot come to disagree about the headers — and the inline/attachment
+ * rule, which is a security decision, is written once.
+ */
+async function sendAttachment(res, record) {
       const { stream, meta } = await svc.streamAttachment(record.storageFileId);
       const mimeType =
         record.mimeType || meta.mimeType || "application/octet-stream";
@@ -312,22 +337,133 @@ router.get(
       /* PRIVATE, and never cached by a shared proxy — this response is
          specific to one authenticated person. */
       res.setHeader("Cache-Control", "private, no-store");
-      stream.pipe(res);
-    } catch (e) {
-      console.error("[cowork/attachments download]", e.code || "", e.message);
-      if (e.code === "STORAGE_NOT_CONFIGURED") {
-        return res.status(503).json({
-          error: "Attachment storage is not configured on this server.",
-          code: "STORAGE_NOT_CONFIGURED",
-        });
+      /* The SIZE, so the browser's own downloader shows a progress bar and
+         an estimate rather than an unbounded spinner. Drive's own figure
+         first — it is the authority on what is about to be sent, and a
+         Content-Length that disagrees with the body truncates the file. */
+      const declaredSize = Number(meta.size) || Number(record.size) || 0;
+      if (declaredSize > 0) {
+        res.setHeader("Content-Length", String(declaredSize));
       }
-      res.status(404).json({
-        error: "File not found or not accessible.",
-        code: "DOWNLOAD_FAILED",
+      stream.pipe(res);
+}
+
+/* ── Download tickets ────────────────────────────────────────────────────── */
+
+/**
+ * **Why a ticket exists at all.** Reported 28 September 2026: a 3 GB file on
+ * a submission showed "Opening…" for ever and never arrived.
+ *
+ * The route above streams it perfectly well. The BROWSER was the problem: an
+ * anchor with a download attribute cannot carry an Authorization header, so
+ * the page fetched the file itself and buffered every byte into memory
+ * before handing it over. At a few megabytes that is invisible. At three
+ * gigabytes it is a tab holding 3 GB of RAM, no progress, no save dialog,
+ * and nothing to show for it.
+ *
+ * A ticket is a URL the browser can open on its own, so the download goes
+ * through the browser's own downloader — straight to disk, with a progress
+ * bar, at any size, surviving a navigation away from the page.
+ *
+ * **It is not a credential.** It is a random 32-byte capability for ONE
+ * attachment, issued only after the same `mayViewTask` check the
+ * authenticated route performs, and it expires in ten minutes. It identifies
+ * nobody and grants nothing else. That is what makes it safe to put in a
+ * URL — somewhere a bearer token must never go.
+ *
+ * In memory, deliberately: a ten-minute capability does not belong in a
+ * database, and a restart forgetting them costs somebody one click.
+ */
+const TICKET_TTL_MS = 10 * 60 * 1000;
+const TICKET_MAX = 5000;
+const tickets = new Map();
+
+function pruneTickets() {
+  const now = Date.now();
+  for (const [key, value] of tickets) {
+    if (value.expiresAt <= now) tickets.delete(key);
+  }
+  /* A ceiling as well as a clock: an expiry alone bounds the map only while
+     somebody keeps asking, and the oldest are the ones worth losing. */
+  while (tickets.size > TICKET_MAX) {
+    tickets.delete(tickets.keys().next().value);
+  }
+}
+
+// ── POST /attachments/:id/download-ticket ────────────────────────────────────
+// A short-lived URL the browser can open by itself. Same permission check as
+// the download above; the ticket carries the ANSWER, because the request that
+// redeems it has no session on it.
+router.post(
+  "/attachments/:id/download-ticket",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const record = await svc.getAttachment(req.params.id);
+      if (!record) return res.status(404).json({ error: "Attachment not found." });
+
+      const taskId = taskIdFor(record.entityType, record.entityId);
+      if (!taskId) return res.status(403).json({ error: "Not accessible." });
+
+      const gate = await mayViewTask(taskId, req.coworkUser);
+      if (!gate.ok) {
+        return res
+          .status(gate.reason === "not_found" ? 404 : 403)
+          .json({ error: "You do not have access to this file.", code: "PERMISSION_DENIED" });
+      }
+
+      pruneTickets();
+      const ticket = require("crypto").randomBytes(32).toString("hex");
+      tickets.set(ticket, {
+        attachmentId: String(req.params.id),
+        issuedTo: String(req.coworkUser.employeeId),
+        expiresAt: Date.now() + TICKET_TTL_MS,
       });
+
+      /* A PATH, not a URL: the engine does not reliably know the origin it
+         was reached on, and the caller already knows where it sent this. */
+      res.json({
+        path: `/cowork/attachments/download/${ticket}`,
+        expiresInSecs: Math.floor(TICKET_TTL_MS / 1000),
+      });
+    } catch (e) {
+      console.error("[cowork/attachments ticket]", e.message);
+      res.status(400).json({ error: e.message });
     }
   },
 );
+
+// ── GET /attachments/download/:ticket ────────────────────────────────────────
+// Redeemed by the browser itself, so it carries no Authorization header — the
+// ticket IS the authorization, and it was issued behind the same check. Three
+// segments, so it can never be confused with `/attachments/:id`.
+router.get("/attachments/download/:ticket", async (req, res) => {
+  try {
+    pruneTickets();
+    const held = tickets.get(String(req.params.ticket));
+    if (!held) {
+      return res.status(404).json({
+        error: "This download link has expired. Open the file again.",
+        code: "TICKET_EXPIRED",
+      });
+    }
+
+    const record = await svc.getAttachment(held.attachmentId);
+    if (!record) return res.status(404).json({ error: "Attachment not found." });
+
+    await sendAttachment(res, record);
+  } catch (e) {
+    console.error("[cowork/attachments ticketed download]", e.code || "", e.message);
+    if (e.code === "STORAGE_NOT_CONFIGURED") {
+      return res.status(503).json({
+        error: "Attachment storage is not configured on this server.",
+        code: "STORAGE_NOT_CONFIGURED",
+      });
+    }
+    res.status(404).json({ error: "File not found or not accessible.", code: "DOWNLOAD_FAILED" });
+  }
+});
 
 /* ── List for one entity ─────────────────────────────────────────────────── */
 
