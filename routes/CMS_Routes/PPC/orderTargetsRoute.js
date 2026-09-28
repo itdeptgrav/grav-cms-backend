@@ -35,7 +35,7 @@ const dayOf = (raw) => (/^\d{4}-\d{2}-\d{2}$/.test(String(raw || "")) ? String(r
 
 const wrap = (fn) => async (req, res) => {
   try { await fn(req, res); } catch (err) {
-    if (err instanceof svc.TargetError) return res.status(err.status).json({ success: false, message: err.message });
+    if (err instanceof svc.TargetError) return res.status(err.status).json({ success: false, message: err.message, ...(err.errors ? { errors: err.errors, facts: err.facts } : {}) });
     console.error("[ppc targets]", err);
     return res.status(500).json({ success: false, message: "Server error", error: err.message });
   }
@@ -93,6 +93,7 @@ router.post("/targets/orders/:moId/po", requireCompany, canSet, wrap(async (req,
   if (date && Number.isNaN(new Date(date).getTime())) return res.status(400).json({ success: false, message: "The PO date is not a date." });
   const where = recordPo(mo, { poNumber: number, poDate: date });
   await mo.save();
+  require("../../../services/ppc/control/orders.service").invalidateSnapshots(companyOf(req));
   res.json({ success: true, message: number ? `PO ${number} recorded on ${where.on}.` : "PO number cleared.", po: poOf(mo.toObject()) });
 }));
 

@@ -38,6 +38,7 @@ const orders = require("../../../services/ppc/control/orders.service");
 const reports = require("../../../services/ppc/control/reports.service");
 const overview = require("../../../services/ppc/control/overview.service");
 const calendar = require("../../../services/ppc/control/calendar.service");
+const targetBoard = require("../../../services/ppc/control/targetBoard.service");
 const assistant = require("../../../services/ppc/control/assistant/engine");
 const { DEPARTMENTS, DEPARTMENT_META, isId } = require("../../../services/ppc/control/ledger.service");
 const shift = require("../../../services/manufacturing/shiftHours");
@@ -60,6 +61,9 @@ router.use("/control", requireCompany, canRead);
 
 router.get("/control/overview", wrap(async (req, res) => res.json({ success: true, ...(await overview.overview(companyOf(req), req.query)) })));
 /* The target calendar: one month, day by day (?month=YYYY-MM). */
+/* Targets in plain words (27 Sep 2026): every target, and one day's board. */
+router.get("/control/targets", wrap(async (req, res) => res.json({ success: true, ...(await targetBoard.list(companyOf(req), req.query)) })));
+router.get("/control/day", wrap(async (req, res) => res.json({ success: true, ...(await targetBoard.day(companyOf(req), req.query)) })));
 router.get("/control/calendar", wrap(async (req, res) => res.json({ success: true, ...(await calendar.calendar(companyOf(req), req.query)) })));
 
 router.get("/control/orders", wrap(async (req, res) => res.json({ success: true, ...(await orders.listOrders(companyOf(req), req.query)) })));

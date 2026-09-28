@@ -172,9 +172,9 @@ function evaluateTarget(t, events, asOfDay, extra = {}) {
 
   /* A sentence the floor can act on. */
   let advice;
-  if (!started) advice = `Starts ${t.from}.`;
+  if (!started) advice = `Starts ${dayWords(t.from)}.`;
   else if (nothingDueYet) advice = `Nothing due yet — the ${t.hoursFrom && t.hoursTo ? `${t.hoursFrom}–${t.hoursTo}` : "09:30–18:30"} window has not opened.`;
-  else if (over) advice = doneWholeSpan >= totalExpected ? `Met: ${doneWholeSpan} of ${totalExpected} by ${t.to}.` : `Missed: ${doneWholeSpan} of ${totalExpected} by ${t.to} (${totalExpected - doneWholeSpan} short).`;
+  else if (over) advice = doneWholeSpan >= totalExpected ? `Met: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)}.` : `Missed: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)} (${totalExpected - doneWholeSpan} short).`;
   else if (remainingToTarget === 0) advice = `Target reached with ${daysLeft} day${daysLeft === 1 ? "" : "s"} to spare.`;
   else if (!daysLeft) advice = `Last day: ${remainingToTarget} more needed today.`;
   else if (neededPerDay > Math.round(perDay)) advice = `Behind by ${Math.max(0, Math.round(expectedToDate) - doneToDate)}: needs ${neededPerDay} a day for the remaining ${daysLeft} day${daysLeft === 1 ? "" : "s"} (target pace is ${Math.round(perDay)}).`;
@@ -284,15 +284,18 @@ function assessTarget(t, std, others = []) {
   };
 }
 
+/** A day as people read it: "3 Oct 2026" (27 Sep 2026 — ISO dates were printed in every sentence). */
+const dayWords = (ymd) => { const [y, m, d] = String(ymd).split("-").map(Number); return y && m && d ? `${d} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][m - 1]} ${y}` : String(ymd || ""); };
+
 /** Describe a target in one sentence — used by the PPC form's live preview and every card. */
 function describeTarget(t) {
   const dept = DEPARTMENT_META[t.department]?.label || t.department;
   const hours = t.hoursFrom && t.hoursTo ? ` between ${t.hoursFrom} and ${t.hoursTo}` : "";
-  const span = t.from === t.to ? `on ${t.from}` : `from ${t.from} to ${t.to}`;
+  const span = t.from === t.to ? `on ${dayWords(t.from)}` : `from ${dayWords(t.from)} to ${dayWords(t.to)}`;
   const n = targetDays(t).length;
   if (t.kind === "per_day") return `${dept}: ${t.pieces} pieces a day${hours}, ${span} (${n} working day${n === 1 ? "" : "s"} → ${t.pieces * n} in total).`;
   if (t.kind === "per_hour") { const h = windowHours(t); return `${dept}: ${t.pieces} pieces an hour${hours}, ${span} (${Math.round(t.pieces * h)} a day → ${Math.round(t.pieces * h * n)} in total).`; }
-  return `${dept}: ${t.pieces} pieces in total by ${t.to}, starting ${t.from} (${n} working day${n === 1 ? "" : "s"} → about ${Math.round(t.pieces / (n || 1))} a day).`;
+  return `${dept}: ${t.pieces} pieces in total by ${dayWords(t.to)}, starting ${dayWords(t.from)} (${n} working day${n === 1 ? "" : "s"} → about ${Math.round(t.pieces / (n || 1))} a day).`;
 }
 
 module.exports = { DEPARTMENT_META, KIND_META, evaluateTarget, describeTarget, assessTarget, capacityAt, efficiencyOf, targetDays, expectedPerDay, doneOn, dayOf, shiftDay, instant, windowHours };

@@ -603,3 +603,36 @@ and its approval queue. `departmentWriteGuard` exports `seedIdentity` for
 it, because the wrapper runs before the router's own auth. The machine
 register (`/api/cms/machines`) and the registered-operations routes need
 only a session and were never department-gated.
+
+## PPC targets: rules, the day board, speed — 27 Sep 2026
+
+**What a target may ask** — `orderTargets.service.checkTarget(companyId, moId,
+body)` is the ONE check, used by `previewTarget` (the form, before saving)
+and `setTarget` (the save). ERRORS block and a refused save writes nothing
+(409, `errors[]` + `facts` in the body): the department already finished
+the order; the target asks for more than the department has LEFT
+(order quantity − what it has recorded, read from the same ledger the
+pipeline shows); the first date is before today or the last date has
+passed. WARNINGS are shown and allowed: ends after the delivery date or the
+order has none; replaces the department's current target; leaves pieces
+with no target; IE's capacity / busy warnings. `previewTarget` now answers
+`{ok, errors, warnings, facts: {orderQuantity, done, left, asked, …}}`.
+Target sentences print dates as "3 Oct 2026" (`dayWords` in the evaluator).
+
+**Reads** — `services/ppc/control/targetBoard.service.js`:
+`GET /api/cms/ppc/control/targets` (every target, one plain `state`:
+upcoming | on_track | behind | done | missed | stopped, with `say`, asked /
+done / left, from / to, delivery) and `GET /control/day?date=` (the PPC
+overview's day: running targets by department, starting soon, ending soon,
+just ended, active orders with no target, deliveries due; a future day is
+judged by TODAY's standing). `GET /targets/department/:dept` also returns
+`upcoming` (targets starting in the next 14 days) — the department panels
+show them — and reads its orders side by side.
+
+**Speed** — `orders.snapshot` is shared: identical concurrent calls wait on
+one computation and a result is reused for `PPC_SNAPSHOT_CACHE_MS` (20 s; 0
+disables). Target, cancel and PO writes call `invalidateSnapshots`. One
+page used to fire the orders read four times at once, each rebuilding the
+whole company (1–3 s each); warm reads are now ~0.2 s. The snapshot is
+SHARED: never mutate it. `orderDetail` reads the ten departments' books
+side by side.

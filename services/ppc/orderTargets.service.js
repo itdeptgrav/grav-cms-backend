@@ -39,7 +39,7 @@ const FINISHING = new Set(["embroidery", "printing", "washing", "trimming", "iro
 
 async function orderContext(companyId, moId) {
   const [mo, wos] = await Promise.all([
-    CustomerRequest.findById(moId).select("requestId customerInfo.name requestType status dueDate items").lean(),
+    CustomerRequest.findById(moId).select("requestId customerInfo.name customerInfo.deliveryDeadline requestType status dueDate items").lean(),
     packagingAccess.findWorkOrders(companyId, { customerRequestId: oid(moId) }, "_id workOrderNumber quantity stockItemName status packagingRecords").lean(),
   ]);
   if (!mo) return null;
@@ -49,6 +49,7 @@ async function orderContext(companyId, moId) {
     mo, wos,
     moId: String(mo._id), moNumber: mo.requestId ? `MO-${mo.requestId}` : "", customerName: mo.customerInfo?.name || "",
     requestType: mo.requestType || "", status: mo.status || "", dueDate: mo.dueDate || null,
+    deliveryDate: mo.customerInfo?.deliveryDeadline || null,
     quantity, workOrderIds: wos.map((w) => w._id), shortIds: new Set(wos.map((w) => String(w._id).slice(-8).toLowerCase())),
     workOrders: wos.map((w) => ({ id: String(w._id), number: displayWorkOrderNumber(w), product: w.stockItemName || "", quantity: w.quantity || 0 })),
   };
@@ -163,8 +164,11 @@ async function orderDetail(companyId, moId, asOfDay) {
     PpcOrderTarget.find({ companyId, status: "active", manufacturingOrderId: { $ne: oid(moId) }, to: { $gte: ev.shiftDay(asOfDay, -1) } }).lean(),
   ]);
   const departments = [];
+  /* Read every department's book at once (27 Sep 2026): ten sequential reads
+     were most of this page's wait. */
+  const eventsByDept = new Map(await Promise.all(DEPARTMENTS.map(async (d) => [d, await doneEvents(d, ctx)])));
   for (const department of DEPARTMENTS) {
-    const events = await doneEvents(department, ctx);
+    const events = eventsByDept.get(department);
     const doneOverall = sum(events);
     const mine = targets.filter((t) => t.department === department);
     const active = mine.find((t) => t.status === "active") || null;
@@ -194,26 +198,36 @@ async function orderDetail(companyId, moId, asOfDay) {
  * department overview is already inside its own portal.
  */
 async function departmentDay(department, asOfDay) {
-  if (!DEPARTMENTS.includes(department)) return { targets: [] };
-  const targets = await PpcOrderTarget.find({ department, status: "active", from: { $lte: asOfDay }, to: { $gte: ev.shiftDay(asOfDay, -7) } })
+  if (!DEPARTMENTS.includes(department)) return { targets: [], upcoming: [] };
+  /* Running or just ended (last 7 days), AND starting in the next 14 days —
+     27 Sep 2026: "the upcoming assigned targets also can showcase". */
+  const targets = await PpcOrderTarget.find({ department, status: "active", from: { $lte: ev.shiftDay(asOfDay, 14) }, to: { $gte: ev.shiftDay(asOfDay, -7) } })
     .sort({ from: 1 }).lean();
+  /* one order read and one standard read per order/company, all at once */
+  const ctxByMo = new Map(); const stdByCo = new Map();
+  await Promise.all([...new Set(targets.map((t) => String(t.manufacturingOrderId)))].map(async (mo) => {
+    const t = targets.find((x) => String(x.manufacturingOrderId) === mo);
+    const ctx = await orderContext(t.companyId, mo);
+    ctxByMo.set(mo, ctx ? { ctx, events: await doneEvents(department, ctx) } : null);
+  }));
+  await Promise.all([...new Set(targets.map((t) => String(t.companyId)))].map(async (co) => { stdByCo.set(co, await standards.standardFor(co, department)); }));
   const out = [];
-  const stdCache = new Map();
   for (const t of targets) {
-    const ctx = await orderContext(t.companyId, t.manufacturingOrderId);
-    if (!ctx) continue;
-    const key = String(t.companyId);
-    if (!stdCache.has(key)) stdCache.set(key, await standards.standardFor(t.companyId, department));
-    const events = await doneEvents(department, ctx);
+    const hit = ctxByMo.get(String(t.manufacturingOrderId));
+    if (!hit) continue;
+    const { ctx, events } = hit;
     const doneOverall = sum(events);
     out.push({
-      ...ev.evaluateTarget(t, events, asOfDay, { doneOverall, orderQuantity: ctx.quantity, standard: stdCache.get(key) }),
-      moId: ctx.moId, moNumber: ctx.moNumber, customerName: ctx.customerName, description: ev.describeTarget(t), assignedBy: t.assignedBy?.name || "",
+      ...ev.evaluateTarget(t, events, asOfDay, { doneOverall, orderQuantity: ctx.quantity, standard: stdByCo.get(String(t.companyId)) }),
+      moId: ctx.moId, moNumber: ctx.moNumber, customerName: ctx.customerName, deliveryDate: ctx.deliveryDate, description: ev.describeTarget(t), assignedBy: t.assignedBy?.name || "",
+      startsInDays: t.from > asOfDay ? Math.round((Date.parse(t.from) - Date.parse(asOfDay)) / 86400000) : 0,
     });
   }
+  const upcoming = out.filter((x) => x.from > asOfDay).sort((a, b) => a.from.localeCompare(b.from));
+  const current = out.filter((x) => x.from <= asOfDay);
   /* Today's targets first, then ones that just ended (still worth a glance). */
-  out.sort((a, b) => (b.covers - a.covers) || a.from.localeCompare(b.from));
-  const covering = out.filter((x) => x.covers);
+  current.sort((a, b) => (b.covers - a.covers) || a.from.localeCompare(b.from));
+  const covering = current.filter((x) => x.covers);
   const summary = {
     targets: covering.length,
     expectedToday: covering.reduce((n, x) => n + (x.today?.expected || 0), 0),
@@ -221,7 +235,7 @@ async function departmentDay(department, asOfDay) {
     behind: covering.filter((x) => x.status === "behind").length,
     achieved: covering.filter((x) => x.status === "achieved" || x.status === "exceeded").length,
   };
-  return { department, ...ev.DEPARTMENT_META[department], asOfDay, summary, targets: out };
+  return { department, ...ev.DEPARTMENT_META[department], asOfDay, summary: { ...summary, upcoming: upcoming.length }, targets: current, upcoming };
 }
 
 /* ── writes ──────────────────────────────────────────────────────────────── */
@@ -254,6 +268,70 @@ function validateBody(body) {
   return t;
 }
 
+/* ── WHAT A TARGET MAY ASK (27 Sep 2026) ──────────────────────────────────────
+ * One check, used by the form's preview AND by the save, so the form shows
+ * the same refusal the server would give and never lets a bad target reach
+ * the database. ERRORS block; WARNINGS are shown and allowed.
+ *
+ * Errors — a target that cannot be right:
+ *   · the department has already done the whole order;
+ *   · it asks for more pieces than the department has LEFT on the order
+ *     (order quantity − what that department has already recorded);
+ *   · its last date has passed, or its first date is before today.
+ * Warnings — a target that may be right but needs a second look:
+ *   · it ends after the customer's delivery date, or the order has none;
+ *   · it replaces the department's current target on this order;
+ *   · it leaves pieces with no target;
+ *   · IE's standard says the department cannot do that many a day, or it is
+ *     already busy on other orders over those dates.
+ * "Left" is read from the same ledger the order page's pipeline shows, so
+ * the number in the message is the number on the screen. */
+const fmtDay = (ymd) => new Date(`${ymd}T00:00:00Z`).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+
+async function checkTarget(companyId, moId, body) {
+  const errors = [], warnings = [];
+  let t = null;
+  try { t = validateBody(body); } catch (e) { if (e instanceof TargetError) return { t: null, errors: [e.message], warnings, facts: null }; throw e; }
+  const label = ev.DEPARTMENT_META[t.department]?.label || t.department;
+  const today = ev.dayOf(new Date());
+  const orders = require("./control/orders.service");
+  const [ctx, snap, previous] = await Promise.all([
+    orderContext(companyId, moId),
+    orders.snapshot(companyId, { moIds: [String(moId)] }),
+    PpcOrderTarget.findOne({ companyId, manufacturingOrderId: oid(moId), department: t.department, status: "active" }).lean(),
+  ]);
+  if (!ctx) return { t, errors: ["That order was not found."], warnings, facts: null };
+  const row = orders.summariseOrders(snap).find((r) => r.moId === String(moId)) || null;
+  const quantity = row?.quantity || ctx.quantity;
+  const done = row ? (row.departments.find((d) => d.department === t.department)?.done || 0) : sum(await doneEvents(t.department, ctx));
+  const left = Math.max(0, quantity - done);
+  const days = ev.targetDays(t).length;
+  const perDay = ev.expectedPerDay(t);
+  const asked = t.kind === "total" ? t.pieces : Math.round(perDay * days);
+  const delivery = ctx.deliveryDate ? ev.dayOf(ctx.deliveryDate) : null;
+  const facts = { moNumber: ctx.moNumber, department: t.department, label, orderQuantity: quantity, done, left, asked, days, perDay: Math.round(perDay * 10) / 10, from: t.from, to: t.to, deliveryDate: delivery, today, replaces: previous ? ev.describeTarget(previous) : null };
+
+  if (!quantity) errors.push(`${ctx.moNumber || "This order"} has no quantity yet — there is nothing to set a target against.`);
+  else if (left === 0) errors.push(`${label} has already finished all ${quantity} pieces of ${ctx.moNumber}. No target is needed.`);
+  else if (asked > left) {
+    const how = t.kind === "total" ? `${asked} pieces` : `${asked} pieces (${Math.round(perDay)} a day × ${days} day${days === 1 ? "" : "s"})`;
+    errors.push(`Too many pieces. This asks for ${how}, but ${label} has only ${left} left on ${ctx.moNumber} (${done} of ${quantity} already done). Ask for ${left} or fewer${t.kind === "total" ? "" : ` — for example ${Math.max(1, Math.floor(left / days))} a day`}.`);
+  }
+  if (t.to < today) errors.push(`The last date (${fmtDay(t.to)}) has already passed. Pick today (${fmtDay(today)}) or a later date.`);
+  else if (t.from < today) errors.push(`The first date (${fmtDay(t.from)}) is in the past. Start today (${fmtDay(today)}) or later.`);
+
+  if (!errors.length) {
+    if (!delivery) warnings.push(`${ctx.moNumber} has no delivery date, so this target cannot be checked against it.`);
+    else if (t.to > delivery) warnings.push(`This ends on ${fmtDay(t.to)}, after the customer's delivery date (${fmtDay(delivery)}).`);
+    if (previous) warnings.push(`${label} already has a target on ${ctx.moNumber}: "${ev.describeTarget(previous)}" Saving replaces it.`);
+    if (asked < left) warnings.push(`After this target, ${left - asked} of ${label}'s pieces on ${ctx.moNumber} still have no target.`);
+    const assessment = await assess(companyId, moId, t);
+    for (const w of assessment.warnings) if (w.level === "warn") warnings.push(w.text);
+    return { t, errors, warnings, facts, assessment };
+  }
+  return { t, errors, warnings, facts, assessment: null };
+}
+
 /** The feasibility check for a proposed target: IE's standard + the department's other commitments. */
 async function assess(companyId, moId, t) {
   const [std, others] = await Promise.all([
@@ -265,23 +343,23 @@ async function assess(companyId, moId, t) {
 
 /** What the form shows before saving: the sentence, the totals and the check. */
 async function previewTarget(companyId, moId, body) {
-  const t = validateBody(body);
-  const days = ev.targetDays(t);
-  const assessment = await assess(companyId, moId, t);
-  return { description: ev.describeTarget(t), days: days.length, perDay: Math.round(ev.expectedPerDay(t)),
-    total: t.kind === "total" ? t.pieces : Math.round(ev.expectedPerDay(t) * days.length), assessment };
+  const c = await checkTarget(companyId, moId, body);
+  if (!c.t) return { ok: false, errors: c.errors, warnings: [], description: "", days: 0, perDay: 0, total: 0, facts: null, assessment: null };
+  const days = ev.targetDays(c.t);
+  return { ok: c.errors.length === 0, errors: c.errors, warnings: c.warnings, facts: c.facts,
+    description: ev.describeTarget(c.t), days: days.length, perDay: Math.round(ev.expectedPerDay(c.t)),
+    total: c.t.kind === "total" ? c.t.pieces : Math.round(ev.expectedPerDay(c.t) * days.length), assessment: c.assessment };
 }
 
 async function setTarget(companyId, moId, body, actor) {
-  const t = validateBody(body);
+  const check = await checkTarget(companyId, moId, body);
+  if (!check.t) throw new TargetError(400, check.errors[0] || "The target is not complete.");
+  if (check.errors.length) { const e = new TargetError(409, check.errors.join(" ")); e.errors = check.errors; e.facts = check.facts; throw e; }
+  const t = check.t;
   const ctx = await orderContext(companyId, moId);
   if (!ctx) throw new TargetError(404, "That order was not found.");
-  if (!ctx.quantity) throw new TargetError(409, `${ctx.moNumber || "This order"} has no quantity yet — nothing to set a target against.`);
-  const total = t.kind === "total" ? t.pieces : ev.expectedPerDay(t) * ev.targetDays(t).length;
-  const warnings = [];
-  if (total > ctx.quantity * 1.5) warnings.push(`This asks for ${Math.round(total)} pieces; the whole order is ${ctx.quantity}.`);
-  const assessment = await assess(companyId, moId, t);
-  for (const w of assessment.warnings) if (w.level === "warn") warnings.push(w.text);
+  const warnings = check.warnings;
+  const assessment = check.assessment;
 
   const now = new Date();
   const previous = await PpcOrderTarget.findOne({ companyId, manufacturingOrderId: oid(moId), department: t.department, status: "active" });
@@ -293,6 +371,7 @@ async function setTarget(companyId, moId, body, actor) {
     previous.status = "replaced"; previous.replacedById = doc._id; previous.endedAt = now; previous.endedBy = actor; previous.endReason = "Replaced by a new target";
     await previous.save();
   }
+  require("./control/orders.service").invalidateSnapshots(companyId);
   return { target: doc.toObject(), description: ev.describeTarget(doc), replaced: previous ? String(previous._id) : null, warnings };
 }
 
@@ -302,7 +381,8 @@ async function cancelTarget(companyId, targetId, actor, reason = "") {
   if (doc.status !== "active") throw new TargetError(409, "That target is no longer active.");
   doc.status = "cancelled"; doc.endedAt = new Date(); doc.endedBy = actor; doc.endReason = String(reason || "").trim().slice(0, 300);
   await doc.save();
+  require("./control/orders.service").invalidateSnapshots(companyId);
   return { target: doc.toObject() };
 }
 
-module.exports = { listOrders, orderDetail, departmentDay, previewTarget, setTarget, cancelTarget, validateBody, doneEvents, orderContext, TargetError, DEPARTMENTS, KINDS, isId };
+module.exports = { listOrders, orderDetail, departmentDay, previewTarget, setTarget, cancelTarget, checkTarget, validateBody, doneEvents, orderContext, TargetError, DEPARTMENTS, KINDS, isId };

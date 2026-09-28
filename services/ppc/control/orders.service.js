@@ -143,17 +143,21 @@ function riskOf(header, produced, quantity, productionEvents, asOfDay = todayKey
 /** Today's standing of every active target on this order, in one word. */
 function targetStanding(targets, eventsByDept, quantity, asOfDay = todayKey()) {
   const active = targets.filter((t) => t.status === "active");
-  if (!active.length) return { count: 0, status: "none", behind: 0, onTrack: 0, achieved: 0, departments: [] };
+  if (!active.length) return { count: 0, status: "none", behind: 0, missed: 0, onTrack: 0, achieved: 0, departments: [] };
   const rows = active.map((t) => {
     const events = eventsByDept.get(t.department) || [];
     const r = ev.evaluateTarget(t, events, asOfDay, { doneOverall: sum(events), orderQuantity: quantity });
-    return { department: t.department, status: r.status, today: r.today, covers: r.covers };
+    return { department: t.department, status: r.status, today: r.today, covers: r.covers, over: r.over };
   });
-  const behind = rows.filter((r) => r.status === "behind").length;
+  /* "behind" is a target still running short; one that ENDED short is
+     "missed" — the target screens say the same (27 Sep 2026). The order's
+     overall status is still "behind" when either is true. */
+  const behind = rows.filter((r) => r.status === "behind" && !r.over).length;
+  const missed = rows.filter((r) => r.status === "behind" && r.over).length;
   const achieved = rows.filter((r) => r.status === "achieved" || r.status === "exceeded").length;
   const onTrack = rows.filter((r) => r.status === "on_track").length;
-  const status = behind ? "behind" : onTrack ? "on_track" : achieved ? "achieved" : "not_started";
-  return { count: active.length, status, behind, onTrack, achieved, departments: rows };
+  const status = behind || missed ? "behind" : onTrack ? "on_track" : achieved ? "achieved" : "not_started";
+  return { count: active.length, status, behind, missed, onTrack, achieved, departments: rows };
 }
 
 /* ── lists ───────────────────────────────────────────────────────────────── */
@@ -168,7 +172,41 @@ function targetStanding(targets, eventsByDept, quantity, asOfDay = todayKey()) {
  * overview, the department pages and the reports all start here so they
  * cannot disagree with the order list.
  */
-async function snapshot(companyId, { asOfDay = todayKey(), moIds = null, start = null, end = null } = {}) {
+/* ── ONE READ OF THE COMPANY, SHARED (27 Sep 2026) ───────────────────────────
+ * Opening one PPC page fired the same list endpoint four times at once (React
+ * dev double effects, then a re-render when the company resolved), and every
+ * call rebuilt the whole company snapshot — every work order, every
+ * department's book, every target — so they competed and each took 1–3 s.
+ * The snapshot is now shared: identical requests made at the same time wait
+ * on ONE computation, and a result is reused for PPC_SNAPSHOT_CACHE_MS
+ * (default 20 s; 0 disables). Writing a target or a PO calls
+ * `invalidateSnapshots(companyId)`, so what PPC just set is never hidden;
+ * a scan recorded on the floor shows within the window. Callers must treat
+ * the snapshot as READ-ONLY — it is shared. */
+const SNAP_TTL = Number(process.env.PPC_SNAPSHOT_CACHE_MS ?? 20000);
+const snapCache = new Map();
+const isoOrNull = (d) => (d ? new Date(d).toISOString() : null);
+function invalidateSnapshots(companyId = null) {
+  if (!companyId) { snapCache.clear(); return; }
+  const head = `${String(companyId)}|`;
+  for (const k of snapCache.keys()) if (k.startsWith(head)) snapCache.delete(k);
+}
+async function snapshot(companyId, opts = {}) {
+  const asOfDay = opts.asOfDay || todayKey();
+  const key = [String(companyId), asOfDay, opts.moIds ? opts.moIds.map(String).sort().join(",") : "*", isoOrNull(opts.start), isoOrNull(opts.end)].join("|");
+  const now = Date.now();
+  const hit = snapCache.get(key);
+  if (hit && (hit.pending || now - hit.at < SNAP_TTL)) return hit.promise;
+  const entry = { at: now, pending: true, promise: null };
+  entry.promise = snapshotUncached(companyId, { ...opts, asOfDay })
+    .then((v) => { entry.pending = false; entry.at = Date.now(); if (!SNAP_TTL) snapCache.delete(key); return v; })
+    .catch((e) => { snapCache.delete(key); throw e; });
+  snapCache.set(key, entry);
+  if (snapCache.size > 200) for (const [k, v] of snapCache) { if (!v.pending && Date.now() - v.at >= SNAP_TTL) snapCache.delete(k); }
+  return entry.promise;
+}
+
+async function snapshotUncached(companyId, { asOfDay = todayKey(), moIds = null, start = null, end = null } = {}) {
   const index = await ledger.woIndex(companyId, moIds ? { moIds } : {});
   const ids = [...index.byMo.keys()];
   const [headers, events, targets] = ids.length ? await Promise.all([
@@ -225,7 +263,7 @@ function summariseOrders(snap) {
       products: new Set(live.map((w) => `${w.product}|${w.reference}`)).size, variants: new Set(live.map((w) => `${w.product}|${w.reference}|${w.variant}`)).size,
       produced, remaining: Math.max(0, quantity - produced), progressPct: pct(Math.min(produced, quantity || produced), quantity),
       packed: pipeline.find((p) => p.department === "packaging").done, dispatched: pipeline.find((p) => p.department === "dispatch").done, qcPassed: pipeline.find((p) => p.department === "qc").done, cut: pipeline.find((p) => p.department === "cutting").done,
-      ...stage, ...risk, targetStatus: standing.status, targets: standing.count, targetsBehind: standing.behind,
+      ...stage, ...risk, targetStatus: standing.status, targets: standing.count, targetsBehind: standing.behind, targetsMissed: standing.missed,
       todayPieces: sum(todayAll), lastActivityAt: lastAt([...byDept.values()].flat()), lastActivityDepartment: (() => { let best = null; for (const p of pipeline) if (p.lastAt && (!best || p.lastAt > best.lastAt)) best = p; return best ? best.department : null; })(),
       departments: pipeline.map((p) => ({ department: p.department, label: p.label, applicable: p.applicable, done: p.done, remaining: p.remaining, pct: p.pct, today: p.today, hasTarget: Boolean(p.target) })),
       planning: { workOrdersPlanned: live.filter((w) => ["complete", "released"].includes(w.planningState)).length, workOrdersNotPlanned: live.filter((w) => !["complete", "released"].includes(w.planningState)).length },
@@ -350,7 +388,7 @@ async function orderDetail(companyId, moId, asOfDay = todayKey()) {
 
   return {
     asOfDay,
-    order: { ...h, quantity, workOrders: live.length, cancelledWorkOrders: wos.length - live.length, products: products.length, variants: products.reduce((n, p) => n + p.variants.length, 0), produced, remaining: Math.max(0, quantity - produced), progressPct: pct(Math.min(produced, quantity || produced), quantity), packed: pipeline.find((p) => p.department === "packaging").done, dispatched: pipeline.find((p) => p.department === "dispatch").done, qcPassed: pipeline.find((p) => p.department === "qc").done, cut: pipeline.find((p) => p.department === "cutting").done, ...stage, ...risk, targetStatus: standing.status, targets: standing.count, targetsBehind: standing.behind, lastActivityAt: lastAt([...events.values()].flat()), planning: { workOrdersPlanned: live.filter((w) => ["complete", "released"].includes(w.planningState)).length, workOrdersNotPlanned: live.filter((w) => !["complete", "released"].includes(w.planningState)).length } },
+    order: { ...h, quantity, workOrders: live.length, cancelledWorkOrders: wos.length - live.length, products: products.length, variants: products.reduce((n, p) => n + p.variants.length, 0), produced, remaining: Math.max(0, quantity - produced), progressPct: pct(Math.min(produced, quantity || produced), quantity), packed: pipeline.find((p) => p.department === "packaging").done, dispatched: pipeline.find((p) => p.department === "dispatch").done, qcPassed: pipeline.find((p) => p.department === "qc").done, cut: pipeline.find((p) => p.department === "cutting").done, ...stage, ...risk, targetStatus: standing.status, targets: standing.count, targetsBehind: standing.behind, targetsMissed: standing.missed, lastActivityAt: lastAt([...events.values()].flat()), planning: { workOrdersPlanned: live.filter((w) => ["complete", "released"].includes(w.planningState)).length, workOrdersNotPlanned: live.filter((w) => !["complete", "released"].includes(w.planningState)).length } },
     products, workOrders, departments,
     activity: recentActivity(events, 40),
   };
@@ -553,4 +591,4 @@ async function search(companyId, qRaw) {
   return { q, hits: hits.slice(0, 60) };
 }
 
-module.exports = { snapshot, summariseOrders, applyFilters, headersFor, headerOf, poOf, orderTypeOf, pipelineOf, stageOf, riskOf, targetStanding, listOrders, orderDetail, listWorkOrders, workOrderDetail, personWise, personWiseOrders, search, todayKey, pct };
+module.exports = { snapshot, invalidateSnapshots, summariseOrders, applyFilters, headersFor, headerOf, poOf, orderTypeOf, pipelineOf, stageOf, riskOf, targetStanding, listOrders, orderDetail, listWorkOrders, workOrderDetail, personWise, personWiseOrders, search, todayKey, pct };

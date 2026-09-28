@@ -66,7 +66,7 @@ test("before the start and after the end", () => {
 
 test("describeTarget reads as one sentence with the totals worked out", () => {
   assert.equal(describeTarget({ department: "cutting", kind: "per_day", pieces: 300, from: "2026-09-21", to: "2026-09-23", workingDays: [1, 2, 3] }),
-    "Cutting: 300 pieces a day, from 2026-09-21 to 2026-09-23 (3 working days → 900 in total).");
+    "Cutting: 300 pieces a day, from 21 Sep 2026 to 23 Sep 2026 (3 working days → 900 in total).");
   assert.equal(describeTarget({ department: "production", kind: "per_hour", pieces: 25, from: "2026-09-24", to: "2026-09-24", hoursFrom: "09:30", hoursTo: "18:30", workingDays: [4] }),
-    "Production (sewing): 25 pieces an hour between 09:30 and 18:30, on 2026-09-24 (225 a day → 225 in total).");
+    "Production (sewing): 25 pieces an hour between 09:30 and 18:30, on 24 Sep 2026 (225 a day → 225 in total).");
 });

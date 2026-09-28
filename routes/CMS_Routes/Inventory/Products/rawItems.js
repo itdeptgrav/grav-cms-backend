@@ -129,108 +129,12 @@ function scopedSearch(req, extra = {}) {
  * which URL it arrived at. A mixed payload needs every capability its fields
  * imply.
  */
-/* ── SUPPLIER MASTER NOW HAS AN OWNER ───────────────────────────────────────
- * `Vendor` carried no `companyId`, so every supplier query here read one
- * global table shared by every company, and an alias written from this router
- * bound a tenant-owned item to a record whose ownership nobody could state.
- * The previous chunk closed all of it behind SUPPLIER_TENANCY_UNAVAILABLE
- * rather than keep pretending it was safe.
- *
- * Suppliers are now company-owned, so the integration is open again — under
- * the ownership that made it possible, not merely because the refusal was
- * inconvenient:
- *
- *   · every supplier query is company-scoped, and a supplier from another
- *     company answers as one that does not exist;
- *   · a supplier may be NEWLY assigned only if it is Active and owned by this
- *     company — archived, inactive, blacklisted, legacy and cross-company
- *     suppliers are all refused, each with its own reason;
- *   · identity is resolved through one explicitly scoped map, never through a
- *     Mongoose populate that would follow a reference wherever it points;
- *   · aliases already stored against a supplier whose ownership cannot be
- *     proven are LEFT ALONE and reported as unverified. They are the item's
- *     own history, and deleting history to tidy a boundary is not a fix.
- */
-const SUPPLIER_NOT_SELECTABLE = "SUPPLIER_NOT_SELECTABLE";
-
-/**
- * A supplier this company may newly select.
- *
- * ── WHY THIS IS AN `$and`, NOT ANOTHER KEY ──────────────────────────────────
- * Written as `{...tenantContext.tenantFilter(req.tenant), companyId: {$ne: null}}`
- * the second `companyId` REPLACES the first: object spread keeps the last
- * value, so the company filter silently disappeared and every company's
- * suppliers matched. The two conditions are separate facts — "belongs to this
- * company" and "belongs to a company at all" — so they are separate clauses,
- * where neither can overwrite the other.
- */
-const supplierScope = (req, extra = {}) => ({
-  $and: [
-    tenantContext.tenantFilter(req.tenant),
-    tenantContext.ownedOnly(),
-    /* A company-owned supplier part-way through migration has no code yet.
-       It is visible in the Supplier Master for remediation, and must not be
-       offered here: an order or alias bound to it would carry no identity
-       anybody can quote back.
-
-       Stood down while the legacy window is open. NOT ONE of the 94 suppliers
-       in this database carries a code — the supplier-code scheme shipped after
-       them and the migration script deliberately never derives one — so
-       enforcing it emptied the vendor dropdown on every Raw Item form in Store
-       and Sales (reported 10 Sep 2026). It comes back with
-       STORE_PURCHASE_STRICT_TENANCY=1, by which time codes must exist. */
-    ...(tenantContext.legacyWindowOpen() ? [] : [{ supplierCode: { $gt: "" } }]),
-    ...(Object.keys(extra).length ? [extra] : []),
-  ],
-});
-
-/**
- * Resolve the suppliers named on a payload, inside this company.
- *
- * @returns {{ok: true, map: Map}|{ok: false, code, message, details}}
- */
-async function resolveSuppliers(req, ids) {
-  const wanted = [...new Set(ids.map(String))].filter((id) => mongoose.Types.ObjectId.isValid(id));
-  if (!wanted.length) return { ok: true, map: new Map() };
-
-  /* Scoped, and `companyId: null` excluded explicitly: a legacy supplier is
-     inside no company, so nothing new may be bound to it. */
-  const found = await Vendor.find(supplierScope(req, { _id: { $in: wanted } }))
-    .select("_id companyName status supplierCode").lean();
-
-  const map = new Map(found.map((v) => [String(v._id), v]));
-
-  const missing = wanted.find((id) => !map.has(id));
-  if (missing) {
-    /* Another company's supplier answers exactly as an invented id. */
-    return {
-      ok: false, status: 404, code: "SUPPLIER_NOT_FOUND",
-      message: "That supplier was not found in this company.",
-    };
-  }
-
-  const unusable = found.find((v) => v.status !== "Active");
-  if (unusable) {
-    return {
-      ok: false, status: 409, code: SUPPLIER_NOT_SELECTABLE,
-      message: `${unusable.companyName} is ${String(unusable.status).toLowerCase()} and cannot be newly assigned.`,
-      details: { supplier: String(unusable._id), status: unusable.status },
-    };
-  }
-
-  return { ok: true, map };
-}
-
-/** Identity for aliases already stored, resolved only inside this company. */
-async function supplierIdentityMap(req, ids) {
-  const wanted = [...new Set(ids.map(String))].filter((id) => mongoose.Types.ObjectId.isValid(id));
-  if (!wanted.length) return new Map();
-  const found = await Vendor.find({
-    ...tenantContext.tenantFilter(req.tenant),
-    _id: { $in: wanted },
-  }).select("_id companyName status supplierCode companyId").lean();
-  return new Map(found.map((v) => [String(v._id), v]));
-}
+/* The supplier helpers (SUPPLIER_NOT_SELECTABLE, supplierScope,
+   resolveSuppliers, supplierIdentityMap) are imported from
+   services/inventory/rawItemPayload.service.js at the top of this file. The
+   27 Sep 2026 merge re-added this route's older inline copies beside that
+   import, which declared every name twice and stopped the server; the two
+   fixes only the inline copy had were moved into the service. */
 
 /**
  * Put a name on each stored alias's supplier.
@@ -397,28 +301,8 @@ const matchExistingVariant = (incoming, existingList) => {
   return null;
 };
 
-const normaliseVariantNicknames = (incoming) => {
-  if (!Array.isArray(incoming)) return null;
-  return incoming
-    .filter(vn => vn && vn.vendor && vn.nickname && vn.nickname.toString().trim())
-    .map(vn => ({
-      _id: vn._id && mongoose.Types.ObjectId.isValid(vn._id) ? vn._id : undefined,
-      /* A read hands back a NAMED supplier (see resolveAliasVendors), and a
-         form that round-trips an untouched row sends that object straight
-         back. Take the id out of either shape rather than relying on the
-         cast to find `_id` inside an object it was not given. */
-      vendor: vn.vendor && typeof vn.vendor === "object" && vn.vendor._id
-        ? vn.vendor._id
-        : vn.vendor,
-      nickname: vn.nickname.toString().trim(),
-      price: parseFloat(vn.price) || 0,
-      deliveryDays: parseInt(vn.deliveryDays) || 0,
-      notes: (vn.notes || "").toString().trim(),
-      specifications: Array.isArray(vn.specifications)
-        ? vn.specifications.filter(s => s.key && s.key.trim()).map(s => ({ key: s.key.trim(), value: (s.value || "").trim() }))
-        : []
-    }));
-};
+/* normaliseVariantNicknames is imported from rawItemPayload.service.js
+   (its object-shaped vendor fix now lives there — 27 Sep 2026). */
 
 // Map of unit name → { baseUnit, conversions: [{toUnit, factor}] }, resolved
 // from the Unit master — the SAME source R&D's raw-item unit picker reads
