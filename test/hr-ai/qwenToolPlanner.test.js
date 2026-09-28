@@ -5,6 +5,7 @@ process.env.TEST_WITHOUT_MONGO = "1";
 const {
   planToolQuestion,
   validateArguments,
+  groundEntityArguments,
   recentContext,
   STATUS,
   CONTROL,
@@ -95,6 +96,94 @@ test("arguments fail closed on missing required, extra or invalid fields", () =>
   expect(validateArguments({ department: "HR" }, schema)).toBeNull();
   expect(validateArguments({ date: "26/09/2026" }, schema)).toBeNull();
   expect(validateArguments({ date: "2026-09-26", database: "employees" }, schema)).toBeNull();
+});
+
+test("invented entity filters are removed before any data read", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      employeeName: { type: "string" },
+      department: { type: "string" },
+      limit: { type: "integer" },
+    },
+  };
+  expect(groundEntityArguments(
+    { employeeName: "John Doe", department: "Human Resources", limit: 10 },
+    schema,
+    "show everyone in HR",
+    {},
+  )).toEqual({ department: "Human Resources", limit: 10 });
+});
+
+test("an optional date is removed when the user asked for no period", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      employeeName: { type: "string" },
+      date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+    },
+    required: ["employeeName"],
+  };
+  expect(groundEntityArguments(
+    { employeeName: "Arpita Das", date: "2026-09-27" },
+    schema,
+    "father of Arpita Das",
+    {},
+  )).toEqual({ employeeName: "Arpita Das" });
+  expect(groundEntityArguments(
+    { employeeName: "Arpita Das", date: "2026-09-26" },
+    schema,
+    "attendance of Arpita Das yesterday",
+    {},
+  )).toEqual({ employeeName: "Arpita Das", date: "2026-09-26" });
+});
+
+test("a hallucinated required person fails closed but validated follow-up state is allowed", () => {
+  const schema = {
+    type: "object",
+    properties: { employeeName: { type: "string" } },
+    required: ["employeeName"],
+  };
+  expect(groundEntityArguments({ employeeName: "John Doe" }, schema, "show the employee", {})).toBeNull();
+  expect(groundEntityArguments(
+    { employeeName: "Priya Shah" },
+    schema,
+    "what about their attendance?",
+    { previousPlan: { arguments: { employeeName: "Priya Shah" } } },
+  )).toEqual({ employeeName: "Priya Shah" });
+});
+
+test("the route contract treats a relationship of a named person as a person-record request", async () => {
+  const employeeTool = {
+    name: "hr_employee",
+    description: "Complete authorised record for one named employee, including family fields.",
+    parameters: {
+      type: "object",
+      properties: {
+        employeeName: { type: "string" },
+        requestedField: { type: "string", enum: ["fatherName", "primaryManager", "fullRecord"] },
+      },
+      required: ["employeeName", "requestedField"],
+    },
+  };
+  const calls = [];
+  const ask = jest.fn(async (request) => {
+    calls.push(request);
+    if (request.schema.properties.choice) {
+      return { model: "qwen-test", data: { choice: "hr_employee", clarification: null } };
+    }
+    return { model: "qwen-test", data: { employeeName: "Arpita Das", requestedField: "fatherName" } };
+  });
+  const result = await planToolQuestion(
+    { question: "father of Arpita Das", tools: [employeeTool] },
+    { chatJson: ask },
+  );
+  expect(result).toMatchObject({
+    status: STATUS.OK,
+    tool: "hr_employee",
+    arguments: { employeeName: "Arpita Das", requestedField: "fatherName" },
+  });
+  expect(calls[0].system).toContain("parent");
 });
 
 test("recent context contains user words and validated state, never assistant prose", () => {

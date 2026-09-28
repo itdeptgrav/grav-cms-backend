@@ -335,10 +335,23 @@ test("18 · a client-supplied replacement item is never accepted at issue time",
 
 test("16 · the queue groups reservations and unreserved approved lines", async () => {
   const s = await seed({ stockQty: 20, requestedQty: 10 });
-  // Before reserving, the approved stock line is "Ready to reserve".
+  /* ── "READY TO RESERVE" IS GONE ──────────────────────────────────────────
+     Approval now attempts the hold (autoReservation.service), so a line with
+     no hold is no longer "waiting for somebody to reserve it" — it is a line
+     whose attempt found something, or that nobody has attempted.
+
+     This fixture builds the MRF directly, so no approval path ran and no
+     attempt was recorded: that is exactly the pre-existing-request case, and
+     it belongs in Needs attention with a retry. It is deliberately NOT Short —
+     there are 20 on the shelf, and calling it short would raise a purchase
+     nobody needs. */
   const q0 = await call(s.store, `/reservations/queue`);
   expect(q0.status).toBe(200);
-  expect(q0.body.queue.rows.some((row) => row.mrfLineId === s.itemId && row.group === "READY_TO_RESERVE")).toBe(true);
+  const row0 = q0.body.queue.rows.find((row) => row.mrfLineId === s.itemId);
+  expect(row0.group).toBe("NEEDS_ATTENTION");
+  expect(row0.autoReserve.reason).toBe("NEVER_ATTEMPTED");
+  expect(row0.autoReserve.retryable).toBe(true);
+  expect(q0.body.queue.groups.READY_TO_RESERVE).toBeUndefined();
   // After a full reservation it becomes "Ready to pick".
   await reserve(s, [alloc(s, s.locA, 10)]);
   const q1 = await call(s.store, `/reservations/queue?group=READY_TO_PICK`);

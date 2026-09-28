@@ -30,6 +30,7 @@ const {
 } = require("../../models/CMS_Models/Merchandising/TnaPlan");
 const plans = require("./tnaPlan.service");
 const cal = require("./tnaCalendar");
+const sourceEvents = require("./tnaSourceEvents");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
@@ -66,6 +67,14 @@ const PORTFOLIO_VIEWS = Object.freeze({
      population that flag describes instead of filtering a page of rows in
      the browser and reporting a number that is only the first page's. */
   "awaiting-source": null,
+  /* ── THE INTEGRATION GAP, AS A POPULATION ─────────────────────────────
+     A milestone declared automatic whose event NOTHING in GRAV publishes.
+     It is not late and nobody has failed to act: it is disconnected, and
+     it cannot be completed by hand either, because `SOURCE_EVENT` forbids
+     that. Named as a view for the same reason `awaiting-source` is — so
+     the count of them opens the rows it counted rather than being a figure
+     with nothing behind it. */
+  "not-integrated": null,
   all: null,
 });
 
@@ -76,7 +85,23 @@ const VIEW_CLAUSES = Object.freeze({
     actualDate: null,
     status: { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] },
   },
+  "not-integrated": {
+    ...sourceEvents.onlyUnintegrated(),
+    status: { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] },
+  },
 });
+
+/* ── THE EXCEPTION VIEWS EXCLUDE WHAT NOBODY CAN ACT ON ───────────────────
+   A figure in this application always opens a list of exactly the rows it
+   counted — that is the standing rule the register is built on. So the
+   exclusion cannot live in the counts alone: the VIEW has to make it too,
+   or "8 overdue" would open a list of ten. `completed` and `all` are facts
+   about the plan rather than alarms and are left whole; `awaiting-source`
+   is where a disconnected milestone honestly belongs and is left whole
+   deliberately. */
+const EXCEPTION_VIEWS = Object.freeze([
+  "due-soon", "at-risk", "overdue", "blocked", "forecast-late",
+]);
 
 const isPortfolioView = (key) => Object.keys(PORTFOLIO_VIEWS).includes(str(key));
 
@@ -142,7 +167,11 @@ async function milestoneMatch(ctx, {
   }
   const statuses = PORTFOLIO_VIEWS[str(view)];
 
-  const match = { companyId: ctx.companyId, ...(VIEW_CLAUSES[str(view)] || {}) };
+  const match = {
+    companyId: ctx.companyId,
+    ...(VIEW_CLAUSES[str(view)] || {}),
+    ...(EXCEPTION_VIEWS.includes(str(view)) ? sourceEvents.excludeUnintegrated() : {}),
+  };
   if (statuses) match.status = { $in: statuses };
   if (str(owner)) match.ownerDepartment = str(owner).toUpperCase();
   if (undated) {
@@ -334,23 +363,73 @@ const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 async function portfolioCounts(ctx) {
   assertContext(ctx);
+  /* ── THE TOTAL IS THE TOTAL; THE EXCEPTIONS ARE NOT ───────────────────
+     `all` backs a register that lists every milestone, so it counts every
+     milestone — a disconnected one is still on the plan and still has to be
+     readable. What it must not do is appear in the EXCEPTION figures: a
+     milestone whose event nothing publishes will pass its date and go
+     OVERDUE like any other, and counting it there tells a merchandiser to
+     chase work that cannot move and that they are forbidden to record.
+
+     One aggregation, grouped by status AND by whether the milestone is
+     wired, so the two answers cannot disagree about the same row. */
   const rows = await TnaMilestone.aggregate([
     { $match: { companyId: ctx.companyId } },
-    { $group: { _id: "$status", n: { $sum: 1 } } },
+    {
+      $group: {
+        _id: {
+          status: "$status",
+          /* The registry's rule, expressed once, in the shape Mongo needs. */
+          wired: {
+            $not: [{
+              $and: [
+                { $eq: ["$completionAuthority", "SOURCE_EVENT"] },
+                {
+                  $eq: [
+                    { $size: { $setIntersection: [
+                      { $ifNull: ["$sourceEventKinds", []] },
+                      sourceEvents.supportedKinds(),
+                    ] } },
+                    0,
+                  ],
+                },
+              ],
+            }],
+          },
+        },
+        n: { $sum: 1 },
+      },
+    },
   ]);
-  const byStatus = Object.fromEntries(rows.map((r) => [r._id, r.n]));
+  const wiredByStatus = {};
+  let disconnected = 0;
+  let total = 0;
+  for (const r of rows) {
+    total += r.n;
+    if (r._id.wired) wiredByStatus[r._id.status] = (wiredByStatus[r._id.status] || 0) + r.n;
+    else if (![MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE].includes(r._id.status)) {
+      disconnected += r.n;
+    }
+  }
+  /* Completed is a fact about the plan, not an exception, so it counts every
+     milestone that landed however it landed. */
+  const completedAll = rows
+    .filter((r) => r._id.status === MILESTONE_STATUS.COMPLETED)
+    .reduce((t, r) => t + r.n, 0);
+  const byStatus = wiredByStatus;
   const counts = {
     "due-soon": byStatus[MILESTONE_STATUS.DUE_SOON] || 0,
     overdue: byStatus[MILESTONE_STATUS.OVERDUE] || 0,
     blocked: byStatus[MILESTONE_STATUS.BLOCKED] || 0,
     "forecast-late": byStatus[MILESTONE_STATUS.FORECAST_LATE] || 0,
-    completed: byStatus[MILESTONE_STATUS.COMPLETED] || 0,
-    all: rows.reduce((t, r) => t + r.n, 0),
+    completed: completedAll,
+    all: total,
   };
   counts["at-risk"] = AT_RISK_STATUSES.reduce((t, st) => t + (byStatus[st] || 0), 0);
   /* What the Overview shows beside its existing four figures — the same
      population the `at-risk` view lists. */
   counts.deliveryAtRisk = counts["at-risk"];
+  counts["not-integrated"] = disconnected;
   return { counts, generatedAt: new Date() };
 }
 
@@ -383,18 +462,42 @@ const ATTENTION_STATUSES = Object.freeze([
     from the one that was counted. */
 function attentionBuckets({ today, weekEnd, myFileIds }) {
   const live = { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] };
+  /* ── A DISCONNECTED MILESTONE IS NOT SOMEBODY'S FAILURE ────────────────
+     A source-owned milestone whose event nothing publishes will pass its
+     date and go OVERDUE like any other, and counting it tells a merchandiser
+     to chase work that cannot move and that they are forbidden to record.
+     Every attention figure excludes them; the gap itself is counted
+     separately, below, where it reads as an integration problem rather than
+     as a person's. */
+  const wired = sourceEvents.excludeUnintegrated();
+  const and = (clause) => ({ ...clause, ...wired });
   return [
-    ["overdue", { status: MILESTONE_STATUS.OVERDUE }],
+    ["overdue", and({ status: MILESTONE_STATUS.OVERDUE })],
+    /* ── THE TWO DATE WINDOWS ARE NOT FILTERED, AND THAT IS A CHOICE ────
+       These two publish `view=all&from=…&to=…`, and the register's `all`
+       view is deliberately whole — every milestone on the plan is readable
+       there. Excluding here would make the figure disagree with the list it
+       opens, and a number that does not match its own rows is a worse
+       defect than a date window that includes a disconnected milestone.
+       The ALARM figures below — overdue, blocked, at risk, mine — are the
+       ones that imply somebody has failed to act, and they exclude. */
     ["dueToday", { status: live, forecastDate: today }],
     ["dueThisWeek", { status: live, forecastDate: { $gte: today, $lte: weekEnd } }],
-    ["blocked", { status: MILESTONE_STATUS.BLOCKED }],
-    ["atRisk", { status: { $in: AT_RISK_STATUSES } }],
+    ["blocked", and({ status: MILESTONE_STATUS.BLOCKED })],
+    ["atRisk", and({ status: { $in: AT_RISK_STATUSES } })],
     /* Mine is the EXCEPTIONS on my orders, not every milestone on them: this
        is an attention view, and "everything on your twelve orders" is not
        something anybody can act on before lunch. */
     ["mine", myFileIds === null
       ? null
-      : { status: { $in: ATTENTION_STATUSES }, fileId: { $in: myFileIds } }],
+      : and({ status: { $in: ATTENTION_STATUSES }, fileId: { $in: myFileIds } })],
+    /* ── AND THIS ONE IS NOT FILTERED, DELIBERATELY ────────────────────
+       "Waiting on another department's record" is where a disconnected
+       milestone honestly belongs — it IS waiting on somebody else's record,
+       and the only difference is that nobody has built the record yet.
+       Excluding them here emptied the one bucket that was telling the
+       truth about them. The exception buckets above are alarms; this is
+       not one. */
     ["awaitingOther", VIEW_CLAUSES["awaiting-source"]],
   ];
 }
@@ -442,6 +545,18 @@ async function attention(ctx, { today: askedToday } = {}) {
     counts[key] = facet[key] ? (out?.[key]?.[0]?.n || 0) : null;
   }
   counts.ordersAtRisk = out?.ordersAtRisk?.[0]?.n || 0;
+
+  /* ── THE INTEGRATION GAP, COUNTED APART FROM THE BUCKETS ──────────────
+     Outside `buckets` on purpose: every entry there is a figure with a
+     register view behind it, and this one has no list a merchandiser could
+     act on. It is not an alarm and nobody has failed to do anything — an
+     application has not been connected — so it is reported beside the
+     figures rather than among them. */
+  counts.notIntegrated = await TnaMilestone.countDocuments({
+    companyId: ctx.companyId,
+    ...sourceEvents.onlyUnintegrated(),
+    status: { $nin: [MILESTONE_STATUS.COMPLETED, MILESTONE_STATUS.NOT_APPLICABLE] },
+  });
 
   return {
     counts,

@@ -94,6 +94,17 @@ const auditSchema = new mongoose.Schema(
     previousState: { type: String, trim: true, default: "" },
     resultingState: { type: String, trim: true, default: "" },
 
+    /* ── A REQUIREMENT DELIBERATELY WITHDRAWN ───────────────────────────
+       Packing, testing and delivery instructions are optional, so a version
+       that states none of them and a version that WITHDREW one look identical
+       in the projection — there is no field for "explicitly none", and adding
+       one would hand every reader a third state to handle.
+
+       The decision therefore lives here, in the trail, which is where a
+       decision belongs. Field names, nothing else: the values are on the
+       version that stated them and stay readable there for ever. */
+    clearedRequirements: { type: [String], default: undefined },
+
     /* ── M7: which change, and which version of it ──────────────────────── */
     changeRef: { type: String, trim: true, default: "" },
     noticeId: { type: mongoose.Schema.Types.ObjectId, default: null },

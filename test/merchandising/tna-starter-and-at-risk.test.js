@@ -35,7 +35,7 @@ const Account = require("../../models/CMS_Models/Sales/Account");
 const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const { TnaTemplateVersion } = require("../../models/CMS_Models/Merchandising/TnaTemplate");
-const { TnaPlan } = require("../../models/CMS_Models/Merchandising/TnaPlan");
+const { TnaPlan, TnaMilestone } = require("../../models/CMS_Models/Merchandising/TnaPlan");
 const { WorkingCalendarVersion } = require("../../models/CMS_Models/Merchandising/WorkingCalendar");
 
 const producer = require("../../services/sales/merchandisingHandover.service");
@@ -51,7 +51,7 @@ beforeAll(async () => {
   await mongoose.connect(rs.getUri(), { dbName: "tna_starter" });
   const app = express();
   app.use(express.json());
-  for (const r of ["executionRoute", "tnaRoute", "handoverPackRoute"]) {
+  for (const r of ["executionRoute", "tnaRoute", "handoverPackRoute", "ppmRoute"]) {
     app.use("/api/cms/merchandising", require(`../../routes/CMS_Routes/Merchandising/${r}`));
   }
   await new Promise((r) => { server = app.listen(0, r); });
@@ -165,7 +165,7 @@ async function approveBaseline(call, fileId) {
 /* The starter exactly as it was first published — for the company that
    already has it. Derived from the current definition, so the only
    difference is the defect itself. */
-const LEGACY_MILESTONES = starter.MILESTONES.map((m) => (m.milestoneCode === "FINAL_INSPECTION"
+const LEGACY_MILESTONES = starter.LEGACY_STARTER_MILESTONES.map((m) => (m.milestoneCode === "FINAL_INSPECTION"
   ? { ...m, anchor: "EX_FACTORY", offsetWorkingDays: -3, scope: "FILE" }
   : m));
 const LEGACY_DEPENDENCIES = starter.DEPENDENCIES.filter((d) => !(
@@ -190,16 +190,22 @@ describe("a plan from the published starter can commit to a schedule", () => {
     const plan = await call(`/files/${fileId}/tna`);
     const undated = plan.body.milestones.filter((m) => !m.forecastDate);
     expect(undated.map((m) => m.milestoneCode)).toEqual([]);
-    /* Final inspection is per drop now, and falls before its drop's ex-factory. */
-    const fi = plan.body.milestones.filter((m) => m.milestoneCode === "FINAL_INSPECTION");
-    const ex = plan.body.milestones.filter((m) => m.milestoneCode === "EX_FACTORY");
-    expect(fi.map((m) => m.dropRef).sort()).toEqual(["D1", "D2"]);
-    for (const f of fi) {
-      const x = ex.find((e) => e.dropRef === f.dropRef);
-      expect(f.forecastDate < x.forecastDate).toBe(true);
-      /* And never before production has started. */
-      const ps = plan.body.milestones.find((m) => m.milestoneCode === "PRODUCTION_START");
-      expect(f.forecastDate > ps.forecastDate).toBe(true);
+    /* ── WHAT THE STARTER NO LONGER PLACES, AND WHY ────────────────────
+       This test used to assert that final inspection fell before its drop's
+       ex-factory and after production started. None of those three is in the
+       starter any more: each is completed by a system action no application
+       publishes, so a version containing one cannot be published — a schedule
+       must not commit to a date nothing can ever meet. They stay on the
+       company's milestone list, ready to place when their producer exists.
+
+       So the starter's plan is shorter, and this asserts that plainly rather
+       than quietly dropping the check. The anchor arithmetic those rows
+       exercised is covered directly in `tna-calendar-graph.test.js`. */
+    const placed = plan.body.milestones.map((m) => m.milestoneCode);
+    expect([...new Set(placed)].sort())
+      .toEqual(starter.STARTER_PLACEMENTS.map((p) => p.milestoneCode).sort());
+    for (const notYet of ["FINAL_INSPECTION", "EX_FACTORY", "PRODUCTION_START"]) {
+      expect(placed).not.toContain(notYet);
     }
 
     const approved = await approveBaseline(call, fileId);
@@ -236,14 +242,21 @@ describe("a company that already published the defective starter", () => {
     const actor = { name: "Starter configuration" };
     const tpl = await config.createTemplate(ctx, { body: { name: starter.STARTER_TEMPLATE }, actor });
     const cal = await WorkingCalendarVersion.findOne({ companyId: co._id, state: "PUBLISHED" }).lean();
-    const v1 = await config.createVersion(ctx, {
-      templateId: tpl.template.id, actor,
-      body: {
-        milestones: LEGACY_MILESTONES, dependencies: LEGACY_DEPENDENCIES,
-        effectiveFrom: "2026-01-01", defaultCalendarId: String(cal.calendarId),
-      },
+    /* ── WRITTEN STRAIGHT TO DISK, AND THAT IS THE POINT ────────────────
+       This version is HISTORY: what a company published before milestones
+       came from a company-controlled list. It cannot be created through
+       `createVersion` any more, because a step may no longer type its own
+       milestone name — which is exactly the defect the list fixed. Reaching
+       for the model here is not a shortcut around the new rule; the state
+       being reproduced predates it, and the repair path below must still
+       work against a company that holds one. */
+    await TnaTemplateVersion.create({
+      companyId: co._id, templateId: tpl.template.id, versionNo: 1, state: "PUBLISHED",
+      milestones: LEGACY_MILESTONES,
+      dependencies: LEGACY_DEPENDENCIES.map((d, i) => ({ ...d, dependencyRef: `DEP-${i + 1}` })),
+      effectiveFrom: "2026-01-01", effectiveTo: null,
+      defaultCalendarId: cal.calendarId, publishedAt: new Date(),
     });
-    await config.publishVersion(ctx, { templateId: tpl.template.id, versionNo: v1.version.versionNo, actor });
     return { co, templateId: tpl.template.id };
   }
 
@@ -257,45 +270,62 @@ describe("a company that already published the defective starter", () => {
     expect(refused.body.message).toMatch(/FINAL_INSPECTION/);
   }, 240000);
 
-  test("the repair publishes a corrected version and leaves version 1 exactly as it was", async () => {
+  test("the repair is reported and refused, and changes nothing at all", async () => {
+    /* ── WHY THIS REVERSED ─────────────────────────────────────────────
+       This repair republished the starter with final inspection re-anchored.
+       Six of those ten milestones can no longer be published, because nothing
+       publishes the events that would complete them — so the only version it
+       could create now is one MISSING six of the company's milestones. That is
+       not a repair, and doing it quietly would be worse than the defect.
+
+       The defect also matters less than it did: final inspection is one of the
+       six, so it is already shown as not integrated and already kept out of
+       every overdue, at-risk and next-action figure.
+
+       Re-anchoring a milestone inside a company's own published template is
+       now a decision for whoever owns that template. */
     const { co, templateId } = await legacyCompany();
     const call = caller(co, await owner(co));
 
-    /* A plan created before the repair stays pinned to version 1. */
     const earlyFile = await acceptedFile(co, call, { product: "Kurta", deliveries: ORDINARY });
     await call(`/files/${earlyFile}/tna`, { method: "POST", body: { idempotencyKey: uniq(), planStartDate: "2026-10-05" } });
     const earlyPlanBefore = await TnaPlan.findOne({ companyId: co._id }).lean();
-
     const v1Before = await TnaTemplateVersion.findOne({ companyId: co._id, templateId, versionNo: 1 }).lean();
+
     const out = await starter.seedCompany({ _id: co._id }, { apply: true });
-    expect(out.template).toEqual(expect.objectContaining({ repairedFromVersionNo: 1, versionNo: 2 }));
 
-    /* Version 1's content is untouched; only its window closed, which is what
-       publishing any successor does. */
+    /* Reported, with the six it would have lost named. */
+    expect(out.repairBlocked).toEqual(expect.objectContaining({
+      wouldLose: expect.arrayContaining(["FINAL_INSPECTION", "EX_FACTORY", "PRODUCTION_START"]),
+    }));
+    expect(out.template).toBeNull();
+
+    /* And nothing written: no version 2, version 1 byte for byte, plan untouched. */
+    expect(await TnaTemplateVersion.countDocuments({ companyId: co._id, templateId })).toBe(1);
     const v1After = await TnaTemplateVersion.findOne({ companyId: co._id, templateId, versionNo: 1 }).lean();
-    const { effectiveTo: _a, updatedAt: _b, __v: _c, ...v1BeforeContent } = v1Before;
-    const { effectiveTo: _d, updatedAt: _e, __v: _f, ...v1AfterContent } = v1After;
-    expect(v1AfterContent).toEqual(v1BeforeContent);
-    expect(v1After.state).toBe("PUBLISHED");
-
-    /* The running plan is not rewritten. */
+    expect(v1After).toEqual(v1Before);
     const earlyPlanAfter = await TnaPlan.findById(earlyPlanBefore._id).lean();
-    expect(earlyPlanAfter.templateVersionNo).toBe(1);
     expect(earlyPlanAfter.revision).toBe(earlyPlanBefore.revision);
+    expect(earlyPlanAfter.templateVersionNo).toBe(1);
+  }, 300000);
 
-    /* A NEW plan — even one that starts on a date inside version 1's original
-       window — gets the corrected version and can commit. */
-    const newFile = await acceptedFile(co, call, { product: "Hoodie", deliveries: ORDINARY });
-    await call(`/files/${newFile}/tna`, { method: "POST", body: { idempotencyKey: uniq(), planStartDate: "2026-03-02" } });
-    const newPlan = await TnaPlan.findOne({ companyId: co._id, fileId: newFile }).lean();
-    expect(newPlan.templateVersionNo).toBe(2);
-    const approved = await approveBaseline(call, newFile);
-    expect([200, 201]).toContain(approved.status);
+  test("a plan on the legacy template still reads, and its stuck milestones stay honest", async () => {
+    /* The compatibility rule, end to end: history is readable and describes
+       itself truthfully, even though none of it could be created today. */
+    const { co } = await legacyCompany();
+    const call = caller(co, await owner(co));
+    const fileId = await acceptedFile(co, call, { product: "Kurta", deliveries: ORDINARY });
+    await call(`/files/${fileId}/tna`, { method: "POST", body: { idempotencyKey: uniq(), planStartDate: "2026-10-05" } });
 
-    /* Running the seed again repairs nothing further. */
-    const again = await starter.seedCompany({ _id: co._id }, { apply: true });
-    expect(again.template).toBeNull();
-    expect(await TnaTemplateVersion.countDocuments({ companyId: co._id, templateId })).toBe(2);
+    const plan = await call(`/files/${fileId}/tna`);
+    const codes = plan.body.milestones.map((m) => m.milestoneCode);
+    /* All ten are there, including the six that could not be published now. */
+    for (const code of ["FINAL_INSPECTION", "EX_FACTORY", "PRODUCTION_START"]) {
+      expect(codes).toContain(code);
+    }
+    const stuck = plan.body.milestones.filter((m) => m.notIntegrated);
+    expect(stuck.length).toBeGreaterThan(0);
+    expect(stuck[0].integrationNote).toMatch(/not connected|does not publish|publishes/i);
   }, 300000);
 
   test("a company's own edited template is never touched by the repair", async () => {
@@ -335,8 +365,12 @@ describe("the Overview's at-risk figure opens exactly the records it counted", (
     await call(`/files/${slipping}/tna`, { method: "POST", body: { idempotencyKey: uniq(), planStartDate: "2026-11-02" } });
     expect([200, 201]).toContain((await approveBaseline(call, slipping)).status);
     const plan = await call(`/files/${slipping}/tna`);
-    const target = plan.body.milestones.find((m) => m.milestoneCode === "FABRIC_IN_HOUSE"
-      && m.forecastDate && m.baselineDate && !m.actualDate);
+    /* Any baselined, unfinished milestone will do — what is under test is the
+       at-risk figure, not which row slips. Named rows are avoided on purpose:
+       this used to pick FABRIC_IN_HOUSE, which the starter no longer places
+       because nothing publishes the event that would complete it. */
+    const target = plan.body.milestones.find((m) => m.forecastDate && m.baselineDate && !m.actualDate);
+    expect(target).toBeDefined();
     const later = new Date(new Date(`${target.baselineDate}T00:00:00Z`).getTime() + 12 * 86400000)
       .toISOString().slice(0, 10);
     const reason = (await call("/tna/reason-codes")).body;
@@ -369,5 +403,282 @@ describe("the Overview's at-risk figure opens exactly the records it counted", (
     const fl = (await call("/tna/portfolio?view=forecast-late&limit=200")).body.rows;
     const key = (r) => `${r.fileId}:${r.milestoneRef}`;
     expect(rows.map(key).sort()).toEqual([...overdue, ...fl].map(key).sort());
+  }, 300000);
+});
+
+/* ══ 3 — THE TWO WIRED MOMENTS, ON A REAL STARTER PLAN ════════════════════ */
+
+describe("a starter plan's milestones close from their own source records", () => {
+  /**
+   * ── WHAT THIS EXISTS TO CATCH ──────────────────────────────────────────
+   * The production-readiness meeting and the execution pack both publish an
+   * event, and Time & Action consumes both. They were wired, tested against
+   * synthetic events, and then not placed in any real plan: the starter
+   * template was still derived from a ten-row snapshot written before the
+   * publication rule, so a newly seeded company's schedule had no milestone for
+   * either. Wired end to end, and used by nobody.
+   *
+   * So this uses the REAL seeded starter, drives the REAL services, and proves
+   * the two milestones close separately — the meeting from its issued minutes,
+   * the pack from its submitted version — each carrying a reference back to the
+   * record that closed it.
+   */
+  /** The starter, a file, a baselined plan, and the two people who act. */
+  async function readyFile() {
+    const co = await Acc_Company.create({
+      companyName: `Wired Co ${++seq}`, booksFromDate: new Date("2026-04-01"),
+    });
+    await starter.seedCompany({ _id: co._id }, { apply: true });
+    /* ── TWO PEOPLE, BECAUSE THE PRODUCT INSISTS ────────────────────────
+       Minutes are issued by somebody other than the person who took them, and
+       a pack is submitted by somebody other than the person who prepared it.
+       One actor here returns 409 `PPM_SELF_ISSUE`, which is the rule working. */
+    const maker = await owner(co);
+    const checker = await owner(co);
+    const call = caller(co, maker);
+    const asChecker = caller(co, checker);
+    const fileId = await acceptedFile(co, call, { product: "Utility Shirt", deliveries: ORDINARY });
+    await call(`/files/${fileId}/tna`, {
+      method: "POST", body: { idempotencyKey: uniq(), planStartDate: "2026-10-05" },
+    });
+    expect([200, 201]).toContain((await approveBaseline(call, fileId)).status);
+    return { co, call, asChecker, maker, checker, fileId, planCompany: co._id };
+  }
+
+  /**
+   * ── THE PACK'S OWN GATE, SATISFIED THE REAL WAY ────────────────────────
+   * A pack cannot be submitted until this order's materials, packaging and
+   * development work are each approved. That is the product's rule and it is
+   * not worked around here — the three revisions are created and approved
+   * through the real service, by a maker and a different checker.
+   *
+   * It also makes this test a truer end to end than it looks: those same three
+   * approvals publish the three events that close the starter's other three
+   * milestones. So by the time the pack is submitted, five of the plan's five
+   * milestones have closed from five separate records, and none of them was
+   * ticked by hand.
+   */
+  /** The least a revision of each family can honestly say about this order. */
+  const ROW = Object.freeze({
+    MATERIAL_TRIM: {
+      group: "FABRIC", componentCode: "FAB-TWILL-240", componentName: "Cotton twill 240gsm",
+      colourOrShade: "Indigo", placement: "Body, sleeves, collar",
+    },
+    PACKAGING: {
+      group: "POLYBAG", componentCode: "PB-RECYCLED-01", componentName: "Recycled polybag",
+      sizeOrDimension: "300 x 400mm",
+    },
+    DEVELOPMENT: {
+      requirementType: "PRE_PRODUCTION_SAMPLE", title: "Confirm the size M cuff opening",
+      brief: "The PP sample measured 5mm wide at the cuff on size M. Correct the pattern before cutting.",
+      requiredByDate: "2026-10-20", responsibleApplication: "PRODUCT_DEVELOPMENT",
+    },
+  });
+
+  async function approveTheThree(co, fileId, makerActor, checkerActor) {
+    const selection = require("../../services/merchandising/selection.service");
+    const ctx = { companyId: co._id };
+    for (const family of ["MATERIAL_TRIM", "PACKAGING", "DEVELOPMENT"]) {
+      // eslint-disable-next-line no-await-in-loop
+      await selection.createDraft({ ...ctx }, {
+        fileId, family, actor: makerActor, idempotencyKey: uniq(),
+      }).catch(() => {});
+      // eslint-disable-next-line no-await-in-loop
+      const current = await selection.getCurrent(ctx, { fileId, family });
+      if (!current?.working) continue;
+
+      /* One row each, because a revision with none cannot be submitted — the
+         gate is about the order being described, not about the count. */
+      // eslint-disable-next-line no-await-in-loop
+      await selection.addRow(ctx, {
+        fileId, family, actor: makerActor,
+        body: { ...ROW[family], expectedRevision: current.working.revision },
+      });
+      // eslint-disable-next-line no-await-in-loop
+      const withRow = await selection.getCurrent(ctx, { fileId, family });
+      // eslint-disable-next-line no-await-in-loop
+      await selection.submit(ctx, {
+        fileId, family, actor: makerActor, idempotencyKey: uniq(),
+        body: { expectedRevision: withRow.working.revision },
+      });
+      // eslint-disable-next-line no-await-in-loop
+      const submitted = await selection.getCurrent(ctx, { fileId, family });
+      // eslint-disable-next-line no-await-in-loop
+      await selection.approve(ctx, {
+        fileId, family, actor: checkerActor, idempotencyKey: uniq(),
+        body: { expectedRevision: submitted.working.revision },
+      });
+    }
+    /* The approvals are announced through the outbox; carry them now. */
+    await require("../../services/integration/tnaSourceDelivery.service")
+      .deliverPending({ companyId: co._id, limit: 50 });
+  }
+
+  const milestones = async (call, fileId) => (await call(`/files/${fileId}/tna`)).body.milestones;
+  const find = (rows, code) => rows.find((m) => m.milestoneCode === code);
+
+  test("the starter places both, and the meeting comes before the handover", async () => {
+    const { call, asChecker, fileId, planCompany } = await readyFile();
+    const rows = await milestones(call, fileId);
+
+    const meeting = find(rows, "PP_MEETING_HELD");
+    const handover = find(rows, "PPC_HANDOVER");
+    expect(meeting).toBeDefined();
+    expect(handover).toBeDefined();
+    /* The order the work happens in: the meeting settles how the order will be
+       made, and the pack goes to production planning afterwards. */
+    expect(meeting.forecastDate < handover.forecastDate).toBe(true);
+    /* Both open, and neither is "not integrated" — each has a live producer. */
+    for (const m of [meeting, handover]) {
+      expect(m.actualDate).toBeFalsy();
+      expect(m.notIntegrated).toBeFalsy();
+    }
+  }, 300000);
+
+  test("issuing the minutes closes the meeting milestone and ONLY that one", async () => {
+    const { call, asChecker, fileId, planCompany } = await readyFile();
+
+    /* Draft → written up → conducted → issued, through the real routes. */
+    await call(`/files/${fileId}/ppm`, { method: "POST", body: { idempotencyKey: uniq() } });
+    let ppm = (await call(`/files/${fileId}/ppm`)).body;
+    await call(`/files/${fileId}/ppm`, {
+      method: "PATCH",
+      body: {
+        expectedRevision: ppm.working.revision,
+        actualMeetingAt: "2026-10-12T09:30:00.000Z",
+        locationOrMode: "Factory meeting room 2",
+        chairperson: "Production Manager",
+        attendees: [{ name: "A Merchandiser", department: "MERCHANDISING", role: "Merchandiser" }],
+      },
+    });
+    ppm = (await call(`/files/${fileId}/ppm`)).body;
+    await call(`/files/${fileId}/ppm/conduct`, {
+      method: "POST", body: { idempotencyKey: uniq(), expectedRevision: ppm.working.revision },
+    });
+    ppm = (await call(`/files/${fileId}/ppm`)).body;
+    const issued = await asChecker(`/files/${fileId}/ppm/issue`, {
+      method: "POST", body: { idempotencyKey: uniq(), expectedRevision: ppm.working.revision },
+    });
+    expect(issued.status).toBe(200);
+    /* The route says the milestone closed, rather than the test assuming it. */
+    expect(issued.body.timeAndAction).toMatchObject({ closed: true, retrying: false });
+
+    const rows = await milestones(call, fileId);
+    const meeting = find(rows, "PP_MEETING_HELD");
+    expect(meeting.status).toBe("COMPLETED");
+    expect(meeting.actualDate).toBeTruthy();
+
+    /* ── THE POINT: nothing else moved ──────────────────────────────────
+       The pack milestone is a DIFFERENT record's business and is still open. */
+    expect(find(rows, "PPC_HANDOVER").actualDate).toBeFalsy();
+    expect(find(rows, "PPC_HANDOVER").status).not.toBe("COMPLETED");
+
+    /* And the completion is traceable back to the minutes that closed it —
+       no actor, because nobody signed for it by hand. */
+    const stored = await TnaMilestone.findOne({
+      companyId: planCompany, milestoneCode: "PP_MEETING_HELD",
+    }).lean();
+    expect(stored.completion).toMatchObject({
+      sourceEventKind: "merchandising.pre_production_meeting.issued",
+    });
+    expect(stored.completion.sourceRecordRef).toBeTruthy();
+    expect(stored.completion.sourceRecordVersion).toBe(issued.body.versionNo);
+    expect(stored.completedBy).toBeFalsy();
+  }, 300000);
+
+  test("submitting the pack closes the handover milestone and ONLY that one", async () => {
+    const { co, call, asChecker, maker, checker, fileId, planCompany } = await readyFile();
+    await approveTheThree(co, fileId, maker, checker);
+
+    await call(`/files/${fileId}/pack`, { method: "POST", body: { idempotencyKey: uniq() } });
+    const opened = (await call(`/files/${fileId}/pack`)).body;
+    await call(`/files/${fileId}/pack/refresh`, {
+      method: "POST", body: { expectedRevision: opened.pack?.revision },
+    });
+    const draft = (await call(`/files/${fileId}/pack`)).body;
+    const submitted = await asChecker(`/files/${fileId}/pack/submit`, {
+      method: "POST",
+      body: {
+        idempotencyKey: uniq(), declarationAcknowledged: true,
+        expectedRevision: draft.pack?.revision,
+      },
+    });
+    /* The body is in the message on failure: a pack refusal names its gates, and
+       reading them beats guessing which one bit. */
+    expect(submitted.status === 200 ? "submitted" : JSON.stringify(submitted.body))
+      .toBe("submitted");
+    expect(submitted.body.timeAndAction).toMatchObject({ closed: true, retrying: false });
+
+    const rows = await milestones(call, fileId);
+    expect(find(rows, "PPC_HANDOVER").status).toBe("COMPLETED");
+    /* The meeting was never held, and submitting a pack does not pretend it was. */
+    expect(find(rows, "PP_MEETING_HELD").actualDate).toBeFalsy();
+
+    const stored = await TnaMilestone.findOne({
+      companyId: planCompany, milestoneCode: "PPC_HANDOVER",
+    }).lean();
+    expect(stored.completion).toMatchObject({
+      sourceEventKind: "merchandising.execution_pack.submitted",
+    });
+    expect(stored.completion.sourceRecordRef).toBeTruthy();
+    expect(stored.completedBy).toBeFalsy();
+  }, 300000);
+
+  test("both, in order, close two different milestones from two different records", async () => {
+    const { co, call, asChecker, maker, checker, fileId, planCompany } = await readyFile();
+    await approveTheThree(co, fileId, maker, checker);
+
+    await call(`/files/${fileId}/ppm`, { method: "POST", body: { idempotencyKey: uniq() } });
+    let ppm = (await call(`/files/${fileId}/ppm`)).body;
+    await call(`/files/${fileId}/ppm`, {
+      method: "PATCH",
+      body: {
+        expectedRevision: ppm.working.revision,
+        actualMeetingAt: "2026-10-12T09:30:00.000Z",
+        locationOrMode: "Factory meeting room 2",
+        chairperson: "Production Manager",
+        attendees: [{ name: "A Merchandiser", department: "MERCHANDISING", role: "Merchandiser" }],
+      },
+    });
+    ppm = (await call(`/files/${fileId}/ppm`)).body;
+    await call(`/files/${fileId}/ppm/conduct`, {
+      method: "POST", body: { idempotencyKey: uniq(), expectedRevision: ppm.working.revision },
+    });
+    ppm = (await call(`/files/${fileId}/ppm`)).body;
+    await asChecker(`/files/${fileId}/ppm/issue`, {
+      method: "POST", body: { idempotencyKey: uniq(), expectedRevision: ppm.working.revision },
+    });
+
+    await call(`/files/${fileId}/pack`, { method: "POST", body: { idempotencyKey: uniq() } });
+    const opened = (await call(`/files/${fileId}/pack`)).body;
+    await call(`/files/${fileId}/pack/refresh`, {
+      method: "POST", body: { expectedRevision: opened.pack?.revision },
+    });
+    const draft = (await call(`/files/${fileId}/pack`)).body;
+    expect((await asChecker(`/files/${fileId}/pack/submit`, {
+      method: "POST",
+      body: {
+        idempotencyKey: uniq(), declarationAcknowledged: true,
+        expectedRevision: draft.pack?.revision,
+      },
+    })).status).toBe(200);
+
+    const rows = await milestones(call, fileId);
+    const meeting = find(rows, "PP_MEETING_HELD");
+    const handover = find(rows, "PPC_HANDOVER");
+    expect([meeting.status, handover.status]).toEqual(["COMPLETED", "COMPLETED"]);
+
+    /* Two records, two kinds, two different dates — not one event closing both. */
+    const companyId = planCompany;
+    const both = await TnaMilestone.find({
+      companyId, milestoneCode: { $in: ["PP_MEETING_HELD", "PPC_HANDOVER"] },
+    }).lean();
+    const kinds = both.map((m) => m.completion?.sourceEventKind).sort();
+    expect(kinds).toEqual([
+      "merchandising.execution_pack.submitted",
+      "merchandising.pre_production_meeting.issued",
+    ]);
+    const refs = both.map((m) => String(m.completion?.sourceRecordRef || ""));
+    expect(new Set(refs).size).toBe(2);
   }, 300000);
 });

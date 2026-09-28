@@ -143,7 +143,7 @@ function assertContext(ctx) {
 /* ═══ ALLOWLISTED VIEWS ════════════════════════════════════════════════════ */
 
 /** What Merchandising may be told about one handover version. */
-function handoverView(version, receipt, { referenceImages = [] } = {}) {
+function handoverView(version, receipt, { references = null } = {}) {
   const p = version.executionProjection || {};
   const deliveries = (p.deliveries || []).map((d) => ({
     dropRef: str(d.dropRef),
@@ -219,11 +219,20 @@ function handoverView(version, receipt, { referenceImages = [] } = {}) {
         })),
       }
       : null,
-    /* The immutable Sales projection deliberately carries no image. When
-       Sales linked this order to a released Development file, its request is
-       the attributed source of the garment references. These are joined at
-       read time rather than copied into the confirmed order. */
-    referenceImages,
+    /* The immutable Sales projection deliberately carries no image. When this
+       order resolves to a released Development record, that record's Sales
+       request is the attributed source of the garment references — joined at read
+       time through the link recorded on the Execution File, never copied into the
+       confirmed order.
+
+       `referenceImageSource` says WHY there are none when there are none: a
+       handover issued before styles had a stable identity and a style with no
+       development record are different facts, and a screen that cannot tell them
+       apart can only show a blank. */
+    referenceImages: references?.images || [],
+    referenceImageSource: references
+      ? { reason: str(references.reason), ...(references.source ? { record: references.source } : {}) }
+      : null,
     receiptState: computeReceiptState(version, receipt),
     clarification: receipt?.state === "CLARIFICATION_REQUESTED"
       ? {
@@ -253,7 +262,7 @@ function computeReceiptState(version, receipt) {
 }
 
 /** What Merchandising may be told about one Execution File. */
-function fileView(file, { units = null, referenceImages = [] } = {}) {
+function fileView(file, { units = null, references = null } = {}) {
   const p = file.currentExecutionProjection || {};
   const deliveries = (p.deliveries || []).map((d) => ({
     dropRef: str(d.dropRef),
@@ -292,7 +301,20 @@ function fileView(file, { units = null, referenceImages = [] } = {}) {
     packingRequirement: str(p.packingRequirement),
     testingRequirement: str(p.testingRequirement),
     deliveryRequirement: str(p.deliveryRequirement),
-    referenceImages,
+    /* The immutable Sales projection deliberately carries no image. When this
+       order resolves to a released Development record, that record's Sales
+       request is the attributed source of the garment references — joined at read
+       time through the link recorded on the Execution File, never copied into the
+       confirmed order.
+
+       `referenceImageSource` says WHY there are none when there are none: a
+       handover issued before styles had a stable identity and a style with no
+       development record are different facts, and a screen that cannot tell them
+       apart can only show a blank. */
+    referenceImages: references?.images || [],
+    referenceImageSource: references
+      ? { reason: str(references.reason), ...(references.source ? { record: references.source } : {}) }
+      : null,
     lifecycleStatus: str(file.lifecycleStatus),
     lifecycleReason: str(file.lifecycleReason),
     executionPhase: str(file.executionPhase),
@@ -326,34 +348,36 @@ function fileView(file, { units = null, referenceImages = [] } = {}) {
 }
 
 /**
- * Product references attached to the exact Development file named by the
- * handover. No style-code fallback: a similarly named style is not evidence
- * that the buyer attached these pictures to this order.
+ * THE BUYER'S PRODUCT REFERENCES — through the one authoritative link.
+ *
+ * ── WHAT THIS REPLACED, AND WHY IT SHOWED NOTHING ───────────────────────────
+ * It read `SalesHandoverVersion.developmentReference.developmentFileId`. Nothing
+ * in the live Sales issue has ever written that field — only the complete-order
+ * demo stamps it — so on a real order this returned an empty array every time,
+ * and the screen showed no pictures with no explanation. The demo looked
+ * connected; the product was not.
+ *
+ * Stamping it from Sales would have been the wrong repair: a Development File id
+ * is a Merchandising record, and handing Sales a handle on one is what the
+ * ownership boundary exists to prevent. So Merchandising joins its own two
+ * records, by the stable `sampleStyleId`, and records the result on the Execution
+ * File — the SAME resolution the BOM lineage uses, in one place, in
+ * `developmentAdoption.service.js`.
+ *
+ * `reason` is returned rather than swallowed: "this handover predates stable style
+ * identities" and "no development record exists for this style" are different
+ * facts, and a screen that cannot tell them apart can only say nothing.
  */
-async function developmentReferences(version) {
-  const developmentFileId = version?.developmentReference?.developmentFileId;
-  if (!developmentFileId) return [];
-
-  const file = await DevelopmentFile.findOne({
-    _id: developmentFileId,
-    companyId: version.companyId,
-  }).select("currentRequestId developmentNumber").lean();
-  if (!file?.currentRequestId) return [];
-
-  const request = await SalesDevelopmentRequest.findOne({
-    _id: file.currentRequestId,
-    companyId: version.companyId,
-  }).select("referenceImages").lean();
-
-  return (request?.referenceImages || [])
-    .filter((image) => str(image?.url))
-    .map((image) => ({
-      url: str(image.url),
-      caption: str(image.caption),
-      source: file.developmentNumber
-        ? `Development file ${str(file.developmentNumber)}`
-        : "Linked Development file",
-    }));
+async function developmentReferences(ctx, { version = null, file = null } = {}) {
+  const adoption = require("./developmentAdoption.service");
+  /* The version is passed so the resolver can use the EXACT key — the journey and
+     product line behind this order — rather than the style alone, which is not
+     unique. Nothing here writes: see `referenceImagesFor`. */
+  return adoption.referenceImagesFor(ctx, {
+    file,
+    version,
+    projection: file ? null : (version?.executionProjection || null),
+  });
 }
 
 function unitView(unit) {
@@ -522,7 +546,7 @@ async function getHandover(ctx, { id } = {}) {
   const version = await SalesHandoverVersion.findOne({ _id: id, companyId: ctx.companyId }).lean();
   if (!version) throw fail("NOT_FOUND", "Handover not found.");
 
-  const [receipt, lineage, lineReceipts, referenceImages] = await Promise.all([
+  const [receipt, lineage, lineReceipts, references] = await Promise.all([
     HandoverReceipt.findOne({ companyId: ctx.companyId, handoverVersionId: version._id }).lean(),
     SalesHandoverVersion.find({
       companyId: ctx.companyId,
@@ -534,12 +558,12 @@ async function getHandover(ctx, { id } = {}) {
       handoverRef: version.handoverRef,
       handoverLineRef: version.handoverLineRef,
     }).lean(),
-    developmentReferences(version),
+    developmentReferences(ctx, { version }),
   ]);
   const receiptByVersion = new Map(lineReceipts.map((r) => [str(r.handoverVersionId), r]));
 
   return {
-    handover: handoverView(version, receipt, { referenceImages }),
+    handover: handoverView(version, receipt, { references }),
     lineage: lineage.map((v) => {
       const r = receiptByVersion.get(str(v._id));
       return {
@@ -671,6 +695,64 @@ async function acceptHandover(ctx, { id, actor = null } = {}) {
         resultingState: file.lifecycleStatus,
         details: { versionNo: version.versionNo, change: "accepted a newer handover version" },
       });
+    }
+
+    /* ── THE DEVELOPMENT LINEAGE IS DECIDED HERE, ONCE ───────────────────────
+       Acceptance is where this order gains its identity, so it is where the
+       Development record behind it is resolved and recorded — inside this
+       transaction, audited with everything else, and never again.
+
+       It used to be resolved by whoever READ the order first: opening the file or
+       refreshing its images wrote the link, with the failure swallowed. That put a
+       decision about an order's lineage in a GET and made it invisible when it did
+       not happen.
+
+       A refusal here does NOT fail the acceptance. An ambiguous or absent
+       Development record is an ordinary state — most orders never went through
+       development — and the reason is recorded so the file can say why it has no
+       lineage instead of looking as though nobody checked. */
+    if (!str(file.developmentReference?.developmentFileId)) {
+      const adoption = require("./developmentAdoption.service");
+      const found = await adoption.developmentFileFor(ctx, {
+        projection: version.executionProjection, version,
+      });
+      if (found.devFile) {
+        const linked = await adoption.recordDevelopmentFileLink(ctx, file, found.devFile, { session });
+        if (linked.recorded) {
+          /* Re-read onto the in-memory document so the response and anything
+             later in this transaction see the link. */
+          file.developmentReference = {
+            ...(file.developmentReference || {}),
+            developmentFileId: found.devFile._id,
+            developmentNumber: str(found.devFile.developmentNumber),
+          };
+          audits.push({
+            companyId: ctx.companyId, recordType: "EXECUTION_FILE",
+            recordId: file._id, recordRevision: file.revision,
+            action: "FILE_UPDATED", actor: actor || undefined, source: "merchandising",
+            at: now, correlationId,
+            resultingState: file.lifecycleStatus,
+            details: {
+              change: "recorded the Development record this order came from",
+              developmentNumber: str(found.devFile.developmentNumber),
+              resolvedBy: str(found.key),
+            },
+          });
+        }
+      } else if (found.reason) {
+        audits.push({
+          companyId: ctx.companyId, recordType: "EXECUTION_FILE",
+          recordId: file._id, recordRevision: file.revision,
+          action: "FILE_UPDATED", actor: actor || undefined, source: "merchandising",
+          at: now, correlationId,
+          resultingState: file.lifecycleStatus,
+          details: {
+            change: "no Development record could be linked",
+            reason: str(found.reason),
+            ...(found.candidates ? { candidateCount: found.candidates.length } : {}),
+          },
+        });
+      }
     }
 
     await syncUnits({ file, version, session });
@@ -1029,8 +1111,10 @@ async function getFile(ctx, { id } = {}) {
       companyId: ctx.companyId,
     }).lean(),
   ]);
-  const referenceImages = version ? await developmentReferences(version) : [];
-  return { file: fileView(file, { units, referenceImages }) };
+  /* The file is passed, so the link is read from the file where it has already
+     been recorded and resolved (and recorded) exactly once where it has not. */
+  const references = await developmentReferences(ctx, { file, version });
+  return { file: fileView(file, { units, references }) };
 }
 
 /* ═══ FILE COMMANDS ════════════════════════════════════════════════════════ */
@@ -1354,6 +1438,13 @@ async function executionOverview(ctx) {
       /* The at-risk definition, shared with the register view this figure
          opens — see tnaPortfolio.service. */
       status: { $in: [...require("./tnaPortfolio.service").AT_RISK_STATUSES] },
+      /* ── AND THE SAME EXCLUSION THAT VIEW MAKES ────────────────────
+         A milestone whose source application does not exist will go
+         OVERDUE like any other once its date passes. The register's
+         at-risk view omits it — nobody can act on it and nobody may
+         record it — so this figure must omit it too, or the Overview
+         would show eleven and open a list of five. */
+      ...require("./tnaSourceEvents").excludeUnintegrated(),
     }),
     /* ── M6 ────────────────────────────────────────────────────────────
        Packs sent downstream and not yet decided on. Counted from the PACK,

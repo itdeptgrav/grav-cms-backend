@@ -46,6 +46,7 @@ const {
 const config = require("./tnaConfig.service");
 const graph = require("./tnaGraph");
 const cal = require("./tnaCalendar");
+const sourceEvents = require("./tnaSourceEvents");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
@@ -234,6 +235,20 @@ function milestoneView(m) {
     merchandisingMayComplete: m.completionAuthority === COMPLETION_AUTHORITY.MERCHANDISING,
     awaitingSource: Boolean(sourceOwned && !m.actualDate),
     sourceEventKinds: (m.sourceEventKinds || []).map(str),
+    /* ── WAITING FOR SOMETHING, OR WAITING FOR NOTHING ──────────────────
+       A source-owned milestone whose event no application publishes is not
+       late and nobody is sitting on it: it is disconnected, and until a
+       producer exists nothing can ever close it — nor may anybody close it
+       by hand, which is the whole point of `SOURCE_EVENT`.
+
+       Computed here, from the one server-side registry, so a screen never
+       maintains its own list of which integrations are live. The plain
+       sentence travels with it for the same reason. */
+    integration: sourceEvents.milestoneIntegration(m).integration,
+    notIntegrated: sourceOwned && sourceEvents.isNotIntegrated(m),
+    integrationNote: sourceOwned && sourceEvents.isNotIntegrated(m)
+      ? sourceEvents.milestoneIntegration(m).sentence
+      : "",
     scopeKind: str(m.scopeKind),
     dropRef: str(m.dropRef),
     unitDiscriminator: str(m.unitDiscriminator),

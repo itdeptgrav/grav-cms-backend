@@ -656,6 +656,11 @@ async function applyReceipt({
     documentNumber: str(doc.documentRef),
     stockMeta: (pl) => ({
       reason: "Customer-supplied material receipt",
+      /* Explicit ownership on the physical movement: these goods are the
+         customer's, physically held by us. The valuation engine reads this to
+         exclude them from company inventory value and company-owned on-hand
+         while leaving RawItem.quantity — the physical total — untouched. */
+      ownership: "CUSTOMER",
       /* `notes` carries the provenance a stock-ledger reader sees. It names the
          customer and the order, and never a supplier — a stock transaction that
          said "supplier: <customer>" would turn a buyer into a vendor in every

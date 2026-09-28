@@ -70,6 +70,18 @@ const stockTransactionSchema = new mongoose.Schema(
     variantCombination: [{ type: String }],
     variantId:          { type: mongoose.Schema.Types.ObjectId },
 
+    /* ── WHOSE GOODS MOVED ───────────────────────────────────────────────────
+       COMPANY for the factory's own stock (the default — every purchase, MRF,
+       adjustment and return), CUSTOMER for customer-supplied material that is
+       physically held but owned by the customer. It is explicit provenance on
+       each NEW movement so the valuation engine can exclude customer property
+       from company inventory value and on-hand WITHOUT inference; historical
+       customer movements (written before this field) are recovered instead from
+       CustomerMaterialLot.movements[].stockTransactionId. RawItem.quantity stays
+       the honest PHYSICAL total either way — ownership never removes stock, only
+       decides whose it is. */
+    ownership: { type: String, enum: ["COMPANY", "CUSTOMER"], default: "COMPANY" },
+
     previousQuantity: { type: Number, default: 0 },
     newQuantity:      { type: Number, default: 0 },
 

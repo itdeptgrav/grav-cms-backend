@@ -13,6 +13,12 @@ const purchaseOrderItemSchema = new mongoose.Schema(
        Optional and additive: an order raised before this has none, and falls
        back to the whole-document behaviour it has always had. */
     spendLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* ── AND THE MATERIAL-REQUEST LINE BEHIND THAT ──────────────────────────
+       `spendLineId` says which approved line this discharges; this says which
+       material-request line the approval itself came from. Both are needed:
+       an order can then prove, line by line, that the material ordered is the
+       material somebody asked for — never by name, never by position. */
+    sourceMrfLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",
@@ -257,6 +263,41 @@ const purchaseOrderSchema = new mongoose.Schema(
          serves the lookups this field is read by. */
     },
     spendRequestNumber: { type: String, trim: true },
+
+    /* ── A2: THE NEED THIS ORDER EXISTS FOR ─────────────────────────────────
+       The spend request above proves the money was approved. It does not prove
+       the material was needed — that is the material request, and it is the
+       question nobody could answer from a purchase order before this.
+
+       Written by the server from the reloaded MRF, never from a request body.
+       The id is identity; the number and department are stored beside it so a
+       register printed years later still reads sensibly, even if a document is
+       renumbered or a department renamed. */
+    sourceMrfId: { type: mongoose.Schema.Types.ObjectId, ref: "MRF", index: true },
+    sourceMrfNumber: { type: String, trim: true },
+    sourceMrfDepartment: { type: String, trim: true },
+
+    /**
+     * ── THE RULES THIS ORDER WAS RAISED UNDER ────────────────────────────────
+     * Stamped by the server on every order raised through the governed chain,
+     * and never accepted from a client.
+     *
+     * Historical orders are stamped `LEGACY_PRE_MRF_V1` by a controlled
+     * migration. Absence is therefore NOT the legacy signal — it is the
+     * UNPROVEN signal, and an unproven order is refused from acting rather
+     * than excused. There is deliberately no default: a default would stamp
+     * every existing order on its next save and erase the very distinction
+     * the migration exists to record.
+     *
+     * Only the policies `governedPurchaseOrder.service` explicitly supports
+     * are honoured. An unknown one is refused, because a policy names the
+     * rules a record was made under, and rules this code cannot name it
+     * cannot check.
+     */
+    provenancePolicy: { type: String, trim: true, default: undefined },
+    /* When the legacy migration stamped this order, so its classification is
+       auditable rather than a bare enum somebody must take on trust. */
+    provenanceMigratedAt: { type: Date, default: undefined },
 
     /* ── Chunk 1: tenancy ───────────────────────────────────────────────────
        Declared rather than left to `strict:false`, so it is indexed and can

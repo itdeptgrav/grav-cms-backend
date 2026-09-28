@@ -48,6 +48,7 @@ const {
 const {
   MerchandisingAuditEvent, MerchandisingOutboxEvent, MerchandisingIntakeLedger, OUTBOX_KIND,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
+const sourceEvents = require("./tnaSourceEvents");
 const plans = require("./tnaPlan.service");
 const cal = require("./tnaCalendar");
 const { fail } = require("../storePurchase/errors");
@@ -55,17 +56,17 @@ const { fail } = require("../storePurchase/errors");
 const str = (v) => String(v ?? "").trim();
 
 /* ── THE KINDS T&A LISTENS FOR ─────────────────────────────────────────────
-   Read off M4's actual published contract rather than guessed at: these are
-   the three approval events M4 emits. The approval REGISTER emits none — it
-   records external approvals it does not own — so a milestone waiting on a
-   buyer's sign-off stays `AWAITING_SOURCE_RECORD` until somebody outside
-   Merchandising publishes one, and T&A says exactly that instead of
-   pretending to know. */
-const CONSUMED_KINDS = Object.freeze([
-  OUTBOX_KIND.MATERIAL_TRIM_APPROVED,
-  OUTBOX_KIND.PACKAGING_APPROVED,
-  OUTBOX_KIND.DEVELOPMENT_APPROVED,
-]);
+   Derived from `tnaSourceEvents`, which is the ONE registry of which source
+   events have a real producer. It used to be a literal array here, and a
+   second one would have grown beside it the moment a fourth producer
+   appeared — a template could then name an event this consumer had never
+   heard of and publish happily, which is exactly the state the 27 Sep audit
+   found most source-owned milestones in.
+
+   The approval REGISTER still emits none of its own: it records external
+   approvals it does not own, so a milestone waiting on a buyer's sign-off
+   stays disconnected and now says so, instead of pretending to know. */
+const CONSUMED_KINDS = Object.freeze(sourceEvents.supportedKinds());
 
 const isConsumed = (kind) => CONSUMED_KINDS.includes(str(kind));
 
@@ -224,14 +225,19 @@ async function applyEvent(event, session) {
     m.completedAt = at;
     /* No actor. Nobody completed this — a record did, and naming a person
        would put a signature on a statement they did not make. */
+    /* ── THE REFERENCE IS THE PRODUCER'S OWN SHAPE ──────────────────────
+       It read `family` / `revisionId` / `revisionNo` — M4's approval payload,
+       hardcoded. A pre-production meeting has no `revisionId` and an
+       execution pack has no `family`, so both would have closed their
+       milestone with an empty reference and nobody could get back to the
+       record that closed it. Each supported kind states where its reference
+       comes from, in the registry, beside the fact that it is supported. */
     m.completion = {
       recordedVia: "SOURCE_EVENT",
       sourceApp: "MERCHANDISING",
       sourceEventId: event._id,
       sourceEventKind: kind,
-      sourceRecordType: str(event.payload?.family),
-      sourceRecordRef: str(event.payload?.revisionId),
-      sourceRecordVersion: Number(event.payload?.revisionNo) || null,
+      ...sourceEvents.referenceFor(kind, event.payload || {}),
       /* When the SOURCE says it happened, not when we heard. */
       observedAt: event.occurredAt || event.at || event.createdAt || at,
     };

@@ -534,9 +534,75 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
     return approveFamily("PACKAGING", "Packaging");
   });
 
-  /* ── Development requirements ────────────────────────────────────────── */
+  /* ── Pre-production work required ─────────────────────────────────────────
+     TWO SOURCES, AND THE DIFFERENCE IS THE POINT.
+
+     The buyer's confirmed embroidery and wash come through the REAL suggestion and
+     adoption flow: the server reads this order's accepted Sales version, proposes
+     the two processes Sales marked REQUIRED, and a merchandiser supplies the
+     responsible team and the due date — which is exactly what the screen makes a
+     person do. The rows therefore carry a genuine Sales source reference, and a
+     reader can trace each one to the buyer's own statement.
+
+     The rest — the PP sample, the artwork approval, the test package — are
+     Merchandising's own judgement about what this order needs. Nothing in Sales
+     implies them, so they are typed here, and they are marked "Added by
+     Merchandising" on the screen for that reason.
+
+     THERE IS NO PRINT ROW. Sales confirmed printing as NOT_REQUIRED on this
+     garment — the care instruction is woven, not printed — so a print requirement
+     would contradict the order's own confirmed statement. An earlier version of
+     this seed carried one with a note explaining why it had been kept, which
+     described the test setup rather than a business reason. Conflict handling is
+     proved in `test/merchandising/sales-process-intake.route.test.js`, where it
+     belongs; a showcase order should be an order that makes sense. */
   await step("development requirements", async () => {
     await selection.createDraft(ctx, { fileId, family: "DEVELOPMENT", actor: maker, idempotencyKey: key() });
+
+    /* ── WHAT SALES CONFIRMED, ADOPTED THROUGH THE REAL COMMAND ───────────── */
+    const intake = require("../../services/merchandising/salesProcessIntake.service");
+    const offered = await intake.suggest(ctx, { fileId });
+    const suggestionFor = (process) =>
+      (offered.suggestions || []).find((s) => s.process === process);
+
+    const embroidery = suggestionFor("EMBROIDERY");
+    const wash = suggestionFor("WASHING");
+    if (!embroidery || !wash) {
+      /* Loud rather than quiet: if the proposal stops working, the demo must fail
+         on it instead of falling back to typing the rows and looking complete. */
+      throw new Error(
+        "the Sales statement did not produce the expected embroidery and wash suggestions "
+        + `(got: ${(offered.suggestions || []).map((s) => s.process).join(", ") || "none"})`,
+      );
+    }
+
+    const adopted = await intake.adopt(ctx, {
+      fileId,
+      actor: maker,
+      idempotencyKey: key(),
+      decisions: [
+        {
+          suggestionRef: embroidery.suggestionRef,
+          title: "Brand patch embroidery development",
+          brief: "Digitise the patch to the buyer artwork and prove it on bulk twill without puckering.",
+          responsibleApplication: "PRODUCT_DEVELOPMENT",
+          requiredByDate: day(4),
+        },
+        {
+          suggestionRef: wash.suggestionRef,
+          title: "Enzyme wash standard — Washed Olive",
+          brief: "Establish the wash recipe and a sealed standard the laundry and Quality both work to.",
+          responsibleApplication: "PRODUCT_DEVELOPMENT",
+          requiredByDate: day(6),
+          coordinationNote: "Two trial cycles done; shade is a half-step light against the buyer's swatch.",
+        },
+      ],
+    });
+    if (adopted.added.length !== 2) {
+      throw new Error(`adoption added ${adopted.added.length} of the 2 Sales-confirmed requirements`);
+    }
+
+    /* ── AND WHAT MERCHANDISING JUDGED THIS ORDER NEEDS ──────────────────── */
     await addRows("DEVELOPMENT", [
       {
         requirementType: "PRE_PRODUCTION_SAMPLE", requirementCode: "PPS-01",
@@ -544,19 +610,6 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
         brief: "Bulk fabric, bulk trims, bulk snaps. One size M per colourway for the PP meeting.",
         requiredByDate: day(-2), responsibleApplication: "PRODUCT_DEVELOPMENT",
         coordinationNote: "Indigo submitted; Washed Olive waits on the wash trial.",
-      },
-      {
-        requirementType: "WASH", requirementCode: "WSH-01",
-        title: "Enzyme wash standard — Washed Olive",
-        brief: "Establish the wash recipe and a sealed standard the laundry and Quality both work to.",
-        requiredByDate: day(6), responsibleApplication: "PRODUCT_DEVELOPMENT",
-        coordinationNote: "Two trial cycles done; shade is a half-step light against the buyer's swatch.",
-      },
-      {
-        requirementType: "EMBROIDERY", requirementCode: "EMB-01",
-        title: "Brand patch embroidery development",
-        brief: "Digitise the patch to the buyer artwork and prove it on bulk twill without puckering.",
-        requiredByDate: day(4), responsibleApplication: "PRODUCT_DEVELOPMENT",
       },
       {
         requirementType: "ARTWORK", requirementCode: "ART-01",
@@ -570,15 +623,6 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
         title: "Fabric and garment test package",
         brief: "Colour-fastness, shrinkage and the metal-detection pass on snap-fastened garments.",
         requiredByDate: day(12), responsibleApplication: "QUALITY",
-      },
-      {
-        requirementType: "PRINT", requirementCode: "PRN-01",
-        title: "Printed care instruction — not required on this style",
-        brief:
-          "Sales' confirmed requirement states no print on this style; the care instruction is woven. "
-          + "Recorded so the absence is visible rather than an omission, and no approved reference is expected.",
-        requiredByDate: day(12), responsibleApplication: "PRODUCT_DEVELOPMENT",
-        approvedReferenceExpected: false,
       },
     ]);
     return approveFamily("DEVELOPMENT", "Development Requirements");
@@ -648,28 +692,83 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
 
   /* ══ 4 — SCHEDULE AND HANDOVER ═════════════════════════════════════════ */
 
-  const MILESTONES = [
-    ["HANDOVER_ACCEPTED", "Sales handover accepted", "MERCHANDISING", "MERCHANDISING", 0],
-    /* Completed by M4's own published approval event rather than by hand —
-       the one source-event completion path this build actually has. */
-    ["MATERIAL_APPROVED", "Material selection approved", "MERCHANDISING", "SOURCE_EVENT", 4],
-    ["TRIM_CARD", "Trim card approved", "MERCHANDISING", "MERCHANDISING", 7],
-    ["PP_SAMPLE_SUBMIT", "PP sample submission", "PRODUCT_DEVELOPMENT", "SOURCE_EVENT", 12],
-    ["PP_SAMPLE_APPROVED", "PP sample approval", "PRODUCT_DEVELOPMENT", "SOURCE_EVENT", 16],
-    ["LAB_TEST", "Lab-test completion", "QUALITY", "SOURCE_EVENT", 19],
-    ["FABRIC_INHOUSE", "Fabric in-house", "STORE_SUPPLY_CHAIN", "SOURCE_EVENT", 21],
-    ["TRIMS_INHOUSE", "Trims in-house", "STORE_SUPPLY_CHAIN", "SOURCE_EVENT", 24],
-    ["PP_MEETING", "Pre-production meeting", "MERCHANDISING", "MERCHANDISING", 26],
-    ["PACK_SUBMIT", "Execution-pack submission", "MERCHANDISING", "MERCHANDISING", 28],
-    /* The plan's own department vocabulary groups the floor together; PPC
-       and Production are one owner there, and the milestone names say which
-       of them is meant. */
-    ["PPC_REVIEW", "PPC review", "IE_PPC_PRODUCTION", "SOURCE_EVENT", 30],
-    ["PRODUCTION_START", "Production start", "IE_PPC_PRODUCTION", "SOURCE_EVENT", 33],
-    ["EX_FACTORY", "Ex-factory", "IE_PPC_PRODUCTION", "SOURCE_EVENT", 45],
-  ];
+  /* ── WHAT THIS DEMO'S PLAN CAN HONESTLY CONTAIN ──────────────────────────
+     This list used to hold fourteen milestones, seven of them owned by Quality,
+     Store, PPC or Production and completed by events NO application publishes.
+     The 27 Sep audit called those "missing / potentially stuck": the demo made
+     four source applications look connected when they are not.
+
+     A template version may no longer be published containing one, because a
+     schedule is a commitment and those dates could never be met or marked. So
+     the demo places what really exists today:
+
+       • the four milestones Merchandising's own approvals close automatically;
+       • the production-readiness meeting, closed by its issued minutes;
+       • one milestone Merchandising records by hand, which is genuinely its own
+         act — accepting the Sales handover.
+
+     Six, not fourteen. A smaller plan that is true beats a full one that
+     teaches a workflow the product cannot perform. The other eight stay on the
+     company's milestone list, visible and marked as waiting on their own
+     department's system.
+
+     Derived from the library and the registry, never a hand-kept list — so a
+     kind gaining a producer puts its milestone into the NEXT demo seed with no
+     edit here. It does not reach a demo already seeded: a published template
+     version is frozen, and this list is computed when the seed runs. */
+  const DEMO_OWN = Object.freeze([{
+    milestoneCode: "HANDOVER_ACCEPTED",
+    name: "Sales handover accepted",
+    explanation: "Merchandising has accepted the order from Sales and opened the execution file.",
+    category: "ORDER", stage: "ORDER_EXECUTION",
+    ownerDepartment: "MERCHANDISING", completionMethod: "MANUAL",
+    completionCriteria: "An execution file exists for this order line.",
+  }]);
 
   const plan = await step("time & action", async () => {
+    const library = require("../../services/merchandising/tnaMilestoneLibrary.service");
+    const {
+      TnaMilestoneDefinition,
+    } = require("../../models/CMS_Models/Merchandising/TnaMilestoneDefinition");
+    const sourceEvents = require("../../services/merchandising/tnaSourceEvents");
+
+    /* ── THE MILESTONE LIST COMES FIRST ──────────────────────────────────
+       A plan template may only place milestones that are on this company's
+       list, so the list has to exist before the template does. Registered
+       through the library's own service, exactly as
+       `scripts/readiness/seed-tna-starter.js --apply` does — additively, so an
+       entry the company already holds keeps whatever words it has been given
+       since.
+
+       `DEMO_OWN` joins the shipped list because this demo places one milestone
+       the standard library does not describe: accepting the Sales handover,
+       which is Merchandising's own act and is recorded by hand. */
+    {
+      const held = await TnaMilestoneDefinition
+        .find({ companyId: ctx.companyId }).select("code").lean();
+      /* `code` on disk, `milestoneCode` in the shipped library — see
+         `tnaMilestoneLibrary.codeOf`. */
+      const have = new Set(held.map((d) => d.code));
+      for (const entry of [...library.STARTER_LIBRARY, ...DEMO_OWN]
+        .filter((d) => !have.has(d.milestoneCode))) {
+        const body = Object.fromEntries(Object.entries(entry)
+          .filter(([k]) => library.DEFINITION_FIELDS.includes(k)));
+        // eslint-disable-next-line no-await-in-loop
+        await library.createDefinition({ companyId: ctx.companyId, actor: maker }, body);
+      }
+    }
+
+    /* ── EVERYTHING ON THE LIST THIS PLAN MAY ACTUALLY PLACE ──────────────
+       A milestone Merchandising records itself, or one whose event has a live
+       producer. Computed when this seed runs, so a later seed picks up whatever
+       is publishable by then — and never places a date nothing could meet. A
+       demo already seeded keeps the template it was given; published versions
+       do not change underneath anybody. */
+    const PLACED = [...DEMO_OWN, ...library.STARTER_LIBRARY]
+      .filter((d) => d.stage !== "DEVELOPMENT")
+      .filter((d) => d.completionMethod === "MANUAL" || sourceEvents.isSupported(d.systemEventKey))
+      .map((d) => d.milestoneCode);
+
     const calendar = await tnaConfig.createCalendar(ctx, {
       body: { name: "Demo factory week", timezone: "Asia/Kolkata" }, actor: maker,
     });
@@ -703,17 +802,15 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
       body: {
         effectiveFrom: day(-120),
         defaultCalendarId: calendarId,
-        milestones: MILESTONES.map(([milestoneCode, name, ownerDepartment, completionAuthority], i) => ({
-          milestoneCode, name, ownerDepartment, completionAuthority,
-          sourceEventKinds: milestoneCode === "MATERIAL_APPROVED"
-            ? ["merchandising.material_trim_card.approved"] : [],
-          anchor: i === MILESTONES.length - 1 ? "EX_FACTORY" : "PLAN_START",
-          offsetWorkingDays: i === MILESTONES.length - 1 ? 0 : MILESTONES[i][4],
-          scope: "FILE", criticalPathCandidate: i > 8, sortOrder: i,
+        milestones: PLACED.map((code, i) => ({
+          milestoneCode: code,
+          anchor: "PLAN_START",
+          offsetWorkingDays: i * 5,
+          scope: "FILE", criticalPathCandidate: i > 2, sortOrder: i,
         })),
-        dependencies: MILESTONES.slice(1).map(([milestoneCode], i) => ({
-          dependencyRef: `DEP-${i + 1}`, predecessorCode: MILESTONES[i][0],
-          successorCode: milestoneCode, type: "FINISH_TO_START", lagWorkingDays: 0,
+        dependencies: PLACED.slice(1).map((code, i) => ({
+          dependencyRef: `DEP-${i + 1}`, predecessorCode: PLACED[i],
+          successorCode: code, type: "FINISH_TO_START", lagWorkingDays: 0,
         })),
       },
     });
@@ -738,11 +835,9 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
     await require("../../services/merchandising/tnaIntake.service")
       .drain({ companyId: company._id });
 
-    const done = [
-      ["HANDOVER_ACCEPTED", day(-26)],
-      ["TRIM_CARD", day(-15)],
-      ["PP_MEETING", day(-1)],
-    ];
+    /* Only what Merchandising may record by hand. The wired ones closed
+       themselves when the outbox drained, above — which is the point. */
+    const done = [["HANDOVER_ACCEPTED", day(-26)]];
     for (const [ref, actualDate] of done) {
       const live = await tnaPlan.getPlan(ctx, { fileId });
       const m = live.milestones.find((x) => x.milestoneRef === ref);
@@ -754,32 +849,61 @@ module.exports = async function seedCompleteFile({ company, maker, checker, day 
       }).catch((e) => notes.push(`complete ${ref}: ${e.message}`));
     }
 
-    /* Forecast late: the laundry's trial pushed the wash standard, so PP
-       approval will land after the committed date. */
-    const late = (await tnaPlan.getPlan(ctx, { fileId })).milestones
-      .find((x) => x.milestoneRef === "PP_SAMPLE_APPROVED");
-    if (late) {
+    /* ── THE MIXED STATES, ON MILESTONES THAT ACTUALLY EXIST ─────────────
+       These used to name PP_SAMPLE_APPROVED and TRIMS_INHOUSE, which this plan
+       no longer places — and because each was guarded by `if (found)`, they
+       skipped in silence and the demo quietly lost two of the four states it
+       exists to show. Chosen from the plan now, so the demo cannot go quiet
+       again as the milestone list changes.
+
+       Both are real operations a merchandiser performs, on milestones nothing
+       else has closed: pushing a forecast with a reason, and recording a block. */
+    const stillOpen = async () => (await tnaPlan.getPlan(ctx, { fileId })).milestones
+      .filter((m) => !m.actualDate && m.status !== "BLOCKED")
+      .sort((a, b) => String(a.forecastDate).localeCompare(String(b.forecastDate)));
+
+    const open = await stillOpen();
+    let overdueRef = "";
+    if (open.length) {
+      /* Overdue: expected before today and still not done. */
+      const slipped = open[0];
+      overdueRef = slipped.milestoneRef;
       await tnaPlan.updateForecast(ctx, {
-        fileId, milestoneRef: "PP_SAMPLE_APPROVED", actor: maker,
+        fileId, milestoneRef: slipped.milestoneRef, actor: maker,
         body: {
-          forecastDate: day(9), expectedRevision: late.revision, reasonCode: "SUPPLIER_LATE",
-          note: "The laundry needs a third wash trial before Washed Olive can be submitted.",
+          forecastDate: day(-4), expectedRevision: slipped.revision, reasonCode: "SUPPLIER_LATE",
+          note: "The laundry needed a third wash trial, and this was not reached in time.",
         },
-      }).catch((e) => notes.push(`forecast PP_SAMPLE_APPROVED: ${e.message}`));
+      }).catch((e) => notes.push(`forecast ${slipped.milestoneRef}: ${e.message}`));
     }
 
-    /* Blocked: the snap supplier shipped short after the buyer's change. */
-    const blocked = (await tnaPlan.getPlan(ctx, { fileId })).milestones
-      .find((x) => x.milestoneRef === "TRIMS_INHOUSE");
-    if (blocked) {
-      await tnaPlan.blockMilestone(ctx, {
-        fileId, milestoneRef: "TRIMS_INHOUSE", actor: maker,
+    const late = (await stillOpen())
+      .find((m) => m.status !== "OVERDUE" && m.milestoneRef !== overdueRef);
+    if (late) {
+      /* Forecast late: still ahead, but now expected after what was committed. */
+      await tnaPlan.updateForecast(ctx, {
+        fileId, milestoneRef: late.milestoneRef, actor: maker,
         body: {
-          expectedRevision: blocked.revision, reasonCode: "MATERIAL_SHORT",
+          forecastDate: day(24), expectedRevision: late.revision, reasonCode: "SUPPLIER_LATE",
+          note: "Washed Olive cannot be submitted until the third trial is approved.",
+        },
+      }).catch((e) => notes.push(`forecast ${late.milestoneRef}: ${e.message}`));
+    }
+
+    /* Not the overdue one and not the late one: BLOCKED overrides both for
+       display, so blocking either would erase the state just created. */
+    const toBlock = (await stillOpen())
+      .find((m) => m.milestoneRef !== late?.milestoneRef && m.milestoneRef !== overdueRef);
+    if (toBlock) {
+      await tnaPlan.blockMilestone(ctx, {
+        fileId, milestoneRef: toBlock.milestoneRef, actor: maker,
+        body: {
+          expectedRevision: toBlock.revision, reasonCode: "MATERIAL_SHORT",
           note: "Matte-black snaps short by 1,800 pieces after the buyer's finish change.",
         },
-      }).catch((e) => notes.push(`block TRIMS_INHOUSE: ${e.message}`));
+      }).catch((e) => notes.push(`block ${toBlock.milestoneRef}: ${e.message}`));
     }
+
     return tnaPlan.getPlan(ctx, { fileId });
   });
 

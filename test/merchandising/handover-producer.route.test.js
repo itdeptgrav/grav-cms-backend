@@ -490,3 +490,185 @@ describe("inspection", () => {
     expect(JSON.stringify(after.body)).not.toMatch(/:240|unitPrice|estimatedPrice/i);
   });
 });
+
+/* ══ THE THREE WRITTEN REQUIREMENTS ═══════════════════════════════════════ */
+
+// Packing, testing and delivery instructions are prose the buyer agreed. They are
+// optional, and that is where the difficulty is: on a SUCCESSOR version three
+// different things used to arrive looking identical — restated, deliberately
+// cleared, and never sent by the form. The service read all three the same way,
+// so a successor issued to change a delivery date silently dropped the packing
+// instructions the buyer had agreed. Downstream that reads as "Sales stated
+// nothing about packing", which is a different and much worse fact than "no
+// special packing", and nobody was told.
+
+describe("packing, testing and delivery requirements", () => {
+  const current = async (w) => SalesHandoverVersion.findOne({
+    companyId: w.co._id, handoverRef: w.request.requestId, "publication.state": "CURRENT",
+  }).lean();
+
+  test("what Sales types is what the issued version carries, exactly", async () => {
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    const res = await issue(w, who, issueBody(500, {
+      packingRequirement: "Single polybag per piece, 20 per master carton, chest label up.",
+      testingRequirement: "AATCC 61 2A colourfastness and a 3rd-party AQL 2.5 final inspection.",
+      deliveryRequirement: "FOB Chennai. Deliver to CFS by 10 Dec; no partial containers.",
+    }));
+
+    expect(res.status).toBe(201);
+    const v = await current(w);
+    expect(v.executionProjection.packingRequirement)
+      .toBe("Single polybag per piece, 20 per master carton, chest label up.");
+    expect(v.executionProjection.testingRequirement)
+      .toBe("AATCC 61 2A colourfastness and a 3rd-party AQL 2.5 final inspection.");
+    expect(v.executionProjection.deliveryRequirement)
+      .toBe("FOB Chennai. Deliver to CFS by 10 Dec; no partial containers.");
+  });
+
+  test("a first version may state none of them", async () => {
+    /* Most orders have no special packing. Silence on a first version is an
+       ordinary state and must not need a ceremony. */
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    expect((await issue(w, who)).status).toBe(201);
+    const v = await current(w);
+    expect(v.executionProjection.packingRequirement).toBeUndefined();
+    expect(v.executionProjection.testingRequirement).toBeUndefined();
+  });
+
+  test("a successor that OMITS a stated requirement is refused, not quietly emptied", async () => {
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    await issue(w, who, issueBody(500, {
+      packingRequirement: "20 per master carton.",
+      testingRequirement: "AQL 2.5 final inspection.",
+    }));
+
+    /* The realistic mistake: a successor issued to move a date, sending only the
+       fields that form screen knew about. */
+    const res = await issue(w, who, {
+      expectedCurrentVersionNo: 1,
+      deliveries: [{ committedDeliveryDate: "2026-12-20", quantity: 500 }],
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("HANDOVER_REQUIREMENT_RESTATE_REQUIRED");
+    /* It names the field AND quotes what would have been lost, so the person can
+       restate it without going to find the previous version. */
+    expect(res.body.error.details.field).toBe("packingRequirement");
+    expect(res.body.error.details.previousValue).toBe("20 per master carton.");
+
+    /* And nothing happened: version 1 is still current and still says it. */
+    const v = await current(w);
+    expect(v.versionNo).toBe(1);
+    expect(v.executionProjection.packingRequirement).toBe("20 per master carton.");
+    expect(await SalesHandoverVersion.countDocuments({ companyId: w.co._id })).toBe(1);
+  });
+
+  test("a successor may restate it, and the earlier version keeps its own words", async () => {
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    await issue(w, who, issueBody(500, { packingRequirement: "20 per master carton." }));
+
+    const res = await issue(w, who, {
+      expectedCurrentVersionNo: 1,
+      deliveries: [{ committedDeliveryDate: "2026-12-20", quantity: 500 }],
+      packingRequirement: "24 per master carton, buyer changed the pack-out.",
+    });
+    expect(res.status).toBe(201);
+
+    expect((await current(w)).executionProjection.packingRequirement)
+      .toBe("24 per master carton, buyer changed the pack-out.");
+    /* Immutable: the superseded version still says what it said. */
+    const first = await SalesHandoverVersion.findOne({
+      companyId: w.co._id, handoverRef: w.request.requestId, versionNo: 1,
+    }).lean();
+    expect(first.publication.state).toBe("SUPERSEDED");
+    expect(first.executionProjection.packingRequirement).toBe("20 per master carton.");
+  });
+
+  test("null WITHDRAWS it deliberately, and the trail records the decision", async () => {
+    /* The buyer dropped a requirement. That is a statement, not an omission, and
+       the projection has no field for "explicitly none" — so the decision is in
+       the trail, which is where a decision belongs. */
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    await issue(w, who, issueBody(500, {
+      packingRequirement: "20 per master carton.",
+      testingRequirement: "AQL 2.5 final inspection.",
+    }));
+
+    const res = await issue(w, who, {
+      expectedCurrentVersionNo: 1,
+      deliveries: [{ committedDeliveryDate: "2026-12-20", quantity: 500 }],
+      packingRequirement: null,
+      testingRequirement: "AQL 2.5 final inspection.",
+    });
+    expect(res.status).toBe(201);
+
+    const v = await current(w);
+    expect(v.versionNo).toBe(2);
+    expect(v.executionProjection.packingRequirement).toBeUndefined();
+    expect(v.executionProjection.testingRequirement).toBe("AQL 2.5 final inspection.");
+
+    const {
+      SalesHandoverAuditEvent, HANDOVER_EVENT_KINDS,
+    } = require("../../models/CMS_Models/Sales/SalesHandoverEvent");
+    const audit = await SalesHandoverAuditEvent.findOne({
+      companyId: w.co._id, handoverVersionId: v._id, action: HANDOVER_EVENT_KINDS.ISSUED,
+    }).lean();
+    expect(audit.clearedRequirements).toEqual(["packingRequirement"]);
+
+    /* The announcement to Merchandising carries identity and outcome only — the
+       receiver reads the version itself, so content never travels twice. */
+    const { SalesHandoverOutboxEvent } = require("../../models/CMS_Models/Sales/SalesHandoverEvent");
+    const sent = await SalesHandoverOutboxEvent.findOne({
+      companyId: w.co._id, "payload.handoverVersionId": v._id,
+    }).lean();
+    expect(sent.payload.clearedRequirements).toBeUndefined();
+  });
+
+  test("an EMPTY STRING is refused, because it cannot carry a decision", async () => {
+    /* It is what a form sends when a field was never filled in AND what it sends
+       when somebody emptied it on purpose. Guessing either way is how the
+       original defect happened. */
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    await issue(w, who, issueBody(500, { packingRequirement: "20 per master carton." }));
+
+    const res = await issue(w, who, {
+      expectedCurrentVersionNo: 1,
+      deliveries: [{ committedDeliveryDate: "2026-12-20", quantity: 500 }],
+      packingRequirement: "   ",
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("HANDOVER_REQUIREMENT_AMBIGUOUS");
+    /* The message says how to do the thing they meant. */
+    expect(res.body.error.message).toMatch(/null to withdraw/i);
+    expect((await current(w)).executionProjection.packingRequirement).toBe("20 per master carton.");
+  });
+
+  test("silence is fine on a successor when the predecessor said nothing either", async () => {
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    await issue(w, who, issueBody(500));
+    const res = await issue(w, who, {
+      expectedCurrentVersionNo: 1,
+      deliveries: [{ committedDeliveryDate: "2026-12-22", quantity: 500 }],
+    });
+    expect(res.status).toBe(201);
+    expect((await current(w)).versionNo).toBe(2);
+  });
+
+  test("still no price, margin or payment term may ride in on them", async () => {
+    const w = await world();
+    const who = await actor({ companies: [w.co] });
+    const res = await issue(w, who, issueBody(500, {
+      packingRequirement: "20 per carton.",
+      unitPrice: 4.2,
+    }));
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.error.code).toBe("FIELD_NOT_ACCEPTED");
+  });
+});

@@ -292,10 +292,30 @@ function valueItem(item, opts = {}) {
   const txns = Array.isArray(item.stockTransactions) ? item.stockTransactions : [];
   const sorted = chronological(txns).map((m) => ({ ...m, __class: classify(m) }));
 
+  // ── OWNERSHIP SPLIT ────────────────────────────────────────────────────────
+  // Customer-supplied stock is physically on our shelves — it IS in
+  // RawItem.quantity and in these movements — but it is the CUSTOMER'S property.
+  // It must be excluded from company inventory value and company-owned on-hand,
+  // never valued, never landed-costed, and never drag the company figure into
+  // MISSING_INBOUND_PRICE / indeterminate merely for being unpriced. A movement
+  // is customer-owned when its id is in the lot-provenance set
+  // (CustomerMaterialLot.movements[].stockTransactionId — so HISTORICAL movements
+  // are covered with no backfill) OR it carries the explicit `ownership:"CUSTOMER"`
+  // marker written on new customer movements. With neither present the split is a
+  // no-op and this behaves exactly as V1/V2 did.
+  const custIds = opts.customerOwnedTxIds instanceof Set
+    ? opts.customerOwnedTxIds
+    : new Set(Array.isArray(opts.customerOwnedTxIds) ? opts.customerOwnedTxIds.map(String) : []);
+  const isCust = (m) => custIds.has(String(m._id || "")) || m.ownership === "CUSTOMER";
+  const companySorted = sorted.filter((m) => !isCust(m));
+  const customerSorted = sorted.filter((m) => isCust(m));
+
   // ── LANDED-COST OVERLAY (V2) ───────────────────────────────────────────────
   // Layer active landed-cost allocations onto their EXACT receipt movements.
   // Never touches stockTransactions[].unitPrice; only annotates a per-unit
   // landed cost the replay adds on top of the base price for that receipt.
+  // Customer-owned movements are NEVER landed-costed — an allocation naming one
+  // falls through to LANDED_WITHOUT_BASE, reported, never applied.
   const landedMap =
     opts.landedByMovement instanceof Map
       ? opts.landedByMovement
@@ -308,7 +328,7 @@ function valueItem(item, opts = {}) {
     const mid = String(m._id || "");
     const c = m.__class;
     const landed = landedMap.get(mid);
-    if (c.ok && c.dir === "in" && c.priced) {
+    if (c.ok && c.dir === "in" && c.priced && !isCust(m)) {
       const perUnit = landed && isNum(landed.perUnit) ? landed.perUnit : 0;
       c.landedPerUnit = perUnit; // consumed by replayMovements
       if (landed) resolvedTargets.add(mid);
@@ -325,8 +345,8 @@ function valueItem(item, opts = {}) {
         });
       }
     } else if (landed) {
-      // The allocation names a real movement, but it is not a priced inbound —
-      // landed cost cannot value an unpriced/indeterminate receipt.
+      // The allocation names a real movement, but it is not a company priced
+      // inbound — landed cost cannot value an unpriced/customer/indeterminate one.
       resolvedTargets.add(mid);
       landedReasons.add(REASON.LANDED_WITHOUT_BASE);
     }
@@ -340,19 +360,32 @@ function valueItem(item, opts = {}) {
     }
   }
 
-  const itemReplay = replayMovements(sorted);
+  // Company valuation replays ONLY company-owned movements; reconciliation
+  // replays EVERY physical movement; customer on-hand is the customer net.
+  const itemReplay = replayMovements(companySorted);
   itemReplay.exceptions.push(...landedExceptions);
   for (const r of landedReasons) itemReplay.reasons.push(r);
+  const physicalReplay = replayMovements(sorted);
+  const customerReplay = replayMovements(customerSorted);
 
   const storedOnHand = isNum(item.quantity) ? item.quantity : 0;
-  const difference = round4(storedOnHand - itemReplay.replayQty);
+  // Reconciliation is PHYSICAL: the stored on-hand must equal every physical
+  // movement, company and customer alike (customer goods are on the shelf).
+  const difference = round4(storedOnHand - physicalReplay.replayQty);
   const reconciled = Math.abs(difference) <= QTY_TOL;
 
   const reasons = new Set(itemReplay.reasons);
   if (!reconciled) reasons.add(REASON.BALANCE_MISMATCH);
+  if (physicalReplay.negativeReplay) reasons.add(REASON.NEGATIVE_REPLAY);
+
+  const physicalOnHand = round4(physicalReplay.replayQty);
+  const companyOwnedOnHand = round4(itemReplay.replayQty);
+  const customerOwnedOnHand = round4(customerReplay.replayQty);
 
   // Variant breakdown (only when asked). Whole-item / unassigned movements are
   // replayed in their own bucket, never distributed across variants by guess.
+  // Each variant separates the same three ways: physical reconcile, company
+  // value, customer-owned quantity.
   let variants;
   let variantTotalMismatch = false;
   if (withVariants) {
@@ -370,10 +403,14 @@ function valueItem(item, opts = {}) {
     );
     variants = [];
     for (const [k, group] of buckets) {
-      const r = replayMovements(group);
+      const companyGroup = group.filter((m) => !isCust(m));
+      const customerGroup = group.filter((m) => isCust(m));
+      const r = replayMovements(companyGroup); // company value for this variant
+      const phys = replayMovements(group); // physical, for reconciliation
+      const cust = replayMovements(customerGroup); // customer-owned quantity
       const stored = k === "__unassigned__" ? null : storedById.get(k);
       const storedQty = stored && isNum(stored.quantity) ? stored.quantity : null;
-      const vDiff = storedQty == null ? null : round4(storedQty - r.replayQty);
+      const vDiff = storedQty == null ? null : round4(storedQty - phys.replayQty);
       const vReconciled = storedQty == null ? null : Math.abs(vDiff) <= QTY_TOL;
       variants.push({
         variantId: k === "__unassigned__" ? null : k,
@@ -382,11 +419,14 @@ function valueItem(item, opts = {}) {
         combination: stored ? stored.combination || [] : [],
         unit, // variants share the item's base unit — never a second unit
         storedOnHand: storedQty,
-        replayedOnHand: round4(r.replayQty),
+        replayedOnHand: round4(phys.replayQty), // physical
+        physicalOnHand: round4(phys.replayQty),
+        companyOwnedOnHand: round4(r.replayQty),
+        customerOwnedOnHand: round4(cust.replayQty),
         valuedQty: r4(r.valuedQty),
         unvaluedQty: r4(r.unvaluedQty),
         avgCost: r.avgCost, // null when indeterminate
-        knownValue: r.value, // null when indeterminate — never ₹0
+        knownValue: r.value, // company value only — null when indeterminate, never ₹0
         valueState: r.valueState,
         indeterminate: r.indeterminate,
         reconciled: vReconciled,
@@ -430,17 +470,29 @@ function valueItem(item, opts = {}) {
     category: item.category || "",
     unit,
     storedOnHand,
-    replayedOnHand: round4(itemReplay.replayQty),
-    valuedQty: r4(itemReplay.valuedQty), // null when indeterminate
-    unvaluedQty: r4(itemReplay.unvaluedQty), // null when indeterminate
+    // Physical on-hand (every movement) — the figure reconciliation checks.
+    replayedOnHand: physicalOnHand,
+    physicalOnHand,
+    // Company-owned on-hand and customer-owned on-hand, split explicitly.
+    companyOwnedOnHand,
+    customerOwnedOnHand,
+    // CURRENT positive customer-owned on-hand (what is on the shelf now) —
+    // distinct from mere historical presence, so a count of "items holding
+    // customer property" means what it says.
+    hasCustomerOwnedStock: customerOwnedOnHand > QTY_TOL,
+    // Any customer movement ever (received/issued/returned), even if nothing is
+    // held now — useful for provenance, never conflated with the current count.
+    hadCustomerOwnedMovement: customerSorted.length > 0,
+    valuedQty: r4(itemReplay.valuedQty), // null when indeterminate — COMPANY only
+    unvaluedQty: r4(itemReplay.unvaluedQty), // null when indeterminate — COMPANY only
     avgCost: itemReplay.avgCost, // EFFECTIVE moving average (base+landed), or null when indeterminate
     baseAvgCost: itemReplay.baseAvgCost, // base-only moving average, or null when indeterminate
-    knownValue: itemReplay.value, // known value INCL. landed, or null when indeterminate — never ₹0
-    baseStockValue: itemReplay.baseStockValue, // base receipt value only
-    landedInStock: itemReplay.landedInStock, // landed cost still in on-hand stock (proportional after issues)
+    knownValue: itemReplay.value, // COMPANY known value INCL. landed — excludes customer stock; null when indeterminate, never ₹0
+    baseStockValue: itemReplay.baseStockValue, // base receipt value only (company)
+    landedInStock: itemReplay.landedInStock, // landed cost still in company on-hand stock
     hasLandedCost: receipts.some((r) => r.landedPerUnit && r.landedPerUnit !== 0),
-    receipts, // per priced receipt: base / landed / effective unit cost + source
-    valueState: itemReplay.valueState, // complete | partly_unvalued | indeterminate
+    receipts, // per priced COMPANY receipt: base / landed / effective unit cost + source
+    valueState: itemReplay.valueState, // complete | partly_unvalued | indeterminate (company)
     indeterminate,
     indeterminateFrom: itemReplay.indeterminateFrom, // first movement where certainty was lost
     reconciled,
@@ -472,16 +524,28 @@ function summarizeValued(valuedItems) {
   let unreconciledCount = 0;
   let excludedCount = 0; // items whose value is partly/fully excluded
   let itemsWithLandedCost = 0;
-  const onHandByUnit = {};
+  let customerOwnedItemCount = 0; // items holding customer property NOW
+  let itemsWithCustomerHistory = 0; // items with any customer movement ever
+  const onHandByUnit = {}; // PHYSICAL on-hand (company + customer) — reconciliation view
+  const companyOwnedOnHandByUnit = {};
+  const customerOwnedOnHandByUnit = {};
   const unvaluedByUnit = {};
 
+  const num = (v) => (isNum(v) ? v : 0);
+  const physicalOf = (it) => (isNum(it.physicalOnHand) ? it.physicalOnHand : it.replayedOnHand);
+
   for (const it of rows) {
-    // Only a genuinely-known value contributes. An indeterminate item's
-    // knownValue is null and is excluded from the company total — never as ₹0.
-    knownInventoryValue += isNum(it.knownValue) ? it.knownValue : 0;
-    baseStockValue += isNum(it.baseStockValue) ? it.baseStockValue : 0;
-    landedInStock += isNum(it.landedInStock) ? it.landedInStock : 0;
+    // Only a genuinely-known COMPANY value contributes. Customer-owned stock is
+    // never in it.knownValue (the engine excluded it), so the company total is
+    // customer-free by construction — never as ₹0, never indeterminate for it.
+    knownInventoryValue += num(it.knownValue);
+    baseStockValue += num(it.baseStockValue);
+    landedInStock += num(it.landedInStock);
     if (it.hasLandedCost) itemsWithLandedCost += 1;
+    // Count only items with CURRENT positive customer-owned on-hand, not every
+    // item that merely has historical customer movements.
+    if (it.hasCustomerOwnedStock) customerOwnedItemCount += 1;
+    if (it.hadCustomerOwnedMovement) itemsWithCustomerHistory += 1;
     if (it.status === STATUS.COMPLETE) completeCount += 1;
     if (it.indeterminate) indeterminateCount += 1;
     else if (!it.fullyValued) incompleteCount += 1; // partly-unvalued / exceptions / pending
@@ -489,14 +553,21 @@ function summarizeValued(valuedItems) {
     if (!it.fullyValued || it.indeterminate || it.hasExceptions) excludedCount += 1;
 
     const unit = it.unit || "—";
-    onHandByUnit[unit] = round4((onHandByUnit[unit] || 0) + (isNum(it.replayedOnHand) ? it.replayedOnHand : 0));
+    // Quantities never sum across units — each stays grouped by its own unit.
+    onHandByUnit[unit] = round4((onHandByUnit[unit] || 0) + num(physicalOf(it)));
+    companyOwnedOnHandByUnit[unit] = round4((companyOwnedOnHandByUnit[unit] || 0) + num(it.companyOwnedOnHand));
+    if (num(it.customerOwnedOnHand) > QTY_TOL) {
+      customerOwnedOnHandByUnit[unit] = round4((customerOwnedOnHandByUnit[unit] || 0) + num(it.customerOwnedOnHand));
+    }
     if (isNum(it.unvaluedQty) && it.unvaluedQty > QTY_TOL) {
       unvaluedByUnit[unit] = round4((unvaluedByUnit[unit] || 0) + it.unvaluedQty);
     }
   }
 
   return {
+    // Company inventory value — customer-owned property is excluded, by construction.
     knownInventoryValue: round2(knownInventoryValue), // incl. landed cost in stock
+    companyInventoryValue: round2(knownInventoryValue), // explicit alias for the ownership-aware caller
     baseStockValue: round2(baseStockValue),
     landedInStock: round2(landedInStock),
     totalItems: rows.length,
@@ -506,7 +577,13 @@ function summarizeValued(valuedItems) {
     unreconciledCount,
     excludedCount,
     itemsWithLandedCost,
-    onHandByUnit,
+    customerOwnedItemCount, // items holding customer property NOW (positive customer on-hand)
+    itemsWithCustomerHistory, // items with any customer movement ever (may hold none now)
+    // Three on-hand views, each grouped by unit and never summed across units:
+    onHandByUnit, // physical (company + customer) — what a stock-take counts
+    physicalOnHandByUnit: onHandByUnit, // explicit alias
+    companyOwnedOnHandByUnit, // the company's own goods
+    customerOwnedOnHandByUnit, // customer property physically held, excluded from value
     unvaluedByUnit,
   };
 }

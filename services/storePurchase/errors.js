@@ -31,6 +31,39 @@ const CODES = {
   IDEMPOTENCY_IN_PROGRESS: { status: 409, code: "IDEMPOTENCY_IN_PROGRESS" },
   IDEMPOTENCY_KEY_REQUIRED: { status: 400, code: "IDEMPOTENCY_KEY_REQUIRED" },
   POLICY_AMBIGUOUS: { status: 409, code: "POLICY_AMBIGUOUS" },
+
+  /* ── A2: THE MATERIAL PURCHASE-ORDER PROVENANCE CHAIN ──────────────────────
+     Material request (MRF) → purchase shortfall → PRODUCT spend request →
+     Finance approval → purchase order.
+
+     Each of these is an EXPECTED business refusal with a correction a buyer can
+     act on, so each gets its own code and its own status. Left unregistered
+     they would all render as 400 VALIDATION and every distinct problem would
+     read as "something about your input was wrong". */
+  MRF_REQUIRED: { status: 400, code: "MRF_REQUIRED" },
+  MRF_UNAVAILABLE: { status: 404, code: "MRF_UNAVAILABLE" },
+  /* Deliberately the SAME status and shape as MRF_UNAVAILABLE at the boundary:
+     another company's MRF must not be distinguishable from one that does not
+     exist, or the difference itself confirms the record. */
+  MRF_FOREIGN_COMPANY: { status: 404, code: "MRF_UNAVAILABLE" },
+  MRF_NO_PURCHASE_SHORTFALL: { status: 409, code: "MRF_NO_PURCHASE_SHORTFALL" },
+  MRF_NO_PURCHASE_REQUEST: { status: 409, code: "MRF_NO_PURCHASE_REQUEST" },
+  REQUEST_NOT_APPROVED: { status: 409, code: "REQUEST_NOT_APPROVED" },
+  REQUEST_MRF_MISMATCH: { status: 409, code: "REQUEST_MRF_MISMATCH" },
+  BUDGET_AUTHORITY_UNAVAILABLE: { status: 409, code: "BUDGET_AUTHORITY_UNAVAILABLE" },
+  LINE_NOT_APPROVED: { status: 409, code: "LINE_NOT_APPROVED" },
+  QUANTITY_EXCEEDS_APPROVED: { status: 409, code: "QUANTITY_EXCEEDS_APPROVED" },
+  VALUE_EXCEEDS_APPROVED: { status: 409, code: "VALUE_EXCEEDS_APPROVED" },
+  QUANTITY_ALREADY_ORDERED: { status: 409, code: "QUANTITY_ALREADY_ORDERED" },
+  /* The draft was valid when it was saved and its upstream chain has since
+     changed. Raised at ISSUE, never at creation. */
+  PROVENANCE_CHANGED: { status: 409, code: "PROVENANCE_CHANGED" },
+  /* One shortfall, several suppliers: the current model has no governed split,
+     and the answer is upstream rather than an unlinked direct order. */
+  SUPPLIER_SPLIT_REQUIRED: { status: 409, code: "SUPPLIER_SPLIT_REQUIRED" },
+  /* Shipping and custom charges add to what an order commits, so they are
+     Finance's to set, not the buyer's. */
+  CHARGES_EXCEED_APPROVED: { status: 409, code: "CHARGES_EXCEED_APPROVED" },
   /* An unconfigured company cannot issue. Distinct from FORBIDDEN: the actor
      may well hold the capability — the COMPANY has no rule authorising the
      commitment, and the fix is configuration, not a different signer. */
@@ -491,6 +524,22 @@ const CODES = {
   TNA_STATE_CONFLICT: { status: 409, code: "TNA_STATE_CONFLICT" },
   TNA_SELF_APPROVAL: { status: 409, code: "TNA_SELF_APPROVAL" },
   TNA_REASON_REQUIRED: { status: 400, code: "TNA_REASON_REQUIRED" },
+
+  /* ── THE COMPANY'S MILESTONE LIST — 27 Sep 2026 ─────────────────────────
+     Registered because an unlisted key falls back to VALIDATION, and a client
+     that cannot tell "you typed a name a template may not carry" from "that
+     date is not a date" cannot put the person in front of the right control.
+     `TNA_SOURCE_EVENT_UNSUPPORTED` had exactly that defect. */
+  TNA_SOURCE_EVENT_UNSUPPORTED: { status: 400, code: "TNA_SOURCE_EVENT_UNSUPPORTED" },
+  TNA_SOURCE_EVENT_UNKNOWN: { status: 400, code: "TNA_SOURCE_EVENT_UNKNOWN" },
+  TNA_MILESTONE_NOT_IN_LIBRARY: { status: 400, code: "TNA_MILESTONE_NOT_IN_LIBRARY" },
+  TNA_MILESTONE_DESCRIBED_BY_LIBRARY: { status: 400, code: "TNA_MILESTONE_DESCRIBED_BY_LIBRARY" },
+  TNA_MILESTONE_WRONG_STAGE: { status: 400, code: "TNA_MILESTONE_WRONG_STAGE" },
+  TNA_MILESTONE_EXISTS: { status: 409, code: "TNA_MILESTONE_EXISTS" },
+  TNA_MILESTONE_NOT_EDITABLE: { status: 409, code: "TNA_MILESTONE_NOT_EDITABLE" },
+  /* 409 rather than 400: the request is well formed and the company is simply
+     not set up yet, which is a state to resolve rather than a malformed body. */
+  TNA_MILESTONE_LIBRARY_REQUIRED: { status: 409, code: "TNA_MILESTONE_LIBRARY_REQUIRED" },
 
   /* ── M6 — THE EXECUTION PACK AND THE DOWNSTREAM HANDOVER ────────────────
      Registered for exactly the reason the block below states: an unlisted
@@ -1515,6 +1564,12 @@ const CODES = {
   PPC_LINE_ROUTE_UNREADABLE: { status: 503, code: "PPC_LINE_ROUTE_UNREADABLE" },
   PROCESS_REQUIREMENT_EVIDENCE_REQUIRED: { status: 400, code: "PROCESS_REQUIREMENT_EVIDENCE_REQUIRED" },
   PROCESS_REQUIREMENT_RESTATE_REQUIRED: { status: 409, code: "PROCESS_REQUIREMENT_RESTATE_REQUIRED" },
+  /* A successor handover version omitted a requirement its predecessor stated.
+     Omission is not a decision — see merchandisingHandover.service.js. */
+  HANDOVER_REQUIREMENT_RESTATE_REQUIRED: { status: 409, code: "HANDOVER_REQUIREMENT_RESTATE_REQUIRED" },
+  /* An empty string was sent where the contract wants a restatement or an
+     explicit `null`. Refused rather than guessed at. */
+  HANDOVER_REQUIREMENT_AMBIGUOUS: { status: 400, code: "HANDOVER_REQUIREMENT_AMBIGUOUS" },
   PPC_PUBLISH_STAGE_NOT_PUBLISHABLE: { status: 409, code: "PPC_PUBLISH_STAGE_NOT_PUBLISHABLE" },
   PPC_PUBLISH_SCHEDULE_STALE: { status: 409, code: "PPC_PUBLISH_SCHEDULE_STALE" },
   PPC_PUBLISH_SOURCE_MOVED: { status: 409, code: "PPC_PUBLISH_SOURCE_MOVED" },

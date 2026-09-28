@@ -224,6 +224,15 @@ const OUTBOX_KIND = Object.freeze({
   TNA_MILESTONE_AT_RISK: "merchandising.tna_milestone.at_risk",
   TNA_PLAN_COMPLETED: "merchandising.tna_plan.completed",
 
+  /* ── THE PRE-PRODUCTION MEETING'S ONE ANNOUNCEABLE MOMENT ─────────────
+     Issued, and only issued. A meeting that is drafted, scheduled, saved or
+     even conducted is Merchandising's working state — the minutes are the
+     evidence, and until they are certified by somebody other than the person
+     who took them there is no company fact to announce. A T&A milestone that
+     closed when a meeting was merely held would be recording an event that
+     had not finished happening. */
+  PPM_ISSUED: "merchandising.pre_production_meeting.issued",
+
   /* ── M6: what Merchandising announces downstream ──────────────────────
      Three, and only three. Merchandising announces what happened to ITS
      record — a version was sent, replaced, or taken back. It publishes
@@ -264,6 +273,10 @@ const OUTBOX_REQUIRED = Object.freeze({
   [OUTBOX_KIND.TNA_PLAN_BASELINED]: ["executionFileId", "planId", "baselineNo"],
   /* A pack event that named no version would be undeliverable — PPC would
      have nothing to decide about. */
+  /* The minutes a reader must be able to get back to, and the version of
+     them — a successor supersedes its predecessor, and "which minutes closed
+     this milestone" has to stay answerable. */
+  [OUTBOX_KIND.PPM_ISSUED]: ["executionFileId", "ppmId", "ppmRef", "versionNo"],
   [OUTBOX_KIND.PACK_SUBMITTED]: ["executionFileId", "packId", "packVersionNo"],
   [OUTBOX_KIND.PACK_SUPERSEDED]: ["executionFileId", "packId", "packVersionNo"],
   [OUTBOX_KIND.PACK_WITHDRAWN]: ["executionFileId", "packId", "packVersionNo"],
@@ -375,6 +388,18 @@ const outboxEventSchema = new mongoose.Schema(
       supersededRevisionNo: { type: Number, default: null },
       /* Time & Action (M5). */
       planId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      /* ── THE PRE-PRODUCTION MEETING'S MINUTES ──────────────────────────
+         This payload is a STRICT subdocument: a field not declared here is
+         dropped on the way in, silently, and the kind's own required-field
+         check then reports it missing. So a new producer declares its fields
+         beside everybody else's rather than discovering that at runtime. */
+      ppmId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      ppmRef: { type: String, trim: true, default: undefined },
+      versionNo: { type: Number, default: null },
+      conclusion: { type: String, trim: true, default: undefined },
+      /* The day the thing HAPPENED, where the producer knows it — read by
+         `tnaIntake.eventDate` in preference to the moment we heard. */
+      effectiveDate: { type: String, trim: true, default: undefined },
       /* ── M6 ─────────────────────────────────────────────────────────── */
       packId: { type: mongoose.Schema.Types.ObjectId, default: null },
       packVersionNo: { type: Number, default: null },

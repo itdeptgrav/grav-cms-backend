@@ -199,48 +199,64 @@ async function cast(co) {
 const at = (w, who) => ({ token: who.token, company: w.co._id });
 
 /* ── A SMALL, HONEST PROCESS ──────────────────────────────────────────────
-   Four milestones in a chain, one of them owned by another department and
-   closed by a record rather than a person. Enough to exercise propagation,
-   ownership and source-owned completion without a forty-row fixture nobody
-   can read. */
-const MILESTONES = [
+   Four milestones in a chain, one of them closed by a record rather than a
+   person. Enough to exercise propagation, ownership and source-owned
+   completion without a forty-row fixture nobody can read.
+
+   ── WHY THESE ARE NOW LIBRARY ENTRIES ──────────────────────────────────
+   A template step no longer carries a milestone's name, owner or event key —
+   those belong to the company's milestone list, so the fixture puts them on
+   the list and the template places them by code. The old fixture is the best
+   illustration of why: it held "Trim card approved" under `TRIM_APPROVED` and
+   "Fabric in house" under `FABRIC_IN`, which are the two exact duplicate pairs
+   the list was built to end.
+
+   ── AND WHY THE FOURTH ONE IS MERCHANDISING'S ──────────────────────────
+   It used to be `EX_FACTORY`, owned by Production and waiting on an event
+   nobody publishes. A version containing that can no longer be published, so
+   the source-owned milestone here is one whose producer is real: the
+   production-readiness meeting. It still proves what it was there to prove —
+   a milestone a merchandiser may not sign for by hand. The unpublishable case
+   is covered where it belongs, in `tna-milestone-library.test.js`. */
+const LIBRARY = [
   {
-    /* Closed by M4's own trim-card approval — the point of source-owned
-       completion, and the milestone a merchandiser must NOT be able to sign
-       for by hand. */
     milestoneCode: "TRIM_APPROVED", name: "Trim card approved",
-    ownerDepartment: "MERCHANDISING", completionAuthority: "SOURCE_EVENT",
-    sourceEventKinds: [OUTBOX_KIND.MATERIAL_TRIM_APPROVED],
-    anchor: "PLAN_START", offsetWorkingDays: 5, scope: "FILE",
+    category: "MATERIALS", stage: "ORDER_EXECUTION",
+    ownerDepartment: "MERCHANDISING", completionMethod: "SYSTEM_EVENT",
+    systemEventKey: OUTBOX_KIND.MATERIAL_TRIM_APPROVED,
   },
   {
     milestoneCode: "FABRIC_IN", name: "Fabric in house",
-    ownerDepartment: "MERCHANDISING", completionAuthority: "MERCHANDISING",
-    anchor: "PREDECESSOR", offsetWorkingDays: 0, scope: "FILE",
+    category: "MATERIALS", stage: "ORDER_EXECUTION",
+    ownerDepartment: "MERCHANDISING", completionMethod: "MANUAL",
   },
   {
-    /* Merchandising's own act — handing the file to the floor — so
-       Merchandising may record it. */
     milestoneCode: "PPC_HANDOVER", name: "File handed to PPC",
-    ownerDepartment: "MERCHANDISING", completionAuthority: "MERCHANDISING",
-    anchor: "PREDECESSOR", offsetWorkingDays: 0, scope: "FILE",
+    category: "HANDOVER", stage: "ORDER_EXECUTION",
+    ownerDepartment: "MERCHANDISING", completionMethod: "MANUAL",
   },
   {
-    /* Owned by Production and closed by Production's record. Nothing in
-       Merchandising can complete it, and until Production publishes an event
-       it stays visibly awaiting one — which is the honest answer, not a tick
-       box a merchandiser fills in on Production's behalf. */
-    milestoneCode: "EX_FACTORY", name: "Ex-factory",
-    ownerDepartment: "IE_PPC_PRODUCTION", completionAuthority: "SOURCE_EVENT",
-    sourceEventKinds: [],
-    anchor: "DELIVERY", offsetWorkingDays: -5, scope: "FILE",
+    /* Closed by Merchandising's own issued minutes, so nothing in the app may
+       tick it by hand — the same rule the old Production row proved. */
+    milestoneCode: "PP_MEETING", name: "Production readiness meeting held",
+    category: "HANDOVER", stage: "ORDER_EXECUTION",
+    ownerDepartment: "MERCHANDISING", completionMethod: "SYSTEM_EVENT",
+    systemEventKey: OUTBOX_KIND.PPM_ISSUED,
   },
+];
+
+/** What the template places: a code and where the date comes from. */
+const MILESTONES = [
+  { milestoneCode: "TRIM_APPROVED", anchor: "PLAN_START", offsetWorkingDays: 5, scope: "FILE" },
+  { milestoneCode: "FABRIC_IN", anchor: "PREDECESSOR", offsetWorkingDays: 0, scope: "FILE" },
+  { milestoneCode: "PPC_HANDOVER", anchor: "PREDECESSOR", offsetWorkingDays: 0, scope: "FILE" },
+  { milestoneCode: "PP_MEETING", anchor: "DELIVERY", offsetWorkingDays: -5, scope: "FILE" },
 ];
 
 const DEPENDENCIES = [
   { predecessorCode: "TRIM_APPROVED", successorCode: "FABRIC_IN", lagWorkingDays: 2 },
   { predecessorCode: "FABRIC_IN", successorCode: "PPC_HANDOVER", lagWorkingDays: 0 },
-  { predecessorCode: "PPC_HANDOVER", successorCode: "EX_FACTORY", lagWorkingDays: 0 },
+  { predecessorCode: "PPC_HANDOVER", successorCode: "PP_MEETING", lagWorkingDays: 0 },
 ];
 
 /** A published calendar and a published template, ready to plan against. */
@@ -259,6 +275,11 @@ async function process_(w, who, { milestones = MILESTONES, dependencies = DEPEND
     },
   });
   await call(`/tna/calendars/${calId}/versions/1/publish`, { ...t, method: "POST" });
+
+  /* The company's milestone list, which the template then selects from. */
+  for (const def of LIBRARY) {
+    await call("/tna/milestones", { ...t, method: "POST", body: def });
+  }
 
   const tpl = await call("/tna/templates", {
     ...t, method: "POST", body: { name: `Template ${++seq}`, ...applicability },
@@ -338,6 +359,10 @@ describe("§13.4 — a plan is instantiated from a published process", () => {
     const w = await world();
     const c = await cast(w.co);
     const t = at(w, c.owner);
+    /* Its own template, so its own milestone list: the two the cycle joins. */
+    for (const def of LIBRARY.slice(0, 2)) {
+      await call("/tna/milestones", { ...t, method: "POST", body: def });
+    }
     const tpl = await call("/tna/templates", { ...t, method: "POST", body: { name: `Cyclic ${++seq}` } });
     const cal = await call("/tna/calendars", {
       ...t, method: "POST", body: { name: `C ${++seq}`, timezone: "Asia/Kolkata" },

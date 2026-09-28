@@ -26,9 +26,33 @@ const unitOfWork = require("../../../services/storePurchase/unitOfWork.service")
 const idempotencyService = require("../../../services/storePurchase/idempotency.service");
 const locStock = require("../../../services/storePurchase/locationStock.service");
 const control = require("../../../services/storePurchase/goodsReceiptControl.service");
+const receiveWorkspace = require("../../../services/storePurchase/receiveWorkspace.service");
 const { fail, sendError } = require("../../../services/storePurchase/errors");
 
 const ENTITY = "GOODS_RECEIPT";
+
+// ── PURCHASED-ONLY GUARD ─────────────────────────────────────────────────────
+// Inspection, put-away, quarantine disposition and supplier return are the
+// PURCHASED control pipeline: they presume a purchase order, a supplier, and
+// company-owned stock they may freely move between locations. A customer-
+// supplied receipt has none of that — its goods are the customer's, tracked by a
+// CustomerMaterialLot, and its issue/return lifecycle lives on the
+// customer-material document. Letting a generic GRN id drive one of these
+// operations against a CUSTOMER_MATERIAL receipt would move physical location
+// stock WITHOUT synchronising the owning lot, corrupting ownership/location
+// integrity. So these routes refuse a customer-owned receipt outright. Returns
+// true (and sends the 400) when the caller should stop.
+function refuseCustomerOwned(res, grn) {
+  if (grn && grn.sourceType === GoodsReceipt.SOURCE_TYPE.CUSTOMER_MATERIAL) {
+    res.status(400).json({
+      success: false,
+      reason: "PURCHASED_ONLY",
+      message: "This is a customer-supplied receipt. Inspection, put-away, quarantine and supplier return apply only to purchased goods — record issues and returns on the customer-material document instead.",
+    });
+    return true;
+  }
+  return false;
+}
 // Stage is DERIVED (needs the inspection/put-away join), so the register scans a
 // bounded, newest-first set and states that scope honestly. Read per request
 // (env-overridable) so the truncation wording can be exercised in tests.
@@ -184,6 +208,36 @@ router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
   }
 });
 
+/**
+ * GET /workspace — the Receive workspace, as one closed DTO.
+ *
+ * ── DECLARED BEFORE `/:grnId` ───────────────────────────────────────────────
+ * Express matches in order, so registering this after the id route would have
+ * "workspace" read as a receipt id and answer 404. The ordering is the whole
+ * reason this sits here rather than beside the register above.
+ *
+ * ── READ-ONLY, AND COMPOSED FROM EXISTING AUTHORITIES ───────────────────────
+ * It writes nothing. Stage and flags come from `goodsReceiptControl`, customer
+ * standing from the Merchandising register that owns it, and outstanding
+ * purchased quantity from the purchase order's own stored figure. This route
+ * adds no second receipt or stock authority.
+ */
+router.get("/workspace", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const out = await receiveWorkspace.workspace(
+      req.tenant,
+      /* The Merchandising register takes the same shape the customer-materials
+         route gives it — company and actor, resolved by the tenant middleware. */
+      { companyId: req.tenant.companyId, actorId: req.tenant.actorId, tenant: req.tenant },
+      req.query || {},
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    console.error("[goods-receipts] workspace error:", err);
+    return res.status(500).json({ success: false, message: "Server error while loading the receive workspace" });
+  }
+});
+
 // GET /:grnId — one receipt with all lines and linked movement evidence.
 router.get("/:grnId", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
@@ -264,6 +318,7 @@ router.post("/:grnId/inspection",
     try {
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
+      if (refuseCustomerOwned(res, grn)) return;
 
       if (req.idempotent?.recovering) {
         const existing = await GoodsReceiptInspection.findOne({ companyId: req.tenant.companyId, goodsReceiptId: grn._id, idempotencyKey: req.idempotent.key }).lean();
@@ -331,6 +386,7 @@ router.post("/:grnId/putaways",
     try {
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
+      if (refuseCustomerOwned(res, grn)) return;
 
       if (req.idempotent?.recovering) {
         const existing = await GoodsReceiptPutaway.findOne({ companyId: req.tenant.companyId, goodsReceiptId: grn._id, idempotencyKey: req.idempotent.key }).lean();
@@ -408,6 +464,7 @@ router.post("/:grnId/dispositions",
     try {
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
+      if (refuseCustomerOwned(res, grn)) return;
 
       if (req.idempotent?.recovering) {
         const existing = await GoodsReceiptDisposition.findOne({ companyId: req.tenant.companyId, goodsReceiptId: grn._id, idempotencyKey: req.idempotent.key }).lean();
@@ -495,6 +552,7 @@ router.post("/:grnId/supplier-returns",
     try {
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
+      if (refuseCustomerOwned(res, grn)) return;
       const operationId = req.idempotent?.record?._id || null;
 
       if (req.idempotent?.recovering) {

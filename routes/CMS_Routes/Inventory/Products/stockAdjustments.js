@@ -26,6 +26,11 @@ const actionHistory = require("../../../../services/storePurchase/actionHistory.
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
 const idempotency = require("../../../../services/storePurchase/idempotency.service");
+// The shared customer-owned-stock guard: an ordinary company issue may not
+// consume material the factory is only holding for a customer. It was used below
+// but never imported, so every ordinary issue threw a ReferenceError (500) and
+// the guard could not run. Imported from the same service mrfRoutes uses.
+const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
 
 const ENTITY = "STOCK_ADJUSTMENT";
 

@@ -258,17 +258,29 @@ function tenantFilter(ctx) {
  * call sites: an empty predicate while the migration window is open (a valid
  * and always-true `$and` entry), the real exclusion once it closes.
  */
-function ownedOnly() {
-  return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } };
-}
+/* ── THIS DECLARATION WAS DEAD, AND ITS REMOVAL CHANGES NOTHING ────────────
+   A SECOND `function ownedOnly()` is declared ~25 lines below. Function
+   declarations hoist and the later one wins, so THAT is the implementation every
+   caller has been getting; this one has never run. Node accepts the duplicate in
+   sloppy mode, which is why it went unnoticed — Babel does not, so any Jest suite
+   whose require graph reaches this file failed to parse with a message about an
+   already-declared identifier and nothing about tenancy.
 
-/** True while the legacy migration window is open — i.e. while unowned records
- *  are still being treated as this company's. Exposed so a rule that only
- *  makes sense on migrated data can stand down for the same window, rather
- *  than each site inventing its own switch. */
-function legacyWindowOpen() {
-  return LEGACY_READTHROUGH;
-}
+   Only the dead text is removed. Which of the two SHOULD be live is a tenancy
+   question with real consequences during the legacy read-through window — the
+   version below admits no unowned row, this one admitted every row while the
+   window is open — and that is a decision for whoever owns the migration, not a
+   side effect of making a test suite parse.
+
+   The removed implementation, for that decision:
+       return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } }; */
+
+/* A second `legacyWindowOpen()` was declared here, WORD FOR WORD identical to the
+   one below — a copy-paste duplication, not two behaviours. Removed for the same
+   reason as the dead `ownedOnly` above: Node tolerates a duplicate function
+   declaration in sloppy mode, Babel refuses it, and the refusal named an
+   identifier rather than the problem. Nothing about behaviour changes; the
+   surviving definition is byte-identical. */
 
 /**
  * Restrict to records that ARE company-owned — i.e. exclude the legacy

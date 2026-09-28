@@ -41,6 +41,7 @@ const Account = require("../../models/CMS_Models/Sales/Account");
 const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
 const {
   SalesDevelopmentRequest, REQUEST_STATE, MATERIAL_CATEGORY, FORBIDDEN_FIELDS,
+  REFERENCE_TYPE,
 } = require("../../models/CMS_Models/Sales/DevelopmentRequest");
 const {
   SalesHandoverAuditEvent, SalesHandoverOutboxEvent,
@@ -133,6 +134,82 @@ function assertNoForbiddenFields(value, path = "") {
     }
     assertNoForbiddenFields(child, path ? `${path}.${key}` : key);
   }
+}
+
+/* ── WHAT A REFERENCE IMAGE MAY BE ─────────────────────────────────────────
+ *
+ * Sales attaches a picture through the application's own browser→CDN upload and
+ * sends back what that upload returned. So this is not "trust the client": it is
+ * a bounded shape, with the host of the URL checked against the media store the
+ * application actually uses.
+ *
+ * ── WHY THE HOST IS CHECKED ────────────────────────────────────────────────
+ * Without it, `referenceImages: [{ url: "http://anything" }]` is a stored link on
+ * a Sales record that four screens will render — the request, the Development
+ * file, the handover review and the accepted order. A link to somewhere else is
+ * a picture that can change or vanish after the buyer approved it, and an image
+ * loaded from an arbitrary host on an internal page is a tracking pixel nobody
+ * chose. An allowed host list is narrow, boring and exactly the right size.
+ *
+ * `data:` and `javascript:` are refused by the same rule; so is a relative path,
+ * which would resolve against whichever server rendered it.
+ */
+const IMAGE_HOST_SUFFIXES = Object.freeze([
+  "res.cloudinary.com",
+  "drive.google.com",
+  "lh3.googleusercontent.com",
+]);
+
+const IMAGE_LIMIT = 20;
+
+function assertImageUrl(raw, index) {
+  const value = str(raw);
+  if (!value) {
+    throw fail("VALIDATION", `Reference ${index + 1} has no image.`, { field: `referenceImages.${index}.url` });
+  }
+  let parsed;
+  try { parsed = new URL(value); } catch {
+    throw fail("VALIDATION",
+      `Reference ${index + 1} is not a usable image address. Attach the picture instead of typing a link.`,
+      { field: `referenceImages.${index}.url` });
+  }
+  if (parsed.protocol !== "https:") {
+    throw fail("VALIDATION",
+      `Reference ${index + 1} must be an uploaded image. A plain "${parsed.protocol}" link is not stored.`,
+      { field: `referenceImages.${index}.url`, protocol: parsed.protocol });
+  }
+  const host = parsed.hostname.toLowerCase();
+  const allowed = IMAGE_HOST_SUFFIXES.some((s) => host === s || host.endsWith(`.${s}`));
+  if (!allowed) {
+    throw fail("VALIDATION",
+      `Reference ${index + 1} is hosted somewhere this company does not store images (${host}). `
+      + "Attach the picture so it is uploaded here.",
+      { field: `referenceImages.${index}.url`, host });
+  }
+  return value;
+}
+
+function normaliseReferenceImages(input) {
+  const rows = Array.isArray(input) ? input : [];
+  if (rows.length > IMAGE_LIMIT) {
+    throw fail("VALIDATION",
+      `A request carries at most ${IMAGE_LIMIT} reference images.`,
+      { field: "referenceImages", limit: IMAGE_LIMIT });
+  }
+  return rows.map((row, i) => {
+    const type = str(row?.referenceType).toUpperCase();
+    if (type && !Object.values(REFERENCE_TYPE).includes(type)) {
+      throw fail("VALIDATION",
+        `Reference ${i + 1} has a kind this company does not use.`,
+        { field: `referenceImages.${i}.referenceType`, value: type });
+    }
+    return {
+      url: assertImageUrl(row?.url, i),
+      caption: str(row?.caption).slice(0, 200),
+      storageRef: str(row?.storageRef).slice(0, 200),
+      referenceType: type || REFERENCE_TYPE.PRODUCT,
+    };
+  });
 }
 
 function assertShape(body) {
@@ -358,10 +435,7 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
       styleRef: str(body.styleRef) || str(sampleStyle?.styleCode),
       sampleStyleId: sampleStyle?._id || null,
       stockItemId: isId(body.stockItemId) ? body.stockItemId : (line.stockItemId || null),
-      referenceImages: (Array.isArray(body.referenceImages) ? body.referenceImages : [])
-        .slice(0, 20)
-        .map((i) => ({ url: str(i?.url), caption: str(i?.caption).slice(0, 200) }))
-        .filter((i) => i.url),
+      referenceImages: normaliseReferenceImages(body.referenceImages),
       requirementSummary: summary.slice(0, 4000),
       requestedCategories: [...new Set(categories)],
       requiredByDate: str(body.requiredByDate) || null,
@@ -979,7 +1053,11 @@ const requestView = (r) => (r ? {
   styleRef: str(r.styleRef),
   sampleStyleId: r.sampleStyleId ? str(r.sampleStyleId) : null,
   stockItemId: r.stockItemId ? str(r.stockItemId) : null,
-  referenceImages: (r.referenceImages || []).map((i) => ({ url: str(i.url), caption: str(i.caption) })),
+  referenceImages: (r.referenceImages || []).map((i) => ({
+    url: str(i.url), caption: str(i.caption),
+    referenceType: str(i.referenceType) || REFERENCE_TYPE.PRODUCT,
+    storageRef: str(i.storageRef),
+  })),
   requirementSummary: str(r.requirementSummary),
   requestedCategories: (r.requestedCategories || []).map(str),
   requiredByDate: r.requiredByDate || null,

@@ -39,6 +39,10 @@ const selection = require("../../../services/merchandising/selection.service");
 const tnaDelivery = require("../../../services/integration/tnaSourceDelivery.service");
 const adoption = require("../../../services/merchandising/packagingAdoption.service");
 const approvals = require("../../../services/merchandising/approvalRegister.service");
+const salesProcessIntake = require("../../../services/merchandising/salesProcessIntake.service");
+/* `adoption` above is the PACKAGING adoption service; this is the development one,
+   which owns the lineage resolution. Two different records, two different services. */
+const adoption2 = require("../../../services/merchandising/developmentAdoption.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -295,6 +299,52 @@ router.get("/files/:id/selections/:family/revisions/:revisionNo/printable",
       fileId: req.params.id, family: req.params.family, revisionNo: req.params.revisionNo,
     });
     return res.json({ success: true, ...out });
+  }));
+
+/* ── REPAIRING A LEGACY FILE'S DEVELOPMENT LINK ─────────────────────────────
+   A POST, deliberately. Files accepted before the link was stamped at acceptance
+   carry none; they read perfectly well (every reader resolves what it needs) but
+   nothing records it. This is how somebody settles one — asked for, reported, and
+   refused when the lineage is ambiguous. Reading an order never does this. */
+router.post("/files/:id/development-link/repair", requireCompany, canManage,
+  handle(async (req, res) => {
+    const out = await adoption2.repairDevelopmentLink(req.merchandising, {
+      fileId: req.params.id, actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ── WHAT SALES CONFIRMED, AND WHETHER THIS LIST MATCHES IT ──────────────────
+   Three reads and one command. All four derive the Sales side on the SERVER from
+   the version the file itself accepted: a browser that could state which handover
+   version a requirement came from could claim the buyer approved something they
+   never saw, and nothing downstream would think to question it. */
+
+router.get("/files/:id/sales-process-intake", requireCompany, canRead, handle(async (req, res) => {
+  const out = await salesProcessIntake.suggest(req.merchandising, { fileId: req.params.id });
+  return res.json({ success: true, ...out });
+}));
+
+router.get("/files/:id/sales-process-reconciliation", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await salesProcessIntake.reconcile(req.merchandising, { fileId: req.params.id });
+    return res.json({ success: true, ...out });
+  }));
+
+/* Adoption WRITES — into a draft, and only into a draft. It approves nothing, so
+   it sits with the writer exactly as adding a row by hand does. */
+router.post("/files/:id/sales-process-intake/adopt", requireCompany, canWriteSelection,
+  handle(async (req, res) => {
+    const out = await salesProcessIntake.adopt(req.merchandising, {
+      fileId: req.params.id,
+      /* The client sends WHICH suggestions and what it decided about them. It
+         does not send what the suggestion was, and it cannot send where it came
+         from — `sourceRef` is not a body field anywhere in this flow. */
+      decisions: req.body?.decisions,
+      actor: actor(req),
+      idempotencyKey: idempotencyKey(req),
+    });
+    return res.status(201).json({ success: true, ...out });
   }));
 
 /* ── Draft authorship ──────────────────────────────────────────────────── */

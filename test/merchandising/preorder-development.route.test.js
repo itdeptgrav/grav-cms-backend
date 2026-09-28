@@ -2898,3 +2898,88 @@ describe("a superseded release is history, not authority", () => {
     expect(notReleased.body.error.code).toBe("DEVELOPMENT_NOT_RELEASED");
   });
 });
+
+/* ══ THE BUYER'S PICTURES ═════════════════════════════════════════════════ */
+
+// The visible Sales brief form had no way to attach one, so the only images in the
+// system were the ones the demo wrote straight onto a request. Sales now attaches
+// them through the application's own upload — which is why the service checks the
+// HOST: a stored link to somebody else's server is a picture that can change after
+// the buyer approved it, and four screens would show the breakage without being
+// able to explain it.
+
+describe("reference images on a Sales brief", () => {
+  const CDN = "https://res.cloudinary.com/demo/image/upload/v1/sales/ref.jpg";
+
+  test("an uploaded picture is stored with its kind and its storage id", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    const res = await askForDevelopment(w, who, {
+      referenceImages: [
+        { url: CDN, caption: "Left chest logo", referenceType: "ARTWORK", storageRef: "sales/ref" },
+      ],
+    });
+    expect(res.status).toBe(201);
+
+    const stored = await SalesDevelopmentRequest.findOne({ companyId: w.co._id }).lean();
+    expect(stored.referenceImages).toHaveLength(1);
+    expect(stored.referenceImages[0]).toMatchObject({
+      url: CDN, caption: "Left chest logo", referenceType: "ARTWORK", storageRef: "sales/ref",
+    });
+  });
+
+  test("a picture with no stated kind is a product picture, not an unset one", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    await askForDevelopment(w, who, { referenceImages: [{ url: CDN }] });
+    const stored = await SalesDevelopmentRequest.findOne({ companyId: w.co._id }).lean();
+    expect(stored.referenceImages[0].referenceType).toBe("PRODUCT");
+  });
+
+  test("a link to somewhere this company does not store images is refused", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    const res = await askForDevelopment(w, who, {
+      referenceImages: [{ url: "https://example.invalid/whatever.jpg", caption: "pasted" }],
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.error.message).toMatch(/does not store images/i);
+    expect(res.body.error.details.host).toBe("example.invalid");
+    /* Nothing was written — a brief is not half-created. */
+    expect(await SalesDevelopmentRequest.countDocuments({ companyId: w.co._id })).toBe(0);
+  });
+
+  test("a plain http link, a data: payload and a bare path are all refused", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    for (const url of [
+      "http://res.cloudinary.com/demo/image/upload/a.jpg",
+      "data:image/png;base64,iVBORw0KGgo=",
+      "/uploads/a.jpg",
+    ]) {
+      const res = await askForDevelopment(w, who, { referenceImages: [{ url }] });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    }
+    expect(await SalesDevelopmentRequest.countDocuments({ companyId: w.co._id })).toBe(0);
+  });
+
+  test("a kind this company does not use is refused rather than stored as itself", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    const res = await askForDevelopment(w, who, {
+      referenceImages: [{ url: CDN, referenceType: "MOODBOARD" }],
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.error.details.field).toBe("referenceImages.0.referenceType");
+  });
+
+  test("more pictures than a brief carries is refused with the limit", async () => {
+    const w = await world();
+    const who = (await cast(w.co)).salesApprover;
+    const res = await askForDevelopment(w, who, {
+      referenceImages: Array.from({ length: 21 }, (_x, i) => ({ url: `${CDN}?${i}` })),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.error.details.limit).toBe(20);
+  });
+});

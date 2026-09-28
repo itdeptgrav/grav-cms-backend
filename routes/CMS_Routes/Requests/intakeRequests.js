@@ -49,6 +49,7 @@ const { Acc_Company, Acc_Ledger } = require("../../../models/Accountant_model/Ac
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 
 const intake = require("../../../services/requestIntake.service");
+const autoReservation = require("../../../services/storePurchase/autoReservation.service");
 const chain = require("../../../services/spendApproval.service");
 const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
@@ -2068,6 +2069,30 @@ async function theCompany() {
   };
 }
 
+/**
+ * Attempt automatic reservation for an MRF the Requests desk just spawned.
+ *
+ * ── WHY THE COMPANY IS RESOLVED HERE ───────────────────────────────────────
+ * This router has no `req.tenant`: it resolves the books through `theCompany()`,
+ * which refuses outright when more than one company exists. `spawnMrf` leaves
+ * `companyId` unset on the request it creates, so the tenant handed to the
+ * reservation service IS the company this route was already acting for — the
+ * same one every other write on this path uses.
+ *
+ * Fire-and-forget by design: the classification has been saved and answered,
+ * and a shelf read must not be able to undo it.
+ */
+async function reserveForSpawnedMrf(mrf, who, whoId) {
+  const { company } = await theCompany();
+  if (!company?._id || !mrf?._id) return;
+  autoReservation.attemptInBackground({
+    tenant: { companyId: company._id, siteId: null },
+    mrfId: mrf._id,
+    trigger: autoReservation.TRIGGERS.INTAKE_CLASSIFIED,
+    actorName: who || "", actorId: whoId || null,
+  });
+}
+
 /* ══ CLASSIFY ═══════════════════════════════════════════════════════════════
  * The internal decision the requester was never asked to make. This is where
  * the request stops being one shape and becomes the document that fulfils it.
@@ -2428,6 +2453,9 @@ router.patch("/:id/classify", async (req, res) => {
       doc.mrfNumber = mrf.mrfNumber;
       stamp();
       await doc.save();
+      /* The request lands with the store already approved, so it is eligible
+         the moment it exists — the fourth door to the one shared rule. */
+      await reserveForSpawnedMrf(mrf, who, whoId);
       return res.json({
         success: true,
         request: intakeRow(doc.toObject(), { kind: "mrf", status: mrf.status }),
@@ -2464,6 +2492,10 @@ router.patch("/:id/classify", async (req, res) => {
           message: `${mrf.mrfNumber} was raised for the stock you are issuing, but the balance could not be sent on: ${partialError}`,
         });
       }
+
+      /* The issue half is with the store and approved; the buy half is a
+         separate document finance owns. Only the issue half is reservable. */
+      await reserveForSpawnedMrf(mrf, who, whoId);
 
       doc.mrfId = mrf._id;
       doc.mrfNumber = mrf.mrfNumber;

@@ -141,6 +141,24 @@ const lineSchema = new mongoose.Schema(
        alone exactly as it did — nothing about the existing fields changes. */
     rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemSku: { type: String, trim: true, default: "" },
+
+    /**
+     * ── WHICH MATERIAL-REQUEST LINE THIS ONE IS BUYING ──────────────────────
+     * The MRF item's own `_id`, written by the server when the shortfall is
+     * turned into a purchase request.
+     *
+     * Without it, "does this request match its material request?" can only be
+     * answered by name or by array position, and both are wrong: two catalogue
+     * items can share a name, a line can be renamed after approval, and a
+     * reordered array silently moves one line's quantity onto another line's
+     * material. With it, the two documents agree on identity or they do not.
+     *
+     * Absent on a request raised any other way; a purchase order requires it.
+     */
+    sourceMrfLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* The variant the request line named, so a purchase cannot quietly order a
+       different one of the same item. */
+    variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     baseUnit: { type: String, trim: true, default: "" },
 
     /* ── THE SERVICE MASTER RECORD THIS LINE WAS MATCHED TO ──────────────────
@@ -649,6 +667,96 @@ const spendRequestSchema = new mongoose.Schema(
     /* The promise this became. Set once; see budgetCommitment.service. */
     commitmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_BudgetCommitment" },
     commitmentStatus: { type: String, trim: true },
+
+    /**
+     * ── WHICH BUDGET RULES THIS REQUEST WAS RAISED UNDER ────────────────────
+     * `COMMITMENT_REQUIRED` — Finance reviewed it and a budget commitment must
+     *   exist before anything is ordered against it.
+     * `BUDGET_PAUSED` — budget involvement was explicitly switched off for MRF
+     *   purchasing at the moment this was raised (`requestsSettings
+     *   .mrfBudgetEnabled === false`), so the request was created already
+     *   approved and no commitment was ever made.
+     *
+     * ── WHY IT IS STORED RATHER THAN INFERRED ───────────────────────────────
+     * A missing `commitmentId` has two possible meanings: budget review was
+     * paused, or the commitment is missing when it should not be. Those are
+     * opposite facts, and reading absence as "paused" makes a corrupt or
+     * deleted commitment look like a deliberate policy — which is precisely the
+     * case that must be refused. The mode is therefore recorded when the
+     * request is created, by the server, from the policy in force THEN; the
+     * setting can be flipped later without rewriting history.
+     *
+     * No default, deliberately: its absence marks a request raised before this
+     * field existed, and a default would stamp every one of them on its next
+     * save and destroy the distinction.
+     */
+    /**
+     * ── COMMERCIAL ADJUSTMENTS, WHERE FINANCE CAN SEE THEM ──────────────────
+     * Shipping, a negotiated discount and any other charge that moves what the
+     * company will owe.
+     *
+     * They live HERE rather than on the purchase order because they are money:
+     * a freight line added after approval changes the figure Finance agreed,
+     * and a purchase order is not where that decision belongs. Putting them on
+     * the request means the approver sees the grand total they are actually
+     * approving, and the order simply carries it forward.
+     *
+     * The feature is preserved, not removed: a buyer who needs a charge adds
+     * it to the request and has it reapproved, and the order then shows it
+     * exactly as before.
+     */
+    /* ── WHAT STORE QUOTED ──────────────────────────────────────────────────
+     * Written while Store prices or requotes the request, and editable right
+     * up to the moment Finance approves it. These are a QUOTE: a figure under
+     * negotiation, not an agreement.
+     */
+    quotedShippingCharges: { type: Number, min: 0, default: 0 },
+    quotedDiscount: { type: Number, min: 0, default: 0 },
+    quotedCustomCharges: {
+      type: [new mongoose.Schema({
+        label: { type: String, trim: true, required: true },
+        amount: { type: Number, min: 0, required: true },
+      }, { _id: false })],
+      default: [],
+    },
+
+    /* ── AND WHAT FINANCE APPROVED ──────────────────────────────────────────
+     * Snapshotted from the quoted figures at the moment of approval, and never
+     * written again.
+     *
+     * ── WHY A SNAPSHOT AND NOT THE SAME FIELDS ──────────────────────────────
+     * A single set of fields would mean "what Finance agreed" and "what Store
+     * last typed" were the same value, so an edit after approval would rewrite
+     * history — the purchase order would carry figures nobody had approved,
+     * and the record of the approval would say they had. Two fields keep the
+     * two questions separate, and the purchase order reads only this one.
+     *
+     * Changing an adjustment therefore means requoting, which sends the
+     * request back for confirmation and Finance approval, and the snapshot is
+     * retaken. There is no path that edits it in place.
+     */
+    approvedShippingCharges: { type: Number, min: 0, default: 0 },
+    approvedDiscount: { type: Number, min: 0, default: 0 },
+    approvedCustomCharges: {
+      type: [new mongoose.Schema({
+        label: { type: String, trim: true, required: true },
+        amount: { type: Number, min: 0, required: true },
+      }, { _id: false })],
+      default: [],
+    },
+    /* When the snapshot was taken, so "approved on the figures of that date"
+       is answerable without reading the history. */
+    adjustmentsApprovedAt: { type: Date, default: undefined },
+
+    budgetApprovalMode: {
+      type: String,
+      enum: ["COMMITMENT_REQUIRED", "BUDGET_PAUSED"],
+      default: undefined,
+    },
+    /* When and by what the mode above was decided — auditable, not a bare
+       enum somebody has to take on trust. */
+    budgetApprovalModeAt: { type: Date, default: undefined },
+    budgetApprovalModeSource: { type: String, trim: true, default: undefined },
 
     /* ── WHAT THE STORE PRICED IT AT ──────────────────────────────────────
      * Filled by Store & Purchase when they decide a request cannot come off

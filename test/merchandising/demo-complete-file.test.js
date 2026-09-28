@@ -232,7 +232,13 @@ describe("all five sections have something real in them", () => {
     for (const family of ["MATERIAL_TRIM", "PACKAGING", "DEVELOPMENT"]) {
       const current = await selection.getCurrent(ctx(), { fileId: seeded.fileId, family });
       expect(current.approved).toBeTruthy();
-      expect(current.approved.rows.length).toBeGreaterThanOrEqual(6);
+      /* Development carries five: the two the buyer's own confirmed processes imply,
+         and three that are Merchandising's own judgement. It used to carry six,
+         the sixth being a PRINT row that contradicted Sales' "no print on this
+         style" — removed, because a showcase order should be an order that makes
+         sense. Conflict handling is proved in sales-process-intake.route.test.js. */
+      expect(current.approved.rows.length)
+        .toBeGreaterThanOrEqual(family === "DEVELOPMENT" ? 5 : 6);
       seen[family] = current.approved.revisionNo;
     }
     /* The buyer's change produced a second packaging revision; the first is
@@ -247,6 +253,60 @@ describe("all five sections have something real in them", () => {
     expect(superseded.rows.length).toBeGreaterThan(0);
     /* Materials carries the trim change the same way. */
     expect(await MaterialTrimRevision.countDocuments({ fileId: seeded.fileId })).toBe(2);
+  });
+
+  test("the buyer's confirmed processes reached the list through the real adoption flow", async () => {
+    /* NOT typed by the seed. The server read this order's accepted Sales version,
+       proposed the two processes Sales marked REQUIRED, and the seed supplied the
+       responsible team and the due date — the two answers nothing invents. So each
+       row carries a source reference a reader can follow to the buyer's own
+       statement, which a hand-typed row could never have. */
+    const selection = require("../../services/merchandising/selection.service");
+    const current = await selection.getCurrent(ctx(), {
+      fileId: seeded.fileId, family: "DEVELOPMENT",
+    });
+    const rows = current.approved.rows;
+
+    const fromSales = rows.filter((r) => r.sourceRef?.app === "sales");
+    expect(fromSales.map((r) => r.requirementType).sort()).toEqual(["EMBROIDERY", "WASH"]);
+    for (const r of fromSales) {
+      expect(r.sourceRef.recordType).toBe("handover_version");
+      expect(r.sourceRef.sourceVersion).toBe("1");
+      expect(r.responsibleApplication).toBe("PRODUCT_DEVELOPMENT");
+      expect(r.requiredByDate).toBeTruthy();
+    }
+
+    /* And the rest are Merchandising's own, with no borrowed authority. */
+    const own = rows.filter((r) => !r.sourceRef?.app);
+    expect(own.map((r) => r.requirementType).sort())
+      .toEqual(["ARTWORK", "OTHER", "PRE_PRODUCTION_SAMPLE"]);
+  });
+
+  test("nothing in the order contradicts what Sales confirmed", async () => {
+    /* The reconciliation the server computes, on the demo itself. Printing is
+       NOT_REQUIRED and there is no print work; embroidery and wash are REQUIRED and
+       both are covered. No exception note is needed anywhere, because there is
+       nothing to excuse. */
+    const intake = require("../../services/merchandising/salesProcessIntake.service");
+    const out = await intake.reconcile(ctx(), { fileId: seeded.fileId });
+
+    expect(out.blocking).toEqual([]);
+    expect(out.maySubmit).toBe(true);
+    const byProcess = Object.fromEntries(out.findings.map((f) => [f.process, f.state]));
+    expect(byProcess).toEqual({
+      EMBROIDERY: "COVERED",
+      WASHING: "COVERED",
+      PRINTING: "CONFIRMED_NOT_REQUIRED",
+    });
+
+    /* And no row carries a note explaining away a contradiction. */
+    const selection = require("../../services/merchandising/selection.service");
+    const current = await selection.getCurrent(ctx(), {
+      fileId: seeded.fileId, family: "DEVELOPMENT",
+    });
+    for (const r of current.approved.rows) {
+      expect(String(r.coordinationNote || "")).not.toMatch(/kept deliberately|despite Sales|no print/i);
+    }
   });
 
   test("Approvals & PP Meeting: a register, and an issued minute", async () => {
@@ -278,12 +338,47 @@ describe("all five sections have something real in them", () => {
   test("Schedule & Handover: a baselined plan in mixed states, and eight departments", async () => {
     const tnaPlan = require("../../services/merchandising/tnaPlan.service");
     const plan = await tnaPlan.getPlan(ctx(), { fileId: seeded.fileId });
-    expect(plan.milestones.length).toBeGreaterThanOrEqual(10);
+    /* ── SIX, NOT FOURTEEN, AND THAT IS THE CORRECTION ─────────────────
+       This asked for ten. The demo used to place fourteen milestones, seven
+       owned by Quality, Store, PPC or Production and completed by events no
+       application publishes — which is what the 27 Sep audit called
+       "missing / potentially stuck". A version containing one can no longer be
+       published, so the demo places only what really exists: the four
+       Merchandising approvals that close themselves, the production-readiness
+       meeting, and the one step Merchandising records by hand.
+
+       The number is asserted as "more than a token plan" rather than pinned,
+       because it should GROW on its own as each owning application starts
+       publishing — with no edit to the demo or to this line. */
+    expect(plan.milestones.length).toBeGreaterThanOrEqual(5);
+    /* And every one of them is genuinely completable by somebody or something. */
+    const registry = require("../../services/merchandising/tnaSourceEvents");
+    expect(registry.unsupportedInVersion(plan.milestones)).toEqual([]);
     expect(plan.plan.currentBaselineNo).toBe(1);
+    /* ── WHY THIS NO LONGER DEMANDS ALL FOUR STATES ────────────────────
+       It used to require COMPLETED, OVERDUE, FORECAST_LATE and BLOCKED
+       together. That needed at least three milestones nobody had closed, and
+       the fourteen-milestone template had plenty — because seven of them
+       waited on events no application publishes and so could never close at
+       all. The states were populated by the very rows that made the demo
+       dishonest.
+
+       Truthfully, five of this plan's six milestones close themselves the
+       moment Merchandising's own approvals publish, which is the behaviour
+       worth showing. So this asserts what a mixed plan really means — work
+       finished, and work visibly not on track — rather than a tally that can
+       only be reached by keeping unreachable rows in the schedule.
+
+       A demo seeded after an owning application starts publishing will hold
+       more states again, because it is given more open rows to slip. An
+       existing one will not: its template version is already published and
+       frozen. */
     const statuses = new Set(plan.milestones.map((m) => m.status));
-    for (const wanted of ["COMPLETED", "OVERDUE", "FORECAST_LATE", "BLOCKED"]) {
-      expect([...statuses]).toContain(wanted);
-    }
+    expect([...statuses]).toContain("COMPLETED");
+    const offTrack = [...statuses].filter((st) => ["OVERDUE", "FORECAST_LATE", "BLOCKED"].includes(st));
+    expect(offTrack.length).toBeGreaterThanOrEqual(1);
+    /* And the operations that produce those states really ran. */
+    expect(seeded.notes.filter((n) => /^(forecast|block) /.test(n))).toEqual([]);
     /* A baseline and a forecast that visibly differ — the reason the two
        columns exist. */
     expect(plan.milestones.some((m) => m.forecastDate && m.baselineDate

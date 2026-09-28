@@ -849,6 +849,24 @@ async function decide({
     request.financeApprovedAt = now;
     request.status = chain.statusAfter("finance");
 
+    /* ── THE QUOTE'S CHARGES BECOME THE APPROVAL'S ─────────────────────
+       Snapshotted at the moment of the yes, and never written again. Store's
+       `quoted*` figures stay editable up to here and stop mattering after it;
+       the purchase order reads only these.
+
+       Two fields rather than one because "what Store last typed" and "what
+       Finance agreed" are different questions: sharing a field would let an
+       edit after approval rewrite the record of the decision, and the order
+       would then carry figures nobody had approved. Changing a charge means
+       requoting, which returns the request for confirmation and approval and
+       retakes this snapshot. */
+    request.approvedShippingCharges = Number(request.quotedShippingCharges) || 0;
+    request.approvedDiscount = Number(request.quotedDiscount) || 0;
+    request.approvedCustomCharges = (request.quotedCustomCharges || [])
+      .map((c) => ({ label: String(c.label || "").trim(), amount: Number(c.amount) || 0 }))
+      .filter((c) => c.label);
+    request.adjustmentsApprovedAt = now;
+
     /* ── FINANCE'S YES IS THE COMMITMENT ────────────────────────────────
        Not the TL's, and not the submission. Until finance agrees, nothing has
        been promised; the moment they do, the money is spoken for even though

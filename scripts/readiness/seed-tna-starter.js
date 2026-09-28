@@ -50,6 +50,11 @@ const {
 const { OUTBOX_KIND } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 
 const config = require("../../services/merchandising/tnaConfig.service");
+const sourceEvents = require("../../services/merchandising/tnaSourceEvents");
+const library = require("../../services/merchandising/tnaMilestoneLibrary.service");
+const {
+  TnaMilestoneDefinition,
+} = require("../../models/CMS_Models/Merchandising/TnaMilestoneDefinition");
 
 const CLI_APPLY = process.argv.includes("--apply");
 const line = (s = "") => process.stdout.write(`${s}\n`);
@@ -62,13 +67,23 @@ const STARTER_TEMPLATE = "Standard garment order";
 const WEEK_PATTERN = [true, true, true, true, true, true, false];
 
 /**
- * The cross-department shape of a garment order.
+ * THE LEGACY STARTER SIGNATURE. NOT WHAT IS SEEDED TODAY.
  *
- * Read the third and fourth columns rather than the dates. Every milestone
- * owned outside Merchandising completes on its owner's event, and the two that
- * have no event to wait for yet say so by carrying none.
+ * ── READ THIS BEFORE CHANGING ANYTHING HERE ───────────────────────────────
+ * This array is a FINGERPRINT, not a configuration. Every company seeded before
+ * the milestone library existed holds a published version shaped exactly like
+ * this, and `isShippedStarter` recognises an untouched one by comparing against
+ * it. Editing it does not change what new companies get — it changes which
+ * existing templates the script believes it recognises.
+ *
+ * What a new company gets is `STARTER_PLACEMENTS`, below, which is a separate
+ * list and deliberately not derived from this one. Deriving it from here was
+ * the defect: the current starter inherited a ten-row snapshot from before the
+ * publication rule, so a milestone added to the library afterwards — the
+ * production-readiness meeting — was wired end to end and never placed in a
+ * single real plan.
  */
-const MILESTONES = [
+const LEGACY_STARTER_MILESTONES = [
   {
     milestoneCode: "TRIM_CARD_APPROVED", name: "Trim card approved",
     ownerDepartment: "MERCHANDISING", completionAuthority: "SOURCE_EVENT",
@@ -162,6 +177,114 @@ const MILESTONES = [
   },
 ];
 
+/**
+ * ── WHAT A TEMPLATE STEP SENDS, NOW THAT THE MILESTONE LIST EXISTS ────────
+ * Only the code and the placement. The name, the owning department, how it is
+ * completed and which system action completes it come from the company's
+ * milestone list — see `tnaMilestoneLibrary.STARTER_LIBRARY`, which holds
+ * these same ten codes.
+ *
+ * `LEGACY_STARTER_MILESTONES` above is kept whole because it is ALSO the description of what
+ * is on disk in every company seeded before the list existed, which is what
+ * `isShippedStarter` recognises. Derived rather than written twice, so the two
+ * cannot drift.
+ */
+/**
+ * WHAT A NEW COMPANY'S STARTER TEMPLATE ACTUALLY PLACES.
+ *
+ * A code and where its date comes from. Nothing else: the name, the owning
+ * department, how it is completed and which system action closes it belong to
+ * the company's milestone list, and a template that repeated them would be able
+ * to disagree with it.
+ *
+ * ── WHY THESE FIVE, IN THIS ORDER ─────────────────────────────────────────
+ * Every one is completed by an application that publishes TODAY. A version
+ * cannot be published containing a milestone whose event nothing produces, and
+ * rightly: a schedule is a commitment, and a date nothing can meet or mark is
+ * not one.
+ *
+ * The readiness meeting sits BEFORE the pack handover because that is the order
+ * the work happens in — the meeting settles how the order will be made, and the
+ * pack is what goes to production planning afterwards. Each closes from its own
+ * record: the meeting from its issued minutes, the pack from its submitted
+ * version. Neither closes the other.
+ *
+ * Nothing owned by Store, PPC, Production, Quality or Logistics is here. Those
+ * milestones are on every company's list, each naming the application that owes
+ * its event, and adding one now to make this list look longer would put a date
+ * on the board that nobody could ever meet.
+ */
+const STARTER_PLACEMENTS = Object.freeze([
+  {
+    milestoneCode: "TRIM_CARD_APPROVED",            // Materials and trims approved
+    anchor: "PLAN_START", offsetWorkingDays: 5, scope: "FILE",
+    criticalPathCandidate: true, sortOrder: 0,
+  },
+  {
+    milestoneCode: "PACKAGING_APPROVED",            // Packaging approved
+    anchor: "PLAN_START", offsetWorkingDays: 8, scope: "FILE",
+    criticalPathCandidate: false, sortOrder: 1,
+  },
+  {
+    milestoneCode: "DEVELOPMENT_APPROVED",          // Development work list approved
+    anchor: "PLAN_START", offsetWorkingDays: 8, scope: "FILE",
+    criticalPathCandidate: true, sortOrder: 2,
+  },
+  {
+    milestoneCode: "PP_MEETING_HELD",               // Production readiness meeting held
+    anchor: "PREDECESSOR", offsetWorkingDays: 3, scope: "FILE",
+    criticalPathCandidate: true, sortOrder: 3,
+  },
+  {
+    milestoneCode: "PPC_HANDOVER",                  // Order pack sent to production planning
+    anchor: "PREDECESSOR", offsetWorkingDays: 2, scope: "FILE",
+    criticalPathCandidate: true, sortOrder: 4,
+  },
+]);
+
+/**
+ * The order the work happens in. The meeting cannot be held before the order's
+ * materials, packaging and development work are settled, and the pack cannot go
+ * to production planning before the meeting that agreed how to make it.
+ */
+const STARTER_EDGES = Object.freeze([
+  { predecessorCode: "TRIM_CARD_APPROVED", successorCode: "PP_MEETING_HELD", lagWorkingDays: 0 },
+  { predecessorCode: "PACKAGING_APPROVED", successorCode: "PP_MEETING_HELD", lagWorkingDays: 0 },
+  { predecessorCode: "DEVELOPMENT_APPROVED", successorCode: "PP_MEETING_HELD", lagWorkingDays: 0 },
+  { predecessorCode: "PP_MEETING_HELD", successorCode: "PPC_HANDOVER", lagWorkingDays: 0 },
+]);
+
+/**
+ * A guard, not a filter. The list above is written by hand on purpose — what
+ * belongs in a company's first schedule is a judgement — so this asserts at
+ * load time that every placement names a library milestone whose producer is
+ * real. If a kind is ever removed from the registry, this fails loudly here
+ * rather than at a customer's first publish.
+ */
+(() => {
+  for (const step of STARTER_PLACEMENTS) {
+    const def = library.STARTER_LIBRARY.find((d) => d.milestoneCode === step.milestoneCode);
+    if (!def) {
+      throw new Error(`seed-tna-starter: ${step.milestoneCode} is not in the milestone library.`);
+    }
+    if (def.completionMethod === "SYSTEM_EVENT" && !sourceEvents.isSupported(def.systemEventKey)) {
+      throw new Error(
+        `seed-tna-starter: ${step.milestoneCode} waits on ${def.systemEventKey}, which no `
+        + "application publishes, so a template placing it could never be published.",
+      );
+    }
+  }
+  const codes = STARTER_PLACEMENTS.map((s) => s.milestoneCode);
+  for (const edge of STARTER_EDGES) {
+    for (const end of [edge.predecessorCode, edge.successorCode]) {
+      if (!codes.includes(end)) {
+        throw new Error(`seed-tna-starter: an edge names ${end}, which the starter does not place.`);
+      }
+    }
+  }
+})();
+
+
 const DEPENDENCIES = [
   { predecessorCode: "TRIM_CARD_APPROVED", successorCode: "SAMPLE_APPROVED", lagWorkingDays: 0 },
   { predecessorCode: "PACKAGING_APPROVED", successorCode: "PPC_HANDOVER", lagWorkingDays: 0 },
@@ -192,7 +315,7 @@ const DEPENDENCIES = [
    current definition with final inspection anchored back to the target
    ex-factory date, and without the two edges that join the end of the order
    to the graph. */
-const SHIPPED_V1_MILESTONES = Object.freeze(MILESTONES.map((m) => (m.milestoneCode === "FINAL_INSPECTION"
+const SHIPPED_V1_MILESTONES = Object.freeze(LEGACY_STARTER_MILESTONES.map((m) => (m.milestoneCode === "FINAL_INSPECTION"
   ? { ...m, anchor: "EX_FACTORY", offsetWorkingDays: -3, scope: "FILE" }
   : m)));
 const SHIPPED_V1_DEPENDENCIES = Object.freeze(DEPENDENCIES.filter((d) => !(
@@ -274,7 +397,7 @@ async function merchandisingCompanies() {
  * when it was created, and moving one onto another definition is the plan
  * owner's decision, not a configuration script's.
  */
-async function repairShippedStarter(company, { apply, ctx, actor, out }) {
+async function repairShippedStarter(company, { out }) {
   const template = await TnaTemplate.findOne({ companyId: company._id, name: STARTER_TEMPLATE }).lean();
   if (!template) return;
   const current = await TnaTemplateVersion.findOne({
@@ -283,32 +406,69 @@ async function repairShippedStarter(company, { apply, ctx, actor, out }) {
   if (!current || !isShippedStarter(current)) return;
 
   out.repairable = { templateId: String(template._id), versionNo: current.versionNo };
-  if (!apply) return;
 
-  const created = await config.createVersion(ctx, {
-    templateId: String(template._id), actor,
-    body: {
-      milestones: MILESTONES,
-      dependencies: DEPENDENCIES,
-      effectiveFrom: new Date(current.effectiveFrom).toISOString().slice(0, 10),
-      ...(current.defaultCalendarId ? { defaultCalendarId: String(current.defaultCalendarId) } : {}),
-    },
-  });
-  await config.publishVersion(ctx, {
-    templateId: String(template._id), versionNo: created.version.versionNo, actor,
-  });
-  out.template = {
-    id: String(template._id), name: STARTER_TEMPLATE,
-    versionNo: created.version.versionNo, repairedFromVersionNo: current.versionNo,
+  /* ── THE REPAIR CANNOT BE APPLIED ANY MORE, AND MUST NOT BE FAKED ──────
+     This repair republished the whole starter definition with final inspection
+     re-anchored. Six of those ten milestones can no longer be PUBLISHED,
+     because nothing publishes the events that would complete them. So the only
+     version this could create now is one missing six of the company's
+     milestones — which is not a repair, it is a smaller template wearing the
+     word "repair".
+
+     The defect also matters less than it did: final inspection is one of the
+     six, so it is shown as not integrated and is already kept out of every
+     overdue, at-risk and next-action figure. A wrong forecast date on a
+     milestone nothing can complete is not what it was.
+
+     So this reports, and stops. Re-anchoring that milestone inside a company's
+     own published template is a decision about their schedule, and belongs to
+     whoever owns it. */
+  out.repairBlocked = {
+    reason: "Six of the starter's milestones wait on an event no application publishes yet, "
+      + "so a new version containing them cannot be published. Republishing without them "
+      + "would quietly remove them from this company's template.",
+    /* Named against what the current starter can place, so the list stays
+       right on its own as producers are built. */
+    wouldLose: LEGACY_STARTER_MILESTONES
+      .map((m) => m.milestoneCode)
+      .filter((c) => !STARTER_PLACEMENTS.some((p) => p.milestoneCode === c)),
   };
-  out.repairable = null;
 }
 
 async function seedCompany(company, { apply = false, skipTemplate = false } = {}) {
   const APPLY = apply;
   const ctx = { companyId: company._id };
   const actor = { name: "Starter configuration" };
-  const out = { calendar: null, template: null, repairable: null, skipped: [] };
+  const out = {
+    milestoneLibrary: null, calendar: null, template: null, repairable: null, skipped: [],
+  };
+
+  /* ── THE MILESTONE LIST, FIRST ─────────────────────────────────────────
+     Before the template, because a template step now selects from this list
+     and a company with an empty list would have its steps shaped the old way.
+     Additive only: an entry the company already has is left exactly as it is,
+     because its words may have been improved since and this script does not
+     know better than whoever improved them. */
+  {
+    const held = await TnaMilestoneDefinition
+      .find({ companyId: company._id }).select("code").lean();
+    /* `code` on disk, `milestoneCode` in the shipped library — see
+         `tnaMilestoneLibrary.codeOf`. */
+      const have = new Set(held.map((d) => d.code));
+    const missing = library.STARTER_LIBRARY.filter((d) => !have.has(d.milestoneCode));
+    out.milestoneLibrary = { held: have.size, missing: missing.length, added: 0 };
+
+    if (missing.length && APPLY) {
+      for (const entry of missing) {
+        const body = Object.fromEntries(Object.entries(entry)
+          .filter(([k]) => library.DEFINITION_FIELDS.includes(k)));
+        await library.createDefinition({ companyId: company._id, actor }, body);
+        out.milestoneLibrary.added += 1;
+      }
+    } else if (!missing.length) {
+      out.skipped.push("every starter milestone is already on the list");
+    }
+  }
 
   /* ── The calendar ──────────────────────────────────────────────────── */
   const publishedCal = await WorkingCalendarVersion
@@ -350,7 +510,7 @@ async function seedCompany(company, { apply = false, skipTemplate = false } = {}
     out.skipped.push("template not requested");
   } else if (publishedTpl) {
     out.skipped.push("a published template already exists");
-    await repairShippedStarter(company, { apply: APPLY, ctx, actor, out });
+    await repairShippedStarter(company, { out });
   } else if (APPLY) {
     const existing = await TnaTemplate
       .findOne({ companyId: company._id, name: STARTER_TEMPLATE }).lean();
@@ -371,8 +531,8 @@ async function seedCompany(company, { apply = false, skipTemplate = false } = {}
       : (await config.createVersion(ctx, {
         templateId: tplId, actor,
         body: {
-          milestones: MILESTONES,
-          dependencies: DEPENDENCIES,
+          milestones: STARTER_PLACEMENTS,
+          dependencies: STARTER_EDGES,
           effectiveFrom: "2026-01-01",
           ...(calVersion ? { defaultCalendarId: String(calVersion.calendarId) } : {}),
         },
@@ -430,6 +590,16 @@ async function main() {
     if (!APPLY) { line(`WOULD SEED  ${label}`); continue; }
     seeded += 1;
     line(`SEEDED  ${label}`);
+    if (res.milestoneLibrary) {
+      const ml = res.milestoneLibrary;
+      say("  milestone list", APPLY
+        ? `${ml.added} added, ${ml.held} already held`
+        : `${ml.missing} would be added, ${ml.held} already held`);
+    }
+    if (res.repairBlocked) {
+      say("  starter repair", "no longer possible — reported, nothing changed");
+      say("    would lose", res.repairBlocked.wouldLose.join(", "));
+    }
     if (res.calendar) say("  calendar", `${res.calendar.name} v${res.calendar.versionNo}  ${res.calendar.id}`);
     if (res.template) say("  template", `${res.template.name} v${res.template.versionNo}  ${res.template.id}`);
   }
@@ -444,7 +614,9 @@ async function main() {
 
 module.exports = {
   seedCompany, merchandisingCompanies,
-  MILESTONES, DEPENDENCIES, REASON_CODES, WEEK_PATTERN, isShippedStarter,
+  LEGACY_STARTER_MILESTONES, STARTER_PLACEMENTS, STARTER_EDGES,
+  DEPENDENCIES, REASON_CODES, WEEK_PATTERN,
+  isShippedStarter,
   STARTER_CALENDAR, STARTER_TEMPLATE,
 };
 

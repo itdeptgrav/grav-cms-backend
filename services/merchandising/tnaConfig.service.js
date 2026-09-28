@@ -37,6 +37,9 @@ const {
 } = require("../../models/CMS_Models/Merchandising/WorkingCalendar");
 const { TnaReasonCode } = require("../../models/CMS_Models/Merchandising/TnaPlan");
 const graph = require("./tnaGraph");
+const sourceEvents = require("./tnaSourceEvents");
+const library = require("./tnaMilestoneLibrary.service");
+const { MILESTONE_STAGE: STAGE } = library;
 const cal = require("./tnaCalendar");
 const { fail } = require("../storePurchase/errors");
 
@@ -151,10 +154,29 @@ async function listVersions(ctx, { templateId } = {}) {
 const VERSION_FIELDS = Object.freeze([
   "effectiveFrom", "selectors", "milestones", "dependencies", "defaultCalendarId",
 ]);
-const MILESTONE_FIELDS = Object.freeze([
-  "milestoneCode", "name", "ownerDepartment", "completionAuthority", "sourceEventKinds",
+/**
+ * ── WHAT A TEMPLATE STEP MAY SAY, ONCE THE MILESTONE LIST EXISTS ──────────
+ * A step CHOOSES a milestone and PLACES it. It does not describe it: the name,
+ * the owning department, how it is completed and which system action completes
+ * it all come from the company's milestone list, by code.
+ *
+ * This is the whole point of the list. When a step could type its own name,
+ * two templates produced "Trim card approved" under two different codes and
+ * "Fabric in house" twice, so no report could answer "how late is the trim
+ * card, across every order" — there was no single thing to be late.
+ */
+const STEP_FIELDS = Object.freeze([
+  "milestoneCode",
   "anchor", "offsetWorkingDays", "scope", "criticalPathCandidate", "sortOrder",
 ]);
+
+/** What a step may no longer say, and where to say it instead. */
+const DESCRIBED_BY_LIBRARY = Object.freeze({
+  name: "the milestone's name",
+  ownerDepartment: "which department owns it",
+  completionAuthority: "how it is completed",
+  sourceEventKinds: "which system action completes it",
+});
 
 /**
  * Fields that would let a template carry another department's operational
@@ -198,8 +220,17 @@ function assertShape(body, allowed, label) {
  * fabrication the whole ownership model exists to prevent, so it is refused at
  * publish — where a person is looking — with the department named.
  */
-function shapeMilestone(raw, index) {
-  assertShape(raw, MILESTONE_FIELDS, "a milestone definition");
+function shapeMilestone(raw, index, library) {
+  for (const [field, what] of Object.entries(DESCRIBED_BY_LIBRARY)) {
+    if (raw && raw[field] !== undefined) {
+      throw fail("TNA_MILESTONE_DESCRIBED_BY_LIBRARY",
+        `A template step cannot set ${what}. Choose a milestone by its code and that `
+        + "comes with it. To change what the milestone means, change it on the "
+        + "company's milestone list, where every template sees the same change.",
+        { field, index });
+    }
+  }
+  assertShape(raw, STEP_FIELDS, "a milestone definition");
 
   const milestoneCode = str(raw.milestoneCode).toUpperCase();
   if (!/^[A-Z][A-Z0-9_]{2,39}$/.test(milestoneCode)) {
@@ -207,60 +238,53 @@ function shapeMilestone(raw, index) {
       `Milestone ${index + 1} needs a code of A–Z, 0–9 and underscores, three characters or more.`,
       { field: "milestoneCode", index });
   }
-  const name = str(raw.name);
-  if (!name) throw fail("VALIDATION", `Milestone ${milestoneCode} needs a name.`, { field: "name", index });
 
-  const ownerDepartment = str(raw.ownerDepartment).toUpperCase();
-  if (!Object.values(OWNER_DEPARTMENT).includes(ownerDepartment)) {
-    throw fail("VALIDATION",
-      `Say which department owns ${milestoneCode}: ${Object.values(OWNER_DEPARTMENT).join(", ")}.`,
-      { field: "ownerDepartment", index });
-  }
-  const completionAuthority = str(raw.completionAuthority).toUpperCase()
-    || COMPLETION_AUTHORITY.SOURCE_EVENT;
-  if (!Object.values(COMPLETION_AUTHORITY).includes(completionAuthority)) {
-    throw fail("VALIDATION",
-      `${milestoneCode} needs a completion authority of MERCHANDISING or SOURCE_EVENT.`,
-      { field: "completionAuthority", index });
-  }
-  if (completionAuthority === COMPLETION_AUTHORITY.MERCHANDISING
-    && ownerDepartment !== OWNER_DEPARTMENT.MERCHANDISING) {
-    throw fail("VALIDATION",
-      `${milestoneCode} is owned by ${ownerDepartment}, so Merchandising cannot be the one to mark it done. `
-      + "Merchandising coordinates visibility; it cannot mark another department ready. "
-      + "Use SOURCE_EVENT and name the event kinds that may complete it.",
-      { field: "completionAuthority", index, ownerDepartment });
-  }
-
-  const anchor = str(raw.anchor).toUpperCase() || ANCHOR.PLAN_START;
-  if (!Object.values(ANCHOR).includes(anchor)) {
-    throw fail("VALIDATION", `${milestoneCode} needs a known anchor.`, { field: "anchor", index });
-  }
-  const offsetWorkingDays = Number(raw.offsetWorkingDays ?? 0);
-  if (!Number.isInteger(offsetWorkingDays)) {
-    throw fail("VALIDATION",
-      `${milestoneCode}'s offset must be a whole number of working days.`,
-      { field: "offsetWorkingDays", index });
-  }
-  const scope = str(raw.scope).toUpperCase() || MILESTONE_SCOPE.FILE;
-  if (!Object.values(MILESTONE_SCOPE).includes(scope)) {
-    throw fail("VALIDATION", `${milestoneCode} needs a known scope.`, { field: "scope", index });
-  }
-
-  return {
-    milestoneCode, name, ownerDepartment, completionAuthority,
-    sourceEventKinds: [...new Set((Array.isArray(raw.sourceEventKinds) ? raw.sourceEventKinds : [])
-      .map(str).filter(Boolean))],
-    anchor, offsetWorkingDays, scope,
-    criticalPathCandidate: raw.criticalPathCandidate === true,
-    sortOrder: Number(raw.sortOrder ?? index),
+  /* ── THE PLACEMENT FIELDS, WHICH ARE THE STEP'S OWN ─────────────────── */
+  const placement = () => {
+    const anchor = str(raw.anchor).toUpperCase() || ANCHOR.PLAN_START;
+    if (!Object.values(ANCHOR).includes(anchor)) {
+      throw fail("VALIDATION", `${milestoneCode} needs a known anchor.`, { field: "anchor", index });
+    }
+    const offsetWorkingDays = Number(raw.offsetWorkingDays ?? 0);
+    if (!Number.isInteger(offsetWorkingDays)) {
+      throw fail("VALIDATION",
+        `${milestoneCode}'s offset must be a whole number of working days.`,
+        { field: "offsetWorkingDays", index });
+    }
+    const scope = str(raw.scope).toUpperCase() || MILESTONE_SCOPE.FILE;
+    if (!Object.values(MILESTONE_SCOPE).includes(scope)) {
+      throw fail("VALIDATION", `${milestoneCode} needs a known scope.`, { field: "scope", index });
+    }
+    return {
+      anchor, offsetWorkingDays, scope,
+      criticalPathCandidate: raw.criticalPathCandidate === true,
+      sortOrder: Number(raw.sortOrder ?? index),
+    };
   };
+
+  const def = library.get(milestoneCode);
+  if (!def) {
+    throw fail("TNA_MILESTONE_NOT_IN_LIBRARY",
+      `${milestoneCode} is not on the company's milestone list, so a template cannot use it. `
+      + "Add it to the list first — that is what keeps every order's milestones comparable.",
+      { field: "milestoneCode", index, milestoneCode, available: library.codes() });
+  }
+  /* ── DEVELOPMENT WORK IS NOT ASKED FOR TWICE ──────────────────────────
+     A T&A template plans a CONFIRMED order. A milestone the list marks as
+     Development work is refused here by name, so a schedule cannot ask
+     Product Development to approve a sample the buyer signed off before the
+     order existed. Work that genuinely recurs per order is marked as
+     belonging to both, and passes. */
+  library.assertSelectable(def, STAGE.ORDER_EXECUTION);
+  return { ...library.factsFor(milestoneCode), ...placement() };
 }
 
-function shapeVersionBody(body) {
+
+function shapeVersionBody(body, library) {
   assertShape(body, VERSION_FIELDS, "a template version");
 
-  const milestones = (Array.isArray(body.milestones) ? body.milestones : []).map(shapeMilestone);
+  const milestones = (Array.isArray(body.milestones) ? body.milestones : [])
+    .map((raw, i) => shapeMilestone(raw, i, library));
   const codes = milestones.map((m) => m.milestoneCode);
   if (new Set(codes).size !== codes.length) {
     throw fail("VALIDATION", "Two milestones share one code.", { field: "milestones" });
@@ -295,7 +319,7 @@ function shapeVersionBody(body) {
 
 async function createVersion(ctx, { templateId, body = {}, actor = null } = {}) {
   const t = await loadTemplate(ctx, templateId);
-  const shaped = shapeVersionBody(body);
+  const shaped = shapeVersionBody(body, await library.libraryFor(ctx.companyId));
 
   const existing = await TnaTemplateVersion.findOne({
     companyId: ctx.companyId, templateId: t._id, state: VERSION_STATE.DRAFT,
@@ -345,7 +369,7 @@ async function updateVersion(ctx, { templateId, versionNo, body = {}, actor = nu
       + "Publish a new version instead.",
       { versionNo: version.versionNo, state: version.state });
   }
-  const shaped = shapeVersionBody(body);
+  const shaped = shapeVersionBody(body, await library.libraryFor(ctx.companyId));
   version.set(shaped);
   version.set("updatedBy", actor || undefined);
   await version.save();
@@ -373,6 +397,42 @@ async function publishVersion(ctx, { templateId, versionNo, actor = null } = {})
   /* Refuses a cycle, an unknown code, a self-edge and a duplicate pair — and
      names the loop rather than reporting "invalid graph". */
   graph.rank(version.milestones.map((m) => m.milestoneCode), version.dependencies);
+
+  /* ── AND REFUSES A MILESTONE NOTHING CAN EVER CLOSE ──────────────────────
+     A `SOURCE_EVENT` milestone cannot be completed by hand — that is the
+     point of it. So one naming an event no application publishes is
+     unreachable: nobody may tick it and nothing will ever arrive. Published
+     freely until now, which is how the 27 Sep audit found most source-owned
+     milestones sitting as ordinary work somebody had failed to do.
+
+     Refused at PUBLISH, not at draft: an author must be able to write the
+     template they intend and see what is missing. Existing published
+     versions and every plan already running on one are untouched — their
+     milestones are preserved and described honestly instead of being
+     rewritten underneath somebody. */
+  const unsupported = sourceEvents.unsupportedInVersion(version.milestones || []);
+  if (unsupported.length) {
+    /* ── NAMED, NOT COUNTED ────────────────────────────────────────────
+       The author's next question is "which one, waiting for what, from
+       whom" — three facts, or the message sends them to read the registry.
+       And it does NOT suggest making the milestone manual: Merchandising
+       may not complete another department's work, so that "fix" would be a
+       fabrication. The honest instruction is to take it off this version
+       until the owning application publishes. */
+    const lines = unsupported.map((u) => {
+      const what = u.kinds.length ? u.kinds.join(", ") : "no event at all";
+      const who = u.owed.length ? u.owed.join(" / ") : "no application";
+      return `"${u.name || u.milestoneCode}" (${u.milestoneCode}) needs ${what}, `
+        + `which ${who} would have to publish`;
+    });
+    throw fail("TNA_SOURCE_EVENT_UNSUPPORTED",
+      `This version cannot be published: ${unsupported.length} milestone(s) are completed by a `
+      + "system action that no application publishes yet, so a schedule would be committing to "
+      + `a date nothing could ever meet. ${lines.join("; ")}. `
+      + "Remove them from this version until the owning application publishes its event. "
+      + "Versions already published keep theirs and show them as not integrated.",
+      { milestones: unsupported });
+  }
 
   const now = new Date();
   const previous = await TnaTemplateVersion.findOne({
@@ -731,8 +791,13 @@ async function upsertReasonCode(ctx, { body = {} } = {}) {
   return { reasonCode: { code: str(doc.code), label: str(doc.label), kind: str(doc.kind) } };
 }
 
+/* The one list a template-authoring screen reads. Derived, never a
+   second array in a browser. */
+const sourceEventCatalogue = () => sourceEvents.catalogue();
+
 module.exports = {
-  DEFAULT_LIMIT, MAX_LIMIT, VERSION_FIELDS, MILESTONE_FIELDS, REFUSED_FIELDS,
+  sourceEventCatalogue,
+  DEFAULT_LIMIT, MAX_LIMIT, VERSION_FIELDS, STEP_FIELDS, REFUSED_FIELDS,
   templateView, versionView, calendarView, calendarVersionView,
   listTemplates, createTemplate, listVersions, createVersion, getVersion,
   updateVersion, publishVersion, retireVersion,

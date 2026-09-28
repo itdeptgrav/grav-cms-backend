@@ -342,6 +342,98 @@ function assertIssueBodyShape(body) {
   }
 }
 
+/* ═══ THE THREE WRITTEN REQUIREMENTS, AND WHAT SILENCE MEANS ════════════════
+ *
+ * Packing, testing and delivery instructions are prose the buyer agreed. They
+ * are optional on a first version — many orders have none — and that is where
+ * the difficulty starts, because on a SUCCESSOR version three different things
+ * arrive looking identical:
+ *
+ *   the salesperson restated it        → a statement
+ *   the salesperson cleared it         → also a statement, the opposite one
+ *   the form did not send the field    → NOT a statement
+ *
+ * The old code read all three the same way (`str(body.x) ? store : omit`), so a
+ * successor issued to change a delivery date silently dropped the packing
+ * instructions the buyer had agreed. Downstream that reads as "Sales stated
+ * nothing about packing", which is a different and much worse fact than "no
+ * special packing" — and nobody was told.
+ *
+ * So the contract is explicit, and it is the same shape as the one that already
+ * governs the process statement:
+ *
+ *   a non-empty string  → stated, and stored
+ *   `null`              → DELIBERATELY CLEARED: there is no longer such a
+ *                         requirement. Recorded as a clearance so the trail
+ *                         shows a decision was taken.
+ *   absent              → nothing said. Fine on a first version, and on a
+ *                         successor whose predecessor also said nothing.
+ *                         REFUSED when the predecessor stated one.
+ *   `""`                → refused outright. An empty string is what a form
+ *                         sends when a field was never filled in AND what it
+ *                         sends when somebody emptied it, so it cannot carry a
+ *                         decision. The refusal says to send `null` to clear.
+ */
+const WRITTEN_REQUIREMENTS = Object.freeze([
+  ["packingRequirement", "packing instructions"],
+  ["testingRequirement", "testing and inspection requirements"],
+  ["deliveryRequirement", "delivery and shipping instructions"],
+]);
+
+const REQUIREMENT_LIMIT = 2000;
+
+/**
+ * Read the three written requirements against what the current version says.
+ *
+ * @returns {{ stated: object, cleared: string[] }} `stated` holds only the
+ *   fields with a value to store; `cleared` names the ones deliberately
+ *   withdrawn, for the audit trail.
+ */
+function readWrittenRequirements(body, current) {
+  const stated = {};
+  const cleared = [];
+  const previous = current?.executionProjection || {};
+
+  for (const [field, label] of WRITTEN_REQUIREMENTS) {
+    const sent = Object.prototype.hasOwnProperty.call(body || {}, field);
+    const value = body?.[field];
+    const had = str(previous[field]);
+
+    if (sent && value === null) {
+      /* A decision, and the trail records it as one. Storing nothing is right —
+         the projection has no field for "explicitly none" and inventing one
+         would give every reader a third state to handle. The clearance is the
+         version's own history. */
+      if (had) cleared.push(field);
+      continue;
+    }
+
+    if (sent && typeof value === "string" && !value.trim()) {
+      throw fail("HANDOVER_REQUIREMENT_AMBIGUOUS",
+        `Leave the ${label} out if there are none to state, or send it as null to withdraw what `
+        + "the previous version stated. An empty box cannot tell those two apart.",
+        { field });
+    }
+
+    if (sent && value !== undefined) {
+      if (typeof value !== "string") {
+        throw fail("VALIDATION", `The ${label} must be text.`, { field });
+      }
+      stated[field] = value.trim().slice(0, REQUIREMENT_LIMIT);
+      continue;
+    }
+
+    /* Not sent. Only a problem when the predecessor stated one. */
+    if (had) {
+      throw fail("HANDOVER_REQUIREMENT_RESTATE_REQUIRED",
+        `Version ${current.versionNo} states the ${label} the buyer agreed. Restate them on the new `
+        + "version, or withdraw them deliberately — they are not carried forward silently.",
+        { field, currentVersionNo: current.versionNo, previousValue: had });
+    }
+  }
+  return { stated, cleared };
+}
+
 /** The order line this reference names, or a refusal. */
 function findLine(request, lineRef) {
   const wanted = str(lineRef);
@@ -403,9 +495,9 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
     breakdown,
     deliveries,
     allocations,
-    ...(str(body.packingRequirement) ? { packingRequirement: str(body.packingRequirement).slice(0, 2000) } : {}),
-    ...(str(body.testingRequirement) ? { testingRequirement: str(body.testingRequirement).slice(0, 2000) } : {}),
-    ...(str(body.deliveryRequirement) ? { deliveryRequirement: str(body.deliveryRequirement).slice(0, 2000) } : {}),
+    /* Packing, testing and delivery are merged in INSIDE the transaction, once
+       the version being superseded is known: whether silence is allowed depends
+       on what that version said. See `readWrittenRequirements`. */
     ...(processRequirements ? { processRequirements } : {}),
   };
   /* Derived here purely to prove the projection resolves to a coherent set of
@@ -452,6 +544,11 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
         { field: "processRequirements", currentVersionNo: current.versionNo });
     }
 
+    /* The same rule for the three written requirements: restated, deliberately
+       withdrawn, or refused — never quietly lost. */
+    const written = readWrittenRequirements(body, current);
+    Object.assign(executionProjection, written.stated);
+
     /* ── RETIRE FIRST, THEN ISSUE ─────────────────────────────────────
        The one-CURRENT-per-line partial unique index is checked as each write
        lands, not at commit — so the successor can only be created once its
@@ -491,6 +588,11 @@ async function issue(scope, { requestId, lineId, body = {}, actor = null } = {})
       action: HANDOVER_EVENT_KINDS.ISSUED,
       actor: actor || undefined,
       resultingState: "CURRENT",
+      /* A CLEARED requirement leaves no trace in the projection — there is no
+         field for "explicitly none" and inventing one would hand every reader a
+         third state. So the decision lives here, where a trail belongs: this
+         version withdrew what the last one stated. */
+      ...(written.cleared.length ? { clearedRequirements: written.cleared } : {}),
     }];
     const outbox = [{
       companyId: scope.companyId,

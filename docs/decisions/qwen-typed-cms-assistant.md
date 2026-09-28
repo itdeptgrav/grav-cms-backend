@@ -9,11 +9,14 @@ Use Qwen as the central assistant's only live language planner. Models do not
 receive unrestricted database access and do not own permissions, identity,
 company scope, calculations or writes.
 
-Every CMS application extends the assistant by registering a typed capability:
+Every CMS application extends the assistant by registering a typed capability
+and semantic-catalogue metadata (see
+`docs/decisions/cms-semantic-catalogue.md`):
 
 1. GRAV resolves the signed-in actor and removes capabilities they may not use.
-2. Qwen receives only the authorised capability names and developer-written
-   descriptions and chooses exactly one capability.
+2. GRAV detects explicit business domains and exact catalogue metrics. Exact
+   catalogue claims execute without Qwen; otherwise Qwen receives only the
+   authorised, domain-compatible capability names and descriptions.
 3. Qwen receives only that capability's closed JSON schema and fills its
    arguments from the user's words and the last validated plan.
 4. GRAV validates the object, rejects unknown fields, and re-authorises the
@@ -28,24 +31,34 @@ when the signed-in actor holds its underlying permission.
 
 ## HR catalogue now connected
 
-The existing deterministic HR services are exposed through eleven permission-
-gated read capabilities:
+The deterministic HR services are exposed through a permission-gated read
+catalogue covering the current HR business model:
 
-- workforce overview;
-- daily attendance by date and department;
-- leave, regularisation, upcoming leave and named-person leave balances;
-- one employee's directory profile and attendance;
-- employee directory and department structure;
-- overtime;
-- holidays;
-- HR policies and shift/leave settings;
-- aggregate payroll runs;
-- authorised named-person or self salary/payslip data.
+- workforce overview, employee directory and complete authorised employee
+  records (private, statutory, medical and compensation fields remain separate
+  permission classes);
+- daily and ranged attendance, raw punch timelines, work/break/late/early/OT
+  measures, HR review evidence, monthly exclusions and all existing monthly
+  report inputs;
+- leave applications, regularisation, balances, entitlements, approval history,
+  holiday calendar and complete leave configuration;
+- department/designation hierarchy and manager assignments;
+- job postings, candidates and recruitment tasks;
+- employee document register and lifecycle metadata;
+- company payroll runs, employee payroll items, earnings, deductions,
+  contributions, adjustments and an opt-in day audit for a named employee and
+  pay period;
+- performance evidence (attendance, leave and SOP/C4 points), complete active
+  policies, attendance/payroll/C4 settings and HR audit history.
+
+The full field/domain matrix and intentional exclusions are recorded in
+`docs/decisions/hr-assistant-data-catalogue.md`.
 
 The catalogue uses the same `hrCapabilities` actor contract as the mounted HR
-routes. Salary and payroll are not offered to a directory-only user. The model
-never sees a forbidden tool and every selected tool checks permission again
-before reading.
+routes. Salary and payroll are not offered to a directory-only user. Private
+employee, identifier, medical and compensation fields are projected
+independently. The model never sees a forbidden tool and every selected tool
+checks permission again before reading.
 
 ## Conversation contract
 
@@ -79,4 +92,3 @@ employee edit or other consequential action.
   remain aligned with mounted HR endpoint permissions.
 - `test/hr-ai/openJevPilot.test.js` proves the central path remains Qwen-only
   even when a stale Open-Jev flag is present.
-

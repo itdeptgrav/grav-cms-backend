@@ -38,6 +38,7 @@ const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
 const config = require("../../../services/merchandising/tnaConfig.service");
+const milestoneLibrary = require("../../../services/merchandising/tnaMilestoneLibrary.service");
 const plans = require("../../../services/merchandising/tnaPlan.service");
 const portfolio = require("../../../services/merchandising/tnaPortfolio.service");
 
@@ -136,6 +137,61 @@ router.post("/tna/bulk/reschedule/apply", requireCompany, canExecute, handle(asy
    Merchandising setup uses. Reading them is open to any Merchandising seat,
    because a merchandiser has to be able to see which template their plan came
    from in order to question a date. */
+
+/**
+ * GET /tna/source-events — which automatic source events actually work.
+ *
+ * ── THE SERVER SAYS, AND THE BROWSER ASKS ───────────────────────────────
+ * A template author choosing "completed by a source event" needs to know
+ * whether anything will ever send one. The alternative is an array of
+ * supported kinds maintained in a React file, which is how a screen ends up
+ * promising an integration that was removed months earlier. There is one
+ * registry, it is `tnaSourceEvents.js`, and this is how a client reads it.
+ *
+ * `FILE_READ` rather than the configuration rung: the Time & Action tab shows
+ * the same states on a milestone badge, and a merchandiser who may read a
+ * plan may read why one of its milestones cannot move.
+ */
+router.get("/tna/source-events", requireCompany, canRead, handle(async (req, res) => {
+  return res.json({ success: true, ...config.sourceEventCatalogue() });
+}));
+
+/**
+ * THE COMPANY'S MILESTONE LIST.
+ *
+ * `FILE_READ` to read it, for the same reason as the source events above: a
+ * template's milestone picker needs it, and so does anybody reading a plan who
+ * wants to know what a milestone means and what counts as done. Writing it is
+ * the configuration rung, because this is the list every order is measured
+ * against.
+ *
+ * There is no delete. A milestone named by a published template or a running
+ * plan must stay readable for as long as those do, so retiring one is
+ * `isActive: false` — it disappears from the picker and nothing else changes.
+ */
+router.get("/tna/milestones", requireCompany, canRead, handle(async (req, res) => {
+  const out = await milestoneLibrary.listDefinitions(ctx(req), {
+    stage: req.query?.stage,
+    includeInactive: String(req.query?.includeInactive || "") === "1",
+  });
+  return res.json({ success: true, ...out });
+}));
+
+router.post("/tna/milestones", requireCompany, canConfigure, handle(async (req, res) => {
+  const out = await milestoneLibrary.createDefinition(
+    { ...ctx(req), actor: actor(req) }, req.body || {},
+  );
+  return res.status(201).json({ success: true, milestone: out });
+}));
+
+router.patch("/tna/milestones/:milestoneCode", requireCompany, canConfigure,
+  handle(async (req, res) => {
+    const out = await milestoneLibrary.updateDefinition(
+      { ...ctx(req), actor: actor(req) },
+      { milestoneCode: req.params.milestoneCode }, req.body || {},
+    );
+    return res.json({ success: true, milestone: out });
+  }));
 
 router.get("/tna/templates", requireCompany, canRead, handle(async (req, res) => {
   const out = await config.listTemplates(ctx(req));

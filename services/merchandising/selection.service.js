@@ -1025,6 +1025,42 @@ async function submit(ctx, { fileId, family: familyName, body = {}, actor = null
       throw fail("SELECTION_STATE_CONFLICT",
         `A ${family.label} revision needs at least one row before it can be submitted.`);
     }
+
+    /* ── A DEVELOPMENT REVISION MUST AGREE WITH WHAT SALES CONFIRMED ───────
+       Checked at SUBMISSION and not while drafting, for the same reason a
+       handover's process statement is checked at issue: a draft is where somebody
+       works things out, and refusing a keystroke because the embroidery row is not
+       written yet would make the screen unusable. Submitting is the moment the
+       list becomes one a second person is asked to approve, and that is the moment
+       it has to be consistent with the buyer's own confirmed requirements.
+
+       Three things block, and nothing else:
+         · Sales explicitly REQUIRES a process and no row covers it;
+         · a row was adopted from a Sales statement that has since been superseded
+           and nobody has looked at it;
+         · Sales explicitly says NOT REQUIRED and actionable work remains, with no
+           recorded reason why.
+
+       An UNSTATED process never blocks. "Sales has not said" is a question for
+       Sales, not grounds to stop Merchandising working — and treating it as one
+       would teach people to write a row just to clear the gate. */
+    if (family.key === REVISION_FAMILY.DEVELOPMENT) {
+      const intake = require("./salesProcessIntake.service");
+      const out = await intake.reconcile(ctx, { fileId: str(file._id) });
+      if (!out.maySubmit) {
+        throw fail("SELECTION_STATE_CONFLICT",
+          `This list does not yet agree with what Sales confirmed: ${out.blocking[0].words} `
+          + `(${out.blocking[0].process.toLowerCase()}). ${out.blocking[0].detail}`,
+          {
+            reason: "SALES_RECONCILIATION_BLOCKED",
+            findings: out.blocking.map((f) => ({
+              process: f.process, state: f.state, words: f.words, detail: f.detail,
+              requirementRefs: f.requirementRefs,
+            })),
+          });
+      }
+    }
+
     const at = new Date();
     const correlationId = crypto.randomUUID();
 

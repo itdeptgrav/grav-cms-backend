@@ -42,6 +42,40 @@ const {
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
+
+/* ── THE FAMILIES, IN WORDS ────────────────────────────────────────────────
+   `MATERIAL_TRIM` is storage's name for it. A person reading why a row did not
+   arrive should not have to translate. */
+const FAMILY_WORD = Object.freeze({
+  MATERIAL_TRIM: "Materials and trims",
+  PACKAGING: "Packaging",
+});
+
+/**
+ * One transaction, or an honest refusal.
+ *
+ * The same shape `selection.service.js` uses, and here for the same reason: a
+ * command that writes a record AND the audit row describing it must not be able to
+ * write one without the other. A deployment that cannot do that is told so rather
+ * than quietly doing half the work.
+ */
+async function withTxn(fn) {
+  const session = await mongoose.startSession();
+  try {
+    let out;
+    await session.withTransaction(async () => { out = await fn(session); });
+    return out;
+  } catch (err) {
+    if (/Transaction numbers|replica set|transactions are not supported/i.test(str(err?.message))) {
+      throw fail("MERCHANDISING_TRANSACTION_REQUIRED",
+        "This deployment cannot record the decision atomically. Ask an operator — the database "
+        + "needs a replica set.");
+    }
+    throw err;
+  } finally {
+    session.endSession();
+  }
+}
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
 
 /**
@@ -110,32 +144,380 @@ function assertContext(ctx) {
  * appears the first time anybody looks for it, and is fixed from then on.
  */
 async function resolveDevelopmentFor(ctx, file) {
-  const projection = file.currentExecutionProjection || {};
-  const styleId = projection.sampleStyleId;
-  const styleRef = str(projection.styleRef);
+  /* ── THE SAME RESOLUTION THE IMAGES USE, AND THE SAME REFUSAL ────────────
+     This used to sort candidates by `updatedAt` and take the newest one that had
+     an approved revision. Nothing enforces one Development File per style, and two
+     files for one style is a legitimate state — two journey product lines, one
+     style — so "newest" could import another product line's approved BOM into this
+     order. Silently, with a result nobody would question.
 
-  /* The style id is the stable join. `styleRef` is a display code somebody can
-     edit, so it is the fallback rather than the key. */
-  const query = { companyId: ctx.companyId };
-  if (isId(styleId)) query.sampleStyleId = styleId;
-  else if (styleRef) query.styleRef = styleRef;
-  else return null;
-
-  const candidates = await DevelopmentFile.find(query)
-    .select("developmentNumber productName styleRef").sort({ updatedAt: -1 }).lean();
-  if (!candidates.length) return null;
+     The style-code fallback stays HERE and only here: files created before styles
+     carried a stable identity are adoptable by their display code, which is how
+     this path has always worked. The ambiguity refusal applies to it too. */
+  const found = await developmentFileFor(ctx, {
+    projection: file.currentExecutionProjection || {},
+    allowStyleRefFallback: true,
+  });
+  if (!found.devFile) return null;
 
   /* Only an APPROVED revision may be adopted, and where a development file has
      been revised the latest approved one is what the order takes. A file whose
-     selection was never approved is not a source — the order selects for
-     itself, which is the honest outcome. */
-  for (const devFile of candidates) {
-    const revision = await DevelopmentBomRevision.findOne({
-      companyId: ctx.companyId, developmentFileId: devFile._id, state: BOM_STATE.APPROVED,
-    }).sort({ revisionNo: -1 }).lean();
-    if (revision) return { devFile, revision };
+     selection was never approved is not a source — the order selects for itself,
+     which is the honest outcome. */
+  const revision = await DevelopmentBomRevision.findOne({
+    companyId: ctx.companyId, developmentFileId: found.devFile._id, state: BOM_STATE.APPROVED,
+  }).sort({ revisionNo: -1 }).lean();
+  return revision ? { devFile: found.devFile, revision } : null;
+}
+
+/** Why a lineage cannot be resolved — each one a different thing to do about it. */
+const LINEAGE = Object.freeze({
+  NO_STABLE_STYLE_IDENTITY: "NO_STABLE_STYLE_IDENTITY",
+  NO_DEVELOPMENT_RECORD: "NO_DEVELOPMENT_RECORD",
+  AMBIGUOUS: "AMBIGUOUS_DEVELOPMENT_LINEAGE",
+  MISSING: "DEVELOPMENT_RECORD_MISSING",
+  NO_SALES_REQUEST: "NO_SALES_REQUEST",
+});
+
+/**
+ * THE EXACT KEY, WHERE SALES' OWN RECORDS CAN PRODUCE IT.
+ *
+ * A Development File is unique per `{companyId, journeyId, productLineRef}` — the
+ * database says so. `sampleStyleId` is NOT unique across files: one style may be
+ * developed on two journey product lines, which is ordinary and legitimate.
+ *
+ * Both halves of the exact key are Sales-owned and stable:
+ *   `productLineRef`  the order line's own product-line reference
+ *   `journeyId`       the SampleStyle's journey
+ *
+ * So Merchandising derives the key from Sales' records and looks up its own file
+ * with it. Nothing about this gives Sales a handle on a Merchandising id, which is
+ * the constraint that ruled out the obvious fix of letting Sales stamp the link.
+ */
+async function preciseKeyFor(ctx, { projection, version }) {
+  const styleId = projection?.sampleStyleId;
+  if (!isId(styleId)) return null;
+
+  const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
+  const style = await (SampleStyle.findById ? SampleStyle : SampleStyle())
+    .findById(styleId).select("journeyId").lean();
+  const journeyId = style?.journeyId;
+  if (!isId(journeyId)) return null;
+
+  /* The line's product-line reference, from the order Sales issued this version
+     against. `sourceRecord.recordId` where the version is to hand — it names the
+     exact CustomerRequest — otherwise the order reference it carries. */
+  const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+  const model = CustomerRequest.findOne ? CustomerRequest : CustomerRequest();
+  const orderId = version?.sourceRecord?.recordId;
+  const order = isId(orderId)
+    ? await model.findById(orderId).select("items").lean()
+    : await model.findOne({ requestId: str(projection?.orderRef) }).select("items").lean();
+  if (!order) return null;
+
+  const line = (order.items || []).find((i) => str(i.lineRef) === str(projection?.orderLineRef));
+  const productLineRef = str(line?.productLineRef);
+  if (!productLineRef) return null;
+
+  return { journeyId, productLineRef };
+}
+
+/**
+ * WHICH DEVELOPMENT RECORD IS THIS ORDER'S — ONE ANSWER, OR AN HONEST REFUSAL.
+ *
+ * ── WHY NEWEST WAS THE WRONG ANSWER ─────────────────────────────────────────
+ * This used to `find({ sampleStyleId })`, sort by `updatedAt` and take the first.
+ * Nothing in the database enforces one Development File per style, so "newest" is
+ * not authority — it is whichever file somebody happened to touch most recently.
+ * Two files for one style is a legitimate state (two journey product lines, one
+ * style), and picking by recency would attach one buyer's pictures, and one
+ * development BOM, to the other buyer's order. Silently, and with a plausible
+ * result nobody would question.
+ *
+ * So: the exact key first, and where that cannot be built, the style with the
+ * ambiguity REFUSED rather than broken by a tiebreak.
+ */
+async function developmentFileFor(ctx, { projection, version = null, allowStyleRefFallback = false } = {}) {
+  const SELECT = "developmentNumber productName styleRef currentRequestId releaseReference "
+    + "journeyId productLineRef updatedAt";
+
+  /* 1 · The unique key, where Sales' records can produce it. */
+  const exact = await preciseKeyFor(ctx, { projection, version });
+  if (exact) {
+    const devFile = await DevelopmentFile.findOne({
+      companyId: ctx.companyId,
+      journeyId: exact.journeyId,
+      productLineRef: exact.productLineRef,
+    }).select(SELECT).lean();
+    /* One by construction — the collection's own unique index guarantees it. */
+    if (devFile) return { devFile, reason: "", key: "JOURNEY_PRODUCT_LINE" };
   }
-  return null;
+
+  /* 2 · The stable style identity, with no tiebreak. */
+  const styleId = projection?.sampleStyleId;
+  const styleRef = str(projection?.styleRef);
+  const query = { companyId: ctx.companyId };
+  if (isId(styleId)) query.sampleStyleId = styleId;
+  else if (allowStyleRefFallback && styleRef) query.styleRef = styleRef;
+  else return { devFile: null, reason: LINEAGE.NO_STABLE_STYLE_IDENTITY };
+
+  const candidates = await DevelopmentFile.find(query).select(SELECT).lean();
+  if (!candidates.length) return { devFile: null, reason: LINEAGE.NO_DEVELOPMENT_RECORD };
+  if (candidates.length > 1) {
+    return {
+      devFile: null,
+      reason: LINEAGE.AMBIGUOUS,
+      /* Named, so a person can go and look at both and say which one this order
+         came from. Nothing here decides it for them. */
+      candidates: candidates.map((c) => ({
+        developmentFileId: str(c._id),
+        developmentNumber: str(c.developmentNumber),
+        productName: str(c.productName),
+        styleRef: str(c.styleRef),
+        productLineRef: str(c.productLineRef),
+      })),
+    };
+  }
+  return { devFile: candidates[0], reason: "", key: isId(styleId) ? "SAMPLE_STYLE" : "STYLE_REF" };
+}
+
+/**
+ * Record the link once, so the next read is a fact and not a join.
+ *
+ * Never overwritten: a file already pointing at a Development record keeps
+ * pointing at it. Re-resolving later could silently move an accepted order onto a
+ * different development record, which is exactly the kind of quiet change an
+ * immutable order must not make.
+ */
+async function recordDevelopmentFileLink(ctx, file, devFile, {
+  session = null, bomRevisionNo = null,
+} = {}) {
+  if (!file?._id || !devFile?._id) return { recorded: false, reason: "NOTHING_TO_RECORD" };
+  if (str(file.developmentReference?.developmentFileId)) {
+    return { recorded: false, reason: "ALREADY_LINKED" };
+  }
+
+  const res = await ExecutionFile.updateOne(
+    {
+      _id: file._id, companyId: ctx.companyId,
+      /* Never overwritten: a file already pointing at a Development record keeps
+         pointing at it. Re-resolving later could move an accepted order onto a
+         different record, which is exactly the quiet change an immutable order
+         must not make. */
+      $or: [
+        { "developmentReference.developmentFileId": null },
+        { "developmentReference.developmentFileId": { $exists: false } },
+      ],
+    },
+    {
+      $set: {
+        "developmentReference.developmentFileId": devFile._id,
+        "developmentReference.developmentNumber": str(devFile.developmentNumber),
+        ...(Number.isFinite(Number(bomRevisionNo))
+          ? { "developmentReference.bomRevisionNo": Number(bomRevisionNo) } : {}),
+        ...(str(devFile.releaseReference)
+          ? { "developmentReference.releaseReference": str(devFile.releaseReference) }
+          : {}),
+      },
+    },
+    session ? { session } : {},
+  );
+  /* ── NOT SWALLOWED ────────────────────────────────────────────────────────
+     This ended in `.catch(() => {})`, on the reasoning that a failed write was
+     not a failed answer because the next read would resolve it again. That
+     reasoning died with the read-only change: the link is now recorded once, at
+     acceptance, and a failure to record it means the file has no lineage and
+     nobody was told. It throws, inside the acceptance transaction, so the
+     acceptance either carries its link or does not happen. */
+  if (!res.matchedCount) {
+    /* Somebody linked it between the read and here. Not an error — the file has
+       a link, which is the outcome this was for. */
+    return { recorded: false, reason: "ALREADY_LINKED" };
+  }
+  return {
+    recorded: true,
+    developmentFileId: str(devFile._id),
+    developmentNumber: str(devFile.developmentNumber),
+  };
+}
+
+/**
+ * THE BUYER'S PRODUCT REFERENCES, through the recorded link.
+ *
+ * Read from the Sales Development Request that the Development file was built
+ * from — never copied into the order, so there is one editable original and every
+ * screen shows the same pictures. Sales changes them in one place.
+ *
+ * Takes the file when there is one (an accepted order) and falls back to the
+ * projection alone (a handover still being reviewed, which has no file yet).
+ */
+async function referenceImagesFor(ctx, { file = null, projection = null, version = null } = {}) {
+  const shape = projection || file?.currentExecutionProjection || null;
+  let devFileId = str(file?.developmentReference?.developmentFileId);
+  let devNumber = str(file?.developmentReference?.developmentNumber);
+
+  if (!devFileId) {
+    /* ── A READ RESOLVES; IT DOES NOT RECORD ──────────────────────────────
+       This used to WRITE the link it had just resolved, so opening an order — or
+       refreshing it — mutated business data. Wrong twice over: a GET is not where
+       a decision about an order's lineage belongs, and the write was swallowed
+       with `.catch(() => {})`, so a failure to record it was invisible.
+
+       The link is stamped AT ACCEPTANCE now, inside that transaction and audited
+       with it. A file accepted before that existed is repaired by an explicit
+       command — `repairDevelopmentLink` — not by somebody looking at it. */
+    const found = await developmentFileFor(ctx, { projection: shape, version });
+    if (!found.devFile) {
+      return {
+        images: [], reason: found.reason,
+        ...(found.candidates ? { candidates: found.candidates } : {}),
+      };
+    }
+    devFileId = str(found.devFile._id);
+    devNumber = str(found.devFile.developmentNumber);
+  }
+
+  const devFile = await DevelopmentFile.findOne({ _id: devFileId, companyId: ctx.companyId })
+    .select("currentRequestId developmentNumber").lean();
+  if (!devFile) return { images: [], reason: LINEAGE.MISSING };
+  if (!devFile.currentRequestId) return { images: [], reason: LINEAGE.NO_SALES_REQUEST };
+
+  const SalesDevelopmentRequest = require("../../models/CMS_Models/Sales/DevelopmentRequest")
+    .SalesDevelopmentRequest;
+  const request = await SalesDevelopmentRequest.findOne({
+    _id: devFile.currentRequestId, companyId: ctx.companyId,
+  }).select("referenceImages requestRef versionNo").lean();
+  if (!request) return { images: [], reason: LINEAGE.NO_SALES_REQUEST };
+
+  const label = devNumber || str(devFile.developmentNumber);
+  return {
+    reason: "",
+    source: {
+      app: "sales", recordType: "development_request",
+      recordId: str(request._id), recordRef: str(request.requestRef),
+      sourceVersion: String(request.versionNo ?? ""),
+      developmentNumber: label,
+    },
+    images: (request.referenceImages || [])
+      .filter((image) => str(image?.url))
+      .map((image) => ({
+        url: str(image.url),
+        caption: str(image.caption),
+        referenceType: str(image.referenceType) || "PRODUCT",
+        /* Attributed, because every image is somebody's. */
+        source: label ? `Development file ${label}` : "Linked Development file",
+      })),
+  };
+}
+
+/**
+ * REPAIR A FILE'S DEVELOPMENT LINK — DELIBERATELY, AND ONCE.
+ *
+ * Files accepted before the link was stamped at acceptance carry none. They stay
+ * perfectly readable — every reader falls back to resolving the lineage for the
+ * answer it needs — but nothing records it, so every read re-derives it.
+ *
+ * This is the command that settles them. It is a COMMAND: somebody asks for it,
+ * it says what it did, and a failure to write is a failure that is reported. The
+ * alternative — repairing on read — is what this replaced, and it put a decision
+ * about an order's lineage inside a GET.
+ *
+ * Idempotent: a file that already has a link is left exactly as it is, and says so.
+ * Ambiguity is refused here as everywhere — a repair that guessed would be worse
+ * than the gap it filled, because nobody would know it had guessed.
+ */
+async function repairDevelopmentLink(ctx, { fileId, actor = null } = {}) {
+  assertContext(ctx);
+  if (!isId(fileId)) throw fail("NOT_FOUND", "Execution file not found.");
+
+  /* ── RESOLVED BEFORE THE TRANSACTION, DECIDED INSIDE IT ───────────────────
+     Reading which Development record this order came from is several queries and
+     no writes, so it does not belong inside a transaction holding a write lock.
+     What happens inside is the pair that must not come apart: the link and the
+     audit row describing it. */
+  const before = await ExecutionFile.findOne({ _id: fileId, companyId: ctx.companyId }).lean();
+  if (!before) throw fail("NOT_FOUND", "Execution file not found.");
+
+  const alreadyLinked = (f) => ({
+    repaired: false, reason: "ALREADY_LINKED",
+    developmentNumber: str(f.developmentReference?.developmentNumber),
+    sentence: "This order already records the Development job it came from.",
+  });
+  if (str(before.developmentReference?.developmentFileId)) return alreadyLinked(before);
+
+  const SalesHandoverVersion = require("../../models/CMS_Models/Sales/SalesHandoverVersion");
+  const version = before.currentHandoverVersionId
+    ? await SalesHandoverVersion.findOne({
+      _id: before.currentHandoverVersionId, companyId: ctx.companyId,
+    }).lean()
+    : null;
+
+  const found = await developmentFileFor(ctx, {
+    projection: before.currentExecutionProjection || {}, version,
+  });
+  if (!found.devFile) {
+    /* Neither a link nor an audit row. Nothing happened, so nothing is recorded as
+       having happened — an audit trail of attempted repairs would be noise that
+       buries the one entry that matters. */
+    return {
+      repaired: false, reason: found.reason,
+      ...(found.candidates ? { candidates: found.candidates } : {}),
+      sentence: found.reason === LINEAGE.AMBIGUOUS
+        ? "More than one Development job matches this order's style. Nothing was linked — say "
+          + "which one it came from rather than letting this choose."
+        : "No Development job could be identified for this order, so there is nothing to link.",
+    };
+  }
+
+  return withTxn(async (session) => {
+    /* Re-read INSIDE the transaction. Between the resolution above and here
+       somebody may have accepted a newer version, or another repair may have won —
+       and a repair that wrote a link over one that already existed would move an
+       order's lineage without a word. */
+    const file = await ExecutionFile
+      .findOne({ _id: fileId, companyId: ctx.companyId }).session(session).lean();
+    if (!file) throw fail("NOT_FOUND", "Execution file not found.");
+    if (str(file.developmentReference?.developmentFileId)) {
+      /* The idempotent answer, and NO audit row: nothing was repaired, so a row
+         saying it was would be a false entry in the one record somebody consults
+         to find out what happened to this order. */
+      return alreadyLinked(file);
+    }
+
+    const linked = await recordDevelopmentFileLink(ctx, file, found.devFile, { session });
+    if (!linked.recorded) {
+      return {
+        repaired: false, reason: linked.reason,
+        sentence: "Somebody linked this order while the repair was running. Nothing was changed.",
+      };
+    }
+
+    /* ── THE AUDIT ROW IS PART OF THE REPAIR, NOT A FOLLOW-UP ───────────────
+       Same session. This used to be a separate write after the update had already
+       committed, so a failure here left the file linked with nothing recording who
+       linked it or why — a change to an order's lineage that the trail denies ever
+       happened. Now the pair commits together or neither does. */
+    await MerchandisingAuditEvent.create([{
+      companyId: ctx.companyId, recordType: "EXECUTION_FILE",
+      recordId: file._id, recordRevision: file.revision,
+      action: "FILE_UPDATED", actor: actor || undefined, source: "merchandising",
+      at: new Date(), correlationId: crypto.randomUUID(),
+      resultingState: str(file.lifecycleStatus),
+      details: {
+        change: "repaired the Development record link on a file accepted before it was stamped",
+        developmentNumber: str(found.devFile.developmentNumber),
+        resolvedBy: str(found.key),
+      },
+    }], { session, ordered: true });
+
+    return {
+      repaired: true,
+      developmentFileId: str(found.devFile._id),
+      developmentNumber: str(found.devFile.developmentNumber),
+      resolvedBy: str(found.key),
+      sentence: `Linked to Development job ${str(found.devFile.developmentNumber)}.`,
+    };
+  });
 }
 
 /** The approved development selection behind one execution file, if any. */
@@ -159,20 +541,15 @@ async function sourceFor(ctx, file) {
   const found = await resolveDevelopmentFor(ctx, file);
   if (!found) return null;
 
-  /* Record it, so this is the last time it is a join. A failure to write is
-     not a failure to answer: the caller still gets the source it asked for and
-     the next read resolves it again. */
-  await ExecutionFile.updateOne(
-    { _id: file._id, companyId: ctx.companyId },
-    {
-      $set: {
-        "developmentReference.developmentFileId": found.devFile._id,
-        "developmentReference.developmentNumber": str(found.devFile.developmentNumber),
-        "developmentReference.bomRevisionNo": found.revision.revisionNo,
-      },
-    },
-  ).catch(() => {});
-
+  /* ── AND THIS DOES NOT RECORD EITHER ──────────────────────────────────────
+     It used to write the link here, which made `preview` — a GET — mutate the
+     order it was previewing. Same defect as the image read had, same reason it is
+     wrong: reading an order must not decide its lineage. The link is stamped at
+     acceptance, inside that transaction. `adopt` stamps the revision it imported —
+     and that is NOT one transaction: it adds the rows one at a time through the
+     selection service, each in its own, and writes the stamp after them. It is
+     retry-safe rather than atomic, which is a different promise and is described
+     where it is made, at the end of `adopt`. */
   return found;
 }
 
@@ -364,6 +741,28 @@ function changedFrom(dev, row, family) {
  * every immutability rule those already enforce applies here too. This service
  * writes no selection revision itself.
  */
+/**
+ * A ROW THAT DID NOT ARRIVE, DESCRIBED THE WAY A PERSON WOULD ASK ABOUT IT.
+ *
+ * `rowRef` alone — "DR-btn" — is the development revision's internal name for the
+ * row. Putting only that on screen asks a merchandiser to go and translate it
+ * before they can even tell whether the missing thing matters. The component's own
+ * name and code are already crossing into the order on every row that DID arrive,
+ * so naming them here discloses nothing new; what is deliberately absent is
+ * anything about supplier, rate, cost or consumption, which never cross at all.
+ */
+function missingEntry(family, row, err) {
+  return {
+    family,
+    familyLabel: FAMILY_WORD[family] || family,
+    rowRef: str(row?.rowRef),
+    /* What a person reads on a trim card, and the SKU beside it. */
+    componentName: str(row?.rawItemName) || str(row?.rawItemSku) || "Unnamed selection",
+    componentCode: str(row?.rawItemSku),
+    reason: str(err?.message),
+  };
+}
+
 async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
   assertContext(ctx);
   const selection = require("./selection.service");
@@ -384,9 +783,17 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
   const already = file?.developmentReference || {};
   if (Number(already.importedRevisionNo) === Number(shown.bomRevisionNo)) {
     return {
+      status: "REPLAYED",
+      complete: true,
+      retryable: false,
       replayed: true,
-      families: [], skipped: [],
-      adopted: Number(already.importedRowCount) || 0,
+      families: [], skipped: [], missing: [],
+      adopted: 0,
+      /* What is THERE, which is what a replay is reporting. `adopted` is 0 because
+         this call added nothing — the two used to be the same number and a reader
+         could not tell an import from a replay of one. */
+      present: Number(already.importedRowCount) || 0,
+      intended: Number(already.importedRowCount) || 0,
       developmentNumber: shown.developmentNumber,
       bomRevisionNo: shown.bomRevisionNo,
       importedAt: already.importedAt || null,
@@ -396,7 +803,13 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
   }
   const at = new Date();
   const correlationId = crypto.randomUUID();
-  const outcome = { families: [], adopted: 0, skipped: [] };
+  /* `intended` is every row this revision means to bring across; `present` is how
+     many of them are now in the order's draft, whether this call added them or an
+     earlier interrupted run did. Completeness is `present === intended`, and
+     nothing else. */
+  const outcome = {
+    families: [], adopted: 0, present: 0, intended: 0, skipped: [], missing: [],
+  };
 
   for (const [family, rows] of [
     ["MATERIAL_TRIM", shown.materialTrimRows],
@@ -404,23 +817,67 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
   ]) {
     if (!rows.length) continue;
 
-    /* A family that already has a draft is left alone: adopting into
-       somebody's work in progress would overwrite decisions they had already
-       made about this order. */
-    let draft;
+    /* ── THE DRAFT THIS FAMILY ALREADY HAS, OR A NEW ONE ──────────────────
+       A retry after an interrupted import finds a draft the interrupted run
+       created. Creating one refuses — correctly, one draft per family — and the
+       old code caught that refusal, recorded the whole family as "skipped" and
+       moved on. So the rows the first run never managed to add were never added
+       by any run, and the file was stamped as imported anyway.
+
+       So: use the open draft where there is one. Adopting into somebody's work in
+       progress is still not something this does blindly — it adds only rows that
+       are NOT already there, matched on the exact lineage reference it writes, so
+       a row somebody edited or removed on purpose is not silently reinstated by a
+       retry of a different operation. */
+    let draft = null;
+    let existingRefs = new Set();
     try {
-      draft = await selection.createDraft(ctx, {
-        fileId: str(fileId), family, body: {}, actor,
-        idempotencyKey: `${str(idempotencyKey) || crypto.randomUUID()}-${family}`,
-      });
+      const current = await selection.getCurrent(ctx, { fileId: str(fileId), family });
+      const open = current?.working && str(current.working.state) === "DRAFT" ? current.working : null;
+      /* Rows already representing this revision — in the open draft, and in an
+         approved revision, because a row that reached approval is certainly
+         represented and must not be added a second time. */
+      for (const source of [open, current?.approved]) {
+        for (const r of (source?.rows || [])) {
+          const ref = str(r.sourceRef?.recordRef);
+          if (ref) existingRefs.add(ref);
+        }
+      }
+      draft = open
+        ? { revision: open }
+        : await selection.createDraft(ctx, {
+          fileId: str(fileId), family, body: {}, actor,
+          idempotencyKey: `${str(idempotencyKey) || crypto.randomUUID()}-${family}`,
+        });
     } catch (err) {
-      outcome.skipped.push({ family, reason: str(err?.message) });
+      /* A family that genuinely cannot take rows — a cancelled file, a submitted
+         revision awaiting a decision. Recorded as missing, and the import is
+         therefore INCOMPLETE rather than done. */
+      for (const row of rows) outcome.missing.push(missingEntry(family, row, err));
+      outcome.families.push({
+        family, familyLabel: FAMILY_WORD[family] || family,
+        revisionNo: null, intended: rows.length, present: 0, added: 0,
+        blocked: str(err?.message),
+      });
+      /* Counted as intended even though none arrived — otherwise a family that
+         could not take a single row would leave `present === intended` and the
+         import would call itself complete, which is the whole defect. */
+      outcome.intended += rows.length;
       continue;
     }
 
     let added = 0;
+    let present = 0;
     let revision = draft?.revision?.revision ?? 0;
     for (const row of rows) {
+      const recordRef = `${shown.developmentNumber} · Revision ${shown.bomRevisionNo} · ${row.rowRef}`;
+      if (existingRefs.has(recordRef)) {
+        /* Already imported, by an earlier run of this same import. Not added, not
+           counted as an addition, and counted as PRESENT — which is what
+           completeness is actually about. */
+        present += 1;
+        continue;
+      }
       try {
         const res = await selection.addRow(ctx, {
           fileId: str(fileId), family,
@@ -470,19 +927,30 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
             app: "merchandising",
             recordType: "DEVELOPMENT_BOM_ROW",
             recordId: shown.developmentFileId,
-            recordRef: `${shown.developmentNumber} · Revision ${shown.bomRevisionNo} · ${row.rowRef}`,
+            recordRef,
             sourceVersion: String(shown.bomRevisionNo),
             sourceState: shown.revisionState,
           },
         });
         revision = res?.revision?.revision ?? revision + 1;
         added += 1;
+        present += 1;
       } catch (err) {
+        /* A row that did not arrive. `skipped` is kept for the existing readers,
+           and `missing` is what completeness is decided on — the old code had only
+           the first, which is why a partial import could be stamped as done. */
         outcome.skipped.push({ family, rowRef: row.rowRef, reason: str(err?.message) });
+        outcome.missing.push(missingEntry(family, row, err));
       }
     }
-    outcome.families.push({ family, revisionNo: draft?.revision?.revisionNo ?? null, adopted: added });
+    outcome.families.push({
+      family, familyLabel: FAMILY_WORD[family] || family,
+      revisionNo: draft?.revision?.revisionNo ?? null,
+      adopted: added, intended: rows.length, present, added,
+    });
     outcome.adopted += added;
+    outcome.present += present;
+    outcome.intended += rows.length;
   }
 
   await MerchandisingAuditEvent.create([{
@@ -504,31 +972,91 @@ async function adopt(ctx, { fileId, actor = null, idempotencyKey } = {}) {
     },
   }]);
 
-  /* Stamped after the rows are in, so a run that fell over halfway is
-     retried rather than recorded as done. */
-  await ExecutionFile.updateOne(
+  /* ── AN IMPORT IS DONE WHEN EVERY ROW IS THERE, AND NOT BEFORE ───────────
+     This is the correction. The stamp used to go on unconditionally, after a loop
+     that caught each row's failure into `skipped` and carried on — so an import
+     that lost three rows recorded `importedRevisionNo` anyway, and the next retry
+     answered "already imported into this order. Nothing was changed." The three
+     rows were never coming.
+
+     Completion is now `present === intended`: every row this revision means to
+     bring across is in the order's draft, whether this call added it or an earlier
+     interrupted run did. Short of that, the three completion fields are NOT
+     written, so a retry runs again and finishes the job.
+
+     ── WHAT IS STAMPED EITHER WAY ─────────────────────────────────────────
+     The LINEAGE — which development job and which revision this order draws on.
+     That is true as soon as it has been read, it is what the images and the BOM
+     both resolve through, and it is a different fact from "the rows arrived".
+
+     ── AND THIS IS NOT ONE TRANSACTION ────────────────────────────────────
+     Said plainly, because a comment here once claimed it was. The rows are added
+     one at a time through the selection service, each in its own transaction, and
+     the stamp is a fourth write after them. It cannot be one transaction without
+     the selection service taking a session, which is a larger change than this
+     correction. What makes it SAFE is not atomicity but the completion rule above
+     plus the presence check per row: an interrupted run leaves the file unstamped
+     and its rows individually identifiable, so a retry adds exactly what is
+     missing and no row can arrive twice. */
+  const complete = outcome.intended > 0 && outcome.present === outcome.intended;
+
+  const stamped = await ExecutionFile.updateOne(
     { _id: file._id, companyId: ctx.companyId },
     {
       $set: {
-        "developmentReference.importedRevisionNo": shown.bomRevisionNo,
-        "developmentReference.importedAt": at,
-        "developmentReference.importedRowCount": outcome.adopted,
-        ...(actor ? { "developmentReference.importedBy": actor } : {}),
+        ...(str(file.developmentReference?.developmentFileId)
+          ? {}
+          : {
+            "developmentReference.developmentFileId": shown.developmentFileId,
+            "developmentReference.developmentNumber": shown.developmentNumber,
+          }),
+        "developmentReference.bomRevisionNo": shown.bomRevisionNo,
+        ...(complete
+          ? {
+            "developmentReference.importedRevisionNo": shown.bomRevisionNo,
+            "developmentReference.importedAt": at,
+            /* The total that is THERE, not the number this call happened to add —
+               a retry that added the last two rows of nine imported nine. */
+            "developmentReference.importedRowCount": outcome.present,
+            ...(actor ? { "developmentReference.importedBy": actor } : {}),
+          }
+          : {}),
       },
     },
-  ).catch(() => {});
+  );
+  if (!stamped.matchedCount) {
+    throw fail("NOT_FOUND",
+      "The execution file was not found when recording what was imported. The rows were added; "
+      + "re-read the file before importing again.",
+      { reason: "IMPORT_STAMP_FAILED" });
+  }
 
+  /* ── THREE OUTCOMES, TOLD APART ───────────────────────────────────────────
+     A caller — and a screen — has to know which of these happened, because the
+     right next step differs: nothing, retry, or review and approve. The old
+     response said `replayed: false` and a count, which could not distinguish
+     "finished" from "lost three rows and stopped". */
   return {
     ...outcome,
+    status: complete ? "COMPLETE" : "INCOMPLETE",
+    complete,
+    retryable: !complete,
     replayed: false,
     developmentNumber: shown.developmentNumber,
     bomRevisionNo: shown.bomRevisionNo,
-    importedAt: at,
-    /* Said again on the way out. Nothing here approved anything. */
-    note: `${outcome.adopted} identity(ies) adopted into draft revisions. Nothing is approved — `
-      + "review them against this order and approve on each tab.",
+    importedAt: complete ? at : null,
+    note: complete
+      ? `${outcome.present} identity(ies) adopted into draft revisions. Nothing is approved — `
+        + "review them against this order and approve on each tab."
+      : `${outcome.present} of ${outcome.intended} identity(ies) are in this order's drafts; `
+        + `${outcome.missing.length} did not arrive. The import is NOT recorded as done — run it `
+        + "again and it will add only what is missing.",
   };
 }
 
 module.exports = {
-  resolveDevelopmentFor, GROUP_FOR, FAMILY_FOR, sourceFor, preview, adopt };
+  LINEAGE,
+  resolveDevelopmentFor, developmentFileFor, preciseKeyFor, recordDevelopmentFileLink,
+  repairDevelopmentLink,
+  referenceImagesFor,
+  GROUP_FOR, FAMILY_FOR, sourceFor, preview, adopt };

@@ -1,4 +1,189 @@
-# ACTIVE TASK — ACCOUNTING ASSISTANT UNIFIED SEMANTIC READ CATALOGUE (27 Sep 2026)
+# ACTIVE TASK — STORE & PURCHASE, TWO LANES (28 Sep 2026)
+
+> **The CMS-wide Assistant Semantic Catalogue entry that used to head this file
+> is unchanged and still below.** It is durable history, not stale text: this
+> file records what is active, and appending rather than replacing keeps the
+> record of what came before. Nothing was deleted.
+
+The active implementation scope is the **Store & Purchase two-lane programme**
+(`docs/tasks/store-purchase-two-lane-plan.md`).
+
+| Lane | Owns | State |
+|---|---|---|
+| **A — Purchase** | Purchase workspace, purchase orders, sourcing, the MRF → purchase-request → PO chain | A1 accepted; **A2 in integrity review** |
+| **B — Receive** | Goods receipt, inspection, put-away, customer materials, receiving presentation | active, separately owned |
+
+## Lane A — Automatic reservation and Requests fulfilment (28 Sep 2026)
+
+Approving a material request now **attempts to hold the stock for it**, through
+one shared service that every approval path calls. Picking and issuing stay
+manual. Full decision record:
+`docs/decisions/store-automatic-reservation.md`.
+
+- **Trigger.** `services/storePurchase/autoReservation.service.js`, called after
+  each approval path's own commit and never inside it — a failed shelf read must
+  not roll back an approval a person made. Seven named triggers over six doors
+  (TL approval, two auto-forward creations, store-on-behalf, Requests-desk
+  classification, line matched/registered, manual retry).
+- **Eligibility.** Approved, matched, still owed, not service/buy, usable
+  quantity and unit. Stock only from active `USABLE_STOCK` locations in active
+  warehouses of this company.
+- **Ownership fails closed.** The customer's share is subtracted *at reservation
+  time* (it was only guarded at issue). A customer lot with stock available and
+  no `locationId` cannot be attributed to a shelf, so the line stops as
+  `ATTENTION` / `OWNERSHIP_UNPROVEN` rather than being guessed either way.
+- **Partial is preserved and exact.** What was held stays held; the remainder is
+  a stated shortfall, never a rounded one.
+- **`SHORT` ≠ `ATTENTION`, and neither is "never attempted".** A line nobody has
+  attempted is Needs attention with a retry — filing it under Short would raise
+  a purchase for material that may be sitting on the shelf.
+- **Requests owns reserve/pick/issue/return.** The queue lives at
+  `/store/dashboard/order-requests`; `/store/dashboard/operations/reservations`
+  is kept working as a thin wrapper over the same component. "Ready to reserve"
+  is no longer a daily stage.
+- **Purchase owns shortfalls.** No PO, no requisition, no budget commitment is
+  raised here. The MRF remains the source of the need and the shortfall.
+- **Reservation is not a movement.** On-hand, `LocationBalance`,
+  `LocationMovement` and the ledger are untouched, and that is asserted by count.
+
+Two audit findings recorded rather than papered over:
+
+- **No MO-origin MRF path exists.** `new MRF(` / `MRF.create(` appear in exactly
+  three files, none manufacturing; `MRF` has no work-order or MO field and
+  `creationMode` is `["SELF","BYPASS"]`. The brief listed MO-origin as an
+  approval path; it is not one today.
+- **`MRF.items.warehouseId` was undeclared** although the availability read and
+  the manual reserve drawer both passed `line.warehouseId` as the preferred
+  warehouse. Mongoose dropped it on every write, so the preference was always
+  null. Now declared, which makes the existing code mean what it says.
+
+## Lane A, where it stands
+
+- **A1 — Purchase workspace** (accepted). One stage-based workspace at the
+  existing register URL: *To source / Draft orders / On order / Completed*,
+  crossed with *All / Materials / Outside services / Freight*.
+- **A2 — Mandatory source MRF** (this correction). Every new material purchase
+  order must prove the complete server-validated chain
+  **MRF → approved PRODUCT SpendRequest → PO**, at every entry point.
+
+Full record — audit, contract, parity matrix, every correction and its
+reasoning: **`docs/tasks/store-purchase-lane-a-purchase-a1.md`**.
+
+### The A2 invariant
+
+> A new material purchase order requires a real, same-company `sourceMrfId` and
+> the complete validated chain. Every line and its full approved quantity come
+> from the stored request, mapped one-to-one onto the material request's own buy
+> lines by id. All commercial values — supplier, rate, tax, discount, shipping,
+> custom charges, line totals and grand total — are the approval's, and are
+> reconciled for equality within the money tolerance at creation and at issue.
+
+### Not in A2, deliberately
+
+- Manufacturing Order → MRF automation.
+- Partial or split ordering (needs a per-line ordered quantity, index
+  relaxation, and a commitment-discharge design).
+- Service orders, which keep their own approved-service-request flow.
+
+### Known integration blockers, not Lane A defects
+
+- `next build` compiles but the export aborts on ~19 pre-existing routes that
+  read `useSearchParams` outside a Suspense boundary, all unmodified from HEAD.
+- `services/storePurchase/receiveWorkspace.service.js:257` and `:356` carry the
+  `$or`-over-tenancy search leak fixed elsewhere. **Lane B's file** — reported,
+  not touched.
+
+---
+
+# ACTIVE TASK — CMS-WIDE ASSISTANT SEMANTIC CATALOGUE (27 Sep 2026)
+
+The user requested a final architectural replacement for screenshot-by-
+screenshot routing fixes, starting with complete HR coverage and reusable by
+every CMS application.
+
+## Implemented
+
+- Added one compiled semantic-catalogue runtime for business domains, entities,
+  scalar metrics, aliases and tool compatibility.
+- Migrated HR to 10 domains, 5 entities, 55 scalar metrics and 89 aliases;
+  exact reads validate the named employee before execution and cannot be
+  selected through a model-invented metric enum.
+- Registered all current HR and Accounting assistant tools against the same
+  semantic contract and added a release-blocking catalogue audit.
+- Added entity-first precedence: a unique real employee, department or ledger
+  may claim its typed capability; missing, fuzzy and ambiguous entities fail
+  closed. This fixes cross-application terms such as the Accounting ledger
+  `Salary Payable` without a ledger-specific phrase rule.
+- Exact single-ledger facts now use a deterministic renderer. Structurally
+  incomplete postings produce a reconciliation warning and never expose a
+  misleading calculated/cached amount.
+- Every plan now records tool, typed arguments, selection source and detected
+  domains for diagnosis.
+- Added generated alias/domain/collision tests plus permission and HTTP-boundary
+  verification.
+
+## Evidence
+
+- Catalogue preflight: 27 registered tools, HR and Accounting audits clean.
+- Pure routing/catalogue suite: 83/83 passing.
+- Route reviewer: 5/5 passing.
+- Database route and HR-permission parity: 24/24 passing.
+- Fresh-chat live database proof selects the correct capability for Arpita's
+  email, Arpita's attendance, Accounts department designations, Salary Payable
+  ledger balance and Arpita's configured gross salary.
+- Backend health reports database connected and socket running.
+
+Durable architecture and the extension protocol are in
+`docs/decisions/cms-semantic-catalogue.md`.
+
+---
+
+# PREVIOUS ACTIVE TASK — ORDER EXECUTION FLOW-CLOSURE AUDIT (27 Sep 2026)
+
+The user asked to identify every Order Execution state that looks complete only
+because demo data was seeded, before further implementation. The durable audit,
+gap matrix, closure order and acceptance definition are in:
+
+`docs/tasks/order-execution-flow-closure-audit-2026-09-27.md`
+
+No application behaviour was changed in this inspection pass.
+
+---
+
+# PREVIOUS ACTIVE TASK — COMPLETE HR ASSISTANT READ CATALOGUE (27 Sep 2026)
+
+> User explicitly requested every currently stored, authorised HR business data
+> point be available to the assistant rather than adding phrase-specific fixes.
+
+## Implemented
+
+- Expanded Qwen's typed HR catalogue from dashboard summaries to complete
+  authorised employee, attendance, attendance-exclusion, leave, recruitment,
+  document, payroll, performance, policy/configuration and audit reads.
+- Named-person reads now use the existing HR field policy: directory, private,
+  identifier, medical and compensation fields are independently projected.
+- Detailed attendance includes raw punch timeline, shifts, work/break/OT/late/
+  early/missed-punch calculations, HR review evidence and all data needed by the
+  existing monthly HR reports.
+- Payroll exposes every business calculation while bank credentials remain
+  excluded; the large day audit is available only for one named employee and
+  one explicit month/year.
+- Full attendance, leave, payroll and C4 configuration and full active policy
+  records replace the former compact-only settings packet.
+- The security boundary recursively strips passwords/tokens, biometric data,
+  storage links/ids and bank account/IFSC values before evidence reaches Qwen.
+
+## Evidence
+
+- 51/51 catalogue, closed-planner and Qwen-only regression tests pass.
+- 24/24 central-assistant integration and HR permission-parity tests pass using
+  the isolated database test environment.
+- `docs/decisions/hr-assistant-data-catalogue.md` is the field/domain coverage
+  matrix and records the intentional secret exclusions.
+
+---
+
+# PREVIOUS ACTIVE TASK — ACCOUNTING ASSISTANT UNIFIED SEMANTIC READ CATALOGUE (27 Sep 2026)
 
 > User explicitly approved connecting every authorised Accounting capability.
 > “All” means the signed-in person’s real Accounting permissions, never raw
@@ -5272,6 +5457,23 @@ No full regression suite and no production build were run, per the brief.
   nothing below this line should be treated as decided until it is.
 # ACTIVE TASK — QWEN-ONLY TYPED HR ASSISTANT (27 Sep 2026)
 
+## CMS semantic-catalogue migration — completed
+
+- Added the reusable compiler/runtime in `services/ai/semanticCatalogue.js`.
+  Domains, entities and metrics are validated once; the runtime performs
+  longest-unique metric resolution, domain detection, collision audits and
+  cross-catalogue model-candidate filtering.
+- Migrated HR to 10 domains, 5 entities, 55 scalar metrics and 89 aliases.
+  Migrated all 21 HR tools to machine-readable domain/subject metadata.
+- Added Accounting's 6 domains and 4 entities and migrated its 6 registered
+  tools, preventing HR vocabulary from hiding a valid Accounting capability.
+- Added plan-v2 trace state containing the selected tool, typed arguments,
+  catalogue-claim/Qwen selection source and all detected domains.
+- Added `npm run audit:assistant-catalogues`; it fails for ambiguous aliases,
+  missing tool metadata, or unknown catalogue/domain/subject references.
+- Durable extension contract:
+  `docs/decisions/cms-semantic-catalogue.md`.
+
 ## User outcome
 
 Make the central GRAV assistant understand HR questions without adding a phrase
@@ -5294,6 +5496,42 @@ rule for every wording, while keeping HR records and actions reliable.
 - Added structured conversation state so contextual follow-ups reuse the last
   validated tool/arguments without feeding prior HR answer prose back into the
   planner.
+- Added a typed employee-field contract for common scalar/profile questions
+  (for example manager, department, joining date and family fields). Qwen maps
+  natural language to a field id; GRAV reads the authorised value and formats
+  it deterministically, eliminating the final answer-generation model pass for
+  these lookups.
+- Added a canonical HR semantic-metric registry and `hr_person_metric` tool.
+  Current employee-master compensation and posted payroll are now distinct
+  sources with explicit temporal grain; related metrics use catalogue-declared
+  period variants rather than sentence-specific routing rules.
+- Added catalogue-owned deterministic claims for explicit scalar terms. Exact
+  fields such as email, personal email, manager, CTC, DOB and employment dates
+  bypass model enum selection; ambiguous or free-form requests still use Qwen.
+  Longest unique alias matching prevents a broad field from shadowing a more
+  specific field.
+- Expanded the registry to 55 scalar metrics with 89 standard aliases, covering
+  every standard employee/profile field plus configured compensation and posted
+  payroll values. All aliases are checked as one generated collision/routing
+  matrix rather than by isolated prompt regressions.
+- Restored deterministic domain filtering before Qwen planning: recognised HR
+  requests offer only matching HR tools, preventing an attendance request from
+  reaching an unrelated employee-field enum. Named-person attendance now has a
+  deterministic specific-day/30-day read and formatter.
+- Removed scalar HR enum selection from Qwen entirely. `hr_person_metric` is
+  catalogue-only, and Qwen's broad employee schema now contains only
+  `fullRecord` and `attendanceSummary`; a language model can no longer replace
+  email/CTC/manager/attendance with another valid-looking profile field.
+- Added authoritative subject-type validation to catalogue claims. Employee
+  scalar claims execute only when the remaining subject resolves to a real
+  employee, preventing organisation nouns such as “Accounts department” from
+  being treated as a person's name. Department/designation lookups now have a
+  deterministic organisation renderer.
+- Added catalogue-driven scalar comparisons. Questions in the generic form
+  `is <employee>'s <metric> <expected value>?` now resolve the employee and
+  metric first, read the authorised value, and return a deterministic yes/no
+  plus the canonical value. The comparison grammar is generated across every
+  registered HR metric alias rather than patched for individual sentences.
 
 ## Safety boundary
 
@@ -5303,9 +5541,33 @@ execution and audit event. The model has no raw MongoDB access.
 
 ## Verification
 
+- Semantic catalogue preflight: 2 catalogues, 27 tools, zero issues.
+- Pure compiler/planner/catalogue/pilot tests: 76/76.
+- Route-review tests: 5/5.
+- Database-backed central assistant and HR permission-parity tests: 24/24.
+
 - 67/67 focused Qwen planner, central assistant, HR permission parity and legacy
   pilot-isolation tests pass.
 - Syntax and diff checks pass.
+- The focused planner/catalogue/pilot subset passes 66/66 plus 5/5 route-review
+  tests, including exact manager and parent-field rendering, every one of the 89
+  aliases, semantic compensation/payroll separation, period-variant selection,
+  deterministic named-person attendance, and the broad-record fallback.
+- A fresh-history live check of `what is arpita's email?` selected
+  `employee.work_email` without model planning and returned the authorised work
+  email in 1.036 seconds.
+- A fresh-history live matrix selected deterministic sources for attendance,
+  work email, CTC, father and blood group. `arpita's attendance` returned the
+  authorised 30-day tally through `hr_employee` in 1.186 seconds, without model
+  field selection.
+- A fresh-history live check of `designations inside accounts department?`
+  selected `hr_departments` with the canonical `ACCOUNTS` entity and returned
+  `ACCOUNTANT, ACCOUNTS MANAGER`; it did not enter employee lookup.
+- Generated scalar-comparison and catalogue tests pass 32/32. A live database
+  check of `is Arpita's secondary manager Sakib?` selected the catalogue claim
+  and returned `Yes` with `SHAIK SAKIB (GR0063)`; a false religion comparison
+  returned `No` with the authoritative value, and the existing email lookup
+  remained on the deterministic work-email metric.
 
 Durable architecture: `docs/decisions/qwen-typed-cms-assistant.md`.
 

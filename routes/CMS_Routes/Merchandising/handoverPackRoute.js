@@ -41,6 +41,7 @@ const {
 const departmentStatus = require("../../../services/merchandising/departmentStatus.service");
 const pack = require("../../../services/merchandising/executionPack.service");
 const delivery = require("../../../services/integration/executionPackDelivery.service");
+const tnaDelivery = require("../../../services/integration/tnaSourceDelivery.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -149,9 +150,30 @@ router.post("/files/:id/pack/submit", requireCompany, canSubmit, handle(async (r
   const carried = await delivery.deliverPending({
     companyId: req.merchandising.companyId, limit: 50,
   });
+  /* ── AND THE SAME EVENT CLOSES THE ORDER'S OWN MILESTONE ─────────────
+     The pack already publishes `execution_pack.submitted` for PPC; Time &
+     Action consumes the very same event rather than a second one written
+     for it. Two carriers over one outbox, each idempotent on its own
+     ledger — a second announcement would be a second version of one fact. */
+  const tna = await tnaDelivery.deliverPending({
+    companyId: req.merchandising.companyId, limit: 50,
+  });
   return res.json({
     success: true,
     ...out,
+    /* `closed`/`retrying` rather than per-call counts, for the reason set out
+       in `ppmRoute.js`: a count of flushed events describes this call, so a
+       replay of one submission answered differently from the first. */
+    timeAndAction: {
+      closed: tna.applied > 0,
+      retrying: tna.failures.length > 0,
+      note: tna.failures.length
+        ? "The pack is submitted. Its Time & Action milestone has not been updated "
+          + "yet and will be retried."
+        : tna.applied
+          ? "The pack is submitted and the matching Time & Action milestone is closed."
+          : "The pack is submitted. No Time & Action milestone on this order waits for it.",
+    },
     downstream: {
       delivered: carried.delivered,
       pending: carried.pending,

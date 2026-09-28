@@ -283,14 +283,39 @@ async function main() {
     (m) => m.completionAuthority === "MERCHANDISING" && m.ownerDepartment !== "MERCHANDISING");
   check("Merchandising completes no other department's milestone", wrong.length === 0,
     wrong.length ? wrong.map((m) => m.milestoneCode).join(", ") : "checked every milestone");
+  /* ── WHAT THE STARTER CAN HONESTLY PLACE TODAY ──────────────────────────
+     This used to check that the starter spanned four or more departments, and
+     it did — by placing six milestones completed by events that no application
+     publishes. A version containing one can no longer be published: a schedule
+     is a commitment, and those dates could never be met or marked.
+
+     So the starter is Merchandising-only for now, and that is the honest state
+     rather than a regression. The six remain on every company's milestone list,
+     each naming the application that owes its event, and each will become
+     placeable the day that application publishes.
+
+     The check therefore asks the useful question instead: is every milestone in
+     the published template one that something or somebody can actually close? */
   const departments = [...new Set((tplV?.milestones || []).map((m) => m.ownerDepartment))];
-  check("the template is genuinely cross-department", departments.length >= 4,
-    departments.join(", "));
+  const registry = require("../../services/merchandising/tnaSourceEvents");
+  const stuck = registry.unsupportedInVersion(tplV?.milestones || []);
+  check("every published milestone can actually be completed", stuck.length === 0,
+    stuck.length
+      ? stuck.map((u) => `${u.milestoneCode} waits on ${u.owed.join("/") || "nothing"}`).join("; ")
+      : `${departments.join(", ")} — and nothing waiting on an application that does not exist`);
+
+  const waiting = require("../../services/merchandising/tnaMilestoneLibrary.service")
+    .STARTER_LIBRARY.filter((d) => d.systemEventKey && !registry.isSupported(d.systemEventKey));
+  say("milestones on the list but not yet placeable", `${waiting.length} — `
+    + waiting.map((d) => d.milestoneCode).join(", "));
 
   /* ── Idempotency and non-destruction ────────────────────────────────── */
   const again = await seed.seedCompany(inScope[0], { apply: true });
+  /* Three things to skip now, not two: the milestone list joined the calendar
+     and the template. Counted loosely on purpose — what matters is that nothing
+     was created a second time, not how many sentences said so. */
   check("re-running skips the company rather than versioning it",
-    again.skipped.length === 2 && !again.template && !again.calendar,
+    again.skipped.length >= 2 && !again.template && !again.calendar,
     again.skipped.join("; ") || "nothing skipped");
   check("still exactly one published template and one published calendar",
     (await TnaTemplateVersion.countDocuments({ state: "PUBLISHED" })) === 1

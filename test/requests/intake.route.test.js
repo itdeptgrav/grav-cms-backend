@@ -3628,15 +3628,24 @@ describe("a matched item's identity survives intake → spend → purchase order
     expect(approved.status).toBe(200);
     expect(approved.body.request.status).toBe("approved");
 
-    const conv = await call(s.store, `/${spendId}/purchase-order`, { method: "POST", app: "spend", body: {} });
-    expect(conv.status).toBe(201);
+    /* ── STAGE 3 — AND HERE THE RULE CHANGED ──────────────────────────────
+       A material purchase order must now say which MATERIAL REQUEST it
+       fulfils. An intake requirement is a real operational need, but it is not
+       a material request, and this one was never linked to one — so the
+       conversion is refused rather than producing an order nobody can trace to
+       a material request.
 
-    /* Stage 3 — the PO line carries the same identity, unchanged. */
-    const po = await PurchaseOrder.findOne({ spendRequestId: spendId }).lean();
-    expect(String(po.items[0].rawItem)).toBe(String(item._id));
-    expect(po.items[0].sku).toBe("SKU-MOUSE-1");
-    expect(po.items[0].baseUnit).toBe("Box");
-    expect(po.items[0].quantity).toBe(4);
+       This is the intended workflow change, not a regression: the intake must
+       first be linked to, or converted into, a material request. That
+       conversion is deliberately not automated. The identity assertions above
+       still stand — they are what this test is really about — and the refusal
+       below proves the identity survives as far as the rule allows. */
+    const conv = await call(s.store, `/${spendId}/purchase-order`, { method: "POST", app: "spend", body: {} });
+    expect(conv.status).toBe(400);
+    expect(conv.body.error.code).toBe("MRF_REQUIRED");
+    expect(conv.body.error.details.origin).toBe("intake");
+    /* And no half-made order is left behind. */
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: spendId })).toBe(0);
   });
 
   test("partial stock: only the buy balance changes quantity; the identity is unchanged", async () => {
@@ -3668,15 +3677,14 @@ describe("a matched item's identity survives intake → spend → purchase order
 
     const approved = await toApproved(s, saved.spendRequestId);
     expect(approved.status).toBe(200);
+    /* As above: the buy balance and its identity are what this test is about,
+       and both are asserted on the spend request. The order itself now needs a
+       material request, which an intake-origin requirement does not have until
+       somebody links or converts it. */
     const conv = await call(s.store, `/${saved.spendRequestId}/purchase-order`, { method: "POST", app: "spend", body: {} });
-    expect(conv.status).toBe(201);
-
-    const po = await PurchaseOrder.findOne({ spendRequestId: saved.spendRequestId }).lean();
-    expect(String(po.items[0].rawItem)).toBe(String(item._id));
-    expect(po.items[0].sku).toBe("SKU-BLADE-9");
-    expect(po.items[0].baseUnit).toBe("Strip");
-    /* The balance, not the whole requirement. */
-    expect(po.items[0].quantity).toBe(12);
+    expect(conv.status).toBe(400);
+    expect(conv.body.error.code).toBe("MRF_REQUIRED");
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: saved.spendRequestId })).toBe(0);
   });
 });
 

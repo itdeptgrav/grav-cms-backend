@@ -32,6 +32,10 @@ const {
 } = require("../../../../Middlewear/storePurchaseTenant");
 const { CAPABILITIES } = require("../../../../services/storePurchase/capabilities");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+const purchaseWorkspace = require("../../../../services/storePurchase/purchaseWorkspace.service");
+/* A2: the one authority that decides whether a material purchase order may
+   exist at all. Both creation journeys go through it. */
+const governed = require("../../../../services/storePurchase/governedPurchaseOrder.service");
 const sequences = require("../../../../services/storePurchase/documentSequence.service");
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const approvalPolicy = require("../../../../services/storePurchase/approvalPolicy.service");
@@ -106,13 +110,33 @@ router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
     /* THE tenant boundary for this register. In legacy mode this selects the
        records with no company at all — never both, so an ordinary list can
        never quietly include unowned documents. */
-    let filter = { ...tenantContext.tenantFilter(req.tenant) };
+    const filter = { ...tenantContext.tenantFilter(req.tenant) };
 
     if (search) {
-      filter.$or = [
-        { poNumber: { $regex: search, $options: "i" } },
-        { vendorName: { $regex: search, $options: "i" } },
-        { "items.itemName": { $regex: search, $options: "i" } },
+      /* ── TWO `$or`s CANNOT SHARE ONE OBJECT ───────────────────────────────
+         `tenantFilter` returns an `$or` whenever legacy read-through is on,
+         which is the default. Assigning the search terms to `filter.$or`
+         REPLACED it, so the query kept the search and lost the company — and
+         typing in the box returned another company's orders. Each condition
+         gets its own entry under `$and` instead, so neither can overwrite the
+         other.
+
+         And the term is escaped before it becomes a pattern: unescaped, `A.C`
+         also matches "ABC" and `.*` matches everything, silently widening the
+         search past what was typed, while an unterminated `(` makes the regex
+         throw and turns a typo into a 500. */
+      const rx = new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      const tenancy = filter.$or;
+      delete filter.$or;
+      filter.$and = [
+        ...(tenancy ? [{ $or: tenancy }] : []),
+        {
+          $or: [
+            { poNumber: rx },
+            { vendorName: rx },
+            { "items.itemName": rx },
+          ],
+        },
       ];
     }
     if (status && status !== "all") filter.status = status;
@@ -419,7 +443,16 @@ router.get("/reports/exceptions", requireCapability(CAPABILITIES.READ), async (r
     const search = typeof q.q === "string" ? q.q.trim() : (typeof q.supplier === "string" ? q.supplier.trim() : "");
     if (search) {
       const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [{ poNumber: rx }, { vendorName: rx }, { spendRequestNumber: rx }];
+      /* Folded under `$and`, not assigned over the tenancy. `tenantFilter`
+         returns an `$or` whenever legacy read-through is on — the default —
+         and a second `$or` on the same object replaces the first, which would
+         drop the company scope from every searched exceptions read. */
+      const tenancy = filter.$or;
+      delete filter.$or;
+      filter.$and = [
+        ...(tenancy ? [{ $or: tenancy }] : []),
+        { $or: [{ poNumber: rx }, { vendorName: rx }, { spendRequestNumber: rx }] },
+      ];
     }
 
     // Bounded scan for speed. The bound is disclosed honestly below, and is
@@ -550,6 +583,71 @@ router.get("/reports/exceptions", requireCapability(CAPABILITIES.READ), async (r
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PO by ID
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * GET /workspace — the stage-based Purchase workspace, as one closed DTO.
+ *
+ * ── DECLARED BEFORE `/:id` ──────────────────────────────────────────────────
+ * Express matches in order, so registering this after the id route would have
+ * "workspace" read as a purchase-order id and answer 404.
+ *
+ * ── READ-ONLY, AND COMPOSED FROM EXISTING AUTHORITIES ───────────────────────
+ * It writes nothing. Stage comes from each source's stored status, exceptions
+ * come from `poExceptionsRegister` (whose rules are not copied), and the stored
+ * line receipt state is read as it stands — this route never recomputes a
+ * pending receipt quantity or derives receipt-control state, both of which
+ * belong to Receive.
+ */
+/**
+ * The material requests this company could raise a purchase order against.
+ *
+ * Read-only, bounded and company-scoped. Registered before `/:id` — a named
+ * route after it is read as an id and 404s.
+ */
+router.get("/source-mrfs", requireCapability(CAPABILITIES.PO_CREATE), async (req, res) => {
+  try {
+    const out = await governed.selectableMrfs(req.tenant, {
+      search: String(req.query.search || "").slice(0, 200),
+      limit: req.query.limit,
+    });
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[purchase-orders] source-mrfs error:", err);
+    return res.status(500).json({ success: false, message: "Server error while loading material requests" });
+  }
+});
+
+/**
+ * The whole chain behind one material request, for the form's summary.
+ *
+ * Refuses with the same coded reasons creation would, so the form can tell a
+ * buyer what is missing before they fill anything in.
+ */
+router.get("/source-mrfs/:mrfId/provenance", requireCapability(CAPABILITIES.PO_CREATE), async (req, res) => {
+  try {
+    const out = await governed.provenanceSummary(req.tenant, req.params.mrfId);
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[purchase-orders] mrf provenance error:", err);
+    return res.status(500).json({ success: false, message: "Server error while reading the material request" });
+  }
+});
+
+router.get("/workspace", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const out = await purchaseWorkspace.workspace(
+      req.tenant,
+      { companyId: req.tenant.companyId, actorId: req.tenant.actorId, tenant: req.tenant },
+      req.query || {},
+    );
+    return res.json({ success: true, ...out });
+  } catch (err) {
+    console.error("[purchase-orders] workspace error:", err);
+    return res.status(500).json({ success: false, message: "Server error while loading the purchase workspace" });
+  }
+});
+
 router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     /* Scoped find, not findById: another company's id must answer exactly as
@@ -792,18 +890,31 @@ router.post(
     }
 
     const {
-      vendor,
-      vendorName,
       orderDate,
       expectedDeliveryDate,
-      items,
-      taxRate,
       shippingCharges,
       discount,
       notes,
       termsConditions,
       paymentTerms,
     } = req.body;
+
+    /* ── A2: EVERY MATERIAL ORDER PROVES WHY IT EXISTS ──────────────────────
+       The chain — material request → purchase shortfall → approved purchase
+       request → this order — is resolved from STORED records. The browser says
+       which material request it is ordering against; it does not get to say
+       what was approved.
+
+       Supplier, item identity, quantity, rate and tax therefore come back from
+       the chain rather than off the body, which is why they are no longer
+       read from it above. Delivery dates, charges, terms, notes and
+       attachments are operational and remain the caller's to set: they do not
+       alter the commercial decision Finance made. */
+    const chain = await governed.resolveChain(req.tenant, req.body);
+    const vendor = chain.vendorId || undefined;
+    const vendorName = chain.vendorName || "";
+    const items = chain.lines;
+    const taxRate = chain.totals.headerTaxRate;
 
     /* ── A NEW ORDER IS ALWAYS A DRAFT ──────────────────────────────────────
      * Creation used to take `status` straight from the body, so a caller
@@ -825,9 +936,10 @@ router.post(
     }
     const status = "DRAFT";
 
-    const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true"
-    if (!vendor && !isEmergency)
-      return res.status(400).json({ success: false, message: "Vendor is required" });
+    /* Urgency is a reason to move fast, not a reason to buy material nobody
+       asked for against money nobody approved. The flag is recorded, and the
+       chain above has already run regardless of it. */
+    const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true";
     if (!items?.length)
       return res
         .status(400)
@@ -881,6 +993,14 @@ router.post(
         const itemGstRate = Number(item.gstRate) || 0;
         const itemGstAmount = totalPrice * itemGstRate / 100;
         return {
+          /* The approved purchase-request line this order line discharges.
+             Without it a supplier bill cannot say which budget allocation it
+             settles, and billing one line of a four-line request releases the
+             whole commitment. */
+          spendLineId: item.spendLineId || null,
+          /* And the material-request line behind it, so the chain is provable
+             from the order alone — line by line, by id. */
+          sourceMrfLineId: item.sourceMrfLineId || null,
           rawItem: item.rawItem,
           itemName: item.itemName || ri?.name || "Unknown Item",
           sku: item.sku || ri?.sku || "",
@@ -897,6 +1017,8 @@ router.post(
           receivedQuantity: 0,
           pendingQuantity: qty,
           status: "PENDING",
+          /* From the approved line, like everything else that identifies the
+             material — a different variant is a different thing to buy. */
           variantId: item.variantId || null,
           variantCombination: item.variantCombination || [],
           variantName: item.variantCombination?.join(" • ") || "",
@@ -908,21 +1030,20 @@ router.post(
       }),
     );
 
-    const subtotal = itemsWithDetails.reduce((sum, i) => sum + (i.totalPrice || 0), 0);
-    const taxAmount = itemsWithDetails.reduce((sum, i) => sum + (i.gstAmount || 0), 0);
-    const customChargesArr = Array.isArray(req.body.customCharges)
-      ? req.body.customCharges
-      : [];
-    const customChargesTotal = customChargesArr.reduce(
-      (s, c) => s + (parseFloat(c.amount) || 0),
-      0,
-    );
-    const totalAmount =
-      subtotal +
-      taxAmount +
-      (Number(shippingCharges) || 0) -
-      (Number(discount) || 0) +
-      customChargesTotal;
+    /* ── THE MONEY IS THE APPROVAL'S, END TO END ──────────────────────────
+       Subtotal, tax and total come from the chain the server resolved, not
+       from figures re-derived here out of a body. Charges and discounts that
+       would change the total were refused before this point — see
+       `resolveChain`. The fields remain on the model and on the form so the
+       approved figures can still be read and printed. */
+    const subtotal = chain.totals.subtotal;
+    const taxAmount = chain.totals.taxAmount;
+    /* The adjustments Finance approved on the request, carried onto the order
+       read-only. The feature is preserved: a buyer who needs freight adds it
+       to the purchase request and has it reapproved, and it then appears here
+       exactly as it always did. */
+    const customChargesArr = chain.totals.customCharges;
+    const totalAmount = chain.totals.totalAmount;
 
     const purchaseOrderData = {
       /* Tenancy from context ONLY — never from the payload. */
@@ -938,9 +1059,11 @@ router.post(
       subtotal,
       taxRate: Number(taxRate) || 0,
       taxAmount,
-      shippingCharges: Number(shippingCharges) || 0,
-      discount: Number(discount) || 0,
-      customCharges: customChargesArr.filter((c) => c.label?.trim()),
+      /* From the approval, not the payload — and not forced to zero, which
+         would have removed a feature people use. */
+      shippingCharges: chain.totals.shippingCharges,
+      discount: chain.totals.discount,
+      customCharges: customChargesArr,
       totalAmount,
       totalReceived: 0,
       totalPending: itemsWithDetails.reduce((sum, i) => sum + i.quantity, 0),
@@ -951,6 +1074,13 @@ router.post(
       termsConditions: termsConditions || "",
       isEmergencyOrder: isEmergency,
       createdBy: req.user.id,
+      /* ── SERVER-OWNED PROVENANCE ──────────────────────────────────────────
+         Written from the reloaded records, never from the body — including the
+         policy stamp that tells a governed order apart from a genuinely
+         historical one. This is what lets a supplier bill later discharge the
+         right budget commitment, and what lets anyone ask a purchase order why
+         it exists. */
+      ...governed.provenanceFields(chain),
     };
 
     /* Creation, its history entry and the idempotency effect marker as one
@@ -1499,6 +1629,22 @@ router.patch(
         cancellableStates: ["DRAFT", "ISSUED"],
         reason,
       });
+    }
+
+    /* ── A2: THE CHAIN IS PROVED AGAIN AT ISSUE ─────────────────────────────
+       Validating at creation is not enough. A draft sits between creation and
+       issue, and both ends move while it does: the draft can be edited, and the
+       approval it rests on can be revised, rejected, or already spent by
+       another order. Issuing is the moment a supplier is actually committed, so
+       the chain is re-proved against the records as they stand now.
+
+       Placed BEFORE the approval policy, the status write, the timestamps, the
+       history entry and the notification — a refusal here must leave the order
+       exactly as it was, with nothing sent to anybody. */
+    if (status === "ISSUED") {
+      await governed.assertIssuable(req.tenant, purchaseOrder.toObject
+        ? purchaseOrder.toObject()
+        : purchaseOrder);
     }
 
     /* ── Approval policy, where one is configured ───────────────────────── */

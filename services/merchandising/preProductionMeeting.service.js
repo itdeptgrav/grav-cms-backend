@@ -45,12 +45,15 @@ const {
   OWNER_DEPARTMENTS, SOURCE_AVAILABILITY,
 } = require("../../models/CMS_Models/Merchandising/PreProductionMeeting");
 const {
-  MerchandisingAuditEvent, MerchandisingCommandLedger,
+  MerchandisingAuditEvent, MerchandisingCommandLedger, MerchandisingOutboxEvent, OUTBOX_KIND,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 const { Counter } = require("../salesJourneyRef");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
+/* A plan date is a day, not an instant. The meeting's own day is what a
+   milestone records; the consumer reads it in the plan's timezone. */
+const dayOf = (v) => (v ? new Date(v).toISOString().slice(0, 10) : "");
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
 
 /* ═══ WHAT MAY BE STATED, AND BY WHOM ══════════════════════════════════════ */
@@ -1243,6 +1246,33 @@ async function issue(ctx, { fileId, body = {}, actor = null, idempotencyKey } = 
         ? doc.successorOfVersionNo : null,
     }, { at, correlationId }));
     await MerchandisingAuditEvent.create(rows, { session, ordered: true });
+
+    /* ── THE ONE THING ANOTHER PART OF THE COMPANY ACTS ON ──────────────
+       The minutes are now permanent evidence, so the Time & Action
+       milestone that was waiting for them can close from the record rather
+       than from somebody's recollection a fortnight later.
+
+       Published, not called. `tnaIntake` consumes this through the outbox
+       exactly as it consumes the three selection approvals — so issuing
+       minutes cannot fail because a schedule is malformed, and this service
+       still does not know that Time & Action exists. The carrier runs after
+       the transaction commits; see the route. */
+    await MerchandisingOutboxEvent.create([{
+      companyId: ctx.companyId,
+      kind: OUTBOX_KIND.PPM_ISSUED,
+      payload: {
+        executionFileId: file._id,
+        ppmId: String(doc._id),
+        ppmRef: str(doc.ppmRef),
+        versionNo: doc.versionNo,
+        conclusion,
+        /* The date the meeting was HELD, not the date the minutes were
+           certified — that is when the thing the milestone names happened.
+           `tnaIntake.eventDate` prefers a stated date over its own clock. */
+        effectiveDate: dayOf(doc.conductedAt || at),
+      },
+      correlationId,
+    }], { session, ordered: true });
 
     return {
       ppmId: String(doc._id), versionNo: doc.versionNo, state: doc.state,

@@ -49,9 +49,8 @@ const stockAccountability = require("../../../../services/stockAccountability.se
    because the Development BOM's inline creation must judge a payload by the
    same rules and a second copy of them would drift. */
 const {
-  SUPPLIER_NOT_SELECTABLE, supplierScope, resolveSuppliers, supplierIdentityMap,
   validateEmbeddedConversions, validateEmbeddedVendors,
-  escapeRegex, normaliseVariantNicknames, normaliseUnitConversion,
+  escapeRegex, normaliseUnitConversion,
 } = require("../../../../services/inventory/rawItemPayload.service");
 const rawItemCreation = require("../../../../services/inventory/rawItemCreation.service");
 

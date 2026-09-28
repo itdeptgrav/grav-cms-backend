@@ -151,6 +151,64 @@ const mrfItemSchema = new mongoose.Schema(
     purchaseRequisitionId: { type: mongoose.Schema.Types.ObjectId, ref: "Requisition", default: null },
     purchaseRequisitionNumber: { type: String, trim: true, default: "" },
     purchaseFormRaisedAt: { type: Date, default: null },
+
+    /* ── WHERE THIS LINE MUST COME FROM, WHEN SOMEBODY SAID ──────────────────
+     * A request that names a warehouse is naming a REQUIREMENT, not a
+     * preference: the material has to come from that site because that is where
+     * the work is. The availability read and the manual reserve drawer have both
+     * been passing `line.warehouseId` as their preferred warehouse since stock
+     * reservations were built (see the `availabilityFor` call in mrfRoutes), but
+     * the field was never declared — so mongoose dropped it on every write and
+     * the preference was silently always null.
+     *
+     * Declaring it makes that existing code mean what it says, and lets
+     * automatic reservation honour the requirement instead of letting an
+     * alphabetically-earlier warehouse win. Null stays the ordinary case: most
+     * requests do not care, and those allocate across every usable location.
+     */
+    warehouseId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* ── WHAT AUTOMATIC RESERVATION DID, AND WHY ──────────────────────────────
+     * Approving a request now attempts to hold the stock for it, so the store
+     * no longer chooses locations by hand for the ordinary case. This records
+     * the attempt — on the LINE, because eligibility is a per-line fact and a
+     * mixed request (two lines on the shelf, one to be bought) is the ordinary
+     * case, not the exception.
+     *
+     * It exists separately from StockReservation because the interesting
+     * outcomes create no reservation at all: a line that is SHORT, SKIPPED or
+     * ATTENTION has nothing held, and "we looked and found nothing" has to be
+     * distinguishable from "nobody has looked yet". `attemptedAt === null` is
+     * that second fact, and it is what puts a pre-existing approved request in
+     * the Needs-attention queue with a Try-automatic-reservation action rather
+     * than silently claiming it is short.
+     *
+     * The reserved locations and quantities are NOT duplicated here — they live
+     * on the StockReservation this attempt created, which is the one authority
+     * for what is held. This says what happened and why. */
+    autoReserve: {
+      attemptedAt: { type: Date, default: null },
+      outcome: {
+        type: String,
+        enum: ["RESERVED", "PARTIAL", "SHORT", "SKIPPED", "ATTENTION"],
+        default: null,
+      },
+      /* A machine-readable cause, so the UI can word the recovery rather than
+         echoing a sentence the server happened to compose. */
+      reason: { type: String, trim: true, default: "" },
+      /* The sentence a store user reads. */
+      message: { type: String, trim: true, default: "" },
+      /* In the requester's business unit, both of them — the reserved figure is
+         a copy of the reservation's for queue reads that must not join. */
+      reservedQty: { type: Number, default: 0, min: 0 },
+      shortQty: { type: Number, default: 0, min: 0 },
+      /* WHICH approval path triggered this, and who was acting. */
+      trigger: { type: String, trim: true, default: "" },
+      actorName: { type: String, trim: true, default: "" },
+      /* Retries are expected (a failed attempt is re-runnable); the count keeps
+         a repeatedly-failing line visible rather than looking freshly tried. */
+      attempts: { type: Number, default: 0, min: 0 },
+    },
   },
   { _id: true }
 );

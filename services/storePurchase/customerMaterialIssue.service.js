@@ -886,6 +886,7 @@ async function postIssue(ctx, {
       note: `Customer material issued to ${target.order.number}`,
       stockMeta: {
         reason: "Customer-supplied material issued to production",
+        ownership: "CUSTOMER", // customer property leaving the shelf — never company value
         notes: `${str(lot.customerLabel)} · ${str(lot.orderRef)}`
           + `${target.workOrder ? ` · ${target.workOrder.number}` : ""}`
           + ` · lot ${str(lot.goodsReceiptNumber)}`,
@@ -1044,6 +1045,7 @@ async function postReturn(ctx, {
       note: `Returned to ${str(lot.customerLabel) || "customer"}`,
       stockMeta: {
         reason: "Customer-supplied material returned to customer",
+        ownership: "CUSTOMER", // customer property going back to its owner — never company value
         notes: `${str(lot.customerLabel)} · ${str(lot.orderRef)} · lot `
           + `${str(lot.goodsReceiptNumber)}${customerReference ? ` · ${str(customerReference)}` : ""}`,
       },

@@ -347,6 +347,8 @@ rescheduleSchema.index({ companyId: 1, planId: 1, state: 1, createdAt: -1 });
 
 /* ── APPROVED REASONS ──────────────────────────────────────────────────── */
 
+const { REASON_CODE_KINDS } = require("./TnaConfiguration");
+
 const reasonCodeSchema = new mongoose.Schema(
   {
     companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
@@ -358,7 +360,48 @@ const reasonCodeSchema = new mongoose.Schema(
   { timestamps: true, collection: "merchandising_tna_reason_codes" },
 );
 
+/* ── UNCHANGED, AND NOW DOING A SECOND JOB ─────────────────────────────────
+   This index has always given one reason code per code per kind per company.
+   Since the milestone library moved into this same collection with
+   `kind: "MILESTONE"`, the same index also gives one milestone per code per
+   company — which is why that library needed no new uniqueness index built on
+   a live cluster. See `TnaConfiguration.js`. Do not narrow it. */
 reasonCodeSchema.index({ companyId: 1, code: 1, kind: 1 }, { unique: true });
+
+/* ── AND WHY A READ HERE CANNOT RETURN A MILESTONE ─────────────────────────
+   `merchandising_tna_reason_codes` now holds two kinds of configuration record.
+   Milestone definitions are a Mongoose discriminator, so their own model filters
+   itself; this model is the collection's base-level reader and would otherwise
+   see everything.
+
+   The guard is `kind: $in [BLOCK, RESCHEDULE]` rather than a discriminator of
+   its own, because `kind` here is real information — what the reason is FOR —
+   with two values, not a type tag with one. Splitting reason codes into two
+   models to satisfy the pattern would have made the pattern the point.
+
+   Every existing document already carries one of those two values, which is the
+   whole reason this needed no backfill: an unfiltered `TnaReasonCode.find()`
+   keeps returning exactly the documents it returned before, and a milestone
+   cannot appear among them however it is queried. A caller that passes its own
+   `kind` is left alone — `$and` is used so a narrower request still wins. */
+function reasonCodesOnly(next) {
+  const q = this.getQuery();
+  if (q.kind === undefined) {
+    this.where({ kind: { $in: [...REASON_CODE_KINDS] } });
+  } else {
+    /* Somebody asked for a kind. Honour it, and still refuse MILESTONE. */
+    this.setQuery({
+      $and: [q, { kind: { $in: [...REASON_CODE_KINDS] } }],
+    });
+  }
+  return next();
+}
+for (const op of [
+  "find", "findOne", "findOneAndUpdate", "findOneAndDelete", "countDocuments",
+  "distinct", "updateOne", "updateMany", "deleteOne", "deleteMany",
+]) {
+  reasonCodeSchema.pre(op, reasonCodesOnly);
+}
 
 module.exports = {
   PLAN_STATE, MILESTONE_STATUS, SCOPE_KIND, BASELINE_MUTABLE,

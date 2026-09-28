@@ -19,6 +19,8 @@ const mrfChat = require("../../../../services/mrfChat.service");
 const { buildContext } = require("../../../../services/mrfContext.service");
 const mrfUnits = require("../../../../services/mrfUnits.service");
 const fulfilment = require("../../../../services/storeFulfilment.service");
+/* Shipping, discount and charges, and the one rule for the total they make. */
+const spendAdjustments = require("../../../../services/spendAdjustments.service");
 
 /* ── Chunk 1B: tenancy, authority, history, safe stock effects ─────────────
  * Chunk 0 measured what this router does today: every authenticated caller
@@ -46,6 +48,7 @@ const { fail, sendError } = require("../../../../services/storePurchase/errors")
    the error mentioning an index. Requiring it at module load means the model is
    compiled, and any build scheduled, long before a transaction opens. */
 const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
+const autoReservation = require("../../../../services/storePurchase/autoReservation.service");
 // Chunk 9A — stock reservations & picking. The reservation record/projection
 // live here; the CONTROLLED ISSUE reuses this file's own adjustStock engine.
 const reservationSvc = require("../../../../services/storePurchase/reservation.service");
@@ -948,6 +951,17 @@ router.patch(
       tag: `mrf-item-matched-${mrf._id}-${item._id}`,
     }).catch(() => { });
 
+    /* ── A LINE CAN BECOME ELIGIBLE LONG AFTER THE REQUEST WAS APPROVED ────
+       An UNMATCHED line is approved but not reservable: nothing says which
+       material it is. Matching it is the moment it becomes eligible, so it is
+       the moment the hold is attempted — for THIS line only, because the rest
+       of the request was already attempted at approval. */
+    autoReservation.attemptInBackground({
+      tenant: req.tenant, mrfId: mrf._id, lineId: item._id,
+      trigger: autoReservation.TRIGGERS.LINE_MATCHED,
+      actorName: actorName(req), actorId: req.user?.id || null,
+    });
+
     const matchedPayload = { success: true, message: "Matched to existing item", mrf, wasRematch };
     return req.idempotent
       ? await req.idempotent.succeed(200, matchedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
@@ -1041,6 +1055,14 @@ router.patch(
       url: "/coworking/mrf",
       tag: `mrf-item-registered-${mrf._id}-${item._id}`,
     }).catch(() => { });
+
+    /* Registering a described line creates the catalogue item and links it —
+       the same eligibility moment as matching, reached by the other door. */
+    autoReservation.attemptInBackground({
+      tenant: req.tenant, mrfId: mrf._id, lineId: item._id,
+      trigger: autoReservation.TRIGGERS.LINE_MATCHED,
+      actorName: actorName(req), actorId: req.user?.id || null,
+    });
 
     const registeredPayload = { success: true, message: "Item added to inventory", mrf, rawItem: newRawItem };
     return req.idempotent
@@ -1249,8 +1271,16 @@ router.post(
     });
 
     // Only once the creation is authoritative.
-    if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
-    else mrfNotify.submitted(mrf).catch(() => { });
+    if (autoForward) {
+      mrfNotify.autoForwarded(mrf).catch(() => { });
+      /* Already approved on arrival — eligible now, by the same rule the TL
+         approval path uses. */
+      autoReservation.attemptInBackground({
+        tenant: req.tenant, mrfId: mrf._id,
+        trigger: autoReservation.TRIGGERS.AUTO_FORWARDED,
+        actorName: fullName, actorId: employee?._id || actorId || null,
+      });
+    } else mrfNotify.submitted(mrf).catch(() => { });
 
     const createdPayload = {
       success: true,
@@ -1382,6 +1412,14 @@ router.post(
         data: { mrfId: String(mrf._id), mrfNumber: mrf.mrfNumber, url: "/coworking/mrf" },
       }).catch(() => { });
     }
+
+    /* A store-raised request is approved the instant it is created, so it is
+       eligible immediately — the third door to the same rule. */
+    autoReservation.attemptInBackground({
+      tenant: req.tenant, mrfId: mrf._id,
+      trigger: autoReservation.TRIGGERS.STORE_ON_BEHALF,
+      actorName: actorName(req), actorId: req.user?.id || null,
+    });
 
     const bypassPayload = {
       success: true,
@@ -2011,6 +2049,21 @@ router.post(
       const vendorName = String(b.vendorName || "").trim();
       const price = fulfilment.priceFor({ lines: buying, gstPercent: b.gstPercent });
 
+      /* ── WHAT STORE NEGOTIATED BESIDE THE RATES ──────────────────────────
+         Freight, a discount and charges like handling are part of what the
+         company will pay, and Store is who agrees them with the supplier. They
+         are entered here, with the quote, so the requester confirms the real
+         payable figure and Finance approves that same figure — rather than a
+         line subtotal that grows on the purchase order afterwards. */
+      const adj = spendAdjustments.readAdjustments(b, price.grandTotal);
+      if (!adj.ok) {
+        return res.status(400).json({ success: false, message: adj.message, field: adj.field });
+      }
+      const payable = spendAdjustments.summarise({
+        subtotal: price.subtotal, taxAmount: price.taxAmount,
+        shipping: adj.shipping, customCharges: adj.custom, discount: adj.discount,
+      });
+
       /* The budget head is the requester's manager's decision, carried. Store
          does not choose it and cannot override it — a head picked by the
          person who knows the shelf rather than the envelope is exactly the
@@ -2073,6 +2126,17 @@ router.post(
         unit: l.unit,
         rate: l.rate,
         amount: Math.round(l.buyQty * l.rate * 100) / 100,
+        /* ── LINE-LEVEL PROVENANCE ──────────────────────────────────────────
+           Which material-request line this is buying, and what that line said
+           the material was. A purchase order raised from this can then prove,
+           line by line, that it is ordering the thing that was asked for —
+           rather than matching on a name two catalogue items can share, or on
+           an array position a reorder silently changes. */
+        sourceMrfLineId: l.itemId,
+        rawItem: l.rawItem || null,
+        rawItemSku: l.rawItemSku || "",
+        variantId: l.variantId || null,
+        baseUnit: l.baseUnit || "",
       }));
 
       const created = await spendCreate.createSpendRequest({
@@ -2133,13 +2197,31 @@ router.post(
          finance approval sits behind. */
       spend.gstPercent = price.gstPercent;
       spend.taxAmount = price.taxAmount;
-      spend.grandTotal = price.grandTotal;
+      /* Store's quoted adjustments, and the total they make. `grandTotal` is
+         what the requester confirms, what Finance approves, what
+         `allocateLines` splits and what the commitment is written for — so it
+         has to be the payable figure, not the line subtotal plus tax. */
+      spend.quotedShippingCharges = payable.shippingCharges;
+      spend.quotedDiscount = payable.discount;
+      spend.quotedCustomCharges = payable.customCharges;
+      spend.grandTotal = payable.grandTotal;
       spend.expectedDeliveryDate = b.expectedDeliveryDate ? new Date(b.expectedDeliveryDate) : undefined;
       spend.pricedBy = actorId;
       spend.pricedByName = who;
       spend.pricedAt = now;
       spend.sourceMrfId = mrf._id;
       spend.sourceMrfNumber = mrf.mrfNumber;
+      /* ── THE BUDGET RULES IN FORCE AT THIS MOMENT ───────────────────────
+         Recorded rather than left to be inferred later from a missing
+         commitment. A missing commitment has two opposite meanings — review
+         was paused, or the commitment is gone when it should not be — and
+         reading absence as policy makes the second look like the first.
+
+         Written from the setting as it stands NOW, so flipping the setting
+         later cannot rewrite what this request was approved under. */
+      spend.budgetApprovalMode = budgetInvolvementEnabled ? "COMMITMENT_REQUIRED" : "BUDGET_PAUSED";
+      spend.budgetApprovalModeAt = now;
+      spend.budgetApprovalModeSource = "RequestsSettings.mrfBudgetEnabled";
       await spend.save();
     }
 
@@ -3237,6 +3319,54 @@ router.post("/:id/items/:itemId/reserve",
     }
   });
 
+// ── POST /:id/auto-reserve — ask for another automatic attempt ──────────────
+//
+// The exception-resolution door, not a normal daily action. It exists for two
+// cases the queue puts in Needs attention: a request approved before automatic
+// reservation existed, and an attempt that could not be completed. Both are
+// re-runnable by construction — the attempt is idempotent, because an existing
+// active hold is returned rather than added to.
+//
+// `?lineId=` narrows to one line; without it every eligible line is attempted.
+router.post("/:id/auto-reserve",
+  requireCapability(CAPABILITIES.MRF_FULFIL), refuseLegacyWrite,
+  async (req, res) => {
+    try {
+      const mrf = await loadMrf(req, req.params.id, { lean: true });
+      const result = await autoReservation.attemptForRequest({
+        tenant: req.tenant,
+        mrfId: mrf._id,
+        lineId: req.body?.lineId || req.query?.lineId || null,
+        trigger: autoReservation.TRIGGERS.MANUAL_RETRY,
+        actorName: actorName(req), actorId: req.user?.id || null,
+      });
+      /* `attemptForRequest` resolves on every path, so a refusal arrives as a
+         reason rather than a throw. Said as itself: "this request is not
+         approved" is not a server error. */
+      if (!result.attempted) {
+        return res.status(409).json({
+          success: false,
+          reason: result.reason || "NOT_ATTEMPTED",
+          message: result.reason === "NOT_APPROVED"
+            ? "This request is not approved, so no stock can be held for it."
+            : "Automatic reservation could not be attempted for this request.",
+        });
+      }
+      const held = result.lines.filter((l) => ["RESERVED", "PARTIAL"].includes(l.outcome)).length;
+      res.json({
+        success: true,
+        message: held
+          ? `Stock was held for ${held} line${held === 1 ? "" : "s"}.`
+          : "Nothing could be held — see each line for why.",
+        lines: result.lines,
+      });
+    } catch (e) {
+      if (e?.name === "StorePurchaseError") return sendError(res, e);
+      console.error("[mrf-auto-reserve]", e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  });
+
 // Load one active reservation within the tenant, or 404.
 async function loadReservation(req, reservationId, { lean = false } = {}) {
   const q = StockReservation.findOne({ _id: reservationId, companyId: req.tenant.companyId });
@@ -3490,7 +3620,9 @@ router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (r
     const mrfs = await MRF.find({
       ...tenantContext.tenantFilter(req.tenant),
       status: { $in: ["APPROVED", "PARTIALLY_ISSUED"] },
-    }).select("mrfNumber requestedForName requestedForDept neededBy status fulfilmentDecision items").sort({ neededBy: 1, createdAt: -1 }).limit(CAP).lean();
+    })/* `items` in full: a projection that omitted `items.autoReserve` would read
+       as "never attempted" for every line and fill the queue with retries. */
+      .select("mrfNumber requestedForName requestedForDept neededBy status fulfilmentDecision items").sort({ neededBy: 1, createdAt: -1 }).limit(CAP).lean();
 
     const rows = [];
     for (const r of reservations) {
@@ -3499,10 +3631,18 @@ router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (r
         kind: "reservation", reservationId: v.id, mrfId: v.mrfId, mrfNumber: v.mrfNumber, mrfLineId: v.mrfLineId,
         requestedForName: v.requestedForName, requestedForDept: v.requestedForDept, neededBy: v.neededBy,
         item: v.item, unit: v.unit, requestedQty: v.requestedQty, reservedQty: v.reservedQty, activeReservedQty: v.activeReservedQty,
-        issuedQty: v.issuedQty, backorderedQty: v.backorderedQty, status: v.status, group: v.group,
+        issuedQty: v.issuedQty, backorderedQty: v.backorderedQty, status: v.status,
+        /* One vocabulary across both kinds of row — see `stageOfGroup`. */
+        group: autoReservation.stageOfGroup(v.group),
         allocations: v.allocations.map((a) => ({ warehouseShortName: a.warehouseShortName, locationCode: a.locationCode, activeQty: a.activeQty })),
       });
     }
+    /* ── APPROVED LINES WITH NO ACTIVE HOLD ────────────────────────────────
+       These used to be one group, "Ready to reserve", which meant "a person
+       still has to do this". Automatic reservation does it, so the question a
+       line here answers is no longer "has anyone reserved it" but "what did the
+       attempt find" — which `lineStage` reads off the attempt record the
+       service writes. A line it returns null for is not queue work at all. */
     for (const m of mrfs) {
       if (m.fulfilmentDecision === "buy_or_service") continue;
       for (const it of (m.items || [])) {
@@ -3510,12 +3650,28 @@ router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (r
         if (["REJECTED", "UNFULFILLED", "ISSUED", "RETURNED"].includes(it.itemStatus)) continue;
         if ((it.issuedQty || 0) >= (it.requestedQty || 0) - reservationSvc.TOL) continue;
         if (reservedLineIds.has(String(it._id))) continue;
+        const staged = autoReservation.lineStage(it);
+        if (!staged) continue;
+        const owed = reservationSvc.r4(Math.max(0, (it.requestedQty || 0) - (it.issuedQty || 0)));
         rows.push({
           kind: "line", mrfId: String(m._id), mrfNumber: m.mrfNumber, mrfLineId: String(it._id),
           requestedForName: m.requestedForName || "", requestedForDept: m.requestedForDept || "", neededBy: m.neededBy || null,
           item: { rawItemId: String(it.rawItem), name: it.rawItemName, sku: it.rawItemSku, variantId: it.variantId ? String(it.variantId) : null, variant: (it.variantCombination || []).join(" • ") },
-          unit: it.unit, requestedQty: it.requestedQty, reservedQty: 0, activeReservedQty: 0, issuedQty: it.issuedQty || 0, backorderedQty: 0,
-          status: "UNRESERVED", group: "READY_TO_RESERVE", allocations: [],
+          unit: it.unit, requestedQty: it.requestedQty, reservedQty: 0, activeReservedQty: 0, issuedQty: it.issuedQty || 0,
+          /* The short figure is what is still owed, not zero: a line the shelf
+             could not answer is short by the whole remainder, and the purchase
+             path reads this number. */
+          backorderedQty: staged.stage === "SHORT" ? owed : 0,
+          status: "UNRESERVED", group: staged.stage, allocations: [],
+          /* The attempt, carried so the row can explain itself and offer the
+             right recovery without a second read. */
+          autoReserve: {
+            attemptedAt: it.autoReserve?.attemptedAt || null,
+            outcome: it.autoReserve?.outcome || null,
+            reason: staged.reason, message: staged.message,
+            retryable: staged.retryable,
+            attempts: it.autoReserve?.attempts || 0,
+          },
         });
       }
     }
@@ -3530,7 +3686,9 @@ router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (r
     const search = typeof q.search === "string" ? q.search.trim().toLowerCase() : "";
     if (search) filtered = filtered.filter((r) => [r.mrfNumber, r.item.name, r.item.sku, r.requestedForName].filter(Boolean).some((s) => String(s).toLowerCase().includes(search)));
 
-    const groupOrder = reservationSvc.GROUPS;
+    /* The work stages, not the old reservation groups: "Ready to reserve" is
+       no longer a daily stage because approval reserves. */
+    const groupOrder = autoReservation.STAGES;
     filtered.sort((a, b) => {
       const ga = (groupOrder[a.group]?.order || 99), gb = (groupOrder[b.group]?.order || 99);
       if (ga !== gb) return ga - gb;

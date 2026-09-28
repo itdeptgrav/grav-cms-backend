@@ -294,13 +294,23 @@ describe("it is the same milestones the file's own plan holds", () => {
     expect((await w.call("/tna/portfolio/attention")).body.counts.blocked).toBe(2);
   }, 180000);
 
-  test("only one T&A collection exists to be read", async () => {
+  test("only one collection holds a milestone on an order", async () => {
     /* The migration this chunk could have been and deliberately was not: a
        second, Overview-shaped copy of the milestones that would need keeping
-       in step with the first. */
+       in step with the first.
+
+       ── WHY THE DEFINITIONS COLLECTION IS NOT THAT ──────────────────────
+       `merchandising_tna_milestone_definitions` holds the company's LIST of
+       milestones — the words, the owning department, the system action that
+       closes one. It holds no milestone on any order, and nothing reads a
+       date or a status from it: a plan snapshots what it needs at creation,
+       so renaming an entry cannot reach a running order. One list, one set
+       of rows, and no copy to keep in step. Any OTHER new name matching
+       /milestone/ is the duplication this test exists to catch. */
     const names = (await mongoose.connection.db.listCollections().toArray()).map((c) => c.name);
-    const tna = names.filter((n) => /milestone/i.test(n));
-    expect(tna).toEqual([TnaMilestone.collection.name]);
+    const tna = names.filter((n) => /milestone/i.test(n)).sort();
+    expect(tna.filter((n) => n !== "merchandising_tna_milestone_definitions"))
+      .toEqual([TnaMilestone.collection.name]);
     expect(TnaMilestone.collection.name).toBe("merchandising_tna_milestones");
   }, 180000);
 });

@@ -15,11 +15,28 @@ const OvertimeReport = require("../models/HR_Models/OvertimeReport");
 const Policy = require("../models/HR_Models/Policy");
 const AttendanceSettings = require("../models/HR_Models/Attendancesettings");
 const PayrollSettings = require("../models/HR_Models/Payrollsettings");
+const C4Config = require("../models/HR_Models/C4Config");
 const { Payroll, PayrollItem } = require("../models/HR_Models/Payroll");
 const { CompanyHoliday, LeaveConfig } = require("../models/HR_Models/LeaveManagement");
 const { fullName, resolveEmployeeByQuery, resolveSelfEmployee, istDateStr, istNow } = require("./hrEmployeeContext");
 
 const MAX_ROWS = 50;
+
+function assistantPlain(value) {
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.map(assistantPlain);
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value.toJSON === "function") return assistantPlain(value.toJSON());
+  if (typeof value !== "object") return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    // Internal persistence/audit identifiers do not help answer policy
+    // questions and should not become model context.
+    if (["_id", "__v", "updatedBy", "createdBy"].includes(key)) continue;
+    out[key] = assistantPlain(child);
+  }
+  return out;
+}
 
 // Indian-style amount words ("47411" -> "47.41 thousand", "2630726" -> "26.31
 // lakh"), and a "raw (words)" form so the model can quote lakh/crore directly.
@@ -78,7 +95,7 @@ async function buildDirectoryContext({ department } = {}) {
 // ── Departments: the org's departments + designations + live headcounts ────────
 async function buildDepartmentsContext() {
   const [depts, counts] = await Promise.all([
-    Department.find({}).select("name status designations").lean().catch(() => []),
+    Department.find({}).select("name status designations primaryManager secondaryManager createdAt updatedAt").lean().catch(() => []),
     Employee.aggregate([
       { $match: { isActive: { $ne: false } } },
       { $group: { _id: "$department", count: { $sum: 1 } } },
@@ -91,7 +108,24 @@ async function buildDepartmentsContext() {
       name: d.name,
       status: d.status || "active",
       headcount: countByName.get(String(d.name || "").toLowerCase()) || 0,
-      designations: (d.designations || []).filter((x) => x.isActive !== false).map((x) => x.name),
+      designations: (d.designations || []).map((x) => ({
+        name: x.name,
+        active: x.isActive !== false,
+        managers: (x.managers || []).map((manager) => ({
+          departmentName: manager.departmentName,
+          designationName: manager.designationName,
+        })),
+      })),
+      primaryManager: d.primaryManager ? {
+        name: d.primaryManager.managerName,
+        designation: d.primaryManager.designation,
+      } : null,
+      secondaryManager: d.secondaryManager ? {
+        name: d.secondaryManager.managerName,
+        designation: d.secondaryManager.designation,
+      } : null,
+      createdAt: d.createdAt,
+      updatedAt: d.updatedAt,
     })),
   };
 }
@@ -190,10 +224,11 @@ async function buildHolidaysContext() {
 
 // ── Policies & settings: attendance rules, leave entitlements, SOP policies ─────
 async function buildPoliciesContext() {
-  const [att, leaveCfg, paySettings, policies] = await Promise.all([
+  const [att, leaveCfg, paySettings, c4Config, policies] = await Promise.all([
     AttendanceSettings.findOne({}).lean().catch(() => null),
     LeaveConfig.findOne({}).lean().catch(() => null),
     PayrollSettings.findOne({}).lean().catch(() => null),
+    C4Config.findOne({}).lean().catch(() => null),
     Policy.find({ isActive: true }).select("name description category scope thresholdMins points").limit(MAX_ROWS).lean().catch(() => []),
   ]);
   return {
@@ -216,6 +251,14 @@ async function buildPoliciesContext() {
       ? { payableDaysBasis: paySettings.payableDaysBasis, roundingMode: paySettings.roundingMode, ptEnabled: paySettings.ptEnabled }
       : null,
     hrPolicies: policies.map((p) => ({ name: p.name, category: p.category, scope: p.scope, thresholdMins: p.thresholdMins, description: p.description ? String(p.description).slice(0, 120) : null })),
+    // Complete stored configuration is supplied as structured evidence as
+    // well as the compact compatibility summary above. This lets Qwen answer
+    // uncommon settings questions without adding another phrase-specific path.
+    completeAttendanceSettings: assistantPlain(att),
+    completeLeaveSettings: assistantPlain(leaveCfg),
+    completePayrollSettings: assistantPlain(paySettings),
+    completeC4ScoringSettings: assistantPlain(c4Config),
+    completeActivePolicies: assistantPlain(policies),
   };
 }
 

@@ -152,6 +152,19 @@ The contract-only first task is [Slice 2A — Sales-line-to-Production release c
 
 **Exit:** Pilot reconciliation is signed off by PPC and Production, scanners continue to function on deployed devices, and rollback does not erase scans or released decisions.
 
+### Supervisor Flow signals — approved semantics
+
+The Live Production Tracker may overlay the digital flow between consecutive operations without claiming a physical pile location. For an approved Production execution basis, `pending pieces` means distinct pieces with an upstream completion scan and no downstream-or-later completion scan. Placement on the 3D floor still requires current server-owned machine assignments on the company-owned canvas.
+
+- **Piling:** pending pieces exist and recent upstream completions exceed downstream completions.
+- **Possible blockage:** pending pieces exist, upstream reported output, and downstream reported no output in the selected window. This is an inspection signal, not proof of a stoppage.
+- **May run out of work:** the current pending buffer is forecast to run out inside the user-selected window because the downstream feed requirement is greater than the observed upstream supply.
+- **Normal:** the two recent scan rates are within the stable band.
+
+The run-out forecast uses the frozen operation SAM and the number of distinct operators evidenced by scans in that same window. It never infers operators from machine count or PPC line headcount. When that evidence is incomplete it may use the observed downstream scan rate as the current consumption rate; when scan rates are unavailable, the forecast is unavailable. The UI must show which basis was used.
+
+Approved supervisor wording is direct and operation-specific: “37 pieces completed Cutting but not Sewing”, “Work is piling up before Pressing: 18 pieces pending”, “Check Pressing: no output for 60 minutes, with 37 pieces pending”, “Pressing may run out of work in 45 minutes”, “Sewing is not feeding Pressing fast enough”, and “Sewing and Pressing are running at a similar speed.”
+
 ## 6. Barcode protection gate for every slice
 
 Before merging a slice that touches work orders, operations, assignments, layout-derived views or scan consumers, run and record:

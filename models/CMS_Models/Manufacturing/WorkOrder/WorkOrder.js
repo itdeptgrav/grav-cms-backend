@@ -5,6 +5,11 @@ const {
   PLANNING_STATES,
   PLANNING_STATE_NOT_STARTED,
 } = require("../../../../constants/workOrderPlanningState");
+const {
+  productionExecutionBasisSchema,
+  installExecutionBasisGuard,
+  documentWriteRefusal,
+} = require("./productionExecutionBasis.schema");
 
 // ── operationAssignmentSchema ─────────────────────────────────────────────────
 // Stores operation identity (name + code) and planned timing only.
@@ -543,9 +548,27 @@ const workOrderSchema = new mongoose.Schema(
     forwardedAt: { type: Date, default: null },
     forwardedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
     vendorWorkOrderReference: { type: String, trim: true, default: null },
+
+    /* ── PRODUCTION EXECUTION BASES (28 Sep 2026) ─────────────────────────
+       What Production accepted for executing this WorkOrder: append-only,
+       frozen snapshots — see productionExecutionBasis.schema.js. Written ONLY
+       by services/production/executionBasis/; every other write that names
+       this path is refused by the guard installed below.
+
+       `default: undefined` so a WorkOrder that never received a basis stores
+       nothing (absence is the honest state of every existing record), and
+       `select: false` so ordinary WorkOrder reads never carry the frozen
+       routes — a reader that needs them asks with `+productionExecutionBases`. */
+    productionExecutionBases: {
+      type: [productionExecutionBasisSchema],
+      default: undefined,
+      select: false,
+    },
   },
   { timestamps: true },
 );
+
+installExecutionBasisGuard(workOrderSchema);
 
 // ── Indexes (added 29 Aug 2026, chasing QC dashboard load time) ──────────────
 // The collection carries ~9 KB per document, so a scan here is expensive well
@@ -622,6 +645,12 @@ workOrderSchema.statics.canonicalNumber = canonicalWorkOrderNumber;
  * independent — and keeping them in one function is how that stays visible.
  */
 workOrderSchema.pre("validate", function assignNewWorkOrderInvariants(next) {
+  /* Independent of both invariants below and checked first, for new and
+     existing records alike: a document save may never carry or change a
+     Production execution basis. Only the dedicated service writes one. */
+  const basisRefusal = documentWriteRefusal(this);
+  if (basisRefusal) this.invalidate("productionExecutionBases", basisRefusal);
+
   if (!this.isNew) {
     /* The Sales-line link is part of the order's creation, not an edit: an
        existing order may neither gain one (that would be a backfill nobody

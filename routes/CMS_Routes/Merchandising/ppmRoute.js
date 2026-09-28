@@ -36,6 +36,7 @@ const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
 const ppm = require("../../../services/merchandising/preProductionMeeting.service");
+const tnaDelivery = require("../../../services/integration/tnaSourceDelivery.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -138,7 +139,42 @@ router.post("/files/:id/ppm/issue", requireCompany, canDecide, handle(async (req
     fileId: req.params.id, body: req.body || {},
     actor: actor(req), idempotencyKey: idempotencyKey(req),
   });
-  return res.json({ success: true, ...out });
+  /* ── THEN CARRY, AFTER THE COMMIT AND NEVER INSIDE IT ────────────────
+     Issuing minutes is the commercial act; closing the Time & Action
+     milestone is bookkeeping about it. `deliverPending` never throws, so a
+     malformed schedule cannot tell an approver their minutes failed — the
+     event stays unconsumed and the next sweep picks it up. */
+  const carried = await tnaDelivery.deliverPending({
+    companyId: req.merchandising.companyId, limit: 50,
+  });
+  return res.json({
+    success: true,
+    ...out,
+    /* ── WHAT THIS SAYS, AND WHAT IT DELIBERATELY NO LONGER SAYS ────────
+       Stated rather than assumed, so a screen showing the milestone closed
+       shows it because it closed.
+
+       It used to report `applied` and `noops` — how many outbox events this
+       call flushed. Those describe the CALL, not the minutes: a first issue
+       flushes one and a replay of the same issue flushes none, so the same
+       operation answered two different things and an idempotent replay stopped
+       being idempotent in its own response. The counts were also never useful
+       to a caller; one order's minutes close at most one milestone.
+
+       `closed` is a fact about this order. `retrying` is the honest word for a
+       delivery that has not landed yet — it will be retried, and the caller
+       does not need to know how many attempts were in the queue. */
+    timeAndAction: {
+      closed: carried.applied > 0,
+      retrying: carried.failures.length > 0,
+      note: carried.failures.length
+        ? "The minutes are issued. Their Time & Action milestone has not been "
+          + "updated yet and will be retried."
+        : carried.applied
+          ? "The minutes are issued and the matching Time & Action milestone is closed."
+          : "The minutes are issued. No Time & Action milestone on this order waits for them.",
+    },
+  });
 }));
 
 router.post("/files/:id/ppm/cancel", requireCompany, canDecide, handle(async (req, res) => {

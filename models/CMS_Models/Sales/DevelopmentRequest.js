@@ -96,11 +96,44 @@ const FORBIDDEN_FIELDS = Object.freeze({
   probability: "the pipeline probability, which is Sales' own workflow",
 });
 
-/** A reference image, by URL. Never a payload — Merchandising links, not stores. */
+/**
+ * A reference image, BY REFERENCE. Never a payload — Merchandising links, not
+ * stores, and the bytes live in the application's media store.
+ *
+ * ── WHY THERE IS NO RAW URL FIELD ANY MORE ──────────────────────────────────
+ * There is one, and it is still called `url`, but it is no longer somewhere a
+ * person types. Sales attaches a picture through the same browser→CDN upload the
+ * rest of the application uses (`lib/cloudinaryUpload.js`), and the form sends
+ * back what that upload returned. A typed URL would have let a buyer reference
+ * point at anything at all — a link that rots, an image on somebody else's
+ * server, a page that is not an image — and every downstream reader (the
+ * Development file, the handover review, the accepted order) would show the
+ * breakage without being able to explain it.
+ *
+ * `storageRef` is the media store's own id for the object, which is what makes
+ * the attachment traceable to the upload rather than to a string. `referenceType`
+ * says what the picture IS, because "front view" and "the buyer's own sample
+ * photo" are read differently by the person selecting fabric.
+ */
+const REFERENCE_TYPE = Object.freeze({
+  PRODUCT: "PRODUCT",
+  ARTWORK: "ARTWORK",
+  BUYER_SAMPLE: "BUYER_SAMPLE",
+  TRIM: "TRIM",
+  PACKAGING: "PACKAGING",
+  OTHER: "OTHER",
+});
+
 const imageSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true, maxlength: 2000 },
     caption: { type: String, trim: true, default: "", maxlength: 200 },
+    /* The media store's id for the uploaded object. Absent on images attached
+       before the upload control existed, which stay readable. */
+    storageRef: { type: String, trim: true, default: "" },
+    referenceType: {
+      type: String, enum: Object.values(REFERENCE_TYPE), default: REFERENCE_TYPE.PRODUCT,
+    },
   },
   { _id: false },
 );
@@ -293,6 +326,7 @@ requestSchema.pre("save", function freezeIssued(next) {
 });
 
 module.exports = {
+  REFERENCE_TYPE,
   REQUEST_STATE, MATERIAL_CATEGORY, FORBIDDEN_FIELDS,
   SalesDevelopmentRequest: mongoose.models.SalesDevelopmentRequest
     || mongoose.model("SalesDevelopmentRequest", requestSchema),

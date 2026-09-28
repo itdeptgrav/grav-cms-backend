@@ -9,6 +9,7 @@
     "test": "node --test \"services/**/*.test.js\"",
     "//test:openjev": "The Accounts pilot suite is a node:test file under test/, which neither `npm test` (services only) nor Jest covers \u2014 Jest would see zero tests in it, because requiring node:test shadows Jest's own globals. The HR pilot suite next to it IS a Jest file and runs with `npx jest`.",
     "test:openjev": "node --test test/hr-ai/openJevAccountsPilot.test.js",
+    "audit:assistant-catalogues": "node scripts/audits/assistant-semantic-catalogues.js",
     "verify": "node -r dotenv/config verify.js",
     "verify:all": "node -r dotenv/config verify.js --all",
     "face:service": "node services/face-biometric/run.js service",

@@ -22,6 +22,7 @@ const { authorizedTools, getTool } = require("./toolRegistry");
 const { planToolQuestion, STATUS: PLAN_STATUS, CONTROL: PLAN_CONTROL } = require("./qwenToolPlanner");
 const { resolveHrAccess, resolveHrActor } = require("../access/hrAccess");
 const { resolveAccountingAccess } = require("../access/accountingAccess");
+const { semanticToolCandidates, detectSemanticDomains } = require("./semanticCatalogue");
 
 const REPLY_SCHEMA = { type: "object", properties: { reply: { type: "string" } }, required: ["reply"] };
 
@@ -186,7 +187,31 @@ async function selectContext({ user, message, history = [], routeContext }) {
   let contextState = null;
 
   if (!tools.length) return { toolData, toolsUsed, directAnswer, contextState };
-  const plan = await planToolQuestion({ question: message, tools, history });
+  // A tool may claim an exact catalogue-defined request before model planning.
+  // Claims are typed semantic metadata (not sentence regexes) and are accepted
+  // only when exactly one authorised tool claims the message.
+  const claims = (await Promise.all(tools.map(async (tool) => {
+    if (!tool.claim) return null;
+    try {
+      const args = await tool.claim({ message, history });
+      return args ? { tool: tool.name, arguments: args } : null;
+    } catch {
+      return null;
+    }
+  }))).filter(Boolean);
+  const plan = claims.length === 1
+    ? { status: PLAN_STATUS.OK, tool: claims[0].tool, arguments: claims[0].arguments, selection: "catalogue_claim" }
+    : await planToolQuestion({
+      question: message,
+      // Existing tool relevance contracts form a deterministic first-stage
+      // domain filter. When at least one authorised tool explicitly recognises
+      // the request, Qwen cannot escape that domain and select an unrelated
+      // but schema-valid tool/enum. Unrecognised paraphrases still see the full
+      // authorised catalogue.
+      tools: semanticToolCandidates(tools, message),
+      history,
+    });
+  if (!plan.selection) plan.selection = "qwen";
   if (plan.status !== PLAN_STATUS.OK) {
     // Planning is part of the model service. Fail visibly instead of silently
     // changing behaviour through phrase rules or attaching the wrong dataset.
@@ -211,7 +236,16 @@ async function selectContext({ user, message, history = [], routeContext }) {
     const data = await tool.provideContext({ user, message, args: plan.arguments || {} });
     toolData.push({ tool: plan.tool, data });
     toolsUsed.push(plan.tool);
-    contextState = { schema: "grav.assistant.plan/1", tool: plan.tool, arguments: plan.arguments || {} };
+    contextState = {
+      schema: "grav.assistant.plan/2",
+      tool: plan.tool,
+      arguments: plan.arguments || {},
+      selection: plan.selection,
+      detectedDomains: detectSemanticDomains(message),
+    };
+    if (tool.renderAnswer) {
+      directAnswer = tool.renderAnswer({ data, args: plan.arguments || {}, message, user }) || null;
+    }
   } catch {
     directAnswer = "I couldn't read that data safely right now. Please try again.";
   }
@@ -220,8 +254,8 @@ async function selectContext({ user, message, history = [], routeContext }) {
 
 async function chat({ user, message, routeContext, history = [] } = {}) {
   const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
-  if (directAnswer && !toolData.length) {
-    return { reply: directAnswer.slice(0, 4000), model: "qwen3", toolsUsed: [], contextState };
+  if (directAnswer) {
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted
@@ -238,9 +272,9 @@ async function chat({ user, message, routeContext, history = [] } = {}) {
  */
 async function chatStreaming({ user, message, routeContext, history = [], onThinking, onAnswer, signal } = {}) {
   const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
-  if (directAnswer && !toolData.length) {
+  if (directAnswer) {
     if (onAnswer) onAnswer(directAnswer);
-    return { reply: directAnswer.slice(0, 4000), model: "qwen3", toolsUsed: [], contextState };
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted

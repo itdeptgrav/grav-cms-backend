@@ -2170,6 +2170,11 @@ app.use("/api/cms/inventory/overview/operations", overviewOperationsRoutes);
 // Stock exceptions — company-scoped inventory-integrity queues (Chunk 10B).
 const stockExceptionsRoutes = require("./routes/CMS_Routes/Inventory/overview/stockExceptions");
 app.use("/api/cms/inventory/overview/stock-exceptions", stockExceptionsRoutes);
+// Stock register — the authoritative company-scoped read model behind Inventory
+// → Stock (physical on-hand, ownership split, reserved/available, location
+// coverage), composed read-only from the existing stock authorities.
+const inventoryStockRoutes = require("./routes/CMS_Routes/Inventory/overview/stock");
+app.use("/api/cms/inventory/overview/stock", inventoryStockRoutes);
 
 // Inventory Chatbot (Store Assistant) — PM-facing Q&A over live inventory data
 const inventoryChatbotRoutes = require("./routes/CMS_Routes/Inventory/chatbot/inventoryChatbot.routes");
@@ -2441,6 +2446,15 @@ app.use("/api/cms/production/scanner", require(`${S_ROUTES}/scannerAdminRoutes.j
 /* Machine intelligence — mounted on the supervisor prefix AFTER
    supervisorFloorRoutes, so it can only ADD /machine-intelligence paths. */
 app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/machineIntelligenceRoutes.js`));
+/* Production flow — WIP between consecutive operations. Same rule: mounted
+   last on the prefix, it can only ADD /flow paths. */
+app.use("/api/cms/production/supervisor", require(`${S_ROUTES}/flowTrackingRoutes.js`));
+/* Production's receipt of a PPC SEWING publication for an existing WorkOrder:
+   the frozen execution basis the flow projection reads. Own prefix, own guards. */
+app.use("/api/cms/production/execution-bases", require("./routes/CMS_Routes/Production/ExecutionBasis/executionBasisRoutes.js"));
+/* Server-owned machine assignment (Machine → WorkOrder → execution basis →
+   frozen operation) and device-verified scanner synchronisation. */
+app.use("/api/cms/production/machine-assignments", require("./routes/CMS_Routes/Production/MachineAssignment/machineAssignmentRoutes.js"));
 /* The floor's own assistant and its machine/operator targets: narrow prefixes
    of their own, each router carrying its own EmployeeAuthMiddleware. */
 app.use("/api/cms/production/assistant", require("./routes/CMS_Routes/Production/Assistant/productionAssistantRoutes.js"));
