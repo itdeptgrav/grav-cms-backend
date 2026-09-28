@@ -13,6 +13,8 @@ const router = express.Router();
 
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const StockLedger = require("../../../../models/CMS_Models/Inventory/Operations/StockLedger");
+const LandedCostAllocation = require("../../../../models/CMS_Models/Inventory/Valuation/LandedCostAllocation");
+const { Acc_Voucher } = require("../../../../models/Accountant_model/Acc_VoucherModels");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const { requireTenant } = require("../../../../Middlewear/storePurchaseTenant");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
@@ -99,18 +101,64 @@ async function compensatingByItem(itemIds) {
   return { applied, pendingCount };
 }
 
+// Active landed-cost allocations for these items, keyed for the engine's
+// overlay: itemId → Map(movementId → { perUnit, sources[] }). Only allocations
+// whose SOURCE VOUCHER is currently posted contribute — a cancelled/void
+// voucher's allocation is excluded by authoritative status without deleting it.
+async function landedByItem(companyId, itemIds) {
+  const out = new Map();
+  if (!companyId || !itemIds.length) return out;
+  const allocs = await LandedCostAllocation.find({
+    companyId,
+    status: "active",
+    "targets.itemId": { $in: itemIds },
+  }).lean();
+  if (!allocs.length) return out;
+  const voucherIds = [...new Set(allocs.map((a) => String(a.sourceVoucherId)))];
+  const vouchers = await Acc_Voucher.find({ _id: { $in: voucherIds } })
+    .select("status")
+    .lean();
+  const postedVoucher = new Set(
+    vouchers.filter((v) => v.status === "posted").map((v) => String(v._id)),
+  );
+  for (const a of allocs) {
+    if (!postedVoucher.has(String(a.sourceVoucherId))) continue; // excluded by status
+    for (const t of a.targets || []) {
+      const itemKey = String(t.itemId);
+      if (!out.has(itemKey)) out.set(itemKey, new Map());
+      const mm = out.get(itemKey);
+      const mid = String(t.movementId);
+      const prev = mm.get(mid) || { perUnit: 0, sources: [] };
+      prev.perUnit += Number(t.allocatedPerUnit) || 0;
+      prev.sources.push({
+        allocationId: String(a._id),
+        voucherId: String(a.sourceVoucherId),
+        voucherNumber: a.sourceVoucherNumber || "",
+      });
+      mm.set(mid, prev);
+    }
+  }
+  return out;
+}
+
 // Attach ONLY applied compensating movements and value each item; pending
 // corrections are passed as a count so they show as attention, not as stock.
-function valueAll(items, comp, withVariants) {
+// `landed` (itemId → movement landed map) overlays landed cost onto receipts.
+function valueAll(items, comp, landed, withVariants) {
   const applied = comp.applied || new Map();
   const pendingCount = comp.pendingCount || new Map();
+  const landedMap = landed || new Map();
   return items.map((it) => {
     const key = String(it._id);
     const rows = applied.get(key) || [];
     const merged = rows.length
       ? { ...it, stockTransactions: [...(it.stockTransactions || []), ...compensatingToMovements(rows)] }
       : it;
-    return valueItem(merged, { withVariants, pendingCorrectionCount: pendingCount.get(key) || 0 });
+    return valueItem(merged, {
+      withVariants,
+      pendingCorrectionCount: pendingCount.get(key) || 0,
+      landedByMovement: landedMap.get(key) || new Map(),
+    });
   });
 }
 
@@ -162,15 +210,23 @@ router.get("/", async (req, res) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .lean();
-      const compMap = await compensatingByItem(items.map((i) => i._id));
-      rows = valueAll(items, compMap, withVariants);
+      const ids = items.map((i) => i._id);
+      const [compMap, landed] = await Promise.all([
+        compensatingByItem(ids),
+        landedByItem(req.tenant && req.tenant.companyId, ids),
+      ]);
+      rows = valueAll(items, compMap, landed, withVariants);
     } else {
       // Analytic path — status filter or value/attention sort need every item
       // valued. Still scoped to this company and never shipped whole to the
       // browser: we value server-side, then return only the requested page.
       const items = await RawItem.find(clause).select(VALUATION_PROJECTION).lean();
-      const compMap = await compensatingByItem(items.map((i) => i._id));
-      let valued = valueAll(items, compMap, withVariants);
+      const ids = items.map((i) => i._id);
+      const [compMap, landed] = await Promise.all([
+        compensatingByItem(ids),
+        landedByItem(req.tenant && req.tenant.companyId, ids),
+      ]);
+      let valued = valueAll(items, compMap, landed, withVariants);
       if (status && status !== "all") valued = valued.filter((v) => matchesStatus(v, status));
       sortValued(valued, sort, dir);
       total = valued.length;
@@ -191,17 +247,21 @@ router.get("/", async (req, res) => {
 
 // The company-scoped summary, computed the ONE way. Exported so the Store
 // overview consumes the identical valuation answer (never a second formula).
-async function summarizeCompany(clause) {
+async function summarizeCompany(clause, companyId) {
   const items = await RawItem.find(clause).select(VALUATION_PROJECTION).lean();
-  const compMap = await compensatingByItem(items.map((i) => i._id));
-  const valued = valueAll(items, compMap, false);
+  const ids = items.map((i) => i._id);
+  const [compMap, landed] = await Promise.all([
+    compensatingByItem(ids),
+    landedByItem(companyId, ids),
+  ]);
+  const valued = valueAll(items, compMap, landed, false);
   return { summary: summarizeValued(valued), valued };
 }
 
 // ── GET /summary — company totals, honest about what is excluded ─────────────
 router.get("/summary", async (req, res) => {
   try {
-    const { summary } = await summarizeCompany(queryClause(req));
+    const { summary } = await summarizeCompany(queryClause(req), req.tenant && req.tenant.companyId);
     res.json({ success: true, summary, note: LANDED_COST_NOTE });
   } catch (e) {
     console.error("[inventory-valuation] summary:", e);
@@ -216,8 +276,11 @@ router.get("/item/:id", async (req, res) => {
       .select(VALUATION_PROJECTION)
       .lean();
     if (!item) return res.status(404).json({ success: false, message: "Item not found." });
-    const compMap = await compensatingByItem([item._id]);
-    const [valued] = valueAll([item], compMap, true);
+    const [compMap, landed] = await Promise.all([
+      compensatingByItem([item._id]),
+      landedByItem(req.tenant && req.tenant.companyId, [item._id]),
+    ]);
+    const [valued] = valueAll([item], compMap, landed, true);
     res.json({ success: true, valuation: valued, note: LANDED_COST_NOTE });
   } catch (e) {
     console.error("[inventory-valuation] item:", e);

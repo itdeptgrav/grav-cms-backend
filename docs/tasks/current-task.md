@@ -1,8 +1,13 @@
-> **Status:** Store & Purchase professionalisation is the active scope.
+> **Status:** Central Costing Chunks 1-2 launch sequence is the active scope.
 >
-> **Active brief:** `docs/product/store-purchase-professionalization.md`.
+> **Active brief:** `docs/tasks/central-costing-roadmap.md`.
 >
-> **ACTIVE IMPLEMENTATION SCOPE — Chunk 1: tenant boundary, permissions,
+> **ACTIVE IMPLEMENTATION SCOPE:** Central Costing Chunk 1, specified in
+> `docs/handoff/central-costing-chunk-01-prompt.md`. Chunk 2 may start only
+> after Chunk 1's company boundary, permissions, immutable version contract
+> and protected API are complete.
+>
+> **PAUSED STORE/PURCHASE SCOPE — Chunk 1: tenant boundary, permissions,
 > immutable audit history, idempotency, document sequences and safe lifecycle
 > controls. NOT COMPLETE.** Architecture record:
 > `docs/decisions/store-purchase-tenancy-permissions.md`.

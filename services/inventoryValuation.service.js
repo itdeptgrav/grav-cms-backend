@@ -51,6 +51,12 @@ const REASON = Object.freeze({
   // A correction row exists that has not been APPLIED to stock — it is a claim,
   // not a movement, so it changes nothing but is worth attention.
   UNAPPLIED_CORRECTION: "UNAPPLIED_CORRECTION",
+  // A landed-cost allocation names a receipt movement that is not in this item's
+  // stream — it is reported, never guessed onto some other movement.
+  MISSING_ALLOCATION_TARGET: "MISSING_ALLOCATION_TARGET",
+  // A landed-cost allocation targets a receipt whose base cost is unknown —
+  // landed cost cannot make an unpriced receipt magically valued.
+  LANDED_WITHOUT_BASE: "LANDED_WITHOUT_BASE",
 });
 
 const STATUS = Object.freeze({
@@ -145,7 +151,8 @@ function classify(m) {
 function replayMovements(sortedWithClass) {
   let qtyOnHand = 0; // running replayed balance across ALL movements
   let valuedQty = 0; // meaningful only while !indeterminate
-  let value = 0; // meaningful only while !indeterminate
+  let value = 0; // EFFECTIVE value (base + landed), meaningful while !indeterminate
+  let baseValue = 0; // BASE value (receipt price only), same qty flow as `value`
   let unvaluedQty = 0; // meaningful only while !indeterminate
   let indeterminate = false;
   let indeterminateFrom = null;
@@ -159,6 +166,7 @@ function replayMovements(sortedWithClass) {
       qtyOnHand = 0;
       valuedQty = 0;
       value = 0;
+      baseValue = 0;
       unvaluedQty = 0;
       indeterminate = false;
       indeterminateFrom = null; // a clean slate — remaining value is exactly 0
@@ -176,8 +184,10 @@ function replayMovements(sortedWithClass) {
       qtyOnHand += c.qty;
       if (c.priced) {
         if (!indeterminate) {
+          const landedPerUnit = isNum(c.landedPerUnit) ? c.landedPerUnit : 0;
           valuedQty += c.qty;
-          value += c.qty * c.unitCost;
+          baseValue += c.qty * c.unitCost;
+          value += c.qty * (c.unitCost + landedPerUnit); // effective = base + landed
         }
         const t = timeOf(m);
         if (t && (latestPricedAt == null || t > latestPricedAt)) latestPricedAt = t;
@@ -200,11 +210,15 @@ function replayMovements(sortedWithClass) {
       }
       if (!indeterminate) {
         // Clean moving average: no unvalued stock exists here, so removal is
-        // unambiguous — at the average of the valued pool.
+        // unambiguous. Each lane is removed at its OWN average of the shared
+        // valued quantity, so the landed portion left in stock stays exactly
+        // proportional (a partial issue carries out its share of landed cost).
         const avg = valuedQty > QTY_TOL ? value / valuedQty : 0;
+        const baseAvg = valuedQty > QTY_TOL ? baseValue / valuedQty : 0;
         const fromValued = Math.min(c.qty, valuedQty);
         valuedQty -= fromValued;
         value -= fromValued * avg;
+        baseValue -= fromValued * baseAvg;
         if (c.qty - fromValued > QTY_TOL) negativeReplay = true; // out > on hand
       }
       qtyOnHand -= c.qty;
@@ -214,6 +228,7 @@ function replayMovements(sortedWithClass) {
   }
 
   if (Math.abs(value) < 0.005) value = 0; // clear float dust to a clean zero
+  if (Math.abs(baseValue) < 0.005) baseValue = 0;
   if (valuedQty < 0 && valuedQty > -QTY_TOL) valuedQty = 0;
   if (unvaluedQty < 0 && unvaluedQty > -QTY_TOL) unvaluedQty = 0;
   if (negativeReplay) reasons.add(REASON.NEGATIVE_REPLAY);
@@ -230,14 +245,24 @@ function replayMovements(sortedWithClass) {
       ? round4(value / valuedQty)
       : null;
   const knownValue = indeterminate ? null : round2(value);
+  const baseStockValue = indeterminate ? null : round2(baseValue);
+  const landedInStock = indeterminate ? null : round2(value - baseValue);
+  const baseAvgCost = indeterminate
+    ? null
+    : valuedQty > QTY_TOL
+      ? round4(baseValue / valuedQty)
+      : null;
 
   return {
     qtyOnHand,
     valuedQty: indeterminate ? null : valuedQty,
     unvaluedQty: indeterminate ? null : unvaluedQty,
     replayQty: qtyOnHand,
-    value: knownValue, // null when indeterminate — never ₹0
-    avgCost, // null when indeterminate
+    value: knownValue, // EFFECTIVE known value (base + landed) — null when indeterminate
+    baseStockValue, // base receipt value only — null when indeterminate
+    landedInStock, // landed cost still carried in on-hand stock — null when indeterminate
+    avgCost, // effective moving average — null when indeterminate
+    baseAvgCost, // base moving average — null when indeterminate
     valueState,
     indeterminate,
     indeterminateFrom,
@@ -267,7 +292,57 @@ function valueItem(item, opts = {}) {
   const txns = Array.isArray(item.stockTransactions) ? item.stockTransactions : [];
   const sorted = chronological(txns).map((m) => ({ ...m, __class: classify(m) }));
 
+  // ── LANDED-COST OVERLAY (V2) ───────────────────────────────────────────────
+  // Layer active landed-cost allocations onto their EXACT receipt movements.
+  // Never touches stockTransactions[].unitPrice; only annotates a per-unit
+  // landed cost the replay adds on top of the base price for that receipt.
+  const landedMap =
+    opts.landedByMovement instanceof Map
+      ? opts.landedByMovement
+      : new Map(Object.entries(opts.landedByMovement || {}));
+  const receipts = [];
+  const landedReasons = new Set();
+  const landedExceptions = [];
+  const resolvedTargets = new Set();
+  for (const m of sorted) {
+    const mid = String(m._id || "");
+    const c = m.__class;
+    const landed = landedMap.get(mid);
+    if (c.ok && c.dir === "in" && c.priced) {
+      const perUnit = landed && isNum(landed.perUnit) ? landed.perUnit : 0;
+      c.landedPerUnit = perUnit; // consumed by replayMovements
+      if (landed) resolvedTargets.add(mid);
+      if (perUnit !== 0 || landed) {
+        receipts.push({
+          movementId: mid,
+          variantId: m.variantId != null ? String(m.variantId) : null,
+          quantity: c.qty,
+          baseUnitCost: round4(c.unitCost),
+          landedPerUnit: round4(perUnit),
+          effectiveUnitCost: round4(c.unitCost + perUnit),
+          sources: landed ? landed.sources || [] : [],
+          at: timeOf(m) ? new Date(timeOf(m)) : null,
+        });
+      }
+    } else if (landed) {
+      // The allocation names a real movement, but it is not a priced inbound —
+      // landed cost cannot value an unpriced/indeterminate receipt.
+      resolvedTargets.add(mid);
+      landedReasons.add(REASON.LANDED_WITHOUT_BASE);
+    }
+  }
+  // An allocation whose target movement is not in this item at all is an
+  // exception — reported, never guessed onto another movement.
+  for (const mid of landedMap.keys()) {
+    if (!resolvedTargets.has(mid)) {
+      landedExceptions.push({ reason: REASON.MISSING_ALLOCATION_TARGET, _id: mid });
+      landedReasons.add(REASON.MISSING_ALLOCATION_TARGET);
+    }
+  }
+
   const itemReplay = replayMovements(sorted);
+  itemReplay.exceptions.push(...landedExceptions);
+  for (const r of landedReasons) itemReplay.reasons.push(r);
 
   const storedOnHand = isNum(item.quantity) ? item.quantity : 0;
   const difference = round4(storedOnHand - itemReplay.replayQty);
@@ -358,8 +433,13 @@ function valueItem(item, opts = {}) {
     replayedOnHand: round4(itemReplay.replayQty),
     valuedQty: r4(itemReplay.valuedQty), // null when indeterminate
     unvaluedQty: r4(itemReplay.unvaluedQty), // null when indeterminate
-    avgCost: itemReplay.avgCost, // moving weighted-average, or null when indeterminate
-    knownValue: itemReplay.value, // known value, or null when indeterminate — never ₹0
+    avgCost: itemReplay.avgCost, // EFFECTIVE moving average (base+landed), or null when indeterminate
+    baseAvgCost: itemReplay.baseAvgCost, // base-only moving average, or null when indeterminate
+    knownValue: itemReplay.value, // known value INCL. landed, or null when indeterminate — never ₹0
+    baseStockValue: itemReplay.baseStockValue, // base receipt value only
+    landedInStock: itemReplay.landedInStock, // landed cost still in on-hand stock (proportional after issues)
+    hasLandedCost: receipts.some((r) => r.landedPerUnit && r.landedPerUnit !== 0),
+    receipts, // per priced receipt: base / landed / effective unit cost + source
     valueState: itemReplay.valueState, // complete | partly_unvalued | indeterminate
     indeterminate,
     indeterminateFrom: itemReplay.indeterminateFrom, // first movement where certainty was lost
@@ -383,12 +463,15 @@ function valueItem(item, opts = {}) {
  */
 function summarizeValued(valuedItems) {
   const rows = Array.isArray(valuedItems) ? valuedItems : [];
-  let knownInventoryValue = 0;
+  let knownInventoryValue = 0; // includes landed cost still in stock
+  let baseStockValue = 0; // base receipt value only
+  let landedInStock = 0; // landed cost still carried in on-hand stock
   let completeCount = 0;
   let incompleteCount = 0;
   let indeterminateCount = 0;
   let unreconciledCount = 0;
   let excludedCount = 0; // items whose value is partly/fully excluded
+  let itemsWithLandedCost = 0;
   const onHandByUnit = {};
   const unvaluedByUnit = {};
 
@@ -396,6 +479,9 @@ function summarizeValued(valuedItems) {
     // Only a genuinely-known value contributes. An indeterminate item's
     // knownValue is null and is excluded from the company total — never as ₹0.
     knownInventoryValue += isNum(it.knownValue) ? it.knownValue : 0;
+    baseStockValue += isNum(it.baseStockValue) ? it.baseStockValue : 0;
+    landedInStock += isNum(it.landedInStock) ? it.landedInStock : 0;
+    if (it.hasLandedCost) itemsWithLandedCost += 1;
     if (it.status === STATUS.COMPLETE) completeCount += 1;
     if (it.indeterminate) indeterminateCount += 1;
     else if (!it.fullyValued) incompleteCount += 1; // partly-unvalued / exceptions / pending
@@ -410,13 +496,16 @@ function summarizeValued(valuedItems) {
   }
 
   return {
-    knownInventoryValue: round2(knownInventoryValue),
+    knownInventoryValue: round2(knownInventoryValue), // incl. landed cost in stock
+    baseStockValue: round2(baseStockValue),
+    landedInStock: round2(landedInStock),
     totalItems: rows.length,
     completeCount,
     incompleteCount,
     indeterminateCount,
     unreconciledCount,
     excludedCount,
+    itemsWithLandedCost,
     onHandByUnit,
     unvaluedByUnit,
   };
