@@ -129,13 +129,28 @@ const measureGroupSchema = new mongoose.Schema(
     partKey: { type: String },
     assignedSize: { type: String, default: null },
     multiplier: { type: Number, default: 1 },
+    /*
+     * A reference names geometry two ways: by stable id, and by the array position it used to be identified by.
+     *
+     * Position alone is not identity. Deleting a connector or a node re-indexes the arrays, and every binding above
+     * the hole then addresses different geometry while still resolving perfectly. The ids survive that; the indices
+     * are kept so data written before they existed still loads, and as a fallback when a ref has no ids.
+     */
     ref1: {
       pathIdx: { type: Number },
       segIdx: { type: Number },
+      pathId: { type: String },
+      nodeId: { type: String },
+      legacyPathIdx: { type: Number },
+      legacySegIdx: { type: Number },
     },
     ref2: {
       pathIdx: { type: Number },
       segIdx: { type: Number },
+      pathId: { type: String },
+      nodeId: { type: String },
+      legacyPathIdx: { type: Number },
+      legacySegIdx: { type: Number },
     },
     color: { type: String, default: "#2563eb" },
     targetFullInches: { type: Number, default: 0 },
@@ -438,6 +453,13 @@ const patternGradingConfigSchema = new mongoose.Schema(
     basePatternSize: { type: String, default: "M" },
     garmentType: { type: String, default: null },            // SHIRT | TROUSER | … declared, never inferred
     patternEngineVersion: { type: String, default: null },   // LEGACY | V3
+    /*
+     * WHICH DRAWN PIECE IS WHICH, CONFIRMED ONCE FOR THIS MASTER.
+     *
+     * Roles are identified by fingerprint rather than by array index, so re-exporting the drawing with its elements
+     * in another order cannot silently move "front leg" onto a pocket facing. The index is kept for convenience only.
+     */
+    pieceRoles: { type: [mongoose.Schema.Types.Mixed], default: [] },
     isActive: { type: Boolean, default: true },
     version: { type: Number, default: 1 },
 

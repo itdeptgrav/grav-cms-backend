@@ -2875,10 +2875,18 @@ router.get("/unmatched", auth, async (req, res) => {
        / Cr Bank, no party on it anywhere — be recognised as settling something
        the books already owe. Resolved per voucher it would be 500 round trips. */
     const liabilities = await billMatching.liabilityLedgerIdsFor(vouchers);
+    /* And which of them are customer/supplier accounts, for the vouchers that
+       never had the party flag written on the line. Same one-query reason. */
+    const partyAccounts = await billMatching.partyAccountIdsFor(vouchers);
 
     const rows = vouchers
       .map((v) => {
-        const state = billMatching.matchStateOf(v, null, liabilities);
+        const state = billMatching.matchStateOf(
+          v,
+          null,
+          liabilities,
+          partyAccounts,
+        );
         return {
           _id: v._id,
           voucherNumber: v.voucherNumber,
@@ -2923,7 +2931,13 @@ router.get("/:id/match", auth, async (req, res) => {
        in the response is what lets a screen offer the choice. */
     const partyLedgerId = req.query.partyLedgerId || null;
     const liabilities = await billMatching.liabilityLedgerIdsFor(voucher);
-    const state = billMatching.matchStateOf(voucher, partyLedgerId, liabilities);
+    const partyAccounts = await billMatching.partyAccountIdsFor(voucher);
+    const state = billMatching.matchStateOf(
+      voucher,
+      partyLedgerId,
+      liabilities,
+      partyAccounts,
+    );
     const openBills = state.matchable
       ? await billMatching.openBillsForVoucher(voucher, {
           excludeVoucherId: voucher._id,

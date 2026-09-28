@@ -4371,3 +4371,105 @@ tracking, wastage). They were left alone: this change was scoped to the Project
 Manager side that was reported. The durable fix for all of them is either the
 model's migration (with a decision about which form to store) or applying the
 same resolver in each router.
+
+---
+
+## EPF wage ceiling made configurable + leave cap reads the permanent address (25 Sep 2026)
+
+### EPF wage ceiling
+
+`epfWageCeiling` is now a salary-config field (default ₹15,000) and every
+surface that quotes an EPF figure reads it. It was previously implicit: EPF was
+`ROUND(MIN(basic × 12%, 1800))`, with ₹15,000 living only in the fact that 12%
+of 15,000 is 1,800, so a company moving to ₹25,000 had nothing to edit.
+
+| surface | change |
+|---|---|
+| `services/salaryFormula.js` | `epfWageCeiling` knob; new `employeePf(basic, cfg)` — the one copy |
+| `routes/HrRoutes/Payroll_section.js` | all three inline copies (run / bulk / recalculate) now call `employeePf` |
+| `routes/HrRoutes/employeeImportExport.js` | XLSX cell applies the ceiling before the rupee cap |
+| `EmployeeForm.js` | mirror updated; both field labels now name the real rule |
+| `appointmentTemplate.js` | `rulesOf()`; Annexure I **and the letter's PF sentence** follow the settings |
+| `documentKit.js` | `useSalaryRules()`; preview and PDF are handed the same rules |
+| `models/Salaryconfig.js`, `Employee-Section.js` | field + **save allowlist** |
+| settings page | new "EPF Wage Ceiling" row; the cap follows it while the two are in step |
+
+Existing employees follow via `resyncAllSalaries`, which `PUT /config/salary`
+already runs. The payslip is a pure renderer of the stored payroll item and was
+not touched.
+
+Verification: `verifyEpfCeiling.js` — 39 checks, PURE tier. It evaluates the
+XLSX formula and the letter rather than matching source.
+
+### Leave cap
+
+The 7-day (Odisha) / 10-day monthly cap read the CURRENT address first, which
+inverted the rule: an employee from another state renting in Bhubaneswar was
+capped at 7. `services/leaveHomeState.service.js` now resolves it on the
+PERMANENT address, falling back to current when there is none and saying so.
+`GET /leave/balance` returns the resolved cap; the Expo `LeaveScreen.js` reports
+it instead of holding a second copy of the rule. `EmployeeForm.js` keeps the
+"same as current" copy in step so it cannot go stale and silently decide 7 vs 10.
+
+Verification: `verifyLeaveHomeState.js` — 35 checks, PURE tier.
+
+Full safe suite: 20 harnesses. Pre-existing failures unchanged —
+`verifyPayrollLadder` and `verifyManagerChain` (the dev `employees` collection
+is empty) and `verifyPartyLinkSafety` (known Rourkela mislink).
+
+---
+
+## Leave: the type the employee picked, and a split that survives an edit (25 Sep 2026)
+
+Reported as a mobile UI bug — "they applied for PL, the edit screen shows CL".
+It was that, three times over, and the data underneath was worse.
+
+### The type was derived from the split
+
+`split.CL >= split.PL ? "CL" : "PL"` is `"CL"` when both are zero, and zero is
+common: `maxPL` is 0 whenever the employee is not PL-eligible, has no PL left,
+or has used the month's cap.
+
+| where | was | now |
+|---|---|---|
+| apply payload | `leaveType: primaryType` | `form.leaveType` |
+| edit modal | CL row always, PL row only if `editMaxPL > 0`, whole block hidden from primary managers | one row, for `editTarget.leaveType`, whichever manager is acting |
+| edit reset effect | filled CL first whatever the type | opens in the bucket applied under |
+| edit payload | `leaveType: editPrimaryType` | not sent (the server pins the type) |
+| editor bounds | `avail` / `maxCLPerMonth` — the MANAGER's balance | `applicantBalance`, new on `/manager/pending` |
+
+### The split was being discarded
+
+`PUT /manager/:id/edit` never read `paidDays` and set `paidDays = totalDays,
+lwpDays = 0` for every non-LOP type. So the split editor saved nothing — and
+any edit at all reset the split, turning 3 paid + 2 LWP into 5 paid because
+somebody fixed a typo in the reason. Payroll reads `paidDays`.
+
+`PUT /:id` (employee self-edit) had the mirror bug: it updated `totalDays` and
+left `paidDays` alone, so shortening a 5-day leave to 2 left 3 paid days on a
+2-day row. Both now keep the split consistent with the dates.
+
+### Also
+
+The MANAGER APPROVE header comment had the quick-apply roles backwards — the
+**primary** classifies via `/quick-apply/:id/resolve` (the route 403s anyone
+else), then the secondary approves. Corrected.
+
+A withdraw-request card read `paidDays ?? totalDays` under a "days" label, so a
+fully-unpaid five-day leave showed as "PL · 0 days". It now shows the length
+and how much of it is unpaid.
+
+### Verification
+
+`verifyLeaveEditSplit.js` — 28 checks, PURE tier. It lifts the route's split
+block and evaluates it, so it tests the arithmetic that ships. Backend safe
+suite: 21 harnesses, only the three known failures (empty `employees`
+collection × 2, Rourkela party mislink).
+
+App side: its own `npm run verify` — 10 checks green (refs, regularize, OT,
+lockfile, updates, palette, web pitfalls, parity, payslip template identical
+across all three repos, boot) and `expo export --platform android` bundles
+clean.
+
+Production build: EAS `production` profile, versionCode 57 → 58, app-bundle,
+remote Android credentials (Build Credentials O36CqMUsjU).

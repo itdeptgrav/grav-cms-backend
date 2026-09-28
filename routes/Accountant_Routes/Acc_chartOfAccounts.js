@@ -279,6 +279,34 @@ router.get("/tree", async (req, res) => {
       groups.map((g) => [String(g._id), { ...g, children: [], ledgers: [] }]),
     );
 
+    /* ── WHERE AN ADVANCE IS SHOWN ─────────────────────────────────────
+       A customer who has paid more than they have been billed is money owed
+       back, not a receivable. The ledger still BELONGS under Sundry Debtors —
+       that is where the invoices, the bill matching and the receivables
+       ageing look for it, and a balance that crosses zero with every invoice
+       cannot drag the ledger between groups as it goes — but showing it there
+       means the only way to find who is in advance is to open all thirty
+       customers one at a time.
+
+       So the tree hangs the line under "Advance from Customers" for as long
+       as its balance is the wrong way round. Nothing is written: `groupId` on
+       the ledger is untouched, and the moment an invoice puts the customer
+       back in debit the line returns to Sundry Debtors on its own. The mirror
+       case is a supplier paid ahead of their bill, which is an asset.
+
+       The groups come from the chart (see seedAdvanceGroups); if a company
+       has not got them, nothing is regrouped and the tree is exactly as it
+       was. */
+    const ADVANCE_EPSILON = 0.5; // rounding dust is not an advance
+    let advanceFromCustomers = null;
+    let advanceToSuppliers = null;
+    groupMap.forEach((g) => {
+      const n = String(g.name || "").trim().toLowerCase();
+      if (n === "advance from customers") advanceFromCustomers = g;
+      else if (n === "advance to suppliers") advanceToSuppliers = g;
+    });
+
+
     ledgers.forEach((l) => {
       // Enrich with computed balance from vouchers
       /* ── THE BALANCE IS THE VOUCHERS, ALWAYS ────────────────────────────
@@ -315,7 +343,29 @@ router.get("/tree", async (req, res) => {
       if (!l.aliases.includes(l.vendorCode)) l.aliases.push(l.vendorCode);
       if (!l.aliases.includes(l.customerCode)) l.aliases.push(l.customerCode);
 
-      const parent = groupMap.get(String(l.groupId));
+      const home = groupMap.get(String(l.groupId));
+      const homeName = String(home?.name || l.groupName || "").trim().toLowerCase();
+
+      /* Shown under the advance group while the balance is inverted. */
+      let parent = home;
+      if (
+        advanceFromCustomers &&
+        homeName === "sundry debtors" &&
+        l.currentBalance < -ADVANCE_EPSILON
+      ) {
+        parent = advanceFromCustomers;
+        l.regroupedFrom = home ? home.name : l.groupName;
+        l.isAdvance = true;
+      } else if (
+        advanceToSuppliers &&
+        homeName === "sundry creditors" &&
+        l.currentBalance > ADVANCE_EPSILON
+      ) {
+        parent = advanceToSuppliers;
+        l.regroupedFrom = home ? home.name : l.groupName;
+        l.isAdvance = true;
+      }
+
       if (parent) parent.ledgers.push(l);
     });
 
@@ -5175,10 +5225,19 @@ const MANUFACTURING_CHART = [
   { kind: "ledger", parent: "Inventory", name: "Packing Materials" },
 
   // Loans & Advances + GST Input
+  /* A supplier paid ahead of their bill is an asset, and a customer who has
+     paid ahead of their invoices is money owed back. Both used to be a single
+     LEDGER you posted to by hand, which meant the figure only ever matched the
+     parties if somebody kept it up to date. They are GROUPS now: the chart and
+     the balance sheet list the actual parties under them, each at its own
+     balance, for as long as that balance is the wrong way round. Nothing is
+     posted and nothing is written — the party's ledger stays under Sundry
+     Debtors / Sundry Creditors, which is where bill matching and the
+     receivables ageing look for it. */
   {
-    kind: "ledger",
+    kind: "group",
     parent: "Loans & Advances (Asset)",
-    name: "Advances to Suppliers",
+    name: "Advance to Suppliers",
   },
   {
     kind: "ledger",
@@ -5269,9 +5328,10 @@ const MANUFACTURING_CHART = [
     name: "Other Current Liabilities",
   },
   {
-    kind: "ledger",
-    parent: "Other Current Liabilities",
-    name: "Advances from Customers",
+    // Mirror of "Advance to Suppliers" above — see the note there.
+    kind: "group",
+    parent: "Current Liabilities",
+    name: "Advance from Customers",
   },
 
   // Long-term borrowings (use existing Secured Loans default group)
@@ -5427,11 +5487,34 @@ router.post("/seed-manufacturing", async (req, res) => {
       existingGroups.map((g) => [g.name.toLowerCase(), g]),
     );
 
-    // Existing ledgers — needed for idempotency
-    const existingLedgers = await Acc_Ledger.find({
-      companyId,
-      isActive: true,
-    })
+    /* Names taken by a group in any state, for the same reason as the
+       ledgers above. Kept separate from groupByName because THAT map also
+       resolves parents, and a new ledger must not be hung under a group
+       somebody deleted. */
+    const allGroupNames = new Set(
+      (await Acc_Group.find({ companyId }).select("name").lean()).map((g) =>
+        g.name.toLowerCase(),
+      ),
+    );
+
+    /* ── WHAT COUNTS AS "ALREADY THERE" ──────────────────────────────────
+       Deliberately NOT filtered by isActive. A soft-deleted ledger still
+       holds its name: `acc_ledgers` has a unique index on
+       (companyId, name), so creating it again throws E11000 no matter
+       what isActive says.
+
+       This check used to read active ledgers only, and the consequence was
+       a dialog that could never be cleared. Six soft-deleted ledgers on
+       this company — Cash in Hand, CGST/SGST/IGST Input, Capital
+       Work-in-Progress, Long-term Investments — were invisible to the
+       check, so every preview offered them, every seed threw a duplicate
+       key, the error went into results.errors where nothing displayed it,
+       and the count came back unchanged. The button looked like it had
+       done nothing because it had.
+
+       A ledger somebody deleted is not re-created here. Seeding fills in
+       what is missing from the chart; it does not overrule a deletion. */
+    const existingLedgers = await Acc_Ledger.find({ companyId })
       .select("name")
       .lean();
     const ledgerNameSet = new Set(
@@ -5480,6 +5563,11 @@ router.post("/seed-manufacturing", async (req, res) => {
       if (groupByName.has(item.name.toLowerCase())) {
         results.groupsSkipped.push(item.name);
         return true; // already done — counts as placed
+      }
+      if (allGroupNames.has(item.name.toLowerCase())) {
+        // Exists but deleted. The unique index would reject a create.
+        results.groupsSkipped.push(item.name);
+        return true;
       }
       const parent = groupByName.get(item.parent.toLowerCase());
       if (!parent) {

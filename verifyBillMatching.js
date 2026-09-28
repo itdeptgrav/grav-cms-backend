@@ -77,6 +77,166 @@ async function putBack() {
   ] };
   check("and the Dr side of a payment", bm.matchStateOf(payment).partyLedgerName === "A Supplier");
 
+  /* ── A PARTY LINE NOBODY LABELLED ──────────────────────────────────────
+     A voucher names its party in three places and they do not always agree:
+     the `isPartyLedger` flag on the line, `partyLedgerId` on the header, and
+     the ledger the line actually points at. One credit note in these books
+     arrived with the first two missing — its credit side named a Sundry
+     Debtor for the whole amount and nothing said so — and the matcher replied
+     "not against a customer or supplier account" while the register beside it
+     displayed that customer's name from a third field.
+
+     The chart of accounts is the tie-breaker: a line on the settling side
+     pointing at a Sundry Debtor or Sundry Creditor IS the party line. */
+  const unlabelled = {
+    ...fake,
+    voucherType: "credit_note",
+    partyLedgerId: null,
+    ledgerEntries: [
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Sales Returns", type: "Dr", amount: 900 },
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Output IGST", type: "Dr", amount: 100 },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        ledgerId: new mongoose.Types.ObjectId(),
+        ledgerName: "A Customer",
+        type: "Cr",
+        amount: 1000,
+        isPartyLedger: false, // never written
+        billAllocations: [],
+      },
+    ],
+  };
+  const custLedgerId = String(unlabelled.ledgerEntries[2].ledgerId);
+
+  check(
+    "unlabelled party line: still refused when nothing says it is a party",
+    bm.matchStateOf(unlabelled).matchable === false,
+  );
+  const labelledByChart = bm.matchStateOf(
+    unlabelled,
+    null,
+    null,
+    new Set([custLedgerId]),
+  );
+  check(
+    "but matchable once the chart says that ledger is a customer account",
+    labelledByChart.matchable === true &&
+      labelledByChart.partyLedgerName === "A Customer" &&
+      labelledByChart.total === 1000,
+    JSON.stringify({
+      matchable: labelledByChart.matchable,
+      party: labelledByChart.partyLedgerName,
+      total: labelledByChart.total,
+    }),
+  );
+
+  /* The guard that keeps this from becoming the old "only line on that side"
+     guess, which claimed a party for bank interest and inter-bank transfers.
+     A ledger that is NOT a party account stays unmatched however alone it is
+     on its side. */
+  const interest = {
+    ...fake,
+    voucherType: "receipt",
+    partyLedgerId: null,
+    ledgerEntries: [
+      { _id: new mongoose.Types.ObjectId(), ledgerName: "Bank", type: "Dr", amount: 250 },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        ledgerId: new mongoose.Types.ObjectId(),
+        ledgerName: "Bank Interest Received",
+        type: "Cr",
+        amount: 250,
+        billAllocations: [],
+      },
+    ],
+  };
+  check(
+    "bank interest is still not a customer, even alone on the Cr side",
+    bm.matchStateOf(interest, null, null, new Set([custLedgerId])).matchable === false,
+  );
+
+  /* ── A PAID INVOICE IS STILL CREDITABLE ────────────────────────────────
+     A receipt settles what is OWED, so once an invoice is paid there is
+     nothing left for another receipt to do. A credit note is a different
+     act — goods came back, or the price was wrong — and that is true whether
+     or not the customer has paid. The bill list used to filter on the unpaid
+     balance for every type alike, so a credit note could not be attached to
+     the invoice it plainly belonged to; the register showed "Paid" beside it,
+     which reads as closed rather than still creditable.
+
+     Driven against the real books rather than a fixture: the question is
+     whether the FOLD separates notes from payments, and a fixture cannot
+     answer that. */
+  console.log("\na paid invoice can still be credited");
+  {
+    const cns = await Acc_Voucher.find({
+      voucherType: "credit_note",
+      status: { $nin: ["cancelled", "void"] },
+    }).limit(20).lean();
+
+    let offeredPaid = 0;
+    let badCap = [];
+    for (const cn of cns) {
+      const liab = await bm.liabilityLedgerIdsFor(cn);
+      const party = await bm.partyAccountIdsFor(cn);
+      const st = bm.matchStateOf(cn, null, liab, party);
+      if (!st.matchable) continue;
+      const bills = await bm.openBillsForVoucher(cn, {
+        excludeVoucherId: cn._id,
+        partyLedgerId: st.partyLedgerId,
+        liabilityLedgerIds: liab,
+        partyAccountIds: party,
+      });
+      for (const b of bills) {
+        if (b.settled) offeredPaid += 1;
+        /* Whatever a bill's payment state, a note may never reduce it by more
+           than it was worth. */
+        if (b.allocatable - b.originalAmount > 0.01) {
+          badCap.push(`${cn.voucherNumber}/${b.billName}: creditable ${b.allocatable} > value ${b.originalAmount}`);
+        }
+        if (!(b.allocatable > 0)) {
+          badCap.push(`${cn.voucherNumber}/${b.billName}: offered with nothing creditable`);
+        }
+      }
+    }
+    check(
+      `credit notes are offered settled invoices (${offeredPaid} across ${cns.length} notes)`,
+      offeredPaid > 0,
+      "no paid invoice was offered — the filter is still on the unpaid balance",
+    );
+    check(
+      "and none may be credited for more than the invoice was worth",
+      badCap.length === 0,
+      badCap.slice(0, 3).join(" | "),
+    );
+
+    /* The other half: a receipt must NOT start seeing settled bills, or every
+       match screen fills with invoices that have nothing left to pay. */
+    const rcs = await Acc_Voucher.find({
+      voucherType: "receipt",
+      status: { $nin: ["cancelled", "void"] },
+    }).limit(20).lean();
+    let settledToReceipt = 0;
+    for (const r of rcs) {
+      const liab = await bm.liabilityLedgerIdsFor(r);
+      const party = await bm.partyAccountIdsFor(r);
+      const st = bm.matchStateOf(r, null, liab, party);
+      if (!st.matchable) continue;
+      const bills = await bm.openBillsForVoucher(r, {
+        excludeVoucherId: r._id,
+        partyLedgerId: st.partyLedgerId,
+        liabilityLedgerIds: liab,
+        partyAccountIds: party,
+      });
+      settledToReceipt += bills.filter((b) => b.settled).length;
+    }
+    check(
+      "a receipt is still offered only what is unpaid",
+      settledToReceipt === 0,
+      `${settledToReceipt} settled bills were offered to receipts`,
+    );
+  }
+
   check("a sales voucher is refused outright", (() => {
     try { bm.assertMatchable({ voucherType: "sales", status: "posted" }); return false; }
     catch (e) { return e.status === 400 && /can be matched to bills/.test(e.message); }

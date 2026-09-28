@@ -36,6 +36,9 @@ const PURE = [
   "verifyApprovalPolicy",      // which edits need an approver
   "verifySalaryRules",         // EDLI/admin caps, CTC composition
   "verifySalaryParity",        // the form's preview agrees with the server
+  "verifyEpfCeiling",          // one EPF wage ceiling, read by every surface
+  "verifyLeaveHomeState",      // the monthly leave cap follows the permanent address
+  "verifyLeaveEditSplit",      // editing a leave does not change what it pays
   "verifyFoodAllowance",       // proration and the other deduction
   "verifyAuditFloor",          // what the change log will and will not record
   "verifyBuiltInFields",       // the field registry still matches the form
