@@ -35,6 +35,7 @@ const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const { isUsedAs, DEFAULT_USED_AS } = require("../../models/CMS_Models/Inventory/Products/usedAs");
 const tenantContext = require("../storePurchase/tenantContext.service");
 const { fail } = require("../storePurchase/errors");
+const materialOwnership = require("./materialOwnership.service");
 /* One implementation of the payload judgements, shared with the Store route. */
 const {
   validateEmbeddedConversions, validateEmbeddedVendors,
@@ -88,7 +89,7 @@ const MERCHANDISING_SECTIONS = Object.freeze([SECTION.IDENTITY, SECTION.CLASSIFI
 /** Which payload keys belong to which section. */
 const SECTION_FIELDS = Object.freeze({
   [SECTION.IDENTITY]: ["name", "description", "notes"],
-  [SECTION.CLASSIFICATION]: ["category", "customCategory", "unit", "customUnit", "usedAs", "customsTariffCode"],
+  [SECTION.CLASSIFICATION]: ["category", "customCategory", "unit", "customUnit", "usedAs", "customsTariffCode", "defaultOwnership", "owningCustomerId"],
   [SECTION.STOCK_LEVELS]: ["minStock", "maxStock"],
   [SECTION.STOCK]: ["quantity"],
   [SECTION.ATTRIBUTES]: ["attributes"],
@@ -221,6 +222,7 @@ function publicItem(item) {
     usedAs: str(item?.usedAs),
     description: str(item?.description),
     variantCount: Array.isArray(item?.variants) ? item.variants.length : 0,
+    ownership: materialOwnership.ownershipView(item),
   };
 }
 
@@ -328,6 +330,13 @@ async function createRawItem({
      Looked up in both modes, because the answer is worth reporting even when
      it is not worth refusing: Store's response carries it as `duplicate` so a
      screen can say so without a second request. */
+  /* ── WHOSE PROPERTY IT NORMALLY IS ──────────────────────────────────────
+     Decided by the one rule every door shares. A client that says nothing
+     gets COMPANY_OWNED; one that says CUSTOMER_OWNED must name a customer
+     this company can reach, or nothing is saved. What comes back is the two
+     catalogue fields and their snapshot — never a quantity or a movement. */
+  const ownership = await materialOwnership.resolveOwnership(tenant, { stored: null, payload, session });
+
   const duplicate = await findDuplicate(tenant, payload, session);
   if (duplicate && onDuplicate === "refuse") {
     throw fail("CONFLICT",
@@ -423,6 +432,9 @@ async function createRawItem({
     customsTariffCode: tariffCode(payload.customsTariffCode),
     unit: str(payload.customUnit) ? "" : (payload.unit || ""),
     customUnit: str(payload.customUnit) || "",
+    defaultOwnership: ownership.defaultOwnership,
+    owningCustomerId: ownership.owningCustomerId,
+    owningCustomer: ownership.owningCustomer,
     quantity: 0,
     minStock: num(minStock) || 0,
     maxStock: num(maxStock) || 0,

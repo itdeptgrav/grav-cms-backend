@@ -143,3 +143,54 @@ The active comparison baseline is restored to the untouched
 independent one-second person crops. It has no Grounding DINO checkpoint, pose
 gate, temporal override, or camera-zone rule. Further changes require a scored
 comparison set rather than additional frame-by-frame patches.
+
+## Stock phone-detector audit — 28 September 2026
+
+A larger development audit was created before attempting another live-phone
+override. It contains 90 full-resolution person crops from the supplied clip:
+30 visibly active phone-use examples and 60 hard negatives covering laptop
+work, raised hands, standing/idle people and real phones lying unused on the
+shared desk. The positive contract requires the target person to be visibly
+viewing, touching or operating the handset; simple phone presence is negative.
+
+Two unmodified, off-the-shelf detectors were measured: YOLO11x's COCO
+`cell phone` class and `IDEA-Research/grounding-dino-tiny`. Results were also
+scored after assigning a detection to the target person's expanded box, after a
+two-of-three temporal gate, and after requiring detector consensus. None met the
+precision gate. The strongest combined policy reached 60.0% precision and 90.0%
+recall, but still produced 18 false phone labels among 60 negatives. The best
+single YOLO ownership gate reached 52.9% precision; the best Grounding DINO
+ownership gate reached 40.3% precision.
+
+The stock phone-detector override is therefore rejected. The failure is
+semantic, not merely a confidence-threshold problem: the detectors localize
+phone-like objects but do not determine whether the target person is actively
+using one. Raising thresholds reduced true positives without eliminating the
+high-confidence unattended-phone and non-phone errors. No detector result from
+this audit is deployed.
+
+The active preview is the Qwen2.5-VL-3B baseline plus the previously accepted
+talking-only interaction verifier. Baseline `PHONE`, `WORKING` and `NO TASK`
+decisions remain unchanged; only baseline `TALKING` candidates enter the
+two-person verifier. The complete concise result is recorded in
+`scripts/cctv-activity-pilot/phone-detector-audit-v2.summary.json`. This is a
+one-clip development result, not a held-out accuracy claim.
+
+## Qwen-only temporal phone gate — 28 September 2026
+
+Because the original Qwen classifier remained useful outside its false PHONE
+proposals, a narrow Qwen-only gate was tested instead of replacing it. A PHONE
+proposal now receives three tight chronological crops of the same anonymous
+track, with no surrounding padding. A strict verifier requires a visible,
+target-owned handset in contact with the target and evidence of active use in
+at least two crops. If verification fails, Qwen reclassifies the current crop
+with PHONE removed from the available labels.
+
+The verifier passed four selected development cases: it retained the two visible
+phone-use cases and rejected the red-shirt and plaid-shirt false positives. The
+verifier took 0.73–1.24 seconds per proposed PHONE result. This is promising but
+not held-out evidence: the cases were selected from known errors and the full
+video must be inspected for regressions. The isolated live candidate is
+`live_preview_qwen_phone_gate.py`; the previous server remains available for
+rollback. Metrics and limitations are recorded in
+`scripts/cctv-activity-pilot/qwen-phone-verifier-v1.summary.json`.

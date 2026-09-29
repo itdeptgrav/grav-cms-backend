@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
 const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
-const { employerPfCosts } = require("../../services/salaryFormula");
+const { employeePf, employerPfCosts } = require("../../services/salaryFormula");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
@@ -606,9 +606,6 @@ function computeEmployeePayroll(employee, ctx) {
   const hraEarned = isIntern ? 0 : grossEarned - basicEarned;
   const specialEarned = 0;
 
-  const epfCap = salaryCfg?.epfCapAmount ?? 1800;
-  const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-
   // EPF — respect the HR per-employee override stored on the employee's
   // salary. When epfOverride is set, the HR-entered monthly EPF is treated as
   // the full-month figure and prorated by the same ratio the earned gross
@@ -628,11 +625,15 @@ function computeEmployeePayroll(employee, ctx) {
   // the full basic and theirs is zero. It is short-circuited regardless: the
   // reason it must not apply is the enrolment, not the arithmetic, and a
   // future change to that function should not be able to start deducting.
+  /* employeePf, not the arithmetic spelled out again: the wage ceiling, the
+     percentage and the rupee cap are all settings, and a copy here is a copy
+     that stops agreeing with the employee's contract the day one of them is
+     edited. */
   const epf = isIntern
     ? 0
     : epfOverridden
       ? Math.round(overrideEpfFull * earnedRatio)
-      : Math.round(Math.min(basicEarned * eepfPct, epfCap));
+      : employeePf(basicEarned, salaryCfg);
   // Eligibility on the FULL basic, amount on the earned basic — see computeEsi.
   const { esic, erEsic } = isIntern
     ? { esic: 0, erEsic: 0 }
@@ -1648,9 +1649,6 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
     const grossTotal = grossEarnedBase + ot + bn + inc + oth;
 
-    const epfCap = salaryCfg?.epfCapAmount ?? 1800;
-    const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-
     // EPF — respect the employee's HR override. When set, prorate the stored
     // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
     const epfOverridden = !!empSalary.epfOverride;
@@ -1658,7 +1656,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     const earnedRatio = fullGross > 0 ? grossEarnedBase / fullGross : 1;
     const epf = epfOverridden
       ? Math.round(overrideEpfFull * earnedRatio)
-      : Math.round(Math.min(basicEarned * eepfPct, epfCap));
+      : employeePf(basicEarned, salaryCfg);
     // Eligibility on the full basic, not the prorated one — see computeEsi.
     const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
     const pt =
@@ -1942,9 +1940,6 @@ router.patch(
       const grossTotal = grossEarnedBase + ot + bn + inc + oth;
 
       // Statutory deductions recomputed on the NEW earned basic.
-      const epfCap = salaryCfg?.epfCapAmount ?? 1800;
-      const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-
       // EPF — respect the employee's HR override. When set, prorate the stored
       // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
       const epfOverridden = !isInternItem && !!employee.salary?.epfOverride;
@@ -1958,7 +1953,7 @@ router.patch(
         ? 0
         : epfOverridden
           ? Math.round(overrideEpfFull * earnedRatio)
-          : Math.round(Math.min(basicEarned * eepfPct, epfCap));
+          : employeePf(basicEarned, salaryCfg);
       // Eligibility is re-tested against the employee's CURRENT full basic, so
       // a recalculate is what clears a stale ESIC that an earlier run wrote on
       // the prorated basic (or that a since-raised salary made inapplicable).

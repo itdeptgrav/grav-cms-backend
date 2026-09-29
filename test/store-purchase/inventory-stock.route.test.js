@@ -199,12 +199,50 @@ test("ownership and state filters narrow server-side, honestly", async () => {
   expect(customerOnly.rows.length).toBe(0);      // itemA is mixed, not customer-only
 });
 
+test("the attention lenses are server-driven and consistent with the register beneath them", async () => {
+  const s = await seed();
+  // Needs storage location → only the unassigned item (itemC).
+  const storage = (await call(s.store, "?lens=needs_storage")).body;
+  expect(storage.rows.map((x) => x.rawItemId)).toEqual([String(s.itemC._id)]);
+  expect(storage.filters.lens).toBe("needs_storage");
+  // Customer property → the item that holds customer material, INCLUDING mixed (itemA).
+  const customer = (await call(s.store, "?lens=customer")).body;
+  expect(customer.rows.map((x) => x.rawItemId)).toEqual([String(s.itemA._id)]);
+  // Needs review → quarantine-only or ownership-indeterminate. None in this seed —
+  // and out-of-stock (itemB) is NOT "needs review", so the lens is empty here.
+  const review = (await call(s.store, "?lens=needs_review")).body;
+  expect(review.rows.length).toBe(0);
+});
+
+test("the low-stock lens is the reorder rule the Materials catalogue used to monitor", async () => {
+  const s = await seed();
+  // Held but at/below its own minimum → low. Zero held → out of stock, NOT low.
+  const low = await RawItem.create({ companyId: s.company._id, name: `Thread ${seq}`, sku: `L-${seq}`, unit: "pcs", quantity: 5, minStock: 20 });
+  await RawItem.create({ companyId: s.company._id, name: `Elastic ${seq}`, sku: `E-${seq}`, unit: "m", quantity: 0, minStock: 20 });
+  const r = (await call(s.store, "?lens=low_stock")).body;
+  expect(r.filters.lens).toBe("low_stock");
+  expect(r.rows.map((x) => x.rawItemId)).toEqual([String(low._id)]);
+  expect(r.rows[0].reorder).toEqual({ minStock: 20, low: true });
+  // No minimum set (0) is never "low" — the seed's itemA/itemC are not in the lens.
+  const all = (await call(s.store)).body;
+  expect(byId(all.rows, s.itemC._id).reorder.low).toBe(false);
+});
+
+test("an invalid lens falls back to 'all' (never a misleading partial view)", async () => {
+  const s = await seed();
+  const r = await call(s.store, "?lens=nonsense");
+  expect(r.status).toBe(200);
+  expect(r.body.filters.lens).toBe("all");
+  expect(r.body.pagination.total).toBe(3);
+});
+
 test("invalid query values fail safe (fall back to 'all'), never 500", async () => {
   const s = await seed();
-  const r = await call(s.store, "?ownership=nonsense&state=whatever&page=abc&pageSize=-5");
+  const r = await call(s.store, "?ownership=nonsense&state=whatever&lens=bogus&page=abc&pageSize=-5");
   expect(r.status).toBe(200);
   expect(r.body.filters.ownership).toBe("all");
   expect(r.body.filters.state).toBe("all");
+  expect(r.body.filters.lens).toBe("all");
   expect(r.body.pagination.page).toBe(1);
   expect(r.body.pagination.total).toBe(3);       // nothing was filtered out
 });

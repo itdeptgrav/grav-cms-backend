@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-28",
+  "model": "Qwen2.5-VL-3B-Instruct",
+  "design": "Run the original activity classifier first. Only PHONE proposals receive three tight chronological crops from the same anonymous track. Accept PHONE only when Qwen confirms target-owned active handset use in at least two crops; otherwise reclassify without PHONE.",
+  "development_cases": [
+    {"case": "t20_id5", "expected": "PHONE", "result": "PHONE", "seconds": 1.2357},
+    {"case": "t20_id3", "expected": "NOT PHONE", "result": "NOT PHONE", "seconds": 0.73},
+    {"case": "t40_id1", "expected": "NOT PHONE", "result": "NOT PHONE", "seconds": 0.8476},
+    {"case": "t40_id5", "expected": "PHONE", "result": "PHONE", "seconds": 0.7966}
+  ],
+  "score": "4/4 targeted development cases",
+  "active_candidate": "live_preview_qwen_phone_gate.py",
+  "limitations": [
+    "The four cases were selected from previously observed errors and are not held out.",
+    "The full video still requires reviewer inspection for regressions.",
+    "Phone verification adds approximately 0.7 to 1.24 seconds only to PHONE proposals and requires a temporal evidence buffer."
+  ]
+}

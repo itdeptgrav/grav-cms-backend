@@ -118,6 +118,23 @@ const PARTY_SIDE = {
  */
 const OBLIGATION_TYPES = new Set(["payment", "debit_note"]);
 
+/**
+ * The types that reduce what a bill was WORTH, rather than paying it off.
+ *
+ * This is the difference that makes a paid invoice creditable. A receipt
+ * settles what is owed, so once an invoice is paid there is nothing left for
+ * another receipt to do and offering it would be noise. A credit note is a
+ * different act: goods came back, or the price was wrong, and that is true
+ * whether or not the customer has paid. Refusing to credit a paid invoice
+ * left people with a credit note they could not attach to the invoice it
+ * plainly belonged to — the register even showed "Paid" beside it, which
+ * reads as "settled and closed" rather than "still creditable".
+ *
+ * So for these two types the bill list is not filtered by what is unpaid, and
+ * the cap is the invoice value less the notes already raised against it.
+ */
+const NOTE_TYPES = new Set(["credit_note", "debit_note"]);
+
 /** The document type a settlement of this voucher applies against. */
 const SOURCE_TYPE = {
   receipt: "sales",
@@ -172,7 +189,11 @@ function assertMatchable(voucher) {
  * ₹1,48,000, which is worse than refusing it: half a receipt allocated looks
  * exactly like a whole one.
  */
-function partyEntriesOf(voucher, liabilityLedgerIds = null) {
+function partyEntriesOf(
+  voucher,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
   const entries = voucher.ledgerEntries || [];
   const wantSide = PARTY_SIDE[voucher.voucherType] || "Cr";
   const flagged = entries.filter((e) => e.isPartyLedger && e.type === wantSide);
@@ -204,11 +225,24 @@ function partyEntriesOf(voucher, liabilityLedgerIds = null) {
      party for 66 of 139 receipts that have none — see the note above. A
      ledger's nature is a fact about the account; line count is a coincidence. */
   if (liabilityLedgerIds && OBLIGATION_TYPES.has(voucher.voucherType)) {
-    return entries.filter(
+    const owed = entries.filter(
       (e) =>
         e.type === wantSide &&
         e.ledgerId &&
         liabilityLedgerIds.has(String(e.ledgerId)),
+    );
+    if (owed.length) return owed;
+  }
+
+  /* Neither the flag nor the header id named a party, so ask what the ledger
+     itself is — see partyAccountIdsFor. This is what makes a credit note
+     whose customer line was never flagged matchable again. */
+  if (partyAccountIds) {
+    return entries.filter(
+      (e) =>
+        e.type === wantSide &&
+        e.ledgerId &&
+        partyAccountIds.has(String(e.ledgerId)),
     );
   }
   return [];
@@ -221,6 +255,64 @@ function partyEntriesOf(voucher, liabilityLedgerIds = null) {
  * summarises up to 500 at a time, and a lookup per voucher there is 500 round
  * trips to Mumbai for a fact that fits in a single `$in`.
  */
+/**
+ * Which ledgers on these vouchers are actual PARTY accounts?
+ *
+ * A voucher says who it is against in three places, and they do not always
+ * agree: the `isPartyLedger` flag on the line, the denormalised
+ * `partyLedgerId` on the header, and the ledger the line actually points at.
+ * The first two are written by whatever created the voucher — an import, a
+ * copy, a ledger merge — and one of CN/002/26-27's kind arrives with neither,
+ * even though its credit side plainly names a Sundry Debtor for the full
+ * amount. The matcher then reported "not against a customer or supplier
+ * account" about a voucher whose customer was sitting right there, while the
+ * register beside it displayed that customer's name from a third field again.
+ *
+ * So ask the chart of accounts instead of the voucher. A line on the settling
+ * side pointing at a ledger under Sundry Debtors or Sundry Creditors IS the
+ * party line; that is what those groups mean.
+ *
+ * This is the same principle the liability lookup below already applies, and
+ * for the same stated reason: a ledger's nature is a fact about the account.
+ * It is NOT the old "if there is only one line on that side, use it" guess —
+ * that claimed a party for bank interest, director's loans and inter-bank
+ * transfers. Those sit under income, liabilities and assets, so none of them
+ * are reachable here. Measured against this database: it resolves one extra
+ * credit note and one extra receipt, and leaves all 29 party-less receipts
+ * and 237 party-less payments exactly as they were.
+ *
+ * One query for the whole page, like its neighbour — `/unmatched` summarises
+ * up to 500 vouchers at a time.
+ */
+async function partyAccountIdsFor(vouchers) {
+  const list = Array.isArray(vouchers) ? vouchers : [vouchers];
+  const ids = new Set();
+  for (const v of list) {
+    if (!v) continue;
+    const wantSide = PARTY_SIDE[v.voucherType] || "Cr";
+    for (const e of v.ledgerEntries || []) {
+      if (e.type === wantSide && e.ledgerId) ids.add(String(e.ledgerId));
+    }
+  }
+  if (!ids.size) return new Set();
+
+  const { Acc_Ledger } = require("../models/Accountant_model/Acc_MasterModels");
+  const rows = await Acc_Ledger.find({
+    _id: { $in: [...ids] },
+    $or: [
+      // The two groups that mean "a party owes us / we owe them".
+      { groupName: { $in: [/^sundry debtors$/i, /^sundry creditors$/i] } },
+      // A ledger wired to a CRM customer or vendor is a party whatever its
+      // group is called — charts get renamed, the link does not.
+      { linkedCustomerId: { $ne: null } },
+      { linkedVendorId: { $ne: null } },
+    ],
+  })
+    .select("_id")
+    .lean();
+  return new Set(rows.map((r) => String(r._id)));
+}
+
 async function liabilityLedgerIdsFor(vouchers) {
   const list = Array.isArray(vouchers) ? vouchers : [vouchers];
   const ids = new Set();
@@ -249,8 +341,13 @@ async function liabilityLedgerIdsFor(vouchers) {
  * `partyLedgerId` picks a leg on a voucher that settles several parties; with
  * one party it is ignored, so every existing caller behaves as before.
  */
-function findPartyEntry(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
-  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
+function findPartyEntry(
+  voucher,
+  partyLedgerId = null,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds, partyAccountIds);
   if (partyLedgerId) {
     return parties.find((e) => String(e.ledgerId) === String(partyLedgerId)) || null;
   }
@@ -288,8 +385,18 @@ function settlementRows(entry) {
  * `unallocated` is the headline: it is what the matching screen offers, and
  * zero means this voucher is fully matched and must be left alone.
  */
-function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) {
-  const entry = findPartyEntry(voucher, partyLedgerId, liabilityLedgerIds);
+function matchStateOf(
+  voucher,
+  partyLedgerId = null,
+  liabilityLedgerIds = null,
+  partyAccountIds = null,
+) {
+  const entry = findPartyEntry(
+    voucher,
+    partyLedgerId,
+    liabilityLedgerIds,
+    partyAccountIds,
+  );
   if (!entry) {
     return {
       matchable: false,
@@ -306,7 +413,7 @@ function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) 
   const allocated = money(rows.reduce((s, a) => s + (Number(a.amount) || 0), 0));
   const total = money(entry.amount);
 
-  const parties = partyEntriesOf(voucher, liabilityLedgerIds);
+  const parties = partyEntriesOf(voucher, liabilityLedgerIds, partyAccountIds);
   return {
     matchable: true,
     /* Every party this voucher settles, so a screen can offer a choice
@@ -346,10 +453,28 @@ function matchStateOf(voucher, partyLedgerId = null, liabilityLedgerIds = null) 
  * this receipt already settled is still offered, at its pre-settlement figure,
  * rather than vanishing.
  */
-async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedgerId = null, liabilityLedgerIds = null } = {}) {
+async function openBillsForVoucher(
+  voucher,
+  {
+    excludeVoucherId = null,
+    partyLedgerId = null,
+    liabilityLedgerIds = null,
+    partyAccountIds = null,
+  } = {},
+) {
   const liabilities =
     liabilityLedgerIds || (await liabilityLedgerIdsFor(voucher));
-  const state = matchStateOf(voucher, partyLedgerId, liabilities);
+  /* Resolved here as well, and not optional: this recomputes the state rather
+     than taking the caller's, so without it a voucher the screen just decided
+     WAS matchable gets an empty bill list — matchable, with nothing to match. */
+  const partyAccounts =
+    partyAccountIds || (await partyAccountIdsFor(voucher));
+  const state = matchStateOf(
+    voucher,
+    partyLedgerId,
+    liabilities,
+    partyAccounts,
+  );
   if (!state.matchable || !state.partyLedgerId) return [];
 
   const folded = await openItems.billsByLedger(voucher.companyId, [
@@ -369,16 +494,37 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedg
 
   const wantPositive = (PARTY_SIDE[voucher.voucherType] || "Cr") === "Cr";
 
+  const isNote = NOTE_TYPES.has(voucher.voucherType);
+
   const fromFold = [...folded.values()]
     .map((bill) => {
       const own = ownByBill.get(bill.billName) || 0;
       /* Undoing a settlement moves `remaining` AWAY from zero, in whichever
          direction this voucher type settles from. */
       const remaining = bill.remaining + (wantPositive ? own : -own);
+      const outstanding = money(Math.abs(remaining));
+
+      /* How much this voucher may put on the bill.
+
+         For a receipt or payment that is simply what is still unpaid. For a
+         note it is the bill's own value less the notes already raised against
+         it — you can credit an invoice the customer has paid, but you can
+         never credit more than the invoice was for. `own` is added back when
+         re-opening this voucher's own screen, exactly as `remaining` is. */
+      const creditedByOthers = money(
+        Math.max(0, (bill.creditedByNotes || 0) - (isNote ? own : 0)),
+      );
+      const allocatable = isNote
+        ? money(Math.max(0, money(bill.originalAmount) - creditedByOthers))
+        : outstanding;
+
       return {
         billName: bill.billName,
         originalAmount: money(bill.originalAmount),
-        outstanding: money(Math.abs(remaining)),
+        outstanding,
+        allocatable,
+        creditedByNotes: creditedByOthers,
+        settled: Math.abs(remaining) <= EPSILON,
         signedRemaining: money(remaining),
         alreadyOnThisVoucher: money(own),
         firstVoucherDate: bill.firstVoucherDate || null,
@@ -387,9 +533,14 @@ async function openBillsForVoucher(voucher, { excludeVoucherId = null, partyLedg
       };
     })
     .filter((b) =>
-      wantPositive
-        ? b.signedRemaining > EPSILON
-        : b.signedRemaining < -EPSILON,
+      isNote
+        ? /* Settled or not, a bill is offered while any of its value remains
+             uncredited. A fully credited one is dropped — there is nothing
+             left of it to reduce. */
+          b.allocatable > EPSILON
+        : wantPositive
+          ? b.signedRemaining > EPSILON
+          : b.signedRemaining < -EPSILON,
     );
 
   /* Invoices that never established a bill. Without these the screen tells a
@@ -501,15 +652,27 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
     }
   }
 
+  const isNote = NOTE_TYPES.has(voucher.voucherType);
+
   return candidates
     .map((i) => {
       const face = Number(i.grandTotal) || 0;
       const credited = notedByInvoice.get(String(i._id)) || 0;
       const settled = settledByName.get(i.voucherNumber) || 0;
+      const outstanding = money(Math.max(0, face - credited - settled));
+      /* A note may reduce this invoice by whatever has not already been
+         credited, whether or not it has been paid — see NOTE_TYPES. For a
+         receipt the cap stays what is unpaid. */
+      const allocatable = isNote
+        ? money(Math.max(0, face - credited))
+        : outstanding;
       return {
         billName: i.voucherNumber,
         originalAmount: money(face),
-        outstanding: money(Math.max(0, face - credited - settled)),
+        outstanding,
+        allocatable,
+        creditedByNotes: money(credited),
+        settled: outstanding <= EPSILON,
         firstVoucherDate: i.voucherDate || null,
         dueDate: i.dueDate || null,
         voucherNumbers: [i.voucherNumber],
@@ -519,7 +682,7 @@ async function unbilledInvoicesForParty(voucher, foldedBills, partyLedgerId = nu
         sourceVoucherId: i._id,
       };
     })
-    .filter((b) => b.outstanding > EPSILON);
+    .filter((b) => (isNote ? b.allocatable : b.outstanding) > EPSILON);
 }
 
 /**
@@ -689,7 +852,13 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
      be refused at the write with "no single party ledger line" — the screen
      offering bills it cannot then accept. */
   const liabilities = await liabilityLedgerIdsFor(voucher);
-  const entry = findPartyEntry(voucher, partyLedgerId, liabilities);
+  const partyAccounts = await partyAccountIdsFor(voucher);
+  const entry = findPartyEntry(
+    voucher,
+    partyLedgerId,
+    liabilities,
+    partyAccounts,
+  );
   if (!entry) {
     const e = new Error(
       "This voucher has no single party ledger line, so there is nothing to match it against.",
@@ -737,6 +906,7 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
       excludeVoucherId: voucher._id,
       partyLedgerId: entry.ledgerId,
       liabilityLedgerIds: liabilities,
+      partyAccountIds: partyAccounts,
     });
     const byName = new Map(available.map((b) => [b.billName, b]));
 
@@ -759,9 +929,15 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
         e.status = 400;
         throw e;
       }
-      if (amount - bill.outstanding > EPSILON) {
+      /* The same figure the screen offered. Using `outstanding` here would
+         refuse every credit note against a paid invoice that the list had
+         just shown as available. */
+      const cap = bill.allocatable != null ? bill.allocatable : bill.outstanding;
+      if (amount - cap > EPSILON) {
         const e = new Error(
-          `"${billName}" has ₹${bill.outstanding.toFixed(2)} outstanding — you cannot allocate ₹${amount.toFixed(2)} to it.`,
+          NOTE_TYPES.has(voucher.voucherType)
+            ? `"${billName}" has ₹${cap.toFixed(2)} left to credit — you cannot allocate ₹${amount.toFixed(2)} to it.`
+            : `"${billName}" has ₹${cap.toFixed(2)} outstanding — you cannot allocate ₹${amount.toFixed(2)} to it.`,
         );
         e.status = 400;
         throw e;
@@ -827,10 +1003,13 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
     }
   }
 
-  /* The same liability set the leg was resolved with. Recomputing without it
+  /* The same sets the leg was resolved with. Recomputing without them
      reported `matchable: false, allocated: 0` for a payroll payment that had
-     just been allocated correctly — the write landed, the answer denied it. */
-  return matchStateOf(voucher, entry.ledgerId, liabilities);
+     just been allocated correctly — the write landed, the answer denied it.
+     The party-account set is here for the same reason: a credit note whose
+     party line was never flagged resolves only with it, so leaving it out
+     would deny a credit note its own successful match. */
+  return matchStateOf(voucher, entry.ledgerId, liabilities, partyAccounts);
 }
 
 /** Unmatch: drop this voucher's settlements, keeping everything else. */
@@ -843,7 +1022,9 @@ module.exports = {
   PARTY_SIDE,
   SOURCE_TYPE,
   OBLIGATION_TYPES,
+  NOTE_TYPES,
   liabilityLedgerIdsFor,
+  partyAccountIdsFor,
   openJournalObligations,
   partyEntriesOf,
   unbilledInvoicesForParty,

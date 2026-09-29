@@ -76,29 +76,39 @@ const PUNCH_THRESHOLDS = {
 //  HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-/* An overtime report is filed on the night it was worked.
+/* AN OVERTIME REPORT HAS A FULL DAY TO BE FILED.
    ------------------------------------------------------------------------
-   The deadline used to be NOON THE FOLLOWING DAY, which let a report be
-   written most of a day later, about hours nobody could still check, and put
-   yesterday's overtime in front of an approver in the middle of today's work.
-   It now closes at 23:59 on the day itself: the report is written while the
-   person is still there, and a day's overtime is settled before the next one
-   starts.
+   It closes at 23:59 on the day AFTER the one worked. The two earlier rules
+   were both wrong at the ends: noon-the-following-day cut a night shift off
+   mid-morning, and 23:59 on the night itself gave somebody who worked until
+   22:00 about an hour, on their own time, on their own phone — and anyone
+   who simply went home lost the report altogether while they slept.
+
+   One clear day is the rule people can actually keep: work Monday night,
+   file any time up to the end of Tuesday.
+
+   APPROVAL IS NOT BOUNDED BY THIS, and never was — the approve and reject
+   routes do not consult it. The person filing has a deadline because the
+   hours have to be recorded while they can still be checked; the manager
+   approving does not, because a report already filed is evidence that keeps.
 
    23:59:59.999 IST, not 23:59:00 — a report submitted at 23:59:30 is filed at
    11:59 PM by any reading a person would give it, and cutting it off
    thirty seconds earlier would be a rule nobody could see. */
-const OT_CUTOFF_UTC_HOUR = 18; // 23:59 IST − 5:30 = 18:29 UTC, same date
+const OT_CUTOFF_UTC_HOUR = 18; // 23:59 IST − 5:30 = 18:29 UTC
 const OT_CUTOFF_UTC_MIN = 29;
+const OT_CUTOFF_DAYS_AFTER = 1; // the day after the one worked
 
 function isOvertimeExpired(dateStr) {
   if (!dateStr) return false;
   const [y, m, d] = dateStr.split("-").map(Number);
   if (!y || !m || !d) return false;
+  /* Date.UTC normalises an overflowing day, so the last day of a month, of
+     a year, and 29 February all roll to the right date without a branch. */
   const cutoffUtcMs = Date.UTC(
     y,
     m - 1,
-    d,
+    d + OT_CUTOFF_DAYS_AFTER,
     OT_CUTOFF_UTC_HOUR,
     OT_CUTOFF_UTC_MIN,
     59,
@@ -307,7 +317,7 @@ router.post(
         return res.status(400).json({
           success: false,
           message:
-            "This overtime report has expired — it has to be filed by 11:59 PM on the day you worked it. Contact HR if you need an exception.",
+            "This overtime report has expired — it has to be filed by 11:59 PM on the day after you worked it. Contact HR if you need an exception.",
         });
       }
 
@@ -749,7 +759,7 @@ async function detectAndNotifyStayOvers(dateStr, io) {
         continue;
       }
 
-      // Skip if past the 23:59 same-day expiry — pinging is pointless
+      // Past the deadline (23:59 the day after) — pinging is pointless
       if (isOvertimeExpired(dateStr)) {
         skippedExpired++;
         continue;

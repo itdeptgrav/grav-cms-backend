@@ -636,3 +636,73 @@ page used to fire the orders read four times at once, each rebuilding the
 whole company (1–3 s each); warm reads are now ~0.2 s. The snapshot is
 SHARED: never mutate it. `orderDetail` reads the ten departments' books
 side by side.
+
+## QC raw item checking — 28 Sep 2026
+
+QC's SECOND book, for the raw material a job-work customer sends, kept
+entirely apart from the per-piece product inspection:
+`routes/CMS_Routes/Manufacturing/QC/qcRawItemRoutes.js` on
+`/api/cms/manufacturing/qc/raw-items` (mounted above the inspection
+router, auth inside), `QCRawItemInspection` (one record per STICKER checked
+against ONE order: quantity, passedQuantity, defectiveQuantity, defects[],
+checker; a re-check supersedes the earlier record) and `QCRawItemSetting`
+(kind "defect" = the rejection reasons, kind "checker" = who may check, by
+email; the QC owner always may). Nothing in the product check reads these,
+and this reads nothing of the product check's.
+
+Flow: the checker picks the ORDER first (`GET /orders`, every live order,
+job-work first — `fulfilmentModel === "JOB_WORK"` on the order or any line),
+`POST /lookup {code, moId}` reads the Store's `itemid=<24 hex>` sticker
+(name, variant, quantity, unit from the Barcode) and reports a prior verdict
+on this order or another, `POST /save` records passed (whole quantity) or
+defective (reasons from the setup, a defective quantity ≤ the sticker's,
+the rest passes; 409 `ALREADY_CHECKED` unless `recheck`).
+`GET /orders/:moId` answers raw item by raw item. "To check" (`expected`,
+`expectedFrom`) is what the Store RECEIVED for the order — `CustomerMaterialLot`
+by `orderRef` (the request id or MO number) or a movement on this MO — when
+any lot was recorded, else what the work orders' `rawMaterials` REQUIRE (the
+same source the Store's requirement reads); checked / passed / defective /
+remaining come from the standing records, plus by-defect, by-checker and
+every record. The lot model exports `{ CustomerMaterialLot }` — a bare
+require of it is not a model, and the first version crashed the detail on
+exactly that. `GET /my-day?date=` is the
+checker's day on the shift clock (`shiftHours` buckets; the owner may pass
+`email=` or `all`); `GET /report?from&to` the owner's range.
+
+**29 Sep 2026.** A checker row carries `productCheck` (default true): the
+owner unticks it on Raw item setup (`PATCH /checkers/:id`) to keep a raw
+item checker OFF the product piece station; `/config` answers `me.productCheck`
+and the CMS shell hides Inspect piece on false (the station also refuses in
+words). `dayShape` groups each order's records into `byOrder[].items[]`, ONE
+row per raw item + variant whatever the number of labels ("12 + 10 = 22");
+the flat `recent` list stays for the rail. The word "sticker" is gone from
+every message ("raw item" / "label"); the JSON keys (`stickers`, the
+`NOT_A_STICKER` code) are unchanged. In qcRoutes.js,
+`computeWorkOrderQcStats` reads the inspections ONCE with the fields
+`buildPieceProgress` needs (it read 2 300 rows twice, ~3 s) and caches the
+result for `QC_ORDERS_CACHE_MS` (15 s; 0 disables).
+
+**Job work only, and the GRN — never the bill of material (29 Sep 2026).**
+`GET /orders` lists only the orders Sales marked JOB_WORK on the PI/order
+line (plus any order that already has checks, so records are never
+orphaned); scopes `jobwork` (default) | `checked`. `GET /orders/:moId`
+frames each raw item with two figures: ASKED = the ISSUED
+`CustomerMaterialExpectation` for the order (`orderRef` = the request id;
+Merchandising's material request to the customer, latest revision) and
+RECEIVED = the Store's CUSTOMER_MATERIAL `GoodsReceipt` lines against the
+order (`customerMaterial.orderRef`, base quantity; the ownership lots are
+the fallback when no receipt names the order). "To check" IS received;
+remaining = received − checked; `shortOfAsked` = asked − received; state
+`awaiting` = asked but nothing received. Company purchase orders carry no
+order link (`sourceMrfId` only) and are not read. `GET /report` now takes
+`moId` (one order, all time) and `email`, and answers `days[]` (each day's
+shift-hour buckets, totals and byOrder), `records` (≤5000) beside byDay /
+byChecker / byOrder / byRawItem / byDefect — the CMS builds the Excel
+from it (`lib/reports/rawItemQcWorkbook.js`).
+
+**Two collections came from renaming empty, unreferenced orphans** (the
+cluster is at its 500-collection cap): `trips` → `qc_raw_item_inspections`,
+`helpers` → `qc_raw_item_settings`. A rename keeps the old indexes — the
+first save failed on an inherited unique `tripNumber_1` — so every
+inherited index was dropped and the models' own built (`syncIndexes`). Do
+the same for any future rename.

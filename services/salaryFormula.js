@@ -46,6 +46,12 @@ function knobs(cfg = {}) {
     basicPct: (cfg.basicPct ?? 50) / 100,
     hraPct: (cfg.hraPct ?? 50) / 100,
     eepfPct: (cfg.eepfPct ?? 12) / 100,
+    /* The Basic the EPF percentage is charged on stops here, exactly as it
+       does for EDLI and admin charges below. It used to be implicit: the only
+       knob was the ₹1,800 cap, which is 12% of ₹15,000, so the ceiling was
+       real but unreachable — a company moving to a ₹25,000 ceiling had
+       nothing to edit. */
+    epfWageCeiling: cfg.epfWageCeiling ?? 15000,
     epfCapAmount: cfg.epfCapAmount ?? 1800,
     edliPct: (cfg.edliPct ?? 0.5) / 100,
     /* The wage the percentage is charged on stops here. Historically stored as
@@ -97,11 +103,7 @@ function computeSalary(s = {}, cfg = {}, employmentType = "") {
   const basic = Math.round(gross * k.basicPct);
   const hra = Math.round(gross * k.hraPct);
 
-  /* EPF's cap IS on the money (₹1,800 = 12% of the ₹15,000 ceiling), which is
-     why it reads differently from the two below. */
-  const epf = s.epfOverride
-    ? Number(s.epf) || 0
-    : Math.round(Math.min(basic * k.eepfPct, k.epfCapAmount));
+  const epf = s.epfOverride ? Number(s.epf) || 0 : employeePf(basic, cfg);
 
   const edli = s.edliOverride
     ? Number(s.edli) || 0
@@ -185,6 +187,29 @@ function computeSalary(s = {}, cfg = {}, employmentType = "") {
 }
 
 /**
+ * The employee's own PF for a given Basic.
+ *
+ * Charged on min(Basic, wage ceiling) and then held at a hard rupee maximum —
+ * the same shape as EDLI and admin charges below.
+ *
+ * THIS IS THE ONLY COPY. The arithmetic used to be written out five times: here,
+ * three times in Payroll_section.js, and once in the browser in EmployeeForm.js.
+ * The browser one has to stay a mirror (it runs before anything is saved, and
+ * there is no shared package between the two repos) and verifySalaryParity.js
+ * checks it against this. The three in payroll did not have to stay, and don't:
+ * a ceiling nobody can reach from payroll is a ceiling that changes the contract
+ * and not the payslip.
+ */
+function employeePf(basic, cfg = {}) {
+  const k = knobs(cfg);
+  const b = Number(basic) || 0;
+  return Math.min(
+    Math.round(Math.min(b, k.epfWageCeiling) * k.eepfPct),
+    k.epfCapAmount,
+  );
+}
+
+/**
  * EDLI and admin charges for a given Basic.
  *
  * Both are EMPLOYER costs on the PF side, charged on min(basic, ceiling) and
@@ -206,4 +231,4 @@ function employerPfCosts(basic, cfg = {}) {
   };
 }
 
-module.exports = { computeSalary, knobs, employerPfCosts };
+module.exports = { computeSalary, knobs, employeePf, employerPfCosts };

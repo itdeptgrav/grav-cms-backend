@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const multer = require("multer");
+const { monthlyLeaveCap } = require("../../services/leaveHomeState.service");
 // Push notifications — every leave event goes through utils/notifyEmployee.js,
 // which fans out to the mobile app (Expo) and the CMS (FCM) in one call and
 // never throws, never rejects and never blocks the response.
@@ -261,8 +262,14 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
     const id = req.user.id,
       year = Number(req.query.year) || new Date().getFullYear();
     const config = await LeaveConfig.getConfig();
+    /* `address` is here for the monthly cap, which is judged on the permanent
+       state. The app used to work that out itself from the two caps this
+       endpoint returned, which meant the rule existed twice and the screen
+       could promise a number the server would not honour. The server decides
+       and says so; both caps stay in the payload only so an older build of the
+       app keeps working. */
     const emp = await Employee.findById(id)
-      .select("biometricId dateOfJoining")
+      .select("biometricId dateOfJoining address")
       .lean();
     const bal = await ensureBalance(id, year, emp?.biometricId, config);
     const wd = workingDaysSinceJoining(emp?.dateOfJoining);
@@ -314,6 +321,21 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
           maxLeaveDaysPerMonth: config.maxLeaveDaysPerMonth,
           maxLeaveDaysPerMonthOdisha: config.maxLeaveDaysPerMonthOdisha,
         },
+        /* The cap that actually applies to THIS employee, already resolved.
+           `source` says which address it came from, so the app can tell
+           somebody that their permanent address is missing rather than
+           silently judging them on the room they rent. */
+        monthlyCap: (() => {
+          const c = monthlyLeaveCap(emp || {}, config);
+          return {
+            days: c.cap,
+            state: c.state,
+            source: c.source,
+            usedFallback: c.usedFallback,
+            sameAsCurrent: c.sameAsCurrent,
+            isHomeState: c.isHomeState,
+          };
+        })(),
         eligibility: {
           waitingComplete: wc,
           plComplete: pc,
@@ -441,6 +463,52 @@ router.get("/manager/my-team", AllEmployeeAppMiddleware, async (req, res) => {
 //  manager_approved leaves where they're the secondary. So this collapses to
 //  the same simple query the codebase had BEFORE quick-apply was added.
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── WHOSE BALANCE BOUNDS THE SPLIT ───────────────────────────────
+   A manager adjusting somebody's CL/PL/LOP split needs to know how much CL and
+   PL THAT PERSON has left. The app had no such figure, so it bounded the
+   editor with the manager's own balance and the manager's own monthly CL cap
+   — which is nobody's entitlement but the manager's.
+
+   One balance read per pending row. The list is what one manager has waiting,
+   so it is small, and a stale number here would be a manager granting leave
+   that does not exist. */
+async function applicantBalances(rows) {
+  if (!rows.length) return rows;
+  const config = await LeaveConfig.getConfig();
+  const year = new Date().getFullYear();
+
+  return Promise.all(
+    rows.map(async (r) => {
+      try {
+        const bal = await ensureBalance(r.employeeId, year, "", config);
+        const ent = {
+          CL: config.clPerYear,
+          SL: config.slPerYear,
+          PL: bal.plEligible ? config.plPerYear : 0,
+        };
+        // What this application itself already holds is added back, or a
+        // manager could not leave the split where the employee put it.
+        const mine = r.paidDays != null ? Number(r.paidDays) : 0;
+        return {
+          ...r,
+          applicantBalance: {
+            CL: Math.max(0, ent.CL - bal.consumed.CL),
+            SL: Math.max(0, ent.SL - bal.consumed.SL),
+            PL: Math.max(0, ent.PL - bal.consumed.PL),
+            plEligible: !!bal.plEligible,
+            heldByThisApplication: mine,
+            maxCLPerMonth: config.maxCLPerMonth || 3,
+          },
+        };
+      } catch (_) {
+        /* A balance that cannot be read must not hide the approval. The app
+           falls back to bounding by the application's own length. */
+        return r;
+      }
+    }),
+  );
+}
+
 router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     res.json({
@@ -464,7 +532,8 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
         ],
       })
         .sort({ createdAt: -1 })
-        .lean(),
+        .lean()
+        .then(applicantBalances),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -1711,17 +1780,13 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       effectiveAvailable = Math.min(availableBalance, clRemainingThisMonth);
     }
 
-    const empState = (
-      emp.address?.current?.state ||
-      emp.address?.permanent?.state ||
-      ""
-    )
-      .toLowerCase()
-      .trim();
-    const isOdisha = ["odisha", "orissa"].includes(empState);
-    const monthlyCap = isOdisha
-      ? config.maxLeaveDaysPerMonthOdisha || 7
-      : config.maxLeaveDaysPerMonth || 10;
+    /* The cap follows the PERMANENT address. This read `current` first, which
+       inverted the rule it was written for: the bigger allowance exists for
+       somebody whose home is in another state, and that person is very often
+       the one renting a room in Bhubaneswar. They were being capped at 7.
+       See services/leaveHomeState.service.js. */
+    const capInfo = monthlyLeaveCap(emp, config);
+    const monthlyCap = capInfo.cap;
     const { used: totalMonthUsed } = await countMonthlyUsage(
       req.user.id,
       fromDate,
@@ -2056,6 +2121,24 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
     a.fromDate = nF;
     a.toDate = nT;
     a.totalDays = nt;
+    /* ── AND SO DOES THE SPLIT HERE ───────────────────────────────
+       totalDays was updated and paidDays/lwpDays were left exactly as they
+       were. Shorten a five-day application carrying 3 paid + 2 LWP to two days
+       and the row said totalDays 2, paidDays 3 — three paid days for a
+       two-day leave, and payroll reads paidDays.
+
+       The employee cannot choose the split here (only a manager can), so this
+       only has to keep it consistent: clamp the paid part to the new length
+       and let LWP take what is left. Lengthening leaves the extra unpaid,
+       which is the safe direction — granting paid days is a manager's call. */
+    if (a.leaveType === "LOP") {
+      a.paidDays = 0;
+      a.lwpDays = nt;
+    } else {
+      const wasPaid = a.paidDays != null ? Number(a.paidDays) : nt;
+      a.paidDays = Math.min(Math.max(0, wasPaid), nt);
+      a.lwpDays = Math.round((nt - a.paidDays) * 2) / 2;
+    }
     if (reason !== undefined) a.reason = reason;
     if (isHalfDay !== undefined) {
       a.isHalfDay = isHalfDay;
@@ -2159,7 +2242,8 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         message: "Classify the quick-apply first using the resolve endpoint.",
       });
 
-    const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
+    const { fromDate, toDate, reason, isHalfDay, halfDaySlot, paidDays: paidIn } =
+      req.body;
     const nType = a.leaveType;
     const nF = fromDate || a.fromDate;
     const nT =
@@ -2187,13 +2271,45 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         code: "OVERLAP",
       });
 
+    /* ── THE PAID / LWP SPLIT SURVIVES AN EDIT ───────────────────────
+       This read `paidDays = totalDays; lwpDays = 0` for every type but LOP,
+       which quietly did two wrong things.
+
+       One: it ignored the split the manager had just set. The app sends
+       `paidDays` (its CL+PL total) from the LEAVE SPLIT editor, the server
+       threw it away, the response said "Updated", and the row came back fully
+       paid. Nothing anybody did in that editor was ever saved.
+
+       Two — worse, because it needed no editor at all: ANY edit reset the
+       split. A five-day application carrying 3 paid + 2 LWP, edited only to
+       correct its reason, came back 5 paid + 0 LWP. Payroll reads paidDays,
+       so that is two days of unpaid leave turned into paid by a typo fix.
+
+       An explicit `paidDays` is honoured and bounded; no `paidDays` keeps what
+       the row had, clamped if the dates shrank under it. LOP stays wholly
+       unpaid by definition. */
     let paidDays, lwpDays;
     if (nType === "LOP") {
       paidDays = 0;
       lwpDays = totalDays;
     } else {
-      paidDays = totalDays;
-      lwpDays = 0;
+      const asked =
+        paidIn === undefined || paidIn === null || paidIn === ""
+          ? a.paidDays != null
+            ? Number(a.paidDays)
+            : totalDays
+          : Number(paidIn);
+
+      if (!Number.isFinite(asked) || asked < 0) {
+        return res.status(400).json({
+          success: false,
+          message: "paidDays must be a number of days, zero or more.",
+        });
+      }
+
+      // Half days are the only fractional case the rest of the module allows.
+      paidDays = Math.min(Math.round(asked * 2) / 2, totalDays);
+      lwpDays = Math.round((totalDays - paidDays) * 2) / 2;
     }
 
     const config = await LeaveConfig.getConfig();
@@ -2216,7 +2332,14 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       .select("firstName lastName")
       .lean();
     const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "Manager";
-    a.hrRemarks = `Dates adjusted by ${mgrName}: ${nType} ${nF}→${nT} (${totalDays} day${totalDays !== 1 ? "s" : ""})`;
+    /* The split is part of what was adjusted now, so it is part of what the
+       trail says — named only when some of it is unpaid, since "5 paid" on a
+       five-day leave is noise. */
+    a.hrRemarks =
+      `Dates adjusted by ${mgrName}: ${nType} ${nF}→${nT} ` +
+      `(${totalDays} day${totalDays !== 1 ? "s" : ""}` +
+      (lwpDays > 0 ? `, ${paidDays} paid + ${lwpDays} LWP` : "") +
+      ")";
 
     await a.save();
 
@@ -2243,8 +2366,17 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 //    manager_approved  → secondary acts here, status → hr_approved (final)
 //
 //  Quick-apply flow (isQuickApply=true):
-//    pending           → BLOCKED here — secondary must use /quick-apply/:id/resolve
-//    manager_approved  → primary acts here, status → hr_approved (final)
+//    pending           → BLOCKED here — the PRIMARY classifies it first,
+//                        via /quick-apply/:id/resolve
+//    manager_approved  → secondary acts here, status → hr_approved (final)
+//
+//  This block used to name the roles the other way round — "secondary must
+//  use resolve", "primary acts here" — which is neither what the resolve
+//  route enforces (it 403s anybody but the primary, see the guard there) nor
+//  what /manager/pending hands out (primary gets `pending`, secondary gets
+//  `manager_approved`). The order is the same as the regular flow; only the
+//  primary's ACTION differs, because a quick-apply arrives with no type on
+//  it and has to be classified before it can be approved.
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch(
   "/manager/:id/approve",
