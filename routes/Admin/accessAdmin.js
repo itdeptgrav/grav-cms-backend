@@ -95,6 +95,7 @@ const AUTHORISATION_ACTIONS = new Set([
   "department.create",
   "department.deactivate",
   "department.delete",
+  "department.cctv",            // a department's "CCTV camera access" gate switched
   "accountant.revoke",
 ]);
 
@@ -111,6 +112,11 @@ function audit(req, action, detail) {
        thirty-second TTL. */
     console.warn("[access-admin] HR cache invalidation skipped:", err.message);
   }
+  /* CCTV reads the department gate and the person's identity on every check;
+     any of these changes can open or close it. The CCTV site forgets what it
+     knew and re-checks every open view now (fire-and-forget; it re-checks on
+     its own within seconds anyway). */
+  require("../../services/cctv/cctvLink").notifyAccessChanged({ all: true });
 }
 
 const fail = (res, code, message) => res.status(code).json({ success: false, message });
@@ -427,6 +433,8 @@ router.patch("/departments/:id", async (req, res) => {
     }
 
     const rejected = [];
+    // CCTV's department gate: a change to either field changes who may watch.
+    const cctvGateBefore = dept.isActive !== false && dept.cctvEnabled === true;
 
     for (const [field, value] of Object.entries(req.body || {})) {
       if (EDITABLE.includes(field)) {
@@ -456,6 +464,11 @@ router.patch("/departments/:id", async (req, res) => {
 
     dept.updatedBy = req.admin._id;
     await dept.save();
+
+    if (cctvGateBefore !== (dept.isActive !== false && dept.cctvEnabled === true)) {
+      // audit() also tells the CCTV site to re-check everybody's open views now.
+      audit(req, "department.cctv", `${dept.name} — CCTV ${cctvGateBefore ? "closed" : "opened"} for its members`);
+    }
 
     res.json({
       success: true,
@@ -1661,6 +1674,26 @@ router.get("/budget-departments", async (req, res) => {
 
 router.get("/department-roles/vocabulary", (req, res) => {
   res.json({ success: true, roles: deptRoles.ROLES });
+});
+
+/**
+ * GET /api/admin/cctv/cameras — the CCTV site's cameras (key "nvr2:8",
+ * display name, technical name, NVR, channel, order, audio availability) for
+ * the per-person CCTV editor on People & roles. Read from the CCTV site
+ * itself (service key): this database keeps no camera registry, so a rename
+ * or re-order there shows up here without a second list to keep in step.
+ * Who holds which camera: GET /department-roles/cctv (holders[].cctvCameras).
+ */
+router.get("/cctv/cameras", async (req, res) => {
+  const { fetchCameras, CctvLinkError } = require("../../services/cctv/cctvLink");
+  try {
+    const out = await fetchCameras({ fresh: req.query.fresh === "1" });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    if (err instanceof CctvLinkError) return res.status(err.status).json({ success: false, code: err.code, message: err.message });
+    console.error("[access-admin] cctv cameras:", err);
+    fail(res, 502, "The CCTV camera list could not be read.");
+  }
 });
 
 /** GET /api/admin/department-roles/:slug — everyone holding a role there. */

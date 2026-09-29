@@ -66,6 +66,16 @@ const ROLE_KEYS = ["viewer", "editor", "approver", "owner"];
 const ACCOUNTING = "accountant";
 const ENTITY = "access-grant";
 
+/* Applications whose slug is fixed in code rather than a catalogue
+   (AccessDepartment) row — resolveAppAccess's `requireCatalogueEntry: false`.
+   CCTV: access is per camera (live / sound / playback on each), stored on the
+   grant row as `cctvCameras`; its only role is Viewer, and only a platform
+   administrator (the Owner of every application) may change it. See
+   services/cctv/cctvAccess.service.js for how it is read. */
+const CCTV = "cctv";
+const CODE_FIXED_APPLICATIONS = new Set([CCTV]);
+const catalogueOpts = (app) => ({ requireCatalogueEntry: !CODE_FIXED_APPLICATIONS.has(app) });
+
 class AccessGrantError extends Error {
   constructor(status, code, message, details) {
     super(message);
@@ -79,7 +89,7 @@ const refuse = (status, code, message, details) => { throw new AccessGrantError(
 /* ── input ────────────────────────────────────────────────────────────── */
 
 /** The only keys a caller may send. Anything else is refused by name. */
-const ALLOWED_KEYS = new Set(["email", "application", "role", "reason", "idempotencyKey", "name", "budgetDepartments"]);
+const ALLOWED_KEYS = new Set(["email", "application", "role", "reason", "idempotencyKey", "name", "budgetDepartments", "cctvCameras"]);
 
 /** Refused with a specific message, because each is a forgery risk. */
 const FORBIDDEN_KEYS = [
@@ -117,8 +127,60 @@ function assertIdempotencyKey(key) {
 }
 
 /**
+ * CCTV: which cameras, and live / sound / playback on each. Viewer with at
+ * least one camera, or no role (revoke) with none — there is no "CCTV with
+ * nothing in it" grant and no other role.
+ */
+function parseCctvCameras(application, role, raw) {
+  if (application !== CCTV) {
+    if (raw !== undefined) refuse(400, "FIELD_NOT_ACCEPTED", "cctvCameras applies to the CCTV application only.", { field: "cctvCameras" });
+    return undefined;
+  }
+  if (role !== null && role !== "viewer") {
+    refuse(400, "INVALID_ROLE", "CCTV has no roles: give the person cameras (role viewer), or revoke CCTV (no role).");
+  }
+  if (raw !== undefined && !Array.isArray(raw)) refuse(400, "CCTV_CAMERAS_INVALID", "cctvCameras must be a list of cameras.");
+  const { normaliseCameraList, MAX_CAMERAS } = require("../cctv/cctvAccess.service");
+  const { cameras, invalid, tooMany } = normaliseCameraList(raw || []);
+  if (invalid.length) {
+    refuse(400, "CCTV_CAMERAS_INVALID", `Unknown camera ${invalid.slice(0, 3).map((k) => `"${k}"`).join(", ")} — cameras are named "nvr<N>:<channel>".`, { invalid: invalid.slice(0, 20) });
+  }
+  if (tooMany) refuse(400, "CCTV_CAMERAS_INVALID", `At most ${MAX_CAMERAS} cameras per person.`);
+  if (role === "viewer" && cameras.length === 0) {
+    refuse(400, "CCTV_NO_CAMERAS", "Give at least one camera live video or playback, or revoke CCTV access.");
+  }
+  if (role === null && cameras.length > 0) {
+    refuse(400, "CCTV_CAMERAS_INVALID", "Revoking CCTV removes every camera; send no cameras with it.");
+  }
+  return role === null ? [] : cameras;
+}
+
+/**
+ * One line for the Access history: what changed on which camera, by display
+ * name when the CCTV camera list has been read recently (never fetched here —
+ * this runs inside the grant transaction), else by its "nvr:channel" key.
+ */
+function cctvChangeText(before, after) {
+  let names = new Map();
+  try { names = require("../cctv/cctvLink").cachedCameraNames(); } catch { /* keys still name them */ }
+  const label = (k) => names.get(k) || k;
+  const feats = (c) => ["live", "audio", "playback"].filter((f) => c[f]).map((f) => (f === "audio" ? "sound" : f));
+  const was = new Map(before.map((c) => [c.key, c]));
+  const now = new Map(after.map((c) => [c.key, c]));
+  const parts = [];
+  for (const c of after) {
+    const b = was.get(c.key);
+    if (!b) parts.push(`+${label(c.key)} (${feats(c).join(", ")})`);
+    else if (JSON.stringify(feats(b)) !== JSON.stringify(feats(c))) parts.push(`${label(c.key)} ${feats(b).join("+")} → ${feats(c).join("+")}`);
+  }
+  for (const b of before) if (!now.has(b.key)) parts.push(`−${label(b.key)}`);
+  if (!after.length) return before.length ? `CCTV access removed (had ${before.length} camera${before.length === 1 ? "" : "s"})` : "CCTV: no cameras";
+  return `CCTV ${after.length} camera${after.length === 1 ? "" : "s"}${parts.length ? `: ${parts.join("; ")}` : " (unchanged)"}`;
+}
+
+/**
  * Validate the raw request (body + headers). Throws AccessGrantError.
- * @returns normalised { email, application, role, reason, idempotencyKey, name, budgetDepartments }
+ * @returns normalised { email, application, role, reason, idempotencyKey, name, budgetDepartments, cctvCameras }
  */
 function parseRequest({ body = {}, headers = {}, defaults = {} } = {}) {
   const src = { ...defaults, ...(body || {}) };
@@ -152,7 +214,8 @@ function parseRequest({ body = {}, headers = {}, defaults = {} } = {}) {
     budgetDepartments = [...new Set((Array.isArray(src.budgetDepartments) ? src.budgetDepartments : [])
       .map((v) => String(v ?? "").trim().toLowerCase()).filter(Boolean))];
   }
-  return { email, application, role, reason, idempotencyKey, name: src.name ? String(src.name).trim() : "", budgetDepartments };
+  const cctvCameras = parseCctvCameras(application, role, src.cctvCameras);
+  return { email, application, role, reason, idempotencyKey, name: src.name ? String(src.name).trim() : "", budgetDepartments, cctvCameras };
 }
 
 /* ── identity and authority ───────────────────────────────────────────── */
@@ -193,7 +256,7 @@ async function canonicalTarget(email) {
  */
 async function authorise(actor, application) {
   const { resolveAppAccess, isVerifiedPlatformAdmin } = require("./appAccess.service");
-  const access = await resolveAppAccess(actor, application);
+  const access = await resolveAppAccess(actor, application, catalogueOpts(application));
   if (access.denialCode === "ACCESS_CHECK_UNAVAILABLE") refuse(503, "ACCESS_GRANT_UNAVAILABLE", "Access could not be checked just now. Nothing was changed.");
   // Only somebody entitled to administer access is told an application is
   // missing or inactive; everybody else gets the same 403.
@@ -213,6 +276,8 @@ function fingerprint(actor, req) {
   return crypto.createHash("sha256").update(JSON.stringify({
     actor: String(actor.id), email: req.email, application: req.application, role: req.role,
     reason: req.reason, budgetDepartments: req.budgetDepartments ?? null,
+    // Only when present, so every earlier fingerprint (and its replay) is unchanged.
+    ...(req.cctvCameras !== undefined ? { cctvCameras: req.cctvCameras } : {}),
   })).digest("hex");
 }
 
@@ -221,7 +286,9 @@ const departmentRoleStore = {
   async read(session, app, email) {
     const DepartmentRole = require("../../models/Access/DepartmentRole");
     const row = await DepartmentRole.findOne({ departmentSlug: app, email }).session(session).lean();
-    return { role: row && row.isActive ? row.role : null, budgetDepartments: row?.budgetDepartments ?? null };
+    const out = { role: row && row.isActive ? row.role : null, budgetDepartments: row?.budgetDepartments ?? null };
+    if (app === CCTV) out.cctvCameras = require("../cctv/cctvAccess.service").camerasOfRow(row);
+    return out;
   },
   async otherActiveOwners(session, app, email) {
     const DepartmentRole = require("../../models/Access/DepartmentRole");
@@ -231,7 +298,10 @@ const departmentRoleStore = {
     const DepartmentRole = require("../../models/Access/DepartmentRole");
     const sideEffects = [];
     if (req.role === null) {
-      await DepartmentRole.updateOne({ departmentSlug: app, email }, { $set: { isActive: false } }, { session });
+      // A revoked CCTV grant keeps no cameras: nothing stale can come back
+      // with a later Viewer grant that names different ones.
+      await DepartmentRole.updateOne({ departmentSlug: app, email },
+        { $set: { isActive: false, ...(app === CCTV ? { cctvCameras: [] } : {}) } }, { session });
       return sideEffects;
     }
     if (req.role === "owner") {
@@ -250,6 +320,7 @@ const departmentRoleStore = {
           role: req.role, isActive: true,
           ...(req.name || target.name ? { name: req.name || target.name } : {}),
           ...(req.budgetDepartments !== undefined ? { budgetDepartments: req.budgetDepartments } : {}),
+          ...(req.cctvCameras !== undefined ? { cctvCameras: req.cctvCameras } : {}),
           grantedBy: actor.id, grantedByEmail: actor.email || "",
         },
         $setOnInsert: { departmentSlug: app, email },
@@ -436,7 +507,8 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
       const before = await store.read(session, req.application, target.email);
       const nextBudget = req.budgetDepartments !== undefined ? req.budgetDepartments : before.budgetDepartments;
       const unchanged = before.role === req.role
-        && JSON.stringify(before.budgetDepartments ?? null) === JSON.stringify(req.role === null ? before.budgetDepartments ?? null : nextBudget ?? null);
+        && JSON.stringify(before.budgetDepartments ?? null) === JSON.stringify(req.role === null ? before.budgetDepartments ?? null : nextBudget ?? null)
+        && (req.cctvCameras === undefined || JSON.stringify(before.cctvCameras || []) === JSON.stringify(req.cctvCameras));
 
       if (!unchanged && before.role === "owner" && req.role !== "owner") {
         const others = await store.otherActiveOwners(session, req.application, target.email);
@@ -452,6 +524,7 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
       const after = {
         role: req.role,
         ...(req.budgetDepartments !== undefined ? { budgetDepartments: req.budgetDepartments } : {}),
+        ...(req.cctvCameras !== undefined ? { cctvCameras: req.cctvCameras } : {}),
       };
       const event = {
         _id: req.idempotencyKey,
@@ -463,7 +536,11 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
           subject: String(actor.subject || ""), authority: authority.isAdmin ? "platform_admin" : "application_owner",
         },
         target: { subject: target.subject, id: String(target.id), email: target.email },
-        before: { role: before.role, ...(before.budgetDepartments ? { budgetDepartments: before.budgetDepartments } : {}) },
+        before: {
+          role: before.role,
+          ...(before.budgetDepartments ? { budgetDepartments: before.budgetDepartments } : {}),
+          ...(before.cctvCameras ? { cctvCameras: before.cctvCameras } : {}),
+        },
         after,
         changed: !unchanged,
         sideEffects,
@@ -484,7 +561,9 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
         entityId: `${req.application}:${target.email}`,
         entityLabel: target.email,
         action: req.role === null ? "delete" : (before.role ? "update" : "create"),
-        summary: `${target.email}: ${before.role || "no access"} → ${req.role || "no access"} in ${req.application}. ${req.reason}`,
+        summary: req.application === CCTV
+          ? `${target.email}: ${cctvChangeText(before.cctvCameras || [], req.cctvCameras || [])}. ${req.reason}`
+          : `${target.email}: ${before.role || "no access"} → ${req.role || "no access"} in ${req.application}. ${req.reason}`,
         before: event.before,
         after: { ...after, changed: !unchanged, sideEffects, idempotencyKey: req.idempotencyKey, reason: req.reason, auditEventId: event._id },
         actorId: mongoose.isValidObjectId(actor.id) ? actor.id : undefined,
@@ -516,6 +595,10 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
 
   if (!outcome.replayed && outcome.changed) {
     invalidateAfterCommit(req.application, [target.email, ...(outcome.after.sideEffects || []).map((x) => x.email)]);
+    // The CCTV site drops what it knew about this person and re-checks every
+    // open picture, sound and playback of theirs now (best effort — it also
+    // re-checks on its own within seconds).
+    if (req.application === CCTV) require("../cctv/cctvLink").notifyAccessChanged({ email: target.email });
   }
 
   // The answer is what the canonical resolver now says — never the request.
@@ -525,14 +608,17 @@ async function changeAppAccess({ actor, body, headers = {}, defaults = {}, via =
   // makes the resolver say so.
   const { resolveAppAccess } = require("./appAccess.service");
   const fresh = await canonicalTarget(target.email).catch(() => null);
-  const effective = await resolveAppAccess((fresh || target).actor, req.application);
+  const effective = await resolveAppAccess((fresh || target).actor, req.application, catalogueOpts(req.application));
   return {
     replayed: outcome.replayed,
     changed: outcome.changed,
     application: req.application,
     target: { subject: target.subject, id: String(target.id), email: target.email },
     before: { role: outcome.before?.role ?? null },
-    after: { role: outcome.after?.role ?? null, sideEffects: outcome.after?.sideEffects || [] },
+    after: {
+      role: outcome.after?.role ?? null, sideEffects: outcome.after?.sideEffects || [],
+      ...(req.application === CCTV ? { cctvCameras: outcome.after?.cctvCameras ?? req.cctvCameras ?? [] } : {}),
+    },
     effective: { allowed: effective.allowed, role: effective.role, source: effective.source, denialCode: effective.denialCode },
     auditId: outcome.auditId,
   };
@@ -564,4 +650,4 @@ function sendGrantError(res, err) {
   return res.status(503).json({ success: false, code: "ACCESS_GRANT_UNAVAILABLE", message: "The access change could not be completed. Nothing was changed." });
 }
 
-module.exports = { changeAppAccess, canonicalActorForEmail, sendGrantError, parseRequest, AccessGrantError, ROLE_KEYS, FORBIDDEN_KEYS, FORBIDDEN_HEADERS };
+module.exports = { changeAppAccess, canonicalActorForEmail, sendGrantError, parseRequest, AccessGrantError, ROLE_KEYS, FORBIDDEN_KEYS, FORBIDDEN_HEADERS, CODE_FIXED_APPLICATIONS, cctvChangeText };

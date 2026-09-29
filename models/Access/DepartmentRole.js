@@ -97,6 +97,29 @@ const departmentRoleSchema = new mongoose.Schema(
       default: undefined,
     },
 
+    /* ── WHICH CCTV CAMERAS THIS GRANT COVERS, AND WHAT ON EACH ─────────────
+     * Only meaningful on the `cctv` grant — a module whose slug is fixed in
+     * code (services/cctv/cctvAccess.service.js); there is no CCTV department.
+     * One entry per camera the person may use, keyed by the CCTV app's STABLE
+     * camera key "<nvr>:<channel>" ("nvr2:8"), never by a list position, with
+     * what they may do there: live video, sound (live and recorded), recorded
+     * playback. A camera that is not listed does not exist for them. Empty
+     * means empty: CCTV opens and says no camera has been assigned — it never
+     * falls back to every camera.
+     *
+     * Written only by services/access/accessGrantAdmin.service.js, like the
+     * role itself, so every change is in the grant audit chain. */
+    cctvCameras: {
+      type: [{
+        _id: false,
+        key: { type: String, required: true, lowercase: true, trim: true },
+        live: { type: Boolean, default: false },
+        audio: { type: Boolean, default: false },
+        playback: { type: Boolean, default: false },
+      }],
+      default: undefined,
+    },
+
     isActive: { type: Boolean, default: true },
 
     grantedBy: { type: mongoose.Schema.Types.ObjectId },

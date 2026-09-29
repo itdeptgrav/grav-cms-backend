@@ -36,7 +36,8 @@ function listFiles() {
     const abs = path.join(ROOT, rel);
     if (!fs.existsSync(abs)) return;
     const st = fs.statSync(abs);
-    if (st.isFile()) { if (/\.js$/.test(rel) && !/\.test\.js$/.test(rel)) out.push(rel); return; }
+    // Always "/"-separated, so the pinned lists below match on Windows too.
+    if (st.isFile()) { if (/\.js$/.test(rel) && !/\.test\.js$/.test(rel)) out.push(rel.split(path.sep).join("/")); return; }
     for (const name of fs.readdirSync(abs)) {
       // Skip transient files other suites create and delete while running
       // (test/accountant/reporting-mutation.test.js writes __mutant_*.js).
