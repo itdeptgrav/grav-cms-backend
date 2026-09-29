@@ -660,7 +660,7 @@ router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
         "vendor",
         "companyName contactPerson phone email address gstNumber bankDetails",
       )
-      .populate("items.rawItem", "name sku unit description sellingPrice")
+      .populate("items.rawItem", "name sku unit description sellingPrice defaultOwnership owningCustomerId owningCustomer")
       .populate("createdBy", "name email")
       .populate("approvedBy", "name email")
       .populate("deliveries.receivedBy", "name email");

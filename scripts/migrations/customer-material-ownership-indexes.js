@@ -87,6 +87,23 @@ const INDEXES = Object.freeze([
     why: "first-print idempotency: one label per print key, per company",
   },
   {
+    collection: "barcodes",
+    name: "companyId_1_printBatchKey_1_printBatchSeq_1",
+    key: { companyId: 1, printBatchKey: 1, printBatchSeq: 1 },
+    /* The company-owned counterpart of the key above. A print run of five rolls
+       is five labels at positions 1..5 under one key; a retry re-inserts the
+       same five triples and the database refuses them, so a second press of
+       Print cannot mint a second set of identities for the same rolls.
+
+       Partial for the same reason: every label printed before this carries no
+       batch key and must not collide on "". */
+    options: {
+      unique: true,
+      partialFilterExpression: { printBatchKey: { $type: "string", $gt: "" } },
+    },
+    why: "print-run idempotency: one label per (batch key, position), per company",
+  },
+  {
     collection: "customer_material_lots",
     name: "companyId_1_documentRef_1_status_1",
     key: { companyId: 1, documentRef: 1, status: 1 },

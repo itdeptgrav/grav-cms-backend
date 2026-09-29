@@ -126,6 +126,44 @@ remained 4/4 and working improved from 8/10 to 10/10, but no-task regressed from
 redistributed errors rather than reducing them. Its summary is stored in
 `scripts/cctv-activity-pilot/prompt-comparison-selective.summary.json`.
 
+A Qwen-only conditional interaction cascade was then evaluated without changing
+the baseline phone or working decisions. A 24-pair prompt-development audit was
+created from two chronological target/nearest-person crops: 8 reciprocal
+interaction views and 16 clear nearby-but-not-interacting views. The initial
+strict reciprocal prompt collapsed to `NO CLEAR INTERACTION` for every sample
+(0% interaction recall) and is rejected. A revised directed-exchange prompt
+scored 18/24, with 62.5% interaction recall, 62.5% interaction precision and
+81.25% no-interaction specificity at about 0.22 seconds per verifier request.
+
+The revised verifier was regressed against the 28-person development audit. The
+safe policy is narrower than originally proposed: preserve baseline `PHONE`,
+`WORKING`, and `NO TASK` directly, and invoke the two-person verifier only for a
+baseline `TALKING/INTERACTING` result. Passing baseline `NO TASK` through the
+verifier created false-positive interactions. The talking-only cascade scored
+23/28 (82.1%) versus 19/28 (67.9%) for the baseline decisions from the same
+model run; phone remained 4/4 and working decisions were untouched. The active
+external preview is this isolated candidate and the original server remains
+preserved for rollback. These are development results, not held-out accuracy.
+The audit fixture, evaluator and metrics are stored in
+`scripts/cctv-activity-pilot/interaction-audit-set.v1.json`,
+`scripts/cctv-activity-pilot/evaluate_interaction_verifier.py`, and
+`scripts/cctv-activity-pilot/interaction-cascade-v1.summary.json`.
+
+A subsequent 90-crop phone-use audit rejected stock YOLO11x and Grounding DINO
+phone overrides. Even person ownership, detector consensus and two-of-three
+temporal confirmation left 18 false PHONE labels among 60 hard negatives at the
+best operating point. The active external preview has therefore been restored
+to Qwen2.5-VL-3B plus the talking-only interaction verifier; it has no generic
+phone-detector override. The result and limitations are stored in
+`scripts/cctv-activity-pilot/phone-detector-audit-v2.summary.json`.
+
+The current external preview candidate adds a Qwen-only temporal gate for PHONE
+proposals. On four selected known cases it retained two genuine phone-use labels
+and rejected two false positives. This 4/4 targeted result is not held out; the
+full clip requires reviewer inspection before the candidate can replace the
+rollback baseline. See
+`scripts/cctv-activity-pilot/qwen-phone-verifier-v1.summary.json`.
+
 The repository currently has substantial unrelated work in flight and the CCTV
 viewer is externally hosted. Do not implement this task inside the CMS until the
 deployment owner confirms the correct repository and host. Do not remount the

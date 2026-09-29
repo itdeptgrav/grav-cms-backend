@@ -132,6 +132,36 @@ const barcodeSchema = new mongoose.Schema(
     // ── Audit ────────────────────────────────────────────────────────────────
     generatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
 
+    /* ── THE ARRIVAL THIS LABEL BELONGS TO ────────────────────────────────
+       A company-owned label carried the purchase order and the supplier but
+       never the RECEIPT, although the receipt is the document that proves the
+       goods physically arrived and in what quantity. Without it a label printed
+       from a receipt could only claim the order it discharges, and a store
+       person holding a sticker could not get back to the delivery it came off.
+
+       Customer-owned labels have carried this since they existed, inside
+       `customerMaterial`. These are the same three facts for the ordinary case,
+       deliberately named the same way. Null on a label printed from stock on
+       hand rather than from an arrival — that is an honest absence, not a gap. */
+    goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    goodsReceiptNumber: { type: String, trim: true, default: "" },
+    goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* ── WHICH PRINT RUN MINTED THIS ──────────────────────────────────────
+       A thermal printer that times out is the ordinary case, and the operator
+       presses Print again. Without a key that second press minted a second set
+       of identities for the same physical rolls, and two stickers claiming the
+       same 20 metres is exactly the failure labels exist to prevent.
+
+       `printBatchKey` is the client's stable intent for one run — not a
+       timestamp, which differs on every retry and would defeat the whole
+       mechanism. `printBatchSeq` is this label's position in that run, so a
+       PARTIAL batch can be told apart from a complete one and completed rather
+       than restarted. Customer-owned labels solve the same problem with
+       `customerMaterial.printKey`; this is its company-owned counterpart. */
+    printBatchKey: { type: String, trim: true, default: "" },
+    printBatchSeq: { type: Number, default: null, min: 1 },
+
     // ── Cutting sessions ─────────────────────────────────────────────────────
     /* ── CUSTOMER-OWNED MATERIAL ──────────────────────────────────────────
        Present only on a label for material the factory does not own. Its whole
@@ -242,6 +272,21 @@ barcodeSchema.pre("validate", function enforceOwnership(next) {
 });
 
 barcodeSchema.index({ rawItem: 1, variantId: 1, createdAt: -1 });
+/* ── ONE LABEL PER (BATCH, POSITION) ────────────────────────────────────────
+   The index IS the idempotency: a retried print run re-inserts the same
+   (company, key, seq) triples and the database refuses the duplicates, so a
+   second press cannot mint a second identity however the request is retried.
+   Partial — labels with no batch key (every existing one, and every one printed
+   before this) are untouched and unconstrained.
+
+   Built by `scripts/migrations/customer-material-ownership-indexes.js` rather
+   than lazily, for the reason spelled out on `companyId` above: an index build
+   inside the goods-receipt transaction takes collection locks the transaction
+   then cannot acquire. */
+barcodeSchema.index(
+  { companyId: 1, printBatchKey: 1, printBatchSeq: 1 },
+  { unique: true, partialFilterExpression: { printBatchKey: { $type: "string", $gt: "" } } },
+);
 
 module.exports =
   mongoose.models.Barcode || mongoose.model("Barcode", barcodeSchema);

@@ -13,6 +13,7 @@
 
 const mongoose = require("mongoose");
 const { USED_AS_VALUES, DEFAULT_USED_AS } = require("./usedAs");
+const { DEFAULT_OWNERSHIP, DEFAULT_OWNERSHIP_VALUES } = require("./materialOwnership");
 
 // e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
 const unitConversionSchema = new mongoose.Schema(
@@ -266,6 +267,38 @@ const rawItemSchema = new mongoose.Schema(
     unit:       { type: String, default: "" },
     customUnit: { type: String, default: "" },
 
+    /* ── WHOSE PROPERTY THIS MATERIAL NORMALLY IS ─────────────────────────
+       A catalogue DEFAULT, not a stock fact. CUSTOMER_OWNED says the material
+       is normally supplied by a customer and remains their property, so a
+       receipt of it preselects customer ownership and the customer named
+       below. It never creates stock and never re-owns stock already held:
+       physical ownership is decided per receipt (GoodsReceipt.sourceType),
+       per lot (CustomerMaterialLot) and per movement
+       (stockTransactions[].ownership), and none of those read this field.
+       Defaults to COMPANY_OWNED so every item registered before the field
+       existed, and every client that never sends it, reads as what it was. */
+    defaultOwnership: {
+      type: String,
+      enum: DEFAULT_OWNERSHIP_VALUES,
+      default: DEFAULT_OWNERSHIP.COMPANY_OWNED,
+    },
+    /* The customer whose property a CUSTOMER_OWNED material normally is. The
+       identity is the Customer's own id — the same reference every lot and
+       receipt carries — and it is validated on the server against this
+       company's reach before it is stored. Always null on a company-owned
+       material: the route clears it rather than letting a stale customer
+       ride along after somebody switches the default back. */
+    owningCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
+    /* Display snapshot beside the id, in the same shape the receipts and lots
+       keep (services/merchandising/customerIdentity.service.js). Never the
+       authority — the id is — and deliberately allowed to go stale rather
+       than restating what this default was set to. */
+    owningCustomer: {
+      customerCode:  { type: String, trim: true, default: "" },
+      customerLabel: { type: String, trim: true, default: "" },
+      customerName:  { type: String, trim: true, default: "" },
+    },
+
     quantity: { type: Number, default: 0, min: 0 },
     minStock: { type: Number, default: 0 },
     maxStock: { type: Number, default: 0 },
@@ -353,6 +386,8 @@ rawItemSchema.index(
 rawItemSchema.index({ companyId: 1, category: 1 });
 /* The Merchandising picker reads this company's items of one `usedAs` set. */
 rawItemSchema.index({ companyId: 1, usedAs: 1 });
+/* "Every material that is normally this customer's property", per company. */
+rawItemSchema.index({ companyId: 1, owningCustomerId: 1 });
 rawItemSchema.index({ name: 1 });
 rawItemSchema.index({ category: 1 });
 rawItemSchema.index({ "variants.vendorNicknames.vendor": 1 });

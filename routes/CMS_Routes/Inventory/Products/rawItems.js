@@ -54,6 +54,8 @@ const {
   escapeRegex, normaliseVariantNicknames, normaliseUnitConversion,
 } = require("../../../../services/inventory/rawItemPayload.service");
 const rawItemCreation = require("../../../../services/inventory/rawItemCreation.service");
+const materialSetup = require("../../../../services/inventory/materialSetup.service");
+const materialOwnership = require("../../../../services/inventory/materialOwnership.service");
 
 /* One list, shared with the narrow Merchandising door so the two cannot
    accept different words for the same shelf. */
@@ -358,6 +360,15 @@ router.get("/", canRead, async (req, res) => {
       status,
       category,
       usedAs,
+      /* Catalogue-maintenance narrowing for the Materials register:
+         `setup=needed` keeps items missing classification, base unit or a
+         budget head; `budget=unmapped` keeps items whose budget head does not
+         resolve; `productType` narrows on the stored material type. All three
+         are applied HERE so pagination and counts stay honest — never as a
+         page-only cut in the browser. */
+      setup,
+      budget,
+      productType,
       page = 1,
       limit = 20
     } = req.query;
@@ -391,6 +402,9 @@ router.get("/", canRead, async (req, res) => {
     if (usedAs && isUsedAs(usedAs)) {
       clauses.push({ usedAs: String(usedAs).trim().toUpperCase() });
     }
+    if (typeof productType === "string" && productType.trim()) {
+      clauses.push({ productType: productType.trim() });
+    }
 
     const filter = { ...tenantContext.tenantFilter(req.tenant) };
     if (clauses.length) filter.$and = clauses;
@@ -411,6 +425,22 @@ router.get("/", canRead, async (req, res) => {
       rawItems = rawItems.filter(it => it.status === status);
     }
 
+    /* ── CATALOGUE SETUP, DECIDED ONCE ────────────────────────────────────
+       One category-mapping read per request; a failure leaves the budget fact
+       UNKNOWN (null) rather than "unmapped", and the response says so. */
+    let budgetMap = null;
+    try {
+      budgetMap = await require("../../../../services/itemBudgetHead.service")
+        .categoryMap(req.tenant?.companyId || null);
+    } catch (e) {
+      console.error("[raw-items] category budget map:", e);
+      budgetMap = null;
+    }
+    rawItems.forEach((it) => { it.setup = materialSetup.setupOf(it, budgetMap); });
+    if (setup === "needed") rawItems = rawItems.filter((it) => it.setup.needsSetup);
+    const budgetFilterApplied = budget === "unmapped" && Boolean(budgetMap);
+    if (budgetFilterApplied) rawItems = rawItems.filter((it) => it.setup.budgetUnmapped === true);
+
     const totalItems = rawItems.length;
     const paged = rawItems.slice(skip, skip + limitNum);
 
@@ -424,7 +454,7 @@ router.get("/", canRead, async (req, res) => {
     });
 
     const allForStats = await RawItem.find(scoped(req))
-      .select("quantity minStock variants")
+      .select("quantity minStock variants category customCategory usedAs unit customUnit budgetLedgerId")
       .lean();
 
     let total = 0, lowStock = 0, outOfStock = 0, totalVariants = 0;
@@ -453,6 +483,10 @@ router.get("/", canRead, async (req, res) => {
         outOfStock,
         totalVariants
       },
+      /* Company-wide catalogue-maintenance counts (not the filtered page).
+         `needBudgetMapping` is null when the mappings could not be read. */
+      setupCounts: materialSetup.countSetup(allForStats, budgetMap),
+      budgetFilter: budget === "unmapped" ? (budgetFilterApplied ? "applied" : "unavailable") : null,
       filters: {
         categories: RAW_ITEM_CATEGORIES,
         statuses: ["In Stock", "Low Stock", "Out of Stock"]
@@ -763,6 +797,24 @@ router.get("/accountability", canRead, async (req, res) => {
 // without an N+1 fetch per row. Registered BEFORE "/:id" for the same reason
 // as /accountability above.
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── THE CUSTOMERS A MATERIAL MAY BE THE PROPERTY OF ───────────────────────
+   Behind the catalogue read, because it exists to fill the item form's
+   "Owning customer" control and for nothing else. The rows are the same ones
+   the save accepts: the search applies the reach rule the validation applies,
+   so a customer offered here is never refused on save. */
+router.get("/data/customers", canRead, async (req, res) => {
+  try {
+    const customers = await materialOwnership.searchCustomers(req.tenant, {
+      q: req.query.search ?? req.query.q ?? "", limit: req.query.limit,
+    });
+    res.json({ success: true, customers });
+  } catch (error) {
+    if (error instanceof StorePurchaseError) return sendError(res, error);
+    console.error("Error searching owning customers:", error);
+    res.status(500).json({ success: false, message: "Server error while searching customers" });
+  }
+});
+
 router.get("/data/attributes-batch", canRead, async (req, res) => {
   try {
     const ids = String(req.query.ids || "")
@@ -895,7 +947,9 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       attributes,
       variants,
       description,
-      notes
+      notes,
+      defaultOwnership,
+      owningCustomerId,
     } = req.body;
 
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }));
@@ -986,6 +1040,21 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
        resetting it to NOT_CLASSIFIED. */
     if (usedAs !== undefined && isUsedAs(usedAs)) {
       rawItem.usedAs = String(usedAs).trim().toUpperCase();
+    }
+
+    /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
+       Read only when the payload speaks about it (absent keys are "not part
+       of this edit"). The rule returns the two catalogue fields and their
+       snapshot and nothing else, and those are the only fields assigned here:
+       no lot, receipt, balance or movement is touched, because none of them
+       read this default — each decided its owner when it was written. */
+    if (defaultOwnership !== undefined || owningCustomerId !== undefined) {
+      const ownership = await materialOwnership.resolveOwnership(req.tenant, {
+        stored: rawItem, payload: { defaultOwnership, owningCustomerId },
+      });
+      rawItem.defaultOwnership = ownership.defaultOwnership;
+      rawItem.owningCustomerId = ownership.owningCustomerId;
+      rawItem.owningCustomer = ownership.owningCustomer;
     }
 
     if (unit !== undefined || customUnit !== undefined) {
