@@ -2051,7 +2051,21 @@ router.get("/report", async (req, res) => {
  *  gender, the same way `/inspections` does (`resolveProductImage`) — worth
  *  the extra StockItem batch only where a card actually shows a photo (the
  *  per-MO work-order list), not the MO rollup, which never does. */
-async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } = {}) {
+/* A short cache for the department-wide reads (29 Sep 2026). The Orders page
+   and the hub re-read the whole book on every visit; a figure a few seconds
+   old is fine there, and an inspection just recorded shows up within
+   QC_ORDERS_CACHE_MS (default 15 s; 0 disables). Keyed by the query. */
+const STATS_CACHE = new Map();
+const STATS_CACHE_MS = Number(process.env.QC_ORDERS_CACHE_MS ?? 15000);
+async function computeWorkOrderQcStats(extraQuery = {}, opts = {}) {
+  const key = JSON.stringify([extraQuery, opts]);
+  const hit = STATS_CACHE.get(key);
+  if (STATS_CACHE_MS > 0 && hit && hit.at > Date.now() - STATS_CACHE_MS) return hit.value;
+  const value = await computeWorkOrderQcStatsUncached(extraQuery, opts);
+  if (STATS_CACHE_MS > 0) STATS_CACHE.set(key, { at: Date.now(), value });
+  return value;
+}
+async function computeWorkOrderQcStatsUncached(extraQuery = {}, { withDetail = false } = {}) {
   /* ── AN UNROUTED ORDER IS NOT A QC CANDIDATE ──────────────────────────
      QC listed every non-cancelled work order, so an order created before its
      product had any operations appeared as ready to inspect — and looking up
@@ -2090,18 +2104,29 @@ async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } =
   const shortIdOf = (id) => id.toString().slice(-8);
   const shortIds = workOrders.map((wo) => shortIdOf(wo._id));
 
-  const scans = await QCInspection.find({ workOrderShortId: { $in: shortIds } })
-    .select("workOrderShortId barcodeId")
-    .lean();
+  /* ONE read of the scans, not two (29 Sep 2026: the Orders page took ~3 s).
+     This used to fetch every scan for the short ids, then hand the barcodes to
+     pieceProgressMany, which fetched the SAME rows again with more fields —
+     2 300 rows twice, over Atlas latency. Now the one read carries the fields
+     buildPieceProgress needs and the rows are grouped here. */
+  const [scans, stages] = await Promise.all([
+    QCInspection.find({ workOrderShortId: { $in: shortIds } })
+      .select("workOrderShortId barcodeId stageId status inspectedAt inspectedByQCName inspectedByBiometricId")
+      .lean(),
+    qcStages.listStages(),
+  ]);
 
   const barcodesByShortId = new Map();
+  const scansByBarcode = new Map();
   for (const s of scans) {
     if (!barcodesByShortId.has(s.workOrderShortId)) barcodesByShortId.set(s.workOrderShortId, new Set());
     barcodesByShortId.get(s.workOrderShortId).add(s.barcodeId);
+    if (!scansByBarcode.has(s.barcodeId)) scansByBarcode.set(s.barcodeId, []);
+    scansByBarcode.get(s.barcodeId).push(s);
   }
 
-  const allBarcodes = [...new Set(scans.map((s) => s.barcodeId))];
-  const progressByBarcode = await qcStages.pieceProgressMany(allBarcodes);
+  const progressByBarcode = {};
+  for (const [bc, rows] of scansByBarcode) progressByBarcode[bc] = qcStages.buildPieceProgress(rows, stages);
 
   return workOrders.map((wo) => {
     const shortId = shortIdOf(wo._id);

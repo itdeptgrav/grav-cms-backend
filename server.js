@@ -2199,6 +2199,12 @@ app.use("/api/cms/manufacturing/qc/team", qcTeamRoutes);
 // Mounted BEFORE the main qc router for the same reason /team is: the
 // assistant owns /assistant and /assistant/report, and a future qcRoutes route
 // on that prefix would otherwise shadow it silently.
+// Raw item checking (28 Sep 2026): QC's second book, for the raw material a
+// job-work customer sends. Mounted on the LONGER prefix and BEFORE the
+// inspection router for the same reason /team is. Its auth lives inside.
+const qcRawItemRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRawItemRoutes");
+app.use("/api/cms/manufacturing/qc/raw-items", qcRawItemRoutes);
+
 const qcAssistantRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcAssistantRoutes");
 app.use("/api/cms/manufacturing/qc", qcAssistantRoutes);
 
