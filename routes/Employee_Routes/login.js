@@ -2,6 +2,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const Employee = require("../../models/Employee");
+const { EMPLOYED_QUERY, refuseIfNotEmployed } = require("../../services/employmentStatus");
 
 const router = express.Router();
 
@@ -109,9 +110,16 @@ router.post("/login", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Password is required" });
 
+    /* NOT `$or: [{status:"active"},{isActive:true}]`. Two fields carry the
+       same fact and an OR needs only one of them to still say "active" — so
+       a record where either had been written and the other had not let a
+       former employee back in. HR's delete writes both, which is why this
+       held in practice; nothing guaranteed it. EMPLOYED_QUERY asks the
+       question the other way round: neither field may say they have left.
+       See services/employmentStatus.js. */
     const employee = await Employee.findOne({
       phone: phoneNumber,
-      $or: [{ status: "active" }, { isActive: true }],
+      ...EMPLOYED_QUERY,
     }).select("+password");
     if (!employee)
       return res

@@ -39,6 +39,7 @@ const { SECRET, verifyCmsToken, TOKEN_TTL, COOKIE_NAME, cookieOptions } = requir
 const AccessDepartment = require("../../models/Access/AccessDepartment");
 const DeptUser = require("../../models/Access/DeptUser");
 const Employee = require("../../models/Employee");
+const { refuseIfNotEmployed } = require("../../services/employmentStatus");
 const {
   matchesEmployeePassword,
   upgradeEmployeePassword,
@@ -697,9 +698,12 @@ router.post("/verify", async (req, res) => {
     if (decoded.v === 2 && decoded.subject === "employee") {
       const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
 
-      if (!employee || employee.isActive === false || employee.status === "inactive") {
+      if (!employee) {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
+      // No longer employed — said in words, and with a code the client can
+      // branch on, rather than a bare "Unauthorized" they cannot act on.
+      if (refuseIfNotEmployed(res, employee)) return;
 
       const allowed = await resolveEmployeeLauncher(employee);
 
@@ -1034,9 +1038,12 @@ router.post("/switch-department", async (req, res) => {
     /* ---- employee session ---- */
     if (decoded.subject === "employee") {
       const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
-      if (!employee || employee.isActive === false || employee.status === "inactive") {
+      if (!employee) {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
+      // No longer employed — said in words, and with a code the client can
+      // branch on, rather than a bare "Unauthorized" they cannot act on.
+      if (refuseIfNotEmployed(res, employee)) return;
 
       const allowed = await resolveEmployeeLauncher(employee);
       const dept = allowed.find((d) => d.slug === slug);
@@ -1233,6 +1240,9 @@ router.post("/change-password", async (req, res) => {
 
       const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
       if (!employee) return res.status(401).json({ success: false, message: "Unauthorized" });
+      // This one had no employment check at all — somebody who had left
+      // could still set a new password on their old account.
+      if (refuseIfNotEmployed(res, employee)) return;
 
       if (currentPassword) {
         // The same matcher login uses, so someone still on a derived default
@@ -1347,9 +1357,10 @@ router.post("/cowork-sso", async (req, res) => {
     }
 
     const employee = await Employee.findById(decoded.id).select(EMPLOYEE_SESSION_PROJECTION);
-    if (!employee || employee.isActive === false || employee.status === "inactive") {
+    if (!employee) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
+    if (refuseIfNotEmployed(res, employee)) return;
 
     // ── WHICH EXTERNAL APP IS BEING OPENED ────────────────────────────────
     //

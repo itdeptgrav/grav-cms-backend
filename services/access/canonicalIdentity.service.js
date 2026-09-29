@@ -68,7 +68,11 @@ const models = () => ({
   Acc_User: require("../../models/Accountant_model/Acc_OrgModels").Acc_User,
 });
 
-const employeeActive = (e) => e && e.isActive !== false && e.status !== "inactive";
+/* One rule, shared with the app's middleware and the session checks in
+   deptAuth. This spelled it out and matched only the literal "inactive",
+   so an employee marked "terminated" or "resigned" still signed in. */
+const { isEmployed } = require("../employmentStatus");
+const employeeActive = (e) => Boolean(e) && isEmployed(e);
 
 /**
  * Every record this address names, by kind. No password is read or compared.
