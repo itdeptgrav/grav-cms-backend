@@ -1,0 +1,31 @@
+{
+  "description": "Prompt-development audit for the conditional two-person interaction verifier. Labels are based on visible reciprocal evidence only; this is not a held-out test set.",
+  "source_directory": "results/interaction_pair_audit_v1",
+  "samples": [
+    {"image": "t010.0_target003_near007.jpg", "expected": "interacting", "note": "Target reaches toward person B while person B visibly attends and gestures."},
+    {"image": "t010.0_target007_near003.jpg", "expected": "interacting", "note": "Reverse-target view of the same reciprocal exchange."},
+    {"image": "t015.0_target003_near011.jpg", "expected": "interacting", "note": "Target and person B remain engaged in the hand/gesture exchange."},
+    {"image": "t015.0_target011_near003.jpg", "expected": "interacting", "note": "Reverse-target view of the same reciprocal exchange."},
+    {"image": "t020.0_target003_near016.jpg", "expected": "interacting", "note": "Target attends to person B's visible gesture across both moments."},
+    {"image": "t020.0_target016_near003.jpg", "expected": "interacting", "note": "Reverse-target view of the same reciprocal exchange."},
+    {"image": "t025.0_target003_near016.jpg", "expected": "interacting", "note": "Ongoing directed gesture with visible attention from the target."},
+    {"image": "t025.0_target016_near003.jpg", "expected": "interacting", "note": "Reverse-target view of the same reciprocal exchange."},
+
+    {"image": "t005.0_target001_near004.jpg", "expected": "no_clear_interaction", "note": "Both people are occupied at separate laptops."},
+    {"image": "t005.0_target002_near004.jpg", "expected": "no_clear_interaction", "note": "People are merely adjacent and oriented elsewhere."},
+    {"image": "t005.0_target004_near002.jpg", "expected": "no_clear_interaction", "note": "Reverse-target view; no reciprocal engagement."},
+    {"image": "t005.0_target006_near005.jpg", "expected": "no_clear_interaction", "note": "Standing/walking target and seated person are focused elsewhere."},
+    {"image": "t010.0_target001_near004.jpg", "expected": "no_clear_interaction", "note": "Both people continue independent laptop activity."},
+    {"image": "t010.0_target002_near004.jpg", "expected": "no_clear_interaction", "note": "Adjacent seating without reciprocal evidence."},
+    {"image": "t010.0_target004_near002.jpg", "expected": "no_clear_interaction", "note": "Reverse-target view; adjacent seating only."},
+    {"image": "t010.0_target006_near005.jpg", "expected": "no_clear_interaction", "note": "Target stands nearby while person B remains occupied."},
+    {"image": "t020.0_target006_near005.jpg", "expected": "no_clear_interaction", "note": "Target passes while person B is focused on a phone."},
+    {"image": "t020.0_target013_near014.jpg", "expected": "no_clear_interaction", "note": "Adjacent seated people with attention elsewhere."},
+    {"image": "t020.0_target014_near013.jpg", "expected": "no_clear_interaction", "note": "Reverse-target view; no reciprocal engagement."},
+    {"image": "t040.0_target006_near005.jpg", "expected": "no_clear_interaction", "note": "Walking target and seated person show no shared attention."},
+    {"image": "t040.0_target013_near014.jpg", "expected": "no_clear_interaction", "note": "Target sits behind person B without visible engagement."},
+    {"image": "t050.0_target013_near014.jpg", "expected": "no_clear_interaction", "note": "People remain close but independently occupied."},
+    {"image": "t050.0_target001_near014.jpg", "expected": "no_clear_interaction", "note": "Separate work areas with no reciprocal evidence."},
+    {"image": "t060.0_target006_near014.jpg", "expected": "no_clear_interaction", "note": "Standing target and seated person are not visibly engaged."}
+  ]
+}

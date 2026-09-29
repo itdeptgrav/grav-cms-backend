@@ -1,0 +1,59 @@
+{
+  "date": "2026-09-28",
+  "status": "development_candidate",
+  "model": "Qwen2.5-VL-3B-Instruct",
+  "architecture": "baseline_then_conditional_interaction_verifier",
+  "policy": {
+    "accept_directly": ["using_phone", "working", "no_observable_task"],
+    "verify": ["talking_or_interacting"],
+    "verifier_context": [
+      "target crop at current sample",
+      "nearest-person crop at current sample",
+      "same two tracked crops approximately one second earlier"
+    ],
+    "full_scene_used": false,
+    "phone_detector_used": false,
+    "training_used": false
+  },
+  "pair_prompt_development_audit": {
+    "sample_count": 24,
+    "interaction_samples": 8,
+    "no_clear_interaction_samples": 16,
+    "strict_reciprocal": {
+      "accuracy": 0.6667,
+      "interaction_recall": 0.0,
+      "interaction_precision": 0.0,
+      "no_interaction_specificity": 1.0,
+      "mean_seconds": 0.215,
+      "decision": "rejected_all_negative_collapse"
+    },
+    "directed_exchange": {
+      "accuracy": 0.75,
+      "interaction_recall": 0.625,
+      "interaction_precision": 0.625,
+      "no_interaction_specificity": 0.8125,
+      "mean_seconds": 0.216,
+      "decision": "selected_for_cascade_regression"
+    }
+  },
+  "full_development_audit": {
+    "sample_count": 28,
+    "same_run_baseline_correct": 19,
+    "same_run_baseline_accuracy": 0.6786,
+    "talking_only_cascade_correct": 23,
+    "talking_only_cascade_accuracy": 0.8214,
+    "delta_correct": 4,
+    "phone_correct": 4,
+    "phone_total": 4,
+    "working_correct": 9,
+    "mean_baseline_seconds": 0.218,
+    "mean_verifier_seconds_when_invoked_approx": 0.22,
+    "mean_verifier_seconds_across_all_samples": 0.11
+  },
+  "limitations": [
+    "The pair audit and 28-sample audit are prompt-development sets, not held-out evaluation.",
+    "Nearest spatial person is not guaranteed to be the true interaction partner.",
+    "The directed-exchange verifier still misses some interactions and produces some false positives.",
+    "The live variant must be visually reviewed before replacing the preserved baseline."
+  ]
+}

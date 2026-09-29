@@ -37,6 +37,7 @@
 
 const mongoose = require("mongoose");
 
+const materialOwnership = require("../inventory/materialOwnership.service");
 const GoodsReceipt = require("../../models/CMS_Models/StorePurchase/GoodsReceipt");
 const {
   CustomerMaterialExpectation, STATE,
@@ -362,8 +363,16 @@ function lotView(lot, labelCount = 0) {
 async function standingFor(ctx, doc, session = null) {
   const byLine = await receivedByLine(ctx, doc.documentRef, session);
   const held = await heldByLine(ctx, doc.documentRef, session);
+  /* What the catalogue says each material normally is. The document, not the
+     catalogue, decides the ownership of what is received here — this is shown
+     beside the line so a storekeeper sees when the two disagree. */
+  const defaults = await materialOwnership.materialDefaultsFor(
+    ctx, (doc.lines || []).map((l) => l.rawItemId), session,
+  );
   const lines = (doc.lines || []).map((l) => {
     const base = lineStanding(l, byLine.get(str(l.lineRef)), doc.state);
+    base.rawItemId = str(l.rawItemId);
+    base.materialDefault = defaults.get(str(l.rawItemId)) || null;
     const physical = held.get(str(l.lineRef))
       || {
         available: 0, issued: 0, returnedToCustomer: 0, lots: [],

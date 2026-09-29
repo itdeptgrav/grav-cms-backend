@@ -80,6 +80,20 @@ const OWNERSHIP_FILTERS = new Set(["all", "company", "customer", "mixed"]);
 const STATE_FILTERS = new Set([
   "all", "available", "fully_reserved", "unassigned", "not_usable", "out_of_stock",
 ]);
+// The attention LENSES — a READ-ONLY slice over the rows this endpoint already
+// computes (no new arithmetic, no reservation/movement/write change). Each reuses
+// the very fields the rows already carry, so a lens is always exactly consistent
+// with the register beneath it and is server-driven (never a page-only client cut).
+const LENS_FILTERS = new Set(["all", "needs_storage", "needs_review", "customer", "low_stock"]);
+const lensMatch = (lens) => {
+  if (lens === "needs_storage") return (r) => r.stockState === "unassigned";
+  if (lens === "needs_review") return (r) => r.stockState === "not_usable" || (r.ownership && r.ownership.label === "indeterminate");
+  if (lens === "customer") return (r) => Boolean(r.ownership && r.ownership.hasCustomerOwned);
+  // The reorder rule the Materials catalogue used to monitor (rawItems.computeStatus):
+  // held but at or below the item's own minimum. Out-of-stock stays its own state.
+  if (lens === "low_stock") return (r) => r.reorder && r.reorder.low === true;
+  return () => true;
+};
 
 const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const key = (w, l) => `${String(w)}:${String(l)}`;
@@ -149,6 +163,7 @@ router.get("/", async (req, res) => {
     // Invalid filter values fail SAFE: they fall back to "all" rather than 500.
     const ownershipFilter = OWNERSHIP_FILTERS.has(req.query.ownership) ? req.query.ownership : "all";
     const stateFilter = STATE_FILTERS.has(req.query.state) ? req.query.state : "all";
+    const lens = LENS_FILTERS.has(req.query.lens) ? req.query.lens : "all";
 
     // ── The item set (bounded scan, tenant-scoped, optional search) ──────────
     const clause = { companyId };
@@ -158,7 +173,7 @@ router.get("/", async (req, res) => {
     }
     const matchingSearch = await RawItem.countDocuments(clause);
     const items = await RawItem.find(clause)
-      .select("name sku unit customUnit quantity variants")
+      .select("name sku unit customUnit quantity minStock variants")
       .sort({ name: 1 })
       .limit(SCAN_CAP)
       .lean();
@@ -274,11 +289,15 @@ router.get("/", async (req, res) => {
             tracked: locRows.length > 0,
             main,
             extraCount,
+            // `stored` is the already-computed assigned total (Σ location on-hand) —
+            // surfaced so the register can SHOW how much is placed vs unassigned
+            // without the browser re-deriving a quantity. Not a new calculation.
+            stored: assigned > TOL ? r4(assigned) : 0,
             unassigned: unassigned > TOL ? unassigned : 0,
             quarantine,
             receiving,
           }
-        : { available: false, tracked: null, main: null, extraCount: 0, unassigned: null, quarantine: null, receiving: null };
+        : { available: false, tracked: null, main: null, extraCount: 0, stored: null, unassigned: null, quarantine: null, receiving: null };
 
       const availableOut = availableDimOk ? available : null;
 
@@ -311,6 +330,12 @@ router.get("/", async (req, res) => {
         variants,
         location,
         stockState,
+        // The item's own reorder minimum, READ from the record — not a new rule.
+        // `low` mirrors rawItems.computeStatus: 0 < held <= minStock.
+        reorder: {
+          minStock: Number.isFinite(Number(it.minStock)) ? Number(it.minStock) : null,
+          low: physicalOnHand > TOL && Number(it.minStock) > 0 && physicalOnHand <= Number(it.minStock),
+        },
         partial,
       };
     });
@@ -325,14 +350,15 @@ router.get("/", async (req, res) => {
       return true;
     };
     const stateMatch = (row) => stateFilter === "all" || row.stockState === stateFilter;
+    const lensMatchFn = lensMatch(lens);
 
-    const filtered = composed.filter((r) => ownershipMatch(r) && stateMatch(r));
+    const filtered = composed.filter((r) => lensMatchFn(r) && ownershipMatch(r) && stateMatch(r));
     const total = filtered.length;
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const safePage = Math.min(page, totalPages);
     const rows = filtered.slice((safePage - 1) * pageSize, (safePage - 1) * pageSize + pageSize);
 
-    const anyFilter = Boolean(search) || ownershipFilter !== "all" || stateFilter !== "all";
+    const anyFilter = Boolean(search) || ownershipFilter !== "all" || stateFilter !== "all" || lens !== "all";
 
     res.json({
       success: true,
@@ -360,7 +386,7 @@ router.get("/", async (req, res) => {
           ? `Showing the first ${SCAN_CAP} materials by name. Narrow with search to see the rest.`
           : null,
       },
-      filters: { search, ownership: ownershipFilter, state: stateFilter },
+      filters: { search, ownership: ownershipFilter, state: stateFilter, lens },
     });
   } catch (error) {
     console.error("[inventory-stock] failed:", error);

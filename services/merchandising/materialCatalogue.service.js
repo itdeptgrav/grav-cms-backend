@@ -44,6 +44,7 @@
 
 const mongoose = require("mongoose");
 
+const materialOwnership = require("../inventory/materialOwnership.service");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const { ROW_CATEGORY } = require("../../models/CMS_Models/Merchandising/Development");
 const usedAsDef = require("../../models/CMS_Models/Inventory/Products/usedAs");
@@ -106,7 +107,11 @@ function suggestCategory(item) {
    Named field by field. `select` with a minus list would have been shorter
    and would have leaked every field added to RawItem afterwards. */
 const SAFE_SELECT = "name sku category customCategory usedAs unit customUnit attributes "
-  + "variants._id variants.sku variants.combination companyId";
+  + "variants._id variants.sku variants.combination companyId "
+  /* Whose property the material normally is — a merchandiser choosing a
+     customer-supplied line should see it. The customer's id and label only;
+     nothing commercial travels with them. */
+  + "defaultOwnership owningCustomerId owningCustomer";
 
 /* ── AND AN ALLOW-LIST OF FIELDS IS NOT ENOUGH ─────────────────────────────
    `attributes` is the one safe-looking field that is FREE TEXT, both in its
@@ -241,6 +246,8 @@ const safeItem = (item) => {
     variants,
     variantCount: variants.length,
     suggestedCategory: suggestCategory(item),
+    /* Company owned, or customer property with the customer named. */
+    ownership: materialOwnership.ownershipView(item),
   };
 };
 
