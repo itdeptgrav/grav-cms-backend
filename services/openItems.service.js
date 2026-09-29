@@ -79,6 +79,12 @@ function foldAllocations(rows = []) {
         billName: r.billName,
         originalAmount: 0,
         remaining: 0,
+        /* Settled by a credit or debit note, as opposed to paid. Tracked
+           separately because a note reduces what the bill was WORTH while a
+           receipt reduces what is still owed on it — the cap on a further
+           note is the invoice value less the notes already raised, not the
+           unpaid balance. */
+        creditedByNotes: 0,
         firstVoucherDate: r.voucherDate || null,
         // `dueDate`/`creditDays` are captured ONLY here, at first encounter,
         // and never touched again for this bill — matching the inline
@@ -286,6 +292,13 @@ async function fetchAllocationRows(companyId, ledgerIds, { asOf = null } = {}) {
         voucherType: "$voucherType",
         voucherTypeName: "$voucherTypeName",
         voucherDate: "$voucherDate",
+        /* Which KIND of voucher put this row on the bill. A receipt and a
+           credit note both settle a sales bill from the same side with the
+           same billType, so without this they are indistinguishable in the
+           fold — and "how much of this invoice has already been credited?"
+           is unanswerable. That question is what lets a credit note be
+           raised against an invoice the customer has already paid. */
+        voucherType: "$voucherType",
       },
     },
   ]);

@@ -162,6 +162,7 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
       "basicPct",
       "hraPct",
       "eepfPct",
+      "epfWageCeiling",
       "epfCapAmount",
       "foodAllowance",
       "edliPct",
