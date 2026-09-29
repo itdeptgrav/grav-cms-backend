@@ -19,19 +19,19 @@
 
 const mongoose = require("mongoose");
 
-const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
 const { resolveCapabilities, CAPABILITIES } = require("./capabilities");
 const { fail } = require("./errors");
 
-const MEMBERSHIP_SOURCES = Object.freeze({
-  MEMBERSHIP_RECORD: "MEMBERSHIP_RECORD",
-  SINGLE_COMPANY_DEPLOYMENT: "SINGLE_COMPANY_DEPLOYMENT",
-  SERVICE: "SERVICE",
-});
-
-/** Loaded lazily: the accountant master models are a large module and the
- *  Store routers should not pay for it at require time. */
-const companyModel = () => require("../../models/Accountant_model/Acc_MasterModels").Acc_Company;
+/* ── THE MEMBERSHIP RESOLUTION ITSELF MOVED, THE RULES DID NOT ──────────────
+ * Central Costing needs the same answer to "which company is this person
+ * acting for", and a second implementation is a second answer waiting to
+ * disagree with this one. So the ordered, fail-closed resolution now lives at
+ * a neutral path and both domains call it. Nothing about Store & Purchase's
+ * behaviour changes: the order, the error codes and the wording are the same,
+ * with the wording passed in rather than duplicated. */
+const {
+  MEMBERSHIP_SOURCES, resolveCompanyForActor,
+} = require("../companyContext/companyMembership.service");
 
 /**
  * Resolve the tenant context for an authenticated actor.
@@ -40,109 +40,50 @@ const companyModel = () => require("../../models/Accountant_model/Acc_MasterMode
  * @throws {StorePurchaseError} 401 when unauthenticated, 403 when membership
  *         cannot be proved
  */
-async function resolveForActor(user, { requestedCompanyId = null } = {}) {
+/* ── RESOLVED ONCE A MINUTE PER ACTOR, NOT ONCE PER REQUEST (26 Sep 2026) ──
+ * Resolving an actor is six or seven sequential reads (login row, employee,
+ * memberships, companies, department roles, capabilities). Against Atlas each
+ * is ~50 ms, so every Store request paid 300–400 ms before its own query ran,
+ * and a page that makes four calls waited well over a second for facts that
+ * had not changed since the last click. The answer is kept for
+ * STORE_TENANT_CACHE_MS (default 60 s; 0 disables) per actor and requested
+ * company. A membership or capability change therefore takes up to a minute
+ * to reach an open session — acceptable for a grant, and `invalidateActor`
+ * is there for the writers that want it immediate. Each hit hands back a
+ * COPY: the middleware writes legacyMode and siteId onto the context. */
+const TENANT_CACHE_MS = Number(process.env.STORE_TENANT_CACHE_MS ?? 60000);
+const actorCache = new Map();
+function invalidateActor(userId) { if (userId == null) actorCache.clear(); else for (const k of [...actorCache.keys()]) if (k.startsWith(`${userId}|`)) actorCache.delete(k); }
+
+async function resolveForActor(user, opts = {}) {
   if (!user || !user.id) {
     throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
   }
+  const key = `${user.id}|${opts.requestedCompanyId || ""}|${String(user.email || "").toLowerCase()}`;
+  if (TENANT_CACHE_MS > 0) {
+    const hit = actorCache.get(key);
+    if (hit && hit.until > Date.now()) return { ...hit.ctx };
+    if (actorCache.size > 500) actorCache.clear();
+  }
+  const ctx = await resolveForActorUncached(user, opts);
+  if (TENANT_CACHE_MS > 0) actorCache.set(key, { ctx, until: Date.now() + TENANT_CACHE_MS });
+  return { ...ctx };
+}
+
+async function resolveForActorUncached(user, { requestedCompanyId = null } = {}) {
 
   const email = user.email ? String(user.email).toLowerCase().trim() : "";
   const employeeRef = mongoose.Types.ObjectId.isValid(user.id)
     ? new mongoose.Types.ObjectId(user.id)
     : null;
 
-  /* ── 1. An explicit membership record decides ───────────────────────────
-   *
-   * ── WHY THIS IS NOT A `findOne` ────────────────────────────────────────
-   * The model permits an actor to hold memberships in several companies, and
-   * an earlier version took whichever one the database happened to return
-   * first. That is not a tenant boundary: the same person, on two identical
-   * requests, could be resolved into two different companies, and nothing
-   * about the request would say which. Selection has to be deterministic and
-   * it has to be the caller's stated, validated choice.
-   *
-   * So: read EVERY active membership. One is unambiguous. More than one
-   * requires the caller to name the company they are acting for — and that
-   * name is validated against the memberships, never trusted on its own. */
-  const or = [];
-  if (email) or.push({ email });
-  if (employeeRef) or.push({ employeeRef });
-
-  let memberships = [];
-  if (or.length) {
-    memberships = await SpCompanyMembership.find({ isActive: true, $or: or })
-      .select("companyId siteIds personName email employeeRef")
-      .sort({ companyId: 1 }) // stable order, so any diagnostic reads the same twice
-      .lean()
-      .catch(() => []);
-  }
-
-  /* Two rows naming the SAME company (one matched by email, one by
-     employeeRef) are one membership found twice, not a choice. */
-  const byCompany = new Map();
-  for (const m of memberships) byCompany.set(String(m.companyId), m);
-  const distinct = [...byCompany.values()];
-
-  let companyId;
-  let permittedSiteIds = [];
-  let membershipSource;
-  let membership = null;
-
-  if (distinct.length === 1) {
-    membership = distinct[0];
-    companyId = membership.companyId;
-    permittedSiteIds = (membership.siteIds || []).map(String);
-    membershipSource = MEMBERSHIP_SOURCES.MEMBERSHIP_RECORD;
-  } else if (distinct.length > 1) {
-    /* Multi-company: the caller must choose, and the choice must be one of
-       theirs. A requested company identifies WHICH authorised membership to
-       use; it is never authority by itself. */
-    const wanted = requestedCompanyId ? String(requestedCompanyId) : null;
-    if (!wanted) {
-      throw fail(
-        "COMPANY_SELECTION_REQUIRED",
-        "You belong to more than one company. Choose which one you are working in.",
-        { companies: distinct.map((m) => String(m.companyId)) },
-      );
-    }
-    membership = byCompany.get(wanted) || null;
-    if (!membership) {
-      /* Non-disclosing: naming a company they do not belong to is answered
-         the same way as naming one that does not exist. */
-      throw fail(
-        "TENANT_MEMBERSHIP_UNPROVEN",
-        "You do not have access to that company in Store & Purchase.",
-        {},
-      );
-    }
-    companyId = membership.companyId;
-    permittedSiteIds = (membership.siteIds || []).map(String);
-    membershipSource = MEMBERSHIP_SOURCES.MEMBERSHIP_RECORD;
-  } else {
-    /* ── 2. Single-company deployment ──────────────────────────────────────
-     * A DEPLOYMENT FACT, not an inference from this request: it reads neither
-     * the body, the query, nor the document being accessed. It is the same
-     * rule mrfRoutes.js already applies at the fulfilment decision, and it is
-     * what keeps the live single-company system working while memberships are
-     * populated. The moment a second company exists, or anybody is given an
-     * explicit membership, it stops applying — for everybody, at once. */
-    const Acc_Company = companyModel();
-    const anyMembershipExists = await SpCompanyMembership.exists({ isActive: true }).catch(() => null);
-    const companies = await Acc_Company.find({}).select("_id").limit(2).lean().catch(() => []);
-
-    if (!anyMembershipExists && companies.length === 1) {
-      companyId = companies[0]._id;
-      membershipSource = MEMBERSHIP_SOURCES.SINGLE_COMPANY_DEPLOYMENT;
-    } else {
-      /* ── 3. Fail closed ─────────────────────────────────────────────────── */
-      throw fail(
-        "TENANT_MEMBERSHIP_UNPROVEN",
-        companies.length === 0
-          ? "No company is set up in the books yet. Ask finance to create one before using Store & Purchase."
-          : "Your account is not linked to a company in Store & Purchase. Ask an administrator to grant you access.",
-        { companiesConfigured: companies.length, hasMembershipRecords: Boolean(anyMembershipExists) },
-      );
-    }
-  }
+  const {
+    companyId, permittedSiteIds, membershipSource, membership,
+  } = await resolveCompanyForActor(user, {
+    requestedCompanyId,
+    domainLabel: "Store & Purchase",
+    fail,
+  });
 
   const { capabilities, via, isAdmin } = await resolveCapabilities({
     email,
@@ -289,6 +230,19 @@ function tenantFilter(ctx) {
   return { companyId: ctx.companyId };
 }
 
+/* ── RESTORED AFTER THE MERGE OF 23 SEP 2026 ────────────────────────────────
+ * These two were defined on NEW_CMS_BRANCH and absent from MAIN_SUB_BRANCH.
+ * The merge (fdeea4a) took the union of the two export lists but only one
+ * side's function bodies, so `module.exports` named two identifiers that no
+ * longer existed and the whole backend died on require with
+ * "ReferenceError: ownedOnly is not defined" -- before a single route loaded.
+ *
+ * They are restored rather than dropped from the exports because six route
+ * files in the MERGED tree still call them (purchaseOrders, rawItems,
+ * warehouses, stockAdjustments, services, vendor). Removing the exports would
+ * have swapped a boot crash for six runtime crashes.
+ */
+
 /**
  * The clause that keeps unowned (legacy) records OUT of a selection list.
  *
@@ -304,20 +258,91 @@ function tenantFilter(ctx) {
  * call sites: an empty predicate while the migration window is open (a valid
  * and always-true `$and` entry), the real exclusion once it closes.
  */
+/* ── THIS DECLARATION WAS DEAD, AND ITS REMOVAL CHANGES NOTHING ────────────
+   A SECOND `function ownedOnly()` is declared ~25 lines below. Function
+   declarations hoist and the later one wins, so THAT is the implementation every
+   caller has been getting; this one has never run. Node accepts the duplicate in
+   sloppy mode, which is why it went unnoticed — Babel does not, so any Jest suite
+   whose require graph reaches this file failed to parse with a message about an
+   already-declared identifier and nothing about tenancy.
+
+   Only the dead text is removed. Which of the two SHOULD be live is a tenancy
+   question with real consequences during the legacy read-through window — the
+   version below admits no unowned row, this one admitted every row while the
+   window is open — and that is a decision for whoever owns the migration, not a
+   side effect of making a test suite parse.
+
+   The removed implementation, for that decision:
+       return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } }; */
+
+/* A second `legacyWindowOpen()` was declared here, WORD FOR WORD identical to the
+   one below — a copy-paste duplication, not two behaviours. Removed for the same
+   reason as the dead `ownedOnly` above: Node tolerates a duplicate function
+   declaration in sloppy mode, Babel refuses it, and the refusal named an
+   identifier rather than the problem. Nothing about behaviour changes; the
+   surviving definition is byte-identical. */
+
+/**
+ * Restrict to records that ARE company-owned — i.e. exclude the legacy
+ * `companyId: null` / missing rows that tenantFilter() still admits during the
+ * LEGACY_READTHROUGH window.
+ *
+ * Always combined with tenantFilter() via `$and`, never used alone: tenantFilter's
+ * read-through `$or` lets legacy-global rows through so old screens keep working,
+ * and a lookup that must resolve to THIS company's own record (a vendor/product/
+ * PO reference) ANDs this on top to drop those legacy rows again. It takes no
+ * context and only asserts "has an owner"; the paired tenantFilter decides which
+ * company. On its own it would match every company's owned rows, which is why
+ * callers always pair the two (see the note at services.js `resolveVendor`).
+ */
 function ownedOnly() {
-  return LEGACY_READTHROUGH ? {} : { companyId: { $ne: null } };
+  return { companyId: { $exists: true, $ne: null } };
 }
 
-/** True while the legacy migration window is open — i.e. while unowned records
- *  are still being treated as this company's. Exposed so a rule that only
- *  makes sense on migrated data can stand down for the same window, rather
- *  than each site inventing its own switch. */
+/**
+ * Whether the legacy read-through window is still open (STORE_PURCHASE_STRICT_
+ * TENANCY !== "1"). While open, unowned (companyId:null) records remain visible
+ * and actionable so pre-tenancy data keeps working; routes call `!legacyWindowOpen()`
+ * to switch on the strict checks that must wait until the backfill has run.
+ */
 function legacyWindowOpen() {
   return LEGACY_READTHROUGH;
 }
 
-/** Fields every new operational record must carry, taken from context only. */
+/**
+ * Fields every new operational record must carry, taken from context only.
+ *
+ * ── AND IT REFUSES RATHER THAN STAMPING NOTHING ─────────────────────────────
+ * This returned `{ companyId: undefined }` whenever the context carried no
+ * company, and mongoose simply left the field off — so the record was created
+ * UNOWNED. A supplier registered that way appeared instantly as "Not yet
+ * owned — this supplier predates company ownership", could not be edited, and
+ * could not be chosen in the quotation register: indistinguishable from a
+ * record migrated from before ownership existed, which it was not.
+ *
+ * Legacy mode is a READ scope. It selects the records nobody has claimed so
+ * they can be looked at and migrated; creating a new one inside it would mint
+ * exactly the problem the migration exists to clear up. Both cases refuse,
+ * loudly, rather than producing a record nobody owns.
+ */
 function stamp(ctx) {
+  if (!ctx) {
+    throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
+  }
+  if (ctx.legacyMode) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Legacy scope is for reading records nobody has claimed yet. A new record cannot be created in it.",
+      { reason: "LEGACY_SCOPE_IS_READ_ONLY" },
+    );
+  }
+  if (!ctx.companyId) {
+    throw fail(
+      "TENANT_MEMBERSHIP_UNPROVEN",
+      "Your company could not be resolved, so a new record cannot be created. Nothing was saved.",
+      { reason: "COMPANY_CONTEXT_UNRESOLVED" },
+    );
+  }
   const out = { companyId: ctx.companyId };
   if (ctx.siteId) out.siteId = ctx.siteId;
   return out;
@@ -412,6 +437,7 @@ function assertSameTenant(ctx, doc, label = "record") {
 }
 
 module.exports = {
+  invalidateActor,
   MEMBERSHIP_SOURCES,
   CAPABILITIES,
   resolveForActor,

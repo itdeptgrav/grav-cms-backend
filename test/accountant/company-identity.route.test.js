@@ -18,6 +18,19 @@ const mongoose = require("mongoose");
 const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
 const { mintLetterToken } = require("../../utils/letterDownloadToken");
 
+/* Lane A Chunk 3A mounted the canonical company-scope guard on the routers under
+   test. Everything else in that module stays REAL — only the two company guards
+   are pass-throughs, because these suites are about budget, ledger and forecast
+   behaviour and their auth doubles do not build an organisation that owns the
+   fixture company. Company isolation has its own suite,
+   test/accountant/company-isolation.route.test.js, which exercises the real
+   guard against real routers. */
+jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  ...jest.requireActual("../../Middlewear/AccountantOrgAuthMiddleware"),
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
+}));
+
 jest.mock("../../services/companyDrive.service", () => ({
   uploadCompanyFile: jest.fn(async (buf) => ({
     driveFileId: "drive-" + Math.random().toString(36).slice(2),

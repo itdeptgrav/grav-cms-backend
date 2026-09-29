@@ -32,6 +32,19 @@ const DepartmentRole = require("../../models/Access/DepartmentRole");
 const Employee = require("../../models/Employee");
 const AccessDepartment = require("../../models/Access/AccessDepartment");
 
+/* Lane A Chunk 3A mounted the canonical company-scope guard on the routers under
+   test. Everything else in that module stays REAL — only the two company guards
+   are pass-throughs, because these suites are about budget, ledger and forecast
+   behaviour and their auth doubles do not build an organisation that owns the
+   fixture company. Company isolation has its own suite,
+   test/accountant/company-isolation.route.test.js, which exercises the real
+   guard against real routers. */
+jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  ...jest.requireActual("../../Middlewear/AccountantOrgAuthMiddleware"),
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
+}));
+
 jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
   accountantAuth: (req, res, next) => {
     req.user = JSON.parse(req.headers["x-test-user"]);
@@ -64,9 +77,14 @@ beforeAll(async () => {
      route reads for the audit trail. */
   const a = express();
   a.use(express.json());
-  a.use((req, _res, next) => {
-    req.admin = { _id: new mongoose.Types.ObjectId(), email: "exec@grav.in" };
-    next();
+  /* GAC-2: the canonical write re-verifies the admin against the database,
+     so the stand-in is a real, active admin row (collections are cleared
+     between tests, so it is found or created per request). */
+  a.use(async (req, _res, next) => {
+    try {
+      req.admin = (await canonicalPerson("exec@grav.in", true)).toObject();
+      next();
+    } catch (err) { next(err); }
   });
   a.use("/api/admin", require("../../routes/Admin/accessAdmin"));
   await new Promise((r) => { adminSrv = a.listen(0, r); });
@@ -78,12 +96,35 @@ afterAll(async () => {
   await new Promise((r) => adminSrv.close(r));
 });
 
-const admin = (path, body, method) =>
-  fetch(`${adminBase}${path}`, {
+/* GAC-2: grants go to canonical people only (the write creates no
+   identities), and every write carries a reason and an idempotency key. */
+async function canonicalPerson(email, isAdmin = false) {
+  const DeptUser = require("../../models/Access/DeptUser");
+  const found = await DeptUser.findOne({ email });
+  if (found) return found;
+  const { ensureAccessDepartments } = require("../../services/ensureAccessDepartments");
+  await ensureAccessDepartments(mongoose.connection);
+  require("../../services/memo").invalidate("access-departments:active");
+  /* The Budget app is seeded by scripts/seedBudgetDepartment.js, not the
+     built-in catalogue; the canonical write refuses an app that is not there. */
+  await portalNamed("budget", "Budget");
+  require("../../services/memo").invalidate("access-departments:active");
+  const ceo = await AccessDepartment.findOne({ slug: "ceo" });
+  return DeptUser.create({ name: email.split("@")[0], email, passwordHash: "x", departmentId: ceo._id, isAdmin, isActive: true });
+}
+let writeSeq = 0;
+const admin = async (path, body, method) => {
+  const write = body && (method || "PUT") === "PUT";
+  if (write && body.email) await canonicalPerson(body.email);
+  const payload = write
+    ? { reason: "Budget access regression check", idempotencyKey: `budget-${++writeSeq}-${Date.now()}`, ...body }
+    : body;
+  return fetch(`${adminBase}${path}`, {
     method: method || (body ? "PUT" : "GET"),
     headers: { "Content-Type": "application/json" },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    ...(payload ? { body: JSON.stringify(payload) } : {}),
   }).then(async (r) => ({ status: r.status, body: JSON.parse((await r.text()) || "null") }));
+};
 
 /* A person who signs into NO portal — the case the old resolution could not
    answer at all. `deptSlug: "budget"` is the standalone app, which is not a
@@ -392,14 +433,18 @@ test("changing the departments on a grant changes what resolves", async () => {
   expect(cycles.body.departments.map((d) => d.name)).toEqual(["Marketing"]);
 });
 
-test("departments sent on a non-Budget grant are ignored, not stored", async () => {
+/* GAC-2 (25 Sep 2026): this used to pin "ignored, not stored". The canonical
+   access write refuses any field that is not part of the change it is making,
+   so Budget departments on a non-Budget grant are now REFUSED — still never
+   stored. The frontend sends them only on the Budget row. */
+test("departments sent on a non-Budget grant are refused, and never stored", async () => {
   const email = `notbudget${seq}@demo.example`;
-  await admin("/department-roles/hr", {
+  const res = await admin("/department-roles/hr", {
     email, name: "Someone", role: "editor", budgetDepartments: ["logistics"],
+    reason: "Budget departments sent on the wrong application", idempotencyKey: `notbudget-${seq}-${Date.now()}`,
   });
-  const holders = await admin("/department-roles/hr");
-  const hit = holders.body.holders.find((h) => h.email === email);
-  expect(hit.budgetDepartments).toEqual([]);
+  expect(res.status).toBe(400);
+  expect(await DepartmentRole.countDocuments({ departmentSlug: "hr", email })).toBe(0);
 });
 
 test("the picker offers the company's own departments, not a finance registry", async () => {

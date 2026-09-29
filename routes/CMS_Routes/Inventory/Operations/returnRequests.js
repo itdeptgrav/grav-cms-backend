@@ -33,6 +33,8 @@ const mongoose = require("mongoose");
 const router   = express.Router({ mergeParams: true }); // mergeParams to get :poId
 const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const RawItem       = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const Warehouse     = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
+const locStock      = require("../../../../services/storePurchase/locationStock.service");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 
 const {
@@ -44,6 +46,16 @@ const unitOfWork = require("../../../../services/storePurchase/unitOfWork.servic
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const SpActionHistory = require("../../../../models/CMS_Models/StorePurchase/SpActionHistory");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
+// The canonical supplier-return stock mutation lives in ONE service so the Goods
+// Receipt exception handoff reuses it rather than reproducing it. The concurrency
+// seam moved there too; `at`/`moveStock` are used by the receive/cancel handlers
+// below, and `__hooks` is re-exported so the existing return tests still register.
+const supplierReturn = require("../../../../services/storePurchase/supplierReturn.service");
+const { at, moveStock, frozenBaseFactor } = supplierReturn;
+// The SAME strict Goods Receipt UoM resolver the receive flow uses — a PO-unit
+// quantity is converted into the RawItem's registered base unit, refusing when a
+// differing unit has no finite positive conversion. No second algorithm.
+const { resolveConversion } = require("../../../../services/storePurchase/goodsReceipt.service");
 
 const ENTITY = "PURCHASE_ORDER";
 
@@ -82,345 +94,43 @@ const historyEntry = (req, po, entry) => ({
 });
 
 /**
- * Find the variant a return line refers to, if it names one.
- *
- * Kept separate from the write so availability can be checked before anything
- * is changed.
+ * Warehouse Stock V1 — resolve and validate an EXPLICIT warehouse/location a
+ * store person chose for a supplier return (source) or a replacement receipt
+ * (destination). Returns a lean `{ warehouse, location }`, or null when none was
+ * named. A named-but-unusable location (inactive, foreign, or not in that
+ * warehouse) throws — a source/destination is never guessed.
  */
-function matchVariant(rawItem, variantId, variantCombination) {
-  if (variantId && rawItem.variants?.length) {
-    const byId = rawItem.variants.id(variantId);
-    if (byId) return byId;
-  }
-  if (variantCombination?.length && rawItem.variants?.length) {
-    return rawItem.variants.find(v =>
-      v.combination?.length === variantCombination.length &&
-      v.combination.every((val, i) => val === variantCombination[i])
-    ) || null;
-  }
-  return null;
-}
-
-/**
- * Move stock for a return, refusing rather than clamping.
- *
- * ── WHY THE OLD CLAMP WAS THE WORST KIND OF BUG ─────────────────────────────
- * `Math.max(0, prev + delta)` turns "you cannot take 40 from a shelf of 10"
- * into "the shelf now holds 0" and returns success. Nobody is told, the return
- * is recorded as though 40 came off, and the discrepancy surfaces weeks later
- * during a count with no trail explaining it. A refusal is a worse afternoon
- * and a far better system: the caller finds out immediately, while they are
- * standing next to the goods.
- *
- * The check and the write are in one function on purpose — separating them
- * invites a caller to skip the check.
- */
-async function moveStock({
-  rawItemId, variantId, variantCombination, delta, txn, session = null, operationId = null,
-}) {
-  const q = RawItem.findById(rawItemId);
-  if (session) q.session(session);
-  const rawItem = await q;
-  if (!rawItem) {
-    throw fail("VALIDATION", "That item is no longer in the catalogue, so its stock cannot be adjusted.", {
-      rawItemId: String(rawItemId || ""),
-    });
-  }
-
-  const wantsVariant = Boolean(variantId) || Boolean(variantCombination?.length);
-  const matchedVariant = matchVariant(rawItem, variantId, variantCombination);
-
-  /* ── A NAMED VARIANT THAT CANNOT BE FOUND IS A REFUSAL ──────────────────
-   * The old helper fell through to adjusting only the item-level balance, so
-   * a return against a variant that had been renamed or removed quietly took
-   * the quantity off the parent and left every variant's count untouched. The
-   * two then disagree, and nothing says why. */
-  if (wantsVariant && !matchedVariant) {
-    throw fail(
-      "INVALID_TRANSITION",
-      `That variant of "${rawItem.name}" is no longer in the catalogue, so its stock cannot be adjusted. Nothing was changed.`,
-      {
-        reason: "VARIANT_NOT_FOUND",
-        itemName: rawItem.name,
-        variantId: variantId ? String(variantId) : null,
-        variantCombination: variantCombination || [],
-      },
-    );
-  }
-
-  /* ── THE MOVEMENT ITSELF IS ONE OPERATION ──────────────────────────────
-   * This used to read the item, adjust it in memory and save the whole
-   * document. Four returns raised at the same moment each read 100, each
-   * computed 95, and each saved — the shelf ended at 95 having given out 20.
-   * A full-document save cannot express "subtract five from whatever is there
-   * now", which is the only thing that is actually true.
-   *
-   * So the read-modify-write is replaced by a conditional `$inc`: the filter
-   * carries the sufficiency check, and MongoDB applies both together. A
-   * simultaneous movement that emptied the shelf first makes this one's filter
-   * fail to match, and it is refused having changed nothing. The ledger line
-   * is appended in the same operation so it can never be lost separately —
-   * it is the evidence recovery reads.
-   */
-  const take = delta < 0 ? Math.abs(delta) : 0;
-  const filter = { _id: rawItem._id };
-  if (take > 0) {
-    filter.quantity = { $gte: take };
-    if (matchedVariant) {
-      filter.variants = { $elemMatch: { _id: matchedVariant._id, quantity: { $gte: take } } };
+async function resolveLocation(req, warehouseId, locationId) {
+  if (!warehouseId || !locationId) {
+    if (warehouseId || locationId) {
+      throw fail("VALIDATION", "A location needs both a warehouse and a location.", { reason: "LOCATION_INCOMPLETE" });
     }
+    return null;
   }
-
-  const statusExpr = (qtyExpr, minExpr) => ({
-    $switch: {
-      branches: [
-        { case: { $lte: [qtyExpr, 0] }, then: "Out of Stock" },
-        { case: { $lte: [qtyExpr, { $ifNull: [minExpr, 0] }] }, then: "Low Stock" },
-      ],
-      default: "In Stock",
-    },
-  });
-
-  const nextQty = { $add: [{ $ifNull: ["$quantity", 0] }, delta] };
-
-  /* ── THE VARIANT'S BALANCE, READ WHERE IT IS BEING WRITTEN ────────────────
-   * These were taken from `matchedVariant`, which is a JavaScript snapshot
-   * read before this update ran. Under concurrent movements it is exactly as
-   * stale as the item-level read that this pipeline exists to replace: two
-   * simultaneous variant movements both recorded "was 20, now 15", and the
-   * ledger's before/after chain broke where it is most needed. Both values are
-   * therefore computed by MongoDB from the document it is actually updating. */
-  const variantQtyNow = matchedVariant
-    ? {
-      $ifNull: [
-        {
-          $first: {
-            $map: {
-              input: {
-                $filter: {
-                  input: { $ifNull: ["$variants", []] },
-                  as: "v",
-                  cond: { $eq: ["$$v._id", matchedVariant._id] },
-                },
-              },
-              as: "v",
-              in: { $ifNull: ["$$v.quantity", 0] },
-            },
-          },
-        },
-        0,
-      ],
-    }
-    : null;
-
-  /* Between reading the item (which is where `matchedVariant` comes from) and
-     writing it. A test parks here to make that read genuinely stale — which is
-     the only way to show the ledger values are derived from the document being
-     written rather than from the snapshot. */
-  await at("stock:beforeWrite", { rawItemId: rawItem._id, operationId });
-
-  const stampedAt = new Date();
-  const pipeline = [
-    {
-      $set: {
-        stockTransactions: {
-          $concatArrays: [
-            { $ifNull: ["$stockTransactions", []] },
-            [{
-              ...txn,
-              operationId,
-              previousQuantity: { $ifNull: ["$quantity", 0] },
-              newQuantity: nextQty,
-              ...(matchedVariant ? {
-                variantPreviousQuantity: variantQtyNow,
-                variantNewQuantity: { $add: [variantQtyNow, delta] },
-              } : {}),
-              /* Mongoose's timestamps do not run for a pipeline update, so a
-                 ledger line written this way carried none at all. */
-              createdAt: stampedAt,
-              updatedAt: stampedAt,
-            }],
-          ],
-        },
-        quantity: nextQty,
-      },
-    },
-    {
-      $set: {
-        status: statusExpr("$quantity", "$minStock"),
-        ...(matchedVariant ? {
-          variants: {
-            $map: {
-              input: { $ifNull: ["$variants", []] },
-              as: "v",
-              in: {
-                $cond: [
-                  { $eq: ["$$v._id", matchedVariant._id] },
-                  {
-                    $mergeObjects: ["$$v", {
-                      quantity: { $add: [{ $ifNull: ["$$v.quantity", 0] }, delta] },
-                      status: statusExpr(
-                        { $add: [{ $ifNull: ["$$v.quantity", 0] }, delta] },
-                        { $ifNull: ["$$v.minStock", { $ifNull: ["$minStock", 0] }] },
-                      ),
-                    }],
-                  },
-                  "$$v",
-                ],
-              },
-            },
-          },
-        } : {}),
-      },
-    },
-  ];
-
-  const update = RawItem.findOneAndUpdate(filter, pipeline, { new: true });
-  if (session) update.session(session);
-  const updated = await update;
-
-  if (!updated) {
-    /* The filter did not match: somebody else took the stock between the read
-       above and this write, or there was never enough. Re-read to say which
-       and by how much — the figures are stable now that this attempt has
-       failed to change anything. */
-    const now = await RawItem.findById(rawItem._id).lean();
-    const available = now?.quantity || 0;
-    const variantNow = matchedVariant
-      ? (now?.variants || []).find((v) => String(v._id) === String(matchedVariant._id))
-      : null;
-    if (matchedVariant && (variantNow?.quantity || 0) < take) {
-      throw fail(
-        "INVALID_TRANSITION",
-        `Cannot take ${take} of that variant of "${rawItem.name}" out of stock — only ${variantNow?.quantity || 0} is there. Nothing was changed.`,
-        {
-          reason: "INSUFFICIENT_VARIANT_STOCK",
-          available: variantNow?.quantity || 0, requested: take, itemName: rawItem.name,
-        },
-      );
-    }
-    throw fail(
-      "INVALID_TRANSITION",
-      `Cannot take ${take} ${rawItem.unit || "unit"} of "${rawItem.name}" out of stock — only ${available} is there. Nothing was changed.`,
-      { reason: "INSUFFICIENT_STOCK", available, requested: take, itemName: rawItem.name },
-    );
-  }
-
-  const newQuantity = updated.quantity || 0;
-  return { previousQuantity: newQuantity - delta, newQuantity };
+  const warehouse = await Warehouse.findOne({ _id: warehouseId, ...tenantContext.tenantFilter(req.tenant) }).lean();
+  const location = locStock.findLocation(warehouse, locationId);
+  const err = locStock.usableLocationError(warehouse, location, req.tenant.companyId);
+  if (err) throw fail("VALIDATION", err.message, { reason: err.reason });
+  return { warehouse, location };
 }
 
-/**
- * The guard that makes two simultaneous returns safe.
- *
- * ── WHY THE CHECK CANNOT LIVE IN JAVASCRIPT ─────────────────────────────────
- * Reading the order, adding up its existing returns, and deciding there is room
- * is three steps with gaps between them. Two store people raising a return at
- * the same moment — separate requests, separate idempotency keys, both entirely
- * legitimate — each read the same "15 already returned of 20 received", each
- * concluded 5 was fine, and both pushed. The line ended up 25 returned against
- * 20 received. Idempotency does not help: these are two different actions, and
- * each is individually correct.
- *
- * So the sum is computed by MongoDB as part of the update's own filter. The
- * document is matched and modified in one operation, and the loser's filter is
- * re-evaluated against the winner's already-updated document — where the room
- * is gone, so it simply does not match. No transaction required, which matters
- * because this deployment does not have them.
- */
-function returnableGuard(poItemId, dmgQty) {
-  const alreadyReturned = {
-    $sum: {
-      $map: {
-        input: {
-          $filter: {
-            input: { $ifNull: ["$returnRequests", []] },
-            as: "r",
-            cond: { $eq: ["$$r.poItemId", poItemId] },
-          },
-        },
-        as: "r",
-        in: { $ifNull: ["$$r.damagedQuantity", 0] },
-      },
-    },
-  };
-  const received = {
-    $ifNull: [
-      {
-        $first: {
-          $map: {
-            input: {
-              $filter: {
-                input: { $ifNull: ["$items", []] },
-                as: "i",
-                cond: { $eq: ["$$i._id", poItemId] },
-              },
-            },
-            as: "i",
-            in: { $ifNull: ["$$i.receivedQuantity", 0] },
-          },
-        },
-      },
-      0,
-    ],
-  };
-  return { $expr: { $lte: [{ $add: [dmgQty, alreadyReturned] }, received] } };
-}
-
-/**
- * What is actually left on a line, read fresh.
- *
- * Only called once the atomic guard has already refused, to turn "the update
- * matched nothing" into a sentence naming the real figures. Reading it earlier
- * would be the race all over again.
- */
-function returnableNow(po, poItemId) {
-  const item = (po.items || []).find((i) => String(i._id) === String(poItemId));
-  const received = item?.receivedQuantity || 0;
-  const alreadyReturned = (po.returnRequests || [])
-    .filter((r) => String(r.poItemId) === String(poItemId))
-    .reduce((sum, r) => sum + (r.damagedQuantity || 0), 0);
-  return { received, alreadyReturned, remaining: Math.max(0, received - alreadyReturned) };
-}
-
-/* ── A NARROW SEAM FOR PROVING INTERLEAVINGS ────────────────────────────────
- * The guards in this file each exist for one instant: the moment between one
- * request deciding there is room and another writing that room away. Firing
- * two requests with `Promise.all` and hoping they collide proves very little —
- * it usually passes because the first finished before the second started, and
- * it would go on passing if the guard were deleted.
- *
- * So each contested boundary announces itself. Nothing is registered in normal
- * operation, and `at()` is then a property lookup on an empty object. A test
- * registers a function, holds the first request exactly there, drives the
- * second one to completion, and only then lets the first continue — so the
- * interleaving is something the test states rather than something it hopes for.
- *
- * Deliberately not a general event bus: four named points, no ordering
- * guarantees, and no caller anywhere outside tests. */
-/* ── AND IT CANNOT FIRE OUTSIDE A TEST RUN ──────────────────────────────────
- * A mutable object that any code could write a function into, consulted on the
- * path that moves stock, is a way to pause a production request forever. The
- * risk is small and the mitigation costs nothing, so the seam is switched off
- * unless a test runner is what is running: outside one, `at()` returns its
- * argument without so much as a property lookup, and `__hooks` is not exported
- * for anything to reach.
- *
- * `JEST_WORKER_ID` is set by the runner in every worker, including
- * `--runInBand`; NODE_ENV covers a runner that does not set it. */
-const TESTING = Boolean(process.env.JEST_WORKER_ID) || process.env.NODE_ENV === "test";
-
-const hooks = TESTING ? Object.create(null) : null;
-
-const at = TESTING
-  ? async function at(point, ctx = {}) {
-    const fn = hooks[point];
-    if (typeof fn === "function") await fn(ctx);
-    return ctx;
-  }
-  /* Production: a function that returns its argument. Nothing to register a
-     hook in, and nothing that can wait. */
-  : async (point, ctx = {}) => ctx;
+/** Snapshot the source/destination onto a return / receipt subdocument. */
+const sourceSnapshot = (loc) => (loc ? {
+  sourceWarehouseId: loc.warehouse._id,
+  sourceLocationId: loc.location._id,
+  sourceWarehouseName: loc.warehouse.name || "",
+  sourceWarehouseShortName: loc.warehouse.shortName || "",
+  sourceLocationCode: loc.location.code || "",
+  sourceLocationName: loc.location.name || "",
+} : {});
+const destSnapshot = (loc) => (loc ? {
+  destWarehouseId: loc.warehouse._id,
+  destLocationId: loc.location._id,
+  destWarehouseName: loc.warehouse.name || "",
+  destWarehouseShortName: loc.warehouse.shortName || "",
+  destLocationCode: loc.location.code || "",
+  destLocationName: loc.location.name || "",
+} : {});
 
 /**
  * Take one receipt back out of a return, atomically.
@@ -604,7 +314,7 @@ router.post(
   withIdempotency("PO_RETURN_CREATE"),
   async (req, res) => {
   try {
-    const { poItemId, damagedQuantity, reason = "" } = req.body;
+    const { poItemId, damagedQuantity, reason = "", warehouseId = null, locationId = null } = req.body;
 
     if (!poItemId) return res.status(400).json({ success: false, message: "poItemId required" });
     const dmgQty = parseFloat(damagedQuantity);
@@ -698,6 +408,47 @@ router.post(
     const poItem = po.items.id(poItemId);
     if (!poItem) return notFound(res, "PO item");
 
+    /* ── WAREHOUSE STOCK V1: THE EXPLICIT SOURCE LOCATION ──────────────────
+     * The damaged goods leave a specific location. If this item/variant is
+     * location-tracked, a valid source is REQUIRED — never guessed from
+     * Unassigned — and it must actually hold the quantity, checked HERE before
+     * anything moves so an over-return at a location changes nothing. A legacy
+     * (untracked) item keeps the existing company-level behaviour. */
+    const loc = await resolveLocation(req, warehouseId, locationId);
+    const scopeVariantId = poItem.variantId || null;
+    if (!loc && await locStock.isLocationTracked(req.tenant.companyId, poItem.rawItem, scopeVariantId)) {
+      return res.status(400).json({
+        success: false,
+        reason: "LOCATION_REQUIRED",
+        message: `"${poItem.itemName}" is tracked by location — choose the warehouse and location to return it from.`,
+      });
+    }
+    const rawUnit = await RawItem.findById(poItem.rawItem).select("unit customUnit").lean();
+
+    /* ── ONE UNIT CONTRACT — business vs base ──────────────────────────────
+     * The return is raised in the PO line's BUSINESS unit, but stock lives in the
+     * RawItem's registered BASE unit. Convert once, fail closed on a missing/zero/
+     * negative conversion, and use the BASE quantity for every stock decision —
+     * the location sufficiency check, the RawItem deduction and the location move.
+     * The returnable limit stays in business units. */
+    const baseUnit = rawUnit?.customUnit || rawUnit?.unit || poItem.unit;
+    const conv = await resolveConversion({ quantity: dmgQty, fromUnit: poItem.unit, toUnit: baseUnit });
+    const baseQty = conv.baseQuantity;
+
+    if (loc) {
+      const onHand = await locStock.locationOnHand(
+        null, req.tenant.companyId, poItem.rawItem, scopeVariantId, loc.warehouse._id, loc.location._id,
+      );
+      // Compare BASE quantity to the base-unit balance, and state both representations.
+      if (baseQty > onHand + 1e-6) {
+        return res.status(409).json({
+          success: false,
+          reason: "INSUFFICIENT_AT_LOCATION",
+          message: `Returning ${dmgQty} ${poItem.unit} requires ${baseQty} ${baseUnit} at ${loc.location.code}, but only ${onHand} ${baseUnit} ${onHand === 1 ? "is" : "are"} recorded there.`,
+        });
+      }
+    }
+
     /* ── WHAT IS STILL RETURNABLE ON THIS LINE ─────────────────────────────
      * Checking each return against the line's RECEIVED quantity in isolation
      * let two 15-unit returns be raised against a line that received 20: each
@@ -717,15 +468,24 @@ router.post(
       unit:              poItem.unit,
       variantId:         poItem.variantId || null,
       variantCombination: poItem.variantCombination || [],
-      damagedQuantity:   dmgQty,
+      damagedQuantity:   dmgQty,          // BUSINESS quantity, in `unit`
       returnedQuantity:  0,
       pendingReturnQty:  dmgQty,
+      /* Frozen conversion evidence — the stock (base) quantity actually taken off,
+         so the returnable limit stays in business units while stock moves in base
+         units, and a replacement is credited on the SAME basis. */
+      baseQuantity:      baseQty,
+      baseUnit,
+      conversionFactor:  conv.factor,
       status:            "PENDING",
       reason,
       reportedBy:        req.user?.id || null,
       reportedAt:        new Date(),
       operationId,
       receipts:          [],
+      /* The source location, snapshotted so the return history reads correctly
+         after a warehouse is renamed. Empty for a legacy company-level return. */
+      ...sourceSnapshot(loc),
       createdAt:         new Date(),
       updatedAt:         new Date(),
     };
@@ -735,98 +495,17 @@ router.post(
     await unitOfWork.run(req.tenant, {
       idempotencyRecord: req.idempotent?.record,
       mutate: async (session) => {
-        /* ── THE CONCURRENCY GATE, BEFORE ANY STOCK MOVES ──────────────────
-         * One operation: match the order only if this line still has room,
-         * and push the return in the same breath. A simultaneous return that
-         * used up the room loses here — and loses having changed nothing,
-         * which is why this comes before the deduction rather than after it. */
-        const q = PurchaseOrder.findOneAndUpdate(
-          {
-            _id: po._id,
-            ...tenantContext.tenantFilter(req.tenant),
-            ...returnableGuard(poItem._id, dmgQty),
-          },
-          { $push: { returnRequests: newReturn } },
-          { new: true },
-        );
-        if (session) q.session(session);
-        const updated = await q;
-
-        if (!updated) {
-          /* The guard refused. Read the current figures — now that the race is
-             over, they are stable — and say precisely what is left. */
-          const fresh = await loadPo(req).lean();
-          const state = fresh
-            ? returnableNow(fresh, poItem._id)
-            : { received: 0, alreadyReturned: 0, remaining: 0 };
-          throw fail(
-            "INVALID_TRANSITION",
-            state.alreadyReturned > 0
-              ? `Only ${state.remaining} ${poItem.unit} of "${poItem.itemName}" can still be returned — ${state.received} was received and ${state.alreadyReturned} has already been returned.`
-              : `Damaged qty (${dmgQty}) cannot exceed received qty (${state.received}).`,
-            {
-              reason: "RETURNABLE_QUANTITY_EXCEEDED",
-              receivedQuantity: state.received,
-              alreadyReturnedQuantity: state.alreadyReturned,
-              remainingReturnable: state.remaining,
-              requested: dmgQty,
-              unit: poItem.unit,
-              itemName: poItem.itemName,
-            },
-          );
-        }
-        before = returnableNow(updated, poItem._id);
-
-        /* ── IF THE STOCK WILL NOT MOVE, THE RETURN MUST NOT STAND ─────────
-         * The push had to come first to win the race; that leaves a window
-         * where the return exists and the deduction has not happened. Inside a
-         * transaction the abort takes care of it. Without one, the push is
-         * undone explicitly — a return claiming stock came off a shelf it
-         * never left is worse than no return at all, and the caller is about
-         * to be told plainly why (insufficient stock, missing variant). */
-        /* Between winning the room on the order and taking the stock. */
-        await at("returnCreate:beforeStock", { poId: po._id, operationId });
-        try {
-          moved = await moveStock({
-          rawItemId: poItem.rawItem,
-          variantId: poItem.variantId,
-          variantCombination: poItem.variantCombination,
-          delta: -dmgQty,
-          session,
-          operationId,
-          txn: {
-            type: poItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
-            quantity: dmgQty,
-            reason: `Return request — damaged/faulty (PO: ${po.poNumber})`,
-            notes: reason || "Damaged goods reported by store",
-            variantId: poItem.variantId || undefined,
-            variantCombination: poItem.variantCombination?.length ? poItem.variantCombination : undefined,
-            purchaseOrder: po.poNumber,
-            purchaseOrderId: po._id,
-            performedBy: req.user?.id || null,
-          },
-          });
-        } catch (stockError) {
-          /* As on the receipt path: a test can leave the interrupted state
-             standing so the reconciliation branch is what a retry meets. */
-          const gate = await at("returnCreate:beforeCompensate", {
-            poId: po._id, operationId, skip: false,
-          });
-          if (gate.skip) throw stockError;
-
-          const undo = PurchaseOrder.updateOne(
-            { _id: po._id },
-            { $pull: { returnRequests: { operationId } } },
-          );
-          if (session) undo.session(session);
-          await undo.catch((e) => {
-            /* The compensation itself failed. Said out loud: the retry will
-               find a return with no stock behind it and refuse for
-               reconciliation, which is the honest outcome. */
-            console.error("[returns] could not undo the return after a stock failure:", e.message);
-          });
-          throw stockError;
-        }
+        /* The concurrency gate, the company + location deductions, and the
+           compensation on stock failure are ONE shared operation now, so the
+           Goods Receipt exception handoff reuses exactly this — see
+           services/storePurchase/supplierReturn.service.js. */
+        const out = await supplierReturn.raiseSupplierReturnStock({
+          session, tenant: req.tenant, po, poItem, dmgQty, stockQty: baseQty, stockUnit: baseUnit, reason, loc, rawUnit,
+          actor: { id: req.user?.id || null, name: req.user?.name || "" },
+          operationId, idempotencyKey: req.idempotent?.key || "", newReturn,
+        });
+        moved = out.moved;
+        before = out.before;
 
         return {
           entityType: ENTITY,
@@ -882,7 +561,7 @@ router.post(
   withIdempotency("PO_RETURN_RECEIVE"),
   async (req, res) => {
   try {
-    const { quantityReceived, notes = "" } = req.body;
+    const { quantityReceived, notes = "", warehouseId = null, locationId = null } = req.body;
     const recvQty = parseFloat(quantityReceived);
 
     if (isNaN(recvQty) || recvQty <= 0) {
@@ -894,6 +573,34 @@ router.post(
 
     const returnReq = po.returnRequests.id(req.params.returnId);
     if (!returnReq) return notFound(res, "Return request");
+
+    /* ── WAREHOUSE STOCK V1: THE EXPLICIT DESTINATION ──────────────────────
+     * A replacement comes back INTO a chosen location — ANY usable one, not
+     * necessarily where the damaged goods left. For a location-tracked return a
+     * valid active destination is REQUIRED; a legacy return keeps company-level
+     * behaviour. Each partial receipt may enter a different location. */
+    const dest = await resolveLocation(req, warehouseId, locationId);
+    const scopeVariantId = returnReq.variantId || null;
+    if (!dest && await locStock.isLocationTracked(req.tenant.companyId, returnReq.rawItem, scopeVariantId)) {
+      return res.status(400).json({
+        success: false,
+        reason: "LOCATION_REQUIRED",
+        message: `"${returnReq.itemName}" is tracked by location — choose the warehouse and location to receive the replacement into.`,
+      });
+    }
+    const rawUnit = await RawItem.findById(returnReq.rawItem).select("unit customUnit").lean();
+
+    // BUSINESS vs STOCK quantity. The vendor sends the replacement in the return's
+    // BUSINESS unit (recvQty drives the return's pending/received maths and the
+    // receipt record). The stock credited to RawItem / LocationBalance is the
+    // converted BASE quantity, on the SAME frozen basis the outbound stock left in
+    // — so returning 1 carton (factor 10) credits exactly 10 pieces. Fails closed
+    // when a differing frozen base has no valid conversion evidence, and refuses a
+    // LEGACY return whose unit differs from the item's registered base unit rather
+    // than guessing 1:1.
+    const recvBaseUnit = rawUnit?.customUnit || rawUnit?.unit || returnReq.unit || "";
+    const recvFactor = frozenBaseFactor(returnReq, recvBaseUnit);
+    const recvBaseQty = Math.round(recvQty * recvFactor * 10000) / 10000;
 
     const operationId = operationIdOf(req);
 
@@ -986,11 +693,21 @@ router.post(
     const previousState = returnReq.status;
     const receipt = {
       _id: new mongoose.Types.ObjectId(),
-      quantityReceived: recvQty,
+      quantityReceived: recvQty,          // BUSINESS quantity, in the return's unit
+      unit:             returnReq.unit || "",
+      /* The base quantity actually credited to stock, on the SAME frozen basis —
+         so a replacement's audit trail carries both representations, and a replay
+         reproduces identical evidence. */
+      baseQuantityReceived: recvBaseQty,
+      baseUnit:         recvBaseUnit,
+      conversionFactor: recvFactor,
       receivedDate:     new Date(),
       notes,
       receivedBy:       req.user?.id || null,
       operationId,
+      /* The destination this receipt entered, snapshotted so history stays
+         readable after a rename. Empty for a legacy company-level replacement. */
+      ...destSnapshot(dest),
       createdAt:        new Date(),
       updatedAt:        new Date(),
     };
@@ -1094,12 +811,12 @@ router.post(
           rawItemId: returnReq.rawItem,
           variantId: returnReq.variantId,
           variantCombination: returnReq.variantCombination,
-          delta: recvQty,
+          delta: recvBaseQty,
           session,
           operationId,
           txn: {
             type: returnReq.variantId ? "VARIANT_ADD" : "ADD",
-            quantity: recvQty,
+            quantity: recvBaseQty, baseUnit: recvBaseUnit,
             reason: `Return receipt from vendor (PO: ${po.poNumber})`,
             notes: notes || "Vendor replacement received against return request",
             variantId: returnReq.variantId || undefined,
@@ -1109,6 +826,33 @@ router.post(
             performedBy: req.user?.id || null,
           },
           });
+
+          /* Warehouse Stock V1: the SAME unit of work writes ONE location-IN
+             movement — the replacement entering the CHOSEN destination — with
+             the session, so it commits (or rolls back) with the company credit
+             and the receipt record. Per-receipt movement key: distinct on the
+             deployed index, idempotent on replay. A failure lands in the SAME
+             catch as a stock failure, which compensates this receipt. */
+          if (dest) {
+            const inMv = await locStock.applyLocationIn(session, {
+              companyId: req.tenant.companyId, siteId: req.tenant.siteId || null,
+              item: { _id: returnReq.rawItem, unit: rawUnit?.unit, customUnit: rawUnit?.customUnit },
+              variantId: scopeVariantId,
+              warehouse: dest.warehouse, location: dest.location,
+              quantity: recvBaseQty, type: "replacement_receipt", intent: "receive",
+              source: {
+                kind: "replacement_receipt", id: po._id, reference: po.poNumber,
+                returnId: returnReq._id, poLineId: returnReq.poItemId, receiptId: receipt._id,
+              },
+              actor: { id: req.user?.id || null, name: req.user?.name || "" },
+              note: notes || "Vendor replacement received",
+              idempotencyKey: locStock.movementLineKey(req.idempotent?.key || "", receipt._id, "replacement_receipt"),
+              operationKey: req.idempotent?.key || "",
+            });
+            if (!inMv.ok) {
+              throw fail("INVALID_TRANSITION", `Could not credit ${dest.location.code}. Nothing was changed.`, { reason: inMv.reason });
+            }
+          }
         } catch (stockError) {
           /* ── UNDOING ONLY THIS RECEIPT, WITHOUT ASSUMING NOTHING ELSE MOVED
            * The receipt is recorded and the credit failed, so the receipt has
@@ -1410,5 +1154,7 @@ router.patch(
 );
 
 module.exports = router;
-/* Test seam — see the note beside `at()`. Absent entirely outside a test run. */
-if (TESTING) module.exports.__hooks = hooks;
+/* Test seam — now owned by supplierReturn.service, re-exported here so the
+   existing return tests keep registering hooks by the same object. Absent
+   entirely outside a test run. */
+if (supplierReturn.__hooks) module.exports.__hooks = supplierReturn.__hooks;

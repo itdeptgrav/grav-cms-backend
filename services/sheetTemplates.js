@@ -69,6 +69,18 @@ const RAW_ITEM_CATEGORIES = [
 ];
 
 /** Bold-ish section/heading style, kept minimal — CellStyle per grid.ts. */
+const { brandingRequirementsOf } = require("../models/CMS_Models/Sales/enquiryBrandingRequirement");
+
+/* The sheet is read by people, so the codes are spelled out. Kept here rather
+   than imported from a UI module: this file has no frontend to borrow from. */
+const BRANDING_TYPE_LABELS = {
+  embroidery: "Embroidery", screen_print: "Screen print", digital_print: "Digital print",
+  heat_transfer: "Heat transfer", logo_badge: "Logo / badge", woven_patch: "Woven patch", other: "Other",
+};
+const ARTWORK_STATE_LABELS = {
+  provided: "Artwork provided", awaiting_customer: "Awaiting customer artwork", reference_only: "Reference only",
+};
+
 const HEAD_STYLE = { bold: true };
 const TITLE_STYLE = { bold: true, size: 14 };
 
@@ -125,6 +137,43 @@ function writeContextBlock(cells, styles, { enquiry, product }, startRow) {
     cells[ref(0, r)] = label;
     cells[ref(1, r)] = String(value);
     r += 1;
+  }
+
+  /* ── BRANDING, EMBROIDERY AND PRINT, ONE ROW EACH ────────────────────
+     The two lines above summarise three booleans and one placement string,
+     which is all this sheet could say when that was all an enquiry held. A
+     decoration costs money per placement and per size, so each one is listed
+     with what is known about it — and with the customer's artwork as a URL,
+     for the same reason the reference images below are URLs.
+
+     `brandingRequirementsOf` projects an old record's booleans into the same
+     shape, so a pre-structured enquiry still prints one row per decoration
+     rather than nothing. */
+  const requirements = brandingRequirementsOf(product);
+  if (requirements.length) {
+    cells[ref(0, r)] = requirements.length === 1 ? "Branding requirement" : "Branding requirements";
+    styles[ref(0, r)] = HEAD_STYLE;
+    r += 1;
+    for (const req of requirements) {
+      const size = req.width && req.height ? `${req.width} × ${req.height} ${req.unit || "cm"}` : "";
+      cells[ref(0, r)] = [BRANDING_TYPE_LABELS[req.type] || req.type || "Branding", req.placement].filter(Boolean).join(" — ");
+      cells[ref(1, r)] = [
+        size,
+        req.colourNotes,
+        ARTWORK_STATE_LABELS[req.artworkState] || "",
+        req.notes,
+      ].filter(Boolean).join(" · ");
+      r += 1;
+      for (const art of req.artwork || []) {
+        const url = art?.url || (art?.fileId ? `https://drive.google.com/file/d/${art.fileId}/view` : "");
+        if (!url) continue;
+        // Said out loud on the sheet: this is what the customer sent, not a
+        // production file anybody has approved.
+        cells[ref(0, r)] = "Customer artwork";
+        cells[ref(1, r)] = url;
+        r += 1;
+      }
+    }
   }
 
   // ── Reference images — a plain URL per image, not an embed. CoWork's

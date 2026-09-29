@@ -33,6 +33,9 @@ function scanBarcodeFor(workOrderId, unitNumber) {
 const ReturnRequest              = require("../../../../models/CMS_Models/Manufacturing/Return/ReturnRequest");
 const CustomerRequest            = require("../../../../models/Customer_Models/CustomerRequest");
 const WorkOrder                  = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const workOrderStyleLink = require("../../../../services/industrialEngineering/workOrderStyleLink.service");
+const salesLineLink = require("../../../../services/production/salesLineWorkOrderLink.service");
+const departmentWrites = require("../../../../Middlewear/departmentWriteGuard");
 const Measurement                = require("../../../../models/Customer_Models/Measurement");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const StockItem                  = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
@@ -40,6 +43,29 @@ const Customer                   = require("../../../../models/Customer_Models/C
 const EmployeeMpc                = require("../../../../models/Customer_Models/Employee_Mpc");
 
 router.use(EmployeeAuthMiddleware);
+
+/* ── WHO MAY TURN A RETURN INTO PRODUCTION (IE Chunk 1D) ────────────────────
+ * `POST /:id/create-mo` creates a manufacturing order AND its work orders.
+ * Store owns the earlier processing steps of a return; creating work orders is
+ * a production act, and creating or altering a work order is the Project
+ * Manager's everywhere else in Manufacturing — `pmOwnedWrite` on the
+ * manufacturing-order routes, the cancellation and split guards on the
+ * work-order routes. The same authority governs it here rather than a second
+ * model invented for this transition.
+ *
+ * Route-level, not mount-level, deliberately: this router's other endpoints
+ * are Store's and QC's, and a blanket Production guard would park a store
+ * clerk's dispatch in a production approver's queue — the same reasoning
+ * manufacturingOrderRoutes.js records for its own prefix.
+ *
+ * Fails open until an administrator grants the first Production role, so it
+ * locks nobody out today and governs the transition the moment roles exist.
+ * Company membership is proved separately in the handler; neither check
+ * substitutes for the other. */
+const returnProductionGuard = (req, res, next) => {
+  if (req.user?.isAdmin) return next();
+  return departmentWrites("project-manager", { entity: "return work order" })(req, res, next);
+};
 
 async function generateReturnRequestNumber() {
   const now      = new Date();
@@ -299,7 +325,7 @@ router.patch("/:id/dispatch-return", async (req, res) => {
 });
 
 // ─── POST /:id/create-mo — full auto MO creation ─────────────────────────────
-router.post("/:id/create-mo", async (req, res) => {
+router.post("/:id/create-mo", returnProductionGuard, async (req, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid id" });
@@ -320,6 +346,32 @@ router.post("/:id/create-mo", async (req, res) => {
     let newMeasurement = null, newRequest = null;
     const createdWorkOrders = [];
 
+    /* ── IE CHUNK 1D — PROVE THE STYLE BEFORE THE FIRST WRITE ───────────
+       A return/remake makes the same garment as the order it came back from,
+       so its style is INHERITED from that exact source work order — never
+       re-derived from the new return paperwork, whose lines carry no style.
+
+       Resolved here, before the Measurement, the CustomerRequest, the
+       quotation and the work orders are written, because this route writes
+       all of them in sequence with no transaction: proving it later would
+       leave a half-created return order behind. */
+    /* ── IE CHUNK 1D — A REMAKE MUST KNOW ITS STYLE ────────────────────
+       Resolved from the EXACT work orders the returned units came from: their
+       canonical link, or — for a legacy source — the accepted resolver over
+       that source's own stored references. Absence never inherits: a remake
+       that cannot prove a style is not created, and neither is the
+       Measurement, the CustomerRequest, the quotation or any progress row,
+       because this runs before all of them.
+
+       Several sources feeding one remake must agree on one style; one that
+       differs, is disputed, is unprovable or belongs to another company
+       refuses the whole remake. No source record is written to. */
+    const actingCompanyId = await workOrderStyleLink.resolveActingCompany(req, "return remake");
+    const styleBySourceWorkOrder = (workOrderIds, label) =>
+      workOrderStyleLink.styleForDerivative(workOrderIds, {
+        label: label || "This remake", expectedCompanyId: actingCompanyId,
+      });
+
     if (rr.dispatchType === "person_wise") {
       const validPersons = finalPersons.filter((p) => p.products?.some((pr) => (pr.returnQuantity || 0) > 0));
       if (!validPersons.length) return res.status(400).json({ success: false, message: "No valid persons" });
@@ -329,8 +381,10 @@ router.post("/:id/create-mo", async (req, res) => {
         for (const prod of person.products || []) {
           const qty = prod.returnQuantity || 0; if (qty <= 0) continue;
           const key = `${prod.stockItemId?.toString()}_${prod.variantId || ""}`;
-          if (!siMap.has(key)) siMap.set(key, { stockItemId: prod.stockItemId, variantId: prod.variantId || "", productName: prod.productName, productRef: prod.productRef || "", variantAttributes: prod.variantAttributes || [], totalQty: 0, persons: [] });
+          if (!siMap.has(key)) siMap.set(key, { stockItemId: prod.stockItemId, variantId: prod.variantId || "", productName: prod.productName, productRef: prod.productRef || "", variantAttributes: prod.variantAttributes || [], totalQty: 0, persons: [], sourceWorkOrderIds: new Set() });
           const entry = siMap.get(key);
+          /* IE Chunk 1D: the exact work order these units came back from. */
+          if (prod.workOrderId) entry.sourceWorkOrderIds.add(prod.workOrderId.toString());
           entry.totalQty += qty;
           entry.persons.push({ employeeId: person.employeeId, employeeName: person.employeeName, employeeUIN: person.employeeUIN, gender: person.gender || "", qty });
         }
@@ -340,7 +394,21 @@ router.post("/:id/create-mo", async (req, res) => {
       const siDocs = await StockItem.find({ _id: { $in: siIds } }).lean();
       const siDocMap = new Map(siDocs.map((s) => [s._id.toString(), s]));
 
-      const requestItems = [...siMap.values()].map((entry) => ({ stockItemId: entry.stockItemId, stockItemName: entry.productName, stockItemReference: entry.productRef || siDocMap.get(entry.stockItemId?.toString())?.reference || "", variants: [{ variantId: entry.variantId || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, attributes: entry.variantAttributes, quantity: entry.totalQty, specialInstructions: [], estimatedPrice: 0 }], totalQuantity: entry.totalQty, totalEstimatedPrice: 0 }));
+      /* Pre-flight: every remade product's style, proved from its source work
+         order, before the Measurement or the request is written. */
+      for (const entry of siMap.values()) {
+        entry.sampleStyleId = await styleBySourceWorkOrder(
+          [...entry.sourceWorkOrderIds], entry.productName || "This product",
+        );
+      }
+      const { companyId: remakeCompanyId } = await workOrderStyleLink.assertStylesUsable(
+        [...siMap.values()].map((e) => e.sampleStyleId), { expectedCompanyId: actingCompanyId },
+      );
+      /* Each return line's permanent reference is minted HERE, by the server,
+         so the remake WorkOrder can name its own line in its first save. */
+      for (const entry of siMap.values()) entry.lineRef = salesLineLink.newReturnLineRef();
+
+      const requestItems = [...siMap.values()].map((entry) => ({ lineRef: entry.lineRef, stockItemId: entry.stockItemId, sampleStyleId: entry.sampleStyleId, stockItemName: entry.productName, stockItemReference: entry.productRef || siDocMap.get(entry.stockItemId?.toString())?.reference || "", variants: [{ variantId: entry.variantId || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, attributes: entry.variantAttributes, quantity: entry.totalQty, specialInstructions: [], estimatedPrice: 0 }], totalQuantity: entry.totalQty, totalEstimatedPrice: 0 }));
       const employeeMeasurements = validPersons.map((person) => ({ employeeId: person.employeeId, employeeName: person.employeeName, employeeUIN: person.employeeUIN || "", gender: person.gender || "", products: (person.products || []).filter((p) => (p.returnQuantity || 0) > 0).map((prod) => ({ productId: prod.stockItemId, productName: prod.productName, variantId: prod.variantId || null, variantName: (prod.variantAttributes || []).map((v) => v.value).join(" / ") || "Default", quantity: prod.returnQuantity, measurements: [], measuredAt: new Date() })), noProductAssigned: false, categoryMeasurements: [], isCompleted: true, completedAt: new Date(), remarks: `Return ${rr.returnRequestNumber}` }));
 
       newMeasurement = new Measurement({ organizationId: originalMo.customerId, organizationName: customer?.name || rr.customerName || "", name: `Return-${rr.returnRequestNumber}`, description: `Auto-created for return request ${rr.returnRequestNumber}. Original MO: ${rr.originalRequestId}`, registeredEmployeeIds: validPersons.map((p) => p.employeeId).filter(Boolean), employeeMeasurements, totalRegisteredEmployees: validPersons.length, measuredEmployees: validPersons.length, pendingEmployees: 0, completionRate: 100, convertedToPO: false, createdBy: req.user?.id || null });
@@ -361,7 +429,13 @@ router.post("/:id/create-mo", async (req, res) => {
         let variantData = entry.variantId && si?.variants?.length ? si.variants.find((v) => v._id.toString() === entry.variantId) : null;
         if (!variantData && si?.variants?.length) variantData = si.variants[0];
         const rawMaterials = (variantData?.rawItems || []).map((ri) => ({ rawItemId: ri.rawItemId, name: ri.rawItemName, sku: ri.rawItemSku || "", rawItemVariantId: ri.variantId || null, rawItemVariantCombination: ri.variantCombination || [], quantityRequired: (ri.quantity || 0) * entry.totalQty, quantityAllocated: 0, quantityIssued: 0, unit: ri.unit, unitCost: ri.unitCost || 0, totalCost: (ri.totalCost || 0) * entry.totalQty, allocationStatus: "not_allocated" }));
-        const wo = new WorkOrder({ customerRequestId: newRequest._id, stockItemId: entry.stockItemId, stockItemName: entry.productName, stockItemReference: entry.productRef || si?.reference || "", variantId: entry.variantId || variantData?._id?.toString() || "", variantAttributes: entry.variantAttributes.length ? entry.variantAttributes : (variantData?.attributes || []), quantity: entry.totalQty, customerId: originalMo.customerId, customerName: originalMo.customerInfo?.name || "", priority: "high", status: "pending", operations, rawMaterials, estimatedCost: rawMaterials.reduce((s, rm) => s + (rm.totalCost || 0), 0), actualCost: 0, createdBy: req.user?.id || null });
+        /* Its own return line, and where the units came from — not a claim to
+           be the original Sales line. */
+        const returnLink = await salesLineLink.linkForReturn({
+          companyId: remakeCompanyId, returnCustomerRequestId: newRequest._id, returnLineRef: entry.lineRef,
+          returnRequestId: rr._id, originalCustomerRequestId: rr.originalMoId, sourceWorkOrderIds: [...entry.sourceWorkOrderIds],
+        });
+        const wo = new WorkOrder({ customerRequestId: newRequest._id, salesLineLink: returnLink, sampleStyleId: entry.sampleStyleId, stockItemId: entry.stockItemId, stockItemName: entry.productName, stockItemReference: entry.productRef || si?.reference || "", variantId: entry.variantId || variantData?._id?.toString() || "", variantAttributes: entry.variantAttributes.length ? entry.variantAttributes : (variantData?.attributes || []), quantity: entry.totalQty, customerId: originalMo.customerId, customerName: originalMo.customerInfo?.name || "", priority: "high", status: "pending", operations, rawMaterials, estimatedCost: rawMaterials.reduce((s, rm) => s + (rm.totalCost || 0), 0), actualCost: 0, createdBy: req.user?.id || null });
         await wo.save();
         createdWorkOrders.push({ ...entry, woDoc: wo });
       }
@@ -383,20 +457,37 @@ router.post("/:id/create-mo", async (req, res) => {
       const siIds = [...new Set(validBulk.map((p) => p.stockItemId?.toString()).filter(Boolean))];
       const siDocs = await StockItem.find({ _id: { $in: siIds } }).lean();
       const siDocMap = new Map(siDocs.map((s) => [s._id.toString(), s]));
-      const requestItems = validBulk.map((prod) => ({ stockItemId: prod.stockItemId, stockItemName: prod.productName, stockItemReference: prod.productRef || siDocMap.get(prod.stockItemId?.toString())?.reference || "", variants: [{ variantId: prod.variantId || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, attributes: prod.variantAttributes || [], quantity: prod.returnQuantity, specialInstructions: [], estimatedPrice: 0 }], totalQuantity: prod.returnQuantity, totalEstimatedPrice: 0 }));
+
+      /* Pre-flight, same rule as the person-wise branch above. */
+      for (const prod of validBulk) {
+        prod.sampleStyleId = await styleBySourceWorkOrder(
+          [prod.workOrderId], prod.productName || "This product",
+        );
+      }
+      const { companyId: remakeCompanyId } = await workOrderStyleLink.assertStylesUsable(
+        validBulk.map((p) => p.sampleStyleId), { expectedCompanyId: actingCompanyId },
+      );
+      /* Server-minted return-line references, known before the first save. */
+      const bulkLineRefs = validBulk.map(() => salesLineLink.newReturnLineRef());
+
+      const requestItems = validBulk.map((prod, idx) => ({ lineRef: bulkLineRefs[idx], stockItemId: prod.stockItemId, sampleStyleId: prod.sampleStyleId, stockItemName: prod.productName, stockItemReference: prod.productRef || siDocMap.get(prod.stockItemId?.toString())?.reference || "", variants: [{ variantId: prod.variantId || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, attributes: prod.variantAttributes || [], quantity: prod.returnQuantity, specialInstructions: [], estimatedPrice: 0 }], totalQuantity: prod.returnQuantity, totalEstimatedPrice: 0 }));
       newRequest = new CustomerRequest({ requestId: newRequestId, customerId: originalMo.customerId, requestType: "customer_request", customerInfo: { ...originalMo.customerInfo, description: `Return order. Original MO: ${rr.originalRequestId}. Return Req: ${rr.returnRequestNumber}`, deliveryDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, items: requestItems, status: "pending", priority: "high", processingStartedAt: new Date(), processingStartedBy: req.user?.id || null });
       await newRequest.save();
       newRequest.quotations.push({ quotationNumber: `QT-${newRequestId}-001`, date: new Date(), validUntil: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), items: requestItems.map((item) => ({ stockItemId: item.stockItemId, itemName: item.stockItemName, quantity: item.totalQuantity, unitPrice: 0, gstPercentage: 0, priceBeforeGST: 0, gstAmount: 0, priceIncludingGST: 0, discountPercentage: 0, discountAmount: 0 })), subtotalBeforeGST: 0, totalDiscount: 0, totalGST: 0, shippingCharges: 0, grandTotal: 0, customAdditionalCharges: [], paymentSchedule: [], paymentSubmissions: [], status: "sales_approved", preparedBy: req.user?.id || null, customerApproval: { approved: true, approvedAt: new Date(), notes: "Auto-approved — return order" }, salesApproval: { approved: true, approvedAt: new Date(), approvedBy: req.user?.id || null, notes: "Auto-approved — return order" }, createdAt: new Date(), updatedAt: new Date() });
       newRequest.status = "quotation_sales_approved"; newRequest.finalOrderPrice = 0;
       newRequest.notes.push({ text: `Auto-created for return request ${rr.returnRequestNumber}.${processingNotes ? " Notes: " + processingNotes : ""}`, addedBy: req.user?.id || null, addedByModel: "SalesDepartment" });
       await newRequest.save();
-      for (const prod of validBulk) {
+      for (const [idx, prod] of validBulk.entries()) {
         const si = siDocMap.get(prod.stockItemId?.toString());
         const operations = (si?.operations || []).map((op) => ({ operationType: op.type || op.operationType || "", operationCode: op.operationCode || "", plannedTimeSeconds: op.totalSeconds || 0, status: "pending" }));
         let variantData = prod.variantId && si?.variants?.length ? si.variants.find((v) => v._id.toString() === prod.variantId) : null;
         if (!variantData && si?.variants?.length) variantData = si.variants[0];
         const rawMaterials = (variantData?.rawItems || []).map((ri) => ({ rawItemId: ri.rawItemId, name: ri.rawItemName, sku: ri.rawItemSku || "", rawItemVariantId: ri.variantId || null, rawItemVariantCombination: ri.variantCombination || [], quantityRequired: (ri.quantity || 0) * prod.returnQuantity, quantityAllocated: 0, quantityIssued: 0, unit: ri.unit, unitCost: ri.unitCost || 0, totalCost: (ri.totalCost || 0) * prod.returnQuantity, allocationStatus: "not_allocated" }));
-        const wo = new WorkOrder({ customerRequestId: newRequest._id, stockItemId: prod.stockItemId, stockItemName: prod.productName, stockItemReference: prod.productRef || si?.reference || "", variantId: prod.variantId || variantData?._id?.toString() || "", variantAttributes: (prod.variantAttributes || []).length ? prod.variantAttributes : (variantData?.attributes || []), quantity: prod.returnQuantity, customerId: originalMo.customerId, customerName: originalMo.customerInfo?.name || "", priority: "high", status: "pending", operations, rawMaterials, estimatedCost: rawMaterials.reduce((s, rm) => s + (rm.totalCost || 0), 0), actualCost: 0, createdBy: req.user?.id || null });
+        const returnLink = await salesLineLink.linkForReturn({
+          companyId: remakeCompanyId, returnCustomerRequestId: newRequest._id, returnLineRef: bulkLineRefs[idx],
+          returnRequestId: rr._id, originalCustomerRequestId: rr.originalMoId, sourceWorkOrderIds: [prod.workOrderId],
+        });
+        const wo = new WorkOrder({ customerRequestId: newRequest._id, salesLineLink: returnLink, sampleStyleId: prod.sampleStyleId, stockItemId: prod.stockItemId, stockItemName: prod.productName, stockItemReference: prod.productRef || si?.reference || "", variantId: prod.variantId || variantData?._id?.toString() || "", variantAttributes: (prod.variantAttributes || []).length ? prod.variantAttributes : (variantData?.attributes || []), quantity: prod.returnQuantity, customerId: originalMo.customerId, customerName: originalMo.customerInfo?.name || "", priority: "high", status: "pending", operations, rawMaterials, estimatedCost: rawMaterials.reduce((s, rm) => s + (rm.totalCost || 0), 0), actualCost: 0, createdBy: req.user?.id || null });
         await wo.save(); createdWorkOrders.push(wo);
       }
     }
@@ -414,7 +505,13 @@ router.post("/:id/create-mo", async (req, res) => {
     await rr.save();
 
     return res.json({ success: true, message: `New MO ${newRequest.requestId} created from return request ${rr.returnRequestNumber}`, returnRequest: rr, newMoId: newRequest._id, newRequestId: newRequest.requestId, newMeasurementId: newMeasurement?._id || null, workOrdersCreated: createdWorkOrders.length });
-  } catch (err) { console.error("create-mo error:", err); return res.status(500).json({ success: false, message: "Server error", error: err.message }); }
+  } catch (err) {
+    /* IE Chunk 1D: a typed linkage or company refusal keeps its registered
+       status, code and actionable message. Anything else is still a 500. */
+    if (err && err.name === "StorePurchaseError") return workOrderStyleLink.sendTypedError(res, err, "");
+    console.error("create-mo error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
 });
 
 module.exports = router;

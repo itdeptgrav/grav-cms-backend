@@ -54,7 +54,7 @@ const multer = require("multer");
    spreadsheet libraries here that reads legacy .xls, which exceljs cannot. */
 const XLSX = require("xlsx");
 
-const { SECRET, LEGACY_SECRETS, readToken } = require("../../config/jwt");
+const { verifyCmsToken, readToken } = require("../../config/jwt");
 const { Doc_File, kindOf, previewKindOf } = require("../../models/Files/Doc_File");
 const { Doc_Folder, FOLDER_VARIANTS } = require("../../models/Files/Doc_Folder");
 const drive = require("../../services/companyDrive.service");
@@ -82,15 +82,8 @@ function sessionOf(req) {
   const token = readToken(req);
   if (!token) return null;
   try {
-    return jwt.verify(token, SECRET);
+    return verifyCmsToken(token); // SEC-0: configured secret only
   } catch {
-    for (const legacy of LEGACY_SECRETS) {
-      try {
-        return jwt.verify(token, legacy);
-      } catch {
-        /* try the next one */
-      }
-    }
     return null;
   }
 }

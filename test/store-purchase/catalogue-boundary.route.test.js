@@ -1786,6 +1786,36 @@ describe("item supplier aliases bind only to this company's suppliers", () => {
     expect(stored.variants[0].vendorNicknames[0].nickname).toBe("MILL-CODE-1");
   });
 
+  test("opening an item resolves its supplier aliases without crashing", async () => {
+    const a = await company("Acme");
+    const viewer = await person({ co: a, grant: "store", role: "viewer" });
+    const mill = await someSupplier({ co: a, name: "Detail Mills" });
+    const it = await item({
+      co: a,
+      over: {
+        variants: [{
+          combination: ["Red"],
+          sku: "V-DETAIL-1",
+          vendorNicknames: [{ vendor: mill._id, nickname: "DETAIL-CODE-1" }],
+        }],
+      },
+    });
+
+    const res = await call(`/raw-items/${it._id}`, { token: viewer.token });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.rawItem.variants[0].vendorNicknames[0]).toEqual(
+      expect.objectContaining({
+        nickname: "DETAIL-CODE-1",
+        vendor: expect.objectContaining({
+          _id: String(mill._id),
+          companyName: expect.stringContaining("Detail Mills"),
+        }),
+      }),
+    );
+  });
+
   test("another company's supplier is not found, and nothing is written", async () => {
     const a = await company("Acme");
     const b = await company("Borealis");

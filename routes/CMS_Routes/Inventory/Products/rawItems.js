@@ -14,6 +14,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const { isUsedAs, DEFAULT_USED_AS, USED_AS_VALUES } = require("../../../../models/CMS_Models/Inventory/Products/usedAs");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -40,15 +41,25 @@ const {
 } = require("../../../../Middlewear/storePurchaseTenant");
 const { CAPABILITIES, hasAll } = require("../../../../services/storePurchase/capabilities");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
-const { fail, sendError } = require("../../../../services/storePurchase/errors");
+const { fail, sendError, StorePurchaseError } = require("../../../../services/storePurchase/errors");
 const stockAccountability = require("../../../../services/stockAccountability.service");
 
-const RAW_ITEM_CATEGORIES = [
-  "Fabric", "Thread", "Fasteners", "Elastic", "Interlining",
-  "Trims", "Chemicals", "Patterns", "Labels", "Packaging",
-  "Accessories", "Dyes", "Buttons", "Zippers", "Laces",
-  "Ribbons", "Cords", "Tapes", "Piping", "Webbing"
-];
+/* ── SHARED WITH THE NARROW MERCHANDISING DOOR ──────────────────────────────
+   These were defined here. They are now in the inventory service layer,
+   because the Development BOM's inline creation must judge a payload by the
+   same rules and a second copy of them would drift. */
+const {
+  SUPPLIER_NOT_SELECTABLE, supplierScope, resolveSuppliers, supplierIdentityMap,
+  validateEmbeddedConversions, validateEmbeddedVendors,
+  escapeRegex, normaliseVariantNicknames, normaliseUnitConversion,
+} = require("../../../../services/inventory/rawItemPayload.service");
+const rawItemCreation = require("../../../../services/inventory/rawItemCreation.service");
+const materialSetup = require("../../../../services/inventory/materialSetup.service");
+const materialOwnership = require("../../../../services/inventory/materialOwnership.service");
+
+/* One list, shared with the narrow Merchandising door so the two cannot
+   accept different words for the same shelf. */
+const { RAW_ITEM_CATEGORIES } = rawItemCreation;
 
 router.use(EmployeeAuthMiddleware);
 /* Every route below is tenant-resolved. A caller whose company cannot be
@@ -56,6 +67,13 @@ router.use(EmployeeAuthMiddleware);
 router.use(requireTenant);
 
 const canRead = requireCapability(CAPABILITIES.READ);
+/* ── HOW CUSTOMS CLASSIFIES THESE GOODS ─────────────────────────────────────
+   Uppercased and stripped of spaces and dots, because a tariff heading is
+   written "5208.52.00", "52085200" and "5208 52 00" for the same goods and a
+   duty table keyed on one of those would miss the other two. Empty stays
+   empty: an unclassified item is never read as duty-free. */
+const tariffCode = (v) => String(v ?? "").trim().toUpperCase().replace(/[\s.]/g, "").slice(0, 20);
+
 /* Item identity: name, code, category, unit, attributes, variants, thresholds. */
 const canMaintain = [requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite];
 /* Supplier aliases and their pricing are procurement facts about a commercial
@@ -113,108 +131,12 @@ function scopedSearch(req, extra = {}) {
  * which URL it arrived at. A mixed payload needs every capability its fields
  * imply.
  */
-/* ── SUPPLIER MASTER NOW HAS AN OWNER ───────────────────────────────────────
- * `Vendor` carried no `companyId`, so every supplier query here read one
- * global table shared by every company, and an alias written from this router
- * bound a tenant-owned item to a record whose ownership nobody could state.
- * The previous chunk closed all of it behind SUPPLIER_TENANCY_UNAVAILABLE
- * rather than keep pretending it was safe.
- *
- * Suppliers are now company-owned, so the integration is open again — under
- * the ownership that made it possible, not merely because the refusal was
- * inconvenient:
- *
- *   · every supplier query is company-scoped, and a supplier from another
- *     company answers as one that does not exist;
- *   · a supplier may be NEWLY assigned only if it is Active and owned by this
- *     company — archived, inactive, blacklisted, legacy and cross-company
- *     suppliers are all refused, each with its own reason;
- *   · identity is resolved through one explicitly scoped map, never through a
- *     Mongoose populate that would follow a reference wherever it points;
- *   · aliases already stored against a supplier whose ownership cannot be
- *     proven are LEFT ALONE and reported as unverified. They are the item's
- *     own history, and deleting history to tidy a boundary is not a fix.
- */
-const SUPPLIER_NOT_SELECTABLE = "SUPPLIER_NOT_SELECTABLE";
-
-/**
- * A supplier this company may newly select.
- *
- * ── WHY THIS IS AN `$and`, NOT ANOTHER KEY ──────────────────────────────────
- * Written as `{...tenantContext.tenantFilter(req.tenant), companyId: {$ne: null}}`
- * the second `companyId` REPLACES the first: object spread keeps the last
- * value, so the company filter silently disappeared and every company's
- * suppliers matched. The two conditions are separate facts — "belongs to this
- * company" and "belongs to a company at all" — so they are separate clauses,
- * where neither can overwrite the other.
- */
-const supplierScope = (req, extra = {}) => ({
-  $and: [
-    tenantContext.tenantFilter(req.tenant),
-    tenantContext.ownedOnly(),
-    /* A company-owned supplier part-way through migration has no code yet.
-       It is visible in the Supplier Master for remediation, and must not be
-       offered here: an order or alias bound to it would carry no identity
-       anybody can quote back.
-
-       Stood down while the legacy window is open. NOT ONE of the 94 suppliers
-       in this database carries a code — the supplier-code scheme shipped after
-       them and the migration script deliberately never derives one — so
-       enforcing it emptied the vendor dropdown on every Raw Item form in Store
-       and Sales (reported 10 Sep 2026). It comes back with
-       STORE_PURCHASE_STRICT_TENANCY=1, by which time codes must exist. */
-    ...(tenantContext.legacyWindowOpen() ? [] : [{ supplierCode: { $gt: "" } }]),
-    ...(Object.keys(extra).length ? [extra] : []),
-  ],
-});
-
-/**
- * Resolve the suppliers named on a payload, inside this company.
- *
- * @returns {{ok: true, map: Map}|{ok: false, code, message, details}}
- */
-async function resolveSuppliers(req, ids) {
-  const wanted = [...new Set(ids.map(String))].filter((id) => mongoose.Types.ObjectId.isValid(id));
-  if (!wanted.length) return { ok: true, map: new Map() };
-
-  /* Scoped, and `companyId: null` excluded explicitly: a legacy supplier is
-     inside no company, so nothing new may be bound to it. */
-  const found = await Vendor.find(supplierScope(req, { _id: { $in: wanted } }))
-    .select("_id companyName status supplierCode").lean();
-
-  const map = new Map(found.map((v) => [String(v._id), v]));
-
-  const missing = wanted.find((id) => !map.has(id));
-  if (missing) {
-    /* Another company's supplier answers exactly as an invented id. */
-    return {
-      ok: false, status: 404, code: "SUPPLIER_NOT_FOUND",
-      message: "That supplier was not found in this company.",
-    };
-  }
-
-  const unusable = found.find((v) => v.status !== "Active");
-  if (unusable) {
-    return {
-      ok: false, status: 409, code: SUPPLIER_NOT_SELECTABLE,
-      message: `${unusable.companyName} is ${String(unusable.status).toLowerCase()} and cannot be newly assigned.`,
-      details: { supplier: String(unusable._id), status: unusable.status },
-    };
-  }
-
-  return { ok: true, map };
-}
-
-/** Identity for aliases already stored, resolved only inside this company. */
-async function supplierIdentityMap(req, ids) {
-  const wanted = [...new Set(ids.map(String))].filter((id) => mongoose.Types.ObjectId.isValid(id));
-  if (!wanted.length) return new Map();
-  const found = await Vendor.find({
-    ...tenantContext.tenantFilter(req.tenant),
-    _id: { $in: wanted },
-  }).select("_id companyName status supplierCode companyId").lean();
-  return new Map(found.map((v) => [String(v._id), v]));
-}
+/* The supplier helpers (SUPPLIER_NOT_SELECTABLE, supplierScope,
+   resolveSuppliers, supplierIdentityMap) are imported from
+   services/inventory/rawItemPayload.service.js at the top of this file. The
+   27 Sep 2026 merge re-added this route's older inline copies beside that
+   import, which declared every name twice and stopped the server; the two
+   fixes only the inline copy had were moved into the service. */
 
 /**
  * Put a name on each stored alias's supplier.
@@ -338,88 +260,7 @@ function payloadAuthority(req, res, next) {
   ));
 }
 
-/**
- * A conversion target must be a unit this company actually has.
- *
- * `unitConversions` name units as STRINGS, so nothing stopped a factor
- * referring to a unit that does not exist, or to another company's. And
- * `normaliseUnitConversion` accepted a factor of exactly 0 — `qty < 0` is
- * rejected, 0 is not — which stores arithmetic that turns any quantity into
- * nothing.
- */
-async function validateEmbeddedConversions(req, body) {
-  const rows = [];
-  (Array.isArray(body?.variants) ? body.variants : []).forEach((v, i) => {
-    (Array.isArray(v?.unitConversions) ? v.unitConversions : []).forEach((uc, j) => {
-      rows.push({ where: `variants[${i}].unitConversions[${j}]`, uc });
-    });
-  });
-  /* The product-level fields reach the same stored factors. */
-  if (body?.unitConversion) rows.push({ where: "unitConversion", uc: body.unitConversion });
-  (Array.isArray(body?.unitConversions) ? body.unitConversions : []).forEach((uc, j) => {
-    rows.push({ where: `unitConversions[${j}]`, uc });
-  });
-  if (!rows.length) return { ok: true };
 
-  for (const { where, uc } of rows) {
-    const qty = Number(uc?.quantity);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      return {
-        ok: false,
-        message: `${where} needs a conversion factor greater than zero.`,
-        details: { field: where, reason: "INVALID_FACTOR" },
-      };
-    }
-    const name = String(uc?.toUnit || "").trim();
-    if (!name) {
-      return { ok: false, message: `${where} names no target unit.`, details: { field: where, reason: "TARGET_MISSING" } };
-    }
-    const known = await Unit.findOne(scoped(req, {
-      name: new RegExp(`^${escapeRegex(name)}$`, "i"),
-    })).select("_id").lean();
-    if (!known) {
-      /* Another company's unit answers exactly as one that does not exist. */
-      return {
-        ok: false,
-        message: `${where} refers to a unit this company does not have: "${name}".`,
-        details: { field: where, reason: "TARGET_NOT_FOUND" },
-      };
-    }
-  }
-  return { ok: true };
-}
-
-/**
- * A supplier reference submitted with an item.
- *
- * This used to check that the id existed — `Vendor.find({_id: {$in: ids}})`.
- * Existence is not ownership: every id in that global table "exists" for every
- * company, so the check confirmed only that somebody, somewhere, had a
- * supplier by that id. Until Vendor records say whose they are, a reference
- * cannot be established at all, and the honest answer is that the dependency
- * is missing — not that the supplier was not found.
- */
-async function validateEmbeddedVendors(req, body) {
-  const named = [];
-  const ids = [];
-  (Array.isArray(body?.variants) ? body.variants : []).forEach((v, i) => {
-    (Array.isArray(v?.vendorNicknames) ? v.vendorNicknames : []).forEach((vn, j) => {
-      named.push(`variants[${i}].vendorNicknames[${j}]`);
-      if (vn?.vendor) ids.push(vn.vendor);
-    });
-  });
-  if (!named.length) return { ok: true };
-
-  /* Existence was never the question — every id in a global table "exists"
-     for everybody. This asks whether the supplier is THIS company's, and
-     whether it is in a state that may be newly assigned. */
-  const resolved = await resolveSuppliers(req, ids);
-  if (!resolved.ok) return { ok: false, ...resolved, fields: named };
-  return { ok: true }
-}
-
-/** A user's search text is data, not a pattern. */
-const escapeRegex = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -462,28 +303,8 @@ const matchExistingVariant = (incoming, existingList) => {
   return null;
 };
 
-const normaliseVariantNicknames = (incoming) => {
-  if (!Array.isArray(incoming)) return null;
-  return incoming
-    .filter(vn => vn && vn.vendor && vn.nickname && vn.nickname.toString().trim())
-    .map(vn => ({
-      _id: vn._id && mongoose.Types.ObjectId.isValid(vn._id) ? vn._id : undefined,
-      /* A read hands back a NAMED supplier (see resolveAliasVendors), and a
-         form that round-trips an untouched row sends that object straight
-         back. Take the id out of either shape rather than relying on the
-         cast to find `_id` inside an object it was not given. */
-      vendor: vn.vendor && typeof vn.vendor === "object" && vn.vendor._id
-        ? vn.vendor._id
-        : vn.vendor,
-      nickname: vn.nickname.toString().trim(),
-      price: parseFloat(vn.price) || 0,
-      deliveryDays: parseInt(vn.deliveryDays) || 0,
-      notes: (vn.notes || "").toString().trim(),
-      specifications: Array.isArray(vn.specifications)
-        ? vn.specifications.filter(s => s.key && s.key.trim()).map(s => ({ key: s.key.trim(), value: (s.value || "").trim() }))
-        : []
-    }));
-};
+/* normaliseVariantNicknames is imported from rawItemPayload.service.js
+   (its object-shaped vendor fix now lives there — 27 Sep 2026). */
 
 // Map of unit name → { baseUnit, conversions: [{toUnit, factor}] }, resolved
 // from the Unit master — the SAME source R&D's raw-item unit picker reads
@@ -528,19 +349,6 @@ async function buildUnitConversionsMap(req) {
   }
 }
 
-// Normalise unitConversion input → returns object or null
-const normaliseUnitConversion = (uc) => {
-  if (!uc || !uc.toUnit || uc.quantity === undefined || uc.quantity === null || uc.quantity === "") {
-    return null;
-  }
-  const qty = parseFloat(uc.quantity);
-  if (isNaN(qty) || qty < 0) return null;
-  return {
-    fromUnit: (uc.fromUnit || "").toString().trim(),
-    toUnit: (uc.toUnit || "").toString().trim(),
-    quantity: qty
-  };
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET all raw items (pagination, search, filter)
@@ -551,6 +359,16 @@ router.get("/", canRead, async (req, res) => {
       search = "",
       status,
       category,
+      usedAs,
+      /* Catalogue-maintenance narrowing for the Materials register:
+         `setup=needed` keeps items missing classification, base unit or a
+         budget head; `budget=unmapped` keeps items whose budget head does not
+         resolve; `productType` narrows on the stored material type. All three
+         are applied HERE so pagination and counts stay honest — never as a
+         page-only cut in the browser. */
+      setup,
+      budget,
+      productType,
       page = 1,
       limit = 20
     } = req.query;
@@ -579,6 +397,14 @@ router.get("/", canRead, async (req, res) => {
     if (category) {
       clauses.push({ $or: [{ category }, { customCategory: category }] });
     }
+    /* Filter by the Store-owned "Used as" classification. Only recognised
+       values narrow; an unknown value is ignored rather than returning nothing. */
+    if (usedAs && isUsedAs(usedAs)) {
+      clauses.push({ usedAs: String(usedAs).trim().toUpperCase() });
+    }
+    if (typeof productType === "string" && productType.trim()) {
+      clauses.push({ productType: productType.trim() });
+    }
 
     const filter = { ...tenantContext.tenantFilter(req.tenant) };
     if (clauses.length) filter.$and = clauses;
@@ -599,6 +425,22 @@ router.get("/", canRead, async (req, res) => {
       rawItems = rawItems.filter(it => it.status === status);
     }
 
+    /* ── CATALOGUE SETUP, DECIDED ONCE ────────────────────────────────────
+       One category-mapping read per request; a failure leaves the budget fact
+       UNKNOWN (null) rather than "unmapped", and the response says so. */
+    let budgetMap = null;
+    try {
+      budgetMap = await require("../../../../services/itemBudgetHead.service")
+        .categoryMap(req.tenant?.companyId || null);
+    } catch (e) {
+      console.error("[raw-items] category budget map:", e);
+      budgetMap = null;
+    }
+    rawItems.forEach((it) => { it.setup = materialSetup.setupOf(it, budgetMap); });
+    if (setup === "needed") rawItems = rawItems.filter((it) => it.setup.needsSetup);
+    const budgetFilterApplied = budget === "unmapped" && Boolean(budgetMap);
+    if (budgetFilterApplied) rawItems = rawItems.filter((it) => it.setup.budgetUnmapped === true);
+
     const totalItems = rawItems.length;
     const paged = rawItems.slice(skip, skip + limitNum);
 
@@ -612,7 +454,7 @@ router.get("/", canRead, async (req, res) => {
     });
 
     const allForStats = await RawItem.find(scoped(req))
-      .select("quantity minStock variants")
+      .select("quantity minStock variants category customCategory usedAs unit customUnit budgetLedgerId")
       .lean();
 
     let total = 0, lowStock = 0, outOfStock = 0, totalVariants = 0;
@@ -641,6 +483,10 @@ router.get("/", canRead, async (req, res) => {
         outOfStock,
         totalVariants
       },
+      /* Company-wide catalogue-maintenance counts (not the filtered page).
+         `needBudgetMapping` is null when the mappings could not be read. */
+      setupCounts: materialSetup.countSetup(allForStats, budgetMap),
+      budgetFilter: budget === "unmapped" ? (budgetFilterApplied ? "applied" : "unavailable") : null,
       filters: {
         categories: RAW_ITEM_CATEGORIES,
         statuses: ["In Stock", "Low Stock", "Out of Stock"]
@@ -711,6 +557,180 @@ router.get("/data/categories", canRead, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET "Used as" options — the Store-owned classification vocabulary for the
+// create/edit form and the list filter. One source of truth: the same module
+// the model, the migration and the Merchandising pickers read.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/data/used-as", canRead, async (req, res) => {
+  const { USED_AS_VALUES: values, USED_AS_LABELS: labels } = require("../../../../models/CMS_Models/Inventory/Products/usedAs");
+  res.json({
+    success: true,
+    options: values.map((value) => ({ value, label: labels[value] })),
+    defaultValue: DEFAULT_USED_AS,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /data/budget-classification — which budget head an item is expected to
+// come out of, for the Store screens that must SHOW it.
+//
+// ── WHY THIS EXISTS AT ALL ──────────────────────────────────────────────────
+// The resolver, the category mappings, the item overrides and the whole
+// commitment lifecycle have existed for several chunks, and the person adding
+// the item could not see any of it. They filled in a category with no idea
+// that the choice decides which budget the purchase is later checked against,
+// and found out at Finance approval.
+//
+// ── WHY IT IS NOT THE FINANCE ROUTE ─────────────────────────────────────────
+// Everything on `Acc_chartOfAccounts` sits behind `accountantAuth` AND
+// `financeOnly` — owner, approver, admin or accountant. A storekeeper holds
+// none of those, and should not: mapping is Finance's decision. So this is a
+// READ, and a deliberately narrow one.
+//
+// ── WHAT IT DELIBERATELY DOES NOT RETURN ────────────────────────────────────
+// No ledger balances. No budget allocations, consumption or remaining figures.
+// No chart of accounts — a Store caller cannot enumerate heads through this,
+// only see the ONE their own item resolves to. No `setBy`/`setAt`: who made a
+// classification decision is Finance's record, and the Store screen has no
+// question it answers. And nothing here writes.
+//
+// Query: itemIds=a,b,c (capped) and/or category=Fabric
+// ─────────────────────────────────────────────────────────────────────────────
+const BUDGET_CLASSIFICATION_CAP = 100;
+
+/* ── CAN THIS PERSON ACTUALLY OPEN THE FINANCE SCREEN? ──────────────────────
+ * The form offers "Manage in Finance" only to someone who can reach it, and
+ * shows "Ask Finance to map this category" to everyone else. Guessing from
+ * the EMPLOYEE role would be wrong in both directions — the Finance surface
+ * is a separate session with its own roles, and a storekeeper who happens to
+ * be called "admin" in the employee directory still cannot open it.
+ *
+ * So the question is asked of the thing that actually decides: the accountant
+ * token, if this browser carries one, tested against the SAME role list
+ * `financeOnly` uses. No token, an expired one, or a role that is not on that
+ * list all answer `false` — and answering false only ever removes a link.
+ * Never throws: a malformed cookie is "not reachable", not a 500. */
+function financeSurfaceReachable(req) {
+  try {
+    const jwt = require("jsonwebtoken");
+    const raw = req.cookies?.accountant_token
+      || (String(req.headers.cookie || "").match(/accountant_token=([^;]+)/) || [])[1];
+    if (!raw) return false;
+    const decoded = jwt.verify(
+      decodeURIComponent(raw),
+      require("../../../../config/jwt").SECRET,
+    );
+    const role = String(decoded?.role || "");
+    /* The same four roles `financeOnly` accepts, plus the same permission
+       escape hatch. Kept identical on purpose: a link that appears for
+       someone the Finance route then refuses is worse than no link. */
+    return ["owner", "approver", "admin", "accountant"].includes(role)
+      || Boolean(decoded?.permissions?.canApprove);
+  } catch (_) {
+    return false;
+  }
+}
+
+router.get("/data/budget-classification", canRead, async (req, res) => {
+  try {
+    const itemBudgetHead = require("../../../../services/itemBudgetHead.service");
+    const companyId = req.tenant?.companyId || null;
+
+    const askedIds = String(req.query.itemIds || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const ids = [...new Set(askedIds)].slice(0, BUDGET_CLASSIFICATION_CAP);
+    const category = String(req.query.category || "").trim();
+
+    /* ── SCOPED HERE, NOT IN THE SERVICE ──────────────────────────────────
+       `resolveItemIds` is the FINANCE inspection path and reads the item
+       master unscoped, which it says so in its own comment. A Store caller
+       must not reach another company's item through an id-shaped parameter,
+       so the items are loaded through this router's own tenant filter and
+       only then handed to the resolver. Nothing is re-implemented: the
+       answer still comes from `headForItem`. */
+    let items = [];
+    if (ids.length) {
+      const queryable = ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+      const found = queryable.length
+        ? await RawItem.find(scoped(req, { _id: { $in: queryable } }))
+          .select("_id name category customCategory budgetLedgerId budgetLedgerName")
+          .lean()
+        : [];
+      const byId = new Map(found.map((i) => [String(i._id), i]));
+      const map = await itemBudgetHead.categoryMap(companyId);
+
+      /* One row per REQUESTED id, including ids this company holds no item
+         for — a caller that asked about 20 and receives 18 would read the
+         answer as complete. An id belonging to another company comes back
+         in exactly the same shape as one that does not exist; separating
+         them would confirm the other company holds it. */
+      items = ids.map((id) => {
+        const item = byId.get(id);
+        if (!item) {
+          return {
+            itemId: id,
+            found: false,
+            budgetLedgerId: null,
+            budgetLedgerName: null,
+            source: itemBudgetHead.SOURCE_NONE,
+            category: null,
+            message: "No item with this id.",
+          };
+        }
+        /* `customCategory` is in the projection above because the resolver
+           reads it: an item whose category was typed rather than picked
+           stores it there, and it inherits its mapping exactly like any
+           other. This comment previously claimed the opposite, and the claim
+           was the defect — the form previewed the typed value as a mapped
+           category and the saved item then resolved to nothing. */
+        const resolution = itemBudgetHead.headForItem(item, map);
+        return {
+          itemId: id,
+          found: true,
+          ...resolution,
+          budgetLedgerId: resolution.budgetLedgerId ? String(resolution.budgetLedgerId) : null,
+        };
+      });
+    }
+
+    /* The preview behind the Add-item form: what a NEW item in this category
+       would inherit. Resolved with no item override in hand, which is exactly
+       what "the category default" means — not a saved fact about any item. */
+    let categoryDefault = null;
+    if (category) {
+      const map = await itemBudgetHead.categoryMap(companyId);
+      /* Handed in as `customCategory`, because that is what an unsaved custom
+         category IS — and `customCategory || category` then makes the preview
+         and the saved item resolve through the identical path. A standard
+         category is the same string either way, so this is one code path for
+         both rather than a branch the two screens could drift across. */
+      const resolution = itemBudgetHead.headForItem({ customCategory: category }, map);
+      categoryDefault = {
+        ...resolution,
+        budgetLedgerId: resolution.budgetLedgerId ? String(resolution.budgetLedgerId) : null,
+      };
+    }
+
+    res.json({
+      success: true,
+      items,
+      categoryDefault,
+      /* Said rather than left to be inferred from a round number. */
+      capped: askedIds.length > BUDGET_CLASSIFICATION_CAP,
+      financeSurface: {
+        reachable: financeSurfaceReachable(req),
+        path: "/accountant/budgets/item-categories",
+      },
+    });
+  } catch (error) {
+    console.error("[raw-items] budget-classification:", error);
+    res.status(500).json({ success: false, message: "Budget classification could not be read." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /accountability — every stock movement across every raw item, for a date
 // range, with the totals and series the charts render.
 //
@@ -777,6 +797,24 @@ router.get("/accountability", canRead, async (req, res) => {
 // without an N+1 fetch per row. Registered BEFORE "/:id" for the same reason
 // as /accountability above.
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── THE CUSTOMERS A MATERIAL MAY BE THE PROPERTY OF ───────────────────────
+   Behind the catalogue read, because it exists to fill the item form's
+   "Owning customer" control and for nothing else. The rows are the same ones
+   the save accepts: the search applies the reach rule the validation applies,
+   so a customer offered here is never refused on save. */
+router.get("/data/customers", canRead, async (req, res) => {
+  try {
+    const customers = await materialOwnership.searchCustomers(req.tenant, {
+      q: req.query.search ?? req.query.q ?? "", limit: req.query.limit,
+    });
+    res.json({ success: true, customers });
+  } catch (error) {
+    if (error instanceof StorePurchaseError) return sendError(res, error);
+    console.error("Error searching owning customers:", error);
+    res.status(500).json({ success: false, message: "Server error while searching customers" });
+  }
+});
+
 router.get("/data/attributes-batch", canRead, async (req, res) => {
   try {
     const ids = String(req.query.ids || "")
@@ -834,174 +872,42 @@ router.get("/:id", canRead, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CREATE
-// ─────────────────────────────────────────────────────────────────────────────
+/* ── CREATE ────────────────────────────────────────────────────────────────
+   The rule itself now lives in `services/inventory/rawItemCreation.service`,
+   because the Development BOM's inline drawer registers the same master record
+   and a second copy of two hundred lines of validation, SKU minting and
+   opening-stock refusal would drift from this one without anybody noticing.
+
+   Nothing about this door's behaviour changed. It passes every section, so a
+   Store maintainer may still state supplier aliases, conversion factors,
+   discounts, attributes, variants and re-order levels — gated, as before, by
+   `payloadAuthority` on what the payload actually changes. And it passes
+   `onDuplicate: "allow"`, which is what this screen has always done: a
+   storekeeper can see the near-match in front of them and may have a reason to
+   register a second row. The near-match is now REPORTED alongside the created
+   item rather than discovered later. */
 router.post("/", ...canMaintain, payloadAuthority, async (req, res) => {
   try {
-    const {
-      name,
-      category,
-      customCategory,
-      unit,
-      customUnit,
-      minStock,
-      maxStock,
-      discounts,
-      attributes,
-      variants,
-      description,
-      notes
-    } = req.body;
-
-    // Validation
-    if (!name || !name.trim()) {
-      return res.status(400).json({ success: false, message: "Item name is required" });
-    }
-    if (!category && !customCategory) {
-      return res.status(400).json({ success: false, message: "Category is required" });
-    }
-    if (!unit && !customUnit) {
-      return res.status(400).json({ success: false, message: "Unit of measurement is required" });
-    }
-    if (minStock === undefined || isNaN(minStock) || minStock < 0) {
-      return res.status(400).json({ success: false, message: "Valid minimum stock is required" });
-    }
-    if (maxStock === undefined || isNaN(maxStock) || maxStock < 0) {
-      return res.status(400).json({ success: false, message: "Valid maximum stock is required" });
-    }
-    if (parseFloat(minStock) >= parseFloat(maxStock)) {
-      return res.status(400).json({ success: false, message: "Maximum stock must be greater than minimum stock" });
-    }
-
-    if (attributes && Array.isArray(attributes)) {
-      for (let attr of attributes) {
-        if (!attr.name || !attr.name.trim()) {
-          return res.status(400).json({ success: false, message: "Attribute name is required" });
-        }
-        if (!attr.values || !Array.isArray(attr.values) || attr.values.length === 0) {
-          return res.status(400).json({ success: false, message: `Attribute "${attr.name}" must have at least one value` });
-        }
-      }
-    }
-
-    // Generate SKU
-    const nameWords = name.trim().split(' ');
-    const nameCode = nameWords.map(word => word.substring(0, 3).toUpperCase()).join('');
-    const finalCategory = customCategory?.trim() || category;
-    const categoryCode = finalCategory.substring(0, 3).toUpperCase();
-    const randomNum = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
-    const sku = `RAW-${categoryCode}-${nameCode}-${randomNum}`;
-
-    /* Company-scoped: two companies may legitimately hold the same code. */
-    const existingItem = await RawItem.findOne(scoped(req, { sku }));
-    if (existingItem) {
-      return res.status(400).json({ success: false, message: "An item with similar SKU already exists. Please try again." });
-    }
-
-    const convCheck = await validateEmbeddedConversions(req, req.body);
-    if (!convCheck.ok) {
-      return sendError(res, fail("VALIDATION", convCheck.message, convCheck.details));
-    }
-    const vendorCheck = await validateEmbeddedVendors(req, req.body);
-    if (!vendorCheck.ok) {
-      /* Refused whole. Silently dropping the supplier fields would save an
-         item the caller believes has a supplier on it. */
-      return res.status(vendorCheck.status).json({
-        success: false, code: vendorCheck.code, message: vendorCheck.message,
-        fields: vendorCheck.fields, ...(vendorCheck.details || {}),
-      });
-    }
-
-    // Process variants — accept image + per-variant vendorNicknames
-    let processedVariants = [];
-    if (variants && Array.isArray(variants)) {
-      processedVariants = variants.map(variant => {
-        const out = {
-          combination: variant.combination || [],
-          quantity: parseFloat(variant.quantity) || 0,
-          minStock: parseFloat(variant.minStock) || parseFloat(minStock) || 0,
-          maxStock: parseFloat(variant.maxStock) || parseFloat(maxStock) || 0,
-          sku: variant.sku || "",
-          image: variant.image || "",
-          unitConversions: (Array.isArray(variant.unitConversions) ? variant.unitConversions : [])
-            .map(uc => normaliseUnitConversion(uc)).filter(Boolean)
-        };
-        const nks = normaliseVariantNicknames(variant.vendorNicknames);
-        if (nks) out.vendorNicknames = nks;
-        return out;
-      });
-    }
-
-    /* ── AN ITEM IS CREATED EMPTY ─────────────────────────────────────────
-     * This used to sum the variants' quantities into an opening balance and
-     * save it with no stock transaction (S12): stock existed with nothing
-     * anywhere explaining where it came from, and it could never be
-     * reconciled because there was no movement to reconcile against.
-     *
-     * The quantity is REFUSED rather than dropped. Silently ignoring it would
-     * leave the operator looking at a form they filled in, a success message,
-     * and a shelf that never changed — the worst of the three options. Opening
-     * stock is a stock adjustment, and it goes through the path that records
-     * one. */
-    const openingQuantities = processedVariants
-      .map((v, i) => ({ i, q: Number(v.quantity) || 0 }))
-      .filter((x) => x.q > 0);
-    if (openingQuantities.length || (Number(req.body.quantity) || 0) > 0) {
-      return sendError(res, fail(
-        "VALIDATION",
-        "An item is created with no stock. Record the opening balance as a stock adjustment, so the movement is on the record.",
-        {
-          reason: "OPENING_QUANTITY_NOT_ACCEPTED",
-          variantRows: openingQuantities.map((x) => x.i + 1),
-        },
-      ));
-    }
-    processedVariants.forEach((v) => { v.quantity = 0; });
-
-    const newRawItem = new RawItem({
-      /* Ownership from the resolved context ONLY — never from the payload. */
-      ...tenantContext.stamp(req.tenant),
-      name: name.trim(),
-      sku: sku.toUpperCase(),
-      category: customCategory ? "" : (category || ""),
-      customCategory: customCategory || "",
-      unit: customUnit ? "" : (unit || ""),
-      customUnit: customUnit || "",
-      quantity: 0,
-      minStock: parseFloat(minStock),
-      maxStock: parseFloat(maxStock),
-      discounts: discounts && Array.isArray(discounts)
-        ? discounts
-            .filter(d => d.minQuantity && d.price && !isNaN(d.minQuantity) && !isNaN(d.price))
-            .map(d => ({
-              minQuantity: parseFloat(d.minQuantity),
-              price: parseFloat(d.price)
-            }))
-        : [],
-      attributes: attributes && Array.isArray(attributes)
-        ? attributes
-            .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
-            .map(attr => ({
-              name: attr.name.trim(),
-              values: attr.values.filter(val => val && val.trim())
-            }))
-        : [],
-      variants: processedVariants,
-      description: description ? description.trim() : "",
-      notes: notes ? notes.trim() : "",
-      createdBy: req.user.id
+    const { rawItem, duplicate } = await rawItemCreation.createRawItem({
+      /* Company and actor from the resolved context only. */
+      tenant: req.tenant,
+      actorId: req.user.id,
+      payload: req.body,
+      sections: rawItemCreation.STORE_SECTIONS,
+      onDuplicate: "allow",
     });
-
-    await newRawItem.save();
 
     res.status(201).json({
       success: true,
       message: "Raw item registered successfully",
-      rawItem: newRawItem
+      rawItem,
+      /* Present only when this company already holds a material of the same
+         name, class and unit. The screen may say so; nothing was blocked. */
+      ...(duplicate ? { duplicate } : {}),
     });
 
   } catch (error) {
+    if (error instanceof StorePurchaseError) return sendError(res, error);
     console.error("Error creating raw item:", error);
     if (error.code === 11000) {
       return res.status(400).json({ success: false, message: "Item with this SKU already exists" });
@@ -1030,6 +936,8 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       name,
       category,
       customCategory,
+      usedAs,
+      customsTariffCode,
       unit,
       customUnit,
       quantity,
@@ -1039,7 +947,9 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       attributes,
       variants,
       description,
-      notes
+      notes,
+      defaultOwnership,
+      owningCustomerId,
     } = req.body;
 
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }));
@@ -1123,6 +1033,28 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
         rawItem.category = category.trim();
         rawItem.customCategory = "";
       }
+    }
+
+    /* Store-owned classification. Assigned only when a recognised value is
+       sent; an unknown value leaves the current one alone rather than silently
+       resetting it to NOT_CLASSIFIED. */
+    if (usedAs !== undefined && isUsedAs(usedAs)) {
+      rawItem.usedAs = String(usedAs).trim().toUpperCase();
+    }
+
+    /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
+       Read only when the payload speaks about it (absent keys are "not part
+       of this edit"). The rule returns the two catalogue fields and their
+       snapshot and nothing else, and those are the only fields assigned here:
+       no lot, receipt, balance or movement is touched, because none of them
+       read this default — each decided its owner when it was written. */
+    if (defaultOwnership !== undefined || owningCustomerId !== undefined) {
+      const ownership = await materialOwnership.resolveOwnership(req.tenant, {
+        stored: rawItem, payload: { defaultOwnership, owningCustomerId },
+      });
+      rawItem.defaultOwnership = ownership.defaultOwnership;
+      rawItem.owningCustomerId = ownership.owningCustomerId;
+      rawItem.owningCustomer = ownership.owningCustomer;
     }
 
     if (unit !== undefined || customUnit !== undefined) {
@@ -1351,6 +1283,10 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
 
     if (description !== undefined) rawItem.description = description ? description.trim() : "";
     if (notes !== undefined) rawItem.notes = notes ? notes.trim() : "";
+    /* Only when the body says something about it. An absent key is "not part
+       of this edit"; an empty string is somebody clearing the classification,
+       and the two are different intentions. */
+    if (customsTariffCode !== undefined) rawItem.customsTariffCode = tariffCode(customsTariffCode);
 
     rawItem.updatedBy = req.user.id;
     await rawItem.save();

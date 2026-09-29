@@ -1,0 +1,175 @@
+# deploy/mautic/gateway/mautic-gateway.conf.template
+#
+# THE ALLOWLIST GATEWAY IN FRONT OF MAUTIC'S API.
+#
+# ── WHAT THIS CONTAINS THAT MAUTIC CANNOT ──────────────────────────────────
+# Mautic 7.2.0 authorises `POST /api/emails/{id}/send` with the same `view`
+# grant that authorises `GET /api/emails` — its own controller calls
+# `checkEntityAccess($entity)` and that helper defaults to the `view` action. A
+# form's submissions, which are real contact identities, are gated the same way.
+# There is therefore no Mautic role that can read the content estate and cannot
+# send mail from it.
+#
+# GRAV's client is GET-only against a closed table, which stops GRAV from doing
+# it by accident. It does nothing about a STOLEN CREDENTIAL, which is what this
+# file is for.
+#
+# ── DENY BY DEFAULT, AND THE LANE IS THE CREDENTIAL ────────────────────────
+# Three credentials, three policies, and nothing outside a policy is proxied.
+# The lane is chosen by the Authorization header's VALUE, not by a port, a path
+# or a header a caller picks — because a thief chooses those too. The content
+# credential cannot reach a send endpoint through this gateway by any route,
+# because no route through this gateway lets that credential POST anything.
+#
+# ── AND MAUTIC HAS NO OTHER DOOR ───────────────────────────────────────────
+# The `mautic` service publishes no host port. This container is the only member
+# of the compose network that does. A caller on the host cannot reach Mautic's
+# :80 at all, so this is not a proxy somebody can decline to use.
+
+# The map keys are whole `Basic <base64>` header values, which are longer than
+# nginx's default 64-byte hash bucket. Raised here rather than shortening the
+# key, because the key is the credential and truncating it would be matching a
+# prefix.
+map_hash_bucket_size 256;
+map_hash_max_size 2048;
+
+# Base64 of `user:password` per lane, substituted from the environment at
+# start-up. Never logged, never returned, never sent to a browser.
+map $http_authorization $lane {
+    default                            "unknown";
+    "Basic ${GATEWAY_CONTENT_AUTH}"    "content";
+    "Basic ${GATEWAY_OPERATIONAL_AUTH}" "operational";
+    "Basic ${GATEWAY_ADMIN_AUTH}"      "admin";
+}
+
+# ── THE ONLY QUERY PARAMETERS THE CONTENT LANE MAY SEND ────────────────────
+# Pagination, ordering and the minimal projection. Anything else is refused
+# rather than forwarded: `where[0][col]=...` is how a list endpoint becomes a
+# search endpoint, and a search over emails is a different capability from
+# listing them.
+map $args $content_args_ok {
+    default                                                        0;
+    ""                                                             1;
+    "~^(?:(?:start|limit|orderBy|orderByDir|minimal)=[A-Za-z0-9_]+)(?:&(?:start|limit|orderBy|orderByDir|minimal)=[A-Za-z0-9_]+)*$" 1;
+}
+
+# Whether the content lane may proceed: right lane, permitted arguments.
+map "$lane:$content_args_ok" $content_allowed {
+    default        0;
+    "content:1"    1;
+    "admin:1"      1;
+}
+
+# ── NO ARGUMENT ALLOWLIST ON THE OPERATIONAL LANE ──────────────────────────
+# Contact lookup genuinely needs Mautic's `where[0][col]=...` filter syntax, and
+# an allowlist expressive enough to permit that is not a meaningful restriction —
+# it would accept anything the filter grammar can express, which is the whole
+# query surface. The control on this lane is the PATH allowlist below plus the
+# operational role's own Mautic permissions, which grant no content access at
+# all. The content lane, where the restriction actually buys something, keeps its
+# strict parameter list.
+
+upstream mautic_upstream {
+    server mautic:80;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    # Bodies are small API payloads. A 10 MB POST to a marketing API is not a
+    # marketing API call.
+    client_max_body_size 1m;
+
+    # The gateway's own liveness, answered without touching Mautic.
+    location = /gateway-health {
+        access_log off;
+        add_header Content-Type application/json always;
+        return 200 '{"gateway":"ok"}';
+    }
+
+    # ═══ THE CONTENT LANE ═══════════════════════════════════════════════════
+    #
+    # Exactly three collection paths, GET only. `location =` is an EXACT match,
+    # so `/api/emails/1/send`, `/api/emails/new` and `/api/forms/1/submissions`
+    # do not match here — they fall through to the deny-all below.
+
+    location = /api/emails {
+        limit_except GET { deny all; }
+        if ($content_allowed = 0) { return 403 '{"error":"gateway_denied","reason":"This credential may not read emails with those parameters."}'; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    location = /api/forms {
+        limit_except GET { deny all; }
+        if ($content_allowed = 0) { return 403 '{"error":"gateway_denied","reason":"This credential may not read forms with those parameters."}'; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    location = /api/pages {
+        limit_except GET { deny all; }
+        if ($content_allowed = 0) { return 403 '{"error":"gateway_denied","reason":"This credential may not read landing pages with those parameters."}'; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    # ═══ THE OPERATIONAL LANE ═══════════════════════════════════════════════
+    #
+    # The exact paths contact projection, segment enrolment, campaign membership
+    # and the acquisition hold already use — no more. Written as anchored
+    # regular expressions so an id is an id and not a path segment carrying a
+    # second route behind it.
+    #
+    # The content credential is refused here. It has no business writing a
+    # contact, and this is the half of the rule that keeps the two lanes from
+    # collapsing into one.
+
+    location ~ "^/api/(contacts|segments|campaigns|fields/contact|hooks)(/[0-9]+)?(/(new|edit|segments|campaigns|companies|dnc/[a-z]+/(add|remove)|contact/[0-9]+/(add|remove)))?$" {
+        if ($lane = "content")     { return 403 '{"error":"gateway_denied","reason":"The content reader credential may not use operational endpoints."}'; }
+        if ($lane = "unknown")     { return 401 '{"error":"gateway_unauthenticated","reason":"No recognised GRAV credential was presented."}'; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    # OAuth token exchange, when the deployment uses OAuth rather than basic.
+    # Kept for the operational client only; the content lane is basic-only by
+    # design, because a rotating bearer token cannot be mapped to a lane.
+    location = /oauth/v2/token {
+        limit_except POST { deny all; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    # ═══ THE ADMIN LANE ═════════════════════════════════════════════════════
+    #
+    # Provisioning: roles, users, custom fields, webhooks, the test email and
+    # the test segment. Only the admin credential reaches it, and GRAV never
+    # holds that credential — `scripts/marketing/mautic-provision-dev.js` reads
+    # it from the deployment env at provisioning time and the application does
+    # not.
+
+    # A PLAIN prefix, not `^~`. `^~` tells nginx to stop before evaluating regex
+    # locations, which would make this catch-all swallow the operational lane
+    # above it — the deny-all would have won every match and the integration
+    # would have gone dark. Plain prefix is evaluated last, which is what a
+    # catch-all must be.
+    location /api/ {
+        if ($lane != "admin") { return 403 '{"error":"gateway_denied","reason":"This endpoint is not on the GRAV allowlist."}'; }
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+
+    # ═══ EVERYTHING ELSE: MAUTIC'S OWN INTERFACE ════════════════════════════
+    #
+    # The login page, the admin UI, its assets and media. A human's browser with
+    # a Mautic session, which is a different surface from the API and is not
+    # what this gateway exists to constrain. It carries no Authorization header,
+    # so it is lane `unknown` and every `/api/` rule above already refuses it.
+
+    location / {
+        proxy_pass http://mautic_upstream;
+        include /etc/nginx/conf.d/proxy-headers.inc;
+    }
+}

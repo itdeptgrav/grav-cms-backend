@@ -180,14 +180,15 @@ function invalidateEmpListCache() {
   _empListCacheExp = 0;
 }
 
+/* SEC-1: the directory is an ALLOWLIST projection (services/
+   coworkEmployeeProjection.js). It used to be the whole document minus
+   `tempPassword`, which carried the stored Gmail refresh token, authUid and
+   push tokens to every caller. The cache holds the projected rows only. */
 async function listCoworkEmployees() {
   if (_empListCache && Date.now() < _empListCacheExp) return _empListCache;
+  const { directoryEntryFromSnapshot } = require("./coworkEmployeeProjection");
   const snap = await db.collection("cowork_employees").orderBy("createdAt", "desc").get();
-  const result = snap.docs.map(d => {
-    const data = { id: d.id, ...d.data() };
-    delete data.tempPassword;
-    return data;
-  });
+  const result = snap.docs.map(directoryEntryFromSnapshot);
   _empListCache = result;
   _empListCacheExp = Date.now() + EMP_LIST_TTL;
   return result;
@@ -422,9 +423,11 @@ async function getCoworkGroup(groupId) {
         db.collection("cowork_employees").doc(id).get()
       );
       const memberDocs = await Promise.all(memberPromises);
+      // SEC-1: members are other people — directory projection only.
+      const { directoryEntryFromSnapshot } = require("./coworkEmployeeProjection");
       group.members = memberDocs
         .filter(doc => doc.exists)
-        .map(doc => ({ id: doc.id, ...doc.data() }));
+        .map(directoryEntryFromSnapshot);
     }
 
     return group;

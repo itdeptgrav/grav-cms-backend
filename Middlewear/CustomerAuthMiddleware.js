@@ -12,15 +12,14 @@
 // enforce email-match) AND the public /forgot-password flow (where the
 // user has no session yet).
 //
-// ⚠️ JWT_SECRET fallback aligns with the Customer model's
-// generateAuthToken() — both use "grav_clothing_secret_key" so dev
-// without env vars still works. In prod with JWT_SECRET set, fallback
-// is irrelevant.
+// SEC-0 (25 Sep 2026): signer (Customer.generateAuthToken) and verifier both
+// use config/jwt's SECRET. The published fallback literal is gone; there is no
+// secret this file knows other than the configured one.
 // ─────────────────────────────────────────────────────────────────────────
 
 const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
+const { SECRET: JWT_SECRET } = require("../config/jwt"); // SEC-0: configured secret only
 const COOKIE_NAME = "customerToken";
 
 function decodeIfPresent(req) {

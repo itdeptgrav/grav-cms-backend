@@ -37,7 +37,7 @@
 
 const jwt = require("jsonwebtoken");
 
-const { SECRET, LEGACY_SECRETS, readToken } = require("../config/jwt");
+const { verifyCmsToken, readToken } = require("../config/jwt");
 const { getRole } = require("./departmentRoles");
 const Employee = require("../models/Employee");
 
@@ -62,11 +62,9 @@ function decodeCaller(req) {
 
   let decoded = null;
   try {
-    decoded = jwt.verify(token, SECRET);
+    decoded = verifyCmsToken(token); // SEC-0: configured secret only
   } catch {
-    for (const legacy of LEGACY_SECRETS) {
-      try { decoded = jwt.verify(token, legacy); break; } catch { /* next */ }
-    }
+    decoded = null;
   }
   if (!decoded) return null;
 
@@ -140,18 +138,26 @@ async function emailFromId(id) {
 const VIEWER_TTL_MS = 60 * 1000;
 const viewerCache = new Map();
 
-function cacheGet(key) {
+/* GAC-2 correction: an entry is served only while the shared grant revision
+   is the one it was stored under (services/access/grantRevision.js), so a QC
+   role change made in another process — or whose invalidateViewer() call
+   failed — is seen on the next request, not a minute later. An unreadable
+   revision is a miss. */
+async function cacheGet(key) {
   const hit = viewerCache.get(key);
   if (!hit) return null;
   if (Date.now() - hit.at > VIEWER_TTL_MS) { viewerCache.delete(key); return null; }
+  const { cacheEntryIsCurrent } = require("./access/grantRevision");
+  if (!await cacheEntryIsCurrent(hit)) { viewerCache.delete(key); return null; }
   return hit.value;
 }
 
-function cacheSet(key, value) {
+function cacheSet(key, value, revision) {
+  if (revision === null || revision === undefined) return; // revision unreadable: do not cache
   // Bounded so a long-running process cannot accumulate an entry per person
   // seen since boot.
   if (viewerCache.size > 500) viewerCache.clear();
-  viewerCache.set(key, { at: Date.now(), value });
+  viewerCache.set(key, { at: Date.now(), value, revision });
 }
 
 /** Drop cached identity — all of it, or one person's. */
@@ -188,12 +194,15 @@ async function resolveViewer(req) {
 
   // The two lookups below are what the cache is for — see its note above.
   const cacheKey = `v:${String(caller.email || "").toLowerCase()}`;
-  const cached = caller.email ? cacheGet(cacheKey) : null;
+  const cached = caller.email ? await cacheGet(cacheKey) : null;
 
   let role = cached ? cached.role : null;
   let biometricId = cached ? cached.biometricId : "";
 
   if (!cached) {
+    // Stamped BEFORE the reads, so a grant that lands mid-lookup leaves this
+    // entry behind the current revision and it is never served.
+    const revision = await require("./access/grantRevision").revisionForNewEntry();
     // Both are independent reads, so they go together rather than in sequence.
     const [roleResult, empResult] = await Promise.allSettled([
       getRole(SLUG, caller.email),
@@ -208,7 +217,7 @@ async function resolveViewer(req) {
     if (empResult.status === "fulfilled") biometricId = empResult.value?.biometricId || "";
     else console.warn("[qc viewer] employee lookup failed:", empResult.reason?.message);
 
-    if (caller.email) cacheSet(cacheKey, { role, biometricId });
+    if (caller.email) cacheSet(cacheKey, { role, biometricId }, revision);
   }
 
   return {
@@ -271,13 +280,14 @@ function applyViewerFilter(filter, clause) {
 
 /** Has anybody been granted a QC role yet? Decides the unconfigured case above. */
 async function departmentConfigured() {
-  const cached = cacheGet("configured");
+  const cached = await cacheGet("configured");
   if (cached !== null) return cached.value;
+  const revision = await require("./access/grantRevision").revisionForNewEntry();
   try {
     const { listRoles } = require("./departmentRoles");
     const rows = await listRoles(SLUG);
     const value = rows.length > 0;
-    cacheSet("configured", { value });
+    cacheSet("configured", { value }, revision);
     return value;
   } catch {
     // Unknown — assume configured, which is the more restrictive answer. Not

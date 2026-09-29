@@ -36,6 +36,20 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 const auth = accountantAuth;
 
@@ -97,7 +111,7 @@ function cleanGstin(g) {
 /* ------------------------------------------------------------------ */
 /* GET /merge/ledger-suggestions?companyId=&minScore=0.82             */
 /* ------------------------------------------------------------------ */
-router.get("/ledger-suggestions", auth, async (req, res) => {
+router.get("/ledger-suggestions", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -220,7 +234,7 @@ router.get("/ledger-suggestions", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GET /merge/stock-suggestions?companyId=&minScore=0.85              */
 /* ------------------------------------------------------------------ */
-router.get("/stock-suggestions", auth, async (req, res) => {
+router.get("/stock-suggestions", auth, companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -310,7 +324,7 @@ router.get("/stock-suggestions", auth, async (req, res) => {
 /* POST /merge/ledgers                                                 */
 /*   { companyId, survivorId, ghostIds:[...], confirm:"MERGE" }        */
 /* ------------------------------------------------------------------ */
-router.post("/ledgers", auth, async (req, res) => {
+router.post("/ledgers", auth, companyScope, async (req, res) => {
   try {
     const { companyId, survivorId, ghostIds, confirm } = req.body || {};
     if (confirm !== "MERGE")
@@ -404,7 +418,7 @@ router.post("/ledgers", auth, async (req, res) => {
 /* POST /merge/stock-items                                             */
 /*   { companyId, survivorId, ghostIds:[...], confirm:"MERGE" }        */
 /* ------------------------------------------------------------------ */
-router.post("/stock-items", auth, async (req, res) => {
+router.post("/stock-items", auth, companyScope, async (req, res) => {
   try {
     const { companyId, survivorId, ghostIds, confirm } = req.body || {};
     if (confirm !== "MERGE")
@@ -483,7 +497,7 @@ router.post("/stock-items", auth, async (req, res) => {
 /* POST /merge/add-alias                                               */
 /*   { companyId, kind:"ledger"|"stock", id, alias }                   */
 /* ------------------------------------------------------------------ */
-router.post("/add-alias", auth, async (req, res) => {
+router.post("/add-alias", auth, companyScope, async (req, res) => {
   try {
     const { companyId, kind, id, alias } = req.body || {};
     if (!companyId || !kind || !id || !alias)

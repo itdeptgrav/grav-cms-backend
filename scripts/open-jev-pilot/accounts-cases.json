@@ -1,0 +1,64 @@
+{
+  "schema": "grav.openjev.accounts-cases/1",
+  "note": "Privacy-safe evaluation set for the Jev-only Accounts pilot. Every ledger, party and figure here is invented. No real business name, GSTIN, PAN or amount appears in this file, and none may be added to it: the fixtures are committed and the telemetry derived from them is shared.",
+  "actors": {
+    "accountant": { "label": "authorised accounting user", "tools": ["acc_ledger_balance", "acc_financials", "acc_company", "acc_vouchers"] },
+    "outsider": { "label": "no accounting access", "tools": [] }
+  },
+  "cases": [
+    { "id": "en_ledger_plain", "actor": "accountant", "question": "What is the balance of Ariel Fabrics?", "expect": "acc_ledger_balance", "outcome": "answered", "family": "natural-english" },
+    { "id": "en_ledger_terse", "actor": "accountant", "question": "Ariel Fabrics balance?", "expect": "acc_ledger_balance", "outcome": "answered", "family": "natural-english" },
+    { "id": "en_ledger_owed", "actor": "accountant", "question": "how much does Ariel Fabrics owe us", "expect": "acc_ledger_balance", "outcome": "answered", "family": "natural-english" },
+    { "id": "en_bank", "actor": "accountant", "question": "how much is in the current account", "expect": "acc_ledger_balance", "outcome": "answered", "family": "natural-english", "why": "names ONE bank ledger, so it has a single answer — the contrast with hi_paisa_bacha is the point" },
+
+    { "id": "hi_kitna_balance", "actor": "accountant", "question": "Ariel Fabrics ka balance kitna hai", "expect": "acc_ledger_balance", "outcome": "answered", "family": "hinglish" },
+    { "id": "hi_paisa_bacha", "actor": "accountant", "question": "bank me kitna paisa bacha hai", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "hinglish", "why": "routing is right; the company has more than one bank ledger, so 'how much is in the bank' has no single answer and the pilot asks which" },
+    { "id": "hi_kitna_dena", "actor": "accountant", "question": "humko Ariel Fabrics ko kitna dena hai", "expect": "acc_ledger_balance", "outcome": "answered", "family": "hinglish" },
+    { "id": "hi_profit", "actor": "accountant", "question": "is saal ka profit kitna hua", "expect": "acc_financials", "outcome": "answered", "family": "hinglish" },
+
+    { "id": "abbr_pl", "actor": "accountant", "question": "p&l this year", "expect": "acc_financials", "outcome": "answered", "family": "abbreviation" },
+    { "id": "abbr_bs", "actor": "accountant", "question": "b/s totals", "expect": "acc_financials", "outcome": "answered", "family": "abbreviation" },
+    { "id": "abbr_ac", "actor": "accountant", "question": "Ariel Fabrics a/c bal", "expect": "acc_ledger_balance", "outcome": "answered", "family": "abbreviation" },
+    { "id": "abbr_gstin", "actor": "accountant", "question": "our gstin?", "expect": "acc_company", "outcome": "answered", "family": "abbreviation" },
+    { "id": "abbr_fy", "actor": "accountant", "question": "which fy are we in", "expect": "acc_company", "outcome": "answered", "family": "abbreviation" },
+
+    { "id": "miss_balnce", "actor": "accountant", "question": "wat is the balnce of Ariel Fabrcs", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "misspelling", "why": "the ledger name is misspelled, so the resolver falls back to fuzzy matching and the pilot must ask rather than guess" },
+    { "id": "miss_creditrs", "actor": "accountant", "question": "show me sundry creditrs", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "misspelling" },
+    { "id": "miss_mishear", "actor": "accountant", "question": "sundry daughters balance", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "misspelling", "why": "a mis-heard group name; the resolver maps it, but it resolves to a group of many ledgers, not one" },
+
+    { "id": "amb_two_parties", "actor": "accountant", "question": "what is Ariel's balance", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "ambiguous-ledger", "why": "two invented parties share the first word" },
+    { "id": "amb_no_subject", "actor": "accountant", "question": "what's the balance", "expect": "clarify", "outcome": "clarified", "family": "ambiguous-ledger" },
+    { "id": "amb_which_account", "actor": "accountant", "question": "account balance please", "expect": "clarify", "outcome": "clarified", "family": "ambiguous-ledger" },
+
+    { "id": "unknown_ledger", "actor": "accountant", "question": "balance of Thornfield Mills", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "unknown-ledger", "why": "no such ledger exists; the pilot says so and asks for the exact name" },
+
+    { "id": "group_debtors", "actor": "accountant", "question": "sundry debtors balance", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "group-vs-ledger", "why": "a GROUP, not one ledger — 'the balance' has no single answer" },
+    { "id": "group_vs_party", "actor": "accountant", "question": "Ariel Fabrics balance, not the whole debtors group", "expect": "acc_ledger_balance", "outcome": "answered", "family": "group-vs-ledger" },
+    { "id": "group_bank_accounts", "actor": "accountant", "question": "bank accounts group total", "expect": "acc_ledger_balance", "outcome": "clarified", "family": "group-vs-ledger" },
+
+    { "id": "unauth_ledger", "actor": "outsider", "question": "What is the balance of Ariel Fabrics?", "expect": "not_offered", "outcome": "no_pilot", "family": "unauthorised", "why": "no accounting candidate is offered, so no probability can route them into one; the pilot returns null and the ordinary assistant handles it" },
+    { "id": "unauth_financials", "actor": "outsider", "question": "what is our profit this year", "expect": "not_offered", "outcome": "no_pilot", "family": "unauthorised" },
+
+    { "id": "zero_balance", "actor": "accountant", "question": "balance of Petty Cash Unit 2", "expect": "acc_ledger_balance", "outcome": "answered", "family": "zero-balance", "why": "a real ledger that nets to zero must be reported as zero, not as 'not found'" },
+
+    { "id": "drcr_debit", "actor": "accountant", "question": "balance of Ariel Fabrics", "expect": "acc_ledger_balance", "outcome": "answered", "family": "dr-cr", "why": "a debit balance must read Dr" },
+    { "id": "drcr_credit", "actor": "accountant", "question": "balance of Bramble Supplies", "expect": "acc_ledger_balance", "outcome": "answered", "family": "dr-cr", "why": "a credit balance must read Cr" },
+
+    { "id": "voucher_count_all", "actor": "accountant", "question": "how many sales vouchers", "expect": "acc_vouchers", "outcome": "answered", "family": "vouchers", "why": "no date at all means all of them, which the existing service answers natively" },
+    { "id": "voucher_range_explicit", "actor": "accountant", "question": "sales from 2026-04-01 to 2026-06-30", "expect": "acc_vouchers", "outcome": "answered", "family": "vouchers", "why": "a written-out range is passed straight to the existing service" },
+    { "id": "voucher_recent", "actor": "accountant", "question": "recent payments", "expect": "acc_vouchers", "outcome": "answered", "family": "vouchers", "why": "a ranking request, not a period — the service returns the latest with no date filter" },
+    { "id": "voucher_largest", "actor": "accountant", "question": "biggest sales invoice", "expect": "acc_vouchers", "outcome": "answered", "family": "vouchers" },
+    { "id": "voucher_zero", "actor": "accountant", "question": "how many contra vouchers", "expect": "acc_vouchers", "outcome": "answered", "family": "vouchers", "why": "none recorded; 'there were none' is an answer, not a failure" },
+    { "id": "voucher_vague_date", "actor": "accountant", "question": "how many sales invoices last month", "expect": "acc_vouchers", "outcome": "clarified", "family": "vouchers", "why": "'last month' needs a boundary neither the pilot nor the service defines, so it is asked about rather than guessed" },
+    { "id": "voucher_impossible_date", "actor": "accountant", "question": "sales on 2026-02-30", "expect": "acc_vouchers", "outcome": "clarified", "family": "vouchers", "why": "a date the user meant and we could not read; dropping it and answering for all time would report a number nobody asked for" },
+    { "id": "voucher_two_types", "actor": "accountant", "question": "sales and purchase totals", "expect": "acc_vouchers", "outcome": "clarified", "family": "vouchers", "why": "the shared alias table would silently return sales only" },
+    { "id": "unsupported_write", "actor": "accountant", "question": "create a journal entry for 500", "expect": "unsupported", "outcome": "unsupported", "family": "unsupported", "why": "the pilot is read-only; a write request is refused by routing, not by the read" },
+    { "id": "unsupported_chat", "actor": "accountant", "question": "good morning, how are you", "expect": "unsupported", "outcome": "unsupported", "family": "unsupported" },
+
+    { "id": "outage_timeout", "actor": "accountant", "question": "What is the balance of Ariel Fabrics?", "expect": "no_route", "outcome": "failed", "family": "jev-outage", "jev": "timeout", "why": "no silent fallback: the user is told Jev could not route it" },
+    { "id": "outage_unreachable", "actor": "accountant", "question": "p&l this year", "expect": "no_route", "outcome": "failed", "family": "jev-outage", "jev": "unreachable" },
+    { "id": "outage_invalid_body", "actor": "accountant", "question": "our gstin?", "expect": "no_route", "outcome": "failed", "family": "jev-outage", "jev": "invalid" },
+    { "id": "outage_low_confidence", "actor": "accountant", "question": "balance", "expect": "no_route", "outcome": "failed", "family": "jev-outage", "jev": "low_confidence" },
+    { "id": "outage_unoffered_tool", "actor": "accountant", "question": "What is the balance of Ariel Fabrics?", "expect": "no_route", "outcome": "failed", "family": "jev-outage", "jev": "unoffered", "why": "Jev names a tool GRAV never offered; GRAV refuses it" }
+  ]
+}

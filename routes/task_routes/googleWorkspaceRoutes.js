@@ -2,6 +2,13 @@
 const express = require("express");
 const router = express.Router();
 
+// SEC-0 (25 Sep 2026): this file is an UNMOUNTED, unloadable older copy of
+// routes/googleWorkspaceRoutes.js (its ./services/* requires do not resolve
+// here). It carried the same token-returning OAuth callback, so it gets the
+// same containment — administrator gate and no token material in responses —
+// so that reviving it by copy or by mount cannot reopen the leak.
+router.use(require("../../Middlewear/requirePlatformAdmin"));
+
 const { getAuthUrl, getTokensFromCode } = require("./services/googleAuthService");
 const {
     getTaskLists, getAllTasks, getAllTasksFlat, getTasksInList,
@@ -33,11 +40,12 @@ router.get("/auth/callback", async (req, res) => {
         const { code } = req.query;
         if (!code) return res.status(400).json({ success: false, message: "No code provided" });
         const tokens = await getTokensFromCode(code);
+        // SEC-0: never return token material over HTTP.
         res.json({
             success: true,
-            message: "✅ Copy refresh_token into your .env as GOOGLE_REFRESH_TOKEN",
-            refresh_token: tokens.refresh_token,
-            tokens,
+            refreshTokenIssued: Boolean(tokens && tokens.refresh_token),
+            stored: false,
+            message: "Google authorised this application. Tokens are not returned over HTTP.",
         });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });

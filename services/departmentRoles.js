@@ -52,6 +52,25 @@ function dropRoleCaches(slug, email) {
   }
 }
 
+/**
+ * A role change is an authorisation change, so the HR contract's resolved-actor
+ * cache has to forget what it knew — otherwise a revoked approver keeps
+ * approving, and a freshly granted editor is refused, for up to thirty seconds
+ * with nothing on screen to explain either.
+ *
+ * Required lazily and never allowed to throw: this module is imported by the
+ * access layer, and an invalidation failure must not fail a grant that has
+ * already been written. That exact shape — the write lands, the response says
+ * otherwise — is what test/access/department-role-cache.test.js pins.
+ */
+function dropHrAuthorizationCache(reason) {
+  try {
+    require("./access/hrAuthorization").invalidateHrAuthorization(reason);
+  } catch (err) {
+    console.warn("[department-roles] HR cache invalidation skipped:", err.message);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Reading                                                             */
 /* ------------------------------------------------------------------ */
@@ -168,12 +187,26 @@ async function listRoles(departmentSlug) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Grant or change a role. `role: null` revokes.
+ * FIXTURE WRITER — NOT A PRODUCTION PATH (GAC-2 correction, 25 Sep 2026).
  *
- * @param actor  the administrator doing it, recorded on the row so the change
- *               log and the row itself agree about who is responsible
+ * Grant or change a role directly, with no reason, idempotency key, audit
+ * event or authority check. Every production grant goes through
+ * services/access/accessGrantAdmin.service.js (changeAppAccess). This remains
+ * only so test fixtures and the demo seeders can arrange role rows; it refuses
+ * to run unless NODE_ENV is "test" or the caller has opted in with
+ * ALLOW_FIXTURE_ROLE_WRITES=1 (scripts/ie/ieDemoScenario.js does, against the
+ * demo database). test/access/gac2-single-writer.contract.test.js fails if any
+ * route, middleware or service calls it.
+ *
+ * Accounting is refused outright: its only writer is the canonical service's
+ * Acc_User adapter.
  */
 async function setRole({ departmentSlug, email, name, role, password, budgetDepartments, actor }) {
+  if (process.env.NODE_ENV !== "test" && process.env.ALLOW_FIXTURE_ROLE_WRITES !== "1") {
+    const err = new Error("Direct role writes are retired. Use the canonical access write (PUT /api/admin/app-access).");
+    err.code = "DIRECT_ROLE_WRITE_RETIRED";
+    throw err;
+  }
   const slug = String(departmentSlug || "").toLowerCase().trim();
   const mail = String(email || "").toLowerCase().trim();
   if (!slug) throw new Error("A department is required");
@@ -182,17 +215,11 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
     throw new Error(`Role must be one of: ${ROLE_KEYS.join(", ")}`);
   }
 
-  // Accounting keeps its own store — see the note at the top of this file.
+  // Accounting keeps its own store, written ONLY by the canonical service.
   if (slug === ACCOUNTING) {
-    const { setAccountantRole, revokeAccountantRole } = require("./accountantAccess");
-    if (role === null) {
-      await revokeAccountantRole(mail);
-      return { role: null, revoked: true };
-    }
-    const { user, created } = await setAccountantRole({
-      email: mail, name, role, password, actorId: actor?._id,
-    });
-    return { role: user.role, created };
+    const err = new Error("Accounting roles are written only by the canonical access write (changeAppAccess).");
+    err.code = "DIRECT_ROLE_WRITE_RETIRED";
+    throw err;
   }
 
   if (role === null) {
@@ -201,6 +228,7 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
       { $set: { isActive: false } },
       { new: true },
     );
+    dropHrAuthorizationCache(`revoked ${slug} role`);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -250,6 +278,10 @@ async function setRole({ departmentSlug, email, name, role, password, budgetDepa
      database on every call — there is no cache in front of them to invalidate,
      so a cache-drop here would be a no-op at best. If one is ever added, its
      invalidation belongs next to it, not as an undefined name here. */
+
+  /* Covers the incumbent-owner demotion a few lines above as well: that
+     updateMany changes somebody ELSE's role, and they are not the caller. */
+  dropHrAuthorizationCache(`set ${slug} role`);
 
   return { role: row.role, created: !before, previous: before?.role || null };
 }
@@ -320,12 +352,39 @@ async function followEmailChange(oldEmail, newEmail) {
     console.warn("[department-roles] could not follow an accounting email:", err.message);
   }
 
+  /* An address change moves the grants keyed on it, so every cached decision
+     made under the old address is now wrong in both directions. */
+  if (moved) dropHrAuthorizationCache("followed an email change");
+
   return moved;
 }
 
 /* ------------------------------------------------------------------ */
 /* Guarding                                                            */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Is this request's session an active, database-verified platform
+ * administrator? `req.admin` is set only by requirePlatformAdmin (already
+ * re-read). Otherwise the token's claim is merely a hint that decides whether
+ * the database is asked at all. Throws on a lookup failure, which the guards
+ * turn into a fail-closed 500.
+ */
+async function isDatabaseVerifiedAdmin(req) {
+  /* `req.admin` is set by requirePlatformAdmin to the DeptUser it has just
+     re-read (active, admin, current tokenVersion). It is still re-checked by
+     id here, so an object some other middleware happens to put on `req.admin`
+     is never authority by itself. */
+  if (req.admin?._id) {
+    const DeptUser = require("../models/Access/DeptUser");
+    const row = await DeptUser.findById(req.admin._id).select("isAdmin isActive").lean();
+    if (row?.isAdmin && row.isActive) return true;
+  }
+  const u = req.user || req.dept;
+  if (!u?.isAdmin) return false;
+  const { isVerifiedPlatformAdmin } = require("./access/appAccess.service");
+  return isVerifiedPlatformAdmin(u);
+}
 
 /**
  * Express guard: this route needs at least `required` in `departmentSlug`.
@@ -347,13 +406,14 @@ function requireDepartmentRole(departmentSlug, required = "editor") {
         return res.status(401).json({ success: false, message: "Not authenticated" });
       }
 
-      /* A platform administrator is not part of any department's chain.
-         `requireApproval` in services/changeRequests.js already lets them
-         through (`req.user?.isAdmin || req.admin`); this guard did not, so the
-         two disagreed about the same person — an admin could be refused here
-         and waved through there depending on which guard a route happened to
-         reach first. They now agree. */
-      if (req.user?.isAdmin || req.admin) return next();
+      /* A platform administrator is a full-system administrator (owner
+         everywhere) — but only as the DATABASE says, never on a token claim
+         alone (GAC-AR1). `req.admin` is set only by requirePlatformAdmin,
+         which has already re-read the record. */
+      if (await isDatabaseVerifiedAdmin(req)) {
+        req.departmentRole = "owner";
+        return next();
+      }
 
       const slug = String(departmentSlug || "").toLowerCase();
       const assigned = await listRoles(slug);
@@ -398,4 +458,5 @@ module.exports = {
   setRole,
   followEmailChange,
   requireDepartmentRole,
+  isDatabaseVerifiedAdmin,
 };

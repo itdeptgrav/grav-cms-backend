@@ -131,6 +131,11 @@ async function seed({ allocated = 50000 } = {}) {
     isActive: true, gender: "Other", biometricId: `SVST${n}`,
     department: "Store", accessDepartmentId: storeDept._id,
   });
+  /* A Store & Purchase grant, so "may act for Store" resolves through the
+     cache-immune capability path even when the shared department cache is stale. */
+  await require("../../models/Access/DepartmentRole").create({
+    departmentSlug: "store", role: "editor", email: store.email, name: "Bikash", isActive: true,
+  });
 
   return { company, repairs, software, unbudgeted, budget, emp, tl, finEmp, store };
 }

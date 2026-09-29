@@ -23,6 +23,18 @@ const tools = new Map();
  * @param {(user:object)=>boolean} tool.permission  authorisation check
  * @param {(message:string)=>boolean} tool.matches  relevance check
  * @param {(args:{user:object})=>Promise<object>} tool.provideContext
+ * @param {(args:{data:object,args:object,message:string})=>(string|null)} [tool.renderAnswer]
+ *        Optional deterministic renderer for exact scalar reads. This avoids a
+ *        second language-model pass after GRAV has already read the answer.
+ * @param {(args:{message:string,history:Array})=>(object|null|Promise<object|null>)} [tool.claim]
+ *        Optional exact semantic-catalogue claim. GRAV accepts it only when a
+ *        single authorised tool claims the current request.
+ * @param {boolean} [tool.modelSelectable=true]
+ *        False for catalogue-only tools whose arguments must never be guessed
+ *        by a language model. Such tools still execute through `claim`.
+ * @param {{catalogue:string,domains:string[],subjects?:string[]}} [tool.semantic]
+ *        Machine-readable business meaning used by the catalogue runtime to
+ *        constrain model candidates before planning.
  */
 function registerTool(tool) {
   if (!tool || !tool.name) throw new Error("registerTool: tool.name is required");
@@ -40,6 +52,16 @@ function registerTool(tool) {
       typeof tool.provideContext === "function"
         ? tool.provideContext
         : async () => ({}),
+    renderAnswer: typeof tool.renderAnswer === "function" ? tool.renderAnswer : null,
+    claim: typeof tool.claim === "function" ? tool.claim : null,
+    modelSelectable: tool.modelSelectable !== false,
+    semantic: tool.semantic && typeof tool.semantic === "object"
+      ? Object.freeze({
+        catalogue: String(tool.semantic.catalogue || ""),
+        domains: Object.freeze([...(tool.semantic.domains || [])]),
+        subjects: Object.freeze([...(tool.semantic.subjects || [])]),
+      })
+      : null,
   });
 }
 

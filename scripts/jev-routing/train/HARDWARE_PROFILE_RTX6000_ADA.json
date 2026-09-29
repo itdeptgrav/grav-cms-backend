@@ -1,0 +1,21 @@
+{
+  "id": "runpod-rtx-6000-ada-48gb",
+  "display_name": "NVIDIA RTX 6000 Ada Generation (48 GB)",
+  "note": "Identity requires one RTX 6000 Ada, compute capability 8.9 and at least 47 GiB visible VRAM. PyTorch's pinned CUDA 12.8 wheel ships sm_86 SASS for the Ada-compatible 8.x family; the live deterministic CUDA self-test additionally proves execution on the sm_89 device.",
+  "accept_name_patterns": ["RTX 6000 ADA", "RTX 6000 ADA GENERATION"],
+  "reject_name_tokens": ["A6000", "LAPTOP", "MOBILE", "MAX Q", "MAXQ", "SFF", "EMBEDDED"],
+  "compute_capability": "8.9",
+  "required_arch": "sm_86",
+  "min_vram_mib": 48128,
+  "min_driver": [570, 0],
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "transformers": "5.10.2",
+  "peft": "0.19.1",
+  "pinned_packages": {
+    "triton": "3.4.0",
+    "fla_core": "0.4.2",
+    "flash_linear_attention": "0.4.2",
+    "causal_conv1d": "1.6.1"
+  }
+}

@@ -1,0 +1,5 @@
+# Local pilot secrets and state. Nothing here is ever committed.
+.env
+.env.local
+*.local
+downloads/

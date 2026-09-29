@@ -42,6 +42,20 @@ const Acc_RecurringItem = require("../../models/Accountant_model/Acc_RecurringIt
 // requesting company. This router never writes a ledger.
 const { Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 /** Cast to ObjectId, or null. Never throws. Mirrors the C0 house helper. */
@@ -164,7 +178,7 @@ function asValidationError(e, res) {
 /* ------------------------------------------------------------------ */
 /* GET /                                                    READ ONLY  */
 /* ------------------------------------------------------------------ */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const companyId = scopeCompanyId(req);
     if (!companyId) {
@@ -217,7 +231,7 @@ router.get("/", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* POST /                                                              */
 /* ------------------------------------------------------------------ */
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     if (!recurring.canEdit(req.user)) {
       return res.status(403).json({
@@ -268,7 +282,7 @@ router.post("/", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* PATCH /:id                                                          */
 /* ------------------------------------------------------------------ */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", companyScope, async (req, res) => {
   try {
     if (!recurring.canEdit(req.user)) {
       return res.status(403).json({
@@ -366,7 +380,7 @@ router.patch("/:id", async (req, res) => {
 // shape of the past, where a deleted one leaves an unexplained gap. The list
 // endpoint takes `?status=`, so a UI that wants only live items can ask for
 // them without the data being destroyed to achieve it.
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", companyScope, async (req, res) => {
   try {
     if (!recurring.canEdit(req.user)) {
       return res.status(403).json({

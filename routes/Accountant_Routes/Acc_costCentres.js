@@ -18,6 +18,19 @@ const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddlew
 const { Acc_CostCentre } = require("../../models/Accountant_model/Acc_MasterModels");
 const actuals = require("../../services/budgetActuals.service");
 
+/* Lane A Chunk 3A — canonical company isolation. See
+   Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(AccountantAuthMiddleware.accountantAuth);
 
 function companyOf(req) {
@@ -60,7 +73,7 @@ const shape = (c) => ({
  * leaves the picker but never stops reporting: a project closed in March still
  * has to explain what it spent in January, and its budget lines still resolve.
  */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const companyId = actuals.oid(companyOf(req));
     if (!companyId) {
@@ -86,7 +99,7 @@ router.get("/", async (req, res) => {
  * to serve; the field is free text on the model and any Tally category is
  * still accepted.
  */
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
 
@@ -142,7 +155,7 @@ router.post("/", async (req, res) => {
 
 /** PATCH /:id — rename or retire. The id never moves, so budget lines and
  *  voucher allocations pointing at it keep resolving. */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", companyScope, async (req, res) => {
   try {
     if (requireEdit(req, res)) return;
     const companyId = actuals.oid(companyOf(req));

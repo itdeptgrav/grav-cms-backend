@@ -141,6 +141,24 @@ const lineSchema = new mongoose.Schema(
        alone exactly as it did — nothing about the existing fields changes. */
     rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemSku: { type: String, trim: true, default: "" },
+
+    /**
+     * ── WHICH MATERIAL-REQUEST LINE THIS ONE IS BUYING ──────────────────────
+     * The MRF item's own `_id`, written by the server when the shortfall is
+     * turned into a purchase request.
+     *
+     * Without it, "does this request match its material request?" can only be
+     * answered by name or by array position, and both are wrong: two catalogue
+     * items can share a name, a line can be renamed after approval, and a
+     * reordered array silently moves one line's quantity onto another line's
+     * material. With it, the two documents agree on identity or they do not.
+     *
+     * Absent on a request raised any other way; a purchase order requires it.
+     */
+    sourceMrfLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* The variant the request line named, so a purchase cannot quietly order a
+       different one of the same item. */
+    variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     baseUnit: { type: String, trim: true, default: "" },
 
     /* ── THE SERVICE MASTER RECORD THIS LINE WAS MATCHED TO ──────────────────
@@ -222,6 +240,56 @@ const lineSchema = new mongoose.Schema(
       /* Absent, not defaulted. Every request written before this chunk has no
          allocation at all, and a default would manufacture an "unresolved"
          decision on thousands of historical lines that nobody ever made. */
+      default: undefined,
+    },
+
+    /* ── WHERE THIS DEMAND CAME FROM, WHEN IT CAME FROM A COSTING ──────────
+       A line raised from an approved costing's procurement projection carries
+       the exact record it was derived from: which costing, which frozen
+       version, which quantity scenario, and which line of that version.
+
+       ── WHY THE FIGURES ARE STORED AGAIN HERE ──────────────────────────────
+       `quantity`, `unit`, `rate` and `amount` above are the REQUEST's — they
+       are what Store and finance act on, and Store may legitimately revise
+       them during sourcing. These are what the COSTING projected, frozen at
+       handoff. Keeping both is what makes "Store ordered 750 m against a
+       projection of 700 m" a question somebody can ask; storing one would
+       silently overwrite the other's answer.
+
+       ── AND IT IS PROVENANCE, NOT AUTHORITY ────────────────────────────────
+       Nothing here lets a request alter the costing. It is a backward
+       reference for tracing and for duplicate-demand detection, which is why
+       the duplicate check reads THESE fields rather than matching on a name.
+
+       Additive and absent everywhere else: every request raised by hand, by
+       intake classification or before this existed has no such block and
+       behaves exactly as it did. */
+    costingDemandSource: {
+      type: new mongoose.Schema(
+        {
+          source: { type: String, trim: true, enum: ["APPROVED_COSTING_PROJECTION"], required: true },
+          costingId: { type: mongoose.Schema.Types.ObjectId, ref: "Costing", required: true },
+          costingVersionId: { type: mongoose.Schema.Types.ObjectId, ref: "CostingVersion", required: true },
+          costingVersionNumber: { type: Number, default: null },
+          scenarioKey: { type: String, trim: true, required: true },
+          /* The frozen version's own key for the cost line. Stable across
+             versions, which is what makes "what happened to the lining
+             requirement" answerable. */
+          costingLineKey: { type: String, trim: true, required: true },
+          /* The projection's own handle for this requirement, so a later
+             reader can line the request up against a regenerated projection
+             without re-deriving the pairing. */
+          projectionRequirementId: { type: String, trim: true, default: "" },
+          projectedAt: { type: Date, default: null },
+          /* Strings: a projected quantity is a decimal, and storing it as a
+             float is the drift the costing engine spends its life avoiding. */
+          projectedQuantity: { type: String, trim: true, default: "" },
+          projectedUnit: { type: String, trim: true, default: "" },
+          projectedAmountMinor: { type: Number, default: null },
+          currency: { type: String, trim: true, default: "" },
+        },
+        { _id: false },
+      ),
       default: undefined,
     },
 
@@ -320,6 +388,42 @@ const spendRequestSchema = new mongoose.Schema(
 
     title: { type: String, required: true, trim: true },
     requestType: { type: String, enum: REQUEST_TYPES, required: true },
+
+    /* ── THE COSTING THIS WHOLE REQUEST WAS RAISED FROM ────────────────────
+       A compact summary of what every line's `costingDemandSource` already
+       says, so "which requests came out of this approved version" is one
+       indexed query rather than a scan through line arrays.
+
+       `handoffKey` is the idempotency key the creation ran under. It is the
+       join between the Product draft and the Service draft raised by the same
+       action — the two are one decision, and without it a reader cannot tell
+       a pair from two unrelated requests that happen to share a costing.
+
+       Additive and absent on every request that was not raised this way. */
+    costingSource: {
+      type: new mongoose.Schema(
+        {
+          source: { type: String, trim: true, enum: ["APPROVED_COSTING_PROJECTION"], required: true },
+          costingId: { type: mongoose.Schema.Types.ObjectId, ref: "Costing", required: true },
+          costingVersionId: { type: mongoose.Schema.Types.ObjectId, ref: "CostingVersion", required: true },
+          costingVersionNumber: { type: Number, default: null },
+          scenarioKey: { type: String, trim: true, required: true },
+          handoffKey: { type: String, trim: true, default: "" },
+          /* ── BOTH DATES, AND WHY THEY DIFFER ────────────────────────────
+             The projection's date is the CUSTOMER's, from Sales. Purchasing
+             may legitimately need a different one — material has to land
+             before it can be cut — but overwriting the first with the second
+             loses the fact that somebody disagreed with it, and with it the
+             ability to ask who was right. Both are kept, with the reason. */
+          sourceRequiredDate: { type: Date, default: null },
+          requestedRequiredDate: { type: Date, default: null },
+          requiredDateReason: { type: String, trim: true, default: "" },
+          createdAt: { type: Date, default: null },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
 
     /* Who asked. `requestedById` is the biometricId, which is what approver
        routing keys on everywhere else in this app — see mrfApprover.service. */
@@ -564,6 +668,96 @@ const spendRequestSchema = new mongoose.Schema(
     commitmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_BudgetCommitment" },
     commitmentStatus: { type: String, trim: true },
 
+    /**
+     * ── WHICH BUDGET RULES THIS REQUEST WAS RAISED UNDER ────────────────────
+     * `COMMITMENT_REQUIRED` — Finance reviewed it and a budget commitment must
+     *   exist before anything is ordered against it.
+     * `BUDGET_PAUSED` — budget involvement was explicitly switched off for MRF
+     *   purchasing at the moment this was raised (`requestsSettings
+     *   .mrfBudgetEnabled === false`), so the request was created already
+     *   approved and no commitment was ever made.
+     *
+     * ── WHY IT IS STORED RATHER THAN INFERRED ───────────────────────────────
+     * A missing `commitmentId` has two possible meanings: budget review was
+     * paused, or the commitment is missing when it should not be. Those are
+     * opposite facts, and reading absence as "paused" makes a corrupt or
+     * deleted commitment look like a deliberate policy — which is precisely the
+     * case that must be refused. The mode is therefore recorded when the
+     * request is created, by the server, from the policy in force THEN; the
+     * setting can be flipped later without rewriting history.
+     *
+     * No default, deliberately: its absence marks a request raised before this
+     * field existed, and a default would stamp every one of them on its next
+     * save and destroy the distinction.
+     */
+    /**
+     * ── COMMERCIAL ADJUSTMENTS, WHERE FINANCE CAN SEE THEM ──────────────────
+     * Shipping, a negotiated discount and any other charge that moves what the
+     * company will owe.
+     *
+     * They live HERE rather than on the purchase order because they are money:
+     * a freight line added after approval changes the figure Finance agreed,
+     * and a purchase order is not where that decision belongs. Putting them on
+     * the request means the approver sees the grand total they are actually
+     * approving, and the order simply carries it forward.
+     *
+     * The feature is preserved, not removed: a buyer who needs a charge adds
+     * it to the request and has it reapproved, and the order then shows it
+     * exactly as before.
+     */
+    /* ── WHAT STORE QUOTED ──────────────────────────────────────────────────
+     * Written while Store prices or requotes the request, and editable right
+     * up to the moment Finance approves it. These are a QUOTE: a figure under
+     * negotiation, not an agreement.
+     */
+    quotedShippingCharges: { type: Number, min: 0, default: 0 },
+    quotedDiscount: { type: Number, min: 0, default: 0 },
+    quotedCustomCharges: {
+      type: [new mongoose.Schema({
+        label: { type: String, trim: true, required: true },
+        amount: { type: Number, min: 0, required: true },
+      }, { _id: false })],
+      default: [],
+    },
+
+    /* ── AND WHAT FINANCE APPROVED ──────────────────────────────────────────
+     * Snapshotted from the quoted figures at the moment of approval, and never
+     * written again.
+     *
+     * ── WHY A SNAPSHOT AND NOT THE SAME FIELDS ──────────────────────────────
+     * A single set of fields would mean "what Finance agreed" and "what Store
+     * last typed" were the same value, so an edit after approval would rewrite
+     * history — the purchase order would carry figures nobody had approved,
+     * and the record of the approval would say they had. Two fields keep the
+     * two questions separate, and the purchase order reads only this one.
+     *
+     * Changing an adjustment therefore means requoting, which sends the
+     * request back for confirmation and Finance approval, and the snapshot is
+     * retaken. There is no path that edits it in place.
+     */
+    approvedShippingCharges: { type: Number, min: 0, default: 0 },
+    approvedDiscount: { type: Number, min: 0, default: 0 },
+    approvedCustomCharges: {
+      type: [new mongoose.Schema({
+        label: { type: String, trim: true, required: true },
+        amount: { type: Number, min: 0, required: true },
+      }, { _id: false })],
+      default: [],
+    },
+    /* When the snapshot was taken, so "approved on the figures of that date"
+       is answerable without reading the history. */
+    adjustmentsApprovedAt: { type: Date, default: undefined },
+
+    budgetApprovalMode: {
+      type: String,
+      enum: ["COMMITMENT_REQUIRED", "BUDGET_PAUSED"],
+      default: undefined,
+    },
+    /* When and by what the mode above was decided — auditable, not a bare
+       enum somebody has to take on trust. */
+    budgetApprovalModeAt: { type: Date, default: undefined },
+    budgetApprovalModeSource: { type: String, trim: true, default: undefined },
+
     /* ── WHAT THE STORE PRICED IT AT ──────────────────────────────────────
      * Filled by Store & Purchase when they decide a request cannot come off
      * the shelf and has to be bought. The requester never sees these fields
@@ -669,6 +863,14 @@ const spendRequestSchema = new mongoose.Schema(
 
 spendRequestSchema.index({ requestedBy: 1, createdAt: -1 });
 spendRequestSchema.index({ status: 1, createdAt: -1 });
+/* ── DUPLICATE DEMAND IS FOUND BY STORED IDENTITY, NEVER BY NAME ───────────
+   "Has this requirement already been requested" is answered from the costing
+   provenance the handoff wrote. Sparse, so the millions of requests that
+   carry no costing source are not in it. */
+spendRequestSchema.index(
+  { "costingSource.costingVersionId": 1, "costingSource.scenarioKey": 1, status: 1 },
+  { sparse: true },
+);
 /* The approvals queue's own read: what is addressed to me and still waiting. */
 spendRequestSchema.index({ approverBiometricId: 1, status: 1, createdAt: 1 });
 spendRequestSchema.index({ approverAltIds: 1, status: 1 });
@@ -681,9 +883,16 @@ spendRequestSchema.pre("validate", async function (next) {
     const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, "0");
     const prefix = `SPR-${yy}${mm}-`;
+    /* ── READ IN THIS DOCUMENT'S OWN SESSION ──────────────────────────
+       Without it, two requests created inside one transaction both read the
+       state before either was written, both compute the same sequence, and
+       the unique index rejects the second — so an atomic pair of drafts
+       could never be created at all. `$session()` is undefined outside a
+       transaction, which is exactly the previous behaviour. */
     const last = await mongoose
       .model("SpendRequest")
       .findOne({ requestNumber: { $regex: `^${prefix}` } })
+      .session(this.$session() || null)
       .sort({ requestNumber: -1 })
       .lean();
     const seq = last ? parseInt(last.requestNumber.slice(-4), 10) + 1 : 1;

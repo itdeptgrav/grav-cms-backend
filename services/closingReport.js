@@ -172,19 +172,41 @@ function buildClosingReport({ workOrders = [], challans = [], request = null, en
     paidAmount: num(p.paidAmount),
     remainingAmount: num(p.remainingAmount),
   }));
-  const invoiced = num(q?.grandTotal) || num(request?.grandTotal) || 0;
+  /* ── A QUOTATION IS NOT AN INVOICE (G03) ────────────────────────────────
+     This figure is the QUOTED total — the first quotation's grand total, or
+     the request's own — and it used to be reported as `invoiced` and fed a
+     `settled` flag that certified the order as paid. A quotation is an offer;
+     it is not a tax invoice anybody issued, and a payment schedule the
+     salesperson maintains is not a receipt Finance recorded.
+
+     So the number is kept — it is useful context — under its real name, and
+     `settled` is `null`: not "no", but "not provable from here". No issued
+     invoice or receipt is connected to this order yet (Acc_Invoice has no
+     company field and nothing writes its order link), so payment cannot be
+     confirmed by this report. G17 connects the Finance source. */
+  const quoted = num(q?.grandTotal) || num(request?.grandTotal) || 0;
   const received = schedule.reduce((s, p) => s + p.paidAmount, 0);
   const outstanding = schedule.length
     ? schedule.reduce((s, p) => s + p.remainingAmount, 0)
-    : Math.max(0, invoiced - received);
+    : Math.max(0, quoted - received);
   const overdue = schedule.filter((p) => p.status === "overdue"
     || (p.status !== "paid" && p.dueDate && new Date(p.dueDate) < now));
   const money = {
     requestId: request?.requestId || null,
-    invoiced,
+    basis: "quotation",
+    quoted,
+    /* No issued invoice is linked, so there is no invoiced amount — `null`,
+       not the quote. This briefly carried the quoted total "for compatibility",
+       which kept the very claim G03 exists to remove: any reader of `invoiced`
+       still got a quotation labelled as an invoice. It becomes a number only
+       when an authoritative issued invoice is linked to the order (G17). */
+    invoiced: null,
+    invoiceConnected: false,
     received,
     outstanding,
-    settled: invoiced > 0 && outstanding <= 0,
+    /* Unknown, not false: a false would read as "unpaid", which is its own
+       unsupported claim. */
+    settled: null,
     instalments: schedule.length,
     overdue: overdue.length,
     overdueAmount: +overdue.reduce((s, p) => s + p.remainingAmount, 0).toFixed(2),
@@ -224,30 +246,46 @@ function buildClosingReport({ workOrders = [], challans = [], request = null, en
   }));
 
   // ── Can this be closed? Every item is a fact, not a judgement. ───────────
+  //
+  // Each check carries a STATUS, not just done/not-done:
+  //   met          the evidence exists and says yes
+  //   unmet        the evidence exists and says no
+  //   unavailable  the evidence this check needs is not connected — which is
+  //                a blocker, never a pass and never a zero
+  //
+  // `paid` and `cost` are `unavailable` until G17 connects their sources. They
+  // used to pass on a quotation total and on any positive issued quantity,
+  // neither of which is what the label claims.
+  const deliveredStatus = delivery.complete ? "met" : "unmet";
   const checklist = [
     {
       id: "delivered",
       label: "Everything ordered has been dispatched",
-      done: delivery.complete,
+      status: deliveredStatus,
+      done: deliveredStatus === "met",
       detail: delivery.complete ? null : `${delivery.short} of ${delivery.ordered} pieces never went out.`,
     },
     {
       id: "paid",
       label: "The order is paid in full",
-      done: money.settled,
-      detail: money.settled ? null
-        : invoiced > 0
-          ? `${money.outstanding} still outstanding${money.overdue ? ` · ${money.overdue} instalment${money.overdue === 1 ? "" : "s"} overdue` : ""}.`
-          : "No invoice total on the order yet.",
+      status: "unavailable",
+      done: false,
+      source: "issued invoice and recorded receipt",
+      detail: "No issued invoice or recorded receipt is connected to this order, so payment cannot be confirmed "
+        + "here. The quoted total and the payment schedule are not an invoice.",
     },
     {
       id: "cost",
-      label: "Actual material cost is recorded",
-      done: costing.issuedComplete,
-      detail: costing.issuedComplete ? null
-        : "Some materials show nothing issued, so the actual cost is incomplete.",
+      label: "Actual cost is recorded",
+      status: "unavailable",
+      done: false,
+      source: "actual-cost closeout",
+      detail: "No actual-cost record is connected to this order. Materials having an issued quantity does not "
+        + "mean the cost is complete.",
     },
   ];
+
+  const unavailable = checklist.filter((c) => c.status === "unavailable").map((c) => c.id);
 
   return {
     delivery,
@@ -259,8 +297,20 @@ function buildClosingReport({ workOrders = [], challans = [], request = null, en
     lines,
     earlyDispatches: early,
     checklist,
-    canClose: checklist.every((c) => c.done),
-    blockers: checklist.filter((c) => !c.done).length,
+    canClose: checklist.every((c) => c.status === "met"),
+    blockers: checklist.filter((c) => c.status !== "met").length,
+    /* Which blockers are missing EVIDENCE rather than failed facts — so the
+       screen can say "not available" instead of a red cross implying "no". */
+    unavailable,
+    /* Whether closing can happen HERE at all, independent of this order's
+       progress. While a check's source is unconnected no order can close, and
+       the screen must say that rather than present close as one more dispatch
+       away. */
+    closingAvailable: unavailable.length === 0,
+    closingUnavailableReason: unavailable.length
+      ? "Closing is not available: no issued invoice, recorded receipt or actual-cost record is connected "
+        + "to Sales, so payment and actual cost cannot be confirmed."
+      : null,
     now,
   };
 }

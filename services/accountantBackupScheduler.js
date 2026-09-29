@@ -63,13 +63,15 @@ async function checkAndRun({ force = false, trigger = "scheduled" } = {}) {
   }
 }
 
+let _bootTimer = null;
+
 function start() {
   if (_started) return;
   _started = true;
 
   // Kick a check shortly after boot (lets the DB connection settle), then
   // hourly thereafter.
-  setTimeout(() => {
+  _bootTimer = setTimeout(() => {
     checkAndRun().catch(() => {});
   }, 30 * 1000);
 
@@ -77,10 +79,30 @@ function start() {
     checkAndRun().catch(() => {});
   }, TICK_MS);
 
-  // Don't keep the process alive just for this timer.
+  // Don't keep the process alive just for these timers. The boot timeout was
+  // previously left referenced, which is why anything that merely REQUIRED the
+  // backup router — a test walking every route file, for instance — held a
+  // handle open for thirty seconds and then fired a database call into a
+  // torn-down connection.
   if (_timer && typeof _timer.unref === "function") _timer.unref();
+  if (_bootTimer && typeof _bootTimer.unref === "function") _bootTimer.unref();
 
   console.log("✓ [backup-scheduler] started (hourly check)");
 }
 
-module.exports = { start, checkAndRun, isDue };
+/**
+ * Cancel both timers and allow `start()` to run again.
+ *
+ * Production never calls this — the scheduler is meant to run for the life of
+ * the process. It exists so a test that requires the backup router can put back
+ * what the require started, instead of leaving Jest with an open handle.
+ */
+function stop() {
+  if (_bootTimer) clearTimeout(_bootTimer);
+  if (_timer) clearInterval(_timer);
+  _bootTimer = null;
+  _timer = null;
+  _started = false;
+}
+
+module.exports = { start, stop, checkAndRun, isDue };

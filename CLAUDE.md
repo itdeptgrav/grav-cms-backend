@@ -271,3 +271,420 @@ LiveKit (meetings, audio calls, `livekit-server-sdk` token minting), Gemini via 
 - **C1 / C2 / PMP** are employee scoring systems (`services/c1Service.js`, `services/pmpService.js`, `routes/task_routes/c1Routes.js`, `c2Band.routes.js`). Band thresholds live in Firestore `bandconfigs`, not in code — the interactive testers load config from Firestore at startup.
 - **Timer-SOP** applies daily "bleach" penalties for SOP violations (`services/timerSop.service.js`), finalized by the ~00:15 IST cron. All SOP and attendance date logic is IST-based, computed as `Date.now() + 5.5h` and then read with `getUTC*` — follow that pattern rather than introducing a timezone library.
 - **Salary fields are encrypted at rest** via `utils/salaryEncryption.js` keyed on `SALARY_ENCRYPTION_KEY`; rotating the key without re-encrypting orphans existing payroll records.
+
+## PPC order targets — 24 Sep 2026
+
+`PpcOrderTarget` (`ppc_order_targets`) is the piece-completion number PPC asks
+a department for on ONE manufacturing order — per day, per hour (between two
+clock times) or a total by a date, over working days. Against the whole order's
+quantity, never a work order. One active target per order + department; a new
+one marks the old `replaced`, nothing is deleted.
+
+`services/ppc/orderTargets.evaluate.js` is the arithmetic (pure, tested):
+expected vs done per day, today's figure (an hourly target's expectation grows
+with the clock), short days/hours, the pace needed to recover, one sentence of
+advice. `orderTargets.service.js` reads what each department actually DID from
+that department's own book — cutting records, finishing scans, the production
+mark-done ledger, passed QC inspections, `WorkOrder.packagingRecords`,
+dispatch challans — so nothing is ever typed in. Routes:
+`routes/CMS_Routes/PPC/orderTargetsRoute.js` (PPC doors need a PPC role +
+company; `GET /targets/department/:dept` needs only a session and is what
+every department overview shows). This is NOT the planning-file stage
+schedule/publication chain; it sits beside it.
+
+**IE department standards** (`IeDepartmentStandard`, `ie_department_standards`;
+`services/industrialEngineering/departmentStandards.service.js`; routes on
+`/api/cms/ie/department-standards`): per department, SAM minutes a piece,
+operators, hours a day and planned efficiency → capacity a day. The evaluator's
+`assessTarget` uses it for the PPC form's feasibility check (minimum working
+days, over-capacity, generous dates, other commitments on the same dates) and
+`efficiencyOf` for the overview's efficiency (earned = pieces × SAM, available
+= operators × elapsed hours). The assessment is snapshotted onto the target at
+save time. The per-style technical standard IE freezes into a release
+(`processRoute.schema.js`) is a different, richer thing — do not merge them.
+
+## PPC control center — 25 Sep 2026
+
+PPC is the production control center: every production-management READ
+(orders, work orders, bulk and person-wise, departments, hour by hour, day by
+day, target vs achievement, efficiency, delays, eleven reports, search, the
+assistant) lives in `services/ppc/control/` behind
+`routes/CMS_Routes/PPC/controlRoute.js` (`/api/cms/ppc/control/*`, PPC
+PLANNING_READ + company, read-only; writes stay on the targets router).
+
+- `ledger.service.js` is the ONE read of "done": `woIndex(companyId)` (the
+  company's order-linked work orders, via `packagingAccess.findWorkOrders`;
+  a stored `WO-<24 hex>` number is shown as `WO-<last 8>` because that is the
+  barcode form) and `readEvents(index, {start, end})` → per department
+  `{at, qty, moId, woId, unit, personKey, personName, beyond}` from the same
+  six books `orderTargets.service.doneEvents` reads. Two rules the department
+  screens also follow: a unit is distinct PER WORK ORDER, and a unit numbered
+  above the work order's quantity is `beyond` — counted apart, never as done.
+  A production barcode is accepted in both printed forms (8 and 24 hex).
+- `orders.service.js` is the normalised view: `snapshot()` (one read of the
+  company), `summariseOrders`, `listOrders` (server-side filters), `orderDetail`
+  (header → products → variants → work orders → per-department, targets, IE
+  standard), `listWorkOrders`, `workOrderDetail`, `personWise` (each person's
+  unit range on a WO, per department, from EmployeeProductionProgress + the
+  ledger's units), `search`. The header resolves PO from
+  `quotations[].poProof.poNumber`, delivery from `customerInfo.deliveryDeadline`
+  and the type from `requestType === "measurement_conversion" || measurementId`.
+  "Furthest stage" = last applicable department with activity; "earliest stage
+  still short" = first applicable one below the quantity; a finishing stage is
+  applicable only if it has events or a target on that order.
+- `reports.service.js`: `hourly` (shift buckets; a per-day target is spread
+  over its window, rounded on the cumulative line), `daily`, `departmentPage`,
+  `range` (a precise date-time window), `achievement`, `efficiency` (IE
+  standards), `delays` (furthest-behind stage, never a "cause"),
+  `productVariant`, and `report(type)` for the catalogue `REPORTS`.
+- `assistant/intents.js` (pure, tested) + `engine.js`: deterministic
+  question → `{intent, entities}` → the services above → structured blocks.
+  No model is called; a model later produces the same intent shape.
+
+Parity (25 Sep 2026, live data): sewing, QC, packing and dispatch counts equal
+the department portals' own endpoints for every order. Cutting is read from
+`CuttingMasterRecord` entries, which agree with `WorkOrder.cuttingProgress` on
+bulk orders and differ where the desktop sync or `update-cutting` wrote only
+the work order — the work-order detail shows both.
+
+The Production Manager portal folded into PPC the same day: its planning
+pages moved under `/ppc/planning`, `/ppc/schedule`, `/ppc/requests`,
+`/ppc/approvals`, `/ppc/settings`; `routes/login.js` and `deptAuth.js` now
+send `project_manager` to `/ppc`. NOT changed, deliberately: the
+`departmentWrites("project-manager")` gates on work orders, manufacturing
+orders, production dashboard, schedule and closeout, `productionTargetAccess`,
+and the `project-manager` `access_departments` row — re-homing those to the
+`ppc` grant changes who may write and is the owner's call. The scanner floor
+routers (`Production/Scanner/*`, assistant, targets) were re-mounted in
+`server.js`: the merge `fdeea4a` had dropped the block and the whole
+supervisor floor answered 404.
+
+**Trimming and Ironing are always in the pipeline (26 Sep 2026).** `ledger.CORE`
+now holds them beside cutting, sewing, QC, packaging and dispatch; only the
+`OPTIONAL` stages (embroidery, printing, washing) wait for recorded work or a
+target before an order counts them. Every `applicable` check in
+`orders.service.js` reads `OPTIONAL`, so an order page, work-order detail and
+person-wise view show Trimming and Ironing from the start instead of greyed.
+
+## The customer's PO number — 26 Sep 2026
+
+`services/customerRequestPo.js` is the ONE reader and writer. Sales files the PO
+on the approved quotation (`quotations[].poProof`); a request with no quotation
+(measurement conversion, internal order) now carries a root `poProof` — strict
+mode silently dropped that write before the schema field existed. `poOf(mo)`
+answers from whichever holds one; `PO_SELECT` is what a query must select.
+Packaging's carton label, carton list, carton report and the dispatch overview
+used to read the root only and printed "not recorded" for orders Sales HAD
+filed. PPC records one with `POST /api/cms/ppc/targets/orders/:moId/po`
+(PLANNING_WRITE; empty number clears), written where the upload writes.
+
+## Finishing stages (Embroidery, Printing, Washing, Trimming, Ironing) and the shift clock — 24 Sep 2026
+
+Embroidery is a finishing stage too (first in order), recording into
+`finishingscans` like the rest. Its department row predates this and is not
+re-seeded; its older routes (`routes/CMS_Routes/Manufacturing/Embroidery/`) are
+still mounted for the design catalogue, but no page records pieces through them.
+
+`routes/CMS_Routes/Manufacturing/Finishing/finishingRoutes.js` serves both
+departments under `/api/cms/manufacturing/finishing/:stage/…`
+(`services/manufacturing/finishingStages.js` names the stages). One model,
+`FinishingScan` (`finishingscans` — one collection for both, the cluster is near
+its 500-collection cap), unique on `{stage, workOrderId, unitNumber}`, so
+`POST /:stage/done` is idempotent and safe to receive an offline queue's retry.
+`doneAt` is the device's scan moment, bounds-checked (nothing from the future,
+nothing older than 30 days → server time); `doneBy` is the session, never the
+body. Access: `finishingAccess.js` — the stage's own DepartmentRole grant to
+record; Production Supervisor / PM / CEO may read; work-order scoping is
+Packaging's, reused (including the legacy-window stand-down).
+
+`services/manufacturing/shiftHours.js` is the ONE definition of the factory's
+hours (09:30–18:30 IST, nine buckets plus before/after). Packaging's `/hourly`
+and the finishing `/overview` both bucket with it. Do not add another
+hour-bucketing helper.
+
+The departments are seeded by `ensureAccessDepartments.js` (slugs `printing`,
+`washing`, `trimming`, `ironing`; no legacy collection). Adding a stage: add it
+IN PRODUCTION ORDER to `finishingStages.js` (Find Piece walks that order), seed
+it, mirror it in the CMS's `lib/finishing/stages.js`, and give it a glyph in
+`components/finishing/DeptMark.js`. People reach them through a
+DepartmentRole grant or an employee's department assignment.
+
+## The physical store — racks, bins, location QR, put/transfer, 3D (25 Sep 2026)
+
+An extension of Warehouse Stock V1, not a second inventory. `RawItem`
+on-hand stays the only company truth; `LocationBalance` (guarded projection
++ the assigned-total sentinel) and the immutable `LocationMovement` ledger
+say WHERE it sits; located + unallocated = on hand, always. Every existing
+line started UNALLOCATED — the migration placed nothing.
+
+- `Warehouse.locations[]` gained a structural `kind` (AREA ZONE AISLE RACK
+  BAY LEVEL SHELF DRAWER BIN SLOT FLOOR — `LOCATION_KINDS`), `sequence`,
+  `qrToken` (`LOC-` + 8 chars, no 0/O/1/I), `layout` (cm; x/z are the MIN
+  CORNER in the PARENT's frame, rotation about it) and `capacity`; the
+  warehouse gained `floorPlan` (size, walls, fixtures, `layoutVersion`).
+  Racks/shelves/bins are `type: USABLE_STOCK` — reservation and put-away
+  only accept that type — with `kind` telling them apart. A container kind
+  (ZONE AISLE RACK BAY LEVEL) never holds stock; `holdsStockError` refuses it.
+- `LocationMovement` gained `barcodeId`/`barcodeLabel`: the Product Marking
+  sticker the stock moved under. Marking-grain balances are DERIVED from the
+  ledger (`markingBalances`, `markingsAt`), never a second projection; the
+  item-grain guards stay the atomic ones.
+- `services/storePurchase/storeLocations.service.js` is the domain: scan
+  parsing (`parseScan` — a `loc=` label vs an `itemid=` sticker; the client
+  `storeLocations.mjs` mirrors it), addresses, the tree, world boxes,
+  `rackPlan` (R04-L01-B01[-P01], ≤16 chars), `putStock` / `unassignStock` /
+  `transferStock` (all through `locationStock.service`'s guards) and
+  `assertMarkingAt`.
+- `routes/CMS_Routes/Inventory/Operations/storeLocationRoutes.js` on
+  `/api/cms/inventory/store-locations`: reads (dashboard, tree, resolve,
+  location, find, item/marking positions, unallocated, put-away queue,
+  reconciliation, movements, 8 reports) and writes (rack wizard = ONE
+  structural `$push` under the structure version; layout save = ONE write
+  under `floorPlan.layoutVersion`, never a movement; QR mint/backfill; `/put`,
+  `/remove` (back to Unassigned), `/transfer`, `/transfer-all`). Writes use
+  the full chain (capability → refuseLegacyWrite → withIdempotency →
+  unitOfWork). New capability `LOCATION_OPERATE` (store editor+). A TAKE that
+  CONSUMES is NOT here — it is `stock-adjustments /issue` (which now accepts
+  an optional per-line `barcodeId` and guards the sticker's balance at that
+  shelf) and MRF issue (item grain only, unchanged).
+- `worldBoxOf` folds a child's offset into its parent's frame CLOCKWISE with
+  z down (lx·cos − lz·sin, lx·sin + lz·cos), the SVG/plan convention the CMS's
+  `worldBox` and the 3D room use. It was the mirror image until 25 Sep 2026,
+  which drew every shelf of a turned rack beside its posts instead of inside.
+- Two guards learned that version 0 also means "absent": a warehouse created
+  before the location layer has no `structureVersion`/`floorPlan` on disk, and
+  `structureVersion: 0` matched nothing (`versionGuard` in both routers).
+  `usableLocationError` accepts a `companyId:null` warehouse while the
+  TEMPORARY legacy read-through is on — reads already showed it, writes
+  refused it.
+- Migration: `scripts/migrations/store-location-qr-tokens.js` (dry run by
+  default, `--apply` writes) mints tokens/kinds and the defaults. Tests:
+  `storeLocations.service.test.js`, `storeLocationRoutes.test.js` (node:test,
+  no DB).
+
+## The customer's delivery deadline is mandatory — 26 Sep 2026
+
+`customerInfo.deliveryDeadline` on the CustomerRequest is the one date every
+department plans against (PPC targets and verdicts, the department queues'
+due ordering). Half the orders on the board had none. `services/sales/
+deliveryDeadlineGate.js` is now the one check on every door that turns a
+request into production — quotation `sales-approve`, `approve-on-behalf`,
+`mark-internal-order` and a sample style's `production/submit`: a date
+handed in the body (`deliveryDeadline`, or `customerInfoOverride.
+deliveryDeadline` on the on-behalf door) is recorded first; a request that
+still has none is refused 400 with `code: "DELIVERY_DEADLINE_REQUIRED"`
+before anything changes. The finishing `/:stage/orders` list now carries
+`deliveryDeadline`; Packaging, QC, Production and Cutting already did.
+
+An approved order reaches PPC and every department the moment
+`createWorkOrdersAndProgress` creates its work orders inside the approval
+— visibility everywhere is "has a work order of this company (or an unlinked
+one while the legacy window is open)", never the request's own status.
+
+## Issuing from a shelf — 26 Sep 2026
+
+The canonical `POST /api/cms/inventory/stock-adjustments/issue` has taken an
+optional per-line `warehouseId` + `locationId` (+ `barcodeId`) since
+Warehouse Stock V1 and drops that shelf's balance in the same unit of work
+— but no screen sent them, so a sticker scanned off a shelf left the shelf's
+quantity untouched. The Store's Issue Stock drawer now finds the shelf
+(`/markings/:barcodeId` for a scanned sticker, else
+`/items/:id/locations` for the chosen variant), shows it on the line, lets
+the person pick another or "not from a shelf", and sends it.
+
+`locationStock.locationVariantFor` is the write-side twin of the routes'
+`variantKeyOf`: stock put away before a variant was chosen sits at item
+grain (`variantId: null`), which reads already attribute to a one-variant
+item's lone variant — the location debit/credit now keys the same way, so
+"R01-L01-B01 holds 20 of X" and "issue 1 of X from R01-L01-B01" agree.
+
+## Cutting's work-order scope — 26 Sep 2026
+
+`cuttingAccess.workOrderScope` now admits unlinked work orders
+(`salesLineLink.companyId` null or absent) while
+`tenantContext.legacyWindowOpen()` is true, exactly as Packaging's and
+Finishing's scopes do. It admitted linked work only — the comment said
+otherwise — and since 151 of 152 work orders carry no company link, the
+Cutting queue listed one order while every other department listed thirteen.
+`STORE_PURCHASE_STRICT_TENANCY=1` closes the window for all of them at once.
+
+## Cutting seasons — 25 Sep 2026
+
+`CuttingSeason` (`models/CMS_Models/Manufacturing/CuttingMaster/CuttingSeason.js`,
+collection `cutting_seasons`) is the fabric a cutting master was given and the
+pieces cut from it: `draft` (stickers scanned in) → `active` (Start froze the
+list and opened one `Barcode.cuttingSessions` entry per sticker) → `closed`
+(Close settled each session's `endQty`/`barcode.quantity` from the leftover
+the person entered, blank = 0, and summarised pieces per work order with
+photos). Stock consumption is still recorded on the sticker's own session, as
+the old tracker did — the season only remembers which session it opened.
+Routes: `routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingSeasonRoutes.js`
+mounted inside `cuttingMasterRoutes` before the `:moId` routes
+(`/seasons/*` and `/find-piece`, Cutting department guard + company). A piece
+resolves against this company's work orders by short id exactly as the
+finishing router does; a duplicate within a season is refused, one scanned in
+another season is accepted with a warning. `/find-piece` answers the finishing
+router's shape plus a leading `cutting` step.
+
+**The cluster is at its 500-collection cap** (across all databases; this
+database reports 409). Creating `cutting_seasons` failed with
+"already using 500 collections of 500", so the empty, model-less orphan
+`vehicles` collection was RENAMED to `cutting_seasons` (rename keeps the
+count). Any further new collection needs a drop first — the owner's call.
+Offline batches: `POST /seasons/:id/raw-items/batch` and `/pieces/batch` take
+`{scans:[{code|barcode, at}]}` and answer every input by name (saved / already
+/ invalid) with the device's `at` bounds-checked like the finishing scans;
+`GET /seasons/ping` is what the device queue probes. Declared before
+`/seasons/:id` so "ping" is never read as an id.
+
+## Dispatch by carton scan — 25 Sep 2026
+
+`routes/CMS_Routes/Manufacturing/Packaging/cartonDispatchRoutes.js` on
+`/api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/{overview,resolve,dispatch}`
+(Packaging access: readers read, the editor dispatches; company from
+`packagingCompany`). The only way a piece leaves is inside a `PackingCarton`
+whose label was scanned: `dispatch` takes `cartonNumbers[]` (+ optional
+`notes`, `transport{vehicleNumber,driverName,driverPhone,transporter,lrNumber}`),
+re-reads every carton INSIDE one transaction (this company, this order,
+still `packed` — one that is not refuses the whole request), creates ONE
+`DispatchChallan` (`source: "carton"`, `cartons[]` with each box's lines as
+they were, `cartonCount`, `transport`; `persons`/`bulkProducts` still filled
+from the same lines because the PPC ledger, order-target reader, closing
+verdict and CEO dispatch view read them), marks each carton `dispatched`
+(`dispatchChallanNumber`, `dispatchedBy`), bumps each work order's
+`dispatchedQuantity` with a dispatchRecord naming `cartonNumbers` and
+`challanNumber`, and marks person-wise progress docs dispatched. The challan
+number is an atomic counter in `crm_sequences` (`dispatchChallan:<IST day>`),
+seeded past the day's legacy count.
+
+RETIRED (410 `USE_CARTON_DISPATCH`): `POST packaging-dispatch-view/dispatch/bulk`
+and `/dispatch/person-wise`, `POST /dispatch-challans` (the free-form challan)
+and `POST manufacturing/dispatch/bulk`. `POST manufacturing/dispatch/employee`
+stays — the PPC person-wise tracking tab still calls it.
+
+## Store & Purchase request cost — 26 Sep 2026
+
+`tenantContext.resolveForActor` is cached per actor + requested company for
+`STORE_TENANT_CACHE_MS` (default 60 000; 0 disables) and hands back a copy.
+It was six or seven sequential Atlas reads on EVERY Store request, 300–400 ms
+before the route's own query. A membership or capability change reaches an
+open session within a minute; `invalidateActor(userId)` makes it immediate.
+`storeLocations.service.markingBalancesMany` is one aggregate for many
+stickers (the locator looped one query per sticker); the dashboard and
+reconciliation rows read side by side.
+
+## The PPC target calendar — 26 Sep 2026
+
+`services/ppc/control/calendar.service.js` behind
+`GET /api/cms/ppc/control/calendar?month=YYYY-MM`: one month, day by day.
+For each day, every active target that covers it (`targetDays`), what it
+asks (`expectedPerDay`), what was recorded inside its clock window
+(`doneOn`, now exported from orderTargets.evaluate.js), per-department
+load against IE's capacity (`capacityAt` of `standardsFor`), the day's
+pressure (busiest department's asked ÷ capacity: light <60%, normal ≤100%,
+heavy ≤120%, overloaded above; "unknown" when IE has set no standard) and
+achievement (achieved ≥100%, on_track ≥85%, behind, missed, planned for a
+future day), plus the orders whose delivery deadline falls that day. Month
+totals, per-department totals and `orders` (the active orders, for the day
+drawer's target picker — 27 Sep 2026) ride along. It reads the same
+`orders.snapshot` the rest of the control center reads.
+
+## IE may write the floor — 27 Sep 2026
+
+`ieOrDepartmentWrites(inner)` in server.js wraps the mount-level write gates
+of `/api/cms/production/dashboard` (was `pmWrites`) and
+`/api/cms/production/canvas-layout` (was `productionSupervisorWrites`):
+reads pass to the inner gate untouched; a write by an IE editor (or owner /
+approver — `departmentRoles.getEffectiveRole("ie")`) commits directly, as on
+IE's own routes; while IE has no roles configured, a session whose
+`deptSlug` is `ie` counts (the same fail-open rule every department guard
+applies to itself); everyone else goes through the original department gate
+and its approval queue. `departmentWriteGuard` exports `seedIdentity` for
+it, because the wrapper runs before the router's own auth. The machine
+register (`/api/cms/machines`) and the registered-operations routes need
+only a session and were never department-gated.
+
+## PPC targets: rules, the day board, speed — 27 Sep 2026
+
+**What a target may ask** — `orderTargets.service.checkTarget(companyId, moId,
+body)` is the ONE check, used by `previewTarget` (the form, before saving)
+and `setTarget` (the save). ERRORS block and a refused save writes nothing
+(409, `errors[]` + `facts` in the body): the department already finished
+the order; the target asks for more than the department has LEFT
+(order quantity − what it has recorded, read from the same ledger the
+pipeline shows); the first date is before today or the last date has
+passed. WARNINGS are shown and allowed: ends after the delivery date or the
+order has none; replaces the department's current target; leaves pieces
+with no target; IE's capacity / busy warnings. `previewTarget` now answers
+`{ok, errors, warnings, facts: {orderQuantity, done, left, asked, …}}`.
+Target sentences print dates as "3 Oct 2026" (`dayWords` in the evaluator).
+
+**Reads** — `services/ppc/control/targetBoard.service.js`:
+`GET /api/cms/ppc/control/targets` (every target, one plain `state`:
+upcoming | on_track | behind | done | missed | stopped, with `say`, asked /
+done / left, from / to, delivery) and `GET /control/day?date=` (the PPC
+overview's day: running targets by department, starting soon, ending soon,
+just ended, active orders with no target, deliveries due; a future day is
+judged by TODAY's standing). `GET /targets/department/:dept` also returns
+`upcoming` (targets starting in the next 14 days) — the department panels
+show them — and reads its orders side by side.
+
+**Speed** — `orders.snapshot` is shared: identical concurrent calls wait on
+one computation and a result is reused for `PPC_SNAPSHOT_CACHE_MS` (20 s; 0
+disables). Target, cancel and PO writes call `invalidateSnapshots`. One
+page used to fire the orders read four times at once, each rebuilding the
+whole company (1–3 s each); warm reads are now ~0.2 s. The snapshot is
+SHARED: never mutate it. `orderDetail` reads the ten departments' books
+side by side.
+
+## QC raw item checking — 28 Sep 2026
+
+QC's SECOND book, for the raw material a job-work customer sends, kept
+entirely apart from the per-piece product inspection:
+`routes/CMS_Routes/Manufacturing/QC/qcRawItemRoutes.js` on
+`/api/cms/manufacturing/qc/raw-items` (mounted above the inspection
+router, auth inside), `QCRawItemInspection` (one record per STICKER checked
+against ONE order: quantity, passedQuantity, defectiveQuantity, defects[],
+checker; a re-check supersedes the earlier record) and `QCRawItemSetting`
+(kind "defect" = the rejection reasons, kind "checker" = who may check, by
+email; the QC owner always may). Nothing in the product check reads these,
+and this reads nothing of the product check's.
+
+Flow: the checker picks the ORDER first (`GET /orders`, every live order,
+job-work first — `fulfilmentModel === "JOB_WORK"` on the order or any line),
+`POST /lookup {code, moId}` reads the Store's `itemid=<24 hex>` sticker
+(name, variant, quantity, unit from the Barcode) and reports a prior verdict
+on this order or another, `POST /save` records passed (whole quantity) or
+defective (reasons from the setup, a defective quantity ≤ the sticker's,
+the rest passes; 409 `ALREADY_CHECKED` unless `recheck`).
+`GET /orders/:moId` answers raw item by raw item. "To check" (`expected`,
+`expectedFrom`) is what the Store RECEIVED for the order — `CustomerMaterialLot`
+by `orderRef` (the request id or MO number) or a movement on this MO — when
+any lot was recorded, else what the work orders' `rawMaterials` REQUIRE (the
+same source the Store's requirement reads); checked / passed / defective /
+remaining come from the standing records, plus by-defect, by-checker and
+every record. The lot model exports `{ CustomerMaterialLot }` — a bare
+require of it is not a model, and the first version crashed the detail on
+exactly that. `GET /my-day?date=` is the
+checker's day on the shift clock (`shiftHours` buckets; the owner may pass
+`email=` or `all`); `GET /report?from&to` the owner's range.
+
+**29 Sep 2026.** A checker row carries `productCheck` (default true): the
+owner unticks it on Raw item setup (`PATCH /checkers/:id`) to keep a raw
+item checker OFF the product piece station; `/config` answers `me.productCheck`
+and the CMS shell hides Inspect piece on false (the station also refuses in
+words). `dayShape` groups each order's records into `byOrder[].items[]`, ONE
+row per raw item + variant whatever the number of labels ("12 + 10 = 22");
+the flat `recent` list stays for the rail. The word "sticker" is gone from
+every message ("raw item" / "label"); the JSON keys (`stickers`, the
+`NOT_A_STICKER` code) are unchanged. In qcRoutes.js,
+`computeWorkOrderQcStats` reads the inspections ONCE with the fields
+`buildPieceProgress` needs (it read 2 300 rows twice, ~3 s) and caches the
+result for `QC_ORDERS_CACHE_MS` (15 s; 0 disables).
+
+**Two collections came from renaming empty, unreferenced orphans** (the
+cluster is at its 500-collection cap): `trips` → `qc_raw_item_inspections`,
+`helpers` → `qc_raw_item_settings`. A rename keeps the old indexes — the
+first save failed on an inherited unique `tripNumber_1` — so every
+inherited index was dropped and the models' own built (`syncIndexes`). Do
+the same for any future rename.

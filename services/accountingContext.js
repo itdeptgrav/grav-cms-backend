@@ -15,6 +15,7 @@ const mongoose = require("mongoose");
 
 const col = (name) => mongoose.connection.db.collection(name);
 const inr = (n) => Math.round(Number(n) || 0);
+const money = (n) => Number((Number(n) || 0).toFixed(2));
 
 // Indian-style words for an amount ("2630726" -> "26.31 lakh") so the model can
 // quote the lakh/crore figure directly instead of computing (and mis-computing)
@@ -92,33 +93,79 @@ async function buildFinancials() {
   const moveMap = {};
   for (const m of movements) if (m && m._id) moveMap[m._id.toString()] = m.net;
 
+  // Gross-profit classification follows the chart-of-accounts hierarchy, not
+  // user wording and not the dashboard's unrelated CRM/purchase-order data.
+  // Tally's primary Sales/Direct Income groups are gross-profit revenue;
+  // Purchase/Direct Expense groups are COGS/direct cost. Descendants inherit
+  // their primary ancestor's classification.
+  const rootGroupName = (group) => {
+    let current = group;
+    const seen = new Set();
+    while (current && current.parent) {
+      const key = String(current._id || current.name || "");
+      if (seen.has(key)) break;
+      seen.add(key);
+      current = groupMap[String(current.parent)] || current;
+      if (seen.has(String(current._id || current.name || ""))) break;
+    }
+    return String((current && current.name) || (group && group.name) || "").trim();
+  };
+
   let revenue = 0;
   let expenses = 0;
+  let directRevenue = 0;
+  let directExpenses = 0;
   const bs = { asset: 0, liability: 0, equity: 0 };
   for (const led of ledgers) {
     const grp = led.groupId && groupMap[led.groupId.toString()];
     if (!grp) continue;
     const net = moveMap[led._id.toString()] || 0;
-    if (grp.nature === "revenue") revenue += -net; // credit side gives income
-    else if (grp.nature === "expense") expenses += net; // debit side gives expense
+    const root = rootGroupName(grp).toLowerCase();
+    if (grp.nature === "revenue") {
+      const amount = -net; // credit side gives income
+      revenue += amount;
+      if (["sales accounts", "direct incomes", "closing stock"].includes(root)) directRevenue += amount;
+    } else if (grp.nature === "expense") {
+      const amount = net; // debit side gives expense
+      expenses += amount;
+      if (["purchase accounts", "direct expenses", "opening stock"].includes(root)) directExpenses += amount;
+    }
     // Balance sheet uses closing (current) balances by nature.
     if (grp.nature === "asset") bs.asset += led.currentBalance || 0;
     else if (grp.nature === "liability") bs.liability += led.currentBalance || 0;
     else if (grp.nature === "equity") bs.equity += led.currentBalance || 0;
   }
 
-  revenue = inr(revenue);
-  expenses = inr(expenses);
-  const netProfit = revenue - expenses;
-  const assets = inr(Math.abs(bs.asset));
-  const liabilities = inr(Math.abs(bs.liability));
-  const equity = inr(Math.abs(bs.equity));
+  revenue = money(revenue);
+  expenses = money(expenses);
+  directRevenue = money(directRevenue);
+  directExpenses = money(directExpenses);
+  const grossProfit = money(directRevenue - directExpenses);
+  const netProfit = money(revenue - expenses);
+  const percentage = (numerator, denominator) =>
+    denominator === 0 ? 0 : Number(((numerator / denominator) * 100).toFixed(2));
+  const grossProfitMargin = percentage(grossProfit, directRevenue);
+  const netProfitMargin = percentage(netProfit, revenue);
+  const assets = money(Math.abs(bs.asset));
+  const liabilities = money(Math.abs(bs.liability));
+  const equity = money(Math.abs(bs.equity));
   const fy = c.currentFinancialYear || `${from.getUTCFullYear()}-${String((from.getUTCFullYear() + 1) % 100).padStart(2, "0")}`;
 
   return {
+    baseCurrency: c.baseCurrency || "INR",
     financialYear: fy,
     period: `${from.toISOString().slice(0, 10)} to ${to.toISOString().slice(0, 10)}`,
-    profitAndLoss: { totalRevenue: revenue, totalExpenses: expenses, netProfit, result: netProfit >= 0 ? "profit" : "loss" },
+    profitAndLoss: {
+      totalRevenue: revenue,
+      totalExpenses: expenses,
+      directRevenue,
+      directExpenses,
+      grossProfit,
+      grossProfitMargin,
+      netProfit,
+      netProfitMargin,
+      result: netProfit >= 0 ? "profit" : "loss",
+    },
     balanceSheet: { totalAssets: assets, totalLiabilities: liabilities, equity },
     readable:
       `Profit & Loss for FY ${fy} (INR): total revenue ${amt(revenue)}, total expenses ${amt(expenses)}, ` +
@@ -128,7 +175,7 @@ async function buildFinancials() {
 }
 
 // ── One ledger / account balance, OR a group's accounts ("top 5 Sundry Debtors") ─
-const LEDGER_STOP = /\b(what|whats|what's|is|are|was|the|balance|balances|leisure|leasure|ledger|ledgers|of|for|show|me|tell|about|account|accounts|current|how much|in|do we have|owe|owed|to|from|please|give|get|amount|due|top|five|ten|highest|lowest|biggest|largest|list)\b/gi;
+const LEDGER_STOP = /\b(what|whats|what's|is|are|was|the|balance|balances|bal|blnc|blnce|balnc|balnce|cb|closing|leisure|leasure|ledger|ledgers|of|for|show|me|tell|about|account|accounts|current|how much|in|do we have|owe|owed|to|from|please|give|get|amount|due|top|five|ten|highest|lowest|biggest|largest|list)\b/gi;
 // Fix common speech mishearings only (not synonyms).
 const fixMishears = (s) => String(s || "").replace(/\bdaughters?\b/gi, "debtors").replace(/\bdet(er|or)s?\b/gi, "debtors");
 // Detect an ACCOUNT-GROUP intent and return the exact group name (so "sundry
@@ -145,7 +192,28 @@ function groupIntent(text) {
   return null;
 }
 const cleanLedger = (s) =>
-  fixMishears(s).replace(LEDGER_STOP, " ").replace(/[^a-zA-Z0-9&.\s-]/g, " ").replace(/\s+/g, " ").trim();
+  fixMishears(s)
+    // Standard accounting shorthand: CB / C.B. / C-B = closing balance.
+    // It describes the requested figure and is never part of the ledger name.
+    .replace(/\bc\s*[./-]?\s*b(?:\.(?=\s|$))?/gi, " cb ")
+    .replace(LEDGER_STOP, " ")
+    .replace(/[^a-zA-Z0-9&.\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+// A comparison form used only to decide whether a database result is the exact
+// ledger the user named. Punctuation and case are presentation details here;
+// token order and every word still have to match.
+const normalizeLedgerName = (s) =>
+  String(s || "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function preferExactLedgerName(term, matches) {
+  const wanted = normalizeLedgerName(term);
+  if (!wanted || !Array.isArray(matches)) return matches || [];
+  const exact = matches.filter((match) => normalizeLedgerName(match && match.name) === wanted);
+  return exact.length ? exact : matches;
+}
 
 // Levenshtein distance + a 0..1 token similarity, mirroring hrEmployeeContext so
 // a mis-heard/mis-typed party name still resolves ("Davidat Mangeeral" ->
@@ -214,29 +282,87 @@ const CAPS_STOPWORDS = new Set([
 // closing = openingBalance + Σ signedAmount over POSTED vouchers (positive = Dr,
 // negative = Cr), or the trial-balance figure when the ledger is TB-flagged. The
 // stored `currentBalance` field is unmaintained and disagrees with the ledger
-// report, so we never trust it. Returns Map<idString, {abs, drCr, signed}>.
+// report, so it is never used as the calculation source. A disagreement is a
+// cache diagnostic, not grounds to suppress a complete posted-voucher result.
+// We fail closed only when the traceable source itself is structurally
+// incomplete: a zero-opening ledger has settlement-side movement but no
+// normal-side posting (for example a liability with payments but no accrual).
+// Returns Map<idString, {abs, drCr, signed, reconciliation}>.
 async function computeLedgerBalances(cid, ledgers) {
+  const scopedCompanyId = typeof cid === "string" && mongoose.Types.ObjectId.isValid(cid)
+    ? new mongoose.Types.ObjectId(cid)
+    : cid;
   const ids = ledgers.map((l) => l._id).filter(Boolean);
   const moveMap = {};
   if (ids.length) {
     const agg = await col("acc_vouchers")
       .aggregate([
-        { $match: { companyId: cid, status: "posted" } },
+        { $match: { companyId: scopedCompanyId, status: "posted" } },
         { $unwind: "$ledgerEntries" },
         { $match: { "ledgerEntries.ledgerId": { $in: ids } } },
-        { $group: { _id: "$ledgerEntries.ledgerId", net: { $sum: "$ledgerEntries.signedAmount" } } },
+        {
+          $group: {
+            _id: "$ledgerEntries.ledgerId",
+            net: { $sum: "$ledgerEntries.signedAmount" },
+            debit: {
+              $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", 0] },
+            },
+            credit: {
+              $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Cr"] }, "$ledgerEntries.amount", 0] },
+            },
+            count: { $sum: 1 },
+          },
+        },
       ])
       .toArray()
       .catch(() => []);
-    for (const m of agg) if (m && m._id) moveMap[String(m._id)] = m.net || 0;
+    for (const m of agg) if (m && m._id) moveMap[String(m._id)] = {
+      net: Number(m.net) || 0,
+      debit: Number(m.debit) || 0,
+      credit: Number(m.credit) || 0,
+      count: Number(m.count) || 0,
+    };
   }
   const out = new Map();
   for (const led of ledgers) {
+    const movement = moveMap[String(led._id)] || { net: 0, debit: 0, credit: 0, count: 0 };
+    const opening = Number(led.openingBalance) || 0;
     const signed =
       led.balanceFromTrialBalance === true
-        ? led.openingBalance || 0
-        : (led.openingBalance || 0) + (moveMap[String(led._id)] || 0);
-    out.set(String(led._id), { abs: Math.abs(signed), drCr: signed >= 0 ? "Dr" : "Cr", signed });
+        ? opening
+        : opening + movement.net;
+    const storedRaw = Number(led.currentBalance);
+    const storedSigned = Number.isFinite(storedRaw)
+      ? (storedRaw < 0 || led.currentBalanceType !== "Cr" ? storedRaw : -storedRaw)
+      : null;
+    const difference = storedSigned === null ? null : signed - storedSigned;
+    const nature = String(led.nature || "").toLowerCase();
+    const normalCredit = ["liability", "equity", "income", "revenue"].includes(nature);
+    const normalDebit = ["asset", "expense"].includes(nature);
+    const sourceIncomplete = led.balanceFromTrialBalance !== true
+      && Math.abs(opening) <= 0.5
+      && movement.count > 0
+      && ((normalCredit && movement.credit <= 0.5 && movement.debit > 0.5)
+        || (normalDebit && movement.debit <= 0.5 && movement.credit > 0.5));
+    const reconciliation = sourceIncomplete
+      ? {
+          status: "source_incomplete",
+          storedSigned,
+          calculatedSigned: signed,
+          difference,
+          reason: normalCredit ? "missing_normal_credit" : "missing_normal_debit",
+        }
+      : storedSigned === null
+        ? { status: "unavailable", storedSigned: null, calculatedSigned: signed, difference: null }
+        : Math.abs(difference) <= 0.5
+          ? { status: "reconciled", storedSigned, calculatedSigned: signed, difference }
+          : { status: "cache_stale", storedSigned, calculatedSigned: signed, difference };
+    out.set(String(led._id), {
+      abs: Math.abs(signed),
+      drCr: signed >= 0 ? "Dr" : "Cr",
+      signed,
+      reconciliation,
+    });
   }
   return out;
 }
@@ -249,6 +375,8 @@ async function buildLedgerLookup({ query, hint } = {}) {
     nature: 1,
     openingBalance: 1,
     balanceFromTrialBalance: 1,
+    currentBalance: 1,
+    currentBalanceType: 1,
   };
 
   // Build candidate search phrases, most specific first. A NAMED party/account
@@ -292,11 +420,23 @@ async function buildLedgerLookup({ query, hint } = {}) {
       .toArray()
       .catch(() => []);
   let matches = [];
+  let exactNamedMatch = false;
+  let uniqueNamedMatch = false;
   for (const term of terms) {
     const toks = term.split(" ").filter((t) => t.length >= 2);
     if (!toks.length) continue;
-    matches = await search(new RegExp(toks.join(".*"), "i"));
-    if (!matches.length) matches = await search(new RegExp(toks.filter((t) => t.length >= 3).join("|") || term, "i"));
+    // All meaningful tokens must occur, in order. The former any-token (`|`)
+    // fallback turned a failed phrase such as "blnce mayfair lagoon" into a
+    // search for every Mayfair ledger. If this strict lookup misses, the fuzzy
+    // resolver below scores complete names and asks the user before answering.
+    matches = await search(new RegExp(toks.map(escapeRegExp).join(".*"), "i"));
+    const isGroupTerm = grp && normalizeLedgerName(term) === normalizeLedgerName(grp);
+    if (matches.length && !isGroupTerm) {
+      matches = preferExactLedgerName(term, matches);
+      uniqueNamedMatch = matches.length === 1;
+      exactNamedMatch = matches.length === 1
+        && normalizeLedgerName(term) === normalizeLedgerName(matches[0].name);
+    }
     if (matches.length) break;
   }
   // Fuzzy fallback: no exact/substring hit, so the name was likely mis-heard or
@@ -334,7 +474,14 @@ async function buildLedgerLookup({ query, hint } = {}) {
   const bal = (m) => balMap.get(String(m._id)) || { abs: 0, drCr: "Dr" };
   const mapItem = (m) => {
     const b = bal(m);
-    return { name: m.name, group: m.groupName, nature: m.nature, balance: inr(b.abs), drCr: b.drCr };
+    return {
+      name: m.name,
+      group: m.groupName,
+      nature: m.nature,
+      balance: inr(b.abs),
+      drCr: b.drCr,
+      reconciliation: b.reconciliation,
+    };
   };
   // Fuzzy hits keep their similarity order (closest name first — the party the
   // user meant). Exact/group hits sort by balance magnitude, so "top N by
@@ -356,7 +503,62 @@ async function buildLedgerLookup({ query, hint } = {}) {
   const readable =
     `${lead} — ${items.map((i) => `${i.name} (${i.group}): ${lc(i.balance)} ${i.drCr}`).join("; ")}.` +
     (!fuzzy && totalMatched > 1 ? ` (${totalMatched} matching accounts; combined total ${lc(combinedTotal)}.)` : "");
-  return { found: true, matches: items, totalMatched, combinedTotal, fuzzy, readable };
+  return {
+    found: true,
+    matches: items,
+    totalMatched,
+    combinedTotal,
+    fuzzy,
+    exactNamedMatch,
+    uniqueNamedMatch,
+    readable,
+  };
+}
+
+// All-ledger ranking for an explicitly requested debit/credit balance side.
+// This is separate from name/group lookup so an ordinary vague name can never
+// accidentally expand into the whole chart of accounts.
+async function buildLedgerRanking({ balanceSide, ranking = "largest", limit = 5 } = {}) {
+  const side = String(balanceSide || "").toLowerCase();
+  if (!["dr", "cr"].includes(side)) return { found: false, note: "A debit or credit balance side is required." };
+  const cid = await companyId();
+  const ledgers = await col("acc_ledgers")
+    .find({ companyId: cid, isActive: { $ne: false }, name: { $not: /^\s*\[merged/i } })
+    .project({
+      name: 1,
+      groupName: 1,
+      nature: 1,
+      openingBalance: 1,
+      balanceFromTrialBalance: 1,
+      currentBalance: 1,
+      currentBalanceType: 1,
+    })
+    .limit(5000)
+    .toArray()
+    .catch(() => []);
+  const balances = await computeLedgerBalances(cid, ledgers);
+  const rows = ledgers
+    .map((ledger) => {
+      const balance = balances.get(String(ledger._id)) || { abs: 0, drCr: "Dr" };
+      return {
+        name: ledger.name,
+        group: ledger.groupName,
+        nature: ledger.nature,
+        balance: inr(balance.abs),
+        drCr: balance.drCr,
+        reconciliation: balance.reconciliation,
+      };
+    })
+    .filter((row) => row.drCr.toLowerCase() === side)
+    .sort((a, b) => ranking === "smallest" ? a.balance - b.balance : b.balance - a.balance);
+  const safeLimit = Math.max(1, Math.min(15, Number(limit) || 5));
+  return {
+    found: rows.length > 0,
+    fuzzy: false,
+    matches: rows.slice(0, safeLimit),
+    totalMatched: rows.length,
+    balanceSide: side,
+  };
 }
 
 // ── Vouchers / transactions summary and recent list ────────────────────────────
@@ -378,11 +580,17 @@ function normVoucherType(t) {
   return null;
 }
 
-async function buildVouchers({ voucherType, from, to } = {}) {
+async function buildVouchers({ voucherType, partyName, from, to } = {}) {
   const cid = await companyId();
   const match = { companyId: cid };
   const canon = normVoucherType(voucherType);
   if (canon) match.voucherTypeName = new RegExp(`^${canon}$`, "i");
+  if (partyName) {
+    // `partyName` is resolved against this company's ledgers before it reaches
+    // here. Match the complete recorded ledger name; never let model text
+    // become an open-ended database expression.
+    match["ledgerEntries.ledgerName"] = new RegExp(`^${escapeRegExp(String(partyName).trim())}$`, "i");
+  }
   if (from || to) {
     match.voucherDate = {};
     if (from) match.voucherDate.$gte = new Date(from);
@@ -417,7 +625,52 @@ async function buildVouchers({ voucherType, from, to } = {}) {
       ? "Voucher totals (INR): " + summary.map((s) => `${s.type} — ${s.count} vouchers, total ${amt(s.total)}`).join("; ") + "."
       : "No vouchers found for that filter.") +
     (largest.length ? ` Largest by amount: ${largest.slice(0, 5).map((v) => `${v.type} ${v.number} ${amt(v.amount)} (${v.party || "-"})`).join("; ")}.` : "");
-  return { filterType: canon || "all", summary, recent, largest, readable: summaryText };
+  return { filterType: canon || "all", filterParty: partyName || null, summary, recent, largest, readable: summaryText };
 }
 
-module.exports = { buildCompanyInfo, buildFinancials, buildLedgerLookup, buildVouchers };
+const PARTY_REPORTS = Object.freeze({
+  customer_outstanding: ["./customerOutstanding.service", "customerOutstandingReport"],
+  customer_ageing: ["./customerAgeing.service", "customerAgeingReport"],
+  supplier_outstanding: ["./supplierOutstanding.service", "supplierOutstandingReport"],
+  supplier_ageing: ["./supplierAgeing.service", "supplierAgeingReport"],
+});
+
+async function buildPartyReport({ report, asOf = null, search = null } = {}) {
+  const selected = PARTY_REPORTS[report];
+  if (!selected) return { available: false, reason: "unknown_party_report" };
+  const cid = await companyId();
+  if (!cid) return { available: false, reason: "company_unavailable" };
+  const [modulePath, fnName] = selected;
+  const service = require(modulePath);
+  const result = await service[fnName]({
+    companyId: cid,
+    scope: "all",
+    asOf: asOf ? new Date(`${asOf}T23:59:59.999Z`) : null,
+    search: search || "",
+    balanceSide: "both",
+    minOutstanding: 0,
+    ledgerIds: [],
+    restrictToIds: false,
+  });
+  return result || { available: false, reason: "report_unavailable" };
+}
+
+module.exports = {
+  buildCompanyInfo,
+  buildFinancials,
+  buildLedgerLookup,
+  buildLedgerRanking,
+  buildVouchers,
+  buildPartyReport,
+  // Exported for the Open-Jev Accounts pilot, which must resolve a voucher type
+  // from the user's words the SAME way this module does. Sharing the table is
+  // the point: a second alias list in the pilot would drift from this one, and
+  // the two would disagree about what "invoice" means.
+  normVoucherType,
+  VOUCHER_ALIASES,
+  // Pure resolver helpers are exported so regression tests can prove that
+  // spelling variants are cleaned generically and exact names always win.
+  cleanLedger,
+  preferExactLedgerName,
+  computeLedgerBalances,
+};

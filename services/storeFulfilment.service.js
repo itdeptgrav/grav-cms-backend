@@ -173,6 +173,17 @@ function planFor({ decision, items = [], plan = [], availableByItem = new Map() 
       buyQty: money(buyQty),
       rate: money(p.rate),
       note: item.description || "",
+      /* ── THE MATERIAL'S OWN IDENTITY, CARRIED FORWARD ─────────────────────
+         `itemId` says WHICH request line this is; these say WHAT it is. A
+         purchase raised from this line has to be able to prove, later, that
+         the thing ordered is the thing asked for — and a name cannot do that,
+         because two catalogue items can share one and a line can be renamed
+         after the fact. Carried from the request line rather than looked up
+         again downstream, where a different answer would go unnoticed. */
+      rawItem: item.rawItem || null,
+      rawItemSku: item.rawItemSku || "",
+      variantId: item.variantId || null,
+      baseUnit: item.baseUnit || "",
     });
   }
 

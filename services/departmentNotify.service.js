@@ -197,6 +197,29 @@ const EVENT_REGISTRY = [
     templateKey: "sales",
     templateStore: "production",
   },
+  /* ── WHERE A CUSTOMER'S CHANGES WENT ──────────────────────────────────
+     One event per destination, because the department that has to act is
+     different in each case, and "the customer rejected it" reaching everybody
+     is how a rejection ends up being nobody's job. A rejection that was never
+     routed notifies nobody — it is not yet work. */
+  {
+    key: "customer_changes_to_materials",
+    label: "Customer changes routed to Materials / BOM",
+    description: "Merchandising is told the customer asked for a material, colour or trim change, and the BOM has reopened.",
+    departments: ["merchandiser", "project-manager"],
+  },
+  {
+    key: "customer_changes_to_rnd",
+    label: "Customer changes routed to R&D",
+    description: "R&D is told the customer asked for a specification change or another sample round.",
+    departments: ["research-development"],
+  },
+  {
+    key: "customer_changes_to_sales",
+    label: "Customer changes routed to a new product version",
+    description: "Sales is told the rejected product needs replacing with a new version on the enquiry.",
+    departments: ["sales"],
+  },
   {
     key: "customer_decision_recorded",
     label: "Customer approved / rejected quote",

@@ -138,6 +138,11 @@ async function seed() {
     isActive: true, gender: "Other", biometricId: `ST${n}`, department: "Store",
     accessDepartmentId: storeDept._id,
   });
+  /* A Store grant so "may act for Store" resolves through the cache-immune
+     capability path even when the shared department cache is stale. */
+  await require("../../models/Access/DepartmentRole").create({
+    departmentSlug: "store", role: "editor", email: store.email, name: "Bikash", isActive: true,
+  });
 
   const fin = await Employee.create({
     firstName: "Soumya", lastName: `F${n}`, email: `fin${n}@demo.example`,
@@ -3623,15 +3628,24 @@ describe("a matched item's identity survives intake → spend → purchase order
     expect(approved.status).toBe(200);
     expect(approved.body.request.status).toBe("approved");
 
-    const conv = await call(s.store, `/${spendId}/purchase-order`, { method: "POST", app: "spend", body: {} });
-    expect(conv.status).toBe(201);
+    /* ── STAGE 3 — AND HERE THE RULE CHANGED ──────────────────────────────
+       A material purchase order must now say which MATERIAL REQUEST it
+       fulfils. An intake requirement is a real operational need, but it is not
+       a material request, and this one was never linked to one — so the
+       conversion is refused rather than producing an order nobody can trace to
+       a material request.
 
-    /* Stage 3 — the PO line carries the same identity, unchanged. */
-    const po = await PurchaseOrder.findOne({ spendRequestId: spendId }).lean();
-    expect(String(po.items[0].rawItem)).toBe(String(item._id));
-    expect(po.items[0].sku).toBe("SKU-MOUSE-1");
-    expect(po.items[0].baseUnit).toBe("Box");
-    expect(po.items[0].quantity).toBe(4);
+       This is the intended workflow change, not a regression: the intake must
+       first be linked to, or converted into, a material request. That
+       conversion is deliberately not automated. The identity assertions above
+       still stand — they are what this test is really about — and the refusal
+       below proves the identity survives as far as the rule allows. */
+    const conv = await call(s.store, `/${spendId}/purchase-order`, { method: "POST", app: "spend", body: {} });
+    expect(conv.status).toBe(400);
+    expect(conv.body.error.code).toBe("MRF_REQUIRED");
+    expect(conv.body.error.details.origin).toBe("intake");
+    /* And no half-made order is left behind. */
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: spendId })).toBe(0);
   });
 
   test("partial stock: only the buy balance changes quantity; the identity is unchanged", async () => {
@@ -3663,14 +3677,92 @@ describe("a matched item's identity survives intake → spend → purchase order
 
     const approved = await toApproved(s, saved.spendRequestId);
     expect(approved.status).toBe(200);
+    /* As above: the buy balance and its identity are what this test is about,
+       and both are asserted on the spend request. The order itself now needs a
+       material request, which an intake-origin requirement does not have until
+       somebody links or converts it. */
     const conv = await call(s.store, `/${saved.spendRequestId}/purchase-order`, { method: "POST", app: "spend", body: {} });
-    expect(conv.status).toBe(201);
+    expect(conv.status).toBe(400);
+    expect(conv.body.error.code).toBe("MRF_REQUIRED");
+    expect(await PurchaseOrder.countDocuments({ spendRequestId: saved.spendRequestId })).toBe(0);
+  });
+});
 
-    const po = await PurchaseOrder.findOne({ spendRequestId: saved.spendRequestId }).lean();
-    expect(String(po.items[0].rawItem)).toBe(String(item._id));
-    expect(po.items[0].sku).toBe("SKU-BLADE-9");
-    expect(po.items[0].baseUnit).toBe("Strip");
-    /* The balance, not the whole requirement. */
-    expect(po.items[0].quantity).toBe(12);
+/* ══ CANONICAL SERVICE IDENTITY — "Request this service" through intake ══════ */
+describe("canonical service identity is stamped server-side and travels with the line", () => {
+  const Service = require("../../models/CMS_Models/Inventory/Services/Service");
+  const IntakeRequest = require("../../models/CMS_Models/Requests/IntakeRequest");
+  const mkService = (companyId, over = {}) => Service.create({
+    companyId, serviceCode: over.serviceCode || `SVC-${seq++}`, name: over.name || "Lift AMC",
+    billingUnit: over.billingUnit || "visit", sacCode: over.sacCode || "9987",
+    defaultGstRate: 18, status: over.status || "ACTIVE",
+  });
+  const latestIntake = () => IntakeRequest.findOne({}).sort({ createdAt: -1 }).lean();
+
+  test("the line carries the master id and CANONICAL name/unit — a tampered name/unit cannot override", async () => {
+    const s = await seed();
+    const svc = await mkService(s.company._id, { name: "Lift AMC", serviceCode: "SVC-LIFT", billingUnit: "visit" });
+    const r = await call(s.emp, "/", { method: "POST", body: ask({
+      requestType: "SERVICE",
+      items: [{ name: "TAMPERED NAME", serviceId: String(svc._id), quantity: 2, unit: "TAMPERED UNIT", rate: 500 }],
+    }) });
+    expect(r.status).toBe(201);
+    const line = (await latestIntake()).items[0];
+    expect(String(line.service)).toBe(String(svc._id));   // canonical id persisted from the SERVER lookup
+    expect(line.serviceCode).toBe("SVC-LIFT");
+    expect(line.serviceName).toBe("Lift AMC");
+    expect(line.name).toBe("Lift AMC");                   // tampered name ignored
+    expect(line.unit).toBe("visit");                     // tampered unit ignored (canonical billing unit)
+    expect(line.rate).toBe(500);                         // the requester's own estimate is kept
+  });
+
+  test("a PRODUCT request carrying a service id is refused", async () => {
+    const s = await seed();
+    const svc = await mkService(s.company._id);
+    const r = await call(s.emp, "/", { method: "POST", body: ask({
+      requestType: "PRODUCT", items: [{ name: "x", serviceId: String(svc._id), quantity: 1, unit: "job" }],
+    }) });
+    expect(r.status).toBe(400);
+  });
+
+  test("malformed, inactive, foreign and nonexistent service ids are refused", async () => {
+    const s = await seed();
+    const inactive = await mkService(s.company._id, { status: "INACTIVE" });
+    // Foreign: a service whose companyId is not this company's (theCompany stays single).
+    const foreign = await mkService(new mongoose.Types.ObjectId());
+    const line = (serviceId) => ask({ requestType: "SERVICE", items: [{ name: "x", serviceId, quantity: 1, unit: "job" }] });
+    expect((await call(s.emp, "/", { method: "POST", body: line("not-an-id") })).status).toBe(400);
+    expect((await call(s.emp, "/", { method: "POST", body: line(String(inactive._id)) })).status).toBe(400);
+    expect((await call(s.emp, "/", { method: "POST", body: line(String(foreign._id)) })).status).toBe(400);
+    expect((await call(s.emp, "/", { method: "POST", body: line(String(new mongoose.Types.ObjectId())) })).status).toBe(400);
+  });
+
+  test("a plain SERVICE line with no service id remains valid", async () => {
+    const s = await seed();
+    const r = await call(s.emp, "/", { method: "POST", body: ask({
+      requestType: "SERVICE", items: [{ name: "Fix the boiler", quantity: 1, unit: "job" }],
+    }) });
+    expect(r.status).toBe(201);
+    expect((await latestIntake()).items[0].service).toBeNull();
+  });
+
+  test("the canonical identity SURVIVES classification into the SpendRequest — no second manual match", async () => {
+    const s = await seed();
+    const svc = await mkService(s.company._id, { name: "Lift AMC", serviceCode: "SVC-LIFT", billingUnit: "visit" });
+    const { id } = await askAndApprove(s, {
+      requestType: "SERVICE",
+      items: [{ name: "TAMPERED", serviceId: String(svc._id), quantity: 1, unit: "TAMPERED", rate: 6500 }],
+    });
+    const cl = await call(s.store, `/${id}/classify`, { method: "PATCH", body: { kind: "service", rates: { 0: 6500 } } });
+    expect(cl.status).toBe(200);
+
+    const saved = await IntakeRequest.findById(id).lean();
+    const spend = await SpendRequest.findById(saved.spendRequestId).lean();
+    expect(spend.requestType).toBe("SERVICE");
+    /* Carried WITHOUT a `/service-lines` re-match — the conversion prefers the
+       line's own service (spendRequests.js: `l.service` wins). */
+    expect(String(spend.items[0].service)).toBe(String(svc._id));
+    expect(spend.items[0].serviceCode).toBe("SVC-LIFT");
+    expect(spend.items[0].billingUnit).toBe("visit"); // canonical, from the master
   });
 });

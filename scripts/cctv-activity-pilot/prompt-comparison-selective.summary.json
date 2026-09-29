@@ -1,0 +1,28 @@
+{
+  "evaluated_on": "cam09-development-audit-v1",
+  "sample_count": 28,
+  "controlled_variable": "talking and no-task wording only; phone and working wording retained from baseline",
+  "baseline": {
+    "correct": 17,
+    "accuracy": 0.6071,
+    "per_primary_class": {
+      "working": {"correct": 8, "total": 10},
+      "no_observable_task": {"correct": 4, "total": 12},
+      "using_phone": {"correct": 4, "total": 4},
+      "talking_or_interacting": {"correct": 1, "total": 2}
+    }
+  },
+  "selective_candidate": {
+    "correct": 17,
+    "accuracy": 0.6071,
+    "per_primary_class": {
+      "working": {"correct": 10, "total": 10},
+      "no_observable_task": {"correct": 2, "total": 12},
+      "using_phone": {"correct": 4, "total": 4},
+      "talking_or_interacting": {"correct": 1, "total": 2}
+    }
+  },
+  "decision": "reject",
+  "reason": "The candidate preserved phone recall and fixed two working cases, but lost two previously correct no-task cases. Total accuracy was unchanged and the no-task class regressed from 4/12 to 2/12.",
+  "live_preview": "untouched Qwen2.5-VL-3B baseline"
+}

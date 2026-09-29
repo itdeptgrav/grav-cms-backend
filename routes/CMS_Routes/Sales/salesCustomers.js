@@ -11,6 +11,12 @@
 //   - profile.avatar field handled on create + update
 
 const express = require("express");
+const mongoose = require("mongoose");
+const {
+  scopedFilter: scoped, scopeFor: salesScopeFor,
+} = require("../../../services/companyContext/salesScope.service");
+/* One customer, as far as a salesperson is concerned — see the service. */
+const customerAccountLink = require("../../../services/sales/customerAccountLink.service");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Customer = require("../../../models/Customer_Models/Customer");
@@ -201,6 +207,42 @@ router.post("/", salesAuth, async (req, res) => {
       salesAssignedByName: req.user?.name || "Sales Team",
     });
 
+    /* ── AND THE COMMERCIAL RECORD THAT GOES WITH THEM ──────────────────
+       THE BUG THIS FIXES: this route created the portal customer and nothing
+       else. Their commercial terms live on a sales account, so every
+       customer Sales has ever created this way had nowhere to put them — and
+       the terms screen, which edits that account, told the person their
+       customer "is not linked to a sales account yet" and sent them to
+       another page to fix a relationship they had never heard of.
+
+       It is established HERE, with the customer, in one act. A salesperson
+       creates a customer; the system keeps whatever records it needs.
+
+       If it cannot be established the customer is removed again rather than
+       left half-created: a customer that exists without one is precisely the
+       state this fixes, and it is better to fail loudly at the moment
+       somebody is looking at the form. Nothing else references the record
+       yet — it was created two lines ago and no email has gone out. */
+    let account = null;
+    try {
+      const scope = await salesScopeFor(req);
+      const established = await customerAccountLink.ensure({
+        scope,
+        customerId: customer._id,
+        customer: customer.toObject(),
+        actor: { id: req.user?.id, name: req.user?.name || "Sales" },
+      });
+      if (!established.ok) throw new Error(established.message);
+      account = established.account;
+    } catch (linkErr) {
+      await Customer.deleteOne({ _id: customer._id }).catch(() => {});
+      console.error("[salesCustomers] POST / — could not establish the commercial record", linkErr);
+      return res.status(500).json({
+        success: false,
+        message: "The customer could not be set up completely, so nothing was saved. Please try again.",
+      });
+    }
+
     // Send welcome email (non-blocking — never fails the request)
     sendCustomerEmail("welcome", customer.email, {
       name: customer.name,
@@ -219,6 +261,9 @@ router.post("/", salesAuth, async (req, res) => {
       success: true,
       message: "Customer account created successfully",
       customer: safe,
+      /* The record their commercial terms are kept on, established with them.
+         Returned so a caller never has to go looking for it. */
+      account: account ? { _id: String(account._id), accountId: account.accountId || null } : null,
       tempPassword,
     });
   } catch (err) {
@@ -307,7 +352,7 @@ router.get("/stock-items/search", salesAuth, async (req, res) => {
 router.get("/for-account/:accountId", salesAuth, async (req, res) => {
   try {
     const Account = require("../../../models/CMS_Models/Sales/Account");
-    const account = await Account.findById(req.params.accountId)
+    const account = await Account.findOne(await scoped(req, { _id: req.params.accountId }))
       .select("companyName displayName normalizedName linkedCustomer")
       .populate("linkedCustomer", "name email phone customerId profile.companyName isActive")
       .lean();
@@ -316,10 +361,10 @@ router.get("/for-account/:accountId", salesAuth, async (req, res) => {
     const accountName = account.displayName || account.companyName || "";
 
     if (account.linkedCustomer) {
-      const sharedWith = await Account.find({
+      const sharedWith = await Account.find(await scoped(req, {
         _id: { $ne: account._id },
         linkedCustomer: account.linkedCustomer._id,
-      }).select("companyName displayName").lean();
+      })).select("companyName displayName").lean();
       return res.json({
         success: true,
         customer: account.linkedCustomer,
@@ -621,7 +666,7 @@ router.get("/:id/orders", salesAuth, async (req, res) => {
     const orders = await CustomerRequest.find({ customerId: custObjectId })
       .sort({ createdAt: -1 })
       .select(
-        "requestId status priority requestType measurementName measurementId " +
+        "requestId status priority requestType fulfilmentModel measurementName measurementId " +
           "customerInfo items finalOrderPrice totalPaidAmount totalDueAmount " +
           "quotations.quotationNumber quotations.grandTotal quotations.status " +
           "quotations.paymentSchedule quotations.paymentSubmissions " +
@@ -919,6 +964,7 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
   try {
     const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
     const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+    const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
     const customer = await Customer.findById(req.params.id)
       .select("name email phone profile customerId")
       .lean();
@@ -980,8 +1026,20 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
         });
       }
       if (!validatedVariants.length) continue;
+      let sampleStyleId = null;
+      if (item.sampleStyleId && mongoose.Types.ObjectId.isValid(String(item.sampleStyleId))) {
+        const style = await SampleStyle.findById(item.sampleStyleId)
+          .select("production.stockItemId")
+          .lean();
+        // A style may only be carried where it is already linked to this exact
+        // finished item. A customer request cannot invent a commercial link.
+        if (style && String(style.production?.stockItemId || "") === String(stockItem._id)) {
+          sampleStyleId = style._id;
+        }
+      }
       validatedItems.push({
         stockItemId: stockItem._id,
+        sampleStyleId,
         stockItemName: stockItem.name,
         stockItemReference: stockItem.reference,
         variants: validatedVariants,

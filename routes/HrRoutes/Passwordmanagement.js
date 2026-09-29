@@ -623,11 +623,23 @@ router.post("/bulk-reset", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
 
         await Model.findByIdAndUpdate(userId, { password: hashed });
 
+        /* IDENTIFIERS AND STATUS ONLY.
+         *
+         * This used to carry `newPassword: defaultPassword` for every row — the
+         * plaintext of every account it had just reset, in one response. Twelve
+         * selected employees meant twelve working credentials on the screen and
+         * in whatever log, cache or screenshot the response reached.
+         *
+         * The password is SET, not shown. It is the documented default format
+         * built from that person's own mobile number, so nobody needs to be
+         * told it here; an individual account that genuinely needs a generated
+         * one-time credential goes through /reset-password/:userType/:id, which
+         * is the only route in the contract allowed to return one. */
         results.push({
           userId,
           name: `${user.firstName} ${user.lastName || ""}`.trim(),
           email: user.email,
-          newPassword: defaultPassword,
+          reset: true,
         });
       } catch (err) {
         errors.push({ userId, error: err.message });
@@ -911,6 +923,18 @@ router.post(
             kind: "removed",
           })),
         });
+      }
+
+      /* Deleting a department login removes an identity the HR contract's
+         resolver reads, so a decision cached against it is now stale. */
+      if (removed.length) {
+        try {
+          require("../../services/access/hrAuthorization").invalidateHrAuthorization(
+            "department login removed",
+          );
+        } catch (e) {
+          console.warn("[password-management] HR cache invalidation skipped:", e.message);
+        }
       }
 
       res.status(200).json({

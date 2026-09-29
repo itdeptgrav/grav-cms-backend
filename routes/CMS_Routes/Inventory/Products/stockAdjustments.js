@@ -5,6 +5,12 @@ const express  = require("express");
 const router   = express.Router();
 const mongoose = require("mongoose");
 const RawItem         = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const Warehouse       = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
+const locStock        = require("../../../../services/storePurchase/locationStock.service");
+/* The physical store (25 Sep 2026): an issue may name the lot sticker the
+   stock is taken under, so the shelf's per-sticker balance follows it. */
+const storeLoc        = require("../../../../services/storePurchase/storeLocations.service");
+const Barcode         = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const StockItem       = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const Unit            = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const StockIssuance   = require("../../../../models/CMS_Models/Inventory/Operations/StockIssuance");
@@ -20,6 +26,11 @@ const actionHistory = require("../../../../services/storePurchase/actionHistory.
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
 const idempotency = require("../../../../services/storePurchase/idempotency.service");
+// The shared customer-owned-stock guard: an ordinary company issue may not
+// consume material the factory is only holding for a customer. It was used below
+// but never imported, so every ordinary issue threw a ReferenceError (500) and
+// the guard could not run. Imported from the same service mrfRoutes uses.
+const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
 
 const ENTITY = "STOCK_ADJUSTMENT";
 
@@ -551,15 +562,64 @@ router.post(
             `That variant holds ${currentVariant} ${nativeUnit}; ${nativeQty} ${nativeUnit} cannot be issued. Negative stock is not permitted.`,
             { reason: "INSUFFICIENT_STOCK", available: currentVariant, requested: nativeQty, unit: nativeUnit });
         }
+
+        /* ── AND SOME OF WHAT IS ON THE SHELF MAY NOT BE OURS ────────────────
+           One shared guard, called from every ordinary stock-out path rather than
+           written out in each of them. See its own service for why it is
+           location-scoped and why it only ever subtracts.
+
+           This is an EARLY refusal for a clean message; the same guard runs again
+           inside the transaction from the shared helper, which is where the
+           guarantee lives. */
+        await customerOwnedReserve.assertOrdinaryIssueAllowed({
+          companyId: req.tenant.companyId,
+          rawItem,
+          variantId: variant ? variant._id : null,
+          requested: nativeQty,
+          unit: nativeUnit,
+        });
+      }
+
+      /* ── WAREHOUSE STOCK V1: which location this moves to/from ─────────────
+         Optional per line. When given it is validated NOW (active, this
+         company) so an inactive/foreign location refuses before any stock
+         moves; the LocationMovement is written in the SAME unit of work as the
+         RawItem change and the StockIssuance evidence. A debit needs a SOURCE
+         location; a credit needs a DESTINATION. */
+      let warehouse = null, location = null;
+      const wid = objectId(incoming.warehouseId);
+      const lid = incoming.locationId ? objectId(incoming.locationId) : null;
+      if (wid && lid) {
+        warehouse = await Warehouse.findOne(scoped(req, { _id: wid })).lean();
+        location = locStock.findLocation(warehouse, lid);
+        const locErr = locStock.usableLocationError(warehouse, location, req.tenant.companyId);
+        if (locErr) throw fail("VALIDATION", locErr.message, { reason: locErr.reason, rawItemId: String(rawItemId) });
+      } else if (wid || lid) {
+        throw fail("VALIDATION", "A location needs both a warehouse and a location.", { reason: "LOCATION_INCOMPLETE", rawItemId: String(rawItemId) });
+      }
+
+      /* Optional lot sticker: must exist and be printed for THIS item (and
+         variant, when the sticker names one). Only meaningful with a location. */
+      let barcode = null;
+      if (incoming.barcodeId) {
+        const bid = objectId(incoming.barcodeId);
+        barcode = bid ? await Barcode.findById(bid).lean() : null;
+        if (!barcode || String(barcode.rawItem) !== String(oid)) throw fail("VALIDATION", "That sticker is not one of this item's.", { reason: "BARCODE_MISMATCH", rawItemId: String(rawItemId) });
+        if (barcode.variantId && variant && String(barcode.variantId) !== String(variant._id)) throw fail("VALIDATION", "That sticker is for a different variant.", { reason: "BARCODE_VARIANT_MISMATCH", rawItemId: String(rawItemId) });
       }
 
       plan.push({
         rawItem, variant, oid, qty, issuedUnit: issuedUnit || nativeUnit, nativeUnit,
         nativeQty, conversion, itemNotes, currentTotal, currentVariant,
+        warehouse, location, barcode,
       });
     }
 
     const delta = (n) => (direction === "debit" ? -n : n);
+
+    /* Pre-generated so each LocationMovement can point at the REAL StockIssuance
+       document as its source, not the location API's idempotency record. */
+    const issuanceId = new mongoose.Types.ObjectId();
 
     const { result } = await runStockMutation(req, {
       mutate: async (session) => {
@@ -619,6 +679,49 @@ router.post(
             ? (p.variant ? "VARIANT_REDUCE" : "REDUCE")
             : (p.variant ? "VARIANT_ADD" : "ADD");
 
+          /* ── WAREHOUSE STOCK V1: pair the location movement, in this UoW ─────
+             The company total is already moved atomically above. Now move the
+             location: a debit LEAVES a source location (guarded — refuses to go
+             below zero), a credit ENTERS a destination. If the location side
+             fails, UNDO the company change so neither side is left applied. */
+          if (p.location) {
+            const common = {
+              companyId: req.tenant.companyId, siteId: req.tenant.siteId,
+              item: p.rawItem,
+              /* the key the shelf holds it under — item grain for stock put
+                 away before a variant was chosen on a one-variant item */
+              variantId: await locStock.locationVariantFor(session, req.tenant.companyId, p.rawItem, p.variant?._id || null, p.warehouse._id, p.location._id),
+              warehouse: p.warehouse, location: p.location, quantity: p.nativeQty,
+              actor: { id: req.user?.id, name: req.user?.name },
+              note: reasonText, idempotencyKey: req.idempotent?.key || "",
+              barcodeId: p.barcode ? p.barcode._id : null,
+              barcodeLabel: p.barcode ? `${p.barcode.quantity} ${p.barcode.unit}${p.barcode.purchaseOrderNumber ? ` · ${p.barcode.purchaseOrderNumber}` : ""}` : "",
+            };
+            if (direction === "debit") {
+              /* Under a sticker, the shelf must hold that much of THAT lot. */
+              if (p.barcode) await storeLoc.assertMarkingAt(session, req.tenant.companyId, p.barcode, p.warehouse, p.location, p.nativeQty);
+              const out = await locStock.applyLocationOut(session, {
+                ...common, type: "issue",
+                source: { kind: "stock_issue", id: issuanceId, reference: String(issuanceId) },
+              });
+              if (!out.ok) {
+                // Undo the company-total decrement — neither side applied.
+                const undo = { $inc: { quantity: p.nativeQty } };
+                if (p.variant) undo.$inc["variants.$[v].quantity"] = p.nativeQty;
+                await RawItem.updateOne(scoped(req, { _id: p.oid }), undo,
+                  { session, ...(p.variant ? { arrayFilters: [{ "v._id": p.variant._id }] } : {}) });
+                throw fail("VALIDATION",
+                  `${p.location.code} does not hold ${p.nativeQty} ${p.nativeUnit} of ${p.rawItem.name}.`,
+                  { reason: "INSUFFICIENT_AT_LOCATION", rawItemId: String(p.oid) });
+              }
+            } else {
+              await locStock.applyLocationIn(session, {
+                ...common, type: "adjustment", intent: "receive",
+                source: { kind: "stock_adjustment", id: issuanceId, reference: String(issuanceId) },
+              });
+            }
+          }
+
           const tx = {
             type: txType, quantity: p.nativeQty,
             previousQuantity: prevTotal, newQuantity: newTotal,
@@ -628,6 +731,8 @@ router.post(
                 : `Issued as ${p.qty} ${p.issuedUnit} → ${p.nativeQty} ${p.nativeUnit} (${p.conversion.direction})`,
             ].filter(Boolean).join(" | "),
             performedBy: req.user?.id || null,
+            operationId: req.idempotent?.record?._id || null,
+            ...locStock.txLocationSnapshot(p.warehouse, p.location),
           };
           if (p.variant) { tx.variantId = p.variant._id; tx.variantCombination = p.variant.combination || []; }
           if (variantPrevQty !== null) { tx.variantPreviousQuantity = variantPrevQty; tx.variantNewQuantity = variantNewQty; }
@@ -655,6 +760,7 @@ router.post(
         }
 
         const [issuance] = await StockIssuance.create([{
+          _id: issuanceId,
           ...tenantContext.stamp(req.tenant),
           idempotencyKey: req.idempotent?.key || "",
           direction,

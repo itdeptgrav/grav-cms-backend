@@ -17,6 +17,7 @@
 "use strict";
 
 const express = require("express");
+const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
 const router = express.Router();
 
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
@@ -36,7 +37,12 @@ router.get("/", salesAuth, async (req, res) => {
     }
 
     const [enquiries, styles] = await Promise.all([
-      Enquiry.find({ isActive: true, "costingChangeLog.status": "pending" })
+      /* ── SCOPED (Chunk 3A correction) ────────────────────────────────
+         This is a Sales-WIDE inbox, and "wide" meant every company's: it
+         listed pending costing changes — product names and the costing rows
+         attached to them — from enquiries belonging to anybody. Wide means
+         wide within one company. */
+      Enquiry.find(await scoped(req, { isActive: true, "costingChangeLog.status": "pending" }))
         .select("journeyId costingChangeLog").lean(),
       SampleStyle.find({ isActive: true, "materialsChangeLog.status": "pending" })
         .select("journeyId productName sampleStyleId materialsChangeLog").lean(),
@@ -46,7 +52,7 @@ router.get("/", salesAuth, async (req, res) => {
       ...enquiries.map((e) => String(e.journeyId)),
       ...styles.map((s) => String(s.journeyId)),
     ])];
-    const journeys = await SalesJourney.find({ _id: { $in: journeyIds } }).select("journeyId name").lean();
+    const journeys = await SalesJourney.find(await scoped(req, { _id: { $in: journeyIds } })).select("journeyId name").lean();
     const journeyById = new Map(journeys.map((j) => [String(j._id), j]));
 
     const items = [];

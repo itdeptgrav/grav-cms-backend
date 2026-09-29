@@ -155,6 +155,7 @@ async function resolveEmployeeByQuery(query) {
   const bio = (q.match(BIO_RE) || [])[1];
   if (bio) {
     const byBio = await Employee.findOne({ biometricId: new RegExp(`^${bio}$`, "i") })
+      .select(NAME_SELECT)
       .lean()
       .catch(() => null);
     if (byBio) return byBio;

@@ -65,7 +65,7 @@ const AllEmployeeAppMiddleware = async (req, res, next) => {
       });
     }
 
-    var decoded = jwt.verify(token, process.env.JWT_SECRET);
+    var decoded = jwt.verify(token, require("../config/jwt").SECRET);
   } catch (error) {
     return res.status(401).json({
       success: false,

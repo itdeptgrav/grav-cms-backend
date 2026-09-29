@@ -61,6 +61,23 @@ const activitySchema = new mongoose.Schema(
     stage: { type: String, trim: true },
     contactId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMContact" },
 
+    /* ── WHICH PERSON, ON A PRE-ACCOUNT LEAD ────────────────────────────────
+       The `_id` of an embedded contact in that Lead's `contacts[]`. NOT a
+       CRMContact — those belong to an Account and do not exist yet, which is
+       exactly why `contactId` could never answer "who was this call with?" for
+       a Prospect. Putting an embedded id into `contactId` would make it a
+       broken ref that populate() silently resolves to null.
+
+       Optional, and legitimately absent: legacy history predates it, and a
+       general Prospect note is about the record, not a person.
+
+       Valid only on a Lead-owned Activity, and only for a contact of THAT
+       Lead — enforced where the Activity is written, since the model cannot
+       see the Lead. `contactName` stays the historical snapshot: what the
+       person was called at the time, which survives them being renamed,
+       removed or promoted to a CRMContact. */
+    leadContactId: { type: mongoose.Schema.Types.ObjectId },
+
     activityType: { type: String, enum: ACTIVITY_TYPE_CODES, required: true },
     subject: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
@@ -131,6 +148,54 @@ const activitySchema = new mongoose.Schema(
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
 );
 
+/* Per-contact history: the Contacts list's "last interaction" summary, and the
+   referenced-contact check that refuses to delete somebody with history. Both
+   query by lead + contact and want the newest first. */
+/* ── MARKETING PROVENANCE (Marketing Chunk 2) ────────────────────────────────
+ * Which marketing observation produced this row, and which system it came from.
+ * Present ONLY on activities Marketing projected; every activity a person typed
+ * has neither, no migration runs, and nothing in the existing Sales flows reads
+ * them.
+ *
+ * They exist because a projected activity has to be traceable back to the
+ * observation that caused it, and because the partial unique index below is
+ * what makes replay idempotent — a read-then-write check is passed by two
+ * concurrent replays, and an index is not. */
+activitySchema.add({
+  /* ── THE COMPANY IS PART OF THE PROVENANCE IDENTITY ──────────────────────
+     Not decoration. A source event id is unique within ONE Mautic instance, and
+     two companies run two instances: both number their submissions from 1, so
+     `mautic.form_on_submit:submission:1` is a real and different event in each.
+     Keyed on the event id alone, the second company's first projection would
+     have been swallowed as a duplicate of the first company's — and worse, a
+     duplicate lookup would have handed back the OTHER company's activity id. */
+  marketingCompanyId: { type: mongoose.Schema.Types.ObjectId },
+  /* ── STORED, BUT NEVER SELECTED ────────────────────────────────────────
+     This names the system that observed the event, and its value is the
+     marketing provider's own name. The Activity read routes spread the whole
+     document into the response, so a plain field here put that name on a
+     salesperson's timeline in the browser.
+
+     `select: false` keeps the stored value and the provenance unique index
+     exactly as they are — changing the value would give an already-projected
+     event a different index key and let a replay write a duplicate activity —
+     while excluding it from every query that does not ask for it by name.
+     Mongoose applies this to `.lean()` reads too, which is what the Sales
+     routes use. `crmActivityProjection` matches on it in a selector rather than
+     reading it back, so nothing needs it in a result. */
+  marketingSource: { type: String, trim: true, select: false },
+  marketingSourceEventId: { type: String, trim: true },
+});
+
+/* One activity per marketing observation PER COMPANY PER SOURCE SYSTEM, for
+   ever. `partialFilterExpression` keeps the index off every row that has no
+   such field, so hand-written activities are outside it and cannot collide. */
+activitySchema.index(
+  { marketingCompanyId: 1, marketingSource: 1, marketingSourceEventId: 1 },
+  { unique: true, partialFilterExpression: { marketingSourceEventId: { $type: "string" } } },
+);
+
+activitySchema.index({ leadId: 1, leadContactId: 1, activityDate: -1 });
 activitySchema.index({ accountId: 1, activityDate: -1 });
 activitySchema.index({ leadId: 1, activityDate: -1 });
 activitySchema.index({ ownerId: 1, dueDate: 1, status: 1 });

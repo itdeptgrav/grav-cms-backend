@@ -1,0 +1,30 @@
+{
+  "evaluated_on": "cam09-development-audit-v1",
+  "sample_count": 28,
+  "controlled_variable": "prompt text only",
+  "baseline": {
+    "correct": 17,
+    "accuracy": 0.6071,
+    "mean_inference_seconds": 0.234,
+    "per_primary_class": {
+      "working": {"correct": 8, "total": 10},
+      "no_observable_task": {"correct": 4, "total": 12},
+      "using_phone": {"correct": 4, "total": 4},
+      "talking_or_interacting": {"correct": 1, "total": 2}
+    }
+  },
+  "clearer_definitions_candidate": {
+    "correct": 18,
+    "accuracy": 0.6429,
+    "mean_inference_seconds": 0.226,
+    "per_primary_class": {
+      "working": {"correct": 7, "total": 10},
+      "no_observable_task": {"correct": 6, "total": 12},
+      "using_phone": {"correct": 3, "total": 4},
+      "talking_or_interacting": {"correct": 2, "total": 2}
+    }
+  },
+  "decision": "reject",
+  "reason": "The candidate gained one net exact match but regressed the priority phone class from 4/4 to 3/4 and the working class from 8/10 to 7/10. It also changed the known laptop user at track 16 from WORKING to TALKING at the 40-second checkpoint.",
+  "live_preview": "untouched Qwen2.5-VL-3B baseline"
+}

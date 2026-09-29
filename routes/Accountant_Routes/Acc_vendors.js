@@ -7,6 +7,20 @@ const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const { settlementOf } = require("../../services/poSettlement.service");
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const {
   Acc_Voucher,
 } = require("../../models/Accountant_model/Acc_VoucherModels");
@@ -203,7 +217,7 @@ router.use(AccountantAuthMiddleware.accountantAuth);
 // ─────────────────────────────────────────────────────────────────────────────
 // GET / — All vendors with financial stats
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/", async (req, res) => {
+router.get("/", companyScopeOptional, async (req, res) => {
   try {
     const { search = "", status } = req.query;
 
@@ -512,7 +526,7 @@ router.get("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /:id — Single vendor details
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScopeOptional, async (req, res) => {
   try {
     const vendor = await Vendor.findById(req.params.id).select(
       "companyName contactPerson email phone gstNumber panNumber address status rating notes vendorType paymentTerms bankDetails primaryProducts createdBy updatedBy createdAt",
@@ -1201,7 +1215,7 @@ router.put("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /:id/merge — Merge a ghost vendor's transactions into keeper
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/:id/merge", async (req, res) => {
+router.post("/:id/merge", companyScopeOptional, async (req, res) => {
   try {
     const keeperId = req.params.id;
     const { mergeFromId } = req.body || {};

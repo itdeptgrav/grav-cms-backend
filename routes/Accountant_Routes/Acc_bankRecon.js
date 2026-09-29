@@ -23,6 +23,20 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const {
   Acc_Voucher,
 } = require("../../models/Accountant_model/Acc_VoucherModels");
@@ -602,7 +616,7 @@ async function buildLedgerSide(session) {
 // ═════════════════════════════════════════════════════════════════════════════
 router.post(
   "/upload",
-  upload.single("file"),
+  companyScope, upload.single("file"),
   blockViewerWrite,
   async (req, res) => {
     try {
@@ -771,7 +785,7 @@ router.post(
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /sessions
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/sessions", async (req, res) => {
+router.get("/sessions", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -822,7 +836,7 @@ router.get("/sessions/:id", async (req, res) => {
 // Returns vouchers involving the bank ledger near this transaction's date+amount
 // Query: ?amount=X&txnDate=YYYY-MM-DD&type=credit|debit&q=search
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/sessions/:id/match-candidates", async (req, res) => {
+router.get("/sessions/:id/match-candidates", companyScopeOptional, async (req, res) => {
   try {
     const session = await Acc_BankReconSession.findById(req.params.id)
       .select("companyId bankLedgerId periodFrom periodTo")
@@ -1148,7 +1162,7 @@ router.put("/sessions/:id/reconcile", blockViewerWrite, async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PUT /sessions/:id/ledger
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/ledger", blockViewerWrite, async (req, res) => {
+router.put("/sessions/:id/ledger", companyScopeOptional, blockViewerWrite, async (req, res) => {
   try {
     const { bankLedgerId } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
@@ -1193,7 +1207,7 @@ router.delete("/sessions/:id", blockViewerWrite, async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /bank-ledgers
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/bank-ledgers", async (req, res) => {
+router.get("/bank-ledgers", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -1226,7 +1240,7 @@ router.get("/bank-ledgers", async (req, res) => {
 // Aggregates all sessions for a given bank ledger and year (FY or calendar)
 // Query: ?companyId=...&bankLedgerId=...&year=2026&fyMode=true
 // ═════════════════════════════════════════════════════════════════════════════
-router.get("/annual-summary", async (req, res) => {
+router.get("/annual-summary", companyScope, async (req, res) => {
   try {
     const { companyId, bankLedgerId, year, fyMode } = req.query;
     if (!companyId || !year)

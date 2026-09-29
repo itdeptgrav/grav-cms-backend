@@ -54,8 +54,70 @@ const STANDARD_LOCATIONS = Object.freeze([
 
 const LIFECYCLE = Object.freeze(["Active", "Inactive", "Archived"]);
 
+/* ── THE PHYSICAL SHAPE OF A LOCATION (25 Sep 2026) ─────────────────────────
+   `type` above says what a location is FOR (receiving, usable stock,
+   quarantine…) and every stock rule keys on it. `kind` says what it physically
+   IS — a zone of the floor, an aisle, a rack, a bay or level of a rack, a
+   shelf, a drawer, a bin, a slot, or a marked patch of floor — so the store can
+   be drawn, addressed and walked. A rack's shelves and bins stay
+   `type: USABLE_STOCK` because reservation and put-away only accept that type;
+   the kind is a second axis, not a replacement. `AREA` is the kind every
+   location written before this field carried: a named place with no shape. */
+const LOCATION_KINDS = Object.freeze([
+  "AREA", "ZONE", "AISLE", "RACK", "BAY", "LEVEL", "SHELF", "DRAWER", "BIN", "SLOT", "FLOOR",
+]);
+/* Kinds that may hold stock directly. A RACK or ZONE that has children is a
+   container; stock is put on the leaf inside it, never on the container. */
+const HOLDING_KINDS = Object.freeze(["AREA", "SHELF", "DRAWER", "BIN", "SLOT", "FLOOR", "BAY", "LEVEL", "RACK", "ZONE"]);
+
+/* Where the location sits and how big it is, in CENTIMETRES on the
+   warehouse's own floor plan — the same unit the factory floor designer uses.
+   x/z run along the floor (x to the right, z towards the viewer), y is height
+   off the floor. For a child of a rack the position is RELATIVE to the rack's
+   origin, so moving the rack moves everything on it. Serialisable numbers
+   only; nothing here is a runtime scene object, and changing these values is
+   a LAYOUT change that never produces a stock movement. */
+const layoutSchema = new mongoose.Schema(
+  {
+    x: { type: Number, default: 0 },
+    y: { type: Number, default: 0 },
+    z: { type: Number, default: 0 },
+    w: { type: Number, default: 0 },   // width along x
+    h: { type: Number, default: 0 },   // height along y
+    d: { type: Number, default: 0 },   // depth along z
+    rotation: { type: Number, default: 0 }, // degrees about y, clockwise from above
+    color: { type: String, trim: true, default: "" },
+    placed: { type: Boolean, default: false }, // false = never positioned by anybody
+  },
+  { _id: false },
+);
+
+/* Optional. A capacity is only meaningful in the unit the location's stock
+   is actually counted in; nothing here converts between units or invents a
+   universal "pieces". `unit` is free text matched against the base unit of
+   the items placed; a mismatch is reported, never blocked. */
+const capacitySchema = new mongoose.Schema(
+  {
+    value: { type: Number, default: null, min: 0 },
+    unit: { type: String, trim: true, default: "" },
+    warnAtPct: { type: Number, default: 90, min: 1, max: 100 },
+    note: { type: String, trim: true, default: "" },
+  },
+  { _id: false },
+);
+
 const locationSchema = new mongoose.Schema(
   {
+    /* The physical kind — see LOCATION_KINDS. */
+    kind: { type: String, enum: LOCATION_KINDS, default: "AREA" },
+    /* Order among siblings (level 1 below level 2, bay 1 left of bay 2). */
+    sequence: { type: Number, default: 0 },
+    /* The stable token a printed LOCATION QR carries. Never the code (codes can
+       be renamed) and never the name. Minted once, unique within the company. */
+    qrToken: { type: String, trim: true, default: "" },
+    layout: { type: layoutSchema, default: () => ({}) },
+    capacity: { type: capacitySchema, default: () => ({}) },
+
     /* Unique WITHIN its warehouse. A subdocument array cannot carry its own
        unique index, so the route enforces this atomically on write — see the
        `locations.code` guard in warehouses.js. */
@@ -161,6 +223,25 @@ const warehouseSchema = new mongoose.Schema(
 
     locations: [locationSchema],
 
+    /* ── THE ROOM ITSELF (25 Sep 2026) ────────────────────────────────────
+       The floor the racks stand on, in centimetres: its size, its walls,
+       doors and pillars, and the grid the layout builder snaps to. Drawn from
+       photographs and then maintained by the store manager; every number is
+       editable and none is a stock fact. */
+    floorPlan: {
+      widthCm: { type: Number, default: 0 },
+      depthCm: { type: Number, default: 0 },
+      heightCm: { type: Number, default: 300 },
+      gridCm: { type: Number, default: 25 },
+      walls: [{ _id: false, id: String, x1: Number, z1: Number, x2: Number, z2: Number, thickness: { type: Number, default: 15 }, height: { type: Number, default: 300 }, label: { type: String, default: "" } }],
+      fixtures: [{ _id: false, id: String, kind: { type: String, default: "door" }, x: Number, z: Number, w: Number, d: Number, h: { type: Number, default: 0 }, rotation: { type: Number, default: 0 }, label: { type: String, default: "" } }],
+      notes: { type: String, trim: true, default: "" },
+      /* Bumped by every layout save; a stale builder save is refused. */
+      layoutVersion: { type: Number, default: 0 },
+      layoutUpdatedAt: { type: Date, default: null },
+      layoutUpdatedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    },
+
     /* ── LEGACY, AND NOT A FACT ──────────────────────────────────────────
        A stored counter that nothing maintains, from a time when the UI showed
        it as live inventory. Stock is not held per warehouse at all yet. It is
@@ -221,13 +302,20 @@ warehouseSchema.index(
 );
 warehouseSchema.index({ companyId: 1, status: 1, name: 1 });
 warehouseSchema.index({ companyId: 1, "locations.code": 1 });
+/* A location QR or a location id resolves to its warehouse in one read. */
+warehouseSchema.index({ companyId: 1, "locations.qrToken": 1 });
+warehouseSchema.index({ "locations._id": 1 });
 
 warehouseSchema.statics.LOCATION_TYPES = LOCATION_TYPES;
 warehouseSchema.statics.STANDARD_LOCATIONS = STANDARD_LOCATIONS;
 warehouseSchema.statics.LIFECYCLE = LIFECYCLE;
+warehouseSchema.statics.LOCATION_KINDS = LOCATION_KINDS;
+warehouseSchema.statics.HOLDING_KINDS = HOLDING_KINDS;
 
 module.exports =
   mongoose.models.Warehouse || mongoose.model("Warehouse", warehouseSchema);
 module.exports.LOCATION_TYPES = LOCATION_TYPES;
 module.exports.STANDARD_LOCATIONS = STANDARD_LOCATIONS;
 module.exports.LIFECYCLE = LIFECYCLE;
+module.exports.LOCATION_KINDS = LOCATION_KINDS;
+module.exports.HOLDING_KINDS = HOLDING_KINDS;

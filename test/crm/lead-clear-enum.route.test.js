@@ -51,6 +51,20 @@ async function call(path = "", { method = "GET", body, user = SALES_USER } = {})
 
 const checkMet = (checks, key) => (checks.find((c) => c.key === key) || {}).met;
 
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Account, Lead and Contact creation now refuses unless the actor's company is
+ * provable. These suites are not about tenancy, so they seed the simplest
+ * thing that makes ownership provable: a single company, which is the
+ * documented deployment fallback. Without it every creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
+
 describe("'Not sure yet' clears a saved Lead Source / Customer Segment", () => {
   test("PATCH source:'' and industry:'' unset the fields and flip readiness to unmet", async () => {
     const created = await call("/", { method: "POST", body: { captureStatus: "draft", firstName: "Kiran", company: "Test Buyer Co", source: "referral", industry: "hospitality" } });

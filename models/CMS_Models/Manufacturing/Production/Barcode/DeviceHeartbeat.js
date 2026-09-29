@@ -39,6 +39,14 @@ const deviceHeartbeatSchema = new mongoose.Schema(
     resetReason: { type: String, default: "" },
 
     lastHeartbeatAt: { type: Date, default: Date.now },
+
+    // Server-owned causal counter: the ingest route `$inc`s it on every
+    // accepted heartbeat, atomically with the rest of the update. It is never
+    // read from the device. Production machine-assignment sync compares it
+    // with a baseline captured AFTER an assignment commits: only a strictly
+    // greater revision can be evidence of the scanner's post-commit state —
+    // timestamps cannot prove that ordering. Historical documents read as 0.
+    evidenceRevision: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );

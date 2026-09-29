@@ -7,9 +7,22 @@ const Account = require("../../models/CMS_Models/Sales/Account");
 const { assertValidGarmentProfileRefs, GarmentProfileError } = require("../../services/crmGarmentProfile");
 const { stripRestrictedAccountFields } = require("../../services/crmVisibility");
 
+
+/* ── ONE COMPANY AND A SERVICE CONTEXT (Chunk 3B1) ───────────────────────────
+ * These services are company-scoped now: they take `{companyId, reason}` and
+ * put it in the query. The fixtures carry the same company, and the context
+ * names it. */
+let CO;
+let CTX;
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  CO = await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  CTX = { companyId: CO._id, reason: "unit test" };
+});
+
 describe("Garment Sales Profile", () => {
   test("saves and round-trips a full profile across all four sub-sections", async () => {
-    const a = await Account.create({
+    const a = await Account.create({ companyId: CO._id,
       companyName: "Harbor & Field",
       garmentSalesProfile: {
         businessModels: ["export_brand", "full_package_fob"],
@@ -40,7 +53,7 @@ describe("Garment Sales Profile", () => {
 
   test("rejects an invalid lookup code in a controlled multi-select", async () => {
     await expect(
-      Account.create({
+      Account.create({ companyId: CO._id,
         companyName: "Bad Codes Co",
         garmentSalesProfile: { businessModels: ["not_a_real_model"] },
       }),
@@ -49,19 +62,19 @@ describe("Garment Sales Profile", () => {
 
   test("rejects negative quantities and lead times", async () => {
     await expect(
-      Account.create({ companyName: "Neg Qty Co", garmentSalesProfile: { estimatedAnnualPieces: -10 } }),
+      Account.create({ companyId: CO._id, companyName: "Neg Qty Co", garmentSalesProfile: { estimatedAnnualPieces: -10 } }),
     ).rejects.toThrow();
     await expect(
-      Account.create({ companyName: "Neg Lead Co", garmentSalesProfile: { expectedDevelopmentLeadDays: -5 } }),
+      Account.create({ companyId: CO._id, companyName: "Neg Lead Co", garmentSalesProfile: { expectedDevelopmentLeadDays: -5 } }),
     ).rejects.toThrow();
     await expect(
-      Account.create({ companyName: "Neg Wearer Co", garmentSalesProfile: { estimatedWearerCount: -1 } }),
+      Account.create({ companyId: CO._id, companyName: "Neg Wearer Co", garmentSalesProfile: { estimatedWearerCount: -1 } }),
     ).rejects.toThrow();
   });
 
   test("rejects a reversed typical-order-quantity range", async () => {
     await expect(
-      Account.create({
+      Account.create({ companyId: CO._id,
         companyName: "Reversed Range Co",
         garmentSalesProfile: { typicalOrderQuantityMin: 5000, typicalOrderQuantityMax: 1000 },
       }),
@@ -70,7 +83,7 @@ describe("Garment Sales Profile", () => {
 
   test("rejects a reversed target-price band", async () => {
     await expect(
-      Account.create({
+      Account.create({ companyId: CO._id,
         companyName: "Reversed Price Co",
         garmentSalesProfile: { targetPriceBandMin: 10, targetPriceBandMax: 5, targetPriceCurrency: "USD" },
       }),
@@ -79,7 +92,7 @@ describe("Garment Sales Profile", () => {
 
   test("requires a currency when a target price band is set", async () => {
     await expect(
-      Account.create({
+      Account.create({ companyId: CO._id,
         companyName: "No Currency Co",
         garmentSalesProfile: { targetPriceBandMin: 5, targetPriceBandMax: 10 },
       }),
@@ -87,7 +100,7 @@ describe("Garment Sales Profile", () => {
   });
 
   test("treats an untouched dropdown's empty string as not-set, not a validation error", async () => {
-    const a = await Account.create({
+    const a = await Account.create({ companyId: CO._id,
       companyName: "Blank Profile Optionals Co",
       garmentSalesProfile: { orderFrequency: "", customerPotential: "", defaultPoIssuerAccountId: "" },
     });
@@ -98,41 +111,41 @@ describe("Garment Sales Profile", () => {
 
   describe("assertValidGarmentProfileRefs", () => {
     test("passes when no party references are set", async () => {
-      await expect(assertValidGarmentProfileRefs(Account, {})).resolves.toBeUndefined();
+      await expect(assertValidGarmentProfileRefs(Account, {}, CTX)).resolves.toBeUndefined();
     });
 
     test("rejects a PO-issuer reference that does not exist", async () => {
       const fakeId = "507f1f77bcf86cd799439011";
       await expect(
-        assertValidGarmentProfileRefs(Account, { defaultPoIssuerAccountId: fakeId }),
+        assertValidGarmentProfileRefs(Account, { defaultPoIssuerAccountId: fakeId }, CTX),
       ).rejects.toThrow(GarmentProfileError);
     });
 
     test("rejects an agent reference that is archived (inactive)", async () => {
-      const archived = await Account.create({ companyName: "Archived Agent Co", isActive: false });
+      const archived = await Account.create({ companyId: CO._id, companyName: "Archived Agent Co", isActive: false });
       await expect(
-        assertValidGarmentProfileRefs(Account, { defaultAgentAccountId: String(archived._id) }),
+        assertValidGarmentProfileRefs(Account, { defaultAgentAccountId: String(archived._id) }, CTX),
       ).rejects.toThrow(/archived/);
     });
 
     test("accepts a valid active nominated-laboratory/supplier reference", async () => {
-      const lab = await Account.create({ companyName: "Acme Testing Lab" });
-      const supplier = await Account.create({ companyName: "Acme Fabric Mill" });
+      const lab = await Account.create({ companyId: CO._id, companyName: "Acme Testing Lab" });
+      const supplier = await Account.create({ companyId: CO._id, companyName: "Acme Fabric Mill" });
       await expect(
         assertValidGarmentProfileRefs(Account, {
           nominatedLaboratoryAccountIds: [String(lab._id)],
           nominatedSupplierAccountIds: [String(supplier._id)],
-        }),
+        }, CTX),
       ).resolves.toBeUndefined();
     });
 
     test("rejects when only one of several nominated suppliers is invalid", async () => {
-      const supplier = await Account.create({ companyName: "Real Supplier Co" });
+      const supplier = await Account.create({ companyId: CO._id, companyName: "Real Supplier Co" });
       const fakeId = "507f1f77bcf86cd799439099";
       await expect(
         assertValidGarmentProfileRefs(Account, {
           nominatedSupplierAccountIds: [String(supplier._id), fakeId],
-        }),
+        }, CTX),
       ).rejects.toThrow(GarmentProfileError);
     });
   });

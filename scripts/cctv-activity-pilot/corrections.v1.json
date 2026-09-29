@@ -1,0 +1,62 @@
+{
+  "source_report": "CCTV_Qwen_Activity_Audit_cam09_2026-08-28_172449.xlsx",
+  "label_contract": "qwen-cctv-activity-v2-4s",
+  "corrections": [
+    {
+      "sample": 1,
+      "track_id": 6,
+      "previous_label": "talking_or_interacting",
+      "allowed_labels": ["no_observable_task"],
+      "note": "Nearby people did not establish sustained interaction."
+    },
+    {
+      "sample": 2,
+      "track_id": 2,
+      "previous_label": "working",
+      "allowed_labels": ["talking_or_interacting", "no_observable_task"],
+      "note": "Either interaction or no visible task is acceptable; working is not."
+    },
+    {
+      "sample": 3,
+      "track_id": 6,
+      "previous_label": "talking_or_interacting",
+      "allowed_labels": ["no_observable_task"],
+      "note": "The talking label was again unsupported by sustained evidence."
+    },
+    {
+      "sample": 3,
+      "track_id": 5,
+      "previous_label": "working",
+      "allowed_labels": ["using_phone"],
+      "note": "Phone use should be recognised across the temporal window."
+    },
+    {
+      "sample": 4,
+      "track_id": 5,
+      "previous_label": "working",
+      "allowed_labels": ["using_phone"],
+      "note": "Phone use persists into the next sample."
+    }
+  ],
+  "review_notes": [
+    "Sample 1: all other reviewed labels were accepted.",
+    "Sample 4: the remaining labels looked almost all correct but were not locked as exact ground truth."
+  ],
+  "first_four_second_window_expectations": [
+    {
+      "samples": [1, 2, 3, 4],
+      "track_id": 6,
+      "allowed_labels": ["no_observable_task"]
+    },
+    {
+      "samples": [1, 2, 3, 4],
+      "track_id": 2,
+      "allowed_labels": ["talking_or_interacting", "no_observable_task"]
+    },
+    {
+      "samples": [1, 2, 3, 4],
+      "track_id": 5,
+      "allowed_labels": ["using_phone"]
+    }
+  ]
+}

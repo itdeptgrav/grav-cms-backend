@@ -27,6 +27,12 @@ router.get("/", salesAuth, async (req, res) => {
       for (const r of rows) {
         (grouped[r.category] ||= []).push({ code: r.code, label: r.label, ...(r.meta || {}) });
       }
+      /* A category added to the constants after the collection was seeded
+         (e.g. `lead_source`) is served from the constants until
+         scripts/seedCrmLookups.js runs again, rather than silently missing. */
+      for (const [cat, values] of Object.entries(LOOKUP_CATEGORIES)) {
+        if ((!category || category === cat) && !grouped[cat]) grouped[cat] = values;
+      }
     } else {
       grouped = category
         ? { [category]: LOOKUP_CATEGORIES[category] || [] }

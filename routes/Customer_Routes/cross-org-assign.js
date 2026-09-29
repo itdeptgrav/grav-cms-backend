@@ -15,7 +15,7 @@ const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
     if (!token) return res.status(401).json({ success: false, message: 'Access denied. Please sign in.' });
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'grav_clothing_secret_key_2024');
+    const decoded = jwt.verify(token, require("../../config/jwt").SECRET);
     req.customerId = decoded.id;
     next();
   } catch {

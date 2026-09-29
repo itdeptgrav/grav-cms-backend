@@ -10,21 +10,17 @@
  * account's real grants (attached as `user.hrAccess` before tools run), never
  * from the current page.
  *
- * Read-only HR tools:
- *   • hr_overview          — aggregate "how are we doing" HR figures (no scope);
- *   • hr_daily_attendance  — attendance for a day (today, yesterday, or a named
- *                            date), filterable by department;
- *   • hr_leave             — pending leave & regularisation requests, upcoming
- *                            approved leaves, and a named person's leave balance;
- *   • hr_employee          — one employee's profile basics, leave balance and a
- *                            last-30-day attendance tally (never salary/PII).
+ * The catalogue includes compact dashboard reads plus complete typed adapters
+ * for employee records, attendance and exclusions, leave, recruitment,
+ * documents, payroll, performance, organisation structure, policy/settings
+ * and audit history. Field-level permissions still decide what any caller sees.
  */
 
 const { registerTool } = require("../toolRegistry");
 const { buildHrOverviewContext } = require("../../hrOverviewContext");
 const { buildDailyAttendanceContext } = require("../../dailyAttendanceContext");
 const { buildLeaveContext } = require("../../hrLeaveContext");
-const { buildEmployeeLookup, istNow, istDateStr } = require("../../hrEmployeeContext");
+const { buildEmployeeLookup, resolveEmployeeByQuery, istNow, istDateStr } = require("../../hrEmployeeContext");
 const {
   buildDirectoryContext,
   buildDepartmentsContext,
@@ -34,6 +30,111 @@ const {
   buildPayrollContext,
   buildSalaryContext,
 } = require("../../hrExtraContext");
+const {
+  buildFullEmployeeContext,
+  buildAttendanceRecordsContext,
+  buildAttendanceExclusionsContext,
+  buildLeaveRecordsContext,
+  buildRecruitmentContext,
+  buildDocumentRecordsContext,
+  buildPayrollRecordsContext,
+  buildPerformanceContext,
+  buildHrAuditContext,
+} = require("../../hrComprehensiveContext");
+const {
+  MONTH: METRIC_MONTH,
+  YEAR: METRIC_YEAR,
+  HR_CATALOGUE_ID,
+  metricForRequest,
+  metricFromText,
+  metricGlossary,
+  metricIds: semanticMetricIds,
+  parseMetricComparison,
+  renderMetricAnswer,
+  renderMetricComparisonAnswer,
+  stripMetricTerms,
+} = require("../../hrSemanticMetrics");
+
+const semantic = (domains, subjects = []) => ({ catalogue: HR_CATALOGUE_ID, domains, subjects });
+
+// Closed semantic field IDs for fast, exact employee questions. These are data
+// contract keys, not trigger phrases: Qwen maps natural language to one key;
+// GRAV reads and formats the authorised value without another model pass.
+const EMPLOYEE_FIELD_IDS = Object.freeze([
+  "primaryManager", "secondaryManager", "department", "designation", "jobTitle",
+  "workLocation", "dateOfJoining", "confirmationDate", "probationPeriod",
+  "employmentType", "email", "workPhone", "extension", "biometricId", "identityId",
+  "phone", "alternatePhone", "personalEmail", "dateOfBirth", "gender", "bloodGroup",
+  "maritalStatus", "spouseName", "fatherName", "fatherDateOfBirth", "motherName",
+  "nationality", "religion", "placeOfBirth", "countryOfOrigin", "residentialStatus",
+  "isDirector", "isInternational", "isPhysicallyChallenged", "fullRecord",
+  "attendanceSummary",
+]);
+
+const EMPLOYEE_FIELD_LABELS = Object.freeze({
+  primaryManager: "primary manager", secondaryManager: "secondary manager",
+  department: "department", designation: "designation", jobTitle: "job title",
+  workLocation: "work location", dateOfJoining: "date of joining",
+  confirmationDate: "confirmation date", probationPeriod: "probation period",
+  employmentType: "employment type", email: "work email", workPhone: "work phone",
+  extension: "extension", biometricId: "biometric ID", identityId: "identity ID",
+  phone: "phone", alternatePhone: "alternate phone", personalEmail: "personal email",
+  dateOfBirth: "date of birth", gender: "gender", bloodGroup: "blood group",
+  maritalStatus: "marital status", spouseName: "spouse", fatherName: "father",
+  fatherDateOfBirth: "father's date of birth", motherName: "mother",
+  nationality: "nationality", religion: "religion", placeOfBirth: "place of birth",
+  countryOfOrigin: "country of origin", residentialStatus: "residential status",
+  isDirector: "director status", isInternational: "international-employee status",
+  isPhysicallyChallenged: "physical-challenge status",
+});
+
+function compactName(record, prefix) {
+  return [record[`${prefix}FirstName`], record[`${prefix}MiddleName`], record[`${prefix}LastName`]]
+    .filter(Boolean).join(" ").trim();
+}
+
+function employeeFieldValue(record, field) {
+  if (!record) return undefined;
+  if (field === "fatherName") return compactName(record, "father") || undefined;
+  if (field === "motherName") return compactName(record, "mother") || undefined;
+  if (field === "primaryManager" || field === "secondaryManager") {
+    const manager = record[field];
+    return manager && (manager.managerName || manager.name);
+  }
+  return record[field];
+}
+
+function displayEmployeeField(value) {
+  if (value === true) return "Yes";
+  if (value === false) return "No";
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value)) return value.slice(0, 10);
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return value.trim();
+  return "";
+}
+
+function renderEmployeeFieldAnswer({ data, args }) {
+  const field = args && args.requestedField;
+  if (!field || field === "fullRecord") return null;
+  if (field === "attendanceSummary") {
+    const employee = data && data.employee;
+    if (!employee || !employee.found) return (employee && employee.note) || "No matching employee was found.";
+    if (employee.statusOnDate) return employee.statusOnDate;
+    const summary = employee.last30DayAttendance;
+    if (!summary) return `${employee.profile.name}'s attendance is not recorded or is not available to your account.`;
+    return `${employee.profile.name}'s attendance from ${summary.from} to ${summary.to}: ` +
+      `${summary.daysRecorded} recorded days — ${summary.present} present, ${summary.absent} absent, ` +
+      `${summary.leave} on leave, ${summary.halfDay} half-day, ${summary.late} late, ` +
+      `${summary.missedPunch} missed-punch and ${summary.weeklyOff} weekly-off/holiday.`;
+  }
+  const full = data && data.fullRecord;
+  if (!full || !full.found) return (full && full.note) || "No matching employee was found.";
+  const label = EMPLOYEE_FIELD_LABELS[field] || field;
+  const value = displayEmployeeField(employeeFieldValue(full.record, field));
+  if (!value) return `${full.employee}'s ${label} is not recorded or is not available to your account.`;
+  return `${full.employee}'s ${label} is ${value}.`;
+}
 
 // Month number from a message ("...for June" -> 6) for the regex fallback path;
 // the tool-calling path gets the month from the model directly.
@@ -70,7 +171,32 @@ function yearFromMessage(message) {
 }
 
 // The account is authorised for HR tools when the shared resolver said so.
-const hrAuthorised = (user) => Boolean(user && user.hrAccess && user.hrAccess.allowed === true);
+/* ── The tools answer to the SAME contract as the routes ─────────────────────
+ *
+ * `hrAuthorised` was the whole gate: any account that could open HR could ask
+ * the assistant anything HR knows, including one person's salary. That made the
+ * assistant a way around the endpoint permissions rather than a view onto them
+ * — a CEO refused compensation at /api/hr/payslip could simply ask for it here.
+ *
+ * Each tool now names the capability its DATA needs, and the check is the same
+ * capability set services/access/hrAuthorization.js hands the mounted routes.
+ * `user.hrActor` is attached by gravAssistant.ensureAccess before any tool is
+ * offered or run; an unresolved actor holds nothing, so this fails closed.
+ */
+const { CAPABILITIES } = require("../../access/hrCapabilities");
+
+const heldBy = (user) => (user && user.hrActor && user.hrActor.capabilities) || new Set();
+
+/** Application access alone — the floor every HR tool sits on. */
+const hrAuthorised = (user) =>
+  Boolean(user && user.hrActor && user.hrActor.hasHrApplicationAccess === true);
+
+/** Application access AND every capability the tool's data needs. */
+const hrCan = (...capabilities) => (user) => {
+  if (!hrAuthorised(user)) return false;
+  const held = heldBy(user);
+  return capabilities.every((cap) => held.has(cap));
+};
 
 // Deterministic department extraction: "how is the Cutting department doing" →
 // "Cutting". Anything not clearly named falls back to all departments.
@@ -78,6 +204,14 @@ function extractDepartment(message) {
   const m = String(message || "").match(/\b([A-Za-z][A-Za-z &/-]{1,40}?)\s+department\b/i);
   if (m) return m[1].trim();
   return "all";
+}
+
+function extractOrganisationDepartment(message) {
+  const text = String(message || "");
+  const scoped = text.match(/\b(?:inside|in|of|for)\s+(?:the\s+)?([A-Za-z][A-Za-z &/-]{0,40}?)\s+department\b/i);
+  if (scoped) return scoped[1].trim();
+  const direct = text.match(/\b([A-Za-z][A-Za-z &/-]{0,40}?)\s+department\b/i);
+  return direct ? direct[1].trim() : null;
 }
 
 // Parse a date from the message: an explicit YYYY-MM-DD, "today"/"yesterday"/
@@ -230,23 +364,25 @@ const NAMES_A_PERSON = (msg) =>
 
 registerTool({
   name: "hr_overview",
+  semantic: semantic(["people", "organisation", "attendance", "leave"]),
   description:
     "Aggregate HR overview: headcount, department distribution, today/monthly attendance, pending leave & regularisation counts, upcoming holidays, alerts.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ANALYTICS_WORKFORCE),
   matches: (msg) => HR_OVERVIEW_KEYWORDS.test(msg),
   provideContext: async () => ({ hrOverview: await buildHrOverviewContext() }),
 });
 
 registerTool({
   name: "hr_daily_attendance",
+  semantic: semantic(["attendance"], ["department"]),
   description:
     "The WHOLE day's attendance across all employees (or a department): counts of present/absent/on-leave and who they are, for a given date. Do NOT use this to check ONE specific named person — use hr_employee for that. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
   parameters: { type: "object", properties: { ...P_DATE, ...P_DEPARTMENT } },
   matches: (msg) =>
     DAILY_ATTENDANCE_KEYWORDS.test(msg) ||
     (DAY_HINT.test(msg) && /\b(department|staff|attendance|leave|present|absent|late|off|on leave|half.?day|punch)\b/i.test(msg)),
-  provideContext: async ({ message, args }) => {
+  provideContext: async ({ user, message, args }) => {
     const date = validDate(args && args.date) || parseDateFromMessage(message);
     const department = (args && args.department) || extractDepartment(message);
     const built = await buildDailyAttendanceContext({
@@ -308,9 +444,10 @@ registerTool({
 
 registerTool({
   name: "hr_leave",
+  semantic: semantic(["leave"], ["employee", "department"]),
   description:
     "Leave & regularisation for authorised HR: pending leave requests, pending regularisations, upcoming approved leaves, and a named person's CL/SL/PL balance. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.LEAVE_READ),
   parameters: { type: "object", properties: { ...P_DEPARTMENT, ...P_EMPLOYEE } },
   matches: (msg) => LEAVE_KEYWORDS.test(msg),
   provideContext: async ({ message, args }) => {
@@ -326,27 +463,178 @@ registerTool({
 });
 
 registerTool({
-  name: "hr_employee",
+  name: "hr_person_metric",
+  semantic: semantic(["people", "payroll"], ["employee"]),
   description:
-    "Everything about ONE specific named person (or employee ID): whether they were present / absent / on leave / late on a given date, their profile (department, designation, joining date, status), current-year leave balance and last-30-day attendance. Use this whenever the question is about a single named individual. No salary. Read-only.",
-  permission: hrAuthorised,
-  parameters: { type: "object", properties: { ...P_EMPLOYEE, ...P_DATE }, required: ["employeeName"] },
-  matches: (msg) =>
-    EMPLOYEE_BIO.test(msg) || EMPLOYEE_KEYWORDS.test(msg) || PERSON_ATTENDANCE.test(msg) || PERSON_POSSESSIVE.test(msg),
-  provideContext: async ({ message, args }) => {
-    // If the question is about a specific day ("...present yesterday"), report
-    // that day's status for the person; otherwise just their profile + summary.
-    const query = (args && args.employeeName) || message;
-    const date = validDate(args && args.date) || (DATE_REFERENCED.test(message) ? parseDateFromMessage(message) : undefined);
-    return { employee: await buildEmployeeLookup({ query, date }) };
+    `Canonical ONE-VALUE lookup for a named employee. Each metric has one source of truth: employee.* is a current employee-master field; compensation.configured_* is the current configured monthly salary master and needs no payroll run; payroll.* is a posted payroll result and requires an explicit month/year (or year for annual totals). ${metricGlossary()} Prefer this over broad employee, salary or payroll-summary tools whenever the user asks for one exact field or figure. Read-only.`,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
+  // Every scalar field is now resolved from catalogue aliases. Keeping this
+  // tool out of model selection makes a schema-valid but semantically wrong
+  // enum impossible; Qwen cannot choose one profile field for another.
+  modelSelectable: false,
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      metric: {
+        type: "string",
+        enum: semanticMetricIds(),
+        description:
+          "Canonical metric id. A current figure with no period uses compensation.configured_*. If the request names any month/year or asks what was paid/calculated, use the matching payroll.* metric; specifically a period gross is payroll.gross_earnings, never compensation.configured_gross_monthly.",
+      },
+      month: { type: "integer", minimum: 1, maximum: 12, description: "Required only for month_required payroll metrics." },
+      year: { type: "integer", minimum: 2000, maximum: 2100, description: "Required for payroll metrics." },
+    },
+    required: ["employeeName", "metric"],
+  },
+  matches: () => false,
+  claim: async ({ message }) => {
+    const definition = metricFromText(message);
+    if (!definition) return null;
+    const comparison = parseMetricComparison(message, definition);
+    const employeeName = comparison ? comparison.employeeName : stripMetricTerms(message, definition);
+    if (!employeeName) return null;
+    // Metric words can also describe a non-person entity (for example
+    // "designations inside Accounts department"). A scalar person tool may
+    // claim the request only when the remaining subject resolves to a real HR
+    // employee. This is authoritative entity typing, not a phrase heuristic.
+    if (!(await resolveEmployeeByQuery(employeeName))) return null;
+    const month = monthFromMessage(message);
+    const year = yearFromMessage(message);
+    const periodDefinition = metricForRequest(definition.id, { month, year });
+    const needsPeriodArgs = periodDefinition && periodDefinition.id !== definition.id;
+    return {
+      employeeName,
+      metric: definition.id,
+      ...(comparison ? { expectedValue: comparison.expectedValue } : {}),
+      ...(needsPeriodArgs && month ? { month } : {}),
+      ...(needsPeriodArgs && year ? { year } : {}),
+    };
+  },
+  provideContext: async ({ user, message, args }) => {
+    const definition = metricForRequest(args && args.metric, args || {});
+    if (!definition) return { found: false, note: "That HR metric is not registered." };
+
+    const held = heldBy(user);
+    if (definition.id.startsWith("compensation.") &&
+        (!held.has(CAPABILITIES.PEOPLE_READ_PRIVATE) || !held.has(CAPABILITIES.COMPENSATION_READ))) {
+      return { found: false, denied: true, note: "That compensation metric is not available to your account." };
+    }
+    if (definition.id.startsWith("payroll.") &&
+        (!held.has(CAPABILITIES.PAYROLL_READ) || !held.has(CAPABILITIES.COMPENSATION_READ))) {
+      return { found: false, denied: true, note: "That payroll metric is not available to your account." };
+    }
+
+    if (definition.temporal === METRIC_MONTH && !(Number(args.month) >= 1 && Number(args.month) <= 12 && Number(args.year) >= 2000)) {
+      return { found: false, needsPeriod: "month", note: "Which payroll month and year should I use?" };
+    }
+    if (definition.temporal === METRIC_YEAR && !(Number(args.year) >= 2000)) {
+      return { found: false, needsPeriod: "year", note: "Which payroll year should I use?" };
+    }
+    if (definition.temporal !== METRIC_MONTH && definition.temporal !== METRIC_YEAR &&
+        (args.month !== undefined || args.year !== undefined)) {
+      return {
+        found: false,
+        semanticMismatch: true,
+        note: "A current configured metric cannot be combined with a payroll period. Please specify whether you want the current configured value or the posted payroll result for that period.",
+      };
+    }
+
+    const employeeQuery = stripMetricTerms(args.employeeName, definition) || args.employeeName;
+    if (definition.source === "employee_master") {
+      const employeeRecord = await buildFullEmployeeContext({ query: employeeQuery, user });
+      return { found: employeeRecord.found, definition, employeeRecord, note: employeeRecord.note };
+    }
+
+    const payroll = await buildSalaryContext({
+      query: employeeQuery,
+      month: args.month,
+      year: args.year,
+      user,
+      annual: definition.temporal === METRIC_YEAR,
+    });
+    return { found: payroll.found, definition, payroll, note: payroll.note };
+  },
+  renderAnswer: ({ data, args }) => {
+    if (!data || !data.definition) return (data && data.note) || "That HR metric could not be read safely.";
+    if (!data.found) return data.note || "That HR metric is not available.";
+    if (data.definition.source === "employee_master") {
+      const renderer = args && args.expectedValue !== undefined ? renderMetricComparisonAnswer : renderMetricAnswer;
+      return renderer({
+        definition: data.definition,
+        employee: data.employeeRecord.employee,
+        source: data.employeeRecord.record,
+        expectedValue: args && args.expectedValue,
+      });
+    }
+    const renderer = args && args.expectedValue !== undefined ? renderMetricComparisonAnswer : renderMetricAnswer;
+    return renderer({
+      definition: data.definition,
+      employee: data.payroll.employee && data.payroll.employee.name,
+      source: data.payroll,
+      expectedValue: args && args.expectedValue,
+    });
   },
 });
 
 registerTool({
+  name: "hr_employee",
+  semantic: semantic(["people", "attendance", "leave", "documents"], ["employee"]),
+  description:
+    "Complete authorised MULTI-FIELD HR record for one named employee, including custom fields, documents, family details, leave and attendance. Use hr_person_metric instead when the request asks for one standard field or one compensation/payroll value. Read-only.",
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      requestedField: {
+        type: "string",
+        enum: ["fullRecord", "attendanceSummary"],
+        description: "Use attendanceSummary for a named person's attendance; otherwise use fullRecord. Exact scalar fields are handled by the deterministic semantic catalogue and are not model-selectable.",
+      },
+      ...P_DATE,
+    },
+    required: ["employeeName", "requestedField"],
+  },
+  matches: (msg) =>
+    EMPLOYEE_BIO.test(msg) || EMPLOYEE_KEYWORDS.test(msg) || PERSON_ATTENDANCE.test(msg) || PERSON_POSSESSIVE.test(msg),
+  claim: async ({ message }) => {
+    const text = String(message || "");
+    const namedAttendance = PERSON_POSSESSIVE.test(text) ||
+      (PERSON_ATTENDANCE.test(text) && !/\b(everyone|anyone|employees?|staff|team|department|workforce|who)\b/i.test(text));
+    if (!namedAttendance) return null;
+    if (!(await resolveEmployeeByQuery(text))) return null;
+    const date = DATE_REFERENCED.test(text) ? parseDateFromMessage(text) : undefined;
+    return {
+      employeeName: text,
+      requestedField: "attendanceSummary",
+      ...(date ? { date } : {}),
+    };
+  },
+  provideContext: async ({ user, message, args }) => {
+    // If the question is about a specific day ("...present yesterday"), report
+    // that day's status for the person; otherwise just their profile + summary.
+    const query = (args && args.employeeName) || message;
+    const date = validDate(args && args.date) || (DATE_REFERENCED.test(message) ? parseDateFromMessage(message) : undefined);
+    const [summary, fullRecord] = await Promise.all([
+      buildEmployeeLookup({ query, date }),
+      buildFullEmployeeContext({ query, user }),
+    ]);
+    return { employee: summary, fullRecord };
+  },
+  renderAnswer: renderEmployeeFieldAnswer,
+});
+
+// Test seams for the typed field contract and deterministic formatter.
+module.exports._employeeFieldIds = EMPLOYEE_FIELD_IDS;
+module.exports._renderEmployeeFieldAnswer = renderEmployeeFieldAnswer;
+
+registerTool({
   name: "hr_directory",
+  semantic: semantic(["people", "organisation"], ["department"]),
   description:
     "Employee directory for authorised HR: total/active headcount, headcount by department, and a department's members. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
   parameters: { type: "object", properties: { ...P_DEPARTMENT } },
   matches: (msg) =>
     /\b(directory|how many (employees|people|staff|workers)|total (employees|staff|headcount)|head\s?count|number of (employees|staff)|list .*(employees|staff)|employees? in|team size|workforce|staff strength|who works (in|at))\b/i.test(msg),
@@ -358,19 +646,43 @@ registerTool({
 
 registerTool({
   name: "hr_departments",
+  semantic: semantic(["organisation"], ["department"]),
   description:
     "The organisation's departments for authorised HR: each department's status, live headcount and designations. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PEOPLE_READ_DIRECTORY),
+  parameters: { type: "object", properties: { ...P_DEPARTMENT } },
   matches: (msg) =>
     /\b(departments\b|list .*departments?|department list|how many departments|which departments|org structure|organ[a-z]* structure|designations?)\b/i.test(msg),
+  claim: async ({ message }) => {
+    if (!/\bdesignations?\b/i.test(String(message || ""))) return null;
+    const requested = extractOrganisationDepartment(message);
+    if (!requested) return null;
+    const context = await buildDepartmentsContext();
+    const match = (context.departments || []).find((department) =>
+      String(department.name || "").localeCompare(requested, undefined, { sensitivity: "base" }) === 0);
+    return match ? { department: match.name } : null;
+  },
   provideContext: async () => ({ departments: await buildDepartmentsContext() }),
+  renderAnswer: ({ data, args }) => {
+    const requested = args && args.department;
+    if (!requested) return null;
+    const context = data && data.departments;
+    const department = context && (context.departments || []).find((item) =>
+      String(item.name || "").localeCompare(requested, undefined, { sensitivity: "base" }) === 0);
+    if (!department) return `No department matching ${requested} was found.`;
+    const designations = (department.designations || []).filter((item) => item.active !== false).map((item) => item.name);
+    return designations.length
+      ? `The ${department.name} department has these designations: ${designations.join(", ")}.`
+      : `The ${department.name} department has no active designations recorded.`;
+  },
 });
 
 registerTool({
   name: "hr_overtime",
+  semantic: semantic(["attendance"], ["employee", "department"]),
   description:
     "Overtime for authorised HR: recent overtime (hours), pending overtime approvals, filterable by department. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
   parameters: { type: "object", properties: { ...P_DEPARTMENT } },
   matches: (msg) => /\b(over\s?time|\bot\b|extra hours|stay\s?over|worked late|late sitting)\b/i.test(msg),
   provideContext: async ({ message, args }) => {
@@ -381,17 +693,19 @@ registerTool({
 
 registerTool({
   name: "hr_holidays",
+  semantic: semantic(["leave", "policy"]),
   description: "Company holidays for authorised HR: upcoming and this-year holidays with dates and type. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.LEAVE_READ),
   matches: (msg) => /\b(holidays?|public holiday|festival holiday|next holiday|day off|leave calendar|holiday list)\b/i.test(msg),
   provideContext: async () => ({ holidays: await buildHolidaysContext() }),
 });
 
 registerTool({
   name: "hr_policies",
+  semantic: semantic(["policy"]),
   description:
     "HR policies & settings for authorised HR: shift timings, late/half-day thresholds, working days, leave entitlements (CL/SL/PL per year), payroll settings and active SOP policies. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.COMPLIANCE_READ),
   matches: (msg) =>
     /polic(y|ies)|shift\s*(timing|timings|time|times|start|end|hour|hours)|(office|work(ing)?)\s*(timing|timings|hour|hours|time|times|day|days)|what time does (office|work|the shift)|when does (office|work|the shift)|entitlement|(company|hr|leave|attendance)\s*(rule|rules|policy|policies|setting|settings)|\bsettings\b/i.test(
       msg,
@@ -401,18 +715,20 @@ registerTool({
 
 registerTool({
   name: "hr_payroll",
+  semantic: semantic(["payroll"], ["payroll_run"]),
   description:
     "COMPANY-LEVEL payroll runs for authorised HR: whole-company monthly totals (total gross, total deductions, total net pay, total PF/ESIC) and run status across all employees. For ONE person's salary use hr_salary instead. Read-only.",
-  permission: hrAuthorised,
+  permission: hrCan(CAPABILITIES.PAYROLL_READ, CAPABILITIES.COMPENSATION_READ),
   matches: (msg) => /\b(payroll (run|total|summary)|total (net pay|payroll|salary bill)|company.*(payroll|salary)|salary (bill|expense|cost))\b/i.test(msg),
   provideContext: async () => ({ payroll: await buildPayrollContext() }),
 });
 
 registerTool({
   name: "hr_salary",
+  semantic: semantic(["payroll"], ["employee"]),
   description:
-    "SALARY / payslip for authorised HR & CEO. Works for a NAMED employee's monthly pay (basic, gross, allowances, deductions, net pay) AND for the signed-in user's OWN pay when they ask about themselves ('how much did I earn', 'my salary') — leave employeeName EMPTY for a self-question. For a whole-year total ('this year', 'annual'), it returns the year's total across all months. Bank details excluded. Sensitive; read-only.",
-  permission: hrAuthorised,
+    "FULL POSTED PAYSLIP/PAYROLL BREAKDOWN for a processed month or year: earnings components, deductions, net pay, days and status together. This is calculated payroll history, not the employee's configured salary master. Never use this full-summary capability for one requested figure; use hr_person_metric for every single configured or payroll metric. Bank details excluded. Sensitive; read-only.",
+  permission: hrCan(CAPABILITIES.COMPENSATION_READ),
   parameters: {
     type: "object",
     properties: {
@@ -444,4 +760,192 @@ registerTool({
       }),
     };
   },
+});
+
+// ── Complete typed read catalogue ───────────────────────────────────────────
+// These adapters cover the underlying HR record domains rather than only the
+// dashboard summaries above. They deliberately remain separate capabilities:
+// a directory reader must not gain payroll, recruitment, documents or audit
+// merely because all of those records happen to live in the HR application.
+
+const P_RANGE = {
+  from: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$", description: "Inclusive start date YYYY-MM-DD." },
+  to: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$", description: "Inclusive end date YYYY-MM-DD." },
+  limit: { type: "integer", minimum: 1, maximum: 50, description: "Maximum result rows; default 20, maximum 50." },
+};
+
+registerTool({
+  name: "hr_attendance_records",
+  semantic: semantic(["attendance"], ["employee", "department"]),
+  description:
+    "Detailed HR attendance/timecard records over a date range: each employee's final/system status, raw punch timeline, every work/break/overtime/late/early/missed-punch metric, shift, attendance value, holiday state and HR review evidence. Use for histories, hours, punches, ranges and any monthly attendance report; use hr_daily_attendance for one-day workforce counts.",
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
+  parameters: { type: "object", properties: { ...P_EMPLOYEE, ...P_DEPARTMENT, ...P_RANGE } },
+  matches: (msg) => /timecard|attendance history|attendance records?|working hours|work hours|punches?|break minutes|late minutes|early departure|date range/i.test(msg),
+  provideContext: async ({ args }) => ({ attendanceRecords: await buildAttendanceRecordsContext(args || {}) }),
+});
+
+registerTool({
+  name: "hr_attendance_exclusions",
+  semantic: semantic(["attendance"], ["employee"]),
+  description:
+    "Attendance-register exclusions: employees deliberately removed from a specific month, who removed them, when, why and how many existing days were removed. Use for off-roll/month-removal and restore-history questions.",
+  permission: hrCan(CAPABILITIES.ATTENDANCE_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      yearMonth: { type: "string", pattern: "^\\d{4}-\\d{2}$", description: "Attendance month YYYY-MM." },
+      limit: P_RANGE.limit,
+    },
+  },
+  matches: (msg) => /attendance (exclusion|register removal)|removed from (the )?month|off[- ]roll|restore.*attendance/i.test(msg),
+  provideContext: async ({ args }) => ({ attendanceExclusions: await buildAttendanceExclusionsContext(args || {}) }),
+});
+
+registerTool({
+  name: "hr_leave_records",
+  semantic: semantic(["leave"], ["employee", "department"]),
+  description:
+    "Detailed leave-domain records: leave applications with dates/days/reasons/approval chain, regularisation requests with requested corrections and outcomes, or yearly leave balances with entitlement and consumption. Use for record-level or historical leave questions; use hr_leave for a quick dashboard summary.",
+  permission: hrCan(CAPABILITIES.LEAVE_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      recordType: { type: "string", enum: ["leave", "regularization", "balance"], description: "Which HR record family answers the question." },
+      ...P_EMPLOYEE,
+      ...P_DEPARTMENT,
+      status: { type: "string", description: "Exact workflow status when the user named one." },
+      year: { type: "integer", minimum: 2000, maximum: 2100 },
+      ...P_RANGE,
+    },
+    required: ["recordType"],
+  },
+  matches: (msg) => /leave history|leave applications?|regulari[sz]ation|leave entitlement|leave consumed|leave reason|approval chain/i.test(msg),
+  provideContext: async ({ args }) => ({ leaveRecords: await buildLeaveRecordsContext(args || {}) }),
+});
+
+registerTool({
+  name: "hr_recruitment",
+  semantic: semantic(["recruitment"], ["candidate", "department"]),
+  description:
+    "Complete authorised recruitment data: job postings/openings, skills, locations, salary ranges and hiring managers; candidates, contact/application/stage/experience/rating/interview notes; or recruitment interview/meeting/follow-up tasks and outcomes. A partial role, job title, candidate name or skill is a search query for this tool and does not require clarification.",
+  permission: hrCan(CAPABILITIES.RECRUITMENT_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      recordType: { type: "string", enum: ["jobs", "candidates", "tasks"] },
+      query: { type: "string", maxLength: 120, description: "Named job, candidate, skill or task text to find." },
+      status: { type: "string", maxLength: 60 },
+      stage: { type: "string", maxLength: 60 },
+      ...P_DEPARTMENT,
+      ...P_RANGE,
+    },
+    required: ["recordType"],
+  },
+  matches: (msg) => /recruit|candidate|applicant|job posting|job opening|vacanc|interview|hiring|notice period/i.test(msg),
+  provideContext: async ({ args }) => ({ recruitment: await buildRecruitmentContext(args || {}) }),
+});
+
+registerTool({
+  name: "hr_documents",
+  semantic: semantic(["documents"], ["document", "employee", "department"]),
+  description:
+    "Complete authorised employee-document register: appointment/offer/warning/experience/relieving/salary-certificate/other letters, requests, generation/release/revocation/decline state, dates, reasons, letter metadata and history. File storage secrets are never exposed.",
+  permission: hrCan(CAPABILITIES.DOCUMENTS_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      ...P_DEPARTMENT,
+      type: { type: "string", enum: ["appointment", "offer", "warning", "experience", "relieving", "salary_certificate", "other"] },
+      state: { type: "string", enum: ["all", "awaiting_generation", "generated_unreleased", "released", "revoked"] },
+      limit: P_RANGE.limit,
+    },
+  },
+  matches: (msg) => /employee document|appointment letter|offer letter|warning letter|experience letter|relieving letter|salary certificate|document request|released document|revoked document/i.test(msg),
+  provideContext: async ({ user, args }) => ({ documents: await buildDocumentRecordsContext({ ...(args || {}), user }) }),
+});
+
+registerTool({
+  name: "hr_payroll_records",
+  semantic: semantic(["payroll"], ["employee", "department"]),
+  description:
+    "Detailed EMPLOYEE payroll items. Use this instead of hr_salary whenever the user asks how one or more employees' pay was calculated, payable/attendance days, a salary register, contributions, adjustments, or day-by-day evidence. Items include employee/pay period, rates, every earnings and deduction component, employer contributions, adjustments, CTC-related food allowance, override/status/payment metadata. Set includeDayBreakdown=true for a named employee plus month/year when day-by-day calculation is requested. Bank account details are always excluded.",
+  permission: hrCan(CAPABILITIES.PAYROLL_READ, CAPABILITIES.COMPENSATION_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      ...P_DEPARTMENT,
+      status: { type: "string", maxLength: 60 },
+      month: { type: "integer", minimum: 1, maximum: 12 },
+      year: { type: "integer", minimum: 2000, maximum: 2100 },
+      includeDayBreakdown: { type: "boolean", description: "Include the stored per-day payroll audit trail. Only valid when one employee, month and year are all supplied." },
+      limit: P_RANGE.limit,
+    },
+  },
+  matches: (msg) => /payroll item|salary register|payable days|employer pf|employer esic|edli|admin charges|loan deduction|advance deduction|incentive|other earnings|payroll status/i.test(msg),
+  provideContext: async ({ message, args }) => ({
+    payrollRecords: await buildPayrollRecordsContext({
+      ...(args || {}),
+      recordType: "items",
+      employeeName: (args && args.employeeName) || message,
+      month: (args && args.month) || monthFromMessage(message),
+      year: (args && args.year) || yearFromMessage(message),
+    }),
+  }),
+});
+
+registerTool({
+  name: "hr_payroll_runs",
+  semantic: semantic(["payroll"], ["payroll_run"]),
+  description:
+    "Complete COMPANY payroll-run records and stored totals/approval metadata. Use for payroll run status, run-level totals and approval history, not an individual employee's pay or day-by-day calculation.",
+  permission: hrCan(CAPABILITIES.PAYROLL_READ, CAPABILITIES.COMPENSATION_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      status: { type: "string", maxLength: 60 },
+      month: { type: "integer", minimum: 1, maximum: 12 },
+      year: { type: "integer", minimum: 2000, maximum: 2100 },
+      limit: P_RANGE.limit,
+    },
+  },
+  matches: (msg) => /payroll run|payroll approval|payroll processing status|run-level payroll/i.test(msg),
+  provideContext: async ({ args }) => ({ payrollRuns: await buildPayrollRecordsContext({ ...(args || {}), recordType: "runs" }) }),
+});
+
+registerTool({
+  name: "hr_performance",
+  semantic: semantic(["performance", "attendance", "leave"], ["employee", "department"]),
+  description:
+    "Employee or workforce performance for a year: tenure, attendance rate and present/absent/late/half-day/leave/LOP metrics, leave entitlement/consumption/balance and SOP/C4 points with dated entries. Filter by named employee or department.",
+  permission: hrCan(CAPABILITIES.SKILLS_READ, CAPABILITIES.ANALYTICS_WORKFORCE),
+  parameters: {
+    type: "object",
+    properties: { ...P_EMPLOYEE, ...P_DEPARTMENT, year: { type: "integer", minimum: 2000, maximum: 2100 }, limit: P_RANGE.limit },
+  },
+  matches: (msg) => /performance|attendance rate|attendance percentage|sop points|c4 points|penalty points|performance score|tenure/i.test(msg),
+  provideContext: async ({ args }) => ({ performance: await buildPerformanceContext(args || {}) }),
+});
+
+registerTool({
+  name: "hr_audit",
+  semantic: semantic(["audit"], ["employee"]),
+  description:
+    "HR change history and audit evidence: what changed, section/entity/action, changed fields, actor, approval, origin, critical flag and timestamp. Stored secrets are redacted. Use for 'who changed what/when' questions.",
+  permission: hrCan(CAPABILITIES.AUDIT_READ),
+  parameters: {
+    type: "object",
+    properties: {
+      ...P_EMPLOYEE,
+      section: { type: "string", maxLength: 100 },
+      action: { type: "string", enum: ["create", "update", "delete", "approve", "reject", "fail", "import", "export", "other"] },
+      critical: { type: "boolean" },
+      ...P_RANGE,
+    },
+  },
+  matches: (msg) => /audit|change history|who changed|who edited|what changed|history of changes|recent changes/i.test(msg),
+  provideContext: async ({ args }) => ({ audit: await buildHrAuditContext(args || {}) }),
 });

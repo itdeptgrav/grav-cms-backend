@@ -2,6 +2,25 @@
 //
 // Read-only + dispatch routes for the Packaging & Dispatch department.
 // Mount at /api/cms/manufacturing/packaging-dispatch-view
+//
+// ── WHO, AND WHOSE WORK ─────────────────────────────────────────────────────
+// Every route here is guarded by `packagingAccess`: reads by the Packaging
+// viewer and the two departments whose own screens already show these numbers
+// (Production planning and the executive office); dispatch by the Packaging
+// EDITOR alone. Reading the floor is not being on it.
+//
+// Every query is narrowed to the acting company through
+// `WorkOrder.salesLineLink.companyId` — the link the Sales-line ↔ WorkOrder
+// bridge stamps at creation, and the only authoritative company fact there is.
+// A Manufacturing Order is visible when at least one WorkOrder of this company
+// is linked to it; its own status says nothing about whose it is. A historical
+// WorkOrder with no link belongs to nobody: it is absent from every list and
+// unaddressable by id, and is never given a company by its order, buyer, style,
+// product, barcode text or the last characters of its id.
+//
+// A dispatch names progress documents and work orders by id. Every one of them
+// is proved to be this company's BEFORE anything is written, and a batch that
+// names one foreign, unlinked or unknown record is refused whole.
 
 const express  = require("express");
 const router   = express.Router();
@@ -11,8 +30,22 @@ const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequ
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+const access = require("./packagingAccess");
+/* 143 of 152 work orders have no stored number (the model only assigns one to
+   NEW records), so every WO number leaving this file is the display form. */
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
+const { resolvePhotos } = require("../../../../services/manufacturing/workOrderPhoto");
+const shift = require("../../../../services/manufacturing/shiftHours");
 
 router.use(EmployeeAuthMiddleware);
+
+/* Reads: Packaging, plus the Production-planning and executive screens that
+   already show these numbers. Writes: Packaging's editor, and nobody else. */
+const canRead = [access.packagingReader(), access.packagingCompany];
+const canRecord = [access.packagingDepartment("editor"), access.packagingCompany];
+
+/** The acting company, resolved server-side. Never from the client. */
+const companyOf = (req) => req.packaging.companyId;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: resolve gender/category for a list of stockItemIds
@@ -29,14 +62,36 @@ async function resolveStockItemMeta(stockItemIds) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /manufacturing-orders
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders", async (req, res) => {
+router.get("/manufacturing-orders", ...canRead, async (req, res) => {
   try {
     const { page = 1, limit = 12, search = "" } = req.query;
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.max(1, parseInt(limit, 10));
     const skip = (pageNum - 1) * limitNum;
 
-    const query = { status: "quotation_sales_approved" };
+    /* ── WHICH ORDERS EXIST, FOR THIS COMPANY ──────────────────────────
+       From the WORK, not from the order's status: an order is this
+       company's when one of its WorkOrders is linked to this company. The
+       status filter stays, because it is what makes an order a
+       manufacturing order — it is simply not company proof. */
+    const linked = await access.findWorkOrders(companyOf(req), {},
+      "customerRequestId status quantity packagedQuantity dispatchedQuantity productionCompletion").lean();
+    if (!linked.length) {
+      return res.json({
+        success: true,
+        manufacturingOrders: [],
+        pagination: { page: pageNum, limit: limitNum, total: 0, pages: 0 },
+      });
+    }
+    const wosByMo = new Map();
+    for (const wo of linked) {
+      const key = String(wo.customerRequestId || "");
+      if (!key) continue;
+      if (!wosByMo.has(key)) wosByMo.set(key, []);
+      wosByMo.get(key).push(wo);
+    }
+
+    const query = { _id: { $in: [...wosByMo.keys()].map(access.oid) }, status: "quotation_sales_approved" };
     if (search) {
       const re = new RegExp(search.trim(), "i");
       query.$or = [
@@ -53,9 +108,9 @@ router.get("/manufacturing-orders", async (req, res) => {
 
     const enriched = [];
     for (const mo of all) {
-      const wos = await WorkOrder.find({ customerRequestId: mo._id })
-        .select("status quantity packagedQuantity dispatchedQuantity productionCompletion")
-        .lean();
+      /* This company's WorkOrders on that order, and only those: the totals
+         below are this company's numbers, never the order's whole floor. */
+      const wos = wosByMo.get(String(mo._id)) || [];
 
       if (!wos.length) continue;
 
@@ -66,8 +121,7 @@ router.get("/manufacturing-orders", async (req, res) => {
         derivedStatus = "in_production";
       else if (statuses.every((s) => s === "pending")) derivedStatus = "pending";
       else if (statuses.some((s) => s === "planned")) derivedStatus = "planning";
-
-      if (derivedStatus === "pending") continue;
+      /* Pending orders are listed too (25 Sep 2026) — see finishingRoutes. */
 
       const totalQty       = wos.reduce((s, w) => s + (w.quantity || 0), 0);
       const packagedQty    = wos.reduce((s, w) => s + (w.packagedQuantity || 0), 0);
@@ -82,6 +136,7 @@ router.get("/manufacturing-orders", async (req, res) => {
         measurementName: mo.measurementName || null,
         priority: mo.priority || "medium",
         createdAt: mo.createdAt,
+        deliveryDeadline: mo.customerInfo?.deliveryDeadline || null,
         derivedStatus,
         totalQuantity: totalQty,
         packagedQuantity: packagedQty,
@@ -109,32 +164,29 @@ router.get("/manufacturing-orders", async (req, res) => {
 // Returns MO header + paginated WO list (with gender/category + sorted by product name)
 // Query: page, limit, search
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:id", async (req, res) => {
+router.get("/manufacturing-orders/:id", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { page = 1, limit = 12, search = "" } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    /* An order with no WorkOrder of this company is not this company's, and
+       answers exactly as one that does not exist — the id itself discloses
+       nothing. */
+    const { visible } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
     const mo = await CustomerRequest.findById(id)
       .select("requestId customerInfo requestType measurementName priority createdAt deliveryDeadline")
       .lean();
-    if (!mo) return res.status(404).json({ success: false, message: "MO not found" });
+    if (!mo) return access.notFound(res, "manufacturing order");
 
-    const woFilter = { customerRequestId: id };
-    if (search) {
-      const re = new RegExp(search.trim(), "i");
-      woFilter.$or = [
-        { stockItemName: re },
-        { workOrderNumber: re },
-        { stockItemReference: re },
-      ];
-    }
+    /* Search runs over the DISPLAY values below, not the stored fields: most
+       work orders store no number, so "WO-7dc8c1d3" could never match in the
+       database. Every work order of the order is loaded here anyway. */
+    const woFilter = access.scoped(companyOf(req), { customerRequestId: id });
 
     const allWOs = await WorkOrder.find(woFilter)
-      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
+      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantId variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
       .lean();
 
     // Resolve gender/category
@@ -144,8 +196,10 @@ router.get("/manufacturing-orders/:id", async (req, res) => {
       const meta = wo.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
       return {
         _id: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
+        stockItemId: wo.stockItemId || null,
+        variantId: wo.variantId || "",
         quantity: wo.quantity,
         stockItemName: wo.stockItemName || meta?.name || "—",
         stockItemReference: wo.stockItemReference || meta?.reference || "",
@@ -162,10 +216,21 @@ router.get("/manufacturing-orders/:id", async (req, res) => {
     // Sort by product name alphabetically (groups related products together)
     transformedAll.sort((a, b) => a.stockItemName.localeCompare(b.stockItemName));
 
+    const needle = String(search || "").trim().toLowerCase();
+    const matched = needle
+      ? transformedAll.filter((w) => [w.stockItemName, w.stockItemReference, w.workOrderNumber,
+        ...(w.variantAttributes || []).map((v) => v.value)]
+        .some((v) => String(v || "").toLowerCase().includes(needle)))
+      : transformedAll;
+
     // Paginate
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.max(1, parseInt(limit, 10));
-    const paged = transformedAll.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+    const paged = matched.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+    /* Photos for the page on screen only — see workOrderPhoto.js for why the
+       variant image comes first. */
+    const photos = await resolvePhotos(paged);
+    paged.forEach((w, i) => { w.productImage = photos[i]; });
 
     const isMeasurement = mo.requestType === "measurement_conversion";
 
@@ -190,8 +255,8 @@ router.get("/manufacturing-orders/:id", async (req, res) => {
       pagination: {
         page: pageNum,
         limit: limitNum,
-        total: transformedAll.length,
-        totalPages: Math.ceil(transformedAll.length / limitNum),
+        total: matched.length,
+        totalPages: Math.max(1, Math.ceil(matched.length / limitNum)),
       },
     });
   } catch (err) {
@@ -203,16 +268,21 @@ router.get("/manufacturing-orders/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /manufacturing-orders/:id/employees  (unchanged from before)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:id/employees", async (req, res) => {
+router.get("/manufacturing-orders/:id/employees", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { search = "", page = 1, limit = 10 } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    /* This company's WorkOrders on that order. No visible work, no order. */
+    const { visible, objectIds } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
-    const filter = { manufacturingOrderId: new mongoose.Types.ObjectId(id) };
+    /* A person's progress belongs to a WorkOrder, so the WorkOrder is what
+       proves whose it is — the order id alone never does. */
+    const filter = {
+      manufacturingOrderId: new mongoose.Types.ObjectId(id),
+      workOrderId: { $in: objectIds },
+    };
     if (search) {
       const re = new RegExp(search.trim(), "i");
       filter.$or = [{ employeeName: re }, { employeeUIN: re }];
@@ -265,7 +335,7 @@ router.get("/manufacturing-orders/:id/employees", async (req, res) => {
       rec.products.push({
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.gender || "",
@@ -326,27 +396,21 @@ router.get("/manufacturing-orders/:id/employees", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /manufacturing-orders/:id/bulk
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:id/bulk", async (req, res) => {
+router.get("/manufacturing-orders/:id/bulk", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { search = "" } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    const { visible } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
-    const filter = { customerRequestId: new mongoose.Types.ObjectId(id) };
-    if (search) {
-      const re = new RegExp(search.trim(), "i");
-      filter.$or = [
-        { stockItemName: re },
-        { workOrderNumber: re },
-        { stockItemReference: re },
-      ];
-    }
+    /* Search over display values, after resolution — see the detail route. */
+    const filter = access.scoped(companyOf(req), {
+      customerRequestId: new mongoose.Types.ObjectId(id),
+    });
 
     const wos = await WorkOrder.find(filter)
-      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
+      .select("workOrderNumber status quantity stockItemId stockItemName stockItemReference variantId variantAttributes productionCompletion packagedQuantity dispatchedQuantity")
       .lean();
 
     const metaMap = await resolveStockItemMeta(wos.map((w) => w.stockItemId));
@@ -358,7 +422,7 @@ router.get("/manufacturing-orders/:id/bulk", async (req, res) => {
       const dispatchedQty = wo.dispatchedQuantity || 0;
       return {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         status: wo.status,
         productName: wo.stockItemName || meta?.name || "—",
         productRef: wo.stockItemReference || meta?.reference || "",
@@ -374,6 +438,19 @@ router.get("/manufacturing-orders/:id/bulk", async (req, res) => {
     });
 
     workOrders.sort((a, b) => a.productName.localeCompare(b.productName));
+
+    const photos = await resolvePhotos(wos.map((w) => ({ key: String(w._id), ...w })));
+    const photoById = new Map(wos.map((w, i) => [String(w._id), photos[i]]));
+    workOrders.forEach((w) => { w.productImage = photoById.get(String(w.workOrderId)) || null; });
+
+    const needle = String(search || "").trim().toLowerCase();
+    if (needle) {
+      const keep = workOrders.filter((w) => [w.productName, w.productRef, w.workOrderNumber,
+        ...(w.variantAttributes || []).map((v) => v.value)]
+        .some((v) => String(v || "").toLowerCase().includes(needle)));
+      workOrders.length = 0;
+      workOrders.push(...keep);
+    }
 
     const totals = workOrders.reduce((acc, wo) => {
       acc.totalQty      += wo.totalQuantity;
@@ -393,16 +470,15 @@ router.get("/manufacturing-orders/:id/bulk", async (req, res) => {
 
 // ── GET /manufacturing-orders/:id/dispatch-history ───────────────────────────
 // Query: page, limit, search, startDate (ISO), endDate (ISO)
-router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
+router.get("/manufacturing-orders/:id/dispatch-history", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { page = 1, limit = 25, search = "", startDate = "", endDate = "" } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    const { visible, objectIds } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
-    const wos = await WorkOrder.find({ customerRequestId: id })
+    const wos = await WorkOrder.find(access.scoped(companyOf(req), { customerRequestId: id }))
       .select("workOrderNumber stockItemId stockItemName stockItemReference variantAttributes dispatchRecords")
       .lean();
     const metaMap = await resolveStockItemMeta(wos.map((w) => w.stockItemId));
@@ -422,10 +498,12 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
           dispatchedBy: rec.dispatchedBy,
           totalUnits: rec.dispatchedQuantity,
           notes: rec.notes || "",
+          cartonNumbers: rec.cartonNumbers || [],
+          challanNumber: rec.challanNumber || "",
           employeeName: null,
           employeeUIN: null,
           products: [{
-            workOrderNumber: wo.workOrderNumber,
+            workOrderNumber: displayWorkOrderNumber(wo),
             productName: wo.stockItemName || meta?.name || "—",
             productRef: wo.stockItemReference || meta?.reference || "",
             gender: meta?.genderCategory || meta?.gender || "",
@@ -441,6 +519,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
     // Person-wise events (grouped by employee + minute bucket)
     const empDocs = await EmployeeProductionProgress.find({
       manufacturingOrderId: id,
+      workOrderId: { $in: objectIds },
       "dispatchHistory.0": { $exists: true },
     })
       .select("employeeId employeeName employeeUIN workOrderId totalUnits packagedUnits dispatchHistory")
@@ -451,7 +530,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
       const wo = woMap.get(ep.workOrderId.toString());
       const meta = wo?.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
       const product = {
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         gender: meta?.genderCategory || meta?.gender || "",
@@ -494,9 +573,10 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
     // ── Apply date filter ──────────────────────────────────────────────────
     let filtered = events;
     if (startDate || endDate) {
-      const start = startDate ? new Date(startDate) : null;
-      const end = endDate ? new Date(endDate) : null;
-      if (end) end.setHours(23, 59, 59, 999); // include full end day
+      /* IST calendar days — see the note on packagingRoutes' /logs-by-mo. */
+      const DAY = /^\d{4}-\d{2}-\d{2}$/;
+      const start = DAY.test(String(startDate)) ? shift.istDayWindow(startDate).start : null;
+      const end = DAY.test(String(endDate)) ? new Date(shift.istDayWindow(endDate).end.getTime() - 1) : null;
 
       filtered = filtered.filter((ev) => {
         const t = new Date(ev.dispatchedAt);
@@ -561,14 +641,13 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
 // Body: { barcodes: ["WO-xxxx-001","WO-xxxx-002",...] }
 // Resolves these barcodes → finds the employee in this MO who owns those units
 // Returns the employee + dispatchable products (same shape as employees/:eid/products)
-router.post("/manufacturing-orders/:id/lookup-by-barcodes", async (req, res) => {
+router.post("/manufacturing-orders/:id/lookup-by-barcodes", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { barcodes } = req.body;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    const { visible } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
     if (!Array.isArray(barcodes) || !barcodes.length) {
       return res.status(400).json({ success: false, message: "barcodes array is required" });
     }
@@ -597,14 +676,25 @@ router.post("/manufacturing-orders/:id/lookup-by-barcodes", async (req, res) => 
       });
     }
 
-    // Get all WOs of this MO and resolve short IDs
-    const allWOs = await WorkOrder.find({ customerRequestId: id })
+    /* ── A BARCODE NAMES WORK, NOT A COMPANY ──────────────────────────
+       The short id in a barcode is the last 8 characters of a WorkOrder id,
+       which is not unique and is not proof of anything. So the candidates
+       are only THIS company's WorkOrders on THIS order, and a short id that
+       two of them share is refused rather than resolved to whichever was
+       read first — an ambiguous scan is a question for a human, and it can
+       never cross a company boundary because nothing outside this company's
+       work is in the map to begin with. */
+    const allWOs = await WorkOrder.find(access.scoped(companyOf(req), { customerRequestId: id }))
       .select("_id workOrderNumber stockItemId stockItemName stockItemReference variantAttributes")
       .lean();
     const woByShortId = new Map();
+    const ambiguousShortIds = new Set();
     for (const wo of allWOs) {
-      woByShortId.set(wo._id.toString().slice(-8), wo);
+      const shortId = wo._id.toString().slice(-8);
+      if (woByShortId.has(shortId)) ambiguousShortIds.add(shortId);
+      woByShortId.set(shortId, wo);
     }
+    for (const shortId of ambiguousShortIds) woByShortId.delete(shortId);
 
     // Match barcodes to WOs and collect (workOrderId, unitNumber) pairs
     const woUnits = new Map(); // workOrderId.toString() -> Set<unitNumber>
@@ -684,7 +774,7 @@ router.post("/manufacturing-orders/:id/lookup-by-barcodes", async (req, res) => 
       return {
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.genderCategory || meta?.gender || "",
@@ -721,15 +811,15 @@ router.post("/manufacturing-orders/:id/lookup-by-barcodes", async (req, res) => 
 
 // ── GET /manufacturing-orders/:id/remaining-employees ────────────────────────
 // Returns employees whose packaged units haven't been fully dispatched yet.
-router.get("/manufacturing-orders/:id/remaining-employees", async (req, res) => {
+router.get("/manufacturing-orders/:id/remaining-employees", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    const { visible, objectIds } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
     const docs = await EmployeeProductionProgress.find({
       manufacturingOrderId: new mongoose.Types.ObjectId(id),
+      workOrderId: { $in: objectIds },
       isDispatched: false,
       packagedUnits: { $gt: 0 },
     }).lean();
@@ -768,7 +858,7 @@ router.get("/manufacturing-orders/:id/remaining-employees", async (req, res) => 
       rec.products.push({
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.genderCategory || meta?.gender || "",
@@ -804,14 +894,13 @@ router.get("/manufacturing-orders/:id/remaining-employees", async (req, res) => 
 // GET /manufacturing-orders/:id/employees/search
 // Suggest employees by UIN/name for the New Dispatch interface
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:id/employees/search", async (req, res) => {
+router.get("/manufacturing-orders/:id/employees/search", ...canRead, async (req, res) => {
   try {
     const { id } = req.params;
     const { query = "" } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid MO id" });
-    }
+    const { visible, objectIds } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
     if (!query || query.trim().length < 2) {
       return res.json({ success: true, results: [] });
     }
@@ -819,6 +908,7 @@ router.get("/manufacturing-orders/:id/employees/search", async (req, res) => {
     const re = new RegExp(query.trim(), "i");
     const docs = await EmployeeProductionProgress.find({
       manufacturingOrderId: id,
+      workOrderId: { $in: objectIds },
       $or: [{ employeeName: re }, { employeeUIN: re }],
     }).lean();
 
@@ -856,15 +946,18 @@ router.get("/manufacturing-orders/:id/employees/search", async (req, res) => {
 // GET /manufacturing-orders/:id/employees/:employeeId/products
 // Fetch a specific employee's assigned products with dispatch availability
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/manufacturing-orders/:id/employees/:employeeId/products", async (req, res) => {
+router.get("/manufacturing-orders/:id/employees/:employeeId/products", ...canRead, async (req, res) => {
   try {
     const { id, employeeId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(employeeId)) {
+    if (!mongoose.Types.ObjectId.isValid(employeeId)) {
       return res.status(400).json({ success: false, message: "Invalid ID" });
     }
+    const { visible, objectIds } = await access.moScope(companyOf(req), id);
+    if (!visible) return access.notFound(res, "manufacturing order");
 
     const docs = await EmployeeProductionProgress.find({
       manufacturingOrderId: id,
+      workOrderId: { $in: objectIds },
       employeeId,
     }).lean();
 
@@ -883,7 +976,7 @@ router.get("/manufacturing-orders/:id/employees/:employeeId/products", async (re
       return {
         progressDocId: doc._id,
         workOrderId: doc.workOrderId,
-        workOrderNumber: wo?.workOrderNumber || "—",
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
         productGender: meta?.gender || "",
@@ -920,7 +1013,14 @@ router.get("/manufacturing-orders/:id/employees/:employeeId/products", async (re
 // Dispatch person-wise items.
 // Body: { items: [{ progressDocId, quantity?(optional, defaults to packagedUnits) }], notes? }
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/dispatch/person-wise", async (req, res) => {
+router.post("/dispatch/person-wise", ...canRecord, async (req, res) => {
+  /* RETIRED (25 Sep 2026): person-wise dispatch by progress id. Dispatch is a scan of a sealed carton —
+     POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     A typed quantity tied nothing to a box that left, so the same units could
+     be dispatched twice and a challan could name pieces still on the shelf. */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { items, notes = "" } = req.body;
     const dispatchedBy = req.user?.name || req.user?.employeeId || "Dispatch Dept";
@@ -928,6 +1028,15 @@ router.post("/dispatch/person-wise", async (req, res) => {
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ success: false, message: "No items provided" });
     }
+
+    /* ── PROVED WHOLE, BEFORE ANYTHING IS WRITTEN ──────────────────────
+       Every progress document named here is resolved through the WorkOrder
+       it belongs to, and that WorkOrder must be this company's. One id that
+       is another company's, unlinked, unknown or malformed refuses the whole
+       batch: a dispatch half-written across a company boundary is worse than
+       one refused, and the caller is told nothing about what it named. */
+    const proof = await access.resolveProgressDocs(companyOf(req), items.map((i) => i?.progressDocId));
+    if (proof.unproven.length) return access.notFound(res, "dispatchable work");
 
     const now = new Date();
     const summary = {
@@ -941,16 +1050,8 @@ router.post("/dispatch/person-wise", async (req, res) => {
     const byWO = new Map();
 
     for (const item of items) {
-      if (!mongoose.Types.ObjectId.isValid(item.progressDocId)) {
-        summary.failed.push({ progressDocId: item.progressDocId, reason: "Invalid ID" });
-        continue;
-      }
-
-      const doc = await EmployeeProductionProgress.findById(item.progressDocId);
-      if (!doc) {
-        summary.failed.push({ progressDocId: item.progressDocId, reason: "Not found" });
-        continue;
-      }
+      /* Proved above; this is the same document, read once. */
+      const doc = proof.byId.get(String(item.progressDocId));
 
       if (doc.isDispatched) {
         summary.failed.push({
@@ -1004,7 +1105,10 @@ router.post("/dispatch/person-wise", async (req, res) => {
 
     // Write WO.dispatchRecords + bump dispatchedQuantity
     for (const [woKey, agg] of byWO) {
-      const wo = await WorkOrder.findById(agg.workOrderId);
+      /* Company-scoped, like every other WorkOrder read here: the id came
+         from a document already proved to be this company's, and it is
+         re-read under the scope rather than by id alone. */
+      const wo = await WorkOrder.findOne(access.scoped(companyOf(req), { _id: agg.workOrderId }));
       if (!wo) continue;
 
       const currentDispatched = wo.dispatchedQuantity || 0;
@@ -1045,21 +1149,28 @@ router.post("/dispatch/person-wise", async (req, res) => {
 // Dispatch a bulk WO's packaged units.
 // Body: { workOrderId, quantity, notes? }
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/dispatch/bulk", async (req, res) => {
+router.post("/dispatch/bulk", ...canRecord, async (req, res) => {
+  /* RETIRED (25 Sep 2026): bulk dispatch by typed quantity. Dispatch is a scan of a sealed carton —
+     POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     A typed quantity tied nothing to a box that left, so the same units could
+     be dispatched twice and a challan could name pieces still on the shelf. */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { workOrderId, quantity, notes = "" } = req.body;
     const dispatchedBy = req.user?.name || req.user?.employeeId || "Dispatch Dept";
 
-    if (!mongoose.Types.ObjectId.isValid(workOrderId)) {
-      return res.status(400).json({ success: false, message: "Invalid WO id" });
-    }
     const qty = parseInt(quantity, 10);
     if (!qty || qty < 1) {
       return res.status(400).json({ success: false, message: "Invalid quantity" });
     }
 
-    const wo = await WorkOrder.findById(workOrderId);
-    if (!wo) return res.status(404).json({ success: false, message: "WO not found" });
+    /* Another company's, unlinked, unknown and malformed are one answer: the
+       id names no work of yours. */
+    if (!access.isId(workOrderId)) return access.notFound(res, "work order");
+    const wo = await WorkOrder.findOne(access.scoped(companyOf(req), { _id: access.oid(workOrderId) }));
+    if (!wo) return access.notFound(res, "work order");
 
     const packaged = wo.packagedQuantity || 0;
     const alreadyDispatched = wo.dispatchedQuantity || 0;
@@ -1089,7 +1200,7 @@ router.post("/dispatch/bulk", async (req, res) => {
       message: `Dispatched ${qty} unit(s)`,
       workOrder: {
         workOrderId: wo._id,
-        workOrderNumber: wo.workOrderNumber,
+        workOrderNumber: displayWorkOrderNumber(wo),
         dispatchedQuantity: wo.dispatchedQuantity,
         totalQuantity: wo.quantity,
       },

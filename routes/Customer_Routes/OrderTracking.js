@@ -43,7 +43,7 @@ const verifyCustomerToken = async (req, res, next) => {
     }
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+      require("../../config/jwt").SECRET,
     );
     req.customerId = decoded.id;
     next();
@@ -136,6 +136,7 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
     })
       .select(
         "requestId customerInfo requestType measurementName status priority " +
+          "items.stockItemName items.stockItemReference items.lineRef items.fulfilmentModel " +
           "estimatedCompletion deliveryDeadline createdAt finalOrderPrice",
       )
       .lean();
@@ -349,6 +350,11 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         requestId: cr.requestId,
         moNumber: `MO-${cr.requestId}`,
         requestType: cr.requestType || "customer_request",
+        productClassifications: (cr.items || []).map((item) => ({
+          lineRef: item.lineRef || null,
+          productName: item.stockItemName || item.stockItemReference || "Product",
+          fulfilmentModel: item.fulfilmentModel || "FULL_PACKAGE",
+        })),
         isPersonWise,
         measurementName: cr.measurementName || null,
         status: cr.status,

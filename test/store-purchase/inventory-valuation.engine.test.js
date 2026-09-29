@@ -290,3 +290,148 @@ describe("purity and status filtering", () => {
     expect(matchesStatus(complete, STATUS.COMPLETE)).toBe(true);
   });
 });
+
+// ═══ V1 CORRECTION — no unsupported certainty ════════════════════════════════
+describe("indeterminate cost composition (no valued-first assumption)", () => {
+  const unpricedIn = (qty, over = {}) => mv({ type: "ADD", quantity: qty, ...over }); // no unitPrice
+
+  // 4
+  test("valued + unpriced receipt with NO outbound stays partly-valued and incomplete", () => {
+    const it = item({ quantity: 15, stockTransactions: [receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 })] });
+    const v = valueItem(it);
+    expect(v.valueState).toBe("partly_unvalued");
+    expect(v.indeterminate).toBe(false);
+    expect(v.knownValue).toBe(1000); // the valued portion is still exact
+    expect(v.avgCost).toBe(100);
+    expect(v.unvaluedQty).toBe(5);
+    expect(v.status).toBe(STATUS.INCOMPLETE);
+  });
+
+  // 5 + 7
+  test("an outbound while unvalued stock exists makes composition indeterminate (null, not 0)", () => {
+    const it = item({ quantity: 12, stockTransactions: [receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 }), issue(3, { t: 2 })] });
+    const v = valueItem(it);
+    expect(v.indeterminate).toBe(true);
+    expect(v.status).toBe(STATUS.INDETERMINATE);
+    expect(v.knownValue).toBeNull(); // NOT ₹0
+    expect(v.avgCost).toBeNull();
+    expect(v.valuedQty).toBeNull();
+    expect(v.replayedOnHand).toBe(12); // quantity is still known
+    expect(v.reasons).toContain(REASON.COST_COMPOSITION_INDETERMINATE);
+    expect(v.indeterminateFrom).toBeTruthy();
+  });
+
+  // 6 — direction/size of the outbound relative to the valued portion is irrelevant
+  test("indeterminacy holds whether the outbound is smaller or larger than the valued portion", () => {
+    const small = valueItem(item({ quantity: 14, stockTransactions: [receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 }), issue(1, { t: 2 })] }));
+    const large = valueItem(item({ quantity: 3, stockTransactions: [receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 }), issue(12, { t: 2 })] }));
+    expect(small.indeterminate).toBe(true);
+    expect(large.indeterminate).toBe(true);
+    expect(small.knownValue).toBeNull();
+    expect(large.knownValue).toBeNull();
+  });
+
+  // 8
+  test("reaching exactly zero resets the uncertainty", () => {
+    const it = item({
+      quantity: 0,
+      stockTransactions: [receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 }), issue(3, { t: 2 }), issue(12, { t: 3 })], // 15 in, 15 out → 0
+    });
+    const v = valueItem(it);
+    expect(v.replayedOnHand).toBe(0);
+    expect(v.indeterminate).toBe(false); // remaining value is exactly zero
+    expect(v.knownValue).toBe(0);
+  });
+
+  // 9
+  test("a fully priced receipt after zero establishes a clean average again", () => {
+    const it = item({
+      quantity: 4,
+      stockTransactions: [
+        receipt(10, 100, { t: 0 }), unpricedIn(5, { t: 1 }), issue(3, { t: 2 }), issue(12, { t: 3 }), // → 0, reset
+        receipt(4, 250, { t: 4 }), // clean new period
+      ],
+    });
+    const v = valueItem(it);
+    expect(v.indeterminate).toBe(false);
+    expect(v.valueState).toBe("complete");
+    expect(v.knownValue).toBe(1000);
+    expect(v.avgCost).toBe(250);
+  });
+
+  test("an unapplied (pending) correction count marks attention but changes no quantity/value", () => {
+    const base = item({ quantity: 10, stockTransactions: [receipt(10, 100, { t: 0 })] });
+    const clean = valueItem(base);
+    const withPending = valueItem(base, { pendingCorrectionCount: 1 });
+    expect(withPending.knownValue).toBe(clean.knownValue); // unchanged
+    expect(withPending.replayedOnHand).toBe(clean.replayedOnHand); // unchanged
+    expect(withPending.reasons).toContain(REASON.UNAPPLIED_CORRECTION);
+    expect(withPending.status).toBe(STATUS.INCOMPLETE); // attention
+  });
+});
+
+// ═══ V2 LANDED-COST OVERLAY ══════════════════════════════════════════════════
+describe("landed-cost overlay onto priced receipts", () => {
+  const landed = (movementId, perUnit, sources = []) =>
+    new Map([[String(movementId), { perUnit, sources }]]);
+
+  // 13 (engine half) + 14 + 15
+  test("effective receipt cost = base + per-unit landed; weighted average rises correctly", () => {
+    const rid = oid();
+    const it = item({ quantity: 10, stockTransactions: [receipt(10, 100, { _id: rid, t: 0 })] });
+    const v = valueItem(it, { landedByMovement: landed(rid, 8) });
+    expect(v.baseStockValue).toBe(1000); // base unchanged
+    expect(v.landedInStock).toBe(80); // 10 × 8
+    expect(v.knownValue).toBe(1080); // effective
+    expect(v.avgCost).toBe(108); // base 100 + landed 8
+    expect(v.baseAvgCost).toBe(100);
+    expect(v.receipts[0].baseUnitCost).toBe(100);
+    expect(v.receipts[0].landedPerUnit).toBe(8);
+    expect(v.receipts[0].effectiveUnitCost).toBe(108);
+  });
+
+  // 16
+  test("a partial issue leaves only the proportional landed cost in current stock", () => {
+    const rid = oid();
+    const it = item({ quantity: 6, stockTransactions: [receipt(10, 100, { _id: rid, t: 0 }), issue(4, { t: 1 })] });
+    const v = valueItem(it, { landedByMovement: landed(rid, 8) });
+    expect(v.replayedOnHand).toBe(6);
+    expect(v.baseStockValue).toBe(600); // 6 × 100
+    expect(v.landedInStock).toBe(48); // 6/10 of the ₹80 landed — the rest left with the issue
+    expect(v.knownValue).toBe(648);
+    expect(v.avgCost).toBe(108); // an issue does not move the average
+  });
+
+  // 17 — landed cannot rescue an unpriced receipt
+  test("landed cost on an unpriced receipt does not make it valued (honesty preserved)", () => {
+    const rid = oid();
+    const it = item({ quantity: 10, stockTransactions: [mv({ type: "ADD", quantity: 10, _id: rid, t: 0 })] }); // no price
+    const v = valueItem(it, { landedByMovement: landed(rid, 8) });
+    expect(v.unvaluedQty).toBe(10);
+    expect(v.knownValue).toBe(0);
+    expect(v.reasons).toContain(REASON.LANDED_WITHOUT_BASE);
+    expect(v.reasons).toContain(REASON.MISSING_INBOUND_PRICE);
+  });
+
+  // 18
+  test("a landed allocation whose target movement is missing is an exception, not a guess", () => {
+    const rid = oid();
+    const it = item({ quantity: 10, stockTransactions: [receipt(10, 100, { _id: rid, t: 0 })] });
+    const v = valueItem(it, { landedByMovement: landed(oid() /* not in item */, 8) });
+    expect(v.knownValue).toBe(1000); // the real receipt is untouched by the stray allocation
+    expect(v.hasExceptions).toBe(true);
+    expect(v.exceptions.some((e) => e.reason === REASON.MISSING_ALLOCATION_TARGET)).toBe(true);
+  });
+
+  test("indeterminate items stay indeterminate even with a landed allocation", () => {
+    const rid = oid();
+    const it = item({
+      quantity: 12,
+      stockTransactions: [receipt(10, 100, { _id: rid, t: 0 }), mv({ type: "ADD", quantity: 5, t: 1 }), issue(3, { t: 2 })],
+    });
+    const v = valueItem(it, { landedByMovement: landed(rid, 8) });
+    expect(v.indeterminate).toBe(true);
+    expect(v.knownValue).toBeNull(); // never a landed-inflated ₹ figure
+    expect(v.landedInStock).toBeNull();
+  });
+});

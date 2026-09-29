@@ -12,8 +12,45 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const { requireTenant } = require("../../../../Middlewear/storePurchaseTenant");
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
 
 router.use(EmployeeAuthMiddleware);
+
+/* ── WHY TENANCY ARRIVED LATE, AND WHY IT HAD TO ─────────────────────────────
+ * This router was written when a label disclosed nothing about anybody else, so
+ * it carried authentication and no company scope: creation stamped no
+ * `companyId`, the list returned every company's labels, and a material or
+ * purchase order could be named by id from any company at all.
+ *
+ * Customer-owned labels closed half of that — a scan of one is refused across
+ * companies — but only for those, and only on read. The other half is the write
+ * path: a label is a claim about somebody's material, carrying their supplier,
+ * their order and their prices, and nothing stopped one company minting labels
+ * against another's purchase order.
+ *
+ * `requireTenant` is the same middleware every other Store router uses, so the
+ * company is resolved the one way rather than a second way invented here. Reads
+ * stay deliberately permissive about labels that predate this (`companyId:
+ * null`), because refusing them would stop every existing sticker scanning —
+ * writes are where the scope is enforced.
+ */
+router.use(requireTenant);
+
+/* A filter that matches this company's labels and the unowned ones that predate
+   company stamping. Folded into `$and` rather than assigned as `$or`, because
+   `tenantFilter` may itself be an `$or` under legacy read-through and assigning
+   over it would silently drop the company scope. */
+const scopedToCompany = (req, extra = {}) => {
+  const companyId = req.tenant?.companyId || null;
+  return {
+    $and: [
+      extra,
+      { $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }] },
+    ],
+  };
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /suggested-units/:rawItemId
@@ -105,8 +142,37 @@ router.post("/", async (req, res) => {
   try {
     const {
       rawItemId, variantId, quantity, unitId, unitName,
-      purchaseOrderId, purchaseOrderItemId
+      purchaseOrderId, purchaseOrderItemId,
+      /* ── ONE PRINT RUN, HOWEVER MANY TIMES IT IS SENT ──────────────────
+         `labelCount` makes the run one request instead of N, so a browser that
+         dies halfway cannot leave a half-minted batch nobody knows the size of.
+         `printBatchKey` is the client's stable intent for that run: pressing
+         Print again with the same key RETURNS the same labels rather than
+         minting a second set of identities for the same physical rolls. */
+      labelCount, printBatchKey,
+      goodsReceiptId, goodsReceiptLineId,
     } = req.body;
+
+    const companyId = req.tenant?.companyId || null;
+    const batchKey = String(printBatchKey || "").trim();
+    const count = labelCount === undefined ? 1 : Number(labelCount);
+    if (!Number.isInteger(count) || count < 1 || count > 100) {
+      return res.status(400).json({ success: false, message: "Number of labels must be a whole number between 1 and 100." });
+    }
+
+    /* ── A RETRY IS ANSWERED, NOT RE-RUN ────────────────────────────────────
+       Before any validation, because the retry of a run that already succeeded
+       must not be able to fail on a material that has since been edited. */
+    if (batchKey) {
+      const existing = await Barcode.find({ companyId, printBatchKey: batchKey })
+        .sort({ printBatchSeq: 1 }).lean();
+      if (existing.length >= count) {
+        return res.json({
+          success: true, barcodes: existing.slice(0, count), reused: true,
+          message: "These labels were already created — the same ones are returned.",
+        });
+      }
+    }
 
     if (!rawItemId || !mongoose.Types.ObjectId.isValid(rawItemId)) {
       return res.status(400).json({ success: false, message: "Valid rawItemId is required" });
@@ -122,7 +188,10 @@ router.post("/", async (req, res) => {
     }
 
     const [rawItem, unit] = await Promise.all([
-      RawItem.findById(rawItemId).select("name sku variants unit customUnit").lean(),
+      /* Company-scoped: naming another company's material by id must not
+         mint a label carrying their item, their SKU and their variants. */
+      RawItem.findOne(scopedToCompany(req, { _id: rawItemId }))
+        .select("name sku variants unit customUnit").lean(),
       unitId ? Unit.findById(unitId).select("name").lean() : Promise.resolve(null)
     ]);
 
@@ -163,7 +232,9 @@ router.post("/", async (req, res) => {
     let unitPrice = null;
 
     if (purchaseOrderId && mongoose.Types.ObjectId.isValid(purchaseOrderId)) {
-      const po = await PurchaseOrder.findById(purchaseOrderId)
+      /* Likewise: a label carrying another company's order number, supplier
+         and unit price would put their commercial terms on our sticker. */
+      const po = await PurchaseOrder.findOne(scopedToCompany(req, { _id: purchaseOrderId }))
         .select("poNumber vendor vendorName items")
         .populate("vendor", "companyName")
         .lean();
@@ -198,7 +269,35 @@ router.post("/", async (req, res) => {
       }
     }
 
-    const barcode = await Barcode.create({
+    /* ── THE ARRIVAL, WHEN THE LABEL WAS PRINTED FROM ONE ─────────────────
+       Read under the company scope like everything else, and only accepted
+       when the receipt actually names this material — a label must not be able
+       to claim a delivery that did not contain what it is stuck to. */
+    let receiptId = null, receiptNumber = "", receiptLineId = null;
+    if (goodsReceiptId && mongoose.Types.ObjectId.isValid(goodsReceiptId)) {
+      const gr = await GoodsReceipt.findOne({ _id: goodsReceiptId, companyId })
+        .select("receiptNumber lines").lean();
+      if (!gr) {
+        return res.status(404).json({ success: false, message: "That goods receipt was not found." });
+      }
+      const line = (gr.lines || []).find((l) => (
+        goodsReceiptLineId && mongoose.Types.ObjectId.isValid(goodsReceiptLineId)
+          ? String(l._id) === String(goodsReceiptLineId)
+          : String(l.rawItemId || "") === String(rawItem._id)
+      ));
+      if (!line) {
+        return res.status(400).json({
+          success: false,
+          message: "That receipt does not have a line for this material, so a label cannot claim it.",
+        });
+      }
+      receiptId = gr._id;
+      receiptNumber = gr.receiptNumber || "";
+      receiptLineId = line._id;
+    }
+
+    const base = {
+      companyId,
       rawItem: rawItem._id,
       rawItemName: rawItem.name,
       rawItemSku: rawItem.sku,
@@ -213,10 +312,51 @@ router.post("/", async (req, res) => {
       vendor: vendorId,
       vendorName,
       unitPrice,
-      generatedBy: req.user?.id || req.user?._id || null
-    });
+      goodsReceiptId: receiptId,
+      goodsReceiptNumber: receiptNumber,
+      goodsReceiptLineId: receiptLineId,
+      generatedBy: req.user?.id || req.user?._id || null,
+    };
 
-    return res.json({ success: true, barcode });
+    /* ── EACH PHYSICAL ROLL GETS ITS OWN IDENTITY ─────────────────────────
+       Five rolls are five documents, never one document printed five times:
+       two stickers sharing an id cannot be told apart on the floor, and the
+       whole point of a label is that it names ONE physical thing.
+
+       Positions are 1..count under the batch key, and the unique partial index
+       on (companyId, printBatchKey, printBatchSeq) is what makes a concurrent
+       second press collide rather than duplicate. */
+    const docs = Array.from({ length: count }, (_, i) => ({
+      ...base,
+      ...(batchKey ? { printBatchKey: batchKey, printBatchSeq: i + 1 } : {}),
+    }));
+
+    let barcodes;
+    try {
+      barcodes = await Barcode.insertMany(docs, { ordered: true });
+    } catch (e) {
+      /* A duplicate key means another press of the same run got there first.
+         Its labels are the answer — this one mints nothing. */
+      if (batchKey && (e?.code === 11000 || e?.writeErrors?.some((w) => w?.code === 11000))) {
+        const settled = await Barcode.find({ companyId, printBatchKey: batchKey })
+          .sort({ printBatchSeq: 1 }).lean();
+        if (settled.length) {
+          return res.json({
+            success: true, barcodes: settled, reused: true,
+            message: "These labels were already created — the same ones are returned.",
+          });
+        }
+      }
+      throw e;
+    }
+
+    return res.json({
+      success: true,
+      barcodes,
+      /* Kept so the existing single-label callers, which read `barcode`, are
+         untouched by this becoming a batch. */
+      barcode: barcodes[0],
+    });
   } catch (error) {
     console.error("Error creating barcode:", error);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -237,7 +377,15 @@ router.get("/:id", async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Invalid barcode id" });
     }
-    const barcode = await Barcode.findById(req.params.id)
+    /* ── A SCAN IS COMPANY-SCOPED TOO ──────────────────────────────────────
+       The customer-owned branch below has refused cross-company scans since it
+       was written; an ordinary label was left open on the grounds that it
+       disclosed nothing about anybody else. It does: the supplier, the purchase
+       order number and the unit price on it are one company's commercial terms.
+
+       Labels that predate company stamping carry no `companyId` and stay
+       readable — refusing them would stop every sticker already on a shelf. */
+    const barcode = await Barcode.findOne(scopedToCompany(req, { _id: req.params.id }))
       .populate("rawItem", "name sku unit customUnit category quantity minStock status variants")
       .populate("purchaseOrder", "poNumber orderDate expectedDeliveryDate status")
       .populate("vendor", "companyName contactPerson phone email gstNumber")
@@ -261,7 +409,103 @@ router.get("/:id", async (req, res) => {
     // it back would be the largest thing in the response and is never read.
     if (barcode.rawItem) delete barcode.rawItem.variants;
 
-    return res.json({ success: true, barcode });
+    /* ── A SCAN MUST SAY WHOSE MATERIAL THIS IS ──────────────────────────────
+       A customer-supplied roll scans exactly like our own, and until now the
+       answer looked exactly like our own too — at which point somebody cuts a
+       customer's fabric for a different order and nothing warned them.
+
+       So a customer-owned label answers with an explicit ownership block and a
+       banner. Every existing label is untouched: without `customerMaterial.lotId`
+       the response is byte-for-byte what it has always been, which is what keeps
+       the product-marking and purchase-receipt paths working unchanged. */
+    const cm = barcode.customerMaterial || {};
+    if (cm.lotId) {
+      /* ── AND REFUSED ACROSS COMPANIES ────────────────────────────────────
+         A customer-owned label carries the company that printed it, precisely so
+         this can be refused. Scanning another tenant's label would disclose their
+         customer, their order and their quantities to somebody with no
+         relationship to them.
+
+         This router carries no tenant middleware — it never needed one, because
+         an ordinary label discloses nothing about anybody else — so the company
+         is resolved HERE, and only for a customer-owned label. Two consequences,
+         both deliberate: every existing scan is untouched, and a caller whose
+         company cannot be resolved at all is refused rather than allowed through
+         on the grounds that there was nothing to compare.
+
+         Answered as NOT FOUND rather than forbidden, because the existence of the
+         label is itself part of what is being protected: "you may not see this"
+         confirms that another company holds material for a customer. */
+      let scanning = req.tenant?.companyId || null;
+      if (!scanning) {
+        try {
+          const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+          const resolved = await tenantContext.resolveForActor(req.user, {});
+          scanning = resolved?.companyId || null;
+        } catch {
+          scanning = null;
+        }
+      }
+      const owner = String(barcode.companyId || "");
+      if (!scanning || !owner || owner !== String(scanning)) {
+        return res.status(404).json({ success: false, message: "Barcode not found" });
+      }
+      const labels = require("../../../../services/storePurchase/customerMaterialLabel.service");
+      const { CustomerMaterialLot } = require("../../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+      const lot = await CustomerMaterialLot.findById(cm.lotId)
+        .select("availableQuantity issuedQuantity returnedQuantity status baseUnit receivedAt")
+        .lean();
+
+      return res.json({
+        success: true,
+        barcode,
+        /* First in the payload and impossible to miss. A screen that rendered
+           only `barcode` would still be wrong, but it could not be wrong by
+           accident about ownership. */
+        ownership: {
+          kind: "CUSTOMER_OWNED",
+          banner: labels.OWNERSHIP_BANNER,
+          customer: {
+            id: String(cm.customerId || ""),
+            label: String(cm.customerLabel || ""),
+            code: String(cm.customerCode || ""),
+          },
+          orderRef: String(cm.orderRef || ""),
+          orderLineRef: String(cm.orderLineRef || ""),
+          documentRef: String(cm.documentRef || ""),
+          againstRevisionNo: cm.expectationRevisionNo ?? null,
+          expectationLineRef: String(cm.expectationLineRef || ""),
+          lot: {
+            id: String(cm.lotId),
+            goodsReceiptNumber: String(cm.goodsReceiptNumber || ""),
+            receivedAt: lot?.receivedAt || null,
+            availableQuantity: lot?.availableQuantity ?? null,
+            issuedQuantity: lot?.issuedQuantity ?? null,
+            returnedToCustomerQuantity: lot?.returnedQuantity ?? null,
+            status: String(lot?.status || ""),
+            baseUnit: String(lot?.baseUnit || ""),
+          },
+          where: {
+            warehouseName: String(cm.warehouseName || ""),
+            locationCode: String(cm.locationCode || ""),
+          },
+          /* The one sentence a picker needs. */
+          usableFor: `Only order ${String(cm.orderRef || "")}`
+            + `${cm.orderLineRef ? `, line ${cm.orderLineRef}` : ""}.`,
+          /* Said explicitly so nothing downstream treats it as free stock. */
+          availableAsGeneralStock: false,
+        },
+      });
+    }
+
+    /* An ordinary label. The response shape is unchanged, and `ownership` says so
+       rather than being absent — a reader that checks for it gets an answer on
+       every scan instead of having to treat "missing" as "ours". */
+    return res.json({
+      success: true,
+      barcode,
+      ownership: { kind: "COMPANY_OWNED", banner: "", availableAsGeneralStock: true },
+    });
   } catch (error) {
     console.error("Error fetching barcode:", error);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -274,11 +518,17 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
-    const { rawItemId, variantId, purchaseOrderId, page = 1, limit = 50 } = req.query;
-    const filter = {};
-    if (rawItemId && mongoose.Types.ObjectId.isValid(rawItemId)) filter.rawItem = rawItemId;
-    if (variantId && mongoose.Types.ObjectId.isValid(variantId)) filter.variantId = variantId;
-    if (purchaseOrderId && mongoose.Types.ObjectId.isValid(purchaseOrderId)) filter.purchaseOrder = purchaseOrderId;
+    const { rawItemId, variantId, purchaseOrderId, goodsReceiptId, page = 1, limit = 50 } = req.query;
+    const inner = {};
+    if (rawItemId && mongoose.Types.ObjectId.isValid(rawItemId)) inner.rawItem = rawItemId;
+    if (variantId && mongoose.Types.ObjectId.isValid(variantId)) inner.variantId = variantId;
+    if (purchaseOrderId && mongoose.Types.ObjectId.isValid(purchaseOrderId)) inner.purchaseOrder = purchaseOrderId;
+    if (goodsReceiptId && mongoose.Types.ObjectId.isValid(goodsReceiptId)) inner.goodsReceiptId = goodsReceiptId;
+    /* Company-scoped. This list used to return every company's labels — it is
+       what a reprint reads, so it disclosed one company's suppliers, orders and
+       quantities to another. Labels that predate company stamping are included,
+       or every existing sticker would vanish from the screen that reprints it. */
+    const filter = scopedToCompany(req, inner);
 
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.max(1, Math.min(200, parseInt(limit, 10)));

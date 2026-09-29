@@ -1,128 +1,93 @@
 // Middlewear/AccountantAuthMiddleware.js
 //
-// LEGACY accountant auth middleware. Handles JWT extraction from cookies
-// (with or without cookie-parser) and Bearer headers. Has a DEV BYPASS
-// flag for local debugging.
+// COMPATIBILITY FAÇADE over AccountantOrgAuthMiddleware. (Lane A, Chunk 2)
 //
-// HISTORY:
-//   This file is the LEGACY entry-point. The newer sub-account system
-//   (organization + roles: owner/approver/editor/viewer) lives in
-//   AccountantOrgAuthMiddleware.js. Both must coexist:
+// ─── WHAT THIS FILE USED TO BE ────────────────────────────────────────────────
+// Its own authentication system. It read a JWT from any of four cookies or the
+// Bearer header, verified the signature, and then answered from the CLAIMS:
+// a token saying `role: "accountant"` or `role: "admin"` was handed canEdit,
+// canPostDirectly, canApprove, canManageTeam and canManageSettings by
+// `legacyRolePermissions`, with no database anywhere in the decision. Every
+// department login in this CMS issues a token, and the accounting department's
+// own login issues exactly those two role names — so the 39 route files behind
+// this middleware (vouchers, invoices, journals, reports, settings, parties,
+// banking, expenses, payroll) trusted a string in a cookie.
 //
-//     1. Existing accountant routes import { accountantAuth } from here
-//        and we don't want to rewrite every route.
-//     2. The main GRAV CMS login also issues JWTs that we need to keep
-//        accepting (for backwards-compat).
+// Nothing here checked whether the user still existed, was still active, still
+// belonged to an organisation, or had been logged out of all devices. Chunk 1
+// closed that door on the `orgAuth` routes; this closes it on the rest.
 //
-//   So this file accepts BOTH token formats:
-//     - new tokens (with organizationId + role in {owner, approver,
-//       editor, viewer}) → read from `accountant_token` cookie
-//     - legacy tokens (role in {accountant, admin, accountant_viewer})
-//       → read from auth_token / token / jwt cookies
+// ─── WHAT IT IS NOW ───────────────────────────────────────────────────────────
+// A thin translation layer. Every export resolves through `orgAuth`, which is
+// the single place that:
+//   • selects the right credential when several are present,
+//   • confirms the Acc_User against the database (exists, active, token version
+//     current, organisation matches),
+//   • confirms the organisation is active,
+//   • derives permissions from the STORED role, never from the token,
+//   • refuses legacy CMS sessions with ACCOUNTING_SESSION_UPGRADE_REQUIRED.
 //
-//   When a new-system token is used, req.user is populated with the
-//   new user's id/role/email PLUS a `permissions` object so old routes
-//   can opt-in to fine-grained gating.
+// The 39 route files import the same names and are not edited. What changed is
+// what those names do.
 //
-// MODEL REFERENCES:
-//   This file references the Activity-Log model. AFTER the Acc_ rename,
-//   the model name is `Acc_ActivityLog` (formerly `AccountantActivityLog`
-//   / `ActivityLog`). We probe both for backward-compat in case any old
-//   code still registers the legacy name on boot, but the canonical
-//   name is `Acc_ActivityLog`.
+// ─── THE ALLOW-LIST TRANSLATION ───────────────────────────────────────────────
+// Those routes are gated by `makeAuth(["accountant","admin"])` — a role-NAME
+// allow-list. No organisation token can ever contain "accountant" or "admin";
+// they carry owner / approver / editor / viewer. Comparing names would refuse
+// every legitimate user, and accepting the four new names wholesale would let a
+// viewer post vouchers on all 39, because fine-grained `requirePermission`
+// guards exist on only a handful of them.
 //
-// DEV BYPASS — set ACCOUNTANT_AUTH_BYPASS=true in .env to skip auth
-// during local development. Injects a fake admin user. NEVER use in prod.
+// So the allow-list is read for what it MEANT and answered from the role's
+// CAPABILITIES:
+//
+//   makeAuth(["admin"])            → manage settings → canManageSettings
+//   makeAuth(["accountant", ...])  → the module gate → canView to look,
+//                                                      canEdit to change
+//
+// Method-based, because these routes never had a read/write split of their own
+// — one middleware sits in front of both the GET that lists credit notes and
+// the POST that issues one. Deriving it from the HTTP verb is what makes
+// "Viewer · read-only" true across all 39 without editing any of them.
+//
+// ─── WHAT IS DELIBERATELY NOT HERE ────────────────────────────────────────────
+// • No `jwt.verify`. There is exactly one token verifier in Accounting now, and
+//   it lives in AccountantOrgAuthMiddleware. `test/accountant/
+//   accounting-auth-inventory.test.js` fails if a second one reappears.
+// • No `legacyRolePermissions` — that WAS the legacy grant.
+// • No `verifyToken` export — it was an independent verification path, and
+//   nothing imported it.
+// • No company scoping. `orgAuth` attaches a trustworthy `req.organization`;
+//   turning that into per-route company enforcement is Lane A Chunk 3, and
+//   bolting `requireCompanyAccess` onto 39 routes blind would refuse legitimate
+//   traffic on routes that name a company in ways this layer cannot see.
+//
+// DEV BYPASS: `ACCOUNTANT_AUTH_BYPASS=true` is still honoured, but by `orgAuth`
+// — one bypass in one place. It injects an owner-equivalent dev session rather
+// than this file's old fake admin. NEVER set it in production.
 
-const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 
-const DEV_BYPASS = process.env.ACCOUNTANT_AUTH_BYPASS === "true";
-
-if (DEV_BYPASS) {
-  console.warn(
-    "⚠️  [accountant-auth] DEV BYPASS ENABLED — every request will be authenticated as fake admin",
-  );
-}
+const {
+  orgAuth,
+  requireCompanyScope,
+  scopeCompanyIfPresent,
+} = require("./AccountantOrgAuthMiddleware");
 
 /* ------------------------------------------------------------------ */
-/* Cookie parsing — works even when cookie-parser isn't installed     */
+/* Token extraction — delegated                                        */
 /* ------------------------------------------------------------------ */
+//
+// Re-exported so older imports keep resolving, and delegated so there is one
+// implementation of "where might a token be". Extraction is not authorisation:
+// this returns a string and decides nothing.
 
-function parseCookieHeader(cookieHeader) {
-  if (!cookieHeader || typeof cookieHeader !== "string") return {};
-  const out = {};
-  cookieHeader.split(";").forEach((part) => {
-    const idx = part.indexOf("=");
-    if (idx < 0) return;
-    const k = part.slice(0, idx).trim();
-    const v = part.slice(idx + 1).trim();
-    if (k) out[k] = decodeURIComponent(v);
-  });
-  return out;
-}
-
-function extractToken(req) {
-  // PRIORITY ORDER:
-  //   1. accountant_token   — new sub-account system (most specific)
-  //   2. auth_token         — legacy CMS cookie
-  //   3. token / jwt        — older variants
-  //   4. Authorization: Bearer
-
-  if (req.cookies?.accountant_token) return req.cookies.accountant_token;
-  if (req.cookies?.auth_token) return req.cookies.auth_token;
-  if (req.cookies?.token) return req.cookies.token;
-  if (req.cookies?.jwt) return req.cookies.jwt;
-
-  const raw = parseCookieHeader(req.headers?.cookie || "");
-  if (raw.accountant_token) return raw.accountant_token;
-  if (raw.auth_token) return raw.auth_token;
-  if (raw.token) return raw.token;
-  if (raw.jwt) return raw.jwt;
-
-  const authHeader = req.headers?.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.slice(7);
-  }
-
-  return null;
-}
+const {
+  extractToken,
+} = require("./AccountantOrgAuthMiddleware");
 
 /* ------------------------------------------------------------------ */
-/* JWT verifier                                                        */
-/* ------------------------------------------------------------------ */
-
-function verifyToken(req) {
-  const token = extractToken(req);
-
-  if (!token) {
-    const err = new Error(
-      "Authentication required — no token in cookies or Authorization header",
-    );
-    err.status = 401;
-    err.code = "NO_TOKEN";
-    throw err;
-  }
-
-  try {
-    return jwt.verify(
-      token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
-    );
-  } catch (e) {
-    const err = new Error(
-      e.name === "TokenExpiredError"
-        ? "Session expired — please log in again."
-        : "Invalid authentication token",
-    );
-    err.status = 401;
-    err.code = e.name;
-    throw err;
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* Role compatibility map                                              */
+/* Role → capability tables                                            */
 /* ------------------------------------------------------------------ */
 
 const NEW_ROLES = ["owner", "approver", "editor", "viewer"];
@@ -131,6 +96,9 @@ function isNewRole(role) {
   return NEW_ROLES.includes(role);
 }
 
+// Kept as an exported helper because it is a pure, useful description of the
+// role model. Note that `orgAuth` computes the permissions it attaches from the
+// STORED role — this is not what gates anything.
 function newRolePermissions(role) {
   const p = {
     canView: true,
@@ -155,58 +123,14 @@ function newRolePermissions(role) {
   return p;
 }
 
-function legacyRolePermissions(role) {
-  const p = {
-    canView: true,
-    canEdit: false,
-    canPostDirectly: false,
-    canApprove: false,
-    canManageTeam: false,
-    canManageSettings: false,
-  };
-  if (role === "admin" || role === "accountant") {
-    p.canEdit =
-      p.canPostDirectly =
-      p.canApprove =
-      p.canManageTeam =
-      p.canManageSettings =
-        true;
-  }
-  return p;
-}
-
 /* ------------------------------------------------------------------ */
-/* Role-checking factory                                              */
+/* Allow-list → capability                                             */
 /* ------------------------------------------------------------------ */
 
 /**
- * Translate a legacy allow-list into the capability it was actually asking for.
- *
- * THE BUG THIS EXISTS TO FIX
- * --------------------------
- * The 65 accounting routes are gated by `makeAuth(["accountant","admin"])`,
- * which compares a role-name STRING. No new-system token can ever contain
- * "accountant" or "admin" — those tokens carry owner / approver / editor /
- * viewer. So once the correct accountant_token started being issued, every
- * new-system user was refused by every route, owner included, with
- * "Required role: accountant or admin. You are: viewer."
- *
- * Making the allow-list simply accept the four new roles is not the fix either:
- * that is the hole that let a viewer through `adminOnlyAuth`, and it would let a
- * viewer post vouchers on all 65 routes, because the fine-grained
- * `requirePermission` guard is used on only three of them.
- *
- * So the allow-list is read for what it MEANT, and answered from the role's
- * capabilities instead of its name:
- *
- *   makeAuth(["admin"])                    → manage settings   → owner only
- *   makeAuth(["accountant", ...])          → the module gate   → read to look,
- *                                                                edit to change
- *
- * Method-based, because these routes never had a read/write split of their own —
- * a single middleware sits in front of both the GET that lists credit notes and
- * the POST that issues one. Deriving it from the HTTP verb is what makes
- * "Viewer · read-only" true across all 65 without editing any of them.
+ * Translate a legacy role-name allow-list into the capability it was asking for.
+ * Never compares a new role name against an old one — the two vocabularies
+ * share no words, so a name comparison here can only ever be wrong.
  */
 function requiredCapability(allowedRoles, method) {
   // adminOnly — "admin" without "accountant" beside it.
@@ -223,75 +147,111 @@ const CAPABILITY_REFUSAL = {
   canManageSettings: "Only the accounting owner can change this.",
 };
 
+/* ------------------------------------------------------------------ */
+/* makeAuth — the façade                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Build a middleware that authenticates through `orgAuth` and then enforces the
+ * capability the legacy allow-list was standing in for.
+ *
+ * `orgAuth` writes its own response and calls the continuation ONLY when the
+ * request carries a database-confirmed organisation session — so everything
+ * below the continuation can assume `req.user` and `req.organization` are real.
+ * A legacy CMS session never gets that far: `orgAuth` answers it with
+ * 401 ACCOUNTING_SESSION_UPGRADE_REQUIRED, the same refusal the rest of
+ * Accounting gives it.
+ */
 function makeAuth(allowedRoles = []) {
-  return (req, res, next) => {
-    if (DEV_BYPASS) {
-      req.user = {
-        id: "000000000000000000000001",
-        role: "admin",
-        employeeId: "DEV-ADMIN",
-        name: "Dev Admin",
-        email: "dev@local",
-        permissions: legacyRolePermissions("admin"),
-        isDev: true,
-      };
-      return next();
-    }
+  return function accountantCompatAuth(req, res, next) {
+    return orgAuth(req, res, (err) => {
+      if (err) return next(err);
 
-    try {
-      const decoded = verifyToken(req);
-      const role = decoded.role;
-
-      const isNew = isNewRole(role);
-      const permissions = isNew
-        ? newRolePermissions(role)
-        : legacyRolePermissions(role);
-
-      if (isNew) {
-        // Answered from capabilities — a name comparison can only ever fail
-        // here, since the two vocabularies share no words. See
-        // requiredCapability above.
-        const capability = requiredCapability(allowedRoles, req.method);
-        if (!permissions[capability]) {
-          return res.status(403).json({
-            success: false,
-            code: "INSUFFICIENT_ROLE",
-            role,
-            requires: capability,
-            message: CAPABILITY_REFUSAL[capability],
-          });
-        }
-      } else if (allowedRoles.length && !allowedRoles.includes(role)) {
-        // Legacy tokens keep the original name check, unchanged. It has to
-        // stay: legacyRolePermissions() grants canView to ANY role string, so
-        // answering these from capabilities would open the accounting module to
-        // every department login in the system.
-        return res.status(403).json({
+      // Belt and braces. `orgAuth` does not attach a legacy identity outside
+      // the two bootstrap endpoints, but this middleware is the thing standing
+      // in front of the ledger — it states its own precondition rather than
+      // inheriting one.
+      if (!req.user || req.user.isLegacy || req.user.isBootstrapOnly) {
+        return res.status(401).json({
           success: false,
-          code: "INSUFFICIENT_ROLE",
-          message: `Access denied. Required role: ${allowedRoles.join(" or ")}. You are: ${role}.`,
+          code: "ACCOUNTING_SESSION_UPGRADE_REQUIRED",
+          requiresUpgrade: true,
+          upgradeEndpoint: "/api/accountant/auth/sync-legacy",
+          message:
+            "Your accounting session needs to be upgraded before you can use this.",
         });
       }
 
-      req.user = {
-        id: decoded.id || decoded._id || decoded.userId,
-        organizationId: decoded.organizationId || null,
-        role,
-        employeeId: decoded.employeeId,
-        name: decoded.name,
-        email: decoded.email,
-        permissions,
-        isNewSystem: isNew,
-      };
+      const capability = requiredCapability(allowedRoles, req.method);
+      if (!req.user.permissions?.[capability]) {
+        return res.status(403).json({
+          success: false,
+          code: "INSUFFICIENT_ROLE",
+          role: req.user.role,
+          requires: capability,
+          message: CAPABILITY_REFUSAL[capability],
+        });
+      }
+
+      // ── Compatibility fields ────────────────────────────────────────────
+      // Several routes stamp `req.accountantId` onto records they write
+      // (approvals, reviews, imports). It has always meant "the id of the
+      // accounting user making this request", so it is the confirmed
+      // Acc_User._id — not a claim off a token.
+      req.accountantId = req.user.id;
+      // Was set by the old middleware; now always true, since a legacy token
+      // can no longer reach any route.
+      req.user.isNewSystem = true;
 
       next();
-    } catch (err) {
-      return res.status(err.status || 401).json({
+    });
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* requireCapability — for endpoints the METHOD misdescribes           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Demand a capability regardless of the HTTP verb, for routes whose verb lies
+ * about what they do.
+ *
+ * `makeAuth` derives the capability from the method, which is right for the
+ * overwhelming majority of these routes and is what let all 39 be migrated
+ * without editing them. It is wrong for a GET that WRITES — and Accounting has
+ * several, because a "resolve the sales ledger" endpoint auto-creates the
+ * ledger when it is missing. Read as a verb, that is a GET; read as an effect,
+ * it creates an accounting object, and a Viewer must not be able to cause it.
+ *
+ * Mount this AFTER the auth middleware on the specific route, so the URL and
+ * the method stay exactly as they are and only the permission tightens:
+ *
+ *     router.get("/sales-ledgers", auth, requireCapability("canEdit"), handler)
+ *
+ * The refusal is the same `INSUFFICIENT_ROLE` shape `makeAuth` produces, so
+ * callers need no new branch to handle it.
+ */
+function requireCapability(capability) {
+  return function requireAccountingCapability(req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({
         success: false,
-        message: err.message || "Authentication failed",
-        code: err.code,
+        code: "NO_TOKEN",
+        message: "Authentication required",
       });
     }
+    if (!req.user.permissions?.[capability]) {
+      return res.status(403).json({
+        success: false,
+        code: "INSUFFICIENT_ROLE",
+        role: req.user.role,
+        requires: capability,
+        message:
+          CAPABILITY_REFUSAL[capability] ||
+          `You don't have permission: ${capability}`,
+      });
+    }
+    next();
   };
 }
 
@@ -299,35 +259,45 @@ function makeAuth(allowedRoles = []) {
 /* Pre-configured middleware                                          */
 /* ------------------------------------------------------------------ */
 
+// The module gate: canView to read, canEdit to change.
 const accountantAuth = makeAuth(["accountant", "admin"]);
+
+// Reads are open to viewers. Under the capability model this resolves to
+// canView on safe methods — and, because the same middleware would sit in front
+// of an unsafe method if one were ever added to a router using it, canEdit
+// there. Requiring only canView for a write would be a downgrade, not a
+// read-only guarantee.
 const accountantReadOnlyAuth = makeAuth([
   "accountant",
   "accountant_viewer",
   "admin",
 ]);
+
+// Owner-only in practice: canManageSettings is granted to no other role.
 const adminOnlyAuth = makeAuth(["admin"]);
 
 /* ------------------------------------------------------------------ */
 /* Company-scope middleware                                           */
 /* ------------------------------------------------------------------ */
+//
+// This used to validate that a companyId was SUPPLIED and was a well-formed
+// ObjectId — and stop there. It never asked whether the caller's organisation
+// owned that company, so every route using it accepted any id of the right
+// shape, including another organisation's.
+//
+// It now delegates to `requireCompanyScope`, the single canonical check in
+// AccountantOrgAuthMiddleware.js. Routes already mounting `withCompanyScope`
+// become ownership-checked without being edited, and there is one
+// implementation of "which company may this request touch" rather than two that
+// drift apart.
+//
+// The one visible difference for existing callers: `req.companyId` is still
+// set, but a foreign company now gets 403 COMPANY_FORBIDDEN where it used to be
+// served, and a malformed id answers 400 COMPANY_SCOPE_INVALID rather than
+// "Invalid companyId format".
 
 function withCompanyScope(req, res, next) {
-  const companyId =
-    req.params?.companyId || req.query?.companyId || req.body?.companyId;
-
-  if (!companyId) {
-    return res.status(400).json({
-      success: false,
-      message: "companyId is required for this route",
-    });
-  }
-  if (!mongoose.Types.ObjectId.isValid(companyId)) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Invalid companyId format" });
-  }
-  req.companyId = companyId;
-  next();
+  return requireCompanyScope(req, res, next);
 }
 
 /* ------------------------------------------------------------------ */
@@ -366,6 +336,11 @@ function logAccountantActivity(action) {
 /* ------------------------------------------------------------------ */
 /* Exports                                                            */
 /* ------------------------------------------------------------------ */
+//
+// Same surface the 39 route files import, minus two removals that were the
+// legacy grant itself and are imported by nothing:
+//   • `verifyToken`           — an independent jwt.verify path
+//   • `legacyRolePermissions` — role-name string → full accounting rights
 
 module.exports = makeAuth;
 
@@ -373,9 +348,14 @@ module.exports.accountantAuth = accountantAuth;
 module.exports.accountantReadOnlyAuth = accountantReadOnlyAuth;
 module.exports.adminOnlyAuth = adminOnlyAuth;
 module.exports.withCompanyScope = withCompanyScope;
+// Re-exported so the 39 route files behind this façade can reach the canonical
+// guard through the module they already import.
+module.exports.requireCompanyScope = requireCompanyScope;
+module.exports.scopeCompanyIfPresent = scopeCompanyIfPresent;
 module.exports.logAccountantActivity = logAccountantActivity;
 module.exports.makeAuth = makeAuth;
-module.exports.verifyToken = verifyToken;
 module.exports.extractToken = extractToken;
 module.exports.newRolePermissions = newRolePermissions;
-module.exports.legacyRolePermissions = legacyRolePermissions;
+module.exports.isNewRole = isNewRole;
+module.exports.requiredCapability = requiredCapability;
+module.exports.requireCapability = requireCapability;

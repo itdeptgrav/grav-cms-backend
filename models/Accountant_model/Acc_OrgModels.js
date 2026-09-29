@@ -78,6 +78,35 @@ const accountantOrganizationSchema = new mongoose.Schema(
   { timestamps: true, collection: "acc_organizations" },
 );
 
+/* ── ONE ORGANISATION PER COMPANY (decision D2) ────────────────────────────
+ * A unique index on an ARRAY field is multikey: MongoDB indexes one key per
+ * element, so uniqueness holds per element ACROSS documents. Two organisations
+ * therefore cannot both list the same company id, and a race between two
+ * concurrent claims is decided here rather than by whichever read happened
+ * first.
+ *
+ * The partial filter is what keeps "owns nothing" legal. An empty array is
+ * indexed as a single `undefined` key, so without it the second organisation
+ * with `tallyCompanyIds: []` would collide with the first. Admitting only
+ * documents that hold at least one ObjectId excludes both `[]` and a missing
+ * field.
+ *
+ * Within one document this constrains nothing — multikey keys are
+ * de-duplicated — so every write goes through `$addToSet`, never `$push`. See
+ * services/accountantCompanyOwnership.service.js.
+ *
+ * `autoIndex` is off in production (server.js:782), so production builds this
+ * through scripts/migrations/accounting-company-ownership-index.js, which
+ * refuses while a company is held by two organisations. */
+accountantOrganizationSchema.index(
+  { tallyCompanyIds: 1 },
+  {
+    unique: true,
+    name: "acc_org_company_ownership_unique",
+    partialFilterExpression: { tallyCompanyIds: { $type: "objectId" } },
+  },
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Acc_User — the login record
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +124,22 @@ const accountantUserSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, trim: true, lowercase: true },
 
-    passwordHash: { type: String, required: true },
+    /* HOW THIS ROW MAY BE USED (GAC-2 correction, 25 Sep 2026).
+         "password" — an accounting-only person's own login (the historical
+                      meaning; the default, so every existing row keeps it).
+         "none"     — ROLE STORAGE ONLY. The person's identity is their
+                      DeptUser or Employee; this row only says which
+                      Accounting role they hold and carries their Accounting
+                      session version. It is never a login: every password
+                      path refuses it by this field, not by the absence of a
+                      guessable hash, and canonical identity never counts it
+                      as a person. It has no password hash at all. */
+    loginMode: { type: String, enum: ["password", "none"], default: "password" },
+
+    passwordHash: {
+      type: String,
+      required: function passwordRequired() { return this.loginMode !== "none"; },
+    },
 
     role: { type: String, enum: ROLES, required: true, index: true },
     // owner    — single per org; full power; can invite/remove users
@@ -139,14 +183,26 @@ accountantUserSchema.index({ organizationId: 1, email: 1 }, { unique: true });
 
 // Helpers
 accountantUserSchema.methods.setPassword = async function (plain) {
+  if (this.loginMode === "none") {
+    const err = new Error("This Accounting record stores a role only; the person signs in with their GRAV login.");
+    err.code = "ROLE_ONLY_RECORD";
+    throw err;
+  }
   if (!plain || plain.length < 8) {
     throw new Error("Password must be at least 8 characters");
   }
   this.passwordHash = await bcrypt.hash(plain, 10);
 };
 
-accountantUserSchema.methods.checkPassword = function (plain) {
-  return bcrypt.compare(plain || "", this.passwordHash || "");
+accountantUserSchema.methods.checkPassword = async function (plain) {
+  // A role-only record is never a credential, whatever it holds.
+  if (this.loginMode === "none" || !this.passwordHash) return false;
+  return bcrypt.compare(plain || "", this.passwordHash);
+};
+
+/** Can this row be signed into with a password at all? */
+accountantUserSchema.methods.isLoginRecord = function () {
+  return this.loginMode !== "none";
 };
 
 // Convenience: what the user is allowed to do at the broadest level.

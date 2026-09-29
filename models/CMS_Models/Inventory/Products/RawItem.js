@@ -12,6 +12,8 @@
 // merge them in. This file matches what the routes file expects.
 
 const mongoose = require("mongoose");
+const { USED_AS_VALUES, DEFAULT_USED_AS } = require("./usedAs");
+const { DEFAULT_OWNERSHIP, DEFAULT_OWNERSHIP_VALUES } = require("./materialOwnership");
 
 // e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
 const unitConversionSchema = new mongoose.Schema(
@@ -69,6 +71,18 @@ const stockTransactionSchema = new mongoose.Schema(
     variantCombination: [{ type: String }],
     variantId:          { type: mongoose.Schema.Types.ObjectId },
 
+    /* ── WHOSE GOODS MOVED ───────────────────────────────────────────────────
+       COMPANY for the factory's own stock (the default — every purchase, MRF,
+       adjustment and return), CUSTOMER for customer-supplied material that is
+       physically held but owned by the customer. It is explicit provenance on
+       each NEW movement so the valuation engine can exclude customer property
+       from company inventory value and on-hand WITHOUT inference; historical
+       customer movements (written before this field) are recovered instead from
+       CustomerMaterialLot.movements[].stockTransactionId. RawItem.quantity stays
+       the honest PHYSICAL total either way — ownership never removes stock, only
+       decides whose it is. */
+    ownership: { type: String, enum: ["COMPANY", "CUSTOMER"], default: "COMPANY" },
+
     previousQuantity: { type: Number, default: 0 },
     newQuantity:      { type: Number, default: 0 },
 
@@ -103,6 +117,17 @@ const stockTransactionSchema = new mongoose.Schema(
        Null on everything written before, and on movements from routes that are
        not yet governed. */
     operationId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+
+    /* ── WHERE IN THE WAREHOUSE THIS MOVEMENT LANDED / LEFT (Warehouse Stock V1)
+       A snapshot of the warehouse/location the paired LocationMovement records,
+       so Stock movements can show the real location without a fragile join.
+       Absent on legacy movements and on operations not yet location-aware —
+       those read as "Unassigned", never guessed onto a warehouse. */
+    warehouseId:   { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", default: null },
+    locationId:    { type: mongoose.Schema.Types.ObjectId, default: null },
+    warehouseName: { type: String, default: "" },
+    locationCode:  { type: String, default: "" },
+    locationName:  { type: String, default: "" },
 
     /* Mongoose's `timestamps` option does not run for an update written as an
        aggregation pipeline, and the stock movements are written that way so
@@ -150,6 +175,62 @@ const rawItemSchema = new mongoose.Schema(
 
     category:       { type: String, default: "" },
 
+    /* ── HOW CUSTOMS CLASSIFIES THESE GOODS ───────────────────────────────
+       The tariff heading an import of this item is entered under. A property
+       of the GOODS, so it is recorded once here rather than on every
+       quotation — two suppliers of one fabric do not classify it differently,
+       and storing it per offer would let them appear to.
+
+       ── AND IT IS NOT THE HSN ON A QUOTATION ─────────────────────────────
+       `SupplierOffer.hsnCode` is what the supplier wrote for GST. The two
+       derive from the same Harmonised System and are routinely different
+       lengths for the same goods — the GST code is what the seller charges
+       tax under, this is what the importer clears customs under. Reading one
+       as the other is how a duty is worked out against the wrong heading.
+
+       Empty means nobody has classified it. It is never defaulted, never
+       inferred from the category, and never read as "no duty". */
+    customsTariffCode: { type: String, trim: true, uppercase: true, maxlength: 20, default: "" },
+
+    /* ── WHAT WOULD MAKE THIS THE SAME MATERIAL AS ANOTHER ──────────────────
+       The name, the shelf, the unit and the classification, with case, spacing
+       and punctuation removed, joined into one string.
+
+       It exists because the SKU cannot do this job. `RAW-FAB-POLMES-417` ends
+       in three random digits, so registering the same yarn twice a minute apart
+       mints two different codes and a uniqueness check on the SKU passes on
+       both — which is how a catalogue ends up holding one material under four
+       codes that no report can add together.
+
+       Stored rather than computed at query time so the check is an indexed
+       lookup and so "Poly mesh 135", "poly-mesh 135" and "POLY  MESH  135"
+       collide, which a regex on `name` cannot do. Empty on items created before
+       this field existed; the duplicate check falls back to an exact-name
+       comparison for those rather than pretending they have one. */
+    masterIdentityKey: { type: String, trim: true, default: "", index: false },
+
+    /* ── AND WHETHER THAT IDENTITY IS CLAIMED AS THE ONLY ONE ───────────────
+       True only on items registered through a door that REFUSES duplicates —
+       today, the Development BOM's narrow registration drawer. Those rows are
+       covered by a unique index on `{companyId, masterIdentityKey}` (declared
+       below), which is what makes two simultaneous registrations of the same
+       material produce one item rather than two: the second loses the index,
+       not a race that nobody notices.
+
+       Store's own item screen leaves it FALSE, deliberately. A storekeeper can
+       see the catalogue in front of them and may have a real reason to register
+       a second row for what looks like the same material — a different mill's
+       equivalent, a re-coded replacement, a row kept for history. Turning that
+       judgement into a database error nobody can act on would be the migration
+       equivalent of refusing to let a person do their job. So the flag is set
+       by the caller's DUPLICATE POLICY rather than by the field's existence, and
+       the two doors keep their different answers.
+
+       It lives on the item rather than in a separate claim table so that
+       deleting an item releases its claim. A claim outliving the row it
+       described would block re-registering a material that no longer exists. */
+    identityUnique: { type: Boolean, default: false },
+
     /* ── THIS ITEM'S OWN BUDGET HEAD, WHERE IT DIFFERS FROM ITS CATEGORY ───
        Normally empty. The head comes from the item's CATEGORY (see
        Acc_ItemCategoryBudget) because mapping 15 categories is a meeting and
@@ -170,8 +251,53 @@ const rawItemSchema = new mongoose.Schema(
     budgetLedgerSetAt: { type: Date, default: null },
     customCategory: { type: String, default: "" },
 
+    /* ── WHAT PART THIS ITEM PLAYS, AND WHERE IT MAY BE SELECTED ───────────
+       Store-owned. `category` says what the item IS; `usedAs` says what it is
+       FOR — and it is what Merchandising reads to decide whether the item may
+       appear in a product BOM picker. Merchandising can never write it: its
+       routes carry no Store grant and expose no field for it. Defaults to
+       NOT_CLASSIFIED, which keeps an unclassified item OUT of every picker
+       until Store classifies it — the safe direction. */
+    usedAs: {
+      type: String,
+      enum: USED_AS_VALUES,
+      default: DEFAULT_USED_AS,
+    },
+
     unit:       { type: String, default: "" },
     customUnit: { type: String, default: "" },
+
+    /* ── WHOSE PROPERTY THIS MATERIAL NORMALLY IS ─────────────────────────
+       A catalogue DEFAULT, not a stock fact. CUSTOMER_OWNED says the material
+       is normally supplied by a customer and remains their property, so a
+       receipt of it preselects customer ownership and the customer named
+       below. It never creates stock and never re-owns stock already held:
+       physical ownership is decided per receipt (GoodsReceipt.sourceType),
+       per lot (CustomerMaterialLot) and per movement
+       (stockTransactions[].ownership), and none of those read this field.
+       Defaults to COMPANY_OWNED so every item registered before the field
+       existed, and every client that never sends it, reads as what it was. */
+    defaultOwnership: {
+      type: String,
+      enum: DEFAULT_OWNERSHIP_VALUES,
+      default: DEFAULT_OWNERSHIP.COMPANY_OWNED,
+    },
+    /* The customer whose property a CUSTOMER_OWNED material normally is. The
+       identity is the Customer's own id — the same reference every lot and
+       receipt carries — and it is validated on the server against this
+       company's reach before it is stored. Always null on a company-owned
+       material: the route clears it rather than letting a stale customer
+       ride along after somebody switches the default back. */
+    owningCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
+    /* Display snapshot beside the id, in the same shape the receipts and lots
+       keep (services/merchandising/customerIdentity.service.js). Never the
+       authority — the id is — and deliberately allowed to go stale rather
+       than restating what this default was set to. */
+    owningCustomer: {
+      customerCode:  { type: String, trim: true, default: "" },
+      customerLabel: { type: String, trim: true, default: "" },
+      customerName:  { type: String, trim: true, default: "" },
+    },
 
     quantity: { type: Number, default: 0, min: 0 },
     minStock: { type: Number, default: 0 },
@@ -233,7 +359,35 @@ rawItemSchema.add({
    within a company the code is the item's identity. */
 rawItemSchema.index({ companyId: 1, sku: 1 }, { unique: true });
 rawItemSchema.index({ companyId: 1, name: 1 });
+/* Duplicate detection at registration. NOT unique: Store's own screen may
+   deliberately register a near-duplicate, and a unique index would turn a
+   judgement the storekeeper is entitled to make into a database error nobody
+   can act on. Sparse, because items created before the field existed carry no
+   key and must not all collide on "". */
+rawItemSchema.index({ companyId: 1, masterIdentityKey: 1 }, { sparse: true });
+/* ── THE ONE PLACE A CONCURRENT DUPLICATE IS ACTUALLY STOPPED ───────────────
+   A duplicate check that reads and then writes cannot hold under concurrency:
+   two transactions both read "not there" and both insert, because snapshot
+   isolation only conflicts on documents they BOTH touch, and a row that does
+   not exist yet is not one of those.
+
+   So the constraint is an index. Partial, on `identityUnique: true`, so it
+   covers only the rows whose door promises uniqueness — Store's own screen keeps
+   its ability to register a deliberate near-duplicate, because its rows are not
+   in this index at all. See the field. */
+rawItemSchema.index(
+  { companyId: 1, masterIdentityKey: 1 },
+  {
+    unique: true,
+    name: "companyId_1_masterIdentityKey_1_claimed",
+    partialFilterExpression: { identityUnique: true },
+  },
+);
 rawItemSchema.index({ companyId: 1, category: 1 });
+/* The Merchandising picker reads this company's items of one `usedAs` set. */
+rawItemSchema.index({ companyId: 1, usedAs: 1 });
+/* "Every material that is normally this customer's property", per company. */
+rawItemSchema.index({ companyId: 1, owningCustomerId: 1 });
 rawItemSchema.index({ name: 1 });
 rawItemSchema.index({ category: 1 });
 rawItemSchema.index({ "variants.vendorNicknames.vendor": 1 });

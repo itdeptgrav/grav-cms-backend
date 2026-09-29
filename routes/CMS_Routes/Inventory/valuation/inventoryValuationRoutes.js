@@ -13,6 +13,9 @@ const router = express.Router();
 
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const StockLedger = require("../../../../models/CMS_Models/Inventory/Operations/StockLedger");
+const LandedCostAllocation = require("../../../../models/CMS_Models/Inventory/Valuation/LandedCostAllocation");
+const { CustomerMaterialLot } = require("../../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+const { Acc_Voucher } = require("../../../../models/Accountant_model/Acc_VoucherModels");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const { requireTenant } = require("../../../../Middlewear/storePurchaseTenant");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
@@ -30,7 +33,7 @@ router.use(requireTenant);
 // The one line the report and this API both show. Kept here so the honesty
 // statement lives with the numbers it qualifies.
 const LANDED_COST_NOTE =
-  "Weighted-average value is derived from recorded stock receipts and movements. GST, freight and other landed costs are not included unless they are present in the recorded unit cost.";
+  "Physical stock includes customer-supplied material the factory is holding. Company valuation EXCLUDES customer-owned material — its quantity is reported separately, and excluding it is not the same as assigning it zero cost. Weighted-average value is derived from recorded company stock receipts and movements, plus landed costs (inward freight, insurance, customs, clearing) allocated only to eligible company-owned purchase receipts from posted supplier bills. Recoverable GST and other non-acquisition charges are excluded.";
 
 const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -99,18 +102,93 @@ async function compensatingByItem(itemIds) {
   return { applied, pendingCount };
 }
 
+// Active landed-cost allocations for these items, keyed for the engine's
+// overlay: itemId → Map(movementId → { perUnit, sources[] }). Only allocations
+// whose SOURCE VOUCHER is currently posted contribute — a cancelled/void
+// voucher's allocation is excluded by authoritative status without deleting it.
+async function landedByItem(companyId, itemIds) {
+  const out = new Map();
+  if (!companyId || !itemIds.length) return out;
+  const allocs = await LandedCostAllocation.find({
+    companyId,
+    status: "active",
+    "targets.itemId": { $in: itemIds },
+  }).lean();
+  if (!allocs.length) return out;
+  const voucherIds = [...new Set(allocs.map((a) => String(a.sourceVoucherId)))];
+  const vouchers = await Acc_Voucher.find({ _id: { $in: voucherIds } })
+    .select("status")
+    .lean();
+  const postedVoucher = new Set(
+    vouchers.filter((v) => v.status === "posted").map((v) => String(v._id)),
+  );
+  for (const a of allocs) {
+    if (!postedVoucher.has(String(a.sourceVoucherId))) continue; // excluded by status
+    for (const t of a.targets || []) {
+      const itemKey = String(t.itemId);
+      if (!out.has(itemKey)) out.set(itemKey, new Map());
+      const mm = out.get(itemKey);
+      const mid = String(t.movementId);
+      const prev = mm.get(mid) || { perUnit: 0, sources: [] };
+      prev.perUnit += Number(t.allocatedPerUnit) || 0;
+      prev.sources.push({
+        allocationId: String(a._id),
+        voucherId: String(a.sourceVoucherId),
+        voucherNumber: a.sourceVoucherNumber || "",
+      });
+      mm.set(mid, prev);
+    }
+  }
+  return out;
+}
+
+// The set of RawItem stockTransaction ids that belong to CUSTOMER-supplied
+// material, per item, read from lot provenance:
+// CustomerMaterialLot.movements[].stockTransactionId. This covers HISTORICAL
+// customer movements with no schema backfill — every customer receipt, issue and
+// return already stamped its lot movement with the id of the RawItem transaction
+// it created. The engine excludes these from company value and reports them as
+// customer-owned on-hand instead. New movements ALSO carry an explicit
+// ownership marker, so the engine catches them even before this set is built.
+async function customerOwnedByItem(companyId, itemIds) {
+  const out = new Map();
+  if (!companyId || !itemIds.length) return out;
+  const lots = await CustomerMaterialLot.find({ companyId, rawItemId: { $in: itemIds } })
+    .select("rawItemId movements.stockTransactionId")
+    .lean();
+  for (const lot of lots) {
+    const key = String(lot.rawItemId);
+    if (!out.has(key)) out.set(key, new Set());
+    const set = out.get(key);
+    for (const mv of lot.movements || []) {
+      if (mv && mv.stockTransactionId) set.add(String(mv.stockTransactionId));
+    }
+  }
+  return out;
+}
+
 // Attach ONLY applied compensating movements and value each item; pending
 // corrections are passed as a count so they show as attention, not as stock.
-function valueAll(items, comp, withVariants) {
+// `landed` (itemId → movement landed map) overlays landed cost onto receipts.
+// `customerOwned` (itemId → Set(stockTransactionId)) marks customer-supplied
+// movements so company value/on-hand exclude them.
+function valueAll(items, comp, landed, customerOwned, withVariants) {
   const applied = comp.applied || new Map();
   const pendingCount = comp.pendingCount || new Map();
+  const landedMap = landed || new Map();
+  const custMap = customerOwned || new Map();
   return items.map((it) => {
     const key = String(it._id);
     const rows = applied.get(key) || [];
     const merged = rows.length
       ? { ...it, stockTransactions: [...(it.stockTransactions || []), ...compensatingToMovements(rows)] }
       : it;
-    return valueItem(merged, { withVariants, pendingCorrectionCount: pendingCount.get(key) || 0 });
+    return valueItem(merged, {
+      withVariants,
+      pendingCorrectionCount: pendingCount.get(key) || 0,
+      landedByMovement: landedMap.get(key) || new Map(),
+      customerOwnedTxIds: custMap.get(key) || new Set(),
+    });
   });
 }
 
@@ -162,15 +240,25 @@ router.get("/", async (req, res) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .lean();
-      const compMap = await compensatingByItem(items.map((i) => i._id));
-      rows = valueAll(items, compMap, withVariants);
+      const ids = items.map((i) => i._id);
+      const [compMap, landed, customerOwned] = await Promise.all([
+        compensatingByItem(ids),
+        landedByItem(req.tenant && req.tenant.companyId, ids),
+        customerOwnedByItem(req.tenant && req.tenant.companyId, ids),
+      ]);
+      rows = valueAll(items, compMap, landed, customerOwned, withVariants);
     } else {
       // Analytic path — status filter or value/attention sort need every item
       // valued. Still scoped to this company and never shipped whole to the
       // browser: we value server-side, then return only the requested page.
       const items = await RawItem.find(clause).select(VALUATION_PROJECTION).lean();
-      const compMap = await compensatingByItem(items.map((i) => i._id));
-      let valued = valueAll(items, compMap, withVariants);
+      const ids = items.map((i) => i._id);
+      const [compMap, landed, customerOwned] = await Promise.all([
+        compensatingByItem(ids),
+        landedByItem(req.tenant && req.tenant.companyId, ids),
+        customerOwnedByItem(req.tenant && req.tenant.companyId, ids),
+      ]);
+      let valued = valueAll(items, compMap, landed, customerOwned, withVariants);
       if (status && status !== "all") valued = valued.filter((v) => matchesStatus(v, status));
       sortValued(valued, sort, dir);
       total = valued.length;
@@ -191,17 +279,22 @@ router.get("/", async (req, res) => {
 
 // The company-scoped summary, computed the ONE way. Exported so the Store
 // overview consumes the identical valuation answer (never a second formula).
-async function summarizeCompany(clause) {
+async function summarizeCompany(clause, companyId) {
   const items = await RawItem.find(clause).select(VALUATION_PROJECTION).lean();
-  const compMap = await compensatingByItem(items.map((i) => i._id));
-  const valued = valueAll(items, compMap, false);
+  const ids = items.map((i) => i._id);
+  const [compMap, landed, customerOwned] = await Promise.all([
+    compensatingByItem(ids),
+    landedByItem(companyId, ids),
+    customerOwnedByItem(companyId, ids),
+  ]);
+  const valued = valueAll(items, compMap, landed, customerOwned, false);
   return { summary: summarizeValued(valued), valued };
 }
 
 // ── GET /summary — company totals, honest about what is excluded ─────────────
 router.get("/summary", async (req, res) => {
   try {
-    const { summary } = await summarizeCompany(queryClause(req));
+    const { summary } = await summarizeCompany(queryClause(req), req.tenant && req.tenant.companyId);
     res.json({ success: true, summary, note: LANDED_COST_NOTE });
   } catch (e) {
     console.error("[inventory-valuation] summary:", e);
@@ -216,8 +309,12 @@ router.get("/item/:id", async (req, res) => {
       .select(VALUATION_PROJECTION)
       .lean();
     if (!item) return res.status(404).json({ success: false, message: "Item not found." });
-    const compMap = await compensatingByItem([item._id]);
-    const [valued] = valueAll([item], compMap, true);
+    const [compMap, landed, customerOwned] = await Promise.all([
+      compensatingByItem([item._id]),
+      landedByItem(req.tenant && req.tenant.companyId, [item._id]),
+      customerOwnedByItem(req.tenant && req.tenant.companyId, [item._id]),
+    ]);
+    const [valued] = valueAll([item], compMap, landed, customerOwned, true);
     res.json({ success: true, valuation: valued, note: LANDED_COST_NOTE });
   } catch (e) {
     console.error("[inventory-valuation] item:", e);
