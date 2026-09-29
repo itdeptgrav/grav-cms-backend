@@ -682,6 +682,24 @@ every message ("raw item" / "label"); the JSON keys (`stickers`, the
 `buildPieceProgress` needs (it read 2 300 rows twice, ~3 s) and caches the
 result for `QC_ORDERS_CACHE_MS` (15 s; 0 disables).
 
+**Job work only, and the GRN — never the bill of material (29 Sep 2026).**
+`GET /orders` lists only the orders Sales marked JOB_WORK on the PI/order
+line (plus any order that already has checks, so records are never
+orphaned); scopes `jobwork` (default) | `checked`. `GET /orders/:moId`
+frames each raw item with two figures: ASKED = the ISSUED
+`CustomerMaterialExpectation` for the order (`orderRef` = the request id;
+Merchandising's material request to the customer, latest revision) and
+RECEIVED = the Store's CUSTOMER_MATERIAL `GoodsReceipt` lines against the
+order (`customerMaterial.orderRef`, base quantity; the ownership lots are
+the fallback when no receipt names the order). "To check" IS received;
+remaining = received − checked; `shortOfAsked` = asked − received; state
+`awaiting` = asked but nothing received. Company purchase orders carry no
+order link (`sourceMrfId` only) and are not read. `GET /report` now takes
+`moId` (one order, all time) and `email`, and answers `days[]` (each day's
+shift-hour buckets, totals and byOrder), `records` (≤5000) beside byDay /
+byChecker / byOrder / byRawItem / byDefect — the CMS builds the Excel
+from it (`lib/reports/rawItemQcWorkbook.js`).
+
 **Two collections came from renaming empty, unreferenced orphans** (the
 cluster is at its 500-collection cap): `trips` → `qc_raw_item_inspections`,
 `helpers` → `qc_raw_item_settings`. A rename keeps the old indexes — the

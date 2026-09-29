@@ -40,6 +40,8 @@ const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequ
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const Employee = require("../../../../models/Employee");
 const { CustomerMaterialLot } = require("../../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+const { CustomerMaterialExpectation } = require("../../../../models/CMS_Models/Merchandising/CustomerMaterialExpectation");
 
 const SLUG = "qc";
 const oid = (v) => new mongoose.Types.ObjectId(String(v));
@@ -240,74 +242,109 @@ const orderRow = (mo, r) => ({
   ...(r || ZERO),
 });
 
-/** The orders a checker may pick, and the owner's list: every live order, job work first, with what is checked. */
+/** JOB-WORK ORDERS ONLY (29 Sep 2026, explicit request). Raw material is
+ *  checked only where the customer sends it, and Sales marks that on the
+ *  PI/order line (`fulfilmentModel === "JOB_WORK"`), so the list — for the
+ *  owner and for the checker's order picker — is those orders, with what has
+ *  been checked on each. An order somebody checked BEFORE it was marked (or
+ *  by mistake) still shows, so its records are never orphaned. */
 router.get("/orders", requireOwnerOrChecker, async (req, res) => {
   try {
     const q = str(req.query.q).toLowerCase();
-    const scope = str(req.query.scope) || "all"; // all | jobwork | checked
+    const scope = str(req.query.scope) || "jobwork"; // jobwork | checked
     const [mos, rl] = await Promise.all([CustomerRequest.find(LIVE).select(MO_SELECT).sort({ createdAt: -1 }).lean(), rollups(null)]);
-    let out = mos.map((mo) => orderRow(mo, rl.get(String(mo._id))));
-    if (scope === "jobwork") out = out.filter((o) => o.isJobWork);
+    let out = mos.map((mo) => orderRow(mo, rl.get(String(mo._id)))).filter((o) => o.isJobWork || o.stickers > 0);
     if (scope === "checked") out = out.filter((o) => o.stickers > 0);
     if (q) out = out.filter((o) => [o.moNumber, o.requestId, o.customerName].some((v) => String(v).toLowerCase().includes(q)));
-    out.sort((a, b) => (b.isJobWork - a.isJobWork) || (b.stickers > 0) - (a.stickers > 0) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-    res.json({ success: true, orders: out, counts: { all: mos.length, jobwork: out.filter((o) => o.isJobWork).length, checked: [...rl.keys()].length } });
+    out.sort((a, b) => (b.stickers > 0) - (a.stickers > 0) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    res.json({ success: true, orders: out, counts: { jobwork: out.length, checked: out.filter((o) => o.stickers > 0).length, notJobWorkButChecked: out.filter((o) => !o.isJobWork).length } });
   } catch (err) { console.error("[qc raw-items orders]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
-/** What the order needs (its work orders' bills of material) and what has been checked, raw item by raw item. */
+/** One order, raw item by raw item (rewritten 29 Sep 2026). Two figures frame
+ *  the checking and NEITHER is the bill of material:
+ *    asked     what Merchandising asked the customer to send — the ISSUED
+ *              CustomerMaterialExpectation for the order (latest revision);
+ *    received  what the Store actually booked in — the CUSTOMER_MATERIAL goods
+ *              receipts against the order (their lines' base quantity), with the
+ *              ownership lots as the fallback for a receipt recorded before the
+ *              GRN carried the order. "To check" IS the received quantity: a
+ *              roll that never arrived cannot be checked, and one that arrived
+ *              short is checked short.
+ *  Checked / passed / defective / remaining come from the standing records. */
 router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
   try {
     if (!isId(req.params.moId)) return res.status(400).json({ success: false, message: "Not an order id." });
     const mo = await CustomerRequest.findById(req.params.moId).select(MO_SELECT).lean();
     if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
-    const [wos, lots, records, rl] = await Promise.all([
-      WorkOrder.find({ customerRequestId: mo._id }).select("rawMaterials workOrderNumber quantity stockItemName status").lean(),
-      /* on a job-work order the customer's material arrives as lots — what was
-         RECEIVED for this order is the better "how much to check" than the bill */
-      CustomerMaterialLot.find({ $or: [{ orderRef: { $in: [mo.requestId, moNumberOf(mo)].filter(Boolean) } }, { "movements.manufacturingOrderId": mo._id }] }).select("rawItemId variantId itemName sku baseUnit baseQuantity receiptQuantity receiptUnit").lean().catch(() => []),
+    const refs = [mo.requestId, moNumberOf(mo)].filter(Boolean);
+    const [expectation, grns, lots, records, rl, woCount] = await Promise.all([
+      CustomerMaterialExpectation.findOne({ orderRef: { $in: refs }, state: "ISSUED" }).sort({ revisionNo: -1 }).select("documentRef revisionNo lines issuedAt").lean().catch(() => null),
+      GoodsReceipt.find({ sourceType: "CUSTOMER_MATERIAL", "customerMaterial.orderRef": { $in: refs }, status: { $ne: "VOID" } }).select("receiptNumber receiptDate lines").lean().catch(() => []),
+      CustomerMaterialLot.find({ orderRef: { $in: refs } }).select("rawItemId variantId itemName sku baseUnit baseQuantity receiptQuantity receiptUnit receiptNumber").lean().catch(() => []),
       QCRawItemInspection.find({ manufacturingOrderId: mo._id }).sort({ inspectedAt: -1 }).lean(),
       rollups([String(mo._id)]),
+      WorkOrder.countDocuments({ customerRequestId: mo._id }).catch(() => 0),
     ]);
-    const receivedByKey = new Map();
-    for (const l of lots || []) { const key = `${l.rawItemId || ""}|${l.variantId || ""}`; const cur = receivedByKey.get(key) || { received: 0, unit: l.baseUnit || l.receiptUnit || "", itemName: l.itemName || "", sku: l.sku || "" }; cur.received = r4(cur.received + (l.baseQuantity ?? l.receiptQuantity ?? 0)); receivedByKey.set(key, cur); }
-    /* required, from the work orders' bills of material — the same source the Store's requirement reads */
-    const need = new Map();
-    for (const w of wos) for (const rm of w.rawMaterials || []) {
-      const key = `${rm.rawItemId || ""}|${rm.rawItemVariantId || ""}`;
-      const cur = need.get(key) || { rawItemId: rm.rawItemId ? String(rm.rawItemId) : "", variantId: rm.rawItemVariantId ? String(rm.rawItemVariantId) : null, rawItemName: rm.name || "", rawItemSku: rm.sku || "", variantLabel: (rm.rawItemVariantCombination || []).join(" · "), unit: rm.unit || "", required: 0 };
-      cur.required = r4(cur.required + (rm.quantityRequired || 0));
-      need.set(key, cur);
+    const keyOf = (i, v) => `${i || ""}|${v || ""}`;
+    const blank = (k, seed = {}) => ({ rawItemId: k.split("|")[0], variantId: k.split("|")[1] || null, rawItemName: "", rawItemSku: "", variantLabel: "", unit: "", asked: null, received: null, receipts: [], stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null, ...seed });
+    const items = new Map();
+    /* asked */
+    for (const l of expectation?.lines || []) {
+      const k = keyOf(l.rawItemId, l.variantId);
+      const cur = items.get(k) || blank(k, { rawItemName: l.rawItemName || "", rawItemSku: l.rawItemSku || l.sku || "", variantLabel: (l.variantCombination || []).join(" · ") || l.variantLabel || "", unit: l.unit || "" });
+      cur.asked = r4((cur.asked || 0) + (l.requiredQuantity || 0)); if (l.shortClosedAt) cur.shortClosed = true;
+      items.set(k, cur);
+    }
+    /* received — the GRN lines; the lots only when no receipt names the order */
+    const receivedFrom = grns.length ? "grn" : lots.length ? "lots" : null;
+    if (receivedFrom === "grn") {
+      for (const g of grns) for (const l of g.lines || []) {
+        const k = keyOf(l.rawItemId, l.variantId);
+        const cur = items.get(k) || blank(k, { rawItemName: l.itemName || "", rawItemSku: l.sku || "", variantLabel: (l.variantCombination || []).join(" · "), unit: l.baseUnit || l.poUnit || "" });
+        if (!cur.rawItemName) cur.rawItemName = l.itemName || ""; if (!cur.unit) cur.unit = l.baseUnit || l.poUnit || "";
+        cur.received = r4((cur.received || 0) + (l.baseQuantity ?? l.receivedQuantity ?? 0));
+        if (g.receiptNumber && !cur.receipts.includes(g.receiptNumber)) cur.receipts.push(g.receiptNumber);
+        items.set(k, cur);
+      }
+    } else if (receivedFrom === "lots") {
+      for (const l of lots) {
+        const k = keyOf(l.rawItemId, l.variantId);
+        const cur = items.get(k) || blank(k, { rawItemName: l.itemName || "", rawItemSku: l.sku || "", unit: l.baseUnit || l.receiptUnit || "" });
+        if (!cur.rawItemName) cur.rawItemName = l.itemName || ""; if (!cur.unit) cur.unit = l.baseUnit || l.receiptUnit || "";
+        cur.received = r4((cur.received || 0) + (l.baseQuantity ?? l.receiptQuantity ?? 0));
+        if (l.receiptNumber && !cur.receipts.includes(l.receiptNumber)) cur.receipts.push(l.receiptNumber);
+        items.set(k, cur);
+      }
     }
     /* checked, from the records that stand */
     const live = records.filter((r) => !r.superseded);
-    const items = new Map();
-    for (const [key, n] of need) items.set(key, { ...n, received: null, stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null });
-    for (const [key, rcv] of receivedByKey) {
-      const cur = items.get(key) || { rawItemId: key.split("|")[0], variantId: key.split("|")[1] || null, rawItemName: rcv.itemName, rawItemSku: rcv.sku, variantLabel: "", unit: rcv.unit, required: null, stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null };
-      cur.received = rcv.received; items.set(key, cur);
-    }
     for (const r of live) {
-      const key = `${r.rawItemId || ""}|${r.variantId || ""}`;
-      const cur = items.get(key) || { rawItemId: r.rawItemId ? String(r.rawItemId) : "", variantId: r.variantId ? String(r.variantId) : null, rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, unit: r.unit, required: null, received: null, stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null };
+      const k = keyOf(r.rawItemId, r.variantId);
+      const cur = items.get(k) || blank(k, { rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, unit: r.unit });
+      if (!cur.rawItemName) cur.rawItemName = r.rawItemName; if (!cur.variantLabel) cur.variantLabel = r.variantLabel || ""; if (!cur.unit) cur.unit = r.unit || "";
       cur.stickers += 1; cur.checkedQty = r4(cur.checkedQty + r.quantity); cur.passedQty = r4(cur.passedQty + r.passedQuantity); cur.defectiveQty = r4(cur.defectiveQty + r.defectiveQuantity);
       if (!cur.lastAt || r.inspectedAt > cur.lastAt) cur.lastAt = r.inspectedAt;
       for (const d of r.defects || []) { const x = cur.defects.get(d.code) || { code: d.code, name: d.name, stickers: 0, quantity: 0 }; x.stickers += 1; x.quantity = r4(x.quantity + r.defectiveQuantity); cur.defects.set(d.code, x); }
-      items.set(key, cur);
+      items.set(k, cur);
     }
-    /* what there is to check: the quantity RECEIVED for the order when the
-       Store recorded lots, else what the bill of material requires */
-    const rawItems = [...items.values()].map((x) => { const expected = x.received != null && x.received > 0 ? x.received : x.required; return { ...x, expected, expectedFrom: x.received != null && x.received > 0 ? "received" : x.required != null ? "required" : null, defects: [...x.defects.values()].sort((a, b) => b.quantity - a.quantity), remaining: expected != null ? r4(Math.max(0, expected - x.checkedQty)) : null, pct: expected ? Math.min(100, Math.round((x.checkedQty / expected) * 100)) : null, state: expected == null ? (x.stickers ? "checked" : "none") : x.checkedQty >= expected ? "done" : x.checkedQty > 0 ? "partly" : "waiting" }; })
-      .sort((a, b) => (b.stickers - a.stickers) || a.rawItemName.localeCompare(b.rawItemName));
+    const rawItems = [...items.values()].map((x) => {
+      const expected = x.received != null && x.received > 0 ? x.received : null; // to check = received, nothing else
+      const remaining = expected != null ? r4(Math.max(0, expected - x.checkedQty)) : null;
+      const state = expected == null ? (x.stickers ? "checked" : x.asked != null ? "awaiting" : "none") : x.checkedQty >= expected ? "done" : x.checkedQty > 0 ? "partly" : "waiting";
+      return { ...x, defects: [...x.defects.values()].sort((a, b) => b.quantity - a.quantity), expected, expectedFrom: expected != null ? "received" : null, remaining, pct: expected ? Math.min(100, Math.round((x.checkedQty / expected) * 100)) : null, shortOfAsked: x.asked != null && x.received != null ? r4(Math.max(0, x.asked - x.received)) : null, state };
+    }).sort((a, b) => (b.stickers - a.stickers) || (b.expected || 0) - (a.expected || 0) || a.rawItemName.localeCompare(b.rawItemName));
     const byDefect = new Map();
     for (const r of live) for (const d of r.defects || []) { const x = byDefect.get(d.code) || { code: d.code, name: d.name, stickers: 0, quantity: 0 }; x.stickers += 1; x.quantity = r4(x.quantity + r.defectiveQuantity); byDefect.set(d.code, x); }
     const byChecker = new Map();
     for (const r of live) { const x = byChecker.get(r.inspectedByEmail) || { email: r.inspectedByEmail, name: r.inspectedByName, stickers: 0, quantity: 0, defective: 0 }; x.stickers += 1; x.quantity = r4(x.quantity + r.quantity); x.defective += r.status === "defective" ? 1 : 0; byChecker.set(r.inspectedByEmail, x); }
     const totals = rl.get(String(mo._id)) || ZERO;
-    const required = rawItems.reduce((n, x) => n + (x.required || 0), 0);
-    const received = rawItems.reduce((n, x) => n + (x.received || 0), 0);
-    const expected = rawItems.reduce((n, x) => n + (x.expected || 0), 0);
-    res.json({ success: true, order: orderRow(mo, totals), summary: { ...totals, required: r4(required), received: r4(received), expected: r4(expected), remaining: r4(rawItems.reduce((n, x) => n + (x.remaining || 0), 0)), rawItemsRequired: rawItems.filter((x) => x.expected != null).length, rawItemsDone: rawItems.filter((x) => x.state === "done").length, workOrders: wos.length, lots: (lots || []).length }, rawItems, byDefect: [...byDefect.values()].sort((a, b) => b.quantity - a.quantity), byChecker: [...byChecker.values()].sort((a, b) => b.stickers - a.stickers), recent: records.slice(0, 200).map(recordView) });
+    const sum = (f) => r4(rawItems.reduce((n, x) => n + (x[f] || 0), 0));
+    res.json({
+      success: true, order: orderRow(mo, totals),
+      summary: { ...totals, asked: sum("asked"), received: sum("received"), expected: sum("expected"), remaining: sum("remaining"), rawItemsExpected: rawItems.filter((x) => x.expected != null).length, rawItemsAsked: rawItems.filter((x) => x.asked != null).length, rawItemsDone: rawItems.filter((x) => x.state === "done").length, workOrders: woCount, receipts: grns.length || lots.length, receivedFrom, expectation: expectation ? { documentRef: expectation.documentRef, revisionNo: expectation.revisionNo, issuedAt: expectation.issuedAt } : null },
+      rawItems, byDefect: [...byDefect.values()].sort((a, b) => b.quantity - a.quantity), byChecker: [...byChecker.values()].sort((a, b) => b.stickers - a.stickers), recent: records.slice(0, 200).map(recordView),
+    });
   } catch (err) { console.error("[qc raw-items order]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
@@ -448,12 +485,25 @@ router.get("/my-day", requireOwnerOrChecker, async (req, res) => {
 });
 
 /** The owner's report over a range: by day, checker, order, raw item and reason. */
+/** The owner's export (29 Sep 2026: hour-wise, day-wise and order-wise in one
+ *  answer). `from`/`to` bound the days (default the last 7); `moId` narrows
+ *  to one order over ALL time (the order page's export); `email` narrows to
+ *  one checker. `days[]` carries each day's shift-hour buckets so a
+ *  workbook can lay hours out one column per day. */
 router.get("/report", requireOwner, async (req, res) => {
   try {
     const today = shift.istDayKeyOf(new Date());
+    const forOrder = isId(req.query.moId) ? oid(req.query.moId) : null;
     const to = /^\d{4}-\d{2}-\d{2}$/.test(str(req.query.to)) ? str(req.query.to) : today;
-    const from = /^\d{4}-\d{2}-\d{2}$/.test(str(req.query.from)) ? str(req.query.from) : new Date(Date.parse(`${to}T00:00:00Z`) - 6 * 86400000).toISOString().slice(0, 10);
-    const records = await QCRawItemInspection.find({ date: { $gte: from, $lte: to }, superseded: { $ne: true } }).sort({ inspectedAt: -1 }).lean();
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(str(req.query.from)) ? str(req.query.from) : forOrder ? "2000-01-01" : new Date(Date.parse(`${to}T00:00:00Z`) - 6 * 86400000).toISOString().slice(0, 10);
+    const match = { date: { $gte: from, $lte: to }, superseded: { $ne: true } };
+    if (forOrder) match.manufacturingOrderId = forOrder;
+    if (str(req.query.email) && str(req.query.email) !== "all") match.inspectedByEmail = str(req.query.email).toLowerCase();
+    const records = await QCRawItemInspection.find(match).sort({ inspectedAt: -1 }).lean();
+    const buckets = shift.shiftBuckets();
+    const perDay = new Map();
+    for (const r of records) { if (!perDay.has(r.date)) perDay.set(r.date, []); perDay.get(r.date).push(r); }
+    const days = [...perDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([date, rows]) => { const sh = dayShape(rows, buckets); return { date, hours: sh.hours, totals: sh.totals, byOrder: sh.byOrder }; });
     const byDay = new Map(); const byChecker = new Map();
     for (const r of records) {
       const d = byDay.get(r.date) || { date: r.date, stickers: 0, quantity: 0, passed: 0, defective: 0, checkers: new Set() };
@@ -461,8 +511,8 @@ router.get("/report", requireOwner, async (req, res) => {
       const c = byChecker.get(r.inspectedByEmail) || { email: r.inspectedByEmail, name: r.inspectedByName, stickers: 0, quantity: 0, passed: 0, defective: 0, days: new Set() };
       c.stickers += 1; c.quantity = r4(c.quantity + r.quantity); c.passed = r4(c.passed + r.passedQuantity); c.defective = r4(c.defective + r.defectiveQuantity); c.days.add(r.date); byChecker.set(r.inspectedByEmail, c);
     }
-    const shape = dayShape(records, shift.shiftBuckets());
-    res.json({ success: true, from, to, ...shape, byDay: [...byDay.values()].map((d) => ({ ...d, checkers: d.checkers.size })).sort((a, b) => a.date.localeCompare(b.date)), byChecker: [...byChecker.values()].map((c) => ({ ...c, days: c.days.size })).sort((a, b) => b.stickers - a.stickers), recent: records.slice(0, 100).map(recordView) });
+    const shape = dayShape(records, buckets);
+    res.json({ success: true, from, to, moId: forOrder ? String(forOrder) : null, email: str(req.query.email) || "all", shift: shift.SHIFT, days, records: records.slice(0, 5000).map(recordView), ...shape, byDay: [...byDay.values()].map((d) => ({ ...d, checkers: d.checkers.size })).sort((a, b) => a.date.localeCompare(b.date)), byChecker: [...byChecker.values()].map((c) => ({ ...c, days: c.days.size })).sort((a, b) => b.stickers - a.stickers), recent: records.slice(0, 100).map(recordView) });
   } catch (err) { console.error("[qc raw-items report]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
