@@ -888,7 +888,7 @@ router.get("/requests/:requestId/closing-report", async (req, res) => {
                       + "persons.employeeName persons.department persons.totalUnits")
                 .lean(),
             CustomerRequest.findById(requestId)
-                .select("requestId customerInfo.name grandTotal paymentSchedule quotations.grandTotal").lean(),
+                .select("requestId customerInfo.name grandTotal paymentSchedule quotations.grandTotal quotations.paymentSchedule").lean(),
             enquiryForRequest(requestId),
         ]);
 

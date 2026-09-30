@@ -166,11 +166,20 @@ function buildClosingReport({ workOrders = [], challans = [], request = null, en
 
   // ── Money ────────────────────────────────────────────────────────────────
   const q = (request?.quotations || [])[0] || null;
-  const schedule = (request?.paymentSchedule || []).map((p) => ({
+  // The schedule lives on the quotation (quotations[0] is the current one).
+  // It used to be read from the order itself, where it doesn't exist, so
+  // no order ever read as paid; an old order that carries one there still
+  // works. A step with no remainingAmount stored has what's left of its
+  // amount outstanding, not nothing.
+  const steps = q?.paymentSchedule?.length ? q.paymentSchedule : request?.paymentSchedule || [];
+  const schedule = steps.map((p) => ({
     dueDate: p.dueDate || null,
     status: p.status || "pending",
     paidAmount: num(p.paidAmount),
-    remainingAmount: num(p.remainingAmount),
+    remainingAmount:
+      p.remainingAmount != null
+        ? num(p.remainingAmount)
+        : Math.max(0, num(p.amount) - num(p.paidAmount)),
   }));
   const invoiced = num(q?.grandTotal) || num(request?.grandTotal) || 0;
   const received = schedule.reduce((s, p) => s + p.paidAmount, 0);

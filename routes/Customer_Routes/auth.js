@@ -8,6 +8,49 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const axios = require("axios");
 const Customer = require("../../models/Customer_Models/Customer");
+const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+
+// ─── Test view (local testing only) ─────────────────────────────────────
+// CUSTOMER_VIEW_AS="<test login id>:<customer id>", set ONLY in a local
+// backend's .env. When that test login signs in with its own password, its
+// session opens the other customer's account instead, read-only: server.js
+// refuses every change made with it. Ending the setting with ":write" lets
+// it save, straight onto that customer's real account. Either way no
+// request confirmation email goes to the customer. Unset, as on the
+// deployed server, sign-in is unchanged.
+async function viewAsFor(customer) {
+  const [from, to] = String(process.env.CUSTOMER_VIEW_AS || "")
+    .split(":")
+    .map((part) => part.trim());
+  if (!from || !to || String(customer._id) !== from) return null;
+  if (!mongoose.Types.ObjectId.isValid(to)) return null;
+  const target = await Customer.findById(to);
+  return target && target.isActive !== false ? target : null;
+}
+
+// Whether the test view may save: the setting ends in ":write".
+function viewAsCanSave() {
+  const mode = String(process.env.CUSTOMER_VIEW_AS || "").split(":")[2];
+  return mode?.trim() === "write";
+}
+
+// The viewed customer's usual session token, plus who is viewing. The
+// `viewAsOf` claim is what marks it as a test session (see server.js).
+function viewAsToken(target, tester) {
+  return jwt.sign(
+    {
+      id: target._id,
+      phone: target.phone,
+      email: target.email,
+      name: target.name,
+      role: "customer",
+      viewAsOf: String(tester._id),
+    },
+    process.env.JWT_SECRET || "grav_clothing_secret_key",
+    { expiresIn: "7d" },
+  );
+}
 
 const CUSTOMER_COOKIE_NAME = "customerToken";
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 min
@@ -343,13 +386,18 @@ router.post("/login-password", async (req, res) => {
     if (!isValid) {
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
-    const token = customer.generateAuthToken();
+    // A test login named in CUSTOMER_VIEW_AS opens that customer (see above).
+    const viewed = await viewAsFor(customer);
+    const token = viewed
+      ? viewAsToken(viewed, customer)
+      : customer.generateAuthToken();
     setCustomerCookie(res, token);
     customer.lastLogin = new Date();
     await customer.save({ validateBeforeSave: false });
-    const safe = customer.toObject();
+    const safe = (viewed || customer).toObject();
     delete safe.password;
     delete safe.__v;
+    if (viewed) safe.readOnlyView = !viewAsCanSave();
     return res.status(200).json({ success: true, message: "Login successful.", customer: safe, token });
   } catch (err) {
     console.error("[auth/login-password]", err);

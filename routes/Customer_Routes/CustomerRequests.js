@@ -25,6 +25,10 @@ const CustomerRequest = Request; // alias used by edit-request handlers below
 const Customer = require("../../models/Customer_Models/Customer");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const mongoose = require("mongoose");
+const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
+const { Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
 const jwt = require("jsonwebtoken");
 const CustomerEmailService = require("../../services/CustomerEmailService");
 
@@ -300,6 +304,324 @@ router.get("/available-items", verifyCustomerToken, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// The customer's catalogue: the products Sales assigned. Same reading as
+// GET /available-items (objects today, raw ids in older records).
+// ═══════════════════════════════════════════════════════════════════════════
+const assignedIdsOf = (customer) =>
+  (customer?.assignedStockItems || [])
+    .map((a) => {
+      if (!a) return null;
+      if (typeof a === "string") return a;
+      if (a.stockItemId) return a.stockItemId;
+      if (a._id) return a._id;
+      return null;
+    })
+    .filter(Boolean)
+    .map(String);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /available-items/:id/reports — one catalogue product's reports
+// ═══════════════════════════════════════════════════════════════════════════
+// Its fabrics and accessories, from the product's bill of materials, and a
+// tech pack from its measurement points and construction steps. Only what a
+// customer should see: names, the variants used (colour, size of a trim),
+// how much goes into one garment and which sizes use it. Never costs, stock
+// or suppliers: attributes that name a vendor, supplier or mill are dropped,
+// here and in the variant names. The CMS keeps no fabric test reports yet,
+// so `fabricTests` is always empty.
+const isFabric = (raw) =>
+  /fabric/i.test(`${raw?.category || ""} ${raw?.customCategory || ""}`);
+const isSupplierAttr = (name) =>
+  /vendor|supplier|mill|manufacturer|party|source/i.test(String(name || ""));
+const fmtQty = (n) => String(+Number(n).toFixed(3));
+
+// "30, 31, 32, 34" → "30–32, 34"; other labels are listed as they are.
+const compactSizes = (labels) => {
+  const nums = labels.map(Number);
+  if (!labels.length || nums.some((n) => !Number.isFinite(n))) return labels.join(", ");
+  const sorted = [...new Set(nums)].sort((a, b) => a - b);
+  const runs = [];
+  for (const n of sorted) {
+    const last = runs[runs.length - 1];
+    if (last && n === last[1] + 1) last[1] = n;
+    else runs.push([n, n]);
+  }
+  return runs.map(([a, b]) => (a === b ? String(a) : `${a}–${b}`)).join(", ");
+};
+
+router.get("/available-items/:id/reports", verifyCustomerToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid product id" });
+    }
+
+    const customer = await Customer.findById(req.customerId)
+      .select("assignedStockItems")
+      .lean();
+    if (!customer) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+    if (!assignedIdsOf(customer).includes(String(id))) {
+      return res
+        .status(404)
+        .json({ success: false, message: "This product isn't in your catalogue." });
+    }
+
+    const item = await StockItem.findOne({ _id: id, isActive: { $ne: false } })
+      .select(
+        "name reference category genderCategory measurements numberOfPanels " +
+          "operations.type operations.machineType variants.attributes " +
+          "variants.rawItems.rawItemId variants.rawItems.rawItemName " +
+          "variants.rawItems.variantCombination " +
+          "variants.rawItems.requiredQuantity variants.rawItems.quantity " +
+          "variants.rawItems.unit",
+      )
+      .lean();
+    if (!item) {
+      return res
+        .status(404)
+        .json({ success: false, message: "This product isn't in your catalogue." });
+    }
+
+    const variants = item.variants || [];
+    const sizeOf = (v) =>
+      (v.attributes || []).map((a) => a?.value).filter(Boolean).join(" · ") ||
+      "Standard";
+    const allSizes = new Set(variants.map(sizeOf));
+
+    const rawIds = [
+      ...new Set(
+        variants.flatMap((v) => (v.rawItems || []).map((r) => String(r.rawItemId))),
+      ),
+    ].filter((x) => mongoose.Types.ObjectId.isValid(x));
+    const raws = rawIds.length
+      ? await RawItem.find({ _id: { $in: rawIds } })
+          .select("name category customCategory description attributes unit")
+          .lean()
+      : [];
+    const rawById = new Map(raws.map((r) => [String(r._id), r]));
+
+    // One row per material, across every size of the product. A variant's
+    // values follow the order of the material's attributes, so each value is
+    // named by its attribute and supplier values can be left out.
+    const rows = new Map();
+    for (const v of variants) {
+      for (const line of v.rawItems || []) {
+        const key = String(line.rawItemId);
+        const raw = rawById.get(key);
+        if (!rows.has(key)) {
+          rows.set(key, {
+            raw,
+            name: raw?.name || line.rawItemName || "—",
+            unit: line.unit || raw?.unit || "",
+            qty: [],
+            sizes: new Set(),
+            variants: new Set(),
+            specs: new Map(),
+          });
+        }
+        const row = rows.get(key);
+        const attrs = raw?.attributes || [];
+        const values = (line.variantCombination || []).map((val, i) => ({
+          name: attrs.length === (line.variantCombination || []).length ? attrs[i]?.name : "",
+          value: String(val || "").trim(),
+        }));
+        const shown = values.filter(
+          (p) => p.value && p.value !== "Default" && !isSupplierAttr(p.name),
+        );
+        if (shown.length) row.variants.add(shown.map((p) => p.value).join(" · "));
+        for (const p of shown) {
+          if (!p.name) continue;
+          if (!row.specs.has(p.name)) row.specs.set(p.name, new Set());
+          row.specs.get(p.name).add(p.value);
+        }
+        const q = Number(line.requiredQuantity) || Number(line.quantity) || 0;
+        if (q > 0) row.qty.push(q);
+        row.sizes.add(sizeOf(v));
+      }
+    }
+
+    const perGarment = (row) => {
+      if (!row.qty.length) return "";
+      const min = Math.min(...row.qty);
+      const max = Math.max(...row.qty);
+      const amount = min === max ? fmtQty(min) : `${fmtQty(min)}–${fmtQty(max)}`;
+      return `${amount} ${row.unit}`.trim();
+    };
+    const fabrics = [];
+    const accessories = [];
+    for (const row of rows.values()) {
+      const shaped = {
+        name: row.name,
+        category: row.raw?.customCategory || row.raw?.category || "",
+        description: row.raw?.description || "",
+        variants: [...row.variants],
+        specs: [...row.specs.entries()].map(([name, vals]) => [name, [...vals].join(", ")]),
+        perGarment: perGarment(row),
+        usedIn: row.sizes.size >= allSizes.size ? "All sizes" : compactSizes([...row.sizes]),
+      };
+      (isFabric(row.raw) ? fabrics : accessories).push(shaped);
+    }
+    fabrics.sort((a, b) => a.name.localeCompare(b.name));
+    accessories.sort(
+      (a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name),
+    );
+
+    res.status(200).json({
+      success: true,
+      product: {
+        _id: item._id,
+        name: item.name,
+        reference: item.reference || "",
+        category: item.category || "",
+        genderCategory: item.genderCategory || "",
+      },
+      fabrics,
+      accessories,
+      techPack: {
+        styleNo: item.reference || "",
+        panels: item.numberOfPanels || 0,
+        sizes: compactSizes([...allSizes]),
+        measurementPoints: (item.measurements || []).filter(Boolean),
+        construction: (item.operations || [])
+          .filter((op) => op?.type)
+          .map((op, i) => ({ step: i + 1, operation: op.type, machine: op.machineType || "" })),
+      },
+      fabricTests: [],
+    });
+  } catch (error) {
+    console.error("[product reports] error:", error);
+    res.status(500).json({ success: false, message: "Server error while loading reports" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /invoice-history — what the customer's company has been billed, from
+// Accounts
+// ═══════════════════════════════════════════════════════════════════════════
+// Posted sales invoices to the customer's accounts parties, found the way
+// the CMS finds a customer's ledger (Accounts › Customers, GET
+// /:customerId/accounting): the ledgers linked to the customer, or else a
+// ledger named exactly like its company name or name, ignoring case. Not the
+// GSTIN: one GSTIN covers every Mayfair property in a state, and each
+// property is its own party by name. Only garment lines count:
+// charges and services (SAC codes, which start 99, such as website work) are
+// left out, and an invoice with nothing else on it is left out too.
+//
+// Each line lists the catalogue products it was billed under, matched by
+// name or other name ignoring case and spacing, so a product's order history
+// can include it. A size written after " — " in a billed name ("Bottle Green
+// Tshirt — M") is split off first.
+const normName = (s) => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+const splitBilledName = (name) => {
+  const m = String(name || "").match(/^(.*?)\s+[—–]\s+(\S{1,6})$/);
+  return m ? { base: m[1], size: m[2] } : { base: String(name || ""), size: "" };
+};
+const isServiceLine = (line) =>
+  line.isCharge === true || /^99/.test(String(line.hsnCode || "").trim());
+
+router.get("/invoice-history", verifyCustomerToken, async (req, res) => {
+  try {
+    const customer = await Customer.findById(req.customerId)
+      .select("name profile.companyName assignedStockItems")
+      .lean();
+    if (!customer) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    let ledgers = await Acc_Ledger.find({
+      linkedCustomerId: customer._id,
+      isActive: { $ne: false },
+    })
+      .select("_id name")
+      .lean();
+    if (!ledgers.length) {
+      for (const candidate of [customer.profile?.companyName, customer.name].filter(Boolean)) {
+        const exact = new RegExp(
+          "^" + candidate.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+          "i",
+        );
+        ledgers = await Acc_Ledger.find({ name: exact, isActive: { $ne: false } })
+          .select("_id name")
+          .lean();
+        if (ledgers.length) break;
+      }
+    }
+    if (!ledgers.length) {
+      return res.status(200).json({ success: true, parties: [], invoices: [] });
+    }
+
+    const vouchers = await Acc_Voucher.find({
+      voucherType: "sales",
+      status: "posted",
+      isOptional: { $ne: true },
+      partyLedgerId: { $in: ledgers.map((l) => l._id) },
+    })
+      .select("voucherNumber voucherDate referenceNumber referenceDate inventoryEntries grandTotal totalTax")
+      .sort({ voucherDate: -1 })
+      .lean();
+
+    // The catalogue's names and other names, to match billed lines against.
+    const ids = assignedIdsOf(customer);
+    const catalogue = ids.length
+      ? await StockItem.find({ _id: { $in: ids } }).select("name additionalNames").lean()
+      : [];
+    const byName = new Map();
+    for (const product of catalogue) {
+      for (const n of [product.name, ...(product.additionalNames || [])]) {
+        const key = normName(n);
+        if (!key) continue;
+        if (!byName.has(key)) byName.set(key, new Set());
+        byName.get(key).add(String(product._id));
+      }
+    }
+
+    const invoices = vouchers
+      .map((v) => {
+        const lines = (v.inventoryEntries || [])
+          .filter((line) => !isServiceLine(line))
+          .map((line) => {
+            const { base, size } = splitBilledName(line.stockItemName);
+            const matched =
+              byName.get(normName(line.stockItemName)) || byName.get(normName(base));
+            return {
+              name: line.stockItemName || "—",
+              size,
+              quantity: Number(line.quantity) || 0,
+              unit: line.unit || "",
+              rate: Number(line.rate) || 0,
+              amount: Number(line.amount) || 0,
+              taxRate: Number(line.taxRate) || 0,
+              taxAmount: Number(line.taxAmount) || 0,
+              hsn: line.hsnCode || "",
+              productIds: matched ? [...matched] : [],
+            };
+          });
+        return {
+          _id: v._id,
+          invoiceNo: v.voucherNumber,
+          date: v.voucherDate,
+          reference: v.referenceNumber || "",
+          total: Number(v.grandTotal) || 0,
+          units: lines.reduce((sum, l) => sum + l.quantity, 0),
+          lines,
+        };
+      })
+      .filter((invoice) => invoice.lines.length);
+
+    res.status(200).json({
+      success: true,
+      parties: ledgers.map((l) => l.name),
+      invoices,
+    });
+  } catch (error) {
+    console.error("[invoice history] error:", error);
+    res.status(500).json({ success: false, message: "Server error while loading invoices" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // POST /:requestId/delivery-confirmation — customer submits delivery details
 // (called from PaymentPopup after a payment is submitted)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -514,34 +836,38 @@ router.post("/", verifyCustomerToken, async (req, res) => {
     });
 
     // ── Send confirmation email (non-blocking) ───────────────────────
-    try {
-      await CustomerEmailService.sendRequestConfirmationEmail(
-        {
-          requestId: populatedRequest.requestId,
-          createdAt: populatedRequest.createdAt,
-          items: populatedRequest.items.map((item) => ({
-            stockItemName: item.stockItemName,
-            stockItemReference: item.stockItemReference,
-            totalQuantity: item.totalQuantity,
-            totalEstimatedPrice: item.totalEstimatedPrice,
-            variants: (item.variants || []).map((v) => ({
-              attributes: v.attributes || [],
-              quantity: v.quantity,
-              estimatedPrice: v.estimatedPrice,
-              specialInstructions: (v.specialInstructions || []).filter((i) =>
-                i?.trim(),
-              ),
+    // Not for a test login's order (req.testView, set in server.js): it sits
+    // on a real customer's account, and they shouldn't hear about a test.
+    if (!req.testView) {
+      try {
+        await CustomerEmailService.sendRequestConfirmationEmail(
+          {
+            requestId: populatedRequest.requestId,
+            createdAt: populatedRequest.createdAt,
+            items: populatedRequest.items.map((item) => ({
+              stockItemName: item.stockItemName,
+              stockItemReference: item.stockItemReference,
+              totalQuantity: item.totalQuantity,
+              totalEstimatedPrice: item.totalEstimatedPrice,
+              variants: (item.variants || []).map((v) => ({
+                attributes: v.attributes || [],
+                quantity: v.quantity,
+                estimatedPrice: v.estimatedPrice,
+                specialInstructions: (v.specialInstructions || []).filter(
+                  (i) => i?.trim(),
+                ),
+              })),
             })),
-          })),
-        },
-        {
-          name: customer.name,
-          email: customer.email,
-          phone: customer.phone,
-        },
-      );
-    } catch (emailError) {
-      console.error("Request confirmation email failed:", emailError);
+          },
+          {
+            name: customer.name,
+            email: customer.email,
+            phone: customer.phone,
+          },
+        );
+      } catch (emailError) {
+        console.error("Request confirmation email failed:", emailError);
+      }
     }
 
     res.status(201).json({

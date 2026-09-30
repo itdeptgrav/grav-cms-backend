@@ -3205,7 +3205,7 @@ router.get("/:id/closing-report", salesAuth, async (req, res) => {
               + "persons.employeeName persons.department persons.totalUnits")
         .lean(),
       CustomerRequestModel.findById(requestId)
-        .select("requestId grandTotal paymentSchedule quotations.grandTotal").lean(),
+        .select("requestId grandTotal paymentSchedule quotations.grandTotal quotations.paymentSchedule").lean(),
     ]);
 
     if (!workOrders.length) {

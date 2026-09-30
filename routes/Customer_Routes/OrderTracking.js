@@ -5,6 +5,10 @@
 //   GET /:id/tracking
 //     Returns per-product progress (quantities, percentages, stage) +
 //     dispatch event list + person-wise summary counters.
+//     Also, live from the scanners and QC: each product's production
+//     stages with the pieces that have cleared each one, and its pieces
+//     counted once each as not started / in process / completed /
+//     rejected, with the same totals for the order (summary.pieces).
 //
 //   GET /:id/tracking/employees
 //     Paginated employee progress for measurement (person-wise) orders.
@@ -31,6 +35,10 @@ const jwt = require("jsonwebtoken");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const EmployeeProductionProgress = require("../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const ProductionTracking = require("../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const QCInspection = require("../../models/CMS_Models/Manufacturing/QC/DefectRecord");
+const qcStages = require("../../services/qcStages");
+const productionSync = require("../../services/productionSyncService");
 
 // ─── Customer auth ──────────────────────────────────────────────────────────
 const verifyCustomerToken = async (req, res, next) => {
@@ -118,6 +126,249 @@ const computeDispatched = (wo) => {
   return Math.max(directField, fromRecords);
 };
 
+// ─── Live piece progress: the scanners and QC ───────────────────────────────
+// Every garment carries a barcode, WO-<last 8 of the work order id>-<unit>.
+// The machines scan it at each production stage (ProductionTracking, written
+// as it happens) and the production sync rolls those scans up onto the work
+// order (productionCompletion.operationCompletion[].completedUnitNumbers).
+// QC scans it at its checkpoints (QCInspection, written as it happens).
+// Adding the scans made since the last sync to the rollup makes the counts
+// live. Nothing here writes.
+
+const shortIdOf = (id) => String(id).slice(-8);
+
+// The piece's unit number, or null when the barcode is not one of this work
+// order's pieces. Same parsing as the production sync.
+const unitOf = (barcodeId, quantity) => {
+  const unit = parseInt(String(barcodeId || "").split("-")[2], 10);
+  return Number.isInteger(unit) && unit >= 1 && unit <= quantity ? unit : null;
+};
+
+const latestOf = (...dates) =>
+  dates
+    .filter(Boolean)
+    .map((d) => new Date(d))
+    .reduce((a, b) => (!a || b > a ? b : a), null);
+
+// Machine scans of this order's pieces that the rollup may not have counted:
+// everything since the oldest last sync among its work orders (or since the
+// work order was created, if it was never synced). Scans are stored one
+// document per day, so the read starts a day and a half early to be safe
+// about time zones; reading a scan the rollup already has changes nothing,
+// because pieces are counted by unit number. The database does the
+// filtering, so only this order's scans come back.
+async function recentScans(workOrders) {
+  const byShortId = new Map(workOrders.map((wo) => [shortIdOf(wo._id), []]));
+  if (!workOrders.length) return byShortId;
+
+  const DAY_AND_A_HALF = 36 * 60 * 60 * 1000;
+  const since = new Date(
+    Math.min(
+      ...workOrders.map((wo) =>
+        new Date(wo.productionCompletion?.lastSyncedAt || wo.createdAt || 0).getTime(),
+      ),
+    ) - DAY_AND_A_HALF,
+  );
+  const barcode = { $regex: `^WO-(${[...byShortId.keys()].join("|")})-` };
+
+  const scans = await ProductionTracking.aggregate([
+    { $match: { date: { $gte: since }, "machines.operators.barcodeScans.barcodeId": barcode } },
+    { $unwind: "$machines" },
+    { $unwind: "$machines.operators" },
+    { $unwind: "$machines.operators.barcodeScans" },
+    { $match: { "machines.operators.barcodeScans.barcodeId": barcode } },
+    {
+      $project: {
+        _id: 0,
+        barcodeId: "$machines.operators.barcodeScans.barcodeId",
+        timeStamp: "$machines.operators.barcodeScans.timeStamp",
+        activeOps: "$machines.operators.barcodeScans.activeOps",
+      },
+    },
+  ]);
+
+  for (const scan of scans) {
+    byShortId.get(String(scan.barcodeId).split("-")[1])?.push(scan);
+  }
+  return byShortId;
+}
+
+// What QC has recorded on this order's pieces, per work order, by unit
+// number: scrapped, sent back for rework and not yet cleared, and every
+// piece QC has seen. A piece's state comes from qcStages.pieceProgressMany,
+// the reading the QC screens use, so the numbers agree with them.
+async function qcUnits(workOrders) {
+  const byShortId = new Map(
+    workOrders.map((wo) => [
+      shortIdOf(wo._id),
+      {
+        quantity: wo.quantity || 0,
+        seen: new Set(),
+        rejected: new Set(),
+        rework: new Set(),
+        latestAt: null,
+      },
+    ]),
+  );
+  if (!workOrders.length) return byShortId;
+
+  const inspections = await QCInspection.find({
+    workOrderShortId: { $in: [...byShortId.keys()] },
+  })
+    .select("barcodeId workOrderShortId inspectedAt")
+    .lean();
+  if (!inspections.length) return byShortId;
+
+  const progress = await qcStages.pieceProgressMany(
+    inspections.map((i) => i.barcodeId),
+  );
+  for (const insp of inspections) {
+    const qc = byShortId.get(insp.workOrderShortId);
+    const unit = qc && unitOf(insp.barcodeId, qc.quantity);
+    if (!unit) continue;
+    qc.seen.add(unit);
+    qc.latestAt = latestOf(qc.latestAt, insp.inspectedAt);
+    const p = progress[String(insp.barcodeId).trim()];
+    if (p?.rejected) qc.rejected.add(unit);
+    else if (p?.openRework?.length) qc.rework.add(unit);
+  }
+  return byShortId;
+}
+
+// One work order's production stages, in order, each with the pieces that
+// have cleared it: the rollup's unit numbers plus the scans since. A scan
+// counts at the stages whose codes were active on the machine, as in the
+// production sync.
+function stageProgress(wo, scans) {
+  const quantity = wo.quantity || 0;
+  const stored = new Map(
+    (wo.productionCompletion?.operationCompletion || []).map((op) => [
+      Number(op.operationNumber),
+      op,
+    ]),
+  );
+  const stages = (wo.operations || []).length
+    ? wo.operations.map((op, i) => ({
+        number: i + 1,
+        name: op.operationType,
+        code: op.operationCode,
+      }))
+    : [...stored.values()]
+        .map((op) => ({
+          number: Number(op.operationNumber),
+          name: op.operationType,
+          code: op.operationCode,
+        }))
+        .filter((st) => st.number > 0)
+        .sort((a, b) => a.number - b.number);
+
+  // A rollup written before unit numbers were kept has counts only.
+  let unitLevel = true;
+  const units = new Map();
+  for (const st of stages) {
+    const op = stored.get(st.number);
+    const list = (op?.completedUnitNumbers || []).filter(
+      (u) => u >= 1 && u <= quantity,
+    );
+    if (!list.length && (op?.completedQuantity || 0) > 0) unitLevel = false;
+    units.set(st.number, new Set(list));
+  }
+
+  let latestScanAt = null;
+  for (const scan of scans) {
+    const unit = unitOf(scan.barcodeId, quantity);
+    if (!unit) continue;
+    latestScanAt = latestOf(latestScanAt, scan.timeStamp);
+    for (const n of productionSync.resolveActiveOpsCodesToOperationNumbers(
+      scan.activeOps,
+      wo.operations,
+    )) {
+      units.get(n)?.add(unit);
+    }
+  }
+
+  return {
+    unitLevel,
+    units,
+    latestScanAt,
+    stages: stages.map((st) => ({
+      number: st.number,
+      name: st.name || st.code || `Stage ${st.number}`,
+      code: st.code || "",
+      done: Math.min(
+        quantity,
+        Math.max(
+          units.get(st.number).size,
+          unitLevel ? 0 : stored.get(st.number)?.completedQuantity || 0,
+        ),
+      ),
+      total: quantity,
+    })),
+  };
+}
+
+// Every piece counted in exactly one place. Rejected: scrapped by QC,
+// whatever else happened to it. Completed: cleared every stage and not
+// waiting on rework. In process: scanned at a stage or by QC and not yet
+// completed, rework included (inRework says how many). Not started: no
+// scan yet.
+function pieceCounts(wo, live, qc) {
+  const total = wo.quantity || 0;
+  const rejected = qc.rejected.size;
+  const inRework = qc.rework.size;
+
+  if (live.unitLevel) {
+    const started = new Set(qc.seen);
+    for (const set of live.units.values()) set.forEach((u) => started.add(u));
+    const activeUnits = [...started].filter((u) => !qc.rejected.has(u));
+    const sets = [...live.units.values()];
+    const cleared = sets.length
+      ? activeUnits.filter(
+          (u) => !qc.rework.has(u) && sets.every((set) => set.has(u)),
+        ).length
+      : 0;
+    // Completion recorded as a count, without unit numbers (a work order
+    // with no stages to scan that was marked done), still counts.
+    const recorded = Math.min(
+      total,
+      wo.productionCompletion?.overallCompletedQuantity || 0,
+    );
+    const completed = Math.min(
+      Math.max(0, total - rejected),
+      Math.max(cleared, recorded - rejected - inRework),
+    );
+    const active = Math.max(activeUnits.length, completed + inRework);
+    return {
+      total,
+      notStarted: Math.max(0, total - active - rejected),
+      inProcess: Math.max(0, active - completed),
+      inRework,
+      completed,
+      rejected,
+    };
+  }
+
+  // Counts only: the closest reading they allow.
+  const cleared = Math.min(
+    total,
+    wo.productionCompletion?.overallCompletedQuantity || 0,
+  );
+  const started = Math.min(
+    total,
+    Math.max(cleared, qc.seen.size, ...live.stages.map((st) => st.done)),
+  );
+  const completed = Math.max(0, cleared - rejected - inRework);
+  const inProcess = Math.max(0, started - rejected - completed);
+  return {
+    total,
+    notStarted: Math.max(0, total - inProcess - completed - rejected),
+    inProcess,
+    inRework,
+    completed,
+    rejected,
+  };
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /api/customer/requests/:id/tracking
 // ═════════════════════════════════════════════════════════════════════════════
@@ -148,7 +399,7 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
     const workOrders = await WorkOrder.find({ customerRequestId: cr._id })
       .select(
         "workOrderNumber stockItemId stockItemName stockItemReference " +
-          "quantity variantAttributes status " +
+          "quantity variantAttributes status operations " +
           "productionCompletion packagedQuantity dispatchedQuantity " +
           "dispatchRecords timeline createdAt",
       )
@@ -161,8 +412,17 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
+    // Live piece progress, from the scanners and QC.
+    const [scansByShortId, qcByShortId] = await Promise.all([
+      recentScans(workOrders),
+      qcUnits(workOrders),
+    ]);
+
     const products = workOrders.map((wo) => {
       const pc = wo.productionCompletion || {};
+      const shortId = shortIdOf(wo._id);
+      const live = stageProgress(wo, scansByShortId.get(shortId) || []);
+      const qc = qcByShortId.get(shortId);
       const total = wo.quantity || 0;
       const completed = pc.overallCompletedQuantity || 0;
       const packaged = wo.packagedQuantity || 0;
@@ -234,8 +494,21 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         startedAt: wo.timeline?.actualStartDate || null,
         plannedEnd: wo.timeline?.plannedEndDate || null,
         lastSyncedAt: pc.lastSyncedAt || null,
+
+        // Live, from the scanners and QC.
+        pieces: pieceCounts(wo, live, qc),
+        stages: live.stages,
+        updatedAt: latestOf(live.latestScanAt, qc.latestAt, pc.lastSyncedAt),
       };
     });
+
+    const pieces = products.reduce(
+      (acc, p) => {
+        for (const key of Object.keys(acc)) acc[key] += p.pieces[key];
+        return acc;
+      },
+      { total: 0, notStarted: 0, inProcess: 0, inRework: 0, completed: 0, rejected: 0 },
+    );
 
     const totals = products.reduce(
       (acc, p) => {
@@ -367,7 +640,9 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         overallPct,
         totalProducts: products.length,
         totalDispatchEvents: dispatchEvents.length,
+        pieces,
       },
+      updatedAt: latestOf(...products.map((p) => p.updatedAt)),
       products,
       dispatchEvents,
       personWise,

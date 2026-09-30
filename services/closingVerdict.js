@@ -63,7 +63,7 @@ async function closingVerdictForJourney(journeyId) {
               + "persons.employeeName persons.department persons.totalUnits")
         .lean(),
       CustomerRequest.findById(requestId)
-        .select("requestId grandTotal paymentSchedule quotations.grandTotal").lean(),
+        .select("requestId grandTotal paymentSchedule quotations.grandTotal quotations.paymentSchedule").lean(),
     ]);
 
     if (!workOrders.length) return why("no work order was raised against this order");

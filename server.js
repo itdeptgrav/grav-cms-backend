@@ -192,6 +192,29 @@ app.get("/api/system-notice", async (req, res) => {
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
+// ── Test sessions (CUSTOMER_VIEW_AS) ───────────────────────────────────────
+// A session opened through CUSTOMER_VIEW_AS (routes/Customer_Routes/auth.js)
+// is marked req.testView, so routes can hold back the emails a real customer
+// would get (CustomerRequests.js skips the request confirmation). It is
+// read-only: every request that isn't a read is refused, except signing in
+// and out. When the setting ends in ":write" it may save instead, straight
+// onto the customer's real account. Decoding without verifying is enough
+// here: this can only refuse a request or hold back an email, and the
+// routes still verify the token.
+app.use((req, res, next) => {
+  const token = req.cookies?.customerToken;
+  if (!token || !require("jsonwebtoken").decode(token)?.viewAsOf) return next();
+  req.testView = true;
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (req.path.startsWith("/api/customer/auth")) return next();
+  const mode = String(process.env.CUSTOMER_VIEW_AS || "").split(":")[2];
+  if (mode?.trim() === "write") return next();
+  return res.status(403).json({
+    success: false,
+    message: "This is a read-only test login, so changes aren't saved.",
+  });
+});
+
 /**
  * Private Cowork attachments need a Drive service account. Say so at boot if it
  * is absent — and carry on.
@@ -775,6 +798,10 @@ const connectDB = async () => {
     // here rather than at boot because the first flush would otherwise fire
     // against a disconnected connection and log a failure on every restart.
     bw.startFlusher(mongoose);
+
+    // Saves each order's daily Cutting and Production reports for the buyer
+    // just after midnight, India time (services/buyerReports.js).
+    require("./services/buyerReports").startDailySave();
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     // productionSyncService.initialize();
@@ -2272,6 +2299,11 @@ app.use("/api/customer/employees/cross-org", crossOrgRoutes);
 
 const customerOrderTrackingRoutes = require("./routes/Customer_Routes/OrderTracking.js");
 app.use("/api/customer/requests", customerOrderTrackingRoutes);
+
+// The buyer's Cutting, Daily Production, Final Inspection and Order Closing
+// reports on their orders (services/buyerReports.js).
+const customerReportRoutes = require("./routes/Customer_Routes/BuyerReports.js");
+app.use("/api/customer/requests", customerReportRoutes);
 
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes

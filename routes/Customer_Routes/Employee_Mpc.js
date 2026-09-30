@@ -7,6 +7,7 @@ const EmployeeMpc = require("../../models/Customer_Models/Employee_Mpc");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const jwt = require("jsonwebtoken");
 const Customer = require("../../models/Customer_Models/Customer");
+const DepartmentProductRule = require("../../models/Customer_Models/DepartmentProductRule");
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 // This router is mounted twice:
@@ -951,6 +952,88 @@ router.post("/products/resolve", verifyCustomerToken, async (req, res) => {
   res.status(200).json({ success: true, products });
   } catch (error) {
     console.error("Error resolving product names:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─── Department product rules (read-only here) ────────────────────────────────
+// Sales sets, for each department + designation, which products its employees
+// get: the customer's Department tab in the CMS
+// (routes/CMS_Routes/Sales/salesDepartmentRules.js). My MPC reads the rules to
+// give employees their department's products automatically. Only rules Sales
+// has assigned are read here: a draft is Sales's work in progress and never
+// reaches employees until it is assigned. Department and designation match
+// the way the Sales routes match them (case and spacing don't matter), and a
+// product reaches an employee of its gender, or anyone when it is Unisex or
+// untagged.
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function looseTextMatch(value) {
+  const pattern = (value || "")
+    .trim()
+    .split(/\s+/)
+    .map(escapeRegExp)
+    .join("\\s+");
+  return { $regex: `^\\s*${pattern}\\s*$`, $options: "i" };
+}
+function genderMatchesProduct(employeeGender, productGenderCategory) {
+  const gc = (productGenderCategory || "").toLowerCase();
+  if (gc === "unisex" || gc === "") return true;
+  return gc === String(employeeGender || "").toLowerCase();
+}
+
+const RULE_FIELDS = "department designation products updatedAt";
+
+// GET /department-rules — this customer's assigned rules.
+router.get("/department-rules", verifyCustomerToken, async (req, res) => {
+  try {
+    const rules = await DepartmentProductRule.find({
+      customerId: req.customerId,
+      status: "assigned",
+    })
+      .select(RULE_FIELDS)
+      .sort({ department: 1, designation: 1 })
+      .lean();
+    res.status(200).json({ success: true, rules });
+  } catch (error) {
+    console.error("List department rules error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// GET /department-rules/lookup?department=&designation=&gender=
+// The products an employee in that department + designation gets, for their
+// gender. `totalProducts` tells "no rule" apart from "a rule with nothing for
+// this gender": both come back with an empty `products`.
+router.get("/department-rules/lookup", verifyCustomerToken, async (req, res) => {
+  try {
+    const { department = "", designation = "", gender = "" } = req.query;
+    const none = { success: true, rule: null, products: [], totalProducts: 0 };
+    if (!String(department).trim() || !String(designation).trim()) {
+      return res.status(200).json(none);
+    }
+    const rule = await DepartmentProductRule.findOne({
+      customerId: req.customerId,
+      status: "assigned",
+      department: looseTextMatch(String(department)),
+      designation: looseTextMatch(String(designation)),
+    })
+      .select(RULE_FIELDS)
+      .lean();
+    if (!rule) return res.status(200).json(none);
+
+    const products = gender
+      ? rule.products.filter((p) => genderMatchesProduct(gender, p.genderCategory))
+      : rule.products;
+    res.status(200).json({
+      success: true,
+      rule,
+      products,
+      totalProducts: rule.products.length,
+    });
+  } catch (error) {
+    console.error("Lookup department rule error:", error);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
