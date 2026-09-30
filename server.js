@@ -1387,15 +1387,16 @@ app.use("/api/hr", hrProfileRoutes);
  * --------------------------------------------------------------------- */
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
-/* CCTV access is now SSO to the externally-hosted site (cctv.grav.in), NOT the
-   old in-CMS streaming pipeline. cctvAuth is unchanged — it still reuses the CMS
-   session + the per-department cctvEnabled flag and sets req.cctvUser only for
-   allowed users. Behind it we now mount the SSO mint router (routes/cctvSso),
-   which 302-redirects to the CCTV app with a short-lived signed token.
+/* CCTV is the externally-hosted site (cctv.grav.in, grav-cctv), NOT the old
+   in-CMS streaming pipeline. routes/cctvSso mints a 90-second sign-in token that
+   names the person, and answers the CCTV site's per-person permission check
+   (which cameras; live / sound / playback on each) — see
+   services/cctv/cctvAccess.service.js. Each route carries its own guard: the
+   CMS session for sign-in, the CCTV service key for the permission check.
 
-   The old streaming router (./routes/cctv, driving ./services/cctv/*) is left on
-   disk but deliberately NO LONGER mounted. */
-app.use("/api/cctv", require("./Middlewear/cctvAuth"), require("./routes/cctvSso"));
+   The old streaming router (./routes/cctv, driving ./services/cctv/manager.js)
+   is left on disk but deliberately NO LONGER mounted. */
+app.use("/api/cctv", require("./routes/cctvSso"));
 /* Grav CAD desktop: shared-key handshake, no session. Must sit above the
    /api/cms auth gate (see the scanner note further down). */
 app.use("/api/cutting-desk", require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingDeskHandshake"));

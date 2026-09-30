@@ -282,6 +282,9 @@ module.exports = {
   listAccessibleApps,
   isVerifiedPlatformAdmin,
   actorFrom,
+  // The same database re-read, for a module that decides more than "may they
+  // open it" (CCTV: which cameras) — services/cctv/cctvAccess.service.js.
+  verifiedIdentity,
   DENIAL,
   SOURCE,
   CAPABILITIES,

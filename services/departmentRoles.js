@@ -171,14 +171,18 @@ async function listRoles(departmentSlug) {
   }
 
   const rows = await DepartmentRole.find({ departmentSlug: slug })
-    .select("name email role isActive updatedAt budgetDepartments")
+    .select("name email role isActive updatedAt budgetDepartments cctvCameras")
     .sort({ role: 1, name: 1 })
     .lean();
+  const { camerasOfRow } = require("./cctv/cctvAccess.service");
   return rows.map((r) => ({
     email: r.email, name: r.name, role: r.role, isActive: r.isActive !== false, updatedAt: r.updatedAt,
     /* Only ever populated on the Budget grant; the admin screen reads it to
        show which departments a person may submit for. */
     budgetDepartments: r.budgetDepartments || [],
+    /* Only on the CCTV grant: each camera and live / sound / playback on it
+       (normalised — an inactive row lists none). */
+    ...(slug === "cctv" ? { cctvCameras: camerasOfRow(r) } : {}),
   }));
 }
 
