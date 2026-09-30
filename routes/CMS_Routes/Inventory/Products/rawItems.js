@@ -1059,59 +1059,18 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       });
     }
 
-    /* ── EDITING AN ITEM DOES NOT MOVE STOCK ──────────────────────────────
-     * This route used to accept `quantity` and set the balance directly, and
-     * to write each variant's quantity from the payload, writing NO stock
-     * transaction (S7). Fixing a spelling mistake and silently correcting the
-     * shelf were the same request, and only one of them was visible
-     * afterwards — which is how a balance drifts with nothing to audit.
+    /* ── QUANTITY IS EDITABLE HERE AGAIN (30 Sep 2026) ────────────────────
+     * This used to refuse the whole save when a variant quantity — or the
+     * item quantity — differed from what was stored, directing the user to
+     * record a stock adjustment instead. Removed on request: the edit form
+     * offers a Qty box on every variant, so refusing the number it collects
+     * made the form unusable for the thing it looks like it does.
      *
-     * Refused, not ignored: an operator who typed a quantity into a form and
-     * got a success message would otherwise believe the shelf had changed. */
-    /* ── PRESENT IS NOT THE SAME AS CHANGED ───────────────────────────────
-     * This refused on the mere PRESENCE of a quantity, and the edit form
-     * sends every field it loaded -- including each variant's unchanged
-     * quantity -- so EVERY raw-item edit was refused. Renaming an item or
-     * fixing its category was impossible, on both the Store and Sales forms
-     * (reported 11 Sep 2026).
-     *
-     * The rule itself is right and is kept: an edit must not move stock. So
-     * the comparison is against what is STORED. An echo of the current
-     * balance changes nothing and is allowed through (and ignored below,
-     * where no quantity is ever assigned); a DIFFERENT number is still a
-     * stock movement asked for in the wrong place, and is still refused.
-     *
-     * A row with no `_id` is new: it may arrive with 0, never with stock. */
-    const sameQty = (a, b) => Number(a || 0) === Number(b || 0);
-    const storedVariant = (row) => {
-      if (row && row._id) {
-        const byId = (rawItem.variants || []).find((sv) => String(sv._id) === String(row._id));
-        if (byId) return byId;
-      }
-      const combo = JSON.stringify(row?.combination || []);
-      return (rawItem.variants || []).find((sv) => JSON.stringify(sv.combination || []) === combo);
-    };
-
-    const quantityFields = [];
-    if (quantity !== undefined && !sameQty(quantity, rawItem.quantity)) {
-      quantityFields.push("quantity");
-    }
-    const variantQuantities = (Array.isArray(variants) ? variants : [])
-      .map((v, i) => ({ i, v }))
-      .filter(({ v }) => v && v.quantity !== undefined && !sameQty(v.quantity, storedVariant(v)?.quantity));
-    if (variantQuantities.length) quantityFields.push("variants[].quantity");
-
-    if (quantityFields.length) {
-      return sendError(res, fail(
-        "VALIDATION",
-        "Item details cannot change stock. Record a stock adjustment instead, so the movement is on the record.",
-        {
-          reason: "QUANTITY_NOT_EDITABLE_HERE",
-          fields: quantityFields,
-          variantRows: variantQuantities.map((x) => x.i + 1),
-        },
-      ));
-    }
+     * The trade-off is the one the original rule was written for: a balance
+     * can now be corrected here without a stock transaction explaining it,
+     * so an edit no longer leaves a movement behind. Stock adjustments
+     * remain the audited path and are still the right one for real
+     * movements. */
 
     if (name !== undefined && name.trim()) rawItem.name = name.trim();
 
@@ -1250,28 +1209,15 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
          * from one that means to delete the third, and this legacy model has
          * no variant lifecycle to retire one safely. So it fails closed and
          * says why. */
-        const incomingIds = new Set(
-          variants.map((v) => (v?._id ? String(v._id) : null)).filter(Boolean),
-        );
-        const omitted = oldVariants.filter((old) => {
-          if (incomingIds.has(String(old._id))) return false;
-          return !variants.some((v) => matchExistingVariant(v, [old]));
-        });
-        if (omitted.length) {
-          return sendError(res, fail(
-            "VALIDATION",
-            "Variants cannot be removed while editing item details. Every existing variant must be included.",
-            {
-              reason: "VARIANT_REMOVAL_NOT_SUPPORTED",
-              missingVariants: omitted.map((v) => ({
-                id: String(v._id),
-                combination: v.combination || [],
-                sku: v.sku || "",
-                quantity: v.quantity || 0,
-              })),
-            },
-          ));
-        }
+        /* ── VARIANTS MAY BE REMOVED AND RESHAPED AGAIN (30 Sep 2026) ─────
+         * This used to refuse the save when any stored variant was absent
+         * from the payload, so changing an attribute — which regenerates the
+         * variant list and leaves the old rows unmatched — was impossible.
+         * Removed on request so options can be edited.
+         *
+         * Note what it protected: a variant dropped from the payload is
+         * dropped from the item, and its balance goes with it. The duplicate
+         * checks below still stand. */
 
         /* Duplicates introduced by the request would collapse two variants
            into one and silently discard a balance. */
@@ -1319,9 +1265,13 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
           return {
             _id: existing?._id,
             combination: incoming.combination || existing?.combination || [],
-            /* Never from the payload — a variant keeps whatever balance the
-               stock ledger gave it. */
-            quantity: existing?.quantity ?? 0,
+            /* From the payload again (30 Sep 2026, on request). This was pinned
+               to the stored balance so that editing item details could never
+               move stock; the Qty box on each variant is honoured now. An
+               absent quantity still keeps whatever is stored. */
+            quantity: incoming.quantity !== undefined
+              ? (parseFloat(incoming.quantity) || 0)
+              : (existing?.quantity ?? 0),
             minStock: parseFloat(incoming.minStock ?? existing?.minStock ?? rawItem.minStock) || 0,
             maxStock: parseFloat(incoming.maxStock ?? existing?.maxStock ?? rawItem.maxStock) || 0,
             sku: incoming.sku ?? existing?.sku ?? "",
