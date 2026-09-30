@@ -654,6 +654,28 @@ the owner). `materialSetup` no longer counts budget at all unless
 category, intended use or base unit only. The budget-head resolver and the
 requests desk's budget review are untouched.
 
+### …and neither does the Requests desk — 30 Sep 2026
+
+The same switch now decides whether a REQUEST carries a budget head at all.
+`services/requests/budgetGate.js` (`budgetEnabled()` =
+`STORE_BUDGET_SETUP === "1"`) is read by `intakeRequests.js`,
+`spendRequests.js` and `spendFinanceDecision.service.js`. Off (the
+default): `GET /api/requests/intake/me` answers `budgetEnabled: false` and
+`GET …/budget-heads` answers `enabled: false, heads: []` (not "no approved
+heads"); the create route neither requires nor resolves `ledgerId` (a
+posted one is ignored, `headPatch` carries no ledger, plan row or
+snapshot); the approver's route does not refuse a request with no head;
+`readyToClassify` gets `hasApprovedHead: true`; the spend conversion makes
+the spend request with `ledger: null`, which `spendRequestCreate.matchBudget`
+already records as an unbudgeted one (`budgetMatchStatus` none), so finance
+still sees and approves it; the purchase door (`POST /api/requests/spend`)
+accepts no `ledgerId`; and at the finance decision a service master's
+suggested head cannot turn a head-less request into a
+`SUGGESTED_HEAD_UNAVAILABLE` refusal — the lines are recorded unbudgeted.
+Requests raised while budget was on keep their head. Smoke-tested 30 Sep
+2026: a SERVICE request with no head was accepted (`budgetHead: null`) and
+deleted again.
+
 ## Raw items: product type, and the list read once — 30 Sep 2026
 
 `RawItem.productType` exists now. The item form had offered "Product

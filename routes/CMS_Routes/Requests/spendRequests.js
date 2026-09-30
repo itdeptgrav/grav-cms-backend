@@ -39,6 +39,7 @@ const { serviceClassification, isServiceRequest, allocationSummary } = financeDe
 const chain = require("../../../services/spendApproval.service");
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 const budgetMatch = require("../../../services/budgetCommitment.service");
+const { budgetEnabled } = require("../../../services/requests/budgetGate");
 /* Shipping, discount and charges, and the one rule for the total they make. */
 const spendAdjustments = require("../../../services/spendAdjustments.service");
 const itemBudgetHead = require("../../../services/itemBudgetHead.service");
@@ -930,6 +931,9 @@ router.post("/", async (req, res) => {
           message: "Say why none of your approved budget heads fit.",
         });
       }
+    } else if (!budgetEnabled() && !b.ledgerId) {
+      /* Budget is off (services/requests/budgetGate): a purchase request
+         names no head. Recorded as an unbudgeted spend request would be. */
     } else {
       if (!b.ledgerId) {
         return res.status(400).json({

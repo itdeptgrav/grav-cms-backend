@@ -53,6 +53,9 @@ const autoReservation = require("../../../services/storePurchase/autoReservation
 const chain = require("../../../services/spendApproval.service");
 const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
+/* Whether a request carries a budget head at all — see the file. Off unless
+   STORE_BUDGET_SETUP=1 (30 Sep 2026: budget left the Store side). */
+const { budgetEnabled } = require("../../../services/requests/budgetGate");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
 /* Cache-immune Store-grant path — the same additive treatment the spend router
@@ -954,6 +957,12 @@ const deskOrder = (a, b) => {
  */
 router.get("/budget-heads", async (req, res) => {
   try {
+    /* Budget is not part of a request while the switch is off. Answered as
+       such — `enabled: false` — rather than as an empty list, which the form
+       would read as "no approved heads, ask finance". */
+    if (!budgetEnabled()) {
+      return res.json({ success: true, enabled: false, heads: [], department: "", financialYear: null, reason: "budget_off", emptyMessage: null });
+    }
     const emp = await requester(req);
     if (!emp) return res.json({ success: true, heads: [], reason: "no_employee" });
 
@@ -1076,6 +1085,7 @@ router.get("/me", async (req, res) => {
           managesPeople: false,
           isFinance: false,
           canFulfil: false,
+          budgetEnabled: budgetEnabled(),
           /* Said out loud, so the desk can explain itself rather than render
              every tab empty and let the reader draw the wrong conclusion. */
           identityMissing: true,
@@ -1145,6 +1155,10 @@ router.get("/me", async (req, res) => {
         /* Their own Primary Manager, from HR. Null only if the lookup itself
            failed; an unresolved chain answers with a resolution and a note. */
         approver,
+        /* Whether the desk shows a budget head anywhere — the chooser on the
+           form, the approver's panel, the card's fact, the over-budget
+           answer. One switch, the server's (services/requests/budgetGate). */
+        budgetEnabled: budgetEnabled(),
       },
     });
   } catch (e) {
@@ -1304,7 +1318,7 @@ router.post("/", async (req, res) => {
        The field is still honoured on the APPROVER's route and on the purchase
        door, which are different decisions made by different people — see the
        note on that block. */
-    if (b.unbudgetedHead === true || b.requestedHeadName) {
+    if (budgetEnabled() && (b.unbudgetedHead === true || b.requestedHeadName)) {
       return res.status(400).json({
         success: false,
         code: "HEAD_NOT_REQUESTABLE",
@@ -1314,7 +1328,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (!b.ledgerId) {
+    if (budgetEnabled() && !b.ledgerId) {
       return res.status(400).json({
         success: false,
         message: "Choose the budget head this comes out of.",
@@ -1322,7 +1336,15 @@ router.post("/", async (req, res) => {
     }
 
     let headPatch;
-    {
+    if (!budgetEnabled()) {
+      /* ── NO HEAD, BY DESIGN ───────────────────────────────────────────
+         Budget is off (services/requests/budgetGate): the request carries
+         no ledger, no plan row and no snapshot. Whatever a client posted in
+         `ledgerId` is ignored rather than resolved — a switch that is off
+         must not be half on. The spend request it may become is recorded
+         with no head, the way an unbudgeted one already is. */
+      headPatch = { unbudgetedHeadRequest: false, budgetDepartment: emp.department || "" };
+    } else {
       const resolved = await resolveHead({
         department: emp.department,
         ledgerId: b.ledgerId,
@@ -1765,8 +1787,9 @@ async function decide(req, res, outcome) {
     if (!correctingHead) {
       /* Nothing posted, and nothing on the request either — only possible on a
          row raised before the requester was asked for one. It cannot go on to
-         Store without a head, so it is refused here with the reason. */
-      const has = Boolean(doc.ledgerId) || (doc.unbudgetedHeadRequest && doc.requestedHeadName);
+         Store without a head, so it is refused here with the reason.
+         Unless budget is off, in which case no request has one. */
+      const has = !budgetEnabled() || Boolean(doc.ledgerId) || (doc.unbudgetedHeadRequest && doc.requestedHeadName);
       if (!has) {
         return res.status(400).json({
           success: false,
@@ -2387,6 +2410,7 @@ router.patch("/:id/classify", async (req, res) => {
        `ledgerId` OR a named unbudgeted ask both count: the second is a real
        decision the manager made, not a gap. */
     const hasApprovedHead =
+      !budgetEnabled() ||
       Boolean(doc.ledgerId) ||
       (doc.unbudgetedHeadRequest === true && Boolean(doc.requestedHeadName));
 
@@ -2951,7 +2975,16 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
   const requestedHeadName = asksForNewHead ? doc.requestedHeadName || "" : "";
   const requestedHeadReason = asksForNewHead ? doc.requestedHeadReason || "" : "";
 
-  if (!asksForNewHead) {
+  if (!asksForNewHead && !budgetEnabled()) {
+    /* Budget is off: the spend request is made with no head, as an
+       unbudgeted one is. A head a request happens to carry from when budget
+       was on is kept by name only if it still resolves, and dropped quietly
+       if it does not — the switch is off, so it cannot block anything. */
+    if (doc.ledgerId) {
+      const head = await resolveHead({ department: doc.department, ledgerId: doc.ledgerId });
+      ledger = head.error ? null : head.ledger;
+    }
+  } else if (!asksForNewHead) {
     if (!doc.ledgerId) {
       return {
         error:

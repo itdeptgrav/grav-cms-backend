@@ -27,6 +27,7 @@
 "use strict";
 
 const chain = require("./spendApproval.service");
+const { budgetEnabled } = require("./requests/budgetGate");
 const fulfilment = require("./storeFulfilment.service");
 const budgetMatch = require("./budgetCommitment.service");
 const itemBudgetHead = require("./itemBudgetHead.service");
@@ -559,7 +560,10 @@ async function planLineAllocations({ request, body = null, actor = null } = {}) 
          classified this line". */
       head = requestHead;
       source = itemBudgetHead.SOURCE_REQUEST_HEAD;
-    } else if (!suggestedLedgerId && requestUnbudgeted) {
+    } else if ((!suggestedLedgerId || !budgetEnabled()) && requestUnbudgeted) {
+      /* With budget off a request has no head, and a service master's
+         suggested head must not turn that into a refusal — the line is
+         recorded unbudgeted, which is what it is. */
       /* The request itself has no approved head — the explicit unbudgeted
          path. Its lines are unbudgeted too: still promises, reducing nothing,
          and visible as such. */

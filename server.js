@@ -192,6 +192,10 @@ app.get("/api/feature-flags", async (req, res) => {
     for (const d of DEFINITIONS) {
       if (d.key.startsWith("flag.")) flags[d.key] = await getSetting(d.key);
     }
+    /* Not a stored setting: the budget switch is the environment's
+       (STORE_BUDGET_SETUP=1, services/requests/budgetGate). Exposed here so a
+       Store page can hide a "Budget head" label without a session call. */
+    flags["flag.storeBudget"] = require("./services/requests/budgetGate").budgetEnabled();
     res.json({ success: true, flags });
   } catch {
     res.json({ success: true, flags: {} });
