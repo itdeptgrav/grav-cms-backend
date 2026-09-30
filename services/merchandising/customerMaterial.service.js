@@ -478,8 +478,14 @@ async function createDraft(ctx, { fileId, fromRevisionNo = null, actor = null } 
 async function acceptUnit(ctx, wanted, session = null) {
   const name = str(wanted);
   if (!name) throw fail("VALIDATION", "Say which unit the quantity is in.", { field: "unit" });
+  /* The tenant FILTER, not a strict companyId (30 Sep 2026): every unit in
+     this register — Pcs, Mtr, Kilogram — predates company stamping and
+     carries none, so a strict match refused every line a merchandiser typed.
+     The Store's own reads admit those legacy rows while
+     STORE_PURCHASE_STRICT_TENANCY is unset; this is the same rule. */
   const known = await Unit.findOne({
-    companyId: ctx.companyId, status: "Active",
+    ...require("../storePurchase/tenantContext.service").tenantFilter(ctx),
+    status: "Active",
     name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
   }).select("name").session(session).lean();
   if (!known) {
