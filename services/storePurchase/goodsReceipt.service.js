@@ -31,6 +31,7 @@ const { fail } = require("./errors");
    unchanged, because the purchase route is the one caller that must not notice
    this happened. */
 const posting = require("./receiptPosting.service");
+const receivingSession = require("./receivingSession.service");
 
 const { r4, resolveConversion, applyStockIn } = posting;
 
@@ -117,6 +118,16 @@ async function validateReceiptLines({ purchaseOrder, items, tenant, session = nu
  */
 async function applyReceipt({ session, tenant, purchaseOrder, plans, header, actor, idempotencyKey }) {
   const companyId = tenant.companyId;
+
+  /* ── A LINE COUNTED BY LABELLING CLOSES ON ITS LABELS ──────────────────────
+     Checked BEFORE anything is written, inside this transaction: an open count
+     whose applied labels do not hold exactly the quantity being recorded, or
+     that still has a printed label nobody settled, refuses the whole receipt.
+     A goods receipt whose number disagrees with the stickers on the floor is
+     worse than no goods receipt, because everything downstream believes it.
+     Lines with no open count are untouched — this returns an empty list and the
+     receipt proceeds exactly as it always has. */
+  const countedLines = await receivingSession.assertCountsAgree(tenant, { plans }, session);
   // allocate() returns the already-formatted number (e.g. "GRN/2026-27/0001").
   const { number: receiptNumber } = await posting.allocateReceiptNumber({
     companyId, session, siteId: tenant.siteId || null,
@@ -212,6 +223,15 @@ async function applyReceipt({ session, tenant, purchaseOrder, plans, header, act
     idempotencyKey: idempotencyKey || "",
     lines: grnLines,
   }], session ? { session } : {});
+
+  /* ── AND ONLY NOW ARE ITS LABELS STOCK ────────────────────────────────────
+     Inside the same transaction, so a receipt that rolls back takes the
+     activation with it and the count stays open — rather than leaving live
+     stock identities for a delivery no document claims. Applied labels become
+     ACTIVATED and carry this receipt; anything still reserved is voided, since
+     an identity allocated for a package that never arrived must not be
+     printable tomorrow. */
+  await receivingSession.activateForReceipt(tenant, { matched: countedLines, goodsReceipt, actor }, session);
 
   // Legacy-compatible summary — one order-level delivery entry that REFERENCES
   // the authoritative GRN, so old readers keep working and no reader recomputes

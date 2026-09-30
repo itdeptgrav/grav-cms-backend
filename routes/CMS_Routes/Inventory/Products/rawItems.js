@@ -799,24 +799,6 @@ router.get("/accountability", canRead, async (req, res) => {
 // without an N+1 fetch per row. Registered BEFORE "/:id" for the same reason
 // as /accountability above.
 // ─────────────────────────────────────────────────────────────────────────────
-/* ── THE CUSTOMERS A MATERIAL MAY BE THE PROPERTY OF ───────────────────────
-   Behind the catalogue read, because it exists to fill the item form's
-   "Owning customer" control and for nothing else. The rows are the same ones
-   the save accepts: the search applies the reach rule the validation applies,
-   so a customer offered here is never refused on save. */
-router.get("/data/customers", canRead, async (req, res) => {
-  try {
-    const customers = await materialOwnership.searchCustomers(req.tenant, {
-      q: req.query.search ?? req.query.q ?? "", limit: req.query.limit,
-    });
-    res.json({ success: true, customers });
-  } catch (error) {
-    if (error instanceof StorePurchaseError) return sendError(res, error);
-    console.error("Error searching owning customers:", error);
-    res.status(500).json({ success: false, message: "Server error while searching customers" });
-  }
-});
-
 router.get("/data/attributes-batch", canRead, async (req, res) => {
   try {
     const ids = String(req.query.ids || "")
@@ -989,7 +971,6 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       description,
       notes,
       defaultOwnership,
-      owningCustomerId,
     } = req.body;
 
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }));
@@ -1084,18 +1065,15 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
     if (productType !== undefined) rawItem.productType = String(productType || "").trim().slice(0, 80);
 
     /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
-       Read only when the payload speaks about it (absent keys are "not part
-       of this edit"). The rule returns the two catalogue fields and their
-       snapshot and nothing else, and those are the only fields assigned here:
-       no lot, receipt, balance or movement is touched, because none of them
-       read this default — each decided its owner when it was written. */
-    if (defaultOwnership !== undefined || owningCustomerId !== undefined) {
-      const ownership = await materialOwnership.resolveOwnership(req.tenant, {
-        stored: rawItem, payload: { defaultOwnership, owningCustomerId },
-      });
-      rawItem.defaultOwnership = ownership.defaultOwnership;
-      rawItem.owningCustomerId = ownership.owningCustomerId;
-      rawItem.owningCustomer = ownership.owningCustomer;
+       Read only when the payload speaks about it (an absent key is "not part
+       of this edit"). The rule returns the one catalogue field and nothing
+       else, and that is the only field assigned here: no lot, receipt,
+       balance or movement is touched, because none of them read this
+       default — each decided its owner when it was written. */
+    if (defaultOwnership !== undefined) {
+      rawItem.defaultOwnership = materialOwnership.resolveOwnership({
+        stored: rawItem, payload: { defaultOwnership },
+      }).defaultOwnership;
     }
 
     if (unit !== undefined || customUnit !== undefined) {
@@ -1349,6 +1327,9 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
     });
 
   } catch (error) {
+    /* A rule's refusal (a customer this company cannot reach, a customer-owned
+       default with no customer) is an answer, not a bug. */
+    if (error instanceof StorePurchaseError) return sendError(res, error);
     console.error("Error updating raw item:", error);
     if (error.name === 'ValidationError') {
       return res.status(400).json({

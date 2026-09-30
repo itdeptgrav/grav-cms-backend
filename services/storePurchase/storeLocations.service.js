@@ -31,6 +31,9 @@ const LocationMovement = require("../../models/CMS_Models/Inventory/Operations/L
 const LocationBalance = require("../../models/CMS_Models/Inventory/Operations/LocationBalance");
 const loc = require("./locationStock.service");
 const { fail } = require("./errors");
+/* Which printed labels are real stock. A count prints identities before the
+   goods receipt exists, so this is what keeps them off the shelves. */
+const { identityRefusal, usableIdentity } = require("./labelIdentity");
 
 const { LOCATION_KINDS, HOLDING_KINDS } = Warehouse;
 const KIND_LABEL = Object.freeze({
@@ -390,6 +393,16 @@ async function resolveStock(scope, { barcodeId, rawItemId, variantId }) {
     if (!isId(barcodeId)) throw fail("VALIDATION", "That is not a valid item sticker.", { reason: "INVALID_BARCODE" });
     barcode = await Barcode.findById(barcodeId).lean();
     if (!barcode) throw fail("NOT_FOUND", "That item sticker is not on record.", { reason: "BARCODE_NOT_FOUND" });
+    /* ── A LABEL IS NOT STOCK UNTIL ITS RECEIPT IS RECORDED ──────────────
+       Labels are now printed DURING a count, before the goods receipt exists,
+       so the collection holds real scannable identities for material the
+       company has not received. This resolver is the chokepoint every
+       stock-moving path goes through — PUT, TRANSFER, REMOVE, the scan
+       resolve, the marking read — so refusing here is what stops a sticker
+       from a half-finished count being placed on a shelf as if the goods
+       had arrived. The refusal names which case it is; see labelIdentity. */
+    const refusal = identityRefusal(barcode);
+    if (refusal) throw fail("VALIDATION", refusal.message, { reason: refusal.reason, identityState: barcode.identityState || null });
     rawItemId = String(barcode.rawItem); variantId = barcode.variantId ? String(barcode.variantId) : null;
   }
   const iid = oid(rawItemId);

@@ -89,7 +89,7 @@ const MERCHANDISING_SECTIONS = Object.freeze([SECTION.IDENTITY, SECTION.CLASSIFI
 /** Which payload keys belong to which section. */
 const SECTION_FIELDS = Object.freeze({
   [SECTION.IDENTITY]: ["name", "description", "notes"],
-  [SECTION.CLASSIFICATION]: ["category", "customCategory", "unit", "customUnit", "usedAs", "customsTariffCode", "defaultOwnership", "owningCustomerId"],
+  [SECTION.CLASSIFICATION]: ["category", "customCategory", "unit", "customUnit", "usedAs", "customsTariffCode", "defaultOwnership"],
   [SECTION.STOCK_LEVELS]: ["minStock", "maxStock"],
   [SECTION.STOCK]: ["quantity"],
   [SECTION.ATTRIBUTES]: ["attributes"],
@@ -332,10 +332,9 @@ async function createRawItem({
      screen can say so without a second request. */
   /* ── WHOSE PROPERTY IT NORMALLY IS ──────────────────────────────────────
      Decided by the one rule every door shares. A client that says nothing
-     gets COMPANY_OWNED; one that says CUSTOMER_OWNED must name a customer
-     this company can reach, or nothing is saved. What comes back is the two
-     catalogue fields and their snapshot — never a quantity or a movement. */
-  const ownership = await materialOwnership.resolveOwnership(tenant, { stored: null, payload, session });
+     gets COMPANY_OWNED; an unknown word is refused. What comes back is the
+     one catalogue field — never a quantity or a movement. */
+  const ownership = materialOwnership.resolveOwnership({ stored: null, payload });
 
   const duplicate = await findDuplicate(tenant, payload, session);
   if (duplicate && onDuplicate === "refuse") {
@@ -434,8 +433,6 @@ async function createRawItem({
     unit: str(payload.customUnit) ? "" : (payload.unit || ""),
     customUnit: str(payload.customUnit) || "",
     defaultOwnership: ownership.defaultOwnership,
-    owningCustomerId: ownership.owningCustomerId,
-    owningCustomer: ownership.owningCustomer,
     quantity: 0,
     minStock: num(minStock) || 0,
     maxStock: num(maxStock) || 0,

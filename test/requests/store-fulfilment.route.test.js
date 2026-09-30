@@ -482,3 +482,145 @@ describe("what finance may approve", () => {
     expect(r.body.request.status).toBe("rejected");
   });
 });
+
+/* ═══ 6 · WHEN FINANCE'S INVOLVEMENT IS PAUSED ═════════════════════════════
+   `RequestsSettings.mrfBudgetEnabled` is a runtime switch a CEO turns OFF. It
+   does not delete the finance path, bypass a check or weaken a validation — it
+   moves where an MRF-derived spend request STARTS on the approval chain, and
+   records that it did so.
+
+   The branch had no coverage at all before this: every other test in this file
+   runs on the default (`true`) path implicitly, because reading the settings
+   creates the record with the switch on. So the paused path — the one a live
+   business would be running on — was the untested one.
+   ────────────────────────────────────────────────────────────────────────── */
+
+const RequestsSettings = require("../../models/CMS_Models/Configurations/RequestsSettings");
+
+/** Set the switch the way the CEO's settings screen does. */
+const setBudgetInvolvement = async (enabled) => {
+  const doc = await RequestsSettings.get();
+  doc.mrfBudgetEnabled = enabled;
+  await doc.save();
+};
+
+describe("budget & finance review paused for MRF", () => {
+  const commercial = {
+    decision: "buy_or_service",
+    vendorName: "Sharma Engineering",
+    gstin: "21AAAAA0000A1Z5",
+    gstPercent: 18,
+    expectedDeliveryDate: "2026-09-20",
+  };
+
+  test("a paused MRF's buying balance is approved on the spot, and says why", async () => {
+    await setBudgetInvolvement(false);
+    const s = await seed({ stockQty: 0, requestedQty: 10 });
+
+    const r = await decide(s, { ...commercial, lines: [{ itemId: s.itemId, buyQty: 10, rate: 250 }] });
+    expect(r.status).toBe(200);
+    expect(r.body.spendRequest.status).toBe("approved");
+
+    const spend = await SpendRequest.findOne({}).lean();
+    expect(spend.status).toBe("approved");
+    /* WHY it was approved without finance, recorded on the request itself
+       rather than left to be inferred later from a missing commitment. */
+    expect(spend.budgetApprovalMode).toBe("BUDGET_PAUSED");
+    expect(spend.budgetApprovalModeSource).toBe("RequestsSettings.mrfBudgetEnabled");
+    expect(spend.budgetApprovalModeAt).toBeTruthy();
+  });
+
+  test("paused mode commits no money and claims no finance approval", async () => {
+    await setBudgetInvolvement(false);
+    const s = await seed({ stockQty: 0, requestedQty: 10 });
+
+    await decide(s, { ...commercial, lines: [{ itemId: s.itemId, buyQty: 10, rate: 250 }] });
+
+    /* No budget commitment exists — the whole point of pausing. */
+    expect(await Commitment.countDocuments({})).toBe(0);
+
+    const spend = await SpendRequest.findOne({}).lean();
+    expect(spend.commitmentId).toBeFalsy();
+    /* And it does not pretend a finance officer agreed to anything. */
+    expect(spend.financeApprovedBy).toBeFalsy();
+    expect(spend.financeApprovedByName).toBeFalsy();
+    expect(spend.financeApprovedAt).toBeFalsy();
+  });
+
+  test("everything that is NOT budget still holds while paused", async () => {
+    await setBudgetInvolvement(false);
+    const s = await seed({ stockQty: 0, requestedQty: 10 });
+
+    await decide(s, { ...commercial, lines: [{ itemId: s.itemId, buyQty: 10, rate: 250 }] });
+    const spend = await SpendRequest.findOne({}).lean();
+
+    /* Supplier, rate, tax and the commercial total are still recorded. */
+    expect(spend.vendorName).toBe("Sharma Engineering");
+    expect(spend.items[0]).toMatchObject({ quantity: 10, rate: 250, amount: 2500 });
+    expect(spend.gstPercent).toBe(18);
+    expect(spend.grandTotal).toBe(2950);
+    expect(spend.expectedDeliveryDate).toBeTruthy();
+    /* And the provenance a purchase order has to prove later. */
+    expect(String(spend.sourceMrfId)).toBe(String(s.mrf._id));
+    expect(spend.sourceMrfNumber).toBe(s.mrf.mrfNumber);
+    expect(spend.requestedById).toBe(s.emp.biometricId);
+  });
+
+  test("pausing does not touch a request already waiting on finance", async () => {
+    /* Raised under the ordinary rules … */
+    const s = await seed({ stockQty: 0, requestedQty: 10 });
+    await decide(s, { ...commercial, lines: [{ itemId: s.itemId, buyQty: 10, rate: 250 }] });
+
+    const before = await SpendRequest.findOne({}).lean();
+    expect(before.status).toBe("pending_finance");
+    expect(before.budgetApprovalMode).toBe("COMMITMENT_REQUIRED");
+
+    /* … then the switch goes off. The existing request is somebody else's
+       decision to make: retroactively approving it would approve spend that
+       nobody agreed to. */
+    await setBudgetInvolvement(false);
+
+    const after = await SpendRequest.findOne({ _id: before._id }).lean();
+    expect(after.status).toBe("pending_finance");
+    expect(after.budgetApprovalMode).toBe("COMMITMENT_REQUIRED");
+    expect(after.updatedAt).toEqual(before.updatedAt);
+  });
+
+  test("turning it back on restores the finance path for the next request", async () => {
+    await setBudgetInvolvement(false);
+    const paused = await seed({ stockQty: 0, requestedQty: 10 });
+    await decide(paused, { ...commercial, lines: [{ itemId: paused.itemId, buyQty: 10, rate: 250 }] });
+
+    await setBudgetInvolvement(true);
+    const normal = await seed({ stockQty: 0, requestedQty: 10 });
+    const r = await decide(normal, { ...commercial, lines: [{ itemId: normal.itemId, buyQty: 10, rate: 250 }] });
+    expect(r.status).toBe(200);
+    expect(r.body.spendRequest.status).toBe("pending_finance");
+
+    const raised = await SpendRequest.find({}).sort({ createdAt: 1 }).lean();
+    expect(raised).toHaveLength(2);
+    /* The one raised while paused keeps the mode it was raised under — the
+       switch decides the next request, never an earlier one. */
+    expect(raised[0].budgetApprovalMode).toBe("BUDGET_PAUSED");
+    expect(raised[1].budgetApprovalMode).toBe("COMMITMENT_REQUIRED");
+    expect(raised[1].status).toBe("pending_finance");
+  });
+
+  test("the switch is read per request, so no restart is needed either way", async () => {
+    await setBudgetInvolvement(false);
+    const a = await seed({ stockQty: 0, requestedQty: 10 });
+    await decide(a, { ...commercial, lines: [{ itemId: a.itemId, buyQty: 10, rate: 250 }] });
+
+    await setBudgetInvolvement(true);
+    const b = await seed({ stockQty: 0, requestedQty: 10 });
+    await decide(b, { ...commercial, lines: [{ itemId: b.itemId, buyQty: 10, rate: 250 }] });
+
+    await setBudgetInvolvement(false);
+    const c = await seed({ stockQty: 0, requestedQty: 10 });
+    await decide(c, { ...commercial, lines: [{ itemId: c.itemId, buyQty: 10, rate: 250 }] });
+
+    const modes = (await SpendRequest.find({}).sort({ createdAt: 1 }).lean())
+      .map((r) => r.budgetApprovalMode);
+    expect(modes).toEqual(["BUDGET_PAUSED", "COMMITMENT_REQUIRED", "BUDGET_PAUSED"]);
+  });
+});

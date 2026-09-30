@@ -281,29 +281,33 @@ const rawItemSchema = new mongoose.Schema(
        per lot (CustomerMaterialLot) and per movement
        (stockTransactions[].ownership), and none of those read this field.
        Defaults to COMPANY_OWNED so every item registered before the field
-       existed, and every client that never sends it, reads as what it was. */
+       existed, and every client that never sends it, reads as what it was.
+       It names no customer: which customer's goods arrive is a fact of the
+       customer-supplied document a receipt is recorded against. */
     defaultOwnership: {
       type: String,
       enum: DEFAULT_OWNERSHIP_VALUES,
       default: DEFAULT_OWNERSHIP.COMPANY_OWNED,
     },
-    /* The customer whose property a CUSTOMER_OWNED material normally is. The
-       identity is the Customer's own id — the same reference every lot and
-       receipt carries — and it is validated on the server against this
-       company's reach before it is stored. Always null on a company-owned
-       material: the route clears it rather than letting a stale customer
-       ride along after somebody switches the default back. */
-    owningCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
-    /* Display snapshot beside the id, in the same shape the receipts and lots
-       keep (services/merchandising/customerIdentity.service.js). Never the
-       authority — the id is — and deliberately allowed to go stale rather
-       than restating what this default was set to. */
-    owningCustomer: {
-      customerCode:  { type: String, trim: true, default: "" },
-      customerLabel: { type: String, trim: true, default: "" },
-      customerName:  { type: String, trim: true, default: "" },
-    },
 
+    /* ── WHAT A LABEL ON THIS MATERIAL IS PUT ON ──────────────────────────
+       INDIVIDUAL is one label per piece; PACKAGE is one per roll, bundle,
+       drum or carton carrying the quantity measured in it; LOT is one label
+       for a whole delivery. It is what stops the one mistake that makes
+       labelling useless — one sticker per metre of cloth.
+
+       Null by default and NEVER guessed from the unit. A unit is a free-text
+       name a company defines for itself: "Pcs", "Nos" and "Each" are one idea
+       and none of them is a flag, and "Roll" is a unit in one company and a
+       package in another. Reading a tracking level out of a unit name is a
+       guess that is right often enough to be trusted and wrong often enough
+       to mislabel a delivery, so when this is unset the receiver is asked,
+       with nothing preselected. */
+    defaultTrackingLevel: {
+      type: String,
+      enum: ["INDIVIDUAL", "PACKAGE", "LOT", null],
+      default: null,
+    },
     quantity: { type: Number, default: 0, min: 0 },
     minStock: { type: Number, default: 0 },
     maxStock: { type: Number, default: 0 },
@@ -423,8 +427,6 @@ rawItemSchema.index(
 rawItemSchema.index({ companyId: 1, category: 1 });
 /* The Merchandising picker reads this company's items of one `usedAs` set. */
 rawItemSchema.index({ companyId: 1, usedAs: 1 });
-/* "Every material that is normally this customer's property", per company. */
-rawItemSchema.index({ companyId: 1, owningCustomerId: 1 });
 rawItemSchema.index({ name: 1 });
 rawItemSchema.index({ category: 1 });
 rawItemSchema.index({ "variants.vendorNicknames.vendor": 1 });

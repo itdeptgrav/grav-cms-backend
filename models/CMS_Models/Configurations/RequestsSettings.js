@@ -2,6 +2,40 @@
 //
 // GLOBAL SWITCHES FOR THE REQUESTS SYSTEM (MRF, spend requests, …).
 //
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ CURRENTLY PAUSED — 30 Sep 2026                                           ║
+// ║                                                                          ║
+// ║ `mrfBudgetEnabled` is set to FALSE in the live database. MRF purchasing   ║
+// ║ is running with no Finance review and no budget commitment.              ║
+// ║                                                                          ║
+// ║ WHERE IT LIVES   one document, collection `requestssettings`,            ║
+// ║                  `{ key: "requests" }`. Not an env var, not a constant,  ║
+// ║                  not a code branch anyone commented out.                 ║
+// ║                                                                          ║
+// ║ IT IS TEMPORARY  a product decision, recorded in this document's own     ║
+// ║                  `note` field along with who changed it and when.        ║
+// ║                                                                          ║
+// ║ TO RESTORE IT    set `mrfBudgetEnabled` back to TRUE. That is the whole  ║
+// ║                  action. Either:                                         ║
+// ║                    · the CEO settings screen (Settings → requests), or   ║
+// ║                    · PUT /api/cms/requests/settings                      ║
+// ║                      { "mrfBudgetEnabled": true }  (ceo/admin token), or ║
+// ║                    · node -r dotenv/config \                             ║
+// ║                        scripts/migrations/pause-mrf-budget.js            ║
+// ║                        --restore --apply                                 ║
+// ║                                                                          ║
+// ║ NOTHING WAS DELETED. No code was removed, disabled, commented out or     ║
+// ║ stubbed to achieve this, so there is nothing to recover when it is       ║
+// ║ turned back on. The finance path is intact and fully tested — see        ║
+// ║ test/requests/store-fulfilment.route.test.js, which covers both the      ║
+// ║ paused and the normal path and proves the switch flips between them.     ║
+// ║                                                                          ║
+// ║ IT ONLY AFFECTS THE NEXT REQUEST. `budgetApprovalMode` is stamped on a   ║
+// ║ SpendRequest when it is raised, so flipping this cannot rewrite what an  ║
+// ║ existing request was approved under, and a request already sitting at    ║
+// ║ `pending_finance` stays there waiting for Finance.                       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
 // The first (and so far only) switch: whether finance/budget involvement is
 // currently part of the MRF flow.
 //

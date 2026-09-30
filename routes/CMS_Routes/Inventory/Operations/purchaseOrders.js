@@ -660,7 +660,7 @@ router.get("/:id", requireCapability(CAPABILITIES.READ), async (req, res) => {
         "vendor",
         "companyName contactPerson phone email address gstNumber bankDetails",
       )
-      .populate("items.rawItem", "name sku unit description sellingPrice defaultOwnership owningCustomerId owningCustomer")
+      .populate("items.rawItem", "name sku unit description sellingPrice defaultOwnership")
       .populate("createdBy", "name email")
       .populate("approvedBy", "name email")
       .populate("deliveries.receivedBy", "name email");
@@ -1906,6 +1906,222 @@ router.post(
   normalizeReceiptCommand,
   withIdempotency("PO_RECEIVE", { target: (req) => req.params.id }),
   (req, res) => handleGoodsReceipt(req, res),
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /:id/lines/:lineId/material-link — REPAIR A MISSING MATERIAL IDENTITY.
+//
+// The one narrow write the receiving screen needs for a legacy line saved
+// without `rawItem`. It sets the material (and the exact variant, where the
+// material has variants) and the registered-unit snapshot — nothing else on
+// the order. Refused when the line already has a link, when anything has been
+// received against it, when the material is not this company's, when the
+// variant is not the material's, or when the PO unit and the material's unit
+// have no recorded conversion. Every repair writes a history entry with the
+// reason REPAIR_MISSING_MATERIAL_LINK. See poMaterialLink.service.js.
+//
+// Idempotent: the key is bound to THIS order line, so a retry replays; a fresh
+// key naming the same material and variant answers `unchanged: true`.
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch(
+  "/:id/lines/:lineId/material-link",
+  requireCapability(CAPABILITIES.PO_REPAIR_LINK),
+  refuseLegacyWrite,
+  withIdempotency("PO_LINE_MATERIAL_LINK", { target: (req) => `${req.params.id}:${req.params.lineId}` }),
+  async (req, res) => {
+    try {
+      const poMaterialLink = require("../../../../services/storePurchase/poMaterialLink.service");
+      const { rawItemId, variantId = null } = req.body || {};
+      const out = await poMaterialLink.repairMissingMaterialLink(req.tenant, {
+        poId: req.params.id, lineId: req.params.lineId, rawItemId, variantId,
+      }, { idempotencyKey: req.idempotent?.key || "", requestId: req.id || "" });
+
+      const body = {
+        success: true,
+        message: out.unchanged
+          ? "This line is already linked to that material."
+          : "Material linked. This line can now be received.",
+        unchanged: out.unchanged,
+        line: out.line,
+        unit: out.unit,
+        purchaseOrder: out.purchaseOrder,
+      };
+      return req.idempotent
+        ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: req.params.id })
+        : res.json(body);
+    } catch (error) {
+      if (error?.name === "StorePurchaseError") return sendError(res, error);
+      console.error("[purchase-orders] material-link repair error:", error);
+      return res.status(500).json({ success: false, message: "Server error while linking the material" });
+    }
+  },
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COUNT & LABEL — a draft receiving session on one purchase-order line.
+//
+// A receiver counts a delivery BY labelling it: a sticker goes on each roll as
+// it comes off the vehicle, and the count is how many stickers went on. So a
+// label is printed BEFORE the goods receipt exists, which means its identity
+// must be allocated here — unique, durable, and NOT stock until the receipt is
+// recorded. The rules, the five identity states and every refusal live in
+// services/storePurchase/receivingSession.service.js.
+//
+// All of it is RECEIPT_RECORD: counting a delivery is receiving work. None of
+// it moves stock, records a receipt, or touches a commercial value.
+// ═════════════════════════════════════════════════════════════════════════════
+const receivingSession = require("../../../../services/storePurchase/receivingSession.service");
+
+const countRoute = (fn) => async (req, res) => {
+  try {
+    return await fn(req, res);
+  } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
+    console.error("[purchase-orders] receiving session error:", error);
+    return res.status(500).json({ success: false, message: "Server error on this count. Nothing was changed." });
+  }
+};
+
+const actorOf = (req) => ({ id: req.user?.id || null, name: req.user?.name || "" });
+
+// Every open count on this order — what the receiving screen reads on load.
+router.get("/:id/receiving-sessions", requireCapability(CAPABILITIES.READ), countRoute(async (req, res) => {
+  const out = await receivingSession.readForOrder(req.tenant, { poId: req.params.id });
+  return res.json({ success: true, ...out });
+}));
+
+/* Open the count for a line, or hand back the one already open. One call, not
+   two: the client cannot resolve the race between two terminals, and the
+   unique partial index on (company, line) does. */
+router.post(
+  "/:id/lines/:lineId/receiving-session",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.openOrResume(req.tenant, {
+      poId: req.params.id, lineId: req.params.lineId,
+      receivingMode: req.body?.receivingMode,
+      trackingLevel: req.body?.trackingLevel ?? null,
+      trackingOverrideReason: req.body?.trackingOverrideReason || "",
+    }, actorOf(req));
+    return res.status(out.resumed ? 200 : 201).json({ success: true, ...out });
+  }),
+);
+
+// What a label on this delivery stands for. Locked once one has been reserved.
+router.patch(
+  "/:id/receiving-sessions/:sessionId/tracking",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.setTrackingLevel(req.tenant, {
+      sessionId: req.params.sessionId,
+      trackingLevel: req.body?.trackingLevel,
+      reason: req.body?.reason || "",
+    });
+    return res.json({ success: true, ...out });
+  }),
+);
+
+/* Reserve identities. THE mint: idempotent on the caller's key and bound to
+   this count, so a second press of Print — a timeout, a retry, a double tap —
+   replays the same identities instead of minting a second set for one roll. */
+router.post(
+  "/:id/receiving-sessions/:sessionId/labels",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  withIdempotency("RECEIVING_LABEL_RESERVE", { target: (req) => req.params.sessionId }),
+  countRoute(async (req, res) => {
+    const out = await receivingSession.reserveBatch(req.tenant, {
+      sessionId: req.params.sessionId,
+      count: req.body?.count,
+      quantityPerLabel: req.body?.quantityPerLabel ?? null,
+    }, actorOf(req));
+    const body = { success: true, ...out };
+    return req.idempotent
+      ? await req.idempotent.succeed(201, body, { entityType: ENTITY, entityId: req.params.id })
+      : res.status(201).json(body);
+  }),
+);
+
+/* The job was handed to a print dialog. Not a claim that a sticker exists —
+   there is no printer integration to make one — only that the code is on paper
+   somewhere and the identity is no longer merely reserved. */
+router.post(
+  "/:id/receiving-sessions/:sessionId/labels/printed",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.markPrinted(req.tenant, {
+      sessionId: req.params.sessionId, barcodeIds: req.body?.barcodeIds || [],
+    });
+    return res.json({ success: true, ...out });
+  }),
+);
+
+// The sticker is on the goods. This is the act that increments the count.
+router.post(
+  "/:id/receiving-sessions/:sessionId/labels/:barcodeId/apply",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.applyLabel(req.tenant, {
+      sessionId: req.params.sessionId, barcodeId: req.params.barcodeId,
+      quantity: req.body?.quantity ?? null,
+    });
+    return res.json({ success: true, ...out });
+  }),
+);
+
+// Never used again, and kept in the record with its reason.
+router.post(
+  "/:id/receiving-sessions/:sessionId/labels/:barcodeId/void",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.voidLabel(req.tenant, {
+      sessionId: req.params.sessionId, barcodeId: req.params.barcodeId,
+      reason: req.body?.reason || "", replace: Boolean(req.body?.replace),
+    }, actorOf(req));
+    return res.json({ success: true, ...out });
+  }),
+);
+
+// The last confirmed label goes back to printed. The sticker is still on the goods.
+router.post(
+  "/:id/receiving-sessions/:sessionId/undo",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.undoLast(req.tenant, { sessionId: req.params.sessionId });
+    return res.json({ success: true, ...out });
+  }),
+);
+
+/* What a scanned code means here. A read: it decides nothing, so a scanner
+   pointed at the wrong pile gets an answer rather than a changed count. */
+router.post(
+  "/:id/receiving-sessions/:sessionId/scan",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  countRoute(async (req, res) => {
+    const out = await receivingSession.resolveScan(req.tenant, {
+      sessionId: req.params.sessionId, barcodeId: req.body?.barcodeId,
+    });
+    return res.json({ success: true, ...out });
+  }),
+);
+
+// Abandon the count: every identity it reserved is voided, applied ones included.
+router.post(
+  "/:id/receiving-sessions/:sessionId/cancel",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.cancel(req.tenant, {
+      sessionId: req.params.sessionId, reason: req.body?.reason || "",
+    }, actorOf(req));
+    return res.json({ success: true, ...out });
+  }),
 );
 
 // GET /:id/goods-receipts — the authoritative receipts recorded against this PO.

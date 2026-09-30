@@ -68,6 +68,12 @@ const CAPABILITIES = Object.freeze({
   LEGACY_READ: "sp.legacy.read",
   HISTORY_READ: "sp.history.read",
   POLICY_ADMIN: "sp.policy.admin",
+  /* Repairing a MISSING material identity on an issued purchase-order line
+     (29 Sep 2026). Deliberately not RECEIPT_RECORD — a receiver may not decide
+     what a supplier's line IS — and not PO_CREATE, which is a draft authority.
+     It is a buyer-level decision, so it sits with the approver. The route
+     changes nothing commercial and refuses a line that already has a link. */
+  PO_REPAIR_LINK: "sp.po.repair",
 });
 
 const ALL = Object.freeze(Object.values(CAPABILITIES));
@@ -101,7 +107,7 @@ const GRANTS = {
       C.READ, C.HISTORY_READ, C.SOURCING_MANAGE, C.PO_CREATE, C.PO_APPROVE,
       C.PO_ISSUE, C.PO_CANCEL, C.RECEIPT_RECORD, C.STOCK_ISSUE, C.STOCK_RETURN,
       C.STOCK_ADJUST, C.MASTER_MAINTAIN, C.REQUISITION_REVIEW, C.LEGACY_READ,
-      C.MRF_FULFIL, C.LOCATION_OPERATE,
+      C.MRF_FULFIL, C.LOCATION_OPERATE, C.PO_REPAIR_LINK,
     ],
     owner: ADMIN_SET,
   },

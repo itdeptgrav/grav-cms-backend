@@ -2,22 +2,37 @@
 //
 // RAW ITEM CHECKING — QC's second book (28 Sep 2026).
 //
-// On a job-work order the customer sends the raw material, and a factory
-// checks it before it is cut. This router is that check, mounted on
+// Raw material is checked before it is cut, because a defect found after cutting
+// is a defect you have paid to create. This router is that check, mounted on
 // /api/cms/manufacturing/qc/raw-items and kept entirely apart from the
 // per-piece product inspection in qcRoutes.js: different model
 // (QCRawItemInspection), different defect reasons (QCRawItemSetting kind
 // "defect"), its own roster (kind "checker"). Nothing here touches, and
 // nothing in the product check reads, the other's collection.
 //
-// The flow the floor asked for:
-//   1. the checker picks the ORDER (search by MO number or customer);
-//   2. scans a raw-item sticker (the Store's `itemid=<24 hex>` label — its
-//      name, variant, quantity and unit come from the label);
-//   3. passes it, or marks a defect from the reasons the owner defined,
-//      with how much of the sticker's quantity is defective;
+// ── EVERY ELIGIBLE ORDER, NOT ONLY JOB WORK (29 Sep 2026) ──────────────────
+// This shipped for job work: the customer sends the cloth, so `/orders` filtered
+// on `fulfilmentModel === "JOB_WORK"` and the per-order figures counted only
+// CUSTOMER_MATERIAL goods receipts.
+//
+// That conflated WHO OWNS THE MATERIAL with WHETHER IT NEEDS INSPECTING. A roll
+// the factory bought can arrive short, shaded wrong or holed exactly as a
+// customer's can. Eligibility is now the material REQUIREMENT — see
+// services/manufacturing/qcRawItemOrders.js, which reads
+// `WorkOrder.rawMaterials[]` — and ownership is carried as descriptive context
+// (`materialSource`) that the Orders screen may filter by and that decides
+// nothing.
+//
+// The flow, scan-first since 29 Sep 2026:
+//   1. the checker scans a raw-item label on the unified Inspect screen (the
+//      Store's label, in any of its four forms — see
+//      services/manufacturing/qcBarcodeIdentity.js);
+//   2. the ORDER is resolved from the label, the standing verdicts and who needs
+//      the material, and is asked for only when genuinely ambiguous;
+//   3. they pass it, or mark a defect from the reasons the owner defined,
+//      with how much of the label's quantity is defective;
 //   4. the order shows, raw item by raw item, how much is checked, passed,
-//      defective and (against the order's requirement) still to check;
+//      defective and (against what arrived) still to check;
 //   5. the checker sees their own day, hour by hour.
 //
 // Who may do what: the QC OWNER (or a platform administrator) sets up
@@ -42,12 +57,19 @@ const Employee = require("../../../../models/Employee");
 const { CustomerMaterialLot } = require("../../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
 const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
 const { CustomerMaterialExpectation } = require("../../../../models/CMS_Models/Merchandising/CustomerMaterialExpectation");
+const { resolveQcActor } = require("../../../../services/manufacturing/qcActor");
+const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarcodeIdentity");
+const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
 
 const SLUG = "qc";
 const oid = (v) => new mongoose.Types.ObjectId(String(v));
 const isId = (v) => mongoose.Types.ObjectId.isValid(String(v || "")) && /^[0-9a-f]{24}$/i.test(String(v));
 const r4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
 const str = (v) => String(v ?? "").trim();
+/* DESCRIPTIVE, NEVER A GATE (29 Sep 2026). Sales marking an order as job work is
+   real information — it means the customer is sending the material — and it is
+   reported on the order row and stored on each record. What it no longer does is
+   decide whether the order may be inspected. See the header. */
 const isJobWork = (mo) => mo?.fulfilmentModel === "JOB_WORK" || (mo?.items || []).some((i) => i.fulfilmentModel === "JOB_WORK");
 const moNumberOf = (mo) => (mo?.requestId ? `MO-${mo.requestId}` : "");
 
@@ -64,22 +86,17 @@ function qcAuth(req, res, next) {
 }
 router.use(qcAuth);
 
-/** Resolve the caller once: their QC role, whether they own, whether they are a checker. */
-async function whoAmI(req) {
-  if (req.qcWho) return req.qcWho;
-  const u = req.qcUser;
-  const role = u.isAdmin ? "owner" : await getRole(SLUG, u.email);
-  const owner = u.isAdmin || role === "owner";
-  const now = new Date();
-  const checkerRow = u.email ? await QCRawItemSetting.findOne({ kind: "checker", email: u.email, isActive: true, $or: [{ validFrom: null }, { validFrom: { $lte: now } }], $and: [{ $or: [{ validTo: null }, { validTo: { $gte: now } }] }] }).lean() : null;
-  const emp = u.email ? await Employee.findOne({ email: u.email }).select("firstName middleName lastName biometricId").lean() : null;
-  const name = emp ? [emp.firstName, emp.middleName, emp.lastName].filter(Boolean).join(" ").trim() || u.name : u.name;
-  /* a raw item checker may be kept OFF the product piece station (29 Sep 2026);
-     everyone else in QC, and the owner, keep it as before */
-  const productCheck = owner || !checkerRow || checkerRow.productCheck !== false;
-  req.qcWho = { email: u.email, name: name || u.email, biometricId: emp?.biometricId || checkerRow?.biometricId || "", role: role || null, owner, checker: Boolean(checkerRow) || owner, productCheck, checkerRow };
-  return req.qcWho;
-}
+/**
+ * Resolve the caller once: their QC role, whether they own, whether they check.
+ *
+ * MOVED TO services/manufacturing/qcActor.js (29 Sep 2026) and delegated to from
+ * here. The unified Inspect screen's `/identify-barcode` needs the same three
+ * capabilities to say whether somebody may open the branch a barcode resolved
+ * to, and it cannot read a capability model that lives inside this router. The
+ * rules did not change; `req.qcWho` is still the per-request cache.
+ */
+const whoAmI = (req) => resolveQcActor(req);
+
 async function requireOwner(req, res, next) {
   try {
     const who = await whoAmI(req);
@@ -91,14 +108,14 @@ async function requireChecker(req, res, next) {
   try {
     const who = await whoAmI(req);
     if (who.checker) return next();
-    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "You are not assigned as a raw item checker. Ask the QC owner to add you on Raw item setup." });
+    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "You are not assigned as a raw-material checker. Ask the QC owner to add you under Setup \u203a Raw-material QC." });
   } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
 }
 async function requireOwnerOrChecker(req, res, next) {
   try {
     const who = await whoAmI(req);
     if (who.owner || who.checker) return next();
-    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "Raw item checking is for the QC owner and the assigned checkers." });
+    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "Raw material checking is for the QC owner and the assigned checkers." });
   } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
 }
 
@@ -224,17 +241,47 @@ router.delete("/checkers/:id", requireOwner, async (req, res) => {
 const LIVE = { status: { $nin: ["cancelled", "rejected", "draft", "pending"] } };
 const MO_SELECT = "requestId customerInfo.name customerInfo.deliveryDeadline requestType status createdAt fulfilmentModel items.fulfilmentModel items.stockItemName";
 
-/** Per order, what has been checked (non-superseded records only). */
+/**
+ * Per order, what has been checked (non-superseded records only).
+ *
+ * ── `byUnit` IS WHY THIS GROUPS TWICE (29 Sep 2026) ──────────────────────
+ * `checkedQty`, `passedQty` and `defectiveQty` are quantities of MATERIAL, and
+ * an order's materials are not all measured the same way — 40 metres of fabric
+ * and 2 kilograms of thread and 500 pieces of button are three different
+ * quantities. Summing them gives a number with no unit and no meaning, which is
+ * exactly what a single `$group` on the order did and still does: those three
+ * fields are BYTE-IDENTICAL to what they were, because a reader that already
+ * shows them (the raw-material order page's own totals) must not change.
+ *
+ * What is new is `byUnit`: the same figures cut by the record's `unit`, so a
+ * caller can say "420 m passed · 15 m defective" when the order is measured one
+ * way and refuse to total anything when it is measured several. The unified QC
+ * Orders list is built on it. An empty unit (a record saved before the label
+ * carried one) is its own bucket, spelled "", never folded into another.
+ *
+ * The first stage groups by (order, unit); the second rolls those up to the
+ * order. `rawItems` and `checkers` become arrays OF ARRAYS on the way through,
+ * so both are flattened to a set here rather than counted twice.
+ */
 async function rollups(moIds = null) {
   const match = { superseded: { $ne: true } };
   if (moIds) match.manufacturingOrderId = { $in: moIds.map(oid) };
   const rows = await QCRawItemInspection.aggregate([
     { $match: match },
-    { $group: { _id: "$manufacturingOrderId", stickers: { $sum: 1 }, checkedQty: { $sum: "$quantity" }, passedQty: { $sum: "$passedQuantity" }, defectiveQty: { $sum: "$defectiveQuantity" }, defectiveStickers: { $sum: { $cond: [{ $eq: ["$status", "defective"] }, 1, 0] } }, rawItems: { $addToSet: { i: "$rawItemId", v: "$variantId" } }, lastAt: { $max: "$inspectedAt" }, checkers: { $addToSet: "$inspectedByEmail" } } },
+    { $group: { _id: { mo: "$manufacturingOrderId", unit: { $ifNull: ["$unit", ""] } }, stickers: { $sum: 1 }, checkedQty: { $sum: "$quantity" }, passedQty: { $sum: "$passedQuantity" }, defectiveQty: { $sum: "$defectiveQuantity" }, defectiveStickers: { $sum: { $cond: [{ $eq: ["$status", "defective"] }, 1, 0] } }, rawItems: { $addToSet: { i: "$rawItemId", v: "$variantId" } }, lastAt: { $max: "$inspectedAt" }, checkers: { $addToSet: "$inspectedByEmail" } } },
+    { $group: { _id: "$_id.mo", stickers: { $sum: "$stickers" }, checkedQty: { $sum: "$checkedQty" }, passedQty: { $sum: "$passedQty" }, defectiveQty: { $sum: "$defectiveQty" }, defectiveStickers: { $sum: "$defectiveStickers" }, rawItemSets: { $push: "$rawItems" }, checkerSets: { $push: "$checkers" }, lastAt: { $max: "$lastAt" }, byUnit: { $push: { unit: "$_id.unit", stickers: "$stickers", checkedQty: "$checkedQty", passedQty: "$passedQty", defectiveQty: "$defectiveQty", defectiveStickers: "$defectiveStickers" } } } },
   ]);
-  return new Map(rows.map((r) => [String(r._id), { stickers: r.stickers, checkedQty: r4(r.checkedQty), passedQty: r4(r.passedQty), defectiveQty: r4(r.defectiveQty), defectiveStickers: r.defectiveStickers, rawItems: r.rawItems.length, lastAt: r.lastAt, checkers: r.checkers.length }]));
+  const distinct = (sets, key) => { const s = new Set(); for (const arr of sets || []) for (const v of arr || []) s.add(key(v)); return s.size; };
+  return new Map(rows.map((r) => [String(r._id), {
+    stickers: r.stickers, checkedQty: r4(r.checkedQty), passedQty: r4(r.passedQty), defectiveQty: r4(r.defectiveQty), defectiveStickers: r.defectiveStickers,
+    rawItems: distinct(r.rawItemSets, (v) => `${v.i || ""}|${v.v || ""}`),
+    lastAt: r.lastAt,
+    checkers: distinct(r.checkerSets, (v) => String(v || "")),
+    /* Biggest first, so a caller showing one line shows the one that matters. */
+    byUnit: (r.byUnit || []).map((u) => ({ unit: u.unit || "", stickers: u.stickers, checkedQty: r4(u.checkedQty), passedQty: r4(u.passedQty), defectiveQty: r4(u.defectiveQty), defectiveStickers: u.defectiveStickers })).sort((a, b) => b.checkedQty - a.checkedQty || String(a.unit).localeCompare(String(b.unit))),
+  }]));
 }
-const ZERO = { stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defectiveStickers: 0, rawItems: 0, lastAt: null, checkers: 0 };
+const ZERO = { stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defectiveStickers: 0, rawItems: 0, lastAt: null, checkers: 0, byUnit: [] };
 
 const orderRow = (mo, r) => ({
   manufacturingOrderId: String(mo._id), moNumber: moNumberOf(mo), requestId: mo.requestId || "", customerName: mo.customerInfo?.name || "—", requestType: mo.requestType || "", status: mo.status || "", createdAt: mo.createdAt || null, deliveryDate: mo.customerInfo?.deliveryDeadline || null,
@@ -242,35 +289,88 @@ const orderRow = (mo, r) => ({
   ...(r || ZERO),
 });
 
-/** JOB-WORK ORDERS ONLY (29 Sep 2026, explicit request). Raw material is
- *  checked only where the customer sends it, and Sales marks that on the
- *  PI/order line (`fulfilmentModel === "JOB_WORK"`), so the list — for the
- *  owner and for the checker's order picker — is those orders, with what has
- *  been checked on each. An order somebody checked BEFORE it was marked (or
- *  by mistake) still shows, so its records are never orphaned. */
+/**
+ * EVERY ELIGIBLE ORDER (29 Sep 2026). Eligibility is the material REQUIREMENT,
+ * not who owns the material: an order qualifies when a live work order of it
+ * allocates raw material, or something has already been checked on it, or
+ * customer material was received against it. See
+ * services/manufacturing/qcRawItemOrders.js for why the job-work filter this
+ * replaces was the wrong question.
+ *
+ * `scope`  all (the default) | checked | requires
+ * `source` all (the default) | FACTORY_PROCURED | CUSTOMER_SUPPLIED
+ *
+ * `source` is a FILTER, not a boundary. Narrowing to customer-supplied gives
+ * exactly the old list; the difference is that it is now the reader's choice.
+ */
 router.get("/orders", requireOwnerOrChecker, async (req, res) => {
   try {
     const q = str(req.query.q).toLowerCase();
-    const scope = str(req.query.scope) || "jobwork"; // jobwork | checked
-    const [mos, rl] = await Promise.all([CustomerRequest.find(LIVE).select(MO_SELECT).sort({ createdAt: -1 }).lean(), rollups(null)]);
-    let out = mos.map((mo) => orderRow(mo, rl.get(String(mo._id)))).filter((o) => o.isJobWork || o.stickers > 0);
+    const scope = str(req.query.scope) || "all"; // all | checked | requires
+    const source = str(req.query.source).toUpperCase() || "ALL";
+    const [eligible, rl] = await Promise.all([qcOrders.eligibleOrders(), rollups(null)]);
+
+    const rows = eligible
+      .filter((e) => e.eligible)
+      .map((e) => ({
+        ...orderRow(e.mo, rl.get(String(e.mo._id))),
+        materialSource: e.source.source,
+        materialSourceLabel: e.source.sourceLabel,
+        salesSaysJobWork: e.source.salesSaysJobWork,
+        /* WHY this order is here, so a reader can tell work that is coming from
+           work that is done. */
+        why: e.why,
+        rawItemsRequired: e.requirement.lines.size,
+        requiredQuantity: r4([...e.requirement.lines.values()].reduce((n, l) => n + (l.requiredQuantity || 0), 0)),
+        workOrders: e.requirement.workOrders,
+      }));
+
+    let out = rows;
     if (scope === "checked") out = out.filter((o) => o.stickers > 0);
+    else if (scope === "requires") out = out.filter((o) => o.why.requires);
+    if (source !== "ALL") out = out.filter((o) => o.materialSource === source);
     if (q) out = out.filter((o) => [o.moNumber, o.requestId, o.customerName].some((v) => String(v).toLowerCase().includes(q)));
     out.sort((a, b) => (b.stickers > 0) - (a.stickers > 0) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-    res.json({ success: true, orders: out, counts: { jobwork: out.length, checked: out.filter((o) => o.stickers > 0).length, notJobWorkButChecked: out.filter((o) => !o.isJobWork).length } });
+
+    res.json({
+      success: true, orders: out, scope, source,
+      counts: {
+        all: rows.length,
+        checked: rows.filter((o) => o.stickers > 0).length,
+        requires: rows.filter((o) => o.why.requires).length,
+        factoryProcured: rows.filter((o) => o.materialSource === qcOrders.SOURCE.FACTORY).length,
+        customerSupplied: rows.filter((o) => o.materialSource === qcOrders.SOURCE.CUSTOMER).length,
+        /* Kept so an older bundle reading `counts.jobwork` still renders a
+           number rather than an empty tab count. */
+        jobwork: rows.filter((o) => o.salesSaysJobWork).length,
+      },
+    });
   } catch (err) { console.error("[qc raw-items orders]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
-/** One order, raw item by raw item (rewritten 29 Sep 2026). Two figures frame
- *  the checking and NEITHER is the bill of material:
- *    asked     what Merchandising asked the customer to send — the ISSUED
- *              CustomerMaterialExpectation for the order (latest revision);
- *    received  what the Store actually booked in — the CUSTOMER_MATERIAL goods
- *              receipts against the order (their lines' base quantity), with the
- *              ownership lots as the fallback for a receipt recorded before the
- *              GRN carried the order. "To check" IS the received quantity: a
- *              roll that never arrived cannot be checked, and one that arrived
- *              short is checked short.
+/** One order, raw item by raw item. THREE figures frame the checking, and none
+ *  of them is a guess:
+ *    required  what the order NEEDS — `quantityRequired` summed across the live
+ *              work orders' `rawMaterials[]` allocations. Present for EVERY
+ *              order, which is what makes this page work for factory-procured
+ *              material (29 Sep 2026);
+ *    asked     what Merchandising asked the CUSTOMER to send — the ISSUED
+ *              CustomerMaterialExpectation for the order (latest revision).
+ *              Customer-supplied material only;
+ *    received  what the Store actually booked in as customer material — the
+ *              CUSTOMER_MATERIAL goods receipts against the order (their lines'
+ *              base quantity), with the ownership lots as the fallback for a
+ *              receipt recorded before the GRN carried the order.
+ *
+ *  "TO CHECK" IS `received` WHEN THERE IS ONE, ELSE `required`, and the row says
+ *  which through `expectedFrom`. The precedence is deliberate and preserves the
+ *  earlier behaviour exactly for customer-supplied orders: a roll that never
+ *  arrived cannot be checked, and one that arrived short is checked short, so
+ *  where the arrival is known it is the better answer. Where it is not — a
+ *  factory order, whose rolls are bought against a purchase order and not
+ *  against this MO — the requirement is the only honest target, and before this
+ *  such an order had none at all and reported nothing to check.
+ *
  *  Checked / passed / defective / remaining come from the standing records. */
 router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
   try {
@@ -278,17 +378,30 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
     const mo = await CustomerRequest.findById(req.params.moId).select(MO_SELECT).lean();
     if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
     const refs = [mo.requestId, moNumberOf(mo)].filter(Boolean);
-    const [expectation, grns, lots, records, rl, woCount] = await Promise.all([
+    const [expectation, grns, lots, records, rl, woCount, reqMap] = await Promise.all([
       CustomerMaterialExpectation.findOne({ orderRef: { $in: refs }, state: "ISSUED" }).sort({ revisionNo: -1 }).select("documentRef revisionNo lines issuedAt").lean().catch(() => null),
       GoodsReceipt.find({ sourceType: "CUSTOMER_MATERIAL", "customerMaterial.orderRef": { $in: refs }, status: { $ne: "VOID" } }).select("receiptNumber receiptDate lines").lean().catch(() => []),
       CustomerMaterialLot.find({ orderRef: { $in: refs } }).select("rawItemId variantId itemName sku baseUnit baseQuantity receiptQuantity receiptUnit receiptNumber").lean().catch(() => []),
       QCRawItemInspection.find({ manufacturingOrderId: mo._id }).sort({ inspectedAt: -1 }).lean(),
       rollups([String(mo._id)]),
       WorkOrder.countDocuments({ customerRequestId: mo._id }).catch(() => 0),
+      qcOrders.requirementsByOrder([String(mo._id)]).catch(() => new Map()),
     ]);
     const keyOf = (i, v) => `${i || ""}|${v || ""}`;
-    const blank = (k, seed = {}) => ({ rawItemId: k.split("|")[0], variantId: k.split("|")[1] || null, rawItemName: "", rawItemSku: "", variantLabel: "", unit: "", asked: null, received: null, receipts: [], stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null, ...seed });
+    const blank = (k, seed = {}) => ({ rawItemId: k.split("|")[0], variantId: k.split("|")[1] || null, rawItemName: "", rawItemSku: "", variantLabel: "", unit: "", required: null, allocated: null, issued: null, asked: null, received: null, receipts: [], stickers: 0, checkedQty: 0, passedQty: 0, defectiveQty: 0, defects: new Map(), lastAt: null, ...seed });
     const items = new Map();
+    /* required — the order's own bill of material, for every order. Seeded FIRST
+       so a factory-procured order has a row per material it needs even before
+       anything has been received or checked; previously such an order produced
+       an empty page. */
+    for (const line of (reqMap.get(String(mo._id))?.lines || new Map()).values()) {
+      const k = keyOf(line.rawItemId, line.variantId);
+      const cur = items.get(k) || blank(k, { rawItemName: line.rawItemName, rawItemSku: line.rawItemSku, variantLabel: line.variantLabel, unit: line.unit });
+      cur.required = r4((cur.required || 0) + (line.requiredQuantity || 0));
+      cur.allocated = r4((cur.allocated || 0) + (line.allocatedQuantity || 0));
+      cur.issued = r4((cur.issued || 0) + (line.issuedQuantity || 0));
+      items.set(k, cur);
+    }
     /* asked */
     for (const l of expectation?.lines || []) {
       const k = keyOf(l.rawItemId, l.variantId);
@@ -329,10 +442,17 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
       items.set(k, cur);
     }
     const rawItems = [...items.values()].map((x) => {
-      const expected = x.received != null && x.received > 0 ? x.received : null; // to check = received, nothing else
+      /* Received when the Store booked an arrival against this order, else the
+         order's own requirement. `expectedFrom` names which, because "45 m to
+         check" means different things when it is what arrived and when it is
+         what the order needs. */
+      const received = x.received != null && x.received > 0 ? x.received : null;
+      const required = x.required != null && x.required > 0 ? x.required : null;
+      const expected = received != null ? received : required;
+      const expectedFrom = received != null ? "received" : required != null ? "required" : null;
       const remaining = expected != null ? r4(Math.max(0, expected - x.checkedQty)) : null;
       const state = expected == null ? (x.stickers ? "checked" : x.asked != null ? "awaiting" : "none") : x.checkedQty >= expected ? "done" : x.checkedQty > 0 ? "partly" : "waiting";
-      return { ...x, defects: [...x.defects.values()].sort((a, b) => b.quantity - a.quantity), expected, expectedFrom: expected != null ? "received" : null, remaining, pct: expected ? Math.min(100, Math.round((x.checkedQty / expected) * 100)) : null, shortOfAsked: x.asked != null && x.received != null ? r4(Math.max(0, x.asked - x.received)) : null, state };
+      return { ...x, defects: [...x.defects.values()].sort((a, b) => b.quantity - a.quantity), expected, expectedFrom, remaining, pct: expected ? Math.min(100, Math.round((x.checkedQty / expected) * 100)) : null, shortOfAsked: x.asked != null && x.received != null ? r4(Math.max(0, x.asked - x.received)) : null, state };
     }).sort((a, b) => (b.stickers - a.stickers) || (b.expected || 0) - (a.expected || 0) || a.rawItemName.localeCompare(b.rawItemName));
     const byDefect = new Map();
     for (const r of live) for (const d of r.defects || []) { const x = byDefect.get(d.code) || { code: d.code, name: d.name, stickers: 0, quantity: 0 }; x.stickers += 1; x.quantity = r4(x.quantity + r.defectiveQuantity); byDefect.set(d.code, x); }
@@ -341,8 +461,14 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
     const totals = rl.get(String(mo._id)) || ZERO;
     const sum = (f) => r4(rawItems.reduce((n, x) => n + (x[f] || 0), 0));
     res.json({
-      success: true, order: orderRow(mo, totals),
-      summary: { ...totals, asked: sum("asked"), received: sum("received"), expected: sum("expected"), remaining: sum("remaining"), rawItemsExpected: rawItems.filter((x) => x.expected != null).length, rawItemsAsked: rawItems.filter((x) => x.asked != null).length, rawItemsDone: rawItems.filter((x) => x.state === "done").length, workOrders: woCount, receipts: grns.length || lots.length, receivedFrom, expectation: expectation ? { documentRef: expectation.documentRef, revisionNo: expectation.revisionNo, issuedAt: expectation.issuedAt } : null },
+      success: true,
+      order: {
+        ...orderRow(mo, totals),
+        /* Provenance, as context. Nothing on this page is gated on it. */
+        materialSource: qcOrders.orderSource(mo, { hasCustomerMaterial: grns.length > 0 || lots.length > 0 }).source,
+        materialSourceLabel: qcOrders.orderSource(mo, { hasCustomerMaterial: grns.length > 0 || lots.length > 0 }).sourceLabel,
+      },
+      summary: { ...totals, required: sum("required"), asked: sum("asked"), received: sum("received"), expected: sum("expected"), remaining: sum("remaining"), rawItemsExpected: rawItems.filter((x) => x.expected != null).length, rawItemsAsked: rawItems.filter((x) => x.asked != null).length, rawItemsDone: rawItems.filter((x) => x.state === "done").length, workOrders: woCount, receipts: grns.length || lots.length, receivedFrom, expectation: expectation ? { documentRef: expectation.documentRef, revisionNo: expectation.revisionNo, issuedAt: expectation.issuedAt } : null },
       rawItems, byDefect: [...byDefect.values()].sort((a, b) => b.quantity - a.quantity), byChecker: [...byChecker.values()].sort((a, b) => b.stickers - a.stickers), recent: records.slice(0, 200).map(recordView),
     });
   } catch (err) { console.error("[qc raw-items order]", err); res.status(500).json({ success: false, message: err.message }); }
@@ -354,12 +480,18 @@ function recordView(r) {
 
 /* ── the scan ────────────────────────────────────────────────────────────── */
 
-/** The sticker's id from whatever the scanner or camera read. */
+/**
+ * The sticker's id from whatever the scanner or camera read.
+ *
+ * DELEGATED to the shared classifier (29 Sep 2026), which fixed a real gap: this
+ * accepted `itemid=<id>`, the legacy `RawItem=<id>` and a bare 24-hex id, but NOT
+ * the URL form — `https://…/store/dashboard/item-info?itemid=<id>` — which is what
+ * every currently printed Store label encodes and what a phone camera hands over.
+ * Camera-scanning a modern label was refused here as "not a raw item label".
+ */
 function stickerIdOf(raw) {
-  const s = str(raw);
-  if (!s) return null;
-  const m = /(?:itemid=|RawItem=)([0-9a-f]{24})/i.exec(s) || /^([0-9a-f]{24})$/i.exec(s);
-  return m ? m[1] : null;
+  const id = classifyQcBarcode(raw);
+  return id.type === "raw_material" ? id.normalizedBarcode : null;
 }
 const stickerView = (b) => ({
   barcodeId: String(b._id), rawItemId: b.rawItem ? String(b.rawItem) : null, rawItemName: b.rawItemName || "—", rawItemSku: b.rawItemSku || "", variantId: b.variantId ? String(b.variantId) : null, variantLabel: (b.variantCombination || []).join(" · ") || "", variantSku: b.variantSku || "",
@@ -367,25 +499,89 @@ const stickerView = (b) => ({
   customerOrderRef: b.customerMaterial?.orderRef || "", customerLabel: b.customerMaterial?.customerLabel || "",
 });
 
-/** Look a sticker up against an order: what it is, and whether it was already checked. */
+/**
+ * Look a label up: what it is, which order it is for, and whether it was already
+ * checked.
+ *
+ * ── `moId` IS OPTIONAL SINCE 29 SEP 2026, AND THAT IS THE WHOLE POINT ──────
+ * This used to refuse every scan without one — "Choose the order first" — because
+ * a factory-procured label carries no order and the code had no other way to find
+ * one. It does now (services/manufacturing/qcRawItemOrders.js), so the order is
+ * RESOLVED from the label, from the standing verdicts and from who needs the
+ * material, and the checker is asked only when the answer is genuinely ambiguous.
+ *
+ * Three answers, and the caller must handle all three:
+ *   order set, orderResolution "auto"    one order — carry on
+ *   order null, orderResolution "choose" several — ask, then call again with moId
+ *   order null, orderResolution "none"   nothing — do NOT invent one
+ *
+ * Passing `moId` still pins the order, which is what the chooser's second call
+ * does and what a deep link from an order page does.
+ */
 router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
   try {
     const id = stickerIdOf(req.body?.code);
-    if (!id) return res.status(400).json({ success: false, code: "NOT_A_STICKER", message: "That is not a raw item label. Scan the Store's label on the raw item (it reads itemid=…)." });
-    if (!isId(req.body?.moId)) return res.status(400).json({ success: false, message: "Choose the order first." });
-    const [b, mo] = await Promise.all([Barcode.findById(id).lean(), CustomerRequest.findById(req.body.moId).select(MO_SELECT).lean()]);
-    if (!b) return res.status(404).json({ success: false, code: "UNKNOWN_STICKER", message: "No raw item with that label is on record." });
-    if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
+    if (!id) return res.status(400).json({ success: false, code: "NOT_A_STICKER", message: "That is not a raw material label. Scan the Store's label on the material itself." });
+    const b = await Barcode.findById(id).lean();
+    if (!b) return res.status(404).json({ success: false, code: "UNKNOWN_STICKER", message: "No raw material with that label is on record." });
+
+    /* An explicit order pins it; otherwise resolve. */
+    let mo = null;
+    let resolution = null;
+    if (isId(req.body?.moId)) {
+      mo = await CustomerRequest.findById(req.body.moId).select(MO_SELECT).lean();
+      if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
+    } else {
+      resolution = await qcOrders.resolveOrdersForLabel(b);
+      if (resolution.resolution === "auto") {
+        mo = await CustomerRequest.findById(resolution.candidates[0].manufacturingOrderId).select(MO_SELECT).lean();
+      }
+    }
+
+    const src = qcOrders.labelSource(b);
+
+    /* No order yet: report the label and the choice, and nothing about a verdict
+       — there is no order to record one against. */
+    if (!mo) {
+      const priors = await QCRawItemInspection.find({ barcodeId: b._id, superseded: { $ne: true } })
+        .select("moNumber status inspectedAt inspectedByName").lean();
+      return res.json({
+        success: true,
+        sticker: { ...stickerView(b), ...src },
+        order: null,
+        orders: resolution?.candidates || [],
+        orderResolution: resolution?.resolution || "none",
+        orderReason: resolution?.reason || "",
+        prior: null,
+        warnings: priors.length ? [`Already checked on ${priors.map((p) => p.moNumber).join(", ")}.`] : [],
+      });
+    }
+
     const [onThis, elsewhere] = await Promise.all([
       QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: mo._id, superseded: { $ne: true } }).lean(),
       QCRawItemInspection.find({ barcodeId: b._id, manufacturingOrderId: { $ne: mo._id }, superseded: { $ne: true } }).select("moNumber status inspectedAt inspectedByName").lean(),
     ]);
     const warnings = [];
     const ref = b.customerMaterial?.orderRef || "";
-    if (ref && ref !== mo.requestId && ref !== moNumberOf(mo)) warnings.push(`This raw item was received for ${ref}, not ${moNumberOf(mo)}.`);
-    if (!(b.quantity > 0)) warnings.push("This raw item shows no quantity left (it was used up).");
+    if (ref && ref !== mo.requestId && ref !== moNumberOf(mo)) warnings.push(`This material was received for ${ref}, not ${moNumberOf(mo)}.`);
+    if (!(b.quantity > 0)) warnings.push("This label shows no quantity left (it was used up).");
     if (elsewhere.length) warnings.push(`Already checked on ${elsewhere.map((e) => e.moNumber).join(", ")}.`);
-    res.json({ success: true, sticker: stickerView(b), order: { manufacturingOrderId: String(mo._id), moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "", isJobWork: isJobWork(mo) }, prior: onThis ? recordView(onThis) : null, warnings });
+
+    res.json({
+      success: true,
+      sticker: { ...stickerView(b), ...src },
+      order: {
+        manufacturingOrderId: String(mo._id), moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "",
+        /* Descriptive. See the header — this decides nothing. */
+        isJobWork: isJobWork(mo),
+        ...qcOrders.orderSource(mo),
+      },
+      orders: resolution?.candidates || [],
+      orderResolution: resolution?.resolution || "auto",
+      orderReason: resolution?.reason || "",
+      prior: onThis ? recordView(onThis) : null,
+      warnings,
+    });
   } catch (err) { console.error("[qc raw-items lookup]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
@@ -410,7 +606,7 @@ router.post("/save", requireChecker, async (req, res) => {
       const known = await QCRawItemSetting.find({ kind: "defect", code: { $in: codes }, isActive: true }).lean();
       const byCode = new Map(known.map((d) => [d.code, d]));
       const unknown = codes.filter((c) => !byCode.has(c));
-      if (unknown.length) return res.status(400).json({ success: false, message: `Unknown reason${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. The owner defines them on Raw item setup.` });
+      if (unknown.length) return res.status(400).json({ success: false, message: `Unknown reason${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. The owner defines them under Setup \u203a Raw-material QC.` });
       picked = codes.map((c) => ({ code: c, name: byCode.get(c).name, category: byCode.get(c).category || "" }));
       defQty = defectiveQuantity === undefined || defectiveQuantity === null || defectiveQuantity === "" ? qty : r4(defectiveQuantity);
       if (!(defQty > 0) || defQty > qty) return res.status(400).json({ success: false, message: `The defective quantity must be between 0 and ${qty} ${b.unit || ""}.`.trim() });

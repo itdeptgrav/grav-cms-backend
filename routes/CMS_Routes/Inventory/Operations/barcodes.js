@@ -7,6 +7,7 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+const { identityRefusal } = require("../../../../services/storePurchase/labelIdentity");
 const Barcode = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
@@ -501,10 +502,30 @@ router.get("/:id", async (req, res) => {
     /* An ordinary label. The response shape is unchanged, and `ownership` says so
        rather than being absent — a reader that checks for it gets an answer on
        every scan instead of having to treat "missing" as "ours". */
+    /* ── A SCAN GETS THE TRUTH, NOT A 404 ─────────────────────────────────
+       A label reserved or printed during a count is a real identity for
+       material GRAV has not received. Hiding it would be wrong — the person
+       holding it needs to know what it is — but calling it available stock is
+       worse. So the record is returned and the claim is corrected.
+
+       The concrete case, because an abstract rule is easy to overrule in a
+       cleanup: somebody is standing at a scanner holding a label off a roll in
+       a count that has not been finished. A 404 tells them the sticker is
+       rubbish and they bin it — and it was about to become a real stock
+       identity the moment the receipt was recorded. Returning the record with
+       `availableAsGeneralStock: false` and the reason tells them to go and
+       finish the receipt instead. Do not turn this into a 404. */
+    const idRefusal = identityRefusal(barcode);
     return res.json({
       success: true,
       barcode,
-      ownership: { kind: "COMPANY_OWNED", banner: "", availableAsGeneralStock: true },
+      identityState: barcode.identityState || "ACTIVATED",
+      ownership: {
+        kind: "COMPANY_OWNED",
+        banner: idRefusal ? idRefusal.message : "",
+        availableAsGeneralStock: !idRefusal,
+      },
+      ...(idRefusal ? { notStock: { reason: idRefusal.reason, message: idRefusal.message } } : {}),
     });
   } catch (error) {
     console.error("Error fetching barcode:", error);

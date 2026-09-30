@@ -2201,6 +2201,12 @@ app.use("/api/cms/measurements", measurementRoutes);
 const qcTeamRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcTeamRoutes");
 app.use("/api/cms/manufacturing/qc/team", qcTeamRoutes);
 
+// Raw-material checking is a separate QC workflow. Keep the longer prefix
+// ahead of the general QC router so its config, scan and reporting endpoints
+// cannot fall through to another handler and return the application's 404 HTML.
+const qcRawItemRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRawItemRoutes");
+app.use("/api/cms/manufacturing/qc/raw-items", qcRawItemRoutes);
+
 // Mounted BEFORE the main qc router for the same reason /team is: the
 // assistant owns /assistant and /assistant/report, and a future qcRoutes route
 // on that prefix would otherwise shadow it silently.
@@ -2212,6 +2218,13 @@ app.use("/api/cms/manufacturing/qc/raw-items", qcRawItemRoutes);
 
 const qcAssistantRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcAssistantRoutes");
 app.use("/api/cms/manufacturing/qc", qcAssistantRoutes);
+
+// The unified Inspect screen's hinge: POST /identify-barcode says whether a
+// scanned value is a garment piece, a raw-material label or neither, and whether
+// this person may inspect it. Mounted ahead of qcRoutes for the same
+// shadowing reason as the assistant above.
+const qcIdentifyRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcIdentifyRoutes");
+app.use("/api/cms/manufacturing/qc", qcIdentifyRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);

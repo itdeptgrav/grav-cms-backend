@@ -73,6 +73,7 @@ const {
 const { getEffectiveRole, roleAtLeast } = require("../../../services/departmentRoles");
 const { fail, sendError, handle } = require("../../../services/storePurchase/errors");
 const ieRead = require("../../../services/industrialEngineering/ieRead.service");
+const ieDevelopment = require("../../../services/industrialEngineering/ieDevelopment.service");
 const ieOrders = require("../../../services/industrialEngineering/ieOrders.service");
 const ieLibrary = require("../../../services/industrialEngineering/ieOperationLibrary.service");
 const ieStyleFile = require("../../../services/industrialEngineering/ieStyleFile.service");
@@ -262,6 +263,57 @@ router.get("/orders/:orderId", requireCompany, canRead, handle(async (req, res) 
  * engineering unit an order opens into. Bounded and stably ordered. It does
  * not take a Journey, does not require one, and does not publish one.
  */
+/* ══ IE DEVELOPMENT — THE PRE-ORDER REGISTER ══════════════════════════════════
+ *
+ * ── WHY THIS IS NOT `GET /styles` WITH A FILTER ─────────────────────────────
+ * `/styles` below is Chunk 1's read of the LEGACY route comparison: two stored
+ * operation arrays published side by side with a statement of whether they
+ * agree. It answers "what does this style's route look like, and do the two
+ * sources disagree". It is not a work queue, it composes nothing from
+ * Merchandising or R&D, and it deliberately picks no authority between the two
+ * arrays. Both endpoints stay exactly as they are.
+ *
+ * This register answers a different question — WHOSE MOVE IS IT — over the same
+ * Sales style population, and composes the published position from Sales,
+ * Merchandising, R&D and the existing `IeStyleFile` and its approved children.
+ * See services/industrialEngineering/ieDevelopment.service.js.
+ *
+ * ── AND READING IT OPENS NOTHING ────────────────────────────────────────────
+ * A row may say a file MAY be opened (`canOpenEngineeringFile`); opening one is
+ * still the deliberate POST further down, behind `canWrite`. `canRead` here, as
+ * on every other read in this department. */
+
+/**
+ * GET /development — the register, one view at a time.
+ *
+ * `role` travels into the service because `canOpenEngineeringFile` is a
+ * courtesy to the screen and not the boundary: the POST re-proves it. Every
+ * other decision on the row is a fact about records, not about the reader.
+ */
+router.get("/development", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieDevelopment.listDevelopment({ ...req.ie, role: req.ieRole }, {
+    view: req.query.view,
+    q: req.query.q,
+    limit: req.query.limit,
+    cursor: req.query.cursor,
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/**
+ * GET /development/:styleId — one row, with the read-only upstream evidence.
+ *
+ * The workspace's Source & Handoff section is built from this. There is no
+ * PATCH beside it and there will not be one: Sales', Merchandising's and R&D's
+ * records are theirs, and IE reads them.
+ */
+router.get("/development/:styleId", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieDevelopment.readDevelopment({ ...req.ie, role: req.ieRole }, {
+    styleId: req.params.styleId,
+  });
+  return res.json({ success: true, ...out });
+}));
+
 router.get("/styles", requireCompany, canRead, handle(async (req, res) => {
   const out = await ieRead.listStyles(req.ie, {
     limit: req.query.limit,

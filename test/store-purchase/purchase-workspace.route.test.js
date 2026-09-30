@@ -158,6 +158,11 @@ describe("reaching the workspace", () => {
     expect(bad.body.status).toBe("open");
   });
 
+  test("the Purchase Orders scope excludes sourcing records", () => {
+    expect(svc.readQuery({ records: "orders" }).ordersOnly).toBe(true);
+    expect(svc.readQuery({}).ordersOnly).toBe(false);
+  });
+
   test("another company's purchasing is never visible", async () => {
     const a = await company(); const b = await company();
     const tokenB = await actor(b);
@@ -326,26 +331,29 @@ describe("money and units", () => {
      open question, and an approved need has an APPROVED amount, not an ordered
      one. Counting any of them as "not valued" would report them as orders
      somebody forgot to price. */
-  test("needs, quotations and decisions are not counted as unpriced orders", () => {
+  test("quotations and decisions are not counted as unpriced orders", () => {
     const s = svc.summarise([
       { recordType: "material-order", totalAmount: 500, currency: "INR" },
-      { recordType: "need", approvedAmount: 9999, currency: "INR" },
       { recordType: "offer", currency: "INR" },
       { recordType: "decision", currency: null },
     ]);
     expect(s.totalsByCurrency).toEqual([{ currency: "INR", amount: 500 }]);
     expect(s.unvaluedCount).toBe(0);
-    /* The figures describe one order, though four rows are on screen. */
+    /* The figures describe one order, though three rows are on screen. */
     expect(s.valuedRecordCount).toBe(1);
-    expect(s.rowCount).toBe(4);
-    /* Needs are counted in their own right, never valued. */
-    expect(s.needCount).toBe(1);
+    expect(s.rowCount).toBe(3);
   });
 
-  test("an approved need's amount never reaches the stage total", () => {
-    const s = svc.summarise([{ recordType: "need", approvedAmount: 100000, totalAmount: 100000, currency: "INR" }]);
-    expect(s.totalsByCurrency).toEqual([]);
-    expect(s.needCount).toBe(1);
+  /* ── THE SUMMARY COUNTS PURCHASING RECORDS, AND ONLY THOSE (30 Sep 2026) ──
+     `needCount` is gone with the rows it counted. A count of pre-purchase
+     records in a summary of purchasing is a figure nobody can act on from
+     this screen. */
+  test("the summary carries no approved-needs count", () => {
+    const s = svc.summarise([{ recordType: "material-order", totalAmount: 500, currency: "INR" }]);
+    expect(s).not.toHaveProperty("needCount");
+    expect(Object.keys(s).sort()).toEqual(
+      ["rowCount", "totalsByCurrency", "unvaluedCount", "valuedRecordCount"],
+    );
   });
 
   test("a mixed-unit order reports a line count, never a summed quantity", async () => {
@@ -835,148 +843,80 @@ describe("search keeps company scoping", () => {
    already quoted. A workspace whose first tab only fills up after an offer
    exists hides the work that most needs doing.
    ────────────────────────────────────────────────────────────────────────── */
-describe("approved needs in To source", () => {
-  it("an approved need with no offer and no decision still appears", async () => {
+describe("approved demand is NOT a purchasing record (30 Sep 2026)", () => {
+  /* ── WHY THESE ROWS LEFT ─────────────────────────────────────────────────
+     This workspace lists purchasing records. An approved spend request is a
+     PRE-purchase record: nobody has ordered anything, so a row reading
+     "Approved, not yet ordered" in a table of purchase orders described a
+     document that did not exist, and a buyer could not tell it from one that
+     did. The demand still lives in Store › Requests, and the request's own
+     page still raises the order. Nothing about the governed chain changed.
+     ──────────────────────────────────────────────────────────────────────── */
+
+  it("an approved request never appears as a workspace row", async () => {
     const co = await company();
     const token = await actor(co);
     const need = await makeNeed(co, { title: "Two laptops" });
 
     const res = await call(`${WS}?stage=to-source`, { token });
     expect(res.status).toBe(200);
-    const row = res.body.rows.find((r) => r.reference === need.requestNumber);
-    expect(row).toBeDefined();
-    expect(row.recordType).toBe("need");
-    expect(row.stage).toBe("to-source");
-    /* Nothing has been sourced, so there is no supplier to name. */
-    expect(row.supplierLabel).toBe("");
+    expect(res.body.rows.some((r) => r.recordType === "need")).toBe(false);
+    expect(res.body.rows.some((r) => r.reference === need.requestNumber)).toBe(false);
   });
 
-  it("each need is labelled Material or Outside service by its request type", async () => {
-    const co = await company();
-    const token = await actor(co);
-    const product = await makeNeed(co, { requestType: "PRODUCT" });
-    const service = await makeNeed(co, { requestType: "SERVICE" });
-    /* A legacy SOFTWARE request is a service, exactly as the model labels it
-       on screen — never silently reclassified as a material. */
-    const legacy = await makeNeed(co, { requestType: "SOFTWARE" });
-
-    const res = await call(`${WS}?stage=to-source`, { token });
-    const byRef = Object.fromEntries(res.body.rows.map((r) => [r.reference, r]));
-    expect(byRef[product.requestNumber].purchaseType).toBe("material");
-    expect(byRef[service.requestNumber].purchaseType).toBe("service");
-    expect(byRef[legacy.requestNumber].purchaseType).toBe("service");
-  });
-
-  it("the type filter selects needs by their kind", async () => {
-    const co = await company();
-    const token = await actor(co);
-    const product = await makeNeed(co, { requestType: "PRODUCT" });
-    const service = await makeNeed(co, { requestType: "SERVICE" });
-
-    const mat = await call(`${WS}?stage=to-source&type=material`, { token });
-    expect(mat.body.rows.map((r) => r.reference)).toContain(product.requestNumber);
-    expect(mat.body.rows.map((r) => r.reference)).not.toContain(service.requestNumber);
-
-    const svcOnly = await call(`${WS}?stage=to-source&type=service`, { token });
-    expect(svcOnly.body.rows.map((r) => r.reference)).toContain(service.requestNumber);
-    expect(svcOnly.body.rows.map((r) => r.reference)).not.toContain(product.requestNumber);
-  });
-
-  it("freight has no approved-demand source, so no need is invented for it", async () => {
+  it("no stage, type or status combination surfaces one", async () => {
     const co = await company();
     const token = await actor(co);
     await makeNeed(co, { requestType: "PRODUCT" });
     await makeNeed(co, { requestType: "SERVICE" });
+    await makeNeed(co, { requestType: "SOFTWARE" });
 
-    /* A request is raised as PRODUCT or SERVICE; there is no freight demand
-       record anywhere, and manufacturing one from a material request would be
-       a guess presented as a fact. */
-    const res = await call(`${WS}?stage=to-source&type=freight`, { token });
-    expect(res.body.rows.filter((r) => r.recordType === "need")).toEqual([]);
-  });
-
-  it("only approved demand appears — not draft, pending, rejected or already ordered", async () => {
-    const co = await company();
-    const token = await actor(co);
-    const approved = await makeNeed(co, { status: "approved" });
-    const ordered = await makeNeed(co, { status: "ordered" });
-    const pending = await makeNeed(co, { status: "pending_finance" });
-    const rejected = await makeNeed(co, { status: "rejected" });
-    /* Alive, but finance sent it back over the FIGURE. Not approved, so not
-       something to ring a supplier about. */
-    const exception = await makeNeed(co, { status: "budget_exception" });
-
-    const res = await call(`${WS}?stage=to-source`, { token });
-    const refs = res.body.rows.map((r) => r.reference);
-    expect(refs).toContain(approved.requestNumber);
-    for (const other of [ordered, pending, rejected, exception]) {
-      expect(refs).not.toContain(other.requestNumber);
+    for (const stage of ["to-source", "drafted", "on-order", "completed", "closed"]) {
+      for (const type of ["all", "material", "service", "freight"]) {
+        for (const status of ["open", "closed"]) {
+          const res = await call(`${WS}?stage=${stage}&type=${type}&status=${status}`, { token });
+          expect(res.status).toBe(200);
+          expect(res.body.rows.some((r) => r.recordType === "need")).toBe(false);
+        }
+      }
     }
   });
 
-  it("an approved need carries what a buyer needs before ringing anyone", async () => {
+  it("the summary reports no approved-needs count", async () => {
     const co = await company();
     const token = await actor(co);
-    const need = await makeNeed(co, {
-      department: "Cutting", requestedByName: "Meena",
-      neededBy: new Date("2026-11-01"), priority: "URGENT", totalAmount: 45000,
-    });
+    await makeNeed(co);
 
     const res = await call(`${WS}?stage=to-source`, { token });
-    const row = res.body.rows.find((r) => r.reference === need.requestNumber);
-    expect(row.requestedFor).toBe("Cutting");
-    expect(row.requestedByName).toBe("Meena");
-    expect(row.priority).toBe("URGENT");
-    expect(row.approvedAmount).toBe(45000);
-    expect(new Date(row.neededBy).toISOString()).toContain("2026-11-01");
+    expect(res.body.summary).not.toHaveProperty("needCount");
   });
 
-  it("a need's action opens the approved request, and this read writes nothing", async () => {
+  it("approved demand is no longer a source the response reports on", async () => {
     const co = await company();
     const token = await actor(co);
-    const need = await makeNeed(co);
+    await makeNeed(co);
 
     const res = await call(`${WS}?stage=to-source`, { token });
-    const row = res.body.rows.find((r) => r.reference === need.requestNumber);
-    expect(row.nextAction.href).toBe(`/store/dashboard/order-requests/quote/${need._id}`);
+    expect(res.body.sources).not.toHaveProperty("approvedNeeds");
+    expect((res.body.unavailable || []).some((u) => u.source === "approvedNeeds")).toBe(false);
+  });
 
-    /* The request is untouched: same status, no order reference minted. */
+  /* THE REQUEST ITSELF IS UNTOUCHED. Removing a listing must not remove,
+     rewrite or re-status the record it used to list. */
+  it("the spend request is left exactly as it was", async () => {
+    const co = await company();
+    const token = await actor(co);
+    const need = await makeNeed(co, { title: "Two laptops" });
+    const before = await SpendRequest.collection.findOne({ _id: need._id });
+
+    await call(`${WS}?stage=to-source`, { token });
+
     const after = await SpendRequest.collection.findOne({ _id: need._id });
+    expect(after).toEqual(before);
     expect(after.status).toBe("approved");
-    expect(after.orderReference).toBeUndefined();
-  });
-
-  it("needs are company-scoped like every other source", async () => {
-    const mine = await company();
-    const theirs = await company();
-    const token = await actor(mine);
-    const ours = await makeNeed(mine);
-    const notOurs = await makeNeed(theirs);
-
-    const res = await call(`${WS}?stage=to-source`, { token });
-    const refs = res.body.rows.map((r) => r.reference);
-    expect(refs).toContain(ours.requestNumber);
-    expect(refs).not.toContain(notOurs.requestNumber);
-  });
-
-  it("needs appear only in To source, never in a later stage", async () => {
-    const co = await company();
-    const token = await actor(co);
-    const need = await makeNeed(co);
-
-    for (const stage of ["draft-orders", "on-order", "completed"]) {
-      const res = await call(`${WS}?stage=${stage}`, { token });
-      expect(res.body.rows.map((r) => r.reference)).not.toContain(need.requestNumber);
-    }
   });
 });
 
-/* ──────────────────────────────────────────────────────────────────────────
-   3 + 4. CLOSED IS ONE ORTHOGONAL VIEW
-
-   A cancelled order has no stage. Giving it one either drops it or repeats it
-   under all four tabs, and both were happening.
-   ────────────────────────────────────────────────────────────────────────── */
 describe("cancelled and closed", () => {
   it("an expired ACTIVE offer appears in the closed view, exactly once", async () => {
     const co = await company();
@@ -1290,91 +1230,24 @@ describe("legacy exact-status links", () => {
    {id}` — a store requirement and its work orders, a different record
    entirely. The spend request's own page is the `quote` route.
    ────────────────────────────────────────────────────────────────────────── */
-describe("an approved need links to the page that can open it", () => {
-  it("the destination is the quote route, exactly", async () => {
-    const co = await company();
-    const token = await actor(co);
-    const need = await makeNeed(co);
-
-    const res = await call(`${WS}?stage=to-source`, { token });
-    const row = res.body.rows.find((r) => r.reference === need.requestNumber);
-    expect(row.nextAction.href).toBe(`/store/dashboard/order-requests/quote/${need._id}`);
-    /* Not the generic route, which serves a different record. */
-    expect(row.nextAction.href).not.toBe(`/store/dashboard/order-requests/${need._id}`);
-    expect(row.nextAction.href).toMatch(/\/order-requests\/quote\/[0-9a-f]{24}$/);
-  });
-
-  it("the API that page loads serves this exact request", async () => {
-    /* ── THE CONTRACT THE LINK DEPENDS ON ─────────────────────────────────
-       The quote page loads through `GET /api/requests/spend/{id}`, so that
-       route must answer with THIS request. Asserting only that the href
-       contains the id would have passed for the generic route too — which
-       reads `/api/cms/store/order-requests/{id}`, an entirely different
-       record. This drives the real route and checks the record that comes
-       back. */
-    const co = await company();
-    const Employee = require("../../models/Employee");
-    const biometricId = `PWEMP${++seq}`;
-    /* Inserted rather than `create`d: the Employee schema defaults `gender` to
-       "" and then refuses it against its own enum, so a minimal fixture cannot
-       be saved through the model. This suite is testing a purchasing route, not
-       the HR schema, and inventing a gender for a fixture person to satisfy a
-       validator would be the wrong fix. */
-    const empId = new mongoose.Types.ObjectId();
-    await Employee.collection.insertOne({
-      _id: empId, firstName: "Rutu", lastName: "P",
-      email: `emp${seq}@x.example`, biometricId, isActive: true,
-    });
-    const token = tokenFor({ id: String(empId), employeeId: biometricId, email: `emp${seq}@x.example` });
-
-    const need = await makeNeed(co, { title: "Two laptops for sampling" });
-    /* The viewer is the requester, so the route's own ownership check passes
-       without needing a fulfilment grant — this test is about the ROUTE, not
-       about who may see somebody else's request. */
-    await SpendRequest.collection.updateOne({ _id: need._id }, { $set: { requestedBy: empId } });
-
-    const spendApp = express();
-    spendApp.use(express.json());
-    spendApp.use("/api/requests/spend", require("../../routes/CMS_Routes/Requests/spendRequests"));
-    const spendServer = await new Promise((resolve) => {
-      const srv = spendApp.listen(0, () => resolve(srv));
-    });
-    try {
-      const port = spendServer.address().port;
-      const r = await fetch(`http://127.0.0.1:${port}/api/requests/spend/${need._id}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const body = await r.json().catch(() => null);
-      expect(r.status).toBe(200);
-      /* The exact approved request, by its own number — not merely a 200. */
-      expect(body.request.requestNumber).toBe(need.requestNumber);
-      expect(body.request.title).toBe("Two laptops for sampling");
-      /* And still approved, so the page's "Create purchase order" action is
-         the one it will offer. */
-      expect(body.request.status).toBe("approved");
-    } finally {
-      await new Promise((resolve) => spendServer.close(resolve));
-    }
-  });
-
-  it("the generic order-requests route is a different API, not an alias", () => {
-    /* Why the href had to change at all: the two routes read different
-       endpoints, so the generic one cannot serve a spend request. */
+describe("the approved request still raises the order from its own page", () => {
+  /* ── WHERE THE ACTION LIVES NOW ──────────────────────────────────────────
+     The workspace row used to be the way in. It never raised anything itself —
+     it linked to the request's own page, which is where the button has always
+     been. Removing the row removed a listing, not an action, and this proves
+     the destination is still there and still governed.
+     ──────────────────────────────────────────────────────────────────────── */
+  it("the quote page carries Create purchase order for an approved request", () => {
     const fs = require("fs");
-    const genericPage = "/Users/risheeray/grav-cms/app/store/dashboard/order-requests/[id]/page.js";
-    const quotePage = "/Users/risheeray/grav-cms/app/store/dashboard/order-requests/quote/[id]/page.js";
-    const generic = fs.readFileSync(genericPage, "utf8");
-    const quote = fs.readFileSync(quotePage, "utf8");
-
-    expect(generic).toContain("/api/cms/store/order-requests/");
-    expect(generic).not.toContain("spendApi");
-
-    /* The quote page loads the spend request and carries the action that
-       turns it into an order. */
-    expect(quote).toContain("spendApi");
-    expect(quote).toMatch(/spendApi\(`\/\$\{id\}`\)/);
-    expect(quote).toContain("/purchase-order");
+    const quote = fs.readFileSync(
+      "/Users/risheeray/grav-cms/app/store/dashboard/order-requests/quote/[id]/page.js",
+      "utf8",
+    );
     expect(quote).toContain("Create purchase order");
+    /* Offered only on an approved request, and only until one exists. */
+    expect(quote).toMatch(/r\.status === "approved"/);
+    /* It posts to the governed route, which is what writes PO provenance. */
+    expect(quote).toMatch(/\/purchase-order/);
     /* An approved SERVICE becomes a service order from the same page. */
     expect(quote).toContain("/service-order");
   });

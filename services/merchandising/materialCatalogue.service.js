@@ -109,9 +109,8 @@ function suggestCategory(item) {
 const SAFE_SELECT = "name sku category customCategory usedAs unit customUnit attributes "
   + "variants._id variants.sku variants.combination companyId "
   /* Whose property the material normally is — a merchandiser choosing a
-     customer-supplied line should see it. The customer's id and label only;
-     nothing commercial travels with them. */
-  + "defaultOwnership owningCustomerId owningCustomer";
+     customer-supplied line should see it. */
+  + "defaultOwnership";
 
 /* ── AND AN ALLOW-LIST OF FIELDS IS NOT ENOUGH ─────────────────────────────
    `attributes` is the one safe-looking field that is FREE TEXT, both in its
@@ -246,7 +245,7 @@ const safeItem = (item) => {
     variants,
     variantCount: variants.length,
     suggestedCategory: suggestCategory(item),
-    /* Company owned, or customer property with the customer named. */
+    /* Company owned, or customer property. */
     ownership: materialOwnership.ownershipView(item),
   };
 };

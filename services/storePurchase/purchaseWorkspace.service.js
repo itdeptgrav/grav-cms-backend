@@ -38,7 +38,6 @@ const ServiceSupplierOffer = require("../../models/CMS_Models/Inventory/Sourcing
 const FreightOffer = require("../../models/CMS_Models/Inventory/Sourcing/FreightOffer");
 /* The approved purchasing demand that starts the whole chain. Read-only here:
    this adapter never writes a request, and never changes one's status. */
-const SpendRequest = require("../../models/CMS_Models/Requests/SpendRequest");
 
 const tenantContext = require("./tenantContext.service");
 
@@ -67,7 +66,8 @@ function scoped(tenant, base, ...orGroups) {
   return filter;
 }
 
-/* The four tabs, as the URL spells them. */
+/* The four adapter stages, including the legacy sourcing view retained for
+   callers outside the Purchase Orders screen. */
 const STAGE = Object.freeze({
   TO_SOURCE: "to-source",
   DRAFT: "draft-orders",
@@ -87,36 +87,15 @@ const TYPE = Object.freeze({
 const TYPES = Object.freeze([TYPE.ALL, TYPE.MATERIAL, TYPE.SERVICE, TYPE.FREIGHT]);
 
 const RECORD = Object.freeze({
-  /* An approved need with no quotation and no order yet — where purchasing
-     actually begins. Without it, "To source" only started once somebody had
-     already gone out to a supplier, which is the middle of the job. */
-  NEED: "need",
+  /* There is deliberately no `NEED` here. Approved demand is a pre-purchase
+     record and does not belong in a workspace of purchasing records — see the
+     note in `workspace()`. */
   MATERIAL_ORDER: "material-order",
   SERVICE_ORDER: "service-order",
   OFFER: "offer",
   DECISION: "decision",
 });
 
-/* ── THE APPROVED-DEMAND SOURCE ─────────────────────────────────────────────
-   A spend request at `approved` is money somebody has signed off and nobody has
-   ordered against: the next status is `ordered`, and it carries the PO or work
-   order number. So `approved` is exactly "needs purchasing, not yet bought".
-
-   `budget_exception` is deliberately NOT included. It is alive, but finance
-   sent it back over the figure — showing it as approved demand would put a
-   buyer on a supplier call for money nobody has agreed. */
-const NEED_STATUS = "approved";
-
-/* A request is raised as a PRODUCT or a SERVICE. `SOFTWARE` is a legacy third
-   value that the model itself already labels "Service" on screen, so it maps
-   the same way here rather than quietly becoming a material.
-
-   There is no freight entry: see the note in `workspace`. */
-const NEED_TYPE = Object.freeze({
-  PRODUCT: TYPE.MATERIAL,
-  SERVICE: TYPE.SERVICE,
-  SOFTWARE: TYPE.SERVICE,
-});
 
 /* ── THE STAGE MAPPING, FROM STORED STATUS ONLY ──────────────────────────────
    Read these beside §3 of the task document. A status absent from a table does
@@ -175,9 +154,6 @@ const ACTION = Object.freeze({
   RESOLVE_EXCEPTION: { code: "RESOLVE_EXCEPTION", label: "Resolve exception" },
   VIEW_COMPLETED: { code: "VIEW_COMPLETED", label: "View completed order" },
   REVIEW_OFFER: { code: "REVIEW_OFFER", label: "Review quotation" },
-  /* Opens the approved request Store raises the order from. Wording says what
-     the destination does — it does not promise an order has been raised. */
-  RAISE_ORDER: { code: "RAISE_ORDER", label: "Raise order from approved request" },
   /* The freight register, which has no per-quotation page to open. */
   OPEN_FREIGHT_REGISTER: { code: "OPEN_FREIGHT_REGISTER", label: "Open freight quotations" },
 });
@@ -247,13 +223,14 @@ function readQuery(q = {}) {
   const inferred = explicitStage ? null : inferredViewFor(poStatus);
   const stage = explicitStage || inferred?.stage || STAGE.TO_SOURCE;
   const status = explicitStatus || inferred?.status || STATUS_FILTER.OPEN;
+  const ordersOnly = str(q.records) === "orders";
 
   return {
     stage, type, status, search: str(q.search).slice(0, 200), page, pageSize,
     vendor, poStatus,
     /* So the page can tell whether a status it sent was honoured, and avoid
        showing a chip for a filter the server ignored. */
-    poStatusApplied: Boolean(poStatus),
+    poStatusApplied: Boolean(poStatus), ordersOnly,
     stageInferred: Boolean(inferred),
   };
 }
@@ -470,103 +447,6 @@ function statusesFor(map, stage, statusFilter) {
   return Object.entries(map).filter(([, v]) => v === stage).map(([k]) => k);
 }
 
-/**
- * Approved purchasing demand — where purchasing actually begins.
- *
- * ── WHY THIS SOURCE ─────────────────────────────────────────────────────────
- * "To source" used to start only once a supplier quotation existed, so the work
- * that most needs doing — an approved need nobody has gone out on yet — was the
- * one thing the workspace could not show. A spend request at `approved` is
- * money signed off and not yet ordered against: the next status is `ordered`,
- * which carries the PO or work-order number. So `approved` is precisely
- * "needs purchasing, not yet bought", and it is read here READ-ONLY — this
- * adapter never writes a request and never moves one's status.
- *
- * `budget_exception` is excluded on purpose: it is alive, but finance sent it
- * back over the figure, so it is not approved and showing it as approved demand
- * would put a buyer on a supplier call for money nobody has agreed.
- */
-async function readApprovedNeeds(tenant, { type, search }) {
-  /* Only the kinds this type filter asked for. Freight is absent by design —
-     see NEED_TYPE and the note in `workspace`. */
-  const wanted = Object.entries(NEED_TYPE)
-    .filter(([, t]) => type === TYPE.ALL || t === type)
-    .map(([k]) => k);
-  if (!wanted.length) return { rows: [], coverage: null };
-
-  const rx = search ? rxOf(search) : null;
-  const filter = scoped(
-    tenant,
-    { status: NEED_STATUS, requestType: { $in: wanted } },
-    rx ? [{ requestNumber: rx }, { title: rx }, { department: rx }, { requestedByName: rx }] : null,
-  );
-
-  const limit = ORDER_CAP();
-  const [storedMatchCount, docs] = await Promise.all([
-    SpendRequest.countDocuments(filter),
-    SpendRequest.find(filter)
-      .select("requestNumber title requestType department requestedByName "
-        + "neededBy priority totalAmount financeApprovedAt createdAt")
-      .sort({ financeApprovedAt: -1, createdAt: -1, _id: -1 })
-      .limit(limit)
-      .lean(),
-  ]);
-  return {
-    rows: docs,
-    coverage: { scannedCount: docs.length, scanCap: limit, storedMatchCount, truncated: storedMatchCount > limit },
-  };
-}
-
-/**
- * One approved need as a workspace row.
- *
- * It carries no supplier and no order value, because neither exists yet — that
- * is the whole point of the row. `totalAmount` is what was APPROVED, so it is
- * reported under its own label rather than as an ordered value.
- */
-function needRow(req) {
-  return {
-    id: idOf(req._id),
-    recordType: RECORD.NEED,
-    /* Clearly labelled by kind, so a buyer knows whether this becomes a
-       purchase order or an outside-service order before opening it. */
-    purchaseType: NEED_TYPE[req.requestType] || TYPE.MATERIAL,
-    reference: req.requestNumber || "",
-    title: req.title || "",
-    /* No supplier has been chosen — that is what needs doing. */
-    supplierLabel: "",
-    stage: STAGE.TO_SOURCE,
-    /* The request's own stored status, verbatim, like every other row. */
-    exactStatus: NEED_STATUS,
-    orderDate: req.financeApprovedAt || req.createdAt || null,
-    /* When the requester needs it — a real stored date or nothing. */
-    neededBy: req.neededBy || null,
-    requestedFor: req.department || "",
-    requestedByName: req.requestedByName || "",
-    priority: req.priority || null,
-    approvedAmount: num(req.totalAmount),
-    /* The books are kept in one currency and a request states no other, so the
-       figure is reported in the company's own. */
-    currency: "INR",
-    exceptionSummary: null,
-    exceptionHref: null,
-    nextAction: {
-      ...ACTION.RAISE_ORDER,
-      /* ── THE SPEND REQUEST'S OWN PAGE, NOT THE GENERIC ONE ──────────────
-         `/store/dashboard/order-requests/{id}` looks like the right route and
-         is not: it reads `/api/cms/store/order-requests/{id}`, a store
-         requirement and its work orders. Handing it a spend request id gets a
-         screen about a different record entirely — or nothing.
-
-         The quote page is the spend request's page. It loads this exact
-         request through `/api/requests/spend/{id}` and carries the action that
-         raises the order from it: "Create purchase order" for an approved
-         PRODUCT, and the service-order flow for an approved SERVICE. Still
-         read-only from here — this links, it does not act. */
-      href: `/store/dashboard/order-requests/quote/${idOf(req._id)}`,
-    },
-  };
-}
 
 async function readMaterialOrders(tenant, { stage, status, search, vendor, poStatus }) {
   let statuses = statusesFor(MATERIAL_STAGE, stage, status);
@@ -720,8 +600,7 @@ async function readExceptions(tenant) {
  *
  * ── ONLY THINGS THAT HAVE AN ORDERED VALUE ──────────────────────────────────
  * A committed order has one. A quotation is a rate for a quantity nobody has
- * committed to, a sourcing decision is an open question, and an approved need
- * has an APPROVED amount rather than an ordered one. Counting any of those as
+ * committed to, and a sourcing decision is an open question. Counting either as
  * "not valued" would report them as orders somebody forgot to price; counting
  * them in the total would report money as committed that nobody has committed.
  * They are excluded, and `valuedRecordCount` says how many rows the figures
@@ -733,9 +612,7 @@ function summarise(rows) {
   const byCurrency = new Map();
   let unvalued = 0;
   let valuedRows = 0;
-  let needCount = 0;
   for (const r of rows) {
-    if (r.recordType === RECORD.NEED) { needCount += 1; continue; }
     if (!VALUED_RECORDS.includes(r.recordType)) continue;
     valuedRows += 1;
     if (r.totalAmount === null || r.totalAmount === undefined) { unvalued += 1; continue; }
@@ -748,9 +625,6 @@ function summarise(rows) {
     unvaluedCount: unvalued,
     /* The orders the figures above describe — not every row on screen. */
     valuedRecordCount: valuedRows,
-    /* Approved needs are counted, never valued: the amount on one is what was
-       approved, which is not what has been ordered. */
-    needCount,
     rowCount: rows.length,
   };
 }
@@ -766,7 +640,7 @@ function summarise(rows) {
 async function workspace(tenant, ctx, query = {}) {
   const {
     stage, type, status, search, page, pageSize, vendor, poStatus,
-    poStatusApplied, stageInferred,
+    poStatusApplied, stageInferred, ordersOnly,
   } = readQuery(query);
   /* Asking for a supplier or a purchase-order status is asking about material
      orders, so the other sources are not read at all — reading them only to
@@ -809,18 +683,23 @@ async function workspace(tenant, ctx, query = {}) {
     rows = rows.concat((out.rows || []).map(serviceRow));
   }
 
-  /* ── APPROVED NEEDS, AT THE START OF THE CHAIN ──────────────────────────
-     Only in To source, and only in the open view: an approved request is by
-     definition not closed. A need with no quotation and no sourcing decision
-     still appears — that is the case this exists for. */
-  if (!materialOnly && stage === STAGE.TO_SOURCE && status === STATUS_FILTER.OPEN
-      && (wantMaterial || wantService)) {
-    const out = await attempt("approvedNeeds", () => readApprovedNeeds(tenant, { type, search }));
-    rows = rows.concat((out.rows || []).map(needRow));
-  }
+  /* ── WHY APPROVED DEMAND IS NOT LISTED HERE (30 Sep 2026) ───────────────
+     This workspace shows PURCHASING records. An approved spend request is a
+     pre-purchase record: nobody has ordered anything, so a row reading
+     "Approved, not yet ordered" in a table of purchase orders described a
+     document that did not exist.
 
-  /* Offers and decisions only reach the stages they belong to. */
-  if (!materialOnly && (status === STATUS_FILTER.CLOSED
+     It is not lost, and nothing about the governed chain changed. Approved
+     buying balances live in Store › Requests, and the approved request's own
+     page carries "Create purchase order", which is the same governed flow the
+     row used to link to (`/store/dashboard/order-requests/quote/:id` →
+     `POST /api/requests/spend/:id/purchase-order`). A record appears here once
+     an actual purchase order exists. */
+
+  /* The Purchase Orders page asks for `records=orders`, which skips these
+     sourcing records even in the closed view. Legacy adapter callers can still
+     read them; their dedicated sourcing screens and data remain untouched. */
+  if (!ordersOnly && !materialOnly && (status === STATUS_FILTER.CLOSED
       || stage === STAGE.TO_SOURCE || stage === STAGE.DRAFT)) {
     if (wantMaterial) {
       const out = await attempt("materialOffers", () => readOffers(SupplierOffer, tenant, {
@@ -843,7 +722,6 @@ async function workspace(tenant, ctx, query = {}) {
         stage, status, search, asOf, extraSearchFields: ["laneLabel", "originCity", "destinationCity"],
       }));
       rows = rows.concat((out.rows || [])
-        /* Freight has no `[id]` page; its register is the destination. */
         .map((o) => offerRow(o, {
           purchaseType: TYPE.FREIGHT, asOf,
           registerHref: "/store/dashboard/supplier-offers?subject=freight",
@@ -852,7 +730,7 @@ async function workspace(tenant, ctx, query = {}) {
     }
   }
 
-  if (!materialOnly && stage === STAGE.TO_SOURCE && status !== STATUS_FILTER.CLOSED) {
+  if (!ordersOnly && !materialOnly && stage === STAGE.TO_SOURCE && status !== STATUS_FILTER.CLOSED) {
     const out = await attempt("sourcingDecisions", async () => {
       const sourcingDecision = require("./sourcingDecision.service");
       const queue = await sourcingDecision.openQueue(ctx, { limit: DECISION_CAP() });
@@ -861,8 +739,6 @@ async function workspace(tenant, ctx, query = {}) {
         coverage: {
           scannedCount: (queue.rows || []).length, scanCap: DECISION_CAP(),
           storedMatchCount: (queue.rows || []).length, truncated: Boolean(queue.hasMore),
-          /* The decision queue reports its own unreadable costings; carried
-             through rather than swallowed. */
           unreadable: queue.unreadable || [],
         },
       };
@@ -895,6 +771,9 @@ async function workspace(tenant, ctx, query = {}) {
     /* False when the caller named a status this workspace does not recognise,
        so the page can drop the chip rather than claim a filter is on. */
     poStatusApplied,
+    /* The Purchase Orders page requests this closed scope so quotation records
+       cannot leak back through its closed-record view. */
+    recordScope: ordersOnly ? "orders" : "all-purchasing",
     /* True when the stage came from a legacy status link rather than a tab. */
     stageInferred,
     /* True when the stage tabs do not apply to what is shown, so the page can
@@ -925,9 +804,9 @@ async function workspace(tenant, ctx, query = {}) {
 }
 
 module.exports = {
-  workspace, materialRow, serviceRow, offerRow, decisionRow, needRow, statusesFor, summarise,
-  readMaterialOrders, readServiceOrders, readOffers, readExceptions, readApprovedNeeds,
-  scoped, NEED_STATUS, NEED_TYPE, VALUED_RECORDS, SpendRequest,
+  workspace, materialRow, serviceRow, offerRow, decisionRow, statusesFor, summarise,
+  readMaterialOrders, readServiceOrders, readOffers, readExceptions,
+  scoped, VALUED_RECORDS,
   STAGE, STAGES, TYPE, TYPES, RECORD, ACTION,
   MATERIAL_STAGE, SERVICE_STAGE, OFFER_STAGE, CLOSED_STATUS,
   STATUS_FILTER, STATUS_FILTERS,

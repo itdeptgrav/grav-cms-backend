@@ -782,3 +782,65 @@ cluster is at its 500-collection cap): `trips` → `qc_raw_item_inspections`,
 first save failed on an inherited unique `tripNumber_1` — so every
 inherited index was dropped and the models' own built (`syncIndexes`). Do
 the same for any future rename.
+## MRF budget & Finance review is PAUSED — 30 Sep 2026
+
+**`RequestsSettings.mrfBudgetEnabled` is `false` in the live database.** MRF
+purchasing currently runs with no Finance review and no budget commitment.
+
+One document holds it: collection `requestssettings`, `{ key: "requests" }`,
+model `models/CMS_Models/Configurations/RequestsSettings.js`. Not an env var,
+not a constant, not a commented-out branch. It is read fresh on every request
+(no cache) in `mrfRoutes.js`'s `/:id/budget-head` and `/:id/fulfilment-decision`,
+so a change takes effect on the next request with no restart.
+
+While paused, an MRF that needs buying spins off a SpendRequest at `approved`
+instead of `pending_finance`, stamped `budgetApprovalMode: "BUDGET_PAUSED"` —
+which is what lets `governedPurchaseOrder.service.js` waive the commitment
+check for it. Everything that is not budget still applies: TL approval, the
+issue-or-buy decision, supplier, rate, tax, quantities, tenancy, and the PO's
+proof of its source MRF, lines, quantities and totals.
+
+**To restore: set `mrfBudgetEnabled` back to `true`.** That is the whole action
+— the CEO settings screen, `PUT /api/cms/requests/settings`, or
+`node -r dotenv/config scripts/migrations/pause-mrf-budget.js --restore --apply`.
+**No code was deleted, disabled or stubbed, so nothing has to be recovered.**
+
+Two things that are load-bearing and easy to get wrong:
+
+- **It only decides the NEXT request.** `budgetApprovalMode` is stamped at
+  creation, so flipping the switch cannot rewrite what an existing request was
+  approved under, and anything at `pending_finance` stays there. There were 0
+  such requests when it was paused; if there ever are, they are a separate
+  decision.
+- **Do not backfill `budgetApprovalMode`.** It has no default on purpose. An
+  absent marker means "raised before the field existed", and
+  `governedPurchaseOrder.service.js` fails closed on it and demands a
+  commitment. Only an explicit `BUDGET_PAUSED` waives that.
+
+Full note: `docs/decisions/mrf-budget-paused.md`. Both paths are covered by
+`test/requests/store-fulfilment.route.test.js`.
+
+## The Purchase workspace lists purchasing records only — 30 Sep 2026
+
+`GET /purchase-orders/workspace` no longer returns `recordType: "need"` rows,
+and `summarise()` no longer returns `needCount`. An approved SpendRequest is a
+PRE-purchase record: nobody has ordered anything, so a row reading "Approved,
+not yet ordered" in a table of purchase orders described a document that did
+not exist, and a buyer could not tell it from one that did.
+
+Removed from `services/storePurchase/purchaseWorkspace.service.js`:
+`readApprovedNeeds()`, `needRow()`, `RECORD.NEED`, `NEED_STATUS`, `NEED_TYPE`,
+`ACTION.RAISE_ORDER`, the `needCount` summary field and the `approvedNeeds`
+source entry. On the frontend the matching labels, row branches, detail fields
+and the "Approved needs" summary item went from
+`components/store/purchase-workspace/workspace.mjs` and the Purchase page.
+
+**Nothing about the governed chain changed, and no MRF or SpendRequest was
+touched.** The buying balance still lives in Store › Requests; the approved
+request's own page still carries **Create purchase order**
+(`/store/dashboard/order-requests/quote/:id` →
+`POST /api/requests/spend/:id/purchase-order`), which is the same governed flow
+the removed row merely linked to. `/purchase-orders/source-mrfs` and its
+`/provenance` endpoint, `governedPurchaseOrder.service.js` and the New Purchase
+Order form's MRF selector are all unchanged. A record appears in the Purchase
+workspace once an actual purchase order exists.

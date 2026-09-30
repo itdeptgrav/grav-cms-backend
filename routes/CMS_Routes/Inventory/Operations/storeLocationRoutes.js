@@ -41,6 +41,10 @@ const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsR
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const { requireTenant, requireCapability, refuseLegacyWrite, withIdempotency } = require("../../../../Middlewear/storePurchaseTenant");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
+/* Only an ACTIVATED label is stock. A label printed during a count that has
+   not been finished is a real identity for material GRAV has not received —
+   see services/storePurchase/labelIdentity.js. */
+const { usableIdentity } = require("../../../../services/storePurchase/labelIdentity");
 const { CAPABILITIES } = tenantContext;
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const idempotency = require("../../../../services/storePurchase/idempotency.service");
@@ -49,6 +53,8 @@ const { fail, sendError } = require("../../../../services/storePurchase/errors")
 const loc = require("../../../../services/storePurchase/locationStock.service");
 const S = require("../../../../services/storePurchase/storeLocations.service");
 
+const roomPolygon = require("../../../../services/storePurchase/roomPolygon");
+const r2 = (n) => Math.round(n * 100) / 100;
 /* A warehouse created before the location layer has neither structureVersion
    nor floorPlan on disk, so a guard of `field: 0` matches nothing and every
    first write reports a conflict. Version 0 therefore also means "absent". */
@@ -238,8 +244,40 @@ router.put("/warehouses/:id/layout", requireCapability(CAPABILITIES.MASTER_MAINT
     const fp = req.body.floorPlan || {};
     for (const k of ["widthCm", "depthCm", "heightCm", "gridCm"]) if (fp[k] !== undefined) { const n = Number(fp[k]); if (!Number.isFinite(n) || n < 0) throw fail("VALIDATION", `Floor ${k} must be a non-negative number of centimetres.`, { reason: "INVALID_LAYOUT" }); $set[`floorPlan.${k}`] = n; }
     if (fp.notes !== undefined) $set["floorPlan.notes"] = text(fp.notes).slice(0, 2000);
+    /* ── THE ROOM'S OUTLINE ────────────────────────────────────────────────
+       This handler rebuilds the floor plan from NAMED fields and silently
+       drops anything it does not know, so the room needs its own branch or it
+       would never reach the database however correctly the editor sent it.
+
+       The polygon is validated here rather than trusted: this PUT is what the
+       3D room, the collision area, the walkthrough's walkable floor, the
+       minimap and the camera framing are all generated from, and a
+       self-crossing outline would produce a building nobody can walk through,
+       with nothing downstream able to report why. `widthCm`/`depthCm` are
+       overwritten from its bounding box in the same breath, so the outline and
+       the stated size cannot disagree — see roomPolygon.js. */
+    if (fp.room !== undefined) {
+      const { room, bounds } = roomPolygon.validateRoom(fp.room, {
+        fallbackHeightCm: fp.heightCm ?? w.floorPlan?.heightCm ?? 300,
+      });
+      $set["floorPlan.room"] = room;
+      $set["floorPlan.widthCm"] = r2(bounds.x + bounds.w);
+      $set["floorPlan.depthCm"] = r2(bounds.z + bounds.d);
+      $set["floorPlan.heightCm"] = room.heightCm;
+    }
     if (Array.isArray(fp.walls)) $set["floorPlan.walls"] = fp.walls.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), x1: Number(x.x1) || 0, z1: Number(x.z1) || 0, x2: Number(x.x2) || 0, z2: Number(x.z2) || 0, thickness: Number(x.thickness) || 15, height: Number(x.height) || (fp.heightCm || w.floorPlan?.heightCm || 300), label: text(x.label) }));
-    if (Array.isArray(fp.fixtures)) $set["floorPlan.fixtures"] = fp.fixtures.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), kind: text(x.kind) || "door", x: Number(x.x) || 0, z: Number(x.z) || 0, w: Number(x.w) || 0, d: Number(x.d) || 0, h: Number(x.h) || 0, rotation: Number(x.rotation) || 0, label: text(x.label) }));
+    if (Array.isArray(fp.fixtures)) $set["floorPlan.fixtures"] = fp.fixtures.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), kind: text(x.kind) || "door", x: Number(x.x) || 0, z: Number(x.z) || 0, w: Number(x.w) || 0, d: Number(x.d) || 0, h: Number(x.h) || 0, rotation: Number(x.rotation) || 0, label: text(x.label), facingDeg: Number.isFinite(Number(x.facingDeg)) ? ((Number(x.facingDeg) % 360) + 360) % 360 : null }));
+    /* The walkthrough's primary entrance: one of THIS plan's fixture ids, or
+       cleared. A id naming no fixture is refused rather than stored, so the
+       walkthrough can never start at a door that is not on the plan. */
+    if (fp.entranceId !== undefined) {
+      const wanted = text(fp.entranceId);
+      if (wanted) {
+        const known = new Set((Array.isArray(fp.fixtures) ? fp.fixtures : (w.floorPlan?.fixtures || [])).map((x) => text(x.id)));
+        if (!known.has(wanted)) throw fail("VALIDATION", "The entrance must be a doorway on this floor plan.", { reason: "INVALID_LAYOUT", field: "entranceId" });
+      }
+      $set["floorPlan.entranceId"] = wanted;
+    }
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     const arrayFilters = [];
     let n = 0;
@@ -422,11 +460,18 @@ router.get("/find", requireCapability(CAPABILITIES.READ), async (req, res) => {
     /* markings: by sticker id, PO number, vendor, item name/sku */
     const mq = { $or: [{ rawItemName: rx }, { rawItemSku: rx }, { variantSku: rx }, { purchaseOrderNumber: rx }, { vendorName: rx }] };
     if (parsed.type === "item") mq.$or.push({ _id: objectId(parsed.barcodeId) });
+    /* ── THE LOCATOR ANSWERS FOR STOCK, NOT FOR PAPER ──────────────────────
+       A label reserved or printed during a count that has not been finalised
+       names material the company has not received. Offering it here would send
+       somebody to look for a roll that is still on the lorry. `$and`, because
+       both clauses are `$or`s and assigning two `$or` keys onto one object
+       silently drops the first. */
+    const markingQuery = { $and: [mq, usableIdentity()] };
     /* three independent reads, side by side (26 Sep 2026) */
     const [whs, items, marks] = await Promise.all([
       Warehouse.find(scoped(req, { status: { $ne: "Archived" } })).lean(),
       RawItem.find(scoped(req, { $or: [{ name: rx }, { sku: rx }, { category: rx }, { "variants.sku": rx }, { "variants.combination": rx }] })).select("name sku category unit customUnit quantity image variants._id variants.sku variants.combination variants.quantity variants.image").limit(25).lean(),
-      Barcode.find(mq).select("rawItem rawItemName rawItemSku variantId variantCombination variantSku quantity unit purchaseOrderNumber vendorName createdAt").sort({ createdAt: -1 }).limit(25).lean(),
+      Barcode.find(markingQuery).select("rawItem rawItemName rawItemSku variantId variantCombination variantSku quantity unit purchaseOrderNumber vendorName createdAt").sort({ createdAt: -1 }).limit(25).lean(),
     ]);
     const whById = new Map(whs.map((w) => [String(w._id), w]));
     const totalsByWh = new Map();
@@ -548,7 +593,11 @@ router.get("/putaway-queue", requireCapability(CAPABILITIES.READ), async (req, r
     const companyId = companyOf(req);
     /* stickers whose printed quantity is not fully placed, newest first */
     const owned = await RawItem.find(scoped(req, {})).select("_id").lean();
-    const marks = await Barcode.find({ rawItem: { $in: owned.map((i) => i._id) } }).sort({ createdAt: -1 }).limit(300).lean();
+    /* Put-away is work owed on goods that ARRIVED. A label still reserved or
+       printed inside an open count is not work: the receipt has not been
+       recorded, so there is nothing to put anywhere yet, and listing it would
+       have a storekeeper hunting a pallet that is still being counted. */
+    const marks = await Barcode.find({ $and: [{ rawItem: { $in: owned.map((i) => i._id) } }, usableIdentity()] }).sort({ createdAt: -1 }).limit(300).lean();
     const placed = await LocationMovement.aggregate([{ $match: { companyId: objectId(companyId), barcodeId: { $in: marks.map((m) => m._id) }, applied: { $ne: false } } }, { $group: { _id: "$barcodeId", located: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$quantity", { $multiply: ["$quantity", -1] }] } }, lastAt: { $max: "$createdAt" } } }]);
     const pm = new Map(placed.map((p) => [String(p._id), p]));
     const pending = marks.map((m) => { const p = pm.get(String(m._id)); const located = loc.round4(p?.located || 0); return { barcodeId: String(m._id), rawItemId: String(m.rawItem), variantId: m.variantId ? String(m.variantId) : null, rawItemName: m.rawItemName, rawItemSku: m.rawItemSku, variant: (m.variantCombination || []).join(" · "), quantity: m.quantity, unit: m.unit, purchaseOrderNumber: m.purchaseOrderNumber, vendorName: m.vendorName, printedAt: m.createdAt, located, pending: loc.round4(Math.max(0, m.quantity - located)), lastAt: p?.lastAt || null }; }).filter((r) => r.pending > loc.QTY_TOL);

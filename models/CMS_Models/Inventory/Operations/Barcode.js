@@ -162,6 +162,69 @@ const barcodeSchema = new mongoose.Schema(
     printBatchKey: { type: String, trim: true, default: "" },
     printBatchSeq: { type: Number, default: null, min: 1 },
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE LIFE OF ONE LABEL IDENTITY
+     * ═════════════════════════════════════════════════════════════════════
+     * A label printed while the goods are still being counted is a real,
+     * unique, server-allocated identity — and it is NOT stock. Between the
+     * printer and the recorded receipt it names nothing that may be put on a
+     * shelf, issued, or found by a stock search.
+     *
+     *   RESERVED   allocated inside a draft receiving session, printable
+     *   PRINTED    handed to a print job; the code exists on paper somewhere
+     *   APPLIED    the receiver says the sticker is on the goods and counted it
+     *   ACTIVATED  the goods receipt was recorded; this is now a stock identity
+     *   VOIDED     terminal, and KEPT: a damaged or unused label stays in the
+     *              record so the gap in the sequence has an explanation
+     *
+     * ── WHY THE DEFAULT IS ACTIVATED ──────────────────────────────────────
+     * Every label that existed before this field, and every label the Material
+     * labels screen mints from stock on hand, is live the moment it is created:
+     * those are printed for material the company already holds. Defaulting to
+     * ACTIVATED states what was already true of them rather than retiring the
+     * whole register into a draft state nothing would activate. Only the
+     * receiving session sets RESERVED, explicitly. */
+    identityState: {
+      type: String,
+      enum: ["RESERVED", "PRINTED", "APPLIED", "ACTIVATED", "VOIDED"],
+      default: "ACTIVATED",
+      required: true,
+    },
+
+    /* The draft count this identity was reserved in, and its position in that
+       count's own sequence — "7 of 12" on the screen, and the number printed
+       on the sticker. Null on every label minted outside a session. */
+    receivingSessionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    sessionSequence: { type: Number, default: null, min: 1 },
+
+    /* ── WAS THE QUANTITY MEASURED, OR ASSUMED? ───────────────────────────
+       A package label is reserved with a NOMINAL quantity (what a roll usually
+       holds) and applied with the MEASURED one (what this roll actually holds).
+       The two are routinely different — 42.5 m and 39.8 m are two rolls — and a
+       label that still carries its nominal figure at finalisation is a package
+       nobody measured, which is not the same fact as a package holding zero.
+       The service refuses to finalise on one; this is how it can tell. */
+    quantityMeasured: { type: Boolean, default: false },
+
+    /* When each step happened. Kept as separate stamps rather than one
+       "updatedAt" because the audit question is "when did this sticker go on
+       the goods", which is not when the row was last written. */
+    printedAt: { type: Date, default: null },
+    appliedAt: { type: Date, default: null },
+    activatedAt: { type: Date, default: null },
+    voidedAt: { type: Date, default: null },
+    voidedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    /* Why it will never be used. Required by the service on every void: a
+       voided identity with no reason is a gap in the printed sequence that
+       nobody can account for. */
+    voidReason: { type: String, trim: true, default: "" },
+    /* The identity printed to take a voided one's place, where there is one.
+       This is what makes a reprint-after-damage traceable as a REPLACEMENT
+       rather than as a second sticker for the same package. */
+    replacedByBarcodeId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    replacesBarcodeId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+
     // ── Cutting sessions ─────────────────────────────────────────────────────
     /* ── CUSTOMER-OWNED MATERIAL ──────────────────────────────────────────
        Present only on a label for material the factory does not own. Its whole
@@ -287,6 +350,21 @@ barcodeSchema.index(
   { companyId: 1, printBatchKey: 1, printBatchSeq: 1 },
   { unique: true, partialFilterExpression: { printBatchKey: { $type: "string", $gt: "" } } },
 );
+
+/* ── THE COUNT-AND-LABEL INDEXES ARE NOT DECLARED HERE ─────────────────────
+   `{companyId, receivingSessionId, sessionSequence}` (unique, partial) and
+   `{receivingSessionId, sessionSequence}` are real and needed — the first IS
+   the concurrency guarantee that two terminals counting one delivery cannot
+   put two stickers under one number.
+
+   They are built by `scripts/migrations/receiving-session-indexes.js` and are
+   deliberately absent from this schema, for the reason spelled out on
+   `companyId` above: this collection is written inside the goods-receipt
+   transaction, mongoose builds a schema's indexes lazily on first use, and a
+   build that lands inside that transaction takes locks the transaction then
+   cannot acquire — failing with a VersionError that mentions neither indexes
+   nor transactions. Declaring them here would re-open a hazard this file has
+   already been bitten by twice. */
 
 module.exports =
   mongoose.models.Barcode || mongoose.model("Barcode", barcodeSchema);

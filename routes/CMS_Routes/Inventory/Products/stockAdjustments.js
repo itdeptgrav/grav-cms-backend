@@ -606,6 +606,10 @@ router.post(
         barcode = bid ? await Barcode.findById(bid).lean() : null;
         if (!barcode || String(barcode.rawItem) !== String(oid)) throw fail("VALIDATION", "That sticker is not one of this item's.", { reason: "BARCODE_MISMATCH", rawItemId: String(rawItemId) });
         if (barcode.variantId && variant && String(barcode.variantId) !== String(variant._id)) throw fail("VALIDATION", "That sticker is for a different variant.", { reason: "BARCODE_VARIANT_MISMATCH", rawItemId: String(rawItemId) });
+        /* A label printed during a count that was never finished names
+           material GRAV has not received. It cannot back an issue. */
+        const idRefusal = identityRefusal(barcode);
+        if (idRefusal) throw fail("VALIDATION", idRefusal.message, { reason: idRefusal.reason, rawItemId: String(rawItemId) });
       }
 
       plan.push({

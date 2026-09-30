@@ -229,12 +229,53 @@ const warehouseSchema = new mongoose.Schema(
        photographs and then maintained by the store manager; every number is
        editable and none is a stock fact. */
     floorPlan: {
+      /* ── THE ROOM'S OUTLINE, AND THE RECTANGLE DERIVED FROM IT ──────────
+         `widthCm`/`depthCm` said every warehouse was a rectangle. Almost none
+         are: a store is L-shaped around a stairwell, U-shaped around an
+         office, notched where the loading bay cuts in. A rectangle that does
+         not match the building is worse than no plan — racks get drawn into
+         walls that exist, and the 3D room somebody walks through is a
+         different building from the one they are standing in.
+
+         So the room is a closed polygon of corners in centimetres, shaped on
+         the 2D plan, and that plan is the ONE editable copy:
+
+           Design (2D) polygon → saved layout version → generated 3D room,
+           collision area, walkthrough navigation, minimap, camera framing
+
+         The 3D view holds no editable shape of its own, because two editable
+         copies of one building drift apart and neither can then be trusted.
+
+         Stored OPEN — the closing wall between the last corner and the first
+         is implied. Empty on every plan drawn before this, which reads as the
+         rectangle it always was (roomShape.mjs `roomOf`), so nothing needed a
+         migration. */
+      room: {
+        shape: { type: String, enum: ["RECTANGLE", "L", "U", "CUSTOM"], default: "RECTANGLE" },
+        points: [{ _id: false, x: { type: Number, default: 0 }, z: { type: Number, default: 0 } }],
+        heightCm: { type: Number, default: 300 },
+      },
+      /* The polygon's BOUNDING BOX, recomputed by the server on every layout
+         save. Every reader that predates the room — the 3D grid, the minimap,
+         the fitted overview — keeps using these untouched. They are derived,
+         never an input: a client cannot store an outline and a size that
+         disagree, which is exactly how the 2D plan and the 3D warehouse would
+         come apart. */
       widthCm: { type: Number, default: 0 },
       depthCm: { type: Number, default: 0 },
       heightCm: { type: Number, default: 300 },
       gridCm: { type: Number, default: 25 },
       walls: [{ _id: false, id: String, x1: Number, z1: Number, x2: Number, z2: Number, thickness: { type: Number, default: 15 }, height: { type: Number, default: 300 }, label: { type: String, default: "" } }],
-      fixtures: [{ _id: false, id: String, kind: { type: String, default: "door" }, x: Number, z: Number, w: Number, d: Number, h: { type: Number, default: 0 }, rotation: { type: Number, default: 0 }, label: { type: String, default: "" } }],
+      /* `facingDeg` is the direction a DOORWAY faces INTO the room, in the
+         plan's degrees (0 = +x, 90 = +z), recorded on 29 Sep 2026 for the
+         walkthrough. Null means "derive it from the geometry" — the inward
+         normal of the wall the door sits on — so every door drawn before this
+         still opens the right way and nothing had to be migrated. */
+      fixtures: [{ _id: false, id: String, kind: { type: String, default: "door" }, x: Number, z: Number, w: Number, d: Number, h: { type: Number, default: 0 }, rotation: { type: Number, default: 0 }, label: { type: String, default: "" }, facingDeg: { type: Number, default: null } }],
+      /* The doorway a walkthrough starts at — the id of one of the fixtures
+         above. Empty means the room has no primary entrance chosen yet, and
+         the map opens on the fitted overview instead. */
+      entranceId: { type: String, default: "" },
       notes: { type: String, trim: true, default: "" },
       /* Bumped by every layout save; a stale builder save is refused. */
       layoutVersion: { type: Number, default: 0 },

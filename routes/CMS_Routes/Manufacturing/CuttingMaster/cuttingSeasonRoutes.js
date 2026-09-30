@@ -26,6 +26,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const CuttingSeason = require("../../../../models/CMS_Models/Manufacturing/CuttingMaster/CuttingSeason");
+const { identityRefusal } = require("../../../../services/storePurchase/labelIdentity");
 const Barcode = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
@@ -178,6 +179,10 @@ router.post("/seasons/:id/raw-items", ...canWrite, async (req, res) => {
     const b = await Barcode.findById(id).lean();
     if (!b) return fail(res, 404, "No raw-item sticker matches that code.");
     if ((b.quantity || 0) <= 0) return fail(res, 400, `${b.rawItemName || "This sticker"} has no quantity left.`);
+    /* A label printed while a delivery was being counted is a real code for
+       material GRAV has not received. It must not be cut. */
+    const idRefusal = identityRefusal(b);
+    if (idRefusal) return fail(res, 400, idRefusal.message, { reason: idRefusal.reason });
     if (!(await RawItem.exists({ _id: b.rawItem }))) return fail(res, 404, "The sticker's raw item no longer exists.");
     const other = await CuttingSeason.findOne({ companyId: companyOf(req), _id: { $ne: s._id }, status: { $ne: "closed" }, "rawItems.barcodeId": oid(id) }).select("name").lean();
     if (other) return fail(res, 409, `That sticker is already in the open season "${other.name}".`);

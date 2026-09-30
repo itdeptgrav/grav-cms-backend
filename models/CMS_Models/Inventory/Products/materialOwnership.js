@@ -31,10 +31,6 @@ const OWNERSHIP_WORDS = Object.freeze({
 const isDefaultOwnership = (v) =>
   DEFAULT_OWNERSHIP_VALUES.includes(String(v ?? "").trim().toUpperCase());
 
-/** An empty snapshot: what a company-owned material carries. */
-const NO_OWNING_CUSTOMER = Object.freeze({ customerCode: "", customerLabel: "", customerName: "" });
-
 module.exports = {
   DEFAULT_OWNERSHIP, DEFAULT_OWNERSHIP_VALUES, OWNERSHIP_WORDS, isDefaultOwnership,
-  NO_OWNING_CUSTOMER,
 };

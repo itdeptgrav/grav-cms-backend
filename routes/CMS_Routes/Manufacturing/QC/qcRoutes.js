@@ -86,17 +86,21 @@ const extractCategory = (code) => {
   return m ? m[0].toUpperCase() : "OTHER";
 };
 
-const findWorkOrderByShortId = async (shortId) => {
-  const matches = await WorkOrder.aggregate([
-    { $match: { $expr: { $eq: [{ $substrCP: [{ $toString: "$_id" }, 16, 8] }, shortId] } } },
-    { $limit: 1 },
-    { $project: {
+const { findWorkOrderByShortId: findWorkOrderByShortIdShared } = require("../../../../services/manufacturing/workOrderShortId");
+
+/* ── THE SHORT-ID RULE LIVES IN ONE PLACE NOW ─────────────────────────────
+   This was the only correct implementation of it and `/identify-barcode` had
+   a second, broken one (`findOne({ workOrderShortId })` against a field that
+   is on no document). The pipeline is unchanged — same `$substrCP` bounds,
+   same `$limit`, same projection — it just comes from the service now, so the
+   two lookups cannot drift again. See services/manufacturing/workOrderShortId.js. */
+const findWorkOrderByShortId = (shortId) =>
+  findWorkOrderByShortIdShared(shortId, {
+    project: {
       _id: 1, workOrderNumber: 1, stockItemName: 1, stockItemReference: 1,
       stockItemId: 1, quantity: 1, status: 1, variantAttributes: 1, customerRequestId: 1,
-    }},
-  ]);
-  return matches[0] || null;
-};
+    },
+  });
 
 // ─── Master operations cache (1 min TTL) ──────────────────────────────────────
 let opsCache   = null;
@@ -2221,7 +2225,14 @@ router.get("/orders", async (req, res) => {
         measurementName: mo?.measurementName || null,
         status: mo?.status || null,
         createdAt: mo?.createdAt || null,
-        deadline: mo?.deliveryDeadline || mo?.estimatedCompletion || null,
+        /* THE CUSTOMER'S OWN DEADLINE FIRST (29 Sep 2026). `deliveryDeadline`
+           does not exist at the root of a CustomerRequest — only under
+           `customerInfo` — so this read `estimatedCompletion` every time, which
+           is a planning date, not the date the customer was promised. It is the
+           same field `lib/deadline.js` and every other department shows, and the
+           same one the raw-material book already sent, so the two QC books
+           could not agree on one order's delivery date until now. */
+        deadline: mo?.customerInfo?.deliveryDeadline || mo?.deliveryDeadline || mo?.estimatedCompletion || null,
         orderValue: mo?.finalOrderPrice || 0,
         ...r,
       };
@@ -2273,7 +2284,7 @@ router.get("/orders/:moId", async (req, res) => {
             measurementName: mo.measurementName || null,
             status: mo.status || null,
             createdAt: mo.createdAt || null,
-            deadline: mo.deliveryDeadline || mo.estimatedCompletion || null,
+            deadline: mo.customerInfo?.deliveryDeadline || mo.deliveryDeadline || mo.estimatedCompletion || null,
             orderValue: mo.finalOrderPrice || 0,
           },
       orders,

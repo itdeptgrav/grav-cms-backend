@@ -331,6 +331,15 @@ Approval requires:
 
 ## 7. Application information architecture
 
+> **Superseding decision — 30 September 2026:** IE now has a pre-order
+> **Development** register as well as the confirmed **Orders** register. The
+> accepted backend can open the one Style Engineering File directly from an
+> approved R&D technical style before an order exists and attach a later order
+> to that same file. Development is therefore a first-class style work queue,
+> not the previously rejected generic top-level Styles list and not a second
+> engineering aggregate. See
+> `docs/audits/sales-merchandising-rnd-ie-development-connection-audit.md`.
+
 **Superseded 8 September 2026 — IE navigates order-wise.** The numbered list
 below this note is the approved navigation; the earlier style-first proposal it
 replaced is kept only as the paragraph that follows, so the change is legible
@@ -338,23 +347,41 @@ rather than silently rewritten.
 
 Use the simple application name **IE** and the following navigation:
 
-1. **Orders** — the landing page. A bounded, company-scoped register of the
+1. **Development** — the landing page and the IE side of Sales' pre-order
+   Sample & Style stage. A bounded, company-scoped register follows the style
+   through Sales development, Merchandising selection/release, R&D technical
+   and sample work, then IE engineering. It may show upstream work before R&D
+   approval, but the one existing Style Engineering File opens and becomes
+   actionable only from an approved R&D technical revision. It shows
+   engineering, review, approval, layout/capacity and release position without
+   editing Sales, Merchandising or R&D records.
+2. **Orders** — IE's post-confirmation order-execution context: a bounded,
+   company-scoped register of the
    production orders IE must engineer, each showing its linked styles, their
-   engineering readiness, route/SAM position and typed gaps.
-2. **Operations** — reusable operation methods, codes, machine types and
+   engineering readiness, route/SAM position, applicable released standard,
+   change impact and typed gaps. PPC still schedules and Production still
+   executes; this section does neither.
+3. **Operations** — reusable operation methods, codes, machine types and
    attachments (the operation library).
-3. **Line Planning** — standard line configurations, stations and balancing.
-4. **Capacity** — capacity standards, line assumptions and target comparison.
-5. **Reports** — SAM history, balance loss, capacity and plan-versus-actual.
-6. **IE Settings** — allowance policies, templates, approvals and numbering.
+4. **Machines** — the existing machine and machine-type register, while
+   physical assignment remains Production/Maintenance-owned.
+5. **Floor Layout** — the existing physical layout surface, separate from a
+   style's standard line balance.
+6. **Line Planning** — standard line configurations, stations and balancing.
+7. **Capacity** — capacity standards, line assumptions and target comparison.
+8. **Reports** — SAM history, balance loss, capacity and plan-versus-actual.
+9. **IE Settings** — allowance policies, templates, approvals and numbering.
 
 ### 7.0 What was decided, and what will not be built
 
-- **IE works order-wise.** A department that engineers what the factory is
-  about to make navigates by the thing the factory is about to make. The
-  landing page is Orders.
-- **A style is an engineering unit inside an order, not a peer of it.** Styles
-  are reached by opening an order. There is no top-level Styles section.
+- **IE has two distinct halves, matching the real garment lifecycle.**
+  Development is linked to Sales' Sample & Style stage and exists before the
+  confirmed order; Orders is the post-confirmation engineering context for the
+  real demand. Both reach the same Style Engineering File and released
+  standards rather than copying them.
+- **There is still no generic top-level Styles master.** Development is a
+  governed work queue with engineering state and next actions, not an
+  unfiltered duplicate of Sales or R&D's style list.
 - **Overview and My Work will NOT be built.** Both were personal-queue
   abstractions over an order register that did not exist yet. An Overview is a
   set of counts nobody can act on without opening the order behind them, and My
@@ -367,6 +394,10 @@ Use the simple application name **IE** and the following navigation:
   reusable internal read APIs — the order detail composes the same projection
   and links out to the style endpoint — but they are no longer a navigation
   destination of their own.
+- **The pre-order file endpoints are now accepted foundations.**
+  `POST /api/cms/ie/styles/:styleId/engineering-file` and its matching `GET`
+  open/read the same `{companyId, sampleStyleId}` file as the order-nested
+  endpoints. A later order attaches to it; it never creates a second file.
 - **No frontend until orders are actually linkable.** Chunk 1B's order contract
   has since been reviewed and accepted, and the shell is still blocked — for a
   second and larger reason. The readiness audit found 0 of 95 operational orders
