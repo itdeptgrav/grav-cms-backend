@@ -135,13 +135,20 @@ function fileType(name, url) {
 
 /* ══ IMAGES ═══════════════════════════════════════════════════════════════ */
 
+/**
+ * One image, or `null` where there is no address for it.
+ *
+ * An image with no usable url is not an image — it is a row in a gallery that
+ * would draw a broken frame, and there is nothing a person can do with it. A
+ * DOCUMENT is different: its name, kind, revision and date are evidence on
+ * their own, so an unopenable one is still published and says it cannot be
+ * opened. That asymmetry is deliberate.
+ */
 const image = ({ key, url, caption, kind, source, at = null, note = "" }) => {
   const href = safeUrl(url);
+  if (!href) return null;
   return {
     key,
-    /* `null` rather than the unusable string. A screen that renders an <img>
-       from an absent url draws a broken frame; one that is told there is no
-       address draws the fallback it has. */
     url: href,
     caption: str(caption),
     kind,
@@ -161,7 +168,11 @@ const image = ({ key, url, caption, kind, source, at = null, note = "" }) => {
  */
 function imagesFor({ style, request, product }) {
   const out = [];
-  const push = (spec) => { if (out.length < IMAGE_CAP) out.push(image(spec)); };
+  const push = (spec) => {
+    if (out.length >= IMAGE_CAP) return;
+    const built = image(spec);
+    if (built) out.push(built);
+  };
 
   /* ── SALES ─────────────────────────────────────────────────────────────── */
   (request?.referenceImages || []).forEach((ref, i) => push({
@@ -180,19 +191,31 @@ function imagesFor({ style, request, product }) {
     source: SOURCE.SALES,
   }));
 
-  const artwork = style?.brief?.brandingRequirements?.artwork;
-  if (artwork?.url) {
-    push({
-      key: "artwork",
-      url: artwork.url,
-      caption: artwork.name,
+  /* ── ARTWORK IS PER DECORATION, AND THERE MAY BE SEVERAL ──────────────
+     `brief.brandingRequirements` is a LIST — one row per decoration (an
+     embroidery at the left chest, a print at the back) — and each row carries
+     its OWN artwork images. Reading it as a single object published the first
+     decoration's first file and silently dropped the rest, which on a garment
+     with a chest logo and a back print is half the artwork missing.
+
+     The decoration's type, placement and artwork state travel as the note: an
+     engineer planning the method needs to know that this file is the back
+     print, and "awaited" is a different fact from a file that is here. */
+  (style?.brief?.brandingRequirements || []).forEach((decoration, d) => {
+    const label = [
+      str(decoration.type),
+      str(decoration.placement),
+      str(decoration.artworkState),
+    ].filter(Boolean).join(" · ");
+    (decoration.artwork || []).forEach((art, i) => push({
+      key: `artwork-${d}-${i}`,
+      url: art.url,
+      caption: art.name,
       kind: IMAGE_KIND.ARTWORK,
       source: SOURCE.SALES,
-      /* The state Sales recorded for it — "supplied", "awaited". Published as
-         the note it is, not folded into the caption. */
-      note: str(style.brief.brandingRequirements.artworkState),
-    });
-  }
+      note: label,
+    }));
+  });
 
   /* ── R&D ───────────────────────────────────────────────────────────────── */
   (style?.sample?.photos || []).forEach((img, i) => push({
@@ -395,26 +418,28 @@ function thumbnailFor(style) {
       source: SOURCE.SALES,
     };
   }
-  const artwork = style?.brief?.brandingRequirements?.artwork;
-  if (safeUrl(artwork?.url)) {
-    return {
-      url: safeUrl(artwork.url),
-      caption: str(artwork.name),
-      kind: IMAGE_KIND.ARTWORK,
-      source: SOURCE.SALES,
-    };
+  for (const decoration of (style?.brief?.brandingRequirements || [])) {
+    const art = (decoration.artwork || []).find((a) => safeUrl(a?.url));
+    if (art) {
+      return {
+        url: safeUrl(art.url),
+        caption: str(art.name),
+        kind: IMAGE_KIND.ARTWORK,
+        source: SOURCE.SALES,
+      };
+    }
   }
   return null;
 }
 
 /** The fields the list and the detail must select for the two functions above. */
 const EVIDENCE_LIST_PROJECTION = [
-  "brief.images", "brief.brandingRequirements.artwork",
+  "brief.images", "brief.brandingRequirements",
 ].join(" ");
 
 const EVIDENCE_DETAIL_PROJECTION = [
   "brief.images",
-  "brief.brandingRequirements.artwork", "brief.brandingRequirements.artworkState",
+  "brief.brandingRequirements",
   "sample.photos", "sample.rounds",
   "techSheet.file",
   "techSheet.technicalRevisions.file",

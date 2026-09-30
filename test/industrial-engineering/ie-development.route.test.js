@@ -727,6 +727,201 @@ describe("a read writes nothing", () => {
   });
 });
 
+/* ══ 11b. THE GARMENT, AND THE ALLOWLIST THAT LETS IT OUT ═════════════════
+ *
+ * The evidence projection reads fields that already exist on records this
+ * boundary already reads. What must be true of it is that the STORE's own
+ * handles never leave, that an unusable address is never offered as a link, and
+ * that a filename never decides what a document IS.
+ */
+
+describe("evidence", () => {
+  const evidence = require("../../services/industrialEngineering/ieDevelopmentEvidence");
+
+  /** A style with one of everything the schema can hold. */
+  async function withEvidence(world) {
+    const n = ++seq;
+    return SampleStyle.create({
+      sampleStyleId: `SS-EV-${n}`,
+      productName: `Tee ${n}`, styleCode: `EV-${n}`, variantLabel: "Navy", variantKey: `v${n}`,
+      journeyId: world.journey._id, enquiryId: world.enquiry._id,
+      stage: "rnd",
+      brief: {
+        images: [
+          { name: "front.png", url: "https://example.test/front.png", fileId: "drive-1", publicId: "cloud-1" },
+          { name: "no-address", url: "" },
+        ],
+        /* A LIST of decorations, each with its own artwork — the shape the
+           schema actually has. A garment with a chest logo and a back print
+           carries two rows, and both sets of files are evidence. */
+        brandingRequirements: [
+          {
+            type: "Embroidery", placement: "Left chest", artworkState: "supplied",
+            artwork: [{ name: "logo.ai", url: "https://example.test/logo.ai", publicId: "cloud-2" }],
+          },
+        ],
+      },
+      sample: {
+        status: "approved",
+        photos: [{ name: "sample.jpg", url: "https://example.test/sample.jpg" }],
+        rounds: [{
+          roundNo: 2, type: "proto", outcome: "rejected", madeAt: new Date("2026-08-10"),
+          images: [{ name: "round2.jpg", url: "https://example.test/round2.jpg" }],
+        }],
+      },
+      techSheet: {
+        technical: { status: "approved" },
+        file: { name: "techpack.pdf", url: "https://example.test/techpack.pdf", uploadedAt: new Date("2026-08-01") },
+        technicalRevisions: [{
+          revision: 3, submittedAt: new Date("2026-08-01"), decidedAt: new Date("2026-08-05"),
+          outcome: "approved",
+          file: { name: "rev3.pdf", url: "https://example.test/rev3.pdf", uploadedAt: new Date("2026-08-01") },
+        }],
+      },
+    });
+  }
+
+  test("images and documents are published, each with its source and its kind", async () => {
+    const w = await company("Evidence");
+    const s = await withEvidence(w);
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    const kinds = res.body.evidence.images.map((i) => `${i.source}/${i.kind}`);
+    expect(kinds).toEqual(expect.arrayContaining([
+      "SALES/PRODUCT_REFERENCE", "SALES/ARTWORK",
+      "RESEARCH_DEVELOPMENT/SAMPLE_PHOTO", "RESEARCH_DEVELOPMENT/SAMPLE_ROUND",
+    ]));
+    /* A round's pictures carry their round, so a rejected round 2 is never read
+       as the approved garment. */
+    const round = res.body.evidence.images.find((i) => i.kind === "SAMPLE_ROUND");
+    expect(round.note).toBe("Round 2 · proto · rejected");
+    /* And the artwork carries its decoration, so "the back print" is never read
+       as "the chest logo". */
+    const art = res.body.evidence.images.find((i) => i.kind === "ARTWORK");
+    expect(art.note).toBe("Embroidery · Left chest · supplied");
+
+    const docs = res.body.evidence.documents;
+    expect(docs.map((d) => d.kind)).toEqual(["TECH_PACK", "TECHNICAL_REVISION"]);
+    expect(docs[1]).toMatchObject({ revision: 3, fileType: "PDF", openable: true, note: "approved" });
+  });
+
+  test("the media store's own handles never leave", async () => {
+    const w = await company("NoHandles");
+    const s = await withEvidence(w);
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    const paths = walk(res.body).map(([p]) => p);
+    for (const handle of ["storageRef", "fileId", "publicId"]) {
+      expect(paths.filter((p) => p.includes(handle))).toEqual([]);
+    }
+    const values = walk(res.body).map(([, v]) => String(v));
+    expect(values).not.toContain("drive-1");
+    expect(values).not.toContain("cloud-1");
+    expect(values).not.toContain("cloud-2");
+  });
+
+  test("an address a browser cannot open is evidence with NO link, never a dead action", async () => {
+    const w = await company("BadUrl");
+    const s = await withEvidence(w);
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    /* The brief image with an empty url is dropped from the gallery, because an
+       image with no address is not an image. A DOCUMENT with no address is
+       still evidence and says it cannot be opened. */
+    for (const image of res.body.evidence.images) expect(image.url).toMatch(/^https?:\/\//);
+    for (const doc of res.body.evidence.documents) {
+      if (doc.openable) expect(doc.url).toMatch(/^https?:\/\//);
+      else expect(doc.url).toBeNull();
+    }
+    /* And the rule itself, without a database. */
+    expect(evidence.safeUrl("javascript:alert(1)")).toBeNull();
+    expect(evidence.safeUrl("/uploads/secret.pdf")).toBeNull();
+    expect(evidence.safeUrl("s3://bucket/key")).toBeNull();
+    expect(evidence.safeUrl("https://example.test/a.pdf")).toBe("https://example.test/a.pdf");
+  });
+
+  test("a filename decides the file TYPE and never the evidence KIND", () => {
+    expect(evidence.fileType("measurements.pdf", "")).toBe("PDF");
+    expect(evidence.fileType("", "https://example.test/x/y.PNG?sig=1")).toBe("PNG");
+    expect(evidence.fileType("", "")).toBe("");
+    /* Only two document kinds exist, and both come from WHERE the record was
+       stored — never from what it is called. */
+    expect(Object.values(evidence.DOCUMENT_KIND)).toEqual(["TECH_PACK", "TECHNICAL_REVISION"]);
+  });
+
+  test("a style with nothing attached publishes empty lists and names the gaps", async () => {
+    const w = await company("NoEvidence");
+    const s = await style(w, { code: "NE-1" });
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    expect(res.body.evidence.images).toEqual([]);
+    expect(res.body.evidence.documents).toEqual([]);
+    /* And the gaps name their OWNER, so the screen can say who would store it. */
+    const owners = res.body.evidence.unavailable.map((u) => `${u.kind}:${u.owner}`);
+    expect(owners).toEqual(expect.arrayContaining([
+      "MERCHANDISING_EVIDENCE:MERCHANDISING",
+      "MEASUREMENT_CHART:RESEARCH_DEVELOPMENT",
+      "CONSTRUCTION_DRAWING:RESEARCH_DEVELOPMENT",
+    ]));
+  });
+
+  test("a register row carries one thumbnail or none, and costs no extra query", async () => {
+    const w = await company("Thumb");
+    await withEvidence(w);
+    await style(w, { code: "NOPIC-1" });
+    const a = await ieViewer(w.co);
+    const res = await call("/development?view=all", { token: a.token, company: w.co._id });
+
+    const withPic = res.body.rows.find((r) => r.thumbnail);
+    expect(withPic.thumbnail).toMatchObject({
+      url: "https://example.test/front.png", kind: "PRODUCT_REFERENCE", source: "SALES",
+    });
+    expect(res.body.rows.some((r) => r.thumbnail === null)).toBe(true);
+  });
+
+  test("the discussion attachments are a CONVERSATION and never leave", async () => {
+    const w = await company("NoChat");
+    const n = ++seq;
+    const s = await SampleStyle.create({
+      sampleStyleId: `SS-CHAT-${n}`,
+      productName: `Tee ${n}`, styleCode: `CHAT-${n}`, variantKey: `v${n}`,
+      journeyId: w.journey._id, enquiryId: w.enquiry._id,
+      sample: {
+        discussion: [{ text: "our price to them is confidential",
+          attachment: { name: "quote.pdf", url: "https://example.test/quote.pdf" } }],
+      },
+    });
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    const values = walk(res.body).map(([, v]) => String(v));
+    expect(values).not.toContain("https://example.test/quote.pdf");
+    expect(values.some((v) => /confidential/i.test(v))).toBe(false);
+  });
+
+  test("reading the evidence still writes nothing", async () => {
+    const w = await company("EvidenceNoWrite");
+    const s = await withEvidence(w);
+    const a = await ieViewer(w.co);
+    const spies = [
+      jest.spyOn(mongoose.Model.prototype, "save"),
+      ...["updateOne", "findOneAndUpdate", "create", "insertMany", "bulkWrite", "deleteOne"]
+        .map((name) => jest.spyOn(mongoose.Model, name)),
+    ];
+    try {
+      const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+      expect(res.status).toBe(200);
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+});
+
 /* ══ 12. THE VOCABULARY, WITHOUT A DATABASE ═══════════════════════════════
  *
  * `classify` is pure, which is what makes the two states the demo data cannot
