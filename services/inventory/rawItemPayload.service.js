@@ -58,7 +58,12 @@ const SUPPLIER_NOT_SELECTABLE = "SUPPLIER_NOT_SELECTABLE";
 const supplierScope = (req, extra = {}) => ({
   $and: [
     tenantContext.tenantFilter(req.tenant),
-    { companyId: { $ne: null } },
+    /* A legacy supplier (no company) is a supplier (29 Sep 2026, explicit
+       request: the item form refused "That supplier was not found in this
+       company" for every alias, because NOT ONE supplier in this database
+       carries a company). Admitted while the legacy window is open; the
+       ownership rule returns with STORE_PURCHASE_STRICT_TENANCY=1. */
+    ...(tenantContext.legacyWindowOpen() ? [] : [{ companyId: { $ne: null } }]),
     /* A company-owned supplier part-way through migration has no code yet.
        It is visible in the Supplier Master for remediation, and must not be
        offered here: an order or alias bound to it would carry no identity
@@ -96,7 +101,7 @@ async function resolveSuppliers(req, ids, session = null) {
     /* Another company's supplier answers exactly as an invented id. */
     return {
       ok: false, status: 404, code: "SUPPLIER_NOT_FOUND",
-      message: "That supplier was not found in this company.",
+      message: "That supplier is not on the supplier list any more. Pick another supplier for the alias, or remove the alias.",
     };
   }
 
@@ -159,14 +164,13 @@ async function validateEmbeddedConversions(req, body, session = null) {
     if (!name) {
       return { ok: false, message: `${where} names no target unit.`, details: { field: where, reason: "TARGET_MISSING" } };
     }
-    const known = await Unit.findOne(scoped(req, {
-      name: new RegExp(`^${escapeRegex(name)}$`, "i"),
-    })).select("_id").session(session).lean();
+    /* the unit list is one list while the legacy window is open (29 Sep 2026) */
+    const unitMatch = { name: new RegExp(`^${escapeRegex(name)}$`, "i") };
+    const known = await Unit.findOne(tenantContext.legacyWindowOpen() ? unitMatch : scoped(req, unitMatch)).select("_id").session(session).lean();
     if (!known) {
-      /* Another company's unit answers exactly as one that does not exist. */
       return {
         ok: false,
-        message: `${where} refers to a unit this company does not have: "${name}".`,
+        message: `${where} refers to a unit that is not on the unit list: "${name}". Add it under Units and conversions first.`,
         details: { field: where, reason: "TARGET_NOT_FOUND" },
       };
     }

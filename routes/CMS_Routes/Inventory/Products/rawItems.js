@@ -409,53 +409,55 @@ router.get("/", canRead, async (req, res) => {
     const filter = { ...tenantContext.tenantFilter(req.tenant) };
     if (clauses.length) filter.$and = clauses;
 
-    let rawItems = await RawItem.find(filter)
-      .select("-stockTransactions")
-      .populate("createdBy", "name email")
-      .populate("updatedBy", "name email")
-      /* No vendor populate: resolving a name out of an unowned global table
-         is the leak, whichever route does it. The stored reference is
-         returned as-is and labelled unverified. */
-      .sort({ createdAt: -1 })
-      .lean();
+    /* ── ONE LIGHT READ, THEN THE PAGE (29 Sep 2026) ───────────────────────
+       This read every item IN FULL (variants, aliases, conversions, populated
+       people) to page twenty of them in memory, then read them all AGAIN for
+       the figures — 1–4 s a request on 307 items. Filtering, counting and
+       paging now use a light projection; only the page's rows are read in
+       full. Budget is no longer part of setup (see materialSetup). */
+    const LIGHT = "name sku category customCategory usedAs unit customUnit quantity minStock maxStock status productType createdAt variants.quantity variants.minStock";
+    /* the unit map does not depend on the rows — read it beside them */
+    const [lightRows, unitConversionsMap] = await Promise.all([
+      RawItem.find(filter).select(LIGHT).sort({ createdAt: -1 }).lean(),
+      buildUnitConversionsMap(req),
+    ]);
+    let light = lightRows;
+    light = light.map(applyComputedStatus);
+    if (status) light = light.filter((it) => it.status === status);
+    light.forEach((it) => { it.setup = materialSetup.setupOf(it, null); });
+    if (setup === "needed") light = light.filter((it) => it.setup.needsSetup);
+    const budgetFilterApplied = false;
 
-    rawItems = rawItems.map(applyComputedStatus);
-
-    if (status) {
-      rawItems = rawItems.filter(it => it.status === status);
-    }
-
-    /* ── CATALOGUE SETUP, DECIDED ONCE ────────────────────────────────────
-       One category-mapping read per request; a failure leaves the budget fact
-       UNKNOWN (null) rather than "unmapped", and the response says so. */
-    let budgetMap = null;
-    try {
-      budgetMap = await require("../../../../services/itemBudgetHead.service")
-        .categoryMap(req.tenant?.companyId || null);
-    } catch (e) {
-      console.error("[raw-items] category budget map:", e);
-      budgetMap = null;
-    }
-    rawItems.forEach((it) => { it.setup = materialSetup.setupOf(it, budgetMap); });
-    if (setup === "needed") rawItems = rawItems.filter((it) => it.setup.needsSetup);
-    const budgetFilterApplied = budget === "unmapped" && Boolean(budgetMap);
-    if (budgetFilterApplied) rawItems = rawItems.filter((it) => it.setup.budgetUnmapped === true);
-
-    const totalItems = rawItems.length;
-    const paged = rawItems.slice(skip, skip + limitNum);
+    const totalItems = light.length;
+    const pageIds = light.slice(skip, skip + limitNum).map((it) => it._id);
+    let paged = pageIds.length
+      ? await RawItem.find({ _id: { $in: pageIds } })
+        .select("-stockTransactions")
+        .populate("createdBy", "name email")
+        .populate("updatedBy", "name email")
+        /* No vendor populate: resolving a name out of an unowned global table
+           is the leak, whichever route does it. The stored reference is
+           returned as-is and labelled unverified. */
+        .lean()
+      : [];
+    const order = new Map(pageIds.map((id, i) => [String(id), i]));
+    paged.sort((a, b) => order.get(String(a._id)) - order.get(String(b._id)));
+    paged = paged.map(applyComputedStatus);
+    paged.forEach((it) => { it.setup = materialSetup.setupOf(it, null); });
 
     // Attach each item's registered-unit conversions so a picker (e.g. the
     // Sales costing sheet) can offer "which unit" without a second round
     // trip per row — same map R&D's own raw-item picker resolves against.
-    const unitConversionsMap = await buildUnitConversionsMap(req);
     paged.forEach((it) => {
       const unitName = it.customUnit || it.unit || "";
       it.unitConversions = unitConversionsMap[unitName]?.conversions || [];
     });
 
-    const allForStats = await RawItem.find(scoped(req))
-      .select("quantity minStock variants category customCategory usedAs unit customUnit budgetLedgerId")
-      .lean();
+    /* the whole catalogue's figures — the light read already IS that when the
+       request narrowed nothing */
+    const allForStats = (clauses.length || status || setup === "needed")
+      ? await RawItem.find(scoped(req)).select("quantity minStock variants.quantity category customCategory usedAs unit customUnit").lean()
+      : light;
 
     let total = 0, lowStock = 0, outOfStock = 0, totalVariants = 0;
     allForStats.forEach(it => {
@@ -485,7 +487,7 @@ router.get("/", canRead, async (req, res) => {
       },
       /* Company-wide catalogue-maintenance counts (not the filtered page).
          `needBudgetMapping` is null when the mappings could not be read. */
-      setupCounts: materialSetup.countSetup(allForStats, budgetMap),
+      setupCounts: materialSetup.countSetup(allForStats, null),
       budgetFilter: budget === "unmapped" ? (budgetFilterApplied ? "applied" : "unavailable") : null,
       filters: {
         categories: RAW_ITEM_CATEGORIES,
@@ -845,6 +847,43 @@ router.get("/data/attributes-batch", canRead, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET raw item by ID — vendor aliases come back as stored references
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── THE TRASH ───────────────────────────────────────────────────────────
+   Items deleted from the catalogue wait here (29 Sep 2026). Restore puts one
+   back exactly as it was; "delete permanently" is the old destruction, with
+   the same refusals. */
+router.get("/trash", canRead, async (req, res) => {
+  try {
+    const rows = await RawItem.find(scoped(req, { deletedAt: { $ne: null } }))
+      .setOptions({ withDeleted: true })
+      .select("name sku category customCategory unit customUnit quantity variants.combination variants.quantity deletedAt deletedBy deletedByName")
+      .sort({ deletedAt: -1 })
+      .lean();
+    res.json({ success: true, items: rows.map((r) => ({ _id: r._id, name: r.name, sku: r.sku, category: r.customCategory || r.category || "", unit: r.customUnit || r.unit || "", quantity: r.quantity || 0, variants: (r.variants || []).length, deletedAt: r.deletedAt, deletedByName: r.deletedByName || "" })) });
+  } catch (error) {
+    console.error("Error listing the raw item trash:", error);
+    res.status(500).json({ success: false, message: "Server error while reading the trash" });
+  }
+});
+
+router.post("/:id/restore", ...canMaintain, async (req, res) => {
+  try {
+    const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id, deletedAt: { $ne: null } })).setOptions({ withDeleted: true });
+    if (!rawItem) return res.status(404).json({ success: false, message: "That item is not in the trash." });
+    /* Its code may have been reused while it sat in the trash. */
+    const clash = await RawItem.findOne(scoped(req, { sku: rawItem.sku, _id: { $ne: rawItem._id } })).select("_id name").lean();
+    if (clash) {
+      return res.status(409).json({ success: false, code: "SKU_IN_USE", message: `Another item now uses the code ${rawItem.sku} ("${clash.name}"). Rename that item's code, or this one's after restoring is not possible — the code must be free first.` });
+    }
+    rawItem.deletedAt = null; rawItem.deletedBy = null; rawItem.deletedByName = "";
+    rawItem.updatedBy = req.user?.id;
+    await rawItem.save();
+    res.json({ success: true, message: `"${rawItem.name}" is back in the catalogue.`, rawItem: { _id: rawItem._id, name: rawItem.name, sku: rawItem.sku } });
+  } catch (error) {
+    console.error("Error restoring raw item:", error);
+    res.status(500).json({ success: false, message: "Server error while restoring the item" });
+  }
+});
+
 router.get("/:id", canRead, async (req, res) => {
   try {
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }))
@@ -937,6 +976,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       category,
       customCategory,
       usedAs,
+      productType,
       customsTariffCode,
       unit,
       customUnit,
@@ -1041,6 +1081,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
     if (usedAs !== undefined && isUsedAs(usedAs)) {
       rawItem.usedAs = String(usedAs).trim().toUpperCase();
     }
+    if (productType !== undefined) rawItem.productType = String(productType || "").trim().slice(0, 80);
 
     /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
        Read only when the payload speaks about it (absent keys are "not part
@@ -1326,11 +1367,19 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE
 // ─────────────────────────────────────────────────────────────────────────────
-router.delete("/:id", ...canMaintain, async (req, res) => {
+/* DELETE /:id moves the item to the trash; DELETE /:id/permanent destroys it
+   from there. Both apply the same refusals — an item that a purchase order,
+   a request, a return, a movement or a balance still names is not removed
+   from view either way, because a picker that cannot find it and a document
+   that points at it would then disagree. */
+async function removeRawItem(req, res, { permanent }) {
   try {
-    const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }));
+    const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id })).setOptions({ withDeleted: permanent });
     if (!rawItem) {
-      return res.status(404).json({ success: false, message: "Raw item not found" });
+      return res.status(404).json({ success: false, message: permanent ? "That item is not in the trash." : "Raw item not found" });
+    }
+    if (permanent && !rawItem.deletedAt) {
+      return res.status(409).json({ success: false, message: "Move the item to the trash first; only a trashed item can be deleted permanently." });
     }
 
     /* ── NOTHING IS DELETED OUT FROM UNDER A DOCUMENT THAT NAMES IT ────────
@@ -1384,13 +1433,22 @@ router.delete("/:id", ...canMaintain, async (req, res) => {
       });
     }
 
-    await RawItem.deleteOne(scoped(req, { _id: rawItem._id }));
-    res.json({ success: true, message: "Raw item deleted successfully" });
+    if (permanent) {
+      await RawItem.deleteOne({ _id: rawItem._id });
+      return res.json({ success: true, message: `"${rawItem.name}" was deleted permanently.` });
+    }
+    rawItem.deletedAt = new Date();
+    rawItem.deletedBy = req.user?.id || null;
+    rawItem.deletedByName = req.user?.name || req.user?.email || "";
+    await rawItem.save();
+    res.json({ success: true, message: `"${rawItem.name}" was moved to the trash. Restore it from Materials › Trash.`, trashed: true });
   } catch (error) {
     console.error("Error deleting raw item:", error);
     res.status(500).json({ success: false, message: "Server error while deleting raw item" });
   }
-});
+}
+router.delete("/:id/permanent", ...canMaintain, (req, res) => removeRawItem(req, res, { permanent: true }));
+router.delete("/:id", ...canMaintain, (req, res) => removeRawItem(req, res, { permanent: false }));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PER-VARIANT VENDOR NICKNAMES (replaces item-level endpoints)

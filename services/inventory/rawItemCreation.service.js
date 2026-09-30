@@ -427,6 +427,7 @@ async function createRawItem({
     category: str(payload.customCategory) ? "" : (payload.category || ""),
     customCategory: str(payload.customCategory) || "",
     usedAs: usedAsValue,
+    productType: str(payload.productType).slice(0, 80),
     /* A property of the GOODS, recorded once here rather than on every
        quotation. Distinct from the supplier's GST HSN — see the model. */
     customsTariffCode: tariffCode(payload.customsTariffCode),

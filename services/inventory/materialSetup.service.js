@@ -26,11 +26,18 @@ const text = (v) => (typeof v === "string" ? v.trim() : "");
  * @param budgetMap  the company's `itemBudgetHead.categoryMap(...)`, or `null`
  *                   when it could not be read.
  */
+/* BUDGET IS NOT PART OF SETUP (29 Sep 2026, explicit request: "budget,
+   company based and all the concepts are needed to completely remove" from the
+   Store). A material is set up when it has a category, an intended use and a
+   base unit. The budget-head resolver still exists for the requests desk; it
+   no longer flags an item, counts against it or filters the catalogue.
+   STORE_BUDGET_SETUP=1 brings the old verdict back. */
+const BUDGET_IN_SETUP = process.env.STORE_BUDGET_SETUP === "1";
 function setupOf(item = {}, budgetMap = null) {
   const categoryMissing = !(text(item.customCategory) || text(item.category));
   const useUnclassified = !text(item.usedAs) || item.usedAs === DEFAULT_USED_AS;
   const unitMissing = !(text(item.customUnit) || text(item.unit));
-  const budgetUnmapped = budgetMap
+  const budgetUnmapped = !BUDGET_IN_SETUP ? false : budgetMap
     ? itemBudgetHead.headForItem(item, budgetMap).source === itemBudgetHead.SOURCE_NONE
     : null;
   const classificationNeeded = categoryMissing || useUnclassified;
@@ -51,10 +58,10 @@ function countSetup(items = [], budgetMap = null) {
   return {
     total: items.length,
     needClassification,
-    needBudgetMapping: budgetMap ? needBudgetMapping : null,
+    needBudgetMapping: !BUDGET_IN_SETUP ? 0 : budgetMap ? needBudgetMapping : null,
     needUnitSetup,
     needsSetup,
-    budgetAvailable: Boolean(budgetMap),
+    budgetAvailable: !BUDGET_IN_SETUP ? true : Boolean(budgetMap),
   };
 }
 

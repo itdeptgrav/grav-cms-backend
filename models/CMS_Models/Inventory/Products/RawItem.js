@@ -191,6 +191,11 @@ const rawItemSchema = new mongoose.Schema(
        Empty means nobody has classified it. It is never defaulted, never
        inferred from the category, and never read as "no duty". */
     customsTariffCode: { type: String, trim: true, uppercase: true, maxlength: 20, default: "" },
+    /* "Product Type" on the item form (Raw Material, Asset, Consumable…). The
+       form has offered it since the start and the list filtered on it, but
+       the field was never on the schema, so every save dropped it (29 Sep
+       2026: "the marked inputs are defined but edit shows nothing filled"). */
+    productType: { type: String, trim: true, maxlength: 80, default: "" },
 
     /* ── WHAT WOULD MAKE THIS THE SAME MATERIAL AS ANOTHER ──────────────────
        The name, the shelf, the unit and the classification, with case, spacing
@@ -337,6 +342,38 @@ rawItemSchema.pre("save", function (next) {
 });
 
 rawItemSchema.statics.deriveStatus = deriveStatus;
+
+/* ── THE TRASH (29 Sep 2026, explicit request: a deleted item "removed
+   permanently — keep a Trash bin to recover it") ──────────────────────────
+   Deleting an item sets `deletedAt`; nothing is destroyed. Every ordinary
+   read — find, findOne/findById, counts, updates, aggregates — excludes a
+   trashed item, so to the rest of the system it is gone: pickers do not
+   offer it, stock views do not count it, its code is free to reuse... until
+   it is restored. A reader that WANTS the trash says so with the query
+   option `withDeleted: true` (an aggregate: `{ withDeleted: true }` in its
+   options). `{ deletedAt: null }` matches every document written before
+   the field existed, so no backfill was needed. */
+rawItemSchema.add({
+  deletedAt:     { type: Date, default: null, index: true },
+  deletedBy:     { type: mongoose.Schema.Types.ObjectId, default: null },
+  deletedByName: { type: String, default: "", trim: true },
+});
+const LIVE_ONLY = ["find", "findOne", "findOneAndUpdate", "findOneAndReplace", "countDocuments", "updateOne", "updateMany", "distinct"];
+for (const op of LIVE_ONLY) {
+  rawItemSchema.pre(op, function excludeTrashed() {
+    const opts = typeof this.getOptions === "function" ? this.getOptions() : {};
+    if (opts.withDeleted) return;
+    const cond = typeof this.getFilter === "function" ? this.getFilter() : {};
+    if (cond && Object.prototype.hasOwnProperty.call(cond, "deletedAt")) return;
+    this.where({ deletedAt: null });
+  });
+}
+rawItemSchema.pre("aggregate", function excludeTrashedAggregate() {
+  if (this.options && this.options.withDeleted) return;
+  const first = this.pipeline()[0];
+  if (first && first.$match && Object.prototype.hasOwnProperty.call(first.$match, "deletedAt")) return;
+  this.pipeline().unshift({ $match: { deletedAt: null } });
+});
 
 // Indexes
 /* ── TENANT OWNERSHIP ────────────────────────────────────────────────────────

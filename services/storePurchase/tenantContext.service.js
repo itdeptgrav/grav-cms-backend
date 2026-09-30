@@ -296,7 +296,10 @@ function tenantFilter(ctx) {
  * callers always pair the two (see the note at services.js `resolveVendor`).
  */
 function ownedOnly() {
-  return { companyId: { $exists: true, $ne: null } };
+  /* Nothing in this database carries a company (29 Sep 2026): while the
+     legacy read-through is on, "owned" means every row, or every register
+     that pairs this with tenantFilter reads empty. */
+  return LEGACY_READTHROUGH ? {} : { companyId: { $exists: true, $ne: null } };
 }
 
 /**
