@@ -2098,6 +2098,26 @@ router.post(
   }),
 );
 
+/* ── A LABEL PRINTED ELSEWHERE, TAKEN INTO THIS ORDER'S COUNT (30 Sep 2026) ──
+   The receiver scans a raw-item sticker the Material labels screen printed;
+   the server finds the line by the label's material and variant (`lineId`
+   may narrow it), opens or resumes that line's count, and attaches the label
+   as an applied one carrying its own quantity — so the line's received
+   figure grows by what the sticker says, and the receipt that follows stamps
+   the GRN on it. A wrong material, a voided label, one already counted or
+   one already received is refused with the reason. */
+router.post(
+  "/:id/labels/adopt",
+  requireCapability(CAPABILITIES.RECEIPT_RECORD),
+  refuseLegacyWrite,
+  countRoute(async (req, res) => {
+    const out = await receivingSession.adoptLabel(req.tenant, {
+      poId: req.params.id, barcodeId: req.body?.barcodeId, lineId: req.body?.lineId || null,
+    }, actorOf(req));
+    return res.status(201).json({ success: true, ...out });
+  }),
+);
+
 /* What a scanned code means here. A read: it decides nothing, so a scanner
    pointed at the wrong pile gets an answer rather than a changed count. */
 router.post(

@@ -197,6 +197,18 @@ const barcodeSchema = new mongoose.Schema(
     receivingSessionId: { type: mongoose.Schema.Types.ObjectId, default: null },
     sessionSequence: { type: Number, default: null, min: 1 },
 
+    /* ── A LABEL PRINTED ELSEWHERE, TAKEN INTO A COUNT (30 Sep 2026) ───────
+       The Material labels screen prints raw-item stickers on their own, with
+       no receipt behind them. The receiving screen can now ADOPT such a
+       sticker by scanning it: the label is attached to the line's count as an
+       applied label carrying its own quantity, the PO and vendor are written
+       onto it, and the receipt that follows activates it and stamps the GRN —
+       exactly as a label minted by the count would be. This stamp is what
+       tells cancel and undo to RELEASE it (back to the live label it was,
+       detached from the count) rather than void it: the sticker existed
+       before the count and is not the count's to destroy. */
+    adoptedAt: { type: Date, default: null },
+
     /* ── WAS THE QUANTITY MEASURED, OR ASSUMED? ───────────────────────────
        A package label is reserved with a NOMINAL quantity (what a roll usually
        holds) and applied with the MEASURED one (what this roll actually holds).

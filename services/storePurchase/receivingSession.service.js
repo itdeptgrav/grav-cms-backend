@@ -97,6 +97,8 @@ function labelView(b) {
     voidReason: str(b?.voidReason),
     replacedByBarcodeId: b?.replacedByBarcodeId ? str(b.replacedByBarcodeId) : null,
     replacesBarcodeId: b?.replacesBarcodeId ? str(b.replacesBarcodeId) : null,
+    /* Printed elsewhere and taken into this count by a scan — see adoptLabel. */
+    adopted: Boolean(b?.adoptedAt),
   };
 }
 
@@ -673,15 +675,20 @@ async function undoLast(ctx, { sessionId } = {}) {
   }).sort({ appliedAt: -1, sessionSequence: -1 });
   if (!last) throw fail("VALIDATION", "No label has been confirmed on this count yet.", { reason: "NOTHING_TO_UNDO" });
 
+  /* An ADOPTED label was a live sticker before this count: undoing it
+     releases it — back to the label it was, detached — rather than turning
+     it into a "printed" identity of this count, which it never was. */
   const undone = await Barcode.findOneAndUpdate(
     { _id: last._id, companyId: ctx.companyId, identityState: IDENTITY.APPLIED },
-    { $set: { identityState: IDENTITY.PRINTED, appliedAt: null } },
+    last.adoptedAt
+      ? { $set: { identityState: IDENTITY.ACTIVATED, appliedAt: null, adoptedAt: null, receivingSessionId: null, sessionSequence: null } }
+      : { $set: { identityState: IDENTITY.PRINTED, appliedAt: null } },
     { new: true },
   ).lean();
   if (!undone) throw fail("CONFLICT", "That label was settled a moment ago. Refresh the count.", { reason: "LABEL_RACE" });
 
   const labels = await labelsOf(session._id);
-  return { label: labelView(undone), session: sessionView(session, labels), totals: totalsOf(labels) };
+  return { label: labelView(undone), released: Boolean(last.adoptedAt), session: sessionView(session, labels), totals: totalsOf(labels) };
 }
 
 /**
@@ -777,6 +784,13 @@ async function resolveScan(ctx, { sessionId, barcodeId } = {}) {
 async function cancel(ctx, { sessionId, reason = "" } = {}, actor = {}) {
   const session = await openSession(ctx, sessionId);
   const now = new Date();
+  /* Labels printed elsewhere and adopted by a scan existed before this
+     count; they go back to being the live labels they were, detached. Only
+     the identities this count itself reserved are voided. */
+  await Barcode.updateMany(
+    { companyId: ctx.companyId, receivingSessionId: session._id, adoptedAt: { $ne: null }, identityState: { $ne: IDENTITY.VOIDED } },
+    { $set: { identityState: IDENTITY.ACTIVATED, appliedAt: null, adoptedAt: null, receivingSessionId: null, sessionSequence: null } },
+  );
   await Barcode.updateMany(
     { companyId: ctx.companyId, receivingSessionId: session._id, identityState: { $ne: IDENTITY.VOIDED } },
     {
@@ -974,10 +988,185 @@ async function activateForReceipt(ctx, { matched = [], goodsReceipt, actor = {} 
   return { activated, voided };
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ADOPTING A LABEL PRINTED ELSEWHERE  (30 Sep 2026)
+ * ═════════════════════════════════════════════════════════════════════════
+ * The Material labels screen prints raw-item stickers with no receipt behind
+ * them. When such a sticker is already on the goods of a delivery, the
+ * receiver scans it on the receiving screen and it is taken INTO the line's
+ * count: attached as an APPLIED label carrying the quantity printed on it,
+ * with this order, line and supplier written onto it. From there it is an
+ * ordinary counted label — its quantity is part of the line's received figure,
+ * and recording the receipt activates it and stamps the GRN on it.
+ *
+ * What is matched is the label's MATERIAL AND VARIANT against the order's
+ * lines, never a name typed by anybody. A label that names another material,
+ * a voided one, one already counted in a count, and one already received on a
+ * goods receipt are each refused with the reason.
+ */
+async function adoptLabel(ctx, { poId, barcodeId, lineId = null } = {}, actor = {}) {
+  if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Store & Purchase.");
+  if (!validId(poId)) throw fail("NOT_FOUND", "Purchase order not found.");
+  if (!validId(barcodeId)) throw fail("VALIDATION", "That is not a material label printed by GRAV.", { reason: "NOT_A_LABEL" });
+
+  /* The tenant FILTER, not a strict companyId: a label printed before Store
+     had companies carries none, and those are exactly the stickers this is
+     for. Adoption stamps the company on it (below). */
+  const label = await Barcode.findOne({ _id: barcodeId, ...tenantContext.tenantFilter(ctx) }).lean();
+  if (!label) throw fail("NOT_FOUND", "That label is not in this company's register.", { reason: "LABEL_UNKNOWN" });
+
+  const state = str(label.identityState) || IDENTITY.ACTIVATED;
+  if (state === IDENTITY.VOIDED) {
+    throw fail("CONFLICT", `That label was voided${str(label.voidReason) ? `: ${label.voidReason}` : ""}. It cannot be received.`, { reason: "LABEL_VOIDED" });
+  }
+  if (label.goodsReceiptId) {
+    throw fail("CONFLICT",
+      `That label was already received${str(label.goodsReceiptNumber) ? ` on ${label.goodsReceiptNumber}` : ""}. One sticker cannot be received twice.`,
+      { reason: "LABEL_ALREADY_RECEIVED", goodsReceiptNumber: str(label.goodsReceiptNumber) });
+  }
+  if (label.receivingSessionId) {
+    const other = await GoodsReceiptSession.findOne({ _id: label.receivingSessionId }).select("poNumber poItemId status purchaseOrderId").lean();
+    const here = other && String(other.purchaseOrderId) === String(poId);
+    throw fail("CONFLICT",
+      here
+        ? `That label is already counted on this order${other?.status === SESSION_STATUS.OPEN ? "" : " (in a count that is closed)"}.`
+        : `That label belongs to a count on ${str(other?.poNumber) || "another order"}. Do not count it here.`,
+      { reason: here ? "LABEL_ALREADY_COUNTED" : "LABEL_FROM_ANOTHER_SESSION", poNumber: str(other?.poNumber) });
+  }
+  if (state !== IDENTITY.ACTIVATED) {
+    throw fail("CONFLICT", "That label is not a live material label, so it cannot be taken into a receipt.", { reason: "LABEL_NOT_LIVE", state });
+  }
+  const quantity = r4(Number(label.quantity));
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw fail("VALIDATION", "That label carries no quantity, so there is nothing to receive from it.", { reason: "LABEL_NO_QUANTITY" });
+  }
+
+  /* ── THE LINE IT BELONGS TO: MATERIAL AND VARIANT, NEVER A NAME ───────── */
+  const po = await PurchaseOrder.findOne({ _id: poId, ...tenantContext.tenantFilter(ctx) }).lean();
+  if (!po) throw fail("NOT_FOUND", "Purchase order not found.");
+  if (!["ISSUED", "PARTIALLY_RECEIVED"].includes(str(po.status))) {
+    throw fail("LIFECYCLE_BLOCKED",
+      `This order is ${str(po.status).toLowerCase().replace(/_/g, " ")}, so nothing can be received against it.`,
+      { reason: "ORDER_NOT_RECEIVABLE", status: po.status });
+  }
+  const labelItem = str(label.rawItem?._id || label.rawItem);
+  const labelVariant = str(label.variantId);
+  const sameItem = (po.items || []).filter((i) => str(i.rawItem?._id || i.rawItem) === labelItem && str(i.status) !== "CANCELLED");
+  if (!sameItem.length) {
+    throw fail("VALIDATION",
+      `That label is for ${str(label.rawItemName) || "another material"}, which is not on this order.`,
+      { reason: "LABEL_MATERIAL_NOT_ON_ORDER", itemName: str(label.rawItemName) });
+  }
+  let candidates = sameItem.filter((i) => str(i.variantId) === labelVariant);
+  /* A sticker printed with no variant on a one-variant material is that
+     variant (the same rule the store map applies). */
+  if (!candidates.length && !labelVariant && sameItem.length === 1) candidates = sameItem;
+  if (!candidates.length) {
+    throw fail("VALIDATION",
+      `That label is ${str(label.rawItemName)}${(label.variantCombination || []).length ? ` · ${label.variantCombination.join(" · ")}` : ""}; this order has that material only in another variant.`,
+      { reason: "LABEL_VARIANT_NOT_ON_ORDER" });
+  }
+  if (lineId) {
+    candidates = candidates.filter((i) => String(i._id) === str(lineId));
+    if (!candidates.length) {
+      throw fail("VALIDATION", "That label is for a different material or variant than the line you chose.", { reason: "LABEL_LINE_MISMATCH" });
+    }
+  }
+  const outstandingOf = (i) => r4(Math.max(0, (Number(i.quantity) || 0) - (Number(i.receivedQuantity) || 0)));
+  const line = candidates.find((i) => outstandingOf(i) > 0) || candidates[0];
+  if (outstandingOf(line) <= 0 && !lineId) {
+    throw fail("LIFECYCLE_BLOCKED",
+      `Every line for ${str(label.rawItemName) || "that material"} on this order is fully received.`,
+      { reason: "LINE_FULLY_RECEIVED" });
+  }
+  if (str(label.unit) && str(line.unit) && str(label.unit).toLowerCase() !== str(line.unit).toLowerCase()) {
+    throw fail("VALIDATION",
+      `That label is in ${str(label.unit)} and this line is received in ${str(line.unit)}. A quantity in one unit cannot be counted into the other.`,
+      { reason: "LABEL_UNIT_MISMATCH", labelUnit: str(label.unit), lineUnit: str(line.unit) });
+  }
+
+  /* ── THE LINE'S COUNT, OPENED OR RESUMED ─────────────────────────────── */
+  const opened = await openOrResume(ctx, { poId, lineId: String(line._id), receivingMode: RECEIVING_MODE.COUNT_AND_LABEL }, actor);
+  const session = await GoodsReceiptSession.findOne({ _id: opened.session.id, companyId: ctx.companyId });
+  if (!session || str(session.status) !== SESSION_STATUS.OPEN) throw fail("LIFECYCLE_BLOCKED", "This count is no longer open.", { reason: "SESSION_NOT_OPEN" });
+  if (str(session.receivingMode) !== RECEIVING_MODE.COUNT_AND_LABEL) {
+    throw fail("VALIDATION",
+      "This line is being received as a total with no labels. Switch it to Count & label to take printed labels into it.",
+      { reason: "MODE_IS_TOTAL_ONLY" });
+  }
+  const level = str(session.trackingLevel);
+  const existing = await labelsOf(session._id);
+  const t = totalsOf(existing);
+  if (level === TRACKING_LEVEL.INDIVIDUAL && !sameQty(quantity, 1)) {
+    throw fail("VALIDATION",
+      `This count is one label per piece, and that label stands for ${quantity} ${str(label.unit)}. Track this delivery by package to take it in.`,
+      { reason: "LABEL_QUANTITY_NOT_ONE" });
+  }
+  if (level === TRACKING_LEVEL.LOT && t.applied + t.unresolved >= 1) {
+    throw fail("VALIDATION", "A lot is one label, and this count already has it.", { reason: "LOT_IS_ONE_LABEL" });
+  }
+
+  /* No level yet: a printed label carries its own measured quantity, which
+     is what PACKAGE tracking records. Set here, with the reason on record,
+     so the count is not left un-finalisable by a level nobody chose. */
+  const advanced = await GoodsReceiptSession.findOneAndUpdate(
+    { _id: session._id, companyId: ctx.companyId, status: SESSION_STATUS.OPEN },
+    {
+      $inc: { sequenceHigh: 1 },
+      ...(level ? {} : {
+        $set: {
+          trackingLevel: TRACKING_LEVEL.PACKAGE,
+          trackingOverrideReason: session.suggestedTrackingLevel && session.suggestedTrackingLevel !== TRACKING_LEVEL.PACKAGE
+            ? "Printed labels adopted; each carries its own measured quantity." : "",
+        },
+      }),
+    },
+    { new: true },
+  );
+  if (!advanced) throw fail("LIFECYCLE_BLOCKED", "This count is no longer open.", { reason: "SESSION_NOT_OPEN" });
+  const seq = advanced.sequenceHigh;
+
+  const now = new Date();
+  const updated = await Barcode.findOneAndUpdate(
+    {
+      _id: label._id, receivingSessionId: null, goodsReceiptId: null,
+      $or: [{ identityState: IDENTITY.ACTIVATED }, { identityState: { $exists: false } }, { identityState: null }],
+    },
+    {
+      $set: {
+        companyId: ctx.companyId,
+        identityState: IDENTITY.APPLIED, appliedAt: now, adoptedAt: now,
+        quantityMeasured: true,
+        receivingSessionId: session._id, sessionSequence: seq,
+        purchaseOrder: po._id, purchaseOrderNumber: str(po.poNumber), purchaseOrderItemId: line._id,
+        vendor: po.vendor?._id || po.vendor || null, vendorName: str(po.vendorName),
+        unitPrice: Number.isFinite(Number(line.unitPrice)) ? Number(line.unitPrice) : (label.unitPrice ?? null),
+        unit: str(label.unit) || str(line.unit),
+      },
+    },
+    { new: true },
+  ).lean();
+  if (!updated) {
+    /* Somebody took it into a count between the read and the write. The
+       sequence number advanced for nothing; a gap is honest, a double is not. */
+    throw fail("CONFLICT", "That label was taken into a count a moment ago. Refresh and scan again.", { reason: "LABEL_RACE" });
+  }
+
+  const labels = await labelsOf(session._id);
+  return {
+    label: labelView(updated),
+    session: { ...sessionView(advanced, labels), outstanding: outstandingOf(line) },
+    totals: totalsOf(labels),
+    line: { poItemId: String(line._id), itemName: str(line.itemName) || str(label.rawItemName), variant: (line.variantCombination || []).map(str).filter(Boolean).join(" · "), unit: str(line.unit) },
+    added: quantity,
+  };
+}
+
 module.exports = {
   IDENTITY, MAX_BATCH, SESSION_STATUS, RECEIVING_MODE, TRACKING_LEVEL, TRACKING_LEVELS,
   openOrResume, readForOrder, setTrackingLevel,
-  reserveBatch, markPrinted, applyLabel, undoLast, voidLabel, resolveScan, cancel,
+  reserveBatch, markPrinted, applyLabel, undoLast, voidLabel, resolveScan, cancel, adoptLabel,
   assertCountsAgree, activateForReceipt,
   totalsOf, finalizeBlockers, labelView, sessionView,
 };

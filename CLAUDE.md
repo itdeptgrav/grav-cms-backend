@@ -654,6 +654,34 @@ the owner). `materialSetup` no longer counts budget at all unless
 category, intended use or base unit only. The budget-head resolver and the
 requests desk's budget review are untouched.
 
+## Receiving: a label printed elsewhere, scanned into the count — 30 Sep 2026
+
+`POST /api/cms/inventory/operations/purchase-orders/:id/labels/adopt`
+`{ barcodeId, lineId? }` → `receivingSession.adoptLabel`. The Material labels
+screen prints raw-item stickers with no receipt behind them (identityState
+ACTIVATED, no session, no GRN); a delivery often arrives with those already
+on the goods. The receiver scans one on the receiving screen and it is taken
+INTO the matching line's count: the line is found by the label's `rawItem`
+and `variantId` (a no-variant label on a one-variant line matches; `lineId`
+narrows it; the first line with something outstanding wins), the line's
+count is opened or resumed (`COUNT_AND_LABEL`; a count with no tracking
+level is set to PACKAGE with the reason on record), the label becomes
+APPLIED with `quantityMeasured: true`, its own `quantity`, the next
+`sessionSequence`, this PO / line / vendor / unit price and the company
+stamped on it, and `adoptedAt` set. From there it is an ordinary counted
+label: its quantity is in the line's received figure, and recording the
+receipt activates it and stamps the GRN (`activateForReceipt`, unchanged).
+Refused with the reason: a voided label, one with a `goodsReceiptId`, one
+in any count (this order's or another's), a material or variant not on the
+order, a fully received line, a unit that differs from the line's, an
+INDIVIDUAL count for a label whose quantity is not 1, a second label on a
+LOT count, a TOTAL_ONLY line. **`adoptedAt` is what `cancel` and `undoLast`
+read**: an adopted label is RELEASED (back to ACTIVATED, detached from the
+count, `adoptedAt` cleared) rather than voided or sent to PRINTED, because
+it existed before the count. `labelView` carries `adopted`. Smoke-tested on
+PO26094229 (label 6aaa2c29ab80cd1e40036a76, 11 Pcs): adopted → counted →
+second scan refused → count cancelled → label back to ACTIVATED.
+
 ### …and neither does the Requests desk — 30 Sep 2026
 
 The same switch now decides whether a REQUEST carries a budget head at all.
