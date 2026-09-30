@@ -764,10 +764,16 @@ describe("evidence", () => {
       sample: {
         status: "approved",
         photos: [{ name: "sample.jpg", url: "https://example.test/sample.jpg" }],
-        rounds: [{
-          roundNo: 2, type: "proto", outcome: "rejected", madeAt: new Date("2026-08-10"),
-          images: [{ name: "round2.jpg", url: "https://example.test/round2.jpg" }],
-        }],
+        rounds: [
+          {
+            roundNo: 2, type: "proto", outcome: "rejected", madeAt: new Date("2026-08-10"),
+            images: [{ name: "round2.jpg", url: "https://example.test/round2.jpg" }],
+          },
+          {
+            roundNo: 3, type: "fit", outcome: "accepted", madeAt: new Date("2026-08-20"),
+            images: [{ name: "round3.jpg", url: "https://example.test/round3.jpg" }],
+          },
+        ],
       },
       techSheet: {
         technical: { status: "approved" },
@@ -804,6 +810,50 @@ describe("evidence", () => {
     const docs = res.body.evidence.documents;
     expect(docs.map((d) => d.kind)).toEqual(["TECH_PACK", "TECHNICAL_REVISION"]);
     expect(docs[1]).toMatchObject({ revision: 3, fileType: "PDF", openable: true, note: "approved" });
+  });
+
+  test("a round travels as FIELDS, so an ordering rule need not parse a sentence", async () => {
+    const w = await company("Rounds");
+    const s = await withEvidence(w);
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    const rounds = res.body.evidence.images.filter((i) => i.kind === "SAMPLE_ROUND");
+    const three = rounds.find((i) => i.round?.no === 3);
+    const two = rounds.find((i) => i.round?.no === 2);
+
+    /* Round 3 was accepted, so it is the current sample and round 2 is history. */
+    expect(three.round).toMatchObject({ no: 3, type: "fit", outcome: "accepted", current: true });
+    expect(three.superseded).toBe(false);
+    expect(two.round).toMatchObject({ no: 2, outcome: "rejected", current: false });
+    expect(two.superseded).toBe(true);
+    /* Nothing is discarded — the rejected round is still evidence. */
+    expect(rounds).toHaveLength(2);
+  });
+
+  test("with no accepted round yet, nothing is marked superseded", async () => {
+    const w = await company("NoAccepted");
+    const n = ++seq;
+    const s = await SampleStyle.create({
+      sampleStyleId: `SS-NA-${n}`,
+      productName: `Tee ${n}`, styleCode: `NA-${n}`, variantKey: `v${n}`,
+      journeyId: w.journey._id, enquiryId: w.enquiry._id,
+      sample: {
+        rounds: [
+          { roundNo: 1, type: "proto", outcome: "rejected", images: [{ name: "a.jpg", url: "https://example.test/a.jpg" }] },
+          { roundNo: 2, type: "proto", outcome: "pending", images: [{ name: "b.jpg", url: "https://example.test/b.jpg" }] },
+        ],
+      },
+    });
+    const a = await ieViewer(w.co);
+    const res = await call(`/development/${s._id}`, { token: a.token, company: w.co._id });
+
+    /* Every round is still live. Marking them all as old would be a claim
+       nobody made. */
+    for (const image of res.body.evidence.images) {
+      expect(image.superseded).toBe(false);
+      expect(image.round.current).toBe(false);
+    }
   });
 
   test("the media store's own handles never leave", async () => {

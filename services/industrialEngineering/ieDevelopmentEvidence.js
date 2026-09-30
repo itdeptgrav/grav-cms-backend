@@ -58,6 +58,9 @@ const SalesDevelopmentRequest = () => (mongoose.models.SalesDevelopmentRequest
 const IMAGE_CAP = 24;
 const DOCUMENT_CAP = 24;
 
+/** The verdicts that mean a round was ACCEPTED. Sales' own words, not ours. */
+const ACCEPTED_OUTCOMES = new Set(["accepted", "approved"]);
+
 /** Where a piece of evidence came from. The desk, not the collection. */
 const SOURCE = Object.freeze({
   SALES: "SALES",
@@ -144,7 +147,9 @@ function fileType(name, url) {
  * their own, so an unopenable one is still published and says it cannot be
  * opened. That asymmetry is deliberate.
  */
-const image = ({ key, url, caption, kind, source, at = null, note = "" }) => {
+const image = ({
+  key, url, caption, kind, source, at = null, note = "", round = null, superseded = false,
+}) => {
   const href = safeUrl(url);
   if (!href) return null;
   return {
@@ -155,6 +160,14 @@ const image = ({ key, url, caption, kind, source, at = null, note = "" }) => {
     source,
     at: at ? new Date(at).toISOString() : null,
     note: str(note),
+    /* ── THE ROUND, AS FIELDS AND NOT AS A SENTENCE ──────────────────────
+       `note` is for a person to read. A screen that needed to ORDER these —
+       the approved sample first, the rejected round last — would have to parse
+       that sentence back, and parsing a display string is a guess dressed as a
+       fact. So the round travels structured as well, and `superseded` is the
+       one boolean an ordering rule actually needs. */
+    round,
+    superseded: Boolean(superseded),
   };
 };
 
@@ -231,12 +244,23 @@ function imagesFor({ style, request, product }) {
      unlabelled strip is how somebody plans a method from the garment that was
      sent back. The round number, its type and its verdict travel with each
      image as the note. */
-  (style?.sample?.rounds || []).forEach((round, r) => {
+  /* Which round is the CURRENT one: the highest number whose verdict accepted
+     it. Everything before it is history — real evidence, never discarded, and
+     never presented as the garment that was approved. */
+  const rounds = style?.sample?.rounds || [];
+  const acceptedNo = rounds
+    .filter((r) => ACCEPTED_OUTCOMES.has(str(r.outcome)))
+    .reduce((best, r) => Math.max(best, Number(r.roundNo ?? 0)), 0);
+
+  rounds.forEach((round, r) => {
+    const outcome = str(round.outcome);
+    const roundNo = Number.isFinite(Number(round.roundNo)) ? Number(round.roundNo) : null;
     const label = [
-      round.roundNo ? `Round ${round.roundNo}` : "",
+      roundNo ? `Round ${roundNo}` : "",
       str(round.type),
-      str(round.outcome),
+      outcome,
     ].filter(Boolean).join(" · ");
+    const current = Boolean(acceptedNo && roundNo === acceptedNo);
     (round.images || []).forEach((img, i) => push({
       key: `round-${r}-${i}`,
       url: img.url,
@@ -245,6 +269,12 @@ function imagesFor({ style, request, product }) {
       source: SOURCE.RND,
       at: round.madeAt || null,
       note: label,
+      round: { no: roundNo, type: str(round.type), outcome, current },
+      /* A round that is not the accepted one, once an accepted one exists. A
+         style with no accepted round yet has no superseded evidence — every
+         round is still live, and marking them all as old would be a claim
+         nobody made. */
+      superseded: Boolean(acceptedNo) && !current,
     }));
   });
 
@@ -447,7 +477,7 @@ const EVIDENCE_DETAIL_PROJECTION = [
 ].join(" ");
 
 module.exports = {
-  SOURCE, IMAGE_KIND, DOCUMENT_KIND, REFERENCE_KIND, UNAVAILABLE,
+  SOURCE, IMAGE_KIND, DOCUMENT_KIND, REFERENCE_KIND, UNAVAILABLE, ACCEPTED_OUTCOMES,
   IMAGE_CAP, DOCUMENT_CAP,
   EVIDENCE_LIST_PROJECTION, EVIDENCE_DETAIL_PROJECTION,
   safeUrl, fileType, imagesFor, documentsFor, thumbnailFor, evidenceFor,
