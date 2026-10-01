@@ -49,6 +49,9 @@ const SpActionHistory = require("../../../../models/CMS_Models/StorePurchase/SpA
    added (found 25 Sep 2026 on WH-MAIN). */
 const versionGuard = (field, seen) => (seen ? { [field]: seen } : { $or: [{ [field]: 0 }, { [field]: { $exists: false } }] });
 const storeLoc = require("../../../../services/storePurchase/storeLocations.service");
+/* Export / import of the whole warehouse design, so the hosted database can
+   be set up from the local one in a minute (1 Oct 2026). */
+const setupTransfer = require("../../../../services/storePurchase/warehouseSetupTransfer.service");
 
 const ENTITY = "WAREHOUSE";
 
@@ -878,6 +881,49 @@ function decodeCursor(raw) {
   }
   return { at, _id: new mongoose.Types.ObjectId(parts[1]) };
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * SETUP EXPORT / IMPORT (1 Oct 2026)
+ *
+ * The owner: the warehouse design built on the local database has to exist
+ * on the hosted one "within a minute", without registering every rack again.
+ * `GET /setup/export` writes every warehouse of this company (or the ones
+ * named by `ids`) with its floor plan and locations into one JSON file;
+ * `POST /setup/import` merges such a file into this company — a dry run
+ * (`dryRun: true`) answers the plan and writes nothing. Stock never travels.
+ * Declared before `/:id`, which would otherwise read "setup" as an id.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.get("/setup/export", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const file = await setupTransfer.exportSetup(req.tenant, { ids });
+    return res.json({ success: true, file });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[warehouses] setup export error:", err);
+    return res.status(500).json({ success: false, message: "The warehouse setup could not be exported." });
+  }
+});
+
+router.post("/setup/import", requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite, async (req, res) => {
+  try {
+    assertTenantInput(req);
+    const setup = req.body?.setup;
+    const dryRun = req.body?.dryRun === true || req.body?.dryRun === "true";
+    const out = await setupTransfer.importSetup(req.tenant, setup, {
+      actor: objectId(req.user?.id),
+      actorName: req.user?.name || "",
+      dryRun,
+      requestId: req.id || "",
+      idempotencyKey: String(req.get("Idempotency-Key") || ""),
+    });
+    return res.status(dryRun ? 200 : 201).json({ success: true, ...out });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[warehouses] setup import error:", err);
+    return res.status(500).json({ success: false, message: err?.message || "The warehouse setup could not be imported." });
+  }
+});
 
 router.get("/:id/history", requireCapability(CAPABILITIES.HISTORY_READ), async (req, res) => {
   try {
