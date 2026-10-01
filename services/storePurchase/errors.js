@@ -670,6 +670,23 @@ const CODES = {
      outstanding. */
   DEVELOPMENT_MATERIALS_STALE: { status: 409, code: "DEVELOPMENT_MATERIALS_STALE" },
   PRODUCT_LINE_NOT_FOUND: { status: 404, code: "PRODUCT_LINE_NOT_FOUND" },
+
+  /* ── R&D — THE 3D GARMENT WORKSPACE ────────────────────────────────────
+     These refusals let the workspace distinguish a bad anchor, unsupported
+     asset, oversized file and a lifecycle conflict without guessing from a
+     generic validation message. */
+  MODEL_ANCHOR_INVALID: { status: 422, code: "MODEL_ANCHOR_INVALID" },
+  MODEL_ANCHOR_UNKNOWN: { status: 422, code: "MODEL_ANCHOR_UNKNOWN" },
+  MODEL_FILE_TOO_LARGE: { status: 413, code: "MODEL_FILE_TOO_LARGE" },
+  MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
+  MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
+  MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },
+  MODEL_STATE_CONFLICT: { status: 409, code: "MODEL_STATE_CONFLICT" },
+  MODEL_TOO_COMPLEX: { status: 422, code: "MODEL_TOO_COMPLEX" },
+  MODEL_UNREADABLE: { status: 415, code: "MODEL_UNREADABLE" },
+  MODEL_WEB_FILE_REQUIRED: { status: 400, code: "MODEL_WEB_FILE_REQUIRED" },
+  REVISION_CONFLICT: { status: 409, code: "REVISION_CONFLICT" },
+
   /* ── IE CHUNK 1D — A WORK ORDER MUST KNOW ITS STYLE ─────────────────────
    * Registered rather than left to fall through to VALIDATION, which is what
    * an unlisted code silently becomes: an operator told "VALIDATION" cannot
