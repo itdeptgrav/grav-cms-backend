@@ -827,6 +827,55 @@ router.post("/", async (req, res) => {
     // Seed the 28 default groups
     const seeded = await seedDefaultGroups(company._id, req.user?.id);
 
+    /* ── ATTACH IT, OR IT IS INVISIBLE THE MOMENT IT IS CREATED (1 Oct 2026) ──
+     *
+     * GET / draws its list from `Acc_Organization.tallyCompanyIds` — on purpose,
+     * so the picker cannot offer a company the guards would refuse (see the long
+     * note above that handler). But nothing wrote that field:
+     * `attachCompaniesToOrganization` in
+     * services/accountantCompanyOwnership.service.js is its ONLY writer, and it
+     * had no caller anywhere in the codebase. So a company created here was
+     * never owned by anybody, never appeared in the list, and could not be
+     * selected — the live database has exactly that, one orphaned
+     * "GRAV CLOTHING PVT LTD" against an organisation holding `tallyCompanyIds: []`,
+     * which is why the accountant dashboard sits on "No company" forever.
+     *
+     * Creating a company and not attaching it is never what the creator meant,
+     * so it is attached to the organisation that created it, through the
+     * canonical writer rather than a `$push` here — that service is what holds
+     * the one-organisation-per-company line (it refuses a company another
+     * organisation already owns, and survives the race on the index).
+     *
+     * A dev-bypass session has no organisation and attaches nothing; it already
+     * sees every company by the `isDev` exemption, so it loses nothing. A
+     * failure to attach does NOT fail the request — the company exists and is
+     * seeded by this point, and tearing that down would be worse than reporting
+     * it — but it is surfaced in the response so the caller is never told a
+     * company is ready to use when it is not yet owned. */
+    let attachment = { attempted: false };
+    if (req.organization?._id) {
+      try {
+        const { attachCompaniesToOrganization } = require(
+          "../../services/accountantCompanyOwnership.service",
+        );
+        const result = await attachCompaniesToOrganization({
+          organizationId: req.organization._id,
+          companyIds: [company._id],
+        });
+        attachment = result?.ok
+          ? { attempted: true, ok: true }
+          : {
+              attempted: true,
+              ok: false,
+              code: result?.code,
+              message: result?.message,
+            };
+      } catch (e) {
+        console.error("POST tally company — attach to organisation:", e);
+        attachment = { attempted: true, ok: false, message: e.message };
+      }
+    }
+
     await auditCompany(req, {
       entityId: String(company._id),
       entityLabel: company.companyName,
@@ -842,9 +891,16 @@ router.post("/", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Company created and default chart-of-accounts groups seeded.",
+      message:
+        attachment.attempted && !attachment.ok
+          ? "Company created and groups seeded, but it could not be attached to your organisation — it will not appear in the company list until it is."
+          : "Company created and default chart-of-accounts groups seeded.",
       company,
       seededGroups: seeded,
+      attachedToOrganization: attachment.attempted ? attachment.ok === true : null,
+      ...(attachment.attempted && !attachment.ok
+        ? { attachmentError: attachment.message || attachment.code }
+        : {}),
     });
   } catch (err) {
     console.error("POST tally company:", err);
