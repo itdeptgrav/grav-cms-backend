@@ -10,6 +10,9 @@
 //   GET  /locations/:locationId/movements    its history
 //   POST /warehouses/:id/racks               the rack wizard (one structural write)
 //   PUT  /warehouses/:id/layout              the layout builder's save (geometry only — never a movement)
+//   POST /warehouses/:id/layouts             start a new, blank layout and make it live
+//   POST /warehouses/:id/layouts/:lid/activate   make a saved layout the live one
+//   PATCH /warehouses/:id/layouts/:lid       rename a layout ("current" = the implicit one)
 //   POST /warehouses/:id/locations/:lid/qr   mint or re-mint a location label token
 //   POST /warehouses/:id/qr/backfill         mint tokens for every location without one
 //   POST /put | /remove | /transfer | /transfer-all   the guarded physical moves
@@ -54,6 +57,7 @@ const loc = require("../../../../services/storePurchase/locationStock.service");
 const S = require("../../../../services/storePurchase/storeLocations.service");
 
 const roomPolygon = require("../../../../services/storePurchase/roomPolygon");
+const Layouts = require("../../../../services/storePurchase/savedLayouts");
 const r2 = (n) => Math.round(n * 100) / 100;
 /* A warehouse created before the location layer has neither structureVersion
    nor floorPlan on disk, so a guard of `field: 0` matches nothing and every
@@ -130,7 +134,7 @@ router.get("/tree", requireCapability(CAPABILITIES.READ), async (req, res) => {
     const totals = await S.totalsByLocation(companyOf(req), w._id);
     const tree = S.treeOf(w, totals, { includeArchived: req.query.all === "1" });
     const positions = (w.locations || []).filter((l) => l.status !== "Archived" && !S.holdsStockError(w, l));
-    res.json({ success: true, warehouse: { id: String(w._id), name: w.name, code: w.shortName, floorPlan: w.floorPlan || {}, structureVersion: w.structureVersion || 0 }, tree, flat: (w.locations || []).filter((l) => req.query.all === "1" || l.status !== "Archived").map((l) => ({ ...publicLoc(w, l), world: S.worldBoxOf(w, l), totals: totals.get(String(l._id)) || { lines: 0, onHand: 0, items: 0 } })), summary: { positions: positions.length, occupied: positions.filter((l) => totals.has(String(l._id))).length } });
+    res.json({ success: true, warehouse: { id: String(w._id), name: w.name, code: w.shortName, floorPlan: w.floorPlan || {}, structureVersion: w.structureVersion || 0, layouts: Layouts.listOf(w) }, tree, flat: (w.locations || []).filter((l) => req.query.all === "1" || l.status !== "Archived").map((l) => ({ ...publicLoc(w, l), world: S.worldBoxOf(w, l), totals: totals.get(String(l._id)) || { lines: 0, onHand: 0, items: 0 } })), summary: { positions: positions.length, occupied: positions.filter((l) => totals.has(String(l._id))).length } });
   } catch (e) { handle(res, e, "tree"); }
 });
 
@@ -265,8 +269,22 @@ router.put("/warehouses/:id/layout", requireCapability(CAPABILITIES.MASTER_MAINT
       $set["floorPlan.depthCm"] = r2(bounds.z + bounds.d);
       $set["floorPlan.heightCm"] = room.heightCm;
     }
-    if (Array.isArray(fp.walls)) $set["floorPlan.walls"] = fp.walls.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), x1: Number(x.x1) || 0, z1: Number(x.z1) || 0, x2: Number(x.x2) || 0, z2: Number(x.z2) || 0, thickness: Number(x.thickness) || 15, height: Number(x.height) || (fp.heightCm || w.floorPlan?.heightCm || 300), label: text(x.label) }));
-    if (Array.isArray(fp.fixtures)) $set["floorPlan.fixtures"] = fp.fixtures.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), kind: text(x.kind) || "door", x: Number(x.x) || 0, z: Number(x.z) || 0, w: Number(x.w) || 0, d: Number(x.d) || 0, h: Number(x.h) || 0, rotation: Number(x.rotation) || 0, label: text(x.label), facingDeg: Number.isFinite(Number(x.facingDeg)) ? ((Number(x.facingDeg) % 360) + 360) % 360 : null }));
+    /* A wall's `base` is where it starts above the floor (0 = on the floor; a
+       beam over an opening starts higher). It must be below the wall's top, or
+       there is no wall — refused rather than stored as a zero-height sliver. */
+    if (Array.isArray(fp.walls)) $set["floorPlan.walls"] = fp.walls.slice(0, 200).map((x) => {
+      const height = Number(x.height) || (fp.heightCm || w.floorPlan?.heightCm || 300);
+      const base = Math.max(0, Number(x.base) || 0);
+      if (base >= height) throw fail("VALIDATION", `A wall that starts ${base} cm above the floor must reach higher than that; its top is ${height} cm.`, { reason: "INVALID_LAYOUT", field: "walls.base" });
+      return { id: text(x.id) || String(new mongoose.Types.ObjectId()), x1: Number(x.x1) || 0, z1: Number(x.z1) || 0, x2: Number(x.x2) || 0, z2: Number(x.z2) || 0, thickness: Number(x.thickness) || 15, height, base, label: text(x.label) };
+    });
+    /* `facingDeg: null` means "derive it from the wall" and is what every door
+       without a recorded facing is READ back as — so the editor sends it
+       straight back on the next save. `Number(null)` is 0, which stored every
+       such door as facing due east (along the bottom wall, not into the room).
+       Only an actual number is a recorded facing (30 Sep 2026). */
+    const facingOf = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? null : ((Number(v) % 360) + 360) % 360);
+    if (Array.isArray(fp.fixtures)) $set["floorPlan.fixtures"] = fp.fixtures.slice(0, 200).map((x) => ({ id: text(x.id) || String(new mongoose.Types.ObjectId()), kind: text(x.kind) || "door", x: Number(x.x) || 0, z: Number(x.z) || 0, w: Number(x.w) || 0, d: Number(x.d) || 0, h: Number(x.h) || 0, rotation: Number(x.rotation) || 0, label: text(x.label), facingDeg: facingOf(x.facingDeg) }));
     /* The walkthrough's primary entrance: one of THIS plan's fixture ids, or
        cleared. A id naming no fixture is refused rather than stored, so the
        walkthrough can never start at a door that is not on the plan. */
@@ -304,6 +322,76 @@ router.put("/warehouses/:id/layout", requireCapability(CAPABILITIES.MASTER_MAINT
     } });
     return succeed(req, res, 200, { success: true, layoutVersion: result.floorPlan?.layoutVersion || 0, floorPlan: result.floorPlan || {}, atomicity: { mode } }, result._id, WH_ENTITY);
   } catch (e) { handle(res, e, "layout save"); }
+});
+
+/* ── SAVED LAYOUTS (30 Sep 2026) ───────────────────────────────────────────
+   More than one arrangement of the same warehouse; the rules and the reasons
+   are in services/storePurchase/savedLayouts.js. Creating and switching each
+   REPLACE the live arrangement, so both are guarded by the layout version (a
+   builder open elsewhere cannot then save its old arrangement over the new
+   one — it gets the stale-version conflict) and by the structure version (a
+   rack created in between would otherwise be left out of the swap). */
+const STALE_LAYOUT = "Somebody changed this store map after you opened it. Reload the map and try again.";
+function layoutGuards(req, w) {
+  const current = w.floorPlan?.layoutVersion || 0;
+  const structure = w.structureVersion || 0;
+  const seen = Number(req.body.layoutVersion); const seenStructure = Number(req.body.structureVersion);
+  if (req.body.layoutVersion !== undefined && Number.isFinite(seen) && seen !== current) throw fail("CONFLICT", STALE_LAYOUT, { reason: "STALE_VERSION", current });
+  if (req.body.structureVersion !== undefined && Number.isFinite(seenStructure) && seenStructure !== structure) throw fail("CONFLICT", STALE_LAYOUT, { reason: "STALE_STRUCTURE", current: structure });
+  return { current, filter: { _id: w._id, $and: [versionGuard("floorPlan.layoutVersion", current), versionGuard("structureVersion", structure)] } };
+}
+async function swapLayout(req, res, w, plan, action) {
+  const { current, filter } = layoutGuards(req, w);
+  const actor = objectId(req.user?.id);
+  const $set = { ...plan.$set, "floorPlan.layoutVersion": current + 1, "floorPlan.layoutUpdatedAt": new Date(), "floorPlan.layoutUpdatedBy": actor };
+  const { result, mode } = await runMutation(req, { entityType: WH_ENTITY, mutate: async (session) => {
+    const doc = await Warehouse.findOneAndUpdate(scoped(req, filter), { $set }, { new: true, runValidators: true, session, arrayFilters: plan.arrayFilters }).lean();
+    if (!doc) throw fail("CONFLICT", STALE_LAYOUT, { reason: "STALE_VERSION" });
+    return { entityType: WH_ENTITY, entityId: doc._id, entry: { entityType: WH_ENTITY, entityId: doc._id, documentNumber: doc.shortName, action, requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { layoutId: String(plan.layoutId), name: plan.name, layoutVersion: current + 1 } }, result: doc };
+  } });
+  return succeed(req, res, 200, { success: true, layoutId: String(plan.layoutId), name: plan.name, layoutVersion: result.floorPlan?.layoutVersion || 0, layouts: Layouts.listOf(result), atomicity: { mode } }, result._id, WH_ENTITY);
+}
+
+router.post("/warehouses/:id/layouts", requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite, withIdempotency("LOCATION_LAYOUT_CREATE", { target: (req) => `warehouse:${req.params.id}` }), async (req, res) => {
+  try {
+    if (req.idempotent?.recovering) return req.idempotent.succeed(200, { success: true, replayed: true }, { entityType: WH_ENTITY, entityId: objectId(req.params.id) });
+    const w = await loadWarehouse(req, req.params.id);
+    layoutGuards(req, w);
+    const plan = Layouts.planCreate(w, { name: req.body.name, currentName: req.body.currentName, actorId: objectId(req.user?.id), now: new Date() });
+    return await swapLayout(req, res, w, plan, "LOCATION_LAYOUT_CREATED");
+  } catch (e) { handle(res, e, "layout create"); }
+});
+
+router.post("/warehouses/:id/layouts/:layoutId/activate", requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite, withIdempotency("LOCATION_LAYOUT_ACTIVATE", { target: (req) => `warehouse:${req.params.id}` }), async (req, res) => {
+  try {
+    if (req.idempotent?.recovering) return req.idempotent.succeed(200, { success: true, replayed: true }, { entityType: WH_ENTITY, entityId: objectId(req.params.id) });
+    const w = await loadWarehouse(req, req.params.id);
+    layoutGuards(req, w);
+    const plan = Layouts.planActivate(w, req.params.layoutId, { actorId: objectId(req.user?.id), now: new Date() });
+    if (plan.noop) return succeed(req, res, 200, { success: true, layoutId: String(plan.layoutId), name: plan.name, layoutVersion: w.floorPlan?.layoutVersion || 0, layouts: Layouts.listOf(w), unchanged: true }, w._id, WH_ENTITY);
+    return await swapLayout(req, res, w, plan, "LOCATION_LAYOUT_ACTIVATED");
+  } catch (e) { handle(res, e, "layout activate"); }
+});
+
+/* A rename touches only the names, so it does NOT bump the layout version — a
+   builder open with unsaved moves keeps its save. It is still conditioned on
+   the version, so it cannot write the list back over a create or a switch
+   that landed in between. "" is the implicit layout of a warehouse that has
+   only ever had one; renaming it is what first gives it an entry. */
+router.patch("/warehouses/:id/layouts/:layoutId", requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite, withIdempotency("LOCATION_LAYOUT_RENAME", { target: (req) => `warehouse:${req.params.id}` }), async (req, res) => {
+  try {
+    if (req.idempotent?.recovering) return req.idempotent.succeed(200, { success: true, replayed: true }, { entityType: WH_ENTITY, entityId: objectId(req.params.id) });
+    const w = await loadWarehouse(req, req.params.id);
+    const current = w.floorPlan?.layoutVersion || 0;
+    const layoutId = req.params.layoutId === "current" ? "" : req.params.layoutId;
+    const plan = Layouts.planRename(w, layoutId, req.body.name, { actorId: objectId(req.user?.id), now: new Date() });
+    const { result, mode } = await runMutation(req, { entityType: WH_ENTITY, mutate: async (session) => {
+      const doc = await Warehouse.findOneAndUpdate(scoped(req, { _id: w._id, ...versionGuard("floorPlan.layoutVersion", current) }), { $set: plan.$set }, { new: true, runValidators: true, session }).lean();
+      if (!doc) throw fail("CONFLICT", STALE_LAYOUT, { reason: "STALE_VERSION" });
+      return { entityType: WH_ENTITY, entityId: doc._id, entry: { entityType: WH_ENTITY, entityId: doc._id, documentNumber: doc.shortName, action: "LOCATION_LAYOUT_RENAMED", requestId: req.id || "", idempotencyKey: req.idempotent?.key || "", metadata: { layoutId: String(plan.layoutId), name: plan.name } }, result: doc };
+    } });
+    return succeed(req, res, 200, { success: true, layoutId: String(plan.layoutId), name: plan.name, layouts: Layouts.listOf(result), atomicity: { mode } }, result._id, WH_ENTITY);
+  } catch (e) { handle(res, e, "layout rename"); }
 });
 
 async function mintTokens(req, w, locationIds, action) {

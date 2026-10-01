@@ -23,7 +23,7 @@ test("every read the pages use is mounted as GET", () => {
 });
 
 test("every write is mounted with its method and the full store chain", () => {
-  const writes = [["post", "/warehouses/:id/racks"], ["put", "/warehouses/:id/layout"], ["post", "/warehouses/:id/locations/:locationId/qr"], ["post", "/warehouses/:id/qr/backfill"], ["post", "/put"], ["post", "/remove"], ["post", "/transfer"], ["post", "/transfer-all"]];
+  const writes = [["post", "/warehouses/:id/racks"], ["put", "/warehouses/:id/layout"], ["post", "/warehouses/:id/layouts"], ["post", "/warehouses/:id/layouts/:layoutId/activate"], ["patch", "/warehouses/:id/layouts/:layoutId"],["post", "/warehouses/:id/locations/:locationId/qr"], ["post", "/warehouses/:id/qr/backfill"], ["post", "/put"], ["post", "/remove"], ["post", "/transfer"], ["post", "/transfer-all"]];
   for (const [m, p] of writes) {
     const r = find(m, p); assert.ok(r, `${m.toUpperCase()} ${p}`);
     /* capability gate, legacy refusal and the idempotency wrapper all sit before the handler */
