@@ -925,6 +925,17 @@ const publicationSchema = new mongoose.Schema({
      pattern is drafted — and the absence is reported rather than blocking. */
   patternSet: { type: patternSetSchema, default: null },
 
+  /* ── WHEN THIS MODEL IS A PICTURE RATHER THAN A SOURCE ────────────────
+     Set only on a publication produced by a render job. Its presence is what
+     makes the model read-only: a derived preview takes no markers, no
+     measurements and no approvals of its own, because changing the picture
+     would not change the garment. Absent on a model somebody exported from
+     CLO and uploaded, which remains an ordinary publication.
+     See services/rnd/garmentRender.service.js — `assertNotDerived`. */
+  derivedFromPatternRevisionRef: { type: String, trim: true, default: "", immutable: true },
+  derivedFromPatternRevisionNumber: { type: Number, default: null, immutable: true },
+  derivedFromRenderJobRef: { type: String, trim: true, default: "", immutable: true },
+
   /* 2D piece → 3D component. See `pieceMappingSchema` for why each one is a
      record with an author rather than a lookup. */
   pieceMappings: { type: [pieceMappingSchema], default: [] },
@@ -1160,7 +1171,14 @@ annotationSchema.index({ companyId: 1, styleId: 1, status: 1 });
 annotationSchema.statics.CATEGORY = MARKER_CATEGORY;
 annotationSchema.statics.STATUS = MARKER_STATUS;
 
+/* ── SHARED WITH THE PATTERN REVISION RECORD ──────────────────────────────
+ * `PatternRevision` holds the same parsed pattern this publication does, and
+ * the same actor and event shapes. Exported rather than redeclared there so a
+ * change to what a pattern piece IS cannot apply to one of them and not the
+ * other — two drifting definitions of a piece is the kind of fault that only
+ * shows up when a reader compares a bundle with the revision it came from. */
 module.exports = {
+  SHARED: { patternSetSchema, patternPieceSchema, actorRef, eventSchema, point2dSchema },
   PUBLICATION_STATE, MARKER_CATEGORY, MARKER_STATUS, ASSET_KIND,
   PATTERN_CLASSIFICATION, MAPPING_METHOD, MAPPING_STATE,
   MEASUREMENT_KIND, MEASUREMENT_STATUS, MEASUREMENT_CATEGORY, SCALE_STATE,

@@ -37,6 +37,8 @@ const { handle, sendError, fail } = require("../../../services/storePurchase/err
 const { CAPABILITY, rndCapability, liveRndRole, ROLE_CAPABILITIES } = require("../../../services/rnd/access.service");
 const { rndCompanyMiddleware } = require("../../../services/companyContext/rndScope.service");
 const models = require("../../../services/rnd/garmentModel.service");
+const patterns = require("../../../services/rnd/patternRevision.service");
+const renders = require("../../../services/rnd/garmentRender.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -501,6 +503,105 @@ router.post("/garment-models/:publicationId/pattern/rematch", requireCompany, ca
 router.get("/garment-models/styles/:styleId/technical-bundle", requireCompany, canRead,
   handle(async (req, res) => {
     const out = await models.technicalBundleHandover(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ═══ THE 2D PATTERN, WHICH IS THE DESIGN ══════════════════════════════════
+ *
+ * ── WHY THESE SIT ON THE MODEL MOUNT ────────────────────────────────────────
+ * Because a reader of this file needs to see, in one place, that the pattern
+ * routes WRITE and the preview routes do not. Splitting them across two
+ * mounts would make the one-way arrow — pattern → preview — something you have
+ * to go and check rather than something you can read.
+ *
+ * Note what is absent: there is no route that edits a pattern from a model id,
+ * and no route by which a marker, a measurement or an approval on a 3D
+ * publication reaches a revision.
+ */
+
+router.get("/patterns/styles/:styleId/revisions", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await patterns.listRevisions(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
+router.get("/patterns/revisions/:revisionId", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await patterns.readRevision(ctx(req), { revisionId: req.params.revisionId });
+    return res.json({ success: true, ...out });
+  }));
+
+/* Every edit mints the next revision — see the service. There is deliberately
+   no PUT or PATCH on a revision's geometry: a route that could overwrite one
+   is a route that could overwrite an approved one. */
+router.post("/patterns/revisions/:revisionId/edits", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await patterns.editRevision(ctx(req), {
+      revisionId: req.params.revisionId,
+      operations: req.body?.operations,
+      name: req.body?.name,
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+router.put("/patterns/revisions/:revisionId/simulation-inputs", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await patterns.setSimulationInputs(ctx(req), {
+      revisionId: req.params.revisionId,
+      inputs: req.body?.inputs || {},
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+router.post("/patterns/revisions/:revisionId/approve", requireCompany, canApprove,
+  handle(async (req, res) => {
+    const out = await patterns.approveRevision(ctx(req), {
+      revisionId: req.params.revisionId,
+      note: req.body?.note,
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ═══ THE 3D PREVIEW, WHICH IS DERIVED ═════════════════════════════════════
+ *
+ * Two verbs and no more: ask for one, and record what the engine said. There
+ * is no route that edits a preview, because there is nothing about a preview
+ * that is worth editing — it is a picture, and the thing it is a picture of
+ * has its own routes above.
+ */
+
+router.get("/patterns/styles/:styleId/renders", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await renders.listRenders(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
+router.post("/patterns/revisions/:revisionId/render", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await renders.requestRender(ctx(req), {
+      revisionId: req.params.revisionId, actor: actor(req),
+    });
+    return res.status(202).json({ success: true, ...out });
+  }));
+
+/* What the simulation engine reports back. Needs the publish capability
+   because completing a render creates a publication. */
+router.post("/patterns/renders/:jobRef/outcome", requireCompany, canPublish,
+  handle(async (req, res) => {
+    const out = await renders.recordRenderOutcome(ctx(req), {
+      jobRef: req.params.jobRef,
+      status: req.body?.status,
+      publicationId: req.body?.publicationId,
+      publicationRef: req.body?.publicationRef,
+      failure: req.body?.failure,
+      actor: actor(req),
+    });
     return res.json({ success: true, ...out });
   }));
 

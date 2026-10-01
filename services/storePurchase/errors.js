@@ -683,6 +683,20 @@ const CODES = {
      the problem is what it says, which is the distinction this table exists
      to keep. */
   MODEL_MEASUREMENT_INVALID: { status: 422, code: "MODEL_MEASUREMENT_INVALID" },
+
+  /* ── THE PATTERN IS THE DESIGN, THE 3D IS A PICTURE OF IT ─────────────
+     409 rather than 403 on each of these: nothing about the request is
+     unauthorised and nothing about it is malformed. The caller asked for a
+     thing that is not true of this record — an approved revision cannot be
+     rewritten, a derived preview cannot be annotated, a drape cannot start
+     without the inputs a solver needs. Each names the state so a screen can
+     say what to do instead. */
+  PATTERN_REVISION_FROZEN: { status: 409, code: "PATTERN_REVISION_FROZEN" },
+  PATTERN_UNREADABLE: { status: 422, code: "PATTERN_UNREADABLE" },
+  DERIVED_PREVIEW_READ_ONLY: { status: 409, code: "DERIVED_PREVIEW_READ_ONLY" },
+  SIMULATION_INPUTS_MISSING: { status: 422, code: "SIMULATION_INPUTS_MISSING" },
+  SIMULATION_ENGINE_NOT_CONNECTED: { status: 503, code: "SIMULATION_ENGINE_NOT_CONNECTED" },
+  RENDER_ALREADY_RUNNING: { status: 409, code: "RENDER_ALREADY_RUNNING" },
   MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
   MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
   MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },

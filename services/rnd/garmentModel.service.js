@@ -49,6 +49,7 @@ const {
 const drive = require("../companyDrive.service");
 const { inspectGlb, GlbError } = require("../../utils/glbInspect");
 const { auditSurfaces } = require("../../utils/glbSurfaceAudit");
+const { assertNotDerived } = require("./garmentRender.service");
 const {
   classifyBundleFile, routeDroppedFiles, BUNDLE_KIND, ClassifyError,
 } = require("../../utils/bundleFileTypes");
@@ -1889,6 +1890,12 @@ const readConstruction = (c = {}) => ({
 
 /** An approved publication is a record, not a workspace. */
 function assertAnnotatable(row) {
+  /* ── A PREVIEW IS NOT A PLACE TO RECORD ANYTHING ─────────────────────
+     The pattern is the design; this is a picture of one revision of it. A
+     note or a measurement stored against the picture would be a fact about a
+     render — and the next render would not have it. Asked first, because it
+     is the more fundamental refusal of the two. */
+  assertNotDerived(row, "Adding to it");
   if ([PUBLICATION_STATE.APPROVED, PUBLICATION_STATE.SUPERSEDED].includes(row.state)) {
     throw fail("MODEL_STATE_CONFLICT",
       "This model has been accepted. Publish a new model to record further construction on it.",
