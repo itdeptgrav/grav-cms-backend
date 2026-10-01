@@ -440,7 +440,13 @@ async function putStock(session, o) {
       throw fail("VALIDATION", `This sticker labels ${barcode.quantity} ${barcode.unit}; ${mb.located} is already placed, so at most ${round4(barcode.quantity - mb.located)} more can be put under it.`, { reason: "EXCEEDS_MARKING", marking: barcode.quantity, located: mb.located, requested: quantity });
     }
   }
-  const ok = await loc.incAssignedTotal(session, companyId, item._id, variantId, quantity, onHand);
+  /* A STICKER IS PUT EVEN WHEN THE BOOKS SAY 0 ON HAND (1 Oct 2026, owner).
+     The sticker is physically on the goods, so its quantity goes on the
+     shelf whatever company on-hand says; only the sticker's own printed
+     quantity bounds it (above). Located may then exceed on-hand — the
+     reconciliation report shows that gap. A put with no sticker (item grain)
+     keeps the on-hand guard: there is nothing physical to bound it. */
+  const ok = await loc.incAssignedTotal(session, companyId, item._id, variantId, quantity, barcode ? null : onHand);
   if (!ok) throw fail("VALIDATION", `Cannot put ${quantity}: it would place more than this item's on-hand of ${onHand} into locations.`, { reason: "EXCEEDS_ON_HAND", onHand, requested: quantity });
   const inc = await loc.incLocationReturning(session, companyId, item._id, variantId, warehouse._id, location._id, quantity);
   const mv = await loc.writeMovement(session, { ...tenantStamp, ...loc.buildMovement({ companyId, siteId, item, variantId, warehouse, location, direction: "in", quantity, type: "opening_assignment", source: source || { kind: "put", reference: "" }, actor, note, idempotencyKey }), barcodeId: barcode ? barcode._id : null, barcodeLabel });
