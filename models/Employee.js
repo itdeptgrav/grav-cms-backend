@@ -227,6 +227,20 @@ const employeeSchema = new mongoose.Schema({
   status: { type: String, default: "active" },
   isActive: { type: Boolean, default: true },
 
+  // Raised by a sign-in, not by HR.
+  //
+  // A few logins in this CMS are departments rather than people — the CEO
+  // signs in through `ceodepartments` and has no row here at all. Anything
+  // that stores "who asked" keeps a REQUIRED ref into this collection, so such
+  // a login could read the requests desk and never write to it. The first time
+  // one needs a staff record, services/requests/departmentStaffRecord.js
+  // writes one from what the session already proves — badge, name, email,
+  // department — and sets this flag.
+  //
+  // It carries no rights and gates nothing. It exists so HR can tell a record
+  // that was never onboarded from one that was, and finish it off.
+  isDepartmentAccount: { type: Boolean, default: false },
+
   // Custom fields for Work section
   workCustomFields: { type: [customFieldSchema], default: [] },
 

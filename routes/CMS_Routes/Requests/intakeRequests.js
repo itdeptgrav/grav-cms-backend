@@ -56,6 +56,9 @@ const budgetMatch = require("../../../services/budgetCommitment.service");
 /* Whether a request carries a budget head at all — see the file. Off unless
    STORE_BUDGET_SETUP=1 (30 Sep 2026: budget left the Store side). */
 const { budgetEnabled } = require("../../../services/requests/budgetGate");
+/* The staff record behind a department login — why it is written rather than
+   refused is the whole header of that file. */
+const { ensureStaffRecord } = require("../../../services/requests/departmentStaffRecord");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
 /* Cache-immune Store-grant path — the same additive treatment the spend router
@@ -234,6 +237,11 @@ async function standInFor(req) {
  *
  * An employee record always wins — a person who has one is that person, even
  * when their login also carries a department grant.
+ *
+ * A login that has none but DOES carry a badge gets one written for it (see
+ * `departmentStaffRecord`): the CEO is a member of staff, and what was missing
+ * was a row rather than a permission. The stand-in below is what remains for a
+ * login with no badge at all, which has nothing to key a record on.
  */
 async function requester(req) {
   const biometricId = req.user?.employeeId;
@@ -247,7 +255,13 @@ async function requester(req) {
     )
     .lean();
 
-  return emp || standInFor(req);
+  if (emp) return emp;
+
+  const provisioned = await ensureStaffRecord(req).catch((e) => {
+    console.error("[intake] staff record for department login:", e.message);
+    return null;
+  });
+  return provisioned || standInFor(req);
 }
 
 /**
@@ -688,9 +702,23 @@ function intakeRow(r, linked, stock = null, { withMoney = false } = {}) {
     /* Said explicitly rather than left to a null label, because "nobody has
        decided yet" is a real state a manager should be able to read. */
     classified: Boolean(kind),
-    /* The requester's own reference photos, across every line. Nothing else is
-       attachable at intake yet, so this is the whole count. */
+    /* The requester's own reference photos, across every line. */
     attachmentCount: (r.items || []).reduce((n, l) => n + (l.images || []).length, 0),
+    /* ── THE WHOLE DOCUMENTS ATTACHED TO THE ASK ─────────────────────────
+       A quote, a signed agreement, a PO — uploaded on the form since the
+       service fields existed and stored on the request ever since, but never
+       put on the row, so a desk showed "No photos" for a request that had a
+       PDF on it and the file could only be found in the database.
+
+       The link and the name, which is all a reader can act on. `fileId` rides
+       along because Drive serves a thumbnail at thumbnail size from it. */
+    documents: (r.documents || []).map((d) => ({
+      url: d.url,
+      name: d.name || "Attachment",
+      mimeType: d.mimeType || "",
+      fileId: d.fileId || "",
+    })),
+    documentCount: (r.documents || []).length,
     accountHead: null,
     /* An intake request holds no stock report of its own. Once it has become
        an MRF the store's findings live there, and they are read through

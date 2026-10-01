@@ -410,10 +410,10 @@ router.post("/bootstrap", (req, res) => {
 // extracting a token itself. That is what makes the guard below possible: this
 // endpoint consumes a LEGACY BOOTSTRAP IDENTITY, and can now tell one from an
 // organisation-aware session instead of feeding whatever token came first into
-// an Acc_Department lookup.
+// the lookup below.
 //
 // Why that mattered: an accountant_token carries the Acc_User's own email, so
-// the department lookup below would MATCH on it and mint a fresh session. The
+// the lookup below would MATCH on it and mint a fresh session. The
 // revocation check further down reads `iat` from a CMS token and knows nothing
 // about tokenVersion, so a token already revoked by "log out of all devices"
 // could have re-minted itself here — the exact thing that check exists to stop.
@@ -441,68 +441,44 @@ router.post("/sync-legacy", legacyBootstrapAuth, async (req, res) => {
 
     const decoded = req.legacyBootstrap.decoded;
 
-    const legacyUserId =
-      decoded.id || decoded._id || decoded.userId || decoded.employeeId;
-    const legacyEmail = (decoded.email || "").toLowerCase();
+    /* WHAT PROVES AN ACCOUNTING GRANT (1 Oct 2026).
+       ------------------------------------------------------------------
+       This used to resolve an `Acc_Department` row first and refuse anyone
+       who had none. That collection (`acc_departments`) is EMPTY in the
+       live database — the legacy accountant rows were left behind in the
+       pre-rename `accountantdepartments`, and only ever covered one
+       address. So EVERY person who signed in through the CMS — including
+       the Accounting owner — was refused here with "Your account isn't
+       recognised as an accountant in the system", kept on the
+       zero-permission bootstrap identity, and the module never loaded.
 
-    let mongooseRef;
-    try {
-      mongooseRef = require("mongoose");
-    } catch (e) {
-      return res
-        .status(500)
-        .json({ success: false, message: "mongoose not available" });
-    }
+       The department row was only ever the input to the auto-promotion
+       branch (it decided WHO could be made an owner). That branch is
+       retired — nothing is created here any more — so the lookup now gates
+       legitimate users and grants nothing.
 
-    let acctDept = null;
-    try {
-      const Acc_Department =
-        mongooseRef.models.Acc_Department ||
-        require("../../models/Accountant_model/Acc_Department.js");
+       The Acc_User row IS the Accounting grant: it is what Access Control
+       writes, it carries the role and the organisation, and a row with
+       `loginMode: "none"` is exactly this case — Accounting ROLE STORAGE
+       for somebody whose login identity lives elsewhere (see
+       services/access/canonicalIdentity.service.js). So that is what is
+       read, and no row still means ACCOUNTING_GRANT_REQUIRED.
 
-      if (
-        legacyUserId &&
-        mongooseRef.Types.ObjectId.isValid(String(legacyUserId))
-      ) {
-        acctDept = await Acc_Department.findById(legacyUserId);
-      }
-      if (!acctDept && legacyEmail) {
-        acctDept = await Acc_Department.findOne({ email: legacyEmail });
-      }
-
-      if (!acctDept) {
-        const allDepts = await Acc_Department.find({})
-          .select("_id email name role")
-          .lean();
-      }
-    } catch (e) {
-      console.warn("[sync-legacy] Acc_Department lookup failed:", e.message);
-    }
-
-    if (!acctDept) {
+       The email comes from the bootstrap token, which `legacyBootstrapAuth`
+       has already verified against JWT_SECRET — it is this backend's own
+       claim about who signed in, not caller-supplied input. */
+    const legacyEmail = (decoded.email || "").toLowerCase().trim();
+    if (!legacyEmail) {
       return res.status(403).json({
         success: false,
+        code: "ACCOUNTING_GRANT_REQUIRED",
         message:
-          "Your account isn't recognised as an accountant in the system. Only main accountant admin accounts can be promoted to organization owner.",
-        debug: {
-          decodedKeys: Object.keys(decoded),
-          decodedRole: decoded.role,
-          decodedEmail: decoded.email,
-          decodedId: decoded.id || decoded._id || decoded.userId,
-        },
+          "Your session carries no email address, so no Accounting role can be matched to it. Sign in again from the main login page.",
       });
     }
-    if (!acctDept.isActive) {
-      return res.status(403).json({
-        success: false,
-        message: "Your accountant account is inactive.",
-      });
-    }
-
-    const trustedEmail = acctDept.email.toLowerCase();
 
     const emailRe = new RegExp(
-      "^" + trustedEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+      "^" + legacyEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
       "i",
     );
     let user = await Acc_User.findOne({ email: emailRe });
