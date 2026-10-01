@@ -45,6 +45,11 @@ const {
    returned as a 500 and the invoice screen showed verbatim in an alert, so it
    read as "applying the narration failed" even when one had been typed. */
 const { applyDefaultNarration } = require("../../services/voucherNarration.service");
+/* Same fault, same file: `settlementOf` is used by `GET /po-lookup` and
+   `GET /po-detail/:poId` — the purchase-voucher screen's two reads of a
+   purchase order — and was never imported either, so both threw
+   `settlementOf is not defined` as soon as a PO was looked up. */
+const { settlementOf } = require("../../services/poSettlement.service");
 const {
   resolveServiceOrderBilling,
   voucherSummary,
