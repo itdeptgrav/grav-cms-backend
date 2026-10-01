@@ -40,6 +40,8 @@ const chain = require("../../../services/spendApproval.service");
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 const budgetMatch = require("../../../services/budgetCommitment.service");
 const { budgetEnabled } = require("../../../services/requests/budgetGate");
+/* The staff record behind a department login (the CEO and friends). */
+const { ensureStaffRecord } = require("../../../services/requests/departmentStaffRecord");
 /* Shipping, discount and charges, and the one rule for the total they make. */
 const spendAdjustments = require("../../../services/spendAdjustments.service");
 const itemBudgetHead = require("../../../services/itemBudgetHead.service");
@@ -107,7 +109,7 @@ const money = (v) => {
 async function requester(req) {
   const biometricId = req.user?.employeeId;
   const byId = mongoose.isValidObjectId(req.user?.id) ? { _id: req.user.id } : null;
-  return Employee.findOne(
+  const emp = await Employee.findOne(
     biometricId ? { $or: [{ biometricId }, { identityId: biometricId }] } : byId,
   )
     /* `identityId` as well as `biometricId`: an HR record may carry either,
@@ -124,6 +126,17 @@ async function requester(req) {
         "primaryManager accessDepartmentId additionalDepartmentIds isActive status",
     )
     .lean();
+
+  if (emp) return emp;
+
+  /* A department login that is a person — the CEO signs in through
+     `ceodepartments` and has no row here. It gets one written from what the
+     session already proves, once, rather than being told it is not staff. See
+     services/requests/departmentStaffRecord.js. */
+  return ensureStaffRecord(req).catch((e) => {
+    console.error("[spend] staff record for department login:", e.message);
+    return null;
+  });
 }
 
 /* The books this request belongs to — the GRAV Clothing primary profile, the

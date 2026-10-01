@@ -206,6 +206,35 @@ const lineSchema = new mongoose.Schema(
     note: { type: String, trim: true },
     images: { type: [imageSchema], default: [] },
 
+    /* ── THE WORK-ORDER LINE FIELDS, ON THE REQUEST ──────────────────
+       Names and shapes are taken verbatim from models/CMS_Models/Store/
+       WorkerWorkOrder.js rather than invented, so the two documents say the
+       same thing the same way and a request can be read straight into an
+       order without a translation table.
+
+       Every one is OPTIONAL. A requester who knows the HSN and the GST rate
+       can give them — the service master supplies both as suggestions, and
+       until now the form showed them with nowhere to put them — and one who
+       does not leaves them blank, exactly as before. */
+    itemSize: { type: String, trim: true, default: "" },
+    hsnCode: { type: String, trim: true, default: "" },
+    gstPercentage: { type: Number, default: 0, min: 0 },
+
+    /* Computed on save from quantity x rate and the GST rate, never trusted
+       from the client — see the route. Stored so a reader never has to
+       recompute a figure the requester saw. */
+    priceBeforeGST: { type: Number, default: 0, min: 0 },
+    gstAmount: { type: Number, default: 0, min: 0 },
+    priceIncludingGST: { type: Number, default: 0, min: 0 },
+
+    customFields: [
+      {
+        name: { type: String, trim: true, default: "" },
+        value: { type: String, trim: true, default: "" },
+        _id: false,
+      },
+    ],
+
     /* ── THE LINE THE STORE COULD NOT GET ───────────────────────────────────
        Per line, because a request is not one decision. A box of blades may be
        on the shelf, a dock may have to be bought, and the discontinued part
@@ -286,6 +315,89 @@ const intakeRequestSchema = new mongoose.Schema(
        by whoever classifies it, because "quarterly from April" is a commercial
        term and not something the person who needs the thing decides. */
     repeats: { type: Boolean, default: false },
+
+    /* ══ THE WORK-ORDER FIELDS, ON THE REQUEST ═══════════════════════
+       Asked for explicitly (1 Oct 2026): the service request form is to
+       carry every field the Work Order form carries. Shapes mirror
+       WorkerWorkOrder.js.
+
+       A note on two of them, so nobody reads them as workflow:
+
+       · `workOrderStatus` is the Work Order form's own "Status (internal)"
+         — Draft / Issued / Completed. It is NOT this request's `status`,
+         which is the approval workflow and is set by the server. Naming it
+         `status` here would have silently overwritten that.
+
+       · `priority` already existed on the request and is reused rather than
+         duplicated, so there is one priority, not two that can disagree.
+         The request's vocabulary (intake.PRIORITIES) stands.
+
+       All optional. A request that fills none of them behaves exactly as
+       every request did before this. */
+    workOrderNumber: { type: String, trim: true, default: "" },
+    workOrderStatus: {
+      type: String,
+      enum: ["", "Draft", "Issued", "Completed"],
+      default: "",
+    },
+    issueDate: { type: Date, default: null },
+    dueDate: { type: Date, default: null },
+
+    workerName: { type: String, trim: true, default: "" },
+    workerPhone: { type: String, trim: true, default: "" },
+    workerAddress: { type: String, trim: true, default: "" },
+    workerGstin: { type: String, trim: true, default: "" },
+    workerNotes: { type: String, trim: true, default: "" },
+
+    lineSectionLabel: { type: String, trim: true, default: "Items" },
+
+    workArea: { type: String, trim: true, default: "" },
+    workAreaSize: { type: Number, default: 0, min: 0 },
+    workAreaUnit: { type: String, trim: true, default: "sq ft" },
+
+    customHeaderFields: [
+      {
+        name: { type: String, trim: true, default: "" },
+        value: { type: String, trim: true, default: "" },
+        _id: false,
+      },
+    ],
+
+    /* Every detail field is stored whatever the method, so switching the
+       method on edit never discards what was already typed. */
+    paymentMethod: {
+      type: String,
+      enum: ["", "UPI", "Bank Transfer", "Net Banking", "Cheque", "Cash"],
+      default: "",
+    },
+    paymentUpiId: { type: String, trim: true, default: "" },
+    paymentBankName: { type: String, trim: true, default: "" },
+    paymentAccountHolderName: { type: String, trim: true, default: "" },
+    paymentAccountNumber: { type: String, trim: true, default: "" },
+    paymentIfscCode: { type: String, trim: true, default: "" },
+    paymentChequeNumber: { type: String, trim: true, default: "" },
+    paymentNotes: { type: String, trim: true, default: "" },
+
+    /* Whole documents, beside the per-line `images`. Either upload shape can
+       arrive: Drive's {fileId} or Cloudinary's {publicId}. */
+    documents: [
+      {
+        name: { type: String, trim: true, default: "" },
+        url: { type: String, trim: true, default: "" },
+        mimeType: { type: String, trim: true, default: "" },
+        fileId: { type: String, trim: true, default: "" },
+        publicId: { type: String, trim: true, default: "" },
+        uploadedAt: { type: Date, default: Date.now },
+        _id: false,
+      },
+    ],
+
+    /* Snapshots, computed on save beside estimatedTotal. estimatedTotal is
+       left exactly as it was — quantity x rate, GST-free — because the desk,
+       the classification and the spend request all read it. */
+    subtotalBeforeGST: { type: Number, default: 0, min: 0 },
+    totalGST: { type: Number, default: 0, min: 0 },
+    grandTotal: { type: Number, default: 0, min: 0 },
 
     status: { type: String, enum: intake.STATUSES, default: intake.PENDING_TL, index: true },
 

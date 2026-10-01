@@ -1,3 +1,149 @@
+# Latest implementation — the CEO could read the requests desk but never write to it (1 Oct 2026)
+
+> User-requested fix. Two routers, one model field, one new service. Nothing
+> migrated, nothing committed. One row was written to Atlas — see below.
+
+## The fault
+
+Signed in as the CEO, the Raise-a-request form refused on submit:
+
+> "Raising a request has to be done by a member of staff, and this login is a
+> department account with no staff record. Sign in with your own employee login."
+
+The sentence was true and useless. `intakeRequests.requester()` resolved a login
+with no `employees` row to a STAND-IN — department and nothing personal — and
+`refuseStandIn` then blocked raise, approve and withdraw. `ceodepartments` /
+`dept_users` holds `ceo@grav.in` / `CEO001`; `employees` held nothing for it, and
+`spendRequests.requester()` answered `null` outright, so every spend door
+answered "Your staff record was not found."
+
+## The fix — a row, not a looser schema
+
+`services/requests/departmentStaffRecord.js` · `ensureStaffRecord(req)`. For a
+login carrying a badge (`employeeId`) AND a live department grant (`deptId`), it
+finds-or-upserts one `employees` row from what the session already proves: badge,
+name, email, department. `$setOnInsert` only, so a record HR later fills in is
+never flattened back; `accessDepartmentId` is the one field kept current.
+`Employee.isDepartmentAccount` (new, default false) marks it — it gates nothing.
+
+Both routers call it when the lookup misses: `intakeRequests.requester()` falls
+back to it before the stand-in, `spendRequests.requester()` before `null`.
+
+**Why not make `requestedBy` optional.** Three collections hold a REQUIRED ref
+into `employees` for who asked — `IntakeRequest.requestedBy`, `MRF.requestedFor`,
+`SpendRequest.requestedBy` — read by the "my requests" list, withdraw-ownership,
+the approval chain and the MRF/spend spawn. Loosening all three pushes a null
+check into every reader, and a missed one fails as a deleted employee rather than
+as an error. The row keeps every ref valid. It is the move `coworkAuth` already
+makes for a `ceo` claim with no Firestore document (`E000`).
+
+## Attachments were stored and never shown
+
+The form has uploaded documents to Drive and sent them since the service fields
+existed, and `IntakeRequest.documents` has stored them — but no row carried them,
+so a request with a PDF on it read "No photos" and the file was only findable in
+the database. `intakeRow` now carries `documents[]` (url, name, mimeType, fileId)
+and `documentCount`; `components/mrf/RequestDesk.js` renders each as a link in the
+row's quiet line.
+
+## Verified, live, as the CEO
+
+- `GET /api/requests/intake/me` → `standIn: false`.
+- One `employees` row written: `6abe1ca43ab8b52bed0f4005`, CEO001,
+  `isDepartmentAccount: true`, Executive Office. **HR will see it in their list.**
+- Service master created through the API: SVC/2026-27/0002.
+- REQ-2610-0003 raised via the API, then **withdrawn through the UI** (the
+  withdraw door was blocked by the same refusal).
+- REQ-2610-0004 raised through the real form in the browser: PDF uploaded to
+  Drive (`POST /api/upload-to-drive` → 200), `POST /api/requests/intake` → 201,
+  row shows in My requests and in the Store's To-fulfil queue with the PDF as a
+  link.
+- `npm test`: 2165 pass, 3 fail — the same 3 fail on a clean stash
+  (openItems, officeDeadline, a dry-run position test). Unrelated.
+
+## Left undone, deliberately
+
+The requester's own `documents` are still not copied onto the SpendRequest a
+classification spawns (that model's `attachments` are Drive fileIds with no url —
+a different shape and a different door). The intake row keeps them, so they stay
+visible on the desk either way.
+
+---
+
+# Latest implementation — Accounting sessions could never be upgraded (1 Oct 2026)
+
+> User-requested fix, outside the active Store & Purchase lanes. One file
+> changed: `routes/Accountant_Routes/Acc_auth.js`. Nothing written to Atlas,
+> no migration, nothing committed.
+
+## The fault
+
+Nobody who signed in through the main CMS login could reach Accounting. The
+module loaded with every permission `false` and no organisation.
+
+`POST /api/accountant/auth/sync-legacy` — the only door from a CMS session to an
+`accountant_token` — resolved an `Acc_Department` row before it would do
+anything, and refused anyone without one:
+
+> "Your account isn't recognised as an accountant in the system. Only main
+> accountant admin accounts can be promoted to organization owner."
+
+`Acc_Department` is bound to collection `acc_departments`, which holds **zero
+documents** in the live database. The pre-rename legacy rows were left behind in
+`accountantdepartments`, and even that collection holds a single address
+(`accounts@grav.in`). So the lookup failed for every person, **including the
+Accounting owner** (`ray@grav.in`), every time.
+
+The department row was only ever the input to the auto-promotion branch — it
+decided *who could be made an owner*. That branch is retired (GAC-2): nothing is
+created here any more. The lookup had been left behind, where it could only gate
+legitimate users and grant nothing.
+
+## The fix
+
+`sync-legacy` now decides on the **Acc_User row**, which is what Access Control
+actually writes, what carries the role and the organisation, and — with
+`loginMode: "none"` — is exactly the "Accounting role storage for somebody whose
+login identity lives elsewhere" case that `canonicalIdentity.service` describes.
+
+The email comes from the bootstrap token, already verified against `JWT_SECRET`
+by `legacyBootstrapAuth`; it is this backend's own claim about who signed in.
+
+Removed: the `Acc_Department` / `mongooseRef` lookup block and `trustedEmail`.
+Unchanged: the `isLegacy` guard that stops an `accountant_token` re-bootstrapping
+itself, the `sessionsRevokedAt` ("log out of all devices") check, the inactive
+refusal, the cookie + body token, and the `ACCOUNTING_GRANT_REQUIRED` 403 for a
+person with no Accounting role.
+
+## Verification (live dev database, server on :5055)
+
+`POST /sync-legacy` with a CMS-shaped JWT, one address per Accounting role:
+
+| Address | Before | After |
+|---|---|---|
+| `ray@grav.in` | 403 not recognised | 200 — `owner`, org GRAV |
+| `accounts@grav.in` | 403 not recognised | 200 — `approver` |
+| `subhadra.sahoo@grav.in` | 403 not recognised | 200 — `approver` |
+| `casubhamsanket@gmail.com` | 403 not recognised | 200 — `viewer` |
+| `nobody@grav.in` | 403 not recognised | 403 `ACCOUNTING_GRANT_REQUIRED` |
+
+With the upgraded `accountant_token`: `GET /auth/me` returns the owner, the GRAV
+organisation with its three companies, and all six permissions true;
+`GET /tally/companies`, `/dashboard` and `/team` all answer 200.
+
+## Not changed, and why
+
+- **The direct door** `POST /api/accountant/auth/login` is untouched. It is for
+  sub-accounts with no CMS record, and its `classify()` gate is correct.
+- **`Acc_Department` itself.** The model and its empty collection are left
+  alone; no data was migrated or renamed.
+- `test/accountant/{legacy-auth-bootstrap,company-ownership-sync-legacy,accounting-auth-inventory}`
+  fail under `node --test` both before and after this change — they use
+  jest-style `beforeAll`. Pre-existing harness mismatch; they are not in
+  `npm test`'s scope.
+
+---
+
 # Latest implementation — T&A Step 1: the controlled milestone foundation
 
 > **Third pass, 27 Sep 2026.** The starter now places the production-readiness

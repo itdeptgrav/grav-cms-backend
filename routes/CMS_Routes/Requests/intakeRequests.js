@@ -56,6 +56,9 @@ const budgetMatch = require("../../../services/budgetCommitment.service");
 /* Whether a request carries a budget head at all — see the file. Off unless
    STORE_BUDGET_SETUP=1 (30 Sep 2026: budget left the Store side). */
 const { budgetEnabled } = require("../../../services/requests/budgetGate");
+/* The staff record behind a department login — why it is written rather than
+   refused is the whole header of that file. */
+const { ensureStaffRecord } = require("../../../services/requests/departmentStaffRecord");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
 /* Cache-immune Store-grant path — the same additive treatment the spend router
@@ -101,6 +104,66 @@ const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
+
+/* Caps, so a crafted body cannot grow a request without bound. */
+const MAX_PAIRS = 40;
+
+/* The Work Order form's own two vocabularies, repeated here because the
+   request now carries the same fields. An unrecognised value becomes the
+   empty default rather than refusing the request: these are optional
+   descriptive fields, and losing somebody's whole ask over a stale dropdown
+   value would trade the important thing for the cosmetic one. */
+const WORK_ORDER_STATUSES = ["", "Draft", "Issued", "Completed"];
+const PAYMENT_METHODS = ["", "UPI", "Bank Transfer", "Net Banking", "Cheque", "Cash"];
+
+/* A date the browser sent, or null. An unreadable one is null rather than a
+   400: unlike neededBy (which the requester is asked for directly) these two
+   are optional work-order dates, and Invalid Date must never reach Mongo. */
+const dateOrNull = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+const MAX_DOCUMENTS = 25;
+
+/**
+ * The free-form key/value rows the Work Order form calls "Additional
+ * fields" — header-level and per line.
+ *
+ * A pair with no name is dropped: it would render as a blank label beside a
+ * value nobody can interpret. A pair with a name and no value is KEPT,
+ * because "Batch:" with nothing after it is somebody saying the batch is not
+ * known yet, which is information.
+ */
+function cleanPairs(pairs) {
+  if (!Array.isArray(pairs)) return [];
+  return pairs
+    .filter((p) => p && text(p.name, 80))
+    .slice(0, MAX_PAIRS)
+    .map((p) => ({ name: text(p.name, 80), value: text(p.value, 500) }));
+}
+
+/**
+ * Whole documents attached to the request — a PO, a signed agreement, a
+ * quote. Same rule as cleanImages: it has to BE a link, there is a limit,
+ * and a malformed entry is dropped rather than refusing the whole request.
+ *
+ * Either upload shape is accepted, because the CMS has two: Drive returns
+ * {fileId}, Cloudinary returns {publicId}.
+ */
+function cleanDocuments(docs) {
+  if (!Array.isArray(docs)) return [];
+  return docs
+    .filter((d) => d && typeof d.url === "string" && /^https?:\/\//i.test(d.url))
+    .slice(0, MAX_DOCUMENTS)
+    .map((d) => ({
+      url: d.url.trim(),
+      name: text(d.name, 200),
+      mimeType: text(d.mimeType, 120),
+      fileId: text(d.fileId, 120),
+      publicId: text(d.publicId, 200),
+    }));
+}
 
 /**
  * A DEPARTMENT LOGIN THAT HAS NO STAFF RECORD.
@@ -174,6 +237,11 @@ async function standInFor(req) {
  *
  * An employee record always wins — a person who has one is that person, even
  * when their login also carries a department grant.
+ *
+ * A login that has none but DOES carry a badge gets one written for it (see
+ * `departmentStaffRecord`): the CEO is a member of staff, and what was missing
+ * was a row rather than a permission. The stand-in below is what remains for a
+ * login with no badge at all, which has nothing to key a record on.
  */
 async function requester(req) {
   const biometricId = req.user?.employeeId;
@@ -187,7 +255,13 @@ async function requester(req) {
     )
     .lean();
 
-  return emp || standInFor(req);
+  if (emp) return emp;
+
+  const provisioned = await ensureStaffRecord(req).catch((e) => {
+    console.error("[intake] staff record for department login:", e.message);
+    return null;
+  });
+  return provisioned || standInFor(req);
 }
 
 /**
@@ -628,9 +702,23 @@ function intakeRow(r, linked, stock = null, { withMoney = false } = {}) {
     /* Said explicitly rather than left to a null label, because "nobody has
        decided yet" is a real state a manager should be able to read. */
     classified: Boolean(kind),
-    /* The requester's own reference photos, across every line. Nothing else is
-       attachable at intake yet, so this is the whole count. */
+    /* The requester's own reference photos, across every line. */
     attachmentCount: (r.items || []).reduce((n, l) => n + (l.images || []).length, 0),
+    /* ── THE WHOLE DOCUMENTS ATTACHED TO THE ASK ─────────────────────────
+       A quote, a signed agreement, a PO — uploaded on the form since the
+       service fields existed and stored on the request ever since, but never
+       put on the row, so a desk showed "No photos" for a request that had a
+       PDF on it and the file could only be found in the database.
+
+       The link and the name, which is all a reader can act on. `fileId` rides
+       along because Drive serves a thumbnail at thumbnail size from it. */
+    documents: (r.documents || []).map((d) => ({
+      url: d.url,
+      name: d.name || "Attachment",
+      mimeType: d.mimeType || "",
+      fileId: d.fileId || "",
+    })),
+    documentCount: (r.documents || []).length,
     accountHead: null,
     /* An intake request holds no stock report of its own. Once it has become
        an MRF the store's findings live there, and they are read through
@@ -1253,7 +1341,11 @@ router.post("/", async (req, res) => {
        last field while the first is empty is a refusal somebody has to hunt.
        The request type is passed so a canonical service link can be refused on a
        PRODUCT request. */
-    const { lines, estimatedTotal, estimateComplete, error } = await buildLines(b.items, {
+    const {
+      lines, estimatedTotal, estimateComplete, error,
+      /* GST-aware totals, computed line by line in buildLines. */
+      subtotalBeforeGST, totalGST, grandTotal,
+    } = await buildLines(b.items, {
       requestType: String(b.requestType || "PRODUCT").toUpperCase(),
     });
     if (error) return res.status(400).json({ success: false, message: error });
@@ -1451,6 +1543,52 @@ router.post("/", async (req, res) => {
       items: lines,
       estimatedTotal,
       estimateComplete,
+
+      /* ══ THE WORK-ORDER FIELDS (1 Oct 2026) ═══════════════════════
+         Read explicitly, one by one. A field the route does not name is a
+         field Mongoose drops in strict mode — the box would accept typing
+         and the saved request would not have it, which is the one outcome
+         worth more than the feature.
+
+         `workOrderStatus` is the form's own Draft/Issued/Completed and is
+         deliberately NOT `status`: that is the approval workflow and is the
+         server's to set. */
+      workOrderNumber: text(b.workOrderNumber, 60),
+      workOrderStatus: WORK_ORDER_STATUSES.includes(b.workOrderStatus)
+        ? b.workOrderStatus
+        : "",
+      issueDate: dateOrNull(b.issueDate),
+      dueDate: dateOrNull(b.dueDate),
+
+      workerName: text(b.workerName, 160),
+      workerPhone: text(b.workerPhone, 40),
+      workerAddress: text(b.workerAddress, 500),
+      workerGstin: text(b.workerGstin, 20),
+      workerNotes: text(b.workerNotes, 1000),
+
+      lineSectionLabel: text(b.lineSectionLabel, 60) || "Items",
+
+      workArea: text(b.workArea, 500),
+      workAreaSize: Math.max(0, num(b.workAreaSize) || 0),
+      workAreaUnit: text(b.workAreaUnit, 40) || "sq ft",
+
+      customHeaderFields: cleanPairs(b.customHeaderFields),
+
+      paymentMethod: PAYMENT_METHODS.includes(b.paymentMethod) ? b.paymentMethod : "",
+      paymentUpiId: text(b.paymentUpiId, 120),
+      paymentBankName: text(b.paymentBankName, 160),
+      paymentAccountHolderName: text(b.paymentAccountHolderName, 160),
+      paymentAccountNumber: text(b.paymentAccountNumber, 40),
+      paymentIfscCode: text(b.paymentIfscCode, 20),
+      paymentChequeNumber: text(b.paymentChequeNumber, 40),
+      paymentNotes: text(b.paymentNotes, 1000),
+
+      documents: cleanDocuments(b.documents),
+
+      /* Computed from the lines above, never read from the body. */
+      subtotalBeforeGST,
+      totalGST,
+      grandTotal,
       /* Waiting on the first approver, or straight to Store when there is
          nobody in the department above this person. */
       status: intake.startingStatus({ chainLength: built.chain.length }),
@@ -1519,6 +1657,11 @@ async function buildLines(raw, { requestType = "PRODUCT" } = {}) {
   const lines = [];
   let estimatedTotal = 0;
   let estimateComplete = true;
+  /* GST-aware totals, beside estimatedTotal. estimatedTotal keeps its old
+     meaning exactly — quantity x rate, no GST — because the desk, the
+     classification and the spend request all read it. */
+  let subtotalBeforeGST = 0;
+  let totalGST = 0;
 
   /* ── THE ONES THEY RECOGNISED ────────────────────────────────────────────
      A picked catalogue item is verified against the catalogue, never trusted
@@ -1573,6 +1716,18 @@ async function buildLines(raw, { requestType = "PRODUCT" } = {}) {
     if (rate === null) estimateComplete = false;
     else estimatedTotal += quantity * rate;
 
+    /* ── THE LINE'S MONEY, COMPUTED HERE AND NEVER TAKEN FROM THE BODY ───
+       The browser shows a line total while somebody types; the stored one
+       is worked out from the quantity, the rate and the GST rate on this
+       side. A figure a client could set is a figure a client could set
+       wrongly, and these are read back as fact. */
+    const gstPercentage = Math.max(0, num(r?.gstPercentage) || 0);
+    const priceBeforeGST = rate === null ? 0 : Math.round(quantity * rate * 100) / 100;
+    const gstAmount = Math.round(priceBeforeGST * (gstPercentage / 100) * 100) / 100;
+    const priceIncludingGST = Math.round((priceBeforeGST + gstAmount) * 100) / 100;
+    subtotalBeforeGST += priceBeforeGST;
+    totalGST += gstAmount;
+
     lines.push({
       name,
       rawItem: picked ? picked._id : null,
@@ -1587,12 +1742,27 @@ async function buildLines(raw, { requestType = "PRODUCT" } = {}) {
       ...(rate === null ? {} : { rate }),
       note: text(r?.note, 500),
       images: cleanImages(r?.images),
+
+      /* The Work Order line fields (1 Oct 2026). A service's own SAC and
+         GST rate come from the service master as suggestions; whatever is
+         in the box is what is stored, because the requester may correct a
+         suggestion. */
+      itemSize: text(r?.itemSize, 120),
+      hsnCode: text(r?.hsnCode, 40),
+      gstPercentage,
+      priceBeforeGST,
+      gstAmount,
+      priceIncludingGST,
+      customFields: cleanPairs(r?.customFields),
     });
   }
 
   return {
     lines,
     estimatedTotal: Math.round(estimatedTotal * 100) / 100,
+    subtotalBeforeGST: Math.round(subtotalBeforeGST * 100) / 100,
+    totalGST: Math.round(totalGST * 100) / 100,
+    grandTotal: Math.round((subtotalBeforeGST + totalGST) * 100) / 100,
     /* A total nobody could complete is not a total. Saying so beats printing a
        confident figure that quietly treats a missing rate as zero. */
     estimateComplete: estimateComplete && estimatedTotal > 0,
