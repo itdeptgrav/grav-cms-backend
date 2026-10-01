@@ -442,7 +442,10 @@ router.post("/put", requireCapability(OPERATE), refuseLegacyWrite, withIdempoten
     const onHand = loc.onHandOf(stock.item, stock.variantId);
     const sentinel = await LocationBalance.findOne(loc.sentinelFilter(companyOf(req), stock.item._id, stock.variantId)).lean();
     const unassigned = loc.round4(onHand - (sentinel?.onHand || 0));
-    if (qty > unassigned + loc.QTY_TOL) throw fail("VALIDATION", `Only ${unassigned} ${loc.baseUnitOf(stock.item)} of this item is still unplaced (on hand ${onHand}); to move stock that is already on a rack, use Transfer.`, { reason: "EXCEEDS_ON_HAND", onHand, unassigned, requested: qty });
+    /* Only a put with NO sticker is bounded by on-hand. A sticker puts its own
+       printed quantity whatever the books say (1 Oct 2026, owner) — putStock
+       bounds it by the sticker alone. */
+    if (!stock.barcode && qty > unassigned + loc.QTY_TOL) throw fail("VALIDATION", `Only ${unassigned} ${loc.baseUnitOf(stock.item)} of this item is still unplaced (on hand ${onHand}); to move stock that is already on a rack, use Transfer.`, { reason: "EXCEEDS_ON_HAND", onHand, unassigned, requested: qty });
     const { result, mode } = await runMutation(req, { mutate: async (session) => {
       const r = await S.putStock(session, { companyId: companyOf(req), siteId: req.tenant.siteId, tenantStamp: tenantContext.stamp(req.tenant), ...stock, warehouse: dest.warehouse, location: dest.location, quantity: qty, actor: actorOf(req), note: text(req.body?.note), idempotencyKey: req.idempotent?.key || "", source: { kind: req.body?.source === "scan" ? "scan_put" : "put", id: req.idempotent?.record?._id || null, reference: stock.barcode ? String(stock.barcode._id) : "" } });
       return { entityType: ENTITY, entityId: r.movement._id, entry: entry(req, "STOCK_LOCATION_ASSIGNED", r.movement._id, String(r.movement._id), { warehouseId: String(dest.warehouse._id), locationId: String(dest.location._id), locationCode: dest.location.code, quantity: qty, barcodeId: stock.barcode ? String(stock.barcode._id) : "", via: "store-locations/put" }, text(req.body?.note)), result: r };
