@@ -92,6 +92,22 @@ const layoutSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/* A named layout of the warehouse (30 Sep 2026) — see `layouts` below.
+   `floorPlan` is an opaque copy of the live plan's arrangement fields; it was
+   validated when it was live and is written back through the same fields. */
+const savedLayoutSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    floorPlan: { type: mongoose.Schema.Types.Mixed, default: null },
+    positions: [{ _id: false, locationId: { type: mongoose.Schema.Types.ObjectId, required: true }, layout: { type: layoutSchema, default: () => ({}) } }],
+    createdAt: { type: Date, default: null },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    activatedAt: { type: Date, default: null },
+    savedAt: { type: Date, default: null },
+  },
+  { _id: true },
+);
+
 /* Optional. A capacity is only meaningful in the unit the location's stock
    is actually counted in; nothing here converts between units or invents a
    universal "pieces". `unit` is free text matched against the base unit of
@@ -265,7 +281,11 @@ const warehouseSchema = new mongoose.Schema(
       depthCm: { type: Number, default: 0 },
       heightCm: { type: Number, default: 300 },
       gridCm: { type: Number, default: 25 },
-      walls: [{ _id: false, id: String, x1: Number, z1: Number, x2: Number, z2: Number, thickness: { type: Number, default: 15 }, height: { type: Number, default: 300 }, label: { type: String, default: "" } }],
+      /* `height` is the TOP of the wall above the floor; `base` its bottom
+         (30 Sep 2026). 0 is a wall standing on the floor; above it is a beam
+         with an opening underneath — at 200 cm or more the walkthrough lets a
+         person pass under it. */
+      walls: [{ _id: false, id: String, x1: Number, z1: Number, x2: Number, z2: Number, thickness: { type: Number, default: 15 }, height: { type: Number, default: 300 }, base: { type: Number, default: 0 }, label: { type: String, default: "" } }],
       /* `facingDeg` is the direction a DOORWAY faces INTO the room, in the
          plan's degrees (0 = +x, 90 = +z), recorded on 29 Sep 2026 for the
          walkthrough. Null means "derive it from the geometry" — the inward
@@ -277,11 +297,25 @@ const warehouseSchema = new mongoose.Schema(
          the map opens on the fitted overview instead. */
       entranceId: { type: String, default: "" },
       notes: { type: String, trim: true, default: "" },
+      /* Which of `layouts[]` below this floor plan IS — the live one (30 Sep
+         2026). Null on a warehouse that has only ever had one layout. */
+      activeLayoutId: { type: mongoose.Schema.Types.ObjectId, default: null },
       /* Bumped by every layout save; a stale builder save is refused. */
       layoutVersion: { type: Number, default: 0 },
       layoutUpdatedAt: { type: Date, default: null },
       layoutUpdatedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
     },
+
+    /* ── THE OTHER LAYOUTS (30 Sep 2026) ─────────────────────────────────
+       The live arrangement stays in `floorPlan` and `locations[].layout`,
+       which is what every reader already reads. Each entry here is a named
+       layout; the one `floorPlan.activeLayoutId` names is live and keeps no
+       copy, every other one keeps a SNAPSHOT — its plan and the positions of
+       the root locations — until it is switched back in. Written only by
+       services/storePurchase/savedLayouts.js through the store-locations
+       routes, under the layout version. Empty on every warehouse that has
+       only ever had one layout, which is offered as "Original layout". */
+    layouts: [savedLayoutSchema],
 
     /* ── LEGACY, AND NOT A FACT ──────────────────────────────────────────
        A stored counter that nothing maintains, from a time when the UI showed

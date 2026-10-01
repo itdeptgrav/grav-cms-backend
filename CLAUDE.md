@@ -447,6 +447,25 @@ line started UNALLOCATED — the migration placed nothing.
   CONSUMES is NOT here — it is `stock-adjustments /issue` (which now accepts
   an optional per-line `barcodeId` and guards the sticker's balance at that
   shelf) and MRF issue (item grain only, unchanged).
+- **Saved layouts (30 Sep 2026)** — `services/storePurchase/savedLayouts.js`
+  (pure; `savedLayouts.test.js`). A warehouse can hold several named layouts
+  of the same store. The LIVE one stays in `floorPlan` + root
+  `locations[].layout` (every reader unchanged) and `floorPlan.activeLayoutId`
+  names it; the others are snapshots in `warehouse.layouts[]` (plan fields +
+  root positions). `POST /warehouses/:id/layouts` starts a blank room (every
+  root `placed: false`) and makes it live; `POST …/layouts/:lid/activate`
+  swaps a saved one in; both are ONE write guarded by the layout AND
+  structure versions and bump `layoutVersion`, so a builder open elsewhere
+  gets the stale-version conflict instead of saving its old arrangement over
+  the new one. `PATCH …/layouts/:lid` renames without bumping ("current" =
+  the implicit layout of a warehouse that never had a second). A snapshot
+  records `placed` as the map read it (only an explicit false is off), because
+  a record older than the flag has none. `GET /tree` returns
+  `warehouse.layouts`.
+- The layout PUT (30 Sep 2026): `floorPlan.walls[].base` is where a wall
+  starts above the floor (a beam over an opening), refused when not below its
+  `height` (the top); a fixture's `facingDeg: null` stays null ("derive from
+  the wall") instead of becoming 0 through `Number(null)`.
 - `worldBoxOf` folds a child's offset into its parent's frame CLOCKWISE with
   z down (lx·cos − lz·sin, lx·sin + lz·cos), the SVG/plan convention the CMS's
   `worldBox` and the 3D room use. It was the mirror image until 25 Sep 2026,
