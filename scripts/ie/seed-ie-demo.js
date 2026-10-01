@@ -48,6 +48,7 @@ const {
 
 const styleFiles = require("../../services/industrialEngineering/ieStyleFile.service");
 const versions = require("../../services/industrialEngineering/ieBulletinVersion.service");
+const feasibility = require("../../services/industrialEngineering/ieFeasibility.service");
 const layouts = require("../../services/industrialEngineering/ieLineLayout.service");
 const capacity = require("../../services/industrialEngineering/ieCapacityStandard.service");
 const ramps = require("../../services/industrialEngineering/ieRampProfile.service");
@@ -218,6 +219,84 @@ async function buildPrimary({ ctx, editor, approver, world, manifest, skipReleas
   }
 
   const lead = built.find((b) => b.order.key === "A");
+
+  /* ── CAN IT BE MADE? ──────────────────────────────────────────────────
+     A bulletin cannot be submitted until somebody has assessed whether the
+     factory can make the garment — silence is not a pass. The demo records a
+     real judgement rather than a rubber stamp: a folder nobody has arranged
+     yet, a decoration that has to happen before assembly, a needle and thread
+     combination still to confirm, and an in-process check on the placket. */
+  await feasibility.saveFeasibility(ctx, {
+    fileId: lead.fileId,
+    actor: actorOf(editor),
+    body: {
+      expectedRevision: 0,
+      outcome: "FEASIBLE_WITH_CONDITIONS",
+      recommendation: "Make it, once the collar folder is arranged and the decoration is "
+        + "sequenced before front assembly.",
+      findings: [
+        {
+          area: "CONSTRUCTION",
+          title: "Fabric stretches while attaching the collar",
+          observation: "The rib collar grows on the shoulder seam when it is set by hand.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Trial a folder or guide on the next sample round.",
+        },
+        {
+          area: "MACHINES",
+          title: "Collar folder must be arranged before bulk production",
+          observation: "No folder for this collar width is on the floor today.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Arrange or order the folder.",
+          availability: "NEED_TO_ARRANGE",
+        },
+        {
+          area: "SPECIAL_PROCESSES",
+          title: "Chest embroidery must be finished before front assembly",
+          observation: "The crest cannot be hooped once the front is joined to the back.",
+          severity: "CONCERN",
+          owner: "PRODUCTION",
+          requiredAction: "Sequence the outside process before assembly.",
+        },
+        {
+          area: "MATERIALS",
+          title: "Confirm the needle and thread on the approved fabric",
+          observation: "The pique is bio-washed; the needle and thread pairing has not been "
+            + "proved on it.",
+          severity: "CONCERN",
+          owner: "RESEARCH_DEVELOPMENT",
+          requiredAction: "Confirm the combination on the approved fabric.",
+        },
+        {
+          area: "QUALITY_RISK",
+          title: "Placket alignment needs an in-process check",
+          observation: "The placket shifts against the button stand on the sample.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Add an in-process alignment check at the placket operation.",
+        },
+      ],
+      conditions: [
+        {
+          text: "A collar folder is available before bulk production starts",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Arrange the folder and prove it on a sample.",
+        },
+        {
+          text: "Chest decoration is completed before front assembly",
+          owner: "PRODUCTION",
+          requiredAction: "Sequence the embroidery ahead of assembly.",
+        },
+        {
+          text: "The needle and thread combination is confirmed on the approved fabric",
+          owner: "RESEARCH_DEVELOPMENT",
+          requiredAction: "Confirm and record the combination.",
+        },
+      ],
+    },
+  });
 
   /* ── THE APPROVED CHAIN, MAKER THEN CHECKER ──────────────────────────── */
   const submitted = await versions.submitVersion(ctx, {

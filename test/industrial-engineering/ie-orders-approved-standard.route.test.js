@@ -39,6 +39,7 @@ const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem"
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const IeStyleFile = require("../../models/CMS_Models/IndustrialEngineering/IeStyleFile");
 const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering/IeBulletinVersion");
+const { assessFeasible } = require("./support/feasibility");
 
 const {
   STANDARD_STATE, standardSummaryOf,
@@ -273,6 +274,7 @@ async function bulletin(w, ops, { approve = true, fileId = null } = {}) {
   }
 
   const now = await IeStyleFile.findById(id).lean();
+  await assessFeasible(call, { fileId: id, ...t });
   const submitted = await call(`/engineering-files/${id}/bulletin-versions`, {
     method: "POST", ...t, body: { expectedRevision: now.revision },
   });

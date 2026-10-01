@@ -277,6 +277,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },
@@ -1559,6 +1560,7 @@ describe("the frozen evidence is compared field by field", () => {
 });
 
 const IeLineLayoutService = require("../../services/industrialEngineering/ieLineLayout.service");
+const { assessFeasible } = require("./support/feasibility");
 
 /* ══ THE 2D PLANNED-LAYOUT CONTRACT (ie-line-layout-2d/v1) ═════════════════
  *

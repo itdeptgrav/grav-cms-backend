@@ -305,6 +305,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },
@@ -540,6 +541,7 @@ async function released(name) {
 /* ══ THE SLICE-1 SURFACE ════════════════════════════════════════════════════ */
 
 const publication = require("../../services/industrialEngineering/releasePublication.service");
+const { assessFeasible } = require("./support/feasibility");
 
 const patchRoute = (a, w, body) => call(`/engineering-files/${w.fileId}/process-route`, {
   method: "PATCH", token: a.token, company: w.co._id, body,
@@ -720,6 +722,7 @@ describe("the order is the route's own", () => {
 
     const w2 = await world("RouteFrozen", { route: WITH_EMBROIDERY });
     const now = await IeStyleFile.findById(w2.fileId).lean();
+    await assessFeasible(call, { fileId: w2.fileId, token: w2.maker.token, company: w2.co._id });
     const submitted = await call(`/engineering-files/${w2.fileId}/bulletin-versions`, {
       method: "POST", token: w2.maker.token, company: w2.co._id, body: { expectedRevision: now.revision },
     });

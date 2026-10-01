@@ -43,6 +43,7 @@ const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering
 const IeRelease = require("../../models/CMS_Models/IndustrialEngineering/IeRelease");
 
 const { calculateCapacity } = require("../../services/industrialEngineering/capacityCalculation");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, seq = 0;
 
@@ -261,6 +262,7 @@ async function released(name) {
   }
 
   const stored = await IeStyleFile.findById(file.fileId).lean();
+  await assessFeasible(call, { fileId: file.fileId, ...t });
   const submittedVersion = await call(`/engineering-files/${file.fileId}/bulletin-versions`, {
     method: "POST", ...t, body: { expectedRevision: stored.revision },
   });

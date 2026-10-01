@@ -51,6 +51,7 @@ const IeStyleFile = require("../../models/CMS_Models/IndustrialEngineering/IeSty
 const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering/IeBulletinVersion");
 
 const versions = require("../../services/industrialEngineering/ieBulletinVersion.service");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, seq = 0;
 
@@ -454,6 +455,7 @@ describe("what a submitted bulletin version says about R&D", () => {
   test("the frozen source names the exact revision, its key, and what was in it", async () => {
     const { w, fileId, file } = await readyToSubmit("Freeze");
 
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: file.revision },
@@ -483,6 +485,7 @@ describe("what a submitted bulletin version says about R&D", () => {
        technical content is not theirs to hand out; Central Costing reads the
        stored document, having proved the version is the current approved one. */
     const { w, fileId, file } = await readyToSubmit("Publish");
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: file.revision },
@@ -499,6 +502,7 @@ describe("what a submitted bulletin version says about R&D", () => {
 
   test("a client cannot send it — that is the whole point of it", async () => {
     const { w, fileId, file } = await readyToSubmit("Forged");
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const res = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: {
@@ -523,6 +527,7 @@ describe("what a submitted bulletin version says about R&D", () => {
     const { w, fileId, file } = await readyToSubmit("Immutable");
     const t = { token: w.maker.token, company: w.co._id };
 
+    await assessFeasible(call, { fileId: fileId, ...t });
     const first = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", ...t, body: { expectedRevision: file.revision },
     });
@@ -542,6 +547,7 @@ describe("what a submitted bulletin version says about R&D", () => {
 
     /* Resubmitted and approved. */
     const reread = await call(byStyle(w), t);
+    await assessFeasible(call, { fileId: fileId, ...t });
     const second = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", ...t, body: { expectedRevision: reread.body.file.revision },
     });
@@ -576,6 +582,7 @@ describe("what a submitted bulletin version says about R&D", () => {
     const submitter = w.approver;
     const other = await approverIn(w.co);
 
+    await assessFeasible(call, { fileId: fileId, token: submitter.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: submitter.token, company: w.co._id,
       body: { expectedRevision: file.revision },

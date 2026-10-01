@@ -233,6 +233,11 @@ function publishFile(doc, { readiness }) {
     bulletinEditable: !doc.bulletinReviewVersionId,
 
     readiness,
+    /* IE's own judgement, in summary. The Summary card and Review & Approval
+       say what was decided and what is still owed from THIS, rather than each
+       fetching the assessment separately and risking two different answers to
+       one question. The full record stays on its own route. */
+    feasibility: require("./ieFeasibility.service").summariseFeasibility(doc),
     createdByName: doc.createdByName || "",
     updatedByName: doc.updatedByName || "",
     createdAt: doc.createdAt ? new Date(doc.createdAt).toISOString() : null,
@@ -389,6 +394,15 @@ async function readinessFor(doc, { currentApprovedRevision = null } = {}) {
   }
 
   const rowTotals = samTotals(rows.map((r) => ({ proposedSamMinutes: r.proposedSamMinutes })));
+  /* ── CAN IT BE MADE? ───────────────────────────────────────────────────
+     The same gap the submission gate raises, so Review & Approval can say what
+     the assessment still owes rather than refusing at the last step with a
+     reason nobody saw coming. Computed by the assessment's own service — this
+     file decides nothing about feasibility. */
+  for (const g of require("./ieFeasibility.service").feasibilityGaps(doc, { stage: "submitted" })) {
+    gaps.push(gap(g.code, GAP_OWNER.IE, g.action, g.message));
+  }
+
   return {
     ready: gaps.length === 0,
     samComplete: rowTotals.samComplete,
