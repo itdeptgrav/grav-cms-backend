@@ -47,6 +47,10 @@ const canPublish = rndCapability(CAPABILITY.MODEL_PUBLISH);
 const canAnnotate = rndCapability(CAPABILITY.MODEL_ANNOTATE);
 const canSubmit = rndCapability(CAPABILITY.MODEL_SUBMIT);
 const canApprove = rndCapability(CAPABILITY.MODEL_APPROVE);
+const canPublishPattern = rndCapability(CAPABILITY.PATTERN_PUBLISH);
+/* Settling which flat piece is which 3D component is its own act — see the
+   capability's own note in `access.service.js`. */
+const canMap = rndCapability(CAPABILITY.PATTERN_MAP);
 
 const actor = (req) => (req.user?.id
   ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" }
@@ -72,12 +76,30 @@ async function maySource(req) {
  */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: models.LIMITS.SOURCE_BYTES, files: 3, fields: 24 },
+  limits: { fileSize: models.LIMITS.SOURCE_BYTES, files: 4, fields: 24 },
 }).fields([
   { name: "webModel", maxCount: 1 },
   { name: "source", maxCount: 1 },
   { name: "preview", maxCount: 1 },
+  /* The flat pattern, the fourth member of a technical bundle. */
+  { name: "patterns", maxCount: 1 },
 ]);
+
+/** One pattern on its own, for attaching or replacing it on a draft bundle. */
+const uploadPattern = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: models.LIMITS.PATTERN_BYTES, files: 1, fields: 12 },
+}).single("patterns");
+
+/* ── CLASSIFYING A DROP, WHICH STORES NOTHING ─────────────────────────────
+ * Up to four files at once with no field names, because a drag-and-drop does
+ * not have any: the person dropped a folder's worth of exports and the whole
+ * question is what each one is. Nothing here is kept — see `classifyUploads`.
+ */
+const uploadForClassification = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: models.LIMITS.SOURCE_BYTES, files: 4, fields: 8 },
+}).array("files", 4);
 
 const receiveFiles = (req, res, next) => upload(req, res, (err) => {
   if (!err) return next();
@@ -88,11 +110,28 @@ const receiveFiles = (req, res, next) => upload(req, res, (err) => {
   }
   if (err.code === "LIMIT_UNEXPECTED_FILE") {
     return sendError(res, fail("VALIDATION",
-      "A publication carries the web model, the CLO source and a preview, and nothing else.",
+      "A technical bundle carries the web model, the flat pattern, the CLO source and a preview, "
+      + "and nothing else.",
       { field: err.field }));
   }
   return sendError(res, err);
 });
+
+/** The same translation, for the two single-purpose upload paths. */
+const receiveWith = (middleware, limitBytes, what) => (req, res, next) =>
+  middleware(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return sendError(res, fail("PATTERN_TOO_LARGE",
+        `That file is over ${Math.round(limitBytes / 1024 / 1024)}MB, which is the most this workspace `
+        + `accepts for ${what}.`, { limitBytes }));
+    }
+    if (err.code === "LIMIT_UNEXPECTED_FILE" || err.code === "LIMIT_FILE_COUNT") {
+      return sendError(res, fail("VALIDATION",
+        `Attach ${what} and nothing else.`, { field: err.field }));
+    }
+    return sendError(res, err);
+  });
 
 /* ═══ WHO AM I HERE ════════════════════════════════════════════════════════
  *
@@ -322,6 +361,108 @@ router.delete("/garment-models/:publicationId/scale-calibration", requireCompany
       publicationId: req.params.publicationId,
       expectedRevision: req.body?.expectedRevision ?? req.query?.expectedRevision,
     });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ═══ THE FLAT PATTERN ═════════════════════════════════════════════════════
+ *
+ * ── WHY CLASSIFICATION IS A ROUTE AND NOT PART OF THE PUBLISH ───────────────
+ * The brief's rule is that nothing is published until each file's
+ * classification is visible. A server that classified during the publish cannot
+ * satisfy it — by then the decision is made and the bytes are stored. So the
+ * screen asks what these files are, shows the answers, and publishes second.
+ *
+ * It stores nothing, mints no reference and touches no publication, which is
+ * also why it needs only the publish capability rather than a write one: asking
+ * "what is this file" is not a change to anything.
+ */
+router.post("/garment-models/classify", requireCompany, canPublishPattern,
+  receiveWith(uploadForClassification, models.LIMITS.SOURCE_BYTES, "up to four bundle files"),
+  handle(async (req, res) => {
+    const out = await models.classifyUploads(ctx(req), { files: req.files || [], actor: actor(req) });
+    return res.json({ success: true, ...out });
+  }));
+
+/**
+ * ATTACH OR REPLACE THE PATTERN ON A DRAFT BUNDLE.
+ *
+ * PUT rather than POST, because there is at most one pattern on a bundle and
+ * sending a second one replaces the first. A POST would imply a collection and
+ * the first question would be how to address the second member of it.
+ */
+router.put("/garment-models/:publicationId/pattern", requireCompany, canPublishPattern,
+  receiveWith(uploadPattern, models.LIMITS.PATTERN_BYTES, "one DXF pattern export"),
+  handle(async (req, res) => {
+    const out = await models.attachPatternSet(ctx(req), {
+      publicationId: req.params.publicationId,
+      file: req.file,
+      body: req.body || {},
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/**
+ * THE PARSED PATTERN, ITS MAPPING AND EVERYTHING DERIVED FROM BOTH.
+ *
+ * One call rather than three. The 2D viewer cannot draw a piece list without
+ * knowing the unit it is in, and it cannot label a piece "needs mapping"
+ * without the mapping — splitting them would let the screen render a measured
+ * area beside a scale caveat that had not arrived yet.
+ */
+router.get("/garment-models/:publicationId/pattern", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await models.readPatternSet(ctx(req), {
+      publicationId: req.params.publicationId, actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ── MAPPING ───────────────────────────────────────────────────────────────
+ * One endpoint for confirm, reject, set-by-hand and clear, because they are one
+ * decision with four outcomes and a reader of this file should see them
+ * together. The author is taken from the session on every one of them: there is
+ * no body shape here that confirms a mapping anonymously.
+ */
+router.post("/garment-models/:publicationId/pattern/mappings", requireCompany, canMap,
+  handle(async (req, res) => {
+    const out = await models.setPieceMapping(ctx(req), {
+      publicationId: req.params.publicationId,
+      body: req.body || {},
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/** Re-run the matcher. Keeps what a person confirmed — see `proposeMappings`. */
+router.post("/garment-models/:publicationId/pattern/rematch", requireCompany, canMap,
+  handle(async (req, res) => {
+    const out = await models.rematchMappings(ctx(req), {
+      publicationId: req.params.publicationId,
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ── THE TECHNICAL-BUNDLE HANDOVER TO INDUSTRIAL ENGINEERING ───────────────
+ *
+ * GET only, and that is the contract — the same one the measurement handover
+ * already states. There is no companion POST, PATCH or DELETE on this mount
+ * that would let a consumer change an R&D piece, a mapping or a file, and there
+ * is nothing here that derives an operation, a machine, a SAM or a line plan
+ * from pattern geometry. Those are Industrial Engineering's to author, from
+ * this as evidence.
+ *
+ * Only an APPROVED bundle is projected. A draft is R&D's working surface, and
+ * the service answers "nothing is accepted yet" as a fact rather than as an
+ * empty piece list that looks like a parse failure.
+ */
+router.get("/garment-models/styles/:styleId/technical-bundle", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await models.technicalBundleHandover(ctx(req), { styleId: req.params.styleId });
     return res.json({ success: true, ...out });
   }));
 

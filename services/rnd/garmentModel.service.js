@@ -44,9 +44,15 @@ const {
   PUBLICATION_STATE, MARKER_CATEGORY, MARKER_STATUS, ASSET_KIND,
   MEASUREMENT_KIND, MEASUREMENT_STATUS, MEASUREMENT_CATEGORY, SCALE_STATE,
   SURFACE_KINDS, MEASUREMENT_HANDOVER_STATES,
+  PATTERN_CLASSIFICATION, MAPPING_METHOD, MAPPING_STATE,
 } = require("../../models/CMS_Models/RnD/GarmentModel");
 const drive = require("../companyDrive.service");
 const { inspectGlb, GlbError } = require("../../utils/glbInspect");
+const {
+  classifyBundleFile, routeDroppedFiles, BUNDLE_KIND, ClassifyError,
+} = require("../../utils/bundleFileTypes");
+const bundle = require("./patternBundle.service");
+const pieceMapping = require("./patternMapping.service");
 const { mintLetterToken, verifyLetterToken } = require("../../utils/letterDownloadToken");
 const { styleForCompany } = require("../companyContext/rndScope.service");
 const publication = require("./technicalPublication.service");
@@ -70,6 +76,14 @@ const LIMITS = Object.freeze({
   NODES: 5000,
   /* Above this the workspace warns and still loads: it is slow, not wrong. */
   TRIANGLES_WARN: 600_000,
+  /* ── THE PATTERN'S TWO CEILINGS ───────────────────────────────────────
+     The byte limit is about abuse. The vertex limit is not: the parsed set is
+     embedded on the publication, so it has to fit inside MongoDB's document
+     ceiling with room to spare. See `patternBundle.service.js` for why dropping
+     geometry silently would be the worse failure. */
+  PATTERN_BYTES: bundle.LIMITS.PATTERN_BYTES,
+  PATTERN_VERTICES: bundle.LIMITS.STORED_VERTICES,
+  PATTERN_PIECES: bundle.LIMITS.PIECES,
 });
 
 const SOURCE_EXTENSIONS = Object.freeze([".zprj", ".zpac"]);
@@ -290,7 +304,41 @@ function publicationView(row, { subject = "", links = false, mayDownloadSource =
       webModel: assetMeta(row, ASSET_KIND.WEB_MODEL),
       source: assetMeta(row, ASSET_KIND.SOURCE),
       preview: assetMeta(row, ASSET_KIND.PREVIEW),
+      pattern: assetMeta(row, ASSET_KIND.PATTERN),
     },
+
+    /* ── THE BUNDLE'S OWN FACTS ─────────────────────────────────────────
+       Which variant, which stated revisions, and what the three files say that
+       contradicts each other. Carried on every view including the summary,
+       because a tab strip showing "3D model 2" beside a blocking revision
+       mismatch is the one place somebody will notice it. */
+    bundle: {
+      bundleRevision: row.modelNumber,
+      bundleName: `Technical bundle ${row.modelNumber}`,
+      colourway: str(row.colourway),
+      sizeRange: str(row.sizeRange),
+      modelSize: str(row.modelSize),
+      declaredModelRevision: str(row.declaredModelRevision),
+      declaredPatternRevision: str(row.declaredPatternRevision),
+      hasPattern: Boolean(row.patternSet),
+      hasSource: Boolean(assetMeta(row, ASSET_KIND.SOURCE)),
+      patternSetRef: str(row.patternSet?.patternSetRef),
+      patternClassification: str(row.patternSet?.classification),
+      patternPieces: row.patternSet?.stats?.pieces ?? 0,
+      patternUnit: str(row.patternSet?.unit),
+      patternSizes: row.patternSet?.grading?.sizes || [],
+      mappingRevision: row.mappingRevision ?? 0,
+      confirmedMappings: (row.pieceMappings || [])
+        .filter((m) => m.state === MAPPING_STATE.CONFIRMED).length,
+      /* A proposal is outstanding work, and the number belongs where the
+         bundle is named rather than only inside the mapping screen. */
+      unconfirmedMappings: (row.pieceMappings || [])
+        .filter((m) => m.state === MAPPING_STATE.UNCONFIRMED).length,
+    },
+    bundleWarnings: row.bundleWarnings || [],
+    /* One answer to "may this be accepted", computed from the severities and
+       never from a reviewer's reading of a list. */
+    blockingCount: (row.bundleWarnings || []).filter((w) => w.severity === "blocking").length,
     createdBy: row.createdBy || null,
     createdAt: row.createdAt || null,
     submittedAt: row.submittedAt || null,
@@ -312,6 +360,13 @@ function publicationView(row, { subject = "", links = false, mayDownloadSource =
       /* The CLO source is offered only to a reader entitled to take it. */
       source: mayDownloadSource && assetMeta(row, ASSET_KIND.SOURCE)
         ? assetLink({ publicationRef: row.publicationRef, publicationId: id, kind: ASSET_KIND.SOURCE, subject }) : null,
+      /* ── AND THE PATTERN IS THE SAME KIND OF SECRET AS THE SOURCE ──────
+         A DXF is the garment's geometry: whoever holds it can cut the style
+         anywhere. So it is offered on the same permission the CLO project is,
+         and never as a public URL — the stream route re-reads the session and
+         the row before a byte moves, exactly as it does for the model. */
+      pattern: mayDownloadSource && assetMeta(row, ASSET_KIND.PATTERN)
+        ? assetLink({ publicationRef: row.publicationRef, publicationId: id, kind: ASSET_KIND.PATTERN, subject }) : null,
     };
   }
   return view;
@@ -391,6 +446,21 @@ async function listPublications(ctx, { styleId } = {}) {
 
 /* ═══ PUBLISHING A DRAFT ═══════════════════════════════════════════════════ */
 
+/**
+ * The CLO source, checked from its CONTENTS and not only its name.
+ *
+ * ── WHAT CHANGED HERE, AND WHY IT MATTERED ──────────────────────────────────
+ * This used to accept any file whose name ended `.zprj`. That made the source
+ * slot — the one artifact in the bundle that is kept as evidence and can
+ * reproduce the garment — the only one admitted on the uploader's word. A GLB,
+ * a DXF, a PDF or somebody's notes renamed `.zprj` all passed, and nobody would
+ * find out until the day the project had to be opened from it.
+ *
+ * The extension still has to be right, because it is how the screen routes the
+ * file. What is new is that the bytes have to agree: see `readSource` in
+ * `bundleFileTypes.js` for exactly how far that check can honestly go for a
+ * format with no published specification.
+ */
 function assertSourceFile(file) {
   if (!file) return;
   const name = str(file.originalname).toLowerCase();
@@ -399,6 +469,12 @@ function assertSourceFile(file) {
       `The CLO source must be a ${SOURCE_EXTENSIONS.join(" or ")} file. `
       + "It is kept as evidence and is never rendered in the browser.",
       { accepted: SOURCE_EXTENSIONS });
+  }
+  try {
+    classifyBundleFile(file.buffer, file.originalname, BUNDLE_KIND.SOURCE);
+  } catch (err) {
+    if (err instanceof ClassifyError) throw fail(err.code, err.message, err.details);
+    throw err;
   }
   if (file.size > LIMITS.SOURCE_BYTES) {
     throw fail("MODEL_FILE_TOO_LARGE",
@@ -438,12 +514,20 @@ function readWebModel(file) {
       + "Reduce the mesh or the textures in CLO before exporting.",
       { limitBytes: LIMITS.WEB_MODEL_BYTES, bytes: file.size });
   }
-  let read;
+  /* ── GLB OR A SELF-CONTAINED GLTF, DECIDED FROM THE BYTES ──────────────
+     `classifyBundleFile` reads the container itself and refuses a `.gltf` whose
+     geometry or textures live in files beside it — that one would store
+     cleanly and render as an empty viewport. See its own header. */
+  let classified;
   try {
-    read = inspectGlb(file.buffer);
+    classified = classifyBundleFile(file.buffer, file.originalname, BUNDLE_KIND.WEB_MODEL);
   } catch (err) {
-    if (err instanceof GlbError) throw fail("MODEL_UNREADABLE", err.message, { reason: err.code });
+    if (err instanceof ClassifyError) throw fail(err.code, err.message, err.details);
     throw err;
+  }
+  const read = classified.read;
+  if (!read) {
+    throw fail("MODEL_UNREADABLE", "That file could not be read as a garment model.");
   }
   if (read.stats.triangles > LIMITS.TRIANGLES) {
     throw fail("MODEL_TOO_COMPLEX",
@@ -525,9 +609,14 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
   const webFile = files.webModel?.[0] || null;
   const sourceFile = files.source?.[0] || null;
   const previewFile = files.preview?.[0] || null;
+  const patternFile = files.patterns?.[0] || files.pattern?.[0] || null;
 
   const read = readWebModel(webFile);
   assertSourceFile(sourceFile);
+  /* Parsed BEFORE anything is stored, so a pattern that cannot be read refuses
+     the publication rather than leaving a bundle with an unreadable file in
+     it. The same discipline the web model has had since Phase 1. */
+  const patternRead = patternFile ? readPatternFile(patternFile) : null;
   assertPreviewFile(previewFile);
 
   /* ── THE SOURCE IS NOT OPTIONAL FOREVER, AND IS OPTIONAL NOW ──────────
@@ -573,6 +662,7 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
   await upload(webFile, ASSET_KIND.WEB_MODEL, "web");
   await upload(sourceFile, ASSET_KIND.SOURCE, "source");
   await upload(previewFile, ASSET_KIND.PREVIEW, "preview");
+  await upload(patternFile, ASSET_KIND.PATTERN, "pattern");
 
   const last = await GarmentModelPublication
     .findOne({ companyId: ctx.companyId, styleId: style._id })
@@ -613,8 +703,27 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
     /* Stored, not just returned. The person who publishes a model is rarely
        the person who later wonders why the fabric looks grey. */
     warnings: warningsFor(read, { sourceFile }),
+
+    /* ── THE BUNDLE'S OTHER TWO HALVES ──────────────────────────────────── */
+    patternSet: patternRead
+      ? bundle.ingestPatternSet(patternRead, { file: patternFile, actor, parseRevision: 1 })
+      : null,
+    colourway: clean(body.colourway, 120),
+    sizeRange: clean(body.sizeRange, 120),
+    modelSize: clean(body.modelSize, 40),
+    declaredModelRevision: clean(body.declaredModelRevision, 60),
+    declaredPatternRevision: clean(body.declaredPatternRevision, 60),
+
     createdBy: actorOf(actor),
   });
+
+  /* ── MATCHED IMMEDIATELY, CONFIRMED BY NOBODY ─────────────────────────
+     Proposing the mappings at publish time means the workspace opens with the
+     work already laid out; storing them as unconfirmed means not one of them
+     counts as a mapping until a person says so. Both halves matter. */
+  if (row.patternSet) await rematch(row, { actor });
+  await refreshBundleWarnings(row);
+  await row.save();
 
   return {
     publication: publicationView(row, { subject: str(actor?.id) }),
@@ -623,6 +732,535 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
        do is carry a full technical record, and the publisher is told now
        rather than finding out from a marker that names nothing. */
     warnings: warningsFor(read, { sourceFile }),
+    patternWarnings: patternRead?.warnings || [],
+    bundleWarnings: row.bundleWarnings || [],
+    /* What the file turned out to be, echoed back so the screen can state the
+       classification it is publishing rather than re-deriving it. */
+    classification: patternRead
+      ? (patternRead.apparel ? PATTERN_CLASSIFICATION.APPAREL : PATTERN_CLASSIFICATION.GENERIC)
+      : null,
+  };
+}
+
+/* ═══ THE FLAT PATTERN ═════════════════════════════════════════════════════
+ *
+ * ── WHY THE PATTERN IS A SEPARATE ROUTE AS WELL AS A PUBLISH FIELD ──────────
+ * Because the order of work is not the order of the form. A style's 3D model
+ * routinely exists weeks before anybody drafts the pattern, and a workspace that
+ * could only accept the two together would force R&D either to wait or to
+ * publish a throwaway model. So a draft bundle accepts a pattern later, and
+ * accepts a replacement for one that was wrong.
+ *
+ * What it does NOT accept is a change to an approved bundle. That is the whole
+ * value of an approved bundle and it is enforced in one place, below.
+ */
+
+/** Read and classify a pattern upload, refusing what cannot be a pattern. */
+function readPatternFile(file) {
+  if (!file) {
+    throw fail("PATTERN_FILE_REQUIRED", "Attach the pattern export to read it.");
+  }
+  if (file.size > LIMITS.PATTERN_BYTES) {
+    throw fail("PATTERN_TOO_LARGE",
+      `That pattern file is over ${Math.round(LIMITS.PATTERN_BYTES / 1024 / 1024)}MB. `
+      + "Export one size range at a time.",
+      { limitBytes: LIMITS.PATTERN_BYTES, bytes: file.size });
+  }
+  let classified;
+  try {
+    classified = classifyBundleFile(file.buffer, file.originalname, BUNDLE_KIND.PATTERN);
+  } catch (err) {
+    if (err instanceof ClassifyError) throw fail(err.code, err.message, err.details);
+    throw err;
+  }
+  if (!classified.pattern) {
+    throw fail("PATTERN_UNREADABLE", "That file could not be read as a pattern.");
+  }
+  return classified.pattern;
+}
+
+/**
+ * CLASSIFY FILES WITHOUT STORING ANY OF THEM.
+ *
+ * ── WHY THIS EXISTS AS ITS OWN ENDPOINT ─────────────────────────────────────
+ * The brief's rule is that nothing may be published until each file's
+ * classification is visible. That cannot be satisfied by a server that
+ * classifies during the publish — by then the decision is made. So the screen
+ * asks first, shows what came back, and publishes second, and this is the call
+ * it asks with. It writes nothing, mints nothing and touches no publication.
+ *
+ * It is also what makes a multi-file drop routable: each file is identified with
+ * no declared kind, which is exactly the situation a drop creates.
+ */
+async function classifyUploads(ctx, { files = [], actor = null } = {}) {
+  assertContext(ctx);
+  const flat = Array.isArray(files) ? files : Object.values(files || {}).flat();
+  if (!flat.length) throw fail("VALIDATION", "No files were attached to classify.");
+
+  const routed = routeDroppedFiles(flat);
+
+  /* The heavy parse output is deliberately NOT returned. The screen needs the
+     classification, the counts and the warnings to show a confirmation card;
+     sending a megabyte of parsed outlines for a file that may never be
+     published would make the preflight cost more than the publish. */
+  return {
+    files: routed.routed.map((entry) => ({
+      fileName: entry.fileName,
+      extension: entry.extension,
+      bytes: entry.bytes,
+      classification: entry.classification,
+      kind: entry.kind,
+      label: entry.label,
+      detail: entry.detail,
+      warnings: entry.warnings || [],
+      /* The facts a person checks before publishing, and nothing else. */
+      summary: entry.pattern ? {
+        apparel: entry.pattern.apparel,
+        pieces: entry.pattern.stats.pieces,
+        namedPieces: entry.pattern.stats.namedPieces,
+        sizes: entry.pattern.grading.sizes,
+        graded: entry.pattern.grading.graded,
+        unit: entry.pattern.unit,
+        unitSource: entry.pattern.unitSource,
+        unitDeclared: entry.pattern.unitDeclared,
+        notches: entry.pattern.stats.notches,
+        drillPoints: entry.pattern.stats.drillPoints,
+        grainlines: entry.pattern.stats.grainlines,
+        internalLines: entry.pattern.stats.internalLines,
+        conventions: entry.pattern.conventions,
+        styleName: entry.pattern.manifest.styleName,
+        product: entry.pattern.manifest.product,
+        author: entry.pattern.manifest.author,
+        sampleSize: entry.pattern.manifest.sampleSize,
+        pieceNames: entry.pattern.pieces.map((piece) => ({
+          name: piece.name, size: piece.size, quantity: piece.quantity,
+          generatedName: piece.generatedName,
+        })),
+      } : (entry.read ? {
+        meshes: entry.read.stats.meshes,
+        nodes: entry.read.stats.nodes,
+        triangles: entry.read.stats.triangles,
+        namedPieces: entry.read.namedPieces,
+        anchorable: entry.read.anchorable,
+        generator: entry.read.manifest.generator,
+      } : (entry.source ? {
+        container: entry.source.container,
+        /* Said plainly: a `.zprj` is identified by exclusion, because its
+           layout is not published. Overstating that would be the kind of quiet
+           claim this whole record exists to avoid. */
+        signatureVerified: entry.source.signatureVerified,
+      } : null)),
+    })),
+    rejected: routed.rejected,
+    conflicts: routed.conflicts,
+    confirmationRequired: routed.confirmationRequired,
+    actorId: str(actor?.id),
+  };
+}
+
+/** An approved bundle is a record, not a workspace. One place says so. */
+function assertBundleEditable(row, what) {
+  if ([PUBLICATION_STATE.APPROVED, PUBLICATION_STATE.SUPERSEDED].includes(row.state)) {
+    throw fail("MODEL_STATE_CONFLICT",
+      `This technical bundle has been accepted, so ${what} cannot be changed. Publish a new bundle `
+      + "to record a revision.",
+      { state: row.state });
+  }
+}
+
+/**
+ * ATTACH OR REPLACE THE PATTERN ON A DRAFT BUNDLE.
+ *
+ * A replacement re-parses, re-matches and bumps the parse revision — and
+ * deliberately KEEPS mappings a person confirmed, because the alternative is
+ * throwing away the only evidence in the system with a name on it every time
+ * somebody fixes a notch. `proposeMappings` carries them over and the mapping
+ * revision records which parse they were confirmed against, so a stale
+ * confirmation is visible rather than silently trusted.
+ */
+async function attachPatternSet(ctx, { publicationId, file, body = {}, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  assertBundleEditable(row, "its pattern");
+
+  const read = readPatternFile(file);
+  const replacing = Boolean(row.patternSet);
+  const parseRevision = (row.patternSet?.parseRevision || 0) + 1;
+
+  const up = await drive.uploadCompanyFile(file.buffer, {
+    fileName: `${mintRef("GMA")}-${str(file.originalname) || "pattern.dxf"}`,
+    mimeType: str(file.mimetype) || "application/dxf",
+    folderPath: ["rnd", "garment-models", String(row.styleId), "pattern"],
+  });
+  const driveFileId = str(up?.driveFileId);
+  if (!driveFileId) {
+    throw fail("PATTERN_UNREADABLE",
+      "The file store did not return a handle for that upload, so the pattern could not be kept. "
+      + "Nothing was changed; try again.",
+      { reason: "NO_STORAGE_HANDLE" });
+  }
+
+  row.assets = (row.assets || []).filter((a) => a.kind !== ASSET_KIND.PATTERN);
+  row.assets.push({
+    kind: ASSET_KIND.PATTERN,
+    driveFileId,
+    name: str(file.originalname),
+    mimeType: str(file.mimetype),
+    bytes: file.size,
+    sha256: sha256(file.buffer),
+    uploadedAt: new Date(),
+  });
+  row.patternSet = bundle.ingestPatternSet(read, { file, actor, parseRevision });
+  if (str(body.declaredPatternRevision)) {
+    row.declaredPatternRevision = clean(body.declaredPatternRevision, 60);
+  }
+  if (str(body.sizeRange)) row.sizeRange = clean(body.sizeRange, 120);
+
+  await rematch(row, { actor });
+  await refreshBundleWarnings(row);
+  row.revision += 1;
+  await row.save();
+
+  return {
+    publication: publicationView(row, { subject: str(actor?.id) }),
+    patternSet: patternSetView(row, { full: false }),
+    replaced: replacing,
+    classification: row.patternSet.classification,
+    patternWarnings: read.warnings || [],
+    bundleWarnings: row.bundleWarnings || [],
+  };
+}
+
+/* ═══ MAPPING ══════════════════════════════════════════════════════════════ */
+
+/** Re-run the matcher over the current pattern and structure, in place. */
+async function rematch(row, { actor = null } = {}) {
+  if (!row.patternSet) {
+    row.pieceMappings = [];
+    row.mappingRevision = 0;
+    return null;
+  }
+  const revision = (row.mappingRevision || 0) + 1;
+  const result = pieceMapping.proposeMappings(
+    row.patternSet, row.structure || [], row.pieceMappings || [], revision,
+  );
+  row.pieceMappings = result.mappings;
+  row.mappingRevision = revision;
+  return result;
+}
+
+/** The current mapping picture, recomputed for reading rather than stored. */
+function mappingState(row) {
+  if (!row.patternSet) return null;
+  return pieceMapping.proposeMappings(
+    row.patternSet, row.structure || [], row.pieceMappings || [], row.mappingRevision || 1,
+  );
+}
+
+/** Recompute and store what the bundle's files say that contradicts itself. */
+async function refreshBundleWarnings(row) {
+  row.bundleWarnings = bundle.bundleCoherence(row);
+  return row.bundleWarnings;
+}
+
+/**
+ * CONFIRM, REJECT OR SET A MAPPING BY HAND.
+ *
+ * ── THE ONE RULE THIS ENDPOINT ENFORCES ─────────────────────────────────────
+ * Confirming is an act with an author. There is no body shape here that sets
+ * `state: "confirmed"` without recording who did it and when, because a
+ * confirmation nobody is attributable for is indistinguishable from the guess
+ * it was meant to settle.
+ */
+async function setPieceMapping(ctx, { publicationId, body = {}, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  assertBundleEditable(row, "its pattern mapping");
+  if (!row.patternSet) {
+    throw fail("PATTERN_NOT_PUBLISHED",
+      "This bundle has no flat pattern, so there are no pieces to map.");
+  }
+
+  const pieceRef = str(body.pieceRef);
+  const piece = (row.patternSet.pieces || []).find((p) => p.pieceRef === pieceRef);
+  if (!piece) throw fail("NOT_FOUND", "That pattern piece is not in this bundle.");
+
+  const action = str(body.action) || "confirm";
+  const existingIndex = (row.pieceMappings || []).findIndex((m) => m.pieceRef === pieceRef);
+
+  if (action === "clear") {
+    if (existingIndex >= 0) row.pieceMappings.splice(existingIndex, 1);
+    row.revision += 1;
+    await row.save();
+    return mappingResult(row, actor);
+  }
+
+  if (action === "reject") {
+    const current = existingIndex >= 0 ? row.pieceMappings[existingIndex] : null;
+    const rejected = {
+      pieceRef,
+      pieceName: str(piece.name),
+      /* A rejection has to name what was rejected, or re-running the matcher
+         cannot tell which proposal a person turned down. */
+      nodeRef: str(body.nodeRef) || str(current?.nodeRef) || "-",
+      nodeName: str(body.nodeName) || str(current?.nodeName),
+      method: current?.method || MAPPING_METHOD.MANUAL,
+      confidence: current?.confidence ?? 0,
+      basis: str(current?.basis),
+      state: MAPPING_STATE.REJECTED,
+      confirmedBy: actorOf(actor),
+      confirmedAt: new Date(),
+      note: clean(body.note, 1000),
+      mappingRevision: row.mappingRevision || 1,
+    };
+    /* `.set()` rather than index assignment: a DocumentArray casts through
+       `set` and does not reliably cast a plain object written straight to an
+       index, which is how a mapping ends up stored with none of its fields. */
+    if (existingIndex >= 0) row.pieceMappings.set(existingIndex, rejected);
+    else row.pieceMappings.push(rejected);
+    row.revision += 1;
+    await row.save();
+    return mappingResult(row, actor);
+  }
+
+  /* ── CONFIRM, OR SET ONE OUTRIGHT ───────────────────────────────────────
+     A node named in the body is a MANUAL mapping whatever the matcher thought,
+     and it is recorded as `manual` rather than inheriting the proposal's
+     method: a person overriding a 70% name match has not made a 70% name
+     match, they have made a decision. */
+  const nodeRef = str(body.nodeRef);
+  const current = existingIndex >= 0 ? row.pieceMappings[existingIndex] : null;
+  const target = nodeRef || str(current?.nodeRef);
+  if (!target) {
+    throw fail("VALIDATION",
+      "Name the 3D component this piece maps to. There is no proposal to confirm.");
+  }
+  const node = (row.structure || []).find((n) => n.nodeRef === target);
+  if (!node) {
+    throw fail("MODEL_ANCHOR_UNKNOWN",
+      "That 3D component is not in this publication's model.", { nodeRef: target });
+  }
+
+  const manual = Boolean(nodeRef) && nodeRef !== str(current?.nodeRef);
+  const confirmed = {
+    pieceRef,
+    pieceName: str(piece.name),
+    nodeRef: node.nodeRef,
+    nodeName: str(node.name),
+    method: manual ? MAPPING_METHOD.MANUAL : (current?.method || MAPPING_METHOD.MANUAL),
+    confidence: manual
+      ? pieceMapping.CONFIDENCE[MAPPING_METHOD.MANUAL]
+      : (current?.confidence ?? pieceMapping.CONFIDENCE[MAPPING_METHOD.MANUAL]),
+    basis: manual
+      ? `${str(actor?.name) || "A reviewer"} matched this piece to "${str(node.name)}".`
+      : str(current?.basis),
+    state: MAPPING_STATE.CONFIRMED,
+    confirmedBy: actorOf(actor),
+    confirmedAt: new Date(),
+    /* ── ONE PIECE, A REPEATED LEFT/RIGHT COMPONENT ───────────────────────
+       Only ever from an explicit flag on the request. A matcher is never
+       allowed to decide that a piece is cut twice. */
+    repeatedComponent: body.repeatedComponent === true || body.repeatedComponent === "true",
+    note: clean(body.note, 1000),
+    mappingRevision: row.mappingRevision || 1,
+  };
+  if (existingIndex >= 0) row.pieceMappings.set(existingIndex, confirmed);
+  else row.pieceMappings.push(confirmed);
+
+  row.revision += 1;
+  await row.save();
+  return mappingResult(row, actor);
+}
+
+/** Re-run the matcher on request — after a model or pattern replacement. */
+async function rematchMappings(ctx, { publicationId, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  assertBundleEditable(row, "its pattern mapping");
+  if (!row.patternSet) {
+    throw fail("PATTERN_NOT_PUBLISHED", "This bundle has no flat pattern, so there is nothing to match.");
+  }
+  await rematch(row, { actor });
+  row.revision += 1;
+  await row.save();
+  return mappingResult(row, actor);
+}
+
+function mappingResult(row, actor) {
+  const state = mappingState(row);
+  return {
+    mapping: mappingView(row, state),
+    publication: publicationView(row, { subject: str(actor?.id) }),
+    checks: bundle.derivedChecks(row, state, row.bundleWarnings || []),
+  };
+}
+
+function mappingView(row, state = null) {
+  const computed = state || mappingState(row);
+  if (!computed) return null;
+  return {
+    mappingRevision: row.mappingRevision || 0,
+    /* What the model can and cannot do, said before any list of failures. A
+       reader seeing five unmapped pieces needs to know first whether the model
+       could ever have matched them. */
+    availability: computed.availability,
+    mappings: (computed.mappings || []).map((m) => ({
+      pieceRef: m.pieceRef,
+      pieceName: str(m.pieceName),
+      nodeRef: m.nodeRef,
+      nodeName: str(m.nodeName),
+      method: m.method,
+      confidence: m.confidence,
+      basis: str(m.basis),
+      state: m.state,
+      confirmedBy: str(m.confirmedBy?.name),
+      confirmedAt: m.confirmedAt || null,
+      repeatedComponent: Boolean(m.repeatedComponent),
+      note: str(m.note),
+      mappingRevision: m.mappingRevision ?? 1,
+      /* ── SAID, NOT INFERRED BY THE SCREEN ─────────────────────────────
+         Whether this mapping may be relied on downstream is one rule and it
+         lives on the server. A screen computing it from `state` would be a
+         second copy of the rule, and the two would eventually disagree. */
+      usable: m.state === MAPPING_STATE.CONFIRMED,
+    })),
+    unmapped: (computed.unmapped || []).map((u) => ({
+      pieceRef: u.pieceRef,
+      pieceName: str(u.pieceName),
+      reason: u.reason,
+      suggestions: u.suggestions || [],
+    })),
+    unmatchedComponents: computed.unmatchedComponents || [],
+    awaitingConfirmation: computed.awaitingConfirmation || 0,
+    confirmed: (computed.mappings || []).filter((m) => m.state === MAPPING_STATE.CONFIRMED).length,
+  };
+}
+
+/**
+ * The parsed pattern, as the 2D viewer reads it.
+ *
+ * `full` decides whether the point arrays travel. The piece list, the filters
+ * and the inspector need every field EXCEPT the geometry; the viewer needs the
+ * geometry. Sending outlines to a screen drawing a tab strip is how a list
+ * costs four megabytes.
+ */
+function patternSetView(row, { full = true } = {}) {
+  const set = row.patternSet;
+  if (!set) return null;
+  const mappings = new Map((row.pieceMappings || []).map((m) => [m.pieceRef, m]));
+
+  return {
+    patternSetRef: set.patternSetRef,
+    classification: set.classification,
+    /* The one sentence that decides how everything below may be read. */
+    isApparelPattern: set.classification === PATTERN_CLASSIFICATION.APPAREL,
+    manifest: set.manifest || {},
+    unit: str(set.unit),
+    unitSource: str(set.unitSource),
+    unitDeclared: str(set.unitDeclared),
+    unitInMm: set.unitInMm ?? null,
+    scaleVerified: Boolean(set.unit && set.unitInMm),
+    grading: set.grading || {},
+    stats: set.stats || {},
+    bounds: set.bounds || null,
+    conventions: set.conventions || [],
+    layersSeen: set.layersSeen || [],
+    warnings: set.warnings || [],
+    fileName: str(set.fileName),
+    sha256: str(set.sha256),
+    publishedBy: str(set.publishedBy?.name),
+    publishedAt: set.publishedAt || null,
+    parseRevision: set.parseRevision ?? 1,
+
+    pieces: (set.pieces || []).map((piece) => {
+      const mapped = mappings.get(piece.pieceRef) || null;
+      const base = {
+        pieceRef: piece.pieceRef,
+        publishedId: str(piece.publishedId),
+        name: str(piece.name),
+        blockName: str(piece.blockName),
+        /* So a screen can say "unnamed pattern piece" and show the identifier
+           beside it as the technical reference it is — the same honesty the 3D
+           structure panel already uses for `Object_2`. */
+        generatedName: Boolean(piece.generatedName),
+        index: piece.index,
+        size: str(piece.size),
+        quantity: piece.quantity ?? null,
+        material: str(piece.material),
+        componentClass: str(piece.componentClass),
+        description: str(piece.description),
+        width: piece.width ?? null,
+        height: piece.height ?? null,
+        area: piece.area ?? null,
+        perimeter: piece.perimeter ?? null,
+        bounds: piece.bounds || null,
+        insert: piece.insert || null,
+        grainline: piece.grainline || null,
+        notchCount: (piece.notches || []).length,
+        drillPointCount: (piece.drillPoints || []).length,
+        internalLineCount: (piece.internalLines || []).length,
+        seamAllowance: piece.seamAllowance || null,
+        cutOnFold: piece.cutOnFold ?? null,
+        mirrored: piece.mirrored ?? null,
+        insertCount: piece.insertCount ?? null,
+        approximated: str(piece.approximated) || null,
+        layersUsed: piece.layersUsed || [],
+        /* The mapped component, carried on the piece so the inspector does not
+           have to join two lists to answer its most-asked question. */
+        mappedNodeRef: mapped && mapped.state === MAPPING_STATE.CONFIRMED ? mapped.nodeRef : "",
+        mappedNodeName: mapped && mapped.state === MAPPING_STATE.CONFIRMED ? str(mapped.nodeName) : "",
+        mappingState: mapped ? mapped.state : "unmapped",
+        mappingMethod: mapped ? mapped.method : "",
+        mappingConfidence: mapped ? mapped.confidence : null,
+      };
+      if (!full) return base;
+      return {
+        ...base,
+        outline: piece.outline || [],
+        outlineClosed: Boolean(piece.outlineClosed),
+        extraBoundaries: piece.extraBoundaries || [],
+        sewLine: piece.sewLine || null,
+        internalLines: piece.internalLines || [],
+        cutouts: piece.cutouts || [],
+        notches: piece.notches || [],
+        drillPoints: piece.drillPoints || [],
+        turnPoints: piece.turnPoints || [],
+        gradePoints: piece.gradePoints || [],
+        mirrorLine: piece.mirrorLine || null,
+      };
+    }),
+  };
+}
+
+/** The pattern, its mapping and everything derived from both. */
+async function readPatternSet(ctx, { publicationId, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId, { lean: true });
+  if (!row.patternSet) {
+    return {
+      patternSet: null,
+      mapping: null,
+      checks: bundle.derivedChecks(row, null, row.bundleWarnings || []),
+      measurements: null,
+      bundleWarnings: row.bundleWarnings || [],
+      /* Not an error. A bundle without a pattern yet is an ordinary state. */
+      reason: "This technical bundle has no flat pattern attached.",
+    };
+  }
+  const state = mappingState(row);
+  return {
+    patternSet: patternSetView(row, { full: true }),
+    mapping: mappingView(row, state),
+    checks: bundle.derivedChecks(row, state, row.bundleWarnings || []),
+    measurements: bundle.patternMeasurements(row.patternSet),
+    bundleWarnings: row.bundleWarnings || [],
+    state: row.state,
+    /* An approved bundle is read-only, and the server says so rather than the
+       screen deciding from a state string. */
+    editable: ![PUBLICATION_STATE.APPROVED, PUBLICATION_STATE.SUPERSEDED].includes(row.state),
   };
 }
 
@@ -670,6 +1308,24 @@ async function decide(ctx, { publicationId, outcome, note = "", expectedRevision
     throw fail("MODEL_STATE_CONFLICT",
       `This model is ${row.state.toLowerCase().replace("_", " ")}; there is nothing in review to decide.`,
       { state: row.state });
+  }
+
+  /* ── A CONTRADICTION IS NOT APPROVABLE ─────────────────────────────────
+     Recomputed at the moment of decision rather than read from what was stored
+     at upload: a mismatch resolved by replacing the pattern must not still
+     block, and one introduced since must. Only BLOCKING findings refuse —
+     absent optional metadata never does, which is the brief's own rule and also
+     the only way the workspace can hold a sample-size pattern at all. */
+  if (outcome === "approve") {
+    await refreshBundleWarnings(row);
+    const checks = bundle.derivedChecks(row, mappingState(row), row.bundleWarnings || []);
+    if (!checks.approvable) {
+      throw fail("BUNDLE_NOT_APPROVABLE",
+        `This technical bundle cannot be accepted while ${checks.blocking.length} blocking `
+        + `${checks.blocking.length === 1 ? "finding stands" : "findings stand"}: `
+        + `${checks.blocking.map((f) => f.message).join(" ")}`,
+        { blocking: checks.blocking });
+    }
   }
 
   const same = (who) => sameActor(who, actor);
@@ -724,8 +1380,17 @@ async function openAsset(ctx, { publicationId, kind, token, actor = null, mayDow
     throw fail("NOT_FOUND", "That asset link has expired. Reopen the workspace.");
   }
   const row = await publicationForCompany(ctx, publicationId, { lean: true });
-  if (kind === ASSET_KIND.SOURCE && !mayDownloadSource) {
-    throw fail("FORBIDDEN", "Downloading the CLO source needs an R&D role that allows it.");
+  /* ── THE TWO FILES THAT ARE THE GARMENT ITSELF ──────────────────────────
+     The CLO project can reproduce the style; the DXF can cut it. Neither is
+     folded into "can see the workspace", and both need the stronger grant —
+     which is the existing one, deliberately reused rather than a second
+     permission nobody can see in Access Control. */
+  if ([ASSET_KIND.SOURCE, ASSET_KIND.PATTERN].includes(kind) && !mayDownloadSource) {
+    throw fail("FORBIDDEN",
+      kind === ASSET_KIND.PATTERN
+        ? "Downloading the flat pattern needs an R&D role that allows it. The pattern is the garment's "
+          + "geometry — whoever holds it can cut the style."
+        : "Downloading the CLO source needs an R&D role that allows it.");
   }
   const asset = (row.assets || []).find((a) => a.kind === kind);
   if (!asset) throw fail("NOT_FOUND", "This publication has no such asset.");
@@ -739,7 +1404,13 @@ async function openAsset(ctx, { publicationId, kind, token, actor = null, mayDow
        accept, and nothing here should be sniffable into markup. */
     mimeType: kind === ASSET_KIND.WEB_MODEL
       ? "model/gltf-binary"
-      : (asset.mimeType || meta?.mimeType || "application/octet-stream"),
+      /* A DXF is text, and text served with its own type is sniffable into
+         markup on this origin with this session's cookie. `nosniff` is set on
+         the response and the type is deliberately the inert one — nothing
+         renders a DXF in a browser, so there is nothing to lose. */
+      : (kind === ASSET_KIND.PATTERN
+        ? "application/octet-stream"
+        : (asset.mimeType || meta?.mimeType || "application/octet-stream")),
     bytes: asset.bytes || meta?.size || 0,
     /* Only an image is ever drawn in place; everything else downloads. */
     inline: kind === ASSET_KIND.PREVIEW,
@@ -1803,6 +2474,277 @@ async function measurementHandover(ctx, { styleId } = {}) {
   };
 }
 
+/* ═══ THE TECHNICAL-BUNDLE HANDOVER TO INDUSTRIAL ENGINEERING ══════════════
+ *
+ * ── WHAT IE GETS, AND WHAT IT CANNOT DO WITH IT ─────────────────────────────
+ * A READ-ONLY projection of the approved bundle: which revision, which model,
+ * which pattern, the pieces and their verified dimensions, the components they
+ * were confirmed against, the warnings nobody resolved, and the R&D annotations
+ * and measurements already accepted. There is no write anywhere in it, and
+ * there is no route on this mount that would let IE change an R&D piece, a
+ * mapping or a file.
+ *
+ * ── THE FOUR RULES THAT DECIDE WHAT APPEARS ─────────────────────────────────
+ *
+ *   · ONLY AN APPROVED BUNDLE. A draft is R&D's working surface. The brief is
+ *     explicit and it is also the only safe answer: a pattern somebody is still
+ *     drafting would be planned against the moment it reached IE.
+ *   · ONLY CONFIRMED MAPPINGS. A proposed match is this server's inference, and
+ *     handing one over as a component name would let a line plan be built around
+ *     a 70% name similarity. Unconfirmed pieces appear WITH their piece data and
+ *     WITHOUT a component, which is the truthful shape.
+ *   · UNRESOLVED WARNINGS TRAVEL. A bundle approved with four needs-review
+ *     findings is a bundle IE should see the findings of. Hiding them at the
+ *     boundary is how a missing seam allowance becomes somebody else's surprise.
+ *   · AND NOTHING IS DERIVED THAT IE OWNS. No operations, no machines, no SAM,
+ *     no sewing sequence, no line plan, and no marker nesting. Pattern geometry
+ *     makes all five LOOK derivable and none of them is: an operation bulletin
+ *     depends on the machinery a factory has and the method it uses, neither of
+ *     which is in a DXF. They are IE's to author, from this as evidence.
+ */
+
+/**
+ * The approved technical bundle for one style, for IE to read.
+ *
+ * @param {object} ctx     company context
+ * @param {string} styleId the style, scoped to the company as every read is
+ */
+async function technicalBundleHandover(ctx, { styleId } = {}) {
+  assertContext(ctx);
+  const style = await styleForCompany(ctx.companyId, styleId);
+
+  const rows = await GarmentModelPublication
+    .find({ companyId: ctx.companyId, styleId: style._id })
+    .sort({ modelNumber: -1 })
+    .lean();
+
+  const current = rows.find((r) => r.state === PUBLICATION_STATE.APPROVED) || null;
+
+  /* ── A DRAFT BUNDLE IS NOT REPORTED AS AN EMPTY APPROVED ONE ───────────
+     The difference matters to the reader: "nothing is approved yet" is a
+     schedule fact IE acts on, and an empty piece list with no explanation looks
+     like a parse failure. */
+  if (!current) {
+    const pending = rows.filter((r) => r.state !== PUBLICATION_STATE.RETURNED).length;
+    return {
+      style: {
+        id: String(style._id),
+        sampleStyleId: str(style.sampleStyleId),
+        styleCode: str(style.styleCode),
+        productName: str(style.productName),
+      },
+      bundle: null,
+      pieces: [],
+      readOnly: true,
+      available: false,
+      reason: pending
+        ? `R&D has ${pending} technical ${pending === 1 ? "bundle" : "bundles"} for this style and none `
+          + "has been accepted yet. An unapproved bundle stays inside R&D."
+        : "R&D has not published a technical bundle for this style.",
+    };
+  }
+
+  const set = current.patternSet || null;
+  const measurements = set ? bundle.patternMeasurements(set) : null;
+  const state = mappingState(current);
+  const checks = bundle.derivedChecks(current, state, current.bundleWarnings || []);
+
+  const confirmed = new Map((current.pieceMappings || [])
+    .filter((m) => m.state === MAPPING_STATE.CONFIRMED)
+    .map((m) => [m.pieceRef, m]));
+
+  const byRef = new Map((measurements?.pieces || []).map((p) => [p.pieceRef, p]));
+
+  /* R&D's accepted annotations on this bundle's model, as references. IE reads
+     the construction R&D established; it does not get a way to edit one. */
+  const annotations = await GarmentModelAnnotation
+    .find({
+      companyId: ctx.companyId,
+      publicationId: current._id,
+      status: { $in: [MARKER_STATUS.RESOLVED, MARKER_STATUS.IN_APPROVED_PACK] },
+    })
+    .sort({ seq: 1 })
+    .lean()
+    .catch(() => []);
+
+  return {
+    style: {
+      id: String(style._id),
+      sampleStyleId: str(style.sampleStyleId),
+      styleCode: str(style.styleCode),
+      productName: str(style.productName),
+    },
+
+    bundle: {
+      /* ── THE THREE IDENTITIES, EACH WITH ITS OWN HASH ────────────────────
+         So "is this the pattern that was approved" is answerable downstream
+         without trusting a filename, exactly as it is inside R&D. */
+      bundleRevision: current.modelNumber,
+      bundleName: `Technical bundle ${current.modelNumber}`,
+      publicationRef: current.publicationRef,
+      technicalRevisionRef: str(current.technicalRevisionRef),
+      approvedAt: current.decidedAt || null,
+      approvedBy: str(current.decidedBy?.name),
+      publishedBy: str(current.createdBy?.name),
+
+      model: {
+        modelNumber: current.modelNumber,
+        modelName: `3D model ${current.modelNumber}`,
+        generator: str(current.manifest?.generator),
+        cloVersion: str(current.manifest?.cloVersion),
+        unit: str(current.manifest?.unit),
+        modelSize: str(current.modelSize),
+        declaredRevision: str(current.declaredModelRevision),
+        sha256: str((current.assets || []).find((a) => a.kind === ASSET_KIND.WEB_MODEL)?.sha256),
+        meshes: current.stats?.meshes ?? 0,
+        triangles: current.stats?.triangles ?? 0,
+      },
+
+      pattern: set ? {
+        patternSetRef: set.patternSetRef,
+        classification: set.classification,
+        isApparelPattern: set.classification === PATTERN_CLASSIFICATION.APPAREL,
+        declaredRevision: str(current.declaredPatternRevision),
+        sha256: str(set.sha256),
+        styleName: str(set.manifest?.styleName),
+        product: str(set.manifest?.product),
+        sampleSize: str(set.manifest?.sampleSize),
+        unit: str(set.unit),
+        unitSource: str(set.unitSource),
+        /* Whether a length off this pattern may be treated as a real length.
+           Travels WITH the numbers rather than being left for IE to infer. */
+        scaleVerified: Boolean(set.unit && set.unitInMm),
+        sizes: set.grading?.sizes || [],
+        graded: Boolean(set.grading?.graded),
+        pieces: set.stats?.pieces ?? 0,
+        conventions: set.conventions || [],
+      } : null,
+
+      colourway: str(current.colourway),
+      sizeRange: str(current.sizeRange),
+
+      /* ── WHETHER THE SOURCE EXISTS, NEVER A LINK TO IT ─────────────────
+         IE is told the CLO project is on record and is given no way to fetch
+         it. The source download keeps the stronger R&D permission it already
+         had, and this projection is not a second door to it. */
+      cloSourceOnRecord: Boolean((current.assets || []).find((a) => a.kind === ASSET_KIND.SOURCE)),
+      cloSourceAvailableHere: false,
+    },
+
+    /* ── THE PIECE LIST ─────────────────────────────────────────────────── */
+    pieces: (set?.pieces || []).map((piece) => {
+      const mapped = confirmed.get(piece.pieceRef) || null;
+      const measured = byRef.get(piece.pieceRef) || null;
+      return {
+        pieceRef: piece.pieceRef,
+        name: str(piece.name),
+        /* So IE can see that a piece has no chosen name rather than reading an
+           exporter's counter as one. */
+        generatedName: Boolean(piece.generatedName),
+        publishedId: str(piece.publishedId),
+        size: str(piece.size),
+        quantity: piece.quantity ?? null,
+        material: str(piece.material),
+        componentClass: str(piece.componentClass),
+
+        /* Verified dimensions, with the millimetre figures present only where
+           the pattern stated a unit. */
+        width: piece.width ?? null,
+        height: piece.height ?? null,
+        area: piece.area ?? null,
+        perimeter: piece.perimeter ?? null,
+        widthMm: measured?.widthMm ?? null,
+        heightMm: measured?.heightMm ?? null,
+        perimeterMm: measured?.perimeterMm ?? null,
+        areaMm2: measured?.areaMm2 ?? null,
+
+        grainDirection: str(piece.grainline?.direction),
+        grainOffVerticalDegrees: piece.grainline?.offVerticalDegrees ?? null,
+        seamAllowance: piece.seamAllowance || null,
+        cutOnFold: piece.cutOnFold ?? null,
+        mirrored: piece.mirrored ?? null,
+        notches: (piece.notches || []).length,
+        drillPoints: (piece.drillPoints || []).length,
+        notchSpacing: measured?.notchSpacing || [],
+
+        /* ── THE MAPPED COMPONENT, OR NOTHING ───────────────────────────
+           A confirmed mapping yields a name. An unconfirmed one yields
+           `mappedComponent: null` and a stated reason, never a guess. */
+        mappedComponent: mapped ? {
+          nodeRef: mapped.nodeRef,
+          nodeName: str(mapped.nodeName),
+          method: mapped.method,
+          confirmedBy: str(mapped.confirmedBy?.name),
+          confirmedAt: mapped.confirmedAt || null,
+          repeatedComponent: Boolean(mapped.repeatedComponent),
+        } : null,
+        mappingState: mapped ? MAPPING_STATE.CONFIRMED : "unmapped",
+      };
+    }),
+
+    /* ── MEASUREMENT TOTALS, AND THE ONE THING THEY ARE NOT ─────────────── */
+    patternMeasurements: measurements ? {
+      unit: measurements.unit,
+      scaleVerified: measurements.scaleVerified,
+      totalNetArea: measurements.totalNetArea,
+      totalNetAreaMm2: measurements.totalNetAreaMm2,
+      totalNetAreaByQuantity: measurements.totalNetAreaByQuantity,
+      quantityPublishedForEveryPiece: measurements.quantityPublishedForEveryPiece,
+      byMaterial: measurements.byMaterial,
+      byComponentClass: measurements.byComponentClass,
+      grading: measurements.grading,
+      netAreaIsNotConsumption: measurements.netAreaIsNotConsumption,
+    } : null,
+
+    /* ── WHAT THE 3D MODEL CAN AND CANNOT IDENTIFY ─────────────────────── */
+    componentAvailability: state?.availability || null,
+
+    /* R&D's own accepted facts, as references into R&D's records. */
+    annotations: annotations.map((a) => ({
+      markerRef: a.markerRef,
+      seq: a.seq,
+      category: a.category,
+      title: str(a.title),
+      note: str(a.note),
+      construction: a.construction || {},
+      status: a.status,
+      priority: str(a.priority),
+      anchorNodeRef: str(a.anchor?.nodeRef),
+      anchorNodeName: str(a.anchor?.nodeName),
+      author: str(a.author?.name),
+    })),
+    measurements: (current.measurements || [])
+      .filter((m) => MEASUREMENT_HANDOVER_STATES.includes(m.status))
+      .sort((a, b) => a.seq - b.seq)
+      .map((m) => handoverMeasurementView(m, current)),
+
+    /* ── EVERY WARNING NOBODY RESOLVED ──────────────────────────────────
+       Carried whole. A bundle can be approved with needs-review findings — that
+       is a decision an R&D approver is entitled to make — and IE is the next
+       person who has to know what was decided past. */
+    unresolvedWarnings: {
+      blocking: checks.blocking,
+      needsReview: checks.needsReview,
+      informational: checks.informational,
+      counts: checks.counts,
+    },
+    modelWarnings: current.warnings || [],
+    patternWarnings: set?.warnings || [],
+
+    /* ── SAID IN THE PAYLOAD, NOT ONLY IN A COMMENT ─────────────────────
+       A consumer must not be able to mistake this for something it may write
+       to, nor for a licence to derive IE's own records from pattern geometry. */
+    readOnly: true,
+    available: true,
+    authority: "This is R&D's approved technical bundle, read-only. R&D owns the files, the parsed "
+      + "geometry and the confirmed mappings; Industrial Engineering keeps its own engineering records "
+      + "separately and cannot change anything here.",
+    notDerivedHere: "Operations, machine allocation, SAM, sewing sequence, line plans and marker nesting "
+      + "are not derived from this pattern. Geometry alone cannot state them — they depend on the "
+      + "machinery and method a factory uses — and they remain Industrial Engineering's to author.",
+  };
+}
+
 module.exports = {
   workspaceContext,
   LIMITS, TOKEN_SCOPE, SOURCE_EXTENSIONS, PREVIEW_MIME, VIEWER_EXTENSIONS, PRIORITIES,
@@ -1815,4 +2757,11 @@ module.exports = {
   listMeasurements, createMeasurement, updateMeasurement, duplicateMeasurement,
   measurementView, calibrateScale, clearCalibration, scaleBasisOf,
   measurementHandover, handoverMeasurementView,
+
+  /* ── THE FLAT PATTERN, THE MAPPING AND THE BUNDLE ──────────────────── */
+  PATTERN_CLASSIFICATION, MAPPING_METHOD, MAPPING_STATE,
+  classifyUploads, attachPatternSet, readPatternSet,
+  setPieceMapping, rematchMappings,
+  patternSetView, mappingView, mappingState, readPatternFile,
+  technicalBundleHandover,
 };

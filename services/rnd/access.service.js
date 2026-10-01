@@ -80,6 +80,26 @@ const CAPABILITY = Object.freeze({
   MODEL_PUBLISH: "rnd.model.publish",
   MODEL_SUBMIT: "rnd.model.submit",
   MODEL_APPROVE: "rnd.model.approve",
+
+  /* ── THE FLAT PATTERN, AND WHY MAPPING IS NOT ANNOTATING ──────────────
+     Attaching a pattern is publishing: it is the second half of the technical
+     bundle, carries the same consequences as replacing the model, and sits on
+     the same rung.
+
+     CONFIRMING A MAPPING is deliberately its own capability rather than being
+     folded into annotating. A marker is one person's note about a surface and
+     is argued with in replies; a confirmed 2D-to-3D mapping is a STATEMENT that
+     this flat piece is that component, it is what the IE projection carries,
+     and nothing downstream re-examines it. Those are different acts with
+     different consequences, and a role that may leave a note is not
+     automatically a role that may settle the pattern's identity.
+
+     It is granted to the editor rung — the people drafting the pattern are the
+     people who know which piece is which — and it is separable, which is the
+     point: a deployment that wants mapping to be an approver's act changes one
+     line here rather than auditing every route. */
+  PATTERN_PUBLISH: "rnd.pattern.publish",
+  PATTERN_MAP: "rnd.pattern.map",
   /* ── TAKING THE GARMENT AWAY IS ITS OWN PERMISSION ────────────────────
      Reading the workspace and downloading the CLO project are different
      acts. The `.zprj` is the garment: whoever holds it can reproduce the
@@ -95,6 +115,7 @@ const ROLE_CAPABILITIES = (() => {
   const editor = [...viewer,
     CAPABILITY.TECHNICAL_WRITE,
     CAPABILITY.MODEL_ANNOTATE, CAPABILITY.MODEL_PUBLISH, CAPABILITY.MODEL_SUBMIT,
+    CAPABILITY.PATTERN_PUBLISH, CAPABILITY.PATTERN_MAP,
   ];
   const approver = [...editor,
     CAPABILITY.TECHNICAL_SUBMIT, CAPABILITY.MATERIAL_RETURN,

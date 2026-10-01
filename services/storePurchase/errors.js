@@ -692,6 +692,44 @@ const CODES = {
   MODEL_WEB_FILE_REQUIRED: { status: 400, code: "MODEL_WEB_FILE_REQUIRED" },
   REVISION_CONFLICT: { status: 409, code: "REVISION_CONFLICT" },
 
+  /* ── R&D — THE FLAT PATTERN AND THE TECHNICAL BUNDLE ───────────────────
+     Registered for the reason this table states a few entries down: an
+     unlisted code silently becomes VALIDATION, and the upload screen reacts
+     differently to each of these. A file on the wrong card is corrected by
+     dragging it; a file that is not a pattern at all is corrected in CAD; a
+     pattern too large is corrected by exporting fewer sizes; and a bundle whose
+     files contradict each other is not correctable at the upload at all. One
+     generic "VALIDATION" for all four would leave the person guessing which. */
+
+  /* The bytes are not a readable DXF, or are a truncated one. 415 beside
+     MODEL_UNREADABLE, which is the same statement about the model. */
+  PATTERN_UNREADABLE: { status: 415, code: "PATTERN_UNREADABLE" },
+  /* Too many pieces or too many points to store whole. 413 rather than 422:
+     the request is well formed and the entity is simply too large, and the fix
+     is to send less of it. */
+  PATTERN_TOO_LARGE: { status: 413, code: "PATTERN_TOO_LARGE" },
+  PATTERN_FILE_REQUIRED: { status: 400, code: "PATTERN_FILE_REQUIRED" },
+  /* Asked for the pattern, or to map it, on a bundle that has none. 409 because
+     nothing is wrong with the request — the bundle is not in a state that has
+     an answer. */
+  PATTERN_NOT_PUBLISHED: { status: 409, code: "PATTERN_NOT_PUBLISHED" },
+
+  /* The contents contradict the upload card the file arrived on. Distinct from
+     PATTERN_UNREADABLE and MODEL_UNREADABLE on purpose: this file IS readable
+     and IS valid, and it is on the wrong card — which the person fixes by
+     moving it rather than by re-exporting anything. */
+  BUNDLE_FILE_MISMATCH: { status: 415, code: "BUNDLE_FILE_MISMATCH" },
+  BUNDLE_FILE_UNRECOGNISED: { status: 415, code: "BUNDLE_FILE_UNRECOGNISED" },
+  /* A blocking finding stands — the bundle's own files describe two different
+     garments, or a scale that cannot be right. 409, and never 422: the request
+     to approve is well formed and it is the RECORD that is not in a state
+     anybody may accept. */
+  BUNDLE_NOT_APPROVABLE: { status: 409, code: "BUNDLE_NOT_APPROVABLE" },
+  /* A .gltf whose geometry or textures are in files beside it. It would store
+     cleanly and render as an empty viewport, so it is refused with the one fix
+     that works: export GLB. */
+  MODEL_ASSETS_MISSING: { status: 422, code: "MODEL_ASSETS_MISSING" },
+
   /* ── IE CHUNK 1D — A WORK ORDER MUST KNOW ITS STYLE ─────────────────────
    * Registered rather than left to fall through to VALIDATION, which is what
    * an unlisted code silently becomes: an operator told "VALIDATION" cannot

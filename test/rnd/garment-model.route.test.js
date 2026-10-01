@@ -26,6 +26,7 @@
 process.env.SALARY_ENCRYPTION_KEY = process.env.SALARY_ENCRYPTION_KEY || "0".repeat(64);
 process.env.JWT_SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 
+const crypto = require("crypto");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -203,11 +204,35 @@ async function world() {
   };
 }
 
+/**
+ * A CLO project file, as far as one can be faked.
+ *
+ * ── WHY THIS IS NOT THE STRING "CLO PROJECT BYTES" ANY MORE ─────────────────
+ * It used to be, and that was a fixture asserting something the product does
+ * not promise. The source slot is the one artifact in a bundle kept as evidence
+ * and able to reproduce the garment, and it is now validated from its CONTENTS —
+ * a GLB, a DXF, a PDF or somebody's notes renamed `.zprj` is refused, and plain
+ * text is refused, because a CLO project is not text. A fixture that was plain
+ * ASCII could never have been a real `.zprj`, so it tested a path that had to
+ * stop existing.
+ *
+ * A ZIP signature is used because `.zpac` genuinely is a ZIP and a zipped
+ * `.zprj` is accepted on its signature. The trailing bytes are opaque on
+ * purpose: nothing in the product parses inside a CLO project, and a fixture
+ * that pretended to have a readable structure would be claiming a capability
+ * that does not exist.
+ */
+const cloProject = () => Buffer.concat([
+  Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+  Buffer.from([0x14, 0x00, 0x00, 0x00, 0x08, 0x00]),
+  crypto.randomBytes(256),
+]);
+
 /** Publish one draft through the real multipart route. */
 async function publish(w, { glb = jacketGlb(), source = true, fields = {} } = {}) {
   const form = new FormData();
   form.append("webModel", new Blob([glb], { type: "model/gltf-binary" }), "field-jacket.glb");
-  if (source) form.append("source", new Blob([Buffer.from("CLO PROJECT BYTES")], { type: "application/octet-stream" }), "field-jacket.zprj");
+  if (source) form.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "field-jacket.zprj");
   form.append("cloVersion", fields.cloVersion ?? "CLO 7.3.154");
   form.append("unit", fields.unit ?? "cm");
   form.append("upAxis", fields.upAxis ?? "Y");
