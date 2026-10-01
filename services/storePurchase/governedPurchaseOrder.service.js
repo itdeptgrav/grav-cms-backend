@@ -151,6 +151,28 @@ function shortfallLines(mrf) {
 }
 
 /**
+ * What a material request still has to be supplied, line by line — ONLY while
+ * the material-request rule is off (1 Oct 2026, the owner: "it is needed to
+ * ask for the MRF against which to create the PO", with no gate in the way).
+ *
+ * A buy decision (`buyQty`) is the figure where somebody made one; otherwise
+ * the arithmetic `requestedQty − issuedQty` is what the store has not supplied.
+ * The governed path above never reads the subtraction and still does not; this
+ * feeds the DIRECT path, where the buyer enters supplier, quantities and rates
+ * on the form and the order merely names the request it is for.
+ */
+function outstandingLines(mrf) {
+  return (mrf.items || [])
+    .map((i) => {
+      const buy = num(i.buyQty) || 0;
+      const left = Math.max(0, (num(i.requestedQty) || 0) - (num(i.issuedQty) || 0));
+      const qty = buy > 0 ? buy : left;
+      return qty > 0 ? { item: i, quantity: qty, decided: buy > 0 } : null;
+    })
+    .filter(Boolean);
+}
+
+/**
  * The approved purchase request for this MRF.
  *
  * Found through the MRF's own forward link first. When that link points at a
@@ -995,19 +1017,63 @@ function resolveAdHoc(body = {}) {
   };
 }
 
-async function resolveChain(tenant, body = {}) {
-  if (!idOf(body.sourceMrfId) && !MRF_RULE_ON()) return resolveAdHoc(body);
-  const mrf = await loadMrf(tenant, body.sourceMrfId);
-
+/** The governed chain for one material request: its buy decision, its approved
+ *  purchase request, the approved supplier and lines. */
+async function governedChainFor(tenant, mrf, body = {}) {
   const shortfall = shortfallLines(mrf);
   if (!shortfall.length) {
     throw fail("MRF_NO_PURCHASE_SHORTFALL",
       `${mrf.mrfNumber} has nothing to buy — every line was issued from stock or is still being decided. A purchase order needs a line the store decided to purchase.`,
       { mrfNumber: mrf.mrfNumber });
   }
-
   const request = await loadRequest(tenant, mrf);
   return resolveApproved(tenant, request, body, mrf);
+}
+
+/**
+ * An order raised DIRECTLY against a material request (1 Oct 2026).
+ *
+ * Only while the material-request rule is off. The request has no approved
+ * purchase request (or its chain cannot be used), so the supplier, quantities
+ * and rates are the form's — exactly as an ad-hoc order — and the order is
+ * stamped MRF_DIRECT_V1 with the request it is for, so the request's page and
+ * the order agree on why it exists. Nothing is reloaded from an approval
+ * because there is none.
+ */
+function resolveDirectMrf(mrf, body = {}) {
+  const base = resolveAdHoc(body);
+  return {
+    ...base,
+    direct: true,
+    mrf,
+    provenance: {
+      sourceMrfId: idOf(mrf._id),
+      sourceMrfNumber: mrf.mrfNumber || "",
+      sourceMrfDepartment: mrf.requestedForDept || "",
+    },
+  };
+}
+
+async function resolveChain(tenant, body = {}) {
+  if (!idOf(body.sourceMrfId) && !MRF_RULE_ON()) return resolveAdHoc(body);
+  const mrf = await loadMrf(tenant, body.sourceMrfId);
+  if (!MRF_RULE_ON()) {
+    /* The governed chain when the request has one; the form's own figures,
+       named for the request, when it has not. A refusal from the governed
+       attempt is the reason the direct path exists, not an error to surface. */
+    try {
+      return await governedChainFor(tenant, mrf, body);
+    } catch (err) {
+      if (err?.name !== "StorePurchaseError") throw err;
+      if (!outstandingLines(mrf).length) {
+        throw fail("MRF_NO_PURCHASE_SHORTFALL",
+          `${mrf.mrfNumber} has nothing left to supply — every line was issued from stock.`,
+          { mrfNumber: mrf.mrfNumber });
+      }
+      return resolveDirectMrf(mrf, body);
+    }
+  }
+  return governedChainFor(tenant, mrf, body);
 }
 
 /**
@@ -1091,6 +1157,9 @@ const PROVENANCE_POLICY = "MRF_REQUIRED_V1";
    STORE_PURCHASE_REQUIRE_MRF=1 brings the whole rule back, unchanged. */
 const MRF_RULE_ON = () => process.env.STORE_PURCHASE_REQUIRE_MRF === "1";
 const AD_HOC_POLICY = "AD_HOC_NO_MRF_V1";
+/* Raised against a material request with no purchase request behind it, from
+   the form's own supplier and lines (1 Oct 2026). Issuable like an ad-hoc order. */
+const DIRECT_POLICY = "MRF_DIRECT_V1";
 
 /**
  * The marker a controlled migration writes onto orders that predate the rule.
@@ -1155,8 +1224,9 @@ function unprovenReason(po) {
  * rules a record was created under; if this code cannot name them, it cannot
  * check them, and it must say so instead of guessing.
  */
-const SUPPORTED_POLICIES = Object.freeze([PROVENANCE_POLICY, LEGACY_POLICY, AD_HOC_POLICY]);
-const isAdHocOrder = (po) => Boolean(po && po.provenancePolicy === AD_HOC_POLICY);
+const SUPPORTED_POLICIES = Object.freeze([PROVENANCE_POLICY, LEGACY_POLICY, AD_HOC_POLICY, DIRECT_POLICY]);
+const isAdHocOrder = (po) => Boolean(po && (po.provenancePolicy === AD_HOC_POLICY || po.provenancePolicy === DIRECT_POLICY));
+const isDirectOrder = (po) => Boolean(po && po.provenancePolicy === DIRECT_POLICY);
 const isSupportedPolicy = (p) => SUPPORTED_POLICIES.includes(String(p || ""));
 
 /** A governed order: raised under THIS rule, and carrying its proof. */
@@ -1169,6 +1239,14 @@ const isGovernedOrder = (po) => Boolean(po && po.provenancePolicy === PROVENANCE
  * stored record inside `resolveChain`.
  */
 function provenanceFields(chain) {
+  if (chain?.direct) {
+    return {
+      provenancePolicy: DIRECT_POLICY,
+      sourceMrfId: chain.provenance.sourceMrfId,
+      sourceMrfNumber: chain.provenance.sourceMrfNumber,
+      sourceMrfDepartment: chain.provenance.sourceMrfDepartment,
+    };
+  }
   if (chain?.adHoc) return { provenancePolicy: AD_HOC_POLICY };
   return {
     provenancePolicy: PROVENANCE_POLICY,
@@ -1568,30 +1646,30 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
   const cap = Math.min(Number(limit) || SELECTOR_CAP(), SELECTOR_CAP());
 
   /* Only requests with something to buy. A request fulfilled entirely from
-     stock is not a purchasing candidate and would only be noise. */
-  const base = { "items.buyQty": { $gt: 0 } };
+     stock is not a purchasing candidate and would only be noise. While the
+     material-request rule is off (1 Oct 2026) an APPROVED or part-issued
+     request with lines still unsupplied is a candidate too — the buyer orders
+     against it directly (see resolveDirectMrf). */
+  const base = MRF_RULE_ON()
+    ? { "items.buyQty": { $gt: 0 } }
+    : { $or: [{ "items.buyQty": { $gt: 0 } }, { status: { $in: ["APPROVED", "PARTIALLY_ISSUED"] } }] };
   const rx = search
     ? new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
     : null;
 
-  const filter = { ...tenantContext.tenantFilter(tenant), ...base };
-  if (rx) {
-    /* Folded under `$and`: assigning a second `$or` over the tenancy clause
-       would replace it and search across companies. */
-    const tenancy = filter.$or;
-    delete filter.$or;
-    filter.$and = [
-      ...(tenancy ? [{ $or: tenancy }] : []),
-      { $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { "items.rawItemName": rx }] },
-    ];
-  }
+  /* Every clause under one `$and`: the tenancy clause is itself an `$or` under
+     the legacy read-through, and so is the base — assigning either over the
+     other would drop it (and a dropped tenancy clause reads across companies). */
+  const clauses = [tenantContext.tenantFilter(tenant), base];
+  if (rx) clauses.push({ $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { "items.rawItemName": rx }] });
+  const filter = { $and: clauses };
 
   const [storedMatchCount, docs] = await Promise.all([
     MRF.countDocuments(filter),
     MRF.find(filter)
       .select("mrfNumber requestedForDept requestedForName status fulfilmentDecision "
         + "spendRequestId spendRequestNumber createdAt items.rawItemName items.unit "
-        + "items.requestedQty items.issuedQty items.buyQty")
+        + "items.requestedQty items.issuedQty items.buyQty items.rawItem items.rawItemSku items.variantId items.variantCombination")
       .sort({ createdAt: -1, _id: -1 })
       .limit(cap)
       .lean(),
@@ -1624,12 +1702,22 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
   const rows = docs.map((mrf) => {
     const buyLines = (mrf.items || []).filter((i) => num(i.buyQty) > 0);
     const request = mrf.spendRequestId ? byId.get(idOf(mrf.spendRequestId)) : null;
+    const outstanding = outstandingLines(mrf);
 
     /* The exact reason, in the buyer's terms, with the next step. */
     let eligible = false;
+    let direct = false;
     let reason = null;
     let correction = null;
-    if (!request || request.requestType !== MATERIAL_REQUEST_TYPE) {
+    if (!MRF_RULE_ON() && (!request || request.requestType !== MATERIAL_REQUEST_TYPE)) {
+      /* No purchase request and the rule is off: orderable directly when
+         anything is still unsupplied. */
+      if (outstanding.length) { eligible = true; direct = true; }
+      else {
+        reason = "Everything on it was issued from stock — nothing is left to buy.";
+        correction = `/store/dashboard/order-requests/mrf/${idOf(mrf._id)}`;
+      }
+    } else if (!request || request.requestType !== MATERIAL_REQUEST_TYPE) {
       reason = "No approved purchase request yet — sourcing and budget are agreed there first.";
       correction = `/store/dashboard/order-requests/mrf/${idOf(mrf._id)}`;
     } else if (idOf(request.sourceMrfId) !== idOf(mrf._id)) {
@@ -1657,16 +1745,28 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
       requestedForName: mrf.requestedForName || "",
       status: mrf.status || "",
       raisedAt: mrf.createdAt || null,
-      /* Whether it has a purchase shortfall, and how much of one. */
-      hasPurchaseShortfall: buyLines.length > 0,
-      shortfallLineCount: buyLines.length,
-      shortfallLines: buyLines.map((i) => ({
-        itemName: i.rawItemName || "",
-        unit: i.unit || "",
-        requestedQty: num(i.requestedQty),
-        issuedQty: num(i.issuedQty),
-        buyQty: num(i.buyQty),
-      })),
+      /* Whether it has a purchase shortfall, and how much of one. On a
+         direct row the lines are what is still unsupplied (`buyQty` carries
+         that figure so the option text reads the same either way). */
+      hasPurchaseShortfall: (direct ? outstanding : buyLines).length > 0,
+      shortfallLineCount: (direct ? outstanding : buyLines).length,
+      shortfallLines: direct
+        ? outstanding.map(({ item: i, quantity, decided }) => ({
+          itemName: i.rawItemName || "",
+          unit: i.unit || "",
+          requestedQty: num(i.requestedQty),
+          issuedQty: num(i.issuedQty),
+          buyQty: quantity,
+          decided,
+        }))
+        : buyLines.map((i) => ({
+          itemName: i.rawItemName || "",
+          unit: i.unit || "",
+          requestedQty: num(i.requestedQty),
+          issuedQty: num(i.issuedQty),
+          buyQty: num(i.buyQty),
+        })),
+      direct,
       /* Its purchasing readiness — the chain, named as three separate things
          so nobody reads the purchase request as the material request. */
       purchaseRequestNumber: request?.requestNumber || "",
@@ -1707,11 +1807,70 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
  * the fact that approval happened somewhere else entirely.
  */
 async function provenanceSummary(tenant, sourceMrfId) {
-  const chain = await resolveChain(tenant, { sourceMrfId });
+  const loaded = await loadMrf(tenant, sourceMrfId);
+  let chain;
+  try {
+    chain = await governedChainFor(tenant, loaded, { sourceMrfId });
+  } catch (err) {
+    if (err?.name !== "StorePurchaseError" || MRF_RULE_ON()) throw err;
+    /* ── DIRECT: the request alone, for the form to fill from (1 Oct 2026) ── */
+    const outstanding = outstandingLines(loaded);
+    if (!outstanding.length) {
+      throw fail("MRF_NO_PURCHASE_SHORTFALL",
+        `${loaded.mrfNumber} has nothing left to supply — every line was issued from stock.`,
+        { mrfNumber: loaded.mrfNumber });
+    }
+    /* `rawItem` is the catalogue link (null while the line is UNMATCHED —
+       the requester's own name for the thing, not yet a material). */
+    const lines = outstanding.map(({ item: i, quantity, decided }) => ({
+      rawItemId: i.rawItem ? idOf(i.rawItem) : null,
+      sku: i.rawItemSku || "",
+      matched: Boolean(i.rawItem),
+      variantId: i.variantId ? idOf(i.variantId) : null,
+      variantCombination: (i.variantCombination || []).map(String),
+      itemName: i.rawItemName || "",
+      unit: i.unit || "",
+      requestedQty: num(i.requestedQty),
+      satisfiedFromStock: num(i.issuedQty),
+      requiringPurchase: quantity,
+      decided,
+    }));
+    return {
+      governed: false,
+      direct: true,
+      materialRequest: {
+        id: idOf(loaded._id),
+        number: loaded.mrfNumber || "",
+        department: loaded.requestedForDept || "",
+        requestedForName: loaded.requestedForName || "",
+        status: loaded.status || "",
+        lines,
+      },
+      purchaseRequest: null,
+      orderable: lines.map((l) => ({
+        spendLineId: null,
+        rawItemId: l.rawItemId,
+        sku: l.sku,
+        matched: l.matched,
+        variantId: l.variantId,
+        variantCombination: l.variantCombination,
+        itemName: l.itemName,
+        unit: l.unit,
+        approvedQuantity: null,
+        alreadyOrdered: 0,
+        remainingQuantity: l.requiringPurchase,
+        unitPrice: null,
+        gstRate: null,
+      })),
+      totals: null,
+    };
+  }
   const mrf = chain.mrf;
   const request = chain.spendRequest;
 
   return {
+    governed: true,
+    direct: false,
     materialRequest: {
       id: idOf(mrf._id),
       number: mrf.mrfNumber || "",
@@ -1756,7 +1915,8 @@ async function provenanceSummary(tenant, sourceMrfId) {
 module.exports = {
   resolveChain, resolveForRequest, resolveApproved,
   selectableMrfs, provenanceSummary, SELECTOR_CAP,
-  assertIssuable, isLegacyOrder, isGovernedOrder, isAdHocOrder, provenanceFields, resolveAdHoc, MRF_RULE_ON,
+  assertIssuable, isLegacyOrder, isGovernedOrder, isAdHocOrder, isDirectOrder, provenanceFields, resolveAdHoc, MRF_RULE_ON,
+  outstandingLines, DIRECT_POLICY,
   PROVENANCE_POLICY, LEGACY_POLICY, SUPPORTED_POLICIES, isSupportedPolicy,
   PROVENANCE_CUTOVER, unprovenReason,
   loadMrf, loadRequest, shortfallLines, budgetAuthority, supplierOf, orderedQuantities,

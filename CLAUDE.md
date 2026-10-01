@@ -1072,3 +1072,33 @@ subject is now the document itself (`customer_material_document`,
 `doc._id`, the document ref). Recorded through the UI on CSM-2026-0004 as
 GRN/2026-27/0005 (140 pcs, 277 Mtr): both counts FINALIZED, all nine
 labels ACTIVATED with the GRN and an allocation ref, two lots.
+
+## A purchase order against a material request with no purchase request — 1 Oct 2026
+
+The New Purchase Order form's material-request selector listed only requests
+with a recorded buy decision (`items.buyQty > 0`). None of the 41 requests in
+the database had one — Store issues from stock or raises a purchase request
+through a different door — so the selector was always empty while the form
+still said a request was required. While `STORE_PURCHASE_REQUIRE_MRF` is
+unset (`governedPurchaseOrder.service`):
+
+- `selectableMrfs` also lists APPROVED / PARTIALLY_ISSUED requests with lines
+  still unsupplied (`outstandingLines`: `buyQty` where decided, else
+  `requestedQty − issuedQty`), eligible with `direct: true` when they have
+  no approved purchase request. Every clause is folded under one `$and`
+  (the tenancy clause and the base are both `$or`s).
+- `resolveChain` tries the governed chain first and, on a StorePurchaseError,
+  falls back to `resolveDirectMrf`: the form's own supplier and lines (as an
+  ad-hoc order) plus `provenance: { sourceMrfId, sourceMrfNumber,
+  sourceMrfDepartment }`. `provenanceFields` stamps such an order
+  `MRF_DIRECT_V1` (`DIRECT_POLICY`, in `SUPPORTED_POLICIES`; `isAdHocOrder`
+  is true for it, so it issues like an ad-hoc order).
+- `provenanceSummary` answers `{ governed: false, direct: true,
+  materialRequest, purchaseRequest: null, orderable }` for such a request —
+  `orderable` carries `rawItemId` (the item's `rawItem` link; null while the
+  line is UNMATCHED), `sku`, `variantId`, `variantCombination`, `unit`,
+  `remainingQuantity`, `matched`.
+
+Verified 1 Oct 2026 through the form: MRF-2609-0006 chosen → six materials
+filled in → supplier picked → PO/2026-27/0009 created as a draft
+(`MRF_DIRECT_V1`, six lines, ₹195), opened on its page, then deleted again.
