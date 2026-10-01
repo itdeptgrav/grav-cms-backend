@@ -15,6 +15,7 @@
 //     routes/HrRoutes/Payroll_section.js three times — run, bulk, recalculate
 //     routes/HrRoutes/employeeImportExport.js  the formula written into the XLSX
 //     app/.../EmployeeForm.js            the preview HR watches as they type
+//     app/.../payroll/page.js            the drawer HR edits a month in
 //
 // Four of those are now one function. The fifth cannot be — it runs in the
 // browser before anything is saved, and there is no shared package between the
@@ -405,6 +406,147 @@ check(
   "and the settings route runs it unless explicitly told not to",
   /resyncAllSalaries/.test(EMP_ROUTE) && /req\.body\.resync !== false/.test(EMP_ROUTE),
 );
+
+// ── 9. the payroll screen HR edits a month in ───────────────────────────────
+//
+// The gap this section was added for. Sections 1-8 covered every surface that
+// quotes a CONTRACTED figure; the payroll screen quotes an EARNED one, and its
+// edit drawer recomputes PF and ESI live as payable days change. That preview
+// read four statutory constants written into the page —
+//
+//     const epf = Math.round(Math.min(basicEarned * 0.12, 1800));
+//     const esiApplicable = fullBasic > 0 && fullBasic <= 21000 && …;
+//     const esic = esiApplicable ? Math.ceil(basicEarned * 0.0075) : 0;
+//
+// so a company on a ₹25,000 ceiling was shown ₹1,800 in the drawer while the
+// server saved ₹3,000. It is the worst place for that disagreement: the
+// preview is what somebody checks before committing a month's pay.
+//
+// The rule now lives in grav-cms/lib/hr/payrollRates.mjs — one copy on the
+// browser side, mirroring employeePf() and computeEsi(). This evaluates the
+// real module and the real computeEsi and compares them figure for figure.
+head("the payroll screen's preview agrees with the payroll it is previewing");
+
+const RATES = path.join(
+  __dirname, "..", "grav-cms", "lib", "hr", "payrollRates.mjs",
+);
+const PAYROLL_PAGE = path.join(
+  __dirname, "..", "grav-cms", "app", "hr", "dashboard", "payroll", "page.js",
+);
+
+if (!fs.existsSync(RATES) || !fs.existsSync(PAYROLL_PAGE)) {
+  check("the payroll screen and its rules module are where this expects them",
+    false, `${RATES} / ${PAYROLL_PAGE}`);
+} else {
+  /* Same trick as the appointment template: the module has no imports, so
+     stripping `export` makes it evaluable as plain script and the arithmetic
+     checked below is the arithmetic that ships. */
+  const ratesSrc = fs.readFileSync(RATES, "utf8").replace(/^export /gm, "");
+  const rbox = {};
+  vm.createContext(rbox);
+  vm.runInContext(
+    `${ratesSrc}; this.payrollEpf = payrollEpf; this.payrollEsi = payrollEsi;` +
+      ` this.esiWageLimitOf = esiWageLimitOf;`,
+    rbox,
+  );
+
+  /* computeEsi is a local function in the payroll route, not an export, so it
+     is lifted by brace matching rather than required. It closes over nothing. */
+  const esiStart = payrollSrc.indexOf("function computeEsi(");
+  check("computeEsi was found in the payroll route", esiStart !== -1);
+  let serverEsi = null;
+  if (esiStart !== -1) {
+    let depth = 0, end = -1;
+    for (let i = payrollSrc.indexOf("{", esiStart); i < payrollSrc.length; i += 1) {
+      if (payrollSrc[i] === "{") depth += 1;
+      else if (payrollSrc[i] === "}") { depth -= 1; if (depth === 0) { end = i + 1; break; } }
+    }
+    const ebox = {};
+    vm.createContext(ebox);
+    vm.runInContext(
+      `${payrollSrc.slice(esiStart, end)}; this.computeEsi = computeEsi;`,
+      ebox,
+    );
+    serverEsi = ebox.computeEsi;
+  }
+
+  /* Configs either side of the change, plus one that moves the ESI limit and
+     one that moves only the ceiling — the last is the case where the cap is
+     left binding, and both sides have to report that same ₹1,800. */
+  const CFGS = [
+    ["no config at all", undefined],
+    ["the statutory settings", AT_15K],
+    ["a 25,000 ceiling with the cap in step", AT_25K],
+    ["a 25,000 ceiling with the cap left behind", { epfWageCeiling: 25000, epfCapAmount: 1800, eepfPct: 12 }],
+    ["a different percentage", { epfWageCeiling: 25000, epfCapAmount: 3000, eepfPct: 10 }],
+    ["a raised ESI limit", { esiWageLimit: 35000 }],
+    ["ESI percentages of its own", { eeEsicPct: 1, erEsicPct: 4 }],
+  ];
+  /* Earned basics, each against a full basic that is on, under and over the
+     ESI limit — eligibility is decided by the full figure and the amount by
+     the earned one, so both have to vary. */
+  const PAIRS = [
+    [12000, 12000], [12000, 6000], [20000, 20000], [20000, 9500],
+    [21000, 21000], [25000, 25000], [25000, 12500], [40000, 40000], [20000, 0],
+  ];
+
+  let epfDrift = [], esiDrift = [];
+  for (const [label, cfg] of CFGS) {
+    for (const [fullBasic, earned] of PAIRS) {
+      const mine = rbox.payrollEpf(earned, cfg);
+      const theirs = employeePf(earned, cfg || {});
+      if (mine !== theirs) {
+        epfDrift.push(`${label} @ ${earned}: screen ${mine} vs server ${theirs}`);
+      }
+      if (serverEsi) {
+        const a = rbox.payrollEsi(fullBasic, earned, cfg);
+        const b = serverEsi(fullBasic, earned, cfg);
+        if (a.applicable !== b.applicable || a.esic !== b.esic || a.erEsic !== b.erEsic) {
+          esiDrift.push(
+            `${label} @ ${fullBasic}/${earned}: screen ${JSON.stringify(a)} vs server ${JSON.stringify(b)}`,
+          );
+        }
+      }
+    }
+  }
+  check(
+    `PF agrees across ${CFGS.length} configurations and ${PAIRS.length} salaries`,
+    epfDrift.length === 0, epfDrift.slice(0, 3).join("; "),
+  );
+  check(
+    "ESI agrees too, eligibility and both amounts",
+    esiDrift.length === 0, esiDrift.slice(0, 3).join("; "),
+  );
+
+  /* The figures above are only the shipped ones if the page actually calls
+     the module. */
+  const pageSrc = fs.readFileSync(PAYROLL_PAGE, "utf8");
+  check(
+    "the payroll screen imports the rules module",
+    /from "@\/lib\/hr\/payrollRates\.mjs"/.test(pageSrc) &&
+      /payrollEpf\(basicEarned, salaryCfg\)/.test(pageSrc) &&
+      /payrollEsi\(\s*fullBasic,\s*basicEarned,\s*salaryCfg,?\s*\)/.test(pageSrc),
+  );
+  check(
+    "and keeps no statutory constant of its own",
+    !/\*\s*0\.12\b/.test(pageSrc) &&
+      !/\b1800\b/.test(pageSrc) &&
+      !/\b21000\b/.test(pageSrc) &&
+      !/\b0\.0075\b/.test(pageSrc),
+    "a hardcoded rate is back on the payroll screen",
+  );
+  /* A memo that does not list the config recomputes with a stale one: the
+     drawer opens before the request lands, so the first render is always
+     the statutory fallback and only a dependency brings the real rules in. */
+  check(
+    "the preview recomputes when the rules arrive",
+    /}, \[form, item, activeCap, workingDays, salaryCfg\]\);/.test(pageSrc),
+  );
+  check(
+    "the ESI label quotes the limit in force rather than ₹21,000",
+    /esiWageLimitOf\(salaryCfg\)/.test(pageSrc),
+  );
+}
 
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
