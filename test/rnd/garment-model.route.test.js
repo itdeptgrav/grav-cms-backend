@@ -39,7 +39,15 @@ jest.mock("../../services/companyDrive.service", () => ({
   uploadCompanyFile: jest.fn(async (buffer, { fileName, mimeType } = {}) => {
     const id = `drv-${mockDrive.size + 1}-${Date.now()}`;
     mockDrive.set(id, { buffer: Buffer.from(buffer), fileName, mimeType });
-    return { id, name: fileName };
+    /* ── THE SHAPE THE REAL SERVICE RETURNS, EXACTLY ──────────────────────
+       `services/companyDrive.service.js` answers `{ driveFileId, mimeType,
+       bytes }`. This mock used to answer `{ id, name }`, and the difference
+       cost a production defect: the caller guessed at `id`, fell through to
+       stringifying the object, and stored "[object Object]" as every file
+       handle, so every asset request answered 500. The suite passed
+       throughout, because the suite was the only place that shape existed.
+       A mock that does not match its subject is a test that proves the mock. */
+    return { driveFileId: id, mimeType, bytes: buffer.length };
   }),
   streamCompanyFile: jest.fn(async (id) => {
     const held = mockDrive.get(id);
@@ -514,6 +522,118 @@ describe("another company's model does not exist", () => {
       ...w.asReader, method: "POST", body: { category: "construction", title: "x" },
     })).status).toBe(403);
     expect((await publish({ ...w, as: w.asReader })).status).toBe(403);
+  });
+});
+
+/* ═══ 4b · THE GRANT IS THE ANSWER, AND IT IS RE-ASKED EVERY TIME ══════════
+ *
+ * The workspace was unreachable for its first reader, and the reason was not a
+ * bug in the viewer: the account had an R&D job title in its sign-in token, an
+ * active company, and no R&D grant. Everything on screen looked like it should
+ * work. These tests pin the three things that failure taught, so a later
+ * convenience cannot quietly undo them:
+ *
+ *   · a job title is not authority — only the grant is;
+ *   · a grant that was taken away is gone on the NEXT request, not in five
+ *     minutes, because the role is re-read rather than cached;
+ *   · the screen can ask what it may do without being able to do it, so a
+ *     refusal is a sentence rather than an empty black canvas.
+ */
+
+describe("the grant, and only the grant", () => {
+  test("a job title in the sign-in token opens nothing", async () => {
+    const w = await world();
+    /* Same shape of token as everyone else here — it carries `role: "rnd"` —
+       but no row in department_roles. */
+    const titled = await person(w.co, {});
+    const as = { token: titled.token, company: w.co._id };
+
+    expect((await call(w.styleUrl, as)).status).toBe(403);
+    expect((await publish({ ...w, as })).status).toBe(403);
+  });
+
+  test("revoking a grant closes the door on the very next request", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    /* Reading works while the grant stands. */
+    expect((await call(`/api/cms/rnd/garment-models/${id}`, w.as)).status).toBe(200);
+
+    await DepartmentRole.updateOne(
+      { departmentSlug: "research-development", email: w.engineer.email },
+      { $set: { isActive: false } },
+    );
+
+    /* No sign-out, no token change, no waiting for a cache to expire. */
+    expect((await call(`/api/cms/rnd/garment-models/${id}`, w.as)).status).toBe(403);
+    expect((await call(w.styleUrl, w.as)).status).toBe(403);
+    expect((await call(`/api/cms/rnd/garment-models/${id}/annotations`, {
+      ...w.as, method: "POST", body: { category: "construction", title: "x" },
+    })).status).toBe(403);
+  });
+
+  test("an ungranted reader cannot tell a real style from one that never existed", async () => {
+    const w = await world();
+    const stranger = { token: (await person(w.co, {})).token, company: w.co._id };
+    const real = await call(w.styleUrl, stranger);
+    const invented = await call(
+      `/api/cms/rnd/garment-models/styles/${new mongoose.Types.ObjectId()}`, stranger);
+
+    /* Byte for byte the same answer. A difference here — a 404 for one and a
+       403 for the other — would be a way to enumerate the style book without
+       ever being allowed to read it. */
+    expect(real.status).toBe(invented.status);
+    expect(JSON.stringify(real.body)).toBe(JSON.stringify(invented.body));
+  });
+});
+
+describe("the workspace asks what it may do before it draws anything", () => {
+  const CTX = "/api/cms/rnd/garment-models/context";
+
+  test("an editor is told it may open and annotate, and may not approve", async () => {
+    const w = await world();
+    const r = await call(CTX, w.as);
+    expect(r.status).toBe(200);
+    expect(r.body.access).toMatchObject({
+      canOpen: true, canAnnotate: true, canPublish: true, canApprove: false,
+    });
+    /* The company is NAMED, because the refusal screen has to be able to say
+       which company it is refusing in — a person who belongs to two reads an
+       otherwise identical panel twice. */
+    expect(r.body.company.name).toBe(w.co.companyName);
+  });
+
+  test("an approver is told it may approve", async () => {
+    const w = await world();
+    expect((await call(CTX, w.asApprover)).body.access.canApprove).toBe(true);
+  });
+
+  test("a viewer is told it may open and change nothing", async () => {
+    const w = await world();
+    expect((await call(CTX, w.asReader)).body.access).toMatchObject({
+      canOpen: true, canAnnotate: false, canPublish: false, canApprove: false,
+    });
+  });
+
+  test("someone with no grant still gets an answer, so the screen can explain itself", async () => {
+    const w = await world();
+    const stranger = { token: (await person(w.co, {})).token, company: w.co._id };
+    const r = await call(CTX, stranger);
+    /* Deliberately NOT behind the R&D capability: a 403 here would leave the
+       browser with nothing to render but a black canvas, which is the defect
+       this task began with. */
+    expect(r.status).toBe(200);
+    expect(r.body.access.canOpen).toBe(false);
+    expect(r.body.company.name).toBe(w.co.companyName);
+  });
+
+  test("nothing in the answer is an internal name", async () => {
+    const w = await world();
+    const text = JSON.stringify((await call(CTX, w.as)).body);
+    /* No capability strings, no middleware vocabulary, no error codes. What
+       leaves the server is yes/no and a company name. */
+    expect(text).not.toMatch(/rnd\.model\./);
+    expect(text).not.toMatch(/capability|minimumRole|FORBIDDEN/i);
   });
 });
 

@@ -94,6 +94,19 @@ const receiveFiles = (req, res, next) => upload(req, res, (err) => {
   return sendError(res, err);
 });
 
+/* ═══ WHO AM I HERE ════════════════════════════════════════════════════════
+ *
+ * Deliberately NOT behind the R&D capability. It is what an access-denied
+ * screen reads to say which company it is talking about and what this person
+ * may do, and a screen that could only explain a refusal to somebody who had
+ * not been refused would help nobody. Session and company only; it names no
+ * style, no model and no capability key.
+ */
+router.get("/garment-models/context", requireCompany, handle(async (req, res) => {
+  const out = await models.workspaceContext(ctx(req), { role: await liveRndRole(req) });
+  return res.json({ success: true, ...out });
+}));
+
 /* ═══ THE STYLE'S MODELS ═══════════════════════════════════════════════════ */
 
 router.get("/garment-models/styles/:styleId", requireCompany, canRead, handle(async (req, res) => {

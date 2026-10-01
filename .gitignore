@@ -94,3 +94,6 @@ deploy/mautic/data/
 deploy/mautic/backups/
 deploy/mautic/*.sql
 deploy/mautic/*.sql.gz
+
+# Generated demo sign-in passwords for the R&D 3D workspace seeder. Never committed.
+.rnd-demo-credentials.local

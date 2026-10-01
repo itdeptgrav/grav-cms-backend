@@ -301,6 +301,24 @@ function publicationView(row, { subject = "", links = false, mayDownloadSource =
   return view;
 }
 
+/**
+ * The acting company, named rather than numbered.
+ *
+ * Read lazily and failure-tolerantly: a workspace that could not render
+ * because the company's display name was unavailable would be refusing to
+ * work over a label.
+ */
+async function companyLabel(companyId) {
+  if (!companyId) return null;
+  try {
+    const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+    const row = await Acc_Company.findById(companyId).select("companyName").lean();
+    return { id: String(companyId), name: str(row?.companyName) };
+  } catch {
+    return { id: String(companyId), name: "" };
+  }
+}
+
 /* ═══ THE LIST ═════════════════════════════════════════════════════════════ */
 
 /**
@@ -331,6 +349,11 @@ async function listPublications(ctx, { styleId } = {}) {
 
   const approved = rows.find((r) => r.state === PUBLICATION_STATE.APPROVED) || null;
   return {
+    /* Which books this answer is about. The workspace shows it beside the
+       style, and an access-denied panel shows it too — "you cannot open this"
+       is a different sentence from "you cannot open this FOR THIS COMPANY",
+       and only the second one tells somebody what to do next. */
+    company: await companyLabel(ctx.companyId),
     style: {
       id: String(style._id),
       sampleStyleId: str(style.sampleStyleId),
@@ -503,9 +526,27 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
       mimeType: str(file.mimetype) || "application/octet-stream",
       folderPath: ["rnd", "garment-models", String(style._id), folder],
     });
+    /* ── THE FIELD THE STORE ACTUALLY RETURNS ───────────────────────────
+       `uploadCompanyFile` answers `{ driveFileId, mimeType, bytes }`. An
+       earlier version of this guessed at `id` with a chain of fallbacks that
+       ended in the object itself, so every publication stored the literal
+       string "[object Object]" as its file handle and every asset request
+       answered 500 — a failure the tests could not see, because the Drive was
+       mocked with a shape the Drive does not return.
+
+       One field, named, and no fallback: a handle this code cannot read is a
+       publication that will never open, and it is better refused at upload
+       than discovered by a reader staring at an empty viewport. */
+    const driveFileId = str(up?.driveFileId);
+    if (!driveFileId) {
+      throw fail("MODEL_UNREADABLE",
+        "The file store did not return a handle for that upload, so the model could not be kept. "
+        + "Nothing was published; try again.",
+        { reason: "NO_STORAGE_HANDLE", kind });
+    }
     stored.push({
       kind,
-      driveFileId: str(up?.id || up?.fileId || up),
+      driveFileId,
       name: str(file.originalname),
       mimeType: str(file.mimetype),
       bytes: file.size,
@@ -987,7 +1028,37 @@ async function timeline(ctx, { publicationId } = {}) {
   return { publicationRef: row.publicationRef, events };
 }
 
+/**
+ * WHO THIS PERSON IS HERE, ANSWERED WITHOUT NEEDING R&D ACCESS.
+ *
+ * ── WHY THIS IS NOT BEHIND THE CAPABILITY ───────────────────────────────────
+ * It is the question the access-denied screen has to answer, and a screen that
+ * could only explain a refusal to somebody who had not been refused would be
+ * useless. So this needs the SESSION and the COMPANY and nothing else, and it
+ * returns only facts about the caller themselves: which company they are
+ * acting for and what they may do. It names no style, no model and no
+ * capability key — a refusal must never become a way to ask what exists.
+ */
+async function workspaceContext(ctx, { role = null } = {}) {
+  assertContext(ctx);
+  const { ROLE_CAPABILITIES, CAPABILITY } = require("./access.service");
+  const held = role ? ROLE_CAPABILITIES[role] : null;
+  return {
+    company: await companyLabel(ctx.companyId),
+    /* Plain answers, not capability names. A screen decides what to render
+       from these; nothing about the internal vocabulary leaves the server. */
+    access: {
+      role: str(role),
+      canOpen: Boolean(held?.has(CAPABILITY.MODEL_READ)),
+      canAnnotate: Boolean(held?.has(CAPABILITY.MODEL_ANNOTATE)),
+      canPublish: Boolean(held?.has(CAPABILITY.MODEL_PUBLISH)),
+      canApprove: Boolean(held?.has(CAPABILITY.MODEL_APPROVE)),
+    },
+  };
+}
+
 module.exports = {
+  workspaceContext,
   LIMITS, TOKEN_SCOPE, SOURCE_EXTENSIONS, PREVIEW_MIME, VIEWER_EXTENSIONS, PRIORITIES,
   listPublications, createDraft, readPublication, openAsset,
   submitForReview, decide,
