@@ -155,7 +155,7 @@ router.get("/resolve", requireCapability(CAPABILITIES.READ), async (req, res) =>
       const onHand = loc.onHandOf(r.item, r.variantId);
       const sentinel = await LocationBalance.findOne(loc.sentinelFilter(companyOf(req), r.item._id, r.variantId)).lean();
       const assigned = loc.round4(sentinel?.onHand || 0);
-      return res.json({ success: true, type: "item", found: true, marking: markingView(r), item: { rawItemId: String(r.item._id), variantId: r.variantId, name: r.item.name, sku: r.variant?.sku || r.item.sku || "", variant: r.variant ? (r.variant.combination || []).join(" · ") : "", baseUnit: loc.baseUnitOf(r.item), onHand, assigned, unassigned: loc.round4(onHand - assigned) }, located: mb.located, remainingToPut: loc.round4(Math.max(0, Math.min(r.barcode.quantity - mb.located, onHand - assigned))), balances: mb.balances });
+      return res.json({ success: true, type: "item", found: true, marking: markingView(r), item: { rawItemId: String(r.item._id), variantId: r.variantId, name: r.item.name, sku: r.variant?.sku || r.item.sku || "", variant: r.variant ? (r.variant.combination || []).join(" · ") : "", baseUnit: loc.baseUnitOf(r.item), onHand, assigned, unassigned: loc.round4(onHand - assigned) }, located: mb.located, remainingToPut: loc.round4(Math.max(0, r.barcode.quantity - mb.located)) /* bounded by the sticker only, not on-hand — 1 Oct 2026, see putStock */, balances: mb.balances });
     }
     return res.json({ success: true, type: parsed.type, found: false, message: parsed.reason || "Not a store code." });
   } catch (e) { handle(res, e, "resolve"); }
