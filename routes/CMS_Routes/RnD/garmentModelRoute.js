@@ -272,6 +272,33 @@ router.patch("/garment-models/measurements/:measurementId", requireCompany, canA
     return res.json({ success: true, ...out });
   }));
 
+router.post("/garment-models/measurements/:measurementId/duplicate", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await models.duplicateMeasurement(ctx(req), {
+      measurementId: req.params.measurementId, name: req.body?.name, actor: actor(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+/* ── THE HANDOVER TO INDUSTRIAL ENGINEERING ───────────────────────────────
+ *
+ * GET only, and that is the contract. There is no companion POST, PATCH or
+ * DELETE anywhere on this mount that would let a consumer change an R&D
+ * measurement — IE reads what R&D accepted and keeps its own engineering
+ * observations in its own records.
+ *
+ * It is mounted HERE rather than under /api/cms/ie because the thing being
+ * published is R&D's, and the department that owns a fact owns the route that
+ * serves it. Reading it needs the ordinary model-read capability, so an IE
+ * engineer is granted R&D read access deliberately rather than by a second
+ * permission system nobody can see.
+ */
+router.get("/garment-models/styles/:styleId/measurement-handover", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await models.measurementHandover(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
 /* ── SCALE CALIBRATION ─────────────────────────────────────────────────────
  * Stating what one model unit is really worth changes how every number on
  * this publication reads, so it needs the same permission as recording one —

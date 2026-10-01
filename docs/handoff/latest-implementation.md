@@ -1,178 +1,180 @@
-# Latest implementation — the R&D 3D workspace's toolset, and measurements that say what they are worth
+# Latest implementation — measurements that follow the cloth, and a way out of the close-up
 
 1 Oct 2026. **Committed on `NEW_CMS_BRANCH` in both repositories.** Live demo
-data was written to the dev Atlas database (one new draft publication of the
-sweater, three notes, four measurements, one scale calibration); nothing else.
+data was written to the dev Atlas database (one further draft publication of
+the sweater and five named measurements); nothing else.
 
-## The audit that started it
+## 1 · The measurement that follows the garment
 
-Every control already in the workspace, and what was actually behind it:
+A neckline measured as a line through space is a CHORD. It cuts across the neck
+opening, and it always reads SHORT — the dangerous direction, because a pattern
+cut to it does not fit. So there are now three separate modes, separately named,
+and nothing converts one into another:
 
-| Control | Verdict |
+| Mode | What it measures |
 |---|---|
-| Select, Orbit, Pan | real |
-| Measure (two points) | real but **ephemeral** — never stored, gone on reload |
-| Add note | real, correctly refused to viewers and to accepted models |
-| **Isolate part, Hide part** | **dead on this export.** The reference sweater is one merged mesh (`Object_2`, "Pieces 1"). They ran, dimmed nothing, changed nothing |
-| Fit, Reset | real |
-| Front/Back/Left/Right/Top | real, but jumped instantly |
-| Isolate off, Show all | no-ops on a merged mesh |
-| Grid, backgrounds, axis gizmo | real |
-| Structure / Notes / Properties | real; Properties was a thin editor, not an inspector |
+| **Straight distance** | the direct line between two points. Useful for widths and reference checks; it does not follow the garment, and the label says so |
+| **Surface distance** | two points, the shortest route **across** the cloth between them |
+| **Guided curved path** | points placed along a seam, armhole, neckline or hem, each leg following the surface |
 
-Missing entirely: zoom control, perspective/parallel, fullscreen, screenshot,
-wireframe, surface, x-ray, bounding box, annotation and measurement visibility,
-path and angle measurement, calibration, scale state, marker camera focus,
-previous/next, return-to-previous-view, rail filters, mobile sheet.
+### The algorithm
 
-And the one that mattered most: **clicking a note only shaded a list row.**
+`components/rnd/workspace3d/surfacePath.js`, three steps:
 
-## What is now there
+1. **Weld.** A glTF export splits vertices wherever a normal or a UV changes,
+   so two triangles that touch on screen share no index at all. Welding by
+   quantised position is what makes the mesh connected — without it, every pair
+   of points reads as a different piece of cloth and the whole feature refuses.
+2. **Corridor.** A\* over triangles through shared edges, from the triangle
+   under the first point to the one under the second. The shared edges it
+   crosses are the band of fabric the path must stay inside.
+3. **Pull it taut.** One point per portal, started at the edge's midpoint, then
+   relaxed: each is repeatedly moved to the spot **on its own edge** that
+   minimises the distance to its two neighbours. A string drawn tight through a
+   row of rings.
 
-**Navigation.** Orbit, pan, zoom, fit, reset, five preset views, parallel ↔
-perspective, fullscreen, screenshot. Preset views and every focus move glide
-over 340 ms inside the one render loop that already existed — a second
-`requestAnimationFrame` per control is how a viewer ends up with six loops
-fighting over one camera. Touching the canvas cancels a glide, because a camera
-that keeps moving under somebody's drag feels broken.
+Every point it produces lies on a triangle edge, and consecutive points lie in
+one triangle — so each segment is flat against the surface and the whole
+polyline is on the garment.
 
-**Opening a note moves the garment.** The camera travels to the note's own
-anchored point and frames about a third of the garment around it — close enough
-to read a seam, wide enough to know which seam. The author's saved camera sets
-the DIRECTION; the distance is computed for the point, so a note written from a
-wide shot still opens at a readable size. The final position is ray-tested
-against the mesh and pushed out in front of anything in the way, so a marker
-inside a cuff cannot put the camera inside the fabric. Measured live: camera
-moved 2.60 units, final distance 0.5 × the model's extent, never inside.
+**An error worth recording:** the first version projected the MIDPOINT of the
+two neighbours onto the edge. That minimises a different quantity and is only
+the same answer when the two legs are equal, so the string settled a few per
+cent slack and every curve read long. Minimising |P−prev| + |P−next| properly
+(ternary search, the function is convex along the edge) fixed it.
 
-**The inspector** shows title, full note, category, priority, status,
-department relevance, the anchored part, the linked technical item,
-construction detail, author and date, replies, resolution and resolver, and the
-event history with its revision — plus previous, next, and back to the previous
-view.
+### Accuracy, and what it is not
 
-**Measurements** are a server-side record, not a line on a canvas:
-point-to-point, multi-point path, and angle. The browser picks the points; the
-**server computes the number from them**, so two viewers cannot disagree about
-a length and a stored figure is always something that can be rechecked.
+- **Not a proven global geodesic.** The corridor comes from A\* over centroids;
+  a genuinely shorter route round the other side of a sleeve would need an exact
+  method (MMP, Chen–Han).
+- **Bounded by the tessellation, and in the direction that matters.** A mesh is
+  *inscribed* in the shape it stands for, so a path over its flat faces cuts
+  inside the true curve and reads **short**. A 48-segment half-circle measures
+  0.993 of the arc. My first draft of this caveat said "reads slightly long" —
+  the test caught it, and short is the dangerous direction.
+- Against a half-cylinder of known arc length (π) and chord (2), the method
+  reads within **4%** of the arc; a quarter arc within **5%**; a flat run agrees
+  with the straight distance to within 0.03.
+- **Disconnected meshes are refused**, never answered with the gap:
+  *"These points are not connected on the garment surface."*
 
-## Measurement accuracy — what this can and cannot claim
+### Where the arithmetic happens
 
-- A **path is a polyline**: the sum of the straight segments between the points
-  somebody placed. It reads shorter than a curve, exactly as a tape pulled taut
-  between pins does. It is called that on screen, in the payload and in the
-  code. It is **not** a geodesic and nothing here says it is — writing a real
-  one means walking the mesh between two points, and this export is a single
-  7,424-triangle shell with no seam topology to walk.
-- An **angle needs no scale**: a ratio of lengths has no units, so it is as
-  trustworthy on an unscaled export as on a calibrated one, and it carries no
-  scale warning.
-- Three scale states, always on screen: `Scale verified`, `Scale declared by
-  export`, `Scale unverified — use as visual reference only`. Unverified shows
-  the raw figure in the file's own units and never a centimetre.
-- The scale is **frozen onto each measurement** as it is taken. Calibrating
-  later changes what the NEXT measurement says; it never reaches back and
-  relabels a number somebody already wrote down.
-- Calibration belongs to **one publication** and there is no code path that
-  copies it to another — a later export may be drawn at a different scale.
-- The standing caveat is on every surface that lists a measurement, in every
-  state including verified: *3D measurements support review. The approved
-  measurement specification remains the manufacturing authority.*
+The browser picks the points and walks the mesh; the **server recomputes the
+value from the stored route**. A stored number that nothing can recompute is a
+claim rather than a measurement. A surface measurement sent without its route
+is **refused** — never quietly straightened into a chord under a surface
+measurement's name.
 
-**A real finding from the live run.** The reference export declares `cm` and is
-1.197 × 0.703 × 0.322 model units — a sweater 1.2 cm tall. The declared unit is
-wrong, which is precisely why "declared" is not "verified". After calibrating
-against a 45 cm known distance the factor came out at ≈67, and a new
-measurement read **41.18 cm** while the earlier ones correctly still read
-0.22 cm on their original declared basis.
+## 2 · Saving and naming
 
-## Inspection, said honestly
+Completing a placement no longer saves anything. It opens a panel, and the
+**name is required** — the suggested default (`Measurement 4`) is refused
+unchanged, by the server as well as the screen, because a rail of
+"Measurement 1…9" is unreadable three weeks later.
 
-Wireframe, surface and x-ray (double-sided, or the garment reads inside-out);
-bounding box with the model's dimensions; note and measurement visibility
-toggles. **Isolate and Hide are disabled on this export** with the reason on
-hover — *"this export contains one merged garment mesh"* — and the strip beside
-the model says the same. Notes and measurements keep working on that mesh, so
-exactly two controls are disabled rather than the toolbar. A part the export
-numbered rather than named is shown as **"Garment surface"** everywhere a
-garment component belongs, with `Object_2` kept beside it as the muted
-technical reference it actually is.
+Stored per measurement: publication and model number, id and ref, type, name,
+category, every placed point's node reference and local position, the surface
+route, raw value, converted value, unit, scale basis, linked tech-pack/POM item,
+intended size, tolerance, note, status, creator, timestamps, revision and the
+full event history.
 
-**No clipping/section tool was added.** It is the one control that would have
-made the toolbar look complete and could not have been made stable and
-understandable in this slice, so it is not rendered at all. A dead button is a
-promise the product has not kept.
+Lifecycle: **draft → reviewed → accepted**, anything may be **withdrawn**, and a
+withdrawn one may return to draft. A draft's points may be corrected (dragging a
+point onto the seam you meant is part of taking a measurement); the moment it is
+reviewed they are frozen. Nobody reviews or accepts their own. Rename, edit
+note, edit link, duplicate (which copies what was measured and **none** of the
+review) and view history are all supported.
 
-## Modes and usability
+## 3 · The handover to Industrial Engineering
 
-One mode at a time, always named on screen with a one-line instruction beside
-it. Escape cancels and leaves no partial record, Ctrl/Cmd+Z takes back the last
-point, Enter finishes a path, changing tool clears half-placed geometry, and a
-drag is never a point. The keys are bound to the window — the canvas is
-deliberately not focusable — and none of them fire while somebody is typing.
-Nothing on screen says raycast, barycentric, node-local or optimistic lock.
+`GET /api/cms/rnd/garment-models/styles/:styleId/measurement-handover` — read
+only, and there is no companion write anywhere on the mount. Three rules:
 
-## Storage, and the constraint that shaped it
+- **Drafts stay in R&D.** A number somebody is still taking is not a fact anyone
+  downstream should plan against.
+- **Withdrawn is not current.** Kept in R&D as evidence, absent here.
+- **A new model version inherits nothing.** Measurements belong to the
+  publication they were taken on; earlier ones are reported under
+  `previousVersionMeasurements` with their own publication ref.
 
-Measurements **embed on the publication**. They belong to exactly one, can never
-move to another, and are always read with it — there is no query that wants
-them separately. The deciding constraint was blunter: this deployment is at its
-database's 500-collection ceiling, so a new collection is not available. Each
-measurement keeps its own `_id`, `revision`, status, author and events. The API
-contract did not move: all 70 route tests passed unchanged across the storage
-change.
+It carries name, type, value, unit, scale state and basis, POM link, intended
+size, tolerance, note, reviewer and review date, and the points plus the route,
+so IE can draw the measurement read-only without any way to move it.
 
-Company scoping, R&D capabilities, private assets, immutable approved
-publications, optimistic revision checks, maker-checker and non-disclosing
-foreign-company answers are all unchanged and tested.
+## 4 · Getting out of a close-up
 
-## Defects found and fixed on the way
+Opening a note flew the camera onto a seam and offered no way back anybody could
+find. Orbiting out of a close-up on a 39 MB garment is slow and imprecise,
+clicking empty canvas is undiscoverable and fights the orbit control, and Reset
+threw away every display option as well.
 
-- **Every event leaked the author's email.** `by` was returned as the whole
-  `{ id, name, email }` record. A screen rendering it got an object where it
-  expected a person, which is not a wrong name — it takes the entire workspace
-  down to its error screen. Now a name, with a display helper that can never
-  throw.
-- **The structure tree showed `Object_2` as a pattern piece**, in the same type
-  as a real one.
-- **The calibrate tool from the rail armed the pointer and showed no panel** —
-  two points could be placed with no way to finish. The tool now brings its
-  panel.
-- **The workspace-3d route had no Suspense boundary** around its
-  `useSearchParams`, which fails the production build.
-- The draft reading said "0.524 model units" while the saved one beside it said
-  "0.52 cm" — the same length in two vocabularies.
-- On a 375px screen the stats overlay and the display strip took a fifth of the
-  width and overlaid the garment from two edges.
+Now: a **`← Back to full garment`** button in the upper-left of the viewport,
+near-opaque so it reads against pale fabric, present for as long as the close-up
+is, beside a header — *"Viewing: Front neckline curve · 0.34 cm"* — with
+previous/next. Four ways out, all through one function: the button, `Esc`, a
+close icon in the inspector, and **Exit close-up** in the mobile sheet. Reset
+View exits too.
 
-## Verification
+The previous view is captured **once per focus session**, not once per click, so
+walking from one note to the next and pressing Back returns to the view before
+any of them. The close-up distance is a share of the MODEL's size, not of where
+the camera currently is, so clicking the same item twice cannot creep closer. A
+curved measurement is framed by its **whole route**, never its first point.
 
-Live on `http://localhost:3001/research-development/styles/6abb3397de13c635ae989477/workspace-3d`
-(backend on **:5001**), driven through real pointer events on the canvas, on the
-39.5 MB sweater:
+Leaving also puts the reader back on the panel they came from — restoring, not
+resetting: the rail's filter and search are untouched.
 
-three notes on different areas · one distance · one four-point path · one angle
-· Escape abandoning a three-point placement cleanly · calibration from two known
-points · a full browser reload returning all four measurements, three notes and
-the verified scale identically · every display control exercised and confirmed
-to act · the viewer read-only with a reason on every recording tool · 375px with
-the model visible above the sheet and no horizontal overflow.
+## 5 · Live verification (port 3001, the 39.5 MB sweater)
+
+Four measurements created and named through the UI with real pointer events,
+then a full browser reload returning all four identically:
+
+| Name | Type | Value | vs straight |
+|---|---|---|---|
+| Chest width, flat | straight | 0.920 | — |
+| **Front neckline curve** | **surface** | **0.338** | **1.68× the 0.201 chord, 35 route points** |
+| Left armhole seam | guided | 0.230 | 1.09× over 27 route points |
+| Chest print drop from neck | straight | 0.218 | — |
+
+The server's recomputation of each stored route matched the stored value exactly.
+
+Lifecycle and handover, live: two accepted, one withdrawn, one left draft, the
+model approved — the handover returned **exactly the two accepted**, excluded the
+draft and the withdrawn, carried the 35-point route and the reviewer, and
+answered `404` to a POST.
+
+Close-up, measured against the live engine: camera distance **2.942 → 0.490**
+(0.17×) on opening, **identical** on a second click, and **exactly restored** by
+the button, by `Esc` and by the inspector's close icon — including after walking
+to the next item. At 375px the model stays visible above a sheet carrying
+**Exit close-up**, with no horizontal overflow.
+
+**A verification error worth recording.** My first close-up measurements were
+taken against a disposed engine: switching model tabs unmounts the viewport and
+builds a new one, and the "Load NNNN ms" line left over from the previous engine
+says nothing about the new one. Waiting on that text measured an empty scene and
+reported a camera that never moved as "restored exactly". Polling the live
+engine's own `dimensions()` is the only trustworthy signal, and every number
+above was re-taken through it.
+
+## Tests
 
 | Suite | Result |
 |---|---|
-| `test/rnd/garment-model.route.test.js` | 71 passed (48 before) |
-| `test/rnd/demo-access-seed.test.js` | 5 passed |
-| `npx jest test/rnd test/access` | 265 passed, 4 failed |
-| `components/rnd/**` (frontend) | 261 passed (192 before) |
-| `npm test` (whole frontend) | 13,973 passed, 29 failed |
+| `test/rnd/garment-model.route.test.js` | **97 passed** (71 before) |
+| `npx jest test/rnd test/access` | 291 passed, 4 failed |
+| `components/rnd/**` (frontend) | **295 passed** (261 before) |
+| `npm test` (whole frontend) | 14,012 passed, 29 failed |
 
-The 4 backend failures are `department-role-cache` and `gac-ar1-app-access`;
-they fail identically on a clean worktree at `HEAD`. The frontend's 29 are
-IE/Store/PPC suites from other lanes' uncommitted work — a clean worktree at
-`HEAD` fails **33**, so this work removed none and added none.
+The 4 backend failures are `department-role-cache` and `gac-ar1-app-access`,
+which fail identically on a clean worktree at `HEAD`. The frontend's 29 are
+IE/Store/PPC suites from other lanes' uncommitted work; a clean worktree at
+`HEAD` fails 33.
 
-Screenshots: `docs/product/reference-images/rnd-3d-toolset-workspace-`,
-`rnd-3d-marker-closeup-`, `rnd-3d-measure-in-progress-`,
-`rnd-3d-measurements-after-reload-`, `rnd-3d-merged-mesh-`,
-`rnd-3d-viewer-readonly-toolset-`, `rnd-3d-mobile-inspector-`,
-`rnd-3d-calibrated-` (all `2026-10-01.png`).
+Screenshots: `docs/product/reference-images/rnd-3d-surface-path-closeup-`,
+`rnd-3d-surface-measure-in-progress-`, `rnd-3d-measurement-save-panel-`,
+`rnd-3d-measurement-list-`, `rnd-3d-measurement-focused-`,
+`rnd-3d-restored-full-garment-`, `rnd-3d-mobile-close-up-exit-`
+(all `2026-10-01.png`).

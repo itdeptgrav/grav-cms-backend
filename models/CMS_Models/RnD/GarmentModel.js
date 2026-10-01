@@ -206,23 +206,73 @@ const eventSchema = new mongoose.Schema({
  * one, and it is not labelled with a scale warning.
  */
 
+/**
+ * THREE WAYS OF MEASURING A GARMENT, AND THEY ARE NOT INTERCHANGEABLE.
+ *
+ * The distinction that matters is whether the measurement goes THROUGH the
+ * cloth or ALONG it. A neckline measured as a straight line is a chord: it
+ * cuts across the neck hole, and it always reads SHORT, which is the dangerous
+ * direction because a pattern cut to it does not fit. A neckline measured
+ * along the surface is what a tape laid on the garment reads.
+ *
+ * So they are separate kinds, separately named on screen, and nothing converts
+ * one into the other.
+ */
 const MEASUREMENT_KIND = Object.freeze({
-  /* Two points, the straight line between them. */
+  /* Two points, the straight line between them. Width, depth, a reference
+     check across a gap — useful, and never called a surface measurement. */
   DISTANCE: "distance",
-  /* Several points, the sum of the straight segments between them. This is a
-     POLYLINE along the surface, not a geodesic: it is the length of the path
-     the person drew, and it under-reads a curve in exactly the way a tape
-     pulled taut between pins does. Said in those words on screen. */
+  /* Two points, the shortest route between them ACROSS the cloth. The route
+     itself is stored, because it is the measurement. */
+  SURFACE: "surface",
+  /* Several points the person placed along a seam, armhole, neckline or hem,
+     each leg of the route following the surface. */
   PATH: "path",
   /* Three points, the angle at the middle one. */
   ANGLE: "angle",
 });
 
+/** Which kinds carry a route over the cloth rather than a line through it. */
+const SURFACE_KINDS = Object.freeze([MEASUREMENT_KIND.SURFACE, MEASUREMENT_KIND.PATH]);
+
+/**
+ * What a measurement is FOR. R&D's own vocabulary, not a data shape.
+ *
+ * It decides which rail filter the measurement appears under, and — for
+ * "point of measure" — that it is a candidate for the technical pack rather
+ * than a working note.
+ */
+const MEASUREMENT_CATEGORY = Object.freeze({
+  POINT_OF_MEASURE: "point_of_measure",
+  SEAM_PATH: "seam_path",
+  CONSTRUCTION: "construction",
+  PRINT_PLACEMENT: "print_placement",
+  TRIM_PLACEMENT: "trim_placement",
+  FIT_CHECK: "fit_check",
+  GENERAL: "general",
+});
+
+/**
+ * WHERE A MEASUREMENT HAS GOT TO.
+ *
+ * `draft` is R&D's own working figure and stays inside R&D — it is explicitly
+ * NOT handed to Industrial Engineering, because a number somebody is still
+ * taking is not a fact anybody downstream should be planning against.
+ * `reviewed` and `accepted` are facts a second person has looked at, and are
+ * what the handover carries. `withdrawn` is kept as evidence and never
+ * presented as current.
+ */
 const MEASUREMENT_STATUS = Object.freeze({
-  OPEN: "open",
+  DRAFT: "draft",
+  REVIEWED: "reviewed",
   ACCEPTED: "accepted",
   WITHDRAWN: "withdrawn",
 });
+
+/** The states IE is allowed to see. Declared once, beside the states. */
+const MEASUREMENT_HANDOVER_STATES = Object.freeze([
+  MEASUREMENT_STATUS.REVIEWED, MEASUREMENT_STATUS.ACCEPTED,
+]);
 
 /**
  * HOW MUCH THE NUMBER CAN BE TRUSTED, IN THE THREE STATES A PERSON CAN ACT ON.
@@ -294,17 +344,62 @@ const measurementSchema = new mongoose.Schema({
   /* Two for a distance, three for an angle, two or more for a path. Immutable
      as a set: changing a point changes what was measured, and that is a new
      measurement, not an edit of this one. */
-  points: { type: [measurementPointSchema], required: true, immutable: true },
+  /* The points the person PLACED. Not immutable any more: while a
+     measurement is a draft its author may drag one onto the seam they meant,
+     which is an ordinary correction. The moment it is reviewed or accepted
+     they are frozen — see `assertDraft` in the service. */
+  points: { type: [measurementPointSchema], required: true },
 
-  /* In model units for a distance or a path; in DEGREES for an angle, which
-     needs no scale and carries none. */
-  rawValue: { type: Number, required: true, immutable: true },
+  /* ── THE ROUTE OVER THE CLOTH, WHICH IS THE MEASUREMENT ────────────────
+     For a surface or guided measurement the placed points say where somebody
+     clicked and THIS says what was measured. Stored rather than recomputed,
+     for two reasons: a reader next month must see the same line without
+     re-deriving it, and a re-export may tessellate differently, which would
+     silently change a number somebody already accepted. Empty on a straight
+     distance and on an angle, where the points are the line. */
+  surfacePath: { type: [measurementPointSchema], default: [] },
+
+  /* In model units for a distance, a surface route or a path; in DEGREES for
+     an angle, which needs no scale and carries none. */
+  rawValue: { type: Number, required: true },
   scale: { type: scaleBasisSchema, required: true, immutable: true },
 
-  label: { type: String, trim: true, default: "", maxlength: 200 },
+  /* ── A NAME SOMEBODY CHOSE ─────────────────────────────────────────────
+     Required, and the save panel refuses the suggested default unchanged.
+     "Measurement 4" tells the next reader nothing, and a rail of them is
+     unreadable; "Front neckline curve" is the whole point of recording it. */
+  name: { type: String, trim: true, required: true, maxlength: 200 },
+  category: {
+    type: String, enum: Object.values(MEASUREMENT_CATEGORY),
+    default: MEASUREMENT_CATEGORY.GENERAL,
+  },
   note: { type: String, trim: true, default: "", maxlength: 4000 },
 
-  status: { type: String, enum: Object.values(MEASUREMENT_STATUS), default: MEASUREMENT_STATUS.OPEN, index: true },
+  /* What this is a measurement OF, in the technical record. A reference, never
+     a copy — the technical pack stays the one place it lives. */
+  linkedTechnicalItem: {
+    kind: { type: String, trim: true, default: "" },
+    ref: { type: String, trim: true, default: "" },
+    label: { type: String, trim: true, default: "" },
+  },
+  /* Which size the garment was built at, where R&D said. A point of measure
+     means nothing without it. */
+  intendedSize: { type: String, trim: true, default: "", maxlength: 40 },
+  /* Only when R&D explicitly records one. Absent is an absent tolerance, not
+     a zero one. */
+  toleranceMm: { type: Number, default: null, min: 0 },
+
+  status: {
+    type: String, enum: Object.values(MEASUREMENT_STATUS),
+    default: MEASUREMENT_STATUS.DRAFT, index: true,
+  },
+  /* Who looked at it and when — "reviewed" with nobody's name on it is an
+     unattributed decision. */
+  reviewedBy: actorRef(),
+  reviewedAt: { type: Date, default: null },
+
+  /* Where it came from, when it was duplicated rather than taken. */
+  duplicatedFromRef: { type: String, trim: true, default: "" },
 
   camera: { type: cameraSchema, default: null },
   author: actorRef(),
@@ -584,7 +679,8 @@ annotationSchema.statics.STATUS = MARKER_STATUS;
 
 module.exports = {
   PUBLICATION_STATE, MARKER_CATEGORY, MARKER_STATUS, ASSET_KIND,
-  MEASUREMENT_KIND, MEASUREMENT_STATUS, SCALE_STATE,
+  MEASUREMENT_KIND, MEASUREMENT_STATUS, MEASUREMENT_CATEGORY, SCALE_STATE,
+  SURFACE_KINDS, MEASUREMENT_HANDOVER_STATES,
   GarmentModelPublication: mongoose.models.GarmentModelPublication
     || mongoose.model("GarmentModelPublication", publicationSchema),
   GarmentModelAnnotation: mongoose.models.GarmentModelAnnotation

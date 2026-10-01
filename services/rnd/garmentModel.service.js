@@ -42,7 +42,8 @@ const mongoose = require("mongoose");
 const {
   GarmentModelPublication, GarmentModelAnnotation,
   PUBLICATION_STATE, MARKER_CATEGORY, MARKER_STATUS, ASSET_KIND,
-  MEASUREMENT_KIND, MEASUREMENT_STATUS, SCALE_STATE,
+  MEASUREMENT_KIND, MEASUREMENT_STATUS, MEASUREMENT_CATEGORY, SCALE_STATE,
+  SURFACE_KINDS, MEASUREMENT_HANDOVER_STATES,
 } = require("../../models/CMS_Models/RnD/GarmentModel");
 const drive = require("../companyDrive.service");
 const { inspectGlb, GlbError } = require("../../utils/glbInspect");
@@ -1100,10 +1101,13 @@ async function workspaceContext(ctx, { role = null } = {}) {
  */
 
 const MEASUREMENT_POINTS = Object.freeze({
-  [MEASUREMENT_KIND.DISTANCE]: { min: 2, max: 2, says: "A distance is measured between two points." },
+  [MEASUREMENT_KIND.DISTANCE]: { min: 2, max: 2, says: "A straight distance is measured between two points." },
+  [MEASUREMENT_KIND.SURFACE]: { min: 2, max: 2, says: "A surface distance is measured between two points on the garment." },
   [MEASUREMENT_KIND.ANGLE]: { min: 3, max: 3, says: "An angle is measured from three points, and is the angle at the middle one." },
-  [MEASUREMENT_KIND.PATH]: { min: 2, max: 60, says: "A path needs at least two points, and at most 60." },
+  [MEASUREMENT_KIND.PATH]: { min: 2, max: 60, says: "A guided path needs at least two points, and at most 60." },
 });
+
+const isSurfaceKind = (kind) => SURFACE_KINDS.includes(kind);
 
 /** Units, and what one of them is worth in the next one up. Used only to turn
  *  a calibration the person entered into the factor stored beside it. */
@@ -1232,6 +1236,13 @@ function measurementView(row, parent = {}) {
       world: { x: p.world.x, y: p.world.y, z: p.world.z },
     })),
     rawValue: row.rawValue,
+    /* The route over the cloth, for a reader to draw without re-deriving it.
+       Empty on a straight distance, where the points ARE the line. */
+    surfacePath: (row.surfacePath || []).map((p) => ({
+      nodeRef: p.nodeRef,
+      local: { x: p.local.x, y: p.local.y, z: p.local.z },
+    })),
+    followsSurface: SURFACE_KINDS.includes(row.kind),
     /* Degrees for an angle; otherwise the file's own units, named as such. */
     rawUnit: isAngle ? "°" : "model units",
     displayValue: isAngle ? row.rawValue : (scaled ? row.rawValue * scale.factor : null),
@@ -1248,9 +1259,18 @@ function measurementView(row, parent = {}) {
        a fact about this measurement rather than left for each screen to
        re-derive and get wrong once. */
     scaleIndependent: isAngle,
-    label: row.label || "",
+    name: row.name || row.label || "",
+    /* Kept so a screen written against the older shape still reads. */
+    label: row.name || row.label || "",
+    category: row.category || "general",
     note: row.note || "",
+    linkedTechnicalItem: row.linkedTechnicalItem || null,
+    intendedSize: str(row.intendedSize),
+    toleranceMm: row.toleranceMm ?? null,
     status: row.status,
+    reviewedBy: str(row.reviewedBy?.name),
+    reviewedAt: row.reviewedAt || null,
+    duplicatedFromRef: str(row.duplicatedFromRef),
     camera: row.camera || null,
     author: row.author ? { name: str(row.author.name), at: row.createdAt } : null,
     events: (row.events || []).map((e) => ({
@@ -1276,6 +1296,66 @@ async function listMeasurements(ctx, { publicationId } = {}) {
   };
 }
 
+/**
+ * WHAT THE NUMBER IS, FOR EACH KIND.
+ *
+ * A straight distance and an angle are computed from the placed points. A
+ * surface or guided measurement is computed from its ROUTE — the polyline
+ * the viewer walked across the triangles — because that route IS what was
+ * measured, and summing the two endpoints instead would quietly hand back the
+ * chord under a surface measurement's name.
+ */
+function measurementValue(kind, points, route) {
+  if (!isSurfaceKind(kind)) return computeMeasurement(kind, points);
+  if (route.length < 2) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "That measurement has no route across the garment, so there is nothing to measure along. "
+      + "Place it again from the workspace.",
+      { field: "surfacePath" });
+  }
+  let total = 0;
+  for (let i = 1; i < route.length; i += 1) total += span(route[i - 1].world, route[i].world);
+  if (!(total > 0)) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Those points are all in the same place, so there is nothing to measure.");
+  }
+  return total;
+}
+
+/** A name somebody chose, and the one default the save panel must not keep. */
+function readName(value, seq) {
+  const name = clean(value, 200);
+  if (!name) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Give the measurement a name somebody will recognise.", { field: "name" });
+  }
+  /* The suggested default, refused on purpose. A rail of "Measurement 1..9"
+     is a rail nobody can read, and the suggestion exists to be replaced. */
+  if (name.replace(/\s+/g, " ").trim().toLowerCase() === `measurement ${seq}`) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Replace the suggested name with what this measures — a neckline, a placket, a pocket placement.",
+      { field: "name" });
+  }
+  return name;
+}
+
+const readCategory = (value) => {
+  const c = str(value);
+  return Object.values(MEASUREMENT_CATEGORY).includes(c) ? c : MEASUREMENT_CATEGORY.GENERAL;
+};
+
+const readLink = (value) => ({
+  kind: clean(value?.kind, 40),
+  ref: clean(value?.ref, 80),
+  label: clean(value?.label, 200),
+});
+
+const readTolerance = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+};
+
 async function createMeasurement(ctx, { publicationId, body = {}, actor = null } = {}) {
   assertContext(ctx);
   const row = await publicationForCompany(ctx, publicationId, { lean: true });
@@ -1294,12 +1374,19 @@ async function createMeasurement(ctx, { publicationId, body = {}, actor = null }
     throw fail("MODEL_MEASUREMENT_INVALID", rule.says, { field: "points", given: raw.length });
   }
   const points = raw.map((p, i) => readPoint(row, p, i));
-  const rawValue = computeMeasurement(kind, points);
+
+  /* The route, validated against this publication's own node list exactly as
+     the placed points are — a route naming a part the model does not contain
+     is not a route over this garment. */
+  const route = (Array.isArray(body.surfacePath) ? body.surfacePath : [])
+    .map((p, i) => readPoint(row, p, i));
+  const rawValue = measurementValue(kind, points, route);
 
   /* Written against the document rather than through a lean copy, so the
      sequence number is taken from what is actually stored. */
   const parent = await publicationForCompany(ctx, publicationId);
   const seq = (parent.measurements || []).reduce((n, m) => Math.max(n, m.seq), 0) + 1;
+  const name = readName(body.name ?? body.label, seq);
 
   const who = actorOf(actor);
   parent.measurements.push({
@@ -1307,14 +1394,64 @@ async function createMeasurement(ctx, { publicationId, body = {}, actor = null }
     seq,
     kind,
     points,
+    surfacePath: isSurfaceKind(kind) ? route : [],
     rawValue,
     scale: scaleBasisOf(parent),
-    label: clean(body.label, 200),
+    name,
+    category: readCategory(body.category),
     note: clean(body.note, 4000),
+    linkedTechnicalItem: readLink(body.linkedTechnicalItem),
+    intendedSize: clean(body.intendedSize, 40),
+    toleranceMm: readTolerance(body.toleranceMm),
     camera: readCamera(body.camera),
-    status: MEASUREMENT_STATUS.OPEN,
+    status: MEASUREMENT_STATUS.DRAFT,
     author: who,
-    events: [{ kind: "created", note: clean(body.label, 200), by: who, at: new Date() }],
+    events: [{ kind: "created", note: name, by: who, at: new Date() }],
+  });
+  await parent.save();
+  const created = parent.measurements[parent.measurements.length - 1];
+  return { measurement: measurementView(created, parent) };
+}
+
+/**
+ * The same measurement again, as a fresh draft.
+ *
+ * Used for the row of points of measure that differ only by where they are —
+ * three pocket placements, four button positions. It copies what was measured
+ * and deliberately does NOT copy the review: a duplicate is nobody's accepted
+ * fact until somebody looks at it.
+ */
+async function duplicateMeasurement(ctx, { measurementId, name, actor = null } = {}) {
+  assertContext(ctx);
+  const { row, parent } = await measurementForCompany(ctx, measurementId);
+  assertAnnotatable(parent);
+
+  const seq = (parent.measurements || []).reduce((n, m) => Math.max(n, m.seq), 0) + 1;
+  const who = actorOf(actor);
+  const copyName = clean(name, 200) || `${row.name} (copy)`;
+
+  parent.measurements.push({
+    measurementRef: mintRef("MS"),
+    seq,
+    kind: row.kind,
+    points: row.points.map((p) => ({ ...(p.toObject ? p.toObject() : p) })),
+    surfacePath: (row.surfacePath || []).map((p) => ({ ...(p.toObject ? p.toObject() : p) })),
+    rawValue: row.rawValue,
+    /* The scale basis in force NOW, not the original's. A copy taken after a
+       calibration is a calibrated measurement; carrying the old basis over
+       would label it with a confidence nobody has since re-earned. */
+    scale: scaleBasisOf(parent),
+    name: copyName,
+    category: row.category,
+    note: row.note,
+    linkedTechnicalItem: row.linkedTechnicalItem,
+    intendedSize: row.intendedSize,
+    toleranceMm: row.toleranceMm,
+    camera: row.camera,
+    status: MEASUREMENT_STATUS.DRAFT,
+    duplicatedFromRef: row.measurementRef,
+    author: who,
+    events: [{ kind: "duplicated", note: `from ${row.measurementRef}`, by: who, at: new Date() }],
   });
   await parent.save();
   const created = parent.measurements[parent.measurements.length - 1];
@@ -1343,6 +1480,36 @@ async function measurementForCompany(ctx, measurementId) {
  * whole design: moving a point changes what was measured, and the honest
  * record of that is a new measurement beside the old one, not a quiet edit.
  */
+/**
+ * WHEN A MEASUREMENT MAY STILL BE CHANGED, AND WHEN IT IS EVIDENCE.
+ *
+ * A draft is somebody's working figure: the name, the note and even the
+ * points may still be corrected, because dragging a point onto the seam you
+ * meant is an ordinary part of taking a measurement. The moment a second
+ * person reviews or accepts it, what was measured is frozen — otherwise the
+ * thing they signed off is not the thing that is stored.
+ */
+function assertDraft(row, what) {
+  if (row.status !== MEASUREMENT_STATUS.DRAFT) {
+    throw fail("MODEL_STATE_CONFLICT",
+      `This measurement has been ${row.status}, so ${what} would change something somebody already signed off. `
+      + "Reopen it as a draft, or duplicate it and change the copy.",
+      { status: row.status });
+  }
+}
+
+/* draft ⇄ reviewed ⇄ accepted, and anything may be withdrawn. Returning to a
+   draft is allowed and is recorded, because a measurement found to be wrong
+   after review has to be fixable by somebody. */
+const MEASUREMENT_TRANSITIONS = Object.freeze({
+  [MEASUREMENT_STATUS.DRAFT]: [MEASUREMENT_STATUS.REVIEWED, MEASUREMENT_STATUS.WITHDRAWN],
+  [MEASUREMENT_STATUS.REVIEWED]: [
+    MEASUREMENT_STATUS.ACCEPTED, MEASUREMENT_STATUS.DRAFT, MEASUREMENT_STATUS.WITHDRAWN,
+  ],
+  [MEASUREMENT_STATUS.ACCEPTED]: [MEASUREMENT_STATUS.DRAFT, MEASUREMENT_STATUS.WITHDRAWN],
+  [MEASUREMENT_STATUS.WITHDRAWN]: [MEASUREMENT_STATUS.DRAFT],
+});
+
 async function updateMeasurement(ctx, { measurementId, body = {}, expectedRevision, actor = null } = {}) {
   assertContext(ctx);
   const { row, parent } = await measurementForCompany(ctx, measurementId);
@@ -1355,21 +1522,68 @@ async function updateMeasurement(ctx, { measurementId, body = {}, expectedRevisi
     if (!Object.values(MEASUREMENT_STATUS).includes(status)) {
       throw fail("VALIDATION", "That is not a measurement state.", { field: "status" });
     }
-    /* Accepting is a judgement about somebody else's work, so it is somebody
-       else's to make — the rule the model lifecycle already runs on. */
-    if (status === MEASUREMENT_STATUS.ACCEPTED && sameActor(row.author, who)) {
-      throw fail("MODEL_SELF_APPROVAL",
-        "A measurement is accepted by somebody other than the person who took it.");
-    }
     if (status !== row.status) {
+      const allowed = MEASUREMENT_TRANSITIONS[row.status] || [];
+      if (!allowed.includes(status)) {
+        throw fail("INVALID_TRANSITION",
+          `A ${row.status} measurement cannot go straight to ${status}.`,
+          { from: row.status, to: status, allowed });
+      }
+      /* Reviewing and accepting are judgements about somebody's work, so they
+         are somebody else's to make — the rule the model lifecycle runs on. */
+      if ([MEASUREMENT_STATUS.REVIEWED, MEASUREMENT_STATUS.ACCEPTED].includes(status)
+        && sameActor(row.author, actor)) {
+        throw fail("MODEL_SELF_APPROVAL",
+          "A measurement is reviewed by somebody other than the person who took it.");
+      }
       row.events.push({ kind: `status:${status}`, note: clean(body.statusNote, 2000), by: who, at });
       row.status = status;
+      if ([MEASUREMENT_STATUS.REVIEWED, MEASUREMENT_STATUS.ACCEPTED].includes(status)) {
+        row.reviewedBy = who;
+        row.reviewedAt = at;
+      }
     }
   }
-  if (body.label !== undefined) row.label = clean(body.label, 200);
+
+  /* ── REPOSITIONING, WHILE IT IS STILL A DRAFT ─────────────────────────
+     The points and the route move together or not at all: a route that no
+     longer starts where the measurement says it does is worse than either. */
+  if (body.points !== undefined) {
+    assertDraft(row, "moving its points");
+    const rule = MEASUREMENT_POINTS[row.kind];
+    const raw = Array.isArray(body.points) ? body.points : [];
+    if (raw.length < rule.min || raw.length > rule.max) {
+      throw fail("MODEL_MEASUREMENT_INVALID", rule.says, { field: "points", given: raw.length });
+    }
+    const points = raw.map((p, i) => readPoint(parent, p, i));
+    const route = (Array.isArray(body.surfacePath) ? body.surfacePath : [])
+      .map((p, i) => readPoint(parent, p, i));
+    row.rawValue = measurementValue(row.kind, points, route);
+    row.points = points;
+    row.surfacePath = isSurfaceKind(row.kind) ? route : [];
+    row.events.push({ kind: "repositioned", note: "", by: who, at });
+  }
+
+  const renamed = body.name !== undefined || body.label !== undefined;
+  if (renamed) {
+    assertDraft(row, "renaming it");
+    const name = clean(body.name ?? body.label, 200);
+    if (!name) {
+      throw fail("MODEL_MEASUREMENT_INVALID",
+        "Give the measurement a name somebody will recognise.", { field: "name" });
+    }
+    row.name = name;
+  }
   if (body.note !== undefined) row.note = clean(body.note, 4000);
-  if (body.label !== undefined || body.note !== undefined) {
-    row.events.push({ kind: "edited", note: clean(body.label, 200), by: who, at });
+  if (body.category !== undefined) row.category = readCategory(body.category);
+  if (body.linkedTechnicalItem !== undefined) row.linkedTechnicalItem = readLink(body.linkedTechnicalItem);
+  if (body.intendedSize !== undefined) row.intendedSize = clean(body.intendedSize, 40);
+  if (body.toleranceMm !== undefined) row.toleranceMm = readTolerance(body.toleranceMm);
+
+  if (renamed || body.note !== undefined || body.category !== undefined
+    || body.linkedTechnicalItem !== undefined || body.intendedSize !== undefined
+    || body.toleranceMm !== undefined) {
+    row.events.push({ kind: "edited", note: row.name, by: who, at });
   }
 
   row.revision += 1;
@@ -1458,6 +1672,137 @@ async function clearCalibration(ctx, { publicationId, expectedRevision } = {}) {
   return { calibration: null, scale: scaleBasisOf(row), revision: row.revision };
 }
 
+/* ═══ THE HANDOVER TO INDUSTRIAL ENGINEERING ═══════════════════════════════
+ *
+ * ── WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT ───────────────────────────
+ * A READ-ONLY projection of what R&D has accepted about a garment's
+ * measurements, shaped for the one consumer that needs it. There is no write
+ * anywhere in it and there is no route that would let IE change an R&D
+ * measurement: the arrow points one way, IE consumes what R&D signed off, and
+ * IE's own engineering observations live in IE's own records.
+ *
+ * ── THE THREE RULES THAT DECIDE WHAT APPEARS ────────────────────────────────
+ *
+ *   · DRAFTS STAY IN R&D. A number somebody is still taking is not a fact
+ *     anybody downstream should plan against, and a draft that reached IE
+ *     would be planned against — that is what a handover is for.
+ *   · WITHDRAWN IS NOT CURRENT. It stays in R&D's own record as evidence of
+ *     what was once believed, and it is absent here, because a handover is a
+ *     statement about what is true now.
+ *   · A NEW MODEL VERSION INHERITS NOTHING. Measurements belong to the
+ *     publication they were taken on. The projection says which publication
+ *     each came from and reports a superseded one as previous-version rather
+ *     than carrying its numbers forward onto a model nobody measured.
+ *
+ * It also carries the POINTS and the surface ROUTE, so IE can draw the
+ * measurement on the same model read-only without being given any way to
+ * move it.
+ */
+
+function handoverMeasurementView(m, parent) {
+  const isAngle = m.kind === MEASUREMENT_KIND.ANGLE;
+  const scale = m.scale || {};
+  const scaled = !isAngle && scale.state !== SCALE_STATE.UNVERIFIED;
+  return {
+    measurementRef: m.measurementRef,
+    name: m.name || m.label || "",
+    kind: m.kind,
+    followsSurface: SURFACE_KINDS.includes(m.kind),
+    category: m.category || "general",
+
+    rawValue: m.rawValue,
+    rawUnit: isAngle ? "°" : "model units",
+    value: isAngle ? m.rawValue : (scaled ? m.rawValue * scale.factor : null),
+    unit: isAngle ? "°" : (scaled ? scale.unit : ""),
+    /* The confidence travels WITH the number. A handover that passed on a
+       figure without saying it came off an unverified export would be handing
+       IE a millimetre nobody measured. */
+    scale: {
+      state: scale.state,
+      basis: scale.source,
+      calibratedBy: str(scale.calibratedBy),
+      calibratedAt: scale.calibratedAt || null,
+    },
+    scaleIndependent: isAngle,
+
+    intendedSize: str(m.intendedSize),
+    toleranceMm: m.toleranceMm ?? null,
+    linkedTechnicalItem: m.linkedTechnicalItem || null,
+    note: str(m.note),
+
+    /* Enough to draw it, and nothing that could change it. */
+    points: (m.points || []).map((p) => ({
+      nodeRef: p.nodeRef, nodeName: str(p.nodeName),
+      local: { x: p.local.x, y: p.local.y, z: p.local.z },
+    })),
+    surfacePath: (m.surfacePath || []).map((p) => ({
+      nodeRef: p.nodeRef, local: { x: p.local.x, y: p.local.y, z: p.local.z },
+    })),
+
+    status: m.status,
+    reviewedBy: str(m.reviewedBy?.name),
+    reviewedAt: m.reviewedAt || null,
+
+    modelPublicationRef: parent.publicationRef,
+    modelNumber: parent.modelNumber,
+  };
+}
+
+/**
+ * Every measurement R&D stands behind, for one style.
+ *
+ * @param {object} ctx     company context
+ * @param {string} styleId the style, scoped to the company exactly as every
+ *                         other read on this mount is
+ */
+async function measurementHandover(ctx, { styleId } = {}) {
+  assertContext(ctx);
+  const style = await styleForCompany(ctx.companyId, styleId);
+
+  const rows = await GarmentModelPublication
+    .find({ companyId: ctx.companyId, styleId: style._id })
+    .sort({ modelNumber: -1 })
+    .lean();
+
+  const current = rows.find((r) => r.state === PUBLICATION_STATE.APPROVED) || null;
+
+  const collect = (parent) => (parent?.measurements || [])
+    .filter((m) => MEASUREMENT_HANDOVER_STATES.includes(m.status))
+    .sort((a, b) => a.seq - b.seq)
+    .map((m) => handoverMeasurementView(m, parent));
+
+  /* Measurements on EARLIER approved models, reported as what they are. A new
+     export may be cut differently, so the old numbers are history until
+     somebody deliberately re-takes or maps them — never silently inherited. */
+  const previous = rows
+    .filter((r) => r !== current && r.state === PUBLICATION_STATE.SUPERSEDED)
+    .flatMap((parent) => collect(parent));
+
+  return {
+    style: {
+      id: String(style._id),
+      sampleStyleId: str(style.sampleStyleId),
+      styleCode: str(style.styleCode),
+      productName: str(style.productName),
+    },
+    approvedModel: current ? {
+      publicationRef: current.publicationRef,
+      modelNumber: current.modelNumber,
+      modelName: `3D model ${current.modelNumber}`,
+      approvedAt: current.decidedAt || null,
+      approvedBy: str(current.decidedBy?.name),
+      technicalRevisionRef: str(current.technicalRevisionRef),
+    } : null,
+    /* Empty with no approved model, rather than reaching into a draft. */
+    measurements: current ? collect(current) : [],
+    previousVersionMeasurements: previous,
+    /* Said in the payload so a consumer cannot mistake what it has. */
+    readOnly: true,
+    authority: "The approved measurement specification remains the manufacturing authority. "
+      + "These are R&D's reviewed 3D measurements, as supporting evidence.",
+  };
+}
+
 module.exports = {
   workspaceContext,
   LIMITS, TOKEN_SCOPE, SOURCE_EXTENSIONS, PREVIEW_MIME, VIEWER_EXTENSIONS, PRIORITIES,
@@ -1467,6 +1812,7 @@ module.exports = {
   publicationView, annotationView, verifyAssetToken, assetLink,
 
   MEASUREMENT_KIND, MEASUREMENT_STATUS, SCALE_STATE,
-  listMeasurements, createMeasurement, updateMeasurement, measurementView,
-  calibrateScale, clearCalibration, scaleBasisOf,
+  listMeasurements, createMeasurement, updateMeasurement, duplicateMeasurement,
+  measurementView, calibrateScale, clearCalibration, scaleBasisOf,
+  measurementHandover, handoverMeasurementView,
 };
