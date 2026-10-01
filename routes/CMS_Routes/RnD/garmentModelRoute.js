@@ -605,4 +605,38 @@ router.post("/patterns/renders/:jobRef/outcome", requireCompany, canPublish,
     return res.json({ success: true, ...out });
   }));
 
+/* ── WHAT THE IN-APP SOLVER REPORTS BACK ──────────────────────────────────
+   Separate from `/outcome` above, and on a lower capability on purpose.
+
+   `/outcome` can complete a render by naming a MODEL PUBLICATION, which is a
+   file a sample gets approved against — that is `canPublish`, and it stays
+   `canPublish`. A drape is this system's own derived, read-only reading of a 2D
+   pattern; it creates no publication and nothing can be approved against it. The
+   privilege to report one is the same privilege as asking for it in the first
+   place, which is `canAnnotate`. Requiring `canPublish` here would instead mean
+   that only a publisher could use the in-app solver at all — a restriction on
+   the wrong act, and one that would push people towards publishing.
+
+   The browser also reports a FAILURE here, for the same reason: a drape that
+   could not finish is the ordinary outcome of the same act. */
+router.post("/patterns/renders/:jobRef/drape", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await renders.recordRenderOutcome(ctx(req), {
+      jobRef: req.params.jobRef,
+      status: req.body?.status,
+      drape: req.body?.drape || null,
+      failure: req.body?.failure,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* The drape's geometry, on its own, because a job list must not carry 100KB of
+   positions per row. */
+router.get("/patterns/renders/:jobRef/drape", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await renders.readDrape(ctx(req), { jobRef: req.params.jobRef });
+    return res.json({ success: true, drape: out });
+  }));
+
 module.exports = router;

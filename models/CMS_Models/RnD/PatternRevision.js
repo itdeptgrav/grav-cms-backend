@@ -92,6 +92,23 @@ const editSchema = new mongoose.Schema({
  * simply not yet something a 3D preview can be made from, and the screen says
  * which parts are missing in those words.
  */
+/* ── AN EDGE IS TWO OF THE PATTERN'S OWN CORNERS ──────────────────────────
+   Not two mesh vertices. Meshing a piece inserts points along its outline, so a
+   vertex index means something different at every simulation quality — a seam
+   saved while previewing at Draft would sew the wrong thing at High. Outline
+   point indices belong to the pattern and do not move.
+
+   `theLongWay` is for the rare seam that goes round the long side of a piece.
+   Without it the shorter of the two runs between the corners is taken, which is
+   what makes naming the corners in either order mean the direction it looks
+   like — and direction matters: a side seam read backwards sews the garment with
+   a half twist in it that every seam length still agrees with. */
+const seamEdgeSchema = new mongoose.Schema({
+  from: { type: Number, default: null, min: 0 },
+  to: { type: Number, default: null, min: 0 },
+  theLongWay: { type: Boolean, default: false },
+}, { _id: false });
+
 const seamPairingSchema = new mongoose.Schema({
   /* Two edges that are sewn to each other. The pattern says where the pieces
      are; only a person says which edge joins which. */
@@ -99,6 +116,13 @@ const seamPairingSchema = new mongoose.Schema({
   fromEdge: { type: String, trim: true, default: "" },
   toPieceRef: { type: String, trim: true, required: true },
   toEdge: { type: String, trim: true, default: "" },
+  /* What a person called this seam. Used in every sentence about it — "the left
+     side seam joins edges of 38.0cm and 24.1cm" — so it is worth storing rather
+     than generating from two piece refs. */
+  name: { type: String, trim: true, default: "", maxlength: 160 },
+  /* Which run of each outline, by the pattern's own point indices. */
+  fromPoints: { type: seamEdgeSchema, default: null },
+  toPoints: { type: seamEdgeSchema, default: null },
   seamType: { type: String, trim: true, default: "" },
   note: { type: String, trim: true, default: "", maxlength: 240 },
 }, { _id: false });
@@ -258,6 +282,54 @@ const renderJobSchema = new mongoose.Schema({
      ordinary garment-model publication — read-only, and marked as derived. */
   resultPublicationId: { type: mongoose.Schema.Types.ObjectId, default: null },
   resultPublicationRef: { type: String, trim: true, default: "" },
+
+  /* ── OR A DRAPE, WHEN THE SOLVER RAN IN THE BROWSER ──────────────────
+     ── WHY A DRAPE IS NOT A PUBLICATION ──────────────────────────────
+     A garment-model publication is a CLO export: a file somebody made, with a
+     source project behind it, that a sample can be approved against. A drape is
+     this system's own reading of a 2D pattern — derived, read-only, reproducible
+     from the revision and the solver version. Filing one as a publication would
+     put it in the same list as approvable models and somebody would approve it.
+
+     So a completed render names a publication OR a drape, and the two are
+     different kinds of evidence.
+
+     The positions are stored and the triangles are not: the triangulation is a
+     pure function of the pattern, the quality and the solver version, all three
+     of which are recorded here, so it is cheaper to rebuild than to keep. At
+     High quality the positions are about 100KB, which is what a drape costs. */
+  drape: {
+    solverVersion: { type: String, trim: true, default: "" },
+    quality: { type: String, trim: true, default: "" },
+    fabric: { id: String, label: String, version: String },
+    /* Millimetres, always. The one place a 25.4x error could hide is the unit,
+       so the unit is written down beside the numbers. */
+    unit: { type: String, trim: true, default: "mm" },
+    vertexCount: { type: Number, default: 0 },
+    triangleCount: { type: Number, default: 0 },
+    pieces: {
+      type: [new mongoose.Schema({
+        pieceRef: String, name: String, role: String,
+        base: Number, vertexCount: Number,
+      }, { _id: false })],
+      default: [],
+    },
+    /* Float32, three per vertex, in the piece order above. */
+    positions: { type: Buffer, default: null },
+    /* ── WHAT THE DRAPE FOUND, KEPT WITH IT ─────────────────────────
+       A seam that did not close and cloth still under tension are findings
+       about the PATTERN, and they are the reason to look at a drape at all.
+       Stored so they can be read without re-running a minute of arithmetic. */
+    seamClosure: { type: mongoose.Schema.Types.Mixed, default: [] },
+    strain: { type: mongoose.Schema.Types.Mixed, default: null },
+    fidelity: { type: mongoose.Schema.Types.Mixed, default: null },
+    tightestClearanceMm: { type: Number, default: null },
+    template: { type: mongoose.Schema.Types.Mixed, default: null },
+    body: { type: mongoose.Schema.Types.Mixed, default: null },
+    frames: { type: Number, default: 0 },
+    finalMoveMm: { type: Number, default: null },
+    msElapsed: { type: Number, default: 0 },
+  },
 
   /* Why it did not. Both fields, because a code a screen can branch on and a
      sentence a person can act on are different things. */

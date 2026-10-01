@@ -1,3 +1,98 @@
+# ACTIVE TASK — R&D FIT SIMULATION, SLICE 1 (1 Oct 2026)
+
+The active implementation scope is the **first in-app 2D→3D fit slice** for
+R&D. Decision record: `docs/decisions/rnd-fit-simulation.md`.
+
+The product direction is fixed and is not re-litigated by this slice:
+
+- the 2D pattern is the only manufacturing source of truth;
+- the 3D garment is derived from an approved, immutable pattern revision;
+- nothing in 3D may modify 2D geometry;
+- it all happens inside the R&D web application — no Blender, no command-line
+  export, no separate operator application.
+
+**This slice builds:** the cloth solver with body and self collision and staged
+settling; an explicit mm/cm/in unit boundary with the millimetre as the one
+internal unit; the adapter from a `patternSet` revision to simulation pieces;
+triangulation that keeps every vertex's source piece; the geometry-fidelity
+gate; readiness validation and a visual seam-mapping step; the worker lifecycle
+wired to `RenderJob`; Draft/Normal/High; and a derived drape rendered in the
+existing workspace.
+
+**This slice does NOT build** the Fit Assistant or side-by-side trial
+comparison. Boundaries are left for Grab, Pin, Relax, Strain and Clearance.
+
+`cad.zip` is first-party GRAV code, authorised for reuse, **not open source and
+not for redistribution** — see the decision record.
+
+---
+
+# ACTIVE TASK — CUSTOMER-SUPPLIED DEVELOPMENT SAMPLES (1 Oct 2026)
+
+Decision record: `docs/decisions/store-customer-supplied-material.md`.
+Lane A, within the Store & Purchase programme below.
+
+**State: feature complete, UNCOMMITTED, with two things outstanding — one of
+them an operator action nobody can do from a test suite.**
+
+## What was built
+
+A material request line can declare the customer is supplying the material.
+Approving it opens a `CustomerMaterialExpectation` with
+`origin: DEVELOPMENT_SAMPLE`, already `ISSUED`, which Store receives against on
+the existing `CUSTOMER_MATERIAL` goods receipt. No purchase order is created, of
+any value. Ownership is walked from the development file to the customer and
+**refused when it cannot be proven**; `customerId` is never read from a request
+payload.
+
+## Outstanding — 1: one index must be dropped by hand
+
+`merchandising_customer_material_expectations.one_revision_per_development` was
+built by an earlier revision of this feature and is **wrong**: keyed on the
+development, it refuses a second expectation for one development, which is an
+ordinary case. It is replaced by `one_revision_per_document`. The replacement is
+declared and present; the wrong one is still in the database and must go:
+
+```
+node -r dotenv/config scripts/migrations/customer-material-ownership-indexes.js --retire
+```
+
+`--retire` drops only the indexes named in that script's `RETIRED` list, one at a
+time, by name. It is separate from `--apply` deliberately: every other mode of
+that script promises in writing that it touches nothing it did not build.
+
+**Do not run `--apply` for this feature.** Both of this feature's indexes are
+already present. `--apply` would build 7 indexes belonging to other features
+(`customer_material_lots`, `stockissuances`, `barcodes`,
+`customer_material_returns`) and is not scoped to this change.
+
+There is also a pre-existing conflict the script leaves alone and this feature
+did not create: `barcodes.customerMaterial.lotId_1` holds a different index than
+declared (`sparse` wanted, not found). Dropping a live index is a person's
+decision.
+
+## Outstanding — 2: the live authenticated journey is NOT verified
+
+The whole chain is proven against the real services and the real database engine
+by `test/store-purchase/customer-supplied-routing.test.js`, and the Store screen
+is proven structurally by `components/store/receiving/workspace.test.mjs` and the
+`/preview/store/receive` route.
+
+**None of that is the live journey.** The authenticated end-to-end walk — raise,
+approve, see it in Store, receive it, confirm ownership and QC, cancel — has not
+been run, because no session is available in this environment and there is no
+authentication bypass to use. A real session is the only thing that closes it.
+
+## What this feature does not include
+
+Stated here as well as in the decision record, because each is a plausible next
+request and **none is implemented**: supplier free-of-charge receipts,
+inter-company or warehouse transfers as a source of customer material, a
+"sample inward" document type of its own, and Store raising a customer-supplied
+request on its own authority.
+
+---
+
 # ACTIVE TASK — STORE & PURCHASE, TWO LANES (28 Sep 2026)
 
 > **The CMS-wide Assistant Semantic Catalogue entry that used to head this file

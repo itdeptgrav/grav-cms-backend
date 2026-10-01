@@ -81,10 +81,46 @@ function jobView(job, context = {}) {
       adapter: str(job.engine?.adapter),
       version: str(job.engine?.version),
       externalJobId: str(job.engine?.externalJobId),
+      /* So the page knows it is the one that has to do the arithmetic, without
+         matching on an adapter name it would then have to keep in step. */
+      runsInBrowser: Boolean(simulation.activeAdapter()?.runsInBrowser)
+        && str(job.engine?.adapter) === str(process.env.RND_SIMULATION_ADAPTER || "").trim(),
     },
     inputs: job.inputs || {},
     resultPublicationRef: str(job.resultPublicationRef),
     resultPublicationId: job.resultPublicationId ? String(job.resultPublicationId) : "",
+    /* ── THE DRAPE'S FINDINGS, WITHOUT ITS GEOMETRY ────────────────────
+       A job list renders a dozen of these and the positions are 100KB each, so
+       the geometry is fetched on its own by `readDrape` when a reader opens one.
+       What a list needs is whether there is a drape and what it found. */
+    drape: job.drape?.vertexCount
+      ? {
+        present: true,
+        solverVersion: str(job.drape.solverVersion),
+        quality: str(job.drape.quality),
+        fabric: job.drape.fabric || null,
+        unit: str(job.drape.unit) || "mm",
+        vertexCount: job.drape.vertexCount,
+        triangleCount: job.drape.triangleCount ?? 0,
+        pieces: (job.drape.pieces || []).map((p) => ({
+          pieceRef: str(p.pieceRef), name: str(p.name), role: str(p.role),
+          base: p.base ?? 0, vertexCount: p.vertexCount ?? 0,
+        })),
+        seamClosure: job.drape.seamClosure || [],
+        strain: job.drape.strain || null,
+        fidelity: job.drape.fidelity || null,
+        tightestClearanceMm: job.drape.tightestClearanceMm ?? null,
+        template: job.drape.template || null,
+        frames: job.drape.frames ?? 0,
+        finalMoveMm: job.drape.finalMoveMm ?? null,
+        msElapsed: job.drape.msElapsed ?? 0,
+        /* Said here rather than left to each screen, because a drape shown
+           without this sentence is a drape somebody will approve against. */
+        caveat: "This is a drape of the 2D pattern computed in the browser, on a body built from "
+          + "measurements. It shows whether the pattern sews and where the cloth is under tension. "
+          + "It is not a production-accurate garment and a sample should not be approved against it.",
+      }
+      : { present: false },
     failure: {
       code: str(job.failure?.code),
       message: str(job.failure?.message),
@@ -231,6 +267,88 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
   return { render: jobView(job, context) };
 }
 
+/* ═══ A DRAPE, AS IT ARRIVES AND AS IT IS STORED ══════════════════════════
+ *
+ * The browser sends positions as a base64 string because JSON has no binary and
+ * an array of 25,000 numbers is 300KB of text for 100KB of data. They are stored
+ * as a Buffer of little-endian Float32s, three per vertex.
+ *
+ * ── WHY THE LENGTH IS CHECKED AGAINST THE VERTEX COUNT ────────────────────
+ * Because a drape whose positions do not match its piece table is a garment
+ * whose panels are mislabelled, and the labels are the whole value: a reader
+ * looking at a strained area needs to be told which PATTERN PIECE it is. A
+ * mismatch is refused rather than stored and rendered as something.
+ */
+/**
+ * The bytes behind a stored Buffer field, whichever shape the driver returns.
+ *
+ * A `.lean()` read hands back the BSON `Binary` rather than a Node Buffer, and
+ * `Buffer.from(binary)` on one of those produces an EMPTY buffer rather than
+ * throwing — so the drape came back as zero bytes, the viewer drew nothing, and
+ * nothing anywhere said why.
+ */
+function bytesOf(value) {
+  if (!value) return Buffer.alloc(0);
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value.value === "function") return Buffer.from(value.value(true));
+  if (value.buffer) return Buffer.from(value.buffer);
+  return Buffer.alloc(0);
+}
+
+function normaliseDrape(drape) {
+  const vertexCount = Number(drape?.vertexCount) || 0;
+  if (vertexCount < 3) {
+    throw fail("VALIDATION", "That drape has no geometry in it.", { field: "drape.vertexCount" });
+  }
+  let positions = null;
+  if (typeof drape.positions === "string" && drape.positions) {
+    positions = Buffer.from(drape.positions, "base64");
+  } else if (Buffer.isBuffer(drape.positions)) {
+    positions = drape.positions;
+  }
+  if (!positions || positions.length !== vertexCount * 3 * 4) {
+    throw fail("VALIDATION",
+      `That drape carries ${positions ? positions.length : 0} bytes of positions for `
+      + `${vertexCount} points, and ${vertexCount * 3 * 4} were expected. It was not stored: a `
+      + "drape whose points do not match its pieces cannot say which panel anything is on.",
+      { field: "drape.positions" });
+  }
+  const pieces = (Array.isArray(drape.pieces) ? drape.pieces : []).map((p) => ({
+    pieceRef: str(p.pieceRef), name: str(p.name), role: str(p.role),
+    base: Number(p.base) || 0, vertexCount: Number(p.vertexCount) || 0,
+  }));
+  const covered = pieces.reduce((n, p) => n + p.vertexCount, 0);
+  if (covered !== vertexCount) {
+    throw fail("VALIDATION",
+      `That drape's pieces account for ${covered} of its ${vertexCount} points.`,
+      { field: "drape.pieces" });
+  }
+  return {
+    solverVersion: str(drape.solverVersion),
+    quality: str(drape.quality),
+    fabric: {
+      id: str(drape.fabric?.id), label: str(drape.fabric?.label), version: str(drape.fabric?.version),
+    },
+    /* Millimetres or nothing. The adapter that produced this converted once at
+       its own boundary; a drape arriving in some other unit is a drape nobody
+       can measure, so it is refused rather than relabelled. */
+    unit: "mm",
+    vertexCount,
+    triangleCount: Number(drape.triangleCount) || 0,
+    pieces,
+    positions,
+    seamClosure: Array.isArray(drape.seamClosure) ? drape.seamClosure : [],
+    strain: drape.strain || null,
+    fidelity: drape.fidelity || null,
+    tightestClearanceMm: Number.isFinite(drape.tightestClearanceMm) ? drape.tightestClearanceMm : null,
+    template: drape.template || null,
+    body: drape.body || null,
+    frames: Number(drape.frames) || 0,
+    finalMoveMm: Number.isFinite(drape.finalMoveMm) ? drape.finalMoveMm : null,
+    msElapsed: Number(drape.msElapsed) || 0,
+  };
+}
+
 /* ═══ WHAT THE ENGINE REPORTS BACK ════════════════════════════════════════
  *
  * Called by whatever adapter is connected — a webhook, a poller, a worker. It
@@ -239,7 +357,7 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
  * not rewrite it.
  */
 async function recordRenderOutcome(ctx, {
-  jobRef, status, publicationId, publicationRef, failure, actor = null,
+  jobRef, status, publicationId, publicationRef, failure, drape = null, actor = null,
 } = {}) {
   assertContext(ctx);
   const job = await RenderJob.findOne({ companyId: ctx.companyId, jobRef: str(jobRef) });
@@ -261,13 +379,27 @@ async function recordRenderOutcome(ctx, {
   job.finishedAt = at;
 
   if (next === RENDER_STATUS.COMPLETED) {
-    if (!isId(publicationId)) {
+    /* ── A COMPLETED RENDER NAMES WHAT IT PRODUCED ──────────────────────
+       Either a model publication — an engine that exported a file somebody can
+       approve a sample against — or a drape, which is this system's own reading
+       of the 2D pattern. One or the other, never neither: a render that
+       completed with nothing to show is the state this check exists to prevent. */
+    if (drape) {
+      job.drape = normaliseDrape(drape);
+      job.events.push({
+        kind: "completed",
+        note: `drape, ${job.drape.quality} quality, ${job.drape.vertexCount} points`,
+        by: who, at,
+      });
+    } else if (isId(publicationId)) {
+      job.resultPublicationId = publicationId;
+      job.resultPublicationRef = str(publicationRef);
+      job.events.push({ kind: "completed", note: str(publicationRef), by: who, at });
+    } else {
       throw fail("VALIDATION",
-        "A completed render has to name the model publication it produced.", { field: "publicationId" });
+        "A completed render has to name the model publication it produced, or carry the drape it "
+        + "made.", { field: "publicationId" });
     }
-    job.resultPublicationId = publicationId;
-    job.resultPublicationRef = str(publicationRef);
-    job.events.push({ kind: "completed", note: str(publicationRef), by: who, at });
   } else {
     job.failure = {
       code: clean(failure?.code, 80) || "RENDER_FAILED",
@@ -280,6 +412,40 @@ async function recordRenderOutcome(ctx, {
 
   const context = await currentRevisionOf(ctx, job.styleId);
   return { render: jobView(job, context) };
+}
+
+/**
+ * THE DRAPE'S GEOMETRY, ON ITS OWN.
+ *
+ * Separate from `jobView` because it is 100KB and a job list is not. Returns the
+ * positions as base64 and the piece table beside them, so the caller can rebuild
+ * the triangles from the revision — the triangulation is a pure function of the
+ * pattern, the quality and the solver version, all three named here.
+ */
+async function readDrape(ctx, { jobRef } = {}) {
+  assertContext(ctx);
+  const job = await RenderJob.findOne({ companyId: ctx.companyId, jobRef: str(jobRef) }).lean();
+  if (!job) throw fail("NOT_FOUND", "That render job was not found.");
+  if (!job.drape?.vertexCount || !job.drape?.positions) {
+    throw fail("NO_DRAPE",
+      job.status === RENDER_STATUS.COMPLETED
+        ? "This render produced a model publication rather than a drape."
+        : `This render is ${job.status} and has no drape to show.`,
+      { status: job.status });
+  }
+  return {
+    jobRef: job.jobRef,
+    patternRevisionRef: job.patternRevisionRef,
+    patternRevisionNumber: job.patternRevisionNumber,
+    solverVersion: str(job.drape.solverVersion),
+    quality: str(job.drape.quality),
+    unit: str(job.drape.unit) || "mm",
+    vertexCount: job.drape.vertexCount,
+    triangleCount: job.drape.triangleCount ?? 0,
+    pieces: job.drape.pieces || [],
+    body: job.drape.body || null,
+    positionsBase64: bytesOf(job.drape.positions).toString("base64"),
+  };
 }
 
 /**
@@ -304,6 +470,6 @@ function assertNotDerived(publication, what) {
 
 module.exports = {
   RENDER_STATUS,
-  listRenders, requestRender, recordRenderOutcome,
+  listRenders, requestRender, recordRenderOutcome, readDrape,
   stalenessOf, currentRevisionOf, jobView, assertNotDerived,
 };

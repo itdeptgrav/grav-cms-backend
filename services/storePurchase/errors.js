@@ -697,6 +697,9 @@ const CODES = {
   SIMULATION_INPUTS_MISSING: { status: 422, code: "SIMULATION_INPUTS_MISSING" },
   SIMULATION_ENGINE_NOT_CONNECTED: { status: 503, code: "SIMULATION_ENGINE_NOT_CONNECTED" },
   RENDER_ALREADY_RUNNING: { status: 409, code: "RENDER_ALREADY_RUNNING" },
+  /* A render that produced a model publication, or has not finished, has no
+     drape geometry to send. A state, not a missing record. */
+  NO_DRAPE: { status: 409, code: "NO_DRAPE" },
   MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
   MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
   MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },

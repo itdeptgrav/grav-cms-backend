@@ -88,7 +88,19 @@ const patternSet = (over = {}) => ({
 });
 
 const READY_INPUTS = {
-  seamPairings: [{ fromPieceRef: "PC-FRONT", fromEdge: "side", toPieceRef: "PC-BACK", toEdge: "side" }],
+  /* ── A PAIRING NAMES BOTH EDGES, NOT JUST BOTH PIECES ──────────────────
+     `fromPoints`/`toPoints` are the pattern's own outline point indices: the
+     front's right side (corner 1 to 2) sewn to the back's (corner 0 to 3). They
+     were added when the in-app solver arrived, and readiness now requires them,
+     because a pairing that says only "the front joins the back" leaves the
+     solver to guess an edge — and a guessed edge still produces a garment. This
+     fixture previously declared a pattern renderable whose seams named no edges
+     at all. */
+  seamPairings: [{
+    name: "Side seam",
+    fromPieceRef: "PC-FRONT", fromEdge: "side", fromPoints: { from: 1, to: 2 },
+    toPieceRef: "PC-BACK", toEdge: "side", toPoints: { from: 0, to: 3 },
+  }],
   fabrics: [{ name: "Poplin 120gsm", weightGsm: 120, thicknessMm: 0.3 }],
   avatar: { name: "Female M", size: "M", measurements: { chest: 920 } },
   settings: { iterations: 40 },

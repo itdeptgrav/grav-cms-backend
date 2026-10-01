@@ -108,9 +108,18 @@ function checkInputs(patternSet, inputs = {}) {
   );
 
   const pieces = (patternSet?.pieces || []).filter((p) => (p.outline || []).length >= 3);
+  const simulated = pieces.filter((p) => p.simulated !== false);
+  const pairings = inputs.seamPairings || [];
+  const mapping = seamMapping(simulated, pairings);
+
   has("pieces", pieces.length > 0);
   has("unit", Boolean(patternSet?.unit));
-  has("seamPairings", (inputs.seamPairings || []).length > 0);
+  /* ── MAPPED, NOT MERELY LISTED ──────────────────────────────────────
+     A seam that names two pieces but not which run of each outline is sewn
+     cannot be sewn: the solver would have to guess an edge, and a guessed edge
+     produces a garment that looks finished and is wrong. So a pairing only
+     counts once somebody has pointed at both edges. */
+  has("seamPairings", mapping.usable > 0);
   has("fabrics", (inputs.fabrics || []).length > 0);
   has("avatar", Boolean(inputs.avatar?.name) || Object.keys(inputs.avatar?.measurements || {}).length > 0);
   has("renderSize", Boolean(inputs.renderSize));
@@ -121,6 +130,54 @@ function checkInputs(patternSet, inputs = {}) {
     present: present.filter(Boolean),
     /* Counted here so three screens cannot each count it differently. */
     pieceCount: pieces.length,
+    seamMapping: mapping,
+  };
+}
+
+/**
+ * HOW FAR THE SEAM MAP HAS GOT.
+ *
+ * Returned whether or not the pattern is ready, because "3 of 11 seams mapped,
+ * and the back yoke is not joined to anything" is the sentence that tells
+ * somebody what to do next. "Seam pairings are missing" does not.
+ */
+function seamMapping(pieces, pairings) {
+  const refs = new Set(pieces.map((p) => String(p.pieceRef || "")));
+  const joined = new Set();
+  let usable = 0;
+  const unusable = [];
+
+  (pairings || []).forEach((pair, index) => {
+    const name = String(pair.name || pair.note || `Seam ${index + 1}`);
+    const from = String(pair.fromPieceRef || "");
+    const to = String(pair.toPieceRef || "");
+    const edged = (e) => Number.isFinite(e?.from) && Number.isFinite(e?.to);
+    if (!refs.has(from) || !refs.has(to)) {
+      unusable.push({
+        name,
+        why: `names a piece that is not in this pattern (${!refs.has(from) ? from || "—" : to || "—"})`,
+      });
+      return;
+    }
+    if (!edged(pair.fromPoints) || !edged(pair.toPoints)) {
+      unusable.push({ name, why: "does not say which edge of each piece is sewn" });
+      return;
+    }
+    usable += 1;
+    joined.add(from);
+    joined.add(to);
+  });
+
+  return {
+    total: (pairings || []).length,
+    usable,
+    unusable,
+    pieceCount: pieces.length,
+    /* A piece joined to nothing will fall away from the garment on its own.
+       Sometimes that is right — a loose belt — so it is reported, not refused. */
+    unjoinedPieces: pieces
+      .filter((p) => !joined.has(String(p.pieceRef || "")))
+      .map((p) => ({ pieceRef: String(p.pieceRef || ""), name: String(p.name || p.pieceRef || "") })),
   };
 }
 
@@ -183,7 +240,11 @@ function adapterStatus() {
     configured: true,
     name,
     version: adapter.version || "",
-    message: `3D previews are simulated by ${name}.`,
+    runsInBrowser: Boolean(adapter.runsInBrowser),
+    message: adapter.runsInBrowser
+      ? `3D previews are draped by the ${adapter.label || name} in this browser. `
+        + (adapter.description || "")
+      : `3D previews are simulated by ${name}.`,
   };
 }
 
@@ -221,9 +282,24 @@ async function submit(request) {
   }
 }
 
+/* ═══ THE ONE THAT SHIPS ══════════════════════════════════════════════════
+ *
+ * Registered here rather than in server.js so that it is present wherever this
+ * service is — including in tests, which otherwise test a registry the running
+ * application does not have. It is still only USED when
+ * `RND_SIMULATION_ADAPTER=in-app`, so a deployment that has not chosen an engine
+ * still refuses renders with a sentence, exactly as before.
+ */
+const { inAppSolver } = require("./adapters/inAppSolver.adapter");
+
+registerAdapter("in-app", inAppSolver);
+
+/** Adapters whose solving happens in the requesting browser. */
+const runsInBrowser = () => Boolean(activeAdapter()?.runsInBrowser);
+
 module.exports = {
-  REQUIRED_INPUTS, checkInputs,
-  registerAdapter, activeAdapter, adapterStatus, submit,
+  REQUIRED_INPUTS, checkInputs, seamMapping,
+  registerAdapter, activeAdapter, adapterStatus, submit, runsInBrowser,
   /* For tests, which need to put the registry back the way they found it. */
   __adapters: adapters,
 };
