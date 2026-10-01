@@ -16,6 +16,7 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const { requireTenant } = require("../../../../Middlewear/storePurchaseTenant");
 const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
 const GoodsReceipt = require("../../../../models/CMS_Models/StorePurchase/GoodsReceipt");
+const LocationMovement = require("../../../../models/CMS_Models/Inventory/Operations/LocationMovement");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -395,6 +396,21 @@ router.get("/summary", async (req, res) => {
       .select("variantId variantCombination unit quantity identityState receivingSessionId goodsReceiptId voidedAt")
       .lean();
 
+    /* WHAT IS ON A RACK, PER LABEL (1 Oct 2026, owner — for reference, temporary).
+       Labels can be printed twice or in excess, so the owner wants beside the
+       printed total the quantity of the labels actually PUT on a shelf: the
+       ledger's located balance per sticker (LocationMovement in − out, the
+       same arithmetic as storeLocations.markingBalancesMany). Matched by the
+       barcode ids just read, which are already company-scoped. */
+    const located = new Map();
+    if (rows.length) {
+      const agg = await LocationMovement.aggregate([
+        { $match: { barcodeId: { $in: rows.map((b) => b._id) }, applied: { $ne: false } } },
+        { $group: { _id: "$barcodeId", onHand: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$quantity", { $multiply: ["$quantity", -1] }] } } } },
+      ]);
+      for (const a of agg) if (a.onHand > 0.0001) located.set(String(a._id), a.onHand);
+    }
+
     const bucketOf = (b) => {
       const st = String(b.identityState || "ACTIVATED");
       if (st === "VOIDED") return "voided";
@@ -421,6 +437,26 @@ router.get("/summary", async (req, res) => {
       v.rows.push(b);
     }
 
+    /* Per variant, every label not voided (live + in a count) beside the ones
+       on a rack — `referenceByVariant`, read by the material page's
+       "for reference" table. `onRack.byUnit` sums the LOCATED quantity, not
+       the figure printed on the label. */
+    const ref = new Map();
+    for (const b of rows) {
+      if (bucketOf(b) === "voided") continue;
+      const key = b.variantId ? String(b.variantId) : "";
+      if (!ref.has(key)) ref.set(key, { variantId: key || null, variant: (b.variantCombination || []).join(" · "), printed: [], onRack: [] });
+      const r = ref.get(key);
+      r.printed.push(b);
+      const q = located.get(String(b._id));
+      if (q) r.onRack.push({ unit: b.unit, quantity: q });
+    }
+    const referenceByVariant = [...ref.values()].map((r) => ({
+      variantId: r.variantId, variant: r.variant,
+      printed: { labels: r.printed.length, byUnit: byUnit(r.printed) },
+      onRack: { labels: r.onRack.length, byUnit: byUnit(r.onRack) },
+    }));
+
     return res.json({
       success: true,
       summary: {
@@ -428,6 +464,7 @@ router.get("/summary", async (req, res) => {
         inCount: { labels: buckets.inCount.length, byUnit: byUnit(buckets.inCount) },
         voided: { labels: buckets.voided.length },
         liveByVariant: [...variants.values()].map((v) => ({ variantId: v.variantId, variant: v.variant, labels: v.labels, byUnit: byUnit(v.rows) })),
+        referenceByVariant,
         total: rows.length,
       },
     });
