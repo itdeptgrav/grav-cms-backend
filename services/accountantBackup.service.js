@@ -114,13 +114,54 @@ const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/userinfo.email",
 ];
 
+/* Where Google sends the person back. It is this server's own callback route,
+   so it can be derived from the address the backend already uses for public
+   links, API_PUBLIC_URL.
+
+   GOOGLE_OAUTH_REDIRECT_URI still wins when set, because the value has to
+   match the Authorised redirect URI registered on the Google Cloud OAuth
+   client CHARACTER FOR CHARACTER, and only whoever registered it knows what
+   they typed. The derived value is what it OUGHT to be; it is not
+   automatically what Google was told. */
+const OAUTH_CALLBACK_PATH = "/api/accountant/backup/google/callback";
+
+function redirectUri() {
+  const explicit = String(process.env.GOOGLE_OAUTH_REDIRECT_URI || "").trim();
+  if (explicit) return explicit;
+  const base = String(process.env.API_PUBLIC_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
+  return base ? base + OAUTH_CALLBACK_PATH : "";
+}
+
 function getOAuth2Client() {
   const id = process.env.GOOGLE_OAUTH_CLIENT_ID;
   const secret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-  const redirect = process.env.GOOGLE_OAUTH_REDIRECT_URI;
-  if (!id || !secret || !redirect) {
+  const redirect = redirectUri();
+
+  /* NAME THE ONE THAT IS MISSING.
+     ----------------------------------------------------------------------
+     This listed all three whatever the state, so a server with the client id
+     and secret set and only the redirect missing reported the same sentence
+     as a server with nothing set at all — and the weekly backup failed with
+     it, every week, while somebody looked at two variables that were plainly
+     there. */
+  const missing = [];
+  if (!id) missing.push("GOOGLE_OAUTH_CLIENT_ID");
+  if (!secret) missing.push("GOOGLE_OAUTH_CLIENT_SECRET");
+  if (!redirect) missing.push("GOOGLE_OAUTH_REDIRECT_URI (or API_PUBLIC_URL)");
+
+  if (missing.length) {
+    const shouldBe =
+      String(process.env.API_PUBLIC_URL || "https://your-server")
+        .replace(/\/+$/, "") + OAUTH_CALLBACK_PATH;
     throw new Error(
-      "Google sign-in isn't set up on the server yet. Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI.",
+      "Google sign-in isn't set up on the server yet — " +
+        missing.join(" and ") +
+        (missing.length === 1 ? " is not set. " : " are not set. ") +
+        "The callback is " + shouldBe +
+        ", and that exact address must be registered as an Authorised " +
+        "redirect URI on the Google Cloud OAuth client.",
     );
   }
   return new google.auth.OAuth2(id, secret, redirect);

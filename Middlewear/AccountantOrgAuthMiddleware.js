@@ -501,15 +501,29 @@ function attachDevSession(req) {
   req.organization = null;
 }
 
-function attachOrgSession(req, { user, organization }) {
+function attachOrgSession(req, { user, organization, ceoOwner = false }) {
+  /* THE CEO IS AN OWNER HERE, WHATEVER acc_users SAYS.
+     ---------------------------------------------------------------------
+     Accounting's own role list is not the company hierarchy, and had
+     drifted from it: the CEO sat at `approver`, which can post and approve
+     but cannot manage the team or the settings. The result was an owner in
+     some screens and not in others, with nothing on screen to explain the
+     difference. See services/ceoIsAccountingOwner.service.js.
+
+     The stored role is left untouched and still reported as `assignedRole`,
+     so the team screen keeps telling the truth about what was assigned. */
+  const effectiveRole = ceoOwner ? "owner" : user.role;
+
   req.user = {
     id: String(user._id),
     organizationId: String(user.organizationId),
-    role: user.role,
+    role: effectiveRole,
+    assignedRole: user.role,
+    isCeoOwner: Boolean(ceoOwner),
     email: user.email,
     name: user.name,
-    isOwner: user.role === "owner",
-    permissions: permissionsForRole(user.role),
+    isOwner: effectiveRole === "owner",
+    permissions: permissionsForRole(effectiveRole),
   };
   req.organization = organization;
 }
@@ -586,7 +600,12 @@ async function orgAuth(req, res, next) {
     return next();
   }
 
-  attachOrgSession(req, result);
+  /* One cached lookup per email per five minutes — see the service. */
+  const { isCeoEmail } = require("../services/ceoIsAccountingOwner.service");
+  attachOrgSession(req, {
+    ...result,
+    ceoOwner: await isCeoEmail(result.user?.email),
+  });
   next();
 }
 
@@ -621,7 +640,12 @@ async function legacyBootstrapAuth(req, res, next) {
     return next();
   }
 
-  attachOrgSession(req, result);
+  /* One cached lookup per email per five minutes — see the service. */
+  const { isCeoEmail } = require("../services/ceoIsAccountingOwner.service");
+  attachOrgSession(req, {
+    ...result,
+    ceoOwner: await isCeoEmail(result.user?.email),
+  });
   next();
 }
 
