@@ -39,6 +39,12 @@ const canEditLedgers = (req, res, next) =>
 const {
   defaultDueDateOnVoucherBody,
 } = require("../../services/voucherDueDateDefault.service");
+/* Called further down when the narration box was left empty. It was used
+   without ever being imported, so saving ANY voucher threw
+   `ReferenceError: applyDefaultNarration is not defined` — which the module
+   returned as a 500 and the invoice screen showed verbatim in an alert, so it
+   read as "applying the narration failed" even when one had been typed. */
+const { applyDefaultNarration } = require("../../services/voucherNarration.service");
 const {
   resolveServiceOrderBilling,
   voucherSummary,
