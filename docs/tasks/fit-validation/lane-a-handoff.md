@@ -1,206 +1,152 @@
-# Handoff to Lane A — what to consume, and when
+# Lane B → Lane A handoff
 
-**From Lane B (product specification) · 1 Oct 2026.**
-Nothing here blocks Lane A today. It is written so that when the solver needs a
-garment description, the description already exists and nobody has to invent
-one under deadline.
+**Revised 1 Oct 2026**, after an adversarial review of Lane B's own first draft.
+Documentation only. No application code, schema, route or test was touched.
 
 ---
 
-## 1. What Lane B produced
+## 1. Read this first: the first draft was wrong in four places
+
+Lane B reviewed its own output against the real DXF export, the live schemas, the
+`cad.zip` implementation and Lane A's decision record, and found four claims that
+would have caused Lane A to build the wrong thing. All four are corrected. If you
+read the previous version (`f2970a13`), these are the deltas that matter:
+
+| Was | Now |
+|---|---|
+| The post-assembly geometry check catches a reversed seam | **It cannot.** Perimeter, seam length and scale are all identical for a reversed sleeve. Defence is prevention: mandatory confirmed `alignment`, with a visual orientation preview. `garment-template-contract.md` §4.5 |
+| Grain is a `lengthwise` / `crosswise` label derived from the drawing | **A vector in the piece's own coordinates.** Every piece in the real export has a grainline at ~90° because that is the selvedge; the label said nothing about the garment. §4.8 |
+| Chest, waist and hem ease read off the draped garment | **Split by fabric.** A knit drapes to the body's girth whatever size it is, so flat-pattern vs body girth is primary for knits. Two of three categories in scope are knit. `fit-assistant-rules.md` §4 |
+| An unpublished seam allowance is a "slight" error, warned about | **~40 mm on a chest girth** — a whole fit band. A sewing line is published, derived, or the dimensional findings are withheld. §4.12 |
+
+Plus five structural corrections: a documented body-landmark contract (the
+findings needed one and nothing in the record provides it), support for
+separately-drawn left/right pieces, a required-piece list narrowed to your first
+template, a workable boundary-coverage rule, and construction order demoted out of
+readiness.
+
+---
+
+## 2. The six documents, and what each is for
 
 | Document | Answers |
 |---|---|
-| `docs/product/rnd-fit/garment-template-contract.md` | what a template must describe; the name-free seam contract; the three categories; readiness failures and safe warnings |
-| `docs/product/rnd-fit/fabric-profile-contract.md` | what a fitting needs to know about cloth, and how sure it is |
-| `docs/product/rnd-fit/fit-assistant-rules.md` | the nine findings, their wording, and why nothing auto-edits |
-| `docs/product/rnd-fit/validation-matrix.md` | the eighteen cases the pipeline must eventually pass |
-| `docs/product/rnd-fit/plain-language-glossary.md` | the words that go on screen |
+| `docs/product/rnd-fit/garment-template-contract.md` | What a fitting must be given, where each thing comes from, and what stops it. The name-free seam contract |
+| `docs/product/rnd-fit/fabric-profile-contract.md` | What cloth must be described as, and what happens per missing value |
+| `docs/product/rnd-fit/fit-assistant-rules.md` | The nine findings, the body contract, and which four are actually available in release one |
+| `docs/product/rnd-fit/validation-matrix.md` | Eighteen cases: six fittings, seven refusals, four partials, and one documented blind spot |
+| `docs/product/rnd-fit/plain-language-glossary.md` | The words on screen, and the forbidden ones |
+| `docs/tasks/fit-validation/lane-a-handoff.md` | This file |
 
-**No application code, model, route, test or workspace file was touched.**
-
----
-
-## 2. Lane B agrees with the decisions Lane A already recorded
-
-Read from `docs/decisions/rnd-fit-simulation.md`. Nothing in Lane B's documents
-contradicts any of it, and three of them are load-bearing here:
-
-- **Garment knowledge lives in `fit/templates/`, and the solver below it does
-  not know the word "sleeve."** The seam contract is written to make that
-  possible: it describes a garment entirely in pieces, edges, runs, directions
-  and alignments.
-- **A pattern with no stated unit is refused, not assumed.** `VM-13` is the case
-  for it, and the reason is the 25.4× error with no visible symptom.
-- **A drape is evidence; it goes stale rather than re-pointing.** `VM-18`.
-
-The modules Lane A deliberately left behind — `SeamGraph.js`,
-`GarmentAssembler.js`, `collarSupply.js`, `analysis/FitAssistant.js` — are
-exactly what these documents replace. `garment-template-contract.md` §1 records
-why, with the specific evidence: lookups for `"Coller"`, thresholds measured on
-*"Executive shirt M on its base body"*.
+The body-landmark contract is **§3 of `fit-assistant-rules.md`** rather than a
+seventh file, because landmarks exist only to serve findings and the useful part is
+the landmark → dependent-finding mapping. It introduces no schema and asks for none
+in this release.
 
 ---
 
-## 3. Consume in this order
+## 3. Lane B agrees with Lane A's decisions
 
-### Now, if it is cheap — otherwise at the template step
+Read `docs/decisions/rnd-fit-simulation.md` and found nothing to argue with:
 
-**The seam-mapping contract** (`garment-template-contract.md` §4). The one
-structural point worth knowing before writing the assembler:
+- **Millimetres as the one internal unit**, and a unit-less pattern **refused**.
+  Lane B's R2 is the same refusal. Our own parser shipped the 25.4× bug this
+  prevents, because `Number("")` is `0`.
+- **Garment knowledge in `fit/templates/`, the solver ignorant of "sleeve".**
+  This is the whole shape of §4 and §5 of the contract: roles and run vocabularies
+  are per template, and a seam is geometry.
+- **The fidelity gate fails rather than warns.** Agreed, and Lane B adds the
+  distinction it needs: a **pre-simulation** check on declared lengths (R7) and the
+  **post-meshing** gate on built geometry are two different checks at two different
+  moments, and neither replaces the other.
+- **Leaving `SeamGraph.js` and `FitAssistant.js` behind.** Lane B reached the same
+  conclusion from the other direction: the `"Coller"` lookup and the "Executive
+  shirt M, 0.8″ mesh" residuals are why nothing here holds a universal threshold.
+- **The drape is read-only evidence and goes stale.** `fit-assistant-rules.md` §7
+  and VM-18.
 
-> **A seam joins two ordered *sequences* of edges, not two edges.**
+### One place Lane B asks for slightly more than your record
 
-On every garment in scope, the armhole is one sleeve-cap edge sewn to two or
-three body edges in order. A contract that paired one edge to one edge cannot
-express a set-in sleeve, and discovering that after the assembler is written is
-a rewrite rather than a change.
+Your scope says "front, back, sleeves, and an **optional** collar band". Lane B's
+first-release requirement is front, back, sleeves and **a neck finish** — satisfied
+by a band, a collar pair, or a declared facing, so the specific piece stays
+optional but *some* finish is required.
 
-Also worth having early, because both are cheap now and awkward later:
-
-- **Alignment is explicit**, never inferred from outline storage order. A
-  reversed seam drapes and looks nearly right (`VM-10`), so it must be impossible
-  to express accidentally.
-- **Pairing is by normalised position along each side's own total length**, so a
-  125-point armhole sews to a 40-point cap. This is how the archive did it and it
-  is right.
-
-### At the template step
-
-The three categories (§6) — required and optional pieces, cut quantities,
-symmetry, grain, required seams and their order, legitimately unsewn edges.
-
-The conditional-piece rule is the part that bites: a woven shirt may or may not
-have a separate upper-back panel, and whether it does changes which edges exist
-and which seams are required. §6.3 states it as *"when this role is present,
-these seams become required"*.
-
-### At the readiness step
-
-§8 of the template contract: nine readiness failures, seven safe warnings.
-
-This extends what `simulationAdapter.checkInputs()` does today. The current
-check asks whether each list has at least one entry — pieces, unit, seam
-pairings, fabrics, avatar, render size. That is the right shape and it is not
-yet asking whether the mapping is *correct*: nothing currently detects an
-unpaired edge, a seam-length mismatch, a reversed alignment, an open outline or
-a missing grain.
-
-### At the fabric step
-
-`fabric-profile-contract.md`. The practical point:
-
-> The solver wants a **compliance**. R&D, merchandisers and suppliers deal in
-> **percentages, GSM and swatch cards**. A profile must carry both, plus the
-> conversion that links them.
-
-A profile holding only `4e-5` is a number nobody in a sampling room can check,
-so when a drape looks wrong there is no way to tell whether the pattern, the
-mapping or the cloth was at fault.
-
-### Last, after a drape exists
-
-`fit-assistant-rules.md` and `plain-language-glossary.md`. Neither is needed
-until there is something to report on.
+The reason: an unfinished neck opening has no defined finished length, and the
+collar/neck finding is one of only four available in release one. If you would
+rather the neck finish be fully optional, the consequence is that the collar
+finding is withheld whenever it is absent — say so and Lane B will record that
+instead. Nothing else in the pack depends on it.
 
 ---
 
-## 4. The gaps Lane B found in the existing record
+## 4. Consume in this order
 
-Named so Lane A does not rediscover them. **Lane B has not changed any of
-these** — they are Lane A's to act on, or not.
-
-### `PatternRevision.simulationInputs.seamPairings[]`
-
-Holds `fromPieceRef`, `fromEdge`, `toPieceRef`, `toEdge`, `seamType`, `note`.
-
-| Missing | Why it matters |
-|---|---|
-| ordered edge geometry and **direction** | without it a seam can be sewn backwards |
-| **start/end alignment** | the reversed-sleeve case, `VM-10` |
-| **sequences** on each side | a set-in sleeve cannot be expressed as one edge to one edge |
-| **easing allowance** and distribution | the difference between a design and a mismatch |
-| **fold / symmetry** per piece | our exports publish no mirror line, so cut-on-fold is unstated |
-| **layer** | whether a piece is simulated at all |
-| **unsewn edges**, declared | "finished" and "not done yet" are different and currently indistinguishable |
-| **confidence, confirmedBy, confirmedAt** | a confirmation nobody is attributable for is a guess |
-
-### `PatternRevision.simulationInputs.fabrics[]`
-
-Holds `pieceRefs`, `name`, `weightGsm`, `thicknessMm`, `stretchWarpPercent`,
-`stretchWeftPercent`, `bendingRigidity`, `note`.
-
-| Missing | Why it matters |
-|---|---|
-| **category** (woven / knit / non-woven) | decides which rules apply at all; `VM-17` is a refusal because of it |
-| the **load** the stretch percentages were taken at | without it they are not measurements |
-| `shear` | the bias is where a woven actually moves |
-| `friction`, `selfFriction` | how the garment sits on the body and on itself |
-| `source`, `confidence` | whether a reading may be trusted |
-| `conversionVersion` | why last month's fitting and this month's differ |
-
-### Role assignment
-
-There is nowhere on the revision to record **which piece plays which part**. It
-is the single largest gap: without it a template cannot be applied at all, and
-it cannot be derived — our exports name pieces `Pattern_636968`.
+1. **`garment-template-contract.md` §4** — the data shape. Runs, anchors, seams as
+   ordered sequences, and `alignment` as a mandatory confirmed value.
+2. **§8 R1–R11** — the readiness failures. These are the gate before a job is
+   accepted.
+3. **`fabric-profile-contract.md` §4 "Partial profiles"** — per-value behaviour.
+   The rule is: missing values that change *where* cloth settles stop the fitting;
+   missing values that change *how it gets there* warn.
+4. **`fit-assistant-rules.md` §3.4** — which four findings release one can
+   honestly report. Build those; make the other five say "not available".
+5. **`validation-matrix.md`** — VM-01 first. It is the only case built on a real
+   file.
 
 ---
 
-## 5. The constraint that shapes everything
+## 5. The gaps Lane B found in the record
 
-Worth stating once, plainly, because it decides how much automation is possible.
+Not asking for schema changes in this release. Listing them so they are not
+discovered mid-implementation.
 
-The genuine CLO export this house produces publishes AAMA layers **1, 2, 3, 7
-and 8** — boundary, turn points, curve points, grainline, internal lines.
-
-It does **not** publish layers **4, 5, 6, 13 or 14** — notches, grade points,
-mirror line, drill holes, sew line.
-
-Three consequences:
-
-1. **No notches** → seam pairing cannot be derived from registration marks.
-   Nothing in the file says which point on the armhole meets which point on the
-   cap.
-2. **No sew line** → seam allowance is unpublished, so sewing lines are taken as
-   cut lines and the garment reads slightly larger than it is. That is warning
-   `W1`, and it should appear on every fitting made from these files.
-3. **No mirror line** → cut-on-fold is unstated and must be said by a person.
-
-So role assignment and seam mapping are **human work** on the patterns this
-house has today. A template makes that work short and checkable; it cannot make
-it automatic. Anything built on the assumption that a DXF can be assembled
-unattended will fail on the first real file.
-
-Lane A's own decision record already says this — *"arbitrary imported DXF is not
-claimed to assemble automatically"* — and this is the evidence for it.
+| Gap | Where | Consequence today |
+|---|---|---|
+| **No body landmark structure.** `avatarSchema.measurements` is `Schema.Types.Mixed`, default `{}`; `poseRef` is a free string | `models/CMS_Models/RnD/PatternRevision.js` | five of nine findings have nowhere to measure. §3.3 |
+| **No seam alignment field.** `seamPairingSchema` has `fromEdge` / `toEdge` and no orientation | same file | the one failure nothing downstream can catch is unrepresentable. §4.5 |
+| **Seams pair one edge to one edge** | same file | a set-in sleeve cannot be expressed; its body side is 2–3 runs |
+| **No woven/knit flag on fabric** | `fabricSchema` | the Fit Assistant's primary evidence path is undecidable. `fabric-profile-contract.md` §2.1 |
+| **Thickness doubles as collision offset** | `fabricSchema` | the archive's own preset has them a factor of 13 apart |
+| **No fabric grade, source, damping, shear, friction, or stretch load** | `fabricSchema` | measured and guessed cloth are indistinguishable |
+| **Readiness is a presence check** | `services/rnd/simulationAdapter.service.js` — `has("fabrics", (inputs.fabrics \|\| []).length > 0)` | an all-zero profile passes and drapes. VM-14 |
+| **No sewing line anywhere** | our DXF publishes no layer 14; `PatternMeshBuilder.js` has no inset logic | every girth is biased by the allowance until a sewing line is derived. §4.12 |
+| **No notches, no mirror line** | the real export publishes layers 1, 2, 3, 7, 8 only | anchors fall back to arc-length fractions; cut-on-fold must be stated |
 
 ---
 
-## 6. What Lane B is not asking for
+## 6. The constraint that shapes everything
 
-- No change to the solver, the units decision, the worker boundary or the
-  geometry-fidelity gate. All four are right.
-- No schema change today. The gaps in §4 are stated so they can be designed
-  once, when the template step arrives — not patched three times.
-- No API. These are documents, and they stay documents until Lane A needs the
-  shapes.
+> A fitting that cannot be trusted must not be produced.
+
+A believable drape with the wrong dimensions gets a sample approved against it.
+That is the cost of being wrong here, and it is why this pack has seven refusals,
+four partials, and withholds five of nine findings in the first release.
+
+It is also why VM-11 exists as a documented blind spot rather than a passing test.
+A reversed seam produces a believable garment and nothing catches it. Writing that
+down is more useful than a check that does not work.
 
 ---
 
-## 7. Open questions for R&D, not for Lane A
+## 7. What Lane B is not asking for
 
-These need a person in the sampling room, and nothing can be finalised without
-them:
+- No schema migration, route, model or test in this release.
+- No trousers, jackets or any fourth category.
+- No universal threshold anywhere. Every number is a rule set's, held by R&D,
+  versioned, with an author.
+- No change to `docs/tasks/current-task.md` or any file Lane A owns. Lane B has
+  not touched them.
 
-1. **Intended fit per style.** `slim` / `regular` / `relaxed` has to be stated
-   somewhere R&D already works. Guessing it from the numbers defeats the point.
-2. **House ease bands.** The rule sets need real numbers per category and fit,
-   and they must come from this house's own blocks rather than from the
-   Executive shirt.
-3. **Which bodies.** A fitting is against one body; which bodies represent which
-   sizes is a decision nobody has recorded.
-4. **Collar grain.** Whether collars are cut lengthwise or crosswise varies by
-   house, and the template needs this house's answer.
-5. **Measurement method.** Half-chest flat and doubled, or girth on the drape —
-   the two differ by enough to matter and must be stated once.
+---
+
+## 8. Open questions for R&D, not for Lane A
+
+1. **Seam allowance** — one value per garment, or per run? Per run is the truth and
+   per garment is what anybody will actually enter.
+2. **The waist** — on a body with no defined waist, is a detected waist acceptable,
+   or is the finding withheld? Lane B's draft withholds it.
+3. **Stretch load** — what force are stretch percentages measured at here? Without
+   it, two profiles are not comparable.
+4. **Rule sets** — who authors them, and what is the first set for a basic tee?
+   Nothing in this pack works without one, and nothing in this pack invents one.

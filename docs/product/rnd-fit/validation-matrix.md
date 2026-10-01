@@ -1,335 +1,291 @@
 # Validation matrix
 
-**Lane B · acceptance specification · 1 Oct 2026.**
-Eighteen cases a fitting pipeline must handle before anybody may rely on it.
+**Lane B · validation pack · revised 1 Oct 2026.**
+Eighteen cases. Each one states what goes in, what must come out, and what it
+would mean if something else did.
+
+**Revision note.** Two corrections. The first draft's VM-10 claimed the
+post-assembly geometry check catches a reversed seam; **it does not**, and the
+case is rewritten as a prevention case plus an explicit statement of the blind
+spot (VM-11, VM-12). The first draft also said "ten of eighteen are refusals"
+when there were nine; the counts below are recomputed and stated per group.
 
 ---
 
 ## 1. How to read this
 
-Each case states the starting conditions, what readiness must decide, what the
-simulation must do, what the person is told, what must be kept as evidence, and
-— the row that matters most — **what a false result would look like**.
-
-That last row is the point of the document. Every case here has a failure mode
-where the software produces something plausible and wrong, and a plausible
-wrong fitting is worse than a refusal, because somebody approves a sample
-against it.
+These are **product** cases, not unit tests. Each asks: given this input, does the
+product do the honest thing? Lane A may implement any of them as an automated test
+or run them by hand.
 
 ### The three outcomes
 
 | Outcome | Meaning |
 |---|---|
-| **Refused** | readiness stopped it. No fitting exists. The reason names what is missing |
-| **Ran, qualified** | a fitting exists, and a warning travels with it for ever |
-| **Ran** | a fitting exists and nothing qualifies it |
+| **Fitting** | A drape is produced and findings are reported |
+| **Refused** | No drape. A named readiness failure, and what to do about it |
+| **Partial** | A drape is produced; named findings are **withheld** or marked |
+| **Undetected** | A drape is produced and **it is wrong, and nothing catches it**. Exactly one case, VM-11, and it is in the pack to be written down rather than passed |
+
+A **Partial** is not a degraded Fitting. It is the correct outcome whenever the
+drape is watchable but a number would be biased.
 
 ### Evidence
 
-Every run — including a refusal — records: the pattern revision, the template,
-the role assignments, the seam mapping and its confirmations, the fabric
-profiles with their confidence, the body, the unit and how it was known, the
-rule set, and the outcome. A fitting that cannot say what it was made from is
-not evidence.
+Every case records: the readiness codes raised, which sewing-line source was used
+(published / derived / cut boundary), the fabric grade, the rule set version, the
+confirmed seam alignments, and whether scale was self-consistent or externally
+verified.
+
+### Counts
+
+| Group | Cases | Expected outcome |
+|---|---|---|
+| **A** — must produce a fitting | VM-01 … VM-06 | 6 Fitting |
+| **B** — must refuse | VM-07 … VM-10, VM-12 … VM-14 | **7 Refused** |
+| — the blind spot | VM-11 | 1 Undetected |
+| **C** — must run and hold back | VM-15 … VM-18 | 4 Partial |
+
+**Seven of eighteen are refusals.** Six produce a full fitting, four produce a
+fitting with something withheld, and one — VM-11 — produces a wrong fitting that
+nothing in this specification detects. 6 + 7 + 1 + 4 = 18.
+
+VM-11 is numbered inside Group B because it is the case the Group B refusals exist
+to prevent, but it is **not** a refusal: by the time the wrong confirmation has been
+made, there is nothing left to refuse on.
 
 ---
 
-## 2. The cases
+## 2. Group A — must produce a fitting
 
-### Group A — the garment is fine, the fit is the question
+### VM-01 · The real export, fully mapped
 
-These must **run**. A pipeline that refuses them is useless; one that reports
-them all as normal is worse.
+**Input.** `test/fixtures/rnd/clo-tshirt-aama.dxf` — the genuine CLO 7.1.178
+export. Five pieces, two of them the separately-drawn left and right sleeves at
+`QUANTITY: 1` each. Roles assigned, every seam's alignment confirmed, seam
+allowance stated so a sewing line is derived, a measured jersey profile, a body
+with a stated chest girth.
 
----
+**Must produce.** A Fitting. Chest reported by the **knit** path — flat-pattern
+girth against body girth as the primary number (`fit-assistant-rules.md` §4.2).
+Collar and bicep reported. Garment length reported only if R&D stated a target.
+Stomach, hem, shoulder, armhole and sleeve length **withheld** for want of
+landmarks (`fit-assistant-rules.md` §3.4) — all five, each saying so.
 
-#### VM-01 · Normal fit
+**Why it is case one.** This is the only input in the pack that is real. If this
+does not work, nothing above it means anything.
 
-| | |
-|---|---|
-| **Starting conditions** | complete pattern, every role assigned, every edge sewn or declared finished, measured fabric, body matching the size |
-| **Readiness** | Ready |
-| **Simulation** | Completes. Geometry checks pass: every piece's simulated boundary matches its pattern perimeter, every seam's sewn length matches its pattern length, and the built scale matches the pattern's stated scale |
-| **Message** | all nine findings Normal |
-| **Evidence** | the full input record, the drape, the nine findings with their numbers and rule set |
-| **False result** | reporting a problem that is not there. A pipeline that cannot produce a clean pass on a correct garment will be ignored within a week, and then the real findings are ignored with it |
+### VM-02 · Form B sleeves, independently confirmed
 
----
+**Input.** As VM-01, with the two sleeve pieces linked by `pairedWith`, and the
+armhole alignment confirmed **separately** on each side.
 
-#### VM-02 · Tight chest
+**Must produce.** A Fitting with two independent armhole mappings. Evidence shows
+both `pieceRef`s and records each confirmation as independent.
 
-| | |
-|---|---|
-| **Starting conditions** | as VM-01, body chest larger than the garment allows for the stated fit |
-| **Readiness** | Ready |
-| **Simulation** | Completes. The cloth is visibly strained across the chest |
-| **Message** | Chest **Needs attention**, with body girth, garment girth and the shortfall. Stomach may also report |
-| **Evidence** | the chest numbers, the rule set used, the pieces and edges named |
-| **False result** | reporting Normal because the cloth stretched to fit. On a woven this is physically wrong and must be caught by the fabric category, not by the drape looking acceptable |
+**Must not.** Require the two pieces to be merged, or apply one confirmation to
+the other by inference (`garment-template-contract.md` §4.4, §4.7).
 
----
+### VM-03 · Form A sleeve, one piece cut twice
 
-#### VM-03 · Loose chest
+**Input.** A tee drawn with a single sleeve outline, `cutQuantity: 2`,
+`symmetry: mirrored-pair`. Confirmed once.
 
-| | |
-|---|---|
-| **Starting conditions** | as VM-01, considerably more room than the stated fit implies |
-| **Readiness** | Ready |
-| **Simulation** | Completes |
-| **Message** | Chest **Worth a look** — "more room than a regular fit usually has; a relaxed fit may be intended" |
-| **Evidence** | the numbers and the stated intended fit |
-| **False result** | calling it Needs attention. Loose is a design choice far more often than it is a fault, and a red finding on an intended relaxed fit trains people to dismiss red findings |
+**Must produce.** A Fitting with two sleeves. Warning W9: the confirmation was
+**propagated**, naming which side was confirmed and which inherited.
 
----
+**Why.** Both production forms are legitimate (`garment-template-contract.md` §4.7) and the evidence must
+distinguish them — a propagated confirmation is weaker than two real ones.
 
-#### VM-04 · Large stomach
+### VM-04 · A short-sleeved, band-collar woven shirt with no yoke
 
-| | |
-|---|---|
-| **Starting conditions** | body with a stomach girth larger than its chest; garment cut straight |
-| **Readiness** | Ready |
-| **Simulation** | Completes. Strain concentrated at the waist, chest comfortable |
-| **Message** | Stomach **Needs attention** or **Worth a look**; Chest Normal. The two must be reported separately |
-| **Evidence** | both readings, and the height each was taken at |
-| **False result** | averaging the torso into one verdict. "Chest fine, stomach tight" is the finding; a single body reading hides it |
+**Input.** Front, back, two sleeves with no cuff, a collar stand and no fall, no
+separate upper-back panel. A measured poplin profile, `behaviour: woven`. A
+published sewing line.
 
----
+**Must produce.** A Fitting. Chest by the **woven** path — pattern, draped,
+body, strain and clearance together — with the convex cross-section limitation
+stated on the girth finding (`fit-assistant-rules.md` §4.1). W4 for each absent optional piece.
 
-#### VM-05 · Wide shoulder
+**Why.** The first draft's required-piece list would have **refused this shirt**.
+It is an entirely ordinary garment and it must pass (`garment-template-contract.md` §6.3).
 
-| | |
-|---|---|
-| **Starting conditions** | body shoulder wider than the pattern's shoulder |
-| **Readiness** | Ready |
-| **Simulation** | Completes. The shoulder seam is pulled inboard of the shoulder point |
-| **Message** | Shoulder **Needs attention** — the seam sits inside the shoulder point and the back is strained |
-| **Evidence** | seam end position, body shoulder point, both sides separately |
-| **False result** | reporting only one side. Bodies and drapes are not perfectly symmetric; each shoulder is measured and reported on its own |
+### VM-05 · A polo with placket and flat collar
 
----
+**Input.** Front, back, two sleeves, top and under placket, flat collar, cuff
+bands. Knit pique profile.
 
-#### VM-06 · Narrow shoulder
+**Must produce.** A Fitting. The collar simulated lying flat, with the `garment-template-contract.md` §7 sentence
+about roll on the result. Knit girth path. Compound neckline seam: collar join run
+against front neck + placket top + back neck, contiguous from a stated anchor.
 
-| | |
-|---|---|
-| **Starting conditions** | body shoulder narrower than the pattern's |
-| **Readiness** | Ready |
-| **Simulation** | Completes. The seam falls outside the shoulder point |
-| **Message** | Shoulder **Worth a look** — "falls past the shoulder point; correct for a dropped shoulder, check it is intended" |
-| **Evidence** | as VM-05 |
-| **False result** | calling a deliberate dropped shoulder a defect. Category and intended fit decide; on a relaxed tee this is Normal |
+### VM-06 · A rotated piece on the marker
+
+**Input.** VM-01 with one body piece rotated 37° on the marker, its grain vector
+rotated with it in its own local frame.
+
+**Must produce.** A Fitting **numerically identical** to VM-01 in every girth
+finding.
+
+**Why this is the grain case.** Grain is resolved in the piece's own coordinates
+(`garment-template-contract.md` §4.8). If this result differs from VM-01, grain is being read off the marker —
+the exact error the first draft specified.
 
 ---
 
-#### VM-07 · Large bicep
+## 3. Group B — must refuse, and the one case that cannot be refused
 
-| | |
-|---|---|
-| **Starting conditions** | body upper arm larger than the sleeve allows |
-| **Readiness** | Ready |
-| **Simulation** | Completes, sleeve strained |
-| **Message** | Bicep **Needs attention**; Armhole likely **Worth a look** as well |
-| **Evidence** | sleeve girth, body girth, the armhole reading alongside |
-| **False result** | reporting the bicep alone. Sleeve width and armhole are one problem, and fixing the sleeve without the armhole breaks the cap seam |
+### VM-07 · No unit
 
----
+**Input.** A DXF stating no unit anywhere.
 
-#### VM-08 · Short sleeve
+**Must refuse.** R2. **Must not** assume millimetres or inches — the two differ
+by 25.4×, and our own parser once reported inches for every unit-less file
+because `Number("")` is `0`.
 
-| | |
-|---|---|
-| **Starting conditions** | long-sleeved garment whose sleeve does not reach the wrist |
-| **Readiness** | Ready |
-| **Simulation** | Completes |
-| **Message** | Sleeve length **Worth a look** or **Needs attention**, with the shortfall and the pose caveat |
-| **Evidence** | sleeve end position, wrist landmark, the pose used |
-| **False result** | reporting a short-sleeved garment as a short sleeve. The template knows which this is; a short-sleeve style gets the position reported and no verdict |
+### VM-08 · A required role unassigned
 
----
+**Input.** A woven shirt with front, back and a neck finish, and the sleeves
+unassigned.
 
-### Group B — the mapping is wrong
+**Must refuse.** R3, naming the sleeve pieces. The required list is short on
+purpose (`garment-template-contract.md` §6.3), so a refusal here means something genuinely structural is absent.
 
-These must be **refused**. Every one of them produces a plausible garment if
-allowed to run.
+### VM-09 · A seam with no confirmed alignment
 
----
+**Input.** VM-01 with one armhole seam mapped but its `alignment` left
+unconfirmed.
 
-#### VM-09 · Missing seam pairing
+**Must refuse.** R4, naming that seam and that side.
 
-| | |
-|---|---|
-| **Starting conditions** | a required seam for the template has no mapping; the edges exist and are not declared finished |
-| **Readiness** | **Refused** — R4 |
-| **Simulation** | does not start |
-| **Message** | "This garment cannot be fitted yet: the side seam has not been mapped. Pair the front and back side edges, or mark them as finished edges." — names the pieces |
-| **Evidence** | the mapping as it stands, with the gap named |
-| **False result** | **running with an open seam.** The garment drapes as a flat sheet hanging off the shoulders, looks like loose cloth, and every girth reading is enormous. Nothing about it says "unsewn" |
+**Why this refusal exists.** It is the only defence against a reversed seam. See
+VM-11.
 
----
+### VM-10 · A compound side that is not contiguous
 
-#### VM-10 · Reversed seam direction
+**Input.** An armhole whose body side lists the front armhole run and the back
+armhole run with a gap between them, or with the two travelling in opposite
+directions.
 
-| | |
-|---|---|
-| **Starting conditions** | a seam mapped with its alignment the wrong way round — A-start sewn to B-end where it should be B-start |
-| **Readiness** | **Refused**, where it can be detected — a reversal usually makes the seam cross itself or places the two runs' endpoints implausibly far apart |
-| **Simulation** | does not start when detected. Where it cannot be detected before running, the geometry check after assembly must catch the twist and **fail** |
-| **Message** | "The sleeve appears to be sewn in back to front. Check which end of the sleeve cap meets the front of the armhole." |
-| **Evidence** | the alignment as mapped, the endpoint distances that gave it away |
-| **False result** | **the worst case in this document.** A reversed sleeve drapes, renders and looks very nearly right. The twist reads as a drape fold. Nobody catches it by eye, and the fitting is confidently wrong |
+**Must refuse.** R6. **Must not** silently re-order or reverse the runs to make
+them fit (`garment-template-contract.md` §4.4, M1).
 
----
+### VM-11 · A reversed sleeve, confirmed wrongly — the blind spot
 
-#### VM-11 · Seam-length mismatch
+**Input.** VM-01 with the left sleeve's armhole alignment confirmed **the wrong
+way round**: cap start to armhole end. Everything else correct and confirmed.
 
-| | |
-|---|---|
-| **Starting conditions** | two edges mapped to each other whose lengths differ by more than the template's ease allowance |
-| **Readiness** | **Refused** — R5 |
-| **Simulation** | does not start |
-| **Message** | "These two edges do not fit each other: the sleeve cap is 42 mm longer than the armhole it is sewn to, and this seam allows up to 15 mm of easing. Check the pairing, or check the pattern." |
-| **Evidence** | both lengths, the allowance, the seam |
-| **False result** | **easing it in silently.** A solver will happily gather 42 mm into a shorter edge and produce a puckered but complete garment. The pattern error disappears into the drape, and the fitting says the garment is fine |
+**Must happen.** The fitting **runs**, and produces a believable garment with a
+twisted sleeve nobody is told about.
 
----
+**This case is in the pack to be documented, not passed.** It records the known
+limit: piece perimeter, seam length and scale are all **identical** to the correct
+assembly, so Lane A's fidelity gate passes it, and no downstream check in this
+specification detects it. The product's only defence is the confirmation step and
+its visual orientation preview (`garment-template-contract.md` §4.5).
 
-### Group C — the pattern or its units are wrong
+**It is a failure of this case** if any surface claims the reversal was or could be
+caught after assembly, or if the fitting carries a confidence it has not earned.
+The sentence from `garment-template-contract.md` §4.6 must be present on the result.
 
----
+### VM-12 · Seam-length mismatch beyond the template's ease
 
-#### VM-12 · Unknown scale
+**Input.** A sleeve cap 18% longer than the armhole it is mapped to, where the
+template allows 5%.
 
-| | |
-|---|---|
-| **Starting conditions** | pattern whose stated scale cannot be confirmed against its geometry — for example a file whose declared extents are a placeholder |
-| **Readiness** | **Refused** |
-| **Simulation** | does not start |
-| **Message** | "The size of this pattern could not be confirmed. Every measurement would be a guess." |
-| **Evidence** | what the file declared, what the geometry actually spans, and the difference |
-| **False result** | trusting a declared extent. Our own CLO exports declare extents of 1000×1000 while the geometry spans about 52 units — the header is a placeholder. A pipeline that believed it would scale the garment by roughly twenty times |
+**Must refuse.** R7, with both lengths and the allowance. This is the
+**pre-simulation** check on declared lengths, raised before any mesh exists (M4) —
+distinct from the post-meshing fidelity gate, which compares declared length to
+sewn length.
+
+### VM-13 · Uncovered perimeter, never confirmed
+
+**Input.** A tee where the sleeve hems are neither mapped as sewn nor confirmed as
+finished boundary.
+
+**Must refuse.** R5, **showing the uncovered portions on the piece**, and offering
+one confirmation for the remainder rather than one per edge (`garment-template-contract.md` §4.11, decision 8).
+
+**Must not.** Demand a declaration per edge — the first draft's rule, which made a
+first fitting cost a dozen pointless clicks.
+
+### VM-14 · A zeroed fabric profile
+
+**Input.** A profile present, with `weightGsm: 0` and every stiffness at zero —
+which is what the adapter's presence-only check accepts today.
+
+**Must refuse.** On the missing weight. **Must not** produce a drape: zero
+gravity and zero stiffness give cloth that looks like cloth and behaves like
+nothing, and it is indistinguishable on screen from a real result.
 
 ---
 
-#### VM-13 · Wrong units
+## 4. Group C — must run and hold back
 
-| | |
-|---|---|
-| **Starting conditions** | pattern drawn in inches, imported as millimetres — or no unit stated at all |
-| **Readiness** | **Refused** where no unit is stated. Where a unit is stated but implausible, **refused** on the plausibility check |
-| **Simulation** | does not start |
-| **Message** | "This pattern states no unit, so its size is unknown." / "At the stated unit, the largest piece is 25 mm across. That is not a garment piece — check the unit." |
-| **Evidence** | the stated unit, its source, and the largest piece's size at that unit |
-| **False result** | **a 25.4× error with no symptom.** The garment drapes perfectly; every proportion is right; every absolute number is wrong. The Fit Assistant compares it against a real body and reports nonsense with high confidence. This is the reason the unit is refused rather than assumed |
+### VM-15 · Cut boundary only, no allowance
 
----
+**Input.** VM-01 with no seam allowance stated and no published sewing line, so no
+sewing line can be constructed.
 
-#### VM-14 · Open piece
+**Must produce.** A **Partial**: a drape marked **non-authoritative**, with
+**every dimensional finding withheld** — chest, waist, hem, bicep, collar
+(`garment-template-contract.md` §4.12 step 4, W2). Shape observations remain.
 
-| | |
-|---|---|
-| **Starting conditions** | a piece whose outline does not close |
-| **Readiness** | **Refused** — R6 |
-| **Simulation** | does not start |
-| **Message** | "One pattern piece is not closed, so it cannot be made into cloth. The outline starts and ends 14 mm apart." — names the piece |
-| **Evidence** | the piece, the gap size and where it is |
-| **False result** | closing it automatically. A 14 mm gap may be a rounding artefact or a missing segment, and the two need different fixes. Closing it quietly turns a pattern error into a slightly wrong garment |
+**Must not.** Report a girth and subtract a nominal allowance from it. The error is
+not a constant offset on a number: sewing on the cut line changes **where the
+pieces meet and how they drape**. And it is never called "slight" — on a chest
+with two side seams and two armholes, 10 mm of allowance is of the order of 40 mm.
 
----
+### VM-16 · An unclassifiable fabric
 
-#### VM-15 · Self-intersecting piece
+**Input.** A profile with plausible weight and stiffness but `behaviour` unstated
+and unconfirmable.
 
-| | |
-|---|---|
-| **Starting conditions** | an outline that crosses itself |
-| **Readiness** | **Refused** — R6 |
-| **Simulation** | does not start |
-| **Message** | "One pattern piece crosses over itself and cannot be made into cloth." — names the piece and where |
-| **Evidence** | the piece and the crossing location |
-| **False result** | letting it reach the mesh builder. A self-intersecting outline either fails there with an unreadable error, or produces folded-over cloth that behaves erratically and takes the whole fitting with it |
+**Must produce.** A **Partial** with chest, waist and hem **withheld**, saying the
+product cannot tell whether the cloth stretches, and that the two kinds are judged
+on different evidence (`fit-assistant-rules.md` §4.3).
 
----
+**Must not.** Default to woven. Defaulting reverses which number is primary and
+would report a knit's draped conformance as a good fit.
 
-#### VM-16 · Missing grainline
+### VM-17 · A knit two sizes too small
 
-| | |
-|---|---|
-| **Starting conditions** | a simulated piece with no grainline, on a fabric whose lengthwise and crosswise behaviour differ meaningfully |
-| **Readiness** | **Refused** — R8. Where warp and weft are within a small margin of each other, **Ran, qualified** instead |
-| **Simulation** | does not start when refused |
-| **Message** | "This piece does not say which way the grain runs, and this fabric behaves differently along and across. The fitting would be of a fabric nobody specified." |
-| **Evidence** | the piece, the fabric's warp and weft values |
-| **False result** | **assuming vertical.** It is the most common grain and it is wrong often enough to matter — a neck band is cut across the grain precisely so it stretches, and simulating it along the grain produces a band that will not go over a head |
+**Input.** A jersey tee whose flat-pattern chest girth is far below the body's,
+with a measured knit profile.
 
----
+**Must produce.** A Fitting that reports the chest as **much too tight**, on the
+flat-pattern-versus-body difference and on strain, with the `fabric-profile-contract.md` §2.2 note that the
+linear material model **understates** resistance near the stretch limit.
 
-#### VM-17 · Woven fabric using knit properties
+**It is a failure** if the garment's draped girth being close to the body's is
+read as a good fit. It will be close — the body makes it close. This is the single
+case that proves the knit path exists.
 
-| | |
-|---|---|
-| **Starting conditions** | a woven garment whose fabric profile carries knit stretch values — by a wrong preset, a copied profile or a category left unset |
-| **Readiness** | **Refused** where the category and the values contradict each other. Where no category is stated, **Refused** for the missing category |
-| **Simulation** | does not start |
-| **Message** | "This fabric is marked as a woven but stretches like a knit. Check the fabric profile before fitting." |
-| **Evidence** | the profile, its source and confidence, and which values triggered it |
-| **False result** | **everything looks fine.** Excess stretch hides every tight place: the chest gives, the armhole gives, the bicep gives, and all nine findings come back Normal on a garment that would not go on. This is the quietest failure in the document and the reason category is a required field |
+### VM-18 · A stale fitting
+
+**Input.** A confirmed mapping and a completed fitting, then the pattern revision
+changes.
+
+**Must produce.** The existing fitting marked **stale**, R11 raised on any attempt
+to re-run against the new revision with the old mapping.
+
+**Must not.** Re-point the fitting at the new revision. A fitting is a statement
+about one revision and expires with it (`fit-assistant-rules.md` §7).
 
 ---
 
-#### VM-18 · Stale fitting after a pattern revision
+## 5. What this pack does not cover yet
 
-| | |
-|---|---|
-| **Starting conditions** | a fitting exists; a newer pattern revision is approved afterwards |
-| **Readiness** | the existing fitting becomes **stale**. It is not deleted and not silently re-pointed |
-| **Simulation** | nothing re-runs by itself |
-| **Message** | on the old fitting: "This fitting was made from pattern revision 4. Revision 5 has since been approved. Re-run it to see the current pattern." |
-| **Evidence** | the fitting keeps its own revision reference for ever |
-| **False result** | **re-pointing it at the new revision.** The drape, the findings and the numbers would all belong to the old pattern while the screen named the new one. Every number would be wrong and nothing would look wrong. A stale fitting that says so is useful; a silently updated one is a lie |
-
----
-
-## 3. Summary
-
-| # | Case | Readiness | Simulation |
-|---|---|---|---|
-| 01 | Normal fit | Ready | Runs, all Normal |
-| 02 | Tight chest | Ready | Runs, Needs attention |
-| 03 | Loose chest | Ready | Runs, Worth a look |
-| 04 | Large stomach | Ready | Runs, separate readings |
-| 05 | Wide shoulder | Ready | Runs, per side |
-| 06 | Narrow shoulder | Ready | Runs, Worth a look |
-| 07 | Large bicep | Ready | Runs, with armhole |
-| 08 | Short sleeve | Ready | Runs, pose caveat |
-| 09 | Missing seam pairing | **Refused** | — |
-| 10 | Reversed seam direction | **Refused** / fails the geometry check | — |
-| 11 | Seam-length mismatch | **Refused** | — |
-| 12 | Unknown scale | **Refused** | — |
-| 13 | Wrong units | **Refused** | — |
-| 14 | Open piece | **Refused** | — |
-| 15 | Self-intersecting piece | **Refused** | — |
-| 16 | Missing grainline | **Refused** (or qualified if warp ≈ weft) | — |
-| 17 | Woven using knit properties | **Refused** | — |
-| 18 | Stale after revision | **Stale**, kept | nothing automatic |
-
-Ten of eighteen are refusals. That ratio is deliberate: the cases that produce a
-convincing, wrong garment outnumber the ones that produce an obviously broken
-one, and the only defence against a convincing wrong garment is refusing to
-make it.
-
----
-
-## 4. What this pack does not cover yet
-
-Stated so nobody reads its silence as approval.
-
-- **Movement.** Every case is a static pose. Whether a sleeve binds when the arm
-  lifts is not tested, and the armhole finding says so.
-- **Multi-layer garments.** Interlinings and linings are excluded from the
-  drape.
-- **Graded sizes.** Each case is one size. Whether a mapping still holds across
-  a size range is a later pack.
-- **Fabric behaviour over time.** Relaxation, shrinkage after washing, and bias
-  growth under wear are out of scope.
-- **Comparison against a real sample.** The strongest validation available —
-  fit the pattern, make the sample, measure both — needs a made garment and
-  belongs in a later phase.
+- **Movement.** Every case is one static pose. An armhole that passes standing
+  still can bind when the arm lifts, and nothing here tests that.
+- **Collar roll and interlining.** Not modelled, so not testable.
+- **Grading across a size range.** Each case is one size.
+- **Solver convergence under adversarial geometry** — very long thin pieces,
+  near-zero-length runs. Lane A's territory, and worth its own cases later.
+- **Landmark detection accuracy.** Five findings depend on landmarks that do not
+  exist yet (`fit-assistant-rules.md` §3.3); when they do, they need cases of
+  their own, including bodies with no defined waist.
+- **Two readiness failures have no case here.** R8 (an open or self-intersecting
+  outline) and R9 (no fabric profile at all, as distinct from VM-14's zeroed one)
+  are specified in `garment-template-contract.md` §8 and not exercised by any of
+  the eighteen. Stated rather than quietly left out; neither is hard to add.
