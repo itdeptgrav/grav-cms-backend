@@ -1777,6 +1777,175 @@ router.put("/department-roles/:slug", async (req, res) => {
   }
 });
 
+/**
+ * POST /api/admin/department-roles/:slug/bulk
+ * body: { role, scope?, emails?, reason, idempotencyKey, dryRun? }
+ *
+ * GIVE A WHOLE DEPARTMENT A ROLE IN ONE ACTION.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * Every department guard fails OPEN while nobody holds a role in it, and
+ * CLOSED the moment somebody does (see Middlewear/departmentWriteGuard.js).
+ * So granting the FIRST role in a department silently locks out everybody else
+ * who works there — they were writing fine yesterday and are refused today,
+ * with nothing on screen to connect the two. In the live database that had
+ * already happened to six departments (hr, merchandiser, project-manager, qc,
+ * sales, store) while twenty still had nobody at all.
+ *
+ * Granting people back one at a time through PUT /department-roles/:slug is
+ * the same work repeated, and each omission is another person locked out. This
+ * does the whole department in one action.
+ *
+ * ── IT ADDS NO AUTHORITY OF ITS OWN ─────────────────────────────────────────
+ * Each person goes through `changeAppAccess` — the same canonical write the
+ * single-person route uses — so the authority check, the one-owner rule, the
+ * audit event, the grant-revision bump and the cache invalidation all happen
+ * per person, exactly as if an administrator had typed each one. This route
+ * only decides WHO is in the list.
+ *
+ * ── OWNER IS REFUSED ────────────────────────────────────────────────────────
+ * An application has exactly one Owner and promoting somebody demotes the
+ * incumbent. Applied down a list that means each grant demotes the one before
+ * it and the last name in the list wins by accident. Owner stays a deliberate,
+ * one-person decision.
+ *
+ * `dryRun: true` answers the same shape and writes nothing, so the screen can
+ * show exactly who would be affected before anything happens.
+ */
+router.post("/department-roles/:slug/bulk", async (req, res) => {
+  const { changeAppAccess, sendGrantError, AccessGrantError } =
+    require("../../services/access/accessGrantAdmin.service");
+  try {
+    const slug = String(req.params.slug || "").toLowerCase().trim();
+    const role = String(req.body?.role || "").toLowerCase().trim();
+    const scope = String(req.body?.scope || "assigned").toLowerCase().trim();
+    const dryRun = req.body?.dryRun === true;
+
+    if (!["viewer", "editor", "approver"].includes(role)) {
+      return fail(res, 400, 'role must be "viewer", "editor" or "approver". Owner is granted one person at a time, because promoting somebody demotes the current Owner.');
+    }
+    if (!["assigned", "listed", "emails"].includes(scope)) {
+      return fail(res, 400, 'scope must be "assigned" (everyone the department is assigned to), "listed" (everyone who already holds a role here) or "emails".');
+    }
+
+    /* ── who ──────────────────────────────────────────────────────────── */
+    const people = new Map(); // email -> name
+    const addPerson = (email, name) => {
+      const m = String(email || "").toLowerCase().trim();
+      if (m && m.includes("@") && !people.has(m)) people.set(m, String(name || "").trim());
+    };
+
+    if (scope === "emails") {
+      const list = Array.isArray(req.body?.emails) ? req.body.emails : [];
+      if (!list.length) return fail(res, 400, "Name at least one email address.");
+      list.forEach((e) => addPerson(e, ""));
+    } else if (scope === "listed") {
+      (await deptRoles.listRoles(slug)).forEach((h) => addPerson(h.email, h.name));
+    } else {
+      const dept = await AccessDepartment.findOne({ slug }).select("_id").lean();
+      if (!dept) return fail(res, 404, `No department with slug "${slug}".`);
+      /* Assigned to it as their home department OR as an additional one —
+         both are how this screen grants somebody a department. Employees with
+         no email are skipped and reported: they cannot sign in at all, which
+         is a fact about the HR record, not something to grant around. */
+      const emps = await Employee.find({
+        $or: [{ accessDepartmentId: dept._id }, { additionalDepartmentIds: dept._id }],
+      }).select("firstName lastName email status isActive").lean();
+
+      const skippedNoEmail = [];
+      for (const e of emps) {
+        const active = e.isActive !== false && e.status !== "inactive";
+        if (!active) continue;
+        const mail = String(e.email || "").trim();
+        const name = [e.firstName, e.lastName].filter(Boolean).join(" ");
+        if (!mail) { skippedNoEmail.push(name || String(e._id)); continue; }
+        addPerson(mail, name);
+      }
+      res.locals.skippedNoEmail = skippedNoEmail;
+    }
+
+    if (!people.size) {
+      return res.json({
+        success: true, slug, role, dryRun, total: 0,
+        granted: [], unchanged: [], failed: [],
+        skippedNoEmail: res.locals.skippedNoEmail || [],
+        message: "Nobody matched — there is nobody to grant.",
+      });
+    }
+
+    /* ── what each person holds now, so a no-op is reported as one ─────── */
+    const current = new Map();
+    (await deptRoles.listRoles(slug)).forEach((h) => {
+      if (h.isActive !== false) current.set(String(h.email).toLowerCase(), h.role);
+    });
+
+    const baseKey = String(req.body?.idempotencyKey || "").trim()
+      || `bulk-${slug}-${role}-${Date.now()}`;
+    const reason = String(req.body?.reason || "").trim()
+      || `Granting ${role} to the whole ${slug} department so everyone working there can use it.`;
+
+    const granted = [], unchanged = [], failed = [];
+
+    for (const [email, name] of people) {
+      /* NEVER LEVEL ANYBODY DOWN.
+         The point of this action is that everybody in the department can do
+         their work, so somebody who already holds MORE than the role being
+         applied keeps what they have. Without this, "give sales approver"
+         demoted the Sales owner to approver on the way past — the dry run
+         caught exactly that — and bulk-demoting an owner by accident is the
+         worst thing this route could do. Equal roles are left alone too, so a
+         re-run is free. */
+      const held = current.get(email);
+      if (held && deptRoles.roleAtLeast(held, role)) {
+        unchanged.push({ email, role: held, keptHigher: held !== role });
+        continue;
+      }
+      if (dryRun) { granted.push({ email, name, from: current.get(email) || null, to: role }); continue; }
+      try {
+        const out = await changeAppAccess({
+          actor: grantActor(req),
+          body: {
+            email, role, reason,
+            ...(name ? { name } : {}),
+            /* Per person, and derived from the one key the caller sent, so a
+               retried request repeats the SAME keys and replays rather than
+               granting twice. */
+            idempotencyKey: `${baseKey}:${email}`.slice(0, 128),
+          },
+          defaults: { application: slug },
+          via: "admin:department-roles-bulk",
+        });
+        granted.push({ email, name, from: out.before.role || null, to: out.after.role || null, replayed: !!out.replayed });
+      } catch (err) {
+        /* One refusal must not abandon the rest of the department — the people
+           already granted keep their grant and the reason is reported per
+           person, so a second run fixes only what failed. */
+        failed.push({
+          email,
+          code: err instanceof AccessGrantError ? err.code : "UNEXPECTED",
+          message: err?.message || String(err),
+        });
+      }
+    }
+
+    if (!dryRun) {
+      audit(req, "department-role", `${slug}: bulk ${role} — ${granted.length} granted, ${unchanged.length} already, ${failed.length} failed`);
+    }
+
+    res.json({
+      success: true, slug, role, scope, dryRun,
+      total: people.size,
+      granted, unchanged, failed,
+      skippedNoEmail: res.locals.skippedNoEmail || [],
+      message: dryRun
+        ? `${granted.length} person(s) would be given ${role}; ${unchanged.length} already have it or more.`
+        : `${granted.length} person(s) given ${role}; ${unchanged.length} already had it or more${failed.length ? `; ${failed.length} refused` : ""}.`,
+    });
+  } catch (err) {
+    sendGrantError(res, err);
+  }
+});
+
 /* ================================================================== */
 /* CHANGE LOG                                                          */
 /* ================================================================== */
