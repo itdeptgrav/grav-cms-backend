@@ -1102,3 +1102,39 @@ unset (`governedPurchaseOrder.service`):
 Verified 1 Oct 2026 through the form: MRF-2609-0006 chosen → six materials
 filled in → supplier picked → PO/2026-27/0009 created as a draft
 (`MRF_DIRECT_V1`, six lines, ₹195), opened on its page, then deleted again.
+
+## Warehouse setup export / import — 1 Oct 2026
+
+`services/storePurchase/warehouseSetupTransfer.service.js`, on the
+warehouses router as `GET /api/cms/warehouses/setup/export?ids=` (READ) and
+`POST /api/cms/warehouses/setup/import` `{ setup, dryRun }` (MASTER_MAINTAIN,
+`refuseLegacyWrite`), both declared before `/:id`. The owner: the warehouse
+design built on the local database must reach the hosted one "within a
+minute" without registering a rack again.
+
+- **The file** (`format: "grav.warehouse-setup"`, `version: 1`): every
+  warehouse of the company (archived ones only when named by id) with its
+  master fields, floor plan, saved layouts and every non-archived location —
+  code, name, type, kind, sequence, parent, QR token, layout box, capacity,
+  status — with their ids. **No stock**: no balances, movements, items or
+  labels travel, so an import can never invent or move stock.
+- **Import is a merge, never a delete.** A warehouse is matched by code in
+  the company: missing → created; present → master fields and floor plan
+  updated, missing locations added, present ones (matched by token, then by
+  code) reshaped, `structureVersion` and `floorPlan.layoutVersion` bumped,
+  nothing removed. Ids are kept where free (so `?focus=<id>` links and
+  location pages mean the same on both databases); an id already used by
+  something else is re-minted and parents remapped; a QR token already
+  carried by another location is re-minted (one summary warning each: those
+  labels must be reprinted); a location with no token gets one. `dryRun`
+  answers the plan and writes nothing; the plan's warnings are the write's.
+  One `SpActionHistory` row per warehouse (`WAREHOUSE_SETUP_IMPORTED`).
+  Re-running a file is harmless. Writes are per warehouse, not one
+  transaction: a failure midway leaves earlier warehouses imported and a
+  re-run merges the rest.
+
+Verified 1 Oct 2026: WH-MAIN exported (95 locations, all tokened, floor plan,
+2 layouts); dry run of the same file → update, 95 matched, no warnings; a
+renamed copy → created as WH-TEST-IMP with 95 locations, parents inside,
+tokens re-minted and disjoint; a second file with a rename and a new bin →
+update, 1 added / 95 updated, new bin tokened; the test warehouse deleted.
