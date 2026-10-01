@@ -33,6 +33,20 @@ const journeyPayload = (accountId, over = {}) => ({
   ...over,
 });
 
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3A) ─────────────────────
+ * SalesJourney creation now refuses unless the actor's company is provable.
+ * These suites are not about tenancy, so they seed the simplest thing that
+ * makes ownership provable: a single company, which is the documented
+ * deployment fallback. Without it every journey-creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
+
 describe("journey reference generation", () => {
   test("allocates SJ-YYYY-0001 first, then increments", async () => {
     await _resetSequence(YEAR);

@@ -161,3 +161,155 @@ test("an empty category is its own key, not a match for everything", () => {
      whatever that category was mapped to. */
   assert.notEqual(svc.categoryKeyOf(""), svc.categoryKeyOf("Fabric"));
 });
+
+/* ══ A CATEGORY SOMEBODY TYPED IS STILL A CATEGORY ═══════════════════════════
+ *
+ * The Item Master stores a category in two fields: pick one from the list and
+ * it lands in `category`; type your own and it lands in `customCategory` with
+ * `category` set to the empty string.
+ *
+ * `headForItem` read only `category`. So the Add-item form — which previews
+ * the typed value — showed a confidently mapped head, and the moment the item
+ * was saved the same item resolved to "no category, so no budget head can be
+ * derived". Nothing on either screen explained the change, and the head it had
+ * promised was never the one used.
+ */
+
+const custom = new Map([
+  ...map,
+  ["specialty weave", { budgetLedgerId: RAW_MATERIALS, budgetLedgerName: "PURCHASE", category: "Specialty Weave" }],
+]);
+
+test("a custom category resolves exactly as the preview promised", () => {
+  /* What the form previews before saving… */
+  const preview = svc.headForItem({ customCategory: "Specialty Weave" }, custom);
+  /* …and what the item looks like on disk once it is saved. */
+  const saved = svc.headForItem(
+    { name: "Handloom", category: "", customCategory: "Specialty Weave" },
+    custom,
+  );
+
+  assert.equal(preview.budgetLedgerId, RAW_MATERIALS);
+  assert.equal(saved.budgetLedgerId, RAW_MATERIALS);
+  assert.equal(saved.source, "category_mapping");
+  /* The whole point: one answer, not two. */
+  assert.deepEqual(
+    { id: saved.budgetLedgerId, source: saved.source, category: saved.category },
+    { id: preview.budgetLedgerId, source: preview.source, category: preview.category },
+  );
+});
+
+test("an unmapped custom category stays unresolved on both sides of a save", () => {
+  const preview = svc.headForItem({ customCategory: "Handloom Silk" }, custom);
+  const saved = svc.headForItem({ category: "", customCategory: "Handloom Silk" }, custom);
+
+  for (const r of [preview, saved]) {
+    assert.equal(r.budgetLedgerId, null);
+    assert.equal(r.source, "unresolved");
+    /* And it names the category, rather than claiming the item has none —
+       which is a different problem, pointing at a different desk. */
+    assert.match(r.message, /No budget head mapped for category "Handloom Silk"/);
+  }
+});
+
+test("an item override still beats a custom category's default", () => {
+  const r = svc.headForItem(
+    { category: "", customCategory: "Specialty Weave", budgetLedgerId: SAMPLING },
+    custom,
+  );
+  assert.equal(r.budgetLedgerId, SAMPLING);
+  assert.equal(r.source, "item_override");
+});
+
+test("a standard category is unaffected, and wins nothing it did not before", () => {
+  const r = svc.headForItem({ category: "Fabric" }, custom);
+  assert.equal(r.budgetLedgerId, RAW_MATERIALS);
+  assert.equal(r.source, "category_mapping");
+  /* A blank custom field must not shadow a real category. Both the empty
+     string and an absent field are "no custom category". */
+  for (const item of [
+    { category: "Fabric", customCategory: "" },
+    { category: "Fabric", customCategory: null },
+    { category: "Fabric", customCategory: undefined },
+  ]) {
+    assert.equal(svc.headForItem(item, custom).budgetLedgerId, RAW_MATERIALS);
+  }
+  /* And an item with neither still honestly has no category. */
+  const none = svc.headForItem({ name: "Mystery", category: "", customCategory: "" }, custom);
+  assert.equal(none.source, "unresolved");
+  assert.match(none.message, /no category/i);
+});
+
+test("the custom form is normalised by the same rule as the standard one", () => {
+  /* Spelling, spacing and case are `categoryKeyOf`'s business and are
+     deliberately untouched by this fix — a typed "  specialty   weave  "
+     matches a mapping stored as "Specialty Weave", exactly as a picked
+     category would. */
+  for (const typed of ["specialty weave", "SPECIALTY WEAVE", "  Specialty   Weave  "]) {
+    assert.equal(
+      svc.headForItem({ customCategory: typed }, custom).budgetLedgerId,
+      RAW_MATERIALS, typed,
+    );
+  }
+});
+
+test("the effective category is one exported rule, not a rule per caller", () => {
+  /* Exported so the two routes select and report by the same rule instead of
+     each deciding for itself — which is how the preview and the saved answer
+     came apart in the first place. */
+  assert.equal(typeof svc.effectiveCategoryOf, "function");
+  assert.equal(svc.effectiveCategoryOf({ customCategory: "Typed", category: "Picked" }), "Typed");
+  assert.equal(svc.effectiveCategoryOf({ customCategory: "", category: "Picked" }), "Picked");
+  assert.equal(svc.effectiveCategoryOf({ category: "" }), null);
+  assert.equal(svc.effectiveCategoryOf({}), null);
+  /* And the resolution REPORTS the effective category, so a row naming it
+     names the one the head beside it was decided by. */
+  assert.equal(
+    svc.headForItem({ category: "", customCategory: "Specialty Weave" }, custom).category,
+    "Specialty Weave",
+  );
+});
+
+test("every query that feeds the resolver loads the field it reads", () => {
+  /* ── WHY THIS IS STRUCTURAL ─────────────────────────────────────────────
+     A projection that omits `customCategory` does not fail loudly: the field
+     is simply absent, absent is indistinguishable from blank once it reaches
+     the rule, and every custom-category item silently resolves as though it
+     had no category. The symptom appears on a screen, days later, as a
+     budget head that quietly went missing.
+
+     So the four callers are checked here rather than each remembering. A
+     fifth one added without the field fails this test instead of shipping. */
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const root = path.join(__dirname, "..");
+  const callers = [
+    "services/itemBudgetHead.service.js",
+    "services/spendFinanceDecision.service.js",
+    "routes/Accountant_Routes/Acc_chartOfAccounts.js",
+    "routes/CMS_Routes/Inventory/Products/rawItems.js",
+  ];
+
+  let checked = 0;
+  for (const rel of callers) {
+    const src = fs.readFileSync(path.join(root, rel), "utf8");
+    /* An ITEM projection names `category` beside `budgetLedgerId`. The
+       CATEGORY MAPPING's own projection does too — it is a row about a
+       category — so it is excluded by `categoryKey`, which only the mapping
+       carries. A mapping has no items and nothing to resolve. */
+    for (const m of src.matchAll(/\.select\(\s*"([^"]*category[^"]*budgetLedgerId[^"]*)"/gi)) {
+      /* And a SERVICE projection is excluded by `serviceCode`. A service has
+         one category field and no custom form — `headForService` does not
+         read a category at all, deliberately. */
+      if (/categoryKey|serviceCode/.test(m[1])) continue;
+      checked += 1;
+      assert.ok(
+        /customCategory/.test(m[1]),
+        `${rel} resolves from a projection without customCategory: "${m[1]}"`,
+      );
+    }
+  }
+  /* The item projections, not the service ones — a service has one category
+     field and no custom form. */
+  assert.ok(checked >= 3, `expected the item projections to be found, saw ${checked}`);
+});

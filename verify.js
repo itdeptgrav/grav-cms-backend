@@ -39,6 +39,7 @@ const PURE = [
   "verifyEpfCeiling",          // one EPF wage ceiling, read by every surface
   "verifyLeaveHomeState",      // the monthly leave cap follows the permanent address
   "verifyLeaveEditSplit",      // editing a leave does not change what it pays
+  "verifyInactiveLockout",     // a former employee cannot get in, or stay in
   "verifyFoodAllowance",       // proration and the other deduction
   "verifyAuditFloor",          // what the change log will and will not record
   "verifyBuiltInFields",       // the field registry still matches the form

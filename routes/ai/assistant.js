@@ -26,6 +26,7 @@ const { getHotwords } = require("../../services/ai/sttVocab");
 const { correctTranscript } = require("../../services/ai/transcriptCorrect");
 const { ensureSttServer, STT_URL } = require("../../services/ai/sttSidecar");
 const { sendOllamaError } = require("../../services/hrAiShared");
+const { maySeePilotDiagnostics } = require("../../services/ai/openJev/diagnosticsVisibility");
 const { OLLAMA_ERROR_CODES, warmup } = require("../../services/ollamaClient");
 
 const MAX_MESSAGE_LEN = 2000;
@@ -78,7 +79,7 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
 
   try {
     const history = convo.getHistory(user.id);
-    const { reply, model, toolsUsed } = await gravAssistant.chat({
+    const { reply, model, toolsUsed, pilotDiagnostics, contextState } = await gravAssistant.chat({
       user,
       message,
       routeContext,
@@ -87,7 +88,7 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Persist the exchange for this user (not the route).
     convo.append(user.id, { role: "user", content: message });
-    convo.append(user.id, { role: "assistant", content: reply });
+    convo.append(user.id, { role: "assistant", content: reply, toolsUsed, contextState });
 
     return res.json({
       success: true,
@@ -98,6 +99,12 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
         routeAware: Boolean(routeContext),
         assistant: "grav",
         generatedAt: new Date().toISOString(),
+        // Present only in the Open-Jev Accounts pilot mode, and only for a
+        // developer or a platform admin. Ordinary users never receive it, and
+        // with the pilot off there is nothing to receive.
+        ...(pilotDiagnostics && maySeePilotDiagnostics(user)
+          ? { pilotDiagnostics }
+          : {}),
       },
     });
   } catch (err) {
@@ -188,7 +195,7 @@ router.post("/assistant/stream", EmployeeAuthMiddlewear, async (req, res) => {
 
   try {
     const history = convo.getHistory(user.id);
-    const { reply, model, toolsUsed } = await gravAssistant.chatStreaming({
+    const { reply, model, toolsUsed, contextState } = await gravAssistant.chatStreaming({
       user,
       message,
       routeContext,
@@ -201,7 +208,7 @@ router.post("/assistant/stream", EmployeeAuthMiddlewear, async (req, res) => {
     // Persist only once we have a real reply (matches /message).
     if (reply) {
       convo.append(user.id, { role: "user", content: message });
-      convo.append(user.id, { role: "assistant", content: reply });
+      convo.append(user.id, { role: "assistant", content: reply, toolsUsed, contextState });
     }
     sse("reply", {
       reply,

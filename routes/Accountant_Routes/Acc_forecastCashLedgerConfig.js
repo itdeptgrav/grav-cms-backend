@@ -24,6 +24,20 @@ const Acc_ForecastCashLedgerConfig = require("../../models/Accountant_model/Acc_
 const configService = require("../../services/forecastCashLedgerConfig.service");
 const forecast = require("../../services/cashFlowForecastOrchestrator.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 function castId(v) {
@@ -36,7 +50,7 @@ function castId(v) {
 /* ------------------------------------------------------------------ */
 /* GET /                                                    READ ONLY  */
 /* ------------------------------------------------------------------ */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const cid = castId(req.query.companyId);
     if (!cid) {
@@ -100,7 +114,7 @@ router.get("/", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* PATCH /                                                             */
 /* ------------------------------------------------------------------ */
-router.patch("/", async (req, res) => {
+router.patch("/", companyScope, async (req, res) => {
   try {
     if (!configService.canEdit(req.user)) {
       return res.status(403).json({

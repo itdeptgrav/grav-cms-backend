@@ -175,7 +175,7 @@ customerSchema.methods.comparePassword = async function (candidatePassword) {
 customerSchema.methods.generateAuthToken = function () {
   return jwt.sign(
     { id: this._id, phone: this.phone, email: this.email, name: this.name, role: "customer" },
-    process.env.JWT_SECRET || "grav_clothing_secret_key",
+    require("../../config/jwt").SECRET,
     { expiresIn: "7d" }
   );
 };

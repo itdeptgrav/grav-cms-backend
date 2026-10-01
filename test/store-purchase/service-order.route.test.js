@@ -18,6 +18,7 @@ const ServiceOrder = require("../../models/CMS_Models/Inventory/Operations/Servi
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const Employee = require("../../models/Employee");
 const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
+const DepartmentRole = require("../../models/Access/DepartmentRole");
 
 let server, base, seq = 0;
 
@@ -56,9 +57,27 @@ async function seed() {
   const storeDept = (await AccessDepartment.findOne({ slug: "store" })) ||
     (await AccessDepartment.create({ key: `store-${n}`, slug: "store", name: "Store & Purchase", dashboardPath: "/store", isActive: true }));
   const store = await Employee.create({ firstName: "Bikash", lastName: `S${n}`, email: `store${n}@demo.example`, isActive: true, gender: "Other", biometricId: `ST${n}`, department: "Store", accessDepartmentId: storeDept._id });
+  /* The Store user holds Store & Purchase capabilities the way the tenant
+     contract resolves them (a department-role grant) — the SAME signal the
+     route now gates on. No membership row is created, so the single-company
+     fallback still resolves a company for the requester, who holds no grant. */
+  await DepartmentRole.create({ departmentSlug: "store", role: "approver", email: store.email, name: "Bikash", isActive: true });
   const requester = await Employee.create({ firstName: "Rutu", lastName: `R${n}`, email: `req${n}@demo.example`, isActive: true, gender: "Other", biometricId: `RQ${n}`, department: "Logistics" });
   const other = await Employee.create({ firstName: "Zed", lastName: `Z${n}`, email: `zed${n}@demo.example`, isActive: true, gender: "Other", biometricId: `ZZ${n}`, department: "Logistics" });
   return { company, store, requester, other };
+}
+
+/* An employee holding a specific department ROLE, resolved through the same
+   capability contract the route reads. No membership row, so the single-company
+   fallback resolves their company. */
+async function personWithRole(slug, role) {
+  const n = seq++;
+  const emp = await Employee.create({
+    firstName: role, lastName: `${slug}${n}`, email: `${slug}-${role}-${n}@x.example`,
+    isActive: true, gender: "Other", biometricId: `${slug.slice(0, 2).toUpperCase()}${n}`, department: "Store",
+  });
+  await DepartmentRole.create({ departmentSlug: slug, role, email: emp.email, name: role, isActive: true });
+  return emp;
 }
 
 const mkOrder = (s, over = {}) =>
@@ -204,7 +223,11 @@ describe("tenant isolation and race safety", () => {
 
   const mkStore = async (n) => {
     const dept = await storeDeptFor(n);
-    return Employee.create({ firstName: "St", lastName: `${n}`, email: `st${n}@x.example`, isActive: true, gender: "Other", biometricId: `ST${n}`, department: "Store", accessDepartmentId: dept._id });
+    const emp = await Employee.create({ firstName: "St", lastName: `${n}`, email: `st${n}@x.example`, isActive: true, gender: "Other", biometricId: `ST${n}`, department: "Store", accessDepartmentId: dept._id });
+    /* A Store & Purchase grant, so the resolved capability set the route gates
+       on is populated — the same signal every other Store route uses. */
+    await DepartmentRole.create({ departmentSlug: "store", role: "approver", email: emp.email, name: "St", isActive: true });
+    return emp;
   };
   const mkEmp = (n, over = {}) =>
     Employee.create({ firstName: "Em", lastName: `${n}`, email: `em${n}@x.example`, isActive: true, gender: "Other", biometricId: `EM${n}`, department: "Logistics", ...over });
@@ -489,3 +512,262 @@ describe("S3 — service order billing state on the detail page", () => {
   });
 });
 
+
+/* ══ CAPABILITY BOUNDARY — READING IS NOT OPERATING ═════════════════════════ */
+describe("capability boundary: sp.read views, sp.sourcing.manage operates", () => {
+  const OPS = ["issue", "start", "report-completion", "cancel"]
+
+  test("a Store VIEWER may list and read, but cannot operate", async () => {
+    const s = await seed()
+    const so = await mkOrder(s)
+    const viewer = await personWithRole("store", "viewer")
+
+    expect((await call(viewer, "/")).status).toBe(200)          // list
+    const det = await call(viewer, `/${so._id}`)
+    expect(det.status).toBe(200)                                 // read
+    expect(det.body.viewer.canRead).toBe(true)
+    expect(det.body.viewer.canOperate).toBe(false)
+    expect(det.body.viewer).not.toHaveProperty("canFulfil")
+
+    for (const op of OPS) {
+      const r = await call(viewer, `/${so._id}/${op}`, { method: "PATCH", body: op === "cancel" ? { note: "x" } : {} })
+      expect(r.status).toBe(403)
+    }
+    expect((await ServiceOrder.findById(so._id).lean()).status).toBe("DRAFT") // nothing moved
+  })
+
+  test("a read-only CEO grant does NOT imply operational rights", async () => {
+    const s = await seed()
+    const so = await mkOrder(s)
+    const ceo = await personWithRole("ceo", "owner") // top ceo rank still lacks sp.sourcing.manage
+    const det = await call(ceo, `/${so._id}`)
+    expect(det.status).toBe(200)
+    expect(det.body.viewer.canRead).toBe(true)
+    expect(det.body.viewer.canOperate).toBe(false)
+    expect((await call(ceo, `/${so._id}/issue`, { method: "PATCH", body: {} })).status).toBe(403)
+  })
+
+  test("a Store EDITOR (sourcing role) can operate", async () => {
+    const s = await seed()
+    const so = await mkOrder(s)
+    const editor = await personWithRole("store", "editor")
+    const det = await call(editor, `/${so._id}`)
+    expect(det.body.viewer.canOperate).toBe(true)
+    const iss = await call(editor, `/${so._id}/issue`, { method: "PATCH", body: {} })
+    expect(iss.status).toBe(200)
+    expect(iss.body.serviceOrder.status).toBe("ISSUED")
+  })
+
+  test("the requester accepts their own completed order but cannot run supplier-side transitions", async () => {
+    const s = await seed()
+    const done = await mkOrder(s, { status: "COMPLETION_REPORTED" })
+    const acc = await call(s.requester, `/${done._id}/accept`, { method: "PATCH", body: {} })
+    expect(acc.status).toBe(200)
+    expect(acc.body.serviceOrder.status).toBe("ACCEPTED")
+    expect(acc.body.serviceOrder?.status).not.toBe("DRAFT")
+    // A supplier-side transition is refused for the requester (no sp.sourcing.manage).
+    const issued = await mkOrder(s, { status: "ISSUED" })
+    expect((await call(s.requester, `/${issued._id}/start`, { method: "PATCH", body: {} })).status).toBe(403)
+    expect((await call(s.requester, `/${issued._id}/cancel`, { method: "PATCH", body: { note: "x" } })).status).toBe(403)
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+   IDENTITY: AN AUTHENTICATED PRINCIPAL READS, A NAMED EMPLOYEE ACTS
+
+   The router used to demand an `employees` row before it would show anything,
+   which is two different questions answered with one lookup:
+
+     · may this session see this company's orders?   → capability
+     · who, by name, is performing this act?          → HR identity
+
+   A CEO/platform account signs in as a department and has no employee row —
+   EmployeeAuthMiddlewear says exactly that in its own comments — so an account
+   holding `sp.read` was refused the register and told its staff record was
+   missing, as if listing were something a person must be named for.
+
+   These tests fix the boundary in place: reads ask for capability, mutations
+   ask for identity, and neither borrows the other's answer.
+   ══════════════════════════════════════════════════════════════════════════ */
+describe("identity: reading needs capability, acting needs a named employee", () => {
+  const company = () => Acc_Company.create({
+    companyName: `NoHR Co ${seq++}`, booksFromDate: new Date("2026-04-01"),
+  });
+
+  /* A real session, a real membership, a real capability grant — and NO
+     `employees` document. The ObjectId is valid (so `actor()` looks up by _id
+     rather than falling through) and matches nothing; no biometric id exists
+     to match either. Every test below asserts that premise before trusting it. */
+  async function principalWithoutEmployee(companyId, grant = { slug: "ceo", role: "owner" }) {
+    const n = seq++;
+    const email = `nohr-${n}@demo.example`;
+    if (grant) {
+      await DepartmentRole.create({
+        departmentSlug: grant.slug, role: grant.role, email, name: "Principal", isActive: true,
+      });
+    }
+    await SpCompanyMembership.create({ companyId, email, isActive: true });
+    return { _id: new mongoose.Types.ObjectId(), email, firstName: "No", lastName: "Employee" };
+  }
+
+  /* Proving the fixture is what it claims: no employee row by id, by email, or
+     by name. Without this the tests could pass for the wrong reason. */
+  async function assertNoEmployeeRow(p) {
+    expect(await Employee.findById(p._id).lean()).toBeNull();
+    expect(await Employee.countDocuments({ email: p.email })).toBe(0);
+  }
+
+  const orderFor = (companyId, over = {}) => ServiceOrder.create({
+    companyId, serviceOrderNumber: `SVO/2026-27/${String(seq++).padStart(4, "0")}`,
+    spendRequestId: new mongoose.Types.ObjectId(), spendRequestNumber: `SR-${seq}`,
+    vendorName: "Fix It Co", title: "AMC", department: "Logistics", requestedByName: "Rutu",
+    lines: [{ serviceCode: "SVC-1", serviceName: "AMC", billingUnit: "visit", quantity: 1, rate: 100, netAmount: 100, gstRate: 0, gstAmount: 0, lineTotal: 100 }],
+    subtotal: 100, taxAmount: 0, totalAmount: 100, status: "DRAFT", ...over,
+  });
+
+  test("an account with sp.read and no employee record lists the register", async () => {
+    const co = await company();
+    const ceo = await principalWithoutEmployee(co._id);
+    await assertNoEmployeeRow(ceo);
+    await orderFor(co._id);
+    await orderFor(co._id);
+
+    const reg = await call(ceo, "/");
+    expect(reg.status).toBe(200);
+    expect(reg.body.success).toBe(true);
+    expect(reg.body.serviceOrders).toHaveLength(2);
+    /* And the absence of an HR row is not mentioned anywhere in the answer. */
+    expect(reg.body.code).toBeUndefined();
+  });
+
+  test("that same account opens an order: canRead true, isRequester and canAccept false", async () => {
+    const co = await company();
+    const ceo = await principalWithoutEmployee(co._id);
+    await assertNoEmployeeRow(ceo);
+    const so = await orderFor(co._id, { status: "COMPLETION_REPORTED", requestedById: "SOMEONE-ELSE" });
+
+    const det = await call(ceo, `/${so._id}`);
+    expect(det.status).toBe(200);
+    expect(det.body.serviceOrder.serviceOrderNumber).toMatch(/^SVO\//);
+    /* Authorised to look — and, having no identity, not the requester. Three
+       separate answers, none of them a refusal of the whole page. */
+    expect(det.body.viewer.canRead).toBe(true);
+    expect(det.body.viewer.isRequester).toBe(false);
+    expect(det.body.viewer.canAccept).toBe(false);
+    /* A read-only CEO grant carries no operational right either. */
+    expect(det.body.viewer.canOperate).toBe(false);
+  });
+
+  test("no employee record AND no sp.read is refused for CAPABILITY, not misreported as an HR gap", async () => {
+    const co = await company();
+    /* A membership (so a company resolves) but no department grant at all. */
+    const nobody = await principalWithoutEmployee(co._id, null);
+    await assertNoEmployeeRow(nobody);
+    await orderFor(co._id);
+
+    const reg = await call(nobody, "/");
+    expect(reg.status).toBe(403);
+    expect(reg.body.serviceOrders).toBeUndefined();
+    /* THE POINT: the reason given is permission, and it never sends the reader
+       off to HR for a problem HR cannot solve. */
+    expect(reg.body.code).not.toBe("STAFF_RECORD_NOT_LINKED");
+    expect(reg.body.message).not.toMatch(/staff record/i);
+    expect(reg.body.message).toMatch(/Store & Purchase/i);
+  });
+
+  test("a real requester with no Store capability still reads their own order", async () => {
+    const co = await company();
+    const requester = await Employee.create({
+      firstName: "Rutu", lastName: `Own${seq++}`, email: `own${seq}@demo.example`,
+      isActive: true, gender: "Other", biometricId: `OW${seq}`, department: "Logistics",
+    });
+    await member(requester, co._id);
+    const mine = await orderFor(co._id, { requestedBy: requester._id, requestedById: requester.biometricId });
+
+    const det = await call(requester, `/${mine._id}`);
+    expect(det.status).toBe(200);
+    expect(det.body.viewer.canRead).toBe(false);      // no sp.read
+    expect(det.body.viewer.isRequester).toBe(true);   // but it is theirs
+    expect(det.body.viewer.canAccept).toBe(true);
+  });
+
+  test("an unrelated employee cannot read somebody else's order", async () => {
+    const co = await company();
+    const requester = await Employee.create({
+      firstName: "Rutu", lastName: `A${seq++}`, email: `ra${seq}@demo.example`,
+      isActive: true, gender: "Other", biometricId: `RA${seq}`, department: "Logistics",
+    });
+    const stranger = await Employee.create({
+      firstName: "Zed", lastName: `B${seq++}`, email: `zb${seq}@demo.example`,
+      isActive: true, gender: "Other", biometricId: `ZB${seq}`, department: "Logistics",
+    });
+    await member(requester, co._id); await member(stranger, co._id);
+    const theirs = await orderFor(co._id, { requestedBy: requester._id, requestedById: requester.biometricId });
+
+    const det = await call(stranger, `/${theirs._id}`);
+    expect(det.status).toBe(403);
+    expect(det.body.serviceOrder).toBeUndefined();
+  });
+
+  test("a mutation without an employee record is refused by identity — and nothing moves", async () => {
+    const co = await company();
+    /* Deliberately granted the OPERATIONAL capability, so the refusal below
+       cannot be mistaken for a permission failure: this account may operate,
+       it simply cannot be named in the audit trail. */
+    const ceo = await principalWithoutEmployee(co._id, { slug: "store", role: "editor" });
+    await assertNoEmployeeRow(ceo);
+    const so = await orderFor(co._id);
+
+    const r = await call(ceo, `/${so._id}/issue`, { method: "PATCH", body: {} });
+    expect(r.status).toBe(403);
+    expect(r.body.code).toBe("STAFF_RECORD_NOT_LINKED");
+    /* It says the ACTION cannot be recorded — not that the register cannot be
+       shown, which is now plainly false for this same account. */
+    expect(r.body.message).toMatch(/cannot be recorded/i);
+    expect(r.body.message).not.toMatch(/cannot be shown/i);
+    expect(r.body.message).toMatch(/still view/i);
+
+    /* Zero state change, zero history. */
+    const after = await ServiceOrder.findById(so._id).lean();
+    expect(after.status).toBe("DRAFT");
+    expect(after.history || []).toHaveLength(0);
+    expect(after.issued).toBeFalsy();
+    /* And the read that account IS entitled to still works. */
+    expect((await call(ceo, `/${so._id}`)).status).toBe(200);
+  });
+
+  test("a named employee's mutations are unaffected by any of this", async () => {
+    const co = await company();
+    const store = await Employee.create({
+      firstName: "Bikash", lastName: `M${seq++}`, email: `mut${seq}@demo.example`,
+      isActive: true, gender: "Other", biometricId: `MU${seq}`, department: "Store",
+    });
+    await DepartmentRole.create({ departmentSlug: "store", role: "editor", email: store.email, name: "Bikash", isActive: true });
+    await member(store, co._id);
+    const so = await orderFor(co._id);
+
+    const iss = await call(store, `/${so._id}/issue`, { method: "PATCH", body: {} });
+    expect(iss.status).toBe(200);
+    expect(iss.body.serviceOrder.status).toBe("ISSUED");
+    /* The audit trail still names a real employee — the reason the mutation
+       door keeps its requirement. */
+    const after = await ServiceOrder.findById(so._id).lean();
+    expect(String(after.issued.by)).toBe(String(store._id));
+    expect(after.issued.byName).toBeTruthy();
+    expect(after.history).toHaveLength(1);
+  });
+
+  test("a cross-company order is still not found for an account with no employee record", async () => {
+    const A = await company();
+    const B = await company();
+    const ceo = await principalWithoutEmployee(A._id);
+    const theirs = await orderFor(B._id);
+
+    const det = await call(ceo, `/${theirs._id}`);
+    expect(det.status).toBe(404);
+    /* Not found — never a 403 that would confirm the order exists elsewhere. */
+    expect(det.body.message).toMatch(/not found/i);
+    expect(det.body.code).toBeUndefined();
+    expect((await call(ceo, "/")).body.serviceOrders).toHaveLength(0);
+  });
+});

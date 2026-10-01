@@ -1,6 +1,22 @@
 // GRAV-CMS-BACKEND/routes/googleWorkspaceRoutes.js
 const express = require("express");
 const router = express.Router();
+const requirePlatformAdmin = require("../Middlewear/requirePlatformAdmin");
+
+// ── SEC-0 CONTAINMENT (25 Sep 2026) ─────────────────────────────────────────
+// Every route below was mounted with no authentication at all: the company
+// Gmail, Calendar, Drive, Tasks and Chat, any employee's connected mailbox by
+// `employeeId`, and an OAuth callback that returned the refresh token in its
+// response body. Until an employee-level authorisation design is reviewed
+// (the configured database currently has no `employees` collection to anchor
+// one), the whole router is ADMINISTRATOR-ONLY: an active platform
+// administrator re-read from `dept_users` on every request, never a token
+// `isAdmin` claim. 401 without a session, 403 without an administrator record.
+//
+// Known consequence: non-administrators — including Sales staff completing the
+// Gmail connect flow, whose Google redirect lands on /employee-gmail/callback —
+// are refused until that design exists.
+router.use(requirePlatformAdmin);
 
 const { getAuthUrl, getTokensFromCode } = require("./services/googleAuthService");
 const {
@@ -50,14 +66,19 @@ router.get("/auth/callback", async (req, res) => {
     const { code } = req.query;
     if (!code) return res.status(400).json({ success: false, message: "No code provided" });
     const tokens = await getTokensFromCode(code);
+    // SEC-0: no token material ever leaves the server in an HTTP response.
+    // This flow never stored the tokens server-side (it asked the operator to
+    // copy them into .env); rotating GOOGLE_REFRESH_TOKEN is now an
+    // out-of-band operator task, not something a browser response carries.
     res.json({
       success: true,
-      message: "✅ Copy refresh_token into your .env as GOOGLE_REFRESH_TOKEN",
-      refresh_token: tokens.refresh_token,
-      tokens,
+      refreshTokenIssued: Boolean(tokens && tokens.refresh_token),
+      stored: false,
+      message: "Google authorised this application. Tokens are not returned over HTTP; update GOOGLE_REFRESH_TOKEN through the server's secret configuration.",
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error("[google/auth/callback]", err?.message || err);
+    res.status(500).json({ success: false, message: "Google authorisation could not be completed." });
   }
 });
 

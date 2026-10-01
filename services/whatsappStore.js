@@ -5,6 +5,7 @@
 // on its own message id), and applies delivery-status updates to outbound ones.
 // Pure persistence: it never calls Meta back.
 const WhatsAppConversation = require("../models/CMS_Models/Sales/WhatsAppConversation");
+const { serviceFilter } = require("./companyContext/serviceScope.service");
 const { WhatsAppMessage } = require("../models/CMS_Models/Sales/WhatsAppMessage");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -17,13 +18,18 @@ const last10 = (v) => digits(v).slice(-10);
 // Best-effort link a number to an existing Contact (→ its Account) or Lead.
 // Guarded so a missing/edge model never breaks ingestion — linking is a bonus,
 // storing the message is the job.
-async function matchCrmRecords(waId) {
+
+/* ── AN EXPLICIT COMPANY CONTEXT, NOT A GLOBAL READ ─────────────────────────
+ * `ctx` is `{companyId, reason}` built by the trusted factory from an
+ * already-authorised parent operation. No context means refusal, not a
+ * lookup across every company — see services/companyContext/serviceScope.service.js. */
+async function matchCrmRecords(waId, ctx) {
   const tail = last10(waId);
   const out = {};
   if (!tail) return out;
   try {
     const Contact = require("../models/CMS_Models/Sales/Contact");
-    const contacts = await Contact.find({ isActive: true, phone: { $regex: `${tail}$` } }).select("_id accountId").limit(1).lean();
+    const contacts = await Contact.find(serviceFilter(ctx, { isActive: true, phone: { $regex: `${tail}$` } })).select("_id accountId").limit(1).lean();
     if (contacts[0]) {
       out.contactId = contacts[0]._id;
       if (contacts[0].accountId) out.accountId = contacts[0].accountId;
@@ -31,7 +37,7 @@ async function matchCrmRecords(waId) {
   } catch { /* no Contact match */ }
   try {
     const Lead = require("../models/CMS_Models/Sales/Lead");
-    const leads = await Lead.find({ isActive: true, phone: { $regex: `${tail}$` } }).select("_id").limit(1).lean();
+    const leads = await Lead.find(serviceFilter(ctx, { isActive: true, phone: { $regex: `${tail}$` } })).select("_id").limit(1).lean();
     if (leads[0]) out.leadId = leads[0]._id;
   } catch { /* no Lead match */ }
   return out;

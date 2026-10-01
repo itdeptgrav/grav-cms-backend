@@ -39,7 +39,7 @@ const DepartmentRole = require("../../models/Access/DepartmentRole");
 const deptRoles = require("../../services/departmentRoles");
 const qcViewer = require("../../services/qcViewer");
 
-let server, base;
+let server, base, currentAdmin = null;
 
 beforeAll(async () => {
   const app = express();
@@ -50,7 +50,9 @@ beforeAll(async () => {
   app.use(
     "/api/admin",
     (req, _res, next) => {
-      req.admin = { _id: new mongoose.Types.ObjectId(), email: "admin@test.example" };
+      /* GAC-2: the canonical write re-verifies the admin against the database,
+         so the stand-in must be a real, active admin row (seeded per test). */
+      req.admin = currentAdmin || { _id: new mongoose.Types.ObjectId(), email: "admin@test.example" };
       next();
     },
     require("../../routes/Admin/accessAdmin"),
@@ -61,11 +63,18 @@ beforeAll(async () => {
 afterAll(async () => { await new Promise((r) => server.close(r)); });
 afterEach(() => { jest.restoreAllMocks(); });
 
+/* GAC-2: the admin route is now an adapter over the canonical access write,
+   which requires a reason and an idempotency key. The helper supplies them so
+   these tests keep pinning what they were written for — a write that landed
+   is reported as landed. */
+let putSeq = 0;
 const putRole = (slug, body) =>
   fetch(`${base}/api/admin/department-roles/${slug}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      reason: "Role cache regression check", idempotencyKey: `role-cache-${++putSeq}-${Date.now()}`, ...body,
+    }),
   }).then(async (r) => ({ status: r.status, body: JSON.parse((await r.text()) || "null") }));
 
 /* ══ 1 · A NON-QC ROLE: THE PATH THAT THREW ════════════════════════════════ */
@@ -190,6 +199,29 @@ test("a broken QC cache cannot fail a grant that already saved", async () => {
 /* ══ 3 · WHAT THE ADMIN ACTUALLY SAW ═══════════════════════════════════════ */
 
 describe("a successful write is not presented as a failure", () => {
+  /* GAC-2: the canonical write refuses unknown targets and unverified admins,
+     so each test gets the catalogue, a verified admin and canonical people. */
+  beforeEach(async () => {
+    const { ensureAccessDepartments } = require("../../services/ensureAccessDepartments");
+    const { invalidate } = require("../../services/memo");
+    const AccessDepartment = require("../../models/Access/AccessDepartment");
+    const DeptUser = require("../../models/Access/DeptUser");
+    await ensureAccessDepartments(mongoose.connection);
+    invalidate("access-departments:active");
+    const ceo = await AccessDepartment.findOne({ slug: "ceo" });
+    const mk = (email, isAdmin = false) => DeptUser.create({
+      name: email.split("@")[0], email, passwordHash: "x", departmentId: ceo._id, isAdmin, isActive: true,
+    });
+    currentAdmin = (await mk("admin@test.example", true)).toObject();
+    for (const e of ["ui.grant", "ui.revoke", "ui.qc", "ui.retry"]) await mk(`${e}@test.example`);
+    /* Revoking the only Owner is refused (last-Owner rule); an incumbent Owner
+       keeps these tests about the write itself. */
+    for (const slug of ["store", "qc"]) {
+      await DepartmentRole.create({ departmentSlug: slug, email: `${slug}.owner@test.example`, role: "owner" });
+    }
+  });
+  afterEach(() => { currentAdmin = null; });
+
   test("granting a role answers 200, not 500, with the row written", async () => {
     const res = await putRole("store", {
       email: "ui.grant@test.example", name: "UI Grant", role: "editor",

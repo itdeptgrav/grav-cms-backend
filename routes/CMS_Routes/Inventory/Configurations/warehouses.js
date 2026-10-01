@@ -42,6 +42,16 @@ const { fail, sendError } = require("../../../../services/storePurchase/errors")
    through the unit of work below, together with the change it describes. */
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 const SpActionHistory = require("../../../../models/CMS_Models/StorePurchase/SpActionHistory");
+/* The physical shape of a location (kind, layout, capacity, QR token) — one
+   validator shared with the store-location routes, 25 Sep 2026. */
+/* Warehouses created before the location layer carry no structureVersion at
+   all; version 0 must match that absence or their first location can never be
+   added (found 25 Sep 2026 on WH-MAIN). */
+const versionGuard = (field, seen) => (seen ? { [field]: seen } : { $or: [{ [field]: 0 }, { [field]: { $exists: false } }] });
+const storeLoc = require("../../../../services/storePurchase/storeLocations.service");
+/* Export / import of the whole warehouse design, so the hosted database can
+   be set up from the local one in a minute (1 Oct 2026). */
+const setupTransfer = require("../../../../services/storePurchase/warehouseSetupTransfer.service");
 
 const ENTITY = "WAREHOUSE";
 
@@ -335,6 +345,14 @@ const publicLocation = (l) => ({
   parent: l.parent ? String(l.parent) : null,
   status: l.status,
   barcode: l.barcode || "",
+  /* The physical shape (25 Sep 2026): kind, order among siblings, the QR
+     token a printed location label carries, the layout box in cm and the
+     optional capacity. See models/.../Warehouse.js. */
+  kind: l.kind || "AREA",
+  sequence: typeof l.sequence === "number" ? l.sequence : 0,
+  qrToken: l.qrToken || "",
+  layout: l.layout || {},
+  capacity: l.capacity || {},
   description: l.description || "",
   archivedAt: l.archivedAt || null,
   archiveReason: l.archiveReason || "",
@@ -379,6 +397,7 @@ const publicWarehouse = (w) => ({
   description: w.description || "",
   locations: (w.locations || []).map(publicLocation),
   locationCount: (w.locations || []).filter((l) => l.status !== "Archived").length,
+  floorPlan: w.floorPlan || {},
   archivedAt: w.archivedAt || null,
   archiveReason: w.archiveReason || "",
   createdAt: w.createdAt || null,
@@ -862,6 +881,49 @@ function decodeCursor(raw) {
   }
   return { at, _id: new mongoose.Types.ObjectId(parts[1]) };
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * SETUP EXPORT / IMPORT (1 Oct 2026)
+ *
+ * The owner: the warehouse design built on the local database has to exist
+ * on the hosted one "within a minute", without registering every rack again.
+ * `GET /setup/export` writes every warehouse of this company (or the ones
+ * named by `ids`) with its floor plan and locations into one JSON file;
+ * `POST /setup/import` merges such a file into this company — a dry run
+ * (`dryRun: true`) answers the plan and writes nothing. Stock never travels.
+ * Declared before `/:id`, which would otherwise read "setup" as an id.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.get("/setup/export", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const file = await setupTransfer.exportSetup(req.tenant, { ids });
+    return res.json({ success: true, file });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[warehouses] setup export error:", err);
+    return res.status(500).json({ success: false, message: "The warehouse setup could not be exported." });
+  }
+});
+
+router.post("/setup/import", requireCapability(CAPABILITIES.MASTER_MAINTAIN), refuseLegacyWrite, async (req, res) => {
+  try {
+    assertTenantInput(req);
+    const setup = req.body?.setup;
+    const dryRun = req.body?.dryRun === true || req.body?.dryRun === "true";
+    const out = await setupTransfer.importSetup(req.tenant, setup, {
+      actor: objectId(req.user?.id),
+      actorName: req.user?.name || "",
+      dryRun,
+      requestId: req.id || "",
+      idempotencyKey: String(req.get("Idempotency-Key") || ""),
+    });
+    return res.status(dryRun ? 200 : 201).json({ success: true, ...out });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[warehouses] setup import error:", err);
+    return res.status(500).json({ success: false, message: err?.message || "The warehouse setup could not be imported." });
+  }
+});
 
 router.get("/:id/history", requireCapability(CAPABILITIES.HISTORY_READ), async (req, res) => {
   try {
@@ -1700,7 +1762,7 @@ router.post(
           scoped(req, {
             _id: w._id,
             status: { $ne: "Archived" },
-            structureVersion: seenVersion,
+            ...versionGuard("structureVersion", seenVersion),
             "locations.code": { $ne: code },
           }),
           {
@@ -1711,6 +1773,10 @@ router.post(
                 status: "Active",
                 barcode: text(req.body.barcode),
                 description: text(req.body.description),
+                /* The physical shape (25 Sep 2026) — validated by the
+                   store-location service; absent means "an area, unplaced". */
+                ...storeLoc.physicalFieldsFromBody(req.body),
+                qrToken: storeLoc.mintQrToken(),
                 createdBy: actor,
               },
             },
@@ -1848,6 +1914,11 @@ router.put(
       for (const f of ["barcode", "description"]) {
         if (req.body[f] !== undefined) $set[`locations.$[l].${f}`] = text(req.body[f]);
       }
+      /* The physical shape (25 Sep 2026): kind, sequence, layout, capacity —
+         each only when sent, each validated by the shared service. */
+      for (const [path, value] of Object.entries(storeLoc.physicalSetFromBody(req.body, "locations.$[l]."))) {
+        $set[path] = value;
+      }
 
       /* ── THE RENAME RACE ───────────────────────────────────────────────
          Create had an atomic duplicate guard; rename had only the snapshot
@@ -1857,7 +1928,7 @@ router.put(
       const guard = {
         _id: w._id,
         status: { $ne: "Archived" },
-        structureVersion: seenVersion,
+        ...versionGuard("structureVersion", seenVersion),
         ...(renamedTo && renamedTo !== current.code ? { "locations.code": { $ne: renamedTo } } : {}),
       };
 
@@ -2004,7 +2075,7 @@ router.patch(
         const doc = await Warehouse.findOneAndUpdate(
           /* Pinned to the snapshot the descendant check was decided against,
              so a child appearing in between cannot be orphaned. */
-          scoped(req, { _id: w._id, status: { $ne: "Archived" }, structureVersion: seenVersion }),
+          scoped(req, { _id: w._id, status: { $ne: "Archived" }, ...versionGuard("structureVersion", seenVersion) }),
           {
             $inc: { structureVersion: 1 },
             $set: {

@@ -24,6 +24,19 @@ const parentIdOf = async (a) => {
   return doc.parentAccountId ? String(doc.parentAccountId) : null;
 };
 
+
+/* ── ONE COMPANY AND A SERVICE CONTEXT (Chunk 3B1) ───────────────────────────
+ * These services are company-scoped now: they take `{companyId, reason}` and
+ * put it in the query. The fixtures carry the same company, and the context
+ * names it. */
+let CO;
+let CTX;
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  CO = await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  CTX = { companyId: CO._id, reason: "unit test" };
+});
+
 describe("which types are group edges", () => {
   test("only the two ownership types are", () => {
     expect(isHierarchyType("parent_of")).toBe(true);
@@ -36,8 +49,8 @@ describe("which types are group edges", () => {
   });
 
   test("the two types put the child on opposite sides", async () => {
-    const group = await Account.create({ companyName: "Mayfair Group" });
-    const hotel = await Account.create({ companyName: "Mayfair Bhubaneswar" });
+    const group = await Account.create({ companyId: CO._id, companyName: "Mayfair Group" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "Mayfair Bhubaneswar" });
     expect(resolveGroupEdge(parentOf(group, hotel))).toEqual({
       childId: String(hotel._id), parentId: String(group._id),
     });
@@ -47,41 +60,41 @@ describe("which types are group edges", () => {
   });
 
   test("a commercial edge resolves to nothing", async () => {
-    const a = await Account.create({ companyName: "A" });
-    const b = await Account.create({ companyName: "B" });
+    const a = await Account.create({ companyId: CO._id, companyName: "A" });
+    const b = await Account.create({ companyId: CO._id, companyName: "B" });
     expect(resolveGroupEdge({ ...parentOf(a, b), relationshipType: "agent_for" })).toBeNull();
   });
 });
 
 describe("applying a group edge", () => {
   test("parent_of sets the child's parent", async () => {
-    const group = await Account.create({ companyName: "Mayfair Group" });
-    const hotel = await Account.create({ companyName: "Mayfair Bhubaneswar" });
+    const group = await Account.create({ companyId: CO._id, companyName: "Mayfair Group" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "Mayfair Bhubaneswar" });
     const rel = parentOf(group, hotel);
-    await assertGroupEdgeApplicable(Account, rel);
-    await applyGroupLink(Account, rel);
+    await assertGroupEdgeApplicable(Account, rel, CTX);
+    await applyGroupLink(Account, rel, null, CTX);
     expect(await parentIdOf(hotel)).toBe(String(group._id));
     // ...and the group is not itself given a parent.
     expect(await parentIdOf(group)).toBeNull();
   });
 
   test("subsidiary_of sets the same link from the other side", async () => {
-    const group = await Account.create({ companyName: "Mayfair Group" });
-    const hotel = await Account.create({ companyName: "Mayfair Puri" });
+    const group = await Account.create({ companyId: CO._id, companyName: "Mayfair Group" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "Mayfair Puri" });
     const rel = subsidiaryOf(hotel, group);
-    await assertGroupEdgeApplicable(Account, rel);
-    await applyGroupLink(Account, rel);
+    await assertGroupEdgeApplicable(Account, rel, CTX);
+    await applyGroupLink(Account, rel, null, CTX);
     expect(await parentIdOf(hotel)).toBe(String(group._id));
   });
 
   test("twenty properties all hang off one group", async () => {
-    const group = await Account.create({ companyName: "Mayfair Group" });
+    const group = await Account.create({ companyId: CO._id, companyName: "Mayfair Group" });
     const hotels = [];
     for (let i = 0; i < 20; i++) {
-      const h = await Account.create({ companyName: `Mayfair Property ${i + 1}` });
+      const h = await Account.create({ companyId: CO._id, companyName: `Mayfair Property ${i + 1}` });
       const rel = parentOf(group, h);
-      await assertGroupEdgeApplicable(Account, rel);
-      await applyGroupLink(Account, rel);
+      await assertGroupEdgeApplicable(Account, rel, CTX);
+      await applyGroupLink(Account, rel, null, CTX);
       hotels.push(h);
     }
     const children = await Account.find({ parentAccountId: group._id }).lean();
@@ -90,89 +103,89 @@ describe("applying a group edge", () => {
   });
 
   test("re-applying the same edge changes nothing", async () => {
-    const group = await Account.create({ companyName: "G" });
-    const hotel = await Account.create({ companyName: "H" });
+    const group = await Account.create({ companyId: CO._id, companyName: "G" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "H" });
     const rel = parentOf(group, hotel);
-    await assertGroupEdgeApplicable(Account, rel);
-    await applyGroupLink(Account, rel);
+    await assertGroupEdgeApplicable(Account, rel, CTX);
+    await applyGroupLink(Account, rel, null, CTX);
     // Idempotent: asserting again must not read as a conflict with itself.
-    await expect(assertGroupEdgeApplicable(Account, rel)).resolves.toBeTruthy();
-    await applyGroupLink(Account, rel);
+    await expect(assertGroupEdgeApplicable(Account, rel, CTX)).resolves.toBeTruthy();
+    await applyGroupLink(Account, rel, null, CTX);
     expect(await parentIdOf(hotel)).toBe(String(group._id));
   });
 });
 
 describe("an account has exactly one parent", () => {
   test("a second, different group is refused and names the current one", async () => {
-    const mayfair = await Account.create({ companyName: "Mayfair Group", accountId: "ACC-MAYFAIR" });
-    const oberoi = await Account.create({ companyName: "Oberoi Group" });
-    const hotel = await Account.create({ companyName: "Contested Hotel" });
+    const mayfair = await Account.create({ companyId: CO._id, companyName: "Mayfair Group", accountId: "ACC-MAYFAIR" });
+    const oberoi = await Account.create({ companyId: CO._id, companyName: "Oberoi Group" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "Contested Hotel" });
 
     const first = parentOf(mayfair, hotel);
-    await assertGroupEdgeApplicable(Account, first);
-    await applyGroupLink(Account, first);
+    await assertGroupEdgeApplicable(Account, first, CTX);
+    await applyGroupLink(Account, first, null, CTX);
 
-    await expect(assertGroupEdgeApplicable(Account, parentOf(oberoi, hotel))).rejects.toThrow(HierarchyError);
-    await expect(assertGroupEdgeApplicable(Account, parentOf(oberoi, hotel))).rejects.toThrow(/Mayfair Group/);
+    await expect(assertGroupEdgeApplicable(Account, parentOf(oberoi, hotel), CTX)).rejects.toThrow(HierarchyError);
+    await expect(assertGroupEdgeApplicable(Account, parentOf(oberoi, hotel), CTX)).rejects.toThrow(/Mayfair Group/);
     // Refused, not silently reparented.
     expect(await parentIdOf(hotel)).toBe(String(mayfair._id));
   });
 
   test("a cycle is refused", async () => {
-    const a = await Account.create({ companyName: "A" });
-    const b = await Account.create({ companyName: "B" });
+    const a = await Account.create({ companyId: CO._id, companyName: "A" });
+    const b = await Account.create({ companyId: CO._id, companyName: "B" });
     const first = parentOf(a, b);
-    await assertGroupEdgeApplicable(Account, first);
-    await applyGroupLink(Account, first);
+    await assertGroupEdgeApplicable(Account, first, CTX);
+    await applyGroupLink(Account, first, null, CTX);
     // Now make A a child of B — that closes the loop the hierarchy walk relies
     // on terminating.
-    await expect(assertGroupEdgeApplicable(Account, parentOf(b, a))).rejects.toThrow(HierarchyError);
+    await expect(assertGroupEdgeApplicable(Account, parentOf(b, a), CTX)).rejects.toThrow(HierarchyError);
   });
 
   test("self-parenting is refused", async () => {
-    const a = await Account.create({ companyName: "Solo" });
-    await expect(assertGroupEdgeApplicable(Account, parentOf(a, a))).rejects.toThrow(HierarchyError);
+    const a = await Account.create({ companyId: CO._id, companyName: "Solo" });
+    await expect(assertGroupEdgeApplicable(Account, parentOf(a, a), CTX)).rejects.toThrow(HierarchyError);
   });
 
   test("a missing account is refused rather than writing a dangling parent", async () => {
-    const group = await Account.create({ companyName: "G" });
-    const ghost = await Account.create({ companyName: "Ghost" });
+    const group = await Account.create({ companyId: CO._id, companyName: "G" });
+    const ghost = await Account.create({ companyId: CO._id, companyName: "Ghost" });
     await Account.deleteOne({ _id: ghost._id });
-    await expect(assertGroupEdgeApplicable(Account, parentOf(group, ghost))).rejects.toThrow(HierarchyError);
+    await expect(assertGroupEdgeApplicable(Account, parentOf(group, ghost), CTX)).rejects.toThrow(HierarchyError);
   });
 });
 
 describe("ending a group edge", () => {
   test("clears the parent", async () => {
-    const group = await Account.create({ companyName: "G" });
-    const hotel = await Account.create({ companyName: "H" });
+    const group = await Account.create({ companyId: CO._id, companyName: "G" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "H" });
     const rel = parentOf(group, hotel);
-    await assertGroupEdgeApplicable(Account, rel);
-    await applyGroupLink(Account, rel);
-    await clearGroupLink(Account, rel);
+    await assertGroupEdgeApplicable(Account, rel, CTX);
+    await applyGroupLink(Account, rel, null, CTX);
+    await clearGroupLink(Account, rel, null, CTX);
     expect(await parentIdOf(hotel)).toBeNull();
   });
 
   test("does NOT detach an account that has since moved groups", async () => {
-    const oldGroup = await Account.create({ companyName: "Old" });
-    const newGroup = await Account.create({ companyName: "New" });
-    const hotel = await Account.create({ companyName: "H" });
+    const oldGroup = await Account.create({ companyId: CO._id, companyName: "Old" });
+    const newGroup = await Account.create({ companyId: CO._id, companyName: "New" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "H" });
 
     const oldRel = parentOf(oldGroup, hotel);
-    await applyGroupLink(Account, oldRel);
+    await applyGroupLink(Account, oldRel, null, CTX);
     // Moved to a different group (old row ended first in the real flow; here we
     // simulate the stale row surviving).
     await Account.findByIdAndUpdate(hotel._id, { parentAccountId: newGroup._id });
 
-    await clearGroupLink(Account, oldRel);
+    await clearGroupLink(Account, oldRel, null, CTX);
     expect(await parentIdOf(hotel)).toBe(String(newGroup._id));
   });
 
   test("ending a commercial edge touches nothing", async () => {
-    const group = await Account.create({ companyName: "G" });
-    const hotel = await Account.create({ companyName: "H" });
-    await applyGroupLink(Account, parentOf(group, hotel));
-    await clearGroupLink(Account, { ...parentOf(group, hotel), relationshipType: "agent_for" });
+    const group = await Account.create({ companyId: CO._id, companyName: "G" });
+    const hotel = await Account.create({ companyId: CO._id, companyName: "H" });
+    await applyGroupLink(Account, parentOf(group, hotel), null, CTX);
+    await clearGroupLink(Account, { ...parentOf(group, hotel), relationshipType: "agent_for" }, null, CTX);
     expect(await parentIdOf(hotel)).toBe(String(group._id));
   });
 });

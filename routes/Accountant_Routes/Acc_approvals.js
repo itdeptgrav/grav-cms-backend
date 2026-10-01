@@ -34,6 +34,20 @@ const { inheritablePartyLinks } = require("../../services/partyLinkSafety");
  * `assertClearance`, which throws a typed error the approve endpoint maps
  * back to a 409 carrying the full check. */
 const budgetControl = require("../../services/budgetControl.service");
+
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const router = express.Router();
 
 const {
@@ -103,7 +117,7 @@ router.use(orgAuth);
 //                needed approval).
 //   scope=mine → the caller's OWN requests in any status, so an editor can
 //                see whether what they submitted was approved or rejected.
-router.get("/list", async (req, res) => {
+router.get("/list", companyScopeOptional, async (req, res) => {
   try {
     if (!requireOrg(req, res)) return;
     const scope = req.query.scope === "org" ? "org" : "mine";
@@ -137,6 +151,27 @@ router.get("/list", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
+/* ══ THE COMMITMENT IS RECONCILED AFTER THE COMMIT ══════════════════════════
+ * A voucher's `post("save")` hook fires while a transactional save's
+ * transaction is still open, so it deliberately stands aside for any save
+ * carrying a session. Each executor here owns its own transaction and
+ * therefore owns the reconciliation that follows it.
+ *
+ * Never fatal: the approval and its accounting have committed and must stand.
+ * A reconciliation that could not run leaves the commitment as it was — the
+ * truthful state — rather than being reported as reconciled.
+ */
+async function reconcileAfterCommit(voucherId, actor) {
+  if (!voucherId) return null;
+  try {
+    const release = require("../../services/commitmentRelease.service");
+    return await release.reconcileVoucher({ voucherId, actor });
+  } catch (e) {
+    console.error("[approvals] reconciliation after commit failed:", e.message);
+    return { reconciled: false, why: "error", message: e.message };
+  }
+}
+
 function orgFilter(req) {
   if (req.user.isLegacy || req.user.isDev) return {};
   return { organizationId: req.user.organizationId };
@@ -215,6 +250,11 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       await voucher.save({ session });
       await applyLedgerBalances(voucher, +1, session);
       await session.commitTransaction();
+      /* Durable now — and the first moment at which reading the voucher
+         proves anything about what its commitment should be. On the EDIT
+         executor this is what replaces the old release distribution with one
+         matching the voucher's new lines. */
+      await reconcileAfterCommit(voucher._id, approver);
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();
@@ -265,6 +305,11 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       await voucher.save({ session });
       await applyLedgerBalances(voucher, +1, session);
       await session.commitTransaction();
+      /* Durable now — and the first moment at which reading the voucher
+         proves anything about what its commitment should be. On the EDIT
+         executor this is what replaces the old release distribution with one
+         matching the voucher's new lines. */
+      await reconcileAfterCommit(voucher._id, approver);
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();
@@ -289,6 +334,11 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       voucher.updatedBy = approver.id;
       await voucher.save({ session });
       await session.commitTransaction();
+      /* Durable now — and the first moment at which reading the voucher
+         proves anything about what its commitment should be. On the EDIT
+         executor this is what replaces the old release distribution with one
+         matching the voucher's new lines. */
+      await reconcileAfterCommit(voucher._id, approver);
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();
@@ -313,6 +363,11 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       voucher.updatedBy = approver.id;
       await voucher.save({ session });
       await session.commitTransaction();
+      /* Durable now — and the first moment at which reading the voucher
+         proves anything about what its commitment should be. On the EDIT
+         executor this is what replaces the old release distribution with one
+         matching the voucher's new lines. */
+      await reconcileAfterCommit(voucher._id, approver);
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();
@@ -380,6 +435,11 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       }
 
       await session.commitTransaction();
+      /* Durable now — and the first moment at which reading the voucher
+         proves anything about what its commitment should be. On the EDIT
+         executor this is what replaces the old release distribution with one
+         matching the voucher's new lines. */
+      await reconcileAfterCommit(voucher._id, approver);
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();

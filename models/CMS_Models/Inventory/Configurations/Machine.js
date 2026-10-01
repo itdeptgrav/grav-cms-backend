@@ -63,5 +63,16 @@ const machineSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
+/* Server-owned production state (28 Sep 2026): company ownership, the current
+   assignment to a frozen Production execution-basis operation, its bounded
+   history and device synchronisation. Additive, `select: false`, guarded —
+   see machineProductionAssignment.schema.js. Existing machines stay unclaimed. */
+const {
+  addProductionAssignmentPaths,
+  installMachineAssignmentGuard,
+} = require("./machineProductionAssignment.schema");
+addProductionAssignmentPaths(machineSchema);
+installMachineAssignmentGuard(machineSchema);
+
 module.exports = mongoose.model("Machine", machineSchema);
 

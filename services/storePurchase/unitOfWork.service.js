@@ -98,6 +98,20 @@ async function transactionsAvailable() {
  *                   `mutate`, so a malformed receipt stops the operation before
  *                   anything is written rather than after (which would leave a
  *                   mutation with no marker). Omitted by every existing caller.
+ * @param {string}   [options.entityType]  WHAT is being written, known up front.
+ * @param {ObjectId} [options.entityId]    WHICH document, known up front.
+ *                   Together these move the whole marker-ordering decision in
+ *                   here, so a caller whose `mutate` does several writes need not
+ *                   know the deployment mode. When both are given:
+ *                     · MARKED (standalone) — the marker is stamped BEFORE the
+ *                       mutation, so a mutation that fails part-way routes the
+ *                       retry into recovery rather than repeating (at-most-once).
+ *                     · TRANSACTIONAL — NOTHING is marked before the transaction;
+ *                       the marker commits INSIDE it. A rollback therefore rolls
+ *                       the marker back too, and a retry is a clean first attempt.
+ *                   Omit them and the legacy ordering (mark AFTER the mutation,
+ *                   using the entity `mutate` returns) is used — safe only when
+ *                   `mutate` is a single logical commit.
  * @param {function} options.mutate   async (session|null) => ({ entry, result, entityId, entityType })
  *                   `entry` is the history entry; `result` is returned to the
  *                   caller; `entityId`/`entityType` identify what was written.
@@ -107,7 +121,7 @@ async function transactionsAvailable() {
  *                   validated-before-mutation `recoveryReceipt` above instead.
  * @returns {Promise<{result, mode: "TRANSACTIONAL"|"MARKED"}>}
  */
-async function run(ctx, { idempotencyRecord = null, recoveryReceipt = undefined, mutate }) {
+async function run(ctx, { idempotencyRecord = null, entityType = null, entityId = null, recoveryReceipt = undefined, mutate }) {
   /* ── VALIDATE THE RECEIPT FIRST, BEFORE ANYTHING ELSE ──────────────────────
    * Before the probe, before a session, before `mutate`. If the receipt is
    * malformed the operation stops here with nothing written — there is no
@@ -123,15 +137,19 @@ async function run(ctx, { idempotencyRecord = null, recoveryReceipt = undefined,
     const session = await mongoose.startSession();
     try {
       let outcome;
+      /* NOTHING is marked before the transaction: the marker is written INSIDE
+         it, so an abort rolls it back with the stock and the document. A retry
+         after a rollback then finds no marker and runs as a clean first attempt
+         — never a false "effect already applied" that would refuse it. */
       await session.withTransaction(async () => {
-        const { entry, result, entityId, entityType } = await mutate(session);
-        await actionHistory.record(ctx, { ...entry, atomicityDegraded: false }, { session });
+        const r = await mutate(session);
+        await actionHistory.record(ctx, { ...r.entry, atomicityDegraded: false }, { session });
         if (idempotencyRecord) {
           await idempotency.markEffectApplied({
-            record: idempotencyRecord, entityType, entityId, session, receipt,
+            record: idempotencyRecord, entityType: r.entityType, entityId: r.entityId, session, receipt,
           });
         }
-        outcome = result;
+        outcome = r.result;
       });
       return { result: outcome, mode: "TRANSACTIONAL" };
     } finally {
@@ -139,25 +157,31 @@ async function run(ctx, { idempotencyRecord = null, recoveryReceipt = undefined,
     }
   }
 
-  /* ── MARKED mode ─────────────────────────────────────────────────────────
-   * Order matters and is the whole defence: the effect marker is written
-   * IMMEDIATELY after the mutation and BEFORE anything that could still fail.
-   * From that instant a retry cannot re-run the work. */
-  const { entry, result, entityId, entityType } = await mutate(null);
-
-  if (idempotencyRecord) {
+  /* ── MARKED mode (no transaction available) ──────────────────────────────
+   * The marker is the whole defence, so its ordering matters. When the caller
+   * named the entity up front, stamp the marker BEFORE the mutation: a
+   * multi-write `mutate` that fails half-way then routes the retry into
+   * recovery rather than repeating the part that landed. Otherwise fall back to
+   * marking immediately AFTER the mutation (safe when `mutate` is one commit). */
+  if (idempotencyRecord && entityType && entityId) {
     await idempotency.markEffectApplied({ record: idempotencyRecord, entityType, entityId, receipt });
   }
 
+  const r = await mutate(null);
+
+  if (idempotencyRecord && !(entityType && entityId)) {
+    await idempotency.markEffectApplied({ record: idempotencyRecord, entityType: r.entityType, entityId: r.entityId, receipt });
+  }
+
   await actionHistory.record(ctx, {
-    ...entry,
+    ...r.entry,
     /* True in the accurate sense: this entry was not written inside a
        transaction with the change it describes. It does NOT mean the business
        effect can repeat — the marker above prevents that. */
     atomicityDegraded: true,
   });
 
-  return { result, mode: "MARKED" };
+  return { result: r.result, mode: "MARKED" };
 }
 
 /**

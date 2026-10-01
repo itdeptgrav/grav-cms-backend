@@ -30,6 +30,9 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
+const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
+const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
+const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
 
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
@@ -83,11 +86,40 @@ const rawItem = (over = {}) => {
  * A work order with one raw-material line and two operations.
  * `perUnit` is the BOM requirement per produced unit.
  */
+/* ── IE CHUNK 1D — A SPLITTABLE ORDER MUST KNOW ITS STYLE ────────────────
+   Splitting is a derivative creation, and since Chunk 1D a derivative is only
+   created when its source's style can be proved: a split may no longer produce
+   an unlinked work order. So these fixtures carry a company-provable style, as
+   every order created through the release path now does. The split's own
+   behaviour — quantities, BOM scaling, idempotency — is unchanged and is what
+   the assertions below still measure. */
+async function provableStyle() {
+  const n = ++seq;
+  /* ONE company for the suite. The deployment has no membership rows here, so
+     the shared company-context service resolves through its single-company
+     rule — which is the honest shape of this fixture and stops each style
+     inventing a company the actor is not a member of. */
+  const co = (await Acc_Company.findOne({}).lean())
+    || await Acc_Company.create({ companyName: "WOPC Co", booksFromDate: new Date("2026-04-01") });
+  const journey = await SalesJourney.create({
+    journeyId: `SJ-WOPC-${n}`, companyId: co._id, accountId: new mongoose.Types.ObjectId(),
+    ownerId: new mongoose.Types.ObjectId(), ownerName: "O", name: "J", isActive: true,
+  });
+  const style = await SampleStyle.create({
+    sampleStyleId: `SS-WOPC-${n}`, productName: "Tee", styleCode: `ST-WOPC-${n}`,
+    journeyId: journey._id,
+    materials: { status: "pending", rawItems: [] },
+    techSheet: { technical: { status: "draft" } },
+  });
+  return style._id;
+}
+
 async function workOrder({ quantity = 10, perUnit = 2, stock = 1000, unit = "m", rawUnit = "m", status = "pending", withRaw = true, ops = 2, timeline = false } = {}) {
   const n = ++seq;
   const ri = withRaw ? await rawItem({ unit: rawUnit, quantity: stock }) : null;
   return WorkOrder.create({
     workOrderNumber: `WO-${String(n).padStart(4, "0")}`,
+    sampleStyleId: await provableStyle(),
     quantity,
     originalQuantity: quantity,
     status,

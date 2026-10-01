@@ -54,6 +54,8 @@ require("../../models/ProjectManager");
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 const StorePurchaseOrder = require("../../models/CMS_Models/Store/PurchaseOrder");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+const Warehouse = require("../../models/CMS_Models/Inventory/Configurations/Warehouse");
+const LocationMovement = require("../../models/CMS_Models/Inventory/Operations/LocationMovement");
 const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
 const DepartmentRole = require("../../models/Access/DepartmentRole");
@@ -727,6 +729,38 @@ describe("receiving against a PO", () => {
     expect(raw.stockTransactions).toHaveLength(1); // one movement, not two
   });
 
+  test("a receipt into a chosen location writes one stock effect AND one location-in", async () => {
+    const { a } = await companies();
+    const person = await actor({ company: a });
+    const s = await seed({ stockQty: 0 });
+    const po = await issuedPo(person, s);
+    const wh = await Warehouse.create({
+      companyId: a._id, name: "Main WH", shortName: `MW${Date.now() % 100000}`, status: "Active",
+      locations: [{ code: "RECV", name: "Receiving", type: "RECEIVING", status: "Active" }],
+    });
+    const recv = wh.locations[0];
+
+    const res = await call(`${OPS}/${po._id}/receive`, {
+      method: "POST",
+      // V1 records one destination per receipt — sent at the top level.
+      body: { warehouseId: String(wh._id), locationId: String(recv._id), items: [{ itemId: po.items[0]._id, quantity: 10 }], invoiceNumber: "INV-LOC" },
+      token: person.token, idempotencyKey: newKey(),
+    });
+    expect(res.status).toBe(200);
+
+    const raw = await RawItem.findById(s.raw._id).lean();
+    expect(raw.quantity).toBe(10); // one canonical stock effect
+    const tx = raw.stockTransactions.find((t) => t.type === "ADD");
+    expect(String(tx.locationCode)).toBe("RECV"); // location snapshot on the tx
+
+    const mvs = await LocationMovement.find({ itemId: s.raw._id, type: "receipt" }).lean();
+    expect(mvs).toHaveLength(1); // exactly one location-in movement
+    expect(mvs[0].direction).toBe("in");
+    expect(mvs[0].source.kind).toBe("po_receipt"); // real PO as source
+    expect(String(mvs[0].source.id)).toBe(String(po._id));
+    expect(mvs[0].quantity).toBe(10);
+  });
+
   test("a receipt requires the receipt capability", async () => {
     const { a } = await companies();
     const approver = await actor({ company: a, role: "approver" });
@@ -739,6 +773,217 @@ describe("receiving against a PO", () => {
       token: viewer.token, idempotencyKey: newKey(),
     });
     expect(res.status).toBe(403);
+  });
+});
+
+/* ═══ 6b · TWO LINES, ONE ITEM — LOST-UPDATE REGRESSION ══════════════════ */
+
+describe("two PO lines that hit the same RawItem", () => {
+  /* A PO can carry two separate line items pointing at the SAME raw item (two
+     variants of it, or simply two lines). The transaction restructuring made
+     each receipt line load and mutate its OWN copy of that RawItem, all
+     prepared before any was saved — so the second, stale save clobbered the
+     quantity, variants and stock transaction the first had written, and one
+     line's stock silently vanished. The fix loads each distinct item ONCE
+     inside the unit of work and applies every line to that single document.
+     These pin that two lines can never again overwrite one another. */
+
+  /** A raw item with named variants (each starts at zero, with a real _id). */
+  async function seedVariants(combos) {
+    const n = ++seq;
+    const vendor = await Vendor.create({
+      companyName: `Vendor ${n}`, contactPerson: "V", phone: "9", status: "Active",
+    });
+    const raw = await RawItem.create({
+      name: `Fabric ${n}`, sku: `FAB-${n}`, unit: "pcs", quantity: 0, minStock: 0,
+      variants: combos.map((c, i) => ({
+        combination: c, quantity: 0, sku: `FAB-${n}-v${i}`, status: "In Stock",
+      })),
+    });
+    return { vendor, raw };
+  }
+
+  /** Issue a PO whose `items` are exactly the lines given. */
+  async function twoLinePo(person, s, lines) {
+    const created = await call(OPS, {
+      method: "POST", body: poBody(s, { items: lines }),
+      token: person.token, idempotencyKey: newKey(),
+    });
+    expect(created.status).toBe(201);
+    const id = created.body.purchaseOrder._id;
+    const issued = await call(`${OPS}/${id}/status`, {
+      method: "PATCH", body: { status: "ISSUED" }, token: person.token, idempotencyKey: newKey(),
+    });
+    expect(issued.status).toBe(200);
+    return (await call(`${OPS}/${id}`, { token: person.token })).body.purchaseOrder;
+  }
+
+  test("two lines for the same non-variant item BOTH increase stock", async () => {
+    const { a } = await companies();
+    const person = await actor({ company: a });
+    const s = await seed({ stockQty: 5 });
+    const po = await twoLinePo(person, s, [
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 30, unitPrice: 5, unit: "pcs" },
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 20, unitPrice: 5, unit: "pcs" },
+    ]);
+
+    const res = await call(`${OPS}/${po._id}/receive`, {
+      method: "POST",
+      body: {
+        items: [
+          { itemId: po.items[0]._id, quantity: 30 },
+          { itemId: po.items[1]._id, quantity: 20 },
+        ],
+        invoiceNumber: "INV-2L",
+      },
+      token: person.token, idempotencyKey: newKey(),
+    });
+    expect(res.status).toBe(200);
+
+    const raw = await RawItem.findById(s.raw._id).lean();
+    expect(raw.quantity).toBe(55); // 5 + 30 + 20 — neither line lost
+
+    // One canonical stock transaction PER received line, and the pair chains:
+    // previous→new accumulates on the same live document, never overwrites.
+    const adds = raw.stockTransactions.filter((t) => t.type === "ADD");
+    expect(adds).toHaveLength(2);
+    expect(adds.map((t) => t.quantity).sort((x, y) => x - y)).toEqual([20, 30]);
+    expect(adds.map((t) => t.newQuantity).sort((x, y) => x - y)).toEqual([35, 55]);
+  });
+
+  test("two lines for DIFFERENT variants update both, and the parent total is their sum", async () => {
+    const { a } = await companies();
+    const person = await actor({ company: a });
+    const s = await seedVariants([["Red"], ["Blue"]]);
+    const [vRed, vBlue] = (await RawItem.findById(s.raw._id).lean()).variants;
+    const po = await twoLinePo(person, s, [
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 10, unitPrice: 5, unit: "pcs", variantId: String(vRed._id), variantCombination: ["Red"] },
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 7, unitPrice: 5, unit: "pcs", variantId: String(vBlue._id), variantCombination: ["Blue"] },
+    ]);
+
+    const res = await call(`${OPS}/${po._id}/receive`, {
+      method: "POST",
+      body: {
+        items: [
+          { itemId: po.items[0]._id, quantity: 10 },
+          { itemId: po.items[1]._id, quantity: 7 },
+        ],
+      },
+      token: person.token, idempotencyKey: newKey(),
+    });
+    expect(res.status).toBe(200);
+
+    const raw = await RawItem.findById(s.raw._id).lean();
+    const red = raw.variants.find((v) => String(v._id) === String(vRed._id));
+    const blue = raw.variants.find((v) => String(v._id) === String(vBlue._id));
+    expect(red.quantity).toBe(10); // first line not overwritten by the second
+    expect(blue.quantity).toBe(7);
+    expect(raw.quantity).toBe(17); // parent total = Σ variants
+  });
+
+  test("two lines for the SAME variant accumulate, they do not overwrite", async () => {
+    const { a } = await companies();
+    const person = await actor({ company: a });
+    const s = await seedVariants([["Red"]]);
+    const [vRed] = (await RawItem.findById(s.raw._id).lean()).variants;
+    const po = await twoLinePo(person, s, [
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 4, unitPrice: 5, unit: "pcs", variantId: String(vRed._id), variantCombination: ["Red"] },
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 6, unitPrice: 5, unit: "pcs", variantId: String(vRed._id), variantCombination: ["Red"] },
+    ]);
+
+    const res = await call(`${OPS}/${po._id}/receive`, {
+      method: "POST",
+      body: {
+        items: [
+          { itemId: po.items[0]._id, quantity: 4 },
+          { itemId: po.items[1]._id, quantity: 6 },
+        ],
+      },
+      token: person.token, idempotencyKey: newKey(),
+    });
+    expect(res.status).toBe(200);
+
+    const raw = await RawItem.findById(s.raw._id).lean();
+    const red = raw.variants.find((v) => String(v._id) === String(vRed._id));
+    expect(red.quantity).toBe(10); // 4 + 6, not 6
+    expect(raw.quantity).toBe(10);
+  });
+
+  test("the LEGACY deployed index does not break two same-item lines into one location, and a replay adds no duplicate", async () => {
+    /* The deploy-compatibility guarantee. An existing database still carries the
+       ORIGINAL unique index — keyed on idempotencyKey, WITHOUT any per-line
+       discriminator column. Create exactly that index here, then receive two
+       lines of the same item into the SAME location under one operation key.
+       Both must persist (each line derives its own line-scoped movement key), and
+       a replay of the whole receipt must produce NO new movement. No migration,
+       no destructive index drop. */
+    // The EXACT deployed shape — {companyId, idempotencyKey, type, locationId},
+    // no itemId/variantId column — created here as an existing database carries
+    // it, and (default name) so it is byte-for-byte what the model declares.
+    await LocationMovement.collection.createIndex(
+      { companyId: 1, idempotencyKey: 1, type: 1, locationId: 1 },
+      { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string", $gt: "" } } },
+    );
+    const idxNames = (await LocationMovement.collection.indexes()).map((ix) => ix.name);
+    expect(idxNames).toContain("companyId_1_idempotencyKey_1_type_1_locationId_1");
+
+    /* The model must not ask for a DIFFERENTLY shaped replacement — declaring a
+       wider unique index here would make syncIndexes drop this one on deploy,
+       which is exactly the migration we are avoiding. The model's only unique
+       index is this 4-field shape, and it names no itemId/variantId. */
+    const uniqueDecls = LocationMovement.schema.indexes().filter(([, opts]) => opts && opts.unique);
+    expect(uniqueDecls).toHaveLength(1);
+    expect(Object.keys(uniqueDecls[0][0])).toEqual(["companyId", "idempotencyKey", "type", "locationId"]);
+
+    const { a } = await companies();
+    const person = await actor({ company: a });
+    const s = await seed({ stockQty: 0 });
+    const po = await twoLinePo(person, s, [
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 30, unitPrice: 5, unit: "pcs" },
+      { rawItem: String(s.raw._id), itemName: s.raw.name, quantity: 20, unitPrice: 5, unit: "pcs" },
+    ]);
+    const wh = await Warehouse.create({
+      companyId: a._id, name: "Main WH", shortName: `MW${Date.now() % 100000}`, status: "Active",
+      locations: [{ code: "RECV", name: "Receiving", type: "RECEIVING", status: "Active" }],
+    });
+    const recv = wh.locations[0];
+
+    const key = newKey();
+    // Goods Receipt V1 records ONE destination per receipt (the GRN header), so
+    // warehouse/location are sent at the top level, not per line.
+    const body = {
+      warehouseId: String(wh._id), locationId: String(recv._id),
+      items: [
+        { itemId: po.items[0]._id, quantity: 30 },
+        { itemId: po.items[1]._id, quantity: 20 },
+      ],
+      invoiceNumber: "INV-2LOC",
+    };
+
+    const res = await call(`${OPS}/${po._id}/receive`, { method: "POST", body, token: person.token, idempotencyKey: key });
+    expect(res.status).toBe(200);
+
+    const raw = await RawItem.findById(s.raw._id).lean();
+    expect(raw.quantity).toBe(50); // both lines landed under the legacy index
+
+    const mvs = await LocationMovement.find({ itemId: s.raw._id, type: "receipt" }).lean();
+    expect(mvs).toHaveLength(2); // two distinct location-in movements
+    expect(mvs.map((m) => m.quantity).sort((x, y) => x - y)).toEqual([20, 30]);
+    expect(new Set(mvs.map((m) => String(m.locationId))).size).toBe(1); // same location
+    expect(new Set(mvs.map((m) => m.idempotencyKey)).size).toBe(2);     // distinct per-line keys
+    expect(new Set(mvs.map((m) => m.operationKey)).size).toBe(1);       // same operation, kept for audit
+    expect(mvs.every((m) => m.operationKey === key)).toBe(true);
+
+    // Replay the exact same operation — the idempotency middleware replays and
+    // NO new movement is written (the derived keys reproduce, the legacy index
+    // and the marker both hold).
+    const replay = await call(`${OPS}/${po._id}/receive`, { method: "POST", body, token: person.token, idempotencyKey: key });
+    expect(replay.status).toBe(200);
+    expect(replay.replayed).toBe(true);
+    const after = await LocationMovement.find({ itemId: s.raw._id, type: "receipt" }).lean();
+    expect(after).toHaveLength(2); // still two, not four
+    const rawAfter = await RawItem.findById(s.raw._id).lean();
+    expect(rawAfter.quantity).toBe(50); // stock moved exactly once
   });
 });
 
@@ -1063,7 +1308,7 @@ describe("behaviour Chunk 1 deliberately did not change", () => {
     expect((await RawItem.findById(s.raw._id).lean()).quantity).toBe(90);
   });
 
-  test("CHARACTERISATION: Store still records supplier payments (Chunk 8), now scoped and permissioned", async () => {
+  test("Chunk 8: Store payment recording is RETIRED — Accounting owns payment truth; nothing is written", async () => {
     const { a } = await companies();
     const person = await actor({ company: a });
     const s = await seed();
@@ -1072,14 +1317,11 @@ describe("behaviour Chunk 1 deliberately did not change", () => {
       method: "POST", body: { amount: 200, paymentMethod: "BANK_TRANSFER" },
       token: person.token, idempotencyKey: newKey(),
     });
-    expect(res.status).toBe(200);
-    // What Chunk 1 DID change: a double-click no longer records it twice.
-    const key = newKey();
-    const body = { amount: 100, paymentMethod: "CASH" };
-    await call(`${OPS}/${po._id}/payment`, { method: "POST", body, token: person.token, idempotencyKey: key });
-    await call(`${OPS}/${po._id}/payment`, { method: "POST", body, token: person.token, idempotencyKey: key });
+    expect(res.status).toBe(410);
+    expect(res.body.reason).toBe("STORE_PAYMENT_RETIRED");
+    // No Store payment truth is created.
     const after = await PurchaseOrder.findById(po._id).lean();
-    expect(after.payments).toHaveLength(2); // the ₹200 and ONE ₹100
+    expect(after.payments || []).toHaveLength(0);
   });
 
   test("CHARACTERISATION: the worksheet PO register is untouched and moves no stock (Chunk 6)", async () => {

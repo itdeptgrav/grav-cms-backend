@@ -49,11 +49,19 @@ const { Acc_Company, Acc_Ledger } = require("../../../models/Accountant_model/Ac
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 
 const intake = require("../../../services/requestIntake.service");
+const autoReservation = require("../../../services/storePurchase/autoReservation.service");
 const chain = require("../../../services/spendApproval.service");
 const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
+/* Whether a request carries a budget head at all — see the file. Off unless
+   STORE_BUDGET_SETUP=1 (30 Sep 2026: budget left the Store side). */
+const { budgetEnabled } = require("../../../services/requests/budgetGate");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+/* Cache-immune Store-grant path — the same additive treatment the spend router
+   uses, so "may act for Store" survives a momentarily-stale department cache. */
+const { resolveCapabilities: resolveSpCapabilities, hasAll: spHasAll, CAPABILITIES: SP_CAP } =
+  require("../../../services/storePurchase/capabilities");
 const vendorResolve = require("../../../services/vendorResolve.service");
 /* The material door's own fulfilment rules — the split between what is issued
    and what is bought, and the tax on top of the quote. Shared rather than
@@ -85,6 +93,7 @@ function cleanImages(images) {
     .map((im) => ({
       url: im.url.trim(),
       publicId: text(im.publicId, 200),
+      fileId: text(im.fileId, 120),
       name: text(im.name, 120),
     }));
 }
@@ -207,7 +216,7 @@ function refuseStandIn(res, emp, what) {
  * A single role field would have to pick one and would be wrong for them.
  */
 async function viewerOf(emp) {
-  const [managedDocIds, accUser, fulfil] = await Promise.all([
+  const [managedDocIds, accUser, fulfil, caps] = await Promise.all([
     mrfApprover.listManagedEmployeeIds(emp?.biometricId || emp?.identityId).catch(() => []),
     emp?.email
       ? Acc_User.findOne({ email: String(emp.email).trim().toLowerCase() })
@@ -216,7 +225,12 @@ async function viewerOf(emp) {
           .catch(() => null)
       : null,
     resolveFulfilmentAccess(emp).catch(() => ({ allowed: false, via: null })),
+    /* Cache-immune Store grant via the resolved capability set (from
+       department-role grants, not the 30s department cache). ADDITIVE. */
+    resolveSpCapabilities({ email: emp?.email, employeeRef: emp?._id, biometricId: emp?.biometricId })
+      .catch(() => ({ capabilities: [], isAdmin: false })),
   ]);
+  const capabilityFulfils = Boolean(caps?.isAdmin) || spHasAll(caps?.capabilities || [], [SP_CAP.SOURCING_MANAGE]);
 
   /* listManagedEmployeeIds answers with Mongo _ids; everything else in this
      flow — requestedById, approverBiometricId, the session's own employeeId —
@@ -242,8 +256,8 @@ async function viewerOf(emp) {
     /* Finance classifies too. They see every request that spends money anyway,
        and a request stuck because the one store person is on leave is a
        request somebody raises again through a channel nobody is measuring. */
-    canFulfil: Boolean(fulfil?.allowed) || isFinance,
-    fulfilVia: fulfil?.via || (isFinance ? "finance" : null),
+    canFulfil: Boolean(fulfil?.allowed) || isFinance || capabilityFulfils,
+    fulfilVia: fulfil?.via || (isFinance ? "finance" : capabilityFulfils ? "store" : null),
   };
 }
 
@@ -314,6 +328,7 @@ const lineOf = ({
        into one strip would lose which was which. */
     images: (images || []).map((im) => ({
       url: im.url,
+      fileId: im.fileId || null,
       name: im.name || null,
     })),
     catalogueImage: stock?.image || null,
@@ -944,6 +959,12 @@ const deskOrder = (a, b) => {
  */
 router.get("/budget-heads", async (req, res) => {
   try {
+    /* Budget is not part of a request while the switch is off. Answered as
+       such — `enabled: false` — rather than as an empty list, which the form
+       would read as "no approved heads, ask finance". */
+    if (!budgetEnabled()) {
+      return res.json({ success: true, enabled: false, heads: [], department: "", financialYear: null, reason: "budget_off", emptyMessage: null });
+    }
     const emp = await requester(req);
     if (!emp) return res.json({ success: true, heads: [], reason: "no_employee" });
 
@@ -1066,6 +1087,7 @@ router.get("/me", async (req, res) => {
           managesPeople: false,
           isFinance: false,
           canFulfil: false,
+          budgetEnabled: budgetEnabled(),
           /* Said out loud, so the desk can explain itself rather than render
              every tab empty and let the reader draw the wrong conclusion. */
           identityMissing: true,
@@ -1135,6 +1157,10 @@ router.get("/me", async (req, res) => {
         /* Their own Primary Manager, from HR. Null only if the lookup itself
            failed; an unresolved chain answers with a resolution and a note. */
         approver,
+        /* Whether the desk shows a budget head anywhere — the chooser on the
+           form, the approver's panel, the card's fact, the over-budget
+           answer. One switch, the server's (services/requests/budgetGate). */
+        budgetEnabled: budgetEnabled(),
       },
     });
   } catch (e) {
@@ -1224,8 +1250,12 @@ router.post("/", async (req, res) => {
     const purpose = text(b.purpose, 1000);
 
     /* Lines first, matching the form's own order — a refusal that names the
-       last field while the first is empty is a refusal somebody has to hunt. */
-    const { lines, estimatedTotal, estimateComplete, error } = await buildLines(b.items);
+       last field while the first is empty is a refusal somebody has to hunt.
+       The request type is passed so a canonical service link can be refused on a
+       PRODUCT request. */
+    const { lines, estimatedTotal, estimateComplete, error } = await buildLines(b.items, {
+      requestType: String(b.requestType || "PRODUCT").toUpperCase(),
+    });
     if (error) return res.status(400).json({ success: false, message: error });
 
     if (!purpose) {
@@ -1290,7 +1320,7 @@ router.post("/", async (req, res) => {
        The field is still honoured on the APPROVER's route and on the purchase
        door, which are different decisions made by different people — see the
        note on that block. */
-    if (b.unbudgetedHead === true || b.requestedHeadName) {
+    if (budgetEnabled() && (b.unbudgetedHead === true || b.requestedHeadName)) {
       return res.status(400).json({
         success: false,
         code: "HEAD_NOT_REQUESTABLE",
@@ -1300,7 +1330,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (!b.ledgerId) {
+    if (budgetEnabled() && !b.ledgerId) {
       return res.status(400).json({
         success: false,
         message: "Choose the budget head this comes out of.",
@@ -1308,7 +1338,15 @@ router.post("/", async (req, res) => {
     }
 
     let headPatch;
-    {
+    if (!budgetEnabled()) {
+      /* ── NO HEAD, BY DESIGN ───────────────────────────────────────────
+         Budget is off (services/requests/budgetGate): the request carries
+         no ledger, no plan row and no snapshot. Whatever a client posted in
+         `ledgerId` is ignored rather than resolved — a switch that is off
+         must not be half on. The spend request it may become is recorded
+         with no head, the way an unbudgeted one already is. */
+      headPatch = { unbudgetedHeadRequest: false, budgetDepartment: emp.department || "" };
+    } else {
       const resolved = await resolveHead({
         department: emp.department,
         ledgerId: b.ledgerId,
@@ -1447,11 +1485,36 @@ router.post("/", async (req, res) => {
  * yet whether this costs the company anything, and a required rate would make
  * the requester invent one for a box of blades the store already holds.
  */
-async function buildLines(raw) {
+async function buildLines(raw, { requestType = "PRODUCT" } = {}) {
   if (!Array.isArray(raw) || raw.length === 0) {
     return { error: "Add at least one thing you need." };
   }
   if (raw.length > 30) return { error: "That is more than thirty lines — split it up." };
+
+  /* ── CANONICAL SERVICE IDENTITY, RESOLVED SERVER-SIDE ────────────────────────
+     A line may carry a `serviceId` from "Request this service". It is NEVER
+     trusted for its name/price/unit — only the id is read, and the record is
+     resolved against an ACTIVE service in the server-proven company. A PRODUCT
+     request may not carry one; a malformed/foreign/inactive/missing id is
+     refused; a plain described service with no id stays valid. */
+  const rawServiceIds = raw.map((r) => r?.serviceId).filter(Boolean);
+  let activeServiceById = new Map();
+  if (rawServiceIds.length) {
+    if (requestType === "PRODUCT") {
+      return { error: "A product request cannot carry a service. Choose Service, or remove the service link." };
+    }
+    if (rawServiceIds.some((id) => !mongoose.isValidObjectId(id))) {
+      return { error: "That service link is not valid." };
+    }
+    const { company, error: companyError } = await theCompany();
+    if (!company) return { error: companyError || "This request has no company, so its service cannot be verified." };
+    const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
+    const found = await Service.find({
+      _id: { $in: rawServiceIds.filter((id) => mongoose.isValidObjectId(id)) },
+      companyId: company._id, status: "ACTIVE",
+    }).select("_id serviceCode name billingUnit").lean();
+    activeServiceById = new Map(found.map((s) => [String(s._id), s]));
+  }
 
   const lines = [];
   let estimatedTotal = 0;
@@ -1478,17 +1541,28 @@ async function buildLines(raw) {
 
   for (const [i, r] of raw.entries()) {
     const at = `Line ${i + 1}`;
+
+    /* Resolve the canonical service for this line, if it carries an id. */
+    let svc = null;
+    if (r?.serviceId) {
+      if (r?.rawItemId) return { error: `${at}: a line cannot be both a catalogue item and a service.` };
+      svc = activeServiceById.get(String(r.serviceId)) || null;
+      if (!svc) return { error: `${at}: that service is unavailable — it may be inactive, removed, or from another company.` };
+    }
+
     const picked = r?.rawItemId ? catalogue.get(String(r.rawItemId)) : null;
     /* The catalogue's name wins over whatever is in the box. They are usually
        the same; when they are not it is because somebody typed over a pick,
-       and the store must issue what was picked. */
-    const name = picked ? picked.name : text(r?.name, 200);
+       and the store must issue what was picked. A matched service's OWN name
+       wins the same way, so a tampered browser name cannot override it. */
+    const name = svc ? svc.name : picked ? picked.name : text(r?.name, 200);
     if (!name) return { error: `${at}: name what you need.` };
 
     const quantity = num(r?.quantity);
     if (quantity === null || quantity <= 0) return { error: `${at}: add a quantity.` };
 
-    const unit = text(r?.unit, 40);
+    /* A matched service's canonical billing unit wins over the browser's. */
+    const unit = svc && svc.billingUnit ? svc.billingUnit : text(r?.unit, 40);
     if (!unit) return { error: `${at}: say what the quantity is in — pieces, metres, hours.` };
 
     const rate = r?.rate === "" || r?.rate === undefined || r?.rate === null ? null : num(r.rate);
@@ -1504,6 +1578,10 @@ async function buildLines(raw) {
       rawItem: picked ? picked._id : null,
       rawItemSku: picked ? picked.sku || "" : "",
       baseUnit: picked ? picked.customUnit || picked.unit || "" : "",
+      /* Canonical service identity, stamped from the RESOLVED record. */
+      service: svc ? svc._id : null,
+      serviceCode: svc ? svc.serviceCode || "" : "",
+      serviceName: svc ? svc.name || "" : "",
       quantity,
       unit,
       ...(rate === null ? {} : { rate }),
@@ -1711,8 +1789,9 @@ async function decide(req, res, outcome) {
     if (!correctingHead) {
       /* Nothing posted, and nothing on the request either — only possible on a
          row raised before the requester was asked for one. It cannot go on to
-         Store without a head, so it is refused here with the reason. */
-      const has = Boolean(doc.ledgerId) || (doc.unbudgetedHeadRequest && doc.requestedHeadName);
+         Store without a head, so it is refused here with the reason.
+         Unless budget is off, in which case no request has one. */
+      const has = !budgetEnabled() || Boolean(doc.ledgerId) || (doc.unbudgetedHeadRequest && doc.requestedHeadName);
       if (!has) {
         return res.status(400).json({
           success: false,
@@ -1996,23 +2075,33 @@ router.get("/:id/budget-heads", async (req, res) => {
   }
 });
 
+/* The books this request belongs to — the GRAV Clothing primary profile, the
+   way every other Store write resolves it (services/requests/booksCompany.js).
+   It used to refuse when more than one company row existed; see that file. */
+const { theCompany } = require("../../../services/requests/booksCompany");
+
 /**
- * The books this request belongs to.
+ * Attempt automatic reservation for an MRF the Requests desk just spawned.
  *
- * One company today, and this asks rather than assumes: with several, an
- * employee's session says nothing about which set of books their spend belongs
- * to, and picking the first would file it against whichever happened to be
- * created first.
+ * ── WHY THE COMPANY IS RESOLVED HERE ───────────────────────────────────────
+ * This router has no `req.tenant`: it resolves the books through `theCompany()`
+ * (the GRAV Clothing primary profile, never a refusal on count). `spawnMrf` leaves
+ * `companyId` unset on the request it creates, so the tenant handed to the
+ * reservation service IS the company this route was already acting for — the
+ * same one every other write on this path uses.
+ *
+ * Fire-and-forget by design: the classification has been saved and answered,
+ * and a shelf read must not be able to undo it.
  */
-async function theCompany() {
-  const companies = await Acc_Company.find({}).select("_id companyName").limit(2).lean();
-  if (companies.length === 1) return { company: companies[0], error: null };
-  return {
-    company: null,
-    error: companies.length
-      ? "More than one set of books exists, and a request cannot tell which it belongs to. Ask finance to configure this."
-      : "No company is set up in the books yet. Ask finance to create one.",
-  };
+async function reserveForSpawnedMrf(mrf, who, whoId) {
+  const { company } = await theCompany();
+  if (!company?._id || !mrf?._id) return;
+  autoReservation.attemptInBackground({
+    tenant: { companyId: company._id, siteId: null },
+    mrfId: mrf._id,
+    trigger: autoReservation.TRIGGERS.INTAKE_CLASSIFIED,
+    actorName: who || "", actorId: whoId || null,
+  });
 }
 
 /* ══ CLASSIFY ═══════════════════════════════════════════════════════════════
@@ -2309,6 +2398,7 @@ router.patch("/:id/classify", async (req, res) => {
        `ledgerId` OR a named unbudgeted ask both count: the second is a real
        decision the manager made, not a gap. */
     const hasApprovedHead =
+      !budgetEnabled() ||
       Boolean(doc.ledgerId) ||
       (doc.unbudgetedHeadRequest === true && Boolean(doc.requestedHeadName));
 
@@ -2375,6 +2465,9 @@ router.patch("/:id/classify", async (req, res) => {
       doc.mrfNumber = mrf.mrfNumber;
       stamp();
       await doc.save();
+      /* The request lands with the store already approved, so it is eligible
+         the moment it exists — the fourth door to the one shared rule. */
+      await reserveForSpawnedMrf(mrf, who, whoId);
       return res.json({
         success: true,
         request: intakeRow(doc.toObject(), { kind: "mrf", status: mrf.status }),
@@ -2411,6 +2504,10 @@ router.patch("/:id/classify", async (req, res) => {
           message: `${mrf.mrfNumber} was raised for the stock you are issuing, but the balance could not be sent on: ${partialError}`,
         });
       }
+
+      /* The issue half is with the store and approved; the buy half is a
+         separate document finance owns. Only the issue half is reservable. */
+      await reserveForSpawnedMrf(mrf, who, whoId);
 
       doc.mrfId = mrf._id;
       doc.mrfNumber = mrf.mrfNumber;
@@ -2775,7 +2872,7 @@ async function spawnMrf({ doc, classifier, classifierName, now, issueQty = null,
          what the store has to go on when deciding which catalogue item this
          is — or what to register if it is not one yet. */
       images: (l.images || []).map((im) => ({
-        url: im.url, publicId: im.publicId || "", name: im.name || "",
+        url: im.url, publicId: im.publicId || "", fileId: im.fileId || "", name: im.name || "",
       })),
       /* Issuable the moment it lands, when somebody has said what it is.
          UNMATCHED is still an ordinary outcome — a described line nobody
@@ -2866,7 +2963,16 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
   const requestedHeadName = asksForNewHead ? doc.requestedHeadName || "" : "";
   const requestedHeadReason = asksForNewHead ? doc.requestedHeadReason || "" : "";
 
-  if (!asksForNewHead) {
+  if (!asksForNewHead && !budgetEnabled()) {
+    /* Budget is off: the spend request is made with no head, as an
+       unbudgeted one is. A head a request happens to carry from when budget
+       was on is kept by name only if it still resolves, and dropped quietly
+       if it does not — the switch is off, so it cannot block anything. */
+    if (doc.ledgerId) {
+      const head = await resolveHead({ department: doc.department, ledgerId: doc.ledgerId });
+      ledger = head.error ? null : head.ledger;
+    }
+  } else if (!asksForNewHead) {
     if (!doc.ledgerId) {
       return {
         error:
@@ -2890,6 +2996,19 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
   const rates = body.rates && typeof body.rates === "object" ? body.rates : {};
   const lines = [];
   let totalAmount = 0;
+
+  /* Revalidate the carried service identities ONCE — a master deactivated or
+     moved between intake and classification must not travel forward. The
+     canonical commercial-identity fields (code, billing unit, SAC) are read
+     from the master here, exactly as the manual `/service-lines` match would. */
+  const carriedServiceIds = (doc.items || []).map((l) => l.service).filter(Boolean);
+  const activeCarryServices = carriedServiceIds.length
+    ? new Map(
+        (await require("../../../models/CMS_Models/Inventory/Services/Service")
+          .find({ _id: { $in: carriedServiceIds }, companyId: company._id, status: "ACTIVE" })
+          .select("_id serviceCode name billingUnit sacCode").lean()).map((s) => [String(s._id), s]),
+      )
+    : new Map();
 
   for (const [i, l] of (doc.items || []).entries()) {
     /* ── ONLY THE BALANCE, ON A PARTIAL ─────────────────────────────────
@@ -2954,6 +3073,17 @@ async function spawnSpend({ doc, kind, body, schedule, classifier, classifierNam
       rawItem: perLine?.rawItemId || l.rawItem || null,
       rawItemSku: perLine?.rawItemSku || l.rawItemSku || "",
       baseUnit: l.baseUnit || "",
+      /* ── THE CANONICAL SERVICE IDENTITY TRAVELS TOO ──────────────────────
+         Carried from the intake line the requester started from "Request this
+         service", REVALIDATED (still active, still this company) just above, so
+         Store does not match the same master a second time and the eventual
+         Service Order line opens the exact record. If it no longer resolves,
+         the link is dropped to null and the line becomes an ordinary service
+         line — never a stale or foreign reference. */
+      service: (l.service && activeCarryServices.has(String(l.service))) ? l.service : null,
+      serviceCode: (l.service && activeCarryServices.get(String(l.service))?.serviceCode) || "",
+      billingUnit: (l.service && activeCarryServices.get(String(l.service))?.billingUnit) || "",
+      sacCode: (l.service && activeCarryServices.get(String(l.service))?.sacCode) || "",
       spec: perLine?.spec || l.note || "",
       /* Both names, so finance can see that Store went somewhere other than
          where the requester pointed them — and why. */

@@ -4,6 +4,21 @@ const mongoose = require("mongoose");
 
 const purchaseOrderItemSchema = new mongoose.Schema(
   {
+    /* ── THE REQUEST LINE THIS ORDER LINE IS ────────────────────────────────
+       Carried so a supplier bill can say which budget allocation it discharges.
+       The service chain already had this (`ServiceOrder.lines[].spendLineId`);
+       goods did not, so a bill for one line of a four-line request could only
+       release the whole commitment.
+
+       Optional and additive: an order raised before this has none, and falls
+       back to the whole-document behaviour it has always had. */
+    spendLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* ── AND THE MATERIAL-REQUEST LINE BEHIND THAT ──────────────────────────
+       `spendLineId` says which approved line this discharges; this says which
+       material-request line the approval itself came from. Both are needed:
+       an order can then prove, line by line, that the material ordered is the
+       material somebody asked for — never by name, never by position. */
+    sourceMrfLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",
@@ -74,6 +89,13 @@ const deliverySchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "ProjectManager",
     },
+    /* Goods Receipt V1: a delivery created by the authoritative GoodsReceipt
+       flow references its GRN, so this order-level entry is a COMPATIBILITY
+       SUMMARY pointing at the source of truth — never itemised on its own, and
+       never a second place stock is recomputed from. Absent on legacy
+       (pre-GRN) order-level deliveries, which stay readable as history. */
+    goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, ref: "GoodsReceipt", default: null },
+    goodsReceiptNumber: { type: String, trim: true, default: "" },
   },
   { timestamps: true },
 );
@@ -81,7 +103,14 @@ const deliverySchema = new mongoose.Schema(
 // ── Return request receipt sub-doc ───────────────────────────────────────
 const returnReceiptSchema = new mongoose.Schema(
   {
-    quantityReceived: { type: Number,  min: 0 },
+    quantityReceived: { type: Number,  min: 0 },   // BUSINESS quantity, in `unit`
+    unit: { type: String, trim: true, default: "" },
+    /* The base quantity actually credited to stock, on the return's frozen basis —
+       so a replacement's audit trail carries both representations. Defaults keep
+       legacy receipts (business == stock) readable. */
+    baseQuantityReceived: { type: Number, min: 0, default: 0 },
+    baseUnit: { type: String, trim: true, default: "" },
+    conversionFactor: { type: Number, default: 1 },
     receivedDate: { type: Date, default: Date.now },
     notes: { type: String, trim: true, default: "" },
     /* The operation that recorded this receipt — see RawItem.stockTransactions
@@ -93,6 +122,15 @@ const returnReceiptSchema = new mongoose.Schema(
       ref: "ProjectManager",
       default: null,
     },
+    /* Warehouse Stock V1 — the destination this replacement was RECEIVED INTO,
+       snapshotted so the history reads correctly after a warehouse is renamed.
+       Null for a legacy/company-level replacement with no location. */
+    destWarehouseId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    destLocationId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    destWarehouseName: { type: String, trim: true, default: "" },
+    destWarehouseShortName: { type: String, trim: true, default: "" },
+    destLocationCode: { type: String, trim: true, default: "" },
+    destLocationName: { type: String, trim: true, default: "" },
   },
   { timestamps: true },
 );
@@ -110,9 +148,16 @@ const returnRequestSchema = new mongoose.Schema(
     unit: { type: String, trim: true, default: "unit" },
     variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     variantCombination: [{ type: String, trim: true }],
-    damagedQuantity: { type: Number,  min: 0 },
-    returnedQuantity: { type: Number, default: 0, min: 0 },
-    pendingReturnQty: { type: Number, default: 0, min: 0 },
+    damagedQuantity: { type: Number,  min: 0 },   // BUSINESS quantity, in `unit`
+    returnedQuantity: { type: Number, default: 0, min: 0 },  // business unit
+    pendingReturnQty: { type: Number, default: 0, min: 0 },  // business unit
+    /* Frozen conversion evidence — the STOCK (base) quantity actually taken off
+       RawItem / the location, so a replacement can be credited on the SAME basis.
+       Set for a GRN-originated return whose stock sits in the base unit; left at
+       the defaults (base == business, factor 1) for ordinary/legacy returns. */
+    baseQuantity: { type: Number, min: 0, default: 0 },
+    baseUnit: { type: String, trim: true, default: "" },
+    conversionFactor: { type: Number, default: 1 },
     status: {
       type: String,
       enum: ["PENDING", "PARTIAL", "COMPLETED", "CANCELLED"],
@@ -128,6 +173,38 @@ const returnRequestSchema = new mongoose.Schema(
     /* The operation that raised this return. Recovery matches on this rather
        than on (item, quantity), which two separate returns can share. */
     operationId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* Warehouse Stock V1 — the location the damaged goods were RETURNED FROM,
+       snapshotted so the history stays readable after a warehouse is renamed.
+       Null for a legacy/company-level return with no location. */
+    sourceWarehouseId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    sourceLocationId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    sourceWarehouseName: { type: String, trim: true, default: "" },
+    sourceWarehouseShortName: { type: String, trim: true, default: "" },
+    sourceLocationCode: { type: String, trim: true, default: "" },
+    sourceLocationName: { type: String, trim: true, default: "" },
+    /* Goods Receipt exception-resolution provenance — set only when the return
+       was raised from an inspected receipt's rejected stock, so the return and
+       the receipt that produced it can be traced to each other. Null for an
+       ordinary return raised directly against the PO. */
+    goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, ref: "GoodsReceipt", default: null },
+    goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    inspectionId: { type: mongoose.Schema.Types.ObjectId, ref: "GoodsReceiptInspection", default: null },
+    receiptNumber: { type: String, trim: true, default: "" },
+    /* Immutable breakdown of WHICH rejected sources this return consumed — an
+       inspection rejection and/or one or more quarantine REJECT dispositions.
+       Cumulative allocation equals damagedQuantity exactly. Empty for ordinary /
+       legacy returns, which remain readable without it. */
+    rejectionAllocations: {
+      type: [new mongoose.Schema({
+        sourceType: { type: String, enum: ["INSPECTION_REJECTION", "QUARANTINE_DISPOSITION"], required: true },
+        sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        quantity: { type: Number, min: 0, required: true },   // business unit
+        unit: { type: String, trim: true, default: "" },
+        baseQuantity: { type: Number, min: 0, default: 0 },   // stock unit
+        baseUnit: { type: String, trim: true, default: "" },
+      }, { _id: false })],
+      default: [],
+    },
     receipts: [returnReceiptSchema],
   },
   { timestamps: true },
@@ -186,6 +263,41 @@ const purchaseOrderSchema = new mongoose.Schema(
          serves the lookups this field is read by. */
     },
     spendRequestNumber: { type: String, trim: true },
+
+    /* ── A2: THE NEED THIS ORDER EXISTS FOR ─────────────────────────────────
+       The spend request above proves the money was approved. It does not prove
+       the material was needed — that is the material request, and it is the
+       question nobody could answer from a purchase order before this.
+
+       Written by the server from the reloaded MRF, never from a request body.
+       The id is identity; the number and department are stored beside it so a
+       register printed years later still reads sensibly, even if a document is
+       renumbered or a department renamed. */
+    sourceMrfId: { type: mongoose.Schema.Types.ObjectId, ref: "MRF", index: true },
+    sourceMrfNumber: { type: String, trim: true },
+    sourceMrfDepartment: { type: String, trim: true },
+
+    /**
+     * ── THE RULES THIS ORDER WAS RAISED UNDER ────────────────────────────────
+     * Stamped by the server on every order raised through the governed chain,
+     * and never accepted from a client.
+     *
+     * Historical orders are stamped `LEGACY_PRE_MRF_V1` by a controlled
+     * migration. Absence is therefore NOT the legacy signal — it is the
+     * UNPROVEN signal, and an unproven order is refused from acting rather
+     * than excused. There is deliberately no default: a default would stamp
+     * every existing order on its next save and erase the very distinction
+     * the migration exists to record.
+     *
+     * Only the policies `governedPurchaseOrder.service` explicitly supports
+     * are honoured. An unknown one is refused, because a policy names the
+     * rules a record was made under, and rules this code cannot name it
+     * cannot check.
+     */
+    provenancePolicy: { type: String, trim: true, default: undefined },
+    /* When the legacy migration stamped this order, so its classification is
+       auditable rather than a bare enum somebody must take on trust. */
+    provenanceMigratedAt: { type: Date, default: undefined },
 
     /* ── Chunk 1: tenancy ───────────────────────────────────────────────────
        Declared rather than left to `strict:false`, so it is indexed and can

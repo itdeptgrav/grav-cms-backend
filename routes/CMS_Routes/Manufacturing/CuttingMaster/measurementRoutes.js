@@ -12,24 +12,24 @@ const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
+/* Cutting only, this company's work only — see cuttingAccess.js. */
+const cutting = require("./cuttingAccess");
+const canRead = [cutting.cuttingDepartment("viewer"), cutting.cuttingCompany];
+const canRecord = [cutting.cuttingDepartment("editor"), cutting.cuttingCompany];
+
 // ============================================================================
 // GET: Employee measurements for a work order
 // ============================================================================
-router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
+router.get("/work-orders/:woId/employee-measurements", ...canRead, async (req, res) => {
   try {
     const { woId } = req.params;
 
-    const workOrder = await WorkOrder.findById(woId)
+    const workOrder = await cutting.loadScopedWorkOrder(req, res, woId, (q) => q
       .select(
         "workOrderNumber stockItemName stockItemReference quantity variantAttributes customerRequestId stockItemId _id",
       )
-      .lean();
-
-    if (!workOrder) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Work order not found" });
-    }
+      .lean());
+    if (!workOrder) return undefined;
 
     const stockItem = await StockItem.findById(workOrder.stockItemId)
       .select("numberOfPanels genderCategory gender category")
@@ -157,9 +157,10 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
 //     for the MO (instead of an empty array). This lets the frontend show
 //     every employee by default and use the search bar purely to filter.
 // ============================================================================
-router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
+router.get("/manufacturing-orders/:moId/search-employees", ...canRead, async (req, res) => {
   try {
     const { moId } = req.params;
+    if (!(await cutting.orderInScope(req.cutting.companyId, moId))) return cutting.notFound(res, "MO");
     const q = (req.query.q || "").trim().toLowerCase();
 
     const measurement = await Measurement.findOne({ poRequestId: moId })
@@ -393,17 +394,21 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
 // ============================================================================
 router.post(
   "/employee-measurements/:measurementId/update-status",
+  ...canRecord,
   async (req, res) => {
     try {
       const { measurementId } = req.params;
       const { employeeId, productName } = req.body;
 
+      if (!cutting.isId(measurementId)) return cutting.notFound(res, "Measurement");
       const measurement = await Measurement.findOne({
         _id: measurementId,
         "employeeMeasurements.employeeId": employeeId,
       });
 
-      if (!measurement) {
+      /* The measurement's order must be one this company's Cutting may work
+         on; another company's reads exactly like one that does not exist. */
+      if (!measurement || !(await cutting.orderInScope(req.cutting.companyId, measurement.poRequestId))) {
         return res
           .status(404)
           .json({ success: false, message: "Measurement not found" });

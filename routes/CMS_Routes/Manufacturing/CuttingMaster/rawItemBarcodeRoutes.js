@@ -101,6 +101,10 @@ router.post("/start-cutting-session", async (req, res) => {
 
     const barcode = await Barcode.findById(barcodeId).populate("purchaseOrder", "poNumber vendorName status");
     if (!barcode) return res.status(404).json({ success: false, message: "Barcode not found" });
+    /* A label reserved or printed during a count names material that has not
+       been received. Cutting it would consume stock that does not exist. */
+    const idRefusal = identityRefusal(barcode);
+    if (idRefusal) return res.status(400).json({ success: false, message: idRefusal.message, reason: idRefusal.reason });
 
     let unitConversions = [];
     if (barcode.rawItem && barcode.variantId) {

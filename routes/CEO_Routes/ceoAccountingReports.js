@@ -24,7 +24,7 @@ const {
   Acc_Company,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
-const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
+const { SECRET } = require("../../config/jwt"); // SEC-0: configured secret only
 
 const SELF_BASE =
   process.env.SELF_API_URL ||

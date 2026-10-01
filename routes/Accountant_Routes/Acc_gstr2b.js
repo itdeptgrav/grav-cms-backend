@@ -44,6 +44,20 @@ try {
 
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const router = express.Router();
 
 // Multer for file upload — memory storage, 10MB cap (GSTR-2B for a busy month
@@ -549,8 +563,7 @@ function parseGstr2bJson(raw) {
 // POST /upload — receive a GSTR-2B JSON file
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
-  "/upload",
-  accountantAuth,
+  "/upload", accountantAuth, companyScope,
   upload.single("file"),
   async (req, res) => {
     try {
@@ -751,9 +764,8 @@ router.post(
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /periods — list all imported 2B periods for this company
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/periods", accountantAuth, async (req, res) => {
+router.get("/periods", accountantAuth, companyScope, async (req, res) => {
   try {
-    await ensureIndexMigration();
     const { companyId, returnType } = req.query;
     if (!companyId)
       return res
@@ -822,9 +834,8 @@ router.get("/periods", accountantAuth, async (req, res) => {
 // Period-in-range logic: a 2B/2A doc is "in range" if any part of its
 // calendar month overlaps the request range. This means a range starting
 // April 5 still includes April's 2B (which is for April 1–30).
-router.get("/recon-range", accountantAuth, async (req, res) => {
+router.get("/recon-range", accountantAuth, companyScope, async (req, res) => {
   try {
-    await ensureIndexMigration();
     const { companyId, from, to, returnType } = req.query;
     if (!companyId || !from || !to) {
       return res.status(400).json({
@@ -981,7 +992,7 @@ router.get("/recon-range", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /:period — fetch records for a period (with optional pagination + filter)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:period", accountantAuth, async (req, res) => {
+router.get("/:period", accountantAuth, companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -1060,23 +1071,62 @@ router.get("/:period", accountantAuth, async (req, res) => {
 //   amount:  ₹1 (rounding-induced differences ignored)
 //   date:    ±3 days (suppliers sometimes file with off-by-a-day dates)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:period/recon", accountantAuth, async (req, res) => {
+// Shared by the read and the write below — the same shape `doPartiesSync`
+// already uses on the chart-of-accounts router. `persist` is the ONLY
+// difference between them: the computation, the tolerances and the response
+// body are identical either way.
+/* ------------------------------------------------------------------ */
+/* Tolerance normalisation                                             */
+/* ------------------------------------------------------------------ */
+//
+// `Number(value) || fallback` was wrong in three ways at once, and the first is
+// the one that mattered: `Number(0) || 1` is 1, so a caller asking for EXACT
+// matching silently got ₹1 of slack and saw invoices reported as matched that
+// differ by a rupee. It also let a NEGATIVE tolerance through — `amountsMatch`
+// is `diff <= amtTol`, and no absolute difference is ever <= -5, so every
+// invoice would be reported as a mismatch — and it turned `Infinity` into
+// Infinity, matching everything against everything.
+//
+// The rule, and `components/accountant/gstr2bReconRequest.js` on the frontend
+// applies exactly the same one so a request never has to be repaired here:
+//
+//   • absent / blank / non-numeric  → the default (₹1, 3 days)
+//   • negative or non-finite        → the default; a negative tolerance is not
+//                                     a narrower comparison, it is a broken one
+//   • 0                             → 0, honoured. "Compare exactly" is a real
+//                                     request and the only way to ask for it.
+//
+// Invalid values fall back rather than 400 because this endpoint has always
+// been forgiving about them, and a caller that has been sending junk since it
+// was written should not start failing today. What it must never do is
+// reconcile with the junk.
+
+const TOLERANCE_DEFAULTS = Object.freeze({ amount: 1, days: 3 });
+
+function normaliseTolerance(value, fallback) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+async function computeRecon(req, res, { persist }) {
   try {
-    await ensureIndexMigration();
+    // Query for the GET, body-or-query for the POST — same names either way.
     const {
       companyId,
-      amountTolerance = 1,
-      dateTolerance = 3,
+      amountTolerance,
+      dateTolerance,
       cache,
       returnType = "GSTR2B",
-    } = req.query;
+    } = { ...req.query, ...(req.body || {}) };
     if (!companyId)
       return res
         .status(400)
         .json({ success: false, message: "companyId required" });
 
-    const amtTol = Number(amountTolerance) || 1;
-    const dayTol = Number(dateTolerance) || 3;
+    const amtTol = normaliseTolerance(amountTolerance, TOLERANCE_DEFAULTS.amount);
+    const dayTol = normaliseTolerance(dateTolerance, TOLERANCE_DEFAULTS.days);
 
     // `cache=true` means: if we have a stored result, return it instantly
     // without recomputing. The frontend uses this for the initial page open;
@@ -1497,23 +1547,33 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
     const buckets = { matched, mismatched, onlyIn2B, onlyInBooks };
     const reconAt = new Date();
 
-    // Persist the fresh result onto the 2B document so subsequent page loads
-    // can serve from cache (see `?cache=true` path above). Fire-and-forget —
-    // the user gets the result regardless of whether the save succeeds.
-    Acc_GSTR2B.updateOne(
-      { _id: doc._id },
-      {
-        $set: {
-          lastReconAt: reconAt,
-          lastReconBy: req.accountant?.email || "",
-          lastReconSummary: summary,
-          lastReconBuckets: buckets,
-          lastReconTolerance: { amount: amtTol, days: dayTol },
+    // Only the explicit write operation persists. On the GET this block is
+    // skipped entirely: reconciliation is a report, and a Viewer running one
+    // used to stamp `lastReconBy` with their own name and overwrite the stored
+    // summary, buckets and tolerance — a read rewriting the record it read.
+    // Only the explicit write operation persists — and when it is asked to
+    // persist, that is the whole point of the call, so a failure is the answer.
+    // The old `.catch()` swallowed it and still returned `success: true`: the
+    // caller saw a stored reconciliation, `/recon-range` and the period badges
+    // saw nothing, and there was no way to tell from the response which had
+    // happened. Awaited and unguarded, so a failed write reaches the outer
+    // handler below and comes back as a 500.
+    if (persist) {
+      await Acc_GSTR2B.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            lastReconAt: reconAt,
+            // The confirmed session, not `req.accountant` — that property is
+            // never set by any middleware and always wrote an empty string.
+            lastReconBy: req.user?.email || "",
+            lastReconSummary: summary,
+            lastReconBuckets: buckets,
+            lastReconTolerance: { amount: amtTol, days: dayTol },
+          },
         },
-      },
-    ).catch((e) =>
-      console.error("[gstr2b/recon] cache write failed:", e.message),
-    );
+      );
+    }
 
     res.json({
       success: true,
@@ -1533,12 +1593,27 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
     console.error("[gstr2b/recon]", e);
     res.status(500).json({ success: false, message: e.message });
   }
-});
+}
+
+// GET — a pure read. Computes and returns; writes nothing. `?cache=true` still
+// serves a stored result when one exists, so a Viewer opening the page gets the
+// same answer it always did.
+router.get("/:period/recon", accountantAuth, (req, res) =>
+  computeRecon(req, res, { persist: false }),
+);
+
+// POST — the explicit write. Recomputes and stores the result so `/recon-range`
+// and `?cache=true` can serve it. `accountantAuth` derives `canEdit` from the
+// POST method, so a Viewer is refused here by the same rule that refuses every
+// other write on this router.
+router.post("/:period/recon/cache", accountantAuth, (req, res) =>
+  computeRecon(req, res, { persist: true }),
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /:period/supplier-summary — supplier-wise rollup with filing status
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
+router.get("/:period/supplier-summary", accountantAuth, companyScope, async (req, res) => {
   try {
     const { companyId, returnType = "GSTR2B" } = req.query;
     if (!companyId)
@@ -1603,7 +1678,7 @@ router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /:period — remove an imported 2B period (in case of bad upload)
 // ─────────────────────────────────────────────────────────────────────────────
-router.delete("/:period", accountantAuth, async (req, res) => {
+router.delete("/:period", accountantAuth, companyScope, async (req, res) => {
   try {
     const { companyId, returnType = "GSTR2B" } = req.query;
     if (!companyId)

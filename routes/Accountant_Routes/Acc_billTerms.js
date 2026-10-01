@@ -22,6 +22,20 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const creditTerms = require("../../services/creditTerms.service");
 const backfill = require("../../services/billTermsBackfillOrchestrator.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const auth = accountantAuth;
 router.use(auth);
 
@@ -38,7 +52,7 @@ function parseLedgerIds(raw) {
 /* ------------------------------------------------------------------ */
 /* GET /backfill/preview                                    READ ONLY  */
 /* ------------------------------------------------------------------ */
-router.get("/backfill/preview", async (req, res) => {
+router.get("/backfill/preview", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId) {
@@ -56,7 +70,7 @@ router.get("/backfill/preview", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* POST /backfill/apply                                                */
 /* ------------------------------------------------------------------ */
-router.post("/backfill/apply", async (req, res) => {
+router.post("/backfill/apply", companyScope, async (req, res) => {
   try {
     if (!creditTerms.canEditTerms(req.user)) {
       return res.status(403).json({
@@ -96,7 +110,7 @@ router.post("/backfill/apply", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* POST /backfill/rollback                                             */
 /* ------------------------------------------------------------------ */
-router.post("/backfill/rollback", async (req, res) => {
+router.post("/backfill/rollback", companyScope, async (req, res) => {
   try {
     if (!creditTerms.canEditTerms(req.user)) {
       return res.status(403).json({
@@ -147,6 +161,8 @@ router.post("/backfill/rollback", async (req, res) => {
 const mongoose = require("mongoose");
 const Acc_BillTerms = require("../../models/Accountant_model/Acc_BillTerms");
 const forecastExpected = require("../../services/forecastExpectedDate.service");
+
+
 
 /** Cast to ObjectId, or null. Never throws. */
 function castId(v) {

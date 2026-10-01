@@ -46,6 +46,20 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
  * and they use the SAME gate, in budgetControl.service.js. */
 const budgetControl = require("../../services/budgetControl.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 /* ------------------------------------------------------------------ */
@@ -95,7 +109,7 @@ async function applyLedgerBalances(voucher, direction = 1) {
 /* Returns every active ledger whose nature is "expense", grouped by
  * their parent group. Used by the expense form's category picker.
  */
-router.get("/expense-ledgers", async (req, res) => {
+router.get("/expense-ledgers", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -118,7 +132,7 @@ router.get("/expense-ledgers", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* GST Input ledgers — used when GST is claimable on an expense        */
 /* ------------------------------------------------------------------ */
-router.get("/gst-input-ledgers", async (req, res) => {
+router.get("/gst-input-ledgers", companyScope, async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId)
@@ -150,7 +164,7 @@ router.get("/gst-input-ledgers", async (req, res) => {
  * Query: companyId, status, search, dateFrom, dateTo, page, limit,
  *        mode ("pay_now" | "pay_later" | "")
  */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const {
       companyId,
@@ -299,7 +313,7 @@ router.get("/", async (req, res) => {
  *   referenceNumber  — optional (bill #, voucher ref)
  *   autoPost         — if true, post immediately; else save as draft
  */
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     const body = req.body || {};
     const {

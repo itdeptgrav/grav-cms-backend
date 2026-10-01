@@ -54,8 +54,86 @@ const STANDARD_LOCATIONS = Object.freeze([
 
 const LIFECYCLE = Object.freeze(["Active", "Inactive", "Archived"]);
 
+/* ── THE PHYSICAL SHAPE OF A LOCATION (25 Sep 2026) ─────────────────────────
+   `type` above says what a location is FOR (receiving, usable stock,
+   quarantine…) and every stock rule keys on it. `kind` says what it physically
+   IS — a zone of the floor, an aisle, a rack, a bay or level of a rack, a
+   shelf, a drawer, a bin, a slot, or a marked patch of floor — so the store can
+   be drawn, addressed and walked. A rack's shelves and bins stay
+   `type: USABLE_STOCK` because reservation and put-away only accept that type;
+   the kind is a second axis, not a replacement. `AREA` is the kind every
+   location written before this field carried: a named place with no shape. */
+const LOCATION_KINDS = Object.freeze([
+  "AREA", "ZONE", "AISLE", "RACK", "BAY", "LEVEL", "SHELF", "DRAWER", "BIN", "SLOT", "FLOOR",
+]);
+/* Kinds that may hold stock directly. A RACK or ZONE that has children is a
+   container; stock is put on the leaf inside it, never on the container. */
+const HOLDING_KINDS = Object.freeze(["AREA", "SHELF", "DRAWER", "BIN", "SLOT", "FLOOR", "BAY", "LEVEL", "RACK", "ZONE"]);
+
+/* Where the location sits and how big it is, in CENTIMETRES on the
+   warehouse's own floor plan — the same unit the factory floor designer uses.
+   x/z run along the floor (x to the right, z towards the viewer), y is height
+   off the floor. For a child of a rack the position is RELATIVE to the rack's
+   origin, so moving the rack moves everything on it. Serialisable numbers
+   only; nothing here is a runtime scene object, and changing these values is
+   a LAYOUT change that never produces a stock movement. */
+const layoutSchema = new mongoose.Schema(
+  {
+    x: { type: Number, default: 0 },
+    y: { type: Number, default: 0 },
+    z: { type: Number, default: 0 },
+    w: { type: Number, default: 0 },   // width along x
+    h: { type: Number, default: 0 },   // height along y
+    d: { type: Number, default: 0 },   // depth along z
+    rotation: { type: Number, default: 0 }, // degrees about y, clockwise from above
+    color: { type: String, trim: true, default: "" },
+    placed: { type: Boolean, default: false }, // false = never positioned by anybody
+  },
+  { _id: false },
+);
+
+/* A named layout of the warehouse (30 Sep 2026) — see `layouts` below.
+   `floorPlan` is an opaque copy of the live plan's arrangement fields; it was
+   validated when it was live and is written back through the same fields. */
+const savedLayoutSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    floorPlan: { type: mongoose.Schema.Types.Mixed, default: null },
+    positions: [{ _id: false, locationId: { type: mongoose.Schema.Types.ObjectId, required: true }, layout: { type: layoutSchema, default: () => ({}) } }],
+    createdAt: { type: Date, default: null },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    activatedAt: { type: Date, default: null },
+    savedAt: { type: Date, default: null },
+  },
+  { _id: true },
+);
+
+/* Optional. A capacity is only meaningful in the unit the location's stock
+   is actually counted in; nothing here converts between units or invents a
+   universal "pieces". `unit` is free text matched against the base unit of
+   the items placed; a mismatch is reported, never blocked. */
+const capacitySchema = new mongoose.Schema(
+  {
+    value: { type: Number, default: null, min: 0 },
+    unit: { type: String, trim: true, default: "" },
+    warnAtPct: { type: Number, default: 90, min: 1, max: 100 },
+    note: { type: String, trim: true, default: "" },
+  },
+  { _id: false },
+);
+
 const locationSchema = new mongoose.Schema(
   {
+    /* The physical kind — see LOCATION_KINDS. */
+    kind: { type: String, enum: LOCATION_KINDS, default: "AREA" },
+    /* Order among siblings (level 1 below level 2, bay 1 left of bay 2). */
+    sequence: { type: Number, default: 0 },
+    /* The stable token a printed LOCATION QR carries. Never the code (codes can
+       be renamed) and never the name. Minted once, unique within the company. */
+    qrToken: { type: String, trim: true, default: "" },
+    layout: { type: layoutSchema, default: () => ({}) },
+    capacity: { type: capacitySchema, default: () => ({}) },
+
     /* Unique WITHIN its warehouse. A subdocument array cannot carry its own
        unique index, so the route enforces this atomically on write — see the
        `locations.code` guard in warehouses.js. */
@@ -161,6 +239,84 @@ const warehouseSchema = new mongoose.Schema(
 
     locations: [locationSchema],
 
+    /* ── THE ROOM ITSELF (25 Sep 2026) ────────────────────────────────────
+       The floor the racks stand on, in centimetres: its size, its walls,
+       doors and pillars, and the grid the layout builder snaps to. Drawn from
+       photographs and then maintained by the store manager; every number is
+       editable and none is a stock fact. */
+    floorPlan: {
+      /* ── THE ROOM'S OUTLINE, AND THE RECTANGLE DERIVED FROM IT ──────────
+         `widthCm`/`depthCm` said every warehouse was a rectangle. Almost none
+         are: a store is L-shaped around a stairwell, U-shaped around an
+         office, notched where the loading bay cuts in. A rectangle that does
+         not match the building is worse than no plan — racks get drawn into
+         walls that exist, and the 3D room somebody walks through is a
+         different building from the one they are standing in.
+
+         So the room is a closed polygon of corners in centimetres, shaped on
+         the 2D plan, and that plan is the ONE editable copy:
+
+           Design (2D) polygon → saved layout version → generated 3D room,
+           collision area, walkthrough navigation, minimap, camera framing
+
+         The 3D view holds no editable shape of its own, because two editable
+         copies of one building drift apart and neither can then be trusted.
+
+         Stored OPEN — the closing wall between the last corner and the first
+         is implied. Empty on every plan drawn before this, which reads as the
+         rectangle it always was (roomShape.mjs `roomOf`), so nothing needed a
+         migration. */
+      room: {
+        shape: { type: String, enum: ["RECTANGLE", "L", "U", "CUSTOM"], default: "RECTANGLE" },
+        points: [{ _id: false, x: { type: Number, default: 0 }, z: { type: Number, default: 0 } }],
+        heightCm: { type: Number, default: 300 },
+      },
+      /* The polygon's BOUNDING BOX, recomputed by the server on every layout
+         save. Every reader that predates the room — the 3D grid, the minimap,
+         the fitted overview — keeps using these untouched. They are derived,
+         never an input: a client cannot store an outline and a size that
+         disagree, which is exactly how the 2D plan and the 3D warehouse would
+         come apart. */
+      widthCm: { type: Number, default: 0 },
+      depthCm: { type: Number, default: 0 },
+      heightCm: { type: Number, default: 300 },
+      gridCm: { type: Number, default: 25 },
+      /* `height` is the TOP of the wall above the floor; `base` its bottom
+         (30 Sep 2026). 0 is a wall standing on the floor; above it is a beam
+         with an opening underneath — at 200 cm or more the walkthrough lets a
+         person pass under it. */
+      walls: [{ _id: false, id: String, x1: Number, z1: Number, x2: Number, z2: Number, thickness: { type: Number, default: 15 }, height: { type: Number, default: 300 }, base: { type: Number, default: 0 }, label: { type: String, default: "" } }],
+      /* `facingDeg` is the direction a DOORWAY faces INTO the room, in the
+         plan's degrees (0 = +x, 90 = +z), recorded on 29 Sep 2026 for the
+         walkthrough. Null means "derive it from the geometry" — the inward
+         normal of the wall the door sits on — so every door drawn before this
+         still opens the right way and nothing had to be migrated. */
+      fixtures: [{ _id: false, id: String, kind: { type: String, default: "door" }, x: Number, z: Number, w: Number, d: Number, h: { type: Number, default: 0 }, rotation: { type: Number, default: 0 }, label: { type: String, default: "" }, facingDeg: { type: Number, default: null } }],
+      /* The doorway a walkthrough starts at — the id of one of the fixtures
+         above. Empty means the room has no primary entrance chosen yet, and
+         the map opens on the fitted overview instead. */
+      entranceId: { type: String, default: "" },
+      notes: { type: String, trim: true, default: "" },
+      /* Which of `layouts[]` below this floor plan IS — the live one (30 Sep
+         2026). Null on a warehouse that has only ever had one layout. */
+      activeLayoutId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      /* Bumped by every layout save; a stale builder save is refused. */
+      layoutVersion: { type: Number, default: 0 },
+      layoutUpdatedAt: { type: Date, default: null },
+      layoutUpdatedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    },
+
+    /* ── THE OTHER LAYOUTS (30 Sep 2026) ─────────────────────────────────
+       The live arrangement stays in `floorPlan` and `locations[].layout`,
+       which is what every reader already reads. Each entry here is a named
+       layout; the one `floorPlan.activeLayoutId` names is live and keeps no
+       copy, every other one keeps a SNAPSHOT — its plan and the positions of
+       the root locations — until it is switched back in. Written only by
+       services/storePurchase/savedLayouts.js through the store-locations
+       routes, under the layout version. Empty on every warehouse that has
+       only ever had one layout, which is offered as "Original layout". */
+    layouts: [savedLayoutSchema],
+
     /* ── LEGACY, AND NOT A FACT ──────────────────────────────────────────
        A stored counter that nothing maintains, from a time when the UI showed
        it as live inventory. Stock is not held per warehouse at all yet. It is
@@ -221,13 +377,20 @@ warehouseSchema.index(
 );
 warehouseSchema.index({ companyId: 1, status: 1, name: 1 });
 warehouseSchema.index({ companyId: 1, "locations.code": 1 });
+/* A location QR or a location id resolves to its warehouse in one read. */
+warehouseSchema.index({ companyId: 1, "locations.qrToken": 1 });
+warehouseSchema.index({ "locations._id": 1 });
 
 warehouseSchema.statics.LOCATION_TYPES = LOCATION_TYPES;
 warehouseSchema.statics.STANDARD_LOCATIONS = STANDARD_LOCATIONS;
 warehouseSchema.statics.LIFECYCLE = LIFECYCLE;
+warehouseSchema.statics.LOCATION_KINDS = LOCATION_KINDS;
+warehouseSchema.statics.HOLDING_KINDS = HOLDING_KINDS;
 
 module.exports =
   mongoose.models.Warehouse || mongoose.model("Warehouse", warehouseSchema);
 module.exports.LOCATION_TYPES = LOCATION_TYPES;
 module.exports.STANDARD_LOCATIONS = STANDARD_LOCATIONS;
 module.exports.LIFECYCLE = LIFECYCLE;
+module.exports.LOCATION_KINDS = LOCATION_KINDS;
+module.exports.HOLDING_KINDS = HOLDING_KINDS;

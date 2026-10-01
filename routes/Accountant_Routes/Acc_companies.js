@@ -37,6 +37,19 @@ const {
 // an edit to a GSTIN reads as the old value and the new one rather than "a
 // company was updated".
 const { recordChange } = require("../../services/changeLog");
+
+/* Lane A Chunk 3A — canonical company isolation. See
+   Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
 const auditCompany = (req, entry) =>
   recordChange(req, {
     departmentSlug: "accounting",
@@ -68,24 +81,38 @@ const companySnapshot = (c) => ({
 // into it, because the rest of this router (company CRUD, group reseeding)
 // is deliberately more restrictive than this one field.
 //
-// AUTHENTICATE FIRST. This gate used to read `req.user?.role` with nothing
-// mounted above it to put a user there: this router applies `accountantAuth`
-// on exactly one route (`/:id/default-credit-days`, further down), so on every
-// other write `req.user` was undefined, `isOwner` was false, and the OWNER got
-// "Only the owner can add or manage companies." The gate refused everybody,
-// which is why it looked like the role was not being read — it was not being
-// read, because nothing had resolved it yet.
+// AUTHENTICATE FIRST. The permission gate below reads `req.user`, so something
+// has to resolve the session before it runs — the trap documented in
+// Middlewear/departmentWriteGuard.js, where a permission check mounted above a
+// router runs BEFORE that router's own auth and therefore refuses everybody.
+// ── GATE 1 — AUTHENTICATE EVERYTHING ────────────────────────────────────────
+// This used to read `if (req.method === "GET") return next();`, which meant
+// every read on this router was PUBLIC: the company list, a company's detail,
+// its document index, its document links and its file downloads were all served
+// to anyone who could reach the port, with no session of any kind. Company
+// records carry GSTIN, PAN, CIN, addresses and contacts, and the document
+// endpoints stream whatever was uploaded against them.
 //
-// It is the same trap documented in Middlewear/departmentWriteGuard.js: a
-// permission check mounted above a router runs BEFORE that router's own auth.
+// The skip existed because the owner-only gate below it needs `req.user`, and
+// the two were written as one thought — "authenticate the writes, since only
+// the writes are gated". Reads need a session too; what they do not need is
+// `canManageSettings`, and that distinction belongs in gate 2, not here.
+//
+// `/:id/default-credit-days` is still skipped, because it applies
+// `accountantAuth` inline on its own route (further down) alongside
+// `creditTerms.canEditTerms`. Authenticating it here as well would run the
+// whole session resolution twice for one request.
 router.use((req, res, next) => {
-  if (req.method === "GET") return next();
   if (req.path.endsWith("/default-credit-days")) return next();
   // accountantAuth answers 401/403 itself when the session is missing or the
-  // role cannot edit, so reaching the next handler means req.user is populated.
+  // role cannot act, so reaching the next handler means req.user is populated.
+  // On a GET it demands canView; on a write, canEdit.
   return accountantAuth(req, res, next);
 });
 
+// ── GATE 2 — WRITES ARE OWNER-ONLY ──────────────────────────────────────────
+// Unchanged: reads pass, `/default-credit-days` keeps its own weaker rule, and
+// everything else needs `canManageSettings`.
 router.use((req, res, next) => {
   if (req.method === "GET") return next();
   if (req.path.endsWith("/default-credit-days")) return next();
@@ -657,9 +684,65 @@ router.post("/verify", async (req, res) => {
   }
 });
 
+/* ── THE LIST IS THE ORGANISATION'S, NOT THE DATABASE'S ─────────────────────
+ *
+ * This used to answer `Acc_Company.find({ isActive: true })` — every active
+ * company in the deployment, to any authenticated organisation user. The
+ * per-request guards were never the problem: `resolveCompanyScope` correctly
+ * refuses a company outside `tallyCompanyIds` with 403 COMPANY_FORBIDDEN. The
+ * problem was that this endpoint handed the picker companies it would then
+ * refuse, so the accountant dashboard selected one, stored it, and every
+ * subsequent request failed with "This company is not available to your
+ * organization" — an error the user could not clear, because the list it came
+ * from kept offering the same company back.
+ *
+ * So the list is now drawn from the SAME record the guards check:
+ * `Acc_Organization.tallyCompanyIds`, which
+ * services/accountantCompanyOwnership.service.js documents as the canonical
+ * and only ownership record. One source, so the picker cannot offer what the
+ * guard will refuse. Nothing about ownership is decided here — this reads it.
+ *
+ * An organisation holding no companies gets an empty list and a 200. That is
+ * the honest answer: there is nothing wrong with the request, there is simply
+ * nothing assigned, and the frontend's job in that case is to clear its
+ * selection rather than to keep a previous organisation's company id.
+ *
+ * ── THE ONE EXEMPTION ───────────────────────────────────────────────────────
+ * A developer-bypass session (`ACCOUNTANT_AUTH_BYPASS=true`, which attaches
+ * `isDev` and no organisation at all) still sees everything, exactly as
+ * `resolveCompanyScope` and `requireCompanyAccess` already exempt it. It is
+ * checked as `req.user.isDev` — the explicit marker that middleware sets —
+ * rather than as "has no organisation", because those two are not the same
+ * thing: a real session that somehow arrives without an organisation is a
+ * broken session, and must see NOTHING rather than everything.
+ */
 router.get("/", async (req, res) => {
   try {
-    const companies = await Acc_Company.find({ isActive: true })
+    const filter = { isActive: true };
+
+    if (!req.user?.isDev) {
+      if (!req.organization) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_ORGANIZATION_CONTEXT",
+          message: "No organization context.",
+        });
+      }
+      /* `$in: []` matches nothing, which is exactly right for an organisation
+         that has been assigned no companies — and is why this is one query
+         rather than an early return that would have to repeat the response
+         shape.
+
+         The ids are passed through as stored (they are typed ObjectIds on the
+         schema) with only nullish entries dropped. Stringifying them first
+         would turn a stray `null` into the string "null", which Mongoose
+         cannot cast to an _id — a 500 where an empty list is the answer. */
+      filter._id = {
+        $in: (req.organization.tallyCompanyIds || []).filter(Boolean),
+      };
+    }
+
+    const companies = await Acc_Company.find(filter)
       .sort({ isPrimary: -1, createdAt: -1 })
       .lean();
 
@@ -797,6 +880,17 @@ router.put("/:id", async (req, res) => {
     delete updates._id;
     delete updates.createdAt;
 
+    /* DOCUMENTS ARE NOT EDITABLE THROUGH THIS ROUTE.
+       --------------------------------------------------------------------
+       They are files in Drive with a row apiece, written only by
+       POST /:id/documents and DELETE /:id/documents/:docId/files/:fileId.
+       Letting a generic company update $set the array meant any client
+       holding a stale copy could silently destroy every certificate on the
+       company — and one did: the edit dialog seeds its form from the whole
+       document, so pressing Update wiped anything attached since it opened.
+       The client no longer sends it; this makes it impossible to send. */
+    delete updates.documents;
+
     if (updates.isPrimary) {
       await Acc_Company.updateMany(
         { _id: { $ne: req.params.id }, isPrimary: true },
@@ -914,7 +1008,7 @@ router.delete("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/accountant/tally/companies/:id/reseed-groups
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/:id/reseed-groups", async (req, res) => {
+router.post("/:id/reseed-groups", companyScope, async (req, res) => {
   try {
     const company = await Acc_Company.findById(req.params.id);
     if (!company)
@@ -972,7 +1066,7 @@ router.post("/:id/reseed-groups", async (req, res) => {
 //     comment above for why this route is carved out of the owner-only gate.
 //   - Provenance (`defaultCreditDaysUpdatedAt/By/ByName`) is written from the
 //     authenticated user and the clock, never trusted from the body.
-router.patch("/:id/default-credit-days", accountantAuth, async (req, res) => {
+router.patch("/:id/default-credit-days", accountantAuth, companyScope, async (req, res) => {
   try {
     if (!creditTerms.canEditTerms(req.user)) {
       return res.status(403).json({

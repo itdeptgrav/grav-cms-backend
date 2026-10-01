@@ -20,7 +20,7 @@ function ceoAuth(req, res, next) {
         .json({ success: false, message: "Authentication required" });
     const d = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../../config/jwt").SECRET,
     );
     if (!["ceo", "admin", "hr_manager", "project_manager"].includes(d.role))
       return res

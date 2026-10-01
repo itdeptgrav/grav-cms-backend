@@ -27,7 +27,7 @@ function pmAuth(req, res, next) {
   try {
     const token = readToken(req);
     if (!token) return res.status(401).json({ success: false, message: "Auth required" });
-    const d = jwt.verify(token, process.env.JWT_SECRET || "grav_clothing_secret_key");
+    const d = jwt.verify(token, require("../../../config/jwt").SECRET);
     if (!["project_manager", "ceo", "admin"].includes(d.role)) {
       return res.status(403).json({ success: false, message: "Project Manager access required" });
     }

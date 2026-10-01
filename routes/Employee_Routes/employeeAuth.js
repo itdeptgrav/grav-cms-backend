@@ -211,43 +211,57 @@ router.get("/profile/edit", AllEmployeeAppMiddleware, async (req, res) => {
 router.put("/profile", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { user } = req;
-    const updateData = req.body;
 
-    // Remove restricted fields that employees shouldn't change
-    const restrictedFields = [
-      "password",
-      "employeeId",
-      "biometricId",
-      "email",
-      "phone",
-      "phoneNumber",
-      "department",
-      "role",
-      "createdBy",
-      "createdAt",
-      "isActive",
-      "dateOfJoining",
-      "primaryManager",
-      "secondaryManager",
-      "biometricId",
-      "identityId",
-    ];
+    /* ── AN ALLOWLIST, BECAUSE THE DENYLIST WAS THE BUG ────────────────────
+     *
+     * This handler used to delete fourteen named fields from `req.body` and
+     * apply everything that was left. Everything the list did not name was
+     * written straight to the employee's own record:
+     *
+     *   salary, bankDetails          their own pay and bank account
+     *   status, employmentType       "I am permanent now"
+     *   designation, jobTitle        a promotion, self-awarded
+     *   documents                    their Aadhaar, PAN and UAN numbers
+     *   accessDepartmentId           ← and this one is the whole platform:
+     *                                  any employee with the mobile app could
+     *                                  grant themselves HR, Accounting or the
+     *                                  CEO dashboard, because that field IS the
+     *                                  application-access grant login reads.
+     *
+     * The list of what an employee may change about themselves now lives in
+     * services/access/hrWritePolicy.js, beside every other write rule, and
+     * anything protected is REFUSED rather than quietly dropped — a client
+     * that thinks it saved a salary change should be told it did not.
+     *
+     * `req.body` is not mutated. The old code deleted keys from it in place, so
+     * the audit trail and any retry saw a body that was not the one sent. */
+    const { filterSelfProfileUpdate } = require("../../services/access/hrWritePolicy");
+    const { update, rejected } = filterSelfProfileUpdate(req.body);
 
-    restrictedFields.forEach((field) => {
-      delete updateData[field];
-    });
+    if (rejected.length) {
+      return res.status(403).json({
+        success: false,
+        code: "SELF_FIELD_NOT_EDITABLE",
+        message:
+          "Some of those details are maintained by HR and cannot be changed here.",
+        /* The caller's own keys echoed back — this discloses nothing, and
+           without it a client cannot tell which field to drop. */
+        fields: rejected,
+      });
+    }
 
-    // Also remove any field that starts with $ (MongoDB operators)
-    Object.keys(updateData).forEach((key) => {
-      if (key.startsWith("$")) {
-        delete updateData[key];
-      }
-    });
+    if (!Object.keys(update).length) {
+      return res.status(400).json({
+        success: false,
+        code: "NO_EDITABLE_FIELDS",
+        message: "There was nothing to update.",
+      });
+    }
 
-    // Update employee
+    // Update employee — only the allowlisted fields, never req.body itself.
     const updatedEmployee = await Employee.findByIdAndUpdate(
       user.id,
-      updateData,
+      { $set: update },
       {
         new: true,
         runValidators: true,

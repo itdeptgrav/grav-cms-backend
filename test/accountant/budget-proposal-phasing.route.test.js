@@ -22,6 +22,19 @@ const mongoose = require("mongoose");
    authenticates itself with a real signed token (see tokenFor) and is
    untouched by this — which is the point: the boundary being tested is the
    real one. */
+/* Lane A Chunk 3A mounted the canonical company-scope guard on the routers under
+   test. Everything else in that module stays REAL — only the two company guards
+   are pass-throughs, because these suites are about budget, ledger and forecast
+   behaviour and their auth doubles do not build an organisation that owns the
+   fixture company. Company isolation has its own suite,
+   test/accountant/company-isolation.route.test.js, which exercises the real
+   guard against real routers. */
+jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  ...jest.requireActual("../../Middlewear/AccountantOrgAuthMiddleware"),
+  requireCompanyScope: (req, res, next) => next(),
+  scopeCompanyIfPresent: (req, res, next) => next(),
+}));
+
 jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
   accountantAuth: (req, res, next) => {
     const raw = req.headers["x-test-user"];

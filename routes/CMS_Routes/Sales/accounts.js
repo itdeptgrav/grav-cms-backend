@@ -13,6 +13,41 @@
 // The mount-level salesWrites() guard already handles role + approval; an
 // editor's write is held as a ChangeRequest before it ever reaches here.
 const express = require("express");
+const { scopeFor: dupScopeFor } = require("../../../services/companyContext/salesScope.service");
+const { createServiceContext: dupServiceContext } = require("../../../services/companyContext/serviceScope.service");
+
+/* The service context a duplicate check runs under: this request's already
+   resolved company, so "is this a duplicate?" is answered from our own
+   customers and never from somebody else's. */
+const dupCtx = async (req) => {
+  const scope = await dupScopeFor(req);
+  /* `legacyAware`, because duplicate detection has to see the records that
+     predate company ownership — and the factory grants that only where the
+     company master proves exactly one company, never on this caller's say-so. */
+  return dupServiceContext({
+    companyId: scope.companyId,
+    reason: "duplicate detection",
+    legacyAware: true,
+  });
+};
+const {
+  scopedFilter: scoped, scopeFor: salesScopeFor, scopeAndOwnership,
+} = require("../../../services/companyContext/salesScope.service");
+const { stripCompanyOwnershipInput } = require("../../../models/CMS_Models/Sales/companyOwnership");
+
+/* The account loader the cycle walk is allowed to use: the SAME company
+   clause the rest of the request runs under. A parent outside it does not
+   load, and is refused exactly as a missing one is. */
+const scopedAccountLoader = (scope) => (id) =>
+  Account.findOne({ $and: [scope.clause, { _id: id }] }).select("parentAccountId").lean();
+
+/** A tenant refusal keeps its own status rather than becoming a generic 500. */
+function answeredTenantRefusal(res, err) {
+  if (err?.name !== "StorePurchaseError") return false;
+  res.status(err.status).json(err.toResponse());
+  return true;
+}
+const mongoose = require("mongoose");
 const router = express.Router();
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
@@ -20,6 +55,8 @@ const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Site = require("../../../models/CMS_Models/Sales/Site");
 const Department = require("../../../models/CMS_Models/Sales/Department");
 const Address = require("../../../models/CMS_Models/Sales/Address");
+const commercialDefaults = require("../../../services/sales/accountCommercialDefaults.service");
+const customerAccountLink = require("../../../services/sales/customerAccountLink.service");
 const Relationship = require("../../../models/CMS_Models/Sales/AccountRelationship");
 const Team = require("../../../models/CMS_Models/Sales/AccountTeam");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
@@ -73,6 +110,7 @@ router.get("/", salesAuth, async (req, res) => {
       role,
       lifecycleStage,
       tier,
+      linkedCustomer,
       owner,
       includeArchived,
       sortBy = "createdAt",
@@ -89,6 +127,27 @@ router.get("/", salesAuth, async (req, res) => {
     if (lifecycleStage && lifecycleStage !== "all") filter.lifecycleStage = lifecycleStage;
     if (tier && tier !== "all") filter.customerTier = tier;
     if (owner && owner !== "all") filter.assignedTo = owner;
+    /* ── WHICH ACCOUNT IS THIS CUSTOMER ────────────────────────────────
+       The one lookup the sales customer profile needs, so its commercial
+       terms are edited on the record that actually holds them rather than
+       copied into a second store beside it. Company scope still applies
+       below; this only narrows.
+
+       A MALFORMED ID IS REFUSED, NOT IGNORED. Skipping an unparseable filter
+       would answer with every account this user can see, and the caller —
+       which asked "which account is this customer" — would read the first
+       row of that list as the answer. */
+    if (linkedCustomer !== undefined && String(linkedCustomer).trim() !== "") {
+      const linked = String(linkedCustomer).trim();
+      if (!mongoose.Types.ObjectId.isValid(linked)) {
+        return res.status(400).json({
+          success: false,
+          code: "LINKED_CUSTOMER_INVALID",
+          message: "That is not a customer reference this system issued.",
+        });
+      }
+      filter.linkedCustomer = new mongoose.Types.ObjectId(linked);
+    }
     if (search) {
       const re = new RegExp(search, "i");
       filter.$or = [
@@ -107,8 +166,9 @@ router.get("/", salesAuth, async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === "asc" ? 1 : -1;
 
-    const total = await Account.countDocuments(filter);
-    const accounts = await Account.find(filter)
+    const scopedFilterForList = await scoped(req, filter);
+    const total = await Account.countDocuments(scopedFilterForList);
+    const accounts = await Account.find(scopedFilterForList)
       .sort(sort)
       .skip((page - 1) * limit)
       .limit(parseInt(limit))
@@ -117,11 +177,15 @@ router.get("/", salesAuth, async (req, res) => {
 
     const accountIds = accounts.map((a) => a._id);
     const [contactCounts, leadCounts] = await Promise.all([
+      /* The company clause goes in the INITIAL $match: aggregating globally
+         and filtering afterwards has already read every company's rows. */
       Contact.aggregate([
+        { $match: await scoped(req, {}) },
         { $match: { accountId: { $in: accountIds }, isActive: true } },
         { $group: { _id: "$accountId", count: { $sum: 1 } } },
       ]),
       Lead.aggregate([
+        { $match: await scoped(req, {}) },
         // Draft Lead chunk: a draft/archived Lead is not real pipeline, so it
         // must not inflate an account's leadCount or openLeadsValue. `$nin`
         // still counts legacy Leads with no captureStatus as active.
@@ -141,11 +205,11 @@ router.get("/", salesAuth, async (req, res) => {
     }));
 
     const stats = {
-      total: await Account.countDocuments({ isActive: true }),
-      prospect: await Account.countDocuments({ isActive: true, type: "prospect" }),
-      customer: await Account.countDocuments({ isActive: true, type: "customer" }),
-      partner: await Account.countDocuments({ isActive: true, type: "partner" }),
-      hot: await Account.countDocuments({ isActive: true, rating: "hot" }),
+      total: await Account.countDocuments(await scoped(req, { isActive: true })),
+      prospect: await Account.countDocuments(await scoped(req, { isActive: true, type: "prospect" })),
+      customer: await Account.countDocuments(await scoped(req, { isActive: true, type: "customer" })),
+      partner: await Account.countDocuments(await scoped(req, { isActive: true, type: "partner" })),
+      hot: await Account.countDocuments(await scoped(req, { isActive: true, rating: "hot" })),
     };
 
     res.json({
@@ -168,7 +232,7 @@ router.get("/", salesAuth, async (req, res) => {
 // Returns candidate matches so the UI can warn before final save.
 router.post("/duplicate-check", salesAuth, async (req, res) => {
   try {
-    const matches = await findAccountDuplicates(Account, req.body || {}, req.body?.excludeId || null);
+    const matches = await findAccountDuplicates(Account, await dupCtx(req), req.body || {}, req.body?.excludeId || null);
     res.json({ success: true, matches, hasHighConfidence: matches.some((m) => m.confidence === "high") });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
@@ -176,12 +240,147 @@ router.post("/duplicate-check", salesAuth, async (req, res) => {
 });
 
 // POST /api/cms/crm/accounts
+/* ── WHICH COMMERCIAL RECORD IS THIS CUSTOMER'S ────────────────────────────
+ *
+ * The sales customer page asks this to show their payment terms. It answers
+ * with the account, or with what is genuinely in the way — never with the
+ * shape of the database.
+ *
+ * Read-only: establishing a relationship is the POST below, because creating
+ * a record is not something a page should do by being opened.
+ * ═════════════════════════════════════════════════════════════════════════ */
+/* What the terms screen opens on: the record, and the terms themselves.
+   Narrow on purpose — this route answers "which record, and what is agreed",
+   never "everything on it". Nothing restricted (credit limit, credit status,
+   tax registration) is in this projection at all, so there is nothing for a
+   stripper to have to remember to remove. */
+const TERMS_FIELDS = "accountId companyName displayName paymentPlan paymentTermsShape "
+  + "advancePercent creditDays creditDaysFrom paymentTermsCode negotiatedTerms";
+
+async function termsRecord(scope, accountId) {
+  if (!accountId) return null;
+  const account = await Account.findOne({ $and: [scope.clause, { _id: accountId }] })
+    .select(TERMS_FIELDS).lean();
+  return account ? { ...account, _id: String(account._id) } : null;
+}
+
+router.get("/for-customer/:customerId", salesAuth, async (req, res) => {
+  try {
+    const scope = await salesScopeFor(req);
+    const found = await customerAccountLink.resolve({ scope, customerId: req.params.customerId });
+    return res.json({
+      success: true,
+      state: found.state,
+      /* The record AND the terms on it, so the editor opens on what is
+         agreed rather than on an empty form beside a saved plan. */
+      account: await termsRecord(scope, found.account?._id),
+      /* Present only where the state is one a person has to settle. */
+      candidates: found.candidates || null,
+      archived: found.archived || null,
+      reason: found.reason || "",
+      /* True when opening the terms screen would need one act first. */
+      setupRequired: found.state === customerAccountLink.STATE.ABSENT
+        || found.state === customerAccountLink.STATE.REPAIRABLE,
+    });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return undefined;
+    console.error("[accounts] GET /for-customer/:customerId", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ── SET THE CUSTOMER UP, IN ONE ACT ───────────────────────────────────────
+ *
+ * Idempotent by construction — the claim's `_id` is the customer's own id, so
+ * two clicks are one insert and one read of it. Never matches by name, never
+ * creates a second account, and refuses rather than choosing when two records
+ * already claim one customer.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.post("/for-customer/:customerId", salesAuth, async (req, res) => {
+  try {
+    const scope = await salesScopeFor(req);
+    const Customer = require("../../../models/Customer_Models/Customer");
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.customerId))) {
+      return res.status(400).json({ success: false, message: "That is not a customer reference this system issued." });
+    }
+    const customer = await Customer.findById(req.params.customerId)
+      .select("name profile.companyName businessInfo.companyName isActive").lean();
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found." });
+
+    const result = await customerAccountLink.ensure({
+      scope,
+      customerId: req.params.customerId,
+      customer,
+      actor: actor(req),
+      dryRun: req.query.dryRun === "true",
+    });
+    if (!result.ok) {
+      return res.status(409).json({
+        success: false, code: result.code, message: result.message,
+        candidates: result.candidates || null, archived: result.archived || null,
+      });
+    }
+    if (result.created && result.account?._id) {
+      await recordChange(req, {
+        departmentSlug: "sales",
+        entity: "crm-account",
+        entityId: result.account._id,
+        entityLabel: result.account.companyName,
+        action: "create",
+        summary: `Set up commercial terms for ${result.account.companyName}`,
+      });
+    }
+    return res.status(result.created ? 201 : 200).json({
+      success: true,
+      /* Read back through the same projection the screen opens on, so the
+         editor appears in place with whatever is already agreed. */
+      account: await termsRecord(scope, result.account?._id),
+      establishedBy: result.establishedBy,
+      created: Boolean(result.created),
+      dryRun: Boolean(result.dryRun),
+    });
+  } catch (err) {
+    if (answeredTenantRefusal(res, err)) return undefined;
+    console.error("[accounts] POST /for-customer/:customerId", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/", salesAuth, async (req, res) => {
   try {
-    const data = { ...req.body };
+    /* One company decision for the whole request: the parent-account check,
+       the ownership stamp and every related lookup below all use it. */
+    const { scope, ownership } = await scopeAndOwnership(req);
+    /* Ownership is never taken from the body — see stripCompanyOwnershipInput. */
+    const data = stripCompanyOwnershipInput({ ...req.body });
     delete data.excludeId;
     if (data.garmentSalesProfile) {
       await assertValidGarmentProfileRefs(Account, data.garmentSalesProfile);
+    }
+    /* ── THE CUSTOMER'S USUAL COMMERCIAL TERMS ────────────────────────────
+       Refused here by the same rules the enquiry applies, so a default nobody
+       could ever apply is never stored. A new account has no addresses yet,
+       so a default shipping address can only be chosen on a later edit. */
+    if (commercialDefaults.touches(data)) {
+      const checked = commercialDefaults.validate(data, { existing: null });
+      if (!checked.ok) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+          field: checked.field, message: checked.message,
+        });
+      }
+      if (checked.values.defaultShippingAddressId) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID", field: "defaultShippingAddressId",
+          message: "Add the customer's shipping address first, then set it as their default.",
+        });
+      }
+      Object.assign(data, checked.values);
+    }
+    /* A parent from another company is not a parent. Validated BEFORE the
+       create, so an invalid relationship writes nothing at all. */
+    if (data.parentAccountId) {
+      await assertNoAccountCycle(scopedAccountLoader(scope), null, data.parentAccountId);
     }
     if (req.user) {
       data.assignedTo = data.assignedTo || req.user.id;
@@ -189,7 +388,9 @@ router.post("/", salesAuth, async (req, res) => {
       data.createdBy = actor(req);
       data.updatedBy = actor(req);
     }
-    const account = await Account.create(data);
+    /* Ownership from the actor's own membership — proven, or nothing is
+       created. Never from `data`, which is the request. */
+    const account = await Account.create({ ...data, ...ownership });
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-account",
@@ -201,6 +402,7 @@ router.post("/", salesAuth, async (req, res) => {
     });
     res.status(201).json({ success: true, account: stripRestrictedAccountFields(account.toObject(), req.user) });
   } catch (err) {
+    if (err instanceof HierarchyError) return res.status(err.status).json({ success: false, message: err.message });
     res.status(400).json({ success: false, message: err.message });
   }
 });
@@ -210,7 +412,7 @@ router.post("/", salesAuth, async (req, res) => {
 // in a chain it answers "who owns this, and which other properties are theirs".
 router.get("/:id/hierarchy", salesAuth, async (req, res) => {
   try {
-    const self = await Account.findById(req.params.id).select("accountId companyName parentAccountId").lean();
+    const self = await Account.findOne(await scoped(req, { _id: req.params.id })).select("accountId companyName parentAccountId").lean();
     if (!self) return res.status(404).json({ success: false, message: "Account not found" });
 
     // Walk UP the parent chain (bounded).
@@ -219,7 +421,7 @@ router.get("/:id/hierarchy", salesAuth, async (req, res) => {
     const seen = new Set([String(self._id)]);
     while (cursor && !seen.has(String(cursor)) && ancestors.length < 50) {
       seen.add(String(cursor));
-      const p = await Account.findById(cursor).select("accountId companyName parentAccountId").lean();
+      const p = await Account.findOne(await scoped(req, { _id: cursor })).select("accountId companyName parentAccountId").lean();
       if (!p) break;
       ancestors.push({ _id: p._id, accountId: p.accountId, companyName: p.companyName });
       cursor = p.parentAccountId;
@@ -229,10 +431,10 @@ router.get("/:id/hierarchy", salesAuth, async (req, res) => {
     // root account would otherwise "sibling" every other root account, which is
     // not a group, it is the whole customer list.
     const [children, siblings, sites] = await Promise.all([
-      Account.find({ parentAccountId: self._id, isActive: true })
+      Account.find(await scoped(req, { parentAccountId: self._id, isActive: true }))
         .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean(),
       self.parentAccountId
-        ? Account.find({ parentAccountId: self.parentAccountId, isActive: true, _id: { $ne: self._id } })
+        ? Account.find(await scoped(req, { parentAccountId: self.parentAccountId, isActive: true, _id: { $ne: self._id } }))
             .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean()
         : Promise.resolve([]),
       Site.find({ accountId: self._id, isActive: true }).select("siteId name siteType isPrimary").lean(),
@@ -277,7 +479,7 @@ router.get("/:id/history", salesAuth, async (req, res) => {
 // GET /api/cms/crm/accounts/:id — enriched detail
 router.get("/:id", salesAuth, async (req, res) => {
   try {
-    const account = await Account.findById(req.params.id)
+    const account = await Account.findOne(await scoped(req, { _id: req.params.id }))
       .populate("primaryContact", "firstName lastName email phone designation")
       .populate("assignedTo", "name email")
       .populate("parentAccountId", "accountId companyName")
@@ -295,12 +497,12 @@ router.get("/:id", salesAuth, async (req, res) => {
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
 
     const [contacts, leads, sites, departments, addresses, team, relationships, activityAgg] = await Promise.all([
-      Contact.find({ accountId: req.params.id, isActive: true })
+      Contact.find(await scoped(req, { accountId: req.params.id, isActive: true }))
         .select("firstName lastName email phone mobile designation jobTitle roles isPrimary status siteId departmentId")
         .lean(),
       // Draft/archived Leads are excluded from an account's related-leads
       // list too — same active-only rule as the count above.
-      Lead.find({ accountId: req.params.id, isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } })
+      Lead.find(await scoped(req, { accountId: req.params.id, isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } }))
         .select("leadId firstName lastName stage estimatedValue priority expectedCloseDate")
         .lean(),
       Site.find({ accountId: req.params.id, isActive: true }).lean(),
@@ -363,26 +565,67 @@ router.patch("/:id", salesAuth, async (req, res) => {
     // Loaded as a real document (not findByIdAndUpdate) so document middleware
     // — including the Garment Sales Profile's cross-field pre("validate")
     // hook, which query-style updates bypass entirely — actually runs.
-    const account = await Account.findById(req.params.id);
+    const scope = await salesScopeFor(req);
+    const account = await Account.findOne({ $and: [scope.clause, { _id: req.params.id }] });
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
     const before = account.toObject();
 
-    // Cycle-safety before we touch the tree.
+    // Cycle-safety AND company-safety before we touch the tree: the walk can
+    // only load accounts inside this request's company, so a foreign parent is
+    // refused with the same answer a missing one gets. Nothing is saved first.
     if ("parentAccountId" in req.body) {
-      await assertNoAccountCycle(Account, req.params.id, req.body.parentAccountId || null);
+      await assertNoAccountCycle(scopedAccountLoader(scope), req.params.id, req.body.parentAccountId || null);
     }
     if ("garmentSalesProfile" in req.body) {
       await assertValidGarmentProfileRefs(Account, req.body.garmentSalesProfile);
     }
 
-    const update = stripRestrictedUpdates({ ...req.body }, req.user);
+    /* Ownership out of the payload before anything is assigned. The model
+       refuses it too; this is what turns a 500 into a clean, quiet no-op. */
+    const update = stripCompanyOwnershipInput(stripRestrictedUpdates({ ...req.body }, req.user));
     update.updatedBy = actor(req);
+
+    /* ── THE CUSTOMER'S USUAL COMMERCIAL TERMS ────────────────────────────
+       Judged against the account's RESULTING state, not the keystroke: a save
+       that sends only `creditDays` still has to answer for the anchor the
+       account already holds (or does not). */
+    if (commercialDefaults.touches(update)) {
+      const checked = commercialDefaults.validate(update, { existing: before });
+      if (!checked.ok) {
+        return res.status(400).json({
+          success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+          field: checked.field, message: checked.message,
+        });
+      }
+      const chosenAddress = checked.values.defaultShippingAddressId;
+      if (chosenAddress) {
+        /* The account was read under this company's clause above, so an
+           address on somebody else's account is refused exactly as one that
+           does not exist. */
+        const owned = await commercialDefaults.assertShippingAddress(Address, {
+          accountId: account._id, addressId: chosenAddress,
+        });
+        if (!owned.ok) {
+          return res.status(400).json({
+            success: false, code: "COMMERCIAL_DEFAULTS_INVALID",
+            field: owned.field, message: owned.message,
+          });
+        }
+      }
+      Object.assign(update, checked.values);
+    }
 
     for (const [key, value] of Object.entries(update)) {
       // Merge (not replace) the nested profile so a partial save doesn't wipe
       // sibling fields the caller didn't send.
       if (key === "garmentSalesProfile" && value && typeof value === "object") {
         account.garmentSalesProfile = { ...(before.garmentSalesProfile || {}), ...value };
+      } else if (value === undefined) {
+        /* Clearing a default is a real act — "we have no standing advance any
+           more". Assigning `undefined` to a loaded document is a no-op, so the
+           path is unset explicitly. */
+        account.set(key, undefined);
+        account.markModified(key);
       } else {
         account[key] = value;
       }
@@ -413,18 +656,20 @@ router.post("/:id/archive", salesAuth, async (req, res) => {
     if (!reason || !String(reason).trim()) {
       return res.status(400).json({ success: false, message: "An archive reason is required." });
     }
-    const before = await Account.findById(req.params.id).lean();
+    const before = await Account.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!before) return res.status(404).json({ success: false, message: "Account not found" });
 
     // Impact surface — returned so the caller can show what archiving affects.
     const [openTasks, activeRelationships, children] = await Promise.all([
       Activity.countDocuments({ accountId: req.params.id, status: "planned", isActive: true }),
       Relationship.countDocuments({ isActive: true, $or: [{ fromAccountId: req.params.id }, { toAccountId: req.params.id }] }),
-      Account.countDocuments({ parentAccountId: req.params.id, isActive: true }),
+      Account.countDocuments(await scoped(req, { parentAccountId: req.params.id, isActive: true })),
     ]);
 
-    const account = await Account.findByIdAndUpdate(
-      req.params.id,
+    /* A scoped read followed by an unscoped update is not enough: the update
+       is what changes the record, so the company belongs in ITS filter. */
+    const account = await Account.findOneAndUpdate(
+      await scoped(req, { _id: req.params.id }),
       { status: "archived", isActive: false, archivedAt: new Date(), archivedBy: actor(req) },
       { new: true },
     );
@@ -449,11 +694,13 @@ router.post("/:id/archive", salesAuth, async (req, res) => {
 // POST /api/cms/crm/accounts/:id/restore
 router.post("/:id/restore", salesAuth, async (req, res) => {
   try {
-    const before = await Account.findById(req.params.id).lean();
+    const before = await Account.findOne(await scoped(req, { _id: req.params.id })).lean();
     if (!before) return res.status(404).json({ success: false, message: "Account not found" });
 
-    const account = await Account.findByIdAndUpdate(
-      req.params.id,
+    /* A scoped read followed by an unscoped update is not enough: the update
+       is what changes the record, so the company belongs in ITS filter. */
+    const account = await Account.findOneAndUpdate(
+      await scoped(req, { _id: req.params.id }),
       { status: "active", isActive: true, archivedAt: null, archivedBy: null },
       { new: true },
     );
@@ -479,7 +726,7 @@ router.post("/:id/restore", salesAuth, async (req, res) => {
 // accounts page). Archiving via /:id/archive is preferred.
 router.delete("/:id", salesAuth, async (req, res) => {
   try {
-    const account = await Account.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
+    const account = await Account.findOneAndUpdate(await scoped(req, { _id: req.params.id }), { isActive: false }, { new: true });
     if (!account) return res.status(404).json({ success: false, message: "Account not found" });
     await recordChange(req, {
       departmentSlug: "sales",

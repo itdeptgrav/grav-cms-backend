@@ -154,8 +154,12 @@ test("any other state clears the hold — a stale one is worse than none", () =>
 });
 
 test("advancing clears the hold, so the next stage does not inherit it", () => {
+  /* The fixture journey sits on `costQuote`, which was retired into
+     `purchaseInvoice` on 24 Sep 2026 — so that is the stage it advances to.
+     This assertion said `poContract` and had been stale since 25 Aug 2026,
+     when `purchaseInvoice` was inserted ahead of it in the stage order. */
   const p = planStageTransition(J({ stageStates: { costQuote: "waitingOutside" } }), { action: "advance" });
-  assert.equal(p.set.currentStage, "poContract");
+  assert.equal(p.set.currentStage, "purchaseInvoice");
   assert.equal(p.set.hold.on, null);
 });
 

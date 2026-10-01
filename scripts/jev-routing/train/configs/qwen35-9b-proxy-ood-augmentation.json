@@ -1,0 +1,28 @@
+{
+  "schema": "grav.jev.semantic-augmentation/1",
+  "seed": 20260927,
+  "source_train_view_manifest_sha256": "a315052dd82f12e355320a8e2a06d81b70ce84fd53e9f90289e365beaee0afa1",
+  "source_splits": [
+    "train",
+    "validation"
+  ],
+  "minimum_acceptance_rate": 0.8,
+  "teacher": {
+    "model": "Qwen/Qwen3-8B",
+    "revision": "895c8d171bc03c30e113cd7a28c02494b5e068b7",
+    "prompt": "prompts/semantic-paraphrase-teacher-v1.txt",
+    "prompt_sha256": "6886b25a207f1fe22b2bd7e302c734884be939adc215dd88a9c791228fb84761",
+    "do_sample": false,
+    "max_new_tokens": 128
+  },
+  "judge": {
+    "model": "Qwen/Qwen3.5-9B",
+    "revision": "e0330a142393d4516eca6ab0145ce66ac513e842",
+    "prompt": "prompts/semantic-paraphrase-judge-v1.txt",
+    "prompt_sha256": "4621cf023a6c7cf9bf7ea37e2278cf3eeb19006f0722e839c18b80b16e1aff07",
+    "do_sample": false,
+    "max_new_tokens": 128
+  },
+  "validation_role": "proxy_ood_only",
+  "locked_rows_read": false
+}

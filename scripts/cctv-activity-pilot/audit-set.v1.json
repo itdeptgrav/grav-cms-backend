@@ -1,0 +1,54 @@
+{
+  "name": "cam09-development-audit-v1",
+  "status": "development set; not held out",
+  "source_video": "cam09_2026-08-28_172449_recovered.mp4",
+  "selection": {
+    "timestamps_seconds": [0, 20, 40, 60],
+    "method": "Fixed timestamps selected before reviewing model output. Every YOLO track visible at each timestamp was included.",
+    "evidence_view": "Full CCTV frame with highlighted target plus an enlarged target-person crop."
+  },
+  "label_contract": {
+    "using_phone": "A smartphone is visibly held or actively viewed.",
+    "working": "The target is actively using a laptop, paper, pen, document, tool, or machine.",
+    "talking_or_interacting": "The target is visibly interacting with another person without active work.",
+    "no_observable_task": "No clear phone use, work task, or interaction is visible."
+  },
+  "audit_basis": [
+    "Visual review of every selected target panel.",
+    "Earlier reviewer corrections were retained: track 5 phone use, track 6 no task, track 13 not working, track 16 working when using the laptop, and the standing red-shirt track not working.",
+    "Multiple allowed labels are used only where a single still cannot reliably separate working from conversation."
+  ],
+  "samples": [
+    {"video_seconds": 0, "frame": 0, "track_id": 1, "image": "t000.0_id001.jpg", "allowed_labels": ["working"], "audit_note": "Hands are actively on the laptop."},
+    {"video_seconds": 0, "frame": 0, "track_id": 2, "image": "t000.0_id002.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Seated facing the table without visible task interaction."},
+    {"video_seconds": 0, "frame": 0, "track_id": 3, "image": "t000.0_id003.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Standing with hands together; not using the nearby laptop or papers."},
+    {"video_seconds": 0, "frame": 0, "track_id": 4, "image": "t000.0_id004.jpg", "allowed_labels": ["working"], "audit_note": "Seated at and interacting with the laptop."},
+    {"video_seconds": 0, "frame": 0, "track_id": 5, "image": "t000.0_id005.jpg", "allowed_labels": ["using_phone"], "audit_note": "Visible illuminated smartphone under the target's hand."},
+    {"video_seconds": 0, "frame": 0, "track_id": 6, "image": "t000.0_id006.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Standing and observing; no sustained interaction or work object."},
+    {"video_seconds": 0, "frame": 0, "track_id": 7, "image": "t000.0_id007.jpg", "allowed_labels": ["working"], "audit_note": "Seated at the laptop; retained from the reviewer's track-16 correction."},
+
+    {"video_seconds": 20, "frame": 498, "track_id": 1, "image": "t020.0_id001.jpg", "allowed_labels": ["working"], "audit_note": "Hands are actively on the laptop."},
+    {"video_seconds": 20, "frame": 498, "track_id": 3, "image": "t020.0_id003.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Standing beside the table; nearby work objects belong to other people."},
+    {"video_seconds": 20, "frame": 498, "track_id": 5, "image": "t020.0_id005.jpg", "allowed_labels": ["using_phone"], "audit_note": "Phone-use sequence for the repeatedly corrected target."},
+    {"video_seconds": 20, "frame": 498, "track_id": 6, "image": "t020.0_id006.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Standing without visible task; retained from reviewer correction."},
+    {"video_seconds": 20, "frame": 498, "track_id": 13, "image": "t020.0_id013.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Slumped in the chair without using a work object."},
+    {"video_seconds": 20, "frame": 498, "track_id": 14, "image": "t020.0_id014.jpg", "allowed_labels": ["working"], "audit_note": "Right hand remains on the laptop while drinking."},
+    {"video_seconds": 20, "frame": 498, "track_id": 16, "image": "t020.0_id016.jpg", "allowed_labels": ["working"], "audit_note": "Laptop-user correction supplied by the reviewer."},
+
+    {"video_seconds": 40, "frame": 997, "track_id": 1, "image": "t040.0_id001.jpg", "allowed_labels": ["working"], "audit_note": "Hands are actively on the laptop."},
+    {"video_seconds": 40, "frame": 997, "track_id": 3, "image": "t040.0_id003.jpg", "allowed_labels": ["no_observable_task", "talking_or_interacting"], "audit_note": "Clearly not working; a still image cannot prove whether the speech gesture is sustained."},
+    {"video_seconds": 40, "frame": 997, "track_id": 5, "image": "t040.0_id005.jpg", "allowed_labels": ["using_phone"], "audit_note": "Finger is visibly interacting with the illuminated phone."},
+    {"video_seconds": 40, "frame": 997, "track_id": 6, "image": "t040.0_id006.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Passing behind the group without a visible task."},
+    {"video_seconds": 40, "frame": 997, "track_id": 13, "image": "t040.0_id013.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Seated without using the nearby laptop or another task object."},
+    {"video_seconds": 40, "frame": 997, "track_id": 14, "image": "t040.0_id014.jpg", "allowed_labels": ["talking_or_interacting", "working"], "audit_note": "Turned toward the phone user with an open laptop present; temporal evidence is needed to disambiguate."},
+    {"video_seconds": 40, "frame": 997, "track_id": 16, "image": "t040.0_id016.jpg", "allowed_labels": ["working"], "audit_note": "Laptop-user correction supplied by the reviewer; casual gesture does not override work."},
+
+    {"video_seconds": 60, "frame": 1495, "track_id": 1, "image": "t060.0_id001.jpg", "allowed_labels": ["working"], "audit_note": "Hands are actively on the laptop."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 3, "image": "t060.0_id003.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Standing and looking away without using any work object."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 5, "image": "t060.0_id005.jpg", "allowed_labels": ["using_phone"], "audit_note": "Finger is visibly interacting with the illuminated phone."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 6, "image": "t060.0_id006.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Walking away without a visible task."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 13, "image": "t060.0_id013.jpg", "allowed_labels": ["no_observable_task"], "audit_note": "Seated without using a visible work object."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 14, "image": "t060.0_id014.jpg", "allowed_labels": ["talking_or_interacting", "working"], "audit_note": "Oriented toward the phone user with an open laptop present; temporal evidence is needed."},
+    {"video_seconds": 60, "frame": 1495, "track_id": 16, "image": "t060.0_id016.jpg", "allowed_labels": ["working"], "audit_note": "Laptop-user correction supplied by the reviewer; casual gesture does not override work."}
+  ]
+}

@@ -62,6 +62,10 @@ const imageSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true },
     publicId: { type: String, trim: true, default: "" },
+    /* Google Drive (1 Oct 2026 — the form uploads there now, as MRF's
+       `productImageSchema` already allows). The lh3 url renders on its own;
+       the id is what lets a thumbnail be served at thumbnail size. */
+    fileId: { type: String, trim: true, default: "" },
     name: { type: String, trim: true, default: "" },
   },
   { _id: false },
@@ -113,6 +117,19 @@ const lineSchema = new mongoose.Schema(
     /* Unset when the requester described the thing instead of picking it. */
     rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemSku: { type: String, trim: true, default: "" },
+
+    /* ── CANONICAL SERVICE IDENTITY (from "Request this service") ──────────────
+       Set ONLY when the requester arrived from a Service Master record and the
+       server RESOLVED that service (active, in this company) — never from the
+       browser. It carries the master identity through the journey so Store does
+       not have to match the same service a second time, and the resulting
+       Service Order line can open the exact originating master record. A
+       free-text service line leaves these null and stays valid. `service` is
+       the id; the frozen code/name make the history readable if the master is
+       later renamed. */
+    service: { type: mongoose.Schema.Types.ObjectId, ref: "Service", default: null },
+    serviceCode: { type: String, trim: true, default: "" },
+    serviceName: { type: String, trim: true, default: "" },
 
 /* ── FUTURE ITEM-WISE BUDGET ATTRIBUTION (INERT) ────────────────────────────
    Where this line's own budget head will live once a request can charge

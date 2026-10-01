@@ -18,27 +18,45 @@ function invalidateAppAccess(employeeId) {
   if (employeeId) accessCache.delete(String(employeeId));
 }
 
-async function isAppUser(employeeId) {
+/* Two reasons a token stops working, resolved in the same lookup:
+   the holder became an intern, or they stopped working here. The second
+   was not checked at all, so somebody let go kept the app until their
+   token aged out — up to 30 days. See services/employmentStatus.js. */
+async function appAccess(employeeId) {
   const key = String(employeeId);
   const hit = accessCache.get(key);
-  if (hit && Date.now() - hit.at < ACCESS_TTL_MS) return hit.allowed;
+  if (hit && Date.now() - hit.at < ACCESS_TTL_MS) return hit.verdict;
 
   const Employee = require("../models/Employee");
+  const { isEmployed, EMPLOYMENT_SELECT } = require("../services/employmentStatus");
   try {
-    const emp = await Employee.findById(key).select("employmentType").lean();
+    const emp = await Employee.findById(key)
+      .select("employmentType " + EMPLOYMENT_SELECT)
+      .lean();
     // A token for a deleted employee is not this middleware's problem to
     // diagnose — the routes behind it already handle a missing record — so an
     // unknown id is allowed through and fails there with a clearer message.
-    const allowed = !emp || emp.employmentType !== "intern";
-    accessCache.set(key, { allowed, at: Date.now() });
-    return allowed;
+    let verdict = { allowed: true };
+    if (emp && emp.employmentType === "intern") {
+      verdict = {
+        allowed: false,
+        status: 403,
+        code: "INTERN_NO_APP_ACCESS",
+        message: "The GRAV app is for employees. Interns do not have access.",
+      };
+    } else if (emp && !isEmployed(emp)) {
+      const { INACTIVE_REFUSAL } = require("../services/employmentStatus");
+      verdict = { allowed: false, status: 401, ...INACTIVE_REFUSAL };
+    }
+    accessCache.set(key, { verdict, at: Date.now() });
+    return verdict;
   } catch (err) {
     // Mongo is unreachable. Signing the entire workforce out of the app over
     // an infrastructure blip is the worse failure — and the lock is enforced
     // at /login too, so nobody NEW gets in while this is down. Not cached, so
     // the next request tries again.
-    console.warn("[APP-ACCESS] employment-type check failed:", err.message);
-    return true;
+    console.warn("[APP-ACCESS] employment check failed:", err.message);
+    return { allowed: true };
   }
 }
 
@@ -65,7 +83,7 @@ const AllEmployeeAppMiddleware = async (req, res, next) => {
       });
     }
 
-    var decoded = jwt.verify(token, process.env.JWT_SECRET);
+    var decoded = jwt.verify(token, require("../config/jwt").SECRET);
   } catch (error) {
     return res.status(401).json({
       success: false,
@@ -76,12 +94,12 @@ const AllEmployeeAppMiddleware = async (req, res, next) => {
   // Outside the try above on purpose: a failure in here is not a bad token,
   // and reporting it as one sends the app to the login screen to retry
   // something that was never wrong.
-  if (decoded.id && !(await isAppUser(decoded.id))) {
-    return res.status(403).json({
-      success: false,
-      code: "INTERN_NO_APP_ACCESS",
-      message: "The GRAV app is for employees. Interns do not have access.",
-    });
+  if (decoded.id) {
+    const verdict = await appAccess(decoded.id);
+    if (!verdict.allowed) {
+      const { status, allowed, ...body } = verdict;
+      return res.status(status || 403).json(body);
+    }
   }
 
   req.user = {

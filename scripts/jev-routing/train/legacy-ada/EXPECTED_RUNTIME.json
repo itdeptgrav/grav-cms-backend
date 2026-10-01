@@ -1,0 +1,8 @@
+{
+  "note": "Runtime of the 25 Sep 2026 RTX 4000 Ada pod that produced the reused stage-1 baseline and the first smoke run (results.tgz cb619591...). Stage 2 stops on any mismatch: bitwise resume equivalence and a fair before/after comparison both assume the same hardware and build.",
+  "gpu": "NVIDIA RTX 4000 Ada Generation",
+  "torch": "2.8.0+cu128",
+  "cuda": "12.8",
+  "transformers": "5.10.2",
+  "peft": "0.19.1"
+}

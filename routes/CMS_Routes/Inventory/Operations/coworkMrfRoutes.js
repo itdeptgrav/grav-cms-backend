@@ -24,6 +24,7 @@ const NotificationService = require("../../../../services/NotificationService")
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest")
 
 const mrfApprover = require("../../../../services/mrfApprover.service")
+const autoReservation = require("../../../../services/storePurchase/autoReservation.service")
 const mrfNotify = require("../../../../services/mrfNotify.service")
 const mrfChat = require("../../../../services/mrfChat.service")
 const { buildContext } = require("../../../../services/mrfContext.service")
@@ -670,6 +671,18 @@ router.patch(
     await noteInThread(req, mrf, `${actorName || "The TL"} approved this request — it is now with the Store.`, actorName)
     mrfNotify.tlApproved(mrf).catch(e => console.error("[tlApprove notify]", e.message))
 
+    /* ── THE STORE NO LONGER RESERVES BY HAND ───────────────────────────────
+       Approval is what makes a line eligible, so approval is what attempts the
+       hold. AFTER the commit and deliberately not inside it: a shelf read that
+       fails must never un-approve a decision a person already made. The outcome
+       is written onto each line, and a line that could not be held appears in
+       the Store's Needs-attention queue with a retry. */
+    autoReservation.attemptInBackground({
+      tenant: req.tenant, mrfId: mrf._id,
+      trigger: autoReservation.TRIGGERS.TL_APPROVED,
+      actorName, actorId: actor?._id || null,
+    })
+
     const approvedPayload = { success: true, message: "Approved and sent to the Store", mrf, context: buildContext(mrf.toObject(), "tl") }
     return req.idempotent
       ? await req.idempotent.succeed(200, approvedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
@@ -995,6 +1008,14 @@ async function createMrfRequest(req, res) {
     // Only once the creation is authoritative.
     if (autoForward) {
       mrfNotify.autoForwarded(mrf).catch(e => console.error("[mrf autoForward notify]", e.message))
+      /* An auto-forwarded request arrives at the Store already approved, so it
+         is eligible the moment it exists — the same trigger as a TL approval,
+         reached by a different door. */
+      autoReservation.attemptInBackground({
+        tenant: req.tenant, mrfId: mrf._id,
+        trigger: autoReservation.TRIGGERS.AUTO_FORWARDED,
+        actorName: fullName || req.user.name || "", actorId: emp?._id || null,
+      })
     } else {
       mrfNotify.submitted(mrf).catch(e => console.error("[mrf submitted notify]", e.message))
     }

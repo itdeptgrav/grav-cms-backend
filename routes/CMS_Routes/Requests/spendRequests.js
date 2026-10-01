@@ -35,14 +35,22 @@ const fulfilment = require("../../../services/storeFulfilment.service");
 const financeDecision = require("../../../services/spendFinanceDecision.service");
 /* The service-classification read lives beside the finance gate that is
    blocked on it, so the screen and the refusal cannot disagree. */
-const { serviceClassification, isServiceRequest } = financeDecision;
+const { serviceClassification, isServiceRequest, allocationSummary } = financeDecision;
 const chain = require("../../../services/spendApproval.service");
 const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 const budgetMatch = require("../../../services/budgetCommitment.service");
+const { budgetEnabled } = require("../../../services/requests/budgetGate");
+/* Shipping, discount and charges, and the one rule for the total they make. */
+const spendAdjustments = require("../../../services/spendAdjustments.service");
 const itemBudgetHead = require("../../../services/itemBudgetHead.service");
 /* The same Store/board/finance grant the intake door reads. Shared so
    "Store & Purchase" means one thing across both routers. */
 const { resolveFulfilmentAccess } = require("../../../services/access/fulfilmentAccess");
+/* The resolved Store & Purchase capability set — a cache-immune ADDITIONAL path
+   to "may act for Store", so the department-role grant is recognised even when
+   the shared 30s department cache is momentarily stale. Additive only: it never
+   removes the existing department or finance paths. */
+const { resolveCapabilities, hasAll, CAPABILITIES: SP_CAPS } = require("../../../services/storePurchase/capabilities");
 const vendorResolve = require("../../../services/vendorResolve.service");
 const spendCreate = require("../../../services/spendRequestCreate.service");
 const documentSequence = require("../../../services/storePurchase/documentSequence.service");
@@ -118,25 +126,10 @@ async function requester(req) {
     .lean();
 }
 
-/**
- * The books this request belongs to.
- *
- * One company today, and this asks rather than assumes: with several, a
- * department employee's session says nothing about which set of books their
- * spend belongs to, and picking the first would file it against whichever
- * happened to be created first. Refusing is the honest answer until somebody
- * decides the rule.
- */
-async function theCompany() {
-  const companies = await Acc_Company.find({}).select("_id companyName").limit(2).lean();
-  if (companies.length === 1) return { company: companies[0], error: null };
-  return {
-    company: null,
-    error: companies.length
-      ? "More than one set of books exists, and a request cannot tell which it belongs to. Ask finance to configure this."
-      : "No company is set up in the books yet. Ask finance to create one.",
-  };
-}
+/* The books this request belongs to — the GRAV Clothing primary profile, the
+   way every other Store write resolves it (services/requests/booksCompany.js).
+   It used to refuse when more than one company row existed; see that file. */
+const { theCompany } = require("../../../services/requests/booksCompany");
 
 /**
  * The lines, checked and costed.
@@ -200,7 +193,7 @@ function buildLines(raw) {
  * that line for its own writes.
  */
 async function viewerOf(emp) {
-  const [managedDocIds, accUser, fulfil] = await Promise.all([
+  const [managedDocIds, accUser, fulfil, caps] = await Promise.all([
     /* Takes a biometric id STRING and answers with Mongo _ids — passing the
        document returns nothing and comparing its answer to a biometric id
        matches nothing, which is how a TL's queue came back empty for requests
@@ -213,7 +206,14 @@ async function viewerOf(emp) {
           .catch(() => null)
       : null,
     resolveFulfilmentAccess(emp).catch(() => ({ allowed: false, via: null })),
+    /* The resolved Store capability set, read from department-role grants (not
+       the cached department list) — a cache-immune path to the SAME "Store may
+       act" answer. */
+    resolveCapabilities({ email: emp?.email, employeeRef: emp?._id, biometricId: emp?.biometricId })
+      .catch(() => ({ capabilities: [], isAdmin: false })),
   ]);
+  /* Holds the operational Store grant, or is a platform admin. */
+  const capabilityFulfils = Boolean(caps?.isAdmin) || hasAll(caps?.capabilities || [], [SP_CAPS.SOURCING_MANAGE]);
   /* Back into biometric ids, which is the identity everything else in this
      flow speaks — `requestedById`, `viewer.employeeId`, and MRF's own routing.
      One vocabulary end to end rather than two that have to be translated at
@@ -241,7 +241,9 @@ async function viewerOf(emp) {
        request that spends money anyway, and a confirmed quote stuck because
        the one store person is on leave is a quote somebody re-raises through
        a channel nobody is measuring. */
-    canFulfil: Boolean(fulfil?.allowed) || (accUser?.isActive !== false && chain.isFinanceApprover(accUser)),
+    canFulfil: Boolean(fulfil?.allowed)
+      || (accUser?.isActive !== false && chain.isFinanceApprover(accUser))
+      || capabilityFulfils,
   };
 }
 
@@ -405,6 +407,29 @@ const publicRequest = (r) => ({
     revisionReason: l.revisionReason || null,
   })),
   totalAmount: r.totalAmount,
+
+  /* ── THE FIGURE SOMEBODY IS ACTUALLY AGREEING TO ────────────────────────
+     `totalAmount` is the line subtotal. What the company will pay is that plus
+     tax, plus freight and charges, less any discount — and the requester
+     confirms and Finance approves THAT. Exposing only the subtotal left both
+     of them agreeing to a number smaller than the bill, with the difference
+     appearing on a purchase order afterwards.
+
+     Both sets travel: `quoted*` is what Store last entered, `approved*` is
+     what Finance agreed. Before approval they are the same; after it they can
+     only differ if somebody requotes, which returns the request for approval
+     again. Each charge is named, because approving "₹400 of charges" is not
+     approving anything in particular. */
+  taxAmount: typeof r.taxAmount === "number" ? r.taxAmount : null,
+  grandTotal: typeof r.grandTotal === "number" ? r.grandTotal : r.totalAmount,
+  quotedShippingCharges: r.quotedShippingCharges || 0,
+  quotedDiscount: r.quotedDiscount || 0,
+  quotedCustomCharges: (r.quotedCustomCharges || []).map((c) => ({ label: c.label, amount: c.amount })),
+  approvedShippingCharges: r.approvedShippingCharges || 0,
+  approvedDiscount: r.approvedDiscount || 0,
+  approvedCustomCharges: (r.approvedCustomCharges || []).map((c) => ({ label: c.label, amount: c.amount })),
+  adjustmentsApprovedAt: r.adjustmentsApprovedAt || null,
+
   status: r.status,
   /* The state in words, composed here so every screen says the same thing
      about the same status rather than each keeping its own map. */
@@ -891,6 +916,9 @@ router.post("/", async (req, res) => {
           message: "Say why none of your approved budget heads fit.",
         });
       }
+    } else if (!budgetEnabled() && !b.ledgerId) {
+      /* Budget is off (services/requests/budgetGate): a purchase request
+         names no head. Recorded as an unbudgeted spend request would be. */
     } else {
       if (!b.ledgerId) {
         return res.status(400).json({
@@ -1101,6 +1129,9 @@ async function decide(req, res, outcome) {
       /* Finance's deliberate answer where a service's configured default does
          not match the head being approved. Absent on an ordinary approval. */
       lineDecisions: req.body?.serviceClassification || null,
+      /* Finance's per-line budget heads. Absent when every line resolves on
+         its own, which is the common case. */
+      lineAllocations: req.body?.lineAllocations || null,
     });
     if (!r.ok) {
       return res.status(r.status).json({
@@ -1110,9 +1141,22 @@ async function decide(req, res, outcome) {
         ...(r.classification ? { classification: r.classification } : {}),
         ...(r.unresolved ? { unresolved: r.unresolved } : {}),
         ...(r.unclassified ? { unclassified: r.unclassified } : {}),
+        /* Which lines still need a head, and why — so the screen can render
+           the choice rather than send finance off to find it. */
+        ...(r.problems ? { problems: r.problems } : {}),
+        ...(r.totals ? { totals: r.totals } : {}),
       });
     }
-    return res.json({ success: true, request: publicRequest(doc.toObject()) });
+    return res.json({
+      success: true,
+      request: publicRequest(doc.toObject()),
+      /* ── WHAT WAS PROMISED, AND OUT OF WHAT ─────────────────────────────
+         Per line and grouped per head, from the plan the approval used —
+         not recomputed, so the result and the commitment cannot disagree.
+         A promise, not an accounting actual: nothing posts until a voucher
+         does. */
+      ...(r.plan ? { allocation: allocationSummary(r.plan) } : {}),
+    });
   }
 
   /* ── THE TL STEP ────────────────────────────────────────────────────────
@@ -1489,87 +1533,67 @@ router.post("/:id/purchase-order", async (req, res) => {
       });
     }
 
-    /* ── THE VENDOR, SCOPED TO THIS COMPANY ──────────────────────────────
-       Lines carry `vendorId` when the supplier was chosen off the books.
-       Several lines could name several suppliers; a purchase order is one
-       document to one vendor, so a request spanning two is refused rather than
-       silently ordered from whichever line came first. And every vendor lookup
-       is scoped to the request's company: a supplier of the same name — or the
-       same id — belonging to another company is never attached. */
-    /* ── ONE SUPPLIER, BY IDENTITY FIRST ──────────────────────────────────
-       A display name is not identity: two suppliers can share a name, and
-       collapsing them because the string matched would send one order to the
-       wrong one. So the distinct-supplier test is on the stored `vendorId`
-       (the id chosen off the supplier master), and only lines that carry no
-       reliable id fall back to a normalised-name comparison. Never the first
-       of several ids — several ids IS several suppliers. */
-    const vendorIds = [...new Set((doc.items || []).map((l) => l.vendorId).filter(Boolean).map(String))];
-    if (vendorIds.length > 1) {
-      return res.status(400).json({
-        success: false,
-        reason: "MULTIPLE_SUPPLIERS",
-        message: `This quote names ${vendorIds.length} suppliers by id. A purchase order goes to one — raise it in the purchase-order module, or split the request.`,
-      });
-    }
-    /* Lines with no id are compared on their name, case- and space-normalised,
-       so "Sharma" and "sharma " are one supplier and "Sharma" and "Verma" are
-       two. A genuinely name-only supplier is fully supported. */
-    const idlessNames = [...new Set((doc.items || [])
-      .filter((l) => !l.vendorId)
-      .map((l) => (l.vendorName || "").trim())
-      .filter(Boolean))];
-    if ([...new Set(idlessNames.map((x) => x.toLowerCase()))].length > 1) {
-      return res.status(400).json({
-        success: false,
-        reason: "MULTIPLE_SUPPLIERS",
-        message: `This quote names ${idlessNames.length} suppliers (${idlessNames.join(", ")}). A purchase order goes to one — raise it in the purchase-order module, or split the request.`,
-      });
+    /* ── A2: THE SAME AUTHORITY THE PURCHASE-ORDER FORM USES ─────────────
+       Both journeys raise a material order, so both must apply the same rules.
+       Written separately they drift, and the weaker of the two becomes the way
+       round the rule — so the chain (material request → purchase shortfall →
+       approved request → order), the supplier resolution, the line derivation
+       and the provenance all come from one service.
+
+       It resolves from STORED records, so nothing here depends on what the
+       caller sent. */
+    const governed = require("../../../services/storePurchase/governedPurchaseOrder.service");
+    const govTenant = { companyId: doc.companyId, siteId: null, legacyMode: false };
+    /* Named `governedChain`, not `chain`: this file already uses `chain` for
+       the spend STATUS chain a few lines above, and shadowing it put the whole
+       handler in a temporal dead zone. */
+    let governedChain;
+    try {
+      /* The contextual action: the request must still prove an operational
+         need — with its material request, or with the intake requirement it
+         was raised from. A request with neither is refused. */
+      governedChain = await governed.resolveForRequest(govTenant, doc.toObject ? doc.toObject() : doc);
+    } catch (govErr) {
+      if (govErr?.name === "StorePurchaseError") {
+        /* An expected business refusal, with its own status and a correction
+           the buyer can act on — never a 500. */
+        return res.status(govErr.status).json(govErr.toResponse());
+      }
+      throw govErr;
     }
 
-    const vendorName =
-      (doc.items || []).map((l) => (l.vendorName || "").trim()).find(Boolean) || doc.vendorName || "";
-    let vendorId = null;
-    if (vendorIds.length === 1) {
-      /* The one chosen id, trusted only if it really belongs to this company —
-         a supplier of the same id in another company is never attached. */
-      const v = await Vendor.findOne({ _id: vendorIds[0], companyId: doc.companyId }).select("_id").lean().catch(() => null);
-      if (v) vendorId = v._id;
-    }
-    if (!vendorId && vendorName) {
-      const v = await Vendor.findOne({ companyName: vendorName, companyId: doc.companyId }).select("_id").lean().catch(() => null);
-      if (v) vendorId = v._id;
-    }
+    /* Supplier, resolved and company-scoped by the shared authority. A
+       request naming two suppliers was refused there, with a correction that
+       sends the buyer upstream rather than to an unlinked direct order. */
+    const vendorId = governedChain.vendorId;
+    const vendorName = governedChain.vendorName;
 
     /* ── THE LINES, WITH EVERY APPROVED COMMERCIAL FACT ──────────────────
        Quantity, rate, tax and delivery straight off the approved quote, and
        the catalogue identity the spend line carried. Nothing is recomputed
        from a body: the figures finance committed are the figures ordered, and
        a RawItem id is taken from the stored line — never from the request. */
-    const items = (doc.items || []).map((l) => {
-      const quantity = Number(l.quantity) || 0;
-      const unitPrice = Number(l.rate) || 0;
-      const net = Math.round(quantity * unitPrice * 100) / 100;
-      const gstRate = Number(l.gstPercent) || 0;
-      const gstAmount =
-        typeof l.taxAmount === "number"
-          ? Math.round(l.taxAmount * 100) / 100
-          : Math.round(((net * gstRate) / 100) * 100) / 100;
-      return {
-        rawItem: l.rawItem || undefined,
-        itemName: l.name,
-        sku: l.rawItemSku || "",
-        baseUnit: l.baseUnit || "",
-        unit: l.unit || "unit",
-        quantity,
-        unitPrice,
-        totalPrice: net,
-        gstRate,
-        gstAmount,
-        quoteRef: l.quoteRef || "",
-        pendingQuantity: quantity,
-        expectedDeliveryDate: l.expectedDeliveryDate || doc.expectedDeliveryDate || null,
-      };
-    });
+    /* Lines, supplier and totals as the shared authority derived them. The
+       block below is kept only to show what it replaced. */
+    const items = governedChain.lines.map((l) => ({
+      spendLineId: l.spendLineId,
+      /* Line-level provenance, identical to the form's door. */
+      sourceMrfLineId: l.sourceMrfLineId || null,
+      variantId: l.variantId || null,
+      rawItem: l.rawItem || undefined,
+      itemName: l.itemName,
+      sku: l.sku,
+      baseUnit: l.baseUnit,
+      unit: l.unit,
+      quantity: l.quantity,
+      unitPrice: l.unitPrice,
+      totalPrice: l.totalPrice,
+      gstRate: l.gstRate,
+      gstAmount: l.gstAmount,
+      quoteRef: l.quoteRef,
+      pendingQuantity: l.quantity,
+      expectedDeliveryDate: l.expectedDeliveryDate,
+    }));
     if (!items.length) {
       return res.status(400).json({ success: false, message: "This request has no lines to order." });
     }
@@ -1580,18 +1604,16 @@ router.post("/:id/purchase-order", async (req, res) => {
        level GST percentage applied to everything — a request can mix rates,
        and re-deriving the whole order from one of them restates what was
        approved. */
-    const subtotal = Math.round(items.reduce((t, i) => t + i.totalPrice, 0) * 100) / 100;
-    const taxAmount = Math.round(items.reduce((t, i) => t + i.gstAmount, 0) * 100) / 100;
-    const totalAmount = Math.round((subtotal + taxAmount) * 100) / 100;
+    /* Header totals reconcile from the approved lines, as the authority
+       derived them — not one request-level rate applied to everything. */
+    const { subtotal, taxAmount, totalAmount } = governedChain.totals;
 
     /* The legacy header `taxRate` holds a rate only when there is ONE across
        every line. Where the lines mix rates, no single number is the order's
        rate, so it is left at zero and the line rates stay authoritative —
        `taxMode` records which case this is, so a downstream reader never takes
        a mixed-rate order's zero header rate for a zero-rated order. */
-    const distinctRates = [...new Set(items.map((i) => i.gstRate))];
-    const taxMode = distinctRates.length <= 1 ? "SINGLE_RATE" : "MIXED_RATE";
-    const headerTaxRate = taxMode === "SINGLE_RATE" ? (distinctRates[0] || 0) : 0;
+    const { taxMode, headerTaxRate } = governedChain.totals;
 
     /* ── THE NUMBER FROM THE ATOMIC ALLOCATOR ────────────────────────────
        The same company/financial-year sequence the purchase-order module
@@ -1619,8 +1641,10 @@ router.post("/:id/purchase-order", async (req, res) => {
     let po;
     try {
       po = await PurchaseOrder.create({
-        spendRequestId: doc._id,
-        spendRequestNumber: doc.requestNumber,
+        /* Server-owned provenance, identical to the one the purchase-order
+           form writes — including the policy stamp that tells a governed order
+           apart from a genuinely historical one. */
+        ...governed.provenanceFields(governedChain),
         companyId: doc.companyId,
         /* SpendRequest carries no site yet; do not invent one. */
         siteId: null,
@@ -2397,6 +2421,89 @@ router.patch("/:id/confirm", async (req, res) => {
  */
 
 /* ── WHAT STORE AND FINANCE BOTH LOOK AT ──────────────────────────────────── */
+
+/* ══ LINE-WISE BUDGET ALLOCATION ═════════════════════════════════════════════
+ * A request buys fabric from Raw Materials, packaging from Packaging and a
+ * repair from Repairs & Maintenance. Finance is not made to force all three
+ * into one head; each line commits against its own, and the request still
+ * produces exactly ONE commitment document.
+ *
+ * A promise, never an accounting actual. Nothing posts until a voucher does.
+ */
+
+/* ── WHAT FINANCE REVIEWS BEFORE APPROVING ──────────────────────────────────
+ * The same plan the approval will use, computed the same way, so the screen
+ * and the decision cannot disagree about what a line resolves to.
+ *
+ * Read-only. It never refuses: an unresolved line comes back as a `problem`
+ * for the screen to render, because this is the surface on which finance
+ * fixes it.
+ */
+router.get("/:id/line-allocations", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!maySeeRequest(doc, emp, viewer) && !viewer.canFulfil) {
+      return res.status(403).json({ success: false, message: "This request is not yours to read." });
+    }
+
+    const plan = await financeDecision.planLineAllocations({
+      request: doc,
+      body: req.query.dryRun ? null : null,
+      actor: { id: emp._id, name: mrfApprover.buildFullName(emp) },
+    });
+
+    if (!plan.ok) {
+      return res.json({
+        success: true,
+        /* Not an error on a REVIEW surface — this is exactly what finance is
+           here to resolve. */
+        allocation: null,
+        code: plan.code,
+        message: plan.message,
+        problems: plan.problems || [],
+        totals: plan.totals || null,
+        heads: await approvedHeadOptions(doc),
+      });
+    }
+
+    res.json({
+      success: true,
+      allocation: allocationSummary(plan),
+      problems: [],
+      heads: await approvedHeadOptions(doc),
+    });
+  } catch (e) {
+    console.error("[spend] line-allocations:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** The heads this department may actually choose — approved lines, not the
+ *  chart of accounts. */
+async function approvedHeadOptions(doc) {
+  if (!doc.companyId) return [];
+  const { heads } = await budgetMatch.approvedHeadsFor({
+    companyId: doc.companyId,
+    department: doc.budgetDepartment || doc.department || "",
+  }).catch(() => ({ heads: [] }));
+  return heads.map((h) => ({
+    budgetLineId: String(h.budgetLineId),
+    ledgerId: String(h.ledgerId),
+    name: h.name,
+    financialYear: h.financialYear,
+    approved: h.approved,
+    committed: h.committed,
+    actual: h.actual,
+    available: h.available,
+  }));
+}
+
 router.get("/:id/service-classification", async (req, res) => {
   try {
     const emp = await requester(req);
@@ -2569,6 +2676,108 @@ router.patch("/:id/service-lines", async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * STORE SETS THE COMMERCIAL ADJUSTMENTS ON A QUOTE
+ *
+ * Freight, a negotiated discount and charges like handling or insurance. Store
+ * owns these because Store is who agrees them with the supplier — the
+ * department that raised the request has no view of the company's terms.
+ *
+ * ── WHY IT IS HERE AND NOT ON THE PURCHASE ORDER ────────────────────────────
+ * Each one moves what the company will owe. Added to an order after approval
+ * they change the figure Finance agreed, against a budget committed for a
+ * smaller one. Set here, the requester confirms the real payable total, Finance
+ * approves that same total and commits against it, and the order carries it
+ * read-only.
+ *
+ * ── AND WHY IT STOPS AT APPROVAL ────────────────────────────────────────────
+ * Once Finance has approved, the figures are a record of a decision. Changing
+ * one means requoting — which sends the request back for confirmation and
+ * approval, and the snapshot is retaken. There is no edit-in-place door.
+ * ═════════════════════════════════════════════════════════════════════════ */
+router.patch("/:id/adjustments", async (req, res) => {
+  try {
+    const emp = await requester(req);
+    if (!emp) return res.status(404).json({ success: false, message: "Your staff record was not found." });
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const viewer = await viewerOf(emp);
+    if (!viewer.canFulfil) {
+      return res.status(403).json({
+        success: false,
+        message: "Only Store & Purchase can set the charges on a quote.",
+      });
+    }
+
+    /* Editable up to approval, and not after. `approved` and `ordered` are
+       decisions; the rest of the chain is still a quote under negotiation. */
+    const SETTLED = [chain.APPROVED, chain.ORDERED];
+    if (SETTLED.includes(doc.status)) {
+      return res.status(409).json({
+        success: false,
+        reason: "ADJUSTMENTS_SETTLED",
+        message: `${doc.requestNumber} has already been approved at ${doc.grandTotal}. `
+          + "To change a charge, requote it — that sends it back for confirmation and approval "
+          + "so the new figure is the one Finance agrees to.",
+      });
+    }
+    if ([chain.REJECTED, chain.CANCELLED].includes(doc.status)) {
+      return res.status(409).json({
+        success: false,
+        message: `${doc.requestNumber} is ${chain.STAGE_LABEL[doc.status] || doc.status}.`,
+      });
+    }
+
+    const priced = fulfilment.priceFor({
+      lines: (doc.items || []).map((l) => ({
+        buyQty: l.quantity, rate: l.rate, gstPercent: l.gstPercent,
+      })),
+    });
+    const adj = spendAdjustments.readAdjustments(req.body, priced.grandTotal);
+    if (!adj.ok) return res.status(400).json({ success: false, message: adj.message, field: adj.field });
+
+    const payable = spendAdjustments.summarise({
+      subtotal: priced.subtotal, taxAmount: priced.taxAmount,
+      shipping: adj.shipping, customCharges: adj.custom, discount: adj.discount,
+    });
+
+    doc.totalAmount = priced.subtotal;
+    doc.taxAmount = priced.taxAmount;
+    doc.quotedShippingCharges = payable.shippingCharges;
+    doc.quotedDiscount = payable.discount;
+    doc.quotedCustomCharges = payable.customCharges;
+    doc.grandTotal = payable.grandTotal;
+
+    const who = mrfApprover.buildFullName(emp);
+    doc.history.push({
+      at: new Date(), by: emp._id, byName: who,
+      action: "set the charges on the quote",
+      /* Each charge by name, so the approver reads what they are agreeing to
+         rather than one combined figure. */
+      note: [
+        payable.shippingCharges ? `freight ${payable.shippingCharges}` : "",
+        ...payable.customCharges.map((c) => `${c.label} ${c.amount}`),
+        payable.discount ? `discount ${payable.discount}` : "",
+      ].filter(Boolean).join(", ") || "cleared",
+    });
+    await doc.save();
+
+    res.json({
+      success: true,
+      request: publicRequest(doc.toObject()),
+      /* The breakdown, not just the total — every screen that shows the figure
+         has to be able to show why it is that figure. */
+      payable,
+      message: `${doc.requestNumber} now comes to ${payable.grandTotal}.`,
+    });
+  } catch (e) {
+    console.error("[spend] adjustments:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.patch("/:id/requote", async (req, res) => {
   try {
     const emp = await requester(req);
@@ -2693,10 +2902,39 @@ router.patch("/:id/requote", async (req, res) => {
         buyQty: l.quantity, rate: l.rate, gstPercent: l.gstPercent,
       })),
     });
+
+    /* ── THE ADJUSTMENTS TRAVEL WITH THE REQUOTE ─────────────────────────
+       Store may change freight or a discount at the same time as a rate —
+       that is usually the same negotiation. Sent values are validated and
+       replace the quote; omitting them entirely keeps what was already
+       quoted, so a requote about one line does not silently drop the freight
+       agreed last week. */
+    const sentAdjustment = ["shippingCharges", "discount", "customCharges"]
+      .some((k) => req.body?.[k] !== undefined);
+    const adj = sentAdjustment
+      ? spendAdjustments.readAdjustments(req.body, priced.grandTotal)
+      : {
+        ok: true,
+        shipping: doc.quotedShippingCharges || 0,
+        discount: doc.quotedDiscount || 0,
+        custom: (doc.quotedCustomCharges || []).map((c) => ({ label: c.label, amount: c.amount })),
+      };
+    if (!adj.ok) {
+      return res.status(400).json({ success: false, message: adj.message, field: adj.field });
+    }
+    const payable = spendAdjustments.summarise({
+      subtotal: priced.subtotal, taxAmount: priced.taxAmount,
+      shipping: adj.shipping, customCharges: adj.custom, discount: adj.discount,
+    });
+
     doc.totalAmount = priced.subtotal;
     doc.gstPercent = priced.gstPercent;
     doc.taxAmount = priced.taxAmount;
-    doc.grandTotal = priced.grandTotal;
+    doc.quotedShippingCharges = payable.shippingCharges;
+    doc.quotedDiscount = payable.discount;
+    doc.quotedCustomCharges = payable.customCharges;
+    /* The payable figure the requester is about to confirm. */
+    doc.grandTotal = payable.grandTotal;
 
     const now = new Date();
     const who = mrfApprover.buildFullName(emp);

@@ -18,16 +18,45 @@
 "use strict";
 
 const express = require("express");
+const { scopedFilter: scoped } = require("../../../services/companyContext/salesScope.service");
+const { scopeFor: salesScopeFor } = require("../../../services/companyContext/salesScope.service");
+const { createServiceContext } = require("../../../services/companyContext/serviceScope.service");
+
+/**
+ * The trusted company context an email helper is given.
+ *
+ * Taken from THIS already-authorised request. An email helper that resolved
+ * its own company — or worse, took it from the style it was handed — would be
+ * deciding its own authorisation.
+ */
+const sampleEmailScope = async (req) => {
+  const scope = await salesScopeFor(req);
+  /* The factory decides the legacy allowance from the company master. This
+     caller cannot grant it to itself. */
+  return createServiceContext({
+    companyId: scope.companyId,
+    reason: "sample style email",
+    legacyAware: true,
+  });
+};
 const crypto = require("crypto");
 const mongoose = require("mongoose");
 
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
+const CustomerChangeRequest = require("../../../models/CMS_Models/Sales/CustomerChangeRequest");
+const customerChangeRouting = require("../../../services/sales/customerChangeRouting.service");
+const {
+  brandingRequirementsOf,
+  sanitizeBrandingRequirements,
+  ARTWORK_IS_CUSTOMER_REFERENCE,
+} = require("../../../models/CMS_Models/Sales/enquiryBrandingRequirement");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Customer = require("../../../models/Customer_Models/Customer");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+const Service = require("../../../models/CMS_Models/Inventory/Services/Service");
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const Unit = require("../../../models/CMS_Models/Inventory/Configurations/Unit");
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
@@ -37,6 +66,27 @@ const { nextRequestId } = require("../../../services/requestId");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
 const { styleEmailContext, imageGalleryHtml, bomTableHtml, stockItemBom } = require("../../../services/sampleStyleEmail.service");
+const { resolveRequirements } = require("../../../services/sales/sampleRequirements.service");
+/* Merchandising's approved selection joined to R&D's consumption — one
+   BOM → Packaging workflow over two owned records. */
+const packagingBom = require("../../../services/sales/packagingBom.service");
+/* The one ownership rule, reused rather than re-derived — see the service. */
+const { ownershipProofFor } = require("../../../services/centralCosting/technicalSource.service");
+/* Read for its charge TYPES only — the amounts never leave the costing app. */
+const CostingPolicy = require("../../../models/CMS_Models/Costing/CostingPolicy");
+/* The operation master the sample route is chosen from. It carries no company
+   of its own — one global table — so the STYLE is what is proved here, and
+   what comes back is identities and shapes, never a rate. */
+const Operation = require("../../../models/CMS_Models/Inventory/Configurations/Operation");
+/* R&D's structured technical record — what is complete, what may be edited,
+   and what gets frozen on submission. The rules live there rather than in
+   this router so the costing can ask the same questions of the same code. */
+const technicalRecord = require("../../../services/centralCosting/technicalRecord.service");
+/* WHICH materials R&D is expected to complete — one resolver, shared by the
+   GET, the save, the seeding, return-to-materials and the completeness gate,
+   reading the same finished-good BOM the visible Approved BOM panel shows. */
+const { approvedShortlistFor } = require("../../../services/approvedMaterialShortlist.service");
+const developmentChargePolicy = require("../../../services/centralCosting/developmentChargePolicy.service");
 // THIS BACKEND's own public origin — for the BOM-approval decision links,
 // which are the one thing here that must point at the API rather than at the
 // CMS: the Project Manager decides from their inbox without signing in, so
@@ -70,6 +120,9 @@ const {
 const router = express.Router();
 
 const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
+/* The three-field "does this apply?" answer, shared with Production's and
+   Merchandising's own services so one question has one validator. */
+const styleApplicability = require("../../../services/styleApplicability");
 const isObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
 
 // For the department-notification emails below.
@@ -83,10 +136,32 @@ function escapeHtml(s) {
 // A house sample has none — "—" alone read as customer information having
 // gone missing, not as "there genuinely isn't one" (1 Sept 2026 bug fix,
 // same reasoning as sampleStyleEmail.service.js's styleEmailContext).
-async function customerNameFor(style) {
+/**
+ * @param {object} style  the style the email is about
+ * @param {object} req    the authenticated request, for the company scope
+ *
+ * ── WHY THE REQUEST IS A PARAMETER ──────────────────────────────────────────
+ * The account lookup is company-scoped, and `scoped()` resolves that company
+ * from the request. This function did not take one: it referenced a free `req`
+ * that existed nowhere in its scope, so every call reached a ReferenceError the
+ * moment a journey-linked style with an account got past the two guards above.
+ *
+ * It went unnoticed because all six callers are fire-and-forget notification
+ * blocks — `(async () => { … })().catch(() => {})` — so the throw was caught
+ * and discarded, the route answered 200, and the email simply never arrived. A
+ * route returning success proved nothing about this helper.
+ *
+ * `referenceImageFor` beside it has taken `req` since it was written, for the
+ * same reason. This now matches it.
+ */
+async function customerNameFor(style, req) {
   if (style?.sampleType === "house") return "In-house sample — no customer";
   if (!style?.accountId) return "—";
-  const acc = await Account.findById(style.accountId).select("displayName companyName").lean();
+  /* Company-scoped, deliberately: a style carrying a foreign account id would
+     otherwise put that company's customer name into an email. Missing and
+     foreign both fall through to the same "—" the fallback already used. */
+  const acc = await Account.findOne(await scoped(req, { _id: style.accountId }))
+    .select("displayName companyName").lean();
   return acc?.displayName || acc?.companyName || "—";
 }
 
@@ -94,9 +169,11 @@ async function customerNameFor(style) {
 // captured for this product, since SampleStyle carries no images of its own
 // until R&D submits an actual sample photo (see the `/sample` submit action,
 // which DOES have its own photos — that one is used directly instead of this).
-async function referenceImageFor(style) {
+async function referenceImageFor(style, req) {
   if (!style?.enquiryId) return null;
-  const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
+  /* Authorisation is not `style.enquiryId`: a style carrying a foreign
+     enquiry id would otherwise hand over that company's product photograph. */
+  const enq = await Enquiry.findOne(await scoped(req, { _id: style.enquiryId })).select("products").lean();
   return enq?.products?.find((p) => p.product === style.productName)?.images?.[0] || null;
 }
 
@@ -156,11 +233,13 @@ async function canApprove(user) {
   return isSalesManager(user);
 }
 
-async function loadJourney(journeyRef) {
+async function loadJourney(req, journeyRef) {
   const query = isObjectId(journeyRef)
     ? { $or: [{ _id: journeyRef }, { journeyId: journeyRef }] }
     : { journeyId: journeyRef };
-  return SalesJourney.findOne({ ...query, isActive: true });
+  /* `$and` through the scope helper, so this route's own `$or` cannot displace
+     the tenant clause — the failure mode of merging two `$or`s into one. */
+  return SalesJourney.findOne(await scoped(req, { ...query, isActive: true }));
 }
 
 async function resolveStyle(idOrRef) {
@@ -199,6 +278,31 @@ const briefFromProduct = (p) => ({
   sizeRange: p.sizeRange || "",
   branding: [p.logo && "Logo", p.embroidery && "Embroidery", p.printing && "Printing"].filter(Boolean).join(", "),
   brandingPlacement: p.brandingPlacement || "",
+  /* ── EACH DECORATION, WITH ITS OWN ARTWORK ─────────────────────────────
+     The `branding` sentence above is a summary of three booleans and cannot
+     say that the chest logo is embroidered 8 cm wide in Pantone 280 C while
+     the back print is something else entirely — nor carry the file the
+     customer sent for either. This does.
+
+     `brandingRequirementsOf` returns the structured rows when the enquiry has
+     them, and projects the old booleans into the same shape when it does not,
+     so R&D reads one shape for every record. The artwork is the BUYER'S
+     reference material, never an approved production file — see the schema
+     comment on SampleStyle.brief.brandingRequirements. */
+  brandingRequirements: brandingRequirementsOf(p).map((r) => ({
+    ref: r.ref || undefined,
+    type: r.type || "",
+    placement: r.placement || "",
+    width: r.width ?? undefined,
+    height: r.height ?? undefined,
+    unit: r.unit || "",
+    colourNotes: r.colourNotes || "",
+    notes: r.notes || "",
+    artworkState: r.artworkState || "",
+    artwork: (r.artwork || []).map((i) => ({ fileId: i.fileId, publicId: i.publicId, name: i.name, url: i.url })),
+    legacy: Boolean(r.legacy),
+  })),
+  artworkIsCustomerReference: ARTWORK_IS_CUSTOMER_REFERENCE,
   trims: p.trims || "",
   specialConstruction: p.specialConstruction || "",
   // Dropped before 19 Aug 2026: the enquiry product row always carried this
@@ -232,8 +336,15 @@ const briefFromProduct = (p) => ({
 
 const decorate = (styleDoc, journey, account, enquiry) => {
   const o = styleDoc.toObject ? styleDoc.toObject() : styleDoc;
+  const enquiryProduct = enquiry && o.enquiryProductId
+    ? (enquiry.products || []).find((p) => String(p?._id || "") === String(o.enquiryProductId))
+    : null;
   return {
     ...o,
+    /* The permanent enquiry-line identity travels with the style response so
+       a customer-change request can be tied to the product line, never only
+       to a renameable product name. */
+    productLineRef: enquiryProduct?.productLineRef || null,
     // The BOM decision secret NEVER leaves the server (28 Aug 2026). It is
     // `select: false` on the schema, so a plain read already omits it — but
     // the request route ASSIGNS it before saving, which puts it on the
@@ -316,13 +427,13 @@ async function startingSalesPricesFor(styleDocs) {
 }
 
 // Re-decorate a saved style with its journey + customer + enquiry for the response.
-async function withJourney(styleDoc) {
+async function withJourney(styleDoc, req) {
   const [j, acc, enquiry, prices] = await Promise.all([
-    SalesJourney.findById(styleDoc.journeyId).select("journeyId name").lean(),
-    styleDoc.accountId ? Account.findById(styleDoc.accountId).select("accountId companyName displayName").lean() : null,
+    SalesJourney.findOne(await scoped(req, { _id: styleDoc.journeyId })).select("journeyId name").lean(),
+    styleDoc.accountId ? Account.findOne(await scoped(req, { _id: styleDoc.accountId })).select("accountId companyName displayName").lean() : null,
     styleDoc.enquiryId
-      ? Enquiry.findById(styleDoc.enquiryId)
-        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate")
+      ? Enquiry.findOne(await scoped(req, { _id: styleDoc.enquiryId }))
+        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate products._id products.productLineRef")
         .lean()
       : null,
     startingSalesPricesFor([styleDoc]),
@@ -377,6 +488,12 @@ router.post("/house", salesAuth, async (req, res) => {
       embroidery: b.embroidery,
       printing: b.printing,
       brandingPlacement: b.brandingPlacement,
+      /* The house form shares the Enquiry product form, so it sends the same
+         structured rows. Sanitised here rather than trusted: this is a request
+         body, and the brief is a snapshot — it has no identity of its own to
+         reconcile, so the references it carries are simply dropped. */
+      brandingRequirements: (sanitizeBrandingRequirements(b.brandingRequirements) || [])
+        .map(({ ref, ...rest }) => rest),
       trims: b.trims,
       specialConstruction: b.specialConstruction,
       existingUniform: b.existingUniform,
@@ -414,7 +531,7 @@ router.post("/house", salesAuth, async (req, res) => {
       createdBy: who.id,
     });
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /house", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -452,7 +569,7 @@ router.patch("/:id/pictures", salesAuth, async (req, res) => {
     logHistory(style, { kind: "reference_picture_added", note: `${incoming.length} reference picture${incoming.length === 1 ? "" : "s"} added.` }, req);
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] PATCH /:id/pictures", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -526,12 +643,12 @@ router.post("/:id/remove", salesAuth, async (req, res) => {
 // stage transition. Sales calls it when handing the journey to R&D.
 router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => {
   try {
-    const journey = await loadJourney(req.params.journeyRef);
+    const journey = await loadJourney(req, req.params.journeyRef);
     if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
 
     const [enquiry, account] = await Promise.all([
-      Enquiry.findOne({ journeyId: journey._id, isActive: true }).select("products").lean(),
-      journey.accountId ? Account.findById(journey.accountId).select("accountId companyName displayName").lean() : null,
+      Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true })).select("products").lean(),
+      journey.accountId ? Account.findOne(await scoped(req, { _id: journey.accountId })).select("accountId companyName displayName").lean() : null,
     ]);
 
     const { styles, created, renamed, backfilled, waived } = await provisionJourneyStyles({
@@ -558,11 +675,36 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
       })(),
     });
 
+    /* Complete the second half of BRIEF_NEW_VERSION. Removing the rejected
+       enquiry row moves its change request to IN_PROGRESS; provisioning the
+       replacement now links the request to the new permanent line and style.
+       It remains open until the customer approves that replacement. */
+    const scope = await salesScopeFor(req);
+    const replacementCandidates = await CustomerChangeRequest.find({
+      companyId: scope.companyId,
+      enquiryId: enquiry?._id,
+      destination: "BRIEF_NEW_VERSION",
+      status: "IN_PROGRESS",
+      "result.replacementSampleStyleId": { $exists: false },
+    });
+    for (const request of replacementCandidates) {
+      const replacement = styles.find((s) => s.isActive !== false && s.productName === request.productName
+        && String(s._id) !== String(request.sampleStyleId));
+      if (!replacement) continue;
+      const row = (enquiry?.products || []).find(
+        (p) => String(p?._id || "") === String(replacement.enquiryProductId || ""),
+      );
+      request.result = request.result || {};
+      request.result.replacementSampleStyleId = replacement._id;
+      request.result.replacementProductLineRef = row?.productLineRef || undefined;
+      await request.save();
+    }
+
     const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
       created, renamed, backfilled, waived,
-      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account, enquiry), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] POST /by-journey/:journeyRef/provision", err);
@@ -570,24 +712,115 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
   }
 });
 
+/**
+ * GET /for-request/:requestId — which style each line of a customer request is.
+ *
+ * ── THE PROBLEM THIS SOLVES ─────────────────────────────────────────────────
+ * The quotation editor builds its lines from `request.items[].stockItemId` —
+ * an ITEM MASTER product. An approved costing price is published against a
+ * SampleStyle. Nothing in the quotation payload joined the two, so the editor
+ * had no way to ask "is there an approved price for this line" without
+ * matching on the product NAME, which a rename or a coincidence of wording
+ * silently repoints.
+ *
+ * ── AND IT IS NOT A NEW MAPPING ─────────────────────────────────────────────
+ * SampleStyle already stores both halves itself, and has since production
+ * linking was built: `production.customerRequestId` is the request the style
+ * became an order for, and `production.stockItemId` is the item-master
+ * product it became after development. This reads THOSE. No second table, no
+ * inference, and nothing here writes.
+ *
+ * Returned as a list of stored id pairs — the smallest identity the handoff
+ * needs. Deliberately no price, no cost, no margin and no supplier: a Sales
+ * reader gets the SUBJECT of the costing, and asks the costing service itself
+ * for anything commercial, where the capability is checked.
+ */
+router.get("/for-request/:requestId", salesAuth, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(requestId)) {
+      return res.status(400).json({ success: false, message: "That request reference is not valid." });
+    }
+    /* Scoped exactly like every other read in this file — a style belonging to
+       another company's journey is not visible here either. */
+    const styles = await SampleStyle.find(await scoped(req, {
+      "production.customerRequestId": requestId,
+      isActive: true,
+    }))
+      .select("_id styleCode productName production.stockItemId enquiryId")
+      .lean();
+
+    /* ── AND WHICH COMMERCIAL LINE, WHERE THERE IS NO DOUBT ────────────
+       A quotation line's quantity comes from the confirmed commercial line,
+       keyed by the permanent product-line reference AND the style — one
+       enquiry can carry the same garment twice in two colourways. Where a
+       style has exactly ONE confirmed line the reference is not a choice,
+       so it is handed over and the editor never has to ask.
+
+       Where it has two, NOTHING is sent. Picking one here would be picking
+       a colourway on the company's behalf; the pricing command refuses an
+       ambiguous style by name and says what to do about it. */
+    const refByStyle = new Map();
+    const enquiryIds = [...new Set(styles.map((s) => String(s.enquiryId || "")).filter(Boolean))];
+    if (enquiryIds.length) {
+      const enquiries = await Enquiry.find(await scoped(req, { _id: { $in: enquiryIds } }))
+        .select("commercialLines").lean();
+      for (const e of enquiries) {
+        const byStyle = new Map();
+        for (const l of e.commercialLines || []) {
+          const k = String(l.sampleStyleId || "");
+          if (!k) continue;
+          byStyle.set(k, byStyle.has(k) ? null : String(l.productLineRef || ""));
+        }
+        for (const [k, ref] of byStyle) if (ref) refByStyle.set(k, ref);
+      }
+    }
+
+    return res.json({
+      success: true,
+      /* One entry per style that names a product. A style with no
+         `stockItemId` cannot be matched to a quotation line and is omitted
+         rather than returned with a null the caller would have to guard. */
+      links: styles
+        .filter((s) => s.production?.stockItemId)
+        .map((s) => ({
+          sampleStyleId: String(s._id),
+          stockItemId: String(s.production.stockItemId),
+          styleCode: s.styleCode || "",
+          productName: s.productName || "",
+          /* Absent where the style has no confirmed line, or more than one. */
+          ...(refByStyle.has(String(s._id))
+            ? { productLineRef: refByStyle.get(String(s._id)) }
+            : {}),
+        })),
+    });
+  } catch (err) {
+    console.error("[sampleStyles] GET /for-request/:requestId", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
   try {
-    const journey = await loadJourney(req.params.journeyRef);
+    const journey = await loadJourney(req, req.params.journeyRef);
     if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
 
     // READ ONLY. Provisioning lives in POST /by-journey/:journeyRef/provision
     // and in the journey's own stage transition — a GET that creates records
     // meant a style existed only once someone opened the journey, and any
     // prefetch or double-render wrote to the database.
-    const [styles, account] = await Promise.all([
+    const [styles, account, enquiry] = await Promise.all([
       SampleStyle.find({ journeyId: journey._id, isActive: true }).sort({ createdAt: 1 }),
-      journey.accountId ? Account.findById(journey.accountId).select("accountId companyName displayName").lean() : null,
+      journey.accountId ? Account.findOne(await scoped(req, { _id: journey.accountId })).select("accountId companyName displayName").lean() : null,
+      Enquiry.findOne(await scoped(req, { journeyId: journey._id, isActive: true }))
+        .select("enquiryId title summary priority seriousness enquiryDate requirementDeadline expectedClosingDate products._id products.productLineRef")
+        .lean(),
     ]);
 
     const prices = await startingSalesPricesFor(styles);
     return res.json({
       success: true,
-      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account), startingSalesPrice: prices.get(s) ?? null })),
+      sampleStyles: styles.map((s) => ({ ...decorate(s, journey, account, enquiry), startingSalesPrice: prices.get(s) ?? null })),
     });
   } catch (err) {
     console.error("[sampleStyles] GET /by-journey", err);
@@ -633,7 +866,7 @@ router.get("/", salesAuth, async (req, res) => {
     // handful of accounts.
     const accountIds = [...new Set(docs.map((d) => d.accountId).filter(Boolean).map(String))];
     const accounts = accountIds.length
-      ? await Account.find({ _id: { $in: accountIds } }).select("accountId companyName displayName").lean()
+      ? await Account.find(await scoped(req, { _id: { $in: accountIds } })).select("accountId companyName displayName").lean()
       : [];
     const accountById = new Map(accounts.map((a) => [String(a._id), a]));
 
@@ -660,7 +893,7 @@ router.get("/:id", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] GET /:id", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -677,15 +910,48 @@ router.get("/:id", salesAuth, async (req, res) => {
 // blocks Save until every row has one; this is the backend's own copy of
 // that same rule, thrown as a real error rather than silently dropping a
 // row someone typed, in case anything ever calls this route directly.
+/**
+ * The Merchandiser's materials pick — A SHORTLIST, NOT A BILL OF MATERIALS.
+ *
+ * ── THE OWNERSHIP THIS CORRECTS ─────────────────────────────────────────────
+ * This used to REFUSE a row without a quantity, so Merchandising had to type
+ * one for every material they selected. That figure was then read downstream
+ * as the final per-garment consumption and displayed as an established fact —
+ * "0.2625 kg + 5%" — when nobody had measured the garment. Merchandising
+ * selects WHICH materials; R&D establishes WHAT EACH ONE CONSUMES, in the
+ * structured technical record, and that is the only place consumption and
+ * allowance are now recorded.
+ *
+ * So a quantity is neither required nor stored on a new pick. Rows already in
+ * the database keep theirs untouched — this is the write path, not a
+ * migration, and rewriting history to match a corrected process would destroy
+ * the record of what was actually done.
+ */
+/**
+ * What leaves the server for one packaging selection.
+ *
+ * An allowlist rather than the stored row: this record must never carry a
+ * quantity, a rate or a supplier, and publishing it wholesale would make that
+ * a convention instead of a fact.
+ */
+function publicPackagingSelection(r) {
+  return {
+    rowId: String(r.rowId || ""),
+    rawItemId: String(r.rawItemId || ""),
+    rawItemName: r.rawItemName || "",
+    rawItemSku: r.rawItemSku || "",
+    specification: r.specification || "",
+    status: r.status || "proposed",
+    selectedByName: r.selectedBy?.name || "",
+    selectedAt: r.selectedAt || null,
+    withdrawnReason: r.withdrawnReason || "",
+    withdrawnAt: r.withdrawnAt || null,
+  };
+}
+
 function sanitizeMaterialsRawItems(input) {
   if (!Array.isArray(input)) return [];
   const rows = input.filter((r) => r && isObjectId(r.rawItemId));
-  const missingQty = rows.find((r) => r.quantity == null || r.quantity === "" || Number(r.quantity) <= 0);
-  if (missingQty) {
-    const err = new Error(`Quantity is required for "${missingQty.rawItemName || "a raw item"}".`);
-    err.status = 400;
-    throw err;
-  }
   return rows.map((r) => ({
     rawItemId: r.rawItemId,
     rawItemName: String(r.rawItemName || "").trim(),
@@ -694,8 +960,10 @@ function sanitizeMaterialsRawItems(input) {
     variantCombination: Array.isArray(r.variantCombination) ? r.variantCombination.filter(Boolean) : [],
     productVariantId: isObjectId(r.productVariantId) ? r.productVariantId : undefined,
     productVariantLabel: String(r.productVariantLabel || "").trim(),
-    quantity: Number(r.quantity),
-    unit: String(r.unit || "").trim(),
+    /* Deliberately NOT carried: `quantity` and `unit` are R&D's to establish.
+       A value sent here is dropped rather than refused, so an older client
+       still saves its selection instead of failing on a field it should not
+       have been collecting. */
   }));
 }
 
@@ -780,6 +1048,31 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* ── THE COMPANY, PROVED BEFORE ANYTHING IS WRITTEN ──────────────────
+       This route had no company check at all: `resolveStyle` matches by id
+       alone, so a style id from another company's books resolved and was then
+       mutated.
+
+       ── AND THIS IS LEGACY SALES COMPATIBILITY, NOT A MERCHANDISING DOOR ─
+       Material and trim selection IS a Merchandising-owned fact. This route is
+       not a Merchandising endpoint: it is authorised by `salesAuth`, its
+       direct-apply path is open to whoever `bypassesApproval` admits — Sales,
+       an admin, the CEO — and everybody else's write is staged for a SALES
+       decision. That is the pre-existing arrangement, and it is unchanged.
+
+       Nothing under `app/merchandiser/**` calls it; the Merchandising client
+       cannot reach it at all. It is kept for the Sales Style & Sample stage
+       that does, and the legacy Sales authority over a Merchandising-owned
+       fact is recorded as migration debt rather than described as closed.
+       Adding a Merchandising grant here would break that Sales screen, which
+       is a migration and not this correction's to make.
+
+       What was added is a tenancy proof and nothing else — the same authority,
+       the same callers, their own company. */
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
 
     const items = Array.isArray(req.body.items)
       ? req.body.items.map((x) => String(x).trim()).filter(Boolean)
@@ -799,7 +1092,7 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
       await style.save();
 
       (async () => {
-        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        const [customerName, image] = await Promise.all([customerNameFor(style, req), referenceImageFor(style, req)]);
         await notifyEvent("materials_change_requested", {
           heading: `Materials change requested: ${style.productName || style.styleCode || ""}`,
           bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Merchandising")}</strong> proposed a materials change for this style, needing your review.</p>`,
@@ -837,7 +1130,7 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
     logHistory(style, { kind: "materials_set", note: items.join(", ") || "cleared", from: prevItems.join(", "), to: items.join(", ") }, req);
     await style.save();
     await syncMaterialsRawItems(style, rawItems);
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error("[sampleStyles] PATCH /:id/materials", err);
@@ -856,6 +1149,15 @@ router.post("/:id/materials/change/:changeId/decide", salesAuth, async (req, res
     }
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* ── AND THE DECISION IS SCOPED TOO ──────────────────────────────────
+       The same gap as the two routes above, on the route that APPROVES what
+       they staged: a Sales, admin or CEO caller could decide a materials
+       change on a style in another company's books. The authority is
+       unchanged and still Sales' — only the books it reaches are. */
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
 
     const decision = String(req.body?.decision || "").trim();
     if (!["approve", "reject"].includes(decision)) {
@@ -884,7 +1186,7 @@ router.post("/:id/materials/change/:changeId/decide", salesAuth, async (req, res
     style.updatedBy = actor(req);
     await style.save();
     if (decision === "approve") await syncMaterialsRawItems(style, entry.rawItems || []);
-    return res.json({ success: true, status: entry.status, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, status: entry.status, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/materials/change/:changeId/decide", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -898,6 +1200,27 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* ── THE COMPANY, PROVED BEFORE ANYTHING IS WRITTEN ──────────────────
+       This route had no company check at all: `resolveStyle` matches by id
+       alone, so a style id from another company's books resolved and was then
+       mutated.
+
+       ── AND IT IS STILL SALES' ROUTE ───────────────────────────────────
+       Routing a style — sending it to the Merchandiser, sending it on to R&D,
+       pulling it back to the brief — is Sales' act, and the handler below says
+       so itself: `materials → rnd` is refused to anybody but Sales, an admin
+       or the CEO. That the result HANDS WORK TO Merchandising does not make it
+       a Merchandising mutation, and it deliberately does NOT require a
+       Merchandising grant. What was added here is a tenancy proof and nothing
+       else: the same authority acts on the same styles, in their own company.
+
+       Scoped through `salesScopeFor`, the resolution every other route in this
+       file already uses, so a genuine same-company Sales caller is unaffected.
+       Foreign and missing stay one answer. */
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
     const { stage } = req.body;
     if (!SAMPLE_STYLE_STAGE_CODES.includes(stage)) return res.status(400).json({ success: false, message: "Invalid stage." });
 
@@ -981,7 +1304,7 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     // finished good.
     if (stage === "materials" && from === "brief") {
       (async () => {
-        const c = await styleEmailContext(style);
+        const c = await styleEmailContext(style, await sampleEmailScope(req));
         const salesPerson = actor(req).name || "Sales";
         await notifyEvent("sample_sent_to_merchandiser", {
           vars: { product: style.productName || "", customer: c.customerName, salesPerson, styleCode: style.styleCode || style.sampleStyleId || "" },
@@ -1004,7 +1327,7 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     // Project Manager has approved the BOM above.
     if (stage === "rnd" && from !== "rnd") {
       (async () => {
-        const c = await styleEmailContext(style);
+        const c = await styleEmailContext(style, await sampleEmailScope(req));
         const salesPerson = actor(req).name || "Sales";
         const approver = style.bomApproval?.decidedByName || style.bomApproval?.decidedByEmail || "";
         await notifyEvent("sample_sent_to_rnd", {
@@ -1029,7 +1352,7 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] PATCH /:id/stage", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1095,7 +1418,7 @@ router.post("/:id/reset", salesAuth, async (req, res) => {
     style.updatedBy = actor(req);
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/reset", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1158,7 +1481,7 @@ router.post("/:id/bom-approval/request", salesAuth, async (req, res) => {
       deadline,
     };
 
-    const c = await styleEmailContext(style);
+    const c = await styleEmailContext(style, await sampleEmailScope(req));
     const salesPerson = actor(req).name || "Sales";
     const decideBase = `${API_PUBLIC_URL}/api/public/bom-approval/${style._id}/${token}`;
 
@@ -1219,7 +1542,7 @@ ${bomTableHtml(c.bom, c.variantTotal)}
     style.updatedBy = actor(req);
     await style.save();
 
-    return res.json({ success: true, sentTo: result.sent, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sentTo: result.sent, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/bom-approval/request", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1227,6 +1550,291 @@ ${bomTableHtml(c.bom, c.variantTotal)}
 });
 
 // POST /api/cms/crm/sample-styles/:id/tech-sheet  { action, note?, file? }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   R&D'S STRUCTURED TECHNICAL RECORD
+   ═══════════════════════════════════════════════════════════════════════════
+   Read, saved and sent back through here. Every route proves the company
+   through the style's parent before it answers, exactly as the operation
+   picker does — a style id from a browser is not authorisation.
+════════════════════════════════════════════════════════════════════════════ */
+
+/** GET /:id/technical — the record, what is missing, and the approved list. */
+router.get("/:id/technical", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      /* Missing and foreign are one answer. */
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+
+    const technical = style.techSheet?.technical || {};
+    const shortlist = await approvedShortlistFor(style);
+    const approved = shortlist.rows;
+    /* Same gap, on the read side: a sheet opened before this record existed
+       has no seeded rows, so the screen would show an empty form for a style
+       with an approved shortlist. Seeded for DISPLAY only — nothing is
+       written until R&D actually saves.
+
+       Re-merged even when rows DO exist, so a material added to the finished
+       good after the record was seeded appears rather than being invisible
+       until somebody restarts the sheet. R&D's saved facts survive the merge
+       — `mergeOntoApproved` matches them on by identity. */
+    const sheetOpen = ["in_progress", "changes"].includes(style.techSheet?.status);
+    const displayMaterials = sheetOpen || !(technical.materials || []).length
+      ? technicalRecord.mergeOntoApproved(approved, technical.materials || []).rows
+      : (technical.materials || []);
+    const gate = technicalRecord.completeness(
+      { ...technical, materials: displayMaterials },
+      { file: style.techSheet?.file, approvedMaterialCount: approved.length, shortlistBlocker: shortlist.blocker },
+    );
+
+    return res.json({
+      success: true,
+      technical: {
+        status: technical.status || technicalRecord.STATUS.NOT_STARTED,
+        revision: technical.revision || 0,
+        editable: technicalRecord.EDITABLE.includes(technical.status)
+          || ((!technical.status || technical.status === technicalRecord.STATUS.NOT_STARTED) && sheetOpen),
+        materials: displayMaterials,
+        operations: technical.operations || [],
+        requirements: technical.requirements || [],
+      },
+      /* The shortlist, as identity only — so the screen can show what
+         Merchandising selected without implying a consumption. */
+      approvedMaterials: approved.map((r) => ({
+        rawItemId: String(r.rawItemId || ""),
+        rawItemName: r.rawItemName || "",
+        rawItemSku: r.rawItemSku || "",
+        variantId: r.variantId ? String(r.variantId) : null,
+        variantCombination: r.variantCombination || [],
+        appliesToVariantLabels: r.appliesToVariantLabels || [],
+      })),
+      /* Named, so a reader can tell an authoritative BOM from a legacy pick
+         without guessing — and so a style with neither says whose step is
+         outstanding instead of blaming R&D for an empty form. */
+      shortlistSource: shortlist.source,
+      shortlistBlocker: shortlist.blocker,
+      techSheet: {
+        status: style.techSheet?.status || "pending",
+        file: style.techSheet?.file || null,
+      },
+      completeness: gate,
+      /* Frozen history, without the snapshots — a list of what happened, not
+         a payload nobody asked for. */
+      revisions: (style.techSheet?.technicalRevisions || []).map((r) => ({
+        revision: r.revision, submittedAt: r.submittedAt,
+        submittedBy: r.submittedBy?.name || "", outcome: r.outcome,
+        decidedAt: r.decidedAt || null, decidedBy: r.decidedBy?.name || "",
+        decisionNote: r.decisionNote || "",
+      })),
+      families: technicalRecord.REQUIREMENT_FAMILIES,
+    });
+  } catch (err) {
+    console.error("[sampleStyles] GET /:id/technical", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * PUT /:id/technical — save the draft.
+ *
+ * ── WHAT THE BODY MAY AND MAY NOT DECIDE ────────────────────────────────────
+ * It may carry R&D's own facts. It may NOT carry a material identity: the rows
+ * are rebuilt from the approved shortlist and the submission is matched onto
+ * them, so a body naming a raw item the BOM does not hold contributes nothing
+ * and is reported back as rejected. That is the substitution this refuses —
+ * silently accepting it would let R&D swap the material with no trace.
+ */
+router.put("/:id/technical", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+
+    style.techSheet = style.techSheet || {};
+    style.techSheet.technical = style.techSheet.technical || {};
+    const t = style.techSheet.technical;
+
+    /* ── A SHEET ALREADY OPEN WHEN THIS RECORD DID NOT EXIST ──────────
+       Starting the tech sheet is what seeds the record, so every style whose
+       sheet was already in progress before this feature shipped has an
+       open sheet and a `not_started` record — and no way to reach one,
+       because `start` only fires from `pending`. Seeded here instead, the
+       first time R&D saves, from the approved shortlist exactly as `start`
+       would have. Only while the SHEET is genuinely open: this is a gap
+       being closed, not a way to reopen a submitted or approved record. */
+    const sheetOpen = ["in_progress", "changes"].includes(style.techSheet.status);
+    if ((!t.status || t.status === technicalRecord.STATUS.NOT_STARTED) && sheetOpen) {
+      t.status = technicalRecord.STATUS.DRAFT;
+      t.startedAt = t.startedAt || new Date();
+      t.startedBy = t.startedBy || actor(req);
+      t.revision = t.revision || 0;
+      t.operations = t.operations || [];
+      t.requirements = t.requirements || [];
+    }
+
+    /* Only R&D's own in-progress or returned record is writable. A submitted
+       one is with Sales and an approved one is what a costing may have read;
+       both are refused rather than quietly reopened. */
+    if (!technicalRecord.EDITABLE.includes(t.status)) {
+      return res.status(409).json({
+        success: false,
+        code: "TECHNICAL_RECORD_NOT_EDITABLE",
+        message: t.status === technicalRecord.STATUS.SUBMITTED
+          ? "This technical record is with Sales. It can be edited again if they send it back."
+          : t.status === technicalRecord.STATUS.APPROVED
+            ? "This technical record is approved. Sales must return it before it can be changed."
+            : "Start the tech sheet before recording technical facts.",
+        status: t.status || technicalRecord.STATUS.NOT_STARTED,
+      });
+    }
+
+    /* ── IDENTITY COMES FROM THE APPROVED BOM, NOT THE BODY ─────────────
+       The SAME resolver the GET and the screen read, so what R&D is asked to
+       complete and what a save will accept can never differ. */
+    const shortlist = await approvedShortlistFor(style);
+    const { rows, rejected } = technicalRecord.mergeOntoApproved(
+      shortlist.rows,
+      Array.isArray(req.body?.materials) ? req.body.materials : [],
+    );
+    /* A send-back already recorded on a stored row survives a save — it is
+       its own action, with its own actor and reason. */
+    const storedByKey = new Map((t.materials || []).map((m) => [technicalRecord.identityKey(m), m]));
+    t.materials = rows.map((r) => {
+      const prior = storedByKey.get(technicalRecord.identityKey(r));
+      return prior?.returnedToMaterials?.reason
+        ? { ...r, returnedToMaterials: prior.returnedToMaterials }
+        : r;
+    });
+
+    /* ── THE ROUTE IS NOT WRITTEN HERE ANY MORE ────────────────────────
+       Which operations a garment goes through, in what order, and how long
+       each takes is Production's, and it has its own door:
+       PUT /api/cms/production/style-route/styles/:styleId/route.
+
+       `t.operations` is left EXACTLY as it stands — not cleared, not rebuilt
+       from the body, not defaulted to empty. A save from R&D's form must not
+       wipe a route somebody else recorded, and rebuilding it from a body that
+       no longer owns it would do precisely that.
+
+       An `operations` key in the body is IGNORED rather than refused. R&D's
+       own screen still renders the route (read-only, as technical context)
+       and its payload still echoes what it was given; refusing that would
+       break every legitimate save over a field nobody was trying to change.
+       What matters is that nothing here writes it, which the route test
+       proves by sending a changed route and reading the stored one back. */
+
+    /* ── REQUIREMENTS MAP TO EXISTING COSTING FAMILIES ─────────────────── */
+    t.requirements = (Array.isArray(req.body?.requirements) ? req.body.requirements : [])
+      .filter((r) => r && technicalRecord.REQUIREMENT_FAMILIES.includes(r.family) && String(r.name || "").trim())
+      .map((r) => ({
+        family: r.family,
+        name: String(r.name).trim().slice(0, 200),
+        specification: String(r.specification || "").trim().slice(0, 2000),
+        quantity: Number(r.quantity) > 0 ? Number(r.quantity) : undefined,
+        basis: String(r.basis || "").trim(),
+        unit: String(r.unit || "").trim(),
+        rationale: String(r.rationale || "").trim().slice(0, 1000),
+      }));
+
+    style.updatedBy = actor(req);
+    await style.save();
+
+    const gate = technicalRecord.completeness(t, {
+      file: style.techSheet.file,
+      approvedMaterialCount: shortlist.rows.length,
+      shortlistBlocker: shortlist.blocker,
+    });
+    return res.json({
+      success: true,
+      shortlistSource: shortlist.source,
+      shortlistBlocker: shortlist.blocker,
+      technical: {
+        status: t.status, revision: t.revision || 0, editable: true,
+        materials: t.materials, operations: t.operations, requirements: t.requirements,
+      },
+      completeness: gate,
+      /* Said out loud rather than dropped in silence. */
+      rejectedMaterials: rejected,
+    });
+  } catch (err) {
+    console.error("[sampleStyles] PUT /:id/technical", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /:id/technical/materials/return — send one material back to Materials.
+ *
+ * The correction R&D is allowed to make when the wrong item was selected. It
+ * is an ACTION with an author and a reason, not an edit: the row stays, so the
+ * record shows what was questioned and by whom, and Merchandising re-selects.
+ */
+router.post("/:id/technical/materials/return", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      /* Without one, Merchandising is told a material is wrong and not what
+         is wrong with it — which is a round trip that changes nothing. */
+      return res.status(400).json({
+        success: false, code: "RETURN_REASON_REQUIRED",
+        message: "Say what is wrong with this material before sending it back to Materials.",
+      });
+    }
+
+    const t = style.techSheet?.technical;
+    if (!t || !technicalRecord.EDITABLE.includes(t.status)) {
+      return res.status(409).json({
+        success: false, code: "TECHNICAL_RECORD_NOT_EDITABLE",
+        message: "This technical record is not open for editing.",
+      });
+    }
+
+    /* Validated against the SAME shortlist: a material can only be sent back
+       if it is one R&D was actually asked to complete. A record seeded before
+       the resolver existed may not hold the row yet, so the shortlist is what
+       decides — and the row is created if the record is behind it. */
+    const rawItemId = String(req.body?.rawItemId || "");
+    const shortlist = await approvedShortlistFor(style);
+    if (!shortlist.rows.some((r) => String(r.rawItemId) === rawItemId)) {
+      return res.status(404).json({ success: false, message: "That material is not on this style's approved bill of materials." });
+    }
+    t.materials = technicalRecord.mergeOntoApproved(shortlist.rows, t.materials || []).rows;
+    const row = (t.materials || []).find((m) => String(m.rawItemId) === rawItemId);
+    if (!row) return res.status(404).json({ success: false, message: "That material is not on this record." });
+
+    row.returnedToMaterials = { at: new Date(), by: actor(req), reason };
+    logHistory(style, {
+      kind: "material_returned",
+      note: `${row.rawItemName || "A material"} sent back to Materials: ${reason}`,
+    }, req);
+    style.updatedBy = actor(req);
+    await style.save();
+
+    return res.json({
+      success: true,
+      message: `${row.rawItemName || "The material"} was sent back to Materials.`,
+      material: { rawItemId, returnedToMaterials: row.returnedToMaterials },
+    });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/technical/materials/return", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
@@ -1250,36 +1858,214 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       if (!can("in_progress")) return invalid("in_progress");
       style.techSheet.status = "in_progress";
       if (!style.techSheet.startedAt) style.techSheet.startedAt = new Date();
+
+      /* ── STARTING THE SHEET STARTS THE RECORD ────────────────────────
+         Seeded from the APPROVED shortlist, one row per material, carrying
+         identity only — R&D fills the facts. Seeding here rather than on
+         first save means the screen opens with the real material list
+         instead of an empty form somebody has to populate by hand.
+
+         A record already in progress is left exactly as it is: starting a
+         sheet twice must not discard work. */
+      style.techSheet.technical = style.techSheet.technical || {};
+      const t = style.techSheet.technical;
+      if (t.status === technicalRecord.STATUS.NOT_STARTED || !t.status) {
+        t.status = technicalRecord.STATUS.DRAFT;
+        t.startedAt = new Date();
+        t.startedBy = actor(req);
+        t.revision = t.revision || 0;
+        const seed = await approvedShortlistFor(style);
+        t.materials = technicalRecord.mergeOntoApproved(seed.rows, []).rows;
+        t.operations = t.operations || [];
+        t.requirements = t.requirements || [];
+      }
     } else if (action === "submit") {
       if (!can("submitted")) return invalid("submitted");
-      style.techSheet.status = "submitted";
-      style.techSheet.submittedAt = new Date();
+
+      /* The file first, because the completeness check requires it — the
+         record and its evidence are submitted together or not at all. */
       if (req.body.file && (req.body.file.url || req.body.file.name)) {
         style.techSheet.file = { name: req.body.file.name, url: req.body.file.url, uploadedAt: new Date() };
       }
+
+      /* ── THE STRUCTURED RECORD IS THE SUBMISSION ─────────────────────
+         The sheet used to be a status flip plus an upload, so a costing
+         downstream had a PDF and no facts. What Sales approves now is the
+         technical record; the drawing is its evidence.
+
+         Refused rather than warned, and refused BY FIELD AND OWNER — "R&D
+         still needs consumption for Shell fabric" is actionable in a way
+         that "incomplete" is not. */
+      const submitShortlist = await approvedShortlistFor(style);
+      const gate = technicalRecord.completeness(style.techSheet.technical || {}, {
+        file: style.techSheet.file,
+        approvedMaterialCount: submitShortlist.rows.length,
+        shortlistBlocker: submitShortlist.blocker,
+      });
+      if (!gate.complete) {
+        return res.status(400).json({
+          success: false,
+          code: "TECHNICAL_RECORD_INCOMPLETE",
+          message: "The technical record is not complete yet.",
+          gaps: gate.gaps,
+          byOwner: gate.byOwner,
+        });
+      }
+
+      style.techSheet.status = "submitted";
+      style.techSheet.submittedAt = new Date();
+
+      /* ── FROZEN, WITH ITS FILE ───────────────────────────────────────
+         A snapshot taken now is what Sales decided on. R&D editing a later
+         revision must not be able to change what was approved in September,
+         so the copy is plain data and is never written to again. */
+      const technical = style.techSheet.technical;
+      technical.revision = (technical.revision || 0) + 1;
+      technical.status = technicalRecord.STATUS.SUBMITTED;
+      technical.submittedAt = new Date();
+      technical.submittedBy = actor(req);
+      style.techSheet.technicalRevisions = [
+        ...(style.techSheet.technicalRevisions || []),
+        {
+          revision: technical.revision,
+          submittedAt: technical.submittedAt,
+          submittedBy: actor(req),
+          file: style.techSheet.file,
+          /* The sample record too: the outside-service and development rows
+             Central Costing reads live on `sample.serviceRequirements`, and a
+             revision that froze only `techSheet.technical` left every one of
+             them outside the frozen basis. */
+          snapshot: technicalRecord.snapshotOf(technical, style.techSheet.file, style.sample),
+          outcome: "submitted",
+        },
+      ];
     } else if (action === "approve") {
       if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can approve the tech sheet." });
       if (!can("approved")) return invalid("approved");
       style.techSheet.status = "approved";
       style.techSheet.approvedAt = new Date();
       style.techSheet.approvedBy = actor(req);
+
+      /* ── SALES DECIDES; SALES DOES NOT EDIT ──────────────────────────
+         The decision is recorded ON the frozen revision. Not one technical
+         value is read from the request body here — an approver approves what
+         was submitted, and a body that carried a different consumption would
+         otherwise rewrite the fact it was approving. */
+      if (style.techSheet.technical) {
+        style.techSheet.technical.status = technicalRecord.STATUS.APPROVED;
+        style.techSheet.technical.approvedAt = new Date();
+        style.techSheet.technical.approvedBy = actor(req);
+      }
+      const latest = (style.techSheet.technicalRevisions || [])
+        .filter((r) => r.outcome === "submitted")
+        .reduce((best, r) => (r.revision > (best?.revision ?? -1) ? r : best), null);
+      if (latest) {
+        latest.outcome = "approved";
+        latest.decidedAt = new Date();
+        latest.decidedBy = actor(req);
+        latest.decisionNote = (req.body.note || "").trim();
+      }
+      // The approved technical sequence becomes the normal, scan-ready
+      // production route before R&D can release the sample MO/WO.  The work
+      // order later freezes this route in the established Production flow.
+      await syncApprovedTechnicalRoute(style, req.user?.id);
+    } else if (action === "revise") {
+      /* ══ OPENING A SECOND TECHNICAL REVISION ═══════════════════════════
+       *
+       * ── WHAT WAS MISSING ──────────────────────────────────────────────
+       * `approved` was a terminal tech-sheet state, and the technical record
+       * is only editable in DRAFT or REWORK. So once Sales approved revision
+       * 1 there was no mounted route — none — by which R&D could record that
+       * the garment had changed. Everything downstream inherited that dead
+       * end: Industrial Engineering could not re-base onto a revision nobody
+       * could create, and Central Costing's IE_TECHNICAL_APPROVAL_STALE named
+       * a state with no way out of it.
+       *
+       * ── IT IS A DECISION, NOT AN EDIT ─────────────────────────────────
+       * The approved record is what a costing may already have been built on,
+       * so reopening it is Sales' call and it costs a reason — the same
+       * authority and the same price as sending a submitted record back. R&D
+       * then edits, submits and is approved again through the paths that
+       * already exist; this adds no second way to approve anything.
+       *
+       * ── AND NOTHING FROZEN IS TOUCHED ─────────────────────────────────
+       * `technicalRevisions[]` is append-only and every earlier entry keeps
+       * its outcome, its snapshot, its decision and its decider. Revision 1
+       * still says it was approved, because it was. What changes is only
+       * which record is CURRENT. */
+      if (!(await canApprove(req.user))) {
+        return res.status(403).json({ success: false, message: "Only Sales can reopen an approved tech sheet." });
+      }
+      /* Company ownership, proved through the style's own Sales parents —
+         the same proof the technical PUT makes before it writes a fact. */
+      const reviseScope = await salesScopeFor(req);
+      if (!(await ownershipProofFor(style, reviseScope.companyId))) {
+        return res.status(404).json({ success: false, message: "Style not found." });
+      }
+      if (cur !== "approved" || style.techSheet.technical?.status !== technicalRecord.STATUS.APPROVED) {
+        return res.status(409).json({
+          success: false,
+          code: "TECHNICAL_RECORD_NOT_APPROVED",
+          message: "Only an approved technical record is reopened for a new revision.",
+          status: String(style.techSheet.technical?.status || "") || technicalRecord.STATUS.NOT_STARTED,
+          techSheetStatus: cur,
+        });
+      }
+      const reviseReason = String(req.body.note || req.body.reason || "").trim();
+      if (!reviseReason) {
+        return res.status(400).json({
+          success: false,
+          code: "TECHNICAL_REVISION_REASON_REQUIRED",
+          message: "Say why this approved technical record is being reopened.",
+          field: "note",
+        });
+      }
+
+      style.techSheet.status = "in_progress";
+      style.techSheet.revisions.push({ note: reviseReason, at: new Date(), by: actor(req) });
+      /* REWORK, which is what the record's own editable set already names.
+         The revision NUMBER is not touched here: submitting is what mints the
+         next one, so a reopened record that is never resubmitted does not
+         leave a number nobody used. */
+      style.techSheet.technical.status = technicalRecord.STATUS.REWORK;
+      style.techSheet.technical.reopenedAt = new Date();
+      style.techSheet.technical.reopenedBy = actor(req);
+      style.techSheet.technical.reopenReason = reviseReason;
     } else if (action === "changes") {
       if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can request changes." });
       if (!can("changes")) return invalid("changes");
       style.techSheet.status = "changes";
       style.techSheet.revisions.push({ note: (req.body.note || "").trim(), at: new Date(), by: actor(req) });
+
+      /* Back to R&D for a NEW revision. The returned one keeps its snapshot
+         and its outcome, so the history says what was sent back and why. */
+      if (style.techSheet.technical) {
+        style.techSheet.technical.status = technicalRecord.STATUS.REWORK;
+      }
+      const returned = (style.techSheet.technicalRevisions || [])
+        .filter((r) => r.outcome === "submitted")
+        .reduce((best, r) => (r.revision > (best?.revision ?? -1) ? r : best), null);
+      if (returned) {
+        returned.outcome = "returned";
+        returned.decidedAt = new Date();
+        returned.decidedBy = actor(req);
+        returned.decisionNote = (req.body.note || "").trim();
+      }
     } else {
       return res.status(400).json({ success: false, message: "Unknown tech-sheet action." });
     }
 
-    const tsKind = { submit: "tech_submitted", approve: "tech_approved", changes: "tech_changes" }[action];
+    const tsKind = {
+      submit: "tech_submitted", approve: "tech_approved", changes: "tech_changes",
+      revise: "tech_reopened",
+    }[action];
     if (tsKind) logHistory(style, { kind: tsKind, note: req.body.note || "" }, req);
     style.updatedBy = actor(req);
     await style.save();
 
     if (action === "submit") {
       (async () => {
-        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        const [customerName, image] = await Promise.all([customerNameFor(style, req), referenceImageFor(style, req)]);
         await notifyEvent("tech_sheet_submitted", {
           heading: `Tech sheet submitted: ${style.productName || style.styleCode || ""}`,
           bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "R&D")}</strong> submitted the tech sheet for your review.</p>`,
@@ -1297,7 +2083,7 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       })().catch(() => {});
     } else if (action === "approve" || action === "changes") {
       (async () => {
-        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        const [customerName, image] = await Promise.all([customerNameFor(style, req), referenceImageFor(style, req)]);
         const note = req.body.note || "";
         await notifyEvent("tech_sheet_decision", {
           heading: `Tech sheet ${action === "approve" ? "approved" : "changes requested"}: ${style.productName || style.styleCode || ""}`,
@@ -1315,7 +2101,7 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/tech-sheet", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1443,8 +2229,106 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       const { costOperations } = require("../../../services/operationCosting");
       const operations = await costOperations(cleanedOperations);
 
+      /* ── WHAT THE GARMENT IS PACKED IN, AND WHAT IS SENT OUTSIDE ─────────
+         Both optional, unlike the operations above: plenty of styles are
+         packed to a standing company spec and plenty need nothing sent out,
+         and demanding a row for either would teach people to invent one.
+
+         Neither carries a rate. R&D says WHICH and HOW MUCH; the Store
+         quotation registers say what it costs, and a price typed here would
+         be a second, undated answer to a question the register already
+         answers with a reference and a validity.
+
+         ── AND A STARTED ROW IS NEVER DROPPED ─────────────────────────────
+         The first cut FILTERED incomplete rows out. Somebody who chose a
+         carton and moved on before typing the quantity got a green tick and
+         a sample submitted without it — and the costing they saw a fortnight
+         later was short a cost with nothing anywhere saying so. An untouched
+         row is still omitted; a started one is refused by name, with every
+         field it owes, so the browser can mark it.
+
+         Every identity is re-read company-scoped and every snapshot comes
+         from what came back — see the service for why a snapshot a caller can
+         dictate is not evidence. */
+      let requirements;
+      try {
+        /* The company from the already-authorised request, never from the
+           style — a record cannot nominate the scope it is checked against. */
+        const scope = await salesScopeFor(req);
+        requirements = await resolveRequirements(style, req.body, { companyId: scope.companyId });
+      } catch (e) {
+        if (e?.code === "SAMPLE_REQUIREMENT_INCOMPLETE") {
+          return res.status(400).json({
+            success: false, message: e.message,
+            code: e.code,
+            /* Which row, and which field of it. The browser keeps the row and
+               marks it rather than the person hunting for what went wrong. */
+            rows: e.rows,
+          });
+        }
+        throw e;
+      }
+      const { packagingRequirements, serviceRequirements } = requirements;
+
+      /* ── WHAT THE FINISHED GARMENT SHIPS AS ─────────────────────────
+         Freight is quoted per kilogram or per carton, and until this existed
+         neither could be answered anywhere in the system — so a freight rate
+         could be configured, be applicable, and still produce nothing.
+
+         Both are optional: plenty of orders are collected by the customer and
+         need neither. What is not optional is the costing being honest when
+         one is needed and absent, which it is — it blocks and names R&D. */
+      const shipmentIn = req.body.shipment || {};
+      const shipment = {};
+      const weight = Number(shipmentIn.packedWeightGrams);
+      if (shipmentIn.packedWeightGrams !== undefined && shipmentIn.packedWeightGrams !== null && shipmentIn.packedWeightGrams !== "") {
+        if (!Number.isFinite(weight) || weight <= 0) {
+          return res.status(400).json({ success: false, message: "A packed weight is a positive number of grams. A garment of no weight would ship for nothing." });
+        }
+        shipment.packedWeightGrams = weight;
+      }
+      const perCarton = Number(shipmentIn.garmentsPerCarton);
+      if (shipmentIn.garmentsPerCarton !== undefined && shipmentIn.garmentsPerCarton !== null && shipmentIn.garmentsPerCarton !== "") {
+        if (!Number.isInteger(perCarton) || perCarton < 1) {
+          return res.status(400).json({ success: false, message: "Garments per carton is a whole number, at least one." });
+        }
+        shipment.garmentsPerCarton = perCarton;
+      }
+      if (String(shipmentIn.notes || "").trim()) shipment.notes = String(shipmentIn.notes).trim().slice(0, 500);
+      if (Object.keys(shipment).length) style.sample.shipment = shipment;
+
       style.sample.consumptionRawItems = consumptionRawItems;
       style.sample.operations = operations;
+      /* ── IDENTITY FROM THE APPROVED SELECTION, ALWAYS ────────────────
+         R&D fills consumption, unit, basis, evidence and the include/exclude
+         decision. The item and its approved specification come from
+         Merchandising's row and are rebuilt here, so a submitted `rawItemId`
+         naming a different component contributes nothing and the swap cannot
+         happen silently.
+
+         Also seeds: a component approved while R&D was working appears
+         without anybody re-triggering anything. The merge is idempotent, so
+         submitting twice does not produce two rows. */
+      style.sample.packagingRequirements = packagingBom.mergePackaging(
+        style.materials?.packagingSelections || [],
+        packagingRequirements,
+      ).requirements;
+      /* ── R&D NO LONGER WRITES EITHER HALF OF THIS ARRAY ──────────────
+         Outside processes are Production's, on the Route & SAM tab.
+         Development and tooling are Merchandising's, on the Style BOM. Both
+         live in `sample.serviceRequirements[]`, and this older all-in-one
+         submit endpoint happens to save that array — so it must leave it
+         exactly as it found it.
+
+         Kept as an explicit statement rather than by simply not assigning:
+         the array is rebuilt from `requirements` a few lines above for
+         packaging, and somebody adding a line here needs to see that this
+         one is deliberately carried through untouched.
+
+         `serviceRequirements` is still RESOLVED above, because a malformed
+         body should be refused the same way it always was rather than
+         silently ignored — it is validated and then not applied. */
+      style.sample.serviceRequirements = style.sample.serviceRequirements || [];
       style.sample.photos = photos;
       style.sample.status = "submitted";
       style.sample.submittedAt = new Date();
@@ -1571,7 +2455,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       // The sample's OWN photo, not the enquiry reference image — this is
       // what was actually made, so it's the more useful picture to include.
       (async () => {
-        const customerName = await customerNameFor(style);
+        const customerName = await customerNameFor(style, req);
         await notifyEvent("sample_submitted", {
           heading: `Sample submitted for approval: ${style.productName || style.styleCode || ""}`,
           bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "R&D")}</strong> submitted a physical sample for your approval.</p>`,
@@ -1589,7 +2473,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       })().catch(() => {});
     } else if (action === "approve" || action === "reject") {
       (async () => {
-        const customerName = await customerNameFor(style);
+        const customerName = await customerNameFor(style, req);
         const note = req.body.note || "";
         await notifyEvent("sample_decision", {
           heading: `Sample ${action === "approve" ? "approved" : "rejected"}: ${style.productName || style.styleCode || ""}`,
@@ -1620,7 +2504,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
     // still open. The manual send lives at POST /:id/sample/send-whatsapp-
     // approval, which this route deliberately no longer calls.
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1657,7 +2541,7 @@ router.post("/:id/sample/discussion", salesAuth, async (req, res) => {
     style.updatedBy = actor(req);
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample/discussion", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1680,13 +2564,13 @@ router.post("/:id/sample/send-whatsapp-approval", salesAuth, async (req, res) =>
       return res.status(400).json({ success: false, message: "Sales must approve the sample internally first." });
     }
     const [customerName, j] = await Promise.all([
-      customerNameFor(style),
-      SalesJourney.findById(style.journeyId).select("journeyId").lean(),
+      customerNameFor(style, req),
+      SalesJourney.findOne(await scoped(req, { _id: style.journeyId })).select("journeyId").lean(),
     ]);
     const { sendApprovalRequest } = require("../../../services/sampleWhatsapp");
     const result = await sendApprovalRequest(style, { customerName, enquiryRef: j?.journeyId, preparedBy: actor(req).name });
     if (!result.sent) return res.status(502).json({ success: false, message: result.reason });
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample/send-whatsapp-approval", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1706,11 +2590,385 @@ router.post("/:id/sample/send-whatsapp-approval", salesAuth, async (req, res) =>
 // already approved the sample internally; APPENDS to `log`, never
 // overwrites, same append-only discipline as every other decision log in
 // this codebase.
+/* ─────────────────────────────────────────────────────────────────────────
+   ROUTE CUSTOMER CHANGES — what happens after the customer says no.
+
+   POST /api/cms/crm/sample-styles/:id/customer-changes
+   GET  /api/cms/crm/sample-styles/:id/customer-changes
+
+   ── WHY THE SERVER DECIDES ──────────────────────────────────────────────
+   The old recovery was two buttons, and one of them ("Change Product Design")
+   did nothing at all on the server — it navigated. So what a rejection MEANT
+   was decided by whichever button somebody pressed, and the invalidation that
+   should follow it happened, or did not, depending on the screen.
+
+   Routing is a decision about work that other departments will do, against
+   approvals this system granted. It is applied here: the categories are
+   checked, the destination is checked against the dependency chain, the
+   reopening is performed, and the record is written in one place.
+
+   ── WHAT IT REFUSES ─────────────────────────────────────────────────────
+   · a style whose parent belongs to another company (SampleStyle carries no
+     companyId of its own — ownership is proved through journey/enquiry, and
+     the customer-decision handler beside this one has never done it)
+   · a product the customer has not rejected
+   · a decision that has moved since the screen loaded
+   · a destination downstream of what the categories require
+   · a retry of a request already made (idempotency key)
+   ───────────────────────────────────────────────────────────────────────── */
+router.post("/:id/customer-changes", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) {
+      return res.status(403).json({ success: false, message: "Only Sales can route a customer's changes." });
+    }
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const scope = await salesScopeFor(req);
+    const proof = await ownershipProofFor(style, scope.companyId);
+    if (!proof) return res.status(404).json({ success: false, message: "Style not found." });
+
+    /* Only a rejection is routed. Routing an approved sample would reopen work
+       nobody asked to have redone. */
+    const approval = style.customerApproval || {};
+    if (approval.approved !== false) {
+      return res.status(400).json({
+        success: false,
+        code: "NOT_REJECTED",
+        message: "This product has not been rejected by the customer, so there are no changes to route.",
+      });
+    }
+
+    /* ── STALENESS ────────────────────────────────────────────────────
+       The screen states which decision it is answering. If the customer has
+       since changed their mind, or a later rejection replaced this one, the
+       person is looking at something that is no longer true. */
+    const expected = String(req.body?.expectedDecisionAt || "").trim();
+    const actualAt = approval.decidedAt ? new Date(approval.decidedAt).toISOString() : "";
+    if (expected && expected !== actualAt) {
+      return res.status(409).json({
+        success: false,
+        code: "DECISION_CHANGED",
+        message: "The customer's decision has changed since this screen loaded. Reload and look again.",
+      });
+    }
+
+    const categories = customerChangeRouting.normaliseCategories(req.body?.categories);
+    if (!categories.length) {
+      return res.status(400).json({
+        success: false, code: "CATEGORY_REQUIRED",
+        message: "Say what the customer asked to change.",
+      });
+    }
+    const feedback = String(req.body?.customerFeedback || "").trim();
+    if (!feedback) {
+      return res.status(400).json({
+        success: false, code: "FEEDBACK_REQUIRED",
+        message: "Record the customer's own words — they are what the department has to work from.",
+      });
+    }
+
+    const suggested = customerChangeRouting.destinationFor(categories);
+    const chosen = String(req.body?.destination || suggested || "").toUpperCase();
+    const verdict = customerChangeRouting.validateDestination(chosen, categories);
+    if (!verdict.ok) {
+      return res.status(400).json({ success: false, code: verdict.code, message: verdict.message, suggested: verdict.suggested });
+    }
+    const destination = verdict.destination;
+    const plan = customerChangeRouting.invalidationFor(destination);
+
+    /* ── IDEMPOTENCY ──────────────────────────────────────────────────
+       Checked before anything is applied, so a retry cannot open a second
+       sample round on its way to discovering it was a retry. The unique index
+       is the real guard; this is the friendly path. */
+    const idempotencyKey = String(req.body?.idempotencyKey || "").trim() || undefined;
+    if (idempotencyKey) {
+      const already = await CustomerChangeRequest.findOne({ companyId: scope.companyId, idempotencyKey }).lean();
+      if (already) {
+        return res.json({ success: true, changeRequest: already, replayed: true, sampleStyle: await withJourney(style, req) });
+      }
+    }
+
+    const who = actor(req);
+    const now = new Date();
+    /* Captured BEFORE anything is reopened — every branch below moves the
+       stage, and reading it afterwards would record where the product went
+       rather than where it came from. */
+    const previousStage = style.stage || "";
+    const previousState = {
+      materialsStatus: style.materials?.status || "",
+      bomApprovalStatus: style.bomApproval?.status || "",
+      techSheetStatus: style.techSheet?.status || "",
+      sampleStatus: style.sample?.status || "",
+      sampleRounds: (style.sample?.rounds || []).length,
+    };
+
+    /* ── APPLY THE INVALIDATION ───────────────────────────────────────
+       Forward-only in every branch: a previous approval stays on the record as
+       what was true at the time, and no round, revision or log entry is ever
+       removed. */
+    const result = {};
+    if (destination === "MATERIALS_BOM") {
+      /* The approved BOM stays readable as history — `bomApproval` keeps its
+         round number and its decision, and the round is incremented when the
+         next approval is requested, exactly as it always was. What reopens is
+         the selection and the approval state. */
+      style.materials = style.materials || {};
+      style.materials.status = "pending";
+      if (style.bomApproval) {
+        style.bomApproval.status = "none";
+        style.bomApproval.token = undefined;
+      }
+      style.stage = "materials";
+      /* Downstream needs doing again on the new materials. Statuses move back
+         to their "not done yet" values; the revisions and rounds that produced
+         them are untouched. */
+      if (style.techSheet) style.techSheet.status = "pending";
+      if (style.sample) style.sample.status = "not_started";
+      result.bomApprovalRound = (style.bomApproval?.round || 0) + 1;
+    } else if (destination === "TECH_SHEET") {
+      /* The BOM stays approved. A returned technical revision is how R&D is
+         told to open the next one — the same mechanism the tech-sheet
+         "changes" action uses, so there is one way to reopen a tech sheet. */
+      if (style.techSheet) {
+        style.techSheet.status = "changes";
+        style.techSheet.revisions = style.techSheet.revisions || [];
+        style.techSheet.revisions.push({ note: feedback, at: now, by: who });
+        if (style.techSheet.technical) style.techSheet.technical.status = "rework";
+        const open = (style.techSheet.technicalRevisions || [])
+          .filter((r) => r.outcome === "submitted")
+          .reduce((best, r) => (r.revision > (best?.revision ?? -1) ? r : best), null);
+        if (open) {
+          open.outcome = "returned";
+          open.decidedAt = now;
+          open.decidedBy = who;
+          open.decisionNote = feedback;
+        }
+        result.techSheetRevision = (style.techSheet.technical?.revision || 0) + 1;
+      }
+      if (style.sample) style.sample.status = "not_started";
+      style.stage = "rnd";
+    } else if (destination === "SAMPLE_ROUND") {
+      /* The BOM and the tech sheet are both untouched. The existing "reject"
+         action already numbers and supersedes rounds correctly, so this uses
+         the same shape rather than a second numbering scheme. */
+      style.sample = style.sample || {};
+      style.sample.rounds = style.sample.rounds || [];
+      style.sample.revisions = style.sample.revisions || [];
+      const latest = style.sample.rounds[style.sample.rounds.length - 1];
+      if (latest && latest.outcome === "pending") {
+        latest.outcome = "rejected";
+        latest.feedback = feedback;
+        latest.judgedAt = now;
+        latest.judgedBy = who;
+      }
+      style.sample.status = "rejected";
+      style.sample.revisions.push({ note: feedback, roundId: latest?._id, at: now, by: who });
+      style.stage = "rnd";
+      /* The NEXT round's number, which R&D will raise. Not created here: a
+         round is a thing somebody made, and inventing an empty one would put a
+         sample on the record that nobody has sewn. */
+      result.sampleRoundNo = style.sample.rounds.length + 1;
+    } else if (destination === "BRIEF_NEW_VERSION") {
+      /* Nothing on this style is reopened. The rejected product is kept whole
+         and a replacement is raised on the Enquiry — Sales does that with the
+         product editor, which already prefills from the removed row. This
+         request is what links the two. */
+      style.status = "completed";
+    }
+
+    /* The style is no longer waiting on the customer — it is waiting on
+       whoever this was routed to. The verdict itself stays on the record. */
+    style.updatedBy = who;
+    logHistory(style, {
+      kind: "customer_changes_routed",
+      from: previousState.sampleStatus,
+      to: destination,
+      note: customerChangeRouting.summarise({ categories, destination }),
+    }, req);
+    await style.save();
+
+    let changeRequest;
+    try {
+      changeRequest = await CustomerChangeRequest.create({
+        companyId: scope.companyId,
+        journeyId: style.journeyId,
+        /* `ownershipProofFor` answers WHETHER this company owns the style, not
+           which enquiry it belongs to — the style carries that itself. */
+        enquiryId: style.enquiryId,
+        productLineRef: String(req.body?.productLineRef || "").trim() || undefined,
+        productName: style.productName,
+        sampleStyleId: style._id,
+        sourceDecision: {
+          approved: false,
+          decidedAt: approval.decidedAt || null,
+          decidedBy: approval.decidedBy || null,
+          note: approval.note || "",
+        },
+        categories,
+        customerFeedback: feedback,
+        internalInstructions: String(req.body?.internalInstructions || "").trim(),
+        attachments: sanitizeImages(req.body?.attachments),
+        suggestedDestination: suggested,
+        destination,
+        owner: customerChangeRouting.ownerFor(destination),
+        previousStage,
+        previousState,
+        status: "OPEN",
+        result,
+        idempotencyKey,
+        createdBy: who,
+        routedAt: now,
+        routedBy: who,
+      });
+    } catch (err) {
+      /* Two retries racing: the unique index caught the second. Answer with
+         the one that won rather than with a duplicate-key error. */
+      if (err?.code === 11000 && idempotencyKey) {
+        const winner = await CustomerChangeRequest.findOne({ companyId: scope.companyId, idempotencyKey }).lean();
+        if (winner) {
+          return res.json({ success: true, changeRequest: winner, replayed: true, sampleStyle: await withJourney(style, req) });
+        }
+      }
+      throw err;
+    }
+
+    /* ── TELL WHOEVER HAS IT NOW ──────────────────────────────────────
+       Fire-and-forget, like every other notification in this file: the routing
+       is committed, and a mail server being down must not undo it. */
+    (async () => {
+      const EVENT_BY_DESTINATION = {
+        MATERIALS_BOM: "customer_changes_to_materials",
+        TECH_SHEET: "customer_changes_to_rnd",
+        SAMPLE_ROUND: "customer_changes_to_rnd",
+        BRIEF_NEW_VERSION: "customer_changes_to_sales",
+      };
+      const key = EVENT_BY_DESTINATION[destination];
+      if (!key) return;
+      /* ── THE CONTEXT IS A GARNISH, NOT A PRECONDITION ─────────────────
+         `styleEmailContext` reads the account, the customer and the style's
+         photos to make the mail readable. If any of that is unavailable the
+         DEPARTMENT STILL HAS TO BE TOLD — a missing customer name is not a
+         reason for Merchandising never to learn the BOM reopened. Caught
+         separately so the outer catch only ever sees a genuine send failure. */
+      let c = {};
+      try {
+        c = await styleEmailContext(style, await sampleEmailScope(req)) || {};
+      } catch {
+        c = {};
+      }
+      await notifyEvent(key, {
+        vars: {
+          product: style.productName || "",
+          customer: c.customerName || "",
+          salesPerson: who.name || "Sales",
+          destination: (customerChangeRouting.CHANGE_DESTINATIONS.find((d) => d.code === destination) || {}).label || destination,
+          feedback,
+        },
+        heading: `Customer changes on ${style.productName || "a product"}`,
+        ctaUrl: c.viewUrl || `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+        ctaLabel: "Open the style",
+      });
+    })().catch(() => {});
+
+    return res.status(201).json({
+      success: true,
+      changeRequest: changeRequest.toObject(),
+      explanation: plan,
+      sampleStyle: await withJourney(style, req),
+    });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] POST /:id/customer-changes", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/** Every customer change routed on this product, newest first. */
+router.get("/:id/customer-changes", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+    const changeRequests = await CustomerChangeRequest
+      .find({
+        companyId: scope.companyId,
+        $or: [
+          { sampleStyleId: style._id },
+          { "result.replacementSampleStyleId": style._id },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ success: true, changeRequests });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] GET /:id/customer-changes", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* Explicit repair/admin door for a request that has genuinely completed.
+   Normal same-style rework closes automatically when the customer approves
+   the revised sample below. This endpoint exists so a lost client response or
+   an imported decision cannot strand the commercial hold forever. */
+router.post("/:id/customer-changes/:changeRef/resolve", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) {
+      return res.status(403).json({ success: false, message: "Only Sales can resolve customer changes." });
+    }
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+    const request = await CustomerChangeRequest.findOne({
+      companyId: scope.companyId,
+      changeRef: String(req.params.changeRef || "").trim(),
+      sampleStyleId: style._id,
+    });
+    if (!request) return res.status(404).json({ success: false, message: "Customer change request not found." });
+    if (!["OPEN", "IN_PROGRESS"].includes(request.status)) {
+      return res.json({ success: true, changeRequest: request.toObject(), replayed: true });
+    }
+    const decidedAt = style.customerApproval?.decidedAt
+      ? new Date(style.customerApproval.decidedAt).getTime() : 0;
+    const sourceAt = request.sourceDecision?.decidedAt
+      ? new Date(request.sourceDecision.decidedAt).getTime() : 0;
+    if (style.customerApproval?.approved !== true || decidedAt <= sourceAt) {
+      return res.status(409).json({
+        success: false,
+        code: "REVISED_SAMPLE_NOT_APPROVED",
+        message: "The revised product must be approved by the customer before this change can be resolved.",
+      });
+    }
+    request.status = "RESOLVED";
+    request.resolvedAt = new Date();
+    request.resolvedBy = actor(req);
+    request.resolutionNote = String(req.body?.note || "Customer approved the revised product.").trim();
+    await request.save();
+    return res.json({ success: true, changeRequest: request.toObject() });
+  } catch (err) {
+    if (err?.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("[sampleStyles] POST /:id/customer-changes/:changeRef/resolve", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
   try {
     if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can record the customer's decision." });
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
 
     if (!isSampleSettled(style)) {
       return res.status(400).json({ success: false, message: "Sales must approve the sample internally before asking the customer." });
@@ -1739,7 +2997,33 @@ router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
     style.updatedBy = who;
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    /* A routed change remains a hard Purchase Invoice hold until the customer
+       accepts a later result. Close every open request on this style in the
+       same command that records that acceptance; rejecting again leaves the
+       existing request open and can be routed as a new append-only request. */
+    if (approved) {
+      await CustomerChangeRequest.updateMany(
+        {
+          companyId: scope.companyId,
+          $or: [
+            { sampleStyleId: style._id },
+            { "result.replacementSampleStyleId": style._id },
+          ],
+          status: { $in: ["OPEN", "IN_PROGRESS"] },
+          "sourceDecision.decidedAt": { $lt: now },
+        },
+        {
+          $set: {
+            status: "RESOLVED",
+            resolvedAt: now,
+            resolvedBy: who,
+            resolutionNote: note || "Customer approved the revised product.",
+          },
+        },
+      );
+    }
+
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample/customer-decision", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1768,6 +3052,85 @@ router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
 
 const escapeRegex = (s) => String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/* Older StockItem routes stored the operation code/name snapshot but not the
+   master _id.  The route editor still saves by identity, so hydrate that
+   identity at the API boundary instead of making the browser guess it. */
+const hydrateOperationIds = async (operations) => {
+  const rows = Array.isArray(operations) ? operations : [];
+  const codes = [...new Set(rows.map((o) => String(o?.operationCode || "").trim()).filter(Boolean))];
+  const names = [...new Set(rows.map((o) => String(o?.type || o?.name || "").trim()).filter(Boolean))];
+  if (!codes.length && !names.length) return rows;
+
+  const masters = await Operation.find({
+    $or: [
+      ...(codes.length ? [{ operationCode: { $in: codes } }] : []),
+      ...(names.length ? [{ name: { $in: names } }] : []),
+    ],
+  }).select("name operationCode totalSam machineType").lean();
+  const byCode = new Map(masters.filter((o) => o.operationCode).map((o) => [String(o.operationCode), o]));
+  const byName = new Map(masters.map((o) => [String(o.name), o]));
+
+  return rows.map((row) => {
+    if (row?.operationId || row?.id || row?._id) return row;
+    const master = byCode.get(String(row?.operationCode || "").trim())
+      || byName.get(String(row?.type || row?.name || "").trim());
+    return master ? { ...row, operationId: String(master._id) } : row;
+  });
+};
+
+/* The approved technical route is the source of truth for a sample's first
+   production release.  Production still receives an ordinary StockItem route
+   and therefore keeps its normal work-order, scan and QC protocol; this only
+   removes the duplicate R&D data entry that used to sit between approval and
+   release. */
+const syncApprovedTechnicalRoute = async (style, userId) => {
+  const stockItemId = style.production?.stockItemId || style.sourceStockItemId;
+  const technicalRows = style.techSheet?.technical?.operations || [];
+  if (style.techSheet?.technical?.status !== technicalRecord.STATUS.APPROVED || !stockItemId || !technicalRows.length) return false;
+
+  const ids = technicalRows.map((row) => String(row.operationId || "")).filter(isObjectId);
+  if (ids.length !== technicalRows.length) {
+    const err = new Error("The approved technical route contains an invalid operation. Return it to R&D to correct the technical record.");
+    err.status = 400;
+    throw err;
+  }
+  const masters = await Operation.find({ _id: { $in: ids } })
+    .select("name operationCode totalSam machineType").lean();
+  const byId = new Map(masters.map((row) => [String(row._id), row]));
+  const missing = ids.filter((id) => !byId.has(id));
+  if (missing.length) {
+    const err = new Error("An operation in the approved technical route no longer exists. Return it to R&D to choose a current operation.");
+    err.status = 400;
+    throw err;
+  }
+
+  const stockItem = await StockItem.findById(stockItemId);
+  if (!stockItem) {
+    const err = new Error("The product linked to this style no longer exists.");
+    err.status = 404;
+    throw err;
+  }
+  stockItem.operations = ids.map((id, index) => {
+    const master = byId.get(id);
+    const technical = technicalRows[index];
+    const totalSeconds = Math.max(0, (Number(technical.minutes) || 0) * 60 + (Number(technical.seconds) || 0));
+    return {
+      type: master.name || "",
+      operationCode: master.operationCode || "",
+      machine: master.machineType || "",
+      machineType: master.machineType || "",
+      totalSeconds,
+      minutes: Math.floor(totalSeconds / 60),
+      seconds: totalSeconds % 60,
+      operatorSalary: 0,
+      operatorCost: 0,
+    };
+  });
+  stockItem.updatedBy = userId;
+  await stockItem.save();
+  return true;
+};
+
 // GET /api/cms/crm/sample-styles/:id/production
 router.get("/:id/production", salesAuth, async (req, res) => {
   try {
@@ -1781,7 +3144,7 @@ router.get("/:id/production", salesAuth, async (req, res) => {
     if (style.production.customerId) {
       customer = await Customer.findById(style.production.customerId).select("name email phone customerId").lean();
     } else if (style.accountId) {
-      const account = await Account.findById(style.accountId).select("companyName displayName primaryEmail primaryPhone linkedCustomer");
+      const account = await Account.findOne(await scoped(req, { _id: style.accountId })).select("companyName displayName primaryEmail primaryPhone linkedCustomer");
       if (account?.linkedCustomer) {
         customer = await Customer.findById(account.linkedCustomer).select("name email phone customerId").lean();
         // Resolved silently, server-side — the whole point of this step
@@ -1811,7 +3174,7 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         // way to tell the style even HAD a customer on record, let alone
         // find or recreate it, without leaving this page to go read the
         // Enquiry).
-        const journey = await SalesJourney.findById(style.journeyId).select("name").lean();
+        const journey = await SalesJourney.findOne(await scoped(req, { _id: style.journeyId })).select("name").lean();
         if (journey?.name) accountPrefill = { name: journey.name, email: "", phone: "" };
       }
     }
@@ -1829,14 +3192,36 @@ router.get("/:id/production", salesAuth, async (req, res) => {
     let stockItem = null;
     if (linkedStockItemId) {
       stockItem = await StockItem.findById(linkedStockItemId).select("name reference category variants operations").lean();
+      if (stockItem) stockItem.operations = await hydrateOperationIds(stockItem.operations);
     }
 
     let workOrders = [];
     if (style.production.workOrderIds?.length) {
+      /* `cancellation` comes back too. A cancelled attempt is part of this
+         style's history and R&D has to be able to see WHY it was cancelled
+         while they are redefining the route — a status chip alone sends them
+         to another screen to find out. */
       const rows = await WorkOrder.find({ _id: { $in: style.production.workOrderIds } })
-        .select("workOrderNumber status quantity completedQuantity variantAttributes").lean();
-      workOrders = rows.map((w) => ({ id: w._id, workOrderNumber: w.workOrderNumber, status: w.status, quantity: w.quantity, completedQuantity: w.completedQuantity || 0, attributes: w.variantAttributes }));
+        .select("workOrderNumber status quantity completedQuantity variantAttributes operations cancellation").lean();
+      workOrders = rows.map((w) => ({
+        id: w._id, workOrderNumber: w.workOrderNumber, status: w.status,
+        quantity: w.quantity, completedQuantity: w.completedQuantity || 0,
+        attributes: w.variantAttributes,
+        operationCount: (w.operations || []).length,
+        cancellation: w.cancellation
+          ? {
+            at: w.cancellation.at || null,
+            by: w.cancellation.byName || "",
+            reason: w.cancellation.reason || "",
+            cuttingRecorded: Boolean(w.cancellation.cuttingRecorded),
+          }
+          : null,
+      }));
     }
+    /* What is still RUNNING, as opposed to what has ever existed. The page
+       needs both: the history includes cancelled attempts, the "sent to
+       production" state must not. */
+    const liveWorkOrders = workOrders.filter((w) => w.status !== "cancelled");
 
     let customerRequest = null;
     if (style.production.customerRequestId) {
@@ -1873,6 +3258,12 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         customerRequest,
         workOrderIds: style.production.workOrderIds || [],
         workOrders,
+        /* Derived here rather than in the browser, because "may R&D edit the
+           route again" is the same question the submit route answers and the
+           two must not be able to disagree. */
+        liveWorkOrderCount: liveWorkOrders.length,
+        cancelledWorkOrders: workOrders.filter((w) => w.status === "cancelled"),
+        routeEditingOpen: style.production.status !== "submitted",
         log: style.production.log || [],
       },
     });
@@ -1941,7 +3332,7 @@ router.post("/:id/production/customer", salesAuth, async (req, res) => {
     // frontend's own design note: "It'll be reused automatically for every
     // other style raised for the same customer").
     if (style.accountId) {
-      const account = await Account.findById(style.accountId).select("linkedCustomer");
+      const account = await Account.findOne(await scoped(req, { _id: style.accountId })).select("linkedCustomer");
       if (account && !account.linkedCustomer) {
         account.linkedCustomer = customer._id;
         await account.save();
@@ -1975,12 +3366,35 @@ router.get("/:id/production/stock-items/search", salesAuth, async (req, res) => 
 // GET /:id/production/raw-items/search?q= — also the search behind the
 // (unrelated) "Raw materials consumed" picker further up the same R&D page,
 // which has used this exact endpoint since it was written.
+//
+// ── AND IT IS R&D'S ALONE AGAIN ────────────────────────────────────────────
+// The Merchandising packaging picker borrowed this because it was here. It no
+// longer does: it has its own door at
+// `GET /api/cms/merchandising/styles/:styleId/packaging-items`, gated on a
+// live Merchandising grant and returning identity only. This endpoint is
+// therefore back to one audience and is left exactly as it was — a Sales
+// session, this company's item master, and the variant, stock and averaged
+// vendor price its own caller needs.
 router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ success: true, rawItems: [] });
+    /* -- THIS COMPANY'S ITEM MASTER, NOT THE DEPLOYMENT'S ----------------
+       The search ran unscoped: any R&D user could see, and pick, an item
+       belonging to another company. It went unnoticed because the picker
+       only ever wrote a NAME -- nothing downstream resolved the id, so a
+       foreign pick produced a plausible-looking row and no error.
+
+       The packaging picker resolves the id, and the server refuses one that
+       is not this company's. An unscoped search would therefore offer items
+       it then rejects, so it is scoped here by the same company the write
+       path uses. */
+    const scope = await salesScopeFor(req);
     const re = new RegExp(escapeRegex(q), "i");
-    const rows = await RawItem.find({ $or: [{ name: re }, { sku: re }] })
+    const rows = await RawItem.find({
+      companyId: scope.companyId,
+      $or: [{ name: re }, { sku: re }],
+    })
       .select("name sku unit customUnit category quantity variants").limit(10).lean();
     const rawItems = rows.map((r) => {
       const unit = r.customUnit || r.unit || "Unit";
@@ -1994,6 +3408,356 @@ router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
     return res.json({ success: true, rawItems });
   } catch (err) {
     console.error("[sampleStyles] GET /:id/production/raw-items/search", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /:id/requirements/resolve  { rawItemIds: [], serviceIds: [] }
+ *
+ * ARE THE RECORDS THESE SAVED ROWS NAME STILL THERE, AND WHAT DO THEY SAY NOW?
+ *
+ * -- WHY THIS IS NOT A SEARCH ------------------------------------------------
+ * The first cut answered this by searching each row's SAVED NAME and seeing
+ * whether anything came back. That is not identity verification, and it was
+ * wrong in four separate ways:
+ *
+ *   1. A renamed item no longer matches its own snapshot, so a perfectly
+ *      valid record was marked unavailable and somebody was told to choose it
+ *      again -- the one thing a rename must never cause.
+ *   2. A name under two characters was never searched at all, so those rows
+ *      were silently never checked.
+ *   3. The search caps its results, so a common name could push the very
+ *      record being looked for off the end of the list.
+ *   4. Two names that happen to match one search term made the answer depend
+ *      on which rows were on the style.
+ *
+ * So it resolves by ID. The id is what the row actually stores and what the
+ * write path actually refuses, which makes this the same question the save
+ * asks -- and the same answer.
+ *
+ * -- AND MISSING STAYS INDISTINGUISHABLE FROM FOREIGN ------------------------
+ * Both answer `available: false` with no name. Saying which would confirm
+ * that a record the caller cannot see exists.
+ */
+router.post("/:id/requirements/resolve", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* The style must be the caller's company's before anything is resolved
+       against it -- the same proof the write path takes, from the same
+       already-authorised request. */
+    const scope = await salesScopeFor(req);
+    const owned = await ownershipProofFor(style, scope.companyId);
+    if (!owned) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const ids = (list) => [...new Set(
+      (Array.isArray(list) ? list : []).map((v) => String(v || "")).filter(isObjectId),
+    )];
+    const rawItemIds = ids(req.body?.rawItemIds);
+    const serviceIds = ids(req.body?.serviceIds);
+
+    const items = {};
+    if (rawItemIds.length) {
+      const docs = await RawItem.find({ companyId: scope.companyId, _id: { $in: rawItemIds } })
+        .select("name sku unit customUnit variants._id variants.combination variants.sku").lean();
+      const byId = new Map(docs.map((d) => [String(d._id), d]));
+      for (const id of rawItemIds) {
+        const d = byId.get(id);
+        items[id] = d
+          ? {
+            available: true,
+            name: d.name || "",
+            sku: d.sku || "",
+            /* What the register calls its unit today. Offered as CONTEXT
+               beside the unit R&D recorded, never substituted for it. */
+            registeredUnit: d.customUnit || d.unit || "",
+            variants: (d.variants || []).map((v) => ({
+              id: String(v._id),
+              label: (v.combination || []).join(" / ") || v.sku || "",
+              sku: v.sku || "",
+            })),
+          }
+          /* -- EXISTENCE AND OWNERSHIP ONLY ------------------------------
+             `RawItem` has no lifecycle flag: its `status` is derived from
+             quantity against reorder levels, which is a stock fact and not a
+             statement that the company has stopped buying the thing. Judging
+             availability by it would mark an item unavailable for being out
+             of stock. Until the master has a real lifecycle, being this
+             company's and being there is the whole test. */
+          : { available: false };
+      }
+    }
+
+    const services = {};
+    if (serviceIds.length) {
+      const docs = await Service.find({ companyId: scope.companyId, _id: { $in: serviceIds } })
+        .select("name serviceCode billingUnit sacCode status").lean();
+      const byId = new Map(docs.map((d) => [String(d._id), d]));
+      for (const id of serviceIds) {
+        const d = byId.get(id);
+        const active = d && String(d.status || "").toUpperCase() === "ACTIVE";
+        /* Unlike RawItem, the Service master HAS a lifecycle -- and the write
+           path refuses an inactive one, so this must too or the form would
+           pass a row the save then rejects. An INACTIVE service is reported
+           as unavailable WITH its name: it is this company's record and the
+           caller may already see it, so naming it says what to do rather
+           than leaving somebody hunting. */
+        services[id] = d
+          ? {
+            available: Boolean(active),
+            name: d.name || "",
+            serviceCode: d.serviceCode || "",
+            billingUnit: d.billingUnit || "",
+            sacCode: d.sacCode || "",
+            status: d.status || "",
+          }
+          : { available: false };
+      }
+    }
+
+    return res.json({ success: true, items, services });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/requirements/resolve", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /:id/services/search?q= -- the Service Master, for the outside-process
+ * picker on the sampling form.
+ *
+ * -- ACTIVE ONLY, AND THIS COMPANY'S -----------------------------------------
+ * A requirement recorded against a service nobody buys any more is a costing
+ * that cannot be priced, and the write path refuses one -- so the picker does
+ * not offer it either. `defaultRate` is deliberately not in the projection:
+ * it is planning guidance by the master's own account, and a field the screen
+ * cannot see is a field nobody can mistake for a quoted rate.
+ */
+router.get("/:id/services/search", salesAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (q.length < 2) return res.json({ success: true, services: [] });
+    const scope = await salesScopeFor(req);
+    const re = new RegExp(escapeRegex(q), "i");
+    const rows = await Service.find({
+      companyId: scope.companyId,
+      status: "ACTIVE",
+      $or: [{ name: re }, { serviceCode: re }],
+    })
+      .select("name serviceCode billingUnit sacCode category").limit(10).lean();
+    return res.json({
+      success: true,
+      services: rows.map((r) => ({
+        id: r._id, name: r.name, serviceCode: r.serviceCode,
+        billingUnit: r.billingUnit || "", sacCode: r.sacCode || "",
+        category: r.category || "",
+      })),
+    });
+  } catch (err) {
+    console.error("[sampleStyles] GET /:id/services/search", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /:id/development-charges -- the charge TYPES this company has configured
+ * for development, pattern and tooling work it performs itself.
+ *
+ * -- WHY R&D READS THIS AND NOT THE COSTING POLICY ---------------------------
+ * The screen first asked `/api/costings/policy/current`, which needs a costing
+ * capability -- so an R&D person without one got nothing back and could not
+ * classify their own requirement.
+ *
+ * -- AND WHY NO AMOUNT COMES BACK -------------------------------------------
+ * R&D says WHAT work was done; Finance says what the company charges for it.
+ * Only the key, the label, the arithmetic and the unit cross this line, so
+ * nobody here can read the money, quote it, or be tempted to reconcile it
+ * against a figure of their own. The costing reads the amount from the policy
+ * itself, at ITS OWN date.
+ *
+ * -- WHICH IS ALSO WHY A RATE PERIOD IS NOT A FILTER ------------------------
+ * A definition is a charge TYPE and the requirement is recorded against the
+ * type; which RATE applies is a question with the COSTING's date on it. A
+ * style being developed for a season whose rate starts next month would
+ * otherwise find the charge missing from its own form.
+ *
+ * The CATALOGUE, though, is resolved at today. It is a Board policy now, and a
+ * catalogue approved to take effect next month is not yet what the company
+ * publishes -- offering from it would let a requirement point at a charge that
+ * does not exist. The two dating layers do different work, and only the inner
+ * one is deliberately ignored here.
+ */
+router.get("/:id/development-charges", salesAuth, async (req, res) => {
+  try {
+    const scope = await salesScopeFor(req);
+    /* ── ONE ALLOWLIST, NOT A SECOND COPY OF IT ───────────────────────
+       The projection that decides what may cross this boundary lives with the
+       policy, beside the resolution. A second `.map()` here would be a second
+       place for it to widen, and the field that got added would be a rate. */
+    const resolved = await developmentChargePolicy
+      .resolveFor({ companyId: scope.companyId }).catch(() => null);
+    const charges = [...developmentChargePolicy.catalogueForMerchandising(resolved).values()];
+    return res.json({ success: true, charges });
+  } catch (err) {
+    console.error("[sampleStyles] GET /:id/development-charges", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /:id/operations/search?q= — the operation master, for the routing picker.
+ *
+ * ── WHAT IS AND IS NOT SCOPED HERE ──────────────────────────────────────────
+ * The style is proved to this company before anything is read. The OPERATION
+ * MASTER itself carries no company — it is one global table of 259 rows, which
+ * is the same fact that let QC show all of them for an unrouted piece. Adding
+ * tenancy to it is a migration of its own and is not invented here; what this
+ * route does is refuse to answer at all unless the caller's style is proved,
+ * and return identities rather than free text so nothing downstream matches on
+ * a name.
+ *
+ * No rate of any kind comes back. R&D says WHICH operations and in what order;
+ * the labour rate is the company policy's at costing time.
+ */
+router.get("/:id/operations/search", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+
+    const q = String(req.query.q || "").trim();
+    const re = q ? new RegExp(escapeRegex(q), "i") : null;
+    const rows = await Operation.find(re ? { $or: [{ name: re }, { operationCode: re }] } : {})
+      .select("name operationCode totalSam machineType")
+      .sort({ name: 1 })
+      .limit(25)
+      .lean();
+
+    return res.json({
+      success: true,
+      operations: rows.map((o) => ({
+        id: String(o._id),
+        name: o.name || "",
+        operationCode: o.operationCode || "",
+        /* Standard Allowed Minutes, as the master records it. Shown so the
+           person routing can see the shape of the job — never as money. */
+        totalSam: o.totalSam ?? null,
+        machineType: o.machineType || "",
+      })),
+    });
+  } catch (err) {
+    console.error("[sampleStyles] GET /:id/operations/search", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * PUT /:id/operations/route — the sample's draft operation route.
+ *
+ * ── WHY THE WHOLE LIST, IN ORDER ────────────────────────────────────────────
+ * A route is a sequence: collar before side seam before hem. Appending one
+ * operation at a time cannot express a reorder, and the existing per-operation
+ * endpoint took free-text `type` and `machineType`, which is a route matched
+ * on spelling. This replaces the list, by identity, in the order given.
+ *
+ * ── AND IT NEVER TOUCHES A FROZEN ROUTE ─────────────────────────────────────
+ * It writes the PRODUCT's route, which is where a new work order reads its
+ * own from. Work orders already released carry their own frozen copy and are
+ * not reached from here — re-routing a product must never change what a
+ * garment already in production was routed through.
+ */
+router.put("/:id/operations/route", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const scope = await salesScopeFor(req);
+    if (!(await ownershipProofFor(style, scope.companyId))) {
+      return res.status(404).json({ success: false, message: "Style not found." });
+    }
+    const stockItemId = style.production?.stockItemId;
+    if (!stockItemId) {
+      return res.status(400).json({
+        success: false,
+        code: "PRODUCT_NOT_REGISTERED",
+        message: "Register this style as a product before defining its operation route.",
+      });
+    }
+
+    const wanted = Array.isArray(req.body?.operationIds) ? req.body.operationIds : [];
+    if (!wanted.length) {
+      /* Saving an empty route would recreate exactly the state that produced
+         a work order with nothing to progress through. */
+      return res.status(400).json({
+        success: false,
+        code: "ROUTE_EMPTY",
+        message: "A sample route needs at least one operation. A garment routed through nothing cannot be produced or inspected.",
+      });
+    }
+    const ids = wanted.map(String).filter((x) => isObjectId(x));
+    if (ids.length !== wanted.length) {
+      return res.status(400).json({ success: false, message: "One of the chosen operations is not a valid record." });
+    }
+
+    /* ── RE-READ EVERY OPERATION, AND KEEP THE ORDER ASKED FOR ────────
+       The browser sends identities and a sequence. Every name, code, SAM
+       and machine type is taken from what came back, never from the
+       request: a snapshot a caller can dictate is not a snapshot. */
+    const found = await Operation.find({ _id: { $in: ids } })
+      .select("name operationCode totalSam machineType").lean();
+    const byId = new Map(found.map((o) => [String(o._id), o]));
+    const missing = ids.filter((id) => !byId.has(id));
+    if (missing.length) {
+      return res.status(400).json({
+        success: false,
+        message: "One of the chosen operations is no longer in the operation master. Choose it again.",
+      });
+    }
+
+    const stockItem = await StockItem.findById(stockItemId);
+    if (!stockItem) return res.status(404).json({ success: false, message: "Product not found." });
+
+    stockItem.operations = ids.map((id) => {
+      const o = byId.get(id);
+      const seconds = Number.isFinite(Number(o.totalSam)) ? Math.round(Number(o.totalSam) * 60) : 0;
+      return {
+        /* The master's own name is the operation's `type` on the product —
+           the field the work order reads to build its route. */
+        type: o.name || "",
+        operationCode: o.operationCode || "",
+        machine: o.machineType || "",
+        machineType: o.machineType || "",
+        totalSeconds: seconds,
+        minutes: Math.floor(seconds / 60),
+        seconds: seconds % 60,
+        /* ── NO RATE IS WRITTEN HERE ──────────────────────────────────
+           R&D says which operations and in what order. What an operator
+           minute costs is the company's own assumption, read by the costing
+           engine from policy at calculation time — a figure typed here
+           would be a second, undated answer. */
+        operatorSalary: 0,
+        operatorCost: 0,
+      };
+    });
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+
+    return res.json({
+      success: true,
+      message: `Sample route saved: ${ids.length} operation${ids.length === 1 ? "" : "s"}.`,
+      operations: stockItem.operations.map((o, i) => ({
+        position: i + 1,
+        name: o.type,
+        operationCode: o.operationCode || "",
+        machineType: o.machineType || "",
+        totalSam: o.totalSeconds ? Math.round((o.totalSeconds / 60) * 100) / 100 : null,
+      })),
+    });
+  } catch (err) {
+    console.error("[sampleStyles] PUT /:id/operations/route", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -2176,7 +3940,7 @@ router.post("/:id/production/order-quantities", salesAuth, async (req, res) => {
     style.updatedBy = who;
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/production/order-quantities", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2237,6 +4001,11 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     if (!targetStockItemId) return res.status(400).json({ success: false, message: "Register the product first." });
     if (style.production.status === "submitted") return res.status(400).json({ success: false, message: "Already sent to production." });
 
+    // Freeze the Sales-approved technical route onto the product immediately
+    // before the sample MO/WO is created. Production therefore receives its
+    // ordinary route, scanning and QC protocol without a second R&D entry.
+    await syncApprovedTechnicalRoute(style, req.user?.id);
+
     const stockItem = await StockItem.findById(targetStockItemId).select("name reference variants").lean();
     if (!stockItem) return res.status(404).json({ success: false, message: "The registered product could not be found." });
     const customer = await Customer.findById(style.production.customerId).select("name email phone profile").lean();
@@ -2252,7 +4021,7 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     const variantsById = new Map((stockItem.variants || []).map((v) => [String(v._id), v]));
     const ordered = style.production?.orderVariants || [];
     if (!ordered.length) {
-      return res.status(400).json({ success: false, message: "Sales hasn't set the order quantities for this style yet." });
+      return res.status(400).json({ success: false, message: "Sales hasn't set the sample quantities for this style yet." });
     }
     const variants = [];
     for (const row of ordered) {
@@ -2269,6 +4038,10 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
 
     const priority = ["low", "medium", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "medium";
     const deliveryDeadline = req.body?.deliveryDeadline ? new Date(req.body.deliveryDeadline) : null;
+    /* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
+    if (!deliveryDeadline || Number.isNaN(deliveryDeadline.getTime())) {
+      return res.status(400).json({ success: false, code: "DELIVERY_DEADLINE_REQUIRED", message: "Set the delivery deadline for this production run — every department plans against it." });
+    }
 
     const requestId = await nextRequestId(CustomerRequest);
     const request = new CustomerRequest({
@@ -2317,16 +4090,63 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     request.status = "quotation_sales_approved";
     await request.save();
 
-    const { createdWorkOrders } = await createWorkOrdersAndProgress(request, req.user?.id);
+    const { createdWorkOrders, unroutedProducts } = await createWorkOrdersAndProgress(request, req.user?.id);
 
+    /* A production release without a work order is not a release.  The
+       previous path saved the internal request and advanced the style even
+       when the factory returned an empty list, leaving R&D waiting forever
+       for work that did not exist.  Roll back this just-created request (and
+       any partial work orders) before reporting the route problem. */
+    if (unroutedProducts.length || !createdWorkOrders.length) {
+      if (createdWorkOrders.length) {
+        await WorkOrder.deleteMany({ _id: { $in: createdWorkOrders.map((wo) => wo._id) } });
+      }
+      await CustomerRequest.deleteOne({ _id: request._id });
+      return res.status(409).json({
+        success: false,
+        code: "SAMPLE_WORK_ORDERS_NOT_CREATED",
+        message: unroutedProducts.length
+          ? "The approved production route could not be turned into work orders. Return the technical record to R&D to correct the route."
+          : "No sample work orders were created. The sample has not been released to Production.",
+        products: unroutedProducts,
+      });
+    }
+
+    /* ── EVERY ATTEMPT'S WORK ORDERS ARE KEPT, NOT REPLACED ───────────────
+       This used to assign, which was correct while a style could only ever be
+       sent to production once. A style whose first attempt was cancelled and
+       returned to R&D can be sent again, and assigning would drop the
+       cancelled order out of the style's own record — the readback, the R&D
+       page's history and the "is anything still governing this style" check
+       all read this list. The work order itself would survive in its own
+       collection, but nothing would point at it any more.
+
+       Appending is identical to assigning on a first submission, where the
+       list is empty. */
+    const previousWorkOrderIds = (style.production.workOrderIds || []).map(String);
+    const previousRequestId = style.production.customerRequestId || null;
     style.production.customerRequestId = request._id;
-    style.production.workOrderIds = createdWorkOrders.map((w) => w._id);
+    style.production.workOrderIds = [
+      ...(style.production.workOrderIds || []),
+      ...createdWorkOrders.map((w) => w._id),
+    ];
     style.production.status = "submitted";
     style.production.log = style.production.log || [];
     // Kept separate from the push above so the response can hand back
     // exactly the entries THIS call added — the R&D page replays them one
     // at a time as "what just happened", not the style's whole history.
     const newEntries = [
+      /* A resubmission supersedes the previous request as the CURRENT one.
+         Said in the log, because `customerRequestId` now points somewhere
+         else and the earlier request is otherwise reachable only through the
+         cancelled work order. Nothing is deleted. */
+      ...(previousWorkOrderIds.length
+        ? [{
+          kind: "attempt_replaced",
+          note: `Replacement attempt. The previous attempt's ${previousWorkOrderIds.length} work order(s)${previousRequestId ? " and its request" : ""} stay on record.`,
+          by: actor(req), at: new Date(),
+        }]
+        : []),
       { kind: "request_created", note: request.requestId, by: actor(req), at: new Date() },
       { kind: "sales_approved", note: "Internal order — auto-approved.", by: actor(req), at: new Date() },
       { kind: "work_orders_created", note: `${createdWorkOrders.length} work order(s).`, by: actor(req), at: new Date() },
@@ -2335,7 +4155,17 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     style.updatedBy = actor(req);
     await style.save();
 
-    return res.json({ success: true, workOrderIds: style.production.workOrderIds, customerRequestId: request._id, log: newEntries });
+    return res.json({
+      success: true,
+      /* THIS call's work orders, not the style's cumulative list. The list is
+         now kept across attempts, and "3 work orders created" has to mean the
+         three that were just created — the readback is where the whole
+         history is asked for. */
+      workOrderIds: createdWorkOrders.map((w) => w._id),
+      allWorkOrderIds: style.production.workOrderIds,
+      customerRequestId: request._id,
+      log: newEntries,
+    });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/production/submit", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2410,7 +4240,7 @@ router.get("/:id/development-record", salesAuth, async (req, res) => {
     // name where it was approved rather than showing a raw id.
     const journeyIds = [...new Set(priorRaw.map((p) => String(p.journeyId)).filter(Boolean))];
     const journeys = journeyIds.length
-      ? await SalesJourney.find({ _id: { $in: journeyIds } }).select("journeyId").lean()
+      ? await SalesJourney.find(await scoped(req, { _id: { $in: journeyIds } })).select("journeyId").lean()
       : [];
     const refById = Object.fromEntries(journeys.map((j) => [String(j._id), j.journeyId]));
     const priorStyles = priorRaw.map((p) => ({ ...p, journeyRef: refById[String(p.journeyId)] || null }));
@@ -2469,7 +4299,7 @@ router.post("/:id/variants", salesAuth, async (req, res) => {
     logHistory(style, { kind: "variant_raised", note: `${label}${req.body?.note ? ` — ${req.body.note}` : ""}` }, req);
     await style.save();
 
-    return res.status(201).json({ success: true, sampleStyle: await withJourney(style) });
+    return res.status(201).json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     // The compound unique is the real guard; the check above is only the good
     // error message. A race lands here.
@@ -2501,7 +4331,7 @@ router.post("/:id/choose", salesAuth, async (req, res) => {
     style.updatedBy = actor(req);
     await style.save();
 
-    return res.json({ success: true, sampleStyle: await withJourney(style) });
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/choose", err);
     return res.status(500).json({ success: false, message: err.message });

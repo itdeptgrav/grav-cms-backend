@@ -36,6 +36,12 @@ const {
   DISPLAY_STATUSES,
   deadlineBoundaries,
 } = require("./moListQuery");
+// Pure (no model, no connection) — see services/orderOrigin.js. Resolved here
+// rather than in the route so the register row and the detail endpoints read an
+// order's kind the same way. The route used to bolt it on afterwards, and the
+// two halves of a merge (the 31 Aug 2026 badges vs. the service refactor)
+// drifted apart into a 500 — see the route's list handler.
+const { resolveOrderOrigin } = require("../orderOrigin");
 
 /** Sales-approved is what a manufacturing order IS. Never relaxed. */
 const MO_BASE_STATUS = "quotation_sales_approved";
@@ -361,6 +367,27 @@ function buildListPipeline(q) {
               // estimatedCompletion are both still projected above.
               deadline: 1,
               deadlineRisk: 1,
+              // What KIND of order this is — sampling / internal / testing /
+              // a real customer's. Projected because anything absent here
+              // never reaches the UI, and the MO list badges on it
+              // (31 Aug 2026). `isInternalOrder` and `sampleStyleId` ride
+              // along so an older row written before `orderOrigin` existed can
+              // still be read as internal/sampling rather than silently badged
+              // as a customer order.
+              orderOrigin: 1,
+              // Product-wise Job Work summary. The exact classification stays
+              // on each item; this count only drives the register badge.
+              jobWorkProductCount: {
+                $size: {
+                  $filter: {
+                    input: { $ifNull: ["$items", []] },
+                    as: "item",
+                    cond: { $eq: ["$$item.fulfilmentModel", "JOB_WORK"] },
+                  },
+                },
+              },
+              isInternalOrder: 1,
+              sampleStyleId: 1,
             },
           },
         ],
@@ -480,6 +507,14 @@ function projectRow(r) {
     // a caller does not have to re-derive server-side filtering client-side.
     deadline: r.deadline || null,
     deadlineRisk: r.deadlineRisk || "none",
+    // What kind of order this is, resolved once server-side so the list, the
+    // detail page and the Project Manager's email cannot disagree — see
+    // services/orderOrigin.js for why older rows are inferred rather than
+    // read straight off the field.
+    orderOrigin: resolveOrderOrigin(r),
+    // Exact per-line data remains on CustomerRequest.items. This summary is
+    // additive and cannot mislabel a mixed order as wholly Job Work.
+    jobWorkProductCount: Math.max(0, Number(r.jobWorkProductCount) || 0),
   };
 }
 

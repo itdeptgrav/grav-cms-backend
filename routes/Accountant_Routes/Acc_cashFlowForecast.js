@@ -28,12 +28,26 @@ const Acc_RecurringItem = require("../../models/Accountant_model/Acc_RecurringIt
 const partyOrch = require("../../services/partyTermsImpactOrchestrator.service");
 const actionCenter = require("../../services/cashFlowForecastActionCenter.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 /* ------------------------------------------------------------------ */
 /* GET /                                                    READ ONLY  */
 /* ------------------------------------------------------------------ */
-router.get("/", async (req, res) => {
+router.get("/", companyScope, async (req, res) => {
   try {
     const { companyId, horizon, asOfDate, groupBy, layer } = req.query;
 
@@ -75,7 +89,7 @@ router.get("/", async (req, res) => {
 // It recommends nowhere to look, never what the answer is: no credit-days
 // figure, no expected date, no ledger selection. Every action carries an
 // `href` to an existing workflow where a person supplies the value.
-router.get("/action-center", async (req, res) => {
+router.get("/action-center", companyScope, async (req, res) => {
   try {
     const { companyId, horizon, asOfDate } = req.query;
     if (!companyId) {

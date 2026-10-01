@@ -107,6 +107,20 @@ async function logSuccessfulContact(leadId) {
 
 /* ── Auth ─────────────────────────────────────────────────────────────────── */
 
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Account, Lead and Contact creation now refuses unless the actor's company is
+ * provable. These suites are not about tenancy, so they seed the simplest
+ * thing that makes ownership provable: a single company, which is the
+ * documented deployment fallback. Without it every creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
+
 describe("authentication", () => {
   test("POST / without a session is refused", async () => {
     const { status } = await call("/", { method: "POST", body: validBody(), user: null });
@@ -306,15 +320,14 @@ describe("PATCH /leads/:id", () => {
   });
 
   test("a real stage change is routed through the shared transition service, keeping both fields in sync", async () => {
-    const lead = await createLead();
-    await logSuccessfulContact(lead._id);
+    const lead = await createLead(QUALIFICATION_READY_FIELDS);
     const { status, body } = await call(`/${lead._id}`, {
       method: "PATCH",
-      body: { stage: "contacted" },
+      body: { stage: "qualified" },
     });
     expect(status).toBe(200);
-    expect(body.lead.stage).toBe("contacted");
-    expect(body.lead.qualificationState).toBe("contacted");
+    expect(body.lead.stage).toBe("qualified");
+    expect(body.lead.qualificationState).toBe("qualified");
   });
 
   test("proposal_sent/negotiation/won can no longer be assigned via the generic update, and no side effects leak through", async () => {
@@ -352,15 +365,13 @@ describe("PATCH /leads/:id", () => {
 /* ── Contacts — the multi-stakeholder list (Chunk B) ─────────────────────── */
 
 describe("PATCH /leads/:id — contacts", () => {
-  test("saves a contacts list, sanitising shape and dropping nameless entries", async () => {
+  test("saves a contacts list, sanitising shape", async () => {
     const lead = await createLead();
     const { status, body } = await call(`/${lead._id}`, {
       method: "PATCH",
       body: {
         contacts: [
           { name: "  Ravi Kumar ", role: "Head Merchandiser", email: "RAVI@EXAMPLE.COM", phone: "9876500000", isDecisionMaker: true, injected: "ignored" },
-          { name: "", role: "should be dropped" },
-          { role: "no name either" },
         ],
       },
     });
@@ -373,9 +384,26 @@ describe("PATCH /leads/:id — contacts", () => {
     expect(body.lead.contacts[0]._id).toBeTruthy(); // server-assigned
   });
 
-  test("replaces the whole list on save, and an empty list clears it", async () => {
+  test("a nameless row is REFUSED, not silently dropped", async () => {
+    /* This used to drop the bad rows and return 200, so a client with a bug
+       saved fewer people than it thought it had and nothing said so. See
+       test/crm/prospect-contacts.route.test.js for the full contract. */
     const lead = await createLead();
-    await call(`/${lead._id}`, { method: "PATCH", body: { contacts: [{ name: "A" }, { name: "B" }] } });
+    const { status } = await call(`/${lead._id}`, {
+      method: "PATCH",
+      body: { contacts: [{ name: "Ravi Kumar" }, { name: "", role: "no name" }] },
+    });
+    expect(status).toBe(400);
+    expect((await call(`/${lead._id}`)).body.lead.contacts).toBeUndefined();
+  });
+
+  test("replaces the whole list on save, and an empty list clears it", async () => {
+    /* An explicit type: `prospectType` defaults to "individual", and an
+       Individual Prospect takes at most one contact — the server refuses to
+       infer otherwise from the company name. Two active people also need one
+       marked primary, because it will not pick by array order. */
+    const lead = await createLead({ prospectType: "company" });
+    await call(`/${lead._id}`, { method: "PATCH", body: { contacts: [{ name: "A", isPrimary: true }, { name: "B" }] } });
     const two = await call(`/${lead._id}`);
     expect(two.body.lead.contacts).toHaveLength(2);
 
@@ -403,14 +431,13 @@ describe("PATCH /leads/:id — contacts", () => {
 
 describe("PATCH /leads/:id/qualification-state", () => {
   test("moves through the canonical vocabulary and audits it", async () => {
-    const lead = await createLead();
-    await logSuccessfulContact(lead._id);
+    const lead = await createLead(QUALIFICATION_READY_FIELDS);
     const { status, body } = await call(`/${lead._id}/qualification-state`, {
       method: "PATCH",
-      body: { qualificationState: "contacted" },
+      body: { qualificationState: "qualified" },
     });
     expect(status).toBe(200);
-    expect(body.lead.qualificationState).toBe("contacted");
+    expect(body.lead.qualificationState).toBe("qualified");
     expect(recordChange.mock.calls.at(-1)[1]).toMatchObject({ entity: "lead", action: "update" });
   });
 
@@ -473,30 +500,33 @@ describe("canonical transition map — the exact graph from the review", () => {
     expect((await moveTo(lead._id, "qualified")).status).toBe(400);
   });
 
-  test("the happy path: new -> contacted -> qualified -> readyToConvert", async () => {
+  test("the happy path: Interest Confirmed -> Requirement Captured -> Enquiry Ready", async () => {
+    /* Three steps, and the contact funnel is not among them: a Lead exists
+       because a Prospect already proved contact and interest. */
     const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await logSuccessfulContact(lead._id);
-    expect((await moveTo(lead._id, "contacted")).status).toBe(200);
     expect((await moveTo(lead._id, "qualified")).status).toBe(200);
     expect((await moveTo(lead._id, "readyToConvert")).status).toBe(200);
   });
 
-  test("readyToConvert cannot go backward to qualified or contacted", async () => {
+  test("readyToConvert cannot go backward", async () => {
     const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await logSuccessfulContact(lead._id);
-    await moveTo(lead._id, "contacted");
     await moveTo(lead._id, "qualified");
     await moveTo(lead._id, "readyToConvert");
     expect((await moveTo(lead._id, "qualified")).status).toBe(400);
-    expect((await moveTo(lead._id, "contacted")).status).toBe(400);
+    expect((await moveTo(lead._id, "new")).status).toBe(400);
   });
 
-  test("nurture can return to contacted or qualified", async () => {
+  test("nurture returns to Interest Confirmed or Requirement Captured", async () => {
+    /* Wherever the requirement work had actually got to — and never to the
+       legacy contact states, so a resuming Lead resumes in this vocabulary. */
     const lead = await createLead(QUALIFICATION_READY_FIELDS);
-    await logSuccessfulContact(lead._id);
-    await moveTo(lead._id, "contacted");
     expect((await moveTo(lead._id, "nurture", "Busy this month", { nextAction: NEXT_ACTION })).status).toBe(200);
-    expect((await moveTo(lead._id, "qualified")).status).toBe(200);
+    expect((await moveTo(lead._id, "new")).status).toBe(200);
+
+    const other = await createLead(QUALIFICATION_READY_FIELDS);
+    await moveTo(other._id, "nurture", "Busy this month", { nextAction: NEXT_ACTION });
+    expect((await moveTo(other._id, "qualified")).status).toBe(200);
+    expect((await moveTo(other._id, "contacted")).status).toBe(400);
   });
 
   test("every state (except terminal ones) can move to disqualified or duplicate with a reason", async () => {
@@ -540,14 +570,24 @@ describe("canonical transition map — the exact graph from the review", () => {
 /* ── Legacy /:id/stage — now a wrapper over the shared service ──────────── */
 
 describe("PATCH /leads/:id/stage — legacy compatibility wrapper", () => {
-  test("still accepts new/contacted/qualified, keeps qualificationState in sync, no embedded activity", async () => {
-    const lead = await createLead();
-    await logSuccessfulContact(lead._id);
-    const { status, body } = await call(`/${lead._id}/stage`, { method: "PATCH", body: { stage: "contacted" } });
+  test("still accepts new/qualified, keeps qualificationState in sync, no embedded activity", async () => {
+    const lead = await createLead(QUALIFICATION_READY_FIELDS);
+    const { status, body } = await call(`/${lead._id}/stage`, { method: "PATCH", body: { stage: "qualified" } });
     expect(status).toBe(200);
-    expect(body.lead.stage).toBe("contacted");
-    expect(body.lead.qualificationState).toBe("contacted");
+    expect(body.lead.stage).toBe("qualified");
+    expect(body.lead.qualificationState).toBe("qualified");
     expect(body.lead.activities.length).toBe(0); // no more embedded writes
+  });
+
+  test("the legacy wrapper cannot reach a legacy contact state either", async () => {
+    /* Otherwise `stage: "contacted"` would be a back door into exactly the
+       state the canonical API refuses — one rule with two entry points means
+       one answer, not two. */
+    const lead = await createLead(QUALIFICATION_READY_FIELDS);
+    const { status, body } = await call(`/${lead._id}/stage`, { method: "PATCH", body: { stage: "contacted" } });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/legacy/i);
+    expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("new");
   });
 
   test("an unchanged stage is a no-op — no transition audited", async () => {

@@ -45,10 +45,26 @@ const SOURCE_SERVICE = "service_default";
  */
 const SOURCE_MANUAL = "manual_selection";
 /** Nobody has decided. An answer, not an error, and never a default. */
+/**
+ * The head the REQUEST itself was approved against.
+ *
+ * Not a line-level rule and deliberately not dressed as one. Before line-wise
+ * allocation the request header's head was the only authority, and it is still
+ * a real decision: the requester picked it from their own department's
+ * approved lines and finance approved the request on it. A line whose own rule
+ * produces nothing falls back to it rather than being refused — refusing would
+ * make every request that predates item-wise mapping unapprovable.
+ *
+ * It is a distinct value precisely so nobody can later mistake "we used the
+ * request's head because nothing else said otherwise" for "somebody classified
+ * this line".
+ */
+const SOURCE_REQUEST_HEAD = "request_head";
 const SOURCE_NONE = "unresolved";
 
 const RESOLUTION_SOURCES = Object.freeze([
-  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL, SOURCE_NONE,
+  SOURCE_ITEM, SOURCE_CATEGORY, SOURCE_SERVICE, SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD, SOURCE_NONE,
 ]);
 
 /* ── HOW SETTLED THE ANSWER IS ──────────────────────────────────────────────
@@ -90,6 +106,7 @@ module.exports = {
   SOURCE_CATEGORY,
   SOURCE_SERVICE,
   SOURCE_MANUAL,
+  SOURCE_REQUEST_HEAD,
   SOURCE_NONE,
   RESOLUTION_SOURCES,
   STATUS_RESOLVED,

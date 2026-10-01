@@ -17,6 +17,8 @@ const qcStages                   = require("../../../../services/qcStages");
 const qcViewer                   = require("../../../../services/qcViewer");
 const QCDefectType               = require("../../../../models/CMS_Models/Manufacturing/QC/QCDefectType");
 const QCOperationDefectMap       = require("../../../../models/CMS_Models/Manufacturing/QC/QCOperationDefectMap");
+const qcOperators                = require("../../../../services/qcOperators");
+const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const istDateString = (d = new Date()) => {
@@ -84,17 +86,21 @@ const extractCategory = (code) => {
   return m ? m[0].toUpperCase() : "OTHER";
 };
 
-const findWorkOrderByShortId = async (shortId) => {
-  const matches = await WorkOrder.aggregate([
-    { $match: { $expr: { $eq: [{ $substrCP: [{ $toString: "$_id" }, 16, 8] }, shortId] } } },
-    { $limit: 1 },
-    { $project: {
+const { findWorkOrderByShortId: findWorkOrderByShortIdShared } = require("../../../../services/manufacturing/workOrderShortId");
+
+/* ── THE SHORT-ID RULE LIVES IN ONE PLACE NOW ─────────────────────────────
+   This was the only correct implementation of it and `/identify-barcode` had
+   a second, broken one (`findOne({ workOrderShortId })` against a field that
+   is on no document). The pipeline is unchanged — same `$substrCP` bounds,
+   same `$limit`, same projection — it just comes from the service now, so the
+   two lookups cannot drift again. See services/manufacturing/workOrderShortId.js. */
+const findWorkOrderByShortId = (shortId) =>
+  findWorkOrderByShortIdShared(shortId, {
+    project: {
       _id: 1, workOrderNumber: 1, stockItemName: 1, stockItemReference: 1,
       stockItemId: 1, quantity: 1, status: 1, variantAttributes: 1, customerRequestId: 1,
-    }},
-  ]);
-  return matches[0] || null;
-};
+    },
+  });
 
 // ─── Master operations cache (1 min TTL) ──────────────────────────────────────
 let opsCache   = null;
@@ -108,6 +114,31 @@ const getMasterOperations = async () => {
     .select("name operationCode totalSam machineType").lean();
   opsCacheAt = now;
   return opsCache;
+};
+
+/**
+ * The operations THIS PIECE'S work order was routed through.
+ *
+ * ── THE WORK ORDER, NOT THE PRODUCT ─────────────────────────────────────────
+ * The route is frozen onto the work order when it is created. The product's
+ * Operations tab is where that route came FROM, and it can be edited
+ * afterwards — so reading it now can show an inspector operations that were
+ * added after the garment in their hand was made, and hide ones that were
+ * removed. The piece was routed through what the work order says.
+ */
+const getWorkOrderOperations = async (workOrderId) => {
+  if (!workOrderId) return null;
+  const wo = await WorkOrder.findById(workOrderId).select("operations").lean().catch(() => null);
+  const rows = wo?.operations;
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  /* The work order's own field names, mapped to the shape the catalogue
+     below reads. */
+  return rows.map((op) => ({
+    operationCode: op.operationCode || "",
+    type: op.operationType || "",
+    totalSeconds: op.plannedTimeSeconds,
+    machineType: op.machineType || "",
+  }));
 };
 
 /**
@@ -292,7 +323,10 @@ router.post("/lookup-piece", async (req, res) => {
       EmployeeProductionProgress.findOne({
         workOrderId: workOrder._id, unitStart: { $lte: unitNumber }, unitEnd: { $gte: unitNumber },
       }).lean(),
-      getProductOperations(workOrder.stockItemId),
+      /* The piece's own frozen route first; the product's tab only as the
+         source it came from, for a work order made before routes were
+         frozen. Never the master sheet — see the refusal below. */
+      getWorkOrderOperations(workOrder._id).then((rows) => rows || getProductOperations(workOrder.stockItemId)),
       // Only the fields resolveProductImage needs — this product's own images
       // run to full-size URLs across many variants, so fetching the rest of
       // the StockItem document here would be its own bandwidth mistake.
@@ -425,16 +459,27 @@ router.post("/lookup-piece", async (req, res) => {
       }
     }
 
+    /* ── AND NEVER THE WHOLE FACTORY'S VOCABULARY ──────────────────────
+       This fell back to the master operation sheet, reasoned as "a
+       data-entry gap must not stop the line". What it actually did was show
+       an inspector all 259 operations this company has ever defined for a
+       piece whose work order was routed through none of them — a list in
+       which every row is wrong, presented exactly like a correct one.
+
+       An unrouted piece cannot be inspected, because there is nothing to
+       inspect it against. That is a refusal with a remedy, not a list. */
     if (!opSource) {
-      opSource = masterOps;
-      operationScope = {
-        source: "master",
-        reason: !workOrder.stockItemId
-          ? "This work order is not linked to a product."
+      return res.status(409).json({
+        success: false,
+        code: "WORK_ORDER_NOT_ROUTED",
+        message: !workOrder.stockItemId
+          ? `${workOrder.workOrderNumber || "This work order"} is not linked to a product, so this piece has no operation route to inspect against.`
           : !productOps
-            ? "This product has no operations on its Operations tab."
-            : "This product's operations have no operation codes.",
-      };
+            ? `${workOrder.workOrderNumber || "This work order"} has no operation route, so there is nothing to inspect this piece against. Record the product's operations in R&D, then re-plan the order.`
+            : `${workOrder.workOrderNumber || "This work order"}'s operations have no operation codes, so a defect could not be recorded against any of them. Add the codes on the product's Operations tab.`,
+        workOrderNumber: workOrder.workOrderNumber || "",
+        remedy: "RECORD_OPERATIONS_IN_RND",
+      });
     }
 
     const operations = opSource.map(op => {
@@ -891,57 +936,88 @@ router.post("/save-inspection-offline", async (req, res) => {
   }
 });
 
-// ─── GET /piece-operators ──────────────────────────────────────────────────────
-// On-demand: given a barcode, returns every operator + machine + scan time
-// from ProductionTracking. Used by the QC overview "Fetch Operator" button.
+// ─── GET /piece-operators?barcode= ────────────────────────────────────────────
+// On demand — the "View operator" control on a defect. Every scan of this piece
+// from the scanners' own events (services/qcOperators.js says why not the
+// tracking read model), oldest first, with the operator's real name resolved by
+// either badge field, the machine, the operations active at that scan and the
+// time. The response shape predates the rewrite; only its source changed.
 router.get("/piece-operators", async (req, res) => {
   try {
-    const { barcode } = req.query;
+    const barcode = String(req.query.barcode || "").trim();
     if (!barcode) return res.status(400).json({ success: false, message: "barcode required" });
 
-    const scans = await ProductionTracking.aggregate([
-      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
-      { $unwind: "$machines" },
-      { $unwind: "$machines.operators" },
-      { $unwind: "$machines.operators.barcodeScans" },
-      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
-      { $lookup: { from: "machines", localField: "machines.machineId", foreignField: "_id", as: "_m" } },
-      { $project: {
-        _id:          0,
-        operatorId:   "$machines.operators.operatorIdentityId",
-        operatorName: "$machines.operators.operatorName",
-        activeOps:    "$machines.operators.barcodeScans.activeOps",
-        timeStamp:    "$machines.operators.barcodeScans.timeStamp",
-        machineName:  { $arrayElemAt: ["$_m.name", 0] },
-      }},
-      { $sort: { timeStamp: 1 } },
-    ]);
-
-    // Resolve names from Employee if operatorName is blank in the tracking doc
-    const missingIds = [...new Set(
-      scans.filter(s => !s.operatorName && s.operatorId).map(s => s.operatorId)
-    )];
-    let empNameMap = new Map();
-    if (missingIds.length) {
-      const emps = await Employee.find({ identityId: { $in: missingIds } })
-        .select("identityId firstName middleName lastName").lean();
-      empNameMap = new Map(emps.map(e => [
-        e.identityId,
-        [e.firstName, e.middleName, e.lastName].filter(Boolean).join(" ").trim() || e.identityId,
-      ]));
-    }
-
-    const operators = scans.map(s => ({
-      operatorId:   s.operatorId,
-      operatorName: s.operatorName || empNameMap.get(s.operatorId) || s.operatorId || "Unknown",
-      activeOps:    Array.isArray(s.activeOps) ? s.activeOps : [],
-      timeStamp:    s.timeStamp,
-      machineName:  s.machineName || "—",
-    }));
-
-    res.json({ success: true, barcode, operators });
+    const scans = (await qcOperators.scansForBarcodes([barcode])).get(barcode) || [];
+    res.json({
+      success: true,
+      barcode,
+      source: "scanner",
+      operators: scans.map((s) => ({
+        operatorId:   s.operatorId,
+        operatorName: s.operatorName,
+        activeOps:    s.activeOps,
+        timeStamp:    s.scanTime,
+        machineName:  s.machineName || "—",
+      })),
+    });
   } catch (err) {
     console.error("[QC piece-operators]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /operator-defects?date=YYYY-MM-DD ────────────────────────────────────
+// (or ?from=&to=, at most 92 days)
+//
+// THE DAY'S DEFECTS BY THE OPERATOR WHO MADE THEM. Loaded only when asked for —
+// the overview shows a button, not the table — because it joins every defect
+// of the period against the scanner events for those pieces, and most visits
+// to the page never need it.
+//
+// Scoped exactly as /inspections is: an inspector sees the defects they
+// recorded, the QC owner sees the department's.
+router.get("/operator-defects", async (req, res) => {
+  try {
+    const DAY = /^\d{4}-\d{2}-\d{2}$/;
+    const date = DAY.test(req.query.date || "") ? req.query.date : null;
+    const from = DAY.test(req.query.from || "") ? req.query.from : null;
+    const to   = DAY.test(req.query.to   || "") ? req.query.to   : null;
+    let period;
+    if (date) period = { from: date, to: date };
+    else if (from || to) period = { from: from || to, to: to || from };
+    else { const t = istDateString(); period = { from: t, to: t }; }
+    if (period.from > period.to) [period.from, period.to] = [period.to, period.from];
+    const spanDays = Math.round((Date.parse(period.to) - Date.parse(period.from)) / 86400000) + 1;
+    if (spanDays > 92) {
+      return res.status(400).json({ success: false, message: "Choose a period of at most 92 days." });
+    }
+
+    const [viewer, deptConfigured] = await Promise.all([qcViewer.resolveViewer(req), qcViewer.departmentConfigured()]);
+    const filter = {
+      status: { $ne: "passed" },
+      date: period.from === period.to ? period.from : { $gte: period.from, $lte: period.to },
+    };
+    qcViewer.applyViewerFilter(filter, qcViewer.viewerFilter(viewer, { departmentConfigured: deptConfigured }));
+
+    const inspections = await QCInspection.find(filter)
+      .select("barcodeId date status defects workOrderId workOrderShortId manufacturingOrderId moRequestId stageName inspectedAt inspectedByQCName")
+      .sort({ inspectedAt: 1 })
+      .lean();
+
+    const woIds = [...new Set(inspections.map((i) => i.workOrderId).filter(Boolean).map(String))];
+    const moIds = [...new Set(inspections.map((i) => i.manufacturingOrderId).filter(Boolean).map(String))];
+    const [scansByBarcode, wos, mos] = await Promise.all([
+      qcOperators.scansForBarcodes(inspections.map((i) => i.barcodeId)),
+      woIds.length ? WorkOrder.find({ _id: { $in: woIds } }).select("workOrderNumber stockItemName").lean() : [],
+      moIds.length ? CustomerRequest.find({ _id: { $in: moIds } }).select("requestId customerInfo.name").lean() : [],
+    ]);
+    const workOrderById = new Map(wos.map((w) => [String(w._id), { workOrderNumber: displayWorkOrderNumber(w), stockItemName: w.stockItemName || "" }]));
+    const orderById = new Map(mos.map((m) => [String(m._id), { moNumber: m.requestId ? `MO-${m.requestId}` : "", customerName: m.customerInfo?.name || "" }]));
+
+    const report = qcOperators.buildOperatorDefectReport({ inspections, scansByBarcode, workOrderById, orderById });
+    res.json({ success: true, period, ...report });
+  } catch (err) {
+    console.error("[QC operator-defects]", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1979,8 +2055,37 @@ router.get("/report", async (req, res) => {
  *  gender, the same way `/inspections` does (`resolveProductImage`) — worth
  *  the extra StockItem batch only where a card actually shows a photo (the
  *  per-MO work-order list), not the MO rollup, which never does. */
-async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } = {}) {
-  const workOrders = await WorkOrder.find({ status: { $ne: "cancelled" }, ...extraQuery })
+/* A short cache for the department-wide reads (29 Sep 2026). The Orders page
+   and the hub re-read the whole book on every visit; a figure a few seconds
+   old is fine there, and an inspection just recorded shows up within
+   QC_ORDERS_CACHE_MS (default 15 s; 0 disables). Keyed by the query. */
+const STATS_CACHE = new Map();
+const STATS_CACHE_MS = Number(process.env.QC_ORDERS_CACHE_MS ?? 15000);
+async function computeWorkOrderQcStats(extraQuery = {}, opts = {}) {
+  const key = JSON.stringify([extraQuery, opts]);
+  const hit = STATS_CACHE.get(key);
+  if (STATS_CACHE_MS > 0 && hit && hit.at > Date.now() - STATS_CACHE_MS) return hit.value;
+  const value = await computeWorkOrderQcStatsUncached(extraQuery, opts);
+  if (STATS_CACHE_MS > 0) STATS_CACHE.set(key, { at: Date.now(), value });
+  return value;
+}
+async function computeWorkOrderQcStatsUncached(extraQuery = {}, { withDetail = false } = {}) {
+  /* ── AN UNROUTED ORDER IS NOT A QC CANDIDATE ──────────────────────────
+     QC listed every non-cancelled work order, so an order created before its
+     product had any operations appeared as ready to inspect — and looking up
+     one of its pieces then showed the entire company operation master,
+     because there was no route to scope to.
+
+     A piece routed through nothing cannot be inspected against anything. The
+     piece lookup now refuses it by name, so listing it here would be offering
+     an action that always fails. Excluded in the query, not filtered after,
+     so the counts a card shows are counts of orders that can actually be
+     worked on. */
+  const workOrders = await WorkOrder.find({
+    status: { $ne: "cancelled" },
+    "operations.0": { $exists: true },
+    ...extraQuery,
+  })
     .select("workOrderNumber quantity stockItemName stockItemReference stockItemId variantAttributes customerName status createdAt customerRequestId assignedDeadline")
     .sort({ createdAt: -1 })
     .lean();
@@ -2003,18 +2108,29 @@ async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } =
   const shortIdOf = (id) => id.toString().slice(-8);
   const shortIds = workOrders.map((wo) => shortIdOf(wo._id));
 
-  const scans = await QCInspection.find({ workOrderShortId: { $in: shortIds } })
-    .select("workOrderShortId barcodeId")
-    .lean();
+  /* ONE read of the scans, not two (29 Sep 2026: the Orders page took ~3 s).
+     This used to fetch every scan for the short ids, then hand the barcodes to
+     pieceProgressMany, which fetched the SAME rows again with more fields —
+     2 300 rows twice, over Atlas latency. Now the one read carries the fields
+     buildPieceProgress needs and the rows are grouped here. */
+  const [scans, stages] = await Promise.all([
+    QCInspection.find({ workOrderShortId: { $in: shortIds } })
+      .select("workOrderShortId barcodeId stageId status inspectedAt inspectedByQCName inspectedByBiometricId")
+      .lean(),
+    qcStages.listStages(),
+  ]);
 
   const barcodesByShortId = new Map();
+  const scansByBarcode = new Map();
   for (const s of scans) {
     if (!barcodesByShortId.has(s.workOrderShortId)) barcodesByShortId.set(s.workOrderShortId, new Set());
     barcodesByShortId.get(s.workOrderShortId).add(s.barcodeId);
+    if (!scansByBarcode.has(s.barcodeId)) scansByBarcode.set(s.barcodeId, []);
+    scansByBarcode.get(s.barcodeId).push(s);
   }
 
-  const allBarcodes = [...new Set(scans.map((s) => s.barcodeId))];
-  const progressByBarcode = await qcStages.pieceProgressMany(allBarcodes);
+  const progressByBarcode = {};
+  for (const [bc, rows] of scansByBarcode) progressByBarcode[bc] = qcStages.buildPieceProgress(rows, stages);
 
   return workOrders.map((wo) => {
     const shortId = shortIdOf(wo._id);
@@ -2109,7 +2225,14 @@ router.get("/orders", async (req, res) => {
         measurementName: mo?.measurementName || null,
         status: mo?.status || null,
         createdAt: mo?.createdAt || null,
-        deadline: mo?.deliveryDeadline || mo?.estimatedCompletion || null,
+        /* THE CUSTOMER'S OWN DEADLINE FIRST (29 Sep 2026). `deliveryDeadline`
+           does not exist at the root of a CustomerRequest — only under
+           `customerInfo` — so this read `estimatedCompletion` every time, which
+           is a planning date, not the date the customer was promised. It is the
+           same field `lib/deadline.js` and every other department shows, and the
+           same one the raw-material book already sent, so the two QC books
+           could not agree on one order's delivery date until now. */
+        deadline: mo?.customerInfo?.deliveryDeadline || mo?.deliveryDeadline || mo?.estimatedCompletion || null,
         orderValue: mo?.finalOrderPrice || 0,
         ...r,
       };
@@ -2161,7 +2284,7 @@ router.get("/orders/:moId", async (req, res) => {
             measurementName: mo.measurementName || null,
             status: mo.status || null,
             createdAt: mo.createdAt || null,
-            deadline: mo.deliveryDeadline || mo.estimatedCompletion || null,
+            deadline: mo.customerInfo?.deliveryDeadline || mo.deliveryDeadline || mo.estimatedCompletion || null,
             orderValue: mo.finalOrderPrice || 0,
           },
       orders,

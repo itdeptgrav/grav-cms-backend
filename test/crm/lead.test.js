@@ -14,7 +14,13 @@ const Account = require("../../models/CMS_Models/Sales/Account");
 const Activity = require("../../models/CMS_Models/Sales/Activity");
 const { nextLeadRef, createWithRef, _resetSequence } = require("../../services/leadRef");
 const { nextJourneyRef, _resetSequence: _resetJourneySequence } = require("../../services/salesJourneyRef");
-const { LEAD_QUALIFICATION_STATE_CODES, LEAD_QUALIFICATION_TRANSITIONS, LEAD_QUALIFICATION_STATES } = require("../../constants/crm");
+const {
+  LEAD_QUALIFICATION_STATE_CODES,
+  LEAD_QUALIFICATION_TRANSITIONS,
+  LEAD_QUALIFICATION_STATES,
+  LEAD_QUALIFICATION_LEGACY_STATES,
+  LEAD_QUALIFICATION_DISPLAY_STATE,
+} = require("../../constants/crm");
 const { isValidTransition, deriveLegacyStage, assertLeadConvertible } = require("../../services/leadQualification");
 
 const YEAR = new Date().getFullYear();
@@ -131,40 +137,78 @@ describe("canonical qualificationState vs legacy stage", () => {
     ]);
   });
 
-  test("user-facing labels follow the lifecycle vocabulary (stored codes unchanged)", () => {
+  test("user-facing labels describe the REQUIREMENT lifecycle (stored codes unchanged)", () => {
+    /* A Lead exists because a Prospect converted, and a Prospect only converts
+       on a successful interaction with a confirmed interest signal. So the
+       Lead no longer restarts a contact funnel it has already completed — the
+       same codes are relabelled around the only open question at this stage:
+       what does this customer actually want? */
     const label = Object.fromEntries(LEAD_QUALIFICATION_STATES.map((s) => [s.code, s.label]));
-    expect(label.contactAttempted).toBe("Contacting");
-    expect(label.contacted).toBe("Contacted");
-    expect(label.readyToConvert).toBe("Ready for Journey");
-    expect(label.converted).toBe("Journey Started");
-    // The other stages keep their plain names.
-    expect(label.new).toBe("New");
-    expect(label.qualified).toBe("Qualified");
+    expect(label.new).toBe("Interest Confirmed");
+    expect(label.qualified).toBe("Requirement Captured");
+    expect(label.readyToConvert).toBe("Enquiry Ready");
+    expect(label.converted).toBe("Enquiry Raised");
+    // Side outcomes, not forward stages.
     expect(label.nurture).toBe("Nurture");
     expect(label.disqualified).toBe("Disqualified");
     expect(label.duplicate).toBe("Duplicate");
+    // The two contact states are kept readable, and marked for what they are.
+    expect(label.contactAttempted).toMatch(/legacy/i);
+    expect(label.contacted).toMatch(/legacy/i);
+  });
+
+  test("the legacy states are named as legacy and shown at Interest Confirmed", () => {
+    expect([...LEAD_QUALIFICATION_LEGACY_STATES].sort()).toEqual(["contactAttempted", "contacted"]);
+    expect(LEAD_QUALIFICATION_DISPLAY_STATE.contactAttempted).toBe("new");
+    expect(LEAD_QUALIFICATION_DISPLAY_STATE.contacted).toBe("new");
+    // and no CURRENT state is displaced to somewhere else
+    for (const code of ["new", "qualified", "readyToConvert", "nurture", "disqualified", "duplicate", "converted"]) {
+      expect(LEAD_QUALIFICATION_DISPLAY_STATE[code]).toBeUndefined();
+    }
   });
 });
 
 describe("canonical transition map (review item 2) — the data structure itself", () => {
   test("matches the exact graph from the review, state by state", () => {
     expect(LEAD_QUALIFICATION_TRANSITIONS).toEqual({
-      new: ["contactAttempted", "contacted", "nurture", "disqualified", "duplicate"],
-      contactAttempted: ["contacted", "nurture", "disqualified", "duplicate"],
+      new: ["qualified", "nurture", "disqualified", "duplicate"],
+      contactAttempted: ["qualified", "nurture", "disqualified", "duplicate"],
       contacted: ["qualified", "nurture", "disqualified", "duplicate"],
       qualified: ["readyToConvert", "nurture", "disqualified", "duplicate"],
       readyToConvert: ["nurture", "disqualified", "duplicate"],
-      nurture: ["contactAttempted", "contacted", "qualified", "disqualified", "duplicate"],
+      nurture: ["new", "qualified", "disqualified", "duplicate"],
       disqualified: [],
       duplicate: [],
       converted: [],
     });
   });
 
+  test("NOTHING may target a legacy contact state", () => {
+    /* This is what makes them legacy rather than merely discouraged: the graph
+       itself refuses to put a record there, from anywhere, including from
+       nurture — a parked Lead resuming must resume in the current vocabulary. */
+    for (const [from, targets] of Object.entries(LEAD_QUALIFICATION_TRANSITIONS)) {
+      expect(targets).not.toContain("contactAttempted");
+      expect(targets).not.toContain("contacted");
+      expect(isValidTransition(from, "contactAttempted")).toBe(false);
+      expect(isValidTransition(from, "contacted")).toBe(false);
+    }
+  });
+
+  test("a record sitting in a legacy state is not stranded", () => {
+    // readable, and able to advance straight to Requirement Captured
+    for (const legacy of ["contactAttempted", "contacted"]) {
+      expect(isValidTransition(legacy, "qualified")).toBe(true);
+      for (const outcome of ["nurture", "disqualified", "duplicate"]) {
+        expect(isValidTransition(legacy, outcome)).toBe(true);
+      }
+    }
+  });
+
   test("isValidTransition reflects the map directly, including terminal states", () => {
-    expect(isValidTransition("new", "contactAttempted")).toBe(true);
-    expect(isValidTransition("new", "contacted")).toBe(true);
-    expect(isValidTransition("new", "qualified")).toBe(false);
+    expect(isValidTransition("new", "qualified")).toBe(true);
+    expect(isValidTransition("qualified", "readyToConvert")).toBe(true);
+    expect(isValidTransition("new", "readyToConvert")).toBe(false); // no skipping a stage
     expect(isValidTransition("disqualified", "new")).toBe(false);
     expect(isValidTransition("disqualified", "disqualified")).toBe(false);
     expect(isValidTransition("duplicate", "anything")).toBe(false);
@@ -190,9 +234,49 @@ describe("conversion placeholders are unset by this chunk", () => {
   });
 });
 
-describe("assertLeadConvertible — the Lead → Sales Journey bridge's one rule", () => {
-  test("passes silently for a readyToConvert, active Lead", () => {
-    expect(() => assertLeadConvertible({ captureStatus: "active", qualificationState: "readyToConvert" })).not.toThrow();
+describe("assertLeadConvertible — the Lead → Sales Journey bridge's rules", () => {
+  /* A Lead that both CARRIES the state and still MEETS the bar. The two are
+     different facts: the state records that the bar was cleared once, and an
+     ordinary edit can undo it afterwards. */
+  const convertible = (over = {}) => ({
+    captureStatus: "active",
+    qualificationState: "readyToConvert",
+    company: "Northstar Buying Services",
+    phone: "9876500000",
+    requirementItems: [{ product: "Housekeeping shirts", quantity: 500 }],
+    requirementCertainty: "prospect_confirmed",
+    decisionMakerName: "Ravi Kumar",
+    ...over,
+  });
+
+  test("passes silently for a readyToConvert Lead that still meets the bar", () => {
+    expect(() => assertLeadConvertible(convertible())).not.toThrow();
+  });
+
+  test("refuses one whose readiness has since been undone, and names what is missing", () => {
+    for (const [patch, expected] of [
+      [{ decisionMakerName: "" }, /decision-maker/i],
+      [{ requirementCertainty: "suspected" }, /confirmed by the customer or a document/i],
+      [{ phone: "" }, /contact route/i],
+      [{ requirementItems: [] }, /product/i],
+      [{ estimatedAnnualRevenue: 900000, estimatedAnnualRevenueConfidence: "researched" }, /source/i],
+    ]) {
+      expect(() => assertLeadConvertible(convertible(patch))).toThrow(/no longer meets the bar/i);
+      expect(() => assertLeadConvertible(convertible(patch))).toThrow(expected);
+    }
+  });
+
+  test("the error carries the checklist, so a caller can render it", () => {
+    try {
+      assertLeadConvertible(convertible({ decisionMakerName: "" }));
+      throw new Error("should have refused");
+    } catch (err) {
+      /* The label names WHERE the answer is given, because the checklist is
+         also the navigation — it now opens the Contacts editor rather than a
+         decision-maker box that no longer exists on the form. */
+      expect(err.missing).toContain("Someone in Contacts marked as a decision-maker");
+      expect(err.checks.some((c) => c.key === "decisionMaker" && !c.met)).toBe(true);
+    }
   });
   test("refuses a Prospect (draft)", () => {
     expect(() => assertLeadConvertible({ captureStatus: "draft", qualificationState: "new" })).toThrow(/prospects cannot start a sales journey/i);
@@ -201,9 +285,9 @@ describe("assertLeadConvertible — the Lead → Sales Journey bridge's one rule
     expect(() => assertLeadConvertible({ captureStatus: "active", qualificationState: "converted" })).toThrow(/already started a sales journey/i);
   });
   test.each(["new", "contactAttempted", "contacted", "qualified", "nurture", "disqualified", "duplicate"])(
-    "refuses a Lead at \"%s\" (not yet Ready for Journey)",
+    "refuses a Lead at \"%s\" (not yet Enquiry Ready)",
     (qualificationState) => {
-      expect(() => assertLeadConvertible({ captureStatus: "active", qualificationState })).toThrow(/ready for journey/i);
+      expect(() => assertLeadConvertible(convertible({ qualificationState }))).toThrow(/enquiry ready/i);
     },
   );
 });

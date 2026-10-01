@@ -14,6 +14,7 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+const StockLedger = require("../../models/CMS_Models/Inventory/Operations/StockLedger");
 const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
 const DepartmentRole = require("../../models/Access/DepartmentRole");
 const SpCompanyMembership = require("../../models/CMS_Models/StorePurchase/SpCompanyMembership");
@@ -193,5 +194,128 @@ describe("read-only", () => {
     expect(Array.isArray(r.body.valuation.variants)).toBe(true);
     expect(r.body.valuation.variants[0].knownValue).toBe(1000);
     expect(r.body.note).toMatch(/freight/i);
+  });
+});
+
+// A compensating correction row (StockLedger), in a chosen application state.
+const mkCorrection = (company, item, { direction = "DEBIT", quantity = 2, applicationState } = {}) =>
+  StockLedger.create({
+    companyId: company._id, rawItem: item._id, rawItemName: item.name, rawItemSku: item.sku,
+    txnType: "COMPENSATING", direction, quantity,
+    ...(applicationState ? { applicationState } : {}), // omit → undefined (legacy/unknown)
+    createdAt: new Date(clock++),
+  });
+
+// ── V1 CORRECTION — only APPLIED corrections move stock ──────────────────────
+describe("compensating corrections respect applicationState", () => {
+  async function itemWithReceipt(storedQty) {
+    const { a } = await companies();
+    const it = await mkItem(a, { name: "Corrected", quantity: storedQty, stockTransactions: [receipt(10, 100)] });
+    const { token } = await actor(a);
+    return { a, it, token };
+  }
+
+  // 1
+  test("a PENDING correction changes neither quantity nor value", async () => {
+    const { a, it, token } = await itemWithReceipt(10);
+    await mkCorrection(a, it, { direction: "DEBIT", quantity: 2, applicationState: "PENDING" });
+    const r = await call(`/api/cms/inventory/valuation/item/${it._id}`, { token });
+    expect(r.body.valuation.replayedOnHand).toBe(10); // unchanged
+    expect(r.body.valuation.knownValue).toBe(1000);    // unchanged
+    expect(r.body.valuation.pendingCorrections).toBe(1);
+  });
+
+  // 2
+  test("a correction with no/unknown application state changes nothing", async () => {
+    const { a, it, token } = await itemWithReceipt(10);
+    await mkCorrection(a, it, { direction: "DEBIT", quantity: 2 }); // applicationState undefined
+    const r = await call(`/api/cms/inventory/valuation/item/${it._id}`, { token });
+    expect(r.body.valuation.replayedOnHand).toBe(10);
+    expect(r.body.valuation.knownValue).toBe(1000);
+    expect(r.body.valuation.pendingCorrections).toBe(1);
+  });
+
+  // 3
+  test("an APPLIED correction participates exactly once", async () => {
+    const { a, it, token } = await itemWithReceipt(8); // stored reflects the applied −2
+    await mkCorrection(a, it, { direction: "DEBIT", quantity: 2, applicationState: "APPLIED" });
+    const r = await call(`/api/cms/inventory/valuation/item/${it._id}`, { token });
+    expect(r.body.valuation.replayedOnHand).toBe(8);  // 10 − 2, once
+    expect(r.body.valuation.knownValue).toBe(800);    // 1000 − 2×100, once (not 600)
+    expect(r.body.valuation.reconciled).toBe(true);
+    expect(r.body.valuation.pendingCorrections).toBe(0);
+  });
+});
+
+// ── V1 CORRECTION — indeterminate value in the company summary ───────────────
+describe("indeterminate items in the company summary", () => {
+  // 10
+  test("an indeterminate item is excluded from known value and counted separately", async () => {
+    const { a } = await companies();
+    await mkItem(a, { name: "Clean", quantity: 5, stockTransactions: [receipt(5, 100)] }); // known 500
+    // priced receipt + unpriced receipt + an outbound → indeterminate
+    await mkItem(a, {
+      name: "Muddy", quantity: 12,
+      stockTransactions: [receipt(10, 100), noPriceIn(5), { _id: oid(), type: "REDUCE", quantity: 3, createdAt: new Date(clock++) }],
+    });
+    const { token } = await actor(a);
+    const sum = await call("/api/cms/inventory/valuation/summary", { token });
+    expect(sum.body.summary.knownInventoryValue).toBe(500); // Muddy contributes nothing
+    expect(sum.body.summary.indeterminateCount).toBe(1);
+    const list = await call("/api/cms/inventory/valuation?status=indeterminate", { token });
+    expect(list.body.items.map((i) => i.name)).toEqual(["Muddy"]);
+    const muddy = list.body.items[0];
+    expect(muddy.knownValue).toBeNull(); // never ₹0
+    expect(muddy.avgCost).toBeNull();
+    expect(muddy.replayedOnHand).toBe(12); // quantity still known
+  });
+});
+
+// ── V1 CORRECTION — overview isolation and honesty ──────────────────────────
+describe("overview valuation isolation", () => {
+  // 11 + 12
+  test("an unresolvable company yields valuation unavailable and NO valuation query", async () => {
+    await companies();
+    const token = tokenFor({ id: String(new mongoose.Types.ObjectId()), email: "nobody@test.example", name: "Nobody" });
+    const valuationModule = require("../../routes/CMS_Routes/Inventory/valuation/inventoryValuationRoutes");
+    const spy = jest.spyOn(valuationModule, "summarizeCompany");
+    try {
+      const ov = await call("/api/cms/inventory/overview", { token });
+      expect(ov.status).toBe(200);
+      expect(ov.body.stats.rawItems.valuationAvailable).toBe(false);
+      expect(ov.body.stats.rawItems.knownInventoryValue).toBeNull();
+      expect(typeof ov.body.stats.rawItems.valuationMessage).toBe("string");
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // 13
+  test("another company's value never enters the overview", async () => {
+    const { a, b } = await companies();
+    await mkItem(a, { name: "A-only", quantity: 4, stockTransactions: [receipt(4, 100)] }); // 400
+    await mkItem(b, { name: "B-only", quantity: 4, stockTransactions: [receipt(4, 999)] });
+    const { token } = await actor(a);
+    const ov = await call("/api/cms/inventory/overview", { token });
+    expect(ov.body.stats.rawItems.valuationAvailable).toBe(true);
+    expect(ov.body.stats.rawItems.knownInventoryValue).toBe(400); // never includes B
+  });
+
+  // 14
+  test("legacy StockItem value is not combined into RawItem known value", async () => {
+    const { a } = await companies();
+    await mkItem(a, { name: "RawOnly", quantity: 4, stockTransactions: [receipt(4, 100)] });
+    const { token } = await actor(a);
+    const [ov, sum] = await Promise.all([
+      call("/api/cms/inventory/overview", { token }),
+      call("/api/cms/inventory/valuation/summary", { token }),
+    ]);
+    // RawItem known value equals the raw-only engine answer …
+    expect(ov.body.stats.rawItems.knownInventoryValue).toBe(sum.body.summary.knownInventoryValue);
+    // … and there is no combined "known inventory value".
+    expect(ov.body.stats.overall.totalValue).toBeNull();
+    expect(ov.body.stats.overall.combinedValueAvailable).toBe(false);
+    expect(ov.body.stats.stockItems.valuationBasis).toBe("legacy");
   });
 });

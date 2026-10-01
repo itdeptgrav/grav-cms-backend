@@ -42,12 +42,18 @@ const {
   LEAD_QUALIFICATION_STATE_CODES,
   LEAD_QUALIFICATION_REASON_REQUIRED,
   LEAD_QUALIFICATION_RESERVED_STATES,
+  LEAD_QUALIFICATION_LEGACY_STATES,
   LEAD_QUALIFICATION_TRANSITIONS,
   LEGACY_LEAD_STAGE_TO_QUALIFICATION,
   BLOCKED_LEGACY_LEAD_STAGES,
   LEAD_QUALIFICATION_TO_LEGACY_STAGE,
 } = require("../constants/crm");
-const { computeQualificationReadiness, hasSpecificCredibleRequirement, hasContactRoute } = require("./leadReadiness");
+const {
+  computeRequirementIdentifiedReadiness,
+  computeEnquiryReadiness,
+  hasSpecificCredibleRequirement,
+  hasContactRoute,
+} = require("./leadReadiness");
 
 /** A 4xx the caller can act on, as opposed to an unexpected 500. */
 class LeadTransitionError extends Error {
@@ -99,9 +105,12 @@ function deriveLegacyStage(qualificationState, previousStage) {
  * @param {object} [opts.actor]             { id, name } — stamped onto updatedBy
  * @param {object} [opts.nextAction]        { subject, dueDate } — required for nurture
  * @param {object} [opts.context]           DB-dependent facts the route already checked:
- *   {boolean} [hasOutreachAttempt]   required true to reach "contactAttempted"
- *   {boolean} [hasSuccessfulContact] required true to reach "contacted"
- *   {{type,id}} [duplicateTarget]    the verified-to-exist Lead/Account, required for "duplicate"
+ *   {{type,id}} [duplicateTarget] is the only fact this still needs from the
+ *   database. `hasOutreachAttempt` / `hasSuccessfulContact` are no longer read:
+ *   the states they gated are legacy-only and unreachable, and the proof they
+ *   asked for was already given at Prospect conversion. Routes may still pass
+ *   them; they are ignored rather than rejected, so nothing breaks mid-deploy.
+ *   {{type,id}} [duplicateTarget]  the verified-to-exist Lead/Account, required for "duplicate"
  */
 function applyQualificationTransition(lead, { qualificationState, reason, actor, nextAction, context = {} } = {}) {
   // Draft Lead chunk: a Draft cannot move through qualification states at
@@ -126,53 +135,59 @@ function applyQualificationTransition(lead, { qualificationState, reason, actor,
   if (lead.qualificationState === "converted") {
     throw new LeadTransitionError("This Lead has already converted and cannot be re-qualified.");
   }
+  /* ── THE CONTACT FUNNEL IS GONE FROM NEW WORK ─────────────────────────
+     Three gates used to live here: a contact route, a logged outreach
+     attempt, and a successful two-way outcome — the bars for Contacting and
+     Engaged. Every one of them was already cleared before the record became a
+     Lead at all: a Prospect only converts on a successful interaction with a
+     confirmed interest signal. Asking again was asking a salesperson to prove
+     the same thing twice.
+
+     Those two states are unreachable now — nothing in the transition graph
+     targets them — so this says so plainly rather than letting the generic
+     "cannot move from X to Y" imply the move might work from somewhere else. */
+  if (LEAD_QUALIFICATION_LEGACY_STATES.has(qualificationState)) {
+    throw new LeadTransitionError(
+      `"${qualificationState}" is a legacy state kept only so existing records stay readable. A Lead starts at Interest Confirmed — the next step is Requirement Captured.`,
+    );
+  }
+
   if (!isValidTransition(lead.qualificationState, qualificationState)) {
     throw new LeadTransitionError(
       `Cannot move a Lead from "${lead.qualificationState}" to "${qualificationState}".`,
     );
   }
 
-  // Contacting / Engaged — you cannot have contacted a Lead you have no way to
-  // reach. Enforced BEFORE the activity checks so the message names the real
-  // gap (no phone/WhatsApp/email on file) rather than "log an outreach first".
-  // This is what stops "I pressed the button saying I called" on a record that
-  // carries no contact channel at all.
-  if ((qualificationState === "contactAttempted" || qualificationState === "contacted") && !hasContactRoute(lead)) {
-    throw new LeadTransitionError(
-      "This Lead has no contact details yet — add a phone number, WhatsApp or email before marking it Contacting or Engaged.",
-    );
-  }
-  // Contacting — needs a genuinely logged outreach attempt (any completed
-  // call/email/meeting/site visit), not just a button click.
-  if (qualificationState === "contactAttempted" && !context.hasOutreachAttempt) {
-    throw new LeadTransitionError(
-      "Contacting requires a logged outreach attempt (call, email, meeting or site visit) on this Lead.",
-    );
-  }
-  // Engaged — needs a genuinely SUCCESSFUL two-way contact outcome, a higher
-  // bar than merely having attempted.
-  if (qualificationState === "contacted" && !context.hasSuccessfulContact) {
-    throw new LeadTransitionError(
-      "Engaged requires a successful two-way contact outcome (Replied / Connected or Meeting Completed) logged on this Lead.",
-    );
-  }
-  // Ready for Journey — its OWN extra gate on top of Qualified's checklist: a
-  // SPECIFIC, CREDIBLE requirement must exist (confirmed product, quantity and
-  // required-by date). Checked first so this dedicated rule is what speaks.
-  if (qualificationState === "readyToConvert" && !hasSpecificCredibleRequirement(lead)) {
-    throw new LeadTransitionError(
-      "Ready for Journey needs a specific, credible requirement — a confirmed product, quantity and required-by date on this Lead.",
-    );
-  }
-  // Qualified / Ready for Journey — both must clear the qualification checklist
-  // bar; Ready for Journey re-confirms it still holds (and adds the credible-
-  // requirement gate above), not a second, stricter list.
-  if (qualificationState === "qualified" || qualificationState === "readyToConvert") {
-    const { checks, ready } = computeQualificationReadiness(lead);
+  /* ── REQUIREMENT IDENTIFIED ────────────────────────────────────────────
+     "We know what requirement we are investigating." A product, an indicative
+     quantity above zero, and a certainty that is anything but Unknown —
+     `suspected` is enough. No annual figures, no budget, no delivery date. */
+  if (qualificationState === "qualified") {
+    const { checks, ready } = computeRequirementIdentifiedReadiness(lead);
     if (!ready) {
       const missing = checks.filter((c) => !c.met).map((c) => c.label).join("; ");
       throw new LeadTransitionError(
-        `This Lead isn't ready for "${qualificationState}" yet — missing: ${missing}.`,
+        `Requirement Captured needs the requirement itself — missing: ${missing}.`,
+      );
+    }
+  }
+
+  /* ── READY FOR ENQUIRY ─────────────────────────────────────────────────
+     Everything above, plus what an Enquiry cannot be raised without: who they
+     are, a way to reach them, a decision-maker, a requirement the CUSTOMER (or
+     a document) has confirmed rather than one we suspect, and a source behind
+     any estimate presented as researched. Optional estimates stay optional. */
+  if (qualificationState === "readyToConvert") {
+    if (!hasSpecificCredibleRequirement(lead)) {
+      throw new LeadTransitionError(
+        "Enquiry Ready needs a specific requirement — a named product and an indicative quantity on this Lead.",
+      );
+    }
+    const { checks, ready } = computeEnquiryReadiness(lead);
+    if (!ready) {
+      const missing = checks.filter((c) => !c.met).map((c) => c.label).join("; ");
+      throw new LeadTransitionError(
+        `This Lead isn't ready for Enquiry yet — missing: ${missing}.`,
       );
     }
   }
@@ -232,7 +247,30 @@ function assertLeadConvertible(lead) {
     throw new LeadTransitionError("This Lead has already started a Sales Journey.");
   }
   if (lead.qualificationState !== "readyToConvert") {
-    throw new LeadTransitionError('Only a Lead that is "Ready for Journey" can start a Sales Journey.');
+    throw new LeadTransitionError('Only a Lead that is "Enquiry Ready" can start a Sales Journey.');
+  }
+
+  /* ── THE STORED STATE IS A MEMORY, NOT A GUARANTEE ──────────────────────
+     `readyToConvert` records that the Lead cleared the Enquiry bar at some
+     moment in the past. Nothing re-checks it afterwards, and an ordinary edit
+     can undo it: blank the decision-maker, downgrade the requirement certainty
+     back to "suspected", delete the only phone number, add a "researched"
+     annual figure with no source — the state stays `readyToConvert` through
+     every one of those, and the Journey would be raised against a Lead that no
+     longer satisfies a single-one of the rules it was let through on.
+
+     So the bar is re-run here, at the moment it is relied on. The missing
+     labels travel in the message, because "not ready" without saying what is
+     missing sends somebody hunting through a form. */
+  const { checks, ready } = computeEnquiryReadiness(lead);
+  if (!ready) {
+    const missing = checks.filter((c) => !c.met).map((c) => c.label);
+    const err = new LeadTransitionError(
+      `This Lead was marked Enquiry Ready but no longer meets the bar — missing: ${missing.join("; ")}.`,
+    );
+    err.checks = checks;
+    err.missing = missing;
+    throw err;
   }
 }
 

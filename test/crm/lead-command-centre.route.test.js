@@ -75,6 +75,20 @@ async function createActiveLead(over = {}) {
   return body.lead;
 }
 
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Account, Lead and Contact creation now refuses unless the actor's company is
+ * provable. These suites are not about tenancy, so they seed the simplest
+ * thing that makes ownership provable: a single company, which is the
+ * documented deployment fallback. Without it every creating test fails on a
+ * refusal that is correct. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
+
 describe("Lead command centre — enriched interaction logging", () => {
   test("a message interaction persists channel, direction and contactName", async () => {
     const lead = await createActiveLead();
@@ -116,17 +130,24 @@ describe("Lead command centre — enriched interaction logging", () => {
     expect(badDirection.body.message).toMatch(/direction must be one of/i);
   });
 
-  test("a logged message counts as an outreach attempt (unblocks Contact Attempted)", async () => {
+  test("logging a message is still a first-class CRM activity — it just no longer moves the Lead", async () => {
+    /* Calls, email and WhatsApp remain available and are still recorded. What
+       changed is that they no longer drive the Lead's stage: that funnel was
+       completed at the Prospect, and the Lead's own question is the
+       requirement. */
     const lead = await createActiveLead();
-    const blocked = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(blocked.status).toBe(400);
-
-    await call(`/${lead._id}/activities`, {
+    const logged = await call(`/${lead._id}/activities`, {
       method: "POST",
       body: { activityType: "message", subject: "Pinged on WhatsApp", channel: "whatsapp", direction: "outbound", outcome: "no_answer" },
     });
-    const accepted = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
-    expect(accepted.status).toBe(200);
+    expect(logged.status).toBe(201);
+
+    const after = await call(`/${lead._id}`);
+    expect(after.body.lead.qualificationState).toBe("new");
+
+    // and it buys no passage into the legacy states
+    const refused = await call(`/${lead._id}/qualification-state`, { method: "PATCH", body: { qualificationState: "contactAttempted" } });
+    expect(refused.status).toBe(400);
   });
 
   test("a successful message outcome updates lastContactedAt", async () => {

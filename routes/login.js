@@ -130,7 +130,7 @@ router.post("/login", async (req, res) => {
         // Include email so sync-legacy can identify the user without a DB lookup
         email: user.email || "",
       },
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
       { expiresIn: "7d" },
     );
 
@@ -145,8 +145,10 @@ router.post("/login", async (req, res) => {
     let redirectPath = "/";
     if (user.role === "hr_manager") redirectPath = "/hr/dashboard";
     if (user.role === "ceo") redirectPath = "/ceo/dashboard";
+    /* The Production Manager portal folded into PPC on 25 Sep 2026; the old
+       /project-manager/* addresses forward there too. */
     if (user.role === "project_manager")
-      redirectPath = "/project-manager/dashboard";
+      redirectPath = "/ppc";
     if (user.role === "sales") redirectPath = "/sales/dashboard";
     if (user.role === "merchandiser") redirectPath = "/merchandiser/dashboard";
     // R&D's role literal comes from the department slug, which has appeared in
@@ -208,7 +210,7 @@ router.post("/verify", async (req, res) => {
 
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
+      require("../config/jwt").SECRET,
     );
     let user = null;
 

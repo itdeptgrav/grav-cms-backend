@@ -26,6 +26,20 @@ const router = express.Router();
 const AuditNote = require("../../models/Accountant_model/Acc_AuditNote");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(accountantAuth);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -234,7 +248,7 @@ async function notifyAuditNote(note, action, actor) {
 }
 
 // ── GET / — list notes ───────────────────────────────────────────────────────
-router.get("/", async (req, res) => {
+router.get("/", companyScopeOptional, async (req, res) => {
   try {
     if (!orgId(req)) return res.status(401).json({ error: "No org context" });
 
@@ -278,7 +292,7 @@ router.get("/", async (req, res) => {
 });
 
 // ── GET /stats — counts by status ────────────────────────────────────────────
-router.get("/stats", async (req, res) => {
+router.get("/stats", companyScopeOptional, async (req, res) => {
   try {
     if (!orgId(req)) return res.status(401).json({ error: "No org context" });
     const { companyId } = req.query;
@@ -368,7 +382,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // ── POST / — create a note ───────────────────────────────────────────────────
-router.post("/", async (req, res) => {
+router.post("/", companyScope, async (req, res) => {
   try {
     if (!orgId(req)) return res.status(401).json({ error: "No org context" });
     const { title, body, priority, companyId, target } = req.body || {};

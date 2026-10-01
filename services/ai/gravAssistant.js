@@ -2,29 +2,27 @@
 /**
  * services/ai/gravAssistant.js — the ONE central AI service.
  *
- * HYBRID tool use:
- *   1) The model itself sees the user's authorised tools (function-calling) and
- *      chooses which to call, extracting parameters (date, employee, department)
- *      from natural language — so "was Umang present on the fifth of August"
- *      needs no regex; the model resolves it.
- *   2) FAST FALLBACK: if the (small) model doesn't call a tool but the message
- *      clearly maps to HR data by keyword, the regex `relevantTools` path fetches
- *      it anyway. So we get natural-language understanding without losing
- *      reliability.
+ * TYPED QWEN tool use:
+ *   1) Qwen sees only the user's authorised capability names/descriptions and
+ *      chooses one. It receives no business records.
+ *   2) Qwen fills only that capability's closed argument schema.
+ *   3) GRAV validates, re-authorises and executes the deterministic read.
  *
- * A conversational message that needs no data is answered in the single
- * tool-decision round (no second call).
+ * A conversational message that needs no data is answered by the normal Qwen
+ * response round after the planner chooses `conversation`.
  */
 
 // Requiring the feature tool modules registers their permission-gated tools.
 require("./tools/hrTools");
 require("./tools/accountingTools");
 
-const { chatJson, chatStream, chatWithTools } = require("../ollamaClient");
+const { chatJson } = require("../ollamaClient");
 const { buildSystemPrompt } = require("./identity");
-const { relevantTools, authorizedToolDefs, getTool } = require("./toolRegistry");
-const { resolveHrAccess } = require("../access/hrAccess");
+const { authorizedTools, getTool } = require("./toolRegistry");
+const { planToolQuestion, STATUS: PLAN_STATUS, CONTROL: PLAN_CONTROL } = require("./qwenToolPlanner");
+const { resolveHrAccess, resolveHrActor } = require("../access/hrAccess");
 const { resolveAccountingAccess } = require("../access/accountingAccess");
+const { semanticToolCandidates, detectSemanticDomains } = require("./semanticCatalogue");
 
 const REPLY_SCHEMA = { type: "object", properties: { reply: { type: "string" } }, required: ["reply"] };
 
@@ -155,6 +153,18 @@ async function ensureAccess(user) {
       user.hrAccess = { allowed: false, via: null };
     }
   }
+  /* The SAME resolved actor the mounted HR routes are checked against, so an
+     HR tool and an HR endpoint cannot disagree about the same person. Attached
+     here rather than inside each tool because `permission(user)` is
+     synchronous — the tools ask a question, they do not perform a lookup.
+     Failing closed: an unresolvable actor holds no capabilities. */
+  if (user.hrActor === undefined) {
+    try {
+      user.hrActor = await resolveHrActor(user);
+    } catch {
+      user.hrActor = { capabilities: new Set(), hasHrApplicationAccess: false, template: null };
+    }
+  }
   if (user.accountingAccess === undefined) {
     try {
       user.accountingAccess = await resolveAccountingAccess(user);
@@ -164,96 +174,93 @@ async function ensureAccess(user) {
   }
 }
 
-const SELECT_RULES = [
-  "You can call tools that fetch authorised business data. When the user's message needs such data (employees, attendance, leave, departments, overtime, holidays, policies, payroll, etc.), CALL the appropriate tool(s), extracting each parameter from the message yourself (resolve dates to YYYY-MM-DD).",
-  "If the message is general conversation that needs no data, just reply directly.",
-].join("\n");
-
 /**
- * HYBRID context selection. Returns the fetched tool data (and which tools ran),
- * or a `directAnswer` when the model answered a no-data conversational message.
+ * Typed context selection. The model plans; GRAV validates, re-authorises and
+ * executes exactly one deterministic capability.
  */
 async function selectContext({ user, message, history = [], routeContext }) {
   await ensureAccess(user);
-  const tools = authorizedToolDefs(user);
+  const tools = authorizedTools(user);
   const toolData = [];
   const toolsUsed = [];
   let directAnswer = null;
+  let contextState = null;
 
-  if (tools.length) {
-    // Keep the system + tool schemas IDENTICAL across requests so Ollama caches
-    // that ~900-token prefix (first call ~7s of prompt-eval, cached calls ~0.1s).
-    // The per-request route goes in the user message, NOT the system, so it
-    // doesn't break the cache. Today's date changes only daily (re-warms fine).
-    const system = buildSystemPrompt({ taskRules: `${todayLine()}\n${SELECT_RULES}` });
-    // The current route is deliberately NOT sent to the model: it is irrelevant to
-    // what GRAV can answer, and injecting it made the model invent route-based
-    // refusals ("not accessible from the onboarding route"). Access is decided by
-    // the account's permissions only.
-    const messages = [
-      ...history.map((h) => ({ role: h.role === "user" ? "user" : "assistant", content: h.content })),
-      { role: "user", content: message },
-    ];
+  if (!tools.length) return { toolData, toolsUsed, directAnswer, contextState };
+  // A tool may claim an exact catalogue-defined request before model planning.
+  // Claims are typed semantic metadata (not sentence regexes) and are accepted
+  // only when exactly one authorised tool claims the message.
+  const claims = (await Promise.all(tools.map(async (tool) => {
+    if (!tool.claim) return null;
     try {
-      const decision = await chatWithTools({ system, messages, tools });
-      if (decision.toolCalls.length) {
-        for (const call of decision.toolCalls) {
-          const fn = call.function || {};
-          const tool = getTool(fn.name);
-          if (!tool || tool.permission(user) !== true) continue; // re-check permission
-          let args = fn.arguments;
-          if (typeof args === "string") {
-            try {
-              args = JSON.parse(args);
-            } catch {
-              args = {};
-            }
-          }
-          try {
-            const data = await tool.provideContext({ user, message, args: args || {} });
-            toolData.push({ tool: fn.name, data });
-            toolsUsed.push(fn.name);
-          } catch {
-            /* a failing tool must not block the assistant */
-          }
-        }
-      } else if (decision.content && decision.content.trim()) {
-        directAnswer = decision.content.trim();
-      }
+      const args = await tool.claim({ message, history });
+      return args ? { tool: tool.name, arguments: args } : null;
     } catch {
-      /* tool round failed -> regex fallback below */
+      return null;
     }
+  }))).filter(Boolean);
+  const plan = claims.length === 1
+    ? { status: PLAN_STATUS.OK, tool: claims[0].tool, arguments: claims[0].arguments, selection: "catalogue_claim" }
+    : await planToolQuestion({
+      question: message,
+      // Existing tool relevance contracts form a deterministic first-stage
+      // domain filter. When at least one authorised tool explicitly recognises
+      // the request, Qwen cannot escape that domain and select an unrelated
+      // but schema-valid tool/enum. Unrecognised paraphrases still see the full
+      // authorised catalogue.
+      tools: semanticToolCandidates(tools, message),
+      history,
+    });
+  if (!plan.selection) plan.selection = "qwen";
+  if (plan.status !== PLAN_STATUS.OK) {
+    // Planning is part of the model service. Fail visibly instead of silently
+    // changing behaviour through phrase rules or attaching the wrong dataset.
+    if (plan.error) throw plan.error;
+    directAnswer = "I couldn't safely determine which authorised business data to use. Please rephrase the request with the subject and period you want.";
+    return { toolData, toolsUsed, directAnswer, contextState };
+  }
+  if (plan.control === PLAN_CONTROL.CONVERSATION) {
+    return { toolData, toolsUsed, directAnswer, contextState };
+  }
+  if (plan.control === PLAN_CONTROL.CLARIFY) {
+    directAnswer = plan.clarification;
+    return { toolData, toolsUsed, directAnswer, contextState };
   }
 
-  // Fast fallback: model fetched nothing, but the message maps to HR tools by
-  // keyword — fetch via the regex path so an 8B miss doesn't lose the answer.
-  if (!toolData.length) {
-    const rel = relevantTools(user, message);
-    if (rel.length) {
-      directAnswer = null; // we have real data to attach; don't shortcut
-      for (const t of rel) {
-        try {
-          toolData.push({ tool: t.name, data: await t.provideContext({ user, message }) });
-          toolsUsed.push(t.name);
-        } catch {
-          /* omit */
-        }
-      }
-    }
+  const tool = getTool(plan.tool);
+  if (!tool || tool.permission(user) !== true) {
+    directAnswer = "I don't have permission to access that data.";
+    return { toolData, toolsUsed, directAnswer, contextState };
   }
-
-  return { toolData, toolsUsed, directAnswer };
+  try {
+    const data = await tool.provideContext({ user, message, args: plan.arguments || {} });
+    toolData.push({ tool: plan.tool, data });
+    toolsUsed.push(plan.tool);
+    contextState = {
+      schema: "grav.assistant.plan/2",
+      tool: plan.tool,
+      arguments: plan.arguments || {},
+      selection: plan.selection,
+      detectedDomains: detectSemanticDomains(message),
+    };
+    if (tool.renderAnswer) {
+      directAnswer = tool.renderAnswer({ data, args: plan.arguments || {}, message, user }) || null;
+    }
+  } catch {
+    directAnswer = "I couldn't read that data safely right now. Please try again.";
+  }
+  return { toolData, toolsUsed, directAnswer, contextState };
 }
 
 async function chat({ user, message, routeContext, history = [] } = {}) {
-  const { toolData, toolsUsed, directAnswer } = await selectContext({ user, message, history, routeContext });
-  if (directAnswer && !toolData.length) {
-    return { reply: directAnswer.slice(0, 4000), model: "qwen3", toolsUsed: [] };
+  const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
+  if (directAnswer) {
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted
   const { reply, model } = await generateGroundedReply({ system, toolData, history, message });
-  return { reply: reply.slice(0, 4000), model, toolsUsed };
+  return { reply: reply.slice(0, 4000), model, toolsUsed, contextState };
 }
 
 /**
@@ -264,17 +271,17 @@ async function chat({ user, message, routeContext, history = [] } = {}) {
  * conversational reply is emitted as-is.
  */
 async function chatStreaming({ user, message, routeContext, history = [], onThinking, onAnswer, signal } = {}) {
-  const { toolData, toolsUsed, directAnswer } = await selectContext({ user, message, history, routeContext });
-  if (directAnswer && !toolData.length) {
+  const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
+  if (directAnswer) {
     if (onAnswer) onAnswer(directAnswer);
-    return { reply: directAnswer.slice(0, 4000), model: "qwen3", toolsUsed: [] };
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted
   const { reply, model } = await generateGroundedReply({ system, toolData, history, message });
   const finalReply = (reply && reply.trim()) || "I couldn't produce a response for that.";
   if (onAnswer) onAnswer(finalReply);
-  return { reply: finalReply.slice(0, 4000), model, toolsUsed };
+  return { reply: finalReply.slice(0, 4000), model, toolsUsed, contextState };
 }
 
 /**
@@ -293,13 +300,18 @@ async function runStructured({ taskRules, prompt, schema, routeContext } = {}) {
  */
 async function warmupTools() {
   try {
-    const tools = authorizedToolDefs({ hrAccess: { allowed: true }, accountingAccess: { allowed: true }, role: "ceo" });
-    if (!tools.length) return;
-    const system = buildSystemPrompt({ taskRules: `${todayLine()}\n${SELECT_RULES}` });
-    await chatWithTools({ system, messages: [{ role: "user", content: "hello" }], tools });
+    // `warmup()` already loads Qwen. Typed planning schemas vary by the caller's
+    // authorised catalogue, so there is no single safe fake-user prompt to warm.
+    return;
   } catch {
     /* ignore — first real request will just be a little slower */
   }
 }
 
-module.exports = { chat, chatStreaming, runStructured, warmupTools };
+/** The exact tool-selection system prompt, for the offline routing evaluation
+ *  (scripts/open-jev-pilot/evaluate.js) to compare against the same baseline. */
+function toolSelectionSystemPrompt() {
+  return buildSystemPrompt({ taskRules: todayLine() });
+}
+
+module.exports = { chat, chatStreaming, runStructured, warmupTools, toolSelectionSystemPrompt };

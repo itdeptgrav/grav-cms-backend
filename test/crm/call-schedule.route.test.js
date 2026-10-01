@@ -35,15 +35,19 @@ const { createWithRef, _resetSequence } = require("../../services/leadRef");
 
 const SALES_USER = { id: new mongoose.Types.ObjectId().toString(), name: "Anita Rao", role: "sales" };
 
-let server;
+let server, leadsBase;
 let base;
 
 beforeAll(async () => {
   const app = express();
   app.use(express.json());
   app.use("/api/cms/crm/call-schedules", require("../../routes/CMS_Routes/Sales/callSchedule"));
+  /* Mounted alongside so one test can prove the difference between the two
+     routes directly: the same move, refused here and accepted there. */
+  app.use("/api/cms/crm/leads", require("../../routes/CMS_Routes/Sales/leads"));
   await new Promise((resolve) => { server = app.listen(0, resolve); });
   base = `http://127.0.0.1:${server.address().port}/api/cms/crm/call-schedules`;
+  leadsBase = `http://127.0.0.1:${server.address().port}/api/cms/crm/leads`;
 });
 
 afterAll(async () => {
@@ -75,6 +79,18 @@ async function leadAndSchedule(leadOver = {}) {
   });
   return { lead, schedule };
 }
+
+
+/* ── ONE COMPANY, SO OWNERSHIP CAN BE PROVED (Chunk 3B1) ─────────────────────
+ * Lead and Contact reads are company-scoped now. This suite is not about
+ * tenancy, so it seeds the simplest thing that makes ownership provable: a
+ * single company, the documented deployment fallback. */
+beforeEach(async () => {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  if (!(await Acc_Company.countDocuments({}))) {
+    await Acc_Company.create({ companyName: "Test Co", booksFromDate: new Date("2026-04-01") });
+  }
+});
 
 describe("POST /call-schedules/:id/complete — Lead compatibility (review item 3)", () => {
   test("logs the completed call via shared CRMActivity, not the embedded lead.activities[]", async () => {
@@ -131,32 +147,102 @@ describe("POST /call-schedules/:id/complete — Lead compatibility (review item 
     }
   });
 
-  test("a valid legacy stage move (e.g. contacted) IS applied and kept in sync with qualificationState", async () => {
-    const { lead, schedule } = await leadAndSchedule();
+  /* ══ COMPLETING A CALL DOES NOT MOVE A LEAD ═════════════════════════════
+   * These used to prove the opposite: that ticking off a call could take a
+   * Lead to "contacted", and later to "qualified".
+   *
+   * The Lead lifecycle is decided by requirement evidence, and a call is not
+   * requirement evidence — it is a record that a conversation happened. Two
+   * writers for one field is how the two disagree, and a stage that moved
+   * because somebody closed a call reminder is a stage nobody can explain.
+   * ═════════════════════════════════════════════════════════════════════════ */
+
+  test("newLeadStage 'qualified' completes the call but does NOT move the Lead", async () => {
+    const { lead, schedule } = await leadAndSchedule({
+      // everything the requirement gate would want, so the refusal is clearly
+      // about the route and not about an unmet checklist
+      requirementItems: [{ product: "Shirts", quantity: 300 }],
+      requirementCertainty: "suspected",
+    });
     const { status, body } = await call(`/${schedule._id}/complete`, {
       method: "POST",
-      body: { outcome: "interested", newLeadStage: "contacted" },
+      body: { outcome: "interested", newLeadStage: "qualified" },
     });
+
     expect(status).toBe(200);
-    expect(body.leadUpdate).toMatchObject({ applied: true, stage: "contacted", qualificationState: "contacted" });
+    expect(body.leadUpdate.applied).toBe(false);
+    expect(body.leadUpdate.message).toMatch(/requirement workflow|no longer changes/i);
+    // and it reports the UNCHANGED state back, rather than the one asked for
+    expect(body.leadUpdate.qualificationState).toBe("new");
 
     const storedLead = await Lead.findById(lead._id).lean();
-    expect(storedLead.stage).toBe("contacted");
-    expect(storedLead.qualificationState).toBe("contacted");
+    expect(storedLead.qualificationState).toBe("new");
+    expect(storedLead.stage).toBe("new");
   });
 
-  test("newLeadStage 'lost' maps to canonical disqualified, using feedbackNotes as the reason when none is given explicitly", async () => {
+  test("newLeadStage 'lost' does not change the Lead either", async () => {
+    /* Losing a Lead is a decision with a reason attached, taken on the Lead.
+       It is not a side effect of closing a call reminder. */
     const { lead, schedule } = await leadAndSchedule();
     const { status, body } = await call(`/${schedule._id}/complete`, {
       method: "POST",
       body: { outcome: "not_interested", feedbackNotes: "Went with a competitor", newLeadStage: "lost" },
     });
+
     expect(status).toBe(200);
-    expect(body.leadUpdate).toMatchObject({ applied: true, qualificationState: "disqualified" });
+    expect(body.leadUpdate.applied).toBe(false);
 
     const storedLead = await Lead.findById(lead._id).lean();
-    expect(storedLead.qualificationState).toBe("disqualified");
-    expect(storedLead.qualificationReason).toBe("Went with a competitor");
+    expect(storedLead.qualificationState).toBe("new");
+    expect(storedLead.qualificationReason).toBeUndefined();
+  });
+
+  test("an old client sending newLeadStage is not failed — the call still completes fully", async () => {
+    const { lead, schedule } = await leadAndSchedule();
+    const due = "2026-12-01T09:00:00.000Z";
+    const { status } = await call(`/${schedule._id}/complete`, {
+      method: "POST",
+      body: { outcome: "interested", feedbackNotes: "Wants a quote", callDurationActual: 240, nextFollowUpAt: due, newLeadStage: "qualified" },
+    });
+    expect(status).toBe(200);
+
+    // the schedule itself
+    const storedSchedule = await CallSchedule.findById(schedule._id).lean();
+    expect(storedSchedule.status).toBe("completed");
+    expect(storedSchedule.outcome).toBe("interested");
+    expect(storedSchedule.feedbackNotes).toBe("Wants a quote");
+    expect(storedSchedule.callDurationActual).toBe(240);
+    // the refused stage is NOT recorded as though it took effect
+    expect(storedSchedule.newLeadStage).toBeUndefined();
+
+    // the Activity
+    const activity = await Activity.findOne({ leadId: lead._id, activityType: "call" }).lean();
+    expect(activity).toBeTruthy();
+    expect(activity.status).toBe("completed");
+    expect(activity.outcome).toBe("interested");
+
+    // and the two things a completed call really does know
+    const storedLead = await Lead.findById(lead._id).lean();
+    expect(storedLead.lastContactedAt).toBeTruthy();
+    expect(new Date(storedLead.nextFollowUpAt).toISOString()).toBe(due);
+  });
+
+  test("the qualification endpoint remains the only ordinary way to move a Lead", async () => {
+    const { lead, schedule } = await leadAndSchedule({
+      requirementItems: [{ product: "Shirts", quantity: 300 }],
+      requirementCertainty: "suspected",
+    });
+    await call(`/${schedule._id}/complete`, { method: "POST", body: { outcome: "interested", newLeadStage: "qualified" } });
+    expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("new");
+
+    // the same move, through the endpoint that owns it
+    const r = await fetch(`${leadsBase}/${lead._id}/qualification-state`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "x-test-user": JSON.stringify(SALES_USER) },
+      body: JSON.stringify({ qualificationState: "qualified" }),
+    });
+    expect(r.status).toBe(200);
+    expect((await Lead.findById(lead._id).lean()).qualificationState).toBe("qualified");
   });
 
   test("an unreachable transition (new -> qualified) is rejected without failing the call completion", async () => {
@@ -212,13 +298,13 @@ describe("POST /call-schedules/:id/complete — Lead compatibility (review item 
     expect(storedSchedule.newLeadStage).toBeFalsy();
   });
 
-  test("persists newLeadStage on the CallSchedule only once the Lead transition actually succeeds", async () => {
+  test("a refused stage move is NOT persisted on the schedule", async () => {
     const { schedule } = await leadAndSchedule();
     await call(`/${schedule._id}/complete`, {
       method: "POST",
       body: { outcome: "interested", newLeadStage: "contacted" },
     });
     const storedSchedule = await CallSchedule.findById(schedule._id).lean();
-    expect(storedSchedule.newLeadStage).toBe("contacted");
+    expect(storedSchedule.newLeadStage).toBeUndefined();
   });
 });

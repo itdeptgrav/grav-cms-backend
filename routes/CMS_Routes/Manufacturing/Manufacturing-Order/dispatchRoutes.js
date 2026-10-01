@@ -139,6 +139,12 @@ router.post("/employee", async (req, res) => {
 // Body: { workOrderId, quantity, dispatchedBy, notes }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/bulk", async (req, res) => {
+  /* RETIRED (25 Sep 2026): bulk dispatch by typed quantity. Dispatch is a scan of
+     a sealed carton — POST /api/cms/manufacturing/carton-dispatch/manufacturing-orders/:id/dispatch.
+     (POST /employee below is still used by the PPC person-wise tracking tab.) */
+  return res.status(410).json({ success: false, code: "USE_CARTON_DISPATCH",
+    message: "Dispatch is recorded by scanning sealed cartons now. Open the order's Dispatch tab and scan each carton's label." });
+  // eslint-disable-next-line no-unreachable
   try {
     const { workOrderId, quantity, dispatchedBy = "Admin", notes = "" } = req.body;
 

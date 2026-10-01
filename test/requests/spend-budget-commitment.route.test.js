@@ -582,22 +582,40 @@ describe("a spend request must name an account head", () => {
     expect(out.message).toBe("Choose the account head this spend belongs to.");
   });
 
-  test("with more than one set of books, it refuses rather than guessing which", async () => {
-    /* The stronger guarantee, and the reason a cross-company head can never be
-       charged today: an employee's session says nothing about which books
-       their spend belongs to, so with several the route stops instead of
-       filing it against whichever company was created first.
-
-       This fires BEFORE the head is even looked at, which is why there is no
-       "head from another company" case to test — it is unreachable while the
-       company itself is ambiguous. */
+  test("with more than one set of books, it files against the primary (or oldest) company, never refuses", async () => {
+    /* 1 Oct 2026 (owner: no company gate on the Store side). The route used
+       to stop with "More than one set of books exists" whenever a second
+       `Acc_Company` row existed — which the IE demo seed made permanent. It
+       now resolves the books the way every other Store write does
+       (services/requests/booksCompany.js): the `isPrimary` company, else the
+       only one, else the oldest. The first seeded company is the oldest here,
+       so the head it owns is accepted and stored. */
     const { emp, ledger } = await seed();
     await seed(); // a second set of books
     const { status, body: out } = await call(emp, "/", {
       method: "POST", body: body({ ledgerId: String(ledger._id) }),
     });
-    expect(status).toBe(409);
-    expect(out.message).toMatch(/More than one set of books/);
+    expect(status).toBe(201);
+    const saved = await SpendRequest.findById(out.request._id).lean();
+    expect(String(saved.ledgerId)).toBe(String(ledger._id));
+  });
+
+  test("a primary company is the books even when an older one exists", async () => {
+    const older = await seed();
+    const primary = await seed();
+    await Acc_Company.updateOne({ _id: primary.company._id }, { $set: { isPrimary: true } });
+    const { status, body: out } = await call(primary.emp, "/", {
+      method: "POST", body: body({ ledgerId: String(primary.ledger._id) }),
+    });
+    expect(status).toBe(201);
+    const saved = await SpendRequest.findById(out.request._id).lean();
+    expect(String(saved.ledgerId)).toBe(String(primary.ledger._id));
+    /* The older company's head is now another company's head: refused as
+       unknown, not charged. */
+    const foreign = await call(primary.emp, "/", {
+      method: "POST", body: body({ ledgerId: String(older.ledger._id) }),
+    });
+    expect(foreign.status).toBe(400);
   });
 
   test("with a head it goes through, and the head is stored on the request", async () => {

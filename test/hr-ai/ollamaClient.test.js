@@ -122,4 +122,25 @@ describe("ollamaClient.chatJson", () => {
     process.env.OLLAMA_BASE_URL = prev.url;
     process.env.OLLAMA_MODEL = prev.model;
   });
+
+  test("accepts request-scoped endpoint, model and keep-alive overrides", async () => {
+    const fetchImpl = jest.fn().mockResolvedValue(okJson('{"choice":"clarify"}'));
+    const { data, model } = await chatJson({
+      prompt: "p",
+      fetchImpl,
+      baseUrl: "http://reviewer.test:11434/",
+      model: "qwen-reviewer:8b",
+      keepAlive: "2m",
+    });
+
+    expect(data.choice).toBe("clarify");
+    expect(model).toBe("qwen-reviewer:8b");
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "http://reviewer.test:11434/api/chat",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(body.model).toBe("qwen-reviewer:8b");
+    expect(body.keep_alive).toBe("2m");
+  });
 });

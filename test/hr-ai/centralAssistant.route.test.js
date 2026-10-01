@@ -17,6 +17,11 @@
  *   • route context neither grants nor removes permission
  */
 
+/* Employee's pre-save hook encrypts salary fields and throws without a key —
+   the same two lines test/access/department-role-cache.test.js opens with. */
+process.env.SALARY_ENCRYPTION_KEY =
+  process.env.SALARY_ENCRYPTION_KEY || "0".repeat(64);
+
 const express = require("express");
 const mongoose = require("mongoose");
 
@@ -76,17 +81,39 @@ afterAll(async () => {
 });
 
 async function seed() {
-  const dep = (slug, name, path) => AccessDepartment.create({ slug, name, dashboardPath: path, isActive: true });
+  /* `key` is required on AccessDepartment and this fixture never set it, so
+     every test in this file failed at seed time with a validation error long
+     before it reached an assertion. The slug is the right value: it is the
+     stable machine key the model documents, and the two are identical for all
+     twelve seeded departments. */
+  const dep = (slug, name, path) =>
+    AccessDepartment.create({ key: slug, slug, name, dashboardPath: path, isActive: true });
   const hr = await dep("hr", "HR", "/hr/dashboard");
   const sales = await dep("sales", "Sales", "/sales/dashboard");
   const ceo = await dep("ceo", "CEO", "/ceo/dashboard");
 
-  const emp = (bio, extra) => Employee.create({ biometricId: bio, ...extra });
+  /* `gender` is declared `default: ""` against an enum that does not contain
+     "", so a fixture that omits it fails validation on save. Set explicitly
+     here rather than changed in the model — the default is a real defect, but
+     relaxing an enum is a production behaviour change and does not belong in a
+     test fixture's way. */
+  const emp = (bio, extra) => Employee.create({ biometricId: bio, gender: "Other", ...extra });
   const hrEmp = await emp("GRHR1", { accessDepartmentId: hr._id });
   const salesEmp = await emp("GRS1", { accessDepartmentId: sales._id });
   const multiEmp = await emp("GRM1", { accessDepartmentId: sales._id, additionalDepartmentIds: [hr._id] });
   const ceoEmp = await emp("GRC1", { accessDepartmentId: ceo._id });
-  await DeptUser.create({ email: "admin@grav.in", passwordHash: "x", name: "Admin", isAdmin: true, isActive: true });
+  /* `departmentId` is required on DeptUser. A platform administrator belongs to
+     the admin department rather than to HR — which is the point of the test
+     below: their access comes from `isAdmin`, not from any HR grant. */
+  const adminDept = await dep("platform-admin", "Platform Admin", "/admin");
+  await DeptUser.create({
+    email: "admin@grav.in",
+    passwordHash: "x",
+    name: "Admin",
+    departmentId: adminDept._id,
+    isAdmin: true,
+    isActive: true,
+  });
 
   return {
     // x-test-user payloads
@@ -102,7 +129,23 @@ async function seed() {
 
 beforeEach(async () => {
   chatJson.mockReset();
-  chatJson.mockResolvedValue({ model: "qwen3:8b", data: { reply: "Here is what I found." } });
+  chatJson.mockImplementation(async ({ schema, prompt }) => {
+    const properties = (schema && schema.properties) || {};
+    if (properties.choice) {
+      const parsed = JSON.parse(prompt);
+      const q = String(parsed.currentQuestion || "");
+      const choice = /overview|headcount/i.test(q)
+        ? "hr_overview"
+        : /present|absent|attendance/i.test(q)
+          ? "hr_daily_attendance"
+          : "conversation";
+      return { model: "qwen3:8b", data: { choice, clarification: null } };
+    }
+    if (properties.date && properties.department) {
+      return { model: "qwen3:8b", data: { date: "2026-08-08", department: "all" } };
+    }
+    return { model: "qwen3:8b", data: { reply: "Here is what I found." } };
+  });
   convo._clearAll();
   ids = await seed();
 });
@@ -144,10 +187,10 @@ describe("central assistant tool gating", () => {
   });
 
   test("HR manager: HR overview attached on an HR question", async () => {
-    const { status, body } = await message({ message: "How many staff are present today?" }, ids.HR);
+    const { status, body } = await message({ message: "Give me the HR workforce overview and headcount." }, ids.HR);
     expect(status).toBe(200);
     expect(body.meta.toolsUsed).toContain("hr_overview");
-    expect(chatJson.mock.calls[0][0].prompt).toContain("HR_OVERVIEW_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("HR_OVERVIEW_CONTEXT"))).toBe(true);
   });
 
   test("multi-department HR-in-Sales: same access as HR (tools attached)", async () => {
@@ -168,13 +211,13 @@ describe("central assistant tool gating", () => {
     expect(status).toBe(200);
     expect(body.meta.toolsUsed).not.toContain("hr_overview");
     expect(body.meta.toolsUsed).not.toContain("hr_daily_attendance");
-    expect(chatJson.mock.calls[0][0].prompt).not.toContain("HR_OVERVIEW_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("HR_OVERVIEW_CONTEXT"))).toBe(false);
   });
 
   test("Daily Attendance tool is selected for a day-attendance question", async () => {
     const { body } = await message({ message: "Who is absent today?" }, ids.HR);
     expect(body.meta.toolsUsed).toContain("hr_daily_attendance");
-    expect(chatJson.mock.calls[0][0].prompt).toContain("DAILY_ATT_CONTEXT");
+    expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("DAILY_ATT_CONTEXT"))).toBe(true);
   });
 
   test("route context does NOT grant HR access to a Sales-only user", async () => {
@@ -191,7 +234,7 @@ describe("central assistant tool gating", () => {
       { message: "How many staff are present today?", routeContext: "/sales/dashboard" },
       ids.HR,
     );
-    expect(body.meta.toolsUsed).toContain("hr_overview");
+    expect(body.meta.toolsUsed).toContain("hr_daily_attendance");
   });
 
   test("conversation persists per-user and stays isolated", async () => {

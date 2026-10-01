@@ -44,6 +44,20 @@ const fulfilment = require("../../services/storeFulfilment.service");
 const financeDecision = require("../../services/spendFinanceDecision.service");
 const budgetMatch = require("../../services/budgetCommitment.service");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 const {
   orgAuth,
   requirePermission,
@@ -115,7 +129,7 @@ const listRow = (r) => ({
  * What is waiting on finance. Newest last, because this is a queue somebody
  * works down rather than a feed they scan.
  */
-router.get("/", async (req, res) => {
+router.get("/", companyScopeOptional, async (req, res) => {
   try {
     const filter = { status: chain.PENDING_FINANCE };
 
@@ -169,7 +183,7 @@ router.get("/", async (req, res) => {
  * request. The snapshot is a record of what Store was looking at when they
  * priced it; finance is deciding now, and the envelope has moved since.
  */
-router.get("/:id", async (req, res) => {
+router.get("/:id", companyScope, async (req, res) => {
   try {
     const doc = await SpendRequest.findById(req.params.id).lean();
     if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
@@ -329,6 +343,97 @@ router.get("/:id", async (req, res) => {
   }
 });
 
+
+/* ══ WHAT AN ACCOUNTANT REVIEWS BEFORE APPROVING ════════════════════════════
+ * The same plan the approval will use, computed by the same `planLineAllocations`
+ * the Request Desk reads — so the two doors cannot show different heads for
+ * the same line.
+ *
+ * ── AND WHY IT IS A SEPARATE ROUTE ──────────────────────────────────────────
+ * Payables authenticates as an accounting user; the Requests router sits
+ * behind an employee JWT. Making this screen carry two session types to fill
+ * one table is a boundary that breaks quietly the first time somebody has one
+ * cookie and not the other. One extra route on the door the screen already
+ * uses is the cheaper trade — the same reasoning the item-budget-head lookup
+ * in the chart of accounts already follows.
+ *
+ * Read-only, and never a refusal: an unresolved line comes back as a `problem`
+ * for the screen to render, because this is the surface an accountant fixes it
+ * on.
+ */
+router.get("/:id/line-allocations", async (req, res) => {
+  try {
+    /* ── THE SAME PEOPLE WHO MAY ACT ON IT ────────────────────────────────
+       Not a new permission framework — `isApprover` is the check this file
+       already makes on the decision itself. It is applied to the READ because
+       this returns every approved head for the department with its live
+       availability, which is more than the request detail beside it exposes,
+       and because the screen only shows the panel to somebody who may approve
+       anyway. */
+    if (!isApprover(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Reading what a request would commit is an owner's or an approver's call.",
+      });
+    }
+
+    const doc = await SpendRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found." });
+
+    const plan = await financeDecision.planLineAllocations({
+      request: doc,
+      body: null,
+      actor: { id: req.user?.id, name: req.user?.name || "Finance" },
+    });
+
+    /* The heads an accountant may actually choose: this department's approved
+       budget LINES, not the chart of accounts. */
+    const heads = await approvedHeadOptions(doc);
+
+    if (!plan.ok) {
+      return res.json({
+        success: true,
+        allocation: null,
+        code: plan.code,
+        message: plan.message,
+        problems: plan.problems || [],
+        totals: plan.totals || null,
+        heads,
+      });
+    }
+
+    res.json({
+      success: true,
+      allocation: financeDecision.allocationSummary(plan),
+      problems: [],
+      heads,
+    });
+  } catch (e) {
+    console.error("[spend-approvals] line-allocations:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** This department's approved budget lines — never the whole chart. */
+async function approvedHeadOptions(doc) {
+  if (!doc.companyId) return [];
+  const budgetMatch = require("../../services/budgetCommitment.service");
+  const { heads } = await budgetMatch.approvedHeadsFor({
+    companyId: doc.companyId,
+    department: doc.budgetDepartment || doc.department || "",
+  }).catch(() => ({ heads: [] }));
+  return heads.map((h) => ({
+    budgetLineId: String(h.budgetLineId),
+    ledgerId: String(h.ledgerId),
+    name: h.name,
+    financialYear: h.financialYear,
+    approved: h.approved,
+    committed: h.committed,
+    actual: h.actual,
+    available: h.available,
+  }));
+}
+
 /* ══ THE DECISION ═══════════════════════════════════════════════════════════
  * `requirePermission("canEdit")` is the module's own write gate; the role check
  * on top of it is the money one. Both, because they answer different
@@ -368,18 +473,43 @@ async function answer(req, res, outcome) {
     outcome,
     note: String(req.body?.note || "").trim().slice(0, 500),
     expectedPaymentDate: req.body?.expectedPaymentDate || null,
+    /* ── THE SAME ALLOCATION, THROUGH THE SAME DECISION ──────────────────
+       Both finance doors call one `decide`, precisely so a commitment written
+       from Payables and one written from the Request Desk cannot disagree.
+       Forwarding the per-line heads is what keeps that true now that a
+       request can span several. */
+    lineAllocations: req.body?.lineAllocations || null,
+    lineDecisions: req.body?.serviceClassification || null,
   });
   if (!r.ok) {
-    return res.status(r.status).json({ success: false, code: r.code, message: r.message });
+    return res.status(r.status).json({
+      success: false, code: r.code, message: r.message,
+      /* The refusal's own payload — which lines still need a head, and why —
+         so the screen can render the choice rather than send an accountant
+         off to find it. */
+      ...(r.problems ? { problems: r.problems } : {}),
+      ...(r.unresolved ? { unresolved: r.unresolved } : {}),
+      ...(r.unclassified ? { unclassified: r.unclassified } : {}),
+    });
   }
 
   res.json({
     success: true,
     request: listRow(doc.toObject()),
+    /* What was reserved, per line and per head — from the plan the approval
+       used, so the result and the commitment cannot disagree. */
+    ...(r.plan ? { allocation: financeDecision.allocationSummary(r.plan) } : {}),
     message:
       outcome === "rejected"
         ? `${doc.requestNumber} rejected.`
-        : `${doc.requestNumber} approved — the money is committed against ${doc.ledgerName || "the head"}.`,
+        /* ── NO SINGLE HEAD TO NAME WHEN THERE ARE SEVERAL ──────────────
+           `doc.ledgerName` is the REQUEST's head. On a line-wise approval the
+           money is committed against two, three or four, and naming one of
+           them would be a sentence an accountant reconciles against and finds
+           untrue. */
+        : (r.plan && r.plan.headCount > 1
+          ? `${doc.requestNumber} approved — budget reserved across ${r.plan.headCount} heads.`
+          : `${doc.requestNumber} approved — the money is committed against ${doc.ledgerName || "the head"}.`),
   });
 }
 
@@ -403,7 +533,7 @@ async function answer(req, res, outcome) {
  * Approval is never BLOCKED by an overrun. Finance may always say yes; this is
  * an alternative to approving, not a gate in front of it.
  */
-router.post("/:id/budget-exception", requirePermission("canEdit"), async (req, res) => {
+router.post("/:id/budget-exception", companyScope, requirePermission("canEdit"), async (req, res) => {
   try {
     if (!isApprover(req.user)) {
       return res.status(403).json({

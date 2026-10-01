@@ -125,9 +125,11 @@ const getConversationMessages = async (conversationId, userId, limit = 50) => {
  * List all employees (for CEO to start new DMs, and for employees too)
  */
 const listAllEmployees = async (currentUserId) => {
+    // SEC-1: directory projection only (allowlist), never the raw document.
+    const { directoryEntryFromSnapshot } = require("./coworkEmployeeProjection");
     const snap = await db.collection("cowork_employees").get();
     return snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
+        .map(directoryEntryFromSnapshot)
         .filter((e) => e.id !== currentUserId);
 };
 

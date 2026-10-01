@@ -44,6 +44,20 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { orgAuth } = require("../../Middlewear/AccountantOrgAuthMiddleware");
 
+/* Lane A Chunk 3A — canonical company isolation. Every route below that
+   names a companyId is checked against req.organization.tallyCompanyIds by
+   one shared guard; see Middlewear/AccountantOrgAuthMiddleware.js. */
+const accOrgAuth = require("../../Middlewear/AccountantOrgAuthMiddleware");
+/* Resolved per request, not at module load. The guard has ONE implementation —
+   `requireCompanyScope` in AccountantOrgAuthMiddleware.js — and this keeps it
+   that way while still loading under the partial `jest.mock`s several suites
+   use for that module. A mock that omits it fails loudly on the first request
+   to a company-scoped route, which is the correct signal. */
+const companyScope = (req, res, next) =>
+  accOrgAuth.requireCompanyScope(req, res, next);
+const companyScopeOptional = (req, res, next) =>
+  accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
 router.use(orgAuth);
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -136,7 +150,7 @@ async function applyRequest(req, reqDoc) {
 // ─────────────────────────────────────────────────────────────────────────
 // GET /pending — approver queue
 // ─────────────────────────────────────────────────────────────────────────
-router.get("/pending", async (req, res) => {
+router.get("/pending", companyScopeOptional, async (req, res) => {
   try {
     if (!requireOrg(req, res)) return;
     if (!requireCanApprove(req, res)) return;
@@ -161,7 +175,7 @@ router.get("/pending", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // Used by the Balance Sheet to overlay pending moves: the editor sees
 // the ledger in its proposed location with a "pending" badge.
-router.get("/mine", async (req, res) => {
+router.get("/mine", companyScopeOptional, async (req, res) => {
   try {
     if (!requireOrg(req, res)) return;
     const q = {
@@ -184,7 +198,7 @@ router.get("/mine", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /propose
 // ─────────────────────────────────────────────────────────────────────────
-router.post("/propose", async (req, res) => {
+router.post("/propose", companyScope, async (req, res) => {
   try {
     if (!requireOrg(req, res)) return;
     if (!requireCanEdit(req, res)) return;

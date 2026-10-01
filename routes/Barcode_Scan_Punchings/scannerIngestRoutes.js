@@ -344,6 +344,9 @@ router.post("/heartbeat", async (req, res) => {
           resetReason: req.body.resetReason || "",
           lastHeartbeatAt: new Date(),
         },
+        // Server-owned evidence counter (see DeviceHeartbeat). Nothing in the
+        // request body touches it; the device contract is unchanged.
+        $inc: { evidenceRevision: 1 },
       },
       { upsert: true }
     );
