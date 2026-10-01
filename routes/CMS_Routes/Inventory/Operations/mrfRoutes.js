@@ -2087,7 +2087,12 @@ router.post(
        * raised. Reading "the first company" was also how a budget head from
        * one company could be validated against another's books. */
       const { Acc_Ledger } = require("../../../../models/Accountant_model/Acc_MasterModels");
-      const booksCompanyId = mrf.companyId || req.tenant?.companyId;
+      /* 1 Oct 2026: a request raised before company stamping, by a door with
+         no tenant, resolves to the books every other Store write uses (the
+         GRAV Clothing primary profile) instead of being refused here. */
+      const booksCompanyId =
+        mrf.companyId || req.tenant?.companyId ||
+        (await require("../../../../services/requests/booksCompany").theCompany()).company?._id;
       if (!booksCompanyId) {
         return res.status(409).json({
           success: false,

@@ -38,13 +38,17 @@ const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/Purc
 const tenantContext = require("./tenantContext.service");
 const control = require("./goodsReceiptControl.service");
 
-/* The three tabs, as the URL spells them. */
+/* The tabs, as the URL spells them. ALL (1 Oct 2026, the owner: "by default
+   keep the filter for all") is every expected arrival and every recorded
+   receipt in one list, and the default when nothing is asked for. */
 const STAGE = Object.freeze({
+  ALL: "all",
   EXPECTED: "expected",
   ACTION: "action-required",
   COMPLETED: "completed",
 });
-const STAGES = Object.freeze([STAGE.EXPECTED, STAGE.ACTION, STAGE.COMPLETED]);
+const STAGES = Object.freeze([STAGE.ALL, STAGE.EXPECTED, STAGE.ACTION, STAGE.COMPLETED]);
+const STAGE_ORDER = Object.freeze({ [STAGE.EXPECTED]: 0, [STAGE.ACTION]: 1, [STAGE.COMPLETED]: 2 });
 
 /* The source filter. `customer-owned` is the user's word; `CUSTOMER_MATERIAL`
    is the stored one, and they are mapped rather than conflated. */
@@ -140,7 +144,7 @@ function scoped(tenant, extra = {}) {
 
 /** Normalise whatever the URL carried into the closed vocabulary. */
 function readQuery(q = {}) {
-  const stage = STAGES.includes(str(q.stage)) ? str(q.stage) : STAGE.ACTION;
+  const stage = STAGES.includes(str(q.stage)) ? str(q.stage) : STAGE.ALL;
   // Canonical is `customer-owned`; accept the `customer` shorthand (customer-
   // material back link / older links) so it opens the customer view, not All.
   const rawSource = str(q.source);
@@ -559,21 +563,38 @@ async function workspace(tenant, ctx, query = {}) {
     }
   };
 
+  const byExpectedDate = (a, b) => {
+    /* Earliest expected first; rows with no recorded date sit after the dated
+       ones rather than being given a date to sort by. */
+    if (!a.expectedDate && !b.expectedDate) return 0;
+    if (!a.expectedDate) return 1;
+    if (!b.expectedDate) return -1;
+    return new Date(a.expectedDate) - new Date(b.expectedDate);
+  };
   if (stage === STAGE.EXPECTED) {
     if (wantPurchased) rows = rows.concat(await attempt("expectedPurchased", () => readExpectedPurchased(tenant, { search })));
     if (wantCustomer) rows = rows.concat(await attempt("expectedCustomer", () => readExpectedCustomer(ctx, { search })));
-    /* Earliest expected first; rows with no recorded date sit after the dated
-       ones rather than being given a date to sort by. */
-    rows.sort((a, b) => {
-      if (!a.expectedDate && !b.expectedDate) return 0;
-      if (!a.expectedDate) return 1;
-      if (!b.expectedDate) return -1;
-      return new Date(a.expectedDate) - new Date(b.expectedDate);
-    });
+    rows.sort(byExpectedDate);
   } else if (dateInvalid) {
     // Do not query an impossible range — that would return zero and read as
     // "no receipts exist". The page shows the validation message instead.
     rows = [];
+  } else if (stage === STAGE.ALL) {
+    /* ── EVERYTHING, IN THE ORDER A RECEIVER WORKS (1 Oct 2026) ──────────
+       Expected arrivals first (earliest due first), then the recorded
+       receipts that still need work, then the completed ones — each group in
+       its own tab's order. A date range filters the RECORDED rows by receipt
+       date, as on those tabs; an expected arrival has no receipt date, so
+       while a range is set none is listed rather than one being guessed in. */
+    let expected = [];
+    if (!(dateFrom || dateTo)) {
+      if (wantPurchased) expected = expected.concat(await attempt("expectedPurchased", () => readExpectedPurchased(tenant, { search })));
+      if (wantCustomer) expected = expected.concat(await attempt("expectedCustomer", () => readExpectedCustomer(ctx, { search })));
+      expected.sort(byExpectedDate);
+    }
+    const recorded = await attempt("recordedReceipts", () => readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }));
+    const ordered = recorded.slice().sort((a, b) => (STAGE_ORDER[a.stage] ?? 9) - (STAGE_ORDER[b.stage] ?? 9));
+    rows = expected.concat(ordered);
   } else {
     const recorded = await attempt("recordedReceipts", () => readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }));
     rows = recorded.filter((r) => r.stage === stage);

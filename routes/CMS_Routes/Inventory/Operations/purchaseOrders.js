@@ -1838,8 +1838,14 @@ async function handleGoodsReceipt(req, res, { includePurchaseOrder = false, succ
       location = locStock.findLocation(warehouse, locationId);
       const locErr = locStock.usableLocationError(warehouse, location, req.tenant.companyId);
       if (locErr) return res.status(400).json({ success: false, message: locErr.message, reason: locErr.reason });
-    } else if (warehouseId || locationId) {
-      return res.status(400).json({ success: false, message: "A destination needs both a warehouse and a location.", reason: "LOCATION_INCOMPLETE" });
+    } else if (warehouseId) {
+      /* A warehouse on its own (1 Oct 2026): the receiving screen no longer
+         asks for a location. The stock enters the warehouse and is shelved
+         from the put-away queue; no location movement is written. */
+      warehouse = await Warehouse.findOne({ _id: warehouseId, ...tenantContext.tenantFilter(req.tenant) }).lean();
+      if (!warehouse) return res.status(400).json({ success: false, message: "That warehouse was not found.", reason: "WAREHOUSE_UNKNOWN" });
+    } else if (locationId) {
+      return res.status(400).json({ success: false, message: "A location needs its warehouse.", reason: "LOCATION_INCOMPLETE" });
     }
 
     // ── Validate every line (unknown/cancelled/foreign, positive qty,

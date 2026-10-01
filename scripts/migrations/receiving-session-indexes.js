@@ -46,8 +46,24 @@ const INDEXES = Object.freeze([
        history — a part receipt today, another next week — but never two open
        at once, because two open counts would be two label counters for one
        pallet, each starting at 1. */
-    options: { unique: true, partialFilterExpression: { status: "OPEN" } },
+    /* Restricted to rows that HAVE a purchase-order line (1 Oct 2026): a
+       customer-material count carries none, and null would otherwise be one
+       shared key for every open customer-material count. */
+    options: { unique: true, partialFilterExpression: { status: "OPEN", poItemId: { $type: "objectId" } } },
     why: "one open count per purchase-order line — the single label counter",
+  },
+  {
+    collection: "goodsreceiptsessions",
+    name: "companyId_1_customerMaterialId_1_customerLineRef_1",
+    key: { companyId: 1, customerMaterialId: 1, customerLineRef: 1 },
+    options: { unique: true, partialFilterExpression: { status: "OPEN", customerMaterialId: { $type: "objectId" } } },
+    why: "one open count per customer-material document line (1 Oct 2026)",
+  },
+  {
+    collection: "goodsreceiptsessions",
+    name: "companyId_1_customerMaterialId_1_status_1",
+    key: { companyId: 1, customerMaterialId: 1, status: 1 },
+    why: "every open count on one customer-material document — the customer-owned receive screen's read",
   },
   {
     collection: "goodsreceiptsessions",

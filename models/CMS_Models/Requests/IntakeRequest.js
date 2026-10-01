@@ -62,6 +62,10 @@ const imageSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true },
     publicId: { type: String, trim: true, default: "" },
+    /* Google Drive (1 Oct 2026 — the form uploads there now, as MRF's
+       `productImageSchema` already allows). The lh3 url renders on its own;
+       the id is what lets a thumbnail be served at thumbnail size. */
+    fileId: { type: String, trim: true, default: "" },
     name: { type: String, trim: true, default: "" },
   },
   { _id: false },

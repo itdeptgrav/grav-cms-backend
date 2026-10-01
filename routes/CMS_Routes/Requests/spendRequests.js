@@ -126,25 +126,10 @@ async function requester(req) {
     .lean();
 }
 
-/**
- * The books this request belongs to.
- *
- * One company today, and this asks rather than assumes: with several, a
- * department employee's session says nothing about which set of books their
- * spend belongs to, and picking the first would file it against whichever
- * happened to be created first. Refusing is the honest answer until somebody
- * decides the rule.
- */
-async function theCompany() {
-  const companies = await Acc_Company.find({}).select("_id companyName").limit(2).lean();
-  if (companies.length === 1) return { company: companies[0], error: null };
-  return {
-    company: null,
-    error: companies.length
-      ? "More than one set of books exists, and a request cannot tell which it belongs to. Ask finance to configure this."
-      : "No company is set up in the books yet. Ask finance to create one.",
-  };
-}
+/* The books this request belongs to — the GRAV Clothing primary profile, the
+   way every other Store write resolves it (services/requests/booksCompany.js).
+   It used to refuse when more than one company row existed; see that file. */
+const { theCompany } = require("../../../services/requests/booksCompany");
 
 /**
  * The lines, checked and costed.

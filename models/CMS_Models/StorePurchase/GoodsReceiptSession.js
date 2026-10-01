@@ -73,11 +73,21 @@ const goodsReceiptSessionSchema = new mongoose.Schema(
     siteId: { type: mongoose.Schema.Types.ObjectId, default: null },
 
     // ── Which line is being counted ────────────────────────────────────────
-    purchaseOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "PurchaseOrder", required: true },
+    /* ── TWO KINDS OF LINE (1 Oct 2026) ─────────────────────────────────
+       A count hangs off a purchase-order line OR a customer-material
+       document line — the owner asked for the same labels and scan-in on a
+       customer-owned delivery as on a purchase. Exactly one pair is set:
+       `purchaseOrderId` + `poItemId`, or `customerMaterialId` +
+       `customerLineRef`. The unique-on-OPEN indexes are per kind (see
+       scripts/migrations/receiving-session-indexes.js). */
+    purchaseOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "PurchaseOrder", default: null },
     poNumber: { type: String, trim: true, default: "" },
+    customerMaterialId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerMaterialExpectation", default: null },
+    customerDocumentRef: { type: String, trim: true, default: "" },
+    customerLineRef: { type: String, trim: true, default: "" },
     /* The stored-id join to the PO line. Never a name, never an array index:
        a line reordered in the editor must not take another line's count. */
-    poItemId: { type: mongoose.Schema.Types.ObjectId, required: true },
+    poItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
 
     /* Identity snapshots, so a session reads without a join and so a label
        reserved under it can be checked against the material it claims. */

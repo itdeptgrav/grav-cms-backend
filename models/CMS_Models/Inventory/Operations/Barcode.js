@@ -311,6 +311,15 @@ const barcodeSchema = new mongoose.Schema(
 barcodeSchema.pre("validate", function enforceOwnership(next) {
   const cm = this.customerMaterial || {};
   if (!cm.lotId) {
+    /* ── A LABEL PRINTED BEFORE THE DELIVERY IS RECORDED (1 Oct 2026) ─────
+       The customer-owned receive screen prints a line's labels before the
+       lot exists, inside a receiving count. Such a label names the customer
+       and the document but cannot name a lot yet; it is not live (never
+       ACTIVATED) until the delivery is recorded, and that activation stamps
+       the lot. So the half-claim is allowed only while the label belongs to
+       a count and is not live. */
+    const inCount = Boolean(this.receivingSessionId) && String(this.identityState || "") !== "ACTIVATED";
+    if (inCount) return next();
     /* An ordinary label. Untouched, and it must not carry ownership fields
        half-filled — a partial claim is worse than none. */
     if (cm.customerId || (cm.documentRef || "").trim()) {

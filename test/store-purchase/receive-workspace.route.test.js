@@ -172,7 +172,8 @@ describe("reaching the workspace", () => {
     const co = await company(); const token = await actor(co);
     const res = await call(`${WS}?stage=nonsense&source=nonsense`, { token });
     expect(res.status).toBe(200);
-    expect(res.body.stage).toBe("action-required");
+    /* "all" since 1 Oct 2026 — every expected arrival and recorded receipt. */
+    expect(res.body.stage).toBe("all");
     expect(res.body.source).toBe("all");
   });
 });

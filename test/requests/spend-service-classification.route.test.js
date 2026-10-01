@@ -325,11 +325,11 @@ describe("Store matches a service line before finance decides", () => {
   test("another company's service is refused, worded as not found", async () => {
     const s = await seed();
     /* ── ONE SET OF BOOKS PER TEST ────────────────────────────────────────
-       `theCompany()` refuses to raise a request at all when more than one
-       `Acc_Company` exists, so a second seeded company would break request
-       creation rather than test the scope. The service carries a foreign
-       `companyId` directly, which is exactly the shape the route guards
-       against — its query is `{ _id, companyId: doc.companyId }`. */
+       `theCompany()` resolves the primary / oldest `Acc_Company` (it used to
+       refuse on a second row, until 1 Oct 2026), so a second seeded company
+       would simply be ignored rather than test the scope. The service
+       carries a foreign `companyId` directly, which is exactly the shape the
+       route guards against — its query is `{ _id, companyId: doc.companyId }`. */
     const theirs = await Service.create({
       companyId: new mongoose.Types.ObjectId(),
       serviceCode: "SVC/2026-27/8888", name: "Their AMC", status: "ACTIVE",

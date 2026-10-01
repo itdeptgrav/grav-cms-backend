@@ -49,13 +49,20 @@ const r4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
 
    Moved here verbatim. Re-exported from `goodsReceipt.service` so every existing
    caller is untouched. */
+/* A unit's name is compared without regard to case or stray spaces (1 Oct
+   2026): a job-work line said "pcs" and the material's registered unit said
+   "Pcs", and the receipt was refused for a conversion between the same unit.
+   The unit register is looked up the same way. */
+const sameUnit = (a, b) => String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+const escapeRe = (s) => String(s ?? "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const unitNameMatch = (name) => new RegExp(`^\\s*${escapeRe(name)}\\s*$`, "i");
 async function resolveConversion({ quantity, fromUnit, toUnit, session = null }) {
-  if (!fromUnit || !toUnit || fromUnit === toUnit) {
+  if (!fromUnit || !toUnit || sameUnit(fromUnit, toUnit)) {
     return { baseQuantity: r4(quantity), factor: 1, note: "" };
   }
   const q = (m) => (session ? m.session(session) : m);
-  const fromDoc = await q(Unit.findOne({ name: fromUnit }).populate("conversions.toUnit", "name")).lean();
-  const direct = (fromDoc?.conversions || []).find((c) => (c.toUnit?.name || c.toUnit) === toUnit);
+  const fromDoc = await q(Unit.findOne({ name: unitNameMatch(fromUnit) }).populate("conversions.toUnit", "name")).lean();
+  const direct = (fromDoc?.conversions || []).find((c) => sameUnit(c.toUnit?.name || c.toUnit, toUnit));
   if (direct?.quantity) {
     return {
       baseQuantity: r4(quantity * direct.quantity),
@@ -63,8 +70,8 @@ async function resolveConversion({ quantity, fromUnit, toUnit, session = null })
       note: `${quantity} ${fromUnit} = ${r4(quantity * direct.quantity)} ${toUnit}`,
     };
   }
-  const toDoc = await q(Unit.findOne({ name: toUnit }).populate("conversions.toUnit", "name")).lean();
-  const reverse = (toDoc?.conversions || []).find((c) => (c.toUnit?.name || c.toUnit) === fromUnit);
+  const toDoc = await q(Unit.findOne({ name: unitNameMatch(toUnit) }).populate("conversions.toUnit", "name")).lean();
+  const reverse = (toDoc?.conversions || []).find((c) => sameUnit(c.toUnit?.name || c.toUnit, fromUnit));
   if (reverse?.quantity) {
     return {
       baseQuantity: r4(quantity / reverse.quantity),
@@ -84,7 +91,15 @@ async function resolveConversion({ quantity, fromUnit, toUnit, session = null })
 
    Each source supplies its own `pending`; the refusal is shared so the sentence
    and the code are the same whichever gate the goods came through. */
+/* ── OVER-RECEIPT IS ALLOWED UNLESS ASKED FOR (1 Oct 2026) ──────────────────
+   The owner: "a case may happen where we are receiving more than the ordered
+   qty, so don't restrict". A receipt above what is outstanding is recorded as
+   it stands; the line's pending quantity is clamped at zero and the line
+   completes (goodsReceipt.service already does both). The refusal comes
+   back with STORE_PURCHASE_REFUSE_OVER_RECEIPT=1. */
+const REFUSE_OVER_RECEIPT = () => process.env.STORE_PURCHASE_REFUSE_OVER_RECEIPT === "1";
 function assertWithinPending({ requested, pending, label, unit, details = {} }) {
+  if (!REFUSE_OVER_RECEIPT()) return;
   if (r4(requested) > r4(pending)) {
     throw fail("VALIDATION",
       `Cannot receive ${requested} ${unit} for "${label}": only ${r4(pending)} ${unit} remain outstanding.`,

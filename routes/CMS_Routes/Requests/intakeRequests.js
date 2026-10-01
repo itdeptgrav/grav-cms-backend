@@ -93,6 +93,7 @@ function cleanImages(images) {
     .map((im) => ({
       url: im.url.trim(),
       publicId: text(im.publicId, 200),
+      fileId: text(im.fileId, 120),
       name: text(im.name, 120),
     }));
 }
@@ -327,6 +328,7 @@ const lineOf = ({
        into one strip would lose which was which. */
     images: (images || []).map((im) => ({
       url: im.url,
+      fileId: im.fileId || null,
       name: im.name || null,
     })),
     catalogueImage: stock?.image || null,
@@ -2073,31 +2075,17 @@ router.get("/:id/budget-heads", async (req, res) => {
   }
 });
 
-/**
- * The books this request belongs to.
- *
- * One company today, and this asks rather than assumes: with several, an
- * employee's session says nothing about which set of books their spend belongs
- * to, and picking the first would file it against whichever happened to be
- * created first.
- */
-async function theCompany() {
-  const companies = await Acc_Company.find({}).select("_id companyName").limit(2).lean();
-  if (companies.length === 1) return { company: companies[0], error: null };
-  return {
-    company: null,
-    error: companies.length
-      ? "More than one set of books exists, and a request cannot tell which it belongs to. Ask finance to configure this."
-      : "No company is set up in the books yet. Ask finance to create one.",
-  };
-}
+/* The books this request belongs to — the GRAV Clothing primary profile, the
+   way every other Store write resolves it (services/requests/booksCompany.js).
+   It used to refuse when more than one company row existed; see that file. */
+const { theCompany } = require("../../../services/requests/booksCompany");
 
 /**
  * Attempt automatic reservation for an MRF the Requests desk just spawned.
  *
  * ── WHY THE COMPANY IS RESOLVED HERE ───────────────────────────────────────
- * This router has no `req.tenant`: it resolves the books through `theCompany()`,
- * which refuses outright when more than one company exists. `spawnMrf` leaves
+ * This router has no `req.tenant`: it resolves the books through `theCompany()`
+ * (the GRAV Clothing primary profile, never a refusal on count). `spawnMrf` leaves
  * `companyId` unset on the request it creates, so the tenant handed to the
  * reservation service IS the company this route was already acting for — the
  * same one every other write on this path uses.
@@ -2884,7 +2872,7 @@ async function spawnMrf({ doc, classifier, classifierName, now, issueQty = null,
          what the store has to go on when deciding which catalogue item this
          is — or what to register if it is not one yet. */
       images: (l.images || []).map((im) => ({
-        url: im.url, publicId: im.publicId || "", name: im.name || "",
+        url: im.url, publicId: im.publicId || "", fileId: im.fileId || "", name: im.name || "",
       })),
       /* Issuable the moment it lands, when somebody has said what it is.
          UNMATCHED is still an ordinary outcome — a described line nobody

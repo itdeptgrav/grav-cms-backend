@@ -937,3 +937,119 @@ it under Receive › Customer-supplied materials
 (`/store/dashboard/operations/customer-materials/6abb34b2ec5bdaf96e5927b3`).
 Issued through `customerMaterial.service` directly
 (`scratchpad/issue_job_work_cm.js`).
+
+## Receiving labels without bounds — 1 Oct 2026
+
+`receivingSession.service`: `openOrResume` defaults the tracking level to
+the master's or PACKAGE (the screen no longer asks); `reserveBatch` has no
+headroom bound and no one-label lot rule (MAX_BATCH per batch remains), and
+the typed `quantityPerLabel` wins even on an INDIVIDUAL count (1 only when
+nothing is typed); `applyLabel` honours a label's own quantity on such a
+count; `finalizeBlockers` reports only a DUPLICATE identity unless
+STORE_PURCHASE_STRICT_COUNT=1; `activateForReceipt` activates APPLIED AND
+PRINTED labels (a printed sticker is on the goods) and voids only RESERVED;
+`adoptLabel` counts this order's own PRINTED / RESERVED label when it is
+scanned (applies it, returns `added`, `line`, `own: true`) and refuses one
+already counted. `receiptPosting.assertWithinPending` is a no-op unless
+STORE_PURCHASE_REFUSE_OVER_RECEIPT=1 — over-receipt is recorded, pending
+clamps at zero, the line completes.
+`reserveBatch` (1 Oct 2026, later): a count with no stored tracking level
+— one opened before the question was removed — is set to PACKAGE when its
+first label is printed, instead of refusing with "Say what a label on this
+delivery stands for". Seen on PO/2026-27/0007's count.
+
+## Receiving counts on customer-material lines; no location at GRN — 1 Oct 2026
+
+`GoodsReceiptSession` hangs off a purchase-order line (`purchaseOrderId` +
+`poItemId`) OR a customer-material document line (`customerMaterialId` +
+`customerLineRef`); the PO pair is no longer `required`. Indexes
+(`scripts/migrations/receiving-session-indexes.js`, applied 1 Oct 2026):
+the PO unique-on-OPEN index now requires `poItemId` to be an ObjectId, and
+two customer-material indexes were added.
+`services/storePurchase/customerMaterialSession.service.js` is the
+customer-material half — `openOrResume`, `readForDocument`, `reserveBatch`
+(labels carry `customerMaterial.*` without a lot: `Barcode`'s
+`enforceOwnership` hook allows that half-claim while the label is in a count
+and not ACTIVATED), `voidLabel`, `adoptLabel` (own printed label → counted;
+a live label → adopted as customer property) and `activateForReceipt`,
+which the `/receipts` route calls inside the receipt transaction: PRINTED /
+APPLIED labels of the line's count become ACTIVATED, stamped with the lot,
+the GRN, the warehouse / location and an `allocationRef`, their quantity
+converted to the lot's base unit, and the lot's `labelledQuantity` /
+`labelCount` / `lastAllocationSeq` are claimed as `customerMaterialLabel.postLabel`
+would. Routes on `customerMaterials.js` mirror the purchase-order
+receiving-session routes (`/:docId/receiving-sessions…`, `/:docId/labels/adopt`).
+The generic half (mark printed, apply, undo, resolve, cancel) is
+`receivingSession.service`, which now exports `openSession`, `labelsOf`,
+`UNRESOLVED`, `COUNTED`.
+The purchase goods-receipt route accepts a warehouse without a location
+(stock enters the warehouse, no location movement); a location without a
+warehouse is still refused. Verified 1 Oct 2026 on CSM-2026-0004: count
+opened, 2 × 10 pcs printed, one scanned in (+10 on the line), a second scan
+refused, a DRYWALL label refused as not on the document.
+
+
+## The Requests desk files against the primary company; photos carry a Drive id — 1 Oct 2026
+
+`services/requests/booksCompany.js` is the ONE `theCompany()` for
+`intakeRequests.js` and `spendRequests.js` (both used to define their own,
+scanning `acc_companies` and refusing with "More than one set of books
+exists, and a request cannot tell which it belongs to. Ask finance to
+configure this." the moment a second row existed — which the IE demo seed
+of 21 Sep 2026 made permanent: three companies, GRAV CLOTHING PVT LTD
+`isPrimary`, plus "IE Demo Garments" and "IE Demo Textiles"). It now
+resolves the way every other Store write does: the canonical company
+(`canonicalCompany.getCanonicalCompany`, the `isPrimary` row), else the
+only company, else the oldest (`sort isPrimary:-1, _id:1`), and refuses only
+when the books hold no company at all. The MRF fulfilment-decision route's
+"This request has no company, so it cannot become a purchase" falls back to
+the same resolver before refusing. Owner's rule, again: no company / budget /
+accounting gate on the Store side. `spend-budget-commitment.route.test.js`
+now describes the new rule (primary wins over older; a foreign head is still
+refused as unknown). Smoke-tested 1 Oct 2026: a SERVICE request with a
+service link was accepted (201) as REQ-2610-0001 and deleted again.
+
+`IntakeRequest.imageSchema` gained `fileId` (Google Drive), as MRF's
+`productImageSchema` already had; `cleanImages`, the detail view and the
+spawned MRF's lines carry it. The CMS form uploads to Drive now (see the CMS
+note); a stored `publicId` image from the Cloudinary days still renders.
+
+## A repeat scan says which label and which line — 1 Oct 2026
+
+`receivingSession.adoptLabel` and `customerMaterialSession.adoptLabel` used
+to refuse a label already in this document's count with "That label is
+already counted on this order/document." After a page reload the screen's
+own scan list is empty, so that read as a fault. Both now say "Label N was
+already scanned in on <material · variant> — its <qty unit> are in that
+line's count already, even if this screen was reloaded since." and carry
+`sessionSequence` and `line` in the failure details. Nothing about what is
+refused changed.
+
+## Unit names compare without case; the Receive workspace has an `all` stage — 1 Oct 2026
+
+`receiptPosting.resolveConversion` refused CSM-2026-0004's receipt with
+"No unit conversion from "pcs" to "Pcs" is configured": the job-work line
+said `pcs`, the material's registered unit `Pcs`. Unit names are now
+compared trimmed and case-insensitively (`sameUnit`) — the same unit is an
+identity conversion — and the unit register is looked up the same way
+(`unitNameMatch`, an anchored case-insensitive regex). A genuinely missing
+conversion is still refused.
+
+`receiveWorkspace.service`: `STAGE.ALL` (`stage=all`) is in `STAGES` and is
+the DEFAULT when the query names no stage (was `action-required`). It lists
+every expected arrival (earliest due first) and then every recorded receipt,
+those needing work before the completed ones. A date range filters the
+recorded rows by receipt date, as on their own tabs; while one is set no
+expected arrival is listed, since none has a receipt date. The
+`receive-workspace.route.test.js` fallback case expects `all`.
+
+## A customer receipt with no destination crashed on `location._id` — 1 Oct 2026
+
+After the Destination panel left the receive pages, `POST
+/customer-materials/:docId/receipts` still built its recovery receipt with
+`subjectId: location._id` — "Cannot read properties of null (reading
+'_id')", a 500 on every customer delivery. With no location the recovery
+subject is now the document itself (`customer_material_document`,
+`doc._id`, the document ref). Recorded through the UI on CSM-2026-0004 as
+GRN/2026-27/0005 (140 pcs, 277 Mtr): both counts FINALIZED, all nine
+labels ACTIVATED with the GRN and an allocation ref, two lots.

@@ -51,6 +51,9 @@ const customerMaterial = require("../../../services/merchandising/customerMateri
 const receipts = require("../../../services/storePurchase/customerMaterialReceipt.service");
 const movements = require("../../../services/storePurchase/customerMaterialIssue.service");
 const labels = require("../../../services/storePurchase/customerMaterialLabel.service");
+/* Raw-item labels printed BEFORE the delivery is recorded, and scanned in —
+   the purchase receipt's count, on a customer-material line (1 Oct 2026). */
+const counts = require("../../../services/storePurchase/customerMaterialSession.service");
 const unitOfWork = require("../../../services/storePurchase/unitOfWork.service");
 const GoodsReceipt = require("../../../models/CMS_Models/StorePurchase/GoodsReceipt");
 const { CustomerMaterialLot } = require("../../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
@@ -376,9 +379,12 @@ router.post("/:docId/receipts", ...canReceive,
           documentNumber: str(doc.documentRef),
           occurredAt: new Date(),
           previousState: "ISSUED", resultingState: "RECORDED",
-          subjectType: "warehouse_location",
-          subjectId: location._id,
-          subjectCode: str(location.code),
+          /* No destination at GRN time (1 Oct 2026): a receipt with no location
+             is recorded against the document itself. `location._id` here was
+             the "Cannot read properties of null (reading '_id')" refusal. */
+          subjectType: location ? "warehouse_location" : "customer_material_document",
+          subjectId: location ? location._id : doc._id,
+          subjectCode: location ? str(location.code) : str(doc.documentRef),
           facts: receiptFacts([
             ["operationType", "RECEIPT"],
             ["operationKey", str(req.idempotent?.key)],
@@ -405,6 +411,12 @@ router.post("/:docId/receipts", ...canReceive,
           });
           created = out.goodsReceipt;
           lotCount = (out.lots || []).length;
+          /* The line's printed labels become live with this delivery,
+             stamped with the lot and the GRN, claimed on the lot (1 Oct 2026). */
+          await counts.activateForReceipt(context, {
+            doc, goodsReceipt: created, lots: out.lots || [],
+            actor: { id: req.user.id, name: req.user.name },
+          }, session);
           return {
             entityType: ENTITY, entityId: doc._id, result: true,
             entry: {
@@ -981,6 +993,69 @@ router.get("/:docId/lots/:lotId/movements", canRead, handle(async (req, res) => 
     docId: req.params.docId, lotId: req.params.lotId,
   });
   return res.json({ success: true, ...out });
+}));
+
+/* ══ RAW ITEM LABELS BEFORE THE DELIVERY IS RECORDED (1 Oct 2026) ═══════════
+   The same count the purchase receipt runs, on a customer-material line: open
+   or resume, print N labels of Q each, mark printed, count a scanned one,
+   void, undo, cancel — and "adopt", which takes any live raw-item label
+   scanned on the receive screen into the matching line's count. The routes
+   mirror `purchaseOrders.js`'s receiving-session routes so
+   `lib/receivingSessions.js` can drive both with one client. */
+const countRoute = (fn) => async (req, res) => {
+  try {
+    return await fn(req, res);
+  } catch (error) {
+    if (error?.name === "StorePurchaseError") return sendError(res, error);
+    console.error("[customer-materials] receiving count error:", error);
+    return res.status(500).json({ success: false, message: "Server error on this count. Nothing was changed." });
+  }
+};
+const actorOf = (req) => ({ id: req.user?.id || null, name: req.user?.name || "" });
+
+router.get("/:docId/receiving-sessions", canRead, countRoute(async (req, res) => {
+  const out = await counts.readForDocument(ctx(req), { docId: req.params.docId });
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/lines/:lineRef/receiving-session", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.openOrResume(ctx(req), { docId: req.params.docId, lineRef: req.params.lineRef }, actorOf(req));
+  return res.status(out.resumed ? 200 : 201).json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/labels", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.reserveBatch(ctx(req), {
+    sessionId: req.params.sessionId, count: req.body?.count ?? 1, quantityPerLabel: req.body?.quantityPerLabel ?? null,
+  }, actorOf(req));
+  return res.status(201).json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/labels/printed", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.markPrinted(ctx(req), { sessionId: req.params.sessionId, barcodeIds: req.body?.barcodeIds || [] });
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/labels/:barcodeId/apply", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.applyLabel(ctx(req), { sessionId: req.params.sessionId, barcodeId: req.params.barcodeId, quantity: req.body?.quantity ?? null });
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/labels/:barcodeId/void", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.voidLabel(ctx(req), {
+    sessionId: req.params.sessionId, barcodeId: req.params.barcodeId, reason: req.body?.reason || "", replace: Boolean(req.body?.replace),
+  }, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/undo", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.undoLast(ctx(req), { sessionId: req.params.sessionId });
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/scan", canRead, countRoute(async (req, res) => {
+  const out = await counts.resolveScan(ctx(req), { sessionId: req.params.sessionId, barcodeId: req.body?.barcodeId });
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/receiving-sessions/:sessionId/cancel", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.cancel(ctx(req), { sessionId: req.params.sessionId, reason: req.body?.reason || "" }, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+router.post("/:docId/labels/adopt", ...canReceive, countRoute(async (req, res) => {
+  const out = await counts.adoptLabel(ctx(req), { docId: req.params.docId, barcodeId: req.body?.barcodeId, lineRef: req.body?.lineId || req.body?.lineRef || null }, actorOf(req));
+  return res.status(201).json({ success: true, ...out });
 }));
 
 module.exports = router;

@@ -805,8 +805,14 @@ async function applyReceipt({
 
 /** The destination, resolved and proven to be this company's. */
 async function resolveDestination(ctx, { warehouseId, locationId }, session = null) {
+  /* ── NO DESTINATION AT GRN TIME (1 Oct 2026) ──────────────────────────────
+     The receive screen no longer asks where the goods went — the owner: that
+     is Inventory's put-away, not the receipt's. A lot with no warehouse waits
+     in the put-away queue; a warehouse, when a caller still names one, is
+     checked as before. */
   if (!isId(warehouseId)) {
-    throw fail("VALIDATION", "Say which warehouse the goods arrived at.", { field: "warehouseId" });
+    if (isId(locationId)) throw fail("VALIDATION", "A location needs its warehouse.", { field: "warehouseId" });
+    return { warehouse: null, location: null };
   }
   const q = Warehouse.findOne({ _id: warehouseId, companyId: ctx.companyId });
   const warehouse = await (session ? q.session(session) : q);

@@ -245,8 +245,13 @@ async function openOrResume(ctx, {
   const suggested = TRACKING_LEVELS.includes(str(material.defaultTrackingLevel))
     ? str(material.defaultTrackingLevel) : null;
 
+  /* ── NO TRACKING QUESTION (1 Oct 2026) ─────────────────────────────────
+     The receiving screen no longer asks "what does one label stand for". A
+     label printed at the GRN carries the quantity typed for it, which is
+     PACKAGE tracking; the Materials master's own level still wins when it
+     has one, and a caller may still name a level explicitly. */
   const chosen = trackingLevel === null || trackingLevel === undefined || str(trackingLevel) === ""
-    ? null : str(trackingLevel);
+    ? (suggested || TRACKING_LEVEL.PACKAGE) : str(trackingLevel);
   if (chosen !== null && !TRACKING_LEVELS.includes(chosen)) {
     throw fail("VALIDATION", "That is not a tracking level this system records.", { field: "trackingLevel", allowed: TRACKING_LEVELS });
   }
@@ -425,11 +430,17 @@ async function reserveBatch(ctx, { sessionId, count = 1, quantityPerLabel = null
       "This line is being received as a total with no labels. Switch it to Count & label to print any.",
       { reason: "MODE_IS_TOTAL_ONLY" });
   }
-  const level = str(session.trackingLevel);
+  /* A count opened before the tracking question was removed (1 Oct 2026)
+     may still carry no level. It is set to PACKAGE here — what a printed
+     label with a typed quantity is — rather than refusing the print. */
+  let level = str(session.trackingLevel);
   if (!TRACKING_LEVELS.includes(level)) {
-    throw fail("VALIDATION",
-      "Say what a label on this delivery stands for before printing one.",
-      { field: "trackingLevel", reason: "TRACKING_LEVEL_REQUIRED" });
+    level = TRACKING_LEVEL.PACKAGE;
+    await GoodsReceiptSession.updateOne(
+      { _id: session._id, companyId: ctx.companyId },
+      { $set: { trackingLevel: level, trackingOverrideReason: "Set when labels were printed; the receiving screen no longer asks." } },
+    );
+    session.trackingLevel = level;
   }
 
   const n = Number(count);
@@ -438,46 +449,26 @@ async function reserveBatch(ctx, { sessionId, count = 1, quantityPerLabel = null
 
   /* What one label stands for. One piece is one piece and is never editable;
      everything else is a nominal figure, re-measured when the label goes on. */
-  let per;
-  if (level === TRACKING_LEVEL.INDIVIDUAL) {
-    per = 1;
-  } else {
-    per = Number(quantityPerLabel);
-    if (!Number.isFinite(per) || per <= 0) {
-      throw fail("VALIDATION", `Enter what one label holds, in ${str(session.unit) || "the line's unit"}.`, { field: "quantityPerLabel" });
-    }
-    per = r4(per);
+  /* The typed quantity wins (1 Oct 2026): with the tracking question gone,
+     what one label holds is what the receiver typed. A count opened earlier
+     as INDIVIDUAL still defaults to one piece when nothing is typed. */
+  let per = Number(quantityPerLabel);
+  if (!Number.isFinite(per) || per <= 0) {
+    if (level === TRACKING_LEVEL.INDIVIDUAL) per = 1;
+    else throw fail("VALIDATION", `Enter what one label holds, in ${str(session.unit) || "the line's unit"}.`, { field: "quantityPerLabel" });
   }
+  per = r4(per);
 
-  const { outstanding } = await receivableLine(ctx, { poId: session.purchaseOrderId, lineId: session.poItemId });
-  const labels = await labelsOf(session._id);
-  const t = totalsOf(labels);
+  /* The line must still be receivable — that is the one check kept. */
+  await receivableLine(ctx, { poId: session.purchaseOrderId, lineId: session.poItemId });
 
-  if (level === TRACKING_LEVEL.LOT) {
-    const held = t.applied + t.unresolved;
-    if (held + n > 1) {
-      throw fail("VALIDATION",
-        held >= 1
-          ? "A lot is one label, and this count already has it. Void it to start again, or track this delivery by package instead."
-          : "A lot is one label. Reserve one, carrying the whole counted quantity.",
-        { reason: "LOT_IS_ONE_LABEL" });
-    }
-  }
-
-  /* The headroom, in the line's own terms. Unresolved labels consume it: they
-     were reserved in order to be applied, and treating them as free would let
-     one receiver reserve the line twice over. */
+  /* ── NO BOUND ON WHAT MAY BE PRINTED (1 Oct 2026) ───────────────────────
+     Labels used to be capped at the line's outstanding quantity ("more than
+     the N still outstanding ... no approval workflow") and a LOT count at one
+     label. The owner: a delivery can genuinely exceed the order, so a label
+     for it must be printable; the receipt records what arrived. The batch
+     size is still bounded by MAX_BATCH, and a label is still one identity. */
   const wouldHold = r4(per * n);
-  const heldQty = r4(labels
-    .filter((l) => UNRESOLVED.includes(str(l.identityState)))
-    .reduce((s, l) => s + (Number(l.quantity) || 0), 0));
-  const free = r4(Math.max(0, outstanding - t.counted - heldQty));
-  if (wouldHold - free > QTY_TOL) {
-    throw fail("VALIDATION",
-      `${n} × ${per} ${str(session.unit)} is ${wouldHold} ${str(session.unit)}, more than the ${free} ${str(session.unit)} still outstanding on this line. `
-      + "Receiving more than the outstanding quantity needs an over-receipt approval, and there is no approval workflow in the current system.",
-      { reason: "BATCH_OVER_OUTSTANDING", outstanding: free, requested: wouldHold });
-    }
 
   /* ── THE BLOCK OF NUMBERS, TAKEN ATOMICALLY ───────────────────────────── */
   const advanced = await GoodsReceiptSession.findOneAndUpdate(
@@ -613,9 +604,9 @@ async function applyLabel(ctx, { sessionId, barcodeId, quantity = null } = {}) {
   const level = str(session.trackingLevel);
   let measured;
   let quantityMeasured;
-  if (level === TRACKING_LEVEL.INDIVIDUAL) {
-    /* One label, one piece. A per-piece label claiming two pieces is not a
-       per-piece label, so nothing here is editable. */
+  if (level === TRACKING_LEVEL.INDIVIDUAL && (quantity === null || quantity === undefined || str(quantity) === "" || sameQty(quantity, 1))) {
+    /* One label, one piece, unless the label was printed for more (1 Oct
+       2026: the typed quantity per label wins, whatever the count's level). */
     measured = 1;
     quantityMeasured = true;
   } else if (quantity === null || quantity === undefined || str(quantity) === "") {
@@ -821,6 +812,23 @@ function finalizeBlockers({ session, labels, receivedQuantity, outstanding }) {
   const t = totalsOf(labels);
   const unit = str(session.unit);
 
+  /* ── THE COUNT DOES NOT GATE THE RECEIPT (1 Oct 2026) ───────────────────
+     The receiver types the received quantity, or lets scans add to it; the
+     labels printed here are the line's identities and are activated when the
+     receipt is recorded, whatever they add up to. So no tracking level,
+     nothing-counted, unsettled-label, unmeasured, quantity-mismatch or
+     over-receipt blocker any more — only a duplicate identity, which is a
+     data fault. The old rules return with STORE_PURCHASE_STRICT_COUNT=1. */
+  if (process.env.STORE_PURCHASE_STRICT_COUNT !== "1") {
+    const seen = new Set();
+    for (const l of labels) {
+      const key = String(l._id);
+      if (seen.has(key)) { out.push({ code: "DUPLICATE", message: "One label identity appears twice in this count." }); break; }
+      seen.add(key);
+    }
+    return out;
+  }
+
   if (!TRACKING_LEVELS.includes(str(session.trackingLevel))) {
     out.push({ code: "NO_TRACKING_LEVEL", message: "This count has no tracking level, so what its labels stand for is not recorded." });
   }
@@ -941,8 +949,11 @@ async function activateForReceipt(ctx, { matched = [], goodsReceipt, actor = {} 
     const grnLine = (goodsReceipt.lines || []).find((l) => String(l.poItemId) === String(session.poItemId)) || null;
 
     if (!totalOnly) {
+      /* APPLIED and PRINTED both become live (1 Oct 2026): a printed sticker
+         is on the goods whether or not it was scanned; only a RESERVED
+         identity — never sent to a printer — is voided below. */
       const act = await Barcode.updateMany(
-        { companyId: ctx.companyId, receivingSessionId: session._id, identityState: IDENTITY.APPLIED },
+        { companyId: ctx.companyId, receivingSessionId: session._id, identityState: { $in: [IDENTITY.APPLIED, IDENTITY.PRINTED] } },
         {
           $set: {
             identityState: IDENTITY.ACTIVATED, activatedAt: now,
@@ -959,7 +970,7 @@ async function activateForReceipt(ctx, { matched = [], goodsReceipt, actor = {} 
          arrive, and an identity nobody accounts for is one somebody finds on a
          shelf. */
       const vd = await Barcode.updateMany(
-        { companyId: ctx.companyId, receivingSessionId: session._id, identityState: { $in: UNRESOLVED } },
+        { companyId: ctx.companyId, receivingSessionId: session._id, identityState: IDENTITY.RESERVED },
         {
           $set: {
             identityState: IDENTITY.VOIDED, voidedAt: now, voidedBy: actor.id || null,
@@ -1026,13 +1037,31 @@ async function adoptLabel(ctx, { poId, barcodeId, lineId = null } = {}, actor = 
       { reason: "LABEL_ALREADY_RECEIVED", goodsReceiptNumber: str(label.goodsReceiptNumber) });
   }
   if (label.receivingSessionId) {
-    const other = await GoodsReceiptSession.findOne({ _id: label.receivingSessionId }).select("poNumber poItemId status purchaseOrderId").lean();
+    const other = await GoodsReceiptSession.findOne({ _id: label.receivingSessionId }).select("poNumber poItemId status purchaseOrderId unit itemName variantCombination").lean();
     const here = other && String(other.purchaseOrderId) === String(poId);
+    /* ── THIS ORDER'S OWN PRINTED LABEL, SCANNED IN (1 Oct 2026) ─────────
+       A label printed on this order's own count and not yet counted is
+       counted by the scan — the same act as confirming it inside the panel —
+       and its quantity is what the receiving screen adds to the line. A
+       label already counted is refused, so one sticker never adds twice. */
+    if (here && other.status === SESSION_STATUS.OPEN && UNRESOLVED.includes(state)) {
+      const out = await applyLabel(ctx, { sessionId: other._id, barcodeId, quantity: label.quantity });
+      return {
+        ...out,
+        line: { poItemId: String(other.poItemId), itemName: str(other.itemName), variant: (other.variantCombination || []).map(str).filter(Boolean).join(" · "), unit: str(other.unit) },
+        added: r4(Number(label.quantity) || 0),
+        own: true,
+      };
+    }
+    /* Said with the line and the label's number (1 Oct 2026): after a page
+       reload the screen's own scan list is empty, so "already counted" with
+       nothing on screen read as a fault. The line's figure still carries it. */
+    const where = [str(other?.itemName), (other?.variantCombination || []).map(str).filter(Boolean).join(" · ")].filter(Boolean).join(" · ");
     throw fail("CONFLICT",
       here
-        ? `That label is already counted on this order${other?.status === SESSION_STATUS.OPEN ? "" : " (in a count that is closed)"}.`
+        ? `Label ${label.sessionSequence ?? ""} was already scanned in on ${where || "this line"}${other?.status === SESSION_STATUS.OPEN ? "" : " (in a count that is closed)"} — its ${r4(label.quantity)} ${str(label.unit || other?.unit)} are in that line's count already, even if this screen was reloaded since.`
         : `That label belongs to a count on ${str(other?.poNumber) || "another order"}. Do not count it here.`,
-      { reason: here ? "LABEL_ALREADY_COUNTED" : "LABEL_FROM_ANOTHER_SESSION", poNumber: str(other?.poNumber) });
+      { reason: here ? "LABEL_ALREADY_COUNTED" : "LABEL_FROM_ANOTHER_SESSION", poNumber: str(other?.poNumber), sessionSequence: label.sessionSequence ?? null, line: here ? { poItemId: String(other.poItemId), itemName: str(other.itemName), unit: str(other.unit) } : null });
   }
   if (state !== IDENTITY.ACTIVATED) {
     throw fail("CONFLICT", "That label is not a live material label, so it cannot be taken into a receipt.", { reason: "LABEL_NOT_LIVE", state });
@@ -1169,4 +1198,7 @@ module.exports = {
   reserveBatch, markPrinted, applyLabel, undoLast, voidLabel, resolveScan, cancel, adoptLabel,
   assertCountsAgree, activateForReceipt,
   totalsOf, finalizeBlockers, labelView, sessionView,
+  /* For the customer-material counts (customerMaterialSession.service),
+     which reuse the generic half of this service. */
+  openSession, labelsOf, UNRESOLVED, COUNTED,
 };
