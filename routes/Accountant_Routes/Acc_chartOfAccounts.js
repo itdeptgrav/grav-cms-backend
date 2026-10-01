@@ -34,6 +34,12 @@ const {
 // contactDetails still trigger "no state code" errors on the voucher form.
 const { applyGstAutoState } = require("../../services/gstState.util");
 const openItems = require("../../services/openItems.service");
+/* Used by `POST /ledgers/:id/merge` to decide which party links may be
+   inherited by the surviving ledger. It was called without being imported, so
+   merging two ledgers threw `inheritablePartyLinks is not defined` instead of
+   merging. Acc_approvals.js already imports it from the same module; this file
+   did not. */
+const { inheritablePartyLinks } = require("../../services/partyLinkSafety");
 
 /* Lane A Chunk 3A — canonical company isolation. Every route below that
    names a companyId is checked against req.organization.tallyCompanyIds by
