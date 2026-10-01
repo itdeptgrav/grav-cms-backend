@@ -275,6 +275,34 @@ describe("a technical bundle carries the model and the pattern together", () => 
     expect(read.body.reason).toMatch(/no flat pattern attached/);
   });
 
+  test("a DRAFT with no pattern still reports itself editable", async () => {
+    /* ── THE DEFECT THIS PINS, FOUND BY OPENING THE WORKSPACE ─────────────
+       `editable` was returned only on the branch that HAS a pattern. The
+       workspace reads it to decide whether to offer "Attach the flat pattern",
+       so the one case that needs the control most — a draft with no pattern,
+       which is the normal way a pattern arrives — never showed it. A bundle
+       could only ever receive a pattern in the same request that created it,
+       which is not the order the work happens in. Every route test passed
+       throughout, because they all attached the pattern first. */
+    const w = await world();
+    const created = await publish(w, { pattern: false });
+    const read = await call(patternUrl(created.body.publication.id), w.as);
+    expect(read.body.patternSet).toBe(null);
+    expect(read.body.editable).toBe(true);
+    expect(read.body.state).toBe("DRAFT");
+
+    /* And an approved bundle with no pattern is not editable, on the same
+       branch — so the flag is the state's answer rather than a constant. */
+    const second = await publish(w, { pattern: false });
+    const id = second.body.publication.id;
+    await call(`/api/cms/rnd/garment-models/${id}/submit`, { ...w.as, method: "POST", body: {} });
+    await call(`/api/cms/rnd/garment-models/${id}/approve`, {
+      ...w.asApprover, method: "POST", body: {},
+    });
+    const approved = await call(patternUrl(id), w.as);
+    expect(approved.body.editable).toBe(false);
+  });
+
   test("a pattern can be attached to a draft later, which is the real order of work", async () => {
     const w = await world();
     const created = await publish(w, { pattern: false });

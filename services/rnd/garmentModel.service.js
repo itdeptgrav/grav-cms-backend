@@ -1246,6 +1246,16 @@ async function readPatternSet(ctx, { publicationId, actor = null } = {}) {
       checks: bundle.derivedChecks(row, null, row.bundleWarnings || []),
       measurements: null,
       bundleWarnings: row.bundleWarnings || [],
+      state: row.state,
+      /* ── `editable` BELONGS ON THIS BRANCH TOO ─────────────────────────
+         It was omitted here, and the consequence was precise: the workspace
+         reads `editable` to decide whether to offer "Attach the flat pattern",
+         so a DRAFT bundle with no pattern — the exact case that needs the
+         control most, and the normal way a pattern arrives — never showed it.
+         A bundle could only ever receive a pattern at the moment it was first
+         published, which is not the order the work happens in.
+         Found by opening the thing, which is what a live pass is for. */
+      editable: ![PUBLICATION_STATE.APPROVED, PUBLICATION_STATE.SUPERSEDED].includes(row.state),
       /* Not an error. A bundle without a pattern yet is an ordinary state. */
       reason: "This technical bundle has no flat pattern attached.",
     };
