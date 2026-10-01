@@ -880,6 +880,17 @@ router.put("/:id", async (req, res) => {
     delete updates._id;
     delete updates.createdAt;
 
+    /* DOCUMENTS ARE NOT EDITABLE THROUGH THIS ROUTE.
+       --------------------------------------------------------------------
+       They are files in Drive with a row apiece, written only by
+       POST /:id/documents and DELETE /:id/documents/:docId/files/:fileId.
+       Letting a generic company update $set the array meant any client
+       holding a stale copy could silently destroy every certificate on the
+       company — and one did: the edit dialog seeds its form from the whole
+       document, so pressing Update wiped anything attached since it opened.
+       The client no longer sends it; this makes it impossible to send. */
+    delete updates.documents;
+
     if (updates.isPrimary) {
       await Acc_Company.updateMany(
         { _id: { $ne: req.params.id }, isPrimary: true },
