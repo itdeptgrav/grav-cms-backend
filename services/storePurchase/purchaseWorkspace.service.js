@@ -69,12 +69,16 @@ function scoped(tenant, base, ...orGroups) {
 /* The four adapter stages, including the legacy sourcing view retained for
    callers outside the Purchase Orders screen. */
 const STAGE = Object.freeze({
+  /* Every open stage at once (30 Sep 2026, the owner's default: "by default
+     select for all"). Each source reads all of its stage statuses; the exact
+     status filter then does the narrowing on its own. */
+  ALL: "all",
   TO_SOURCE: "to-source",
   DRAFT: "draft-orders",
   ON_ORDER: "on-order",
   COMPLETED: "completed",
 });
-const STAGES = Object.freeze([STAGE.TO_SOURCE, STAGE.DRAFT, STAGE.ON_ORDER, STAGE.COMPLETED]);
+const STAGES = Object.freeze([STAGE.ALL, STAGE.TO_SOURCE, STAGE.DRAFT, STAGE.ON_ORDER, STAGE.COMPLETED]);
 
 /* What is being bought. Freight is its own kind because a transporter's
    quotation is neither a material nor an outside service. */
@@ -222,7 +226,13 @@ function readQuery(q = {}) {
 
   const inferred = explicitStage ? null : inferredViewFor(poStatus);
   const stage = explicitStage || inferred?.stage || STAGE.TO_SOURCE;
-  const status = explicitStatus || inferred?.status || STATUS_FILTER.OPEN;
+  /* A cancelled (or superseded, withdrawn) order is in no open stage. Asked
+     for by exact status under any stage — the "all" stage above all — it is
+     the closed view that holds it, so that is what is read, rather than an
+     open read that can never match it. */
+  const status = CLOSED_STATUS.includes(poStatus)
+    ? STATUS_FILTER.CLOSED
+    : (explicitStatus || inferred?.status || STATUS_FILTER.OPEN);
   const ordersOnly = str(q.records) === "orders";
 
   return {
@@ -319,9 +329,11 @@ function materialRow(po, { exceptionsByPo = new Map() } = {}) {
     exceptionHref: exception ? "/store/dashboard/operations/purchase-exceptions" : null,
     nextAction: {
       ...action,
-      href: po.status === "DRAFT"
-        ? `/store/dashboard/operations/purchase-order/new-edit-purchase-order/${idOf(po._id)}`
-        : `/store/dashboard/operations/purchase-order/${idOf(po._id)}`,
+      /* Every order — a draft included — opens on its OWN page (30 Sep 2026,
+         the owner: a draft's next step is to issue it, and issuing happens on
+         the order page, not in the editor). The editor is a step away from
+         there ("Edit"), and the register row still offers "Edit draft". */
+      href: `/store/dashboard/operations/purchase-order/${idOf(po._id)}`,
     },
   };
 }
@@ -444,6 +456,7 @@ function statusesFor(map, stage, statusFilter) {
       ? CLOSED_STATUS.filter((st) => !map[st])
       : CLOSED_STATUS;
   }
+  if (stage === STAGE.ALL) return Object.keys(map);
   return Object.entries(map).filter(([, v]) => v === stage).map(([k]) => k);
 }
 
@@ -669,7 +682,7 @@ async function workspace(tenant, ctx, query = {}) {
 
   /* Exceptions are only an indicator, and only where an order could carry one. */
   let exceptionsByPo = new Map();
-  if (wantMaterial && (stage === STAGE.ON_ORDER || stage === STAGE.COMPLETED)) {
+  if (wantMaterial && (stage === STAGE.ALL || stage === STAGE.ON_ORDER || stage === STAGE.COMPLETED)) {
     const ex = await attempt("purchaseExceptions", () => readExceptions(tenant));
     exceptionsByPo = ex.byPo || new Map();
   }
@@ -700,14 +713,14 @@ async function workspace(tenant, ctx, query = {}) {
      sourcing records even in the closed view. Legacy adapter callers can still
      read them; their dedicated sourcing screens and data remain untouched. */
   if (!ordersOnly && !materialOnly && (status === STATUS_FILTER.CLOSED
-      || stage === STAGE.TO_SOURCE || stage === STAGE.DRAFT)) {
+      || stage === STAGE.ALL || stage === STAGE.TO_SOURCE || stage === STAGE.DRAFT)) {
     if (wantMaterial) {
       const out = await attempt("materialOffers", () => readOffers(SupplierOffer, tenant, {
         stage, status, search, asOf, extraSearchFields: ["itemName", "itemSku", "supplierItemCode"],
       }));
       rows = rows.concat((out.rows || [])
         .map((o) => offerRow(o, { purchaseType: TYPE.MATERIAL, asOf, hrefBase: "/store/dashboard/supplier-offers" }))
-        .filter((r) => r.stage === stage || status === STATUS_FILTER.CLOSED));
+        .filter((r) => r.stage === stage || stage === STAGE.ALL || status === STATUS_FILTER.CLOSED));
     }
     if (wantService) {
       const out = await attempt("serviceOffers", () => readOffers(ServiceSupplierOffer, tenant, {
@@ -715,7 +728,7 @@ async function workspace(tenant, ctx, query = {}) {
       }));
       rows = rows.concat((out.rows || [])
         .map((o) => offerRow(o, { purchaseType: TYPE.SERVICE, asOf, hrefBase: "/store/dashboard/supplier-offers/services" }))
-        .filter((r) => r.stage === stage || status === STATUS_FILTER.CLOSED));
+        .filter((r) => r.stage === stage || stage === STAGE.ALL || status === STATUS_FILTER.CLOSED));
     }
     if (wantFreight) {
       const out = await attempt("freightOffers", () => readOffers(FreightOffer, tenant, {
@@ -726,11 +739,11 @@ async function workspace(tenant, ctx, query = {}) {
           purchaseType: TYPE.FREIGHT, asOf,
           registerHref: "/store/dashboard/supplier-offers?subject=freight",
         }))
-        .filter((r) => r.stage === stage || status === STATUS_FILTER.CLOSED));
+        .filter((r) => r.stage === stage || stage === STAGE.ALL || status === STATUS_FILTER.CLOSED));
     }
   }
 
-  if (!ordersOnly && !materialOnly && stage === STAGE.TO_SOURCE && status !== STATUS_FILTER.CLOSED) {
+  if (!ordersOnly && !materialOnly && (stage === STAGE.TO_SOURCE || stage === STAGE.ALL) && status !== STATUS_FILTER.CLOSED) {
     const out = await attempt("sourcingDecisions", async () => {
       const sourcingDecision = require("./sourcingDecision.service");
       const queue = await sourcingDecision.openQueue(ctx, { limit: DECISION_CAP() });
@@ -756,7 +769,7 @@ async function workspace(tenant, ctx, query = {}) {
      is read in the first place; neutralising this line alone changes no test.
      It is kept so that a future source which returns a row for a stage it does
      not belong to cannot put that row under the wrong tab. */
-  if (status === STATUS_FILTER.OPEN) rows = rows.filter((r) => r.stage === stage);
+  if (status === STATUS_FILTER.OPEN && stage !== STAGE.ALL) rows = rows.filter((r) => r.stage === stage);
 
   const totalItems = rows.length;
   const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));

@@ -951,11 +951,28 @@ router.post(
      * gives up with a 500 when it does. One $inc against a unique key cannot
      * hand the same number to two callers. A number in the request body is
      * ignored: numbering is server-owned. */
-    const allocated = await sequences.allocate({
-      companyId: req.tenant.companyId,
-      documentType: "PURCHASE_ORDER",
-      siteId: req.tenant.siteId,
-    });
+    /* ── A NUMBER NOBODY HOLDS (30 Sep 2026) ──────────────────────────────
+       The counter can fall behind the register — orders numbered outside
+       this allocator, a restored backup, a counter row created after the
+       first orders — and then hands out a number that exists, and the save
+       fails on the unique index with a message nobody can act on. So the
+       allocated number is checked against the register and the counter is
+       moved on past every taken number. Bounded: a register with twenty
+       consecutive collisions is a data problem to look at, not to loop on. */
+    let allocated = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      allocated = await sequences.allocate({
+        companyId: req.tenant.companyId,
+        documentType: "PURCHASE_ORDER",
+        siteId: req.tenant.siteId,
+      });
+      const taken = await PurchaseOrder.exists({ poNumber: allocated.number, ...tenantContext.tenantFilter(req.tenant) });
+      if (!taken) break;
+      allocated = null;
+    }
+    if (!allocated) {
+      throw fail("CONFLICT", "A free purchase-order number could not be allocated. The number counter is behind the register; ask a developer to look at it.");
+    }
     const poNumber = allocated.number;
 
     // Build items — looks up baseUnit + per-variant vendor nickname

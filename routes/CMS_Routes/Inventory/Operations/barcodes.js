@@ -373,6 +373,70 @@ router.post("/", async (req, res) => {
 // is when it was bought, the barcode's own `createdAt` is when it was received
 // and labelled, and a delivery can be weeks after an order.
 // ─────────────────────────────────────────────────────────────────────────────
+/* ── WHAT THE PRINTED LABELS OF A MATERIAL ADD UP TO (30 Sep 2026) ────────
+   The material page shows, beside its stock position, the quantity carried by
+   the raw-item labels printed for that material — the owner's request: "the
+   total available qty as per the generated raw item barcode". It is NOT a
+   stock figure: a label is an identity somebody printed, its quantity is what
+   was typed or measured when it was printed, and a sticker that was never
+   applied still counts here. So the answer is split the way the register is:
+   LIVE labels (ACTIVATED, or pre-dating identity states), labels inside an
+   open receiving count (reserved / printed / applied — not live until that
+   receipt is recorded), and voided ones, which are named but never summed.
+   Declared above `/:id` so the literal path wins. */
+router.get("/summary", async (req, res) => {
+  try {
+    const { rawItemId } = req.query;
+    if (!rawItemId || !mongoose.Types.ObjectId.isValid(rawItemId)) {
+      return res.status(400).json({ success: false, message: "Valid rawItemId is required" });
+    }
+    const filter = scopedToCompany(req, { rawItem: rawItemId });
+    const rows = await Barcode.find(filter)
+      .select("variantId variantCombination unit quantity identityState receivingSessionId goodsReceiptId voidedAt")
+      .lean();
+
+    const bucketOf = (b) => {
+      const st = String(b.identityState || "ACTIVATED");
+      if (st === "VOIDED") return "voided";
+      if (st === "ACTIVATED") return "live";
+      return "inCount";
+    };
+    const byUnit = (list) => {
+      const m = new Map();
+      for (const b of list) {
+        const u = String(b.unit || "").trim() || "—";
+        m.set(u, (m.get(u) || 0) + (Number(b.quantity) || 0));
+      }
+      return [...m.entries()].map(([unit, quantity]) => ({ unit, quantity: Math.round(quantity * 10000) / 10000 }));
+    };
+    const buckets = { live: [], inCount: [], voided: [] };
+    for (const b of rows) buckets[bucketOf(b)].push(b);
+
+    const variants = new Map();
+    for (const b of buckets.live) {
+      const key = b.variantId ? String(b.variantId) : "";
+      if (!variants.has(key)) variants.set(key, { variantId: key || null, variant: (b.variantCombination || []).join(" · "), labels: 0, rows: [] });
+      const v = variants.get(key);
+      v.labels += 1;
+      v.rows.push(b);
+    }
+
+    return res.json({
+      success: true,
+      summary: {
+        live: { labels: buckets.live.length, byUnit: byUnit(buckets.live) },
+        inCount: { labels: buckets.inCount.length, byUnit: byUnit(buckets.inCount) },
+        voided: { labels: buckets.voided.length },
+        liveByVariant: [...variants.values()].map((v) => ({ variantId: v.variantId, variant: v.variant, labels: v.labels, byUnit: byUnit(v.rows) })),
+        total: rows.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error summarising barcodes:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {

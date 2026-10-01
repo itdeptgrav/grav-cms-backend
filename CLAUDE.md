@@ -673,6 +673,18 @@ the owner). `materialSetup` no longer counts budget at all unless
 category, intended use or base unit only. The budget-head resolver and the
 requests desk's budget review are untouched.
 
+## Purchase workspace: the `all` stage — 30 Sep 2026
+
+`GET /api/cms/inventory/operations/purchase-orders/workspace?stage=all` is
+the Purchase orders page's default now (owner: "by default select for all";
+the stage is a dropdown there). `purchaseWorkspace.service`: `STAGE.ALL`
+is in `STAGES`; `statusesFor(map, "all", OPEN)` is every status of the map;
+exceptions are read for it; the sourcing-record reads and the per-stage
+backstop filter accept it; and a CLOSED status (`poStatus=CANCELLED`,
+SUPERSEDED, WITHDRAWN) forces `status=closed` whatever the caller sent,
+because an open read can never match a cancelled order. Legacy adapter
+callers that send no stage still default to `to-source`.
+
 ## Receiving: a label printed elsewhere, scanned into the count — 30 Sep 2026
 
 `POST /api/cms/inventory/operations/purchase-orders/:id/labels/adopt`
@@ -891,3 +903,56 @@ the removed row merely linked to. `/purchase-orders/source-mrfs` and its
 `/provenance` endpoint, `governedPurchaseOrder.service.js` and the New Purchase
 Order form's MRF selector are all unchanged. A record appears in the Purchase
 workspace once an actual purchase order exists.
+
+## `GET /api/cms/inventory/barcodes/summary?rawItemId=` — 30 Sep 2026
+
+Declared above `/:id` in `barcodes.js`. What a material's printed labels
+add up to, for the material page: `live` (ACTIVATED or pre-identity-state
+labels: count and quantity by unit), `inCount` (RESERVED / PRINTED / APPLIED
+— inside an open receiving count, not live), `voided` (count only),
+`liveByVariant`, `total`. Company-scoped through `scopedToCompany`, so
+labels that predate company stamping are included. It is a label figure,
+never a stock figure.
+
+A dummy order for testing label adoption, **PO-TEST-LABELS-01**
+(`purchaseorders` 6abd0425cd9b91a4723bb1ee, ISSUED), was inserted directly
+(`scratchpad/create_test_po.js`; the create route requires an MRF chain).
+Its three lines are materials with live printed labels. Cancel it from the
+Purchase orders page when the test is done.
+
+## Purchase orders without a material request — 30 Sep 2026
+
+The owner's draft PO/2026-27/0007 could be written on the form and then
+refused at issue ("carries no purchasing provenance ... cannot be issued"),
+and a new order with no material request could not be created at all
+(`MRF_REQUIRED`). The material-request rule is now OFF unless
+`STORE_PURCHASE_REQUIRE_MRF=1` (`governedPurchaseOrder.service`,
+`MRF_RULE_ON`): `resolveChain` with no `sourceMrfId` returns
+`resolveAdHoc(body)` — the form's own supplier and lines, totals computed
+the way the create route computes each line — and the order is stamped
+`provenancePolicy: AD_HOC_NO_MRF_V1` (a SUPPORTED policy); `assertIssuable`
+lets an ad-hoc order issue, and an UNSTAMPED order (the drafts the legacy
+migration never reached) issue as a historical one. The approval policy,
+the issue capability, the history row and the supplier notification are
+unchanged. Smoke-tested through the API: created PO/2026-27/0008 with no
+request, issued it, deleted it again.
+
+Two things found on the way: the PO number counter (`SpDocumentSequence`)
+was behind the register and handed out PO/2026-27/0004 again, so the
+create route now checks the allocated number against the register and
+moves the counter past every taken number (bounded at twenty); and the
+merchandiser's customer-material `acceptUnit` matched units by strict
+`companyId`, which no unit in the register carries, so every line was
+refused — it now uses `tenantContext.tenantFilter`, the Store's own
+read-through.
+
+**A job-work "order" to test receiving customer material:** the
+customer-supplied-materials document **CSM-2026-0004** (rev 1, ISSUED) on
+the demo job-work file MEF-2026-0005 (order DEMO-JW-ORDER-2026-001, "DEMO
+Job Work uniform shirt", customer Demo Customer Materials Ltd) carries two
+lines — Collar Fusing Woven 17.5 · 100 pcs and SuitingFabric 63/37PC Plain
+Green · 150 Mtr — both materials with live printed labels. Store receives
+it under Receive › Customer-supplied materials
+(`/store/dashboard/operations/customer-materials/6abb34b2ec5bdaf96e5927b3`).
+Issued through `customerMaterial.service` directly
+(`scratchpad/issue_job_work_cm.js`).

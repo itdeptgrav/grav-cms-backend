@@ -937,7 +937,66 @@ async function resolveApproved(tenant, request, body = {}, mrf = null) {
  * The material-request route into an order: the rule the New purchase order
  * form enforces on every material purchase, without exception.
  */
+/**
+ * An order from the form's own supplier and lines, with no material request.
+ *
+ * Only while the material-request rule is off (see MRF_RULE_ON). The figures
+ * are computed exactly as the create route computes each line — quantity ×
+ * rate, item charges (amount or percent of the line), GST per line — so the
+ * header totals agree with the lines the route stores. Nothing is reloaded
+ * from an approval because there is none; that is what the AD_HOC stamp says.
+ */
+function resolveAdHoc(body = {}) {
+  const lines = (Array.isArray(body.items) ? body.items : []).filter((i) => i && i.rawItem);
+  if (!lines.length) {
+    throw fail("VALIDATION", "Add at least one material line to the order.", { field: "items" });
+  }
+  if (!body.vendor || !mongoose.isValidObjectId(String(body.vendor))) {
+    throw fail("VALIDATION", "Choose the supplier this order goes to.", { field: "vendor" });
+  }
+  let subtotal = 0;
+  let taxAmount = 0;
+  const rates = new Set();
+  for (const l of lines) {
+    const qty = Number(l.quantity) || 0;
+    const price = Number(l.unitPrice) || 0;
+    const base = qty * price;
+    const charges = (l.itemCharges || []).filter((c) => c && String(c.label || "").trim() && parseFloat(c.value) > 0)
+      .reduce((s, c) => s + (c.type === "percent" ? (base * (parseFloat(c.value) || 0)) / 100 : (parseFloat(c.value) || 0)), 0);
+    const lineTotal = base + charges;
+    const rate = Number(l.gstRate) || 0;
+    rates.add(rate);
+    subtotal += lineTotal;
+    taxAmount += (lineTotal * rate) / 100;
+  }
+  const shipping = money(body.shippingCharges);
+  const discount = money(body.discount);
+  const customCharges = (Array.isArray(body.customCharges) ? body.customCharges : [])
+    .filter((c) => c && String(c.label || "").trim())
+    .map((c) => ({ label: String(c.label).trim(), amount: money(c.amount) }));
+  const customTotal = customCharges.reduce((s, c) => s + c.amount, 0);
+  const distinct = [...rates];
+  return {
+    adHoc: true,
+    vendorId: String(body.vendor),
+    vendorName: String(body.vendorName || ""),
+    lines,
+    totals: {
+      subtotal: money(subtotal),
+      taxAmount: money(taxAmount),
+      headerTaxRate: distinct.length === 1 ? distinct[0] : 0,
+      shippingCharges: shipping,
+      discount,
+      customCharges,
+      customChargesTotal: money(customTotal),
+      totalAmount: money(subtotal + taxAmount + shipping + customTotal - discount),
+    },
+    provenance: null,
+  };
+}
+
 async function resolveChain(tenant, body = {}) {
+  if (!idOf(body.sourceMrfId) && !MRF_RULE_ON()) return resolveAdHoc(body);
   const mrf = await loadMrf(tenant, body.sourceMrfId);
 
   const shortfall = shortfallLines(mrf);
@@ -1019,6 +1078,19 @@ async function resolveForRequest(tenant, request, body = {}) {
  * Versioned, so a later rule change can be told apart from this one.
  */
 const PROVENANCE_POLICY = "MRF_REQUIRED_V1";
+/* ── THE MATERIAL-REQUEST RULE IS OFF UNLESS ASKED FOR (30 Sep 2026) ────────
+   The owner has asked, more than once, for the Store's gates to go: an order
+   raised on the purchase-order form with no material request behind it was
+   created fine and then refused at issue ("carries no purchasing provenance
+   ... cannot be issued"), which is a form that lets you write what it will not
+   let you send. While STORE_PURCHASE_REQUIRE_MRF is unset:
+     · the form may create an order from its own supplier and lines
+       (`resolveAdHoc`), stamped AD_HOC_NO_MRF_V1, and
+     · an order with no stamp at all — the drafts raised before the rule that
+       the legacy migration never reached — issues as a historical order does.
+   STORE_PURCHASE_REQUIRE_MRF=1 brings the whole rule back, unchanged. */
+const MRF_RULE_ON = () => process.env.STORE_PURCHASE_REQUIRE_MRF === "1";
+const AD_HOC_POLICY = "AD_HOC_NO_MRF_V1";
 
 /**
  * The marker a controlled migration writes onto orders that predate the rule.
@@ -1083,7 +1155,8 @@ function unprovenReason(po) {
  * rules a record was created under; if this code cannot name them, it cannot
  * check them, and it must say so instead of guessing.
  */
-const SUPPORTED_POLICIES = Object.freeze([PROVENANCE_POLICY, LEGACY_POLICY]);
+const SUPPORTED_POLICIES = Object.freeze([PROVENANCE_POLICY, LEGACY_POLICY, AD_HOC_POLICY]);
+const isAdHocOrder = (po) => Boolean(po && po.provenancePolicy === AD_HOC_POLICY);
 const isSupportedPolicy = (p) => SUPPORTED_POLICIES.includes(String(p || ""));
 
 /** A governed order: raised under THIS rule, and carrying its proof. */
@@ -1096,6 +1169,7 @@ const isGovernedOrder = (po) => Boolean(po && po.provenancePolicy === PROVENANCE
  * stored record inside `resolveChain`.
  */
 function provenanceFields(chain) {
+  if (chain?.adHoc) return { provenancePolicy: AD_HOC_POLICY };
   return {
     provenancePolicy: PROVENANCE_POLICY,
     sourceMrfId: chain.provenance.sourceMrfId,
@@ -1133,7 +1207,11 @@ async function assertIssuable(tenant, po) {
   /* Historical orders keep the rules they were raised under — but only if a
      migration said so. */
   if (isLegacyOrder(po)) return { governed: false, legacy: true };
-
+  if (isAdHocOrder(po)) return { governed: false, adHoc: true };
+  if (!isGovernedOrder(po) && !MRF_RULE_ON()) {
+    /* Unstamped, and the rule is off: issued as a historical order is. */
+    return { governed: false, legacy: true, unproven: true };
+  }
   if (!isGovernedOrder(po)) {
     /* Neither governed nor migrated: unproven, and unproven fails closed. */
     throw fail("PROVENANCE_CHANGED", unprovenReason(po), {
@@ -1678,7 +1756,7 @@ async function provenanceSummary(tenant, sourceMrfId) {
 module.exports = {
   resolveChain, resolveForRequest, resolveApproved,
   selectableMrfs, provenanceSummary, SELECTOR_CAP,
-  assertIssuable, isLegacyOrder, isGovernedOrder, provenanceFields,
+  assertIssuable, isLegacyOrder, isGovernedOrder, isAdHocOrder, provenanceFields, resolveAdHoc, MRF_RULE_ON,
   PROVENANCE_POLICY, LEGACY_POLICY, SUPPORTED_POLICIES, isSupportedPolicy,
   PROVENANCE_CUTOVER, unprovenReason,
   loadMrf, loadRequest, shortfallLines, budgetAuthority, supplierOf, orderedQuantities,
