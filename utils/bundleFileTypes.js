@@ -31,6 +31,8 @@
 // a label the server applies after the fact.
 "use strict";
 
+const crypto = require("crypto");
+
 const { inspectGlb, GlbError } = require("./glbInspect");
 const { inspectDxf, DxfError } = require("./dxfInspect");
 
@@ -521,7 +523,17 @@ function routeDroppedFiles(files = []) {
     const name = str(file?.originalname || file?.name);
     try {
       const read = classifyBundleFile(file.buffer, name);
-      routed.push({ ...read, bytes: file.buffer.length, confident: true });
+      routed.push({
+        ...read,
+        bytes: file.buffer.length,
+        /* ── THE CONTENT HASH, COMPUTED ONCE AND CARRIED ────────────────
+           It is what answers "have we had this exact file before" — a question
+           a filename cannot answer, because the same export downloaded twice
+           arrives as `tshirt (1).glb`. The publish path hashes the bytes again
+           when it stores them, and the two must agree. */
+        sha256: crypto.createHash("sha256").update(file.buffer).digest("hex"),
+        confident: true,
+      });
     } catch (err) {
       rejected.push({
         fileName: name,

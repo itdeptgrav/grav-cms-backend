@@ -91,6 +91,12 @@ const uploadPattern = multer({
   limits: { fileSize: models.LIMITS.PATTERN_BYTES, files: 1, fields: 12 },
 }).single("patterns");
 
+/** And one CLO project, the same way. */
+const uploadSource = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: models.LIMITS.SOURCE_BYTES, files: 1, fields: 12 },
+}).single("source");
+
 /* ── CLASSIFYING A DROP, WHICH STORES NOTHING ─────────────────────────────
  * Up to four files at once with no field names, because a drag-and-drop does
  * not have any: the person dropped a folder's worth of exports and the whole
@@ -379,7 +385,18 @@ router.delete("/garment-models/:publicationId/scale-calibration", requireCompany
 router.post("/garment-models/classify", requireCompany, canPublishPattern,
   receiveWith(uploadForClassification, models.LIMITS.SOURCE_BYTES, "up to four bundle files"),
   handle(async (req, res) => {
-    const out = await models.classifyUploads(ctx(req), { files: req.files || [], actor: actor(req) });
+    const out = await models.classifyUploads(ctx(req), {
+      files: req.files || [],
+      actor: actor(req),
+      /* ── TWO OPTIONAL ANSWERS, ASKED FOR RATHER THAN ASSUMED ───────────
+         `styleId` lets the reply say "this exact file is already 3D model 3",
+         which needs the style to scope the question. `geometry` returns the
+         outlines a confirmation preview draws. Both cost something, and a
+         drag-and-drop that only wants to know what the files ARE should not
+         pay for either. */
+      styleId: req.body?.styleId || req.query?.styleId || "",
+      geometry: req.body?.geometry === "1" || req.query?.geometry === "1",
+    });
     return res.json({ success: true, ...out });
   }));
 
@@ -394,6 +411,27 @@ router.put("/garment-models/:publicationId/pattern", requireCompany, canPublishP
   receiveWith(uploadPattern, models.LIMITS.PATTERN_BYTES, "one DXF pattern export"),
   handle(async (req, res) => {
     const out = await models.attachPatternSet(ctx(req), {
+      publicationId: req.params.publicationId,
+      file: req.file,
+      body: req.body || {},
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/**
+ * ATTACH OR REPLACE THE CLO SOURCE ON A DRAFT BUNDLE.
+ *
+ * PUT for the same reason the pattern's route is: a bundle carries at most one
+ * source and sending a second replaces the first. Nothing here parses the file
+ * — see `attachSource` — and there is deliberately no route anywhere on this
+ * mount that claims to read inside a `.zprj`.
+ */
+router.put("/garment-models/:publicationId/source", requireCompany, canPublishPattern,
+  receiveWith(uploadSource, models.LIMITS.SOURCE_BYTES, "one CLO project file"),
+  handle(async (req, res) => {
+    const out = await models.attachSource(ctx(req), {
       publicationId: req.params.publicationId,
       file: req.file,
       body: req.body || {},

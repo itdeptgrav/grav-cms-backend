@@ -495,3 +495,108 @@ Run against the real routes on :3001, the real dev database and the real Drive.
   surrounded by nineteen trims and a 94-node avatar skeleton. So the pattern
   pieces cannot be highlighted individually, and the workspace says so in the
   brief's own words rather than claiming a collar it does not contain.
+
+---
+
+# Phase 3b — the import flow (1 Oct 2026)
+
+Phase 3 could read a pattern. It could not be reached: publishing lived behind a
+panel tab, and a person arriving with a new export had to already know where to
+look. Phase 3b is the door.
+
+## 1. One control, three doors
+
+`Import` sits in the workspace header beside the versions it creates, because
+bringing a file in is the act that produces everything else on that bar. The
+menu's three options are the three kinds, each naming the format it accepts, so
+nobody has to remember which extension goes where.
+
+Three buttons in a 34px bar would be three truncated labels. The menu makes the
+KIND the first decision, which it is anyway — a person knows whether they are
+holding a garment, a pattern or a project file before any picker opens.
+
+## 2. Four steps, none skippable
+
+| Step | What happens |
+|---|---|
+| **Choose** | a picker filtered to the door. The filter is a convenience, never the check |
+| **Check** | the bytes go to the server, which says what the file IS. Nothing is stored |
+| **Confirm** | classification, counts, units, axis, warnings — and the file **drawn** |
+| **Import** | uploaded with progress, saved as a **draft** |
+
+The preview is the confirmation, not a decoration. Twenty meshes and five pieces
+can be true of the wrong file, and a person who exported three times this
+morning cannot tell `tshirt_v2.glb` from `tshirt_v2 (1).glb` by its triangle
+count. The 3D half mounts the real engine against an object URL, so it also
+proves the file LOADS in this browser — a model that would fail after upload
+fails here instead, with the person still holding the file.
+
+## 3. Units and axis, said as the formats actually say them
+
+A DXF states its unit and that statement is quoted. **glTF does not.** The
+format specifies Y-up, right-handed and metres, and none of it is written in the
+file — so reporting "Y-up, metres" as though this export declared it would be
+presenting a specification as a measurement. It matters because garment
+exporters routinely are not in metres. The screen says which is which and asks
+the publisher for the real unit.
+
+## 4. Where an import lands
+
+| Door | Destination |
+|---|---|
+| 3D garment | always a **new draft bundle** |
+| Pattern / source, open draft | **attached** to it |
+| Pattern / source, all accepted | a **new draft around the accepted model**, carried forward |
+
+Carrying forward references the same stored object — same bytes, same hash — so
+"is this the model that was approved" has the same answer on both bundles, and a
+40MB re-upload is not demanded to add a 66KB pattern. The row records which
+bundle it came from and the version list labels it **3D carried forward**.
+
+Nothing in the import submits or approves. An import ends at a draft.
+
+## 5. The ZPRJ door exists to not read the file
+
+No preview, no piece count, no extracted metadata, and no "0 items" placeholder
+implying a reading was attempted and came back empty. What is shown is the name,
+the size, the hash and **how the file was identified** — by archive signature,
+or by exclusion. CLO's container is not a published format; this server does not
+open one and does not pretend to.
+
+## 6. Duplicates are reported, never refused
+
+Judged on content, not filename: the same export downloaded twice arrives as
+`tshirt (1).glb`. Scoped to the style, because the same geometry legitimately
+appears on two garments. And it is a statement rather than a refusal —
+re-importing deliberately is legitimate, and only the person knows whether this
+is that.
+
+## 7. What opening it found
+
+Five defects, none visible in a test:
+
+1. **`str()` is a backend helper**, and `runImport` called it. A ReferenceError
+   the instant the button was pressed: no request, no error, nothing. The
+   repository has no ESLint config, so `no-undef` never ran.
+2. **The 3D preview rebuilt its engine on every render.** The effect's
+   dependency list held the parent's inline callbacks, so loads raced and the
+   surviving canvas belonged to a disposed engine — "Drag to turn" over an empty
+   grey rectangle.
+3. **The version name was asked for on an attach and discarded.** You are adding
+   to a version, not creating one; it is no longer asked for.
+4. **Notes were collected and dropped** on both attach paths. They are recorded
+   now, and appended rather than overwritten — the earlier explanation is the
+   history.
+5. **The pattern sheet's empty state asked for the 3D model**, a file it has no
+   card for.
+
+## 8. Not verified, and why
+
+**No genuine `.zprj` was available.** The source door was exercised with a
+ZIP-signature stand-in, which proves the door, the attach path, the metadata
+panel and the refusal of every other format — and does not prove anything about
+real CLO container bytes, because nothing in this system reads them.
+
+**Progress states were not observed on a small file.** A 66KB DXF uploads faster
+than a frame; the sending/server phases are exercised by the 19.2MB GLB and by
+tests, not by watching the DXF.

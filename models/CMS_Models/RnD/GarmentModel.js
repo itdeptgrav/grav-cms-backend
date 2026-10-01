@@ -953,6 +953,15 @@ const publicationSchema = new mongoose.Schema({
      person who publishes is rarely the person who later reads it. */
   bundleWarnings: { type: mongoose.Schema.Types.Mixed, default: [] },
 
+  /* ── WHERE THIS BUNDLE'S 3D MODEL CAME FROM, WHEN IT WAS NOT UPLOADED ──
+     A pattern can be imported onto a style whose every bundle is already
+     accepted. Rather than demand a 40MB re-upload of a model that is already
+     on record, a new draft references the accepted one — same stored object,
+     same bytes, same hash. This names the bundle it came out of, so a reader
+     can see that the 3D half of this draft is the accepted model rather than a
+     new export, and a warning on the row says the same thing in words. */
+  carriedModelFromRef: { type: String, trim: true, default: "" },
+
   /* ── WHAT ONE MODEL UNIT IS REALLY WORTH, IF ANYBODY HAS CHECKED ──────
      Somebody measured a distance they already knew — a placket length off
      the approved spec, a printed scale bar — and said what it really is.

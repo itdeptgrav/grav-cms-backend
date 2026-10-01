@@ -92,6 +92,30 @@ const cloProject = () => Buffer.concat([
   crypto.randomBytes(256),
 ]);
 
+/** A second, different apparel DXF — for "same name, different bytes". */
+function richApparelDxf() {
+  const pairs = (list) => list.map(([c, v]) => `${c}\n${v}`).join("\n");
+  return Buffer.from(pairs([
+    ["0", "SECTION"], ["2", "HEADER"], ["9", "$ACADVER"], ["1", "AC1006"], ["0", "ENDSEC"],
+    ["0", "SECTION"], ["2", "BLOCKS"],
+    ["0", "BLOCK"], ["8", "0"], ["2", "FrontBodice_M"], ["70", "64"], ["10", "0"], ["20", "0"],
+    ["0", "TEXT"], ["8", "15"], ["10", "0"], ["20", "0"], ["1", "PIECE NAME: Front Bodice"],
+    ["0", "TEXT"], ["8", "15"], ["10", "0"], ["20", "0"], ["1", "SIZE: M"],
+    ["0", "POLYLINE"], ["8", "1"], ["66", "1"], ["70", "1"],
+    ["0", "VERTEX"], ["8", "1"], ["10", "0"], ["20", "0"],
+    ["0", "VERTEX"], ["8", "1"], ["10", "220"], ["20", "0"],
+    ["0", "VERTEX"], ["8", "1"], ["10", "220"], ["20", "300"],
+    ["0", "VERTEX"], ["8", "1"], ["10", "0"], ["20", "300"],
+    ["0", "SEQEND"], ["8", "1"],
+    ["0", "LINE"], ["8", "7"], ["10", "100"], ["20", "50"], ["11", "100"], ["21", "250"],
+    ["0", "ENDBLK"], ["8", "0"], ["0", "ENDSEC"],
+    ["0", "SECTION"], ["2", "ENTITIES"],
+    ["0", "INSERT"], ["8", "1"], ["2", "FrontBodice_M"], ["10", "0"], ["20", "0"],
+    ["0", "TEXT"], ["8", "15"], ["10", "0"], ["20", "0"], ["1", "UNITS: METRIC"],
+    ["0", "ENDSEC"], ["0", "EOF"],
+  ]), "latin1");
+}
+
 function buildGlb(gltf) {
   const json = Buffer.from(JSON.stringify(gltf), "utf8");
   const pad = (4 - (json.length % 4)) % 4;
@@ -353,6 +377,316 @@ describe("a technical bundle carries the model and the pattern together", () => 
     expect(r.status).toBe(415);
     expect(r.body.error.code).toBe("BUNDLE_FILE_MISMATCH");
     expect(r.body.message).toMatch(/3D garment model card/);
+  });
+});
+
+/* ═══ 1b · THE IMPORT FLOW ═════════════════════════════════════════════════
+ *
+ * Every import lands as a DRAFT and never touches the accepted bundle. The
+ * three doors are the three file kinds, and each has to work from the state the
+ * workspace is actually in — including the state where everything is approved,
+ * which is the one a pattern import meets most often.
+ */
+
+describe("an import is always a draft, and never replaces what was accepted", () => {
+  async function approvedBundle(w, options = {}) {
+    const created = await publish(w, options);
+    const id = created.body.publication.id;
+    await call(`/api/cms/rnd/garment-models/${id}/submit`, { ...w.as, method: "POST", body: {} });
+    const decided = await call(`/api/cms/rnd/garment-models/${id}/approve`, {
+      ...w.asApprover, method: "POST", body: {},
+    });
+    expect(decided.status).toBe(200);
+    return id;
+  }
+
+  test("importing a 3D garment opens a new draft and leaves the approved one alone", async () => {
+    const w = await world();
+    const approvedId = await approvedBundle(w, { pattern: true });
+
+    const second = await publish(w);
+    expect(second.status).toBe(201);
+    expect(second.body.publication.state).toBe("DRAFT");
+    expect(second.body.publication.modelNumber).toBe(2);
+
+    /* The accepted bundle is untouched until the NEW one is accepted. */
+    const old = await call(`/api/cms/rnd/garment-models/${approvedId}`, w.as);
+    expect(old.body.publication.state).toBe("APPROVED");
+  });
+
+  test("a pattern can be imported when every bundle is accepted, by carrying the model", async () => {
+    /* The state a pattern import meets most often. Refusing it would mean
+       telling somebody to re-upload a 40MB model they already published, to
+       add a 66KB pattern. */
+    const w = await world();
+    const approvedId = await approvedBundle(w);
+    const approved = await call(`/api/cms/rnd/garment-models/${approvedId}`, w.as);
+    const approvedHash = approved.body.publication.files.webModel.sha256;
+
+    const form = new FormData();
+    form.append("patterns", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    form.append("carryModelFrom", approvedId);
+    form.append("unit", "in");
+    const r = await call(w.styleUrl, { ...w.as, method: "POST", form });
+
+    expect(r.status).toBe(201);
+    const p = r.body.publication;
+    expect(p.state).toBe("DRAFT");
+    expect(p.bundle.hasPattern).toBe(true);
+    expect(p.bundle.carriedModelFromRef).toBe(approved.body.publication.publicationRef);
+    /* The SAME bytes — which is what keeps "is this the model that was
+       approved" answerable on both bundles. */
+    expect(p.files.webModel.sha256).toBe(approvedHash);
+    expect(p.warnings.map((x) => x.code)).toContain("MODEL_CARRIED_FORWARD");
+
+    const still = await call(`/api/cms/rnd/garment-models/${approvedId}`, w.as);
+    expect(still.body.publication.state).toBe("APPROVED");
+  });
+
+  test("carrying forward from a bundle with no model is refused with the fix", async () => {
+    const w = await world();
+    const form = new FormData();
+    form.append("patterns", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    form.append("carryModelFrom", String(new mongoose.Types.ObjectId()));
+    const r = await call(w.styleUrl, { ...w.as, method: "POST", form });
+    expect(r.status).toBe(404);
+  });
+
+  test("a bundle still cannot be created with no model at all", async () => {
+    const w = await world();
+    const form = new FormData();
+    form.append("patterns", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    const r = await call(w.styleUrl, { ...w.as, method: "POST", form });
+    expect(r.status).toBe(400);
+    expect(r.body.error.code).toBe("MODEL_WEB_FILE_REQUIRED");
+  });
+
+  test("a CLO source can be attached to a draft, and is never parsed", async () => {
+    const w = await world();
+    const created = await publish(w, { source: false });
+    const id = created.body.publication.id;
+    expect(created.body.publication.bundle.hasSource).toBe(false);
+    expect(created.body.publication.warnings.map((x) => x.code)).toContain("NO_CLO_SOURCE");
+
+    const form = new FormData();
+    form.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "tee.zprj");
+    form.append("cloVersion", "CLO 7.3.154");
+    const r = await call(`/api/cms/rnd/garment-models/${id}/source`, { ...w.as, method: "PUT", form });
+
+    expect(r.status).toBe(200);
+    expect(r.body.replaced).toBe(false);
+    expect(r.body.publication.bundle.hasSource).toBe(true);
+    expect(r.body.publication.files.source.name).toBe("tee.zprj");
+    expect(r.body.publication.files.source.sha256).toMatch(/^[0-9a-f]{64}$/);
+    /* The warning that said there was no source stops being true. */
+    expect(r.body.publication.warnings.map((x) => x.code)).not.toContain("NO_CLO_SOURCE");
+
+    /* ── AND NOTHING CLAIMS TO HAVE READ INSIDE IT ────────────────────────
+       No piece list, no geometry, no parsed metadata — only what the bytes
+       weigh, what they hash to, and what the person said. */
+    const serialised = JSON.stringify(r.body);
+    expect(serialised).not.toMatch(/zprjPieces|sourcePieces|parsedSource/);
+  });
+
+  test("what somebody says about an attach is recorded, and appended", async () => {
+    /* The import screen asks "what changed, and why" on every door. It was
+       being sent and dropped on the two attach paths, so the one place the
+       answer was asked for was the one place it went nowhere. */
+    const w = await world();
+    const created = await publish(w, { source: false });
+    const id = created.body.publication.id;
+
+    const first = new FormData();
+    first.append("patterns", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    first.append("note", "Re-graded the sleeve head.");
+    await call(patternUrl(id), { ...w.as, method: "PUT", form: first });
+
+    const second = new FormData();
+    second.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "tee.zprj");
+    second.append("note", "Project file from the same export.");
+    const r = await call(`/api/cms/rnd/garment-models/${id}/source`, { ...w.as, method: "PUT", form: second });
+
+    const note = r.body.publication.manifest.note;
+    /* BOTH survive: the earlier explanation is the history, and overwriting it
+       would leave only the most recent — exactly backwards. */
+    expect(note).toMatch(/Pattern attached: Re-graded the sleeve head\./);
+    expect(note).toMatch(/CLO source attached: Project file from the same export\./);
+  });
+
+  test("an attach with no note leaves an existing one alone", async () => {
+    const w = await world();
+    const created = await publish(w, { source: false, fields: {} });
+    const id = created.body.publication.id;
+
+    const withNote = new FormData();
+    withNote.append("patterns", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    withNote.append("note", "Keep me.");
+    await call(patternUrl(id), { ...w.as, method: "PUT", form: withNote });
+
+    const silent = new FormData();
+    silent.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "tee.zprj");
+    const r = await call(`/api/cms/rnd/garment-models/${id}/source`, { ...w.as, method: "PUT", form: silent });
+    expect(r.body.publication.manifest.note).toMatch(/Keep me\./);
+  });
+
+  test("replacing the source replaces it rather than appending a second", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    const form = new FormData();
+    form.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "v2.zprj");
+    const r = await call(`/api/cms/rnd/garment-models/${id}/source`, { ...w.as, method: "PUT", form });
+    expect(r.body.replaced).toBe(true);
+
+    const row = await GarmentModelPublication.findById(id).lean();
+    expect(row.assets.filter((a) => a.kind === "source")).toHaveLength(1);
+  });
+
+  test("a renamed file on the source door is refused by its contents", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const form = new FormData();
+    form.append("source", new Blob([cloDxf()], { type: "application/octet-stream" }), "tee.zprj");
+    const r = await call(`/api/cms/rnd/garment-models/${created.body.publication.id}/source`, {
+      ...w.as, method: "PUT", form,
+    });
+    expect(r.status).toBe(415);
+    expect(r.body.error.code).toBe("BUNDLE_FILE_MISMATCH");
+  });
+
+  test("an accepted bundle takes no source either", async () => {
+    const w = await world();
+    const id = await approvedBundle(w);
+    const form = new FormData();
+    form.append("source", new Blob([cloProject()], { type: "application/octet-stream" }), "tee.zprj");
+    const r = await call(`/api/cms/rnd/garment-models/${id}/source`, { ...w.as, method: "PUT", form });
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("MODEL_STATE_CONFLICT");
+  });
+
+  test("a bundle says which of the three things it actually contains", async () => {
+    const w = await world();
+    const bare = await publish(w, { source: false });
+    expect(bare.body.publication.bundle.contains).toEqual(["model"]);
+
+    const full = await publish(w, { pattern: true, source: true });
+    expect(full.body.publication.bundle.contains.sort()).toEqual(["model", "pattern", "source"]);
+  });
+});
+
+/* ═══ 1c · THE CONFIRMATION STEP'S OWN DATA ════════════════════════════════ */
+
+describe("what the confirmation step is given before anything is stored", () => {
+  const classifyUrl = "/api/cms/rnd/garment-models/classify";
+
+  test("geometry for the 2D preview arrives only when it is asked for", async () => {
+    const w = await world();
+
+    const without = new FormData();
+    without.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    const lean = await call(classifyUrl, { ...w.as, method: "POST", form: without });
+    expect(lean.body.files[0].preview).toBe(null);
+
+    const withGeometry = new FormData();
+    withGeometry.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    withGeometry.append("geometry", "1");
+    const full = await call(classifyUrl, { ...w.as, method: "POST", form: withGeometry });
+
+    const preview = full.body.files[0].preview;
+    expect(preview).toBeTruthy();
+    expect(preview.pieceCount).toBe(5);
+    expect(preview.truncated).toBe(false);
+    expect(preview.unit).toBe("in");
+    expect(preview.scaleVerified).toBe(true);
+
+    /* Everything the preview has to DRAW: outlines, grain, and the marks a
+       person checks before committing. */
+    const piece = preview.pieces[0];
+    expect(piece.outline.length).toBe(125);
+    expect(piece.outlineClosed).toBe(true);
+    expect(piece.grainline.direction).toBe("lengthwise");
+    expect(piece.internalLines.length).toBe(4);
+    expect(Array.isArray(piece.notches)).toBe(true);
+    /* A preview ref, not a stored one — nothing has been ingested yet. */
+    expect(piece.pieceRef).toBe("preview-0");
+  });
+
+  test("a GLB reports its axis as the format's guarantee, not as its own claim", async () => {
+    const w = await world();
+    const form = new FormData();
+    form.append("files", new Blob([namedGlb()], { type: "model/gltf-binary" }), "tee.glb");
+    const r = await call(classifyUrl, { ...w.as, method: "POST", form });
+
+    const summary = r.body.files[0].summary;
+    expect(summary.axis).toBe("Y-up, right-handed");
+    expect(summary.axisSource).toMatch(/specification — not stated in the file/);
+    /* And the unit is EMPTY, with the reason — because glTF states none and
+       garment exporters routinely are not in metres. */
+    expect(summary.unit).toBe("");
+    expect(summary.unitNote).toMatch(/glTF declares no unit/);
+    expect(summary.unitNote).toMatch(/frequently do not honour/);
+    expect(summary.meshes).toBe(3);
+    expect(summary.gltfVersion).toBe("2.0");
+  });
+
+  test("the same file imported twice into one style is reported as a duplicate", async () => {
+    const w = await world();
+    const created = await publish(w, { pattern: true });
+    const ref = created.body.publication.publicationRef;
+
+    const form = new FormData();
+    form.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "a-different-name.dxf");
+    form.append("styleId", String(w.style._id));
+    const r = await call(classifyUrl, { ...w.as, method: "POST", form });
+
+    const entry = r.body.files[0];
+    expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(entry.duplicateOf).toBeTruthy();
+    expect(entry.duplicateOf.publicationRef).toBe(ref);
+    expect(entry.duplicateOf.kind).toBe("pattern");
+    /* Reported, NOT refused: re-importing deliberately is legitimate and only
+       the person knows whether this is that. */
+    expect(r.body.rejected).toHaveLength(0);
+  });
+
+  test("a duplicate is judged on contents, not on the filename", async () => {
+    const w = await world();
+    await publish(w, { pattern: true });
+
+    /* Same bytes, different name — still a duplicate. */
+    const same = new FormData();
+    same.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "tshirt (1).dxf");
+    same.append("styleId", String(w.style._id));
+    const dup = await call(classifyUrl, { ...w.as, method: "POST", form: same });
+    expect(dup.body.files[0].duplicateOf).toBeTruthy();
+
+    /* Different bytes, SAME name — not a duplicate. */
+    const other = new FormData();
+    other.append("files", new Blob([richApparelDxf()], { type: "application/dxf" }), "tee.dxf");
+    other.append("styleId", String(w.style._id));
+    const fresh = await call(classifyUrl, { ...w.as, method: "POST", form: other });
+    expect(fresh.body.files[0].duplicateOf).toBe(null);
+  });
+
+  test("duplicates are scoped to the style, because the same geometry may be reused", async () => {
+    const w = await world();
+    const other = await world();
+    await publish(w, { pattern: true });
+
+    const form = new FormData();
+    form.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    form.append("styleId", String(other.style._id));
+    const r = await call(classifyUrl, { ...other.as, method: "POST", form });
+    expect(r.body.files[0].duplicateOf).toBe(null);
+  });
+
+  test("without a style, no duplicate claim is made at all", async () => {
+    const w = await world();
+    await publish(w, { pattern: true });
+    const form = new FormData();
+    form.append("files", new Blob([cloDxf()], { type: "application/dxf" }), "tee.dxf");
+    const r = await call(classifyUrl, { ...w.as, method: "POST", form });
+    expect(r.body.files[0].duplicateOf).toBe(null);
   });
 });
 

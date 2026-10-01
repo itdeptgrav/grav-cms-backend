@@ -322,6 +322,15 @@ function publicationView(row, { subject = "", links = false, mayDownloadSource =
       declaredPatternRevision: str(row.declaredPatternRevision),
       hasPattern: Boolean(row.patternSet),
       hasSource: Boolean(assetMeta(row, ASSET_KIND.SOURCE)),
+      /* Which of the three a reader will actually find in this bundle, so the
+         version list can label a draft by what it contains rather than by what
+         it is called. */
+      contains: [
+        assetMeta(row, ASSET_KIND.WEB_MODEL) ? "model" : null,
+        row.patternSet ? "pattern" : null,
+        assetMeta(row, ASSET_KIND.SOURCE) ? "source" : null,
+      ].filter(Boolean),
+      carriedModelFromRef: str(row.carriedModelFromRef),
       patternSetRef: str(row.patternSet?.patternSetRef),
       patternClassification: str(row.patternSet?.classification),
       patternPieces: row.patternSet?.stats?.pieces ?? 0,
@@ -596,6 +605,32 @@ function warningsFor(read, { sourceFile }) {
 }
 
 /**
+ * The warnings a carried-forward model keeps.
+ *
+ * Everything the earlier parse recorded about the FILE still holds — it is the
+ * same file. What changes is the bundle around it, so the source warning is
+ * recomputed against this bundle's own source and a line is added saying the
+ * model was not re-exported, because a reader looking at a draft is entitled to
+ * know which half of it is new.
+ */
+function carriedWarnings(carried, { sourceFile }) {
+  const kept = (carried.previous.warnings || []).filter((w) => w.code !== "NO_CLO_SOURCE");
+  if (!sourceFile && !(carried.previous.assets || []).some((a) => a.kind === ASSET_KIND.SOURCE)) {
+    kept.push({
+      code: "NO_CLO_SOURCE",
+      message: "No CLO project file was attached, so this publication cannot be reproduced from source.",
+    });
+  }
+  kept.push({
+    code: "MODEL_CARRIED_FORWARD",
+    message: `The 3D model in this draft is the one accepted as ${carried.previous.publicationRef} `
+      + `(3D model ${carried.previous.modelNumber}), not a new export. It is the same file, byte for `
+      + "byte. Import a 3D garment if the model itself has changed.",
+  });
+  return kept;
+}
+
+/**
  * CREATE A DRAFT PUBLICATION.
  *
  * Idempotent in the only sense that matters here: the model number is taken
@@ -611,8 +646,35 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
   const previewFile = files.preview?.[0] || null;
   const patternFile = files.patterns?.[0] || files.pattern?.[0] || null;
 
-  const read = readWebModel(webFile);
+  /* ── A DRAFT THAT CARRIES THE LAST ACCEPTED MODEL FORWARD ──────────────
+     The import flow has to be able to say "save this as a draft" for a PATTERN
+     too, and a bundle cannot exist without a model. When every bundle on the
+     style is already accepted there is no draft to attach to, and the honest
+     options are to refuse — telling somebody to re-upload a 40MB model they
+     have already published, to add a 66KB pattern — or to open a new draft
+     around the model that is already on record.
+     This is the second. The same stored object is referenced, so the bytes are
+     not duplicated and the hash is unchanged, which is what makes "is this the
+     model that was approved" still answerable. It is recorded as carried
+     forward rather than uploaded, because those are different acts. */
+  const carryFrom = str(body.carryModelFrom);
+  let carried = null;
+  if (!webFile && carryFrom) {
+    const previous = await publicationForCompany(ctx, carryFrom, { lean: true });
+    const previousModel = (previous.assets || []).find((a) => a.kind === ASSET_KIND.WEB_MODEL);
+    if (!previousModel) {
+      throw fail("MODEL_WEB_FILE_REQUIRED",
+        "That bundle has no 3D model to carry forward. Import a 3D garment instead.");
+    }
+    carried = { previous, asset: previousModel };
+  }
+
+  const read = carried ? null : readWebModel(webFile);
   assertSourceFile(sourceFile);
+  if (!read && !carried) {
+    throw fail("MODEL_WEB_FILE_REQUIRED",
+      "A publication needs the web-viewable model. Export it from CLO as GLB.");
+  }
   /* Parsed BEFORE anything is stored, so a pattern that cannot be read refuses
      the publication rather than leaving a bundle with an unreadable file in
      it. The same discipline the web model has had since Phase 1. */
@@ -660,6 +722,23 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
   };
 
   await upload(webFile, ASSET_KIND.WEB_MODEL, "web");
+  /* ── A CARRIED MODEL IS REFERENCED, NOT RE-UPLOADED ────────────────────
+     The same stored object, the same bytes, the same hash — so "is this the
+     model that was approved" has the same answer on both bundles, which is the
+     whole point of carrying it rather than asking for it again. Its own upload
+     time travels with it, because the model did not arrive now and the
+     out-of-step check must not think it did. */
+  if (carried) {
+    stored.push({
+      kind: ASSET_KIND.WEB_MODEL,
+      driveFileId: carried.asset.driveFileId,
+      name: carried.asset.name,
+      mimeType: carried.asset.mimeType,
+      bytes: carried.asset.bytes,
+      sha256: carried.asset.sha256,
+      uploadedAt: carried.asset.uploadedAt || carried.previous.createdAt || new Date(),
+    });
+  }
   await upload(sourceFile, ASSET_KIND.SOURCE, "source");
   await upload(previewFile, ASSET_KIND.PREVIEW, "preview");
   await upload(patternFile, ASSET_KIND.PATTERN, "pattern");
@@ -687,22 +766,31 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
       unitScale: num(body.unitScale),
       upAxis: ["Y", "Z"].includes(str(body.upAxis)) ? str(body.upAxis) : "",
       handedness: ["right", "left"].includes(str(body.handedness)) ? str(body.handedness) : "",
-      sourceFileName: str(sourceFile?.originalname),
+      sourceFileName: str(sourceFile?.originalname) || str(carried?.previous.manifest?.sourceFileName),
       note: clean(body.note, 2000),
-      /* …and read from the file where the file already knows. */
-      generator: read.manifest.generator,
-      gltfVersion: read.manifest.gltfVersion,
-      extensionsUsed: read.manifest.extensionsUsed,
-      extensionsRequired: read.manifest.extensionsRequired,
+      /* …and read from the file where the file already knows — or taken from
+         the bundle this model was carried out of, which parsed it already. */
+      generator: read ? read.manifest.generator : str(carried.previous.manifest?.generator),
+      gltfVersion: read ? read.manifest.gltfVersion : str(carried.previous.manifest?.gltfVersion),
+      extensionsUsed: read ? read.manifest.extensionsUsed : (carried.previous.manifest?.extensionsUsed || []),
+      extensionsRequired: read
+        ? read.manifest.extensionsRequired : (carried.previous.manifest?.extensionsRequired || []),
     },
-    structure: read.structure,
-    stats: { ...read.stats, namedPieces: read.namedPieces },
-    hasAvatar: read.hasAvatar,
-    avatarNodeRefs: read.avatarNodeRefs,
+    structure: read ? read.structure : (carried.previous.structure || []),
+    stats: read
+      ? { ...read.stats, namedPieces: read.namedPieces }
+      : { ...(carried.previous.stats || {}) },
+    hasAvatar: read ? read.hasAvatar : Boolean(carried.previous.hasAvatar),
+    avatarNodeRefs: read ? read.avatarNodeRefs : (carried.previous.avatarNodeRefs || []),
     technicalRevisionRef: str(technicalPack?.technicalRevisionRef),
     /* Stored, not just returned. The person who publishes a model is rarely
        the person who later wonders why the fabric looks grey. */
-    warnings: warningsFor(read, { sourceFile }),
+    warnings: read
+      ? warningsFor(read, { sourceFile })
+      : carriedWarnings(carried, { sourceFile }),
+    /* Which bundle this model came out of, so a reader can see that the 3D
+       half of this draft was not re-exported — it is the accepted one. */
+    carriedModelFromRef: carried ? carried.previous.publicationRef : "",
 
     /* ── THE BUNDLE'S OTHER TWO HALVES ──────────────────────────────────── */
     patternSet: patternRead
@@ -730,8 +818,11 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
     /* Not refusals, and not hidden either. A publication nobody can anchor a
        named construction marker to is still worth looking at; what it cannot
        do is carry a full technical record, and the publisher is told now
-       rather than finding out from a marker that names nothing. */
-    warnings: warningsFor(read, { sourceFile }),
+       rather than finding out from a marker that names nothing.
+       Read back off the row rather than recomputed: a carried-forward model
+       has no fresh parse to compute them from, and the row already holds the
+       answer that was stored. */
+    warnings: row.warnings || [],
     patternWarnings: patternRead?.warnings || [],
     bundleWarnings: row.bundleWarnings || [],
     /* What the file turned out to be, echoed back so the screen can state the
@@ -792,17 +883,22 @@ function readPatternFile(file) {
  * It is also what makes a multi-file drop routable: each file is identified with
  * no declared kind, which is exactly the situation a drop creates.
  */
-async function classifyUploads(ctx, { files = [], actor = null } = {}) {
+async function classifyUploads(ctx, { files = [], styleId = "", actor = null, geometry = false } = {}) {
   assertContext(ctx);
   const flat = Array.isArray(files) ? files : Object.values(files || {}).flat();
   if (!flat.length) throw fail("VALIDATION", "No files were attached to classify.");
 
   const routed = routeDroppedFiles(flat);
 
-  /* The heavy parse output is deliberately NOT returned. The screen needs the
-     classification, the counts and the warnings to show a confirmation card;
-     sending a megabyte of parsed outlines for a file that may never be
-     published would make the preflight cost more than the publish. */
+  /* ── HAS THIS EXACT FILE BEEN PUBLISHED HERE ALREADY? ──────────────────
+     Answered by CONTENT, not by filename: `tshirt_final_v2.glb` and
+     `tshirt_FINAL.glb` are the same upload if their bytes hash the same, and
+     a filename comparison would miss it every time somebody re-downloads
+     their own export. Reported rather than refused — re-importing a file
+     deliberately is legitimate (a draft was returned, a bundle needs rebuilding
+     around it) and only the person knows which case they are in. */
+  const seen = styleId ? await publishedHashes(ctx, styleId) : new Map();
+
   return {
     files: routed.routed.map((entry) => ({
       fileName: entry.fileName,
@@ -813,7 +909,18 @@ async function classifyUploads(ctx, { files = [], actor = null } = {}) {
       label: entry.label,
       detail: entry.detail,
       warnings: entry.warnings || [],
+      sha256: entry.sha256 || "",
+      duplicateOf: seen.get(entry.sha256) || null,
       /* The facts a person checks before publishing, and nothing else. */
+      /* ── THE PREVIEW'S GEOMETRY, ON REQUEST ──────────────────────────
+         Originally withheld: sending a megabyte of outlines for a file that
+         may never be published made the preflight cost more than the publish.
+         The import flow changed that calculus — a person confirming a pattern
+         has to SEE the pieces, their grainlines and their notches before
+         committing, and a preview drawn from anything other than the server's
+         own parse would be a different pattern from the one that gets stored.
+         So it is returned when asked for, and only when asked for. */
+      preview: (geometry && entry.pattern) ? patternPreview(entry.pattern) : null,
       summary: entry.pattern ? {
         apparel: entry.pattern.apparel,
         pieces: entry.pattern.stats.pieces,
@@ -840,9 +947,29 @@ async function classifyUploads(ctx, { files = [], actor = null } = {}) {
         meshes: entry.read.stats.meshes,
         nodes: entry.read.stats.nodes,
         triangles: entry.read.stats.triangles,
+        materials: entry.read.stats.materials,
+        animations: entry.read.stats.animations,
         namedPieces: entry.read.namedPieces,
         anchorable: entry.read.anchorable,
+        hasAvatar: entry.read.hasAvatar,
         generator: entry.read.manifest.generator,
+        gltfVersion: entry.read.manifest.gltfVersion,
+        extensionsRequired: entry.read.manifest.extensionsRequired || [],
+        /* ── UNITS AND AXIS, SAID AS THE FORMAT ACTUALLY SAYS THEM ──────
+           glTF 2.0 SPECIFIES a right-handed, Y-up coordinate system and
+           metres as the unit of distance. Neither is written in the file, so
+           reporting "Y-up, metres" as though this export had declared it
+           would be presenting a specification as a measurement.
+           It matters because garment exporters frequently do not honour the
+           metre: a CLO export is routinely in centimetres with the glTF still
+           claiming nothing. So the format's guarantee and the file's silence
+           are reported as the two different things they are, and the bundle
+           records what the PUBLISHER states separately. */
+        axis: "Y-up, right-handed",
+        axisSource: "glTF 2.0 specification — not stated in the file",
+        unit: "",
+        unitNote: "glTF declares no unit. The format assumes metres and garment "
+          + "exporters frequently do not honour that, so state the export's real unit below.",
       } : (entry.source ? {
         container: entry.source.container,
         /* Said plainly: a `.zprj` is identified by exclusion, because its
@@ -855,6 +982,101 @@ async function classifyUploads(ctx, { files = [], actor = null } = {}) {
     conflicts: routed.conflicts,
     confirmationRequired: routed.confirmationRequired,
     actorId: str(actor?.id),
+  };
+}
+
+/**
+ * Every file content-hash already published on one style, and where it came from.
+ *
+ * Keyed by hash so a lookup is one map read per uploaded file rather than a
+ * scan per file. Scoped to the style, because the same block of fabric geometry
+ * legitimately appears on two different styles and that is not a duplicate —
+ * what is worth reporting is the same file imported twice into the same garment.
+ */
+async function publishedHashes(ctx, styleId) {
+  const found = new Map();
+  if (!isId(styleId)) return found;
+  const style = await styleForCompany(ctx.companyId, styleId).catch(() => null);
+  if (!style) return found;
+
+  const rows = await GarmentModelPublication
+    .find({ companyId: ctx.companyId, styleId: style._id })
+    .select("publicationRef modelNumber state assets.kind assets.sha256 assets.name assets.uploadedAt")
+    .sort({ modelNumber: -1 })
+    .lean()
+    .catch(() => []);
+
+  for (const row of rows) {
+    for (const asset of (row.assets || [])) {
+      const hash = str(asset.sha256);
+      if (!hash || found.has(hash)) continue;
+      found.set(hash, {
+        publicationRef: row.publicationRef,
+        modelNumber: row.modelNumber,
+        bundleName: `Technical bundle ${row.modelNumber}`,
+        state: row.state,
+        kind: asset.kind,
+        fileName: str(asset.name),
+        uploadedAt: asset.uploadedAt || null,
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * The parsed pattern, cut down to what a confirmation preview draws.
+ *
+ * ── WHY A SEPARATE SHAPE AND NOT THE STORED ONE ─────────────────────────────
+ * The stored piece carries every field the inspector, the mapping and the IE
+ * projection need. A preview needs the OUTLINES and the marks a person checks
+ * before committing — the pieces are there, the grain runs the right way, the
+ * notches landed. Sending the rest would double the payload of a call that may
+ * be thrown away, and the person is not being asked to confirm the rest yet.
+ *
+ * Capped, and the cap is reported. A preview that silently dropped the last
+ * fifteen pieces of a graded range would be the one thing worse than no preview.
+ */
+function patternPreview(read) {
+  const pieces = read.pieces || [];
+  const LIMIT = 80;
+  const shown = pieces.slice(0, LIMIT);
+  return {
+    unit: read.unit,
+    scaleVerified: Boolean(read.unit && read.unitInMm),
+    unitInMm: read.unitInMm ?? null,
+    bounds: read.bounds,
+    pieceCount: pieces.length,
+    shownCount: shown.length,
+    truncated: pieces.length > LIMIT,
+    pieces: shown.map((piece, index) => ({
+      /* A preview ref, NOT the stored one: nothing has been ingested yet, and
+         handing out an identifier that does not exist in any record is how a
+         screen comes to reference a piece nobody can look up. */
+      pieceRef: `preview-${index}`,
+      name: str(piece.name),
+      generatedName: Boolean(piece.generatedName),
+      size: str(piece.size),
+      quantity: piece.quantity ?? null,
+      width: piece.width ?? null,
+      height: piece.height ?? null,
+      area: piece.area ?? null,
+      bounds: piece.bounds || null,
+      outline: piece.outline || [],
+      outlineClosed: Boolean(piece.outlineClosed),
+      internalLines: piece.internalLines || [],
+      notches: piece.notches || [],
+      drillPoints: piece.drillPoints || [],
+      grainline: piece.grainline || null,
+      mirrorLine: piece.mirrorLine || null,
+      sewLine: piece.sewLine || null,
+      /* Present so the preview's own piece list reads like the real one. */
+      notchCount: (piece.notches || []).length,
+      drillPointCount: (piece.drillPoints || []).length,
+      internalLineCount: (piece.internalLines || []).length,
+      material: str(piece.material),
+      componentClass: str(piece.componentClass),
+    })),
   };
 }
 
@@ -916,6 +1138,7 @@ async function attachPatternSet(ctx, { publicationId, file, body = {}, expectedR
     row.declaredPatternRevision = clean(body.declaredPatternRevision, 60);
   }
   if (str(body.sizeRange)) row.sizeRange = clean(body.sizeRange, 120);
+  appendNote(row, body.note, replacing ? "Pattern replaced" : "Pattern attached");
 
   await rematch(row, { actor });
   await refreshBundleWarnings(row);
@@ -928,6 +1151,93 @@ async function attachPatternSet(ctx, { publicationId, file, body = {}, expectedR
     replaced: replacing,
     classification: row.patternSet.classification,
     patternWarnings: read.warnings || [],
+    bundleWarnings: row.bundleWarnings || [],
+  };
+}
+
+/**
+ * Record what somebody said about a change to a bundle.
+ *
+ * ── APPENDED, NEVER REPLACED ────────────────────────────────────────────────
+ * A bundle accumulates changes — a pattern replaced, a source attached — and
+ * each one may carry its own "what changed, and why". Overwriting the note each
+ * time would mean the only surviving explanation is the most recent, which is
+ * exactly backwards: the earlier ones are the history.
+ *
+ * Empty input changes nothing, so an import with no note does not blank the one
+ * already there.
+ */
+function appendNote(row, text, what) {
+  const addition = clean(text, 2000);
+  if (!addition) return;
+  const existing = str(row.manifest?.note);
+  const line = `${what}: ${addition}`;
+  row.manifest.note = existing ? `${existing}\n${line}`.slice(0, 2000) : line.slice(0, 2000);
+}
+
+/**
+ * ATTACH OR REPLACE THE CLO SOURCE ON A DRAFT BUNDLE.
+ *
+ * ── WHY THIS IS NOT PARSED, AND SAYS SO ─────────────────────────────────────
+ * A `.zprj` is CLO's own container and its layout is not a published format.
+ * Nothing in this service opens one, nothing claims to read one, and no screen
+ * presents a field as having come out of it. What is stored is the bytes, their
+ * hash, their size and what the person said about them — which is the whole of
+ * what can honestly be known, and is enough for the one job the file has: being
+ * the evidence that can reproduce the garment.
+ *
+ * It is validated by EXCLUSION (see `readSource`): it must not be a format this
+ * server can positively identify as something else, and must not be text. That
+ * catches every renamed GLB, DXF, PDF and set of notes, which is the failure
+ * that actually happens.
+ */
+async function attachSource(ctx, { publicationId, file, body = {}, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  assertBundleEditable(row, "its CLO source");
+
+  if (!file) throw fail("VALIDATION", "Attach the CLO project file.");
+  assertSourceFile(file);
+
+  const up = await drive.uploadCompanyFile(file.buffer, {
+    fileName: `${mintRef("GMA")}-${str(file.originalname) || "source.zprj"}`,
+    mimeType: str(file.mimetype) || "application/octet-stream",
+    folderPath: ["rnd", "garment-models", String(row.styleId), "source"],
+  });
+  const driveFileId = str(up?.driveFileId);
+  if (!driveFileId) {
+    throw fail("MODEL_SOURCE_UNSUPPORTED",
+      "The file store did not return a handle for that upload, so the source could not be kept. "
+      + "Nothing was changed; try again.", { reason: "NO_STORAGE_HANDLE" });
+  }
+
+  const replacing = Boolean((row.assets || []).find((a) => a.kind === ASSET_KIND.SOURCE));
+  row.assets = (row.assets || []).filter((a) => a.kind !== ASSET_KIND.SOURCE);
+  row.assets.push({
+    kind: ASSET_KIND.SOURCE,
+    driveFileId,
+    name: str(file.originalname),
+    mimeType: str(file.mimetype),
+    bytes: file.size,
+    sha256: sha256(file.buffer),
+    uploadedAt: new Date(),
+  });
+  row.manifest.sourceFileName = str(file.originalname);
+  if (str(body.cloVersion)) row.manifest.cloVersion = clean(body.cloVersion, 60);
+  appendNote(row, body.note, replacing ? "CLO source replaced" : "CLO source attached");
+
+  /* The "no source" warning is a statement about the bundle, so it stops being
+     true the moment one arrives. A stale warning is as corrosive as a missing
+     one — see `refreshBundleWarnings`. */
+  row.warnings = (row.warnings || []).filter((w) => w.code !== "NO_CLO_SOURCE");
+  await refreshBundleWarnings(row);
+  row.revision += 1;
+  await row.save();
+
+  return {
+    publication: publicationView(row, { subject: str(actor?.id) }),
+    replaced: replacing,
     bundleWarnings: row.bundleWarnings || [],
   };
 }
@@ -2770,7 +3080,7 @@ module.exports = {
 
   /* ── THE FLAT PATTERN, THE MAPPING AND THE BUNDLE ──────────────────── */
   PATTERN_CLASSIFICATION, MAPPING_METHOD, MAPPING_STATE,
-  classifyUploads, attachPatternSet, readPatternSet,
+  classifyUploads, attachPatternSet, attachSource, readPatternSet,
   setPieceMapping, rematchMappings,
   patternSetView, mappingView, mappingState, readPatternFile,
   technicalBundleHandover,
