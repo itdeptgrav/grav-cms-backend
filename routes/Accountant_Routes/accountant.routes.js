@@ -72,10 +72,12 @@ const mounts = [
   ["/bank-transactions", "./Accountant_Routes/Acc_bankTransactions"],
   ["/budgets", "./Accountant_Routes/Acc_budgets"],
 
-  // === books / vouchers / import (new files) ===
+  // === books / vouchers ===
+  // The Tally IMPORTER was removed on 1 Oct 2026 (Tally is no longer imported
+  // from). `/tally/companies` and `/tally/reports` below are NOT the importer —
+  // they are the company register and the financial reports, and they stay.
   ["/chart-of-accounts", "./Accountant_Routes/Acc_chartOfAccounts"],
   ["/tally/companies", "./Accountant_Routes/Acc_companies"],
-  ["/tally/import", "./Accountant_Routes/Acc_import"],
   ["/tally/reports", "./Accountant_Routes/Acc_books"],
   ["/vouchers", "./Accountant_Routes/Acc_vouchers"],
 

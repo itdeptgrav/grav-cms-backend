@@ -949,12 +949,73 @@ router.get("/", auth, companyScope, async (req, res) => {
       }
     }
 
+    /* ── TOTALS FOR THE WHOLE FILTER, NOT THIS PAGE ────────────────────────
+     * The register pages show "Posted N" and a money total above the table.
+     * They were computing both from `items` — which is ONE PAGE of 50 — while
+     * taking the count from `total`, which is the whole filter. So a book with
+     * 71 purchase vouchers worth ₹74,39,740 showed "71 vouchers, Posted 50,
+     * ₹64,90,853": a whole-book count beside page-one money, understating
+     * purchases by ₹9.5 lakh with nothing on screen to say so.
+     *
+     * The client cannot fix this from a page, so the aggregate is computed
+     * here, over the same `filter` the count uses. One extra grouped pass over
+     * an already-indexed query.
+     *
+     * A failure here must not take the register down — the list is the point
+     * and the figures are a header — so it degrades to `summary: null` and the
+     * client shows nothing rather than a wrong number. */
+    let summary = null;
+    try {
+      /* `filter` is written for `find()`, which CASTS it against the schema —
+         a companyId that arrived as a string becomes an ObjectId on the way to
+         Mongo. `aggregate()` does no casting, so handing it the raw filter
+         matched nothing and every figure came back 0. Casting it through a
+         throwaway query is what makes the two agree. */
+      const castFilter = Acc_Voucher.find(filter).cast(Acc_Voucher);
+      const agg = await Acc_Voucher.aggregate([
+        { $match: castFilter },
+        {
+          $group: {
+            _id: "$status",
+            count: { $sum: 1 },
+            grandTotal: { $sum: { $ifNull: ["$grandTotal", 0] } },
+            subtotal: { $sum: { $ifNull: ["$subtotal", 0] } },
+            totalTax: { $sum: { $ifNull: ["$totalTax", 0] } },
+          },
+        },
+      ]);
+      const zero = { count: 0, grandTotal: 0, subtotal: 0, totalTax: 0 };
+      const add = (a, b) => ({
+        count: a.count + b.count,
+        grandTotal: a.grandTotal + b.grandTotal,
+        subtotal: a.subtotal + b.subtotal,
+        totalTax: a.totalTax + b.totalTax,
+      });
+      const byStatus = {};
+      let all = { ...zero };
+      for (const row of agg) {
+        const s = row._id || "unknown";
+        byStatus[s] = { count: row.count, grandTotal: row.grandTotal, subtotal: row.subtotal, totalTax: row.totalTax };
+        all = add(all, byStatus[s]);
+      }
+      summary = {
+        all,
+        byStatus,
+        posted: byStatus.posted || { ...zero },
+        draft: byStatus.draft || { ...zero },
+        pendingApproval: byStatus.pending_approval || { ...zero },
+      };
+    } catch (aggErr) {
+      console.warn("[vouchers] summary aggregate skipped:", aggErr.message);
+    }
+
     res.json({
       items,
       total,
       page: Number(page),
       limit: Number(limit),
       totalPages: Math.ceil(total / Number(limit)),
+      summary,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

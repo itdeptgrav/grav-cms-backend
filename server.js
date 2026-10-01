@@ -2698,6 +2698,12 @@ app.use(
   "/api/accountant/change-history",
   require("./routes/Accountant_Routes/Acc_changeHistory"),
 );
+/* A detail route handed a non-ObjectId used to answer 500 with Mongoose's raw
+   "Cast to ObjectId failed ... for model X" — a mistyped or stale URL reported
+   as a server fault, with an internal model name in the body. The eight routers
+   whose `:id` really is an ObjectId are wrapped below so it answers 404 instead.
+   See services/objectIdParamGuard.js for why this is per-router, not global. */
+const { guardObjectIdParams } = require("./services/objectIdParamGuard");
 app.use("/api/accountant", auditTrail("accounting"));
 
 app.use("/api/accountant/auth", require("./routes/Accountant_Routes/Acc_auth"));
@@ -2741,15 +2747,15 @@ app.use(
 );
 app.use(
   "/api/accountant/expenses",
-  require("./routes/Accountant_Routes/Acc_expenses"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_expenses")),
 );
 app.use(
   "/api/accountant/invoices",
-  require("./routes/Accountant_Routes/Acc_invoices"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_invoices")),
 );
 app.use(
   "/api/accountant/proforma-invoices",
-  require("./routes/Accountant_Routes/Acc_proformaInvoices"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_proformaInvoices")),
 );
 app.use(
   "/api/accountant/eway-bill",
@@ -2763,7 +2769,7 @@ app.use(
 );
 app.use(
   "/api/accountant/vendors",
-  require("./routes/Accountant_Routes/Acc_vendors"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_vendors")),
 );
 // Registered BEFORE the customers router: that router's `GET /:customerId`
 // matches any single segment and would otherwise swallow "/reports".
@@ -2773,11 +2779,11 @@ app.use(
 );
 app.use(
   "/api/accountant/customers",
-  require("./routes/Accountant_Routes/Acc_customers"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_customers"), ["id", "customerId"]),
 );
 app.use(
   "/api/accountant/journal-entries",
-  require("./routes/Accountant_Routes/Acc_journalEntries"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_journalEntries")),
 );
 app.use(
   "/api/accountant/payroll",
@@ -2827,7 +2833,7 @@ app.use(
  * approving here and approving there cannot write different commitments. */
 app.use(
   "/api/accountant/spend-approvals",
-  require("./routes/Accountant_Routes/Acc_spendApprovals"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_spendApprovals")),
 );
 
 // ── Books / Vouchers / Import ─────────────────────────────────────────
@@ -2853,17 +2859,27 @@ app.use(
   "/api/accountant/gst-verification",
   require("./routes/Accountant_Routes/Acc_gstVerification"),
 );
-app.use(
-  "/api/accountant/tally/import",
-  require("./routes/Accountant_Routes/Acc_import"),
-);
+/* The Tally IMPORTER is gone (1 Oct 2026, owner's decision — Tally is no
+   longer imported from). Removed with it: routes/Accountant_Routes/Acc_import.js,
+   Acc_importMapping.js and the seven services/tally*.service.js files.
+
+   NOTHING ELSE TALLY-NAMED WAS TOUCHED, because the name is load-bearing
+   elsewhere and has nothing to do with importing:
+     · `/api/accountant/tally/reports` (just below) is the Balance Sheet,
+       Profit & Loss, Trial Balance and Day Book.
+     · `/api/accountant/tally/companies` is the company register.
+     · `Acc_Organization.tallyCompanyIds` is the organisation → company
+       ownership record, read by 37 route files.
+     · `sourceSystem: "tally_import"` is stamped on 976 of the 1001 vouchers
+       already in the books — history, not machinery.
+   Renaming those is a coordinated frontend + backend change, not a deletion. */
 app.use(
   "/api/accountant/tally/reports",
   require("./routes/Accountant_Routes/Acc_books"),
 );
 app.use(
   "/api/accountant/vouchers",
-  require("./routes/Accountant_Routes/Acc_vouchers"),
+  guardObjectIdParams(require("./routes/Accountant_Routes/Acc_vouchers")),
 );
 
 app.use(
@@ -2901,11 +2917,6 @@ app.use(
 app.use(
   "/api/accountant/merge",
   require("./routes/Accountant_Routes/Acc_merge"),
-);
-
-app.use(
-  "/api/accountant/import-mapping",
-  require("./routes/Accountant_Routes/Acc_importMapping"),
 );
 
 app.use(

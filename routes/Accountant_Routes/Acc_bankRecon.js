@@ -825,6 +825,60 @@ router.get("/sessions/:id", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Session not found" });
     const ledger = await buildLedgerSide(session);
+
+    /* ── A MATCH IS ONLY A MATCH IF THE VOUCHER IS STILL THERE ─────────────
+     * `transaction.matched` is a flag written when the statement was
+     * reconciled, and nothing re-checked it afterwards. A voucher deleted,
+     * voided or never carried across a database copy leaves the flag behind,
+     * so the screen went on reporting "162 / 162 matched, 0 unmatched" against
+     * vouchers that no longer exist. On this database that is 243 of 719
+     * distinct matched ids — a third of them — while every session still
+     * claims to be fully reconciled.
+     *
+     * Reconciliation is the control that says the books agree with the bank,
+     * so a match pointing at nothing has to be visible rather than counted as
+     * agreement. The stored flags are NOT rewritten here — this is a read, and
+     * silently un-matching somebody's work would be worse than reporting it —
+     * each transaction is annotated with `matchResolved`, and the session
+     * carries a `matchIntegrity` summary for the screen to surface.
+     */
+    try {
+      const ids = [
+        ...new Set(
+          (session.transactions || [])
+            .filter((t) => t.matched && t.matchedVoucherId)
+            .map((t) => String(t.matchedVoucherId))
+            .filter((v) => mongoose.Types.ObjectId.isValid(v)),
+        ),
+      ];
+      if (ids.length) {
+        const found = await Acc_Voucher.find({ _id: { $in: ids } })
+          .select("_id")
+          .lean();
+        const alive = new Set(found.map((f) => String(f._id)));
+        let broken = 0;
+        for (const t of session.transactions || []) {
+          if (!t.matched || !t.matchedVoucherId) continue;
+          t.matchResolved = alive.has(String(t.matchedVoucherId));
+          if (!t.matchResolved) broken++;
+        }
+        session.matchIntegrity = {
+          checked: ids.length,
+          resolved: alive.size,
+          missing: ids.length - alive.size,
+          brokenTransactions: broken,
+        };
+      } else {
+        session.matchIntegrity = { checked: 0, resolved: 0, missing: 0, brokenTransactions: 0 };
+      }
+    } catch (integrityErr) {
+      /* The statement is the point of this response; a failed cross-check must
+         not take it down. `matchIntegrity: null` means "not checked", which the
+         screen reports as unknown rather than as clean. */
+      console.warn("[bank-recon] match integrity check skipped:", integrityErr.message);
+      session.matchIntegrity = null;
+    }
+
     res.json({ success: true, session, ledger });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
