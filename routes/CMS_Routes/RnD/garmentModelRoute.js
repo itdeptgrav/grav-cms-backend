@@ -238,4 +238,64 @@ router.post("/garment-models/annotations/:annotationId/replies", requireCompany,
     return res.status(201).json({ success: true, ...out });
   }));
 
+/* ═══ MEASUREMENTS ═════════════════════════════════════════════════════════
+ *
+ * Read with the model, written by whoever may annotate it: a measurement is a
+ * fact somebody recorded about this garment, which is the same kind of act as
+ * raising a construction note and carries the same permission.
+ *
+ * `/measurements/:id` is PATCH-only on purpose. The points are immutable in
+ * the schema, so there is no route that could move one — changing what was
+ * measured is a new measurement beside the old one, never a quiet edit of it.
+ */
+
+router.get("/garment-models/:publicationId/measurements", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await models.listMeasurements(ctx(req), { publicationId: req.params.publicationId });
+    return res.json({ success: true, ...out });
+  }));
+
+router.post("/garment-models/:publicationId/measurements", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await models.createMeasurement(ctx(req), {
+      publicationId: req.params.publicationId, body: req.body || {}, actor: actor(req),
+    });
+    return res.status(201).json({ success: true, ...out });
+  }));
+
+router.patch("/garment-models/measurements/:measurementId", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await models.updateMeasurement(ctx(req), {
+      measurementId: req.params.measurementId, body: req.body || {},
+      expectedRevision: req.body?.expectedRevision, actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* ── SCALE CALIBRATION ─────────────────────────────────────────────────────
+ * Stating what one model unit is really worth changes how every number on
+ * this publication reads, so it needs the same permission as recording one —
+ * and it is refused on an accepted model, which is a record rather than a
+ * workspace. There is no route that copies a calibration to another
+ * publication, deliberately: a later export may be drawn at a different scale.
+ */
+
+router.put("/garment-models/:publicationId/scale-calibration", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await models.calibrateScale(ctx(req), {
+      publicationId: req.params.publicationId, body: req.body || {},
+      expectedRevision: req.body?.expectedRevision, actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+router.delete("/garment-models/:publicationId/scale-calibration", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await models.clearCalibration(ctx(req), {
+      publicationId: req.params.publicationId,
+      expectedRevision: req.body?.expectedRevision ?? req.query?.expectedRevision,
+    });
+    return res.json({ success: true, ...out });
+  }));
+
 module.exports = router;

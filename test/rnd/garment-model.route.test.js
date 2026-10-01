@@ -1160,3 +1160,397 @@ describe("the development timeline", () => {
     expect(now.body.annotation.status).toBe("in_approved_pack");
   });
 });
+
+/* ═══ 10 · MEASUREMENTS ════════════════════════════════════════════════════
+ *
+ * The whole risk in a 3D measuring tool is that it always produces a number.
+ * Three.js will tell you the distance between any two points to fifteen
+ * decimal places whether or not the file is drawn at any particular scale, and
+ * a sampling room reading "7.3 cm" off a screen has no way to know which it
+ * was. So these tests are mostly about what the server REFUSES to call a
+ * centimetre.
+ */
+
+/** Two points on the published jacket, far enough apart to measure. */
+const at = (x, y, z, nodeRef = "n1") => ({
+  nodeRef, local: { x, y, z }, world: { x, y, z },
+});
+
+const measureUrl = (id) => `/api/cms/rnd/garment-models/${id}/measurements`;
+
+async function measured(w, body, who = w.as) {
+  const created = await publish(w);
+  const id = created.body.publication.id;
+  const r = await call(measureUrl(id), { ...who, method: "POST", body });
+  return { id, r };
+}
+
+describe("a measurement is taken from points, and the server does the arithmetic", () => {
+  test("point to point is the straight distance between them", async () => {
+    const w = await world();
+    const { r } = await measured(w, {
+      kind: "distance", label: "Collar stand",
+      points: [at(0, 0, 0), at(3, 4, 0)],
+    });
+    expect(r.status).toBe(201);
+    /* 3-4-5. Computed here, not sent: the request carried no value at all. */
+    expect(r.body.measurement.rawValue).toBeCloseTo(5, 10);
+    expect(r.body.measurement.kind).toBe("distance");
+    expect(r.body.measurement.seq).toBe(1);
+  });
+
+  test("a value in the request is ignored — the points are the measurement", async () => {
+    const w = await world();
+    const { r } = await measured(w, {
+      kind: "distance", rawValue: 999, displayValue: 999,
+      points: [at(0, 0, 0), at(0, 0, 2)],
+    });
+    expect(r.body.measurement.rawValue).toBeCloseTo(2, 10);
+  });
+
+  test("a path is the sum of its segments, and says it is a polyline", async () => {
+    const w = await world();
+    const { r } = await measured(w, {
+      kind: "path", label: "Shoulder seam",
+      points: [at(0, 0, 0), at(1, 0, 0), at(1, 1, 0), at(1, 1, 1)],
+    });
+    expect(r.status).toBe(201);
+    expect(r.body.measurement.rawValue).toBeCloseTo(3, 10);
+    /* Deliberately NOT called a surface or geodesic length anywhere in the
+       payload — the one claim this tool cannot support. */
+    expect(JSON.stringify(r.body)).not.toMatch(/geodesic|surface length|along the surface/i);
+  });
+
+  test("an angle is the angle at the middle point, in degrees", async () => {
+    const w = await world();
+    const { r } = await measured(w, {
+      kind: "angle", points: [at(1, 0, 0), at(0, 0, 0), at(0, 1, 0)],
+    });
+    expect(r.status).toBe(201);
+    expect(r.body.measurement.rawValue).toBeCloseTo(90, 9);
+    expect(r.body.measurement.displayUnit).toBe("°");
+  });
+
+  test("each kind refuses the wrong number of points, and says what it needs", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    for (const [kind, points] of [
+      ["distance", [at(0, 0, 0)]],
+      ["distance", [at(0, 0, 0), at(1, 0, 0), at(2, 0, 0)]],
+      ["angle", [at(0, 0, 0), at(1, 0, 0)]],
+      ["path", [at(0, 0, 0)]],
+    ]) {
+      const r = await call(measureUrl(id), { ...w.as, method: "POST", body: { kind, points } });
+      expect(r.status).toBe(422);
+      expect(r.body.error.code).toBe("MODEL_MEASUREMENT_INVALID");
+    }
+  });
+
+  test("a point on a part this model does not contain is refused", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    const r = await call(measureUrl(id), {
+      ...w.as, method: "POST",
+      body: { kind: "distance", points: [at(0, 0, 0), at(1, 0, 0, "n99")] },
+    });
+    expect(r.status).toBe(422);
+    expect(r.body.error.code).toBe("MODEL_ANCHOR_UNKNOWN");
+  });
+
+  test("two points in the same place are refused rather than answered zero", async () => {
+    const w = await world();
+    const { r } = await measured(w, { kind: "distance", points: [at(1, 1, 1), at(1, 1, 1)] });
+    expect(r.status).toBe(422);
+  });
+});
+
+/* ═══ 10b · WHAT IT WILL AND WILL NOT CALL A CENTIMETRE ════════════════════ */
+
+describe("scale honesty", () => {
+  test("an export that declared a unit is labelled as the exporter's claim", async () => {
+    const w = await world();
+    const { r } = await measured(w, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+    const m = r.body.measurement;
+    /* `publish` states unit "cm", so the file says so and nobody has checked. */
+    expect(m.scale.state).toBe("declared");
+    expect(m.displayValue).toBeCloseTo(2, 10);
+    expect(m.displayUnit).toBe("cm");
+  });
+
+  test("an export that declared nothing yields a raw figure and NO unit", async () => {
+    const w = await world();
+    const created = await publish(w, { fields: { unit: "" } });
+    const id = created.body.publication.id;
+    const r = await call(measureUrl(id), {
+      ...w.as, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] },
+    });
+    const m = r.body.measurement;
+    expect(m.scale.state).toBe("unverified");
+    /* The number exists and is usable for comparison; it is simply not
+       pretending to be a length. */
+    expect(m.rawValue).toBeCloseTo(2, 10);
+    expect(m.rawUnit).toBe("model units");
+    expect(m.displayValue).toBeNull();
+    expect(m.displayUnit).toBe("");
+  });
+
+  test("an angle carries no scale warning, because an angle has no units", async () => {
+    const w = await world();
+    const created = await publish(w, { fields: { unit: "" } });
+    const id = created.body.publication.id;
+    const r = await call(measureUrl(id), {
+      ...w.as, method: "POST",
+      body: { kind: "angle", points: [at(1, 0, 0), at(0, 0, 0), at(0, 1, 0)] },
+    });
+    const m = r.body.measurement;
+    expect(m.scaleIndependent).toBe(true);
+    /* Still 90°, on a file nobody can scale. */
+    expect(m.displayValue).toBeCloseTo(90, 9);
+    expect(m.displayUnit).toBe("°");
+  });
+});
+
+/* ═══ 10c · CALIBRATION ════════════════════════════════════════════════════ */
+
+const calUrl = (id) => `/api/cms/rnd/garment-models/${id}/scale-calibration`;
+
+describe("calibration is what lets this claim a millimetre", () => {
+  test("two known points give a factor, and later measurements are verified", async () => {
+    const w = await world();
+    const created = await publish(w, { fields: { unit: "" } });
+    const id = created.body.publication.id;
+
+    /* 10 model units between the points, and the person says it is 25 cm. */
+    const cal = await call(calUrl(id), {
+      ...w.as, method: "PUT",
+      body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    });
+    expect(cal.status).toBe(200);
+    expect(cal.body.calibration.factor).toBeCloseTo(2.5, 10);
+    expect(cal.body.scale.state).toBe("verified");
+    /* Attributable — "verified" is a claim somebody made. */
+    expect(cal.body.calibration.by).toBe(w.engineer.name);
+
+    const r = await call(measureUrl(id), {
+      ...w.as, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(4, 0, 0)] },
+    });
+    const m = r.body.measurement;
+    expect(m.scale.state).toBe("verified");
+    expect(m.scale.calibratedBy).toBe(w.engineer.name);
+    expect(m.displayValue).toBeCloseTo(10, 10);
+    expect(m.displayUnit).toBe("cm");
+  });
+
+  test("calibrating afterwards does not relabel a number already written down", async () => {
+    const w = await world();
+    const created = await publish(w, { fields: { unit: "" } });
+    const id = created.body.publication.id;
+
+    const before = (await call(measureUrl(id), {
+      ...w.as, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(4, 0, 0)] },
+    })).body.measurement;
+    expect(before.scale.state).toBe("unverified");
+
+    await call(calUrl(id), {
+      ...w.as, method: "PUT",
+      body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    });
+
+    const list = await call(measureUrl(id), w.as);
+    const kept = list.body.measurements.find((x) => x.id === before.id);
+    /* The old measurement is still exactly as honest as when it was taken. */
+    expect(kept.scale.state).toBe("unverified");
+    expect(kept.displayValue).toBeNull();
+    /* And the list says what a NEW one would be taken with. */
+    expect(list.body.scale.state).toBe("verified");
+  });
+
+  test("calibration never follows the garment to the next export", async () => {
+    const w = await world();
+    const first = await publish(w, { fields: { unit: "" } });
+    const firstId = first.body.publication.id;
+    await call(calUrl(firstId), {
+      ...w.as, method: "PUT",
+      body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    });
+    expect((await call(measureUrl(firstId), w.as)).body.scale.state).toBe("verified");
+
+    /* A second export of the same style may be drawn at a different scale, and
+       nothing may assume it is not. */
+    const second = await publish(w, { fields: { unit: "" } });
+    const secondId = second.body.publication.id;
+    const list = await call(measureUrl(secondId), w.as);
+    expect(list.body.calibration).toBeNull();
+    expect(list.body.scale.state).toBe("unverified");
+  });
+
+  test("it refuses a calibration that says nothing usable", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    for (const body of [
+      { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25 },
+      { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 0, unit: "cm" },
+      { points: [at(0, 0, 0)], knownValue: 25, unit: "cm" },
+      { points: [at(0, 0, 0), at(0, 0, 0)], knownValue: 25, unit: "cm" },
+    ]) {
+      expect((await call(calUrl(id), { ...w.as, method: "PUT", body })).status).toBe(422);
+    }
+  });
+
+  test("clearing it puts every later measurement back to unverified", async () => {
+    const w = await world();
+    const created = await publish(w, { fields: { unit: "" } });
+    const id = created.body.publication.id;
+    await call(calUrl(id), {
+      ...w.as, method: "PUT",
+      body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    });
+    const cleared = await call(calUrl(id), { ...w.as, method: "DELETE" });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.scale.state).toBe("unverified");
+  });
+});
+
+/* ═══ 10d · WHO MAY, AND WHAT SURVIVES ════════════════════════════════════ */
+
+describe("measurements live by the same rules as everything else here", () => {
+  test("a viewer reads them and records none", async () => {
+    const w = await world();
+    const { id } = await measured(w, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+
+    expect((await call(measureUrl(id), w.asReader)).status).toBe(200);
+    expect((await call(measureUrl(id), {
+      ...w.asReader, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(1, 0, 0)] },
+    })).status).toBe(403);
+    expect((await call(calUrl(id), {
+      ...w.asReader, method: "PUT", body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    })).status).toBe(403);
+  });
+
+  test("another company's measurements do not exist", async () => {
+    const mine = await world();
+    const theirs = await world();
+    const { id } = await measured(theirs, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+    expect((await call(measureUrl(id), mine.as)).status).toBe(404);
+    expect((await call(measureUrl(id), {
+      ...mine.as, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(1, 0, 0)] },
+    })).status).toBe(404);
+  });
+
+  test("an accepted model takes no further measurements", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    await call(`/api/cms/rnd/garment-models/${id}/submit`, { ...w.as, method: "POST", body: {} });
+    await call(`/api/cms/rnd/garment-models/${id}/approve`, { ...w.asApprover, method: "POST", body: {} });
+
+    const r = await call(measureUrl(id), {
+      ...w.as, method: "POST", body: { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] },
+    });
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("MODEL_STATE_CONFLICT");
+    /* And neither does its scale change under it. */
+    expect((await call(calUrl(id), {
+      ...w.as, method: "PUT", body: { points: [at(0, 0, 0), at(10, 0, 0)], knownValue: 25, unit: "cm" },
+    })).status).toBe(409);
+    /* It stays readable evidence. */
+    expect((await call(measureUrl(id), w.as)).status).toBe(200);
+  });
+
+  test("the points cannot be edited, only the words around them", async () => {
+    const w = await world();
+    const { r } = await measured(w, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+    const m = r.body.measurement;
+
+    const patched = await call(`/api/cms/rnd/garment-models/measurements/${m.id}`, {
+      ...w.as, method: "PATCH",
+      body: {
+        label: "Placket width", note: "Measured flat.",
+        expectedRevision: m.revision,
+        points: [at(0, 0, 0), at(99, 0, 0)], rawValue: 99, kind: "angle",
+      },
+    });
+    expect(patched.status).toBe(200);
+    expect(patched.body.measurement.label).toBe("Placket width");
+    /* Everything that decides what was measured is exactly as it was. */
+    expect(patched.body.measurement.rawValue).toBeCloseTo(2, 10);
+    expect(patched.body.measurement.kind).toBe("distance");
+    expect(patched.body.measurement.points[1].world.x).toBe(2);
+  });
+
+  test("a save from a stale screen is refused rather than overwriting", async () => {
+    const w = await world();
+    const { r } = await measured(w, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+    const m = r.body.measurement;
+    const url = `/api/cms/rnd/garment-models/measurements/${m.id}`;
+    await call(url, { ...w.as, method: "PATCH", body: { label: "First", expectedRevision: m.revision } });
+    const stale = await call(url, {
+      ...w.as, method: "PATCH", body: { label: "Second", expectedRevision: m.revision },
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.error.code).toBe("REVISION_CONFLICT");
+  });
+
+  test("nobody accepts their own measurement", async () => {
+    const w = await world();
+    const { r, id } = await measured(w, { kind: "distance", points: [at(0, 0, 0), at(2, 0, 0)] });
+    const m = r.body.measurement;
+    const url = `/api/cms/rnd/garment-models/measurements/${m.id}`;
+
+    const own = await call(url, {
+      ...w.as, method: "PATCH", body: { status: "accepted", expectedRevision: m.revision },
+    });
+    expect(own.status).toBe(409);
+    expect(own.body.error.code).toBe("MODEL_SELF_APPROVAL");
+
+    const other = await call(url, {
+      ...w.asApprover, method: "PATCH", body: { status: "accepted", expectedRevision: m.revision },
+    });
+    expect(other.status).toBe(200);
+    expect(other.body.measurement.status).toBe("accepted");
+    expect(id).toBeTruthy();
+  });
+
+  test("it survives a reload, point for point and digit for digit", async () => {
+    const w = await world();
+    const { id, r } = await measured(w, {
+      kind: "path", label: "Armhole", note: "Flat, not on the form.",
+      points: [at(0.125, 0.5, -0.25), at(1.25, 0.5, -0.25), at(1.25, 1.75, -0.25)],
+    });
+    const before = r.body.measurement;
+
+    /* A second, independent read — a different request, nothing in memory. */
+    const list = await call(measureUrl(id), w.as);
+    const after = list.body.measurements.find((x) => x.id === before.id);
+
+    expect(after.rawValue).toBe(before.rawValue);
+    expect(after.points).toEqual(before.points);
+    expect(after.label).toBe("Armhole");
+    expect(after.note).toBe("Flat, not on the form.");
+    expect(after.kind).toBe("path");
+  });
+});
+
+describe("a history says who, and nothing else about them", () => {
+  test("an event carries a name, never the author's account record", async () => {
+    const w = await world();
+    const created = await publish(w);
+    const id = created.body.publication.id;
+    const made = await call(`/api/cms/rnd/garment-models/${id}/annotations`, {
+      ...w.as, method: "POST", body: marker("n1", { title: "Collar stand" }),
+    });
+    expect(made.status).toBe(201);
+    const events = made.body.annotation.events;
+    expect(events).toHaveLength(1);
+    /* A string, because that is what a list of "who did this" needs — and
+       because a screen handed `{ id, name, email }` where it expected a person
+       does not show a wrong name, it stops rendering. */
+    expect(typeof events[0].by).toBe("string");
+    expect(events[0].by).toBe(w.engineer.name);
+    /* And the address is not along for the ride. */
+    expect(JSON.stringify(events)).not.toContain("@");
+  });
+});

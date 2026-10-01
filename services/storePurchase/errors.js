@@ -678,6 +678,11 @@ const CODES = {
   MODEL_ANCHOR_INVALID: { status: 422, code: "MODEL_ANCHOR_INVALID" },
   MODEL_ANCHOR_UNKNOWN: { status: 422, code: "MODEL_ANCHOR_UNKNOWN" },
   MODEL_FILE_TOO_LARGE: { status: 413, code: "MODEL_FILE_TOO_LARGE" },
+  /* The points do not describe a measurement — too few, too many, or all in
+     the same place. 422 rather than 400 because the request is well formed and
+     the problem is what it says, which is the distinction this table exists
+     to keep. */
+  MODEL_MEASUREMENT_INVALID: { status: 422, code: "MODEL_MEASUREMENT_INVALID" },
   MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
   MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
   MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },
@@ -783,6 +788,12 @@ const CODES = {
      applicability nobody stated, a predecessor that is later, missing or does
      not apply. 400, naming every entry at once. */
   IE_PROCESS_ROUTE_INVALID: { status: 400, code: "IE_PROCESS_ROUTE_INVALID" },
+  /* ── IE — ENGINEERING FEASIBILITY ─────────────────────────────────────────
+   * A result the findings do not support, a finding that names no area or
+   * desk, or a resolution with nothing said about it: 400, naming the entry.
+   * The conflict is 409 like every other optimistic-lock refusal in IE. */
+  IE_FEASIBILITY_INVALID: { status: 400, code: "IE_FEASIBILITY_INVALID" },
+  IE_FEASIBILITY_REVISION_CONFLICT: { status: 409, code: "IE_FEASIBILITY_REVISION_CONFLICT" },
   IE_BULLETIN_ROW_DUPLICATE: { status: 400, code: "IE_BULLETIN_ROW_DUPLICATE" },
   /* An operation this company's library does not hold — unknown, another
      company's, or not an id at all. One answer for all three. */

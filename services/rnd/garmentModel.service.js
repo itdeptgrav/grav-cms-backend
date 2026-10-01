@@ -42,6 +42,7 @@ const mongoose = require("mongoose");
 const {
   GarmentModelPublication, GarmentModelAnnotation,
   PUBLICATION_STATE, MARKER_CATEGORY, MARKER_STATUS, ASSET_KIND,
+  MEASUREMENT_KIND, MEASUREMENT_STATUS, SCALE_STATE,
 } = require("../../models/CMS_Models/RnD/GarmentModel");
 const drive = require("../companyDrive.service");
 const { inspectGlb, GlbError } = require("../../utils/glbInspect");
@@ -135,6 +136,20 @@ function assertContext(ctx) {
 const actorOf = (a) => ({
   id: str(a?.id), name: str(a?.name), email: str(a?.email).toLowerCase(),
 });
+
+/**
+ * The same person, by whichever identity the session happened to carry.
+ *
+ * Email first because it survives somebody moving between an Employee record
+ * and a department account; the id as well because an account may have no
+ * address. Used everywhere a decision must not be the author's own — a model
+ * being accepted, and now a measurement — so the rule is one function rather
+ * than two that drift.
+ */
+const sameActor = (who, actor) => Boolean(
+  (str(actor?.email) && str(who?.email).toLowerCase() === str(actor?.email).toLowerCase())
+  || (str(actor?.id) && str(who?.id) === str(actor?.id)),
+);
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 const mintRef = (prefix) => `${prefix}-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
@@ -656,10 +671,7 @@ async function decide(ctx, { publicationId, outcome, note = "", expectedRevision
       { state: row.state });
   }
 
-  const same = (who) => Boolean(
-    (str(actor?.email) && str(who?.email).toLowerCase() === str(actor?.email).toLowerCase())
-    || (str(actor?.id) && str(who?.id) === str(actor?.id)),
-  );
+  const same = (who) => sameActor(who, actor);
   if (outcome === "approve" && (same(row.createdBy) || same(row.submittedBy))) {
     throw fail("MODEL_SELF_APPROVAL",
       "A model is accepted by somebody other than the person who published it. "
@@ -758,7 +770,15 @@ const annotationView = (a) => ({
   attachments: (a.attachments || []).map((x) => ({ name: x.name, mimeType: x.mimeType, bytes: x.bytes })),
   author: a.author || null,
   replies: (a.replies || []).map((r) => ({ body: r.body, author: r.author, at: r.at })),
-  events: (a.events || []).map((e) => ({ kind: e.kind, note: e.note, by: e.by, at: e.at })),
+  /* ── A NAME, NOT THE ACTOR RECORD ──────────────────────────────────────
+     `by` is stored as `{ id, name, email }` and used to be returned whole.
+     That put every author's EMAIL ADDRESS into a list whose only job is to
+     say who did something — and a screen rendering it got an object where it
+     expected a person, which is a crash rather than a wrong name. One field,
+     which is the one a reader needs. */
+  events: (a.events || []).map((e) => ({
+    kind: e.kind, note: str(e.note), by: str(e.by?.name), at: e.at,
+  })),
   createdAt: a.createdAt, updatedAt: a.updatedAt,
   revision: a.revision ?? 0,
 });
@@ -1057,6 +1077,387 @@ async function workspaceContext(ctx, { role = null } = {}) {
   };
 }
 
+/* ═══ MEASUREMENTS ═════════════════════════════════════════════════════════
+ *
+ * ── WHAT THIS CAN HONESTLY CLAIM ────────────────────────────────────────────
+ * A distance here is the straight line between two picked points. A path is
+ * the sum of the straight segments between the points somebody placed along a
+ * seam — a POLYLINE, not a geodesic. It under-reads a curve exactly as a tape
+ * pulled taut between pins does, it gets closer the more points are placed,
+ * and nothing in this file or on the screen calls it a surface length.
+ *
+ * Writing a real geodesic would mean walking the triangle mesh between two
+ * points, and the current reference export is one merged 7,424-triangle shell
+ * with no seam topology to walk along. An approximation presented as a
+ * surface measurement is worse than a polyline presented as a polyline.
+ *
+ * ── WHY THE SERVER DOES THE ARITHMETIC ──────────────────────────────────────
+ * The browser picks the points; this computes the number from them. Not
+ * because the browser would lie, but because a stored value that nothing can
+ * recompute is a claim rather than a measurement — and because two viewers
+ * disagreeing about a length is a bug nobody could find if each shipped its
+ * own formula.
+ */
+
+const MEASUREMENT_POINTS = Object.freeze({
+  [MEASUREMENT_KIND.DISTANCE]: { min: 2, max: 2, says: "A distance is measured between two points." },
+  [MEASUREMENT_KIND.ANGLE]: { min: 3, max: 3, says: "An angle is measured from three points, and is the angle at the middle one." },
+  [MEASUREMENT_KIND.PATH]: { min: 2, max: 60, says: "A path needs at least two points, and at most 60." },
+});
+
+/** Units, and what one of them is worth in the next one up. Used only to turn
+ *  a calibration the person entered into the factor stored beside it. */
+const UNIT_IN_MM = Object.freeze({ mm: 1, cm: 10, m: 1000, in: 25.4 });
+
+const isVec = (v) => v && ["x", "y", "z"].every((k) => Number.isFinite(Number(v[k])));
+const vec = (v) => ({ x: Number(v.x), y: Number(v.y), z: Number(v.z) });
+const span = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+
+/**
+ * One picked point, validated against what this publication actually contains.
+ *
+ * The same rule markers live by: a point may only name a node the file
+ * published. A measurement across a part that is not in the model is not a
+ * measurement of this garment.
+ */
+function readPoint(publicationRow, point = {}, index) {
+  const nodeRef = str(point.nodeRef);
+  const node = (publicationRow.structure || []).find((n) => n.nodeRef === nodeRef);
+  if (!node) {
+    throw fail("MODEL_ANCHOR_UNKNOWN",
+      "One of those points is on a part this model does not contain. Reopen the model and place it again.",
+      { nodeRef, point: index + 1 });
+  }
+  if (!isVec(point.local) || !isVec(point.world)) {
+    throw fail("MODEL_ANCHOR_INVALID",
+      "One of those points has no position on the garment.", { point: index + 1 });
+  }
+  return {
+    nodeRef,
+    nodeName: node.name,
+    meshName: node.meshName,
+    triangleIndex: num(point.triangleIndex),
+    local: vec(point.local),
+    world: vec(point.world),
+  };
+}
+
+/**
+ * The number, computed here from the points.
+ *
+ * Distance and path are lengths in MODEL UNITS. An angle is in DEGREES and is
+ * the one result that needs no scale at all — a ratio of two lengths cancels
+ * whatever they were measured in, so an angle off an uncalibrated export is
+ * exactly as good as one off a calibrated one.
+ */
+function computeMeasurement(kind, points) {
+  if (kind === MEASUREMENT_KIND.ANGLE) {
+    const [a, b, c] = points.map((p) => p.world);
+    const u = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+    const v = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+    const lu = Math.hypot(u.x, u.y, u.z);
+    const lv = Math.hypot(v.x, v.y, v.z);
+    if (!lu || !lv) {
+      throw fail("MODEL_MEASUREMENT_INVALID",
+        "Two of those points are in the same place, so there is no angle between them.");
+    }
+    const cos = Math.min(1, Math.max(-1, (u.x * v.x + u.y * v.y + u.z * v.z) / (lu * lv)));
+    return (Math.acos(cos) * 180) / Math.PI;
+  }
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) total += span(points[i - 1].world, points[i].world);
+  if (!(total > 0)) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Those points are all in the same place, so there is nothing to measure.");
+  }
+  return total;
+}
+
+/**
+ * WHAT IS KNOWN ABOUT TURNING MODEL UNITS INTO A REAL LENGTH, RIGHT NOW.
+ *
+ * Three answers and no fourth. The order is deliberate: somebody's own
+ * calibration of THIS publication beats what the exporter claimed, and what
+ * the exporter claimed beats nothing — but "nothing" is an answer that gets
+ * returned rather than quietly replaced with a guess of 1 cm per unit.
+ *
+ * The result is FROZEN onto each measurement as it is taken. Calibrating
+ * afterwards must not reach back and relabel a number somebody already wrote
+ * down as verified; it changes what the NEXT measurement will say.
+ */
+function scaleBasisOf(publicationRow) {
+  const cal = publicationRow.scaleCalibration;
+  if (cal && Number.isFinite(cal.factor) && cal.factor > 0) {
+    return {
+      state: SCALE_STATE.VERIFIED,
+      source: "calibration",
+      factor: cal.factor,
+      unit: cal.unit,
+      calibrationRef: str(cal.calibrationRef),
+      calibratedBy: str(cal.by?.name),
+      calibratedAt: cal.at || null,
+    };
+  }
+  const unit = str(publicationRow.manifest?.unit);
+  if (unit && UNIT_IN_MM[unit]) {
+    /* The exporter said the file is drawn in this unit, so one model unit is
+       one of them. Nobody has checked that, and the label says so. */
+    return { state: SCALE_STATE.DECLARED, source: "export-manifest", factor: 1, unit };
+  }
+  return { state: SCALE_STATE.UNVERIFIED, source: "none", factor: 1, unit: "model units" };
+}
+
+/**
+ * What a reader is shown, with the number and its trustworthiness inseparable.
+ *
+ * `displayValue` exists only where there is something to display it in. Where
+ * the scale is unverified it is null and `rawValue` is all there is — the
+ * screen shows the raw figure and says plainly that it is a visual reference.
+ */
+function measurementView(row, parent = {}) {
+  const isAngle = row.kind === MEASUREMENT_KIND.ANGLE;
+  const scale = row.scale || {};
+  const scaled = !isAngle && scale.state !== SCALE_STATE.UNVERIFIED;
+  return {
+    id: String(row._id),
+    measurementRef: row.measurementRef,
+    seq: row.seq,
+    kind: row.kind,
+    publicationRef: str(parent.publicationRef),
+    modelNumber: parent.modelNumber ?? null,
+    points: (row.points || []).map((p) => ({
+      nodeRef: p.nodeRef,
+      nodeName: p.nodeName,
+      local: { x: p.local.x, y: p.local.y, z: p.local.z },
+      world: { x: p.world.x, y: p.world.y, z: p.world.z },
+    })),
+    rawValue: row.rawValue,
+    /* Degrees for an angle; otherwise the file's own units, named as such. */
+    rawUnit: isAngle ? "°" : "model units",
+    displayValue: isAngle ? row.rawValue : (scaled ? row.rawValue * scale.factor : null),
+    displayUnit: isAngle ? "°" : (scaled ? scale.unit : ""),
+    scale: {
+      state: scale.state,
+      source: scale.source,
+      factor: scale.factor,
+      unit: scale.unit,
+      calibratedBy: str(scale.calibratedBy),
+      calibratedAt: scale.calibratedAt || null,
+    },
+    /* An angle carries no units, so no scale warning belongs on it. Stated as
+       a fact about this measurement rather than left for each screen to
+       re-derive and get wrong once. */
+    scaleIndependent: isAngle,
+    label: row.label || "",
+    note: row.note || "",
+    status: row.status,
+    camera: row.camera || null,
+    author: row.author ? { name: str(row.author.name), at: row.createdAt } : null,
+    events: (row.events || []).map((e) => ({
+      kind: e.kind, note: e.note || "", by: str(e.by?.name), at: e.at,
+    })),
+    revision: row.revision,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function listMeasurements(ctx, { publicationId } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId, { lean: true });
+  const rows = [...(row.measurements || [])].sort((a, b) => a.seq - b.seq);
+  return {
+    publicationRef: row.publicationRef,
+    /* The CURRENT basis, which is what a new measurement would be taken with
+       — not the basis any stored one carries. */
+    scale: scaleBasisOf(row),
+    calibration: calibrationView(row),
+    measurements: rows.map((m) => measurementView(m, row)),
+  };
+}
+
+async function createMeasurement(ctx, { publicationId, body = {}, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId, { lean: true });
+  /* An accepted model is a record, not a workspace — the same rule markers
+     live by, and for the same reason. */
+  assertAnnotatable(row);
+
+  const kind = str(body.kind);
+  const rule = MEASUREMENT_POINTS[kind];
+  if (!rule) {
+    throw fail("VALIDATION", "That is not a kind of measurement.",
+      { field: "kind", accepted: Object.values(MEASUREMENT_KIND) });
+  }
+  const raw = Array.isArray(body.points) ? body.points : [];
+  if (raw.length < rule.min || raw.length > rule.max) {
+    throw fail("MODEL_MEASUREMENT_INVALID", rule.says, { field: "points", given: raw.length });
+  }
+  const points = raw.map((p, i) => readPoint(row, p, i));
+  const rawValue = computeMeasurement(kind, points);
+
+  /* Written against the document rather than through a lean copy, so the
+     sequence number is taken from what is actually stored. */
+  const parent = await publicationForCompany(ctx, publicationId);
+  const seq = (parent.measurements || []).reduce((n, m) => Math.max(n, m.seq), 0) + 1;
+
+  const who = actorOf(actor);
+  parent.measurements.push({
+    measurementRef: mintRef("MS"),
+    seq,
+    kind,
+    points,
+    rawValue,
+    scale: scaleBasisOf(parent),
+    label: clean(body.label, 200),
+    note: clean(body.note, 4000),
+    camera: readCamera(body.camera),
+    status: MEASUREMENT_STATUS.OPEN,
+    author: who,
+    events: [{ kind: "created", note: clean(body.label, 200), by: who, at: new Date() }],
+  });
+  await parent.save();
+  const created = parent.measurements[parent.measurements.length - 1];
+  return { measurement: measurementView(created, parent) };
+}
+
+/**
+ * The measurement, and the publication that holds it.
+ *
+ * Scoped by company in the query itself, so another company's measurement is
+ * NOT FOUND rather than forbidden — the same non-disclosing answer every other
+ * read on this mount gives.
+ */
+async function measurementForCompany(ctx, measurementId) {
+  if (!isId(measurementId)) throw fail("NOT_FOUND", "That measurement was not found.");
+  const parent = await GarmentModelPublication
+    .findOne({ companyId: ctx.companyId, "measurements._id": measurementId })
+    .catch(() => null);
+  const row = parent?.measurements?.id(measurementId);
+  if (!row) throw fail("NOT_FOUND", "That measurement was not found.");
+  return { row, parent };
+}
+
+/**
+ * Label, note and state. The POINTS are immutable by schema and that is the
+ * whole design: moving a point changes what was measured, and the honest
+ * record of that is a new measurement beside the old one, not a quiet edit.
+ */
+async function updateMeasurement(ctx, { measurementId, body = {}, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const { row, parent } = await measurementForCompany(ctx, measurementId);
+  assertFresh(row, expectedRevision);
+  const who = actorOf(actor);
+  const at = new Date();
+
+  if (body.status !== undefined) {
+    const status = str(body.status);
+    if (!Object.values(MEASUREMENT_STATUS).includes(status)) {
+      throw fail("VALIDATION", "That is not a measurement state.", { field: "status" });
+    }
+    /* Accepting is a judgement about somebody else's work, so it is somebody
+       else's to make — the rule the model lifecycle already runs on. */
+    if (status === MEASUREMENT_STATUS.ACCEPTED && sameActor(row.author, who)) {
+      throw fail("MODEL_SELF_APPROVAL",
+        "A measurement is accepted by somebody other than the person who took it.");
+    }
+    if (status !== row.status) {
+      row.events.push({ kind: `status:${status}`, note: clean(body.statusNote, 2000), by: who, at });
+      row.status = status;
+    }
+  }
+  if (body.label !== undefined) row.label = clean(body.label, 200);
+  if (body.note !== undefined) row.note = clean(body.note, 4000);
+  if (body.label !== undefined || body.note !== undefined) {
+    row.events.push({ kind: "edited", note: clean(body.label, 200), by: who, at });
+  }
+
+  row.revision += 1;
+  await parent.save();
+  return { measurement: measurementView(row, parent) };
+}
+
+/* ═══ CALIBRATION ══════════════════════════════════════════════════════════
+ *
+ * Somebody measures something whose real size they already know — a placket
+ * off the approved spec, a printed scale bar in the export — and says what it
+ * really is. That is the only way this workspace can claim a millimetre.
+ *
+ * The factor belongs to ONE publication. A successor export may be drawn at a
+ * different scale, and a factor that followed it across would silently relabel
+ * a wrong number as verified; so a new publication starts uncalibrated, every
+ * time, and there is no code path that copies one.
+ */
+
+function calibrationView(publicationRow) {
+  const cal = publicationRow.scaleCalibration;
+  if (!cal) return null;
+  return {
+    calibrationRef: str(cal.calibrationRef),
+    rawValue: cal.rawValue,
+    knownValue: cal.knownValue,
+    unit: cal.unit,
+    factor: cal.factor,
+    note: str(cal.note),
+    by: str(cal.by?.name),
+    at: cal.at || null,
+  };
+}
+
+async function calibrateScale(ctx, { publicationId, body = {}, expectedRevision, actor = null } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  /* Calibration changes what every number on this model reads as, so it is a
+     change to the model's record — refused on an accepted one, like any other. */
+  assertAnnotatable(row);
+
+  const unit = str(body.unit);
+  if (!UNIT_IN_MM[unit]) {
+    throw fail("MODEL_MEASUREMENT_INVALID", "Say which unit that distance is in.",
+      { field: "unit", accepted: Object.keys(UNIT_IN_MM) });
+  }
+  const knownValue = Number(body.knownValue);
+  if (!Number.isFinite(knownValue) || knownValue <= 0) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Enter the real distance between those two points.", { field: "knownValue" });
+  }
+  const raw = Array.isArray(body.points) ? body.points : [];
+  if (raw.length !== 2) {
+    throw fail("MODEL_MEASUREMENT_INVALID",
+      "Calibration is set from two points whose real distance you know.", { field: "points" });
+  }
+  const points = raw.map((p, i) => readPoint(row, p, i));
+  const rawValue = computeMeasurement(MEASUREMENT_KIND.DISTANCE, points);
+
+  const who = actorOf(actor);
+  row.scaleCalibration = {
+    calibrationRef: mintRef("CB"),
+    rawValue,
+    knownValue,
+    unit,
+    factor: knownValue / rawValue,
+    points,
+    note: clean(body.note, 1000),
+    by: who,
+    at: new Date(),
+  };
+  row.revision += 1;
+  await row.save();
+  return { calibration: calibrationView(row), scale: scaleBasisOf(row), revision: row.revision };
+}
+
+async function clearCalibration(ctx, { publicationId, expectedRevision } = {}) {
+  assertContext(ctx);
+  const row = await publicationForCompany(ctx, publicationId);
+  assertFresh(row, expectedRevision);
+  assertAnnotatable(row);
+  row.scaleCalibration = null;
+  row.revision += 1;
+  await row.save();
+  return { calibration: null, scale: scaleBasisOf(row), revision: row.revision };
+}
+
 module.exports = {
   workspaceContext,
   LIMITS, TOKEN_SCOPE, SOURCE_EXTENSIONS, PREVIEW_MIME, VIEWER_EXTENSIONS, PRIORITIES,
@@ -1064,4 +1465,8 @@ module.exports = {
   submitForReview, decide,
   listAnnotations, createAnnotation, updateAnnotation, replyToAnnotation, timeline,
   publicationView, annotationView, verifyAssetToken, assetLink,
+
+  MEASUREMENT_KIND, MEASUREMENT_STATUS, SCALE_STATE,
+  listMeasurements, createMeasurement, updateMeasurement, measurementView,
+  calibrateScale, clearCalibration, scaleBasisOf,
 };
