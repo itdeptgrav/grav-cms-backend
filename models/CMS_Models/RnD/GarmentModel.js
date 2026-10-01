@@ -883,6 +883,15 @@ const publicationSchema = new mongoose.Schema({
      why the fabric looks grey. */
   warnings: { type: mongoose.Schema.Types.Mixed, default: [] },
 
+  /* ── WHY IT MAY NOT LOOK LIKE IT DID IN CLO ───────────────────────────
+     The appearance audit: which materials sample texture that is not there,
+     which meshes wear them, and the CLO export change that would fix it.
+     Recorded, never acted on — nothing in this system rewrites a material or
+     removes a mesh, because the value of a published model is that it is what
+     CLO produced. Mixed, because it is a report rather than a record anything
+     queries by. */
+  surfaceAudit: { type: mongoose.Schema.Types.Mixed, default: null },
+
   /* Every measurement taken on this model. See the schema's own header for
      why these live here rather than in a collection of their own. */
   measurements: { type: [measurementSchema], default: [] },

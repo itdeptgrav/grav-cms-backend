@@ -48,6 +48,7 @@ const {
 } = require("../../models/CMS_Models/RnD/GarmentModel");
 const drive = require("../companyDrive.service");
 const { inspectGlb, GlbError } = require("../../utils/glbInspect");
+const { auditSurfaces } = require("../../utils/glbSurfaceAudit");
 const {
   classifyBundleFile, routeDroppedFiles, BUNDLE_KIND, ClassifyError,
 } = require("../../utils/bundleFileTypes");
@@ -285,6 +286,9 @@ function publicationView(row, { subject = "", links = false, mayDownloadSource =
     /* Said out loud, because it changes what the workspace can promise. */
     heavy: (row.stats?.triangles ?? 0) > LIMITS.TRIANGLES_WARN,
     warnings: row.warnings || [],
+    /* The appearance audit travels with the publication so the workspace can
+       name the responsible material when somebody clicks a black patch. */
+    surfaceAudit: row.surfaceAudit || null,
     anchorable: (row.stats?.namedPieces ?? 0) > 0,
     hasAvatar: Boolean(row.hasAvatar),
     avatarNodeRefs: row.avatarNodeRefs || [],
@@ -538,6 +542,13 @@ function readWebModel(file) {
   if (!read) {
     throw fail("MODEL_UNREADABLE", "That file could not be read as a garment model.");
   }
+  /* ── WHY THE GARMENT MAY NOT LOOK LIKE IT DID IN CLO ──────────────────
+     Read here, where the bytes are still in hand, and recorded rather than
+     acted on. Nothing below rewrites a material or drops a mesh: the value of
+     a published model is that it is what CLO produced, and a viewer that
+     quietly corrects a garment's colour is one nobody can approve a sample
+     against. See utils/glbSurfaceAudit.js. */
+  read.surfaceAudit = auditSurfaces(file.buffer);
   if (read.stats.triangles > LIMITS.TRIANGLES) {
     throw fail("MODEL_TOO_COMPLEX",
       `This model has ${read.stats.triangles.toLocaleString()} triangles and the workspace accepts `
@@ -580,6 +591,26 @@ function warningsFor(read, { sourceFile }) {
         + `when judging colour. (${unsupported.join(", ")} — the viewer cannot honour it, so the garment `
         + "draws correctly in a finish it was not authored in.)",
       extensions: unsupported,
+    });
+  }
+  /* ── THE GARMENT DRAWS DIFFERENTLY HERE THAN IT DID IN CLO ──────────
+     Named per material and per mesh, with the export change that fixes it,
+     because "materials look wrong" tells an exporter nothing. The wording is
+     deliberately about the DIFFERENCE rather than about blame: a conforming
+     viewer and CLO can both be right about the same file. */
+  for (const finding of read.surfaceAudit?.findings || []) {
+    out.push({
+      code: `SURFACE_${finding.kind}`,
+      message: "This area renders differently from the source application. Check the material or "
+        + "texture export before using this model for approval."
+        + (finding.material ? ` (${finding.material}` : " (")
+        + `${(finding.meshes || []).length ? ` on ${finding.meshes.slice(0, 3).join(", ")}`
+          + `${finding.meshes.length > 3 ? ` and ${finding.meshes.length - 3} more` : ""}` : ""})`,
+      detail: finding.detail,
+      exportFix: finding.exportFix,
+      material: finding.material || "",
+      meshes: finding.meshes || [],
+      share: finding.share ?? null,
     });
   }
   if (read.stats.triangles > LIMITS.TRIANGLES_WARN) {
@@ -780,6 +811,11 @@ async function createDraft(ctx, { styleId, files = {}, body = {}, actor = null }
     stats: read
       ? { ...read.stats, namedPieces: read.namedPieces }
       : { ...(carried.previous.stats || {}) },
+    /* The appearance audit, kept beside the model it describes: the person
+       who publishes is rarely the person who later asks why a panel is black. */
+    surfaceAudit: read
+      ? (read.surfaceAudit || null)
+      : (carried.previous.surfaceAudit || null),
     hasAvatar: read ? read.hasAvatar : Boolean(carried.previous.hasAvatar),
     avatarNodeRefs: read ? read.avatarNodeRefs : (carried.previous.avatarNodeRefs || []),
     technicalRevisionRef: str(technicalPack?.technicalRevisionRef),
