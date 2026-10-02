@@ -734,6 +734,42 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
     seamAllowanceMm: inputs.seamAllowanceMm !== undefined
       ? (Number.isFinite(Number(inputs.seamAllowanceMm)) ? Number(inputs.seamAllowanceMm) : null)
       : (held.seamAllowanceMm ?? null),
+    /* ── THE SEWING-LINE DECISION, STAMPED LIKE EVERY OTHER CONFIRMATION ──
+       What the client sends is the choice. Who made it and when come from the
+       server, for the same reason the role and alignment confirmations do: a
+       confirmation nobody is attributable for is a guess with a name on it.
+
+       `allowanceMm` is cleared unless the decision is that the outline is a cut
+       line. A stored 10 that nothing applies is exactly how an assumption comes
+       back later wearing the clothes of a decision. */
+    sewingLine: (() => {
+      const incoming = inputs.sewingLine;
+      const before = held.sewingLine || {};
+      if (!incoming) return before;
+      const meaning = str(incoming.lineMeaning) || str(before.lineMeaning) || "unknown";
+      const source = str(incoming.source) || str(before.source) || "unknown";
+      const derived = meaning === "cut_line";
+      const changed = meaning !== str(before.lineMeaning) || source !== str(before.source);
+      return {
+        source,
+        lineMeaning: meaning,
+        allowanceMm: derived
+          ? (Number.isFinite(Number(incoming.allowanceMm)) ? Number(incoming.allowanceMm)
+            : (before.allowanceMm ?? null))
+          : null,
+        overrides: Array.isArray(incoming.overrides) ? incoming.overrides : (before.overrides || []),
+        /* A fresh statement is re-stamped; agreeing with what is already there
+           keeps the original identity and time. */
+        confirmed: meaning === "unknown"
+          ? null
+          : stamp(true, changed ? null : before.confirmed),
+        origin: meaning === "unknown" ? "" : (str(incoming.origin) || "user-confirmation"),
+        recommendation: incoming.recommendation || before.recommendation || {},
+        /* Written by the drape runner, which is the only thing that knows which
+           pieces could not take the decision. Never accepted from a client. */
+        exceptions: before.exceptions || [],
+      };
+    })(),
     settings: inputs.settings || held.settings || {},
   };
 

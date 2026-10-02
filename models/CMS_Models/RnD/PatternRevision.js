@@ -329,6 +329,105 @@ const avatarSchema = new mongoose.Schema({
   scaleVerifiedAgainst: { type: String, trim: true, default: "" },
 }, { _id: false });
 
+/* ═══ WHAT THE IMPORTED OUTLINE MEANS ═════════════════════════════════════
+ *
+ * A DXF carries a polyline per piece and, unless it says otherwise, nothing
+ * about what that polyline IS. CLO exports the cut edge for some garments and
+ * the stitch line for others, and AAMA has no field that distinguishes them.
+ * The system cannot know, and guessing is expensive in a way that does not
+ * look like a guess afterwards.
+ *
+ * Measured on PR-97DE89D131, whose five pieces declare `seamAllowance: null`
+ * and publish no second boundary: read as a cut line and inset by a uniform
+ * 10mm, its front and back shoulder runs — the same length to 0.00% as drawn —
+ * come out 5.21% apart, because a miter at each end of a run moves its
+ * endpoints ALONG the run by different amounts on two pieces of different
+ * curvature. Its neck band, 8.95% shorter than the neckline as drawn, which is
+ * an ordinary rib stretch, is asked for 25%, because a 10mm offset on a 92mm
+ * radius hole grows the neckline 582mm to 668mm while the band keeps its
+ * length. Neither mismatch is in the pattern. Both are made by the reading.
+ *
+ * So the reading is recorded: what a person said their file means, who said
+ * it and when. `unknown` is a real answer and the honest default — it blocks
+ * fit approval rather than letting the system pick one quietly.
+ */
+const LINE_MEANING = Object.freeze({
+  /* The outline is where the pieces are stitched together. */
+  SEWING_LINE: "sewing_line",
+  /* The outline is the cut edge; a sewing line must be derived from a stated
+     allowance before anything dimensional can be said. */
+  CUT_LINE: "cut_line",
+  /* The file carries both, as separate boundaries. */
+  BOTH: "both",
+  /* Nobody has said. Fit approval is blocked. */
+  UNKNOWN: "unknown",
+});
+
+const SEWING_LINE_SOURCE = Object.freeze({
+  AS_IMPORTED: "as-imported",
+  DERIVED: "derived",
+  PUBLISHED: "published",
+  UNKNOWN: "unknown",
+});
+
+/* Where a decision came from. A recommendation the system measured is not the
+   same thing as a person agreeing with it, and the difference has to survive. */
+const DECISION_ORIGIN = Object.freeze({
+  FILE_METADATA: "file-metadata",
+  USER_CONFIRMATION: "user-confirmation",
+  RECOMMENDATION: "recommendation",
+});
+
+const allowanceOverrideSchema = new mongoose.Schema({
+  pieceRef: { type: String, trim: true, required: true },
+  /* Empty when the override is for the whole piece rather than one run of it. */
+  runId: { type: String, trim: true, default: "" },
+  allowanceMm: { type: Number, required: true, min: 0 },
+}, { _id: false });
+
+const sewingLineDecisionSchema = new mongoose.Schema({
+  source: {
+    type: String,
+    enum: Object.values(SEWING_LINE_SOURCE),
+    default: SEWING_LINE_SOURCE.UNKNOWN,
+  },
+  lineMeaning: {
+    type: String,
+    enum: Object.values(LINE_MEANING),
+    default: LINE_MEANING.UNKNOWN,
+  },
+  /* Only meaningful when the outline is a cut line. Null otherwise, rather
+     than a number that is not being used — a stored 10 that nothing applies is
+     how an assumption comes back. */
+  allowanceMm: { type: Number, default: null, min: 0 },
+  /* Where an edge or a piece differs from the garment's figure. */
+  overrides: { type: [allowanceOverrideSchema], default: [] },
+  /* Who said so, and when. Stamped by the server. */
+  confirmed: { type: confirmationSchema, default: null },
+  origin: {
+    type: String,
+    enum: [...Object.values(DECISION_ORIGIN), ""],
+    default: "",
+  },
+  /* What the system measured and would have suggested, kept beside what the
+     person chose so a disagreement between them is visible rather than lost. */
+  recommendation: {
+    lineMeaning: { type: String, enum: [...Object.values(LINE_MEANING), ""], default: "" },
+    why: { type: String, trim: true, default: "", maxlength: 1200 },
+  },
+  /* Pieces that could not take the decision as stated and are sewn some other
+     way, by name. This used to live only in a sentence, so nothing downstream
+     could count it, gate on it or show it. */
+  exceptions: {
+    type: [new mongoose.Schema({
+      pieceRef: { type: String, trim: true, default: "" },
+      name: { type: String, trim: true, default: "" },
+      why: { type: String, trim: true, default: "", maxlength: 600 },
+    }, { _id: false })],
+    default: [],
+  },
+}, { _id: false });
+
 const simulationInputsSchema = new mongoose.Schema({
   /* Which of the three categories. Chosen, never guessed. */
   template: { type: String, trim: true, default: "" },
@@ -342,6 +441,11 @@ const simulationInputsSchema = new mongoose.Schema({
      published sewing line and without this, no sewing line can be constructed
      and every dimensional finding is withheld (§4.12 step 4). */
   seamAllowanceMm: { type: Number, default: null, min: 0 },
+  /* ── AND WHAT THAT ALLOWANCE IS FOR, WHICH IS NOT THE SAME QUESTION ──
+     `seamAllowanceMm` says how wide; this says whether an allowance applies at
+     all. A file whose outline is already the stitch line has no allowance to
+     inset, and insetting one anyway invents mismatch. */
+  sewingLine: { type: sewingLineDecisionSchema, default: () => ({}) },
   /* Solver settings, named by the adapter that consumes them. */
   settings: { type: mongoose.Schema.Types.Mixed, default: {} },
 }, { _id: false });
@@ -548,7 +652,13 @@ const renderJobSchema = new mongoose.Schema({
         40mm — the width of a whole fit band. The error is never called slight
         (garment-template-contract.md §4.12). */
     sewingLineSource: {
-      type: String, enum: ["published", "derived", "cut-boundary", ""], default: "",
+      /* `as-imported` is a drape sewn on the lines the file draws, because a
+         person stated that is what they are — distinct from `cut-boundary`,
+         which is the same geometry with nobody standing behind it and every
+         dimension withheld. */
+      type: String,
+      enum: ["published", "derived", "as-imported", "cut-boundary", ""],
+      default: "",
     },
     seamAllowanceMm: { type: Number, default: null },
     /* False when the cut boundary was used. A non-authoritative drape may be

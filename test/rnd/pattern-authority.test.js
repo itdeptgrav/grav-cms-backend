@@ -94,6 +94,119 @@ const refuses = async (fn, code) => {
   throw new Error(`expected a ${code} refusal and nothing was refused`);
 };
 
+/* ═══ 0 · WHAT THE IMPORTED OUTLINE MEANS ═════════════════════════════════
+ *
+ * A DXF carries a polyline per piece and, unless it says otherwise, nothing
+ * about what that polyline IS. CLO exports the cut edge for some garments and
+ * the stitch line for others, and AAMA has no field that tells them apart.
+ *
+ * Guessing is expensive in a way that does not look like a guess afterwards.
+ * Read as a cut edge and inset by a uniform 10mm, the real export's front and
+ * back shoulder runs — the same length to 0.00% as drawn — come out 5.21%
+ * apart, and its neck band, 8.95% shorter than the neckline as drawn, is asked
+ * for 25%. Neither mismatch is in the pattern. Both are made by the reading,
+ * and arrive in the drape as a crumpled neckline that looks like a simulation
+ * fault.
+ *
+ * So the reading is recorded, with who said it.
+ */
+
+describe("the sewing-line decision is recorded, not inferred", () => {
+  test("a fresh revision has not decided, and that is a real answer", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const held = revision.simulationInputs?.sewingLine || {};
+    expect(held.lineMeaning || "unknown").toBe("unknown");
+    expect(held.confirmed || null).toBeNull();
+  });
+
+  test("stating that the outlines are sewing lines is saved, with who said it", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const out = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
+      actor: w.drafter,
+    });
+    const held = out.revision.simulationInputs.sewingLine;
+    expect(held.lineMeaning).toBe("sewing_line");
+    expect(held.source).toBe("as-imported");
+    expect(held.origin).toBe("user-confirmation");
+    /* Stamped by the server. A confirmation nobody is attributable for is a
+       guess with a name on it. */
+    expect(held.confirmed?.at).toBeTruthy();
+    expect(String(held.confirmed?.by?.id || "")).toBe(String(w.drafter.id));
+  });
+
+  test("an allowance is kept only where there is something to inset", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const derived = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "cut_line", source: "derived", allowanceMm: 12 } },
+      actor: w.drafter,
+    });
+    expect(derived.revision.simulationInputs.sewingLine.allowanceMm).toBe(12);
+
+    /* Change the reading and the figure goes, rather than sitting there for
+       something to pick up later. */
+    const asImported = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: derived.revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
+      actor: w.drafter,
+    });
+    expect(asImported.revision.simulationInputs.sewingLine.allowanceMm).toBeNull();
+  });
+
+  test("the decision survives a reload", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
+      actor: w.drafter,
+    });
+    const again = await patterns.readRevision(w.ctx, { revisionId: revision.id });
+    expect(again.revision.simulationInputs.sewingLine.lineMeaning).toBe("sewing_line");
+  });
+
+  test("agreeing with a decision keeps the original identity and time", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const first = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
+      actor: w.drafter,
+    });
+    const stamped = first.revision.simulationInputs.sewingLine.confirmed.at;
+    const second = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: first.revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
+      actor: w.drafter,
+    });
+    expect(String(second.revision.simulationInputs.sewingLine.confirmed.at))
+      .toBe(String(stamped));
+  });
+
+  test("a client may not post its own exceptions", async () => {
+    /* They are written by the drape runner, which is the only thing that knows
+       which pieces could not take the decision. */
+    const w = await world();
+    const revision = await imported(w);
+    const out = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: {
+        sewingLine: {
+          lineMeaning: "sewing_line",
+          exceptions: [{ pieceRef: "PP-1", name: "invented", why: "posted by a client" }],
+        },
+      },
+      actor: w.drafter,
+    });
+    expect(out.revision.simulationInputs.sewingLine.exceptions).toHaveLength(0);
+  });
+});
+
 /* ═══ 1 · IMPORT ══════════════════════════════════════════════════════════ */
 
 describe("importing a pattern starts the record", () => {
