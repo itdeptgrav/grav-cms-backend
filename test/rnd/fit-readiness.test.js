@@ -266,6 +266,79 @@ describe("Group B · patterns that must be refused", () => {
     expect(r5.message).toMatch(/once per piece rather than edge by edge/);
   });
 
+  test("R7 DOES NOT REFUSE A SEAM FOR FLOATING-POINT NOISE, AND STILL REFUSES A REAL GAP", () => {
+    /* A side seam allows 0% ease, which is the right rule and was being applied
+       to lengths summed in floating point. The genuine tee's two side seams are
+       400.2140 mm each and differ in the last bits of a double, so the garment was
+       refused for being "0.0% apart where this seam allows 0%". */
+    const patternSet = tee.patternSet();
+    const inputs = clone(tee.simulationInputs());
+    const side = inputs.seams.find((seam) => {
+      const entry = seam.sideA?.[0];
+      const plan = inputs.pieces.find((p) => p.pieceRef === entry?.pieceRef);
+      return (plan?.runs || []).find((r) => r.runId === entry?.runId)?.role === "side";
+    });
+    expect(side).toBeDefined();
+    const runFor = (entry) => inputs.pieces.find((p) => p.pieceRef === entry.pieceRef)
+      .runs.find((r) => r.runId === entry.runId);
+    const a = runFor(side.sideA[0]);
+    const b = runFor(side.sideB[0]);
+
+    /* The same length, as a double reaches it by two different additions. */
+    a.lengthMm = 400.214;
+    b.lengthMm = 400.21400000000006;
+    expect(codes(assess(patternSet, inputs))).not.toContain("R7");
+
+    /* Half a percent out is a pattern fault and still refuses — the floor is a
+       millimetre, not a licence. */
+    b.lengthMm = 400.214 + 2.1;
+    const refused = assess(patternSet, inputs).failures.find((f) => f.code === "R7");
+    expect(refused).toBeDefined();
+    expect(refused.differenceMm).toBeCloseTo(2.1, 5);
+    /* And the sentence says how far apart in centimetres, so it never reads as
+       "0.0% apart, where this seam allows 0%". */
+    expect(refused.message).toMatch(/cm apart/);
+  });
+
+  test("R5 COUNTS COVERAGE IN ONE UNIT · an inch pattern is not covered by one seam", () => {
+    /* The defect this pins. A piece's perimeter is read off the parsed outline, so
+       it is in the unit the FILE declared; a run's lengthMm is millimetres. R5
+       divided one by the other, so on the genuine CLO export — which declares
+       INCHES — a single mapped shoulder seam made `sewn / perimeter` about 25
+       times too large, the share passed 0.999, and a panel whose hem and armholes
+       were not sewn at all was reported as fully sewn. R5 then stopped asking. */
+    const patternSet = clone(tee.patternSet());
+    patternSet.unit = "in";
+    patternSet.unitInMm = 25.4;
+    /* The same pattern, redrawn in inches: every coordinate and every derived
+       length divided by 25.4, so the garment is physically identical and only the
+       unit it is written in has changed. */
+    const shrink = (v) => v / 25.4;
+    for (const piece of patternSet.pieces) {
+      piece.outline = piece.outline.map((p) => (Array.isArray(p)
+        ? [shrink(p[0]), shrink(p[1])]
+        : { ...p, x: shrink(p.x), y: shrink(p.y) }));
+      if (piece.perimeter) piece.perimeter = shrink(piece.perimeter);
+      if (piece.turnPoints) {
+        piece.turnPoints = piece.turnPoints.map((p) => ({ ...p, x: shrink(p.x), y: shrink(p.y) }));
+      }
+    }
+
+    const inputs = clone(tee.simulationInputs());
+    for (const piece of inputs.pieces) piece.boundaryConfirmed = null;
+    const result = assess(patternSet, inputs);
+    const r5 = result.failures.find((f) => f.code === "R5");
+    expect(r5).toBeDefined();
+    /* Every piece still has unsewn perimeter, exactly as it does in millimetres. */
+    expect(r5.pieces.length).toBe(4);
+    for (const piece of r5.pieces) {
+      expect(piece.sewnShare).toBeLessThan(0.999);
+      /* And the figure shown to a person is millimetres, not inches labelled mm:
+         a 60 cm hem does not read as 2.4. */
+      expect(piece.uncoveredMm).toBeGreaterThan(100);
+    }
+  });
+
   test("VM-14 · A ZEROED FABRIC PROFILE IS REFUSED", () => {
     /* The case the old presence-only check accepted. Zero gravity and zero
        stiffness give cloth that looks like cloth and behaves like nothing. */

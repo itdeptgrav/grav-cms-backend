@@ -78,6 +78,27 @@ const EASE_ALLOWANCE = Object.freeze({
   default: 0.05,
 });
 
+/**
+ * THE DIFFERENCE BELOW WHICH THERE IS NO EASE TO TALK ABOUT.
+ *
+ * A side seam allows no ease, and 0.0 is the right product rule: two side seams
+ * that do not match are a pattern fault, not a sewing allowance. But a ratio of
+ * zero cannot be evaluated against lengths accumulated in floating point. The
+ * genuine CLO tee's two side seams are 400.2140 mm each — identical to four
+ * decimal places and different in the last bits of a double, because one is
+ * summed over two chords and the other over three. That refused the garment with
+ * "0.0% apart, where this seam allows 0%", which is both unactionable and, read
+ * aloud, a contradiction.
+ *
+ * So the rule is kept and the arithmetic is bounded: a difference under a
+ * millimetre is not ease. It is below the spacing of the outline points the
+ * length was measured along, below the seam allowance it will be sewn at, and
+ * below anything a machinist could sew differently if told. Nothing larger is
+ * forgiven — one millimetre on a 40 cm seam is 0.25%, so a side seam that is
+ * genuinely out by even half a percent still refuses.
+ */
+const EASE_FLOOR_MM = 1;
+
 const TEMPLATES = Object.freeze({
   tshirt: {
     id: "tshirt",
@@ -201,5 +222,5 @@ const UNMODELLED = Object.freeze([
 module.exports = {
   TEMPLATES, TEMPLATE_IDS, RUN_ROLES, NECK_FINISH_ROLES, NOT_SIMULATED_ROLES,
   EASE_ALLOWANCE, UNMODELLED,
-  templateFor, easeAllowanceFor, simulates, isNeckFinish,
+  templateFor, easeAllowanceFor, EASE_FLOOR_MM, simulates, isNeckFinish,
 };

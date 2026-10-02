@@ -345,6 +345,13 @@ function checkSeams(patternSet, inputs, simulatedPlans, template) {
     return (plan?.runs || []).find((r) => str(r.runId) === str(runId)) || null;
   };
 
+  /* EVERY LENGTH IN MILLIMETRES, INCLUDING THE ONES MEASURED HERE.
+     `lengthMm` is already millimetres; an outline is in whatever unit the file
+     declared, and this export declares INCHES. Returning one of each from the
+     same function is a 25.4x error that appears only on the seams where one side
+     stated its length and the other did not — which is to say, rarely, and
+     never in a way the shape reveals. */
+  const factor = positive(patternSet?.unitInMm) || 1;
   const measure = (ref, run) => {
     const stated = positive(run?.lengthMm);
     if (stated !== null) return stated;
@@ -353,7 +360,7 @@ function checkSeams(patternSet, inputs, simulatedPlans, template) {
     const from = anchorIndex(run?.startAnchor, outline.length);
     const to = anchorIndex(run?.endAnchor, outline.length);
     if (from === null || to === null) return null;
-    return runLength(outline, from, to);
+    return runLength(outline, from, to) * factor;
   };
 
   for (const seam of seams) {
@@ -497,7 +504,8 @@ function checkSeams(patternSet, inputs, simulatedPlans, template) {
     const bLength = lengthOf(seam.sideB);
     if (!broken && aLength !== null && bLength !== null && aLength > 0 && bLength > 0) {
       const shorter = Math.min(aLength, bLength);
-      const ease = Math.abs(aLength - bLength) / shorter;
+      const difference = Math.abs(aLength - bLength);
+      const ease = difference / shorter;
       const roleOfSeam = str(seam.sideA?.[0]
         && runOf(str(seam.sideA[0].pieceRef), str(seam.sideA[0].runId))?.role);
       const allowed = templates.easeAllowanceFor(roleOfSeam);
@@ -507,12 +515,16 @@ function checkSeams(patternSet, inputs, simulatedPlans, template) {
         allowedPercent: Number((allowed * 100).toFixed(1)),
         role: roleOfSeam,
       });
-      if (ease > allowed) {
+      /* A sub-millimetre difference is arithmetic, not ease — see EASE_FLOOR_MM.
+         Without this floor a seam whose two sides are the SAME length to four
+         decimal places was refused for being 0.0% apart where 0% is allowed. */
+      if (ease > allowed && difference > templates.EASE_FLOOR_MM) {
         failures.push(fail("R7", "seams",
           `"${label}" joins sides of ${(aLength / 10).toFixed(1)} cm and `
-          + `${(bLength / 10).toFixed(1)} cm — ${(ease * 100).toFixed(1)}% apart, where this seam `
-          + `allows ${(allowed * 100).toFixed(0)}%. The pieces as mapped do not fit each other.`,
-          { seamId, aLengthMm: aLength, bLengthMm: bLength }));
+          + `${(bLength / 10).toFixed(1)} cm — ${(difference / 10).toFixed(1)} cm apart, `
+          + `${(ease * 100).toFixed(1)}% of the shorter, where this seam allows `
+          + `${(allowed * 100).toFixed(0)}%. The pieces as mapped do not fit each other.`,
+          { seamId, aLengthMm: aLength, bLengthMm: bLength, differenceMm: difference }));
       } else if (ease > allowed * 0.6 && ease > 0.01) {
         warnings.push(warn("W3", "seams",
           `"${label}" carries ${(ease * 100).toFixed(1)}% ease, inside the `
@@ -850,10 +862,15 @@ function assess(patternSet, inputs = {}, opts = {}) {
 
   /* ── R5 · BOUNDARY COVERAGE ────────────────────────────────────────── */
   const uncovered = [];
+  /* The perimeter comes off the parsed outline, so it is in the FILE's unit, and
+     the runs are in millimetres. Comparing them directly made `sewn / perimeter`
+     about 25x too big on an inch pattern, so one mapped shoulder seam was enough
+     for a whole panel to pass as fully sewn and R5 stopped asking about its hem. */
+  const coverFactor = positive(patternSet?.unitInMm) || 1;
   for (const plan of simulatedPlans) {
     const ref = str(plan.pieceRef);
     const parsedPiece = parsedByRef.get(ref);
-    const perimeter = positive(parsedPiece?.perimeter) || 0;
+    const perimeter = (positive(parsedPiece?.perimeter) || 0) * coverFactor;
     const sewn = (plan.runs || [])
       .filter((run) => (seamCheck.mappedRuns.get(ref) || new Set()).has(str(run.runId)))
       .reduce((total, run) => {
@@ -862,7 +879,8 @@ function assess(patternSet, inputs = {}, opts = {}) {
         if (stated !== null) return total + stated;
         const from = anchorIndex(run.startAnchor, outline.length);
         const to = anchorIndex(run.endAnchor, outline.length);
-        return from === null || to === null ? total : total + runLength(outline, from, to);
+        return from === null || to === null
+          ? total : total + runLength(outline, from, to) * coverFactor;
       }, 0);
     const explicit = (plan.runs || [])
       .filter((run) => ["fold", "vent", "opening", "sleeve.slit"].includes(str(run.role)))

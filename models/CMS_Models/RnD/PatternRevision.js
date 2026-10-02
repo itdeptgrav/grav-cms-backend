@@ -131,6 +131,13 @@ const boundaryRunSchema = new mongoose.Schema({
      stored because everything downstream — pairing, easing, sampling — depends on
      the order being the stated one rather than the storage order of the outline. */
   direction: { type: String, enum: ["forward", "reverse"], default: "forward" },
+  /* WHICH OF THE TWO STRETCHES BETWEEN THE ANCHORS THIS IS.
+     Two points on a closed boundary divide it into two runs and both are real: a
+     neckline and "all of the piece except the neckline" share their ends. The
+     solver takes the shorter one unless told otherwise, so the choice has to be
+     recorded — without this field the screen could offer the long way round,
+     draw it, and have the garment sewn along the short one. */
+  theLongWay: { type: Boolean, default: false },
   /* What this run is for, from the template's own run vocabulary. */
   role: { type: String, trim: true, default: "" },
   /* Arc length between the anchors, in the pattern's own unit. Derived at the
