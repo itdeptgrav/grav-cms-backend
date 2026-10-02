@@ -827,6 +827,55 @@ router.post("/", async (req, res) => {
     // Seed the 28 default groups
     const seeded = await seedDefaultGroups(company._id, req.user?.id);
 
+    /* ── ATTACH IT, OR IT IS INVISIBLE THE MOMENT IT IS CREATED (1 Oct 2026) ──
+     *
+     * GET / draws its list from `Acc_Organization.tallyCompanyIds` — on purpose,
+     * so the picker cannot offer a company the guards would refuse (see the long
+     * note above that handler). But nothing wrote that field:
+     * `attachCompaniesToOrganization` in
+     * services/accountantCompanyOwnership.service.js is its ONLY writer, and it
+     * had no caller anywhere in the codebase. So a company created here was
+     * never owned by anybody, never appeared in the list, and could not be
+     * selected — the live database has exactly that, one orphaned
+     * "GRAV CLOTHING PVT LTD" against an organisation holding `tallyCompanyIds: []`,
+     * which is why the accountant dashboard sits on "No company" forever.
+     *
+     * Creating a company and not attaching it is never what the creator meant,
+     * so it is attached to the organisation that created it, through the
+     * canonical writer rather than a `$push` here — that service is what holds
+     * the one-organisation-per-company line (it refuses a company another
+     * organisation already owns, and survives the race on the index).
+     *
+     * A dev-bypass session has no organisation and attaches nothing; it already
+     * sees every company by the `isDev` exemption, so it loses nothing. A
+     * failure to attach does NOT fail the request — the company exists and is
+     * seeded by this point, and tearing that down would be worse than reporting
+     * it — but it is surfaced in the response so the caller is never told a
+     * company is ready to use when it is not yet owned. */
+    let attachment = { attempted: false };
+    if (req.organization?._id) {
+      try {
+        const { attachCompaniesToOrganization } = require(
+          "../../services/accountantCompanyOwnership.service",
+        );
+        const result = await attachCompaniesToOrganization({
+          organizationId: req.organization._id,
+          companyIds: [company._id],
+        });
+        attachment = result?.ok
+          ? { attempted: true, ok: true }
+          : {
+              attempted: true,
+              ok: false,
+              code: result?.code,
+              message: result?.message,
+            };
+      } catch (e) {
+        console.error("POST tally company — attach to organisation:", e);
+        attachment = { attempted: true, ok: false, message: e.message };
+      }
+    }
+
     await auditCompany(req, {
       entityId: String(company._id),
       entityLabel: company.companyName,
@@ -842,9 +891,16 @@ router.post("/", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Company created and default chart-of-accounts groups seeded.",
+      message:
+        attachment.attempted && !attachment.ok
+          ? "Company created and groups seeded, but it could not be attached to your organisation — it will not appear in the company list until it is."
+          : "Company created and default chart-of-accounts groups seeded.",
       company,
       seededGroups: seeded,
+      attachedToOrganization: attachment.attempted ? attachment.ok === true : null,
+      ...(attachment.attempted && !attachment.ok
+        ? { attachmentError: attachment.message || attachment.code }
+        : {}),
     });
   } catch (err) {
     console.error("POST tally company:", err);
@@ -852,6 +908,112 @@ router.post("/", async (req, res) => {
       success: false,
       message: err.message || "Error creating company",
     });
+  }
+});
+
+/* ── A COMPANY THAT BELONGS TO NOBODY ───────────────────────────────────────
+ *
+ * GET / lists only what the organisation OWNS (`tallyCompanyIds`), which is
+ * right — the picker must not offer what the guards would refuse. But nothing
+ * in the product ever WROTE that field: `attachCompaniesToOrganization` is its
+ * only writer and had no caller at all. A company created before the create
+ * route started attaching them (just above) is therefore invisible for ever,
+ * and the books look empty while the company sits in the database.
+ *
+ * That is exactly the live state on the hosted deployment: one active company,
+ * an organisation holding none, and an owner looking at "No companies yet"
+ * with no way to put it right from any screen.
+ *
+ * These two routes are that way. They are deliberately NOT a general company
+ * mover: they only ever go from "owned by nobody" to "owned by the signed-in
+ * owner's organisation". A company another organisation holds is refused by
+ * the canonical writer, which is the thing that enforces one-organisation-per
+ * company, not this route.
+ *
+ * Both are declared ABOVE `/:id`, or "unattached" is read as a company id.
+ */
+
+/** GET /unattached — active companies no organisation holds. Owner only. */
+router.get("/unattached", async (req, res) => {
+  try {
+    if (!(req.user?.permissions?.canManageSettings === true || req.user?.isDev)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only the Accounting owner can see unattached companies.",
+      });
+    }
+    const { Acc_Organization } = require("../../models/Accountant_model/Acc_OrgModels");
+    const orgs = await Acc_Organization.find({}).select("tallyCompanyIds").lean();
+    const owned = new Set(
+      orgs.flatMap((o) => (o.tallyCompanyIds || []).map(String)),
+    );
+    const all = await Acc_Company.find({ isActive: true })
+      .select("companyName gstin isPrimary createdAt")
+      .sort({ isPrimary: -1, createdAt: -1 })
+      .lean();
+    const companies = all.filter((c) => !owned.has(String(c._id)));
+    res.json({ success: true, companies, ownedCount: owned.size });
+  } catch (err) {
+    console.error("[tally companies] unattached:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/** POST /:id/attach — give this company to the signed-in owner's organisation. */
+router.post("/:id/attach", async (req, res) => {
+  try {
+    // Gate 2 above already refuses a non-owner on any write; this is the
+    // explicit statement of the same rule, because the one below it is a
+    // permanent ownership decision rather than an ordinary edit.
+    if (!(req.user?.permissions?.canManageSettings === true || req.user?.isDev)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only the Accounting owner can attach a company.",
+      });
+    }
+    const organizationId = req.organization?._id || req.user?.organizationId;
+    if (!organizationId) {
+      return res.status(403).json({
+        success: false,
+        code: "NO_ORGANIZATION_CONTEXT",
+        message: "This session has no organisation, so a company cannot be attached to one.",
+      });
+    }
+    const company = await Acc_Company.findById(req.params.id).select("companyName").lean();
+    if (!company) return res.status(404).json({ success: false, message: "Company not found." });
+
+    const { attachCompaniesToOrganization } =
+      require("../../services/accountantCompanyOwnership.service");
+    const result = await attachCompaniesToOrganization({
+      organizationId,
+      companyIds: [company._id],
+    });
+    if (!result?.ok) {
+      return res.status(result?.status || 409).json({
+        success: false,
+        code: result?.code,
+        message: result?.message || "That company could not be attached.",
+      });
+    }
+
+    await auditCompany(req, {
+      entityId: String(company._id),
+      entityLabel: company.companyName,
+      action: "update",
+      summary: `Attached “${company.companyName}” to this organisation, so it appears in the company list.`,
+    });
+
+    res.json({
+      success: true,
+      attached: result.attached,
+      alreadyAttached: result.alreadyAttached,
+      message: result.attached?.length
+        ? `“${company.companyName}” is now part of your organisation.`
+        : `“${company.companyName}” was already part of your organisation.`,
+    });
+  } catch (err) {
+    console.error("[tally companies] attach:", err);
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 

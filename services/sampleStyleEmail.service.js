@@ -31,7 +31,11 @@
 // stays resolvable even when the Account underneath it is gone.
 
 const Account = require("../models/CMS_Models/Sales/Account");
-const { serviceFilter } = require("./companyContext/serviceScope.service");
+/* `assertServiceContext` is called below and was never imported, so the first
+   sample-style image read threw `assertServiceContext is not defined` instead
+   of the tenancy refusal it is there to raise. It lives in the same module as
+   `serviceFilter`, which this file already uses on the very next line. */
+const { serviceFilter, assertServiceContext } = require("./companyContext/serviceScope.service");
 const StockItem = require("../models/CMS_Models/Inventory/Products/StockItem");
 const Enquiry = require("../models/CMS_Models/Sales/Enquiry");
 const SalesJourney = require("../models/CMS_Models/Sales/SalesJourney");

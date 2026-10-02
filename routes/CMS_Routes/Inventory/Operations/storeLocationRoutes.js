@@ -155,7 +155,7 @@ router.get("/resolve", requireCapability(CAPABILITIES.READ), async (req, res) =>
       const onHand = loc.onHandOf(r.item, r.variantId);
       const sentinel = await LocationBalance.findOne(loc.sentinelFilter(companyOf(req), r.item._id, r.variantId)).lean();
       const assigned = loc.round4(sentinel?.onHand || 0);
-      return res.json({ success: true, type: "item", found: true, marking: markingView(r), item: { rawItemId: String(r.item._id), variantId: r.variantId, name: r.item.name, sku: r.variant?.sku || r.item.sku || "", variant: r.variant ? (r.variant.combination || []).join(" · ") : "", baseUnit: loc.baseUnitOf(r.item), onHand, assigned, unassigned: loc.round4(onHand - assigned) }, located: mb.located, remainingToPut: loc.round4(Math.max(0, Math.min(r.barcode.quantity - mb.located, onHand - assigned))), balances: mb.balances });
+      return res.json({ success: true, type: "item", found: true, marking: markingView(r), item: { rawItemId: String(r.item._id), variantId: r.variantId, name: r.item.name, sku: r.variant?.sku || r.item.sku || "", variant: r.variant ? (r.variant.combination || []).join(" · ") : "", baseUnit: loc.baseUnitOf(r.item), onHand, assigned, unassigned: loc.round4(onHand - assigned) }, located: mb.located, remainingToPut: loc.round4(Math.max(0, r.barcode.quantity - mb.located)) /* bounded by the sticker only, not on-hand — 1 Oct 2026, see putStock */, balances: mb.balances });
     }
     return res.json({ success: true, type: parsed.type, found: false, message: parsed.reason || "Not a store code." });
   } catch (e) { handle(res, e, "resolve"); }
@@ -442,7 +442,10 @@ router.post("/put", requireCapability(OPERATE), refuseLegacyWrite, withIdempoten
     const onHand = loc.onHandOf(stock.item, stock.variantId);
     const sentinel = await LocationBalance.findOne(loc.sentinelFilter(companyOf(req), stock.item._id, stock.variantId)).lean();
     const unassigned = loc.round4(onHand - (sentinel?.onHand || 0));
-    if (qty > unassigned + loc.QTY_TOL) throw fail("VALIDATION", `Only ${unassigned} ${loc.baseUnitOf(stock.item)} of this item is still unplaced (on hand ${onHand}); to move stock that is already on a rack, use Transfer.`, { reason: "EXCEEDS_ON_HAND", onHand, unassigned, requested: qty });
+    /* Only a put with NO sticker is bounded by on-hand. A sticker puts its own
+       printed quantity whatever the books say (1 Oct 2026, owner) — putStock
+       bounds it by the sticker alone. */
+    if (!stock.barcode && qty > unassigned + loc.QTY_TOL) throw fail("VALIDATION", `Only ${unassigned} ${loc.baseUnitOf(stock.item)} of this item is still unplaced (on hand ${onHand}); to move stock that is already on a rack, use Transfer.`, { reason: "EXCEEDS_ON_HAND", onHand, unassigned, requested: qty });
     const { result, mode } = await runMutation(req, { mutate: async (session) => {
       const r = await S.putStock(session, { companyId: companyOf(req), siteId: req.tenant.siteId, tenantStamp: tenantContext.stamp(req.tenant), ...stock, warehouse: dest.warehouse, location: dest.location, quantity: qty, actor: actorOf(req), note: text(req.body?.note), idempotencyKey: req.idempotent?.key || "", source: { kind: req.body?.source === "scan" ? "scan_put" : "put", id: req.idempotent?.record?._id || null, reference: stock.barcode ? String(stock.barcode._id) : "" } });
       return { entityType: ENTITY, entityId: r.movement._id, entry: entry(req, "STOCK_LOCATION_ASSIGNED", r.movement._id, String(r.movement._id), { warehouseId: String(dest.warehouse._id), locationId: String(dest.location._id), locationCode: dest.location.code, quantity: qty, barcodeId: stock.barcode ? String(stock.barcode._id) : "", via: "store-locations/put" }, text(req.body?.note)), result: r };

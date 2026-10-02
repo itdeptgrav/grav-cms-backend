@@ -29,8 +29,16 @@
 // bundled one — smaller deploys, and what you want in a container that already
 // has Chrome.
 
-const puppeteer = require("puppeteer");
-
+/* REQUIRED WHEN THE FIRST PDF IS RENDERED, NOT AT BOOT.
+ *
+ * `require("puppeteer")` is the single most expensive import in this process —
+ * it was the top entry when startup was profiled — and it was paid by EVERY
+ * boot, including the overwhelming majority that never render a payslip. The
+ * browser itself was already launched lazily (see getBrowser below); only the
+ * module load was eager, which bought nothing.
+ *
+ * Node caches the module, so the cost is paid once, by the first PDF — the
+ * same request that already pays the ~1s Chromium launch described above. */
 let browserPromise = null;
 
 /**
@@ -59,6 +67,7 @@ class RendererUnavailableError extends Error {
 
 function getBrowser() {
   if (!browserPromise) {
+    const puppeteer = require("puppeteer");
     browserPromise = puppeteer
       .launch({
         headless: "new",

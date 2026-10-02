@@ -51,7 +51,7 @@ const SAMPLE_LIMIT = 5;
 /* ── Safety ──────────────────────────────────────────────────────────────────*/
 
 /**
- * `npm run verify`'s default tier already runs read-only checks against the dev
+ * The verification harnesses used to run read-only checks against the dev
  * database, so read-only execution is an established convention here. What is
  * NOT established is running one against production by accident, so that needs
  * saying out loud — and the flag says "I know this is production and I know
