@@ -198,8 +198,51 @@ async function readRevision(ctx, { revisionId } = {}) {
  * the format. What this owns is that the FILE is kept and that the parse
  * becomes revision 1 rather than becoming the pattern.
  */
+/**
+ * HAS THIS COMPANY ALREADY IMPORTED THIS EXACT FILE AGAINST THIS STYLE?
+ *
+ * Separated from the import itself so a caller can ask BEFORE it uploads
+ * anything. `importRevision` asks again at the moment it writes, because two
+ * requests can race and the second one must still return the first's revision
+ * rather than a rival copy of it.
+ */
+async function findImportedBySha(ctx, { styleId, sha256: digest } = {}) {
+  assertContext(ctx);
+  const sha = str(digest);
+  if (!sha) return null;
+  const style = await styleForCompany(ctx.companyId, styleId);
+  const row = await PatternRevision.findOne(byCompany(ctx, {
+    styleId: style._id,
+    "origin.kind": "dxf-import",
+    "sourceDxf.sha256": sha,
+  })).sort({ revisionNumber: 1 });
+  return row ? revisionView(row, { geometry: true }) : null;
+}
+
+/**
+ * THE ONE DOOR A DXF COMES IN THROUGH.
+ *
+ * ── WHY IT IS IDEMPOTENT ON THE HASH ────────────────────────────────────────
+ * Because it was not, and the cost is on the demo style right now: four garment
+ * publications, each carrying the same 67,307-byte `tshirt-pattern.dxf` with the
+ * same SHA-256, uploaded to four separate files in the store. Nobody meant to do
+ * that. An import is a statement about a FILE, and importing the same file
+ * against the same style twice is the same statement — so the second one returns
+ * the first revision rather than minting a second that will immediately start to
+ * drift from it.
+ *
+ * The check is on `origin.kind === "dxf-import"` as well as the hash, because an
+ * edit revision inherits its parent's `sourceDxf` and is not an import of
+ * anything. Matching it would hand back revision 7 to somebody who imported
+ * revision 1's file.
+ *
+ * @param {object}  opts.patternSet   the parse, in the shape the publication stores
+ * @param {object}  opts.sourceDxf    { driveFileId, name, sha256, bytes }
+ * @param {object}  opts.reconciledFrom  publication this was lifted out of, if any
+ * @returns {{ revision, created: boolean }}  `created: false` means it already existed
+ */
 async function importRevision(ctx, {
-  styleId, patternSet, sourceDxf, name, actor = null,
+  styleId, patternSet, sourceDxf, name, actor = null, reconciledFrom = null,
 } = {}) {
   assertContext(ctx);
   const style = await styleForCompany(ctx.companyId, styleId);
@@ -208,12 +251,28 @@ async function importRevision(ctx, {
       "That file produced no pattern pieces, so there is nothing to import as a revision.");
   }
 
+  /* ── ALREADY IMPORTED? ────────────────────────────────────────────────
+     Answered before anything is written, and answered for THIS company and
+     THIS style only: the same block sent to two styles is two patterns. */
+  const sha = str(sourceDxf?.sha256);
+  if (sha) {
+    const existing = await PatternRevision.findOne(byCompany(ctx, {
+      styleId: style._id,
+      "origin.kind": "dxf-import",
+      "sourceDxf.sha256": sha,
+    })).sort({ revisionNumber: 1 });
+    if (existing) {
+      return { revision: revisionView(existing, { geometry: true }), created: false };
+    }
+  }
+
   const last = await PatternRevision
     .findOne(byCompany(ctx, { styleId: style._id }))
     .sort({ revisionNumber: -1 }).select("revisionNumber").lean();
 
   const who = actorOf(actor);
   const revisionRef = mintRef("PR");
+  const fromRef = str(reconciledFrom?.publicationRef);
   const created = await PatternRevision.create({
     companyId: ctx.companyId,
     styleId: style._id,
@@ -221,20 +280,133 @@ async function importRevision(ctx, {
     revisionNumber: (last?.revisionNumber || 0) + 1,
     name: clean(name, 200) || str(patternSet.manifest?.styleName),
     state: REVISION_STATE.DRAFT,
-    origin: { kind: "dxf-import", parentRevisionRef: "" },
+    origin: {
+      kind: "dxf-import",
+      parentRevisionRef: "",
+      reconciledFromPublicationRef: fromRef,
+      reconciledAt: fromRef ? new Date() : null,
+    },
     sourceDxf: {
       driveFileId: str(sourceDxf?.driveFileId),
       name: str(sourceDxf?.name),
-      sha256: str(sourceDxf?.sha256),
+      sha256: sha,
       bytes: sourceDxf?.bytes || 0,
       /* This revision imported it; every descendant will say the same. */
       importedInRevisionRef: revisionRef,
     },
     patternSet,
     author: who,
-    events: [{ kind: "imported", note: str(sourceDxf?.name), by: who, at: new Date() }],
+    events: [{
+      kind: "imported",
+      note: fromRef
+        ? `Recovered from garment publication ${fromRef} — ${str(sourceDxf?.name)}`
+        : str(sourceDxf?.name),
+      by: who,
+      at: new Date(),
+    }],
   });
-  return { revision: revisionView(created, { geometry: true }) };
+  return { revision: revisionView(created, { geometry: true }), created: true };
+}
+
+/**
+ * THE REVISION THAT SHOULD ALREADY EXIST, BUILT FROM WHAT DOES.
+ *
+ * ── THE SITUATION THIS REPAIRS ──────────────────────────────────────────────
+ * A flat pattern used to be imported by attaching it to a garment bundle, which
+ * parsed it, stored it and showed it in the 2D viewer — and created no pattern
+ * revision, because nothing connected the two. Pattern & Fit reads revisions. So
+ * a style could hold a correctly parsed five-piece pattern and still report that
+ * no pattern had been imported, which is what it does on `JW-SHIRT-DEMO-01`
+ * today: four publications carrying the parse, zero revisions.
+ *
+ * The repair lifts the parse and the file reference out of the publication into
+ * a revision. It does not re-parse and does not re-upload: the bytes in the
+ * store are the bytes that were imported, and a second copy of them would be a
+ * second thing to keep in step.
+ *
+ * ── WHAT IT WILL NOT DO ─────────────────────────────────────────────────────
+ * It never writes to an APPROVED publication. The link it records runs one way
+ * — the revision names the publication it came from — so recovering a pattern
+ * cannot modify a record somebody has already signed off. On editable
+ * publications the back-reference is set, so the two cannot drift apart later.
+ *
+ * Safe to run repeatedly: the hash check in `importRevision` means a second run
+ * finds the revision the first one made and changes nothing.
+ */
+async function reconcileFromPublications(ctx, { styleId, actor = null } = {}) {
+  assertContext(ctx);
+  const style = await styleForCompany(ctx.companyId, styleId);
+  /* Required lazily: the garment model owns publications and this file owns
+     revisions, and a top-level require between them is a cycle. */
+  const { GarmentModelPublication, PUBLICATION_STATE, ASSET_KIND } =
+    require("../../models/CMS_Models/RnD/GarmentModel");
+
+  const publications = await GarmentModelPublication
+    .find({ companyId: ctx.companyId, styleId: style._id })
+    .sort({ createdAt: 1 });
+
+  /* The earliest publication that actually carries a parse is the one whose
+     import this is recovering. Later ones that carry the same file are the same
+     import, and the hash check folds them onto the same revision. */
+  const carriers = publications.filter((p) => (p.patternSet?.pieces || []).length > 0);
+  if (!carriers.length) {
+    throw fail("NO_PATTERN_TO_RECOVER",
+      "No garment publication on this style carries a parsed pattern, so there is nothing to "
+      + "recover. Import the DXF instead.",
+      { styleId: String(style._id) });
+  }
+
+  const results = [];
+  for (const row of carriers) {
+    const asset = (row.assets || []).find((a) => a.kind === ASSET_KIND.PATTERN);
+    const parse = row.patternSet;
+    /* The publication's own parse carries the hash of the file it came from;
+       the asset carries it too. Either is authoritative, and they agree. */
+    const sha = str(asset?.sha256) || str(parse?.sha256);
+    if (!sha) {
+      results.push({ publicationRef: row.publicationRef, skipped: "NO_FILE_HASH" });
+      continue;
+    }
+
+    /* eslint-disable no-await-in-loop -- one style, a handful of publications,
+       and each import has to see what the previous one created. */
+    const out = await importRevision(ctx, {
+      styleId,
+      /* `.toObject()` so the subdocument is lifted as plain data rather than
+         carried across as a live document bound to the publication. */
+      patternSet: typeof parse.toObject === "function" ? parse.toObject() : parse,
+      sourceDxf: {
+        driveFileId: str(asset?.driveFileId),
+        name: str(asset?.name) || str(parse?.fileName),
+        sha256: sha,
+        bytes: asset?.bytes || 0,
+      },
+      name: str(parse?.manifest?.styleName) || str(style.productName),
+      actor,
+      reconciledFrom: { publicationRef: row.publicationRef },
+    });
+
+    /* ── THE BACK-REFERENCE, WHERE IT IS ALLOWED ────────────────────────
+       An approved publication is a record of what was signed off and is not
+       written to, for a pointer or for anything else. Everything else gets the
+       link, so the bundle and the revision cannot drift. */
+    if (row.state !== PUBLICATION_STATE.APPROVED && str(row.patternRevisionRef) !== out.revision.revisionRef) {
+      row.patternRevisionRef = out.revision.revisionRef;
+      await row.save();
+    }
+    results.push({
+      publicationRef: row.publicationRef,
+      state: row.state,
+      revisionRef: out.revision.revisionRef,
+      revisionNumber: out.revision.revisionNumber,
+      created: out.created,
+      linked: row.state !== PUBLICATION_STATE.APPROVED,
+    });
+    /* eslint-enable no-await-in-loop */
+  }
+
+  const revisions = await listRevisions(ctx, { styleId });
+  return { ...revisions, reconciled: results };
 }
 
 /* ═══ EDITING ═════════════════════════════════════════════════════════════ */
@@ -636,6 +808,7 @@ async function approveRevision(ctx, { revisionId, note, expectedRevision, actor 
 
 module.exports = {
   REVISION_STATE, EDIT_KIND, EDITORS,
-  listRevisions, readRevision, importRevision, editRevision,
+  listRevisions, readRevision, importRevision, findImportedBySha,
+  reconcileFromPublications, editRevision,
   setSimulationInputs, approveRevision, revisionView, revisionForCompany,
 };

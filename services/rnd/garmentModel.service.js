@@ -1179,6 +1179,32 @@ async function attachPatternSet(ctx, { publicationId, file, body = {}, expectedR
 
   await rematch(row, { actor });
   await refreshBundleWarnings(row);
+
+  /* ── AND THE SAME FILE BECOMES THE AUTHORITATIVE REVISION ──────────────
+     The parse above is this bundle's copy, for labelling a mesh with the piece
+     it matches. The pattern itself belongs to the style, not to one 3D model,
+     and Pattern & Fit reads it from there — so attaching a DXF here creates or
+     finds the revision for that DXF and points the bundle at it.
+
+     Before this, the two were unconnected: a pattern attached to a bundle was
+     parsed, stored and drawn, and no revision was ever created. A style could
+     carry a correct five-piece parse and still report that no pattern had been
+     imported. `importRevision` is idempotent on the file's hash, so attaching
+     the same DXF to a second bundle links to the first bundle's revision rather
+     than minting a rival copy of it. */
+  const revisions = require("./patternRevision.service");
+  const asset = (row.assets || []).find((a) => a.kind === ASSET_KIND.PATTERN);
+  const imported = await revisions.importRevision(ctx, {
+    styleId: String(row.styleId),
+    patternSet: row.patternSet.toObject ? row.patternSet.toObject() : row.patternSet,
+    sourceDxf: {
+      driveFileId, name: str(file.originalname), sha256: str(asset?.sha256), bytes: file.size,
+    },
+    name: str(row.patternSet?.manifest?.styleName),
+    actor,
+  });
+  row.patternRevisionRef = imported.revision.revisionRef;
+
   row.revision += 1;
   await row.save();
 
@@ -1189,7 +1215,74 @@ async function attachPatternSet(ctx, { publicationId, file, body = {}, expectedR
     classification: row.patternSet.classification,
     patternWarnings: read.warnings || [],
     bundleWarnings: row.bundleWarnings || [],
+    /* What Pattern & Fit needs in order to show the pattern that was just
+       imported, without being told to go and look for it. */
+    patternRevision: imported.revision,
+    patternRevisionCreated: imported.created,
   };
+}
+
+/**
+ * IMPORT A FLAT PATTERN AS A REVISION, WITH NO 3D MODEL INVOLVED.
+ *
+ * ── THE DOOR THAT WAS MISSING ───────────────────────────────────────────────
+ * Until now the only way a DXF entered this system was by being attached to a
+ * garment bundle, which meant a style could not have a pattern before it had a
+ * 3D model. That is backwards for the product it belongs to — the 2D pattern is
+ * the design and the 3D preview is derived from it — and it is the reason
+ * Pattern & Fit had nothing to read on a style whose pattern had been imported
+ * perfectly well.
+ *
+ * So this parses the file with the same parser, stores it under the same
+ * private-asset convention, and hands it to the same revision service that an
+ * attachment now uses. There is one definition of "import this DXF", and both
+ * doors go through it — which is what stops the two records drifting.
+ *
+ * It creates a DRAFT. Nothing in this function can approve a revision, and
+ * nothing in it reads or writes an existing approved one.
+ */
+async function importPatternRevision(ctx, { styleId, file, body = {}, actor = null } = {}) {
+  assertContext(ctx);
+  /* Resolves the style and proves it belongs to this company, before a byte is
+     parsed or stored. A tenant check after an upload is a tenant check that has
+     already written somebody else's file into our store. */
+  const style = await styleForCompany(ctx.companyId, styleId);
+  const read = readPatternFile(file);
+  const digest = sha256(file.buffer);
+
+  const revisions = require("./patternRevision.service");
+  /* ── ASKED BEFORE THE UPLOAD, NOT AFTER ───────────────────────────────
+     An import of a file this style already has is the same import, and the
+     cheap half of making that true is not paying the storage cost twice. Four
+     copies of one 67KB DXF sit in the store on the demo style because nothing
+     ever asked this question. */
+  const already = await revisions.findImportedBySha(ctx, { styleId: String(style._id), sha256: digest });
+  if (already) {
+    return { revision: already, created: false, patternWarnings: read.warnings || [] };
+  }
+
+  const up = await drive.uploadCompanyFile(file.buffer, {
+    fileName: `${mintRef("PRA")}-${str(file.originalname) || "pattern.dxf"}`,
+    mimeType: str(file.mimetype) || "application/dxf",
+    folderPath: ["rnd", "patterns", String(style._id)],
+  });
+  const driveFileId = str(up?.driveFileId);
+  if (!driveFileId) {
+    throw fail("PATTERN_UNREADABLE",
+      "The file store did not return a handle for that upload, so the pattern could not be kept. "
+      + "Nothing was changed; try again.",
+      { reason: "NO_STORAGE_HANDLE" });
+  }
+
+  const patternSet = bundle.ingestPatternSet(read, { file, actor, parseRevision: 1 });
+  const out = await revisions.importRevision(ctx, {
+    styleId: String(style._id),
+    patternSet,
+    sourceDxf: { driveFileId, name: str(file.originalname), sha256: digest, bytes: file.size },
+    name: clean(body.name, 200) || str(patternSet.manifest?.styleName),
+    actor,
+  });
+  return { ...out, patternWarnings: read.warnings || [] };
 }
 
 /**
@@ -3126,5 +3219,6 @@ module.exports = {
   classifyUploads, attachPatternSet, attachSource, readPatternSet,
   setPieceMapping, rematchMappings,
   patternSetView, mappingView, mappingState, readPatternFile,
+  importPatternRevision,
   technicalBundleHandover,
 };

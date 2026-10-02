@@ -525,6 +525,61 @@ router.get("/patterns/styles/:styleId/revisions", requireCompany, canRead,
     return res.json({ success: true, ...out });
   }));
 
+/**
+ * IMPORT A DXF AS THE STYLE'S PATTERN REVISION.
+ *
+ * ── THE ROUTE THAT DID NOT EXIST ────────────────────────────────────────────
+ * A flat pattern could only enter this system by being attached to a garment
+ * bundle, so a style could not hold a pattern before it held a 3D model — and
+ * Pattern & Fit, which reads revisions, found nothing on styles whose pattern
+ * had been imported perfectly well. `JW-SHIRT-DEMO-01` has four publications
+ * carrying a parsed five-piece pattern and zero revisions.
+ *
+ * POST and not PUT: a style accumulates revisions and this adds one. It creates
+ * a DRAFT — there is no argument to this route, and no code path beneath it,
+ * that can approve a revision or touch an approved one.
+ *
+ * Idempotent on the file's SHA-256 within the style, so the same DXF sent twice
+ * returns the first revision and `created: false` rather than a second copy.
+ */
+router.post("/patterns/styles/:styleId/revisions/import", requireCompany, canPublishPattern,
+  receiveWith(uploadPattern, models.LIMITS.PATTERN_BYTES, "one DXF pattern export"),
+  handle(async (req, res) => {
+    const out = await models.importPatternRevision(ctx(req), {
+      styleId: req.params.styleId,
+      file: req.file,
+      body: req.body || {},
+      actor: actor(req),
+    });
+    /* 201 only when a revision was actually created; a repeat import is a 200
+       with the revision it already had, which is a different fact. */
+    return res.status(out.created ? 201 : 200).json({ success: true, ...out });
+  }));
+
+/**
+ * RECOVER THE REVISION THAT SHOULD ALREADY EXIST ON THIS STYLE.
+ *
+ * ── WHY THIS IS A ROUTE AND NOT A BACKFILL ──────────────────────────────────
+ * Because it repairs ONE style, named in the URL, by somebody who is looking at
+ * that style and has the capability to publish its patterns. A job that walked
+ * every company writing revisions nobody asked for would be the same mistake in
+ * the other direction: this system's problem is records appearing without a
+ * decision behind them.
+ *
+ * It re-parses nothing and re-uploads nothing — the bytes already in the store
+ * are the bytes that were imported — and it never writes to an approved
+ * publication. Safe to call repeatedly: the second call finds the revision the
+ * first one made and reports `created: false`.
+ */
+router.post("/patterns/styles/:styleId/revisions/reconcile", requireCompany, canPublishPattern,
+  handle(async (req, res) => {
+    const out = await patterns.reconcileFromPublications(ctx(req), {
+      styleId: req.params.styleId,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
 router.get("/patterns/revisions/:revisionId", requireCompany, canRead,
   handle(async (req, res) => {
     const out = await patterns.readRevision(ctx(req), { revisionId: req.params.revisionId });

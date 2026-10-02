@@ -589,12 +589,36 @@ describe("nothing in 3D can change the pattern", () => {
 
   test("the pattern service exposes no function a 3D record could edit through", () => {
     /* The rule as a property of the module rather than of a call site: every
-       write here takes a revision id and an actor, and there is no entry
-       point that takes a publication, a marker or a measurement. */
+       write here takes a revision id and an actor, and there is no entry point
+       by which a marker, a measurement or an annotation reaches a pattern. */
     const writes = ["importRevision", "editRevision", "setSimulationInputs", "approveRevision"];
     for (const name of writes) expect(typeof patterns[name]).toBe("function");
     const names = Object.keys(patterns);
-    expect(names.some((n) => /publication|marker|measurement|annotation/i.test(n))).toBe(false);
+    expect(names.some((n) => /marker|measurement|annotation/i.test(n))).toBe(false);
+
+    /* ── THE ONE FUNCTION THAT NAMES A PUBLICATION, AND WHY IT IS NOT A HOLE ──
+       `reconcileFromPublications` reads a parse that is stranded inside a
+       garment bundle and makes the pattern revision that should always have
+       existed. The arrow runs publication → revision, which is the direction
+       that was MISSING, not the forbidden one: a style could carry a correct
+       five-piece pattern and report that none had been imported.
+
+       It is not a way for 3D to edit a pattern, and the suite proves that
+       rather than trusting the name — it takes a style, never a publication id;
+       it only ever CREATES, never touching an existing revision; and it is
+       idempotent, so running it cannot change what a previous run decided. */
+    expect(names.filter((n) => /publication/i.test(n))).toEqual(["reconcileFromPublications"]);
+    expect(patterns.reconcileFromPublications.length).toBeLessThanOrEqual(2);
+    const src = require("fs").readFileSync(
+      require("path").join(__dirname, "..", "..", "services", "rnd", "patternRevision.service.js"),
+      "utf8",
+    );
+    const body = src.slice(src.indexOf("async function reconcileFromPublications"));
+    const fn = body.slice(0, body.indexOf("\n}\n") + 2);
+    /* It reads publications and writes only the back-reference, and only on one
+       that is not approved. No other field of a publication is assigned. */
+    expect(fn).toMatch(/state !== PUBLICATION_STATE\.APPROVED/);
+    expect(fn.match(/row\.[a-zA-Z]+\s*=/g) || []).toEqual(["row.patternRevisionRef ="]);
   });
 
   test("a render records nothing on the revision it was made from", async () => {

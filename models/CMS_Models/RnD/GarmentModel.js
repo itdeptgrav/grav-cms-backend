@@ -925,6 +925,23 @@ const publicationSchema = new mongoose.Schema({
      pattern is drafted — and the absence is reported rather than blocking. */
   patternSet: { type: patternSetSchema, default: null },
 
+  /* ── WHICH PATTERN REVISION THIS BUNDLE'S DXF IS ──────────────────────
+     The parse above is a COPY, kept here so the 3D viewer can label a mesh with
+     the piece it matches without reading a second collection. The authority is
+     the pattern revision, and this names it.
+
+     It exists because the two were not connected at all: a flat pattern
+     attached to a bundle was parsed, stored and drawn, and no revision was ever
+     created — so Pattern & Fit, which reads revisions, reported that no pattern
+     had been imported while the 2D viewer beside it was drawing five pieces of
+     that same pattern. Writing both and pointing one at the other is what keeps
+     them from drifting; `patternRevision.service.js` is what decides which
+     revision a given file IS.
+
+     Never set on an approved publication after the fact: a signed-off record is
+     not written to, for a pointer or for anything else. */
+  patternRevisionRef: { type: String, trim: true, default: "" },
+
   /* ── WHEN THIS MODEL IS A PICTURE RATHER THAN A SOURCE ────────────────
      Set only on a publication produced by a render job. Its presence is what
      makes the model read-only: a derived preview takes no markers, no

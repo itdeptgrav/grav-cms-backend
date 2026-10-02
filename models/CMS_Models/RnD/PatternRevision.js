@@ -371,6 +371,15 @@ const patternRevisionSchema = new mongoose.Schema({
   origin: {
     kind: { type: String, enum: ["dxf-import", "edit"], required: true },
     parentRevisionRef: { type: String, trim: true, default: "" },
+    /* ── WHERE A RECONCILED REVISION CAME FROM ─────────────────────────
+       `dxf-import` is still the truth for these — the bytes are a DXF somebody
+       imported — but they were not imported HERE. They were found inside a
+       garment publication that had parsed the same file before this record
+       existed, and lifting them is a one-way repair. Saying so is the
+       difference between a revision whose history is known and one that simply
+       appeared. */
+    reconciledFromPublicationRef: { type: String, trim: true, default: "" },
+    reconciledAt: { type: Date, default: null },
   },
 
   /* ── THE FILE THE PATTERN ROOM SENT, UNCHANGED ───────────────────────
@@ -415,6 +424,15 @@ const patternRevisionSchema = new mongoose.Schema({
 }, { timestamps: true, collection: "rnd_pattern_revisions" });
 
 patternRevisionSchema.index({ companyId: 1, styleId: 1, revisionNumber: 1 }, { unique: true });
+/* ── THE SAME DXF IS THE SAME IMPORT ───────────────────────────────────────
+   Not unique: an edit revision inherits its parent's `sourceDxf`, so a style
+   with eight revisions of one imported file has eight rows carrying that hash.
+   What this index is for is the lookup that makes an import idempotent — "has
+   this company already imported this exact file against this style" — which ran
+   as a collection scan before it existed, and which nothing called at all
+   before that. Four publications on the demo style each uploaded the same
+   67,307-byte DXF to a separate file in the store. */
+patternRevisionSchema.index({ companyId: 1, styleId: 1, "sourceDxf.sha256": 1 });
 patternRevisionSchema.index({ companyId: 1, styleId: 1, state: 1 });
 
 /* ═══ THE RENDER JOB ══════════════════════════════════════════════════════

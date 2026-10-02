@@ -733,6 +733,10 @@ const CODES = {
      nothing is wrong with the request — the bundle is not in a state that has
      an answer. */
   PATTERN_NOT_PUBLISHED: { status: 409, code: "PATTERN_NOT_PUBLISHED" },
+  /* Asked to recover a pattern revision from a style whose publications carry
+     no parsed pattern. 409 for the same reason: the request is well formed and
+     there is simply nothing to recover — the answer is to import the DXF. */
+  NO_PATTERN_TO_RECOVER: { status: 409, code: "NO_PATTERN_TO_RECOVER" },
 
   /* The contents contradict the upload card the file arrived on. Distinct from
      PATTERN_UNREADABLE and MODEL_UNREADABLE on purpose: this file IS readable
