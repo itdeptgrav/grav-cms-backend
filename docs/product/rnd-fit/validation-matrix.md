@@ -1,8 +1,8 @@
 # Validation matrix
 
 **Lane B · validation pack · revised 1 Oct 2026.**
-Eighteen cases. Each one states what goes in, what must come out, and what it
-would mean if something else did.
+Twenty cases. Each one states what goes in, what must come out, and what it would
+mean if something else did.
 
 **Revision note.** Two corrections. The first draft's VM-10 claimed the
 post-assembly geometry check catches a reversed seam; **it does not**, and the
@@ -42,13 +42,17 @@ verified.
 | Group | Cases | Expected outcome |
 |---|---|---|
 | **A** — must produce a fitting | VM-01 … VM-06 | 6 Fitting |
-| **B** — must refuse | VM-07 … VM-10, VM-12 … VM-14 | **7 Refused** |
+| **B** — must refuse | VM-07 … VM-10, VM-12 … VM-14, VM-20 | **8 Refused** |
 | — the blind spot | VM-11 | 1 Undetected |
-| **C** — must run and hold back | VM-15 … VM-18 | 4 Partial |
+| **C** — must run and hold back | VM-15 … VM-19 | 5 Partial |
 
-**Seven of eighteen are refusals.** Six produce a full fitting, four produce a
+**Eight of twenty are refusals.** Six produce a full fitting, five produce a
 fitting with something withheld, and one — VM-11 — produces a wrong fitting that
-nothing in this specification detects. 6 + 7 + 1 + 4 = 18.
+nothing in this specification detects. 6 + 8 + 1 + 5 = 20.
+
+VM-19 and VM-20 were added on 2 Oct 2026 with the neck-finish decision
+(`garment-template-contract.md` §6.4) and are the two halves of it: an absent neck
+finish is a Partial, and a present-but-unmapped one is a refusal.
 
 VM-11 is numbered inside Group B because it is the case the Group B refusals exist
 to prevent, but it is **not** a refusal: by the time the wrong confirmation has been
@@ -274,6 +278,50 @@ about one revision and expires with it (`fit-assistant-rules.md` §7).
 
 ---
 
+---
+
+## 4a. The neck-finish pair
+
+These two were added with the decision in `garment-template-contract.md` §6.4 and
+are listed together because they are only legible against each other. **VM-19
+belongs to Group C** (Partial) and **VM-20 belongs to Group B** (Refused); they are
+placed here rather than renumbered so that every case reference written before 2 Oct
+2026 still points at the same case.
+
+### VM-19 · No neck finish at all
+
+**Input.** A tee with front, back and two sleeves, every seam among them mapped and
+confirmed, a measured jersey profile — and **no neck band, collar or facing
+anywhere in the pattern**.
+
+**Must produce.** A **Partial**. The garment drapes and the body findings are
+reported: chest by the knit path, bicep, and the shape observations. Collar
+circumference, neck clearance and collar roll are **withheld**, each saying why. The
+missing finish is shown **prominently on the fitting** — not in a details panel.
+
+**Must not.** Refuse the drape (`garment-template-contract.md` §6.4). And must not
+**invent** a finish: no band is generated, the neck opening is not closed, and no
+approximated neck circumference is reported from the raw opening.
+
+**Why.** The rest of the garment does not depend on the neck finish. Refusing threw
+away every finding about the body and sleeves to protect one finding about a collar
+that is not there.
+
+### VM-20 · A neck finish that exists but is not mapped
+
+**Input.** The same tee, **with** a neck band piece present in the pattern — and the
+band either given no role, or given its role and left unmapped, or mapped with its
+alignment unconfirmed.
+
+**Must refuse.** R12, naming the band.
+
+**Why this is not VM-19.** An absent piece is a known absence and the product can
+describe it honestly. A piece that exists and is half-joined is an unfinished
+mapping, and draping around it would silently exclude cloth the pattern-maker drew.
+The two inputs look adjacent and the correct answers are opposite.
+
+---
+
 ## 5. What this pack does not cover yet
 
 - **Movement.** Every case is one static pose. An armhole that passes standing
@@ -288,4 +336,4 @@ about one revision and expires with it (`fit-assistant-rules.md` §7).
 - **Two readiness failures have no case here.** R8 (an open or self-intersecting
   outline) and R9 (no fabric profile at all, as distinct from VM-14's zeroed one)
   are specified in `garment-template-contract.md` §8 and not exercised by any of
-  the eighteen. Stated rather than quietly left out; neither is hard to add.
+  the twenty. Stated rather than quietly left out; neither is hard to add.

@@ -504,6 +504,37 @@ front placket fold, side vents.
 **Not simulated:** interlining, buttons and buttonholes, pleats, the collar roll,
 topstitching, and the thickness of a flat-felled seam.
 
+### 6.4 A missing neck finish does not stop the drape
+
+**Decided 2 Oct 2026.** An absent neck finish is the one required role that does
+**not** refuse the fitting.
+
+The reason is that the rest of the garment does not depend on it. Front, back and
+sleeves sewn to each other make a complete, readable garment; the neck opening is
+simply unfinished, exactly as it is on a sampling-room table before the band goes
+on. Refusing the whole drape for it threw away every finding about the body and the
+sleeves to protect one finding about the collar.
+
+So, when the rest of the garment is sufficiently mapped:
+
+| | |
+|---|---|
+| **A fitting is produced** | as a **Partial** — the garment drapes and the body findings are reported |
+| **The gap is shown prominently** | on the fitting itself, not in a details panel: *"This pattern has no neck finish. The neck opening is unfinished."* |
+| **Dependent findings are withheld** | collar circumference, neck clearance, collar roll, and anything else measured at or through the neck opening. Each says why |
+| **Nothing is invented** | no band, no collar, no facing is generated, and the neck opening is not closed or approximated to make a number available |
+
+**And the other half of the decision.** If a neck-finish piece **does** exist in the
+pattern and is unmapped, or is mapped with unconfirmed alignment, that remains a
+**readiness failure** (R12). An absent piece is a known absence; a present piece
+left half-joined is an incomplete mapping, and the two are not the same thing. The
+first is a garment somebody has not finished designing; the second is a mapping
+somebody has not finished doing.
+
+This applies to all three categories. It is the only required role with this
+exception, because it is the only one whose absence leaves the rest of the garment
+intact.
+
 ---
 
 ## 7. What is not simulated, and how that is said
@@ -546,7 +577,7 @@ reversed seam (§4.5).
 |---|---|---|
 | R1 | no piece has a usable closed outline | nothing to sew |
 | R2 | the pattern states no unit | every length is meaningless; out by 25.4× if guessed |
-| R3 | a **required** role for the template is unassigned | incomplete by that template's definition (§6 — the required list is short) |
+| R3 | a **required** role for the template is unassigned — **except a neck finish**, see R12 | incomplete by that template's definition (§6 — the required list is short) |
 | R4 | a seam's `alignment` is absent or unconfirmed | §4.5 — the failure nothing downstream can catch |
 | R5 | a piece's perimeter is neither covered by runs nor confirmed as finished | nobody has finished the mapping (§4.11) |
 | R6 | a compound seam side is non-contiguous or changes direction | §4.4 |
@@ -555,6 +586,7 @@ reversed seam (§4.5).
 | R9 | no fabric profile for a simulated piece | the drape would be of a fabric nobody specified |
 | R10 | a simulated piece has no grain vector, and its fabric behaves differently along and across | the stretch direction is undefined |
 | R11 | the pattern revision changed after the mapping was confirmed | the mapping may point at geometry that moved |
+| R12 | a piece **has** a neck-finish role but is unmapped, or its alignment is unconfirmed | a piece that exists and is half-joined is worse than one that is absent — see §6.4 |
 
 ### Safe warnings — the fitting runs and says this
 

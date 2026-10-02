@@ -34,7 +34,7 @@ readiness.
 | `docs/product/rnd-fit/garment-template-contract.md` | What a fitting must be given, where each thing comes from, and what stops it. The name-free seam contract |
 | `docs/product/rnd-fit/fabric-profile-contract.md` | What cloth must be described as, and what happens per missing value |
 | `docs/product/rnd-fit/fit-assistant-rules.md` | The nine findings, the body contract, and which four are actually available in release one |
-| `docs/product/rnd-fit/validation-matrix.md` | Eighteen cases: six fittings, seven refusals, four partials, and one documented blind spot |
+| `docs/product/rnd-fit/validation-matrix.md` | Twenty cases: six fittings, eight refusals, five partials, and one documented blind spot |
 | `docs/product/rnd-fit/plain-language-glossary.md` | The words on screen, and the forbidden ones |
 | `docs/tasks/fit-validation/lane-a-handoff.md` | This file |
 
@@ -120,8 +120,8 @@ discovered mid-implementation.
 > A fitting that cannot be trusted must not be produced.
 
 A believable drape with the wrong dimensions gets a sample approved against it.
-That is the cost of being wrong here, and it is why this pack has seven refusals,
-four partials, and withholds five of nine findings in the first release.
+That is the cost of being wrong here, and it is why this pack has eight refusals,
+five partials, and withholds five of nine findings in the first release.
 
 It is also why VM-11 exists as a documented blind spot rather than a passing test.
 A reversed seam produces a believable garment and nothing catches it. Writing that

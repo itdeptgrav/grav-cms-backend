@@ -133,7 +133,7 @@ detection runs on the avatar mesh.
 
 | Available using body **measurements** only | Requires landmarks that do not exist |
 |---|---|
-| **collar / neck** — needs a stated neck girth | **stomach / waist** — needs `waist.plane` |
+| **collar / neck** — needs a stated neck girth, **and a neck finish in the pattern** (§5.4) | **stomach / waist** — needs `waist.plane` |
 | **bicep** — needs a stated bicep girth | **hem** — needs `hip.plane` |
 | **chest, knit form** — flat-pattern girth vs a stated chest girth (§4.2) | **shoulder** — needs `shoulder.point` |
 | **garment length** — only where R&D states a target length | **armhole** — needs `armhole.plane` |
@@ -317,6 +317,13 @@ set says by how much for that category.
 Cannot see: the collar's roll and stand (`garment-template-contract.md` §7).
 A polo collar is simulated lying flat, so nothing here is a statement about how
 it will stand up.
+
+**Withheld entirely when the pattern has no neck finish.** The drape still runs
+(`garment-template-contract.md` §6.4) and the garment is still readable, but there
+is no finished neck opening to measure, so collar circumference, neck clearance and
+collar roll are all withheld and the missing finish is shown prominently on the
+fitting. Nothing is invented to produce a number: the opening is not closed, and no
+band is generated.
 
 ### 5.5 Sleeve length
 
