@@ -475,3 +475,156 @@ describe("a drape changes nothing about the pattern it was made from", () => {
     expect(read.patternRevisionNumber).toBe(1);
   });
 });
+
+/* ═══ 5 · THE THREE THINGS QA FOUND ═══════════════════════════════════════ */
+
+describe("what a screen cannot be allowed to get wrong", () => {
+  test("THE SEAM MAP SURVIVES A SAVE AND A RELOAD", async () => {
+    /* The failure this pins was total and silent. The screen posted its map as
+       `simulationInputs.seamPairings`; the record had moved to `seams`; Mongoose
+       strips undeclared paths without complaining. The save returned success and
+       nothing was stored, so Generate 3D then refused because no seam had been
+       mapped. A round trip is the only honest confirmation. */
+    const w = await world();
+    const ready = await renderable(w);
+
+    const fresh = await patterns.readRevision(w.ctx, { revisionId: ready.id });
+    const held = fresh.revision.simulationInputs;
+
+    expect(held.seams).toHaveLength(INPUTS.seams.length);
+    expect(held.seams.map((s) => s.seamId).sort()).toEqual(INPUTS.seams.map((s) => s.seamId).sort());
+    for (const sent of INPUTS.seams) {
+      const kept = held.seams.find((s) => s.seamId === sent.seamId);
+      expect(kept.sideA.map((e) => e.runId)).toEqual(sent.sideA.map((e) => e.runId));
+      expect(kept.sideB.map((e) => e.runId)).toEqual(sent.sideB.map((e) => e.runId));
+      expect(kept.alignment).toBe(sent.alignment);
+      /* And the confirmation carries a time the SERVER stamped: a confirmation
+         nobody is attributable for is a guess. */
+      expect(kept.alignmentConfirmed?.at).toBeTruthy();
+    }
+    /* The piece plans too — losing only the grain or only the boundary
+       confirmation is the partial save hardest to notice. */
+    expect(held.pieces).toHaveLength(INPUTS.pieces.length);
+    for (const sent of INPUTS.pieces) {
+      const kept = held.pieces.find((p) => p.pieceRef === sent.pieceRef);
+      expect(kept.role).toBe(sent.role);
+      expect(kept.grainVector).toEqual(sent.grainVector);
+      expect(kept.boundaryConfirmed?.at).toBeTruthy();
+    }
+    /* `seamPairings` is not a field any more, and a save must not resurrect it. */
+    expect(held.seamPairings).toBeUndefined();
+  });
+
+  test("A FIELD THE RECORD DOES NOT DECLARE IS NOT SILENTLY ACCEPTED", async () => {
+    /* The screen's own guard reads the record back and compares. This proves the
+       thing it compares against: posting the obsolete field stores nothing, so a
+       screen that trusted its 200 would be lying. */
+    const w = await world();
+    const ready = await renderable(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: ready.id,
+      inputs: { ...INPUTS, seams: [], seamPairings: INPUTS.seams },
+      actor: w.actor,
+    });
+    const after = await patterns.readRevision(w.ctx, { revisionId: ready.id });
+    expect(after.revision.simulationInputs.seams).toHaveLength(0);
+    expect(after.revision.simulationInputs.seamPairings).toBeUndefined();
+    /* And readiness says so, rather than the screen claiming a saved map. */
+    expect(after.revision.readiness.ready).toBe(false);
+    expect(after.revision.readiness.failures.some((f) => f.step === "seams")).toBe(true);
+  });
+
+  test("A STORED DRAPE CANNOT OPEN AGAINST ANOTHER REVISION WITH THE SAME POINT COUNT", async () => {
+    /* A point COUNT is not evidence the faces are the same: two revisions that
+       differ by a MOVED point mesh to the same number of points, and the stored
+       positions would then be drawn through a garment that is neither. So a drape
+       must carry a geometry fingerprint, and one that does not is refused at the
+       door rather than trusted when it is reopened. */
+    const w = await world();
+    const ready = await renderable(w);
+    const job = (await withAdapter(() => renders.requestRender(w.ctx, {
+      revisionId: ready.id, actor: w.actor,
+    }))).render;
+
+    await expect(renders.recordRenderOutcome(w.ctx, {
+      jobRef: job.jobRef,
+      status: "completed",
+      drape: { ...drapeFor({ vertexCount: 12 }), geometryIdentity: "" },
+      actor: w.actor,
+    })).rejects.toThrow(/geometry fingerprint/);
+
+    /* With one, it stores — and the fingerprint comes back with the drape, so the
+       page can prove the rebuild rather than assume it. */
+    await renders.recordRenderOutcome(w.ctx, {
+      jobRef: job.jobRef,
+      status: "completed",
+      drape: drapeFor({ vertexCount: 12 }),
+      actor: w.actor,
+    });
+    const read = await renders.readDrape(w.ctx, { jobRef: job.jobRef });
+    expect(read.geometryIdentity).toBe("tee-4-piece-normal-fit-1.0");
+    expect(read.vertexCount).toBe(12);
+    /* And it names its OWN revision and carries the job's frozen setup, so the
+       rebuild never uses whichever revision happens to be selected. */
+    expect(read.patternRevisionRef).toBe(ready.revisionRef);
+    expect(read.patternSet).toBeTruthy();
+    expect(read.inputs.seams).toHaveLength(INPUTS.seams.length);
+  });
+
+  test("AN ABANDONED RENDER IS VISIBLE AND RECOVERABLE", async () => {
+    const w = await world();
+    const ready = await renderable(w);
+    const job = (await withAdapter(() => renders.requestRender(w.ctx, {
+      revisionId: ready.id, actor: w.actor,
+    }))).render;
+
+    /* Still beating: not abandoned, and clearing it is refused — stopping a
+       colleague's running drape is a different act. */
+    await renders.heartbeat(w.ctx, { jobRef: job.jobRef, runId: "lease-abc", actor: w.actor });
+    expect((await renders.listAbandoned(w.ctx, { styleId: w.style._id })).abandoned).toHaveLength(0);
+    await refuses(() => renders.recoverAbandoned(w.ctx, { jobRef: job.jobRef, actor: w.actor }),
+      "RENDER_STILL_RUNNING");
+
+    /* The tab closed. Ninety seconds of silence and nobody is working on it. */
+    await RenderJob.updateOne({ jobRef: job.jobRef }, {
+      $set: { "lease.expiresAt": new Date(Date.now() - 1000) },
+    });
+
+    const stuck = (await renders.listAbandoned(w.ctx, { styleId: w.style._id })).abandoned;
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0].jobRef).toBe(job.jobRef);
+
+    const out = await renders.recoverAbandoned(w.ctx, { jobRef: job.jobRef, actor: w.actor });
+    expect(out.render.status).toBe(RENDER_STATUS.CANCELLED);
+    /* Kept, not deleted: the history is the point, and it says WHY it ended. */
+    const after = await RenderJob.findOne({ jobRef: job.jobRef }).lean();
+    expect(after).toBeTruthy();
+    expect(after.failure.code).toBe("DRAPE_ABANDONED");
+    expect(after.recovery.recoveredAt).toBeTruthy();
+    expect((await renders.listAbandoned(w.ctx, { styleId: w.style._id })).abandoned).toHaveLength(0);
+
+    /* And the revision is free again, which is the whole point. */
+    const retry = await withAdapter(() => renders.requestRender(w.ctx, {
+      revisionId: ready.id, actor: w.actor,
+    }));
+    expect(retry.render.jobRef).not.toBe(job.jobRef);
+  });
+
+  test("a second browser cannot take over a lease the first is still holding", async () => {
+    const w = await world();
+    const ready = await renderable(w);
+    const job = (await withAdapter(() => renders.requestRender(w.ctx, {
+      revisionId: ready.id, actor: w.actor,
+    }))).render;
+    await renders.heartbeat(w.ctx, { jobRef: job.jobRef, runId: "lease-first", actor: w.actor });
+    await refuses(() => renders.heartbeat(w.ctx, {
+      jobRef: job.jobRef, runId: "lease-second", actor: w.actor,
+    }), "RENDER_ALREADY_RUNNING");
+    /* The first keeps it. */
+    const mine = await renders.heartbeat(w.ctx, {
+      jobRef: job.jobRef, runId: "lease-first", actor: w.actor,
+    });
+    expect(mine.holding).toBe(true);
+    expect(mine.heartbeatMs).toBeGreaterThan(0);
+  });
+});

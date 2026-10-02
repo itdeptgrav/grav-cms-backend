@@ -554,6 +554,16 @@ const renderJobSchema = new mongoose.Schema({
         reader is told why instead. */
     geometryIdentity: { type: String, trim: true, default: "" },
     fabricGrade: { type: String, trim: true, default: "" },
+    /* ── DID THE CLOTH STOP MOVING? ──────────────────────────────────
+        A drape that reached the end of its frame budget still moving was
+        photographed mid-motion: the folds are still finding their places, so the
+        cloth's exact position — and any dimension measured on it — would differ a
+        second later. Stored as a verdict rather than only as a number, because
+        "settled to 12.7 mm per frame" reads like a small number and means the
+        opposite. An unsettled drape is a PREVIEW and may not report a dimension. */
+    settled: { type: Boolean, default: null },
+    settledBelowMm: { type: Number, default: null },
+    convergence: { type: String, trim: true, default: "" },
   },
 
   /* Why it did not. Both fields, because a code a screen can branch on and a

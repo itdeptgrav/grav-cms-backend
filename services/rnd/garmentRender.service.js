@@ -120,6 +120,9 @@ function jobView(job, context = {}) {
         outcome: str(job.drape.outcome) || "fitting",
         withheld: job.drape.withheld || [],
         fabricGrade: str(job.drape.fabricGrade),
+        settled: job.drape.settled === true,
+        settledBelowMm: job.drape.settledBelowMm ?? null,
+        convergence: str(job.drape.convergence),
         geometryIdentity: str(job.drape.geometryIdentity),
         /* Said here rather than left to each screen, because a drape shown
            without this sentence is a drape somebody will approve against. */
@@ -292,12 +295,19 @@ async function heartbeat(ctx, { jobRef, runId, actor = null } = {}) {
       { jobRef: job.jobRef, holder });
   }
   const at = new Date();
-  job.lease = {
-    runId: mine || holder,
-    heldBy: job.lease?.heldBy || actorOf(actor),
-    heartbeatAt: at,
-    expiresAt: new Date(at.getTime() + LEASE_MS),
-  };
+  /* ── RENEW IN PLACE, DO NOT REBUILD ─────────────────────────────────────
+     Replacing the whole `lease` object meant re-supplying `heldBy`, and a job whose
+     lease was created without one — any path where the holder was never recorded —
+     then had `undefined` assigned to a nested path and Mongoose refused the save
+     with a cast error. A heartbeat failing on the job it is keeping alive is the
+     one thing this call must never do, so it sets only the fields a renewal
+     actually changes and leaves the holder alone. */
+  job.lease.runId = mine || holder;
+  job.lease.heartbeatAt = at;
+  job.lease.expiresAt = new Date(at.getTime() + LEASE_MS);
+  if (!str(job.lease.heldBy?.id) && !str(job.lease.heldBy?.name)) {
+    job.lease.heldBy = actorOf(actor);
+  }
   await job.save();
   return {
     jobRef: job.jobRef,
@@ -587,6 +597,11 @@ function normaliseDrape(drape) {
     outcome: withheld.length ? "partial" : "fitting",
     readiness: drape.readiness || null,
     fabricGrade: str(drape.fabricGrade),
+    settled: drape.settled === true,
+    settledBelowMm: Number.isFinite(Number(drape.settledBelowMm))
+      ? Number(drape.settledBelowMm) : null,
+    convergence: str(drape.convergence)
+      || (drape.settled === true ? "settled" : "preview not fully settled"),
     /* The fingerprint of the geometry this drape was built from, so a later
        rebuild can be PROVEN to be the same mesh rather than assumed. */
     geometryIdentity: str(drape.geometryIdentity),
