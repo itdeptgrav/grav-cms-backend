@@ -20,8 +20,8 @@
  */
 require("dotenv").config();
 const mongoose = require("mongoose");
-const CategoryBudget = require("./models/Accountant_model/Acc_ItemCategoryBudget");
-const { categoryKeyOf } = require("./services/itemBudgetHead.service");
+const CategoryBudget = require("../../models/Accountant_model/Acc_ItemCategoryBudget");
+const { categoryKeyOf } = require("../../services/itemBudgetHead.service");
 
 const APPLY = process.argv.includes("--apply");
 

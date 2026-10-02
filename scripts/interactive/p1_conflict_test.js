@@ -17,7 +17,7 @@
  *   CLEANUP — Delete all test data
  */
 
-const { db, admin } = require("./config/firebaseAdmin");
+const { db, admin } = require("../../config/firebaseAdmin");
 const { v4: uuidv4 } = require("uuid");
 const readline = require("readline");
 

@@ -7,7 +7,7 @@
 
 const TEST_EMPLOYEE_ID = "GR0067";
 
-const { db } = require("./config/firebaseAdmin");
+const { db } = require("../../config/firebaseAdmin");
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 

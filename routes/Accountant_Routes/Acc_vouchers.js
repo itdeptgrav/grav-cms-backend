@@ -50,6 +50,11 @@ const { applyDefaultNarration } = require("../../services/voucherNarration.servi
    purchase order — and was never imported either, so both threw
    `settlementOf is not defined` as soon as a PO was looked up. */
 const { settlementOf } = require("../../services/poSettlement.service");
+/* A third one in this same file: `billMatching.SETTLING_TYPES` is read by the
+   open-bills lookup and the module was never imported, so that endpoint threw
+   `billMatching is not defined`. This is the third import in this one file lost
+   to a merge that kept the call — see the other two above. */
+const billMatching = require("../../services/billMatching.service");
 const {
   resolveServiceOrderBilling,
   voucherSummary,

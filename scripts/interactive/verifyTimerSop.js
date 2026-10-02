@@ -37,8 +37,8 @@
 
 require("dotenv").config();
 const mongoose = require("mongoose");
-const Employee = require("../models/Employee");
-const { evaluateTimerSop } = require("../services/timerSop.service");
+const Employee = require("../../models/Employee");
+const { evaluateTimerSop } = require("../../services/timerSop.service");
 
 const employeeId = process.argv[2];
 

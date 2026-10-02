@@ -19,8 +19,8 @@
 "use strict";
 
 const mongoose = require("mongoose");
-const FacePhoto = require("./models/HR_Models/FacePhoto");
-const faceConfig = require("./config/faceBiometric");
+const FacePhoto = require("../../models/HR_Models/FacePhoto");
+const faceConfig = require("../../config/faceBiometric");
 
 const APPLY = process.argv.includes("--apply");
 

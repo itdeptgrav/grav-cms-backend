@@ -25,10 +25,10 @@
 "use strict";
 
 const mongoose = require("mongoose");
-const Account = require("./models/CMS_Models/Sales/Account");
-const Relationship = require("./models/CMS_Models/Sales/AccountRelationship");
-const { resolveGroupEdge, isHierarchyType } = require("./services/crmGroupLink");
-const { assertNoAccountCycle } = require("./services/crmHierarchy");
+const Account = require("../../models/CMS_Models/Sales/Account");
+const Relationship = require("../../models/CMS_Models/Sales/AccountRelationship");
+const { resolveGroupEdge, isHierarchyType } = require("../../services/crmGroupLink");
+const { assertNoAccountCycle } = require("../../services/crmHierarchy");
 
 const APPLY = process.argv.includes("--apply");
 

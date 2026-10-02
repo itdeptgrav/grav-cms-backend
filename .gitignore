@@ -94,3 +94,21 @@ deploy/mautic/data/
 deploy/mautic/backups/
 deploy/mautic/*.sql
 deploy/mautic/*.sql.gz
+
+# ===============================
+# Downloaded binaries — not source
+# ===============================
+# cloudflared is a 38 MB vendor binary (and its 19 MB tarball) that was
+# committed on 1 Oct 2026. It is the Cloudflare Tunnel client, downloaded per
+# host, not part of this codebase — the only mentions of "cloudflared" in the
+# source are comments explaining that api.grav.in sits behind the tunnel.
+cloudflared
+cloudflared.tgz
+
+# ===============================
+# Scratch / one-off working files
+# ===============================
+# scratchpad/ was committed with eleven single-use diagnostic scripts on
+# 1 Oct 2026 (company-attach repairs, token minters, access surveys, a boot
+# profiler). They were written to answer one question each and are spent.
+scratchpad/

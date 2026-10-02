@@ -20,8 +20,8 @@
  */
 
 const mongoose = require("mongoose");
-const CallRecording = require("./models/CallRecording");
-const { phoneKey } = require("./services/callRecordingMatch.service");
+const CallRecording = require("../../models/CallRecording");
+const { phoneKey } = require("../../services/callRecordingMatch.service");
 
 (async () => {
   const uri = process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing";

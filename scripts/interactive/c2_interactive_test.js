@@ -16,9 +16,9 @@ mongoose.connect(
     process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing"
 ).catch(e => { console.error("MongoDB:", e.message); process.exit(1); });
 
-const { db, admin } = require("./config/firebaseAdmin");
-const pmpSvc = require("./services/pmpService");
-const Employee = require("./models/Employee");
+const { db, admin } = require("../../config/firebaseAdmin");
+const pmpSvc = require("../../services/pmpService");
+const Employee = require("../../models/Employee");
 const readline = require("readline");
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

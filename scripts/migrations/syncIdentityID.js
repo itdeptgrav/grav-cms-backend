@@ -4,7 +4,7 @@
 // const dns = require("dns").setServers(["8.8.8.8", "8.8.4.4"]);
 // require("dotenv").config();
 // const mongoose = require("mongoose");
-// const Employee = require("./models/Employee"); // <-- adjust path if different
+// const Employee = require("../../models/Employee"); // <-- adjust path if different
 
 // const DRY_RUN = process.argv.includes("--dry-run");
 

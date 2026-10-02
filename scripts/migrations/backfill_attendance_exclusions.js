@@ -48,7 +48,7 @@ const UNDO = process.argv.includes("--undo");
     UNDO ? "MODE: undo" : APPLY ? "MODE: apply — this writes" : "MODE: dry run — nothing is written",
   );
 
-  const AttendanceExclusion = require("./models/HR_Models/AttendanceExclusion");
+  const AttendanceExclusion = require("../../models/HR_Models/AttendanceExclusion");
 
   /* Removals recorded by the old route. entityId is "BID:YYYY-MM". */
   const logs = await db

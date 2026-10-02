@@ -33,15 +33,15 @@
 
 const mongoose = require("mongoose");
 
-const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem");
-const Customer = require("./models/Customer_Models/Customer");
-const EmployeeMpc = require("./models/Customer_Models/Employee_Mpc");
-const Measurement = require("./models/Customer_Models/Measurement");
-const CustomerRequest = require("./models/Customer_Models/CustomerRequest");
-const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
-const EmployeeProductionProgress = require("./models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
-const PatternGradingConfig = require("./models/CMS_Models/Manufacturing/PatternGrading/PatternGradingConfig");
-const SalesDepartment = require("./models/SalesDepartment");
+const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
+const Customer = require("../../models/Customer_Models/Customer");
+const EmployeeMpc = require("../../models/Customer_Models/Employee_Mpc");
+const Measurement = require("../../models/Customer_Models/Measurement");
+const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const EmployeeProductionProgress = require("../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const PatternGradingConfig = require("../../models/CMS_Models/Manufacturing/PatternGrading/PatternGradingConfig");
+const SalesDepartment = require("../../models/SalesDepartment");
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 const args = Object.fromEntries(

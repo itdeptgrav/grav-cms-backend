@@ -37,19 +37,18 @@ npm run dev        # nodemon server.js → http://localhost:5000
 npm start          # node server.js
 ```
 
-`npm run verify` runs the verification harnesses — the hand-written end-to-end checks in the repo root. Two tiers, and the split matters: the default set touches no data (pure business rules, plus read-only checks against the dev database) and takes seconds; `npm run verify:all` adds the ones that WRITE throwaway rows to the shared dev database and delete them again. `node verify.js --list` shows what exists; `node verify.js salary` runs one subject. Add a new harness to the right tier in `verify.js` or nobody will ever run it.
-
-`npm test` runs the node:test files under `services/` and `middleware/`. Coverage is thin — a handful of pure services plus the three `middleware/bandwidth*.test.js` suites. **Most of the codebase has no tests.** The root-level `*_test.js`, `verify*.js`, `fix-*.js`, `backfill_*.js`, and `seed*.js` files are hand-run interactive scripts that read and write the **live dev MongoDB and Firestore**:
+The verification harnesses (`npm run verify`, 42 end-to-end checks of business rules against real data) were REMOVED on 2 Oct 2026 at the owner's request. Two of them were failing when they went, and what they found is recorded in `docs/decisions/verification-harnesses-removed.md` — a payroll late-arrival ladder that never reaches pay, and a customer ledger linked to the wrong party. Neither is fixed.
+`npm test` runs the node:test files under `services/` and `middleware/`. Coverage is thin — a handful of pure services plus the three `middleware/bandwidth*.test.js` suites. **Most of the codebase has no tests.** The hand-run scripts that read and write the **live dev MongoDB and Firestore** are under `scripts/`: `scripts/interactive/` (the testers below), `scripts/migrations/` (one-off backfills and repairs), `scripts/seeds/` and `scripts/payroll/`. The repository root now holds only `server.js` and `jest.config.js`:
 
 ```bash
-node -r dotenv/config c1_interactive_test.js      # C1 scoring engine tester (prompts interactively)
-node -r dotenv/config c2_interactive_test.js      # C2 band tester
-node -r dotenv/config p1_conflict_test.js
-node -r dotenv/config verifyTimerSop.js
-node -r dotenv/config cleanup_test_data.js        # deletes test tasks, resets employee sopPoints
+node -r dotenv/config scripts/interactive/c1_interactive_test.js      # C1 scoring engine tester (prompts interactively)
+node -r dotenv/config scripts/interactive/c2_interactive_test.js      # C2 band tester
+node -r dotenv/config scripts/interactive/p1_conflict_test.js
+node -r dotenv/config scripts/interactive/verifyTimerSop.js
+node -r dotenv/config scripts/interactive/cleanup_test_data.js        # deletes test tasks, resets employee sopPoints
 ```
 
-Read the header comment of a script before running it — most declare hardcoded test employee IDs (e.g. `GR0067`) they will mutate. Run `cleanup_test_data.js` afterwards.
+Read the header comment of a script before running it — most declare hardcoded test employee IDs (e.g. `GR0067`) they will mutate. Run `scripts/interactive/cleanup_test_data.js` afterwards.
 
 ## server.js is the wiring hub
 

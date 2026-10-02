@@ -12,9 +12,9 @@ if (!MONGO_URI) {
 
 // ── model requires (side-effect registers all models) ─────────────────────
 // adjust paths relative to THIS script's location
-const DailyAttendance = require("./models/HR_Models/Dailyattendance");
-const Employee = require("./models/Employee");
-require("./models/HR_Models/LeaveManagement");
+const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+const Employee = require("../../models/Employee");
+require("../../models/HR_Models/LeaveManagement");
 
 function getLeaveApplication() { return mongoose.model("LeaveApplication"); }
 function getLeaveBalance() { return mongoose.model("LeaveBalance"); }

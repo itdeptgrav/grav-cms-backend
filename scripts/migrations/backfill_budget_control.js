@@ -27,8 +27,8 @@
  */
 require("dotenv").config();
 const mongoose = require("mongoose");
-const { Acc_Ledger, Acc_Group } = require("./models/Accountant_model/Acc_MasterModels");
-const classification = require("./services/budgetClassification.service");
+const { Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
+const classification = require("../../services/budgetClassification.service");
 
 const APPLY = process.argv.includes("--apply");
 const UNDO = process.argv.includes("--undo");
