@@ -1,131 +1,123 @@
-# Latest implementation — the flat pattern, and which piece is which component
+# Latest implementation — the genuine CLO T-shirt, mapped and draped through the UI
 
-1 Oct 2026. **Committed on `NEW_CMS_BRANCH` in both repositories.**
+2 Oct 2026. **Committed on `NEW_CMS_BRANCH` in both repositories. Nothing pushed.**
 
-An R&D technical bundle now carries the flat pattern beside the 3D garment and
-the CLO source. The server reads the DXF rather than taking the upload's word
-for anything, and states which flat piece is which 3D component — or says
-plainly that it cannot.
+A pattern maker can import `clo-tshirt-aama.dxf`, map all ten seams of the
+garment by clicking the pattern, save, reload, drape at Normal, and reopen the
+stored drape. That was done end to end in the browser against a throwaway
+MongoDB, and the six faults found on the way are the whole of this change.
 
-Live demo data written to the dev Atlas database: **one new technical bundle**
-(3D model 5 on `JW-SHIRT-DEMO-01`, approved), a **pattern attached to the
-existing 3D model 4**, and one confirmed piece-to-component mapping on it. The
-real CLO GLB (19.2 MB) and the CLO DXF (66 KB) were uploaded to the company
-Drive through the real route. Nothing else was touched; see §6 for how to undo it.
+The verdict is **a complete T-shirt preview, not a fit-approval surface.** Every
+mapped seam closes, the garment is symmetric, and the cloth is not being
+stretched — but the drape ends at 0.1 mm per frame against the 0.05 mm this
+quality settles to, and it is sewn on the CUT boundary, so every dimensional
+finding is withheld and the screen says "Preview — not fully settled". It is
+never labelled fit approved.
 
-## 1 · What was built
+## What the garment did
 
-| Part | Where |
-|---|---|
-| AAMA/ASTM DXF parser | `utils/dxfInspect.js` |
-| Content-based file classification | `utils/bundleFileTypes.js` |
-| Bundle coherence, derived checks, measurements | `services/rnd/patternBundle.service.js` |
-| The 2D→3D mapping ladder | `services/rnd/patternMapping.service.js` |
-| Pattern schema, mappings, bundle fields | `models/CMS_Models/RnD/GarmentModel.js` |
-| Routes, upload, IE projection | `routes/CMS_Routes/RnD/garmentModelRoute.js` |
-| 2D viewer, upload cards, rail | `grav-cms` `components/rnd/workspace3d/patterns/**` |
+Normal, 534 frames, ~22 s in the browser. Mean seam gaps, in the order the
+screen lists them:
 
-New endpoints, all under `/api/cms/rnd`, all behind employee auth → company →
-live R&D grant:
-
-| Method | Path | Capability |
+| seam | declared | closed to |
 |---|---|---|
-| POST | `/garment-models/classify` | `rnd.pattern.publish` — stores nothing |
-| PUT | `/garment-models/:id/pattern` | `rnd.pattern.publish` |
-| GET | `/garment-models/:id/pattern` | `rnd.model.read` |
-| POST | `/garment-models/:id/pattern/mappings` | `rnd.pattern.map` |
-| POST | `/garment-models/:id/pattern/rematch` | `rnd.pattern.map` |
-| GET | `/garment-models/styles/:styleId/technical-bundle` | `rnd.model.read` |
+| Left armhole | 53.3 cm | 4.5 mm |
+| Right armhole | 53.3 cm | 3.6 mm |
+| Left shoulder | 17.1 cm | 3.6 mm |
+| Right shoulder | 17.1 cm | 4.1 mm |
+| Left side seam | 40.0 cm | 0.4 mm |
+| Right side seam | 40.0 cm | 0.3 mm |
+| Left sleeve underarm | 14.9 cm | 1.5 mm |
+| Right sleeve underarm | 14.9 cm | 1.0 mm |
+| Neck band attachment | 55.8 cm | 5.1 mm |
+| Neck band join | 4.1 cm | 2.0 mm |
 
-`rnd.pattern.map` is deliberately its own capability rather than folded into
-annotating: a marker is one person's note and is argued with in replies, while a
-confirmed mapping is a statement that this flat piece **is** that component, it
-is what the IE projection carries, and nothing downstream re-examines it.
+Cloth under tension 259.9% at the worst point, **3.10% on average**. No edge
+left unsewn, no piece sewn to two things, no NaN. The 2D source is byte-identical
+to the file afterwards: 5 pieces, 540 outline points, unit `in`, factor 25.4.
 
-The full design record, including the ASTM D6673 layer table and the four
-defects a real CLO file exposed, is in
-`docs/product/rnd-3d-garment-workspace.md` § Phase 3.
+## The sleeve cap is four runs, and the pattern has no fault
 
-## 2 · The rule everything obeys
+The earlier reading of this file put the sleeve cap 27.8% away from the armhole
+and looked like a pattern that needed gathering. It does not. The sleeve's single
+41.7 cm run is the straight **hem**; the cap is the four published runs between
+the two underarm points, and together they are 53.4 cm against a front-plus-back
+armhole of 53.3 cm — **0.1% ease**. A different run interpretation, not a
+mismatch and not gathering.
 
-**Absent is absent.** No quantity is `null`, not `1`. No grainline is `null`,
-not vertical. No sew line means the seam allowance is *unpublished*, not zero,
-and the inspector says so in those words. One size is a sample pattern, not a
-grading with one step. Each of those defaults would be a statement somebody
-could cut cloth against, attributed to a patternmaker who never made it.
+The combinations a person selected, recorded so they can be checked:
 
-**Net pattern area is never called fabric consumption**, and the payload carries
-the reason so an API consumer cannot mistake it either.
+- **cap, both sleeves** — `1→30`, `30→60`, `60→90`, `90→120`, in that order and
+  the same direction on both sleeves. Reversing one of them to "match the mirror"
+  is wrong and cost 27 mm on the right armhole.
+- **armhole** — front `underarm→shoulder`, then back `shoulder→underarm`, which
+  is one continuous stretch crossing the shoulder seam: `60→31` + `113→84` on the
+  left, `64→93` + `51→80` on the right. Paired start-to-start.
+- **neck opening** — six runs: front `95→0`, `0→29`, then back `115→134`,
+  `134→0`, `0→29`, `29→49` = 58.2 cm, against a 53.4 cm rib band. The band is
+  8.9% shorter **on purpose**, which is why the ease tolerance belongs to a run's
+  role and not to seams in general.
 
-## 3 · Verification
+## The six faults, all invisible to what was already checking
 
-| Suite | Result |
-|---|---|
-| `npx jest test/rnd/` (backend) | **195 passed** |
-| `node --test components/rnd/**/*.test.mjs` (frontend) | **425 passed** |
+1. **A ring on the pattern was not a click target.** Anchors were drawn inside a
+   `pointerEvents="none"` group, so a click aimed at one fell through and merely
+   selected the piece underneath.
+2. **A proposed run was measured in the file's own unit.** This export is in
+   inches, so the pick bar read 0.7 cm for a 17.1 cm shoulder seam.
+3. **Reverse wrote a word nothing reads.** It set `direction`; the solver chooses
+   between the two stretches joining a pair of ends by `theLongWay`, which had no
+   field to be stored in.
+4. **Both sleeves were placed on the left arm.** Handedness came only from a
+   piece's name and this file calls them `Pattern_1621764/5`. Readiness passed
+   nine steps of nine, every seam length matched, every run was confirmed and the
+   drape settled — with a 213 mm average gap on the right armhole. A sleeve also
+   hung 70 mm outboard of the shoulder point, dragging the shoulder seam open.
+5. **Readiness compared inches with millimetres.** R5 divided a perimeter in the
+   file's unit by seam lengths in millimetres, so one mapped shoulder seam made a
+   whole panel pass as fully sewn; and R7 refused the side seams for being
+   "0.0% apart where this seam allows 0%", which is floating-point noise on two
+   lengths that are 400.2140 mm each.
+6. **A finished drape was discarded for being 12 characters too wordy.** The
+   sentence explaining why a cut-boundary drape withholds its chest measurement
+   is 412 characters against a 400 cap, so every such drape failed to save and
+   the browser was told "Something went wrong."
 
-The pattern fixture is a genuine CLO 7.1.178 export, committed at
-`test/fixtures/rnd/clo-tshirt-aama.dxf` with a README explaining why a
-hand-written one cannot test this parser.
+Plus one reporting fault: **2639% strain was ten edges a tenth of a millimetre
+long**, out of 11,328. The screen now names the exclusion and its size.
 
-Walked in the real application on **http://localhost:3001** against the real
-backend on :5050, the real dev Atlas database and the real company Drive, signed
-in as the seeded demo R&D editor, approver and viewer.
+## Tests
 
-## 4 · What the live pass found that the tests did not
+- frontend `node --test "components/rnd/fit/*.test.mjs"` — **177 pass**
+- backend `npx jest test/rnd/` — **354 pass**
 
-1. **A draft with no pattern could never get one** — `editable` was returned only
-   on the branch that already had a pattern, so the control that attaches one
-   never rendered in the exact case that needs it.
-2. **An approved bundle could not start a revision** — "Publish a new bundle" was
-   gated on the current bundle being editable.
-3. **The pattern sheet asked for the 3D model**, a file it has no card for.
-4. **Five piece labels overlapped into a smear at 375px.**
-5. **A screen reader heard "5 pieces in in".**
-6. **`{ ...mongooseSubdoc }` copies internals, not fields** — every confirmed
-   mapping read back from the database arrived blank. Invisible to unit tests,
-   which pass plain objects in.
-7. **Eight new refusal codes all arrived as `VALIDATION`**, because an
-   unregistered code silently becomes it.
+Each fault has a regression test that fails without its fix, verified by
+reverting the fix and re-running. `run.test.mjs` now asserts the thing no
+tolerance can be traded against: **Normal must close every seam tighter than
+Draft and end at a lower movement rate.** Gap bounds are each quality's own mesh
+spacing rather than round numbers, and the woven and the knit are asserted
+separately, because a poplin shoulder carrying two sleeves cannot close the last
+millimetres without stretching and the solver is built to let the cloth win.
 
-Each is fixed, and each has a regression test naming it.
+## What is still not true
 
-## 5 · Limitations, stated rather than implied
+- **Not settled.** 0.1 mm per frame against 0.05 mm. Preview only.
+- **Sewn on the cut boundary.** A published sewing line is still not read into
+  the mesh, so a 10 mm allowance is unaccounted for — of the order of 40 mm round
+  a chest. Every dimensional finding is withheld, by the server, not by courtesy.
+- **One vertex at 259.9%.** At the tightest fold, where cloth turns through
+  nearly 180 degrees in two triangles. Known, pinned, not hidden.
+- **Near-duplicate outline points survive the weld.** The mesher still builds
+  0.12 mm edges from them, which carry a stiffness spike. Only the reporting of
+  that was fixed here, not the mesher.
+- **Draft is rough.** 17 mm shoulders and not settled. It is for seeing whether a
+  mapping sews at all.
+- The fabric is a preset, so W5 stands. No fit findings, no grab or pin, no trial
+  comparison, no trousers or jackets.
 
-* The test DXF publishes **no notches, no drill holes, no sew line, no grading
-  and no chosen piece names**. Those paths are implemented and covered by
-  synthetic fixtures; they have not been run against a genuine export containing
-  them.
-* **No genuine `.zprj` was available.** The source path is verified with a ZIP
-  fixture and by refusing every other format — which is what a container with no
-  published specification honestly allows.
-* **No fully graded production pattern has been run.** The storage ceiling
-  (250,000 points) and draw ceiling (24,000 nodes) are enforced and tested; no
-  real file has reached either.
-* The CLO GLB **merges the whole garment into one mesh called `Cloth`**, beside
-  nineteen trims and a 94-node avatar skeleton, so pattern pieces cannot be
-  highlighted individually. The workspace says so in the brief's own words.
+## How it was verified
 
-## 6 · Undoing the demo data
-
-Three rows on style `6abb3397de13c635ae989477`, all in `GarmentModelPublication`:
-
-* `GM-6424D750D2` — 3D model 5, APPROVED, the new bundle. Deleting it leaves
-  3D model 3 superseded rather than approved; set it back if that matters.
-* `GM-2F1BFAA52C` — 3D model 4, now IN_REVIEW with a pattern and one mapping.
-  Clearing `patternSet`, `pieceMappings` and the `pattern` asset restores it.
-* The two Drive objects behind them, in `rnd/garment-models/<styleId>/`.
-
-`public/__dev__/tshirt-garment.glb` and `tshirt-pattern.dxf` were staged in the
-frontend for the browser pass. That folder is gitignored; delete them when done.
-
-## 7 · Next
-
-1. **A genuine graded, notched DXF.** Everything below the sample-pattern case is
-   implemented against synthetic fixtures and unproven against a real export.
-2. **A CLO re-export with pattern-piece names switched on.** It is the one thing
-   that would make name-based mapping possible on this style at all, and it
-   would turn the mapping ladder's middle rungs from code into evidence.
-3. **The marker-making system**, which takes this verified geometry as input.
-   Deliberately not built here: nesting, fabric optimisation, cutting-room
-   planning, operation bulletins, SAM and sewing sequence all remain out of scope.
+`scripts/rnd/fit-verification-world.js` boots mongodb-memory-server on port
+27018 and seeds one company, one login and one style from the real DXF. It never
+reads `MONGODB_URI` and never touches Atlas. No Atlas collection was dropped and
+no unrelated database was modified.
