@@ -49,6 +49,7 @@ const { fail, sendError } = require("../../../../services/storePurchase/errors")
    compiled, and any build scheduled, long before a transaction opens. */
 const customerOwnedReserve = require("../../../../services/storePurchase/customerOwnedReserve.service");
 const autoReservation = require("../../../../services/storePurchase/autoReservation.service");
+const customerSuppliedRouting = require("../../../../services/storePurchase/customerSuppliedRouting.service");
 // Chunk 9A — stock reservations & picking. The reservation record/projection
 // live here; the CONTROLLED ISSUE reuses this file's own adjustStock engine.
 const reservationSvc = require("../../../../services/storePurchase/reservation.service");
@@ -956,6 +957,12 @@ router.patch(
        material it is. Matching it is the moment it becomes eligible, so it is
        the moment the hold is attempted — for THIS line only, because the rest
        of the request was already attempted at approval. */
+    /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+       The same approval, routed the other way: a customer-supplied line
+       produces a customer-material expectation, never a reservation and
+       never a purchase. Both run after the commit for the same reason —
+       neither may be able to undo a decision a person already made. */
+    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
     autoReservation.attemptInBackground({
       tenant: req.tenant, mrfId: mrf._id, lineId: item._id,
       trigger: autoReservation.TRIGGERS.LINE_MATCHED,
@@ -1058,6 +1065,12 @@ router.patch(
 
     /* Registering a described line creates the catalogue item and links it —
        the same eligibility moment as matching, reached by the other door. */
+    /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+       The same approval, routed the other way: a customer-supplied line
+       produces a customer-material expectation, never a reservation and
+       never a purchase. Both run after the commit for the same reason —
+       neither may be able to undo a decision a person already made. */
+    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
     autoReservation.attemptInBackground({
       tenant: req.tenant, mrfId: mrf._id, lineId: item._id,
       trigger: autoReservation.TRIGGERS.LINE_MATCHED,
@@ -1275,7 +1288,13 @@ router.post(
       mrfNotify.autoForwarded(mrf).catch(() => { });
       /* Already approved on arrival — eligible now, by the same rule the TL
          approval path uses. */
-      autoReservation.attemptInBackground({
+      /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+         The same approval, routed the other way: a customer-supplied line
+         produces a customer-material expectation, never a reservation and
+         never a purchase. Both run after the commit for the same reason —
+         neither may be able to undo a decision a person already made. */
+      customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
+    autoReservation.attemptInBackground({
         tenant: req.tenant, mrfId: mrf._id,
         trigger: autoReservation.TRIGGERS.AUTO_FORWARDED,
         actorName: fullName, actorId: employee?._id || actorId || null,
@@ -1415,6 +1434,12 @@ router.post(
 
     /* A store-raised request is approved the instant it is created, so it is
        eligible immediately — the third door to the same rule. */
+    /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+       The same approval, routed the other way: a customer-supplied line
+       produces a customer-material expectation, never a reservation and
+       never a purchase. Both run after the commit for the same reason —
+       neither may be able to undo a decision a person already made. */
+    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
     autoReservation.attemptInBackground({
       tenant: req.tenant, mrfId: mrf._id,
       trigger: autoReservation.TRIGGERS.STORE_ON_BEHALF,
@@ -1729,6 +1754,17 @@ router.patch(
       previousState: stateBeforeCancel,
       resultingState: mrf.status,
     });
+
+    /* ── AND THE DELIVERIES IT AUTHORISED ───────────────────────────
+       The expectation existed because this request authorised it; the
+       authorisation is now withdrawn, so Store must stop planning around a
+       delivery nobody is sending. Anything already received REFUSES - see
+       `cancelForRequest`: cancelling does not unship a lorry. After the
+       commit, and fire-and-forget, so it cannot undo the cancellation. */
+    customerSuppliedRouting.cancelForRequest({
+      tenant: req.tenant, mrfId: mrf._id,
+      reason: `${mrf.mrfNumber} was cancelled, so this material is no longer expected.`,
+    }).catch(() => {})
     const cancelledPayload = { success: true, message: "MRF cancelled", mrf };
     return req.idempotent
       ? await req.idempotent.succeed(200, cancelledPayload, { entityType: MRF_ENTITY, entityId: mrf._id })

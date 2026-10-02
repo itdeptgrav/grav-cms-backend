@@ -61,7 +61,7 @@ its catalogue audit, permission parity or cross-domain negative tests fail.
 
 ## Current coverage
 
-- HR: 10 domains, 5 entity types, 55 scalar metrics and 89 aliases, plus typed
+- HR: 10 domains, 5 entity types, 62 scalar metrics, plus typed
   record tools for attendance, leave, recruitment, documents, payroll,
   performance, policy and audit.
 - Accounting: 6 domains and 4 entity types covering the currently registered
@@ -77,6 +77,12 @@ collisions before release. It does not infer new business semantics from raw
 database schemas. New modules and calculations still require an explicit
 authoritative definition. Unknown language may use Qwen, but Qwen cannot
 bypass the catalogue, permissions or closed execution schemas.
+
+Standard employee identity fields are an explicit CI contract. Full name,
+title, nickname, both managers, department, designation, job title, location,
+shift, operating status and both work/personal email may not disappear from the
+catalogue without failing tests. Composite values such as a full name are
+assembled only from the authorised employee record; Qwen never guesses them.
 
 ## Verification
 

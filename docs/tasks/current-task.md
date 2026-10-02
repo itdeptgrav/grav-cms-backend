@@ -1,3 +1,23 @@
+# ACTIVE TASK — CMS DEVELOPMENT QWEN RUNTIME (2 Oct 2026)
+
+The user requested that the existing CMS assistant use `qwen3:32b` from the
+development RunPod after a direct comparison with `qwen3:8b`. The runtime is private: Ollama is
+loopback-only on the pod and the local backend reaches it through an SSH tunnel
+on `127.0.0.1:11435`. No production traffic or assistant authority boundary is
+changed. Durable decision: `docs/decisions/cms-dev-qwen-runtime.md`.
+
+Acceptance requires the exact model and quantization to be verified, the tunnel
+to pass a health check, the assistant catalogue/unit suites to remain green,
+and one live structured model request to succeed through the tunnel.
+
+**State: live in CMS development.** Verified `qwen3:32b` / `Q4_K_M` by digest,
+100% GPU residency on the A40, structured requests through the private tunnel,
+68/68 focused assistant tests, a clean catalogue audit, and a healthy restarted
+backend with its database and socket connected. The 8B files remain available
+for rollback but that model is not resident in GPU memory.
+
+---
+
 # ACTIVE TASK — R&D FIT SIMULATION, SLICE 1 (1 Oct 2026)
 
 The active implementation scope is the **first in-app 2D→3D fit slice** for
@@ -5558,7 +5578,7 @@ No full regression suite and no production build were run, per the brief.
   Domains, entities and metrics are validated once; the runtime performs
   longest-unique metric resolution, domain detection, collision audits and
   cross-catalogue model-candidate filtering.
-- Migrated HR to 10 domains, 5 entities, 55 scalar metrics and 89 aliases.
+- Migrated HR to 10 domains, 5 entities and 62 scalar metrics.
   Migrated all 21 HR tools to machine-readable domain/subject metadata.
 - Added Accounting's 6 domains and 4 entities and migrated its 6 registered
   tools, preventing HR vocabulary from hiding a valid Accounting capability.
@@ -5605,7 +5625,7 @@ rule for every wording, while keeping HR records and actions reliable.
   bypass model enum selection; ambiguous or free-form requests still use Qwen.
   Longest unique alias matching prevents a broad field from shadowing a more
   specific field.
-- Expanded the registry to 55 scalar metrics with 89 standard aliases, covering
+- Expanded the registry to 62 scalar metrics, covering
   every standard employee/profile field plus configured compensation and posted
   payroll values. All aliases are checked as one generated collision/routing
   matrix rather than by isolated prompt regressions.
@@ -5627,6 +5647,11 @@ rule for every wording, while keeping HR records and actions reliable.
   metric first, read the authorised value, and return a deterministic yes/no
   plus the canonical value. The comparison grammar is generated across every
   registered HR metric alias rather than patched for individual sentences.
+- Added an enforced standard-identity coverage contract and deterministic
+  composite `employee.full_name` metric. Misspelled-but-unique employee names
+  now pass through the existing fuzzy employee resolver, while the requested
+  field remains catalogue-owned; the language model cannot substitute another
+  employee attribute or ask a generic entity clarification.
 
 ## Safety boundary
 
@@ -5651,6 +5676,21 @@ execution and audit event. The model has no raw MongoDB access.
 - A fresh-history live check of `what is arpita's email?` selected
   `employee.work_email` without model planning and returned the authorised work
   email in 1.036 seconds.
+- A live database and end-to-end fresh-history check of
+  `what is umung's full name?` resolved `UMUNG ARORA (GR0002)`, selected
+  `hr_person_metric` / `employee.full_name` through a catalogue claim, and
+  returned `UMUNG ARORA's full name is UMUNG ARORA.` deterministically. The
+  focused catalogue, planner, route and permission suites pass 68/68, and the
+  assistant catalogue audit reports 62 HR metrics with zero issues.
+- Activated `qwen3:32b` (`Q4_K_M`, immutable Ollama blob
+  `3291abe70f16ee9682de7bfae08db5373ea9d6497e614aaad63340ad421d6312`)
+  for CMS development through the existing private tunnel. On an identical
+  eight-question real-catalogue routing sample it scored 7/8 versus 6/8 for
+  `qwen3:8b`; warm planning was about 4.0–7.6 seconds and resident VRAM was
+  about 28 GB. One audit case failed closed at argument-schema validation, so
+  the larger model is an improvement, not a replacement for typed catalogues
+  and validators. The focused regression suite remains green at 68/68 and the
+  catalogue audit remains clean at 27 tools / 62 HR metrics.
 - A fresh-history live matrix selected deterministic sources for attendance,
   work email, CTC, father and blood group. `arpita's attendance` returned the
   authorised 30-day tally through `hr_employee` in 1.186 seconds, without model
