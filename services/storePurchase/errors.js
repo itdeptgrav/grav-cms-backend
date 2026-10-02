@@ -692,6 +692,22 @@ const CODES = {
      without the inputs a solver needs. Each names the state so a screen can
      say what to do instead. */
   PATTERN_REVISION_FROZEN: { status: 409, code: "PATTERN_REVISION_FROZEN" },
+  /* ── WHAT A FILE'S OUTLINES MEAN, AND THE WAYS THAT CAN BE INCOHERENT ──
+     422 rather than 400: each body is well formed and each field is inside its
+     own vocabulary. What is wrong is the combination, or a figure the
+     combination requires and did not get — "the outline is already the stitch
+     line" together with "inset an allowance into it" describes two different
+     garments, and a cut line with no allowance has no sewing line at all.
+     Registered rather than left to fall through to VALIDATION, because a
+     screen that has to tell a patternmaker which of their two statements to
+     change cannot do it from "the request was invalid". */
+  SEWING_LINE_MEANING_UNKNOWN: { status: 422, code: "SEWING_LINE_MEANING_UNKNOWN" },
+  SEWING_LINE_INCONSISTENT: { status: 422, code: "SEWING_LINE_INCONSISTENT" },
+  SEAM_ALLOWANCE_REQUIRED: { status: 422, code: "SEAM_ALLOWANCE_REQUIRED" },
+  SEAM_ALLOWANCE_INVALID: { status: 422, code: "SEAM_ALLOWANCE_INVALID" },
+  SEWING_LINE_OVERRIDE_UNKNOWN_PIECE: { status: 422, code: "SEWING_LINE_OVERRIDE_UNKNOWN_PIECE" },
+  SEWING_LINE_OVERRIDE_UNKNOWN_RUN: { status: 422, code: "SEWING_LINE_OVERRIDE_UNKNOWN_RUN" },
+  SEWING_LINE_OVERRIDE_DUPLICATE: { status: 422, code: "SEWING_LINE_OVERRIDE_DUPLICATE" },
   PATTERN_UNREADABLE: { status: 422, code: "PATTERN_UNREADABLE" },
   DERIVED_PREVIEW_READ_ONLY: { status: 409, code: "DERIVED_PREVIEW_READ_ONLY" },
   SIMULATION_INPUTS_MISSING: { status: 422, code: "SIMULATION_INPUTS_MISSING" },

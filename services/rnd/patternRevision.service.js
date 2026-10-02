@@ -654,6 +654,152 @@ async function editRevision(ctx, { revisionId, operations = [], name, expectedRe
 }
 
 /** The simulation inputs, which are settings rather than geometry. */
+/* ═══ THE SEWING-LINE DECISION, VALIDATED ══════════════════════════════════
+ *
+ * A schema enum keeps each field inside its own vocabulary and says nothing
+ * about whether the fields agree. `lineMeaning: "sewing_line"` with
+ * `source: "derived"` passes every enum and is incoherent: it says the outline
+ * is already the stitch line and then asks for an allowance to be inset into
+ * it. A record that can hold a contradiction will eventually be read by
+ * something that believes it.
+ *
+ * So the pairing is the contract, and it is checked here rather than trusted.
+ */
+const MEANING_SOURCE = Object.freeze({
+  unknown: "unknown",
+  sewing_line: "as-imported",
+  cut_line: "derived",
+  both: "published",
+});
+
+/**
+ * What the file itself offers towards the question, measured rather than
+ * accepted. A client may post a recommendation; it is ignored, because a
+ * recommendation is evidence and evidence that arrives from the thing being
+ * judged is not evidence.
+ */
+function recommendFrom(patternSet) {
+  const list = (patternSet && patternSet.pieces) || [];
+  if (!list.length) return { lineMeaning: "", why: "" };
+  const stated = list.filter((p) => Number(p.seamAllowance) > 0).length;
+  const second = list.filter((p) => (p.extraBoundaries || []).length > 0).length;
+  if (second) {
+    return {
+      lineMeaning: "both",
+      why: `${second} of ${list.length} pieces carry a second boundary, which is a published `
+        + "sewing line.",
+    };
+  }
+  if (stated) {
+    return {
+      lineMeaning: "cut_line",
+      why: `${stated} of ${list.length} pieces state a seam allowance, so the outlines are cut `
+        + "edges.",
+    };
+  }
+  return {
+    lineMeaning: "sewing_line",
+    why: `No piece of ${list.length} states a seam allowance and none carries a second boundary, `
+      + "so there is nothing to inset — the outlines are the only lines this file has.",
+  };
+}
+
+function resolveSewingLine({ incoming, held, patternSet, pieces, stamp }) {
+  const recommendation = recommendFrom(patternSet);
+  if (!incoming) {
+    return { ...held, recommendation };
+  }
+  const meaning = str(incoming.lineMeaning) || str(held.lineMeaning) || "unknown";
+  if (!Object.prototype.hasOwnProperty.call(MEANING_SOURCE, meaning)) {
+    throw fail("SEWING_LINE_MEANING_UNKNOWN",
+      `"${meaning}" is not something an outline can be. It is a sewing line, a cut line, both, `
+      + "or not yet decided.",
+      { lineMeaning: meaning });
+  }
+  /* The source is DERIVED from the meaning rather than taken alongside it, so
+     the two cannot disagree. A client that sends one is checked against it. */
+  const source = MEANING_SOURCE[meaning];
+  const sent = str(incoming.source);
+  if (sent && sent !== source) {
+    throw fail("SEWING_LINE_INCONSISTENT",
+      `An outline that is "${meaning}" is sewn "${source}", not "${sent}". Those two statements `
+      + "describe different garments, and a record that holds both cannot be read.",
+      { lineMeaning: meaning, source: sent, expected: source });
+  }
+
+  /* ── AN ALLOWANCE ONLY WHERE THERE IS SOMETHING TO INSET ──────────────── */
+  let allowanceMm = null;
+  if (meaning === "cut_line") {
+    const asked = incoming.allowanceMm !== undefined ? incoming.allowanceMm : held.allowanceMm;
+    const value = Number(asked);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw fail("SEAM_ALLOWANCE_REQUIRED",
+        "An outline that is a cut line needs a seam allowance before a sewing line can be derived "
+        + "from it. Without one there is no sewing line and every dimensional finding is withheld.",
+        { allowanceMm: asked ?? null });
+    }
+    allowanceMm = value;
+  }
+
+  /* ── OVERRIDES NAME REAL PIECES AND REAL RUNS, ONCE EACH ──────────────── */
+  const byRef = new Map((pieces || []).map((p) => [str(p.pieceRef), p]));
+  const overrides = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(incoming.overrides) ? incoming.overrides : []) {
+    const pieceRef = str(raw.pieceRef);
+    const runId = str(raw.runId);
+    const plan = byRef.get(pieceRef);
+    if (!plan) {
+      throw fail("SEWING_LINE_OVERRIDE_UNKNOWN_PIECE",
+        `A per-edge allowance names piece "${pieceRef}", which this revision does not simulate.`,
+        { pieceRef });
+    }
+    if (runId && !(plan.runs || []).some((r) => str(r.runId) === runId)) {
+      throw fail("SEWING_LINE_OVERRIDE_UNKNOWN_RUN",
+        `A per-edge allowance names run "${runId}" on "${pieceRef}", which that piece does not have.`,
+        { pieceRef, runId });
+    }
+    const key = `${pieceRef}::${runId}`;
+    if (seen.has(key)) {
+      throw fail("SEWING_LINE_OVERRIDE_DUPLICATE",
+        `Two per-edge allowances name ${runId ? `run "${runId}" on ` : ""}"${pieceRef}". `
+        + "Which one applies would be decided by array order, which is not a decision.",
+        { pieceRef, runId });
+    }
+    seen.add(key);
+    const value = Number(raw.allowanceMm);
+    if (!Number.isFinite(value) || value < 0) {
+      throw fail("SEAM_ALLOWANCE_INVALID",
+        `A per-edge allowance on "${pieceRef}" is ${raw.allowanceMm}, which is not a width.`,
+        { pieceRef, runId, allowanceMm: raw.allowanceMm });
+    }
+    overrides.push({ pieceRef, runId, allowanceMm: value });
+  }
+
+  /* ── A CONFIRMATION IS OF A PARTICULAR DECISION ───────────────────────────
+     Change what was decided and the old confirmation is no longer a
+     confirmation of it. Meaning, source and — where one applies — the
+     allowance all count: somebody who agreed to a 10mm inset did not thereby
+     agree to a 15mm one. */
+  const changed = meaning !== str(held.lineMeaning)
+    || source !== str(held.source)
+    || (meaning === "cut_line" && Number(held.allowanceMm) !== allowanceMm);
+
+  return {
+    source,
+    lineMeaning: meaning,
+    allowanceMm,
+    overrides: Array.isArray(incoming.overrides) ? overrides : (held.overrides || []),
+    confirmed: meaning === "unknown" ? null : stamp(true, changed ? null : held.confirmed),
+    origin: meaning === "unknown" ? "" : (str(incoming.origin) || "user-confirmation"),
+    /* Measured here, never accepted: see recommendFrom. */
+    recommendation,
+    /* Written by the drape, which is the only thing that knows which pieces
+       could not take the decision. Never accepted from a client. */
+    exceptions: held.exceptions || [],
+  };
+}
+
 async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevision, actor = null } = {}) {
   assertContext(ctx);
   const row = await revisionForCompany(ctx, revisionId);
@@ -742,34 +888,13 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
        `allowanceMm` is cleared unless the decision is that the outline is a cut
        line. A stored 10 that nothing applies is exactly how an assumption comes
        back later wearing the clothes of a decision. */
-    sewingLine: (() => {
-      const incoming = inputs.sewingLine;
-      const before = held.sewingLine || {};
-      if (!incoming) return before;
-      const meaning = str(incoming.lineMeaning) || str(before.lineMeaning) || "unknown";
-      const source = str(incoming.source) || str(before.source) || "unknown";
-      const derived = meaning === "cut_line";
-      const changed = meaning !== str(before.lineMeaning) || source !== str(before.source);
-      return {
-        source,
-        lineMeaning: meaning,
-        allowanceMm: derived
-          ? (Number.isFinite(Number(incoming.allowanceMm)) ? Number(incoming.allowanceMm)
-            : (before.allowanceMm ?? null))
-          : null,
-        overrides: Array.isArray(incoming.overrides) ? incoming.overrides : (before.overrides || []),
-        /* A fresh statement is re-stamped; agreeing with what is already there
-           keeps the original identity and time. */
-        confirmed: meaning === "unknown"
-          ? null
-          : stamp(true, changed ? null : before.confirmed),
-        origin: meaning === "unknown" ? "" : (str(incoming.origin) || "user-confirmation"),
-        recommendation: incoming.recommendation || before.recommendation || {},
-        /* Written by the drape runner, which is the only thing that knows which
-           pieces could not take the decision. Never accepted from a client. */
-        exceptions: before.exceptions || [],
-      };
-    })(),
+    sewingLine: resolveSewingLine({
+      incoming: inputs.sewingLine,
+      held: held.sewingLine || {},
+      patternSet: row.patternSet,
+      pieces,
+      stamp,
+    }),
     settings: inputs.settings || held.settings || {},
   };
 

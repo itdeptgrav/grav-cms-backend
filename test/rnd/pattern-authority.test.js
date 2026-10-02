@@ -184,8 +184,133 @@ describe("the sewing-line decision is recorded, not inferred", () => {
       inputs: { sewingLine: { lineMeaning: "sewing_line", source: "as-imported" } },
       actor: w.drafter,
     });
-    expect(String(second.revision.simulationInputs.sewingLine.confirmed.at))
-      .toBe(String(stamped));
+    expect(new Date(second.revision.simulationInputs.sewingLine.confirmed.at).getTime())
+      .toBe(new Date(stamped).getTime());
+  });
+
+  test("a meaning and a source that disagree are refused", async () => {
+    /* Both pass their own enum and together they describe different garments:
+       "the outline is already the stitch line" and "inset an allowance into
+       it". A record that can hold a contradiction is eventually read by
+       something that believes it. */
+    const w = await world();
+    const revision = await imported(w);
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "sewing_line", source: "derived" } },
+      actor: w.drafter,
+    }), "SEWING_LINE_INCONSISTENT");
+  });
+
+  test("a cut line without an allowance is refused, not quietly defaulted", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "cut_line", source: "derived" } },
+      actor: w.drafter,
+    }), "SEAM_ALLOWANCE_REQUIRED");
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "cut_line", source: "derived", allowanceMm: 0 } },
+      actor: w.drafter,
+    }), "SEAM_ALLOWANCE_REQUIRED");
+  });
+
+  test("the four readings each imply exactly one source", async () => {
+    const w = await world();
+    for (const [lineMeaning, source] of [
+      ["sewing_line", "as-imported"], ["cut_line", "derived"],
+      ["both", "published"], ["unknown", "unknown"],
+    ]) {
+      /* eslint-disable no-await-in-loop */
+      const revision = await imported(w);
+      const out = await patterns.setSimulationInputs(w.ctx, {
+        revisionId: revision.id,
+        inputs: {
+          sewingLine: lineMeaning === "cut_line"
+            ? { lineMeaning, allowanceMm: 10 } : { lineMeaning },
+        },
+        actor: w.drafter,
+      });
+      expect(out.revision.simulationInputs.sewingLine.source).toBe(source);
+      /* eslint-enable no-await-in-loop */
+    }
+  });
+
+  test("an override must name a piece and a run this revision has, once", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const ready = await madeRenderable(w, revision);
+    const pieceRef = ready.simulationInputs.pieces[0].pieceRef;
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: ready.id,
+      inputs: {
+        sewingLine: {
+          lineMeaning: "cut_line", allowanceMm: 10,
+          overrides: [{ pieceRef: "PP-NOT-HERE", allowanceMm: 5 }],
+        },
+      },
+      actor: w.drafter,
+    }), "SEWING_LINE_OVERRIDE_UNKNOWN_PIECE");
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: ready.id,
+      inputs: {
+        sewingLine: {
+          lineMeaning: "cut_line", allowanceMm: 10,
+          overrides: [{ pieceRef, allowanceMm: 5 }, { pieceRef, allowanceMm: 7 }],
+        },
+      },
+      actor: w.drafter,
+    }), "SEWING_LINE_OVERRIDE_DUPLICATE");
+    await refuses(() => patterns.setSimulationInputs(w.ctx, {
+      revisionId: ready.id,
+      inputs: {
+        sewingLine: {
+          lineMeaning: "cut_line", allowanceMm: 10,
+          overrides: [{ pieceRef, allowanceMm: -1 }],
+        },
+      },
+      actor: w.drafter,
+    }), "SEAM_ALLOWANCE_INVALID");
+  });
+
+  test("changing the allowance invalidates the confirmation of the old one", async () => {
+    /* Somebody who agreed to a 10mm inset did not thereby agree to a 15mm one. */
+    const w = await world();
+    const revision = await imported(w);
+    const first = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: { sewingLine: { lineMeaning: "cut_line", allowanceMm: 10 } },
+      actor: w.drafter,
+    });
+    const was = new Date(first.revision.simulationInputs.sewingLine.confirmed.at).getTime();
+    await new Promise((r) => { setTimeout(r, 5); });
+    const second = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: first.revision.id,
+      inputs: { sewingLine: { lineMeaning: "cut_line", allowanceMm: 15 } },
+      actor: w.drafter,
+    });
+    expect(new Date(second.revision.simulationInputs.sewingLine.confirmed.at).getTime())
+      .not.toBe(was);
+  });
+
+  test("the recommendation is measured from the file, not taken from the client", async () => {
+    const w = await world();
+    const revision = await imported(w);
+    const out = await patterns.setSimulationInputs(w.ctx, {
+      revisionId: revision.id,
+      inputs: {
+        sewingLine: {
+          lineMeaning: "sewing_line",
+          recommendation: { lineMeaning: "cut_line", why: "posted by a client" },
+        },
+      },
+      actor: w.drafter,
+    });
+    const held = out.revision.simulationInputs.sewingLine.recommendation;
+    expect(held.why).not.toMatch(/posted by a client/);
+    expect(held.lineMeaning).toBeTruthy();
   });
 
   test("a client may not post its own exceptions", async () => {
