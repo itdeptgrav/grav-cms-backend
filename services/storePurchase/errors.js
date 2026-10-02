@@ -700,6 +700,9 @@ const CODES = {
   /* A render that produced a model publication, or has not finished, has no
      drape geometry to send. A state, not a missing record. */
   NO_DRAPE: { status: 409, code: "NO_DRAPE" },
+  /* A drape that is still beating its heartbeat is not abandoned, and "clear"
+     is for work nobody is doing. */
+  RENDER_STILL_RUNNING: { status: 409, code: "RENDER_STILL_RUNNING" },
   MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
   MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
   MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },

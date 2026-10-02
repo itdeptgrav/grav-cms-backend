@@ -639,4 +639,35 @@ router.get("/patterns/renders/:jobRef/drape", requireCompany, canRead,
     return res.json({ success: true, drape: out });
   }));
 
+/* ── A RUNNING DRAPE SAYS IT IS STILL ALIVE ───────────────────────────────
+   The page beats this every few seconds while the solver works. It is the only
+   thing that extends a lease, so a job cannot be kept alive by anything except
+   something that is actually solving it — and a lease that runs out is what makes
+   a closed tab recoverable instead of permanent. */
+router.post("/patterns/renders/:jobRef/heartbeat", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await renders.heartbeat(ctx(req), {
+      jobRef: req.params.jobRef,
+      runId: req.body?.runId,
+      actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+/* Clearing a drape whose browser stopped reporting. Refuses one that is still
+   beating: stopping a colleague's running drape is a different act. */
+router.post("/patterns/renders/:jobRef/recover", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await renders.recoverAbandoned(ctx(req), {
+      jobRef: req.params.jobRef, actor: actor(req),
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+router.get("/patterns/styles/:styleId/renders/abandoned", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await renders.listAbandoned(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
 module.exports = router;

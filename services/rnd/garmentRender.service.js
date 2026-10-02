@@ -114,6 +114,13 @@ function jobView(job, context = {}) {
         frames: job.drape.frames ?? 0,
         finalMoveMm: job.drape.finalMoveMm ?? null,
         msElapsed: job.drape.msElapsed ?? 0,
+        sewingLineSource: str(job.drape.sewingLineSource),
+        seamAllowanceMm: job.drape.seamAllowanceMm ?? null,
+        authoritative: job.drape.authoritative !== false,
+        outcome: str(job.drape.outcome) || "fitting",
+        withheld: job.drape.withheld || [],
+        fabricGrade: str(job.drape.fabricGrade),
+        geometryIdentity: str(job.drape.geometryIdentity),
         /* Said here rather than left to each screen, because a drape shown
            without this sentence is a drape somebody will approve against. */
         caveat: "This is a drape of the 2D pattern computed in the browser, on a body built from "
@@ -125,6 +132,25 @@ function jobView(job, context = {}) {
       code: str(job.failure?.code),
       message: str(job.failure?.message),
     },
+    /* ── IS ANYBODY STILL MAKING THIS? ─────────────────────────────────
+       Computed, never stored: a stored "abandoned" flag would be wrong the
+       moment a heartbeat arrived, and right only until the next one did not. */
+    abandoned: abandoned(job),
+    lease: {
+      heartbeatAt: job.lease?.heartbeatAt || null,
+      expiresAt: job.lease?.expiresAt || null,
+      heldBy: str(job.lease?.heldBy?.name),
+    },
+    recovery: job.recovery?.recoveredAt
+      ? {
+        recoveredAt: job.recovery.recoveredAt,
+        recoveredBy: str(job.recovery.recoveredBy?.name),
+        reason: str(job.recovery.reason),
+      }
+      : null,
+    /* What this render was accepted under — the sewing line it was entitled to
+       use and the findings it was never allowed to report. */
+    acceptedReadiness: job.acceptedReadiness || null,
     requestedBy: str(job.requestedBy?.name),
     startedAt: job.startedAt || null,
     finishedAt: job.finishedAt || null,
@@ -181,6 +207,157 @@ async function listRenders(ctx, { styleId } = {}) {
   };
 }
 
+/* ═══ LEASES, AND WHAT AN ABANDONED JOB IS ════════════════════════════════
+ *
+ * The solver runs in the reader's browser, so a closed tab, a crash or a laptop
+ * lid ends the arithmetic with no message at all. Nothing distinguishes that from
+ * a drape still in progress unless the job says when it was last alive — and the
+ * first version of this record had no such field, so one closed tab blocked the
+ * revision for ever: only one render may run at a time, and nothing would ever
+ * finish that one.
+ *
+ * ── WHY A LEASE AND NOT A TIMEOUT ON THE JOB'S AGE ──────────────────────────
+ * Because a High drape legitimately takes a minute and a slow laptop two, and a
+ * fixed age limit either kills real work or waits so long it is useless. A
+ * heartbeat answers the actual question — is anybody still solving this — and the
+ * answer does not depend on how long the work ought to take.
+ *
+ * Ninety seconds. A run beats every fifteen, so three missed beats is already
+ * conclusive, and somebody who closed a tab does not wait minutes to retry.
+ */
+const LEASE_MS = 90 * 1000;
+const HEARTBEAT_MS = 15 * 1000;
+
+/** Nobody is working on this: it holds a lease and the lease has run out. */
+function abandoned(job, now = Date.now()) {
+  if (![RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING].includes(job.status)) return false;
+  const expires = job.lease?.expiresAt ? new Date(job.lease.expiresAt).getTime() : 0;
+  /* No lease at all means an engine elsewhere owns it, and its own supervision is
+     not ours to second-guess. A QUEUED job that never reached an engine is the
+     one exception: nothing is ever going to pick it up. */
+  if (!expires) {
+    if (job.status !== RENDER_STATUS.QUEUED) return false;
+    const born = new Date(job.createdAt || 0).getTime();
+    return born > 0 && now - born > LEASE_MS;
+  }
+  return now > expires;
+}
+
+/** Close an abandoned job down, keeping it in the history. */
+async function reap(row, who, reason) {
+  const job = row._id ? await RenderJob.findById(row._id) : row;
+  if (!job) return null;
+  if (![RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING].includes(job.status)) return job;
+  const at = new Date();
+  job.status = RENDER_STATUS.CANCELLED;
+  job.finishedAt = at;
+  job.failure = {
+    code: "DRAPE_ABANDONED",
+    message: "This preview stopped reporting and was cleared. The browser making it was closed, "
+      + "lost its connection, or crashed. Nothing about the pattern changed.",
+  };
+  job.recovery = { recoveredBy: who, recoveredAt: at, reason: str(reason) };
+  job.lease = { runId: "", heartbeatAt: null, expiresAt: null };
+  job.events.push({ kind: "cancelled", note: `abandoned — ${str(reason)}`, by: who, at });
+  job.revision += 1;
+  await job.save();
+  return job;
+}
+
+/**
+ * KEEP A RUNNING DRAPE'S LEASE ALIVE.
+ *
+ * Called by the page every few seconds while the solver works, and deliberately
+ * the only thing that extends a lease: a job cannot be kept alive by anything
+ * except something that is actually solving it.
+ */
+async function heartbeat(ctx, { jobRef, runId, actor = null } = {}) {
+  assertContext(ctx);
+  const job = await RenderJob.findOne({ companyId: ctx.companyId, jobRef: str(jobRef) });
+  if (!job) throw fail("NOT_FOUND", "That render job was not found.");
+  if (![RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING].includes(job.status)) {
+    /* Not an error. A heartbeat arriving a moment after the drape reported is
+       ordinary, and answering it with a failure would make a page show one. */
+    return { jobRef: job.jobRef, status: job.status, holding: false };
+  }
+  /* ── A SECOND TAB DOES NOT GET TO TAKE OVER ────────────────────────────
+     Once a run id holds the lease, only that run id may renew it. Otherwise two
+     tabs each believe they own the drape, both report, and the second is refused
+     after a minute of work it did not need to do. */
+  const holder = str(job.lease?.runId);
+  const mine = str(runId);
+  if (holder && mine && holder !== mine && !abandoned(job)) {
+    throw fail("RENDER_ALREADY_RUNNING",
+      "Another browser is already making this preview.",
+      { jobRef: job.jobRef, holder });
+  }
+  const at = new Date();
+  job.lease = {
+    runId: mine || holder,
+    heldBy: job.lease?.heldBy || actorOf(actor),
+    heartbeatAt: at,
+    expiresAt: new Date(at.getTime() + LEASE_MS),
+  };
+  await job.save();
+  return {
+    jobRef: job.jobRef,
+    status: job.status,
+    holding: true,
+    expiresAt: job.lease.expiresAt,
+    heartbeatMs: HEARTBEAT_MS,
+  };
+}
+
+/**
+ * CLEAR AN ABANDONED DRAPE SO THE REVISION CAN BE TRIED AGAIN.
+ *
+ * Refuses a job that is still beating. "Clear" is for work nobody is doing, and a
+ * control that could kill a colleague's running drape is a different control with
+ * a different confirmation.
+ */
+async function recoverAbandoned(ctx, { jobRef, actor = null } = {}) {
+  assertContext(ctx);
+  const job = await RenderJob.findOne({ companyId: ctx.companyId, jobRef: str(jobRef) }).lean();
+  if (!job) throw fail("NOT_FOUND", "That render job was not found.");
+  if (![RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING].includes(job.status)) {
+    throw fail("INVALID_TRANSITION",
+      `This render has already ${job.status}. There is nothing to clear.`, { status: job.status });
+  }
+  if (!abandoned(job)) {
+    const seconds = job.lease?.heartbeatAt
+      ? Math.round((Date.now() - new Date(job.lease.heartbeatAt).getTime()) / 1000)
+      : null;
+    throw fail("RENDER_STILL_RUNNING",
+      "This preview is still being made"
+      + (seconds !== null
+        ? ` — it last reported ${seconds} second${seconds === 1 ? "" : "s"} ago`
+        : "")
+      + ". Stop it from the browser that is making it, rather than clearing it here.",
+      { jobRef: job.jobRef, heartbeatAt: job.lease?.heartbeatAt || null });
+  }
+  const closed = await reap(job, actorOf(actor), "cleared by hand after its browser stopped reporting");
+  const context = await currentRevisionOf(ctx, closed.styleId);
+  return { render: jobView(closed, context) };
+}
+
+/**
+ * Every abandoned job on a style, for the surface that offers to clear them.
+ *
+ * Read-only: finding them must not close them, because a list that reaped as a
+ * side effect of being looked at could not be looked at twice.
+ */
+async function listAbandoned(ctx, { styleId } = {}) {
+  assertContext(ctx);
+  const style = await styleForCompany(ctx.companyId, styleId);
+  const jobs = await RenderJob.find({
+    companyId: ctx.companyId,
+    styleId: style._id,
+    status: { $in: [RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING] },
+  }).lean();
+  const context = await currentRevisionOf(ctx, style._id);
+  return { abandoned: jobs.filter((j) => abandoned(j)).map((j) => jobView(j, context)) };
+}
+
 /* ═══ REQUESTING ONE ══════════════════════════════════════════════════════ */
 
 /**
@@ -197,26 +374,43 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
     .findOne({ _id: revisionId, companyId: ctx.companyId }).lean().catch(() => null);
   if (!revision) throw fail("NOT_FOUND", "That pattern revision was not found.");
 
-  const readiness = simulation.checkInputs(revision.patternSet, revision.simulationInputs);
+  const readiness = simulation.checkInputs(revision.patternSet, revision.simulationInputs, {
+    revisionRef: revision.revisionRef,
+    mappingConfirmedAgainstRef: revision.mappingConfirmedAgainstRef,
+  });
   if (!readiness.ready) {
+    /* The failure's own sentence, not a list of step names. "Seam mapping is
+       missing" sends somebody hunting; "the left armhole does not say which end
+       meets which" does not. */
+    const first = readiness.failures[0];
     throw fail("SIMULATION_INPUTS_MISSING",
-      "This pattern cannot be draped yet: "
-      + readiness.missing.map((m) => m.label.toLowerCase()).join(", ")
-      + (readiness.missing.length === 1 ? " is missing." : " are missing."),
-      { missing: readiness.missing });
+      readiness.failures.length === 1
+        ? first.message
+        : `This pattern cannot be draped yet. ${first.message} `
+          + `(${readiness.failures.length - 1} other thing`
+          + `${readiness.failures.length === 2 ? "" : "s"} still needed.)`,
+      { missing: readiness.missing, failures: readiness.failures, readiness });
   }
 
-  /* One run at a time per revision. Two solvers racing on the same pattern
-     produce two garments and no way to say which is the preview. */
+  /* ── ONE RUN AT A TIME, AND AN ABANDONED ONE IS NOT A RUN ─────────────
+     Two solvers racing on the same pattern produce two garments and no way to say
+     which is the preview. But the first version of this check counted a job whose
+     tab had been closed, so one closed laptop lid blocked the revision for ever
+     with no way to clear it. A lease that has expired means nobody is working. */
   const running = await RenderJob.findOne({
     companyId: ctx.companyId,
     patternRevisionId: revision._id,
     status: { $in: [RENDER_STATUS.QUEUED, RENDER_STATUS.SIMULATING] },
   }).lean();
-  if (running) {
+  if (running && !abandoned(running)) {
     throw fail("RENDER_ALREADY_RUNNING",
       `A preview of pattern revision ${revision.revisionNumber} is already being made.`,
       { jobRef: running.jobRef, status: running.status });
+  }
+  if (running) {
+    /* Closed down rather than ignored, so the history says what happened to it
+       and the list does not grow a column of jobs nothing will ever finish. */
+    await reap(running, actorOf(actor), "superseded by a new request");
   }
 
   const who = actorOf(actor);
@@ -231,6 +425,18 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
     /* A COPY. The revision's settings may be edited afterwards; what this
        garment was draped with cannot change retrospectively. */
     inputs: JSON.parse(JSON.stringify(revision.simulationInputs || {})),
+    /* What the pattern was judged ready on, as it stood. A fitting is evidence,
+       and evidence that cannot say what it assumed is weak evidence. */
+    acceptedReadiness: {
+      outcome: readiness.outcome,
+      sewingLineSource: readiness.sewingLine.source,
+      authoritative: readiness.sewingLine.authoritative,
+      seamAllowanceMm: readiness.sewingLine.allowanceMm,
+      fabricGrade: readiness.fabric.grade,
+      withheld: readiness.withheld,
+      warnings: readiness.warnings.map((w) => ({ code: w.code, message: w.message })),
+      notes: readiness.notes,
+    },
     status: RENDER_STATUS.QUEUED,
     requestedBy: who,
     events: [{ kind: "queued", note: revision.revisionRef, by: who, at }],
@@ -253,6 +459,17 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
     job.status = RENDER_STATUS.SIMULATING;
     job.startedAt = at;
     job.engine = { adapter: out.engine, version: out.version, externalJobId: out.externalJobId };
+    /* A browser-run job holds a lease and beats a heartbeat while it solves. An
+       engine somewhere else does not: it has its own supervision, and a lease we
+       could not renew on its behalf would expire mid-render. */
+    if (simulation.runsInBrowser()) {
+      job.lease = {
+        runId: "",
+        heldBy: who,
+        heartbeatAt: at,
+        expiresAt: new Date(at.getTime() + LEASE_MS),
+      };
+    }
     job.events.push({ kind: "simulating", note: out.engine, by: who, at });
   } else {
     job.status = RENDER_STATUS.FAILED;
@@ -323,9 +540,43 @@ function normaliseDrape(drape) {
       `That drape's pieces account for ${covered} of its ${vertexCount} points.`,
       { field: "drape.pieces" });
   }
+  /* ── A DRAPE MUST SAY WHICH SEWING LINE IT SEWED ON ────────────────────
+     Not optional, and not defaulted to "published". A drape sewn on the cut
+     boundary is not a drape with a small offset on it: the panels meet in the
+     wrong places. A drape that could not say which line it used would be a drape
+     whose numbers nobody can qualify, and the screens would show them anyway. */
+  const sewingLineSource = str(drape.sewingLineSource);
+  if (!["published", "derived", "cut-boundary"].includes(sewingLineSource)) {
+    throw fail("VALIDATION",
+      "That drape does not say whether it was sewn on a published sewing line, a derived one, or "
+      + "the cut boundary. Every dimensional finding depends on which, so it was not stored.",
+      { field: "drape.sewingLineSource" });
+  }
+  const authoritative = sewingLineSource !== "cut-boundary" && drape.authoritative !== false;
+  const withheld = (Array.isArray(drape.withheld) ? drape.withheld : [])
+    .filter((w) => str(w?.finding) && str(w?.why))
+    .map((w) => ({ finding: str(w.finding), why: str(w.why) }));
+  if (!authoritative && !withheld.length) {
+    throw fail("VALIDATION",
+      "That drape was sewn on the cut boundary and withholds nothing. Every dimensional finding "
+      + "is biased by the unstated allowance, so a drape claiming otherwise was not stored.",
+      { field: "drape.withheld" });
+  }
+
   return {
     solverVersion: str(drape.solverVersion),
     quality: str(drape.quality),
+    sewingLineSource,
+    seamAllowanceMm: Number.isFinite(Number(drape.seamAllowanceMm))
+      ? Number(drape.seamAllowanceMm) : null,
+    authoritative,
+    withheld,
+    outcome: withheld.length ? "partial" : "fitting",
+    readiness: drape.readiness || null,
+    fabricGrade: str(drape.fabricGrade),
+    /* The fingerprint of the geometry this drape was built from, so a later
+       rebuild can be PROVEN to be the same mesh rather than assumed. */
+    geometryIdentity: str(drape.geometryIdentity),
     fabric: {
       id: str(drape.fabric?.id), label: str(drape.fabric?.label), version: str(drape.fabric?.version),
     },
@@ -433,10 +684,29 @@ async function readDrape(ctx, { jobRef } = {}) {
         : `This render is ${job.status} and has no drape to show.`,
       { status: job.status });
   }
+  /* ── THE DRAPE'S OWN REVISION, NOT THE ONE SOMEBODY HAS SELECTED ──────
+     The triangles are rebuilt rather than stored, and a rebuild is only honest
+     against the pattern the drape was MADE from. Reading them from whichever
+     revision happens to be open on screen would draw one revision's positions
+     through another revision's faces: a garment that is neither, labelled as
+     one of them. So the pattern travels with the drape. */
+  const revision = await PatternRevision
+    .findOne({ _id: job.patternRevisionId, companyId: ctx.companyId })
+    .select("revisionRef revisionNumber state patternSet simulationInputs")
+    .lean();
+  if (!revision) {
+    throw fail("NO_DRAPE",
+      `This drape was made from pattern revision ${job.patternRevisionNumber}, which is no longer `
+      + "in the record, so its geometry cannot be rebuilt. The findings it reported are still "
+      + "readable.",
+      { patternRevisionRef: job.patternRevisionRef });
+  }
+
   return {
     jobRef: job.jobRef,
     patternRevisionRef: job.patternRevisionRef,
     patternRevisionNumber: job.patternRevisionNumber,
+    patternRevisionId: String(job.patternRevisionId),
     solverVersion: str(job.drape.solverVersion),
     quality: str(job.drape.quality),
     unit: str(job.drape.unit) || "mm",
@@ -444,6 +714,16 @@ async function readDrape(ctx, { jobRef } = {}) {
     triangleCount: job.drape.triangleCount ?? 0,
     pieces: job.drape.pieces || [],
     body: job.drape.body || null,
+    sewingLineSource: str(job.drape.sewingLineSource),
+    seamAllowanceMm: job.drape.seamAllowanceMm ?? null,
+    authoritative: job.drape.authoritative !== false,
+    withheld: job.drape.withheld || [],
+    geometryIdentity: str(job.drape.geometryIdentity),
+    /* Everything needed to rebuild the faces, from the revision the drape names.
+       `inputs` is the job's frozen copy, not the revision's current settings:
+       the seam map may have been edited since, and the mesh depends on it. */
+    patternSet: revision.patternSet || null,
+    inputs: job.inputs || {},
     positionsBase64: bytesOf(job.drape.positions).toString("base64"),
   };
 }
@@ -471,5 +751,6 @@ function assertNotDerived(publication, what) {
 module.exports = {
   RENDER_STATUS,
   listRenders, requestRender, recordRenderOutcome, readDrape,
+  heartbeat, recoverAbandoned, listAbandoned, abandoned, LEASE_MS, HEARTBEAT_MS,
   stalenessOf, currentRevisionOf, jobView, assertNotDerived,
 };

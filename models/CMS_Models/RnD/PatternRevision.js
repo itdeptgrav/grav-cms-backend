@@ -92,74 +92,251 @@ const editSchema = new mongoose.Schema({
  * simply not yet something a 3D preview can be made from, and the screen says
  * which parts are missing in those words.
  */
-/* ── AN EDGE IS TWO OF THE PATTERN'S OWN CORNERS ──────────────────────────
-   Not two mesh vertices. Meshing a piece inserts points along its outline, so a
-   vertex index means something different at every simulation quality — a seam
-   saved while previewing at Draft would sew the wrong thing at High. Outline
-   point indices belong to the pattern and do not move.
+/* ── A BOUNDARY RUN, AND WHY A SEAM SIDE IS A SEQUENCE OF THEM ────────────
+   A run is a stretch of ONE piece's closed boundary, between two anchors, with a
+   direction. Not a line, not a segment list, not a name.
 
-   `theLongWay` is for the rare seam that goes round the long side of a piece.
-   Without it the shorter of the two runs between the corners is taken, which is
-   what makes naming the corners in either order mean the direction it looks
-   like — and direction matters: a side seam read backwards sews the garment with
-   a half twist in it that every seam length still agrees with. */
-const seamEdgeSchema = new mongoose.Schema({
-  from: { type: Number, default: null, min: 0 },
-  to: { type: Number, default: null, min: 0 },
-  theLongWay: { type: Boolean, default: false },
+   Seam sides are ordered SEQUENCES of runs because on every garment in scope the
+   armhole is one sleeve-cap run sewn to two or three body runs in order. A
+   contract pairing one run to one run cannot express a set-in sleeve — which is
+   what the first version of this file tried to do, and why it is replaced rather
+   than extended (garment-template-contract.md §4.4).
+
+   Anchors are stored by KIND, because the kind is what tells a reader how much a
+   pattern edit is likely to have broken: a turn point usually survives one, an
+   arc-length fraction never does (§4.3). */
+const ANCHOR_KIND = Object.freeze({
+  TURN_POINT: "turn-point",
+  NOTCH: "notch",
+  PLACED: "placed",
+  FRACTION: "fraction",
+});
+
+const anchorSchema = new mongoose.Schema({
+  kind: { type: String, enum: Object.values(ANCHOR_KIND), required: true },
+  /* An index into the piece's own outline, as parsed. The authoritative locator
+     for every kind except `fraction`. */
+  pointIndex: { type: Number, default: null, min: 0 },
+  /* Fraction of the piece's perimeter. Only for `fraction`, and the reason W7
+     exists: move one point and every fraction after it means something else. */
+  fraction: { type: Number, default: null, min: 0, max: 1 },
 }, { _id: false });
 
-const seamPairingSchema = new mongoose.Schema({
-  /* Two edges that are sewn to each other. The pattern says where the pieces
-     are; only a person says which edge joins which. */
-  fromPieceRef: { type: String, trim: true, required: true },
-  fromEdge: { type: String, trim: true, default: "" },
-  toPieceRef: { type: String, trim: true, required: true },
-  toEdge: { type: String, trim: true, default: "" },
-  /* What a person called this seam. Used in every sentence about it — "the left
-     side seam joins edges of 38.0cm and 24.1cm" — so it is worth storing rather
-     than generating from two piece refs. */
-  name: { type: String, trim: true, default: "", maxlength: 160 },
-  /* Which run of each outline, by the pattern's own point indices. */
-  fromPoints: { type: seamEdgeSchema, default: null },
-  toPoints: { type: seamEdgeSchema, default: null },
-  seamType: { type: String, trim: true, default: "" },
+const boundaryRunSchema = new mongoose.Schema({
+  runId: { type: String, trim: true, required: true },
+  /* Both anchors are REQUIRED. A run with one end is not a run. */
+  startAnchor: { type: anchorSchema, required: true },
+  endAnchor: { type: anchorSchema, required: true },
+  /* Which way round the boundary this run travels, start to end. Derived, and
+     stored because everything downstream — pairing, easing, sampling — depends on
+     the order being the stated one rather than the storage order of the outline. */
+  direction: { type: String, enum: ["forward", "reverse"], default: "forward" },
+  /* What this run is for, from the template's own run vocabulary. */
+  role: { type: String, trim: true, default: "" },
+  /* Arc length between the anchors, in the pattern's own unit. Derived at the
+     time the run was placed, and stored so readiness can compare DECLARED
+     lengths before any mesh exists (M4). */
+  lengthMm: { type: Number, default: null, min: 0 },
   note: { type: String, trim: true, default: "", maxlength: 240 },
 }, { _id: false });
 
-const fabricSchema = new mongoose.Schema({
-  /* Which pieces this fabric is for. Empty means every piece without its own. */
-  pieceRefs: [{ type: String, trim: true }],
+/* ── PER-PIECE SETUP: EVERYTHING ONLY A PERSON CAN SAY ────────────────────
+   Separate from `patternSet.pieces`, which is the PARSE. A role is assigned and
+   never recognised; nothing here is read from a piece's name. */
+const SYMMETRY = Object.freeze({
+  SINGLE: "single",
+  MIRRORED_PAIR: "mirrored-pair",
+  IDENTICAL_PAIR: "identical-pair",
+  CUT_ON_FOLD: "cut-on-fold",
+});
+
+const PIECE_LAYER = Object.freeze({
+  SHELL: "shell", LINING: "lining", INTERLINING: "interlining",
+  RIB: "rib", TRIM: "trim", POCKETING: "pocketing",
+});
+
+const confirmationSchema = new mongoose.Schema({
+  by: actorRef(),
+  at: { type: Date, default: null },
+}, { _id: false });
+
+const piecePlanSchema = new mongoose.Schema({
+  pieceRef: { type: String, trim: true, required: true },
+  /* From the TEMPLATE's own role vocabulary. Never read from the piece's name:
+     a second shop sends a DXF whose pieces are called `Pattern_636968`. */
+  role: { type: String, trim: true, default: "" },
+  roleConfirmed: { type: confirmationSchema, default: null },
+  /* The count in the FINISHED garment, after unfolding and mirroring — not the
+     number of outlines in the DXF. */
+  cutQuantity: { type: Number, default: null, min: 0 },
+  symmetry: { type: String, enum: [...Object.values(SYMMETRY), ""], default: "" },
+  /* The other half, when left and right are drawn separately (§4.7 Form B). */
+  pairedWith: { type: String, trim: true, default: "" },
+  layer: { type: String, enum: [...Object.values(PIECE_LAYER), ""], default: "" },
+
+  /* ── GRAIN IS A VECTOR, NOT A LABEL ──────────────────────────────────
+     In the piece's OWN local coordinates. Every piece on a marker carries a
+     grainline parallel to the selvedge, so the absolute angle is ~90° for all of
+     them and says nothing about the garment — our parser labels the neck rib
+     "lengthwise", the one piece that must be cut across (§4.8). */
+  grainVector: { type: [Number], default: undefined },
+  grainSource: {
+    type: String, enum: ["marker-grainline", "stated", "confirmed", ""], default: "",
+  },
+  grainConfirmed: { type: confirmationSchema, default: null },
+
+  /* The runs placed on this piece's boundary. */
+  runs: { type: [boundaryRunSchema], default: [] },
+
+  /* ── ONE CONFIRMATION FOR THE WHOLE REMAINING PERIMETER ──────────────
+     Not one per edge. Before anybody places anchors there is no edge set, only a
+     closed boundary, and demanding a declaration per edge made a first fitting
+     cost a dozen pointless clicks (§4.11). */
+  boundaryConfirmed: { type: confirmationSchema, default: null },
+
+  /* Per-piece allowance, where it differs from the garment's. */
+  seamAllowanceMm: { type: Number, default: null, min: 0 },
+  note: { type: String, trim: true, default: "", maxlength: 400 },
+}, { _id: false });
+
+/* ── A SEAM: TWO ORDERED SEQUENCES, AND AN EXPLICIT ALIGNMENT ─────────────
+   `alignment` is the single most important field in this file.
+
+   A sleeve cap sewn front-to-back has the same piece perimeter, the same seam
+   length and the same scale as one sewn correctly, so the geometry-fidelity gate
+   passes it without complaint and the twist reads as a drape fold. Nothing
+   downstream detects it. The defence is prevention: the alignment is a STORED
+   value, never inferred from storage order, a named person confirms it against a
+   visual preview, and simulation is refused without it (§4.5, R4). */
+const SEAM_ALIGNMENT = Object.freeze({
+  START_TO_START: "start-to-start",
+  START_TO_END: "start-to-end",
+});
+
+const seamSideRefSchema = new mongoose.Schema({
+  pieceRef: { type: String, trim: true, required: true },
+  runId: { type: String, trim: true, required: true },
+}, { _id: false });
+
+const seamSchema = new mongoose.Schema({
+  seamId: { type: String, trim: true, required: true },
+  name: { type: String, trim: true, default: "", maxlength: 160 },
+  /* Ordered. The order is the traversal order and is not a set. */
+  sideA: { type: [seamSideRefSchema], default: [] },
+  sideB: { type: [seamSideRefSchema], default: [] },
+
+  alignment: { type: String, enum: [...Object.values(SEAM_ALIGNMENT), ""], default: "" },
+  /* A confirmation nobody is attributable for is a guess. */
+  alignmentConfirmed: { type: confirmationSchema, default: null },
+  confidence: {
+    type: String, enum: ["proposed", "confirmed", "rejected"], default: "proposed",
+  },
+
+  /* ── LEFT AND RIGHT ARE SEPARATE SEAMS ───────────────────────────────
+     Every body-to-sleeve, shoulder and side seam exists twice, and a confirmation
+     on one is never applied to the other by inference. The one exception is a
+     mirrored piece pair, where a single confirmation may be PROPAGATED — and then
+     this field records that it was, which is what makes W9 possible (§4.7). */
+  propagatedFrom: {
+    seamId: { type: String, trim: true, default: "" },
+    side: { type: String, trim: true, default: "" },
+  },
+
+  /* Length difference as a percentage of the shorter side, with where it goes. */
+  easePercent: { type: Number, default: null },
+  easeDistribution: { type: String, trim: true, default: "even" },
+  seamType: {
+    type: String,
+    enum: ["plain", "flat-felled", "french", "overlocked", "bound", "topstitched", "taped", ""],
+    default: "",
+  },
+  note: { type: String, trim: true, default: "", maxlength: 400 },
+}, { _id: false });
+
+/* ── THE FABRIC PROFILE, VALIDATED BY VALUE AND NOT BY PRESENCE ───────────
+   The old block carried seven fields and the adapter checked only that the array
+   was non-empty. A profile with every number at zero passed, and zero gravity
+   with zero stiffness gives cloth that looks like cloth and behaves like nothing
+   — indistinguishable on screen from a real result (fabric-profile-contract.md
+   §1, VM-14).
+
+   `behaviour` is load-bearing: the Fit Assistant takes a different primary
+   evidence path for knit and for woven, and getting it wrong reverses which
+   number is trusted. It is never inferred from the fabric's name. */
+const FABRIC_BEHAVIOUR = Object.freeze({ WOVEN: "woven", KNIT: "knit" });
+const FABRIC_GRADE = Object.freeze({
+  MEASURED: "measured", STATED: "stated", ESTIMATED: "estimated", PRESET: "preset",
+});
+
+const fabricProfileSchema = new mongoose.Schema({
+  profileId: { type: String, trim: true, default: "" },
   name: { type: String, trim: true, required: true, maxlength: 160 },
-  /* The handful of numbers every cloth solver asks for. Absent is absent — a
-     default weight would be this system inventing a fabric. */
+  /* The pieceRefs this covers. Empty means every simulated piece without its own. */
+  appliesTo: [{ type: String, trim: true }],
+
+  behaviour: { type: String, enum: [...Object.values(FABRIC_BEHAVIOUR), ""], default: "" },
+  behaviourConfirmed: { type: confirmationSchema, default: null },
+  grade: { type: String, enum: [...Object.values(FABRIC_GRADE), ""], default: "" },
+  source: { type: String, trim: true, default: "" },
+  measuredBy: { type: String, trim: true, default: "" },
+  measuredAt: { type: Date, default: null },
+
+  /* How hard gravity pulls. The single most visible value in a drape, and the
+     one whose absence is a readiness failure: there is no defensible default. */
   weightGsm: { type: Number, default: null, min: 0 },
+  /* The cloth's actual thickness, as a material property. */
   thicknessMm: { type: Number, default: null, min: 0 },
+  /* A SOLVER parameter, and routinely larger than the cloth because it also
+     absorbs mesh coarseness. The archive's own preset had thickness 0.012 and a
+     gap of 0.16 — a factor of thirteen. Conflating them produces either
+     self-intersection or cloth that is reported too thick (§2.2, M6). */
+  collisionOffsetMm: { type: Number, default: null, min: 0 },
+
   stretchWarpPercent: { type: Number, default: null },
   stretchWeftPercent: { type: Number, default: null },
-  bendingRigidity: { type: Number, default: null },
-  note: { type: String, trim: true, default: "", maxlength: 240 },
+  /* "40% stretch" is not a number until you say under what force. Two profiles
+     measured at different loads are not comparable. */
+  stretchLoadN: { type: Number, default: null, min: 0 },
+
+  shearStiffness: { type: Number, default: null, min: 0 },
+  bendingRigidity: { type: Number, default: null, min: 0 },
+  damping: { type: Number, default: null, min: 0 },
+  frictionBody: { type: Number, default: null, min: 0 },
+  frictionSelf: { type: Number, default: null, min: 0 },
+  note: { type: String, trim: true, default: "", maxlength: 400 },
 }, { _id: false });
 
 const avatarSchema = new mongoose.Schema({
   name: { type: String, trim: true, default: "" },
   size: { type: String, trim: true, default: "" },
-  /* Body measurements, as whatever set the pattern room works in. Mixed
-     because a measurement chart is not a fixed schema and forcing one would
-     drop whatever this house happens to measure. */
+  /* Body measurements, as whatever set the pattern room works in. Mixed because
+     a measurement chart is not a fixed schema and forcing one would drop whatever
+     this house happens to measure. */
   measurements: { type: mongoose.Schema.Types.Mixed, default: {} },
   poseRef: { type: String, trim: true, default: "" },
+  /* ── SELF-CONSISTENT IS NOT VERIFIED (M3) ────────────────────────────
+     Self-consistent means the stated unit, the declared lengths and the built
+     mesh agree — which a pattern drawn at the wrong scale throughout satisfies.
+     Externally verified means at least one length was checked against something
+     outside the file. A fitting states which it has. */
+  scaleVerifiedAgainst: { type: String, trim: true, default: "" },
 }, { _id: false });
 
 const simulationInputsSchema = new mongoose.Schema({
-  seamPairings: { type: [seamPairingSchema], default: [] },
-  fabrics: { type: [fabricSchema], default: [] },
-  avatar: { type: avatarSchema, default: () => ({}) },
-  /* Solver settings — iterations, particle distance, gravity. Named by the
-     adapter that will consume them, not by this record. */
-  settings: { type: mongoose.Schema.Types.Mixed, default: {} },
-  /* Which size of the graded pattern to drape. */
+  /* Which of the three categories. Chosen, never guessed. */
+  template: { type: String, trim: true, default: "" },
+  /* A graded pattern holds several sizes and a drape is of exactly one. */
   renderSize: { type: String, trim: true, default: "" },
+  avatar: { type: avatarSchema, default: () => ({}) },
+  pieces: { type: [piecePlanSchema], default: [] },
+  seams: { type: [seamSchema], default: [] },
+  fabrics: { type: [fabricProfileSchema], default: [] },
+  /* Per garment, where it is not stated per piece or per run. Without a
+     published sewing line and without this, no sewing line can be constructed
+     and every dimensional finding is withheld (§4.12 step 4). */
+  seamAllowanceMm: { type: Number, default: null, min: 0 },
+  /* Solver settings, named by the adapter that consumes them. */
+  settings: { type: mongoose.Schema.Types.Mixed, default: {} },
 }, { _id: false });
 
 /* ═══ THE REVISION ════════════════════════════════════════════════════════ */
@@ -211,6 +388,14 @@ const patternRevisionSchema = new mongoose.Schema({
 
   /* What a 3D preview would need. Stated by people, never inferred. */
   simulationInputs: { type: simulationInputsSchema, default: () => ({}) },
+
+  /* ── WHICH REVISION THE SEAM MAPPING WAS CONFIRMED AGAINST ───────────
+     A mapping names outline point indices. An edit moves them, so a mapping
+     carried onto the next revision may point at geometry that moved — which is
+     R11, and the reason a fitting is never silently re-pointed at a new
+     revision. Holding the ref it was confirmed against is what lets the product
+     say "re-check this" instead of guessing. */
+  mappingConfirmedAgainstRef: { type: String, trim: true, default: "" },
 
   author: actorRef(),
   approvedBy: actorRef(),
@@ -329,6 +514,46 @@ const renderJobSchema = new mongoose.Schema({
     frames: { type: Number, default: 0 },
     finalMoveMm: { type: Number, default: null },
     msElapsed: { type: Number, default: 0 },
+
+    /* ── WHICH SEWING LINE THIS DRAPE WAS SEWN ON ────────────────────
+        `published` | `derived` | `cut-boundary`. Never absent, because a drape
+        sewn on the cut boundary is NOT a drape with a small offset: the panels
+        meet in the wrong places and the whole assembly differs. On a chest with
+        two side seams and two armholes, 10mm of allowance is of the order of
+        40mm — the width of a whole fit band. The error is never called slight
+        (garment-template-contract.md §4.12). */
+    sewingLineSource: {
+      type: String, enum: ["published", "derived", "cut-boundary", ""], default: "",
+    },
+    seamAllowanceMm: { type: Number, default: null },
+    /* False when the cut boundary was used. A non-authoritative drape may be
+       looked at and may not report a dimension. */
+    authoritative: { type: Boolean, default: true },
+    /* Named findings this drape may NOT report, each with the reason, so a
+       screen cannot show a number the drape is not entitled to. */
+    withheld: {
+      type: [new mongoose.Schema({
+        finding: { type: String, trim: true, required: true },
+        why: { type: String, trim: true, required: true, maxlength: 400 },
+      }, { _id: false })],
+      default: [],
+    },
+    /* `fitting` | `partial`. A partial is not a degraded fitting: it is the
+       correct outcome whenever the drape is watchable but a number would be
+       biased (validation-matrix.md §1). */
+    outcome: { type: String, enum: ["fitting", "partial", ""], default: "" },
+    /* The readiness result this drape was run against, as it stood. A fitting is
+       evidence, and evidence that cannot say what it assumed is weak. */
+    readiness: { type: mongoose.Schema.Types.Mixed, default: null },
+    /* ── CAN THIS DRAPE BE REDRAWN? ──────────────────────────────────
+        The triangles are rebuilt from the pattern rather than stored, which is
+        only honest if the rebuild is provably the same mesh. This fingerprints
+        the geometry the drape was built from — the piece refs, their point
+        counts and their perimeters — alongside the solver version. If a rebuild
+        does not match it, the drape is NOT redrawn through today's faces; the
+        reader is told why instead. */
+    geometryIdentity: { type: String, trim: true, default: "" },
+    fabricGrade: { type: String, trim: true, default: "" },
   },
 
   /* Why it did not. Both fields, because a code a screen can branch on and a
@@ -336,6 +561,45 @@ const renderJobSchema = new mongoose.Schema({
   failure: {
     code: { type: String, trim: true, default: "" },
     message: { type: String, trim: true, default: "", maxlength: 2000 },
+  },
+
+  /* ── WHAT THE PATTERN WAS JUDGED READY ON ────────────────────────────
+     A copy, frozen with the job, so a drape can say which sewing line it was
+     entitled to use and which findings it was never allowed to report. The
+     readiness result itself can change the moment somebody edits the setup; what
+     THIS render was accepted under cannot. */
+  acceptedReadiness: { type: mongoose.Schema.Types.Mixed, default: null },
+
+  /* ── THE LEASE, AND WHY A JOB NEEDS ONE ──────────────────────────────
+     The solver runs in the reader's browser. A closed tab, a crash or a laptop
+     lid therefore ends the arithmetic with no message, and the first version of
+     this record had no way to tell that from a drape still in progress — so one
+     closed tab blocked the revision for ever, because only one render may run at
+     a time.
+
+     So a browser-run job holds a LEASE and beats a heartbeat while it solves.
+     A lease that has expired means nobody is working on this: the job is
+     abandoned, it says so on screen, and an authorised person can clear it and
+     try again. The job is not deleted — the history is the point.
+
+     Short on purpose. A Normal drape beats every few seconds, so a minute of
+     silence is already conclusive. */
+  lease: {
+    /* Who is holding it — the browser run's own id, so two tabs cannot be
+       mistaken for one. */
+    runId: { type: String, trim: true, default: "" },
+    heldBy: actorRef(),
+    heartbeatAt: { type: Date, default: null },
+    expiresAt: { type: Date, default: null },
+  },
+
+  /* ── WHAT HAPPENED TO AN ABANDONED JOB ───────────────────────────────
+     Recorded rather than inferred, so "this was cleared because its tab died"
+     and "somebody pressed Stop" are different sentences afterwards. */
+  recovery: {
+    recoveredBy: actorRef(),
+    recoveredAt: { type: Date, default: null },
+    reason: { type: String, trim: true, default: "" },
   },
 
   requestedBy: actorRef(),
@@ -347,9 +611,12 @@ const renderJobSchema = new mongoose.Schema({
 
 renderJobSchema.index({ companyId: 1, styleId: 1, createdAt: -1 });
 renderJobSchema.index({ companyId: 1, patternRevisionRef: 1 });
+/* Finding the jobs whose lease has run out, which is what makes recovery cheap. */
+renderJobSchema.index({ companyId: 1, status: 1, "lease.expiresAt": 1 });
 
 module.exports = {
   REVISION_STATE, EDIT_KIND, RENDER_STATUS,
+  ANCHOR_KIND, SYMMETRY, PIECE_LAYER, SEAM_ALIGNMENT, FABRIC_BEHAVIOUR, FABRIC_GRADE,
   PatternRevision: mongoose.models.PatternRevision
     || mongoose.model("PatternRevision", patternRevisionSchema),
   RenderJob: mongoose.models.RenderJob

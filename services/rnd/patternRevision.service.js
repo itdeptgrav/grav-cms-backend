@@ -96,7 +96,16 @@ function revisionView(row, { geometry = false } = {}) {
     simulationInputs: row.simulationInputs || {},
     /* What a render would still need, computed from this revision rather than
        asserted by a screen. */
-    readiness: checkInputs(row.patternSet, row.simulationInputs),
+    /* ── THE ONE READINESS RESULT ──────────────────────────────────────
+       The same object the render service refuses on, so the screen and the
+       refusal cannot describe different work. The frontend renders this; it
+       derives nothing of its own. */
+    readiness: checkInputs(row.patternSet, row.simulationInputs, {
+      revisionRef: row.revisionRef,
+      mappingConfirmedAgainstRef: row.mappingConfirmedAgainstRef,
+    }),
+    mappingConfirmedAgainstRef: str(row.mappingConfirmedAgainstRef),
+    simulationInputs: row.simulationInputs || {},
     author: str(row.author?.name),
     approvedBy: str(row.approvedBy?.name),
     approvedAt: row.approvedAt || null,
@@ -455,14 +464,76 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
       { state: row.state });
   }
   const who = actorOf(actor);
-  row.simulationInputs = {
-    seamPairings: Array.isArray(inputs.seamPairings) ? inputs.seamPairings : (row.simulationInputs?.seamPairings || []),
-    fabrics: Array.isArray(inputs.fabrics) ? inputs.fabrics : (row.simulationInputs?.fabrics || []),
-    avatar: inputs.avatar || row.simulationInputs?.avatar || {},
-    settings: inputs.settings || row.simulationInputs?.settings || {},
-    renderSize: inputs.renderSize !== undefined ? clean(inputs.renderSize, 40) : str(row.simulationInputs?.renderSize),
+  const held = row.simulationInputs || {};
+  const at = new Date();
+
+  /* ── A CONFIRMATION IS STAMPED HERE, NOT TRUSTED FROM THE CLIENT ──────
+     `alignmentConfirmed`, `roleConfirmed`, `grainConfirmed` and
+     `boundaryConfirmed` all carry an identity and a time, and a confirmation
+     nobody is attributable for is a guess. So the actor and the clock come from
+     the server: a client that posted somebody else's name, or a time, would be
+     posting the evidence rather than the statement.
+
+     What the client says is only WHETHER it is confirmed. */
+  const stamp = (incoming, existing) => {
+    if (!incoming) return existing?.at ? existing : null;
+    /* Already confirmed by this same decision — keep the original identity and
+       time rather than refreshing them on every unrelated save. */
+    if (existing?.at && incoming.keep !== false) return existing;
+    return { by: who, at };
   };
-  row.events.push({ kind: "simulation-inputs", note: "", by: who, at: new Date() });
+
+  const pieces = Array.isArray(inputs.pieces)
+    ? inputs.pieces.map((piece) => {
+      const before = (held.pieces || []).find((p) => str(p.pieceRef) === str(piece.pieceRef));
+      return {
+        ...piece,
+        pieceRef: str(piece.pieceRef),
+        roleConfirmed: stamp(piece.roleConfirmed, before?.roleConfirmed),
+        grainConfirmed: stamp(piece.grainConfirmed, before?.grainConfirmed),
+        boundaryConfirmed: stamp(piece.boundaryConfirmed, before?.boundaryConfirmed),
+      };
+    })
+    : (held.pieces || []);
+
+  const seams = Array.isArray(inputs.seams)
+    ? inputs.seams.map((seam) => {
+      const before = (held.seams || []).find((s2) => str(s2.seamId) === str(seam.seamId));
+      /* ── RE-CONFIRMATION WHEN THE ALIGNMENT ITSELF CHANGES ──────────
+         Keeping the old stamp against a NEW alignment would attribute to
+         somebody a statement they did not make. So the confirmation is dropped
+         whenever the alignment value moves. */
+      const alignmentChanged = before && str(before.alignment) !== str(seam.alignment);
+      return {
+        ...seam,
+        seamId: str(seam.seamId),
+        alignmentConfirmed: alignmentChanged
+          ? stamp(seam.alignmentConfirmed, null)
+          : stamp(seam.alignmentConfirmed, before?.alignmentConfirmed),
+      };
+    })
+    : (held.seams || []);
+
+  row.simulationInputs = {
+    template: inputs.template !== undefined ? clean(inputs.template, 40) : str(held.template),
+    renderSize: inputs.renderSize !== undefined
+      ? clean(inputs.renderSize, 40) : str(held.renderSize),
+    avatar: inputs.avatar || held.avatar || {},
+    pieces,
+    seams,
+    fabrics: Array.isArray(inputs.fabrics) ? inputs.fabrics : (held.fabrics || []),
+    seamAllowanceMm: inputs.seamAllowanceMm !== undefined
+      ? (Number.isFinite(Number(inputs.seamAllowanceMm)) ? Number(inputs.seamAllowanceMm) : null)
+      : (held.seamAllowanceMm ?? null),
+    settings: inputs.settings || held.settings || {},
+  };
+
+  /* ── WHICH REVISION THE MAPPING WAS CONFIRMED AGAINST (R11) ───────────
+     Stamped on the revision whose geometry it was confirmed against, so a later
+     revision inheriting a copy of these inputs can be told the mapping needs
+     re-checking rather than silently re-pointed. */
+  row.mappingConfirmedAgainstRef = row.revisionRef;
+  row.events.push({ kind: "simulation-inputs", note: "", by: who, at });
   row.revision += 1;
   await row.save();
   return { revision: revisionView(row, { geometry: false }) };

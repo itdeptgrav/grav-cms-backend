@@ -55,62 +55,25 @@ async function world() {
   };
 }
 
-/** A small but real pattern: two closed pieces with notches and a grainline. */
+/* ── THE PATTERN THESE TESTS USE ──────────────────────────────────────────
+   Shared with every other R&D suite rather than declared here. The version that
+   lived in this file was two squares and a seam pairing that named no edges at
+   all, which made it a fixture that declared a pattern renderable when a drape
+   could not have sewn it. */
+const tee = require("./fixtures/renderableTee");
+
+/** A plain rectangle, for the edit tests that only need some geometry to move. */
 const square = (x, y, w, h) => [
   { x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h },
 ];
-const patternSet = (over = {}) => ({
-  patternSetRef: "PS-TEST",
-  classification: "apparel_pattern_set",
-  manifest: { styleName: "Shirt", sampleSize: "M" },
-  unit: "mm",
-  unitSource: "header",
-  unitInMm: 1,
-  pieces: [
-    {
-      pieceRef: "PC-FRONT", index: 0, name: "Front", generatedName: false,
-      quantity: 2, componentClass: "shell",
-      outline: square(0, 0, 600, 800), outlineClosed: true,
-      notches: [{ at: { x: 0, y: 400 }, form: "point" }], internalLines: [], gradePoints: [],
-      seamAllowance: { value: 10, source: "parsed" },
-    },
-    {
-      pieceRef: "PC-BACK", index: 1, name: "Back", generatedName: false,
-      quantity: 1, componentClass: "shell",
-      outline: square(700, 0, 620, 800), outlineClosed: true,
-      notches: [], internalLines: [], gradePoints: [],
-      seamAllowance: { value: 10, source: "parsed" },
-    },
-  ],
-  grading: { graded: false, sizes: [], sizeCount: 0, gradePointsPublished: false, pieces: [] },
-  stats: { pieces: 2, namedPieces: 2, piecesWithOutline: 2 },
-  ...over,
-});
 
-const READY_INPUTS = {
-  /* ── A PAIRING NAMES BOTH EDGES, NOT JUST BOTH PIECES ──────────────────
-     `fromPoints`/`toPoints` are the pattern's own outline point indices: the
-     front's right side (corner 1 to 2) sewn to the back's (corner 0 to 3). They
-     were added when the in-app solver arrived, and readiness now requires them,
-     because a pairing that says only "the front joins the back" leaves the
-     solver to guess an edge — and a guessed edge still produces a garment. This
-     fixture previously declared a pattern renderable whose seams named no edges
-     at all. */
-  seamPairings: [{
-    name: "Side seam",
-    fromPieceRef: "PC-FRONT", fromEdge: "side", fromPoints: { from: 1, to: 2 },
-    toPieceRef: "PC-BACK", toEdge: "side", toPoints: { from: 0, to: 3 },
-  }],
-  fabrics: [{ name: "Poplin 120gsm", weightGsm: 120, thicknessMm: 0.3 }],
-  avatar: { name: "Female M", size: "M", measurements: { chest: 920 } },
-  settings: { iterations: 40 },
-  renderSize: "M",
-};
+const patternSet = (over = {}) => tee.patternSet(over);
+const READY_INPUTS = tee.simulationInputs();
 
 async function imported(w, over = {}) {
   const out = await patterns.importRevision(w.ctx, {
     styleId: w.style._id,
-    patternSet: patternSet(over.patternSet),
+    patternSet: patternSet(over.patternSet || {}),
     sourceDxf: { driveFileId: "drv-1", name: "shirt.dxf", sha256: "a".repeat(64), bytes: 4096 },
     name: "Imported from CAD",
     actor: w.drafter,
@@ -140,7 +103,7 @@ describe("importing a pattern starts the record", () => {
     expect(r.revisionNumber).toBe(1);
     expect(r.state).toBe(REVISION_STATE.DRAFT);
     expect(r.origin).toEqual({ kind: "dxf-import", parentRevisionRef: "" });
-    expect(r.pieceCount).toBe(2);
+    expect(r.pieceCount).toBe(4);
     expect(r.unit).toBe("mm");
   });
 
@@ -216,15 +179,17 @@ describe("an edit never changes the thing it was made from", () => {
        things and the summary has to separate them. */
     const w = await world();
     const first = await imported(w);
-    const moved = square(0, 0, 600, 800);
-    moved[2] = { x: 603, y: 804 };
+    /* The fixture's own front panel, with one point nudged 5mm. Rebuilding it as
+       a plain square here would be measuring a reshape of the whole piece. */
+    const moved = tee.bodyOutline(0, tee.BODY_W, tee.BODY_H);
+    moved[2] = { x: moved[2].x + 3, y: moved[2].y + 4 };
     const out = await patterns.editRevision(w.ctx, {
       revisionId: first.id,
       operations: [{ kind: "outline", pieceRef: "PC-FRONT", outline: moved }],
       actor: w.drafter,
     });
     expect(out.revision.edits[0].summary).toMatch(/largest move 5\.00/);
-    expect(out.revision.edits[0].after.points).toBe(4);
+    expect(out.revision.edits[0].after.points).toBe(8);
   });
 
   test("every kind of edit the brief names is supported", async () => {
@@ -378,17 +343,26 @@ describe("a render is requested from a revision, or refused with the reason", ()
       revisionId: first.id, actor: w.drafter,
     }), "SIMULATION_INPUTS_MISSING");
     /* Named, so somebody can go and add them. */
-    expect(err.message).toMatch(/seam pairings/i);
-    expect(err.message).toMatch(/fabric settings/i);
-    expect(err.details.missing.map((m) => m.key).sort())
-      .toEqual(["avatar", "fabrics", "renderSize", "seamPairings"]);
+    /* The refusal quotes the FIRST failure's own sentence rather than listing
+       step names: "seam mapping is missing" sends somebody hunting. */
+    expect(err.message).toMatch(/garment category/i);
+    expect(err.message).toMatch(/other things still needed/i);
+    expect(err.details.missing.map((m) => m.key).sort()).toEqual(
+      ["body", "boundary", "fabric", "roles", "seams", "size", "template"],
+    );
   });
 
   test("the readiness list is on the revision, before anybody presses anything", async () => {
     const w = await world();
     const first = await imported(w);
     expect(first.readiness.ready).toBe(false);
-    expect(first.readiness.present.map((p) => p.key).sort()).toEqual(["pieces", "unit"]);
+    /* Nothing has been set up, so the only steps that are done are the ones a
+       parsed pattern satisfies on its own. */
+    expect(first.readiness.ready).toBe(false);
+    expect(first.readiness.outcome).toBe("refused");
+    expect(first.readiness.steps.map((st) => st.key)).toEqual([
+      "template", "size", "body", "fabric", "roles", "grain", "sewingLine", "seams", "boundary",
+    ]);
     /* Each missing input says WHY it is needed, in a sentence. */
     for (const m of first.readiness.missing) expect(m.why.length).toBeGreaterThan(20);
   });
@@ -403,7 +377,7 @@ describe("a render is requested from a revision, or refused with the reason", ()
     expect(out.render.derivedFrom).toBe("Derived from 2D pattern revision 1.");
     expect(out.render.readOnly).toBe(true);
     /* The settings are COPIED onto the job, not referenced. */
-    expect(out.render.inputs.fabrics[0].name).toBe("Poplin 120gsm");
+    expect(out.render.inputs.fabrics[0].name).toBe("Cotton jersey 180");
   });
 
   test("with no simulation engine connected, the job fails at once and says so", async () => {

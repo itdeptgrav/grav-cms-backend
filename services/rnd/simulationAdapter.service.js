@@ -23,6 +23,8 @@
 // than a job that sits queued for ever or a preview invented locally.
 "use strict";
 
+const readiness = require("./fitReadiness.service");
+
 /**
  * WHAT AN ENGINE IS HANDED.
  *
@@ -53,131 +55,47 @@
  */
 
 /**
- * The inputs a drape cannot proceed without, each with the words the screen
- * uses. Declared here rather than in the UI so the list that BLOCKS a render
- * and the list a person reads are necessarily the same list.
- */
-const REQUIRED_INPUTS = Object.freeze([
-  {
-    key: "pieces",
-    label: "Pattern pieces with outlines",
-    why: "There is nothing to sew without closed piece outlines.",
-  },
-  {
-    key: "unit",
-    label: "A known unit",
-    why: "A pattern read as millimetres when it was drawn in inches is out by 25.4, "
-      + "and nothing about the shape on screen reveals it.",
-  },
-  {
-    key: "seamPairings",
-    label: "Seam pairings",
-    why: "The pattern says where the pieces are. Only a person says which edge is sewn to which, "
-      + "and a simulator cannot guess it.",
-  },
-  {
-    key: "fabrics",
-    label: "Fabric settings",
-    why: "How cloth hangs depends on its weight, thickness and stretch. Without them a drape is "
-      + "a shape, not a garment.",
-  },
-  {
-    key: "avatar",
-    label: "Avatar or body measurements",
-    why: "A garment is draped on a body. Which body changes the result.",
-  },
-  {
-    key: "renderSize",
-    label: "The size to drape",
-    why: "A graded pattern holds several sizes and a drape is of exactly one.",
-  },
-]);
-
-/**
- * WHICH OF THEM ARE THERE, AND WHICH ARE NOT.
+ * WHAT A DRAPE NEEDS, AND WHETHER IT IS THERE.
  *
- * Returns the missing ones in full rather than a boolean, because the screen's
- * job is to say what is still needed — "cannot render" on its own sends
- * somebody hunting.
+ * ── WHY THIS DELEGATES RATHER THAN CHECKS ───────────────────────────────────
+ * It used to hold its own list of six presence checks, one of which was
+ * `(inputs.fabrics || []).length > 0` — a profile with every number at zero
+ * passed it. Worse, the SCREEN had its own idea of readiness, so a reader could
+ * be shown an enabled "Drape this revision" and then refused, which teaches
+ * somebody to distrust the screen rather than the pattern.
+ *
+ * There is now one implementation, in `fitReadiness.service.js`, built against
+ * the product contracts in `docs/product/rnd-fit/`. This function is the shape
+ * the render service and the routes already expect, computed from it — and the
+ * frontend renders the same object rather than deriving anything of its own.
+ *
+ * @param {object} patternSet the parse
+ * @param {object} inputs     `simulationInputs`
+ * @param {object} opts       { revisionRef, mappingConfirmedAgainstRef }
  */
-function checkInputs(patternSet, inputs = {}) {
-  const missing = [];
-  const present = [];
-  const has = (key, ok) => (ok ? present : missing).push(
-    REQUIRED_INPUTS.find((r) => r.key === key),
-  );
+function checkInputs(patternSet, inputs = {}, opts = {}) {
+  const result = readiness.assess(patternSet, inputs, opts);
 
-  const pieces = (patternSet?.pieces || []).filter((p) => (p.outline || []).length >= 3);
-  const simulated = pieces.filter((p) => p.simulated !== false);
-  const pairings = inputs.seamPairings || [];
-  const mapping = seamMapping(simulated, pairings);
-
-  has("pieces", pieces.length > 0);
-  has("unit", Boolean(patternSet?.unit));
-  /* ── MAPPED, NOT MERELY LISTED ──────────────────────────────────────
-     A seam that names two pieces but not which run of each outline is sewn
-     cannot be sewn: the solver would have to guess an edge, and a guessed edge
-     produces a garment that looks finished and is wrong. So a pairing only
-     counts once somebody has pointed at both edges. */
-  has("seamPairings", mapping.usable > 0);
-  has("fabrics", (inputs.fabrics || []).length > 0);
-  has("avatar", Boolean(inputs.avatar?.name) || Object.keys(inputs.avatar?.measurements || {}).length > 0);
-  has("renderSize", Boolean(inputs.renderSize));
+  /* `missing` is kept because `requestRender` composes a sentence from it, and
+     because a caller that only wants "what is left" should not have to walk
+     failures. One entry per step that is not done, in the step's own words. */
+  const missing = result.steps
+    .filter((step) => !step.done)
+    .map((step) => ({
+      key: step.key,
+      label: step.label,
+      why: step.failures[0]?.message || "",
+      codes: [...new Set(step.failures.map((f) => f.code))],
+    }));
 
   return {
-    ready: missing.length === 0,
-    missing: missing.filter(Boolean),
-    present: present.filter(Boolean),
+    ...result,
+    missing,
+    present: result.steps.filter((step) => step.done).map((step) => ({
+      key: step.key, label: step.label, detail: step.detail,
+    })),
     /* Counted here so three screens cannot each count it differently. */
-    pieceCount: pieces.length,
-    seamMapping: mapping,
-  };
-}
-
-/**
- * HOW FAR THE SEAM MAP HAS GOT.
- *
- * Returned whether or not the pattern is ready, because "3 of 11 seams mapped,
- * and the back yoke is not joined to anything" is the sentence that tells
- * somebody what to do next. "Seam pairings are missing" does not.
- */
-function seamMapping(pieces, pairings) {
-  const refs = new Set(pieces.map((p) => String(p.pieceRef || "")));
-  const joined = new Set();
-  let usable = 0;
-  const unusable = [];
-
-  (pairings || []).forEach((pair, index) => {
-    const name = String(pair.name || pair.note || `Seam ${index + 1}`);
-    const from = String(pair.fromPieceRef || "");
-    const to = String(pair.toPieceRef || "");
-    const edged = (e) => Number.isFinite(e?.from) && Number.isFinite(e?.to);
-    if (!refs.has(from) || !refs.has(to)) {
-      unusable.push({
-        name,
-        why: `names a piece that is not in this pattern (${!refs.has(from) ? from || "—" : to || "—"})`,
-      });
-      return;
-    }
-    if (!edged(pair.fromPoints) || !edged(pair.toPoints)) {
-      unusable.push({ name, why: "does not say which edge of each piece is sewn" });
-      return;
-    }
-    usable += 1;
-    joined.add(from);
-    joined.add(to);
-  });
-
-  return {
-    total: (pairings || []).length,
-    usable,
-    unusable,
-    pieceCount: pieces.length,
-    /* A piece joined to nothing will fall away from the garment on its own.
-       Sometimes that is right — a loose belt — so it is reported, not refused. */
-    unjoinedPieces: pieces
-      .filter((p) => !joined.has(String(p.pieceRef || "")))
-      .map((p) => ({ pieceRef: String(p.pieceRef || ""), name: String(p.name || p.pieceRef || "") })),
+    pieceCount: result.pieceCount,
   };
 }
 
@@ -298,7 +216,10 @@ registerAdapter("in-app", inAppSolver);
 const runsInBrowser = () => Boolean(activeAdapter()?.runsInBrowser);
 
 module.exports = {
-  REQUIRED_INPUTS, checkInputs, seamMapping,
+  checkInputs,
+  /* Re-exported so a caller that has a readiness result does not need to know
+     which module produced it. */
+  assess: readiness.assess, STEP_KEYS: readiness.STEP_KEYS,
   registerAdapter, activeAdapter, adapterStatus, submit, runsInBrowser,
   /* For tests, which need to put the registry back the way they found it. */
   __adapters: adapters,

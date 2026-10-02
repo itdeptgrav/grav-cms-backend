@@ -46,11 +46,14 @@ const inAppSolver = {
 
   async submit(request) {
     if (!request?.jobRef) throw new Error("a job reference is required");
+    /* ── READINESS IS NOT RE-CHECKED HERE ──────────────────────────────
+       The render service refuses on `fitReadiness.assess` before a job is ever
+       minted, and that is the one implementation. An adapter re-deciding it with
+       its own shorter list is how the screen and the server came to disagree in
+       the first place. What this checks is only what an ADAPTER is entitled to
+       refuse: a request it cannot physically act on. */
     const pieces = (request.patternSet?.pieces || []).filter((p) => (p.outline || []).length >= 3);
     if (!pieces.length) throw new Error("the pattern has no piece outlines to sew");
-    if (!(request.inputs?.seamPairings || []).length) {
-      throw new Error("no seam has been mapped, so there is nothing to sew");
-    }
     /* Its own id IS the job ref: there is no second system holding a second id,
        and inventing one would imply there were. */
     return { externalJobId: request.jobRef, version: SOLVER_VERSION };
