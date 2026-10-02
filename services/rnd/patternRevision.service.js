@@ -27,7 +27,9 @@ const mongoose = require("mongoose");
 
 const {
   PatternRevision, REVISION_STATE, EDIT_KIND,
+  ANCHOR_KIND, SYMMETRY, PIECE_LAYER, SEAM_ALIGNMENT, FABRIC_BEHAVIOUR, FABRIC_GRADE,
 } = require("../../models/CMS_Models/RnD/PatternRevision");
+const templates = require("./fitTemplates");
 const { styleForCompany } = require("../companyContext/rndScope.service");
 const { checkInputs, adapterStatus } = require("./simulationAdapter.service");
 const { fail } = require("../storePurchase/errors");
@@ -105,7 +107,33 @@ function revisionView(row, { geometry = false } = {}) {
       mappingConfirmedAgainstRef: row.mappingConfirmedAgainstRef,
     }),
     mappingConfirmedAgainstRef: str(row.mappingConfirmedAgainstRef),
-    simulationInputs: row.simulationInputs || {},
+    /* ── THE WORDS THE SCREEN MAY OFFER ────────────────────────────────
+       Sent with the revision rather than hard-coded in the page, because a role
+       list that exists in two places drifts, and the half that drifts is the one
+       readiness does not use: a screen offering "front" while the template
+       declares "body.front" produces a refusal nobody can act on. */
+    vocabulary: {
+      templates: templates.TEMPLATE_IDS.map((id) => {
+        const t = templates.TEMPLATES[id];
+        return {
+          id: t.id,
+          label: t.label,
+          typicalBehaviour: t.typicalBehaviour,
+          roles: t.roles,
+          required: t.required,
+          optional: t.optional || [],
+          requiredCutQuantity: t.requiredCutQuantity || {},
+        };
+      }),
+      runRoles: templates.RUN_ROLES,
+      neckFinishRoles: templates.NECK_FINISH_ROLES,
+      anchorKinds: Object.values(ANCHOR_KIND),
+      symmetries: Object.values(SYMMETRY),
+      pieceLayers: Object.values(PIECE_LAYER),
+      seamAlignments: Object.values(SEAM_ALIGNMENT),
+      fabricBehaviours: Object.values(FABRIC_BEHAVIOUR),
+      fabricGrades: Object.values(FABRIC_GRADE),
+    },
     author: str(row.author?.name),
     approvedBy: str(row.approvedBy?.name),
     approvedAt: row.approvedAt || null,
@@ -438,6 +466,15 @@ async function editRevision(ctx, { revisionId, operations = [], name, expectedRe
        geometry, and losing them on every edit would make a pattern
        un-renderable the moment anybody corrected a name. */
     simulationInputs: parent.simulationInputs,
+    /* ── THE MAPPING CAME FROM THE PARENT, AND SAYS SO ────────────────────
+       The setup is carried onto the new revision because re-entering a body, a
+       fabric and six seam mappings after every pattern edit would be unusable.
+       But a seam mapping names outline POINT INDICES, and an edit moves them —
+       so what is carried is a mapping confirmed against the PARENT, and this is
+       what lets readiness say "re-check this" (R11) instead of silently sewing
+       the new geometry with the old anchors. Carrying the inputs and dropping
+       this stamp is the dangerous half of the pair. */
+    mappingConfirmedAgainstRef: parent.mappingConfirmedAgainstRef || "",
     author: who,
     events: [{ kind: "edited", note: `${edits.length} change(s) from ${parent.revisionRef}`, by: who, at }],
   });

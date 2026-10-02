@@ -30,6 +30,7 @@ const { RenderJob, RENDER_STATUS } = require("../../models/CMS_Models/RnD/Patter
 const patterns = require("../../services/rnd/patternRevision.service");
 const renders = require("../../services/rnd/garmentRender.service");
 const simulation = require("../../services/rnd/simulationAdapter.service");
+const tee = require("./fixtures/renderableTee");
 
 let seq = 0;
 
@@ -55,44 +56,14 @@ async function world() {
 }
 
 /* Two panels with eight corners each, so a seam can name part of an edge. */
-const panel = (x, w, h) => [
-  { x, y: 0 }, { x: x + w, y: 0 }, { x: x + w, y: h * 0.62 }, { x: x + w, y: h },
-  { x: x + w * 0.7, y: h }, { x: x + w * 0.3, y: h }, { x, y: h }, { x, y: h * 0.62 },
-];
-
-const piece = (ref, name, x) => ({
-  pieceRef: ref, index: 0, name, generatedName: false, quantity: 1, componentClass: "shell",
-  outline: panel(x, 560, 760), outlineClosed: true,
-  notches: [], internalLines: [], gradePoints: [], seamAllowance: { value: 10, source: "parsed" },
-});
-
-const patternSet = () => ({
-  patternSetRef: "PS-DRAPE", classification: "apparel_pattern_set",
-  manifest: { styleName: "Tunic", sampleSize: "M" },
-  unit: "mm", unitSource: "header", unitInMm: 1,
-  pieces: [piece("PC-FRONT", "Front Panel", 0), piece("PC-BACK", "Back Panel", 700)],
-  grading: { graded: false, sizes: [], sizeCount: 0, gradePointsPublished: false, pieces: [] },
-  stats: { pieces: 2, namedPieces: 2, piecesWithOutline: 2 },
-});
-
-const INPUTS = {
-  seamPairings: [
-    {
-      name: "Right side seam",
-      fromPieceRef: "PC-FRONT", fromPoints: { from: 1, to: 2 },
-      toPieceRef: "PC-BACK", toPoints: { from: 0, to: 7 },
-    },
-    {
-      name: "Right shoulder",
-      fromPieceRef: "PC-FRONT", fromPoints: { from: 3, to: 4 },
-      toPieceRef: "PC-BACK", toPoints: { from: 6, to: 5 },
-    },
-  ],
-  fabrics: [{ name: "Cotton poplin", weightGsm: 120, thicknessMm: 0.32 }],
-  avatar: { name: "Male M", size: "M", measurements: { chestMm: 1000, heightMm: 1750 } },
-  settings: { quality: "normal", fabric: "poplin" },
-  renderSize: "M",
-};
+/* ── THE FIXTURE IS SHARED, NOT COPIED ──────────────────────────────────────
+   This suite used to carry its own two-panel tunic and its own `seamPairings`
+   inputs. Both predate the readiness contract: `seamPairings` is not a field any
+   more, and a two-panel tunic has no sleeves, so the template refuses it. The
+   copy is gone and `fixtures/renderableTee` is the one definition — the same one
+   the readiness suite uses, so the two cannot drift apart again. */
+const patternSet = tee.patternSet;
+const INPUTS = tee.simulationInputs();
 
 async function renderable(w) {
   const imported = (await patterns.importRevision(w.ctx, {
@@ -118,13 +89,27 @@ function drapeFor({ vertexCount = 12, pieces = null } = {}) {
   return {
     solverVersion: "fit-1.0",
     quality: "normal",
+    /* Which line it was sewn on. Every dimensional finding depends on it, so a
+       drape that does not say is refused rather than stored and guessed at. */
+    sewingLineSource: "derived",
+    authoritative: true,
+    seamAllowanceMm: 10,
+    withheld: [],
+    /* The fingerprint of the mesh this drape was built from, so reopening it can
+       be PROVEN to be the same geometry rather than assumed from a point count. */
+    geometryIdentity: "tee-4-piece-normal-fit-1.0",
     fabric: { id: "poplin", label: "Cotton poplin (shirting)", version: "1" },
     unit: "mm",
     vertexCount,
     triangleCount: 6,
+    /* FOUR pieces, because the fixture tee has four and a drape must account for
+       every point: front, back and two sleeves. `vertexCount` is divided evenly,
+       so callers pass a multiple of four. */
     pieces: pieces || [
-      { pieceRef: "PC-FRONT", name: "Front Panel", role: "front", base: 0, vertexCount: vertexCount / 2 },
-      { pieceRef: "PC-BACK", name: "Back Panel", role: "back", base: vertexCount / 2, vertexCount: vertexCount / 2 },
+      { pieceRef: "PC-FRONT", name: "Front", role: "body.front", base: 0, vertexCount: vertexCount / 4 },
+      { pieceRef: "PC-BACK", name: "Back", role: "body.back", base: vertexCount / 4, vertexCount: vertexCount / 4 },
+      { pieceRef: "PC-SLV-L", name: "Sleeve Left", role: "sleeve", base: (vertexCount / 4) * 2, vertexCount: vertexCount / 4 },
+      { pieceRef: "PC-SLV-R", name: "Sleeve Right", role: "sleeve", base: (vertexCount / 4) * 3, vertexCount: vertexCount / 4 },
     ],
     positions: Buffer.from(positions.buffer).toString("base64"),
     seamClosure: [
@@ -133,7 +118,7 @@ function drapeFor({ vertexCount = 12, pieces = null } = {}) {
     strain: { maxPercent: 11.0, meanPercent: 0.4 },
     fidelity: { ok: true, worstBoundaryMm: 0, worstSeamMm: 0 },
     tightestClearanceMm: 1.9,
-    template: { id: "shirt", label: "Shirt / T-shirt / polo", confidence: 1 },
+    template: { id: "tshirt", label: "Basic T-shirt", confidence: 1 },
     body: { kind: "capsules", estimated: true },
     frames: 534,
     finalMoveMm: 0.42,
@@ -178,63 +163,92 @@ describe("the in-app solver is an adapter like any other", () => {
     expect(out.render.engine.runsInBrowser).toBe(false);
   });
 
-  test("it refuses a job whose pattern has no mapped seam", async () => {
+  /* ── WHERE A MISSING SEAM IS REFUSED ────────────────────────────────────
+     Not here. The adapter refuses only what an adapter is entitled to refuse — a
+     request it cannot physically act on — and readiness refuses the rest before a
+     job is minted. An adapter re-deciding readiness with its own shorter list is
+     how the screen and the server came to disagree. */
+  test("it refuses a pattern with no outline to sew, which is all it may judge", async () => {
+    return withAdapter(async () => {
+      await expect(simulation.submit({
+        jobRef: "RJ-1", patternSet: { pieces: [] }, inputs: {},
+      })).resolves.toMatchObject({ status: "failed" });
+    });
+  });
+
+  test("it accepts a job and names itself, leaving readiness to the render service", async () => {
     await expect(simulation.submit({
-      jobRef: "RJ-1", patternSet: patternSet(), inputs: { seamPairings: [] },
+      jobRef: "RJ-1", patternSet: patternSet(), inputs: { seams: [] },
     })).resolves.toMatchObject({ status: "unavailable" });
     return withAdapter(async () => {
       const out = await simulation.submit({
-        jobRef: "RJ-1", patternSet: patternSet(), inputs: { seamPairings: [] },
+        jobRef: "RJ-1", patternSet: patternSet(), inputs: { seams: [] },
       });
-      expect(out.status).toBe("failed");
-      expect(out.message).toMatch(/no seam has been mapped/);
+      expect(out.status).toBe("accepted");
+      expect(out.version).toBe(require("../../services/rnd/adapters/inAppSolver.adapter")
+        .SOLVER_VERSION);
     });
   });
 });
 
 /* ═══ 2 · READINESS NAMES WHAT IS STILL MISSING ═══════════════════════════ */
 
-describe("readiness says how far the seam map has got", () => {
-  test("a pairing that names two pieces but not two edges does not count", () => {
-    const check = simulation.checkInputs(patternSet(), {
-      ...INPUTS,
-      seamPairings: [{ name: "Side", fromPieceRef: "PC-FRONT", toPieceRef: "PC-BACK" }],
-    });
+describe("readiness names what is still missing", () => {
+  /* These four used to assert on `check.seamMapping`, which the readiness
+     contract replaced with named steps and coded failures. The intent is the
+     same and the shape is not: a seam now names RUNS on each side, so "names two
+     pieces but not two edges" is "names a run that does not exist". */
+
+  test("a seam naming a run that does not exist is a failure, not a silent skip", () => {
+    const check = simulation.checkInputs(patternSet(), tee.simulationInputs({
+      seams: [tee.seam("S-BAD", "Side", [tee.at("PC-FRONT", "no-such-run")],
+        [tee.at("PC-BACK", "side-l")])],
+    }));
     expect(check.ready).toBe(false);
-    expect(check.seamMapping.total).toBe(1);
-    expect(check.seamMapping.usable).toBe(0);
-    expect(check.seamMapping.unusable[0].why).toMatch(/which edge/);
-    expect(check.missing.map((m) => m.key)).toContain("seamPairings");
+    expect(check.failures.some((f) => f.step === "seams")).toBe(true);
+    expect(check.missing.map((m) => m.key)).toContain("seams");
   });
 
-  test("a pairing naming a piece that is not in the pattern says which piece", () => {
-    const check = simulation.checkInputs(patternSet(), {
-      ...INPUTS,
-      seamPairings: [{
-        name: "Collar join", fromPieceRef: "PC-FRONT", fromPoints: { from: 3, to: 4 },
-        toPieceRef: "PC-COLLAR", toPoints: { from: 0, to: 1 },
-      }],
-    });
-    expect(check.seamMapping.usable).toBe(0);
-    expect(check.seamMapping.unusable[0].why).toMatch(/PC-COLLAR/);
+  test("a seam naming a piece that is not in the pattern says which piece", () => {
+    const check = simulation.checkInputs(patternSet(), tee.simulationInputs({
+      seams: [tee.seam("S-COLLAR", "Collar join", [tee.at("PC-FRONT", "shoulder-r")],
+        [tee.at("PC-COLLAR", "join")])],
+    }));
+    expect(check.ready).toBe(false);
+    expect(JSON.stringify(check.failures)).toMatch(/PC-COLLAR/);
   });
 
-  test("a piece joined to nothing is reported, not refused — a loose belt is legal", () => {
-    const check = simulation.checkInputs(patternSet(), {
-      ...INPUTS,
-      seamPairings: [INPUTS.seamPairings[0]],
-    });
-    expect(check.ready).toBe(true);
-    expect(check.seamMapping.usable).toBe(1);
-    expect(check.seamMapping.unjoinedPieces).toEqual([]);
+  test("a piece whose perimeter is not covered is named, and the fix is one confirmation", () => {
+    const plans = tee.simulationInputs().pieces.map((plan) => ({
+      ...plan,
+      boundaryConfirmed: plan.pieceRef === "PC-SLV-L" ? null : plan.boundaryConfirmed,
+    }));
+    const check = simulation.checkInputs(patternSet(), tee.simulationInputs({ pieces: plans }));
+    const boundary = check.failures.filter((f) => f.step === "boundary");
+    expect(boundary).toHaveLength(1);
+    expect(boundary[0].code).toBe("R5");
+    expect(boundary[0].pieces.map((x) => x.pieceRef)).toContain("PC-SLV-L");
   });
 
-  test("a fully mapped pattern is ready, and says so with nothing missing", () => {
+  test("a fully described pattern is ready, with nothing missing", () => {
     const check = simulation.checkInputs(patternSet(), INPUTS);
     expect(check.ready).toBe(true);
     expect(check.missing).toEqual([]);
-    expect(check.seamMapping.usable).toBe(2);
-    expect(check.pieceCount).toBe(2);
+    expect(check.pieceCount).toBe(4);
+    /* The default fixture has no neck finish on purpose, so it is READY and
+       PARTIAL at the same time — the §6.4 case, and the one a screen must not
+       label "everything is ready". */
+    expect(check.outcome).toBe("partial");
+    expect(check.withheld.map((w) => w.finding)).toContain("collar");
+  });
+
+  test("with a neck band it is ready and complete, and nothing is withheld for the neck", () => {
+    const check = simulation.checkInputs(
+      patternSet({ withNeckBand: true }),
+      tee.simulationInputs({ withNeckBand: true }),
+    );
+    expect(check.ready).toBe(true);
+    expect(check.withheld.map((w) => w.finding)).not.toContain("collar");
   });
 });
 
@@ -261,7 +275,7 @@ describe("the job is the server's, whoever does the arithmetic", () => {
     expect(job.drape).toEqual({ present: false });
     /* And the inputs were copied, so editing the revision cannot change what
        this garment was draped with. */
-    expect(job.inputs.seamPairings).toHaveLength(2);
+    expect(job.inputs.seams).toHaveLength(INPUTS.seams.length);
   });
 
   test("a drape completes the job and is stored with what it found", async () => {
@@ -302,7 +316,8 @@ describe("the job is the server's, whoever does the arithmetic", () => {
     expect(read.vertexCount).toBe(12);
     expect(read.unit).toBe("mm");
     expect(read.patternRevisionNumber).toBe(1);
-    expect(read.pieces.map((p) => p.pieceRef)).toEqual(["PC-FRONT", "PC-BACK"]);
+    expect(read.pieces.map((p) => p.pieceRef))
+      .toEqual(["PC-FRONT", "PC-BACK", "PC-SLV-L", "PC-SLV-R"]);
     const bytes = Buffer.from(read.positionsBase64, "base64");
     expect(bytes.length).toBe(12 * 3 * 4);
     const positions = new Float32Array(bytes.buffer, bytes.byteOffset, 36);

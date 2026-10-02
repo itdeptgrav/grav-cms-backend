@@ -545,6 +545,19 @@ function normaliseDrape(drape) {
      boundary is not a drape with a small offset on it: the panels meet in the
      wrong places. A drape that could not say which line it used would be a drape
      whose numbers nobody can qualify, and the screens would show them anyway. */
+  /* ── THE GEOMETRY FINGERPRINT IS NOT OPTIONAL ───────────────────────────
+     Reopening a drape means drawing stored positions through faces rebuilt now.
+     A point COUNT is not evidence those faces are the same ones: two revisions
+     that differ by a moved point mesh to the same number of points, and the
+     stored positions would then be drawn through a garment that is neither. The
+     fingerprint is what makes the rebuild provable, so a drape that does not
+     carry one is refused rather than stored and trusted later. */
+  if (!str(drape.geometryIdentity)) {
+    throw fail("VALIDATION",
+      "That drape does not carry a geometry fingerprint, so reopening it could never be proven "
+      + "to rebuild the same mesh. It was not stored.",
+      { field: "drape.geometryIdentity" });
+  }
   const sewingLineSource = str(drape.sewingLineSource);
   if (!["published", "derived", "cut-boundary"].includes(sewingLineSource)) {
     throw fail("VALIDATION",
