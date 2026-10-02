@@ -628,3 +628,57 @@ describe("what a screen cannot be allowed to get wrong", () => {
     expect(mine.heartbeatMs).toBeGreaterThan(0);
   });
 });
+
+/* ═══ THE RECORD HAS TO BE ABLE TO HOLD WHAT THE PRODUCT WRITES ═══════════ */
+
+describe("a drape is not lost to the length of its own explanation", () => {
+  const { RenderJob } = require("../../models/CMS_Models/RnD/PatternRevision");
+
+  /* The sentence `sewingLine.js` composes when no sewing line could be built.
+     The one that lost a drape was 412 characters — it names the cut boundary,
+     then the reason the derivation failed, then what sewing on the cut line does
+     to a chest with two side seams and two armholes, then that every dimensional
+     finding is withheld. It is authored by this system and never typed by
+     anybody, and the field that stores it allowed 400. So EVERY drape of a
+     pattern without a published sewing line failed to save, the browser was told
+     "Something went wrong. Nothing was changed.", and twenty seconds of
+     somebody's work went in the bin.
+
+     The opening is quoted and the rest padded to that measured length, because
+     what this test is about is the length a record must accept rather than the
+     wording of a sentence that will be edited. */
+  const OBSERVED_LENGTH = 412;
+  const CUT_BOUNDARY_WHY = ("This drape is sewn on the CUT boundary. A sewing line could not be "
+    + "constructed: the stated allowance could not be inset without self-intersection. Sewing on "
+    + "the cut line changes where the pieces meet and how they hang — on a chest with two side "
+    + "seams and two armholes a 10 mm allowance is of the order of 40 mm. The garment may be looked "
+    + "at; every dimensional finding is withheld.").padEnd(OBSERVED_LENGTH, " ").slice(0, OBSERVED_LENGTH);
+
+  test("the withheld-reason field accepts the longest reason the product composes", async () => {
+    expect(CUT_BOUNDARY_WHY.length).toBe(OBSERVED_LENGTH);
+    expect(OBSERVED_LENGTH).toBeGreaterThan(400);
+    const path = RenderJob.schema.path("drape.withheld");
+    const why = path.schema.path("why");
+    expect(why.options.maxlength).toBeGreaterThanOrEqual(CUT_BOUNDARY_WHY.length);
+  });
+
+  test("a job carrying that reason validates", async () => {
+    const job = new RenderJob({
+      jobRef: "RJ-TEST",
+      styleId: new mongoose.Types.ObjectId(),
+      status: "completed",
+      drape: {
+        vertexCount: 3,
+        sewingLineSource: "cut-boundary",
+        geometryIdentity: "abc",
+        authoritative: false,
+        withheld: [{ finding: "chest", why: CUT_BOUNDARY_WHY }],
+      },
+    });
+    /* Only the paths this test is about; a missing unrelated required field
+       would be a different complaint and would hide this one. */
+    const err = await job.validate().then(() => null, (e) => e);
+    const complaints = err ? Object.keys(err.errors || {}) : [];
+    expect(complaints.filter((k) => k.startsWith("drape.withheld"))).toEqual([]);
+  });
+});

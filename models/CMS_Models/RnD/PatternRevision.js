@@ -541,7 +541,14 @@ const renderJobSchema = new mongoose.Schema({
     withheld: {
       type: [new mongoose.Schema({
         finding: { type: String, trim: true, required: true },
-        why: { type: String, trim: true, required: true, maxlength: 400 },
+        /* ── LONG ENOUGH FOR THE SENTENCE THE PRODUCT ITSELF WRITES ──────
+           This was 400, and the reason a cut-boundary drape withholds its chest
+           measurement is 412 characters — so every drape of a pattern with no
+           published sewing line failed to save, on a string the system had
+           authored, and the browser reported "Something went wrong". The text is
+           generated here and never typed by anybody, so the cap was protecting
+           nothing and losing the whole drape. */
+        why: { type: String, trim: true, required: true, maxlength: 1200 },
       }, { _id: false })],
       default: [],
     },

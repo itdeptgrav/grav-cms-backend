@@ -687,7 +687,27 @@ async function recordRenderOutcome(ctx, {
     job.events.push({ kind: next, note: job.failure.message, by: who, at });
   }
   job.revision += 1;
-  await job.save();
+  /* ── A REFUSED WRITE SAYS WHAT IT REFUSED ───────────────────────────────
+     Not for tidiness. A drape is twenty seconds of a person's time and it is
+     thrown away if this write fails, so the sentence they are shown has to name
+     the field — the one that sent us here was a withheld-finding reason four
+     hundred and twelve characters long against a four-hundred cap, and what the
+     browser said was "Something went wrong. Nothing was changed." Nobody could
+     act on that, and every drape of a pattern without a published sewing line
+     hit it. */
+  try {
+    await job.save();
+  } catch (err) {
+    if (err?.name === "ValidationError") {
+      const paths = Object.keys(err.errors || {});
+      throw fail("VALIDATION",
+        `That drape was not stored. ${paths.length === 1 ? "One field" : `${paths.length} fields`} `
+        + `could not be written: ${paths.map((k) => `${k} — ${err.errors[k]?.message || "refused"}`)
+          .join("; ")}`,
+        { field: paths[0] || "drape", paths });
+    }
+    throw err;
+  }
 
   const context = await currentRevisionOf(ctx, job.styleId);
   return { render: jobView(job, context) };
