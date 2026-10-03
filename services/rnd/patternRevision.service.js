@@ -32,6 +32,7 @@ const {
 const templates = require("./fitTemplates");
 const { styleForCompany } = require("../companyContext/rndScope.service");
 const { checkInputs, adapterStatus } = require("./simulationAdapter.service");
+const editorDoc = require("./patternEditorDocument");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => (v === null || v === undefined ? "" : String(v).trim());
@@ -145,7 +146,19 @@ function revisionView(row, { geometry = false } = {}) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
-  if (geometry) view.patternSet = row.patternSet || null;
+  if (geometry) {
+    view.patternSet = row.patternSet || null;
+    /* ── THE EDITOR'S DOCUMENT, OR ONE NORMALISED FROM THE PARSE ──────
+       Sent with the geometry so the editor never has to decide for itself
+       whether an old revision should be reinterpreted, and `origin` says which
+       it got: "no seams mapped" means something different on a revision
+       somebody edited and on one nobody has opened. */
+    const resolved = editorDoc.editorDocumentFor(row);
+    view.editorDocument = resolved.document;
+    view.editorDocumentOrigin = resolved.origin;
+    view.editorDocumentProblems = resolved.problems;
+    view.editorSchemaVersion = editorDoc.EDITOR_SCHEMA_VERSION;
+  }
   return view;
 }
 
@@ -653,6 +666,312 @@ async function editRevision(ctx, { revisionId, operations = [], name, expectedRe
   return { revision: revisionView(created, { geometry: true }) };
 }
 
+/* ═══ SAVING FROM THE 2D EDITOR ════════════════════════════════════════════
+ *
+ * `editRevision` above takes OPERATIONS — a list of named changes applied to the
+ * parent's geometry. That is the right shape for a scripted or audited change
+ * and the wrong shape for a person who has spent twenty minutes reshaping an
+ * armhole: by the end there is no list of operations, there is a pattern.
+ *
+ * So this takes the whole document, validates it, and mints a child revision.
+ * The parent is never read for anything but its identity and its DXF, and never
+ * written to at all — which is rule 1 at the top of this file, and the reason an
+ * approved revision can be opened in the editor without anybody worrying.
+ */
+async function saveEditorRevision(ctx, {
+  revisionId, document, name, changeNote = "", idempotencyKey = "",
+  expectedRevision, actor = null,
+} = {}) {
+  assertContext(ctx);
+  const parent = await revisionForCompany(ctx, revisionId, { lean: true });
+
+  const key = clean(idempotencyKey, 120);
+  if (key) {
+    /* ── THE SAME SAVE, PRESSED TWICE ─────────────────────────────────
+       Checked before anything is written. The unique index below is what makes
+       it true under a race; this is what makes the ordinary retry fast and
+       gives the client back the revision it already made. */
+    const already = await PatternRevision
+      .findOne(byCompany(ctx, { idempotencyKey: key })).lean();
+    if (already) {
+      return { revision: revisionView(already, { geometry: true }), idempotent: true };
+    }
+  }
+
+  if (expectedRevision !== undefined && Number(expectedRevision) !== parent.revision) {
+    throw fail("REVISION_CONFLICT",
+      "This pattern changed while you were working on it. Reload and make the change again.",
+      { expectedRevision: Number(expectedRevision), currentRevision: parent.revision });
+  }
+
+  const title = clean(name, 200);
+  if (!title) {
+    throw fail("VALIDATION",
+      "A revision needs a name — a pattern nobody named is one nobody can ask about a week later.",
+      { field: "name" });
+  }
+
+  const problems = editorDoc.documentProblems(document);
+  if (problems.length) {
+    throw fail("VALIDATION",
+      problems.length === 1 ? problems[0]
+        : `This pattern cannot be saved. ${problems[0]} (${problems.length - 1} other problem`
+          + `${problems.length === 2 ? "" : "s"}.)`,
+      { field: "document", problems });
+  }
+
+  const who = actorOf(actor);
+  const at = new Date();
+  const patternSet = patternSetFromEditor(document, parent.patternSet);
+  const projected = simulationInputsFromEditor(document, parent, who, at);
+
+  const last = await PatternRevision
+    .findOne(byCompany(ctx, { styleId: parent.styleId }))
+    .sort({ revisionNumber: -1 }).select("revisionNumber").lean();
+
+  const payload = {
+    companyId: ctx.companyId,
+    styleId: parent.styleId,
+    revisionRef: mintRef("PR"),
+    revisionNumber: (last?.revisionNumber || 0) + 1,
+    name: title,
+    state: REVISION_STATE.DRAFT,
+    origin: { kind: "edit", parentRevisionRef: parent.revisionRef },
+    /* The file travels with the line: revision 7's DXF is revision 1's DXF. */
+    sourceDxf: parent.sourceDxf,
+    patternSet,
+    editorDocument: document,
+    idempotencyKey: key,
+    edits: [{
+      kind: EDIT_KIND.OUTLINE,
+      summary: clean(changeNote, 400) || `Edited in the 2D pattern editor.`,
+      before: null,
+      after: null,
+      by: who,
+      at,
+    }],
+    simulationInputs: projected.inputs,
+    /* ── WHEN THE EDITOR'S OWN MAPPING COUNTS AS THE CONFIRMATION ───────
+       Readiness refuses a seam mapping confirmed against a DIFFERENT revision,
+       and it is right to: a mapping names outline point indices and an edit
+       moves them. Carrying the parent's stamp forward therefore means every
+       save makes the pattern un-renderable until somebody re-confirms six seams
+       in another screen — which is exactly the mapping they just drew.
+
+       So when every seam in the editor document is CONFIRMED — a person stated
+       which way round each one is sewn and ticked it — those seams are projected
+       into the simulation inputs and stamped against THIS revision. When any is
+       still `needs-checking`, the parent's inputs and the parent's stamp are
+       carried forward unchanged and readiness goes on refusing, which is the
+       honest outcome. */
+    mappingConfirmedAgainstRef: projected.confirmedAgainst,
+    author: who,
+    events: [{
+      kind: "edited",
+      note: clean(changeNote, 400) || `Saved from the 2D editor, from ${parent.revisionRef}.`,
+      by: who,
+      at,
+    }],
+  };
+
+  /* The stamp has to be the ref this save is about to mint, which does not
+     exist until the payload is built. Written here rather than threaded through
+     the projection, so the projection stays a pure function of the document. */
+  if (payload.mappingConfirmedAgainstRef === "PENDING_NEW_REF") {
+    payload.mappingConfirmedAgainstRef = payload.revisionRef;
+  }
+
+  let created;
+  try {
+    created = await PatternRevision.create(payload);
+  } catch (err) {
+    /* Two retries of one save arriving together. The index refused the second;
+       the revision the first one made is the right answer to both. */
+    if (key && err?.code === 11000) {
+      const won = await PatternRevision.findOne(byCompany(ctx, { idempotencyKey: key })).lean();
+      if (won) return { revision: revisionView(won, { geometry: true }), idempotent: true };
+    }
+    throw err;
+  }
+  return { revision: revisionView(created, { geometry: true }), idempotent: false };
+}
+
+/**
+ * The editor's confirmed seam mapping, in the shape readiness reads.
+ *
+ * `simulationInputs` describes the garment — body, fabric, roles, seams — and
+ * the editor document describes the pattern. They overlap on exactly one thing,
+ * the seams, and this is where that overlap is reconciled.
+ *
+ * Returns `{ inputs, confirmedAgainst }`. `confirmedAgainst` is the NEW
+ * revision's ref only when the editor's mapping is wholly confirmed; otherwise
+ * it is whatever the parent carried, which keeps readiness refusing until
+ * somebody has looked.
+ */
+function simulationInputsFromEditor(document, parent, who = null, at = new Date()) {
+  const inputs = JSON.parse(JSON.stringify(parent.simulationInputs || {}));
+  const seams = Array.isArray(document.seams) ? document.seams : [];
+
+  const everyOneConfirmed = seams.length > 0
+    && seams.every((s) => str(s.confidence) === "confirmed" && str(s.alignment));
+  if (!everyOneConfirmed) {
+    return { inputs, confirmedAgainst: str(parent.mappingConfirmedAgainstRef) };
+  }
+
+  const refOf = (pieceId) => {
+    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(pieceId));
+    return p ? (str(p.pieceRef) || `PP-${str(p.pieceId).toUpperCase()}`) : "";
+  };
+  const indexOf = (pieceId, pointId) => {
+    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(pieceId));
+    return p ? (p.points || []).findIndex((v) => str(v.pointId) === str(pointId)) : -1;
+  };
+
+  /* A run's anchors are the first edge's start and the last edge's end, in the
+     order the editor stored them — which is the order it is sewn. */
+  const runRecord = (run, runId) => {
+    const ids = Array.isArray(run.edgePointIds) ? run.edgePointIds : [];
+    if (!ids.length) return null;
+    const startId = run.reversed ? ids[ids.length - 1] : ids[0];
+    const endEdge = run.reversed ? ids[0] : ids[ids.length - 1];
+    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(run.pieceId));
+    if (!p) return null;
+    const endIndex = (indexOf(run.pieceId, endEdge) + (run.reversed ? 0 : 1)) % p.points.length;
+    const startIndex = indexOf(run.pieceId, startId) + (run.reversed ? 1 : 0);
+    if (startIndex < 0 || endIndex < 0) return null;
+    return {
+      runId,
+      startAnchor: { kind: "turn-point", pointIndex: startIndex % p.points.length },
+      endAnchor: { kind: "turn-point", pointIndex: endIndex },
+      direction: run.reversed ? "reverse" : "forward",
+      /* The editor named the edges, so which of the two stretches it is is not a
+         guess: it is the one whose edges were picked. More than half the
+         boundary means it took the long way round. */
+      theLongWay: ids.length > Math.floor(p.points.length / 2),
+      role: str(run.role),
+      lengthMm: Number.isFinite(run.lengthMm) ? run.lengthMm : null,
+    };
+  };
+
+  const pieces = (inputs.pieces || []).map((p) => ({ ...p, runs: [] }));
+  const byRef = new Map(pieces.map((p) => [str(p.pieceRef), p]));
+  const ensure = (ref) => {
+    if (!byRef.has(ref)) {
+      const made = { pieceRef: ref, runs: [] };
+      pieces.push(made);
+      byRef.set(ref, made);
+    }
+    return byRef.get(ref);
+  };
+
+  const out = [];
+  for (const seam of seams) {
+    const aRef = refOf(seam.a?.pieceId);
+    const bRef = refOf(seam.b?.pieceId);
+    const aRun = runRecord(seam.a || {}, `${str(seam.seamId)}-a`);
+    const bRun = runRecord(seam.b || {}, `${str(seam.seamId)}-b`);
+    if (!aRef || !bRef || !aRun || !bRun) continue;
+    ensure(aRef).runs.push(aRun);
+    ensure(bRef).runs.push(bRun);
+    out.push({
+      seamId: str(seam.seamId),
+      name: clean(seam.name, 160),
+      sideA: [{ pieceRef: aRef, runId: aRun.runId }],
+      sideB: [{ pieceRef: bRef, runId: bRun.runId }],
+      alignment: str(seam.alignment),
+      confidence: "confirmed",
+      /* ── A CONFIRMATION NOBODY IS ATTRIBUTABLE FOR IS A GUESS (R4) ──
+         Ticking "I have checked this" in the editor IS the confirmation
+         readiness asks for, so it is recorded with the person who ticked it and
+         when. Without this the mapping is complete and still refused, which
+         sends somebody to a second screen to re-state what they just stated. */
+      alignmentConfirmed: { by: who || undefined, at },
+      easePercent: Number.isFinite(seam.easePercent) ? seam.easePercent : null,
+    });
+  }
+
+  inputs.pieces = pieces;
+  inputs.seams = out;
+  return { inputs, confirmedAgainst: "PENDING_NEW_REF" };
+}
+
+/**
+ * The parse, rewritten from the editor's document.
+ *
+ * Written on every save so that readiness, the render service, the IE
+ * projection and the costing roll-up keep reading the field they already read.
+ * In millimetres, because the editor works in millimetres and converting back to
+ * the file's own unit would put the pattern through two divisions by 25.4 for
+ * no reason anybody benefits from.
+ */
+function patternSetFromEditor(document, parentPatternSet) {
+  const pieces = (document.pieces || []).map((p, i) => {
+    const outline = (p.points || []).map((v) => ({ x: v.x, y: v.y }));
+    return {
+      pieceRef: str(p.pieceRef) || `PP-${str(p.pieceId).toUpperCase()}`,
+      name: str(p.name),
+      generatedName: false,
+      index: i,
+      outline,
+      outlineClosed: Boolean(p.closed),
+      /* The corner/curve split, in the two fields the parse already has for it.
+         Nothing is flattened and re-fitted, so reopening gives back the points
+         that were authored. */
+      turnPoints: (p.points || []).filter((v) => v.kind === "corner").map((v) => ({ x: v.x, y: v.y })),
+      curvePoints: (p.points || []).filter((v) => v.kind === "curve").map((v) => ({ x: v.x, y: v.y })),
+      grainline: p.grainline
+        ? {
+          from: { x: p.grainline.fromX, y: p.grainline.fromY },
+          to: { x: p.grainline.toX, y: p.grainline.toY },
+          length: Math.round(Math.hypot(
+            p.grainline.toX - p.grainline.fromX, p.grainline.toY - p.grainline.fromY,
+          ) * 1e4) / 1e4,
+        }
+        : null,
+      notches: (p.notches || []).map((n) => ({
+        at: { x: n.x, y: n.y }, form: n.form || "point", depth: n.depthMm,
+      })),
+      internalLines: (p.internalLines || []).map((l) => ({
+        points: l.points || [], closed: Boolean(l.closed),
+      })),
+      sewLine: p.sewingLine?.points?.length ? p.sewingLine.points : undefined,
+      seamAllowance: p.allowance?.widthMm
+        ? {
+          value: p.allowance.widthMm,
+          uniform: !(p.points || []).some((v) => Number.isFinite(v.allowanceMm)),
+          source: str(p.allowance.source) || "stated",
+        }
+        : null,
+      description: "",
+    };
+  });
+
+  return {
+    patternSetRef: str(parentPatternSet?.patternSetRef) || `PS-${Date.now().toString(36).toUpperCase()}`,
+    classification: str(parentPatternSet?.classification) || "apparel-pattern",
+    manifest: parentPatternSet?.manifest || {},
+    unit: "mm",
+    unitSource: "pattern-editor",
+    unitDeclared: str(parentPatternSet?.unit),
+    unitInMm: 1,
+    pieces,
+    grading: parentPatternSet?.grading || { graded: false, sizes: [], sizeCount: 0 },
+    stats: {
+      pieces: pieces.length,
+      namedPieces: pieces.filter((x) => x.name).length,
+      piecesWithOutline: pieces.filter((x) => x.outline.length >= 3).length,
+      notches: pieces.reduce((n, x) => n + x.notches.length, 0),
+      internalLines: pieces.reduce((n, x) => n + x.internalLines.length, 0),
+      grainlines: pieces.filter((x) => x.grainline).length,
+      vertices: pieces.reduce((n, x) => n + x.outline.length, 0),
+    },
+    conventions: parentPatternSet?.conventions || [],
+    layersSeen: parentPatternSet?.layersSeen || [],
+    sha256: str(parentPatternSet?.sha256),
+    fileName: str(parentPatternSet?.fileName),
+  };
+}
+
 /** The simulation inputs, which are settings rather than geometry. */
 /* ═══ THE SEWING-LINE DECISION, VALIDATED ══════════════════════════════════
  *
@@ -968,6 +1287,8 @@ async function approveRevision(ctx, { revisionId, note, expectedRevision, actor 
 }
 
 module.exports = {
+  saveEditorRevision,
+  patternSetFromEditor,
   REVISION_STATE, EDIT_KIND, EDITORS,
   listRevisions, readRevision, importRevision, findImportedBySha,
   reconcileFromPublications, editRevision,

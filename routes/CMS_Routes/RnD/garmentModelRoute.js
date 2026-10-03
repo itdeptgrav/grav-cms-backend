@@ -601,6 +601,33 @@ router.post("/patterns/revisions/:revisionId/edits", requireCompany, canAnnotate
     return res.status(201).json({ success: true, ...out });
   }));
 
+/* ── SAVING THE WHOLE DOCUMENT FROM THE 2D EDITOR ────────────────────────
+   `/edits` above takes a list of named operations, which is right for a scripted
+   change and wrong for somebody who has spent twenty minutes reshaping an
+   armhole — by the end there is no list of operations, there is a pattern.
+
+   `canAnnotate` rather than `canPublishPattern`: this creates a DRAFT child
+   revision and writes to nothing that exists. Approving it is a separate
+   capability and a separate endpoint. */
+router.post("/patterns/revisions/:revisionId/editor-save", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await patterns.saveEditorRevision(ctx(req), {
+      revisionId: req.params.revisionId,
+      document: req.body?.document,
+      name: req.body?.name,
+      changeNote: req.body?.changeNote,
+      /* The client's own key for this save ATTEMPT. A retry carries the same
+         one and gets the revision the first arrival made, rather than a second
+         identical draft nobody can tell apart. */
+      idempotencyKey: req.body?.idempotencyKey,
+      expectedRevision: req.body?.expectedRevision,
+      actor: actor(req),
+    });
+    /* 200 on an idempotent repeat, 201 on a revision this request created:
+       the status says which happened without the client parsing the body. */
+    return res.status(out.idempotent ? 200 : 201).json({ success: true, ...out });
+  }));
+
 router.put("/patterns/revisions/:revisionId/simulation-inputs", requireCompany, canAnnotate,
   handle(async (req, res) => {
     const out = await patterns.setSimulationInputs(ctx(req), {

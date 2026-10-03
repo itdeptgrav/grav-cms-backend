@@ -452,6 +452,191 @@ const simulationInputsSchema = new mongoose.Schema({
 
 /* ═══ THE REVISION ════════════════════════════════════════════════════════ */
 
+
+/* ═══ THE 2D EDITOR'S DOCUMENT ═════════════════════════════════════════════
+ *
+ * What the pattern editor knows that the PARSE has no field for: which point is
+ * which across an edit, what each stretch of boundary is for, where a notch is
+ * anchored, which run is sewn to which, and the measurements somebody saved
+ * against a point of measure.
+ *
+ * ── WHY IT IS BESIDE `patternSet` AND NOT INSIDE IT ─────────────────────────
+ * `patternSet` is read by readiness, the render service, the IE projection and
+ * the costing roll-up. Teaching it point ids and seam pairings would mean
+ * changing all of them at once, and the one that was missed would read a field
+ * it did not expect. So the geometry is written to BOTH on every save — from the
+ * same points — and nothing downstream notices. The duplication is real and it
+ * is the price of not rewriting four consumers to add a notch id.
+ *
+ * ── AND WHY IT IS A FIELD AND NOT A COLLECTION ──────────────────────────────
+ * It is one-to-one with a revision and never queried on its own. The cluster has
+ * been at its collection ceiling before; this would be the wrong shape even if
+ * there were room.
+ *
+ * `schemaVersion` is a boundary, not a label. A revision saved before this
+ * existed has no document at all and is NORMALISED from the parse on read, with
+ * every point's provenance recorded as `imported`. One saved by a LATER version
+ * is refused rather than reinterpreted — see `patternEditorDocument.js`.
+ */
+
+const editorPointSchema = new mongoose.Schema({
+  /* Stable across every edit of this revision's line. Everything else — an edge
+     class, a notch anchor, a seam run, a measurement — points at this and not at
+     an array index, because inserting one point near a neckline renumbers every
+     index after it. */
+  pointId: { type: String, trim: true, required: true },
+  x: { type: Number, required: true },
+  y: { type: Number, required: true },
+  /* A corner or a point on a smooth run. Stored rather than inferred: it is
+     what decides whether the boundary is drawn through this point or turns at
+     it, and the two cut differently. */
+  kind: { type: String, enum: ["corner", "curve"], required: true },
+  /* What the segment LEAVING this point is for. On the start point rather than
+     on an index, so splitting a segment leaves both halves classed the same. */
+  edge: { type: String, enum: ["sew", "finished", "fold", "internal", ""], default: "" },
+  /* Per-edge allowance, where it differs from the piece's. A 40 mm hem on a
+     10 mm garment is ordinary and has nowhere else to live. */
+  allowanceMm: { type: Number, default: null, min: 0 },
+}, { _id: false });
+
+const editorNotchSchema = new mongoose.Schema({
+  notchId: { type: String, trim: true, required: true },
+  x: { type: Number, required: true },
+  y: { type: Number, required: true },
+  form: { type: String, enum: ["point", "slit", "v"], default: "point" },
+  depthMm: { type: Number, default: null },
+  /* Anchored to the boundary, so moving a point takes its notch with it rather
+     than leaving it floating beside the piece. */
+  afterPointId: { type: String, trim: true, default: "" },
+  offsetMm: { type: Number, default: null },
+  provenance: { type: String, enum: ["imported", "authored", "derived"], default: "authored" },
+}, { _id: false });
+
+const editorRunSchema = new mongoose.Schema({
+  /* Empty only on a side the editor cannot express — several runs sewn in order
+     — which is carried and marked rather than reduced to its first run. */
+  pieceId: { type: String, trim: true, default: "" },
+  /* ── A RUN IS A LIST OF EDGES, IN TRAVEL ORDER ───────────────────────
+     Not a pair of endpoints. Two points on a closed boundary divide it into two
+     stretches and both are real — a neckline and "all of the front except the
+     neckline" share their ends — so the edges themselves are named, and the
+     order they are named in is the direction the seam is sewn. */
+  edgePointIds: { type: [String], default: [] },
+  reversed: { type: Boolean, default: false },
+  lengthMm: { type: Number, default: null, min: 0 },
+  role: { type: String, trim: true, default: "" },
+}, { _id: false });
+
+const editorSeamSchema = new mongoose.Schema({
+  seamId: { type: String, trim: true, required: true },
+  name: { type: String, trim: true, default: "", maxlength: 160 },
+  a: { type: editorRunSchema, required: true },
+  b: { type: editorRunSchema, required: true },
+  alignment: { type: String, enum: ["start-to-start", "start-to-end", ""], default: "" },
+  /* `needs-checking` is a real outcome and the commonest honest one. A cap sewn
+     front to back has the right length, the right perimeter and the right scale,
+     so nothing downstream catches it — a pairing nobody has looked at is marked
+     rather than promoted. */
+  confidence: {
+    type: String, enum: ["proposed", "needs-checking", "confirmed"], default: "proposed",
+  },
+  easeMm: { type: Number, default: null },
+  easePercent: { type: Number, default: null },
+  note: { type: String, trim: true, default: "", maxlength: 400 },
+  /* A mapping carried in from the setup panel whose side is several runs sewn in
+     order — a set-in sleeve, a neck band. Shown, kept, and not editable here. */
+  unsupported: { type: Boolean, default: false },
+}, { _id: false });
+
+const editorMeasurementSchema = new mongoose.Schema({
+  measurementId: { type: String, trim: true, required: true },
+  kind: { type: String, enum: ["straight", "path", "perimeter", "area"], required: true },
+  pieceId: { type: String, trim: true, required: true },
+  /* Either a point id — follows the point when it moves — or a free position,
+     which does not and is marked as such on screen. */
+  fromPointId: { type: String, trim: true, default: "" },
+  toPointId: { type: String, trim: true, default: "" },
+  fromX: { type: Number, default: null },
+  fromY: { type: Number, default: null },
+  toX: { type: Number, default: null },
+  toY: { type: Number, default: null },
+  theLongWay: { type: Boolean, default: false },
+  name: { type: String, trim: true, default: "", maxlength: 160 },
+  /* The tech pack's own code. Free text on purpose: a point-of-measure
+     vocabulary belongs to a buyer and a product class, and a fixed list here
+     would be wrong for the second customer. */
+  pomCode: { type: String, trim: true, default: "", maxlength: 40 },
+  note: { type: String, trim: true, default: "", maxlength: 400 },
+  /* The value when it was taken, so a reader can see that a measurement has
+     moved since — the number is recomputed from the geometry on read. */
+  valueMmAtSave: { type: Number, default: null },
+}, { _id: false });
+
+const editorPieceSchema = new mongoose.Schema({
+  pieceId: { type: String, trim: true, required: true },
+  /* The parse's own ref, kept: it is what every existing mapping, measurement
+     and readiness failure already quotes. Empty on a piece drawn here. */
+  pieceRef: { type: String, trim: true, default: "" },
+  name: { type: String, trim: true, default: "", maxlength: 200 },
+  closed: { type: Boolean, default: false },
+  points: { type: [editorPointSchema], default: [] },
+  grainline: {
+    type: new mongoose.Schema({
+      fromX: Number, fromY: Number, toX: Number, toY: Number,
+      provenance: { type: String, enum: ["imported", "authored", "derived"], default: "authored" },
+    }, { _id: false }),
+    default: null,
+  },
+  notches: { type: [editorNotchSchema], default: [] },
+  internalLines: {
+    type: [new mongoose.Schema({
+      lineId: { type: String, trim: true, default: "" },
+      points: { type: [{ x: Number, y: Number }], default: [] },
+      closed: { type: Boolean, default: false },
+      provenance: { type: String, enum: ["imported", "authored", "derived"], default: "imported" },
+    }, { _id: false })],
+    default: [],
+  },
+  /* ── THE SEWING LINE IS KEPT APART FROM THE CUT LINE ─────────────────
+     Either published by the file or offset from the boundary here. Never folded
+     into `points`: an allowance baked into the outline is indistinguishable
+     from the cut line a week later, and the next person to add 10 mm adds it to
+     a line that already has 10. */
+  sewingLine: {
+    type: new mongoose.Schema({
+      points: { type: [{ x: Number, y: Number }], default: [] },
+      provenance: { type: String, enum: ["imported", "authored", "derived"], default: "derived" },
+    }, { _id: false }),
+    default: null,
+  },
+  allowance: {
+    type: new mongoose.Schema({
+      widthMm: { type: Number, default: null, min: 0 },
+      source: { type: String, trim: true, default: "" },
+      provenance: { type: String, enum: ["imported", "authored", "derived"], default: "authored" },
+    }, { _id: false }),
+    default: null,
+  },
+  provenance: {
+    geometry: { type: String, enum: ["imported", "authored", "derived"], default: "imported" },
+    note: { type: String, trim: true, default: "", maxlength: 240 },
+  },
+}, { _id: false });
+
+const editorDocumentSchema = new mongoose.Schema({
+  schemaVersion: { type: Number, required: true },
+  /* Millimetres, always. A display unit is a label on a screen and is never
+     what is written here. */
+  unit: { type: String, enum: ["mm"], default: "mm" },
+  /* What the pattern was drawn in before the editor converted it once. Kept so a
+     reader can see the conversion happened and what it was from. */
+  sourceUnit: { type: String, trim: true, default: "" },
+  sourceUnitInMm: { type: Number, default: null },
+  pieces: { type: [editorPieceSchema], default: [] },
+  seams: { type: [editorSeamSchema], default: [] },
+  measurements: { type: [editorMeasurementSchema], default: [] },
+}, { _id: false });
+
 const patternRevisionSchema = new mongoose.Schema({
   companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
   styleId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true, immutable: true },
@@ -503,6 +688,18 @@ const patternRevisionSchema = new mongoose.Schema({
   /* The pattern itself. Same shape as the publication's parse. */
   patternSet: { type: patternSetSchema, default: null },
 
+  /* The 2D editor's own document. Null on a revision nobody has opened in the
+     editor, which is normalised from the parse on read rather than invented. */
+  editorDocument: { type: editorDocumentSchema, default: null },
+
+  /* ── THE SAME SAVE, PRESSED TWICE ────────────────────────────────────
+     A flaky connection makes a client retry, and a retry that creates a second
+     revision gives a style two identical drafts with different numbers and no
+     way to tell which anybody meant. The client sends a key per save attempt;
+     the second arrival with the same key returns the revision the first one
+     made. Sparse, because every revision made any other way has none. */
+  idempotencyKey: { type: String, trim: true, default: "" },
+
   /* What this revision changed from its parent. Empty on an import. */
   edits: { type: [editSchema], default: [] },
 
@@ -528,6 +725,12 @@ const patternRevisionSchema = new mongoose.Schema({
 }, { timestamps: true, collection: "rnd_pattern_revisions" });
 
 patternRevisionSchema.index({ companyId: 1, styleId: 1, revisionNumber: 1 }, { unique: true });
+/* One revision per save attempt. Partial rather than sparse so the empty string
+   every other revision carries does not collide with itself. */
+patternRevisionSchema.index(
+  { companyId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string", $gt: "" } } },
+);
 /* ── THE SAME DXF IS THE SAME IMPORT ───────────────────────────────────────
    Not unique: an edit revision inherits its parent's `sourceDxf`, so a style
    with eight revisions of one imported file has eight rows carrying that hash.
