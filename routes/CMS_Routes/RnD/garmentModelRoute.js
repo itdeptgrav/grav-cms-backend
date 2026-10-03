@@ -39,6 +39,7 @@ const { rndCompanyMiddleware } = require("../../../services/companyContext/rndSc
 const models = require("../../../services/rnd/garmentModel.service");
 const patterns = require("../../../services/rnd/patternRevision.service");
 const renders = require("../../../services/rnd/garmentRender.service");
+const avatars = require("../../../services/rnd/avatar.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -626,6 +627,41 @@ router.post("/patterns/revisions/:revisionId/editor-save", requireCompany, canAn
     /* 200 on an idempotent repeat, 201 on a revision this request created:
        the status says which happened without the client parsing the body. */
     return res.status(out.idempotent ? 200 : 201).json({ success: true, ...out });
+  }));
+
+/* ═══ GENERATED AVATARS ════════════════════════════════════════════════════
+ *
+ * The bodies Pattern & Fit is set up on, generated in the browser by OxiHuman
+ * and recorded here as immutable revisions on the style. The server checks
+ * every record it is sent (`avatarContract.js`) and never edits one: a save
+ * of a changed body is the next revision. `canAnnotate`, like the setup it
+ * feeds — a body is a simulation input, not a pattern change.
+ */
+router.get("/styles/:styleId/avatars", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await avatars.listAvatars(ctx(req), { styleId: req.params.styleId });
+    return res.json({ success: true, ...out });
+  }));
+
+router.get("/styles/:styleId/avatars/:avatarId/revisions/:revision", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await avatars.readAvatarRevision(ctx(req), {
+      styleId: req.params.styleId, avatarId: req.params.avatarId, revision: req.params.revision,
+    });
+    return res.json({ success: true, ...out });
+  }));
+
+router.post("/styles/:styleId/avatars", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await avatars.saveAvatar(ctx(req), {
+      styleId: req.params.styleId,
+      avatarId: req.body?.avatarId,
+      expectedRevision: req.body?.expectedRevision,
+      name: req.body?.name,
+      contract: req.body?.contract,
+      actor: actor(req),
+    });
+    return res.status(out.created ? 201 : 200).json({ success: true, ...out });
   }));
 
 router.put("/patterns/revisions/:revisionId/simulation-inputs", requireCompany, canAnnotate,

@@ -1799,6 +1799,22 @@ const CODES = {
   PPC_CALENDAR_REVISION_STALE: { status: 409, code: "PPC_CALENDAR_REVISION_STALE" },
   PPC_LINE_NOT_FOUND: { status: 404, code: "PPC_LINE_NOT_FOUND" },
   PPC_LINE_REVISION_STALE: { status: 409, code: "PPC_LINE_REVISION_STALE" },
+
+  /* ── R&D GENERATED AVATARS (services/rnd/avatarContract.js) ──────────────
+     422: the record is well formed and something in it is not true — a hash
+     that does not match, a status the numbers deny, an engine that is not the
+     pinned one. Each is its own code so the Avatar panel can say which. */
+  INVALID_RECORD: { status: 422, code: "INVALID_RECORD" },
+  CONTENT_HASH_MISMATCH: { status: 422, code: "CONTENT_HASH_MISMATCH" },
+  ENGINE_VERSION_MISMATCH: { status: 422, code: "ENGINE_VERSION_MISMATCH" },
+  UNIT_MISMATCH: { status: 422, code: "UNIT_MISMATCH" },
+  COORDINATE_MISMATCH: { status: 422, code: "COORDINATE_MISMATCH" },
+  TOLERANCE_MISMATCH: { status: 422, code: "TOLERANCE_MISMATCH" },
+  VERIFICATION_MISMATCH: { status: 422, code: "VERIFICATION_MISMATCH" },
+  COLLISION_BODY_FAILED: { status: 422, code: "COLLISION_BODY_FAILED" },
+  AVATAR_LIMIT: { status: 409, code: "AVATAR_LIMIT" },
+  AVATAR_NOT_FOUND: { status: 404, code: "AVATAR_NOT_FOUND" },
+  AVATAR_HASH_MISMATCH: { status: 409, code: "AVATAR_HASH_MISMATCH" },
 };
 
 class StorePurchaseError extends Error {

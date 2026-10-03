@@ -1358,6 +1358,19 @@ sampleStyleSchema.index(
   },
 );
 
+// ── R&D'S GENERATED AVATARS, OUT OF EVERY OTHER READ'S WAY ──────────────────
+// Immutable, append-only avatar revisions for Pattern & Fit. Embedded here
+// because the cluster has no collection to spare — the reasoning, and why not
+// on a pattern revision, is in `models/CMS_Models/RnD/AvatarRevision.js`.
+// `select: false`, so no existing query of a style loads or sends them; only
+// `services/rnd/avatar.service.js` asks for the path, and it writes with a
+// conditional `$push`, never by saving the whole style.
+const { avatarRevisionSchema } = require("../RnD/AvatarRevision");
+
+sampleStyleSchema.add({
+  rndAvatars: { type: [avatarRevisionSchema], default: undefined, select: false },
+});
+
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old
 // rows validate against the current enum instead of throwing on save.
 sampleStyleSchema.pre("validate", function healStage() {
