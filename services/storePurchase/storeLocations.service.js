@@ -297,13 +297,19 @@ async function contentsOf(scope, companyId, warehouse, locationIds) {
     { $group: { _id: { itemId: "$itemId", variantId: "$variantId", locationId: "$locationId" }, at: { $first: "$createdAt" }, type: { $first: "$type" }, actorName: { $first: "$actorName" }, firstIn: { $last: "$createdAt" } } },
   ]);
   const lastMap = new Map(last.map((x) => [`${x._id.itemId}:${x._id.variantId || ""}:${x._id.locationId}`, x]));
-  return rows.map((r) => {
+  const mapped = rows.map((r) => {
     const it = byItem.get(String(r.itemId));
-    const v = r.variantId && it ? (it.variants || []).find((x) => String(x._id) === String(r.variantId)) : null;
+    /* A row put away before a variant was chosen (variantId null) on an item
+       that has exactly ONE variant IS that variant — the same rule the
+       write side (`locationVariantFor`) and the locator's `variantKeyOf`
+       apply — so the panel never prints "No variant" for it (3 Oct 2026).
+       scripts/migrations/link-no-variant-balances.js writes that link down. */
+    const lone = !r.variantId && it && (it.variants || []).length === 1 ? it.variants[0] : null;
+    const v = r.variantId && it ? (it.variants || []).find((x) => String(x._id) === String(r.variantId)) : lone;
     const lm = lastMap.get(`${r.itemId}:${r.variantId || ""}:${r.locationId}`);
     const location = locationIn(warehouse, r.locationId);
     return {
-      rawItemId: String(r.itemId), variantId: r.variantId ? String(r.variantId) : null,
+      rawItemId: String(r.itemId), variantId: r.variantId ? String(r.variantId) : lone ? String(lone._id) : null,
       name: it?.name || "(item)", sku: v?.sku || it?.sku || "", variant: v ? (v.combination || []).join(" · ") : "", category: it?.category || "",
       image: v?.image || it?.image || "",
       baseUnit: it ? (it.customUnit || it.unit || "") : "", onHand: round4(r.onHand),
@@ -311,6 +317,20 @@ async function contentsOf(scope, companyId, warehouse, locationIds) {
       lastAt: lm?.at || null, lastType: lm?.type || "", lastBy: lm?.actorName || "", placedAt: lm?.firstIn || null,
     };
   });
+  /* ONE LINE PER ITEM-VARIANT PER POSITION (3 Oct 2026, owner): where a folded
+     no-variant row and a real variant row sit on the same shelf, they are one
+     product — add them, keep the later movement. The migration script makes
+     this permanent in the data; until it has run, the screen is still right. */
+  const merged = new Map();
+  for (const c of mapped) {
+    const k = `${c.rawItemId}:${c.variantId || ""}:${c.locationId}`;
+    const prev = merged.get(k);
+    if (!prev) { merged.set(k, c); continue; }
+    prev.onHand = round4(prev.onHand + c.onHand);
+    if (c.lastAt && (!prev.lastAt || new Date(c.lastAt) > new Date(prev.lastAt))) { prev.lastAt = c.lastAt; prev.lastType = c.lastType; prev.lastBy = c.lastBy; }
+    if (c.placedAt && (!prev.placedAt || new Date(c.placedAt) < new Date(prev.placedAt))) prev.placedAt = c.placedAt;
+  }
+  return [...merged.values()];
 }
 
 /** A marking's balance per location, derived from the rows that carry it. */
