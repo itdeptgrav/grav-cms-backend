@@ -239,11 +239,40 @@ The validator refuses, each with the offending values named:
 | A metric nothing produces | Bands for `pressure` or `dragLine` would be a scale over no measurement |
 | Level used twice, ranges out of order | Both make a table somebody will mis-read |
 
-**Status gates classification.** Only an `active` set, in force at the date
-asked about, may judge production work; `draft` and `retired` return
-`unclassified` with the reason. The editor may try a draft out explicitly, under
-`PURPOSE.EXPLORATION`. Two sets in force for one garment at the same time is
-reported as a data defect, never resolved by picking one.
+**The window gates classification, not just the status.** A production
+judgement requires `at` — the date the fitting was made — and the set must be
+`active` *and* in force at that instant:
+
+```
+effectiveFrom <= at < retiredOn
+```
+
+Half-open, like the ranges and for the same reason: the moment a successor takes
+over belongs to exactly one set, so no fitting falls between two sets or under
+both.
+
+`at` is the **analysis's own `madeAt`**, never today's date. The question is never
+"is this set in force now", it is "was it in force when this fitting was made",
+and those differ for every fitting older than the last threshold change. A
+missing or unreadable `at` is refused rather than assumed to be now.
+
+`eligibleAt(set, instant)` is the single implementation of that rule, shared by
+`classifyWithSet` and `selectBandSet`. It was once two, and they disagreed: the
+selector checked the window and the classifier checked only the status, so a set
+approved today and effective next month was refused by one and accepted by the
+other — and the classifier is the one that produces the judgement. Any caller
+holding a set already, which is every caller that reopens a stored analysis,
+could get a production verdict from a table that was not yet in force.
+
+Two sets in force for one garment at the same time is reported as a data defect,
+never resolved by picking one.
+
+**Exploration is not a verdict.** Under `PURPOSE.EXPLORATION` the editor may read
+a draft, a future or a retired set, with no date at all — that is what the mode is
+for. The answer carries `exploration: true`, its rule string begins `NOT A
+PRODUCTION JUDGEMENT`, and its evidence class is `warning`, which
+`countsAsFinding()` refuses. Only a real set, in force at the fitting's own date,
+returns `derived`.
 
 **Approval.** An active set needs an approver and the date they approved it, and
 every set needs a change reason — a threshold that moved for no recorded reason
@@ -267,7 +296,7 @@ by a threshold nobody can name is a screen nobody should act on.
 ### The one public classifier
 
 ```
-classifyWithSet(bandSet, value, { purpose }) → classification
+classifyWithSet(bandSet, value, { purpose, at }) → classification
 ```
 
 **This is the only way to turn a measurement into a word.** It takes a real

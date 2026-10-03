@@ -284,10 +284,15 @@ they are distinct.
 There is exactly one way to turn a measurement into a word:
 
 ```
-classifyWithSet(bandSet, value, { purpose }) → classification
+classifyWithSet(bandSet, value, { purpose, at }) → classification
 ```
 
-It takes a real `FitBandSet` ([schemas §8](./fit-analysis-schemas.md)).
+It takes a real `FitBandSet` ([schemas §8](./fit-analysis-schemas.md)) and, for a
+production judgement, **the date the fitting was made** — because a band set is
+in force over a window rather than forever, and the question is always "was this
+set in force when this fitting was made", not "is it in force now". A missing or
+unreadable date is refused, never assumed to be today.
+
 `metricGuard()` in `metrics.js` is an **internal guard**, not a second
 classifier — it answers only whether a value is answerable at all, takes no band
 set, and can name no band.
