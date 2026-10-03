@@ -279,6 +279,26 @@ they are distinct.
   R&D holds the bands. It does not fall back to a default threshold. A plausible
   default is worse than a refusal, because nobody checks it.
 
+### One classifier
+
+There is exactly one way to turn a measurement into a word:
+
+```
+classifyWithSet(bandSet, value, { purpose }) → classification
+```
+
+It takes a real `FitBandSet` ([schemas §8](./fit-analysis-schemas.md)).
+`metricGuard()` in `metrics.js` is an **internal guard**, not a second
+classifier — it answers only whether a value is answerable at all, takes no band
+set, and can name no band.
+
+### Dates
+
+Every date in this toolset is a calendar date `YYYY-MM-DD` meaning midnight UTC,
+or a full ISO-8601 instant with an explicit zone, and they are compared as parsed
+instants rather than as text. [Schemas §9](./fit-analysis-schemas.md) states the
+rule and why both halves of it matter.
+
 ### Confidence
 
 Two flags travel with every analysis and both appear on screen:

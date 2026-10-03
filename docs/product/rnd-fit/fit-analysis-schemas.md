@@ -34,10 +34,25 @@ Carried by every analysis. `provenanceProblems()` requires all of:
 | `quality` | Mesh density moves every number |
 | `bodyId`, `fabricId` | Held constant across a comparison, or the comparison means nothing |
 | `bandSetId`, `bandSetVersion` | Which thresholds coloured it — **required the moment anything is judged**, and not before |
-| `madeAt` | When |
+| `madeAt` | When — a real timestamp under the date rule below |
 
 A record missing any of these is not a weaker analysis, it is an unattributable
 one, and the validator refuses it rather than defaulting a field.
+
+Two of these are **checked**, not merely present:
+
+- **`patternRevisionNumber`** must be an integer of 1 or more. It is what a
+  comparison puts on screen ("v4 → v5"), and `0`, `-1` and the string `"4"` would
+  each render as something a reader would believe.
+- **`madeAt`** must satisfy the date rule in §9. An analysis that cannot be
+  placed in time cannot be matched to the band set that was in force when it was
+  made.
+
+`bodyId` and `fabricId` are required for a reason worth stating: `comparability()`
+refuses to compare two analyses made on different bodies or in different fabrics,
+and it can only do that if both say which. An analysis missing either is not
+merely incomplete — it will be compared against another *silently*, because the
+blocker has nothing to compare.
 
 The band-set pair is the one conditional entry. An analysis that reported numbers
 without classifying them had no thresholds to cite, so requiring them
@@ -199,9 +214,9 @@ re-meshing. Not offering it is more reliable than offering it with a warning.
 ```
 
 Levels, in order of severity: `slack · easy · close · tight · critical`.
-`fitBandSetProblems()` in `bands.js` is the full validator; `bandSetProblems()`
-in `metrics.js` checks the older cumulative `{ level, upTo }` shape that the
-first fit screens were written against, and remains only for them.
+`fitBandSetProblems()` in `bands.js` is the validator. There is no second one:
+`metrics.js` used to carry a `bandSetProblems()` over an older cumulative
+`{ level, upTo }` shape, and it is gone.
 
 **Ranges are half-open, `[from, to)`,** except the last, which closes at the
 metric's maximum. This is the only arrangement in which "exactly one band for
@@ -249,7 +264,26 @@ decision that differs by category and by fabric behaviour, changes without a
 deploy, and has to be quotable after the fact. A screen that coloured a garment
 by a threshold nobody can name is a screen nobody should act on.
 
-`classify(metricId, value, bandSet)` returns one of:
+### The one public classifier
+
+```
+classifyWithSet(bandSet, value, { purpose }) → classification
+```
+
+**This is the only way to turn a measurement into a word.** It takes a real
+`FitBandSet`. An earlier draft of this toolset had two — this one, and a
+`classify(metricId, value, bandSet)` in `metrics.js` taking the cumulative
+`{ level, upTo }` shape. Two contracts under one meaning is how a caller passes
+one shape to the function expecting the other and gets a confident answer from
+the wrong table; worse, the two **disagreed about boundaries**, because `value <=
+upTo` puts 12% in the band below and `[from, to)` puts it in the band above.
+
+What survives of the older one is `metricGuard(metricId, value)`, an **internal
+guard** answering only whether a value is answerable at all — not a metric, not
+measured, outside the arithmetic. It takes no band set and can name no band.
+`classifyWithSet` calls it first so those three sentences have one author.
+
+It returns one of:
 
 | Level | When | Evidence class |
 |---|---|---|
@@ -260,3 +294,46 @@ by a threshold nobody can name is a screen nobody should act on.
 
 Three of the four outcomes are warnings rather than judgements. That ratio is the
 point: the function refuses far more often than it decides.
+
+---
+
+## 9. Dates
+
+One rule, everywhere a date appears — `effectiveFrom`, `retiredOn`,
+`approval.approvedAt`, `author.at`, `provenance.madeAt`, and the `at` a selection
+is asked about:
+
+> A calendar date `YYYY-MM-DD`, which means **midnight UTC**, or a full ISO-8601
+> instant with an explicit zone: `YYYY-MM-DDTHH:mm[:ss[.sss]]` followed by `Z` or
+> `±HH:MM`. Nothing else.
+
+**A zone is mandatory on an instant.** `new Date("2026-09-01T00:00:00")` is parsed
+in the *runtime's* zone, so the same band set would come into force at different
+moments on a laptop in Bengaluru and on a server in UTC — surfacing as a fitting
+judged by the wrong version on exactly one day a year. A zone is one character;
+the bug it prevents is invisible.
+
+**Dates are compared as parsed instants, never as text.** `"2026-09-01"` and
+`"2026-08-31T20:00:00.000-04:00"` are the same moment and sort the other way as
+strings. A lexical comparison in an "is this set in force?" check is a silent
+wrong answer, which is the worst kind that check can give.
+
+A value that parses but never happened is refused too: the format is satisfied by
+`2026-02-30`, and `Date` rolls it forward to 2 March, so a set could take effect
+a day after a date that does not exist. `instantOf()` round-trips a calendar date
+to catch it.
+
+### Impossible chronology
+
+Well-formed dates in the wrong order are the harder mistake to see, because every
+field reads correctly on its own. `chronologyProblems()` refuses:
+
+| Case | Why |
+|---|---|
+| `retiredOn` at or before `effectiveFrom` | There is no moment at which the set was in force |
+| `approval.approvedAt` after `retiredOn` | An approval of something already withdrawn |
+
+And `selectBandSet()` refuses an unreadable `at` rather than defaulting to now —
+"which set judged this fitting?" asked with a date nothing can read is a question
+with no answer, and answering it with today's set would silently re-date somebody
+else's work.
