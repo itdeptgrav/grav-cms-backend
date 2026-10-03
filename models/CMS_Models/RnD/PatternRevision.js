@@ -327,6 +327,24 @@ const avatarSchema = new mongoose.Schema({
      Externally verified means at least one length was checked against something
      outside the file. A fitting states which it has. */
   scaleVerifiedAgainst: { type: String, trim: true, default: "" },
+  /* ── A GENERATED AVATAR, BY IMMUTABLE REVISION ─────────────────────────
+     When Pattern & Fit is set up on an OxiHuman avatar, this names the exact
+     avatar revision and its content hash. Avatar revisions are never edited
+     (`AvatarRevision.js`), and a render job freezes a copy of these inputs, so
+     a drape points at the body it was set up on even after the avatar gains a
+     newer revision. Declared field by field because Mongoose strips undeclared
+     paths here. Empty when the setup uses the capsule body from measurements. */
+  avatarRef: {
+    type: new mongoose.Schema({
+      avatarId: { type: String, trim: true, required: true },
+      revision: { type: Number, required: true, min: 1 },
+      contentSha256: { type: String, trim: true, required: true },
+      engine: { type: String, trim: true, default: "" },
+      engineVersion: { type: String, trim: true, default: "" },
+      verdict: { type: String, trim: true, default: "" },
+    }, { _id: false }),
+    default: null,
+  },
 }, { _id: false });
 
 /* ═══ WHAT THE IMPORTED OUTLINE MEANS ═════════════════════════════════════
@@ -513,9 +531,7 @@ const editorNotchSchema = new mongoose.Schema({
 }, { _id: false });
 
 const editorRunSchema = new mongoose.Schema({
-  /* Empty only on a side the editor cannot express — several runs sewn in order
-     — which is carried and marked rather than reduced to its first run. */
-  pieceId: { type: String, trim: true, default: "" },
+  pieceId: { type: String, trim: true, required: true },
   /* ── A RUN IS A LIST OF EDGES, IN TRAVEL ORDER ───────────────────────
      Not a pair of endpoints. Two points on a closed boundary divide it into two
      stretches and both are real — a neckline and "all of the front except the
@@ -525,13 +541,52 @@ const editorRunSchema = new mongoose.Schema({
   reversed: { type: Boolean, default: false },
   lengthMm: { type: Number, default: null, min: 0 },
   role: { type: String, trim: true, default: "" },
+  /* Traced in the editor, or translated from a mapping made in the setup panel
+     before the editor existed. A reader weighing a seam is entitled to know. */
+  provenance: { type: String, enum: ["authored", "imported", "derived"], default: "authored" },
+  /* The alignment marks that fall on this run, in sewing order. A notch is the
+     patternmaker's own statement of where two runs meet, and a seam that loses
+     their order loses the one check a machinist actually makes. */
+  notchIds: { type: [String], default: [] },
+}, { _id: false });
+
+/* ── A SIDE IS AN ORDERED LIST OF RUNS ────────────────────────────────────
+ *
+ * The thing one run per side could not say. An armhole is the front-left armhole
+ * AND the back-left armhole, sewn in that order, to one sleeve cap; a neck band
+ * goes round a front neckline and a back neckline. Those are consecutive sewing
+ * operations on two pieces — not one run, and not two seams.
+ *
+ * Reducing such a side to its first run looks like it works and is the worst
+ * available answer: on the archive's own export it paired a 12 cm run with a
+ * 27 cm one and produced 119% of ease that is nowhere in the garment.
+ *
+ * ── RUNS ON DIFFERENT PIECES DO NOT TOUCH, AND THAT IS NOT AN ERROR ────────
+ * A front and a back sit apart on a marker. The order is the order a machinist
+ * sews them, not a claim about where they lie in 2D, so nothing here asks their
+ * endpoints to meet.
+ */
+const editorSideSchema = new mongoose.Schema({
+  runs: { type: [editorRunSchema], default: [] },
+  /* Turns the whole side round: the run ORDER reverses and each run reverses
+     with it, so a cap about to go in backwards is corrected in one action
+     rather than by re-picking every edge. */
+  reversed: { type: Boolean, default: false },
 }, { _id: false });
 
 const editorSeamSchema = new mongoose.Schema({
   seamId: { type: String, trim: true, required: true },
   name: { type: String, trim: true, default: "", maxlength: 160 },
-  a: { type: editorRunSchema, required: true },
-  b: { type: editorRunSchema, required: true },
+  sideA: { type: editorSideSchema, default: () => ({ runs: [], reversed: false }) },
+  sideB: { type: editorSideSchema, default: () => ({ runs: [], reversed: false }) },
+  /* ── SCHEMA v1, KEPT SO AN OLD DOCUMENT SURVIVES BEING READ ──────────
+     v1 stored one run per side, as `a` and `b`. A document saved then is
+     migrated on read into single-item `runs` arrays; these two exist only so
+     mongoose does not strip them off a v1 record on the way past, which would
+     turn a migration into the silent loss of somebody's seam mapping. Nothing
+     writes them. See `patternEditorDocument.js`. */
+  a: { type: mongoose.Schema.Types.Mixed, default: undefined },
+  b: { type: mongoose.Schema.Types.Mixed, default: undefined },
   alignment: { type: String, enum: ["start-to-start", "start-to-end", ""], default: "" },
   /* `needs-checking` is a real outcome and the commonest honest one. A cap sewn
      front to back has the right length, the right perimeter and the right scale,
@@ -543,8 +598,10 @@ const editorSeamSchema = new mongoose.Schema({
   easeMm: { type: Number, default: null },
   easePercent: { type: Number, default: null },
   note: { type: String, trim: true, default: "", maxlength: 400 },
-  /* A mapping carried in from the setup panel whose side is several runs sewn in
-     order — a set-in sleeve, a neck band. Shown, kept, and not editable here. */
+  /* ── NO LONGER REACHABLE, AND KEPT FOR THE RECORDS THAT CARRY IT ────
+     Set by schema v1 on a seam whose side was several runs sewn in order,
+     because the editor could not express one. It can now, so nothing sets this;
+     it stays so a v1 revision saved while it was true still reads back. */
   unsupported: { type: Boolean, default: false },
 }, { _id: false });
 

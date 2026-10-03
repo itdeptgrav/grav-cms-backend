@@ -34,6 +34,7 @@ const { styleForCompany } = require("../companyContext/rndScope.service");
 const { checkInputs, adapterStatus } = require("./simulationAdapter.service");
 const editorDoc = require("./patternEditorDocument");
 const { fail } = require("../storePurchase/errors");
+const avatarLibrary = require("./avatar.service");
 
 const str = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const clean = (v, max) => str(v).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(0, max);
@@ -157,6 +158,10 @@ function revisionView(row, { geometry = false } = {}) {
     view.editorDocument = resolved.document;
     view.editorDocumentOrigin = resolved.origin;
     view.editorDocumentProblems = resolved.problems;
+    /* What a migration did, in words. A reader opening a revision saved under an
+       older schema is entitled to know that something was rebuilt rather than
+       simply finding it there. */
+    view.editorDocumentNotes = resolved.notes || [];
     view.editorSchemaVersion = editorDoc.EDITOR_SCHEMA_VERSION;
   }
   return view;
@@ -812,42 +817,48 @@ function simulationInputsFromEditor(document, parent, who = null, at = new Date(
   const inputs = JSON.parse(JSON.stringify(parent.simulationInputs || {}));
   const seams = Array.isArray(document.seams) ? document.seams : [];
 
+  /* ── CONFIRMED MEANS A PERSON STATED THE ALIGNMENT AND TICKED IT ────── */
   const everyOneConfirmed = seams.length > 0
-    && seams.every((s) => str(s.confidence) === "confirmed" && str(s.alignment));
+    && seams.every((s) => str(s.confidence) === "confirmed" && str(s.alignment)
+      && (s.sideA?.runs || []).length && (s.sideB?.runs || []).length);
   if (!everyOneConfirmed) {
     return { inputs, confirmedAgainst: str(parent.mappingConfirmedAgainstRef) };
   }
 
+  const pieceOf = (pieceId) => (document.pieces || [])
+    .find((x) => str(x.pieceId) === str(pieceId)) || null;
   const refOf = (pieceId) => {
-    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(pieceId));
+    const p = pieceOf(pieceId);
     return p ? (str(p.pieceRef) || `PP-${str(p.pieceId).toUpperCase()}`) : "";
   };
-  const indexOf = (pieceId, pointId) => {
-    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(pieceId));
-    return p ? (p.points || []).findIndex((v) => str(v.pointId) === str(pointId)) : -1;
-  };
 
-  /* A run's anchors are the first edge's start and the last edge's end, in the
-     order the editor stored them — which is the order it is sewn. */
+  /* ── ONE EDITOR RUN → ONE STORED RUN ──────────────────────────────────
+     Anchored by point index on its own piece, in the direction it is sewn. The
+     stored contract has always carried an ARRAY of these per side, because a
+     set-in sleeve is one cap sewn to two body runs in order; the editor can now
+     say that, so this is a translation rather than a reduction. */
   const runRecord = (run, runId) => {
+    const p = pieceOf(run.pieceId);
     const ids = Array.isArray(run.edgePointIds) ? run.edgePointIds : [];
-    if (!ids.length) return null;
-    const startId = run.reversed ? ids[ids.length - 1] : ids[0];
-    const endEdge = run.reversed ? ids[0] : ids[ids.length - 1];
-    const p = (document.pieces || []).find((x) => str(x.pieceId) === str(run.pieceId));
-    if (!p) return null;
-    const endIndex = (indexOf(run.pieceId, endEdge) + (run.reversed ? 0 : 1)) % p.points.length;
-    const startIndex = indexOf(run.pieceId, startId) + (run.reversed ? 1 : 0);
-    if (startIndex < 0 || endIndex < 0) return null;
+    if (!p || !ids.length) return null;
+    const order = (p.points || []).map((v) => str(v.pointId));
+    const n = order.length;
+    const first = order.indexOf(str(ids[0]));
+    const last = order.indexOf(str(ids[ids.length - 1]));
+    if (first < 0 || last < 0) return null;
+
+    /* The run spans the edges it names: it starts where the first one starts and
+       ends where the last one ends. Reversed, those two swap. */
+    const startIndex = run.reversed ? (last + 1) % n : first;
+    const endIndex = run.reversed ? first : (last + 1) % n;
     return {
       runId,
-      startAnchor: { kind: "turn-point", pointIndex: startIndex % p.points.length },
+      startAnchor: { kind: "turn-point", pointIndex: startIndex },
       endAnchor: { kind: "turn-point", pointIndex: endIndex },
       direction: run.reversed ? "reverse" : "forward",
-      /* The editor named the edges, so which of the two stretches it is is not a
-         guess: it is the one whose edges were picked. More than half the
-         boundary means it took the long way round. */
-      theLongWay: ids.length > Math.floor(p.points.length / 2),
+      /* Which of the two stretches between the anchors: not a guess, because the
+         editor named the edges. More than half the boundary is the long way. */
+      theLongWay: ids.length > Math.floor(n / 2),
       role: str(run.role),
       lengthMm: Number.isFinite(run.lengthMm) ? run.lengthMm : null,
     };
@@ -864,27 +875,38 @@ function simulationInputsFromEditor(document, parent, who = null, at = new Date(
     return byRef.get(ref);
   };
 
+  /* A side becomes an ordered list of run refs — the order the machinist sews
+     them, which is the order the editor stored them in. */
+  const sideRecord = (side, seamId, label) => {
+    const runs = editorDoc.orderedRunsOf(side);
+    const refs = [];
+    for (let i = 0; i < runs.length; i += 1) {
+      const ref = refOf(runs[i].pieceId);
+      const runId = `${seamId}-${label}${runs.length > 1 ? i + 1 : ""}`;
+      const record = runRecord(runs[i], runId);
+      if (!ref || !record) return null;
+      ensure(ref).runs.push(record);
+      refs.push({ pieceRef: ref, runId });
+    }
+    return refs.length ? refs : null;
+  };
+
   const out = [];
   for (const seam of seams) {
-    const aRef = refOf(seam.a?.pieceId);
-    const bRef = refOf(seam.b?.pieceId);
-    const aRun = runRecord(seam.a || {}, `${str(seam.seamId)}-a`);
-    const bRun = runRecord(seam.b || {}, `${str(seam.seamId)}-b`);
-    if (!aRef || !bRef || !aRun || !bRun) continue;
-    ensure(aRef).runs.push(aRun);
-    ensure(bRef).runs.push(bRun);
+    const seamId = str(seam.seamId);
+    const sideA = sideRecord(seam.sideA, seamId, "a");
+    const sideB = sideRecord(seam.sideB, seamId, "b");
+    if (!sideA || !sideB) continue;
     out.push({
-      seamId: str(seam.seamId),
+      seamId,
       name: clean(seam.name, 160),
-      sideA: [{ pieceRef: aRef, runId: aRun.runId }],
-      sideB: [{ pieceRef: bRef, runId: bRun.runId }],
+      sideA,
+      sideB,
       alignment: str(seam.alignment),
       confidence: "confirmed",
       /* ── A CONFIRMATION NOBODY IS ATTRIBUTABLE FOR IS A GUESS (R4) ──
          Ticking "I have checked this" in the editor IS the confirmation
-         readiness asks for, so it is recorded with the person who ticked it and
-         when. Without this the mapping is complete and still refused, which
-         sends somebody to a second screen to re-state what they just stated. */
+         readiness asks for, so it carries the person who ticked it and when. */
       alignmentConfirmed: { by: who || undefined, at },
       easePercent: Number.isFinite(seam.easePercent) ? seam.easePercent : null,
     });
@@ -1188,11 +1210,24 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
     })
     : (held.seams || []);
 
+  /* ── AN AVATAR IS NAMED BY AN IMMUTABLE REVISION THAT MUST EXIST ───────
+     A setup on a generated avatar points at one revision of it, checked here
+     against the style's own avatar library and its content hash, so the
+     pointer a render job freezes always resolves to the body it names. The
+     client's copy of the verdict and engine is replaced by the stored one. */
+  let avatar = inputs.avatar || held.avatar || {};
+  if (inputs.avatar && inputs.avatar.avatarRef) {
+    const ref = await avatarLibrary.assertAvatarRef(ctx.companyId, row.styleId, inputs.avatar.avatarRef);
+    avatar = { ...inputs.avatar, avatarRef: ref };
+  } else if (inputs.avatar && !inputs.avatar.avatarRef) {
+    avatar = { ...inputs.avatar, avatarRef: null };
+  }
+
   row.simulationInputs = {
     template: inputs.template !== undefined ? clean(inputs.template, 40) : str(held.template),
     renderSize: inputs.renderSize !== undefined
       ? clean(inputs.renderSize, 40) : str(held.renderSize),
-    avatar: inputs.avatar || held.avatar || {},
+    avatar,
     pieces,
     seams,
     fabrics: Array.isArray(inputs.fabrics) ? inputs.fabrics : (held.fabrics || []),

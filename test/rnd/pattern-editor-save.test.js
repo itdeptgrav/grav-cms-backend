@@ -308,8 +308,8 @@ describe("what a pattern editor knows, and what the schema now holds", () => {
     };
     doc.seams = [{
       seamId: "s1", name: "Left side",
-      a: { pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[1].pointId], reversed: false, lengthMm: 123.4, role: "side" },
-      b: { pieceId: doc.pieces[1].pieceId, edgePointIds: [doc.pieces[1].points[0].pointId, doc.pieces[1].points[1].pointId], reversed: true, lengthMm: 125.9, role: "side" },
+      sideA: { runs: [{ pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[1].pointId], reversed: false, lengthMm: 123.4, role: "side", provenance: "authored", notchIds: [] }], reversed: false },
+      sideB: { runs: [{ pieceId: doc.pieces[1].pieceId, edgePointIds: [doc.pieces[1].points[0].pointId, doc.pieces[1].points[1].pointId], reversed: true, lengthMm: 125.9, role: "side", provenance: "authored", notchIds: [] }], reversed: false },
       alignment: "start-to-start", confidence: "needs-checking", easeMm: 2.5, easePercent: 2.03, note: "",
     }];
     doc.measurements = [{
@@ -346,8 +346,8 @@ describe("what a pattern editor knows, and what the schema now holds", () => {
       seamId: "s1", name: "Left side", alignment: "start-to-start",
       confidence: "needs-checking", easeMm: 2.5, easePercent: 2.03,
     });
-    expect(back.seams[0].a.edgePointIds.length).toBe(2);
-    expect(back.seams[0].b.reversed).toBe(true);
+    expect(back.seams[0].sideA.runs[0].edgePointIds.length).toBe(2);
+    expect(back.seams[0].sideB.runs[0].reversed).toBe(true);
 
     expect(back.measurements[0]).toMatchObject({
       measurementId: "m1", kind: "straight", name: "Chest width", pomCode: "A-01",
@@ -359,12 +359,12 @@ describe("what a pattern editor knows, and what the schema now holds", () => {
     const w = await world();
     const parent = await imported(w);
     const doc = enrich((await documentOf(w, parent.id)).editorDocument);
-    const wanted = doc.seams[0].a.edgePointIds.slice();
+    const wanted = doc.seams[0].sideA.runs[0].edgePointIds.slice();
     const saved = await patterns.saveEditorRevision(w.ctx, {
       revisionId: parent.id, document: doc, name: "x", actor: w.actor,
     });
     const back = (await documentOf(w, saved.revision.id)).editorDocument;
-    expect(back.seams[0].a.edgePointIds).toEqual(wanted);
+    expect(back.seams[0].sideA.runs[0].edgePointIds).toEqual(wanted);
     const onPiece = new Set(back.pieces[0].points.map((v) => v.pointId));
     for (const id of wanted) expect(onPiece.has(id)).toBe(true);
   });
@@ -418,8 +418,8 @@ describe("a document that cannot be saved", () => {
       seamId: "s1", name: "Broken",
       /* Edges 0 and 2 — with 1 missing. Sewn as one run, cloth is attached to a
          gap, and nothing on the screen shows it. */
-      a: { pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[2].pointId] },
-      b: { pieceId: d.pieces[1].pieceId, edgePointIds: [d.pieces[1].points[0].pointId] },
+      sideA: { runs: [{ pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[2].pointId] }] },
+      sideB: { runs: [{ pieceId: d.pieces[1].pieceId, edgePointIds: [d.pieces[1].points[0].pointId] }] },
       alignment: "", confidence: "proposed",
     }];
     const err = await refuses(() => patterns.saveEditorRevision(w.ctx, {
@@ -434,10 +434,10 @@ describe("a document that cannot be saved", () => {
     const d = await doc(w, parent);
     const p = d.pieces[0];
     const q = d.pieces[1];
-    const run = { pieceId: p.pieceId, edgePointIds: [p.points[0].pointId] };
+    const side = { runs: [{ pieceId: p.pieceId, edgePointIds: [p.points[0].pointId] }] };
     d.seams = [
-      { seamId: "s1", name: "First", a: run, b: { pieceId: q.pieceId, edgePointIds: [q.points[0].pointId] }, alignment: "", confidence: "proposed" },
-      { seamId: "s2", name: "Second", a: run, b: { pieceId: q.pieceId, edgePointIds: [q.points[1].pointId] }, alignment: "", confidence: "proposed" },
+      { seamId: "s1", name: "First", sideA: side, sideB: { runs: [{ pieceId: q.pieceId, edgePointIds: [q.points[0].pointId] }] }, alignment: "", confidence: "proposed" },
+      { seamId: "s2", name: "Second", sideA: side, sideB: { runs: [{ pieceId: q.pieceId, edgePointIds: [q.points[1].pointId] }] }, alignment: "", confidence: "proposed" },
     ];
     const err = await refuses(() => patterns.saveEditorRevision(w.ctx, {
       revisionId: parent.id, document: d, name: "x", actor: w.actor,
@@ -451,8 +451,8 @@ describe("a document that cannot be saved", () => {
     const d = await doc(w, parent);
     d.seams = [{
       seamId: "s1", name: "Wrong piece",
-      a: { pieceId: d.pieces[0].pieceId, edgePointIds: [d.pieces[1].points[0].pointId] },
-      b: { pieceId: d.pieces[1].pieceId, edgePointIds: [d.pieces[1].points[1].pointId] },
+      sideA: { runs: [{ pieceId: d.pieces[0].pieceId, edgePointIds: [d.pieces[1].points[0].pointId] }] },
+      sideB: { runs: [{ pieceId: d.pieces[1].pieceId, edgePointIds: [d.pieces[1].points[1].pointId] }] },
       alignment: "", confidence: "proposed",
     }];
     await refuses(() => patterns.saveEditorRevision(w.ctx, {
@@ -578,8 +578,8 @@ describe("a seam mapping confirmed in the editor", () => {
     const q = doc.pieces[1];
     return {
       seamId: "s-side", name: "Left side",
-      a: { pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[1].pointId], reversed: false, role: "side" },
-      b: { pieceId: q.pieceId, edgePointIds: [q.points[0].pointId, q.points[1].pointId], reversed: true, role: "side" },
+      sideA: { runs: [{ pieceId: p.pieceId, edgePointIds: [p.points[0].pointId, p.points[1].pointId], reversed: false, role: "side" }], reversed: false },
+      sideB: { runs: [{ pieceId: q.pieceId, edgePointIds: [q.points[0].pointId, q.points[1].pointId], reversed: true, role: "side" }], reversed: false },
       alignment: "start-to-start", confidence: "confirmed", easePercent: 1.2,
     };
   };
@@ -682,13 +682,16 @@ describe("a seam mapping that already exists on the revision", () => {
        two edges. What matters here is that a single-run side arrives as a LIST
        of edges rather than as nothing — the multi-edge case is the same code
        path and is walked against the real 125-point export. */
-    const usable = seams.filter((s) => !s.unsupported);
-    expect(usable.length).toBeGreaterThan(0);
-    for (const s of usable) {
-      expect(s.a.edgePointIds.length).toBeGreaterThan(0);
-      expect(s.b.edgePointIds.length).toBeGreaterThan(0);
-      expect(Array.isArray(s.a.edgePointIds)).toBe(true);
+    expect(seams.length).toBeGreaterThan(0);
+    for (const s of seams) {
+      expect(s.sideA.runs.length).toBeGreaterThan(0);
+      expect(s.sideB.runs.length).toBeGreaterThan(0);
+      for (const run of [...s.sideA.runs, ...s.sideB.runs]) {
+        expect(run.edgePointIds.length).toBeGreaterThan(0);
+      }
     }
+    /* And at least one side is COMPOUND — the thing v1 could not say. */
+    expect(seams.some((s) => s.sideA.runs.length > 1 || s.sideB.runs.length > 1)).toBe(true);
   });
 
   test("THE RUN IS THE STRETCH IT WAS MEANT TO BE, BY LENGTH", async () => {
@@ -701,23 +704,9 @@ describe("a seam mapping that already exists on the revision", () => {
       revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
     });
     const doc = (await documentOf(w, parent.id)).editorDocument;
-    const lengthOf = (run) => {
-      const p = doc.pieces.find((x) => x.pieceId === run.pieceId);
-      if (!p) return 0;
-      const order = p.points.map((v) => v.pointId);
-      let total = 0;
-      for (const id of run.edgePointIds) {
-        const i = order.indexOf(id);
-        const a = p.points[i];
-        const b = p.points[(i + 1) % p.points.length];
-        total += Math.hypot(b.x - a.x, b.y - a.y);
-      }
-      return total;
-    };
     for (const s of doc.seams) {
-      if (s.unsupported) continue;
-      const a = lengthOf(s.a);
-      const b = lengthOf(s.b);
+      const a = editorDoc.sideLength(s.sideA, doc.pieces).totalMm;
+      const b = editorDoc.sideLength(s.sideB, doc.pieces).totalMm;
       const ease = Math.abs(a - b) / Math.max(1, Math.min(a, b));
       expect(ease).toBeLessThan(0.3);
     }
@@ -743,7 +732,461 @@ describe("a seam mapping that already exists on the revision", () => {
     }
   });
 
-  test("and an unsupported seam does not block a save", async () => {
+  test("every seam is expressible, so opening and saving re-confirms the mapping", async () => {
+    /* The blocker this task removes. Three of the ten seams had a side made of
+       several runs sewn in order, so the mapping could never be re-confirmed in
+       the editor, so every save carried the parent's stamp and readiness refused
+       with R11 for ever. A side is a list of runs now. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    expect(doc.seams.every((s) => s.sideA.runs.length && s.sideB.runs.length)).toBe(true);
+    expect(doc.seams.some((s) => s.unsupported)).toBe(false);
+
+    const confirmed = {
+      ...doc,
+      seams: doc.seams.map((s) => ({ ...s, confidence: "confirmed", alignment: s.alignment || "start-to-start" })),
+    };
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: confirmed, name: "Mapping re-confirmed", actor: w.actor,
+    });
+    const row = await PatternRevision.findById(saved.revision.id).lean();
+    expect(row.mappingConfirmedAgainstRef).toBe(row.revisionRef);
+    expect(saved.revision.readiness.failures.map((f) => f.code)).not.toContain("R11");
+  });
+
+  test("a document with no seams at all leaves the parent's mapping alone", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const before = (await PatternRevision.findById(parent.id).lean()).simulationInputs;
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "x", actor: w.actor,
+    });
+    const row = await PatternRevision.findById(saved.revision.id).lean();
+    /* By value, not by serialised key order: a mongoose round trip reorders
+       keys and that is not a change to anything. */
+    expect(row.simulationInputs).toEqual(before);
+  });
+});
+
+/* ═══ 9 · A MAPPING MADE SOMEWHERE ELSE ═══════════════════════════════════ */
+
+describe("a seam mapping that already exists on the revision", () => {
+  test("IT REACHES THE EDITOR AS MULTI-EDGE RUNS, NOT AS NOTHING", async () => {
+    /* Opening a mapped revision in the editor and saving it must not silently
+       drop the mapping — that would make a renderable pattern un-renderable for
+       no reason anybody could see. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const read = await documentOf(w, parent.id);
+    const seams = read.editorDocument.seams;
+    expect(seams.length).toBeGreaterThan(0);
+    /* The fixture's pieces are eight and four points, so its runs are one and
+       two edges. What matters here is that a single-run side arrives as a LIST
+       of edges rather than as nothing — the multi-edge case is the same code
+       path and is walked against the real 125-point export. */
+    expect(seams.length).toBeGreaterThan(0);
+    for (const s of seams) {
+      expect(s.sideA.runs.length).toBeGreaterThan(0);
+      expect(s.sideB.runs.length).toBeGreaterThan(0);
+      for (const run of [...s.sideA.runs, ...s.sideB.runs]) {
+        expect(run.edgePointIds.length).toBeGreaterThan(0);
+      }
+    }
+    /* And at least one side is COMPOUND — the thing v1 could not say. */
+    expect(seams.some((s) => s.sideA.runs.length > 1 || s.sideB.runs.length > 1)).toBe(true);
+  });
+
+  test("THE RUN IS THE STRETCH IT WAS MEANT TO BE, BY LENGTH", async () => {
+    /* `theLongWay` is about arc length. Choosing by edge count instead picks a
+       twenty-nine-segment curve over the four long segments the other way round
+       and hands the solver a 27 cm run to sew to a 12 cm one. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    for (const s of doc.seams) {
+      const a = editorDoc.sideLength(s.sideA, doc.pieces).totalMm;
+      const b = editorDoc.sideLength(s.sideB, doc.pieces).totalMm;
+      const ease = Math.abs(a - b) / Math.max(1, Math.min(a, b));
+      expect(ease).toBeLessThan(0.3);
+    }
+  });
+
+  test("A SIDE MADE OF SEVERAL RUNS IS CARRIED, NOT MISTRANSLATED", async () => {
+    /* A set-in sleeve is one cap run sewn to two or three body runs in order.
+       The editor's run is one continuous stretch on one piece and cannot say
+       that, so the seam is kept and marked rather than silently reduced to its
+       first run — which is what produced 119% of ease that was nowhere in the
+       pattern. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const carried = doc.seams.filter((s) => s.unsupported);
+    for (const s of carried) {
+      expect(s.confidence).toBe("needs-checking");
+      expect(s.note).toMatch(/runs sewn in order/);
+      expect(s.a.edgePointIds.length === 0 || s.b.edgePointIds.length === 0).toBe(true);
+    }
+  });
+
+});
+
+/* ═══ 10 · COMPOUND SEAM SIDES ════════════════════════════════════════════ */
+
+describe("a seam side is an ordered list of runs", () => {
+  const runOn = (doc, i, at, count) => {
+    const p = doc.pieces[i];
+    return {
+      pieceId: p.pieceId,
+      edgePointIds: Array.from({ length: count },
+        (_, k) => p.points[(at + k) % p.points.length].pointId),
+      reversed: false,
+      role: "",
+      provenance: "authored",
+      notchIds: [],
+    };
+  };
+
+  const seamOf = (a, b, over = {}) => ({
+    seamId: "s1", name: "A seam",
+    sideA: { runs: a, reversed: false },
+    sideB: { runs: b, reversed: false },
+    alignment: "start-to-start", confidence: "needs-checking",
+    easeMm: null, easePercent: null, note: "",
+    ...over,
+  });
+
+  test("ONE RUN PER SIDE STILL WORKS", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    doc.seams = [seamOf([runOn(doc, 0, 0, 2)], [runOn(doc, 1, 0, 2)])];
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "One run a side", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    expect(back.seams[0].sideA.runs).toHaveLength(1);
+    expect(back.seams[0].sideB.runs).toHaveLength(1);
+  });
+
+  test("SEVERAL RUNS ON ONE PIECE ARE KEPT IN ORDER", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const first = runOn(doc, 0, 0, 2);
+    const second = runOn(doc, 0, 4, 2);
+    doc.seams = [seamOf([first, second], [runOn(doc, 1, 0, 4)])];
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "Two runs one piece", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    expect(back.seams[0].sideA.runs.map((r) => r.edgePointIds))
+      .toEqual([first.edgePointIds, second.edgePointIds]);
+  });
+
+  test("RUNS ON DIFFERENT PIECES ARE NOT REFUSED FOR BEING APART IN 2D", async () => {
+    /* A front and a back sit apart on a marker. The order is the order a
+       machinist sews them, not a claim about where they lie. */
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    doc.seams = [seamOf(
+      [runOn(doc, 0, 0, 2), runOn(doc, 1, 0, 2)],
+      [runOn(doc, 2, 0, 2)],
+    )];
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "Front and back to one cap", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    const pieces = back.seams[0].sideA.runs.map((r) => r.pieceId);
+    expect(new Set(pieces).size).toBe(2);
+  });
+
+  test("the saved ORDER is authoritative and survives a reload", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const a = runOn(doc, 1, 0, 2);
+    const b = runOn(doc, 0, 0, 2);
+    doc.seams = [seamOf([a, b], [runOn(doc, 2, 0, 2)])];
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "Back then front", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    expect(back.seams[0].sideA.runs[0].pieceId).toBe(a.pieceId);
+    expect(back.seams[0].sideA.runs[1].pieceId).toBe(b.pieceId);
+  });
+
+  test("a run's own reversal and the side's are both kept", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const a = { ...runOn(doc, 0, 0, 2), reversed: true };
+    doc.seams = [seamOf([a, runOn(doc, 1, 0, 2)], [runOn(doc, 2, 0, 2)],
+      { sideA: { runs: [a, runOn(doc, 1, 0, 2)], reversed: true } })];
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "Reversed", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    expect(back.seams[0].sideA.reversed).toBe(true);
+    expect(back.seams[0].sideA.runs[0].reversed).toBe(true);
+  });
+
+  test("REVERSING A SIDE TURNS THE RUN ORDER AND EACH RUN", () => {
+    const pieces = [
+      { pieceId: "p1", points: [{ pointId: "a", x: 0, y: 0 }, { pointId: "b", x: 10, y: 0 }, { pointId: "c", x: 10, y: 10 }] },
+    ];
+    const side = { runs: [{ pieceId: "p1", edgePointIds: ["a"] }, { pieceId: "p1", edgePointIds: ["b"] }], reversed: true };
+    const ordered = editorDoc.orderedRunsOf(side);
+    expect(ordered.map((r) => r.edgePointIds[0])).toEqual(["b", "a"]);
+    expect(ordered.every((r) => r.reversed)).toBe(true);
+  });
+
+  test("the total length is the sum of the runs, with where each one starts", () => {
+    const pieces = [
+      { pieceId: "p1", name: "Front", points: [
+        { pointId: "a", x: 0, y: 0 }, { pointId: "b", x: 30, y: 0 },
+        { pointId: "c", x: 30, y: 40 }, { pointId: "d", x: 0, y: 40 }] },
+      { pieceId: "p2", name: "Back", points: [
+        { pointId: "e", x: 100, y: 0 }, { pointId: "f", x: 120, y: 0 },
+        { pointId: "g", x: 120, y: 10 }, { pointId: "h", x: 100, y: 10 }] },
+    ];
+    const side = { runs: [
+      { pieceId: "p1", edgePointIds: ["a"] },      /* 30 */
+      { pieceId: "p2", edgePointIds: ["e"] },      /* 20 */
+    ], reversed: false };
+    const out = editorDoc.sideLength(side, pieces);
+    expect(out.totalMm).toBe(50);
+    expect(out.stations).toHaveLength(2);
+    expect(out.stations[0]).toMatchObject({ pieceName: "Front", lengthMm: 30, atMm: 0 });
+    expect(out.stations[1]).toMatchObject({ pieceName: "Back", lengthMm: 20, atMm: 30 });
+  });
+
+  test("the path runs through every run in sewing order", () => {
+    const pieces = [
+      { pieceId: "p1", points: [{ pointId: "a", x: 0, y: 0 }, { pointId: "b", x: 10, y: 0 }, { pointId: "c", x: 10, y: 5 }] },
+    ];
+    const path = editorDoc.sidePath({ runs: [{ pieceId: "p1", edgePointIds: ["a", "b"] }] }, pieces);
+    expect(path.map((p) => p.pointId)).toEqual(["a", "b", "c"]);
+  });
+
+  /* ── WHAT IS REFUSED ─────────────────────────────────────────────────── */
+
+  test("a side with no runs is not a side", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    doc.seams = [seamOf([], [runOn(doc, 1, 0, 2)])];
+    const err = await refuses(() => patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "x", actor: w.actor,
+    }), "VALIDATION");
+    expect(err.message).toMatch(/no runs/);
+  });
+
+  test("THE SAME RUN TWICE ON ONE SIDE IS REFUSED", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const a = runOn(doc, 0, 0, 2);
+    doc.seams = [seamOf([a, { ...a }], [runOn(doc, 1, 0, 4)])];
+    const err = await refuses(() => patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "x", actor: w.actor,
+    }), "VALIDATION");
+    expect(err.message).toMatch(/already in this side/);
+  });
+
+  test("a run naming a piece that is not in the document is refused", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    doc.seams = [seamOf([{ ...runOn(doc, 0, 0, 2), pieceId: "nope" }], [runOn(doc, 1, 0, 2)])];
+    await refuses(() => patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "x", actor: w.actor,
+    }), "VALIDATION");
+  });
+
+  test("an edge in two seams is refused even across compound sides", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const shared = runOn(doc, 0, 0, 2);
+    doc.seams = [
+      seamOf([shared], [runOn(doc, 1, 0, 2)]),
+      { ...seamOf([runOn(doc, 2, 0, 2), shared], [runOn(doc, 3, 0, 2)]), seamId: "s2" },
+    ];
+    const err = await refuses(() => patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: doc, name: "x", actor: w.actor,
+    }), "VALIDATION");
+    expect(err.message).toMatch(/already sewn into/);
+  });
+});
+
+/* ═══ 11 · SCHEMA v1 → v2 ═════════════════════════════════════════════════ */
+
+describe("a document saved under schema v1", () => {
+  const v1Seam = (doc) => ({
+    seamId: "s-old", name: "Left side",
+    a: { pieceId: doc.pieces[0].pieceId, edgePointIds: [doc.pieces[0].points[0].pointId], reversed: false, role: "side" },
+    b: { pieceId: doc.pieces[1].pieceId, edgePointIds: [doc.pieces[1].points[0].pointId], reversed: true, role: "side" },
+    alignment: "start-to-start", confidence: "confirmed", easePercent: 1.2, note: "",
+  });
+
+  test("IT STILL OPENS, AND ITS SIDES BECOME ONE-RUN LISTS", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    await PatternRevision.updateOne({ _id: parent.id }, {
+      $set: { editorDocument: { ...doc, schemaVersion: 1, seams: [v1Seam(doc)] } },
+    });
+    const read = await documentOf(w, parent.id);
+    expect(read.editorDocumentOrigin).toBe("migrated-v1");
+    expect(read.editorDocument.schemaVersion).toBe(editorDoc.EDITOR_SCHEMA_VERSION);
+    const seam = read.editorDocument.seams[0];
+    expect(seam.sideA.runs).toHaveLength(1);
+    expect(seam.sideB.runs).toHaveLength(1);
+    expect(seam.sideB.runs[0].reversed).toBe(true);
+    expect(seam.alignment).toBe("start-to-start");
+    expect(seam.confidence).toBe("confirmed");
+  });
+
+  test("NOTHING ABOUT ITS MEANING CHANGES", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const old = v1Seam(doc);
+    await PatternRevision.updateOne({ _id: parent.id }, {
+      $set: { editorDocument: { ...doc, schemaVersion: 1, seams: [old] } },
+    });
+    const seam = (await documentOf(w, parent.id)).editorDocument.seams[0];
+    expect(seam.sideA.runs[0].edgePointIds).toEqual(old.a.edgePointIds);
+    expect(seam.sideA.runs[0].pieceId).toBe(old.a.pieceId);
+    expect(seam.sideB.runs[0].edgePointIds).toEqual(old.b.edgePointIds);
+  });
+
+  test("A v1 SEAM MARKED UNSUPPORTED IS REBUILT, NOT DROPPED", async () => {
+    /* v1 wrote `unsupported` when a stored side was several runs and it could
+       not hold them, emptying the sides. The edges are recoverable from the
+       mapping v1 read, and an absent seam looks like a garment with no armhole. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const compound = doc.seams.find((s) => s.sideA.runs.length > 1 || s.sideB.runs.length > 1);
+    expect(compound).toBeTruthy();
+
+    await PatternRevision.updateOne({ _id: parent.id }, {
+      $set: {
+        editorDocument: {
+          ...doc, schemaVersion: 1,
+          seams: [{
+            seamId: compound.seamId, name: compound.name, unsupported: true,
+            a: { pieceId: "", edgePointIds: [] }, b: { pieceId: "", edgePointIds: [] },
+            alignment: compound.alignment, confidence: "needs-checking", note: "carried",
+          }],
+        },
+      },
+    });
+    const read = await documentOf(w, parent.id);
+    const back = read.editorDocument.seams[0];
+    expect(back.unsupported).toBeFalsy();
+    expect(back.sideA.runs.length + back.sideB.runs.length).toBeGreaterThan(2);
+    expect(read.editorDocumentNotes.join(" ")).toMatch(/rebuilt from the mapping it came from/);
+  });
+
+  test("a v1 seam whose edges cannot be recovered is kept and still refused", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    await PatternRevision.updateOne({ _id: parent.id }, {
+      $set: {
+        editorDocument: {
+          ...doc, schemaVersion: 1,
+          seams: [{
+            seamId: "s-lost", name: "Left armhole", unsupported: true,
+            a: { pieceId: "", edgePointIds: [] }, b: { pieceId: "", edgePointIds: [] },
+            alignment: "", confidence: "needs-checking", note: "carried",
+          }],
+        },
+      },
+    });
+    const read = await documentOf(w, parent.id);
+    expect(read.editorDocument.seams).toHaveLength(1);
+    expect(read.editorDocument.seams[0].unsupported).toBe(true);
+    expect(read.editorDocumentNotes.join(" ")).toMatch(/not in the document to recover/);
+  });
+
+  test("and a migrated document saves as v2", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    await PatternRevision.updateOne({ _id: parent.id }, {
+      $set: { editorDocument: { ...doc, schemaVersion: 1, seams: [v1Seam(doc)] } },
+    });
+    const migrated = (await documentOf(w, parent.id)).editorDocument;
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: migrated, name: "Migrated", actor: w.actor,
+    });
+    const row = await PatternRevision.findById(saved.revision.id).lean();
+    expect(row.editorDocument.schemaVersion).toBe(2);
+    expect(row.editorDocument.seams[0].sideA.runs).toHaveLength(1);
+  });
+});
+
+/* ═══ 12 · THE LANE A CONTRACT ════════════════════════════════════════════ */
+
+describe("what reaches Lane A", () => {
+  /** A mapping confirmed in the editor, from whatever the revision already has. */
+  const confirmEverything = (doc) => ({
+    ...doc,
+    seams: doc.seams.map((s) => ({
+      ...s,
+      alignment: s.alignment || "start-to-start",
+      confidence: "confirmed",
+    })),
+  });
+
+  test("A COMPOUND SIDE ARRIVES AS AN ORDERED LIST OF RUN REFS", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const compound = doc.seams.find((s) => s.sideA.runs.length > 1 || s.sideB.runs.length > 1);
+    expect(compound).toBeTruthy();
+
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: confirmEverything(doc), name: "Confirmed", actor: w.actor,
+    });
+    const row = await PatternRevision.findById(saved.revision.id).lean();
+    const sent = row.simulationInputs.seams.find((s) => s.seamId === compound.seamId);
+
+    const wider = compound.sideA.runs.length > 1 ? "sideA" : "sideB";
+    expect(sent[wider]).toHaveLength(compound[wider].runs.length);
+    /* Every ref names a piece and a run, and every run it names exists. */
+    const runIds = new Set(row.simulationInputs.pieces
+      .flatMap((p) => p.runs.map((r) => `${p.pieceRef}:${r.runId}`)));
+    for (const ref of sent[wider]) {
+      expect(runIds.has(`${ref.pieceRef}:${ref.runId}`)).toBe(true);
+    }
+  });
+
+  test("each run carries its own direction, and the side carries the order", async () => {
     const w = await world();
     const parent = await imported(w);
     await patterns.setSimulationInputs(w.ctx, {
@@ -751,12 +1194,84 @@ describe("a seam mapping that already exists on the revision", () => {
     });
     const doc = (await documentOf(w, parent.id)).editorDocument;
     const saved = await patterns.saveEditorRevision(w.ctx, {
-      revisionId: parent.id, document: doc, name: "Opened a mapped revision", actor: w.actor,
+      revisionId: parent.id, document: confirmEverything(doc), name: "x", actor: w.actor,
     });
-    expect(saved.revision.revisionRef).toBeTruthy();
-    /* Not every seam is confirmable here, so the parent's mapping and stamp are
-       carried rather than re-stamped. */
     const row = await PatternRevision.findById(saved.revision.id).lean();
-    expect(row.mappingConfirmedAgainstRef).not.toBe(row.revisionRef);
+    const runs = row.simulationInputs.pieces.flatMap((p) => p.runs);
+    expect(runs.length).toBeGreaterThan(0);
+    for (const r of runs) {
+      expect(["forward", "reverse"]).toContain(r.direction);
+      expect(r.startAnchor.kind).toBe("turn-point");
+      expect(Number.isInteger(r.startAnchor.pointIndex)).toBe(true);
+    }
+  });
+
+  test("the confirmation is attributable, which is what R4 asks for", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: confirmEverything(doc), name: "x", actor: w.actor,
+    });
+    const row = await PatternRevision.findById(saved.revision.id).lean();
+    for (const s of row.simulationInputs.seams) {
+      expect(s.confidence).toBe("confirmed");
+      expect(s.alignmentConfirmed?.by?.name).toBe(w.actor.name);
+      expect(s.alignmentConfirmed?.at).toBeTruthy();
+    }
+  });
+
+  test("R11 IS GONE ONCE THE MAPPING IS CONFIRMED HERE", async () => {
+    /* The blocker. Before compound sides, three of the real T-shirt's seams
+       could not be expressed, so the mapping could never be re-confirmed in the
+       editor, so every save carried the parent's stamp and readiness refused
+       with R11 for ever. */
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+
+    /* Before: a mapping nobody has confirmed HERE carries the parent's stamp,
+       and readiness refuses with R11 — which is exactly what happened to every
+       save while three of the seams could not be expressed at all. */
+    const unconfirmed = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, name: "Not confirmed", actor: w.actor,
+      document: { ...doc, seams: doc.seams.map((s) => ({ ...s, confidence: "needs-checking" })) },
+    });
+    expect(unconfirmed.revision.readiness.failures.map((f) => f.code)).toContain("R11");
+
+    /* After: confirmed here, stamped here, and R11 is not among the failures. */
+    const after = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: confirmEverything(doc), name: "Confirmed", actor: w.actor,
+    });
+    const codes = after.revision.readiness.failures.map((f) => f.code);
+    expect(codes).not.toContain("R11");
+    expect(after.revision.mappingConfirmedAgainstRef).toBe(after.revision.revisionRef);
+  });
+
+  test("and no edge is lost on the way through", async () => {
+    const w = await world();
+    const parent = await imported(w);
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: parent.id, inputs: tee.simulationInputs(), actor: w.actor,
+    });
+    const doc = (await documentOf(w, parent.id)).editorDocument;
+    const before = doc.seams.reduce((n, s) =>
+      n + s.sideA.runs.reduce((m, r) => m + r.edgePointIds.length, 0)
+        + s.sideB.runs.reduce((m, r) => m + r.edgePointIds.length, 0), 0);
+
+    const saved = await patterns.saveEditorRevision(w.ctx, {
+      revisionId: parent.id, document: confirmEverything(doc), name: "x", actor: w.actor,
+    });
+    const back = (await documentOf(w, saved.revision.id)).editorDocument;
+    const after = back.seams.reduce((n, s) =>
+      n + s.sideA.runs.reduce((m, r) => m + r.edgePointIds.length, 0)
+        + s.sideB.runs.reduce((m, r) => m + r.edgePointIds.length, 0), 0);
+    expect(after).toBe(before);
   });
 });

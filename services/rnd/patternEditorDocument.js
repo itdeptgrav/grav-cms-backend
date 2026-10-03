@@ -29,7 +29,24 @@
 // cannot be normalised is refused rather than guessed at.
 "use strict";
 
-const EDITOR_SCHEMA_VERSION = 1;
+/* ── v2: A SEAM SIDE IS AN ORDERED LIST OF RUNS ───────────────────────────
+ *
+ * v1 stored one run per side. That cannot say what a set-in sleeve is — one cap
+ * run sewn to a front armhole run and then a back armhole run — nor what a neck
+ * band is, and the archive's own T-shirt has three of them.
+ *
+ * ── WHY A NEW VERSION AND NOT AN EXTENSION OF v1 ──────────────────────────
+ * An extension would have had to let a side be EITHER a run or a list of runs,
+ * and every reader would then have to decide which it was looking at. The one
+ * that guessed wrong would guess silently. A version number is cheap; a reader
+ * that mistakes a run for a side is a seam sewn to the wrong cloth.
+ *
+ * v1 documents are migrated on read, into single-item `runs` arrays, and
+ * nothing about their meaning changes. Nothing is discarded — including the
+ * seams v1 marked `unsupported` because it could not express them, which are now
+ * expressible and are rebuilt from the simulation inputs they came from. */
+const EDITOR_SCHEMA_VERSION = 2;
+const EDITOR_SCHEMA_V1 = 1;
 
 /* ── VOCABULARIES ─────────────────────────────────────────────────────────
    Each is a closed set, because a screen that can write "sewn " with a trailing
@@ -165,22 +182,35 @@ function documentProblems(doc) {
     if (!Object.values(SEAM_CONFIDENCE).includes(str(seam.confidence))) {
       out.push(`${name}: "${seam.confidence}" is not a confidence`);
     }
-    if (seam.unsupported) continue;          /* carried, not editable, not re-confirmed */
-    for (const [side, run] of [["A", seam.a], ["B", seam.b]]) {
-      const problems = runProblems(run, doc, `${name} side ${side}`);
-      out.push(...problems);
-      if (problems.length) continue;
-      /* ── ONE STRETCH OF CLOTH IS SEWN TO ONE OTHER ──────────────────
-         An edge in two seams is a panel sewn to two things along the same
-         inch. It is always a mistake and it is invisible on the screen. */
-      for (const pointId of list(run.edgePointIds)) {
-        const key = `${str(run.pieceId)}:${str(pointId)}`;
-        if (usedEdges.has(key) && usedEdges.get(key) !== str(seam.seamId)) {
-          out.push(`${name}: an edge is already sewn into ${usedEdges.get(key)}`);
-          break;
+    for (const [label, side] of [["A", seam.sideA], ["B", seam.sideB]]) {
+      const where = `${name} side ${label}`;
+      const runs = list(side?.runs);
+      if (!runs.length) { out.push(`${where}: a side with no runs is not a side`); continue; }
+
+      /* ── ONE RUN MAY NOT APPEAR TWICE ON ITS OWN SIDE ──────────────
+         A side is an ordered list of sewing operations. The same stretch of
+         cloth listed twice is one the machinist is asked to sew twice. */
+      const signatures = new Set();
+      runs.forEach((run, i) => {
+        const problems = runProblems(run, doc, `${where}, run ${i + 1}`);
+        out.push(...problems);
+        if (problems.length) return;
+        const signature = `${str(run.pieceId)}:${list(run.edgePointIds).join(",")}`;
+        if (signatures.has(signature)) out.push(`${where}: run ${i + 1} is already in this side`);
+        signatures.add(signature);
+
+        /* ── AND ONE STRETCH OF CLOTH IS SEWN TO ONE OTHER ───────────
+           An edge in two seams is a panel sewn to two things along the same
+           inch. It is always a mistake and it is invisible on the screen. */
+        for (const pointId of list(run.edgePointIds)) {
+          const key = `${str(run.pieceId)}:${str(pointId)}`;
+          if (usedEdges.has(key) && usedEdges.get(key) !== str(seam.seamId)) {
+            out.push(`${where}: an edge is already sewn into ${usedEdges.get(key)}`);
+            break;
+          }
+          usedEdges.set(key, str(seam.seamId));
         }
-        usedEdges.set(key, str(seam.seamId));
-      }
+      });
     }
   }
 
@@ -199,7 +229,14 @@ function documentProblems(doc) {
   return out;
 }
 
-/** A seam run: a continuous span of edges on one piece, in travel order. */
+/**
+ * One run: a continuous span of edges on ONE piece, in travel order.
+ *
+ * Nothing here asks a run to touch the one before it. Runs on different pieces
+ * are consecutive sewing operations, and a front and a back sit apart on a
+ * marker — refusing an armhole because its two halves are not adjacent in 2D
+ * would refuse every set-in sleeve ever drawn.
+ */
 function runProblems(run, doc, where) {
   const out = [];
   if (!run || typeof run !== "object") return [`${where}: there is no run`];
@@ -355,117 +392,168 @@ function seamsFromSimulationInputs(inputs, pieces, { confirmed = false } = {}) {
   const byRef = new Map(pieces.map((p) => [str(p.pieceRef), p]));
   const runsByPiece = new Map();
   for (const p of list(inputs?.pieces)) {
-    for (const r of list(p.runs)) runsByPiece.set(`${str(p.pieceRef)}:${str(r.runId)}`, { piece: str(p.pieceRef), run: r });
+    for (const r of list(p.runs)) {
+      runsByPiece.set(`${str(p.pieceRef)}:${str(r.runId)}`, { piece: str(p.pieceRef), run: r });
+    }
   }
 
-  /* ── A SIDE MADE OF SEVERAL RUNS IS NOT TRANSLATED ────────────────────
-     `sideA`/`sideB` are arrays because a set-in sleeve is one cap run sewn to
-     two or three body runs IN ORDER, and a neck band goes round a neckline made
-     of a front and a back. The editor's run is one continuous stretch on one
-     piece, which cannot express that.
-
-     Taking the first run and ignoring the rest looks like it works and is the
-     worst available answer: it produced a 12 cm armhole paired with a 27 cm one
-     and 119% of ease that is nowhere in the pattern. So a multi-run side is
-     refused here, the seam is carried as `needs-checking` with a reason, and
-     readiness goes on refusing in Lane A's own words. */
-  const asEditorRun = (side) => {
-    const runs = list(side);
-    if (runs.length > 1) return { multiRun: true, count: runs.length };
-    const first = runs[0];
-    if (!first) return null;
-    const found = runsByPiece.get(`${str(first.pieceRef)}:${str(first.runId)}`);
-    const piece = byRef.get(str(first.pieceRef));
+  /* One stored run → one editor run. The side's own order is the order the
+     refs were listed in, which is the order a machinist sews them. */
+  const asEditorRun = (ref) => {
+    const found = runsByPiece.get(`${str(ref?.pieceRef)}:${str(ref?.runId)}`);
+    const piece = byRef.get(str(ref?.pieceRef));
     if (!found || !piece) return null;
     const n = piece.points.length;
     const from = Number(found.run.startAnchor?.pointIndex);
     const to = Number(found.run.endAnchor?.pointIndex);
     if (!Number.isInteger(from) || !Number.isInteger(to) || !n) return null;
 
-    /* ── WHICH OF THE TWO STRETCHES BETWEEN THE ANCHORS ──────────────
-       Two points on a closed boundary divide it into two, and `theLongWay` on
-       the stored run is which one was meant. Walking forward and taking it is
-       wrong half the time: the archive's own front-body armhole walks forward
-       across sixty-odd edges and is a six-edge run the other way round. That
-       mistake turns one armhole into a run that claims most of the panel and
-       collides with every other seam on it. */
+    const all = piece.points.map((v) => str(v.pointId));
     const forward = [];
     for (let k = from; k !== to; k = (k + 1) % n) {
-      forward.push(str(piece.points[k].pointId));
+      forward.push(all[k]);
       if (forward.length > n) break;
     }
     if (!forward.length) return null;
-    const all = piece.points.map((v) => str(v.pointId));
     const inForward = new Set(forward);
     const complement = all.filter((id) => !inForward.has(id));
-    /* ── BY LENGTH, NOT BY EDGE COUNT ────────────────────────────────
-       `theLongWay` is about arc length, and the two are not the same thing: the
-       archive's front-body armhole is twenty-nine short segments of a curve and
-       the stretch the other way round is four long ones. Counting edges picks
-       the curve as "the long way" and hands the solver a 27 cm run to sew to a
-       12 cm one, which readiness then refuses for 119% ease that is not in the
-       pattern. */
-    const lengthOf = (ids) => {
-      const at = new Map(all.map((id, i) => [id, piece.points[i]]));
-      let total = 0;
-      for (const id of ids) {
-        const i = all.indexOf(id);
-        const a = piece.points[i];
-        const b = piece.points[(i + 1) % n];
-        total += Math.hypot(b.x - a.x, b.y - a.y);
-      }
-      return total;
-    };
-    const wantLong = Boolean(found.run.theLongWay);
+
+    /* ── BY ARC LENGTH, NOT BY EDGE COUNT ──────────────────────────────
+       `theLongWay` is about length, and the two differ: the archive's front-body
+       armhole is twenty-nine short segments of a curve and four long ones the
+       other way round. Counting edges picks the curve as "the long way". */
+    const lengthOf = (ids) => ids.reduce((total, id) => {
+      const i = all.indexOf(id);
+      const a = piece.points[i];
+      const b = piece.points[(i + 1) % n];
+      return total + Math.hypot(b.x - a.x, b.y - a.y);
+    }, 0);
     const longer = lengthOf(forward) >= lengthOf(complement) ? forward : complement;
     const shorter = longer === forward ? complement : forward;
-    const ids = (wantLong ? longer : shorter);
+    const ids = found.run.theLongWay ? longer : shorter;
     if (!ids.length) return null;
+
     return {
       pieceId: str(piece.pieceId),
       edgePointIds: ids,
       reversed: str(found.run.direction) === "reverse",
-      lengthMm: Number.isFinite(found.run.lengthMm) ? found.run.lengthMm : null,
+      lengthMm: Number.isFinite(found.run.lengthMm) ? found.run.lengthMm : round4(lengthOf(ids)),
       role: str(found.run.role),
+      /* Translated, not drawn. A reader weighing a seam should know which. */
+      provenance: PROVENANCE.IMPORTED,
+      notchIds: [],
     };
+  };
+
+  /* ── A SIDE IS EVERY RUN IT NAMES, IN ORDER ─────────────────────────────
+     `sideA` and `sideB` have always been arrays on the stored contract, because
+     a set-in sleeve is one cap sewn to two body runs in order. The first version
+     of this translation read only `[0]`, which is how an armhole became a 12 cm
+     run paired with a 27 cm one. */
+  const asEditorSide = (side) => {
+    const refs = list(side);
+    if (!refs.length) return null;
+    const runs = refs.map(asEditorRun);
+    /* All or nothing. A side missing one of its runs is a seam that sews most of
+       an armhole, which is worse than one that refuses to translate. */
+    if (runs.some((r) => !r)) return null;
+    return { runs, reversed: false };
   };
 
   const out = [];
   for (const s of seams) {
-    const a = asEditorRun(s.sideA);
-    const b = asEditorRun(s.sideB);
-    if (!a || !b) continue;
-    if (a.multiRun || b.multiRun) {
-      out.push({
-        seamId: str(s.seamId),
-        name: str(s.name),
-        a: a.multiRun ? { pieceId: "", edgePointIds: [], reversed: false, role: "" } : a,
-        b: b.multiRun ? { pieceId: "", edgePointIds: [], reversed: false, role: "" } : b,
-        alignment: str(s.alignment),
-        confidence: SEAM_CONFIDENCE.NEEDS_CHECKING,
-        easeMm: null,
-        easePercent: null,
-        note: `One side of this seam is ${(a.multiRun ? a : b).count} runs sewn in order — a `
-          + "set-in sleeve or a neck band. The 2D editor pairs one continuous run to one "
-          + "other, so this mapping is shown but not editable here, and it is not re-confirmed "
-          + "by a save.",
-        unsupported: true,
-      });
-      continue;
-    }
+    const sideA = asEditorSide(s.sideA);
+    const sideB = asEditorSide(s.sideB);
+    if (!sideA || !sideB) continue;
     out.push({
       seamId: str(s.seamId),
       name: str(s.name),
-      a,
-      b,
+      sideA,
+      sideB,
       alignment: str(s.alignment),
-      confidence: confirmed && str(s.alignment) ? SEAM_CONFIDENCE.CONFIRMED : SEAM_CONFIDENCE.NEEDS_CHECKING,
+      confidence: confirmed && str(s.alignment)
+        ? SEAM_CONFIDENCE.CONFIRMED : SEAM_CONFIDENCE.NEEDS_CHECKING,
       easeMm: null,
       easePercent: Number.isFinite(s.easePercent) ? s.easePercent : null,
       note: "",
     });
   }
   return out;
+}
+
+/* ── MIGRATION: v1 → v2 ───────────────────────────────────────────────────
+ *
+ * One run per side becomes a side with one run in it. Nothing about the mapping
+ * changes; a side that named one stretch of cloth still names that stretch.
+ *
+ * The one case that needs more than a wrapper is a v1 seam marked `unsupported`.
+ * v1 wrote those when a stored side had several runs and the editor could not
+ * hold them, so the document kept the seam with its sides emptied. The edges are
+ * not in the v1 document to recover — they are in the simulation inputs the v1
+ * translation read, and that is where they are read from again. A seam whose
+ * edges cannot be recovered is kept, still marked, and still refused — never
+ * dropped, because an absent seam looks like a garment with no armhole.
+ */
+function migrateV1(document, { simulationInputs = null, pieces = null } = {}) {
+  const notes = [];
+  const asSide = (run) => ({
+    runs: run && str(run.pieceId) && list(run.edgePointIds).length
+      ? [{
+        pieceId: str(run.pieceId),
+        edgePointIds: list(run.edgePointIds).map(str),
+        reversed: Boolean(run.reversed),
+        lengthMm: Number.isFinite(run.lengthMm) ? run.lengthMm : null,
+        role: str(run.role),
+        provenance: PROVENANCE.IMPORTED,
+        notchIds: [],
+      }]
+      : [],
+    reversed: false,
+  });
+
+  /* The seams v1 could not hold, rebuilt from where it got them. */
+  const rebuilt = new Map();
+  if (simulationInputs && pieces) {
+    for (const s of seamsFromSimulationInputs(simulationInputs, pieces, { confirmed: false })) {
+      rebuilt.set(str(s.seamId), s);
+    }
+  }
+
+  const seams = list(document.seams).map((seam) => {
+    if (seam.unsupported) {
+      const recovered = rebuilt.get(str(seam.seamId));
+      if (recovered) {
+        notes.push(`"${str(seam.name) || str(seam.seamId)}" was carried by schema v1 because its `
+          + "side is several runs sewn in order. It is expressible now and has been rebuilt from "
+          + "the mapping it came from.");
+        return { ...recovered, confidence: SEAM_CONFIDENCE.NEEDS_CHECKING };
+      }
+      notes.push(`"${str(seam.name) || str(seam.seamId)}" was carried by schema v1 and its edges `
+        + "are not in the document to recover. It is kept and still needs checking.");
+      return {
+        seamId: str(seam.seamId), name: str(seam.name),
+        sideA: { runs: [], reversed: false }, sideB: { runs: [], reversed: false },
+        alignment: str(seam.alignment), confidence: SEAM_CONFIDENCE.NEEDS_CHECKING,
+        easeMm: null, easePercent: null, note: str(seam.note), unsupported: true,
+      };
+    }
+    return {
+      seamId: str(seam.seamId),
+      name: str(seam.name),
+      sideA: asSide(seam.a),
+      sideB: asSide(seam.b),
+      alignment: str(seam.alignment),
+      confidence: str(seam.confidence) || SEAM_CONFIDENCE.PROPOSED,
+      easeMm: Number.isFinite(seam.easeMm) ? seam.easeMm : null,
+      easePercent: Number.isFinite(seam.easePercent) ? seam.easePercent : null,
+      note: str(seam.note),
+    };
+  });
+
+  return {
+    document: { ...document, schemaVersion: EDITOR_SCHEMA_VERSION, seams },
+    notes,
+  };
 }
 
 /**
@@ -477,29 +565,122 @@ function seamsFromSimulationInputs(inputs, pieces, { confirmed = false } = {}) {
  */
 function editorDocumentFor(revision) {
   const stored = revision?.editorDocument;
-  if (stored && Number(stored.schemaVersion) === EDITOR_SCHEMA_VERSION) {
-    return { document: stored, origin: "stored", problems: [] };
+  const version = Number(stored?.schemaVersion);
+
+  if (stored && version === EDITOR_SCHEMA_VERSION) {
+    return { document: stored, origin: "stored", problems: [], notes: [] };
   }
-  if (stored && stored.schemaVersion) {
+
+  /* ── v1, MIGRATED — NEVER DISCARDED ───────────────────────────────── */
+  if (stored && version === EDITOR_SCHEMA_V1) {
+    const { document, notes } = migrateV1(stored, {
+      simulationInputs: revision?.simulationInputs || null,
+      pieces: list(stored.pieces),
+    });
+    return { document, origin: "migrated-v1", problems: [], notes };
+  }
+
+  if (stored && version) {
     return {
       document: null,
       origin: "stored",
       problems: [`this revision was saved by editor schema v${stored.schemaVersion} and this `
         + `server reads v${EDITOR_SCHEMA_VERSION}. It is not reinterpreted, because a document `
         + "read under the wrong version is a pattern that looks right and is not."],
+      notes: [],
     };
   }
+
   const { document, problems } = normaliseFromPatternSet(revision?.patternSet || {}, {
     simulationInputs: revision?.simulationInputs || null,
     confirmedAgainst: str(revision?.mappingConfirmedAgainstRef),
     revisionRef: str(revision?.revisionRef),
   });
-  return { document, origin: "normalised", problems };
+  return { document, origin: "normalised", problems, notes: [] };
+}
+
+/* ── WHAT A COMPOUND SIDE MEASURES ────────────────────────────────────────
+ *
+ * The numbers a patternmaker checks a pairing by, derived from the runs rather
+ * than stored beside them — a stored length that nobody recomputes is one that
+ * goes stale the first time a point moves.
+ */
+
+/** Every point along a side, in sewing order, as one path. */
+function sidePath(side, pieces) {
+  const byId = new Map(list(pieces).map((p) => [str(p.pieceId), p]));
+  const out = [];
+  for (const run of orderedRuns(side)) {
+    const piece = byId.get(str(run.pieceId));
+    if (!piece) continue;
+    const order = piece.points.map((v) => str(v.pointId));
+    const ids = runOrder(run);
+    for (let i = 0; i < ids.length; i += 1) {
+      const at = order.indexOf(ids[i]);
+      if (at < 0) continue;
+      const a = piece.points[at];
+      const b = piece.points[(at + 1) % piece.points.length];
+      const [from, to] = run.reversed ? [b, a] : [a, b];
+      if (!out.length) out.push({ x: from.x, y: from.y, pieceId: run.pieceId, pointId: str(from.pointId) });
+      out.push({ x: to.x, y: to.y, pieceId: run.pieceId, pointId: str(to.pointId) });
+    }
+  }
+  return out;
+}
+
+/** The runs of a side in sewing order, honouring the side's own reversal. */
+function orderedRuns(side) {
+  const runs = list(side?.runs);
+  if (!side?.reversed) return runs;
+  /* Turning a side round reverses the ORDER of its runs as well as each run:
+     sewing a front then a back, backwards, is sewing the back then the front. */
+  return [...runs].reverse().map((r) => ({ ...r, reversed: !r.reversed }));
+}
+
+const runOrder = (run) => (run.reversed
+  ? [...list(run.edgePointIds)].reverse()
+  : list(run.edgePointIds));
+
+/** Total sewing length of a side, and the cumulative length at each run. */
+function sideLength(side, pieces) {
+  const byId = new Map(list(pieces).map((p) => [str(p.pieceId), p]));
+  let total = 0;
+  const stations = [];
+  for (const run of orderedRuns(side)) {
+    const piece = byId.get(str(run.pieceId));
+    if (!piece) { stations.push({ pieceId: run.pieceId, lengthMm: 0, atMm: round4(total) }); continue; }
+    const order = piece.points.map((v) => str(v.pointId));
+    let runLength = 0;
+    for (const id of list(run.edgePointIds)) {
+      const at = order.indexOf(id);
+      if (at < 0) continue;
+      const a = piece.points[at];
+      const b = piece.points[(at + 1) % piece.points.length];
+      runLength += Math.hypot(b.x - a.x, b.y - a.y);
+    }
+    stations.push({
+      pieceId: str(run.pieceId),
+      pieceName: str(piece.name) || str(piece.pieceRef),
+      edges: list(run.edgePointIds).length,
+      reversed: Boolean(run.reversed),
+      lengthMm: round4(runLength),
+      /* Where this run starts along the finished seam. What a machinist needs to
+         place a notch, and what makes two sides comparable run by run. */
+      atMm: round4(total),
+    });
+    total += runLength;
+  }
+  return { totalMm: round4(total), stations };
 }
 
 module.exports = {
   EDITOR_SCHEMA_VERSION,
+  EDITOR_SCHEMA_V1,
   seamsFromSimulationInputs,
+  migrateV1,
+  sideLength,
+  sidePath,
+  orderedRunsOf: orderedRuns,
   EDGE_CLASS, POINT_KIND, PROVENANCE, MEASURE_KIND, SEAM_ALIGNMENT, SEAM_CONFIDENCE,
   documentProblems, runProblems, normaliseFromPatternSet, editorDocumentFor,
   round4,
