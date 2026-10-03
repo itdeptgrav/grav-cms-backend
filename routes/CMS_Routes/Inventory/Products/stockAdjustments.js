@@ -1,6 +1,7 @@
 // routes/CMS_Routes/Inventory/Products/stockAdjustments.js
 // Mount: app.use("/api/cms/inventory/stock-adjustments", stockAdjRoutes);
 
+const { attachActorNames } = require("../../../../services/actorNames");
 const express  = require("express");
 const router   = express.Router();
 const mongoose = require("mongoose");
@@ -11,6 +12,9 @@ const locStock        = require("../../../../services/storePurchase/locationStoc
    stock is taken under, so the shelf's per-sticker balance follows it. */
 const storeLoc        = require("../../../../services/storePurchase/storeLocations.service");
 const Barcode         = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
+/* Was referenced in the sticker check but never required (found 2 Oct 2026):
+   every issue that named a scanned label answered "Server error". */
+const { identityRefusal } = require("../../../../services/storePurchase/labelIdentity");
 const StockItem       = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const Unit            = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const StockIssuance   = require("../../../../models/CMS_Models/Inventory/Operations/StockIssuance");
@@ -599,7 +603,9 @@ router.post(
       }
 
       /* Optional lot sticker: must exist and be printed for THIS item (and
-         variant, when the sticker names one). Only meaningful with a location. */
+         variant, when the sticker names one). With a location it also names
+         the lot the shelf balance moves under; with or without one, its own
+         quantity moves with the line (see the mutate block). */
       let barcode = null;
       if (incoming.barcodeId) {
         const bid = objectId(incoming.barcodeId);
@@ -735,11 +741,52 @@ router.post(
                 : `Issued as ${p.qty} ${p.issuedUnit} → ${p.nativeQty} ${p.nativeUnit} (${p.conversion.direction})`,
             ].filter(Boolean).join(" | "),
             performedBy: req.user?.id || null,
+            performedByName: req.user?.name || req.user?.email || "",
             operationId: req.idempotent?.record?._id || null,
             ...locStock.txLocationSnapshot(p.warehouse, p.location),
           };
           if (p.variant) { tx.variantId = p.variant._id; tx.variantCombination = p.variant.combination || []; }
           if (variantPrevQty !== null) { tx.variantPreviousQuantity = variantPrevQty; tx.variantNewQuantity = variantNewQty; }
+
+          /* The label guard runs BEFORE the transaction row is written (3 Oct
+             2026): it used to run after the save, and its undo put the quantity
+             back but left the row behind, so the item's own history showed an
+             issue that never happened (SODIUM read 5 replayed against 36 held). */
+          /* ── THE STICKER'S OWN QUANTITY MOVES WITH THE ISSUE (2 Oct 2026, owner:
+             "once I issue 23 of a 30 m label, that barcode's value must now read
+             7 m"). A label scanned into a line is a lot; what it stands for is
+             what is left ON it. A debit takes the issued amount off the label,
+             a credit (a return) puts it back. The label is in its own unit: when
+             that is the item's native unit the native quantity is used; when it
+             is the unit the line was issued in, the issued quantity; otherwise
+             the line is recorded against the label without changing its figure
+             (the units cannot be related safely) and the line says so. The
+             debit is GUARDED — the label can never read below zero — so a
+             sticker that has already been issued past its figure refuses rather
+             than going negative. Independent of the shelf: a scanned label that
+             was never put away still moves. */
+          let labelQty = null;
+          if (p.barcode) {
+            const lu = String(p.barcode.unit || "").trim().toLowerCase();
+            const amount = lu === String(p.nativeUnit || "").trim().toLowerCase() ? p.nativeQty
+              : lu === String(p.issuedUnit || "").trim().toLowerCase() ? p.qty : null;
+            if (amount != null) {
+              const bq = direction === "debit" ? -round4(amount) : round4(amount);
+              const guard = direction === "debit" ? { quantity: { $gte: round4(amount) - 1e-6 } } : {};
+              const moved = await Barcode.findOneAndUpdate({ _id: p.barcode._id, ...guard }, { $inc: { quantity: bq } }, { new: true, session });
+              if (!moved) {
+                const undo = { $inc: { quantity: p.nativeQty } };
+                if (p.variant) undo.$inc["variants.$[v].quantity"] = p.nativeQty;
+                await RawItem.updateOne(scoped(req, { _id: p.oid }), undo, { session, ...(p.variant ? { arrayFilters: [{ "v._id": p.variant._id }] } : {}) });
+                throw fail("VALIDATION",
+                  `The scanned label of ${p.rawItem.name} reads ${p.barcode.quantity} ${p.barcode.unit}; ${amount} ${p.barcode.unit} cannot be issued off it.`,
+                  { reason: "EXCEEDS_LABEL", rawItemId: String(p.oid), barcodeId: String(p.barcode._id), labelQuantity: p.barcode.quantity, requested: amount });
+              }
+              labelQty = { before: round4(moved.quantity - bq), after: round4(moved.quantity), unit: p.barcode.unit };
+            } else {
+              labelQty = { before: p.barcode.quantity, after: p.barcode.quantity, unit: p.barcode.unit, unchanged: true };
+            }
+          }
 
           updated.stockTransactions.push(tx);
           await updated.save({ session });
@@ -748,12 +795,15 @@ router.post(
             rawItem: updated._id, rawItemName: updated.name, rawItemSku: updated.sku,
             variantId: p.variant?._id || null, variantCombination: p.variant?.combination || [],
             issuedQty: p.qty, issuedUnit: p.issuedUnit, nativeQty: p.nativeQty, nativeUnit: p.nativeUnit,
-            notes: p.itemNotes,
+            notes: [p.itemNotes, labelQty?.unchanged ? `label ${p.barcode._id} kept at ${labelQty.before} ${labelQty.unit} (unit not relatable)` : ""].filter(Boolean).join(" | "),
+            ...(p.barcode ? { barcodeId: p.barcode._id, barcodeQtyBefore: labelQty?.before ?? null, barcodeQtyAfter: labelQty?.after ?? null, barcodeUnit: labelQty?.unit || p.barcode.unit || "" } : {}),
           });
           stockUpdates.push({
             rawItemId: updated._id, rawItemName: updated.name,
             prevQty: prevTotal, newQty: newTotal, nativeUnit: p.nativeUnit,
             issuedQty: p.qty, issuedUnit: p.issuedUnit, nativeQty: p.nativeQty,
+            /* the scanned label's figure before and after, when one was scanned */
+            ...(p.barcode && labelQty ? { label: { barcodeId: String(p.barcode._id), before: labelQty.before, after: labelQty.after, unit: labelQty.unit, unchanged: Boolean(labelQty.unchanged) } } : {}),
             /* The conversion is stated, not left to be inferred. */
             conversion: {
               from: p.issuedUnit, to: p.nativeUnit,
@@ -773,6 +823,7 @@ router.post(
           customerName: customerName || "",
           items: issuanceItems, reason: reasonText, notes,
           performedBy: req.user?.id || null,
+          performedByName: req.user?.name || req.user?.email || "",
         }], { session });
 
         return {
@@ -828,7 +879,8 @@ router.get("/by-mo", requireCapability(CAPABILITIES.READ), async (req, res) => {
     const total   = await StockIssuance.countDocuments(filter);
     const records = await StockIssuance.find(filter)
       .sort({ createdAt: -1 }).skip((pageNum - 1) * limitNum).limit(limitNum)
-      .populate("performedBy", "name").lean();
+      .lean();
+    await attachActorNames(records); // the performer by name, whichever register holds the id (3 Oct 2026)
     return res.json({ success: true, issuances: records, pagination: { total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) || 1 } });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Server error" });
@@ -863,10 +915,11 @@ router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
 
     const rawItems = await RawItem.find(itemFilter)
       .select("name sku unit customUnit stockTransactions variants")
-      .populate("stockTransactions.performedBy", "name email")
+      /* no populate: an Employee populate NULLS a dept_users id; attachActorNames resolves both (3 Oct 2026) */
       .lean();
 
     let allTx = [];
+    await attachActorNames(rawItems.flatMap((it) => it.stockTransactions || []));
     for (const item of rawItems) {
       for (const tx of (item.stockTransactions || [])) {
         if (isAutomatic(tx)) continue;

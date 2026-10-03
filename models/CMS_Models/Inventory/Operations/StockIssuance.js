@@ -14,6 +14,16 @@ const issuanceItemSchema = new mongoose.Schema({
   nativeUnit:         { type: String, required: true },   // raw item's native unit
   notes:              { type: String, default: "" },
 
+  /* ── THE STICKER THIS LINE CAME OFF (2 Oct 2026) ─────────────────────
+     When the line was scanned from a raw-item label, the label's own
+     quantity moves with the issue (down on a debit, back up on a credit).
+     What it read before and after is kept here so the movement can be
+     explained from the issuance alone. */
+  barcodeId:          { type: mongoose.Schema.Types.ObjectId, ref: "Barcode", default: null },
+  barcodeQtyBefore:   { type: Number, default: null },
+  barcodeQtyAfter:    { type: Number, default: null },
+  barcodeUnit:        { type: String, default: "" },
+
   /* ── CUSTOMER-OWNED MATERIAL ────────────────────────────────────────────
      Present only when this line issued material the factory does not own — a
      job-work customer's fabric, handed to production against the one order line
@@ -102,6 +112,7 @@ const stockIssuanceSchema = new mongoose.Schema(
     notes:  { type: String, default: "" },
 
     performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    performedByName: { type: String, default: "" },
   },
   { timestamps: true }
 );

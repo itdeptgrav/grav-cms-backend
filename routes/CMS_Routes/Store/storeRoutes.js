@@ -14,6 +14,7 @@
 //   POST   /work-orders/approve-batch              — bulk store approval
 //   PATCH  /work-orders/:woId/unapprove            — undo (in case of mistake)
 
+const { attachActorNames, actorLabel } = require("../../../services/actorNames");
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -829,8 +830,11 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
     //    the BOM comparison above has no row for; it goes into `extrasMap`
     //    instead of being dropped, so it is not just invisible money moved
     //    outside the model.
-    const issuances = await StockIssuance.find({ manufacturingOrder: id })
-      .populate("performedBy", "name").lean();
+    const issuances = await StockIssuance.find({ manufacturingOrder: id }).lean();
+    /* the performer by NAME (3 Oct 2026): the id is a dept_users row for every
+       department sign-in, which the Employee populate could not resolve, so
+       every row read "System" */
+    await attachActorNames(issuances);
 
     const extrasMap = {};
 
@@ -859,7 +863,7 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
           ex.totalIssued += signedQty;
           ex.issuanceHistory.push({
             direction: iso.direction, date: iso.createdAt,
-            performedBy: iso.performedBy?.name || "System",
+            performedBy: actorLabel(iso),
             reason: iso.reason || "",
             issuedQty: itm.issuedQty, issuedUnit: itm.issuedUnit,
             nativeQty: itm.nativeQty, nativeUnit: itm.nativeUnit,
@@ -895,7 +899,7 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
         b.totalIssued += inBomUnit;
         b.issuanceHistory.push({
           direction: iso.direction, date: iso.createdAt,
-          performedBy: iso.performedBy?.name || "System",
+          performedBy: actorLabel(iso),
           reason: iso.reason || "",
           issuedQty: itm.issuedQty, issuedUnit: itm.issuedUnit,
           nativeQty: itm.nativeQty, nativeUnit: itm.nativeUnit,

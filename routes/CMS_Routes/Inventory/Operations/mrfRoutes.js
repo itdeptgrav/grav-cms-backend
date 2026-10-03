@@ -8,6 +8,8 @@ const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Warehouse = require("../../../../models/CMS_Models/Inventory/Configurations/Warehouse");
 const locStock = require("../../../../services/storePurchase/locationStock.service");
+const Barcode = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
+const { identityRefusal } = require("../../../../services/storePurchase/labelIdentity");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Employee = require("../../../../models/Employee");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -319,6 +321,9 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
       // operation key kept separately for audit/recovery.
       idempotencyKey: loc.idempotencyKey || "",
       operationKey: loc.operationKey || "",
+      /* the lot sticker the stock moved under, when the line was scanned
+         (2 Oct 2026) — this is what the shelf's sticker-grain figure reads */
+      barcodeId: loc.barcodeId || null, barcodeLabel: loc.barcodeLabel || "",
     };
     if (delta < 0) {
       // the location was already guarded+decremented above; finish the pair
@@ -2412,16 +2417,58 @@ router.post(
  * which reruns the whole callback against the rolled-back state — lands the
  * same result exactly once. Nothing here uses `+=` against a captured document.
  */
+/* ── A SCANNED RAW-ITEM LABEL ON A LINE (2 Oct 2026, owner) ─────────────────
+   An issue or a return may name the label the material was scanned from.
+   The label must be one of the line's item (and variant, when both name
+   one) and must be usable (not inside an unfinished count, not voided).
+   Its own quantity then moves with the line — down on an issue, back up on
+   a return — in the label's unit: the line's unit when they match, else the
+   item's base unit, else the label is recorded but its figure left alone.
+   `labelMove` is the planned change; `applyStockPlans` performs it, guarded
+   so a label can never read below zero. */
+async function resolveLineLabel(req, mrfItem, barcodeId) {
+  if (!barcodeId) return null;
+  if (!mongoose.Types.ObjectId.isValid(barcodeId)) throw fail("VALIDATION", "That is not a valid raw-item label.", { reason: "INVALID_BARCODE" });
+  const barcode = await Barcode.findById(barcodeId).lean();
+  if (!barcode || String(barcode.rawItem) !== String(mrfItem.rawItem)) throw fail("VALIDATION", `That label is not one of ${mrfItem.rawItemName}'s.`, { reason: "BARCODE_MISMATCH" });
+  if (barcode.variantId && mrfItem.variantId && String(barcode.variantId) !== String(mrfItem.variantId)) throw fail("VALIDATION", `That label is for a different variant of ${mrfItem.rawItemName}.`, { reason: "BARCODE_VARIANT_MISMATCH" });
+  const refusal = identityRefusal(barcode);
+  if (refusal) throw fail("VALIDATION", refusal.message, { reason: refusal.reason });
+  return barcode;
+}
+const sameUnitName = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+function labelMove(barcode, { lineQty, lineUnit, baseQty, baseUnit, direction }) {
+  if (!barcode) return null;
+  const amount = sameUnitName(barcode.unit, lineUnit) ? lineQty : sameUnitName(barcode.unit, baseUnit) ? baseQty : null;
+  const r4 = (n) => Math.round(n * 10000) / 10000;
+  if (amount == null) return { barcodeId: barcode._id, delta: 0, unit: barcode.unit, before: barcode.quantity, unchanged: true };
+  const delta = direction === "out" ? -r4(amount) : r4(amount);
+  if (direction === "out" && r4(amount) > (Number(barcode.quantity) || 0) + 1e-6) {
+    throw fail("VALIDATION", `The scanned label reads ${barcode.quantity} ${barcode.unit}; ${r4(amount)} ${barcode.unit} cannot be issued off it.`, { reason: "EXCEEDS_LABEL", barcodeId: String(barcode._id), labelQuantity: barcode.quantity, requested: r4(amount) });
+  }
+  return { barcodeId: barcode._id, delta, unit: barcode.unit, before: barcode.quantity, unchanged: false };
+}
+async function applyLabelMove(label, session) {
+  if (!label || label.unchanged || !label.delta) return null;
+  const guard = label.delta < 0 ? { quantity: { $gte: -label.delta - 1e-6 } } : {};
+  const moved = await Barcode.findOneAndUpdate({ _id: label.barcodeId, ...guard }, { $inc: { quantity: label.delta } }, { new: true, session: session || null });
+  if (!moved) throw fail("VALIDATION", `The scanned label no longer holds ${-label.delta} ${label.unit} — it changed while this was being recorded.`, { reason: "EXCEEDS_LABEL", barcodeId: String(label.barcodeId) });
+  return { barcodeId: String(label.barcodeId), before: Math.round((moved.quantity - label.delta) * 10000) / 10000, after: moved.quantity, unit: label.unit };
+}
+
 async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey = "", tenant = null }) {
   const issuedLines = [];
   const stockPlans = [];
   const itemTargets = [];
   const recordedAt = new Date(); // stamped once, so every retry writes the same
 
-  for (const { mrfItem, issuedQty, notes, loc } of planned) {
+  for (const { mrfItem, issuedQty, notes, loc, label } of planned) {
     // The only place a requester-unit quantity is converted to the
     // catalogue's base unit: the stock ledger.
     const deductQty = await convertQty(issuedQty, mrfItem.unit, mrfItem.baseUnit);
+    /* the scanned label's own figure moves with the line (pre-checked here,
+       so an over-issue off a label refuses before anything is applied) */
+    const labelPlan = labelMove(label, { lineQty: issuedQty, lineUnit: mrfItem.unit, baseQty: deductQty, baseUnit: mrfItem.baseUnit, direction: "out" });
 
     /* Warehouse Stock V1: when a source location was chosen, the issue also
        writes a location-OUT movement — sharing ONE source identity with the
@@ -2437,6 +2484,8 @@ async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey
           actor: { id: actorId, name: "" },
           idempotencyKey: locStock.movementLineKey(operationKey, mrfItem._id, "issue"),
           operationKey,
+          /* the lot the shelf balance moves under, when a label was scanned */
+          ...(label ? { barcodeId: label._id, barcodeLabel: `${label.quantity} ${label.unit}${label.purchaseOrderNumber ? ` · ${label.purchaseOrderNumber}` : ""}` } : {}),
         }
       : null;
 
@@ -2444,11 +2493,13 @@ async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey
       rawItemId: mrfItem.rawItem,
       variantId: mrfItem.variantId,
       variantCombination: mrfItem.variantCombination,
+      label: labelPlan,
       delta: -deductQty,
       txnMeta: {
         type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
         quantity: deductQty,
         reason: `MRF Issue — ${mrf.mrfNumber}`,
+        performedByName: req.user?.name || req.user?.email || "",
         notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
         performedBy: actorId,
       },
@@ -2535,9 +2586,14 @@ function applyIssueTargets(doc, itemTargets, { storeNotes, reviewedAt, who, deta
  * it against the rolled-back state and lands the same result.
  */
 async function applyStockPlans(stockPlans, session) {
+  const labels = [];
   for (const sp of stockPlans) {
     await adjustStock(sp.rawItemId, sp.variantId, sp.variantCombination, sp.delta, sp.txnMeta, sp.loc, session);
+    /* the scanned label's own quantity, in the same unit of work */
+    const moved = await applyLabelMove(sp.label, session);
+    if (moved) labels.push(moved);
   }
+  return labels;
 }
 
 router.post(
@@ -2646,7 +2702,9 @@ router.post(
         });
       }
 
-      planned.push({ mrfItem, issuedQty, notes: line.storeNotes || "", loc });
+      /* the raw-item label this line was scanned from, when it was (2 Oct 2026) */
+      const label = await resolveLineLabel(req, mrfItem, line.barcodeId);
+      planned.push({ mrfItem, issuedQty, notes: line.storeNotes || "", loc, label });
     }
 
     if (!planned.length)
@@ -2712,8 +2770,9 @@ router.post(
         const doc = await MRF.findById(mrf._id).session(session || null);
         if (!doc) throw new Error(`MRF ${mrf._id} disappeared mid-issue`);
         const fullyIssued = applyIssueTargets(doc, itemTargets, { storeNotes, reviewedAt, who, detail });
-        await applyStockPlans(stockPlans, session);
+        const labelsMoved = await applyStockPlans(stockPlans, session);
         await doc.save(session ? { session } : {});
+        doc.$locals.labelsMoved = labelsMoved;
         return {
           entityType: MRF_ENTITY,
           entityId: doc._id,
@@ -2751,6 +2810,8 @@ router.post(
         : `Issued. ${issuedLines.filter(l => l.remaining > 0).map(l => `${l.remaining} ${l.unit} of ${l.name}`).join(", ")} still pending on this request.`,
       mrf: obj,
       issued: issuedLines,
+      /* what each scanned label reads now */
+      labels: committed.$locals?.labelsMoved || [],
       context: buildContext(obj, "store"),
     };
     return req.idempotent
@@ -2839,6 +2900,10 @@ router.post(
     }
 
     const creditQty = await convertQty(qty, mrfItem.unit, mrfItem.baseUnit);
+    /* the raw-item label the returned material carries, when scanned: its own
+       figure goes back UP with the return (2 Oct 2026) */
+    const returnLabel = await resolveLineLabel(req, mrfItem, req.body?.barcodeId);
+    const returnLabelPlan = labelMove(returnLabel, { lineQty: qty, lineUnit: mrfItem.unit, baseQty: creditQty, baseUnit: mrfItem.baseUnit, direction: "in" });
     const who = actorName(req);
     const mrfItemId = String(mrfItem._id);
     const returnedAt = new Date();
@@ -2861,6 +2926,7 @@ router.post(
 
     const returnPlan = {
       rawItemId: mrfItem.rawItem, variantId: mrfItem.variantId, variantCombination: mrfItem.variantCombination,
+      label: returnLabelPlan,
       delta: +creditQty,
       txnMeta: {
         type: mrfItem.variantId ? "VARIANT_ADD" : "ADD",
@@ -2868,6 +2934,7 @@ router.post(
         reason: `MRF Return — ${mrf.mrfNumber}`,
         notes: notes || `Return from ${mrf.requestedForName}. MRF: ${mrf.mrfNumber}`,
         performedBy: getActorId(req),
+        performedByName: req.user?.name || req.user?.email || "",
       },
       loc: loc && loc.location
         ? {
@@ -2878,6 +2945,7 @@ router.post(
             actor: { id: getActorId(req), name: who },
             idempotencyKey: locStock.movementLineKey(req.idempotent?.key || "", mrfItem._id, "return"),
             operationKey: req.idempotent?.key || "",
+            ...(returnLabel ? { barcodeId: returnLabel._id, barcodeLabel: `${returnLabel.quantity} ${returnLabel.unit}` } : {}),
           }
         : null,
     };
@@ -3548,7 +3616,7 @@ router.post("/:id/reservations/:reservationId/issue",
         plans.push({
           rawItemId: r.rawItemId, variantId: r.variantId || null, variantCombination: r.variantCombination || [],
           delta: -takeBase,
-          txnMeta: { type: r.variantId ? "VARIANT_REDUCE" : "REDUCE", quantity: takeBase, reason: `MRF Issue — ${mrf.mrfNumber}`, performedBy: req.user?.id || null },
+          txnMeta: { type: r.variantId ? "VARIANT_REDUCE" : "REDUCE", quantity: takeBase, reason: `MRF Issue — ${mrf.mrfNumber}`, performedBy: req.user?.id || null, performedByName: req.user?.name || req.user?.email || "" },
           loc: {
             companyId: req.tenant.companyId, siteId: req.tenant.siteId || null, warehouse: wh, location: loc, type: "issue",
             source: { kind: "mrf_issue", id: mrf._id, reference: mrf.mrfNumber },
