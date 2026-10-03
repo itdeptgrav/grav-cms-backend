@@ -207,17 +207,68 @@ every other anchor does.
 
 ### LA-10 · Band sets, as data
 
-Nothing in the product holds fit thresholds today. They belong in the database
-beside the garment templates, keyed by category, fit and fabric behaviour, with a
-version — the same arrangement the C1/C2 scoring bands already use in Firestore,
-and for the same reason: they change without a deploy and have to be quotable
-after the fact.
+**Lane B's own item, listed here so the dependency is visible.** The schema, the
+validators, the editor and the demo sets are built — `components/rnd/fitTools/`
+`bands.js`, `bandFixtures.mjs`, `BandSetEditor.js`, preview at
+`/preview/fit-bands`. What is deliberately **not** built is persistence.
 
-Until a band set exists, `classify()` returns `unclassified` and the screen shows
-numbers **without a judgement**. It does not fall back to a default threshold.
+Until a real set is stored and in force, `classifyWithSet()` returns
+`unclassified` and the screen shows numbers **without a judgement**. It does not
+fall back to a default threshold, and every fixture set is marked `demo: true`
+and classifies as `FIXTURE`, which can never become a finding.
 
-*Status: does not exist. Not a Lane A item — this one is Lane B's, listed here so
-the dependency is visible.*
+#### Where it will live — **decision not taken**
+
+Atlas is at its 500-collection ceiling, so a `fit_band_sets` collection is not
+available. Two candidate homes, both with a real cost:
+
+| Home | Cost |
+|---|---|
+| A discriminated document type inside an existing Mongo configuration document | No new collection, but band sets are not configuration of anything that document is about, and the containing document grows without bound as versions accumulate |
+| Firestore, beside the C1/C2 `bandconfigs` precedent | No ceiling, and exactly the established pattern for "thresholds R&D owns that change without a deploy" — but it puts an ERP-domain record in the Cowork datastore, against the split `CLAUDE.md` describes |
+
+Firestore is the better fit on every axis except domain cleanliness, and that
+exception is not small. **This is an architecture decision and belongs in
+`docs/decisions/`, not in a task.** It is surfaced here rather than resolved.
+
+#### The API, whichever home wins
+
+```
+GET    /api/rnd/fit-bands?metric&category&fitIntent&fabricBehaviour&at
+         → the ONE set in force at `at`, or null plus the sentence saying why
+GET    /api/rnd/fit-bands/:id                  → every version of one set
+GET    /api/rnd/fit-bands/:id/:version         → that exact version, forever
+POST   /api/rnd/fit-bands                      → create a draft
+PATCH  /api/rnd/fit-bands/:id/:version         → edit a DRAFT, and only a draft
+POST   /api/rnd/fit-bands/:id/:version/activate
+POST   /api/rnd/fit-bands/:id/:version/retire
+```
+
+There is no DELETE. A retired set is still cited by every fitting it judged, and
+a citation that resolves to nothing is worse than no citation at all.
+
+#### What the server must enforce, not the client
+
+`fitBandSetProblems()` runs in the browser so an author sees a gap as they type.
+It is a convenience, never the gate — the same checks run on write, because the
+client is not the thing being trusted:
+
+- **An active version is immutable.** Editing one would silently re-judge every
+  fitting that cites it. Changing a threshold means a new version.
+- **A version string is never reused for one id**, or two different decisions
+  answer to the same citation.
+- **At most one set in force** per `(metric, category, fitIntent,
+  fabricBehaviour)` at any instant. Activation retires the incumbent in the same
+  write, or two sets both claim a garment and nothing can say which judged a
+  fitting. `selectBandSet()` reports that collision rather than breaking the tie.
+- **Activation requires an approver and a change reason.** A demo set may not be
+  approved at all.
+- **An analysis that carries judgements and no `bandSetId` + `bandSetVersion` is
+  refused on write.** `bandCitationProblems()` enforces it client-side; the
+  record is only safe once the server does too.
+
+*Status: schema, validation, editor and tests built. Persistence deliberately
+deferred, pending the decision above.*
 
 ---
 

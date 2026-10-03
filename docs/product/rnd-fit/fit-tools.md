@@ -11,10 +11,29 @@ yet, this document names the gap and
 [`docs/tasks/fit-validation/lane-a-integration-checklist.md`](../../tasks/fit-validation/lane-a-integration-checklist.md)
 turns it into a request.
 
-The executable half of this specification already exists, in the frontend repo
-under `components/rnd/fitTools/`: `evidence.js`, `metrics.js`, `schema.js`,
-`format.js`. Where the two disagree, the code is right and this document is
-stale — it is prose about data, not the data.
+### Which of these is authoritative
+
+**This document is.** Under `AGENTS.md`, `docs/product/` and `docs/decisions/`
+are durable sources of truth, and this is a product document: it states what the
+fit tools mean and how they must behave.
+
+The executable half — `components/rnd/fitTools/` in the frontend repo
+(`evidence.js`, `metrics.js`, `schema.js`, `format.js`, `bands.js`) — **enforces**
+that contract. It is the mechanism, not the meaning. A validator exists so the
+rule below cannot be broken quietly; it does not get to decide what the rule is.
+
+**A disagreement between the two is a defect in one of them, and it is never
+resolved by reading only one.** Neither side silently overrides the other:
+
+- Code that contradicts this document is a bug in the code, **unless** writing it
+  revealed that the stated behaviour is wrong or impossible — in which case the
+  finding is surfaced, this document is corrected first, and the code follows.
+- A rule here that no validator enforces is a gap, not a decision already taken.
+  It is written down as unenforced rather than assumed.
+
+Either way the correction is made explicitly and recorded. Discovering a
+disagreement and quietly conforming to whichever side is in front of you is the
+failure mode this paragraph exists to prevent.
 
 ---
 
@@ -308,8 +327,10 @@ inside it.
 ## 6. What is built, and what is not
 
 **Built** (frontend repo, `components/rnd/fitTools/`, no Lane A file touched):
-the four modules above, fixtures, 68 schema and formatting tests, a mock-driven
-screen, 15 screen tests, and the preview route at `/preview/fit-tools`.
+the modules above plus `bands.js` — the full `FitBandSet` schema, its validators,
+selection by garment and date, and classification — with demo band sets in
+`bandFixtures.mjs`, a Band Set editor, fixtures, and the preview routes
+`/preview/fit-tools` and `/preview/fit-bands`.
 
 **Not built:** anything wired to a real drape. The screen reads fixtures. It is
 not in the drape viewport and must not be put there before the checklist is
