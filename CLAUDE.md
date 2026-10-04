@@ -1163,3 +1163,155 @@ Verified 1 Oct 2026: WH-MAIN exported (95 locations, all tokened, floor plan,
 renamed copy → created as WH-TEST-IMP with 95 locations, parents inside,
 tokens re-minted and disjoint; a second file with a rename and a new bin →
 update, 1 added / 95 updated, new bin tokened; the test warehouse deleted.
+
+## Maintenance: machines, Service Orders and Product Orders (3 Oct 2026)
+
+A department app, `maintenance` (architecture app #11). It READS the Machine
+register and the Store's Item Master and never creates, edits or copies a
+machine, an item or a barcode. Its own data is its orders.
+
+- **Two order systems, both Maintenance's own** (`MaintenanceOrder`,
+  collection `maintenance_orders`; NOT the Store's vendor service orders):
+  - **One flow for both kinds** (owner, 3 Oct 2026: "too many statuses"):
+    `OPEN → IN_PROGRESS → DONE → CLOSED`, `CANCELLED` from Open / In
+    progress (with a reason); steps `start` (clock starts), `done` (needs
+    `workPerformed`, clock stops), `close`, `cancel`. A product job is born
+    Open AND handed over (`inMaintenanceAt` = opening). The first version's
+    words (Draft, Created, In maintenance, Work in progress, Repair
+    completed, Solved, Completed) and step names are read as the new ones
+    (`flow.normalizeStatus`, `storedAs` for queries, `LEGACY_ACTION`), stay
+    valid in the model's enum, and `scripts/migrations/maintenance-order-
+    statuses.js` (dry run; `--apply`) rewrites stored jobs with a
+    `status-renamed` event — run on the LOCAL DB 3 Oct 2026 (10 jobs).
+  - **Service Maintenance `MSO-0001`** — Maintenance's own repair job, typed
+    FREE-FORM (owner, 3 Oct 2026: "not ask barcode … any thing can register"):
+    `serviceInfo {title, category, location}`; `subject.kind` is `"none"` unless
+    a machine or item is linked, which is optional. With a link, a blank title /
+    location falls back to the record's own. The model refuses a `"none"`
+    subject on a product order and a free-form order with no title.
+    `DRAFT → IN_PROGRESS → REPAIR_COMPLETED → CLOSED` (cancel from the first two,
+    with a reason) — superseded by the one flow above.
+  - **Product Maintenance `MPO-0001`** — an exact existing machine or item,
+    found by a scan or a search (the barcode is never required), put into
+    maintenance:
+    `CREATED → IN_MAINTENANCE → WORK_IN_PROGRESS → SOLVED → COMPLETED` (cancel
+    before solved, with a reason). "Put into Maintenance" on create goes straight
+    to `IN_MAINTENANCE`.
+  The states and steps are `services/maintenance/maintenanceOrderFlow.js` (pure,
+  `node --test`); the frontend's `components/maintenance/orderFlow.mjs` mirrors
+  it for words and the preview only — the screens use the server's `actions`.
+- **Service Maintenance is raised with the Store's service form** (owner, 3
+  Oct 2026). `services/maintenance/maintenanceServiceTerms.js` checks it
+  exactly as `routes/CMS_Routes/Inventory/Services/services.js` checks a
+  service (limits, GST 0–100, rate/lead/notice ≥ 0, frequency list, supplier
+  `tenantFilter`+`ownedOnly`, budget head via `itemBudgetHead.assertMappable`)
+  against the books' primary company (`requests/booksCompany.theCompany`) —
+  Maintenance staff need no Store grant — and serves the same lists at `GET
+  /service-options`. Kept on the job: `serviceInfo {title=name, category,
+  description, location}` and, only when `doneBy` is `outside`,
+  `serviceTerms {billingUnit, defaultRate, leadTimeDays, preferredVendorId +
+  Name, budgetLedgerId + Name, sacCode, defaultGstRate, recurring}`. A service
+  job's `problem` is optional (its description, else its name). Nothing is
+  written to the Store or Finance. Product Maintenance by an outside vendor
+  sends the same terms as `body.terms` (`doneBy: outside`) and gets the same
+  checks and `serviceTerms`; its "service name" is the machine or item.
+- **`details`** (immutable, both kinds; `detailsFrom` refuses unknown values in
+  words): priority (low/normal/high/urgent), maintenanceType (breakdown,
+  preventive, routine, inspection, installation, other), specification
+  (service), department, targetDate, estimatedCost (an estimate, ≥ 0),
+  provider {in-house | outside + name, contact}, conditionReceived /
+  accessories / handedOverBy (product only), notes. **`attachments`** are
+  Google Drive references `{fileId, name, mimeType, size, stage, uploadedAt,
+  uploadedBy}` — at create (`stage: raised`), with **Mark done** as proof of
+  the work (`stage: proof`, 4 Oct 2026: `body.attachments` on `POST
+  …/steps/done`, pushed in the same guarded write as the step, the event note
+  naming them; a broken reference refuses the whole step and the job stays In
+  progress) and later via `POST /orders/:id/attachments` (`later`, an
+  `attached` event); `$push` only, at most 20 a call and 60 a job (the cap is
+  part of the write filter; proof is checked against it before the step).
+  Other steps ignore `attachments`. Verified live 4 Oct 2026 (MSO-0015: a PDF,
+  an .xlsx and a photo as proof, read back byte-for-byte).
+- **Files** (`services/maintenance/maintenanceDrive.js`, routes `POST /files`
+  editor, `GET /files/:fileId` viewer): uploaded with the backend's own
+  `GOOGLE_SERVICE_ACCOUNT_KEY` into a private Drive folder "Maintenance" (under
+  `GOOGLE_DRIVE_FOLDER_ID`, or `GOOGLE_DRIVE_MAINTENANCE_FOLDER_ID`) — no
+  `permissions.create`, the companyDrive posture. Read back ONLY if a
+  maintenance job references the fileId; images (not SVG) and PDFs inline,
+  everything else `attachment`, `nosniff`. 25 MB, program files refused.
+  Verified live 3 Oct 2026 against the real Drive (MSO-0012): bytes round-trip,
+  Google lists no "anyone" permission. Tests: `maintenance-files.route.test.js`
+  (Drive replaced by an in-memory stand-in).
+- **Every repair is its own order.** A finished order is never reopened; the
+  same machine's next problem is a new number. The model refuses replace and
+  delete and any update but the lifecycle fields, `$setOnInsert createdAt` and
+  `$push events`; `problem`, `subject`, `subjectAtOpen`, `openedAt/By` never
+  change. Each step is ONE `findOneAndUpdate` keyed on the current status, so two
+  people pressing the same button cannot both move it (409).
+- **Repair time is two stored timestamps**: the clock-start step (`start` /
+  `start-work`) sets `workStartedAt`, the clock-stop step (`complete-repair` /
+  `solve`, which needs `workPerformed`) sets `workDoneAt` and
+  `repairMinutes = round((done − started) / 60000)`. `repairStats` (repairs, last
+  and previous repaired, days since, last and average minutes) is derived from
+  the orders, never stored on the machine.
+- **Numbers** come from `crm_sequences` (`maintenance:MSO`, `maintenance:MPO`),
+  no counter collection. `idempotencyKey` is unique: a resubmission returns the
+  order it made, and is answered BEFORE a number is taken (until 3 Oct 2026 a
+  replay used one up, which is why the local DB has MSO-0001 then MSO-0003).
+- **What a scan identifies** (`GET /subjects/resolve?code=`, a READ):
+  `MCH-` tag → that machine (always allowed: a machine is an Asset); a Store
+  label (`itemid=<id>`, the item-info URL, or bare 24-hex) → the label's
+  `rawItem`, which must be of a type Maintenance Settings allow (409
+  `TYPE_NOT_ALLOWED` otherwise); VOIDED labels and items gone from the Item
+  Master are 404 with the reason; anything else is 404 "Machine or Product Not
+  Found". The Store's parsers are not imported. `createOrder` re-resolves a
+  scanned code and records it on the order only if it really belongs to that
+  subject.
+- **Settings › Allowed Product Types**: `system_settings` row
+  `maintenance.visibleItemTypes` (`services/maintenance/maintenanceSettings.js`).
+  Asset is forced in by every read and write; `__not_classified__` stands for
+  items with no `productType` (297 + 10 blank of 309 on 3 Oct 2026). Owner only
+  to change. Orders already raised keep their item whatever is set later.
+- **The tag lives on the machine**: `Machine.maintenanceTag {code, issuedAt,
+  issuedBy}` (`machineMaintenanceTag.schema.js`), `select: false`, written once
+  by `issueTag` under the query option `machineMaintenanceTagWrite`, filtered on
+  "no tag yet"; `maintenanceTag_code_unique` (partial) means no two machines share
+  one. The code is `MCH-` + 8 chars without 0/O/1/I (`machineTag.js`). **Hand
+  mongoose a COPY of index options** (`tagIndexSpec()`): it writes `background`
+  into them, and a frozen object made `ensureIndexes` throw for every Machine
+  consumer.
+- **Which machines are sewing machines** is `services/maintenance/sewingMachines.js`
+  (stitching + embroidery + snap button, 79 of 90).
+- **Storage.** Atlas is at 500/500 collections, so `maintenance_orders` exists only
+  where it was created (the LOCAL `grav_clothing` copy, 3 Oct 2026). The model is
+  `autoCreate/autoIndex: false`; `maintenanceStorage.orderStorageReady()` asks,
+  and every write is refused 503 `MAINTENANCE_STORAGE_NOT_READY` until
+  `node -r dotenv/config scripts/migrations/machine-maintenance-storage.js --apply`
+  has created it with its five indexes (dry run without `--apply`; never drops).
+  The first version's `machine_maintenance_records` (`MachineMaintenanceRecord`)
+  is read-only now and shown in the same history as "first version" entries.
+- **Access** (`routes/CMS_Routes/Maintenance/maintenanceAccess.js`):
+  database-verified platform admin = owner; else a `maintenance` grant (viewer
+  reads, editor raises and steps, owner changes Settings); before any grant, a
+  session signed into `maintenance` is editor-level ("migration"), never owner.
+  Not `requireDepartmentRole`, which fails open with no grants.
+- Routes (`/api/cms/maintenance`): `GET /overview`, `GET /sewing-machines`,
+  `POST /sewing-machines/:id/tag`, `GET /resolve` (V1 tag-only), `GET
+  /subjects/resolve`, `GET /subjects/search`, `GET /subjects/:kind/:id`, `GET|POST
+  /orders`, `GET /orders/:id`, `POST /orders/:id/steps/:action`, `POST
+  /orders/:id/assign`, `GET /history`, `GET /staff`, `GET /settings`, `PUT
+  /settings/visible-item-types`. `orderView` adds `title` (typed, else the
+  record's name) and `service`; `/history?subject=none` lists free-form jobs;
+  `GET /orders` also answers `overdue` (open / in progress past
+  `details.targetDate`, before today on India's calendar) and filters it with
+  `?due=overdue`. Search covers `serviceInfo.*` and the supplier. Tests: `test/maintenance/` (Jest, 59) and
+  `services/maintenance/*.test.js` (node, 19).
+- Live on the LOCAL DB (3 Oct 2026), SNLS1 (`69b79349b0cb514c2a657c09`,
+  JUK-2026-619, `MCH-P4U9UBX2`): MSO-0001 (1 min, closed), MSO-0003 (closed),
+  MPO-0001 and MPO-0002 (both raised by scanning the tag, completed), MSO-0004
+  (cancelled — raised to check the numbering fix), MSO-0005 (free-form "AC
+  servicing – office", no machine, closed), MPO-0003 (SNLS1 chosen by search,
+  with receiving details), MSO-0006 (generator, outside vendor), MSO-0007
+  (Store form, outside vendor ADITYA TRADERS, every term) and MSO-0008 (Store
+  form, in-house, name only). Raised as
+  "Maintenance live test".
+  Machines 90 → 90, all 334 Store labels and 309 items byte-identical.

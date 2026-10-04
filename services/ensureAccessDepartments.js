@@ -206,6 +206,17 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: null, showOnOnboarding: false,
     legacyUserType: "board", dashboardPath: "/board/dashboard/policies/financing",
     description: "Company policy: the rules every costing is calculated under." },
+  /* Maintenance (3 Oct 2026). The architecture's own app (#11: equipment
+     availability), starting with sewing machines: a permanent tag on each
+     existing machine and its maintenance history. No legacy collection —
+     nobody ever signed in to a maintenance module — so like IE and PPC this
+     registers the department and nothing else, which is what makes it
+     GRANTABLE from CEO → Access Control. That grant is the whole access
+     model: routes/CMS_Routes/Maintenance/maintenanceAccess.js. */
+  { key: "maintenance", slug: "maintenance", name: "Maintenance", sortOrder: 105,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "maintenance", dashboardPath: "/maintenance",
+    description: "Sewing machine tags, breakdowns and maintenance history." },
 ];
 
 // Platform administration is NOT a department.

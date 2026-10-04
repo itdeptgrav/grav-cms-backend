@@ -2081,6 +2081,12 @@ app.use("/api/cms/employees/operators", operatorsRoutes);
 const machinesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/machines");
 app.use("/api/cms/machines", machinesRoutes);
 
+/* Maintenance (3 Oct 2026): the sewing machines the Maintenance team looks
+   after — a permanent tag on each existing machine, scan → that machine, and
+   an append-only maintenance history. Reads the Machine register; never
+   creates a machine. Its own auth and `maintenance` department guard. */
+app.use("/api/cms/maintenance", require("./routes/CMS_Routes/Maintenance/maintenanceRoutes"));
+
 const warehousesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/warehouses");
 app.use("/api/cms/warehouses", warehousesRoutes);
 

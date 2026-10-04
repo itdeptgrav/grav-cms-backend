@@ -74,5 +74,15 @@ const {
 addProductionAssignmentPaths(machineSchema);
 installMachineAssignmentGuard(machineSchema);
 
+/* Maintenance tag (3 Oct 2026): the permanent label identity a Maintenance
+   scan resolves through. Additive, `select: false`, written once by the
+   maintenance tag service — see machineMaintenanceTag.schema.js. */
+const {
+  addMaintenanceTagPaths,
+  installMaintenanceTagGuard,
+} = require("./machineMaintenanceTag.schema");
+addMaintenanceTagPaths(machineSchema);
+installMaintenanceTagGuard(machineSchema);
+
 module.exports = mongoose.model("Machine", machineSchema);
 
