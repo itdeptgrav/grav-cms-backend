@@ -1905,42 +1905,12 @@ async function syncLeaveForOverride({
   } else if (!oldIsLeave && newIsLeave) await createAutoLeave(newStatus);
 }
 
-function buildLeaveDateMap(leaveApp, holidaySetOrNull) {
-  const totalDays = leaveApp.totalDays || 0;
-  const paidDays = leaveApp.paidDays != null ? leaveApp.paidDays : totalDays;
-  const leaveCode = LEAVE_TYPE_TO_STATUS[leaveApp.leaveType] || "LWP";
-  const isFullLOP = leaveApp.leaveType === "LOP" || paidDays === 0;
-
-  const map = new Map(); // dateStr → statusCode
-  let paidUsed = 0;
-
-  const start = new Date(leaveApp.fromDate + "T00:00:00");
-  const end = new Date(leaveApp.toDate + "T00:00:00");
-
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const ds = dateStrOf(new Date(d));
-    const dow = new Date(ds + "T00:00:00").getDay();
-    const isSunday = dow === 0;
-    const isHoliday = holidaySetOrNull ? holidaySetOrNull.has(ds) : false;
-
-    if (isSunday || isHoliday) {
-      // Rest day — don't consume a paid slot, skip from map
-      continue;
-    }
-
-    let code;
-    if (isFullLOP) {
-      code = "LWP";
-    } else if (paidUsed < paidDays) {
-      code = leaveCode;
-      paidUsed++;
-    } else {
-      code = "LWP";
-    }
-    map.set(ds, code);
-  }
-  return map;
-}
+/* The per-day status map for an approved leave. Moved to
+   services/leaveDateMap.js (5 Oct 2026), which also stopped it turning every
+   half-day leave into a whole day — it never read `isHalfDay`, so an
+   approved half-day SL was written into attendance as L-SL instead of P/SL.
+   See that file. All four callers below use it unchanged. */
+const { buildLeaveDateMap } = require("../../services/leaveDateMap");
 
 async function applyLeaveToAttendance(leaveApp) {
   if (!leaveApp || leaveApp.status !== "hr_approved")

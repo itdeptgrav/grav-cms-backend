@@ -1249,3 +1249,40 @@ Six live records had drifted (`STORE`→`STORE & PURCHASE` ×4, `SAMPLING`→`R&
 5 Oct 2026, with the before values printed and the result read back. The
 duplicate `R&D` / `R & D` departments were left alone — nobody is assigned to
 the second one.
+
+### Half-day leave is half a day in attendance (5 Oct 2026)
+
+`buildLeaveDateMap` never read `isHalfDay`. A half-day leave has `paidDays:
+0.5`, so `paidUsed (0) < paidDays (0.5)` handed its one date the FULL-day
+code: every approved half-day was written as `L-SL` / `L-CL` / `L-EL` instead
+of `P/SL` / `P/CL` / `P/PL`, and an unpaid half-day as a whole day of `LWP`
+instead of `P/LWP`. Of 79 approved half-day leaves on 5 Oct 2026, **none** was
+on the right code. It is not cosmetic: `leaveAmountForStatus` prices `L-SL` at
+1.0 SL and `P/SL` at 0.5, so the first HR edit of such a day refunded a full
+day for a half taken; and `LWP` is attendance value 0 where `P/LWP` is 0.5.
+
+It now lives in `services/leaveDateMap.js` (tested, `npm test`) and returns the
+half codes for a half day; full-day behaviour is the original loop, line for
+line. All four callers (approve → attendance, the per-date re-apply, the two
+calendar builders) take the code verbatim, and every `P/…` code was already
+valid everywhere. **Existing rows were deliberately NOT repaired** (owner's
+decision): 73 paid half-days still read `L-xx` and 2 unpaid ones (GR0063
+26 Jun, GR0087 30 Jun) read `LWP`. Only new approvals get the half codes.
+
+### A leave cannot start before the employee joined (5 Oct 2026)
+
+The apply route and the manager's add-on-behalf both loaded `dateOfJoining`
+for the waiting-period rule and never compared it with `fromDate`. A half-day
+SL was filed for **5 Sept 2025** by somebody who joined **4 May 2026** (the
+app's date wheel had no lower bound — a wrong year is one flick away); it was
+accepted, minted a 2025 LeaveBalance, and the day meant — 5 Sept 2026 — read
+HD in HR because no leave named it. `services/leaveDateWindow.js` refuses it
+(`BEFORE_DATE_OF_JOINING`, naming both dates so the wrong YEAR is visible) on
+apply, add-on-behalf, and both edits — the edits only when the start date
+CHANGES, so a leave already on a bad date can still be corrected. Compared as
+UTC calendar days: every `dateOfJoining` is stored at 00:00:00Z, and local
+getters would move it a day west of UTC. The joining date is the whole bound —
+backdating is normal and there is no company backdating window to enforce.
+`test/hr-access/leave-before-joining.route.test.js` drives the real router.
+That record (GR0087, still `pending`) was left for the employee to withdraw and
+re-apply, by the owner's choice.
