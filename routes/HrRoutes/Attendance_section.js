@@ -2298,7 +2298,12 @@ async function applyRegularizationToAttendance(r, actor = {}) {
     emp.netWorkMins = netWorkMins;
     emp.lateMins = lateMins;
     emp.lateDisplay = fmtLateMins(lateMins);
+    /* A correction that takes the late away still leaves it in the late
+       streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+       and services/lateStreak.js. Read before this line overwrites it. */
+    const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
     emp.isLate = lateMins > 0;
+    if (_wasLate && !emp.isLate) emp.lateRegularized = true;
     emp.earlyDepartureMins = earlyDepartureMins;
     emp.isEarlyDeparture = earlyDepartureMins > 0;
     emp.otMins = otMins;
@@ -2445,7 +2450,7 @@ async function applyMonthlyLatePromotion(dayDoc, settings) {
     dateStr: { $lte: dayDoc.dateStr },
   })
     .select(
-      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus employees.inTime",
+      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus employees.inTime employees.lateRegularized",
     )
     .sort({ dateStr: 1 })
     .lean();
@@ -4222,7 +4227,12 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
           )
         : 0;
       emp.lateMins = Math.max(0, lateMins);
+      /* A correction that takes the late away still leaves it in the late
+         streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+         and services/lateStreak.js. Read before this line overwrites it. */
+      const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
       emp.isLate = emp.lateMins > 0;
+      if (_wasLate && !emp.isLate) emp.lateRegularized = true;
       const earlyDepartureMins = emp.finalOut
         ? Math.max(
             0,
@@ -4598,7 +4608,12 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         )
       : 0;
     emp.lateMins = Math.max(0, lateMins);
+    /* A correction that takes the late away still leaves it in the late
+       streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+       and services/lateStreak.js. Read before this line overwrites it. */
+    const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
     emp.isLate = emp.lateMins > 0;
+    if (_wasLate && !emp.isLate) emp.lateRegularized = true;
 
     const earlyDepartureMins = emp.finalOut
       ? Math.max(
@@ -5002,10 +5017,12 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
        function. This screen is the sheet on screen; if the two disagreed
        about who was there, one of them would be lying. */
     const _musterSeen = new Set();
+    const _musterPunched = new Set(); // inactive people only stay if they punched
     for (const d of dayDocs)
       for (const e of d.employees || []) {
         const b = String(e.biometricId || "").toUpperCase();
         if (b) _musterSeen.add(b);
+        if (b && (Number(e.punchCount) > 0 || (e.rawPunches || []).length > 0 || !!e.inTime)) _musterPunched.add(b);
       }
     let _musterLeave = new Set();
     let _musterLeaveUnknown = false;
@@ -5025,6 +5042,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       dojByBid,
       onLeaveInRange: _musterLeave,
       leaveUnknown: _musterLeaveUnknown,
+      punchedInRange: _musterPunched,
     });
     const filteredActive = _deptFiltered.filter((e) =>
       _musterOnRoll(extractBiometricId(e), onStaff(e)),
@@ -6448,12 +6466,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
        each appears on. Together they answer both questions the sheet needs:
        was this person on the roll at all, and from which day were they not. */
     const seenInRange = new Set();
+    const punchedInRange = new Set(); // inactive people only stay if they punched
     const lastSeenInRange = new Map();
     for (const doc of dayDocs) {
       for (const e of doc.employees || []) {
         const b = String(e.biometricId || "").toUpperCase();
         if (!b) continue;
         seenInRange.add(b);
+        if ((Number(e.punchCount) > 0 || (e.rawPunches || []).length > 0 || !!e.inTime)) punchedInRange.add(b);
         lastSeenInRange.set(b, doc.dateStr); // dayDocs are sorted ascending
       }
     }
@@ -6510,6 +6530,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       dojByBid,
       onLeaveInRange,
       leaveUnknown,
+      punchedInRange,
     });
     const onRollThisPeriod = (emp) =>
       onRoll(extractBiometricId(emp), onStaff(emp));
@@ -6815,10 +6836,22 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         ),
       );
     }
+    /* The catch-all below is for device ids with NO employee record — a
+       badge nobody registered still worked those days. It used to take
+       everybody not yet processed, which re-added exactly the people the roll
+       decision above had just left off: an inactive employee with only blank
+       device rows was excluded by onRollThisPeriod and then put straight back
+       here from those rows. Anyone with a record has already been judged. */
+    const hasEmployeeRecord = new Set(
+      rosterCandidates
+        .map((e) => String(extractBiometricId(e) || "").toUpperCase())
+        .filter(Boolean),
+    );
     for (const dayDoc of dayDocs) {
       for (const entry of dayDoc.employees || []) {
         const key = String(entry.biometricId || "").toUpperCase();
         if (!key || processedBids.has(key)) continue;
+        if (hasEmployeeRecord.has(key)) continue;
         if (
           department &&
           department !== "all" &&

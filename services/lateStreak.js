@@ -48,19 +48,29 @@ function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
      sync-time verdict stands. `systemPrediction` is not recomputed while HR
      has ruled on the day, so P* there is what the device recorded.
 
-     Only an explicit null counts as wiped. A projection that did not select
-     `inTime` reads it as undefined and keeps the old rule; and a day whose
-     time HR CORRECTED to on-time still has an inTime, so its recomputed
-     isLate=false is believed — a fixed device error is not a late. */
+     Only an explicit null counts as wiped: a projection that did not select
+     `inTime` reads it as undefined and keeps the old rule.
+
+     …AND NEITHER MAY A REGULARIZATION (5 Oct 2026, owner's rule). An approved
+     regularization that moves the check-in re-judges the day from scratch —
+     isLate false, status P — so it left the streak entirely and the 4th
+     late was docked as "the 3rd". The owner's rule: once the device saw a
+     late, it counts, however it was pardoned; the 3rd late regularized means
+     the 4th is just late and the 5th is the full-day absent. The correction
+     paths (regularization, HR punch edit, override with times) stamp
+     `lateRegularized` when they take a late away, and that day counts here.
+     The same stamp withholds the promotion, so the regularized day itself
+     is never docked. */
   const timesWiped = !!entry.hrFinalStatus && entry.inTime === null;
   const rawLate =
-    (!!entry.isLate || timesWiped) &&
-    ["P*", "LHD", "LAB"].includes(entry.systemPrediction);
+    !!entry.lateRegularized ||
+    ((!!entry.isLate || timesWiped) &&
+      ["P*", "LHD", "LAB"].includes(entry.systemPrediction));
   const rawEarly =
     !rawLate &&
     !!entry.isEarlyDeparture &&
     ["P~", "EAB"].includes(entry.systemPrediction);
-  const mayPromote = !entry.hrFinalStatus && dateStr !== todayStr;
+  const mayPromote = !entry.hrFinalStatus && !entry.lateRegularized && dateStr !== todayStr;
 
   if (rawLate) {
     state.lateCount++;

@@ -119,6 +119,12 @@ const employeeEntrySchema = new mongoose.Schema(
     otMins: { type: Number, default: 0 },
 
     isLate: { type: Boolean, default: false },
+    /* The device recorded this day as LATE, and a correction since — an
+       approved regularization, an HR punch edit or an override with times —
+       made it on-time. The day still counts in the late streak (so the 4th
+       late is not docked in its place) but is never itself docked. Set once,
+       never cleared by a later correction. See services/lateStreak.js. */
+    lateRegularized: { type: Boolean, default: false },
     lateMins: { type: Number, default: 0 },
     /** Human-readable late duration e.g. "1h 30m" — computed by route layer */
     lateDisplay: { type: String, default: "" },
