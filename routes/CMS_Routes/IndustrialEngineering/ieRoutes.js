@@ -74,6 +74,7 @@ const { getEffectiveRole, roleAtLeast } = require("../../../services/departmentR
 const { fail, sendError, handle } = require("../../../services/storePurchase/errors");
 const ieRead = require("../../../services/industrialEngineering/ieRead.service");
 const ieDevelopment = require("../../../services/industrialEngineering/ieDevelopment.service");
+const ieDevelopmentOrder = require("../../../services/industrialEngineering/ieDevelopmentOrder.service");
 const ieOrders = require("../../../services/industrialEngineering/ieOrders.service");
 const ieLibrary = require("../../../services/industrialEngineering/ieOperationLibrary.service");
 const ieStyleFile = require("../../../services/industrialEngineering/ieStyleFile.service");
@@ -301,6 +302,94 @@ router.get("/development", requireCompany, canRead, handle(async (req, res) => {
   return res.json({ success: true, ...out });
 }));
 
+/* The operation GROUPS the stock-item form offers ("Add from group"), so IE
+   can lay down a whole route in one step on a development order (5 Oct 2026).
+   Declared BEFORE /development/:styleId, which would otherwise take it. */
+/* THE WHOLE OPERATION REGISTER, ONCE (5 Oct 2026, owner): "load all the
+   operations at a time so that upon click it directly shows the dropdown."
+   259 rows today — one read when the order opens, filtered in the browser,
+   with the groups beside it. Declared BEFORE /development/:styleId. */
+router.get("/development/operation-catalogue", requireCompany, canRead, handle(async (req, res) => {
+  const Operation = require("../../../models/CMS_Models/Inventory/Configurations/Operation");
+  const OperationGroup = require("../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
+  const [ops, groups] = await Promise.all([
+    Operation.find({}).select("name operationCode totalSam machineType").sort({ name: 1 }).lean(),
+    OperationGroup.find().select("name operations").sort({ name: 1 }).lean(),
+  ]);
+  const row = (o) => ({ operationId: String(o._id), code: o.operationCode || "", name: o.name || "", machineType: o.machineType || "", samMinutes: o.totalSam ?? null });
+  const byId = new Map(ops.map((o) => [String(o._id), row(o)]));
+  return res.json({
+    success: true,
+    operations: [...byId.values()],
+    groups: groups.map((g) => ({ groupId: String(g._id), name: g.name || "", operations: (g.operations || []).map((id) => byId.get(String(id))).filter(Boolean) })),
+  });
+}));
+
+/* REGISTER THE LINES OF AN IMPORTED SHEET (5 Oct 2026, owner: "keep the
+   group import feature here so the user can do the bulk import"). The
+   development order imports a sheet of operations the way the master does
+   (OPERATIONS, TOTAL SAM, M/C TYPE, CODE); a line the register does not have
+   yet is registered here, by the master's own rules — machine type and
+   operation code auto-registered, the operation added to every group whose
+   keyword prefixes its code. A line that matches an existing operation by
+   name and code is NOT registered twice: the existing one is returned. */
+router.post("/development/operation-catalogue/register", requireCompany, canWrite, handle(async (req, res) => {
+  const Operation = require("../../../models/CMS_Models/Inventory/Configurations/Operation");
+  const OperationCode = require("../../../models/CMS_Models/Inventory/Configurations/OperationCode");
+  const OperationGroup = require("../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
+  const MachineType = require("../../../models/CMS_Models/Inventory/Configurations/MachineType");
+  const list = Array.isArray(req.body?.operations) ? req.body.operations : [];
+  if (!list.length) return res.status(400).json({ success: false, message: "No operations to register." });
+  if (list.length > 400) return res.status(400).json({ success: false, message: "At most 400 operations at a time." });
+  const esc = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const by = require("mongoose").isValidObjectId(req.user?.id) ? req.user.id : undefined;
+  const out = [];
+  const refused = [];
+  for (const [i, row] of list.entries()) {
+    const name = String(row?.name || "").trim();
+    const code = String(row?.operationCode || "").trim().toUpperCase();
+    const sam = Number(row?.totalSam);
+    const machineType = String(row?.machineType || "").trim();
+    if (!name || !Number.isFinite(sam) || sam < 0) { refused.push({ line: i + 1, name, reason: "needs a name and a SAM" }); continue; }
+    if (!machineType) { refused.push({ line: i + 1, name, reason: "needs a machine type" }); continue; }
+    const existing = await Operation.findOne({ name: new RegExp(`^${esc(name)}$`, "i"), operationCode: code }).lean();
+    let op = existing;
+    if (!op) {
+      const created = await new Operation({ name, operationCode: code, totalSam: sam, durationSeconds: Math.round(sam * 60), machineType, createdBy: by }).save();
+      op = created.toObject();
+      await MachineType.findOneAndUpdate({ name: machineType }, { name: machineType, createdBy: by }, { upsert: true });
+      if (code) {
+        await OperationCode.findOneAndUpdate({ code }, { code, createdBy: by }, { upsert: true });
+        const groups = await OperationGroup.find({ keyword: { $ne: "" } });
+        for (const g of groups) {
+          if (g.keyword && code.startsWith(String(g.keyword).toUpperCase()) && !g.operations.map(String).includes(String(created._id))) {
+            g.operations.push(created._id); await g.save();
+          }
+        }
+      }
+    }
+    out.push({ line: i + 1, created: !existing, operation: { operationId: String(op._id), code: op.operationCode || "", name: op.name || "", machineType: op.machineType || "", samMinutes: op.totalSam ?? null } });
+  }
+  return res.json({ success: true, registered: out.filter((r) => r.created).length, matched: out.filter((r) => !r.created).length, operations: out, refused });
+}));
+
+router.get("/development/operation-groups", requireCompany, canRead, handle(async (req, res) => {
+  const OperationGroup = require("../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
+  const groups = await OperationGroup.find()
+    .populate("operations", "name operationCode totalSam machineType")
+    .sort({ name: 1 }).lean();
+  return res.json({
+    success: true,
+    groups: groups.map((g) => ({
+      groupId: String(g._id), name: g.name || "",
+      operations: (g.operations || []).filter(Boolean).map((o) => ({
+        operationId: String(o._id), code: o.operationCode || "", name: o.name || "",
+        machineType: o.machineType || "", samMinutes: o.totalSam ?? null,
+      })),
+    })),
+  });
+}));
+
 /**
  * GET /development/:styleId — one row, with the read-only upstream evidence.
  *
@@ -311,6 +400,37 @@ router.get("/development", requireCompany, canRead, handle(async (req, res) => {
 router.get("/development/:styleId", requireCompany, canRead, handle(async (req, res) => {
   const out = await ieDevelopment.readDevelopment({ ...req.ie, role: req.ieRole }, {
     styleId: req.params.styleId,
+  });
+  return res.json({ success: true, ...out });
+}));
+
+/* ══ THE DEVELOPMENT ORDER (4 Oct 2026, owner) ═══════════════════════════════
+ * R&D sends a sample run — the product variants with Sales' quantities, a
+ * priority and a delivery deadline — to Industrial Engineering. IE assigns the
+ * operations with an assumed SAM each, starts processing (which creates the
+ * sampling request and its work orders, so the floor sees them), reads the
+ * departments' progress here, and completes the run with the actual SAM per
+ * operation, which goes back to R&D. The read is read-only; the three writes
+ * need an editor. */
+router.get("/development/:styleId/order", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieDevelopmentOrder.readOrder({ ...req.ie, role: req.ieRole }, { styleId: req.params.styleId });
+  return res.json({ success: true, ...out });
+}));
+router.post("/development/:styleId/order/operations", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieDevelopmentOrder.assignOperations({ ...req.ie, role: req.ieRole }, {
+    styleId: req.params.styleId, rows: req.body?.rows, actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+router.post("/development/:styleId/order/start", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieDevelopmentOrder.startOrder({ ...req.ie, role: req.ieRole }, {
+    styleId: req.params.styleId, actor: actorOf(req), userId: req.user?.id,
+  });
+  return res.json({ success: true, ...out });
+}));
+router.post("/development/:styleId/order/complete", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await ieDevelopmentOrder.completeOrder({ ...req.ie, role: req.ieRole }, {
+    styleId: req.params.styleId, rows: req.body?.rows, note: req.body?.note, actor: actorOf(req),
   });
   return res.json({ success: true, ...out });
 }));

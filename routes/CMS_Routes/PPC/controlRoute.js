@@ -24,6 +24,9 @@
 //   GET /control/search?q=                        PO / MO / WO / product / variant / customer / barcode
 //   GET /control/assistant/suggestions            what the assistant can answer
 //   POST /control/assistant/query { message }     a question, answered from the same services
+//   GET  /control/pieces/:barcode                  one garment piece's whole journey — every stage
+//                                                  done / remaining, who recorded it and when,
+//                                                  operation by operation, checkpoint by checkpoint (4 Oct 2026)
 //
 // Every door is read-only, company-scoped and needs a PPC role that can read
 // planning (the same rule as the order book and targets). Setting or
@@ -41,6 +44,7 @@ const calendar = require("../../../services/ppc/control/calendar.service");
 const targetBoard = require("../../../services/ppc/control/targetBoard.service");
 const assistant = require("../../../services/ppc/control/assistant/engine");
 const { DEPARTMENTS, DEPARTMENT_META, isId } = require("../../../services/ppc/control/ledger.service");
+const pieces = require("../../../services/ppc/control/pieceJourney.service");
 const shift = require("../../../services/manufacturing/shiftHours");
 
 const router = express.Router();
@@ -111,6 +115,13 @@ router.get("/control/reports/:type", wrap(async (req, res) => {
 }));
 
 router.get("/control/search", wrap(async (req, res) => res.json({ success: true, ...(await orders.search(companyOf(req), req.query.q)) })));
+/* ── ONE PIECE'S JOURNEY (4 Oct 2026, owner): "scan the product piece barcode
+   and showcase what's the current stage, what is completed, what remains,
+   and inside: who did it and when." Unrecognised is an answer, not an error. */
+router.get("/control/pieces/:barcode", wrap(async (req, res) => {
+  const d = await pieces.pieceJourney(companyOf(req), req.params.barcode);
+  return res.json({ success: true, ...d });
+}));
 
 router.get("/control/assistant/suggestions", (_req, res) => res.json({ success: true, ...assistant.suggestions() }));
 router.post("/control/assistant/query", wrap(async (req, res) => {

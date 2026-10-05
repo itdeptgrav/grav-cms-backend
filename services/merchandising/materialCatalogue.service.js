@@ -106,8 +106,8 @@ function suggestCategory(item) {
 /* ── THE ALLOW-LIST ────────────────────────────────────────────────────────
    Named field by field. `select` with a minus list would have been shorter
    and would have leaked every field added to RawItem afterwards. */
-const SAFE_SELECT = "name sku category customCategory usedAs unit customUnit attributes "
-  + "variants._id variants.sku variants.combination companyId "
+const SAFE_SELECT = "name sku category customCategory usedAs unit customUnit attributes image "
+  + "variants._id variants.sku variants.combination variants.image variants.quantity variants.unitConversions variants.unitConversion companyId "
   /* Whose property the material normally is — a merchandiser choosing a
      customer-supplied line should see it. */
   + "defaultOwnership";
@@ -169,15 +169,27 @@ const declaredAttributes = (item) => (Array.isArray(item?.attributes) ? item.att
  * Written that way round so that screening a supplier costs the reader the
  * supplier, and not every colourway on every legacy record beside it.
  */
-const safeVariant = (v, attributes = [], screened = false) => {
-  const values = (Array.isArray(v?.combination) ? v.combination : []).map(str);
+/* THE VARIANT IS SHOWN WHOLE (3 Oct 2026, owner: "it is not asking the
+   variant, so how does the system know which one"). This Store files its
+   suppliers as variants, so the positional screening above left every such
+   item "indistinguishable" and the picker stopped asking — a BOM row then
+   named a material and no variant. The combination is kept as Store wrote
+   it; an item with variants always asks which one. */
+const safeVariant = (v, _attributes = [], _screened = false, index = 0) => {
+  const values = (Array.isArray(v?.combination) ? v.combination : []).map(str).filter(Boolean);
   return {
     variantId: str(v?._id),
     sku: str(v?.sku),
-    combination: (screened
-      ? values.filter((_, i) => attributes[i] && attributeIsSafe(attributes[i]))
-      : values
-    ).filter(Boolean),
+    combination: values.length ? values : [`Variant ${index + 1}`],
+    /* what is in stock of this variant, shown in brackets in the picker so the
+       merchandiser chooses one the Store can give (3 Oct 2026, owner) */
+    quantity: Number.isFinite(Number(v?.quantity)) ? Number(v.quantity) : null,
+    /* the units this variant can be measured in — its own conversions, so the
+       merchandiser can state the assumed consumption in metres, kilograms or
+       pieces as Store converts them (4 Oct 2026) */
+    unitConversions: [...(Array.isArray(v?.unitConversions) ? v.unitConversions : []), ...(v?.unitConversion ? [v.unitConversion] : [])]
+      .filter((c) => c && str(c.toUnit))
+      .map((c) => ({ fromUnit: str(c.fromUnit), toUnit: str(c.toUnit), quantity: Number(c.quantity) || 0 })),
   };
 };
 
@@ -217,9 +229,7 @@ const safeVariant = (v, attributes = [], screened = false) => {
  */
 function variantChoiceOf(variants) {
   if (!variants.length) return "none";
-  const labels = variants.map((v) => [...v.combination, v.sku].filter(Boolean).join(" · "));
-  if (labels.some((l) => !l)) return "indistinguishable";
-  return new Set(labels).size === labels.length ? "required" : "indistinguishable";
+  return "required";
 }
 
 const safeItem = (item) => {
@@ -228,7 +238,7 @@ const safeItem = (item) => {
   const declared = declaredAttributes(item);
   const screened = declared.some((a) => !attributeIsSafe(a));
   const variants = (Array.isArray(item?.variants) ? item.variants : [])
-    .map((v) => safeVariant(v, declared, screened));
+    .map((v, i) => safeVariant(v, declared, screened, i));
   return {
     variantChoice: variantChoiceOf(variants),
     rawItemId: str(item?._id),
@@ -237,6 +247,8 @@ const safeItem = (item) => {
     category: str(item?.category),
     customCategory: str(item?.customCategory),
     unit: str(item?.unit) || str(item?.customUnit),
+    /* the photo Store keeps of it — the item's, else its first variant's (3 Oct 2026) */
+    image: str(item?.image) || str((Array.isArray(item?.variants) ? item.variants : []).find((v) => str(v?.image))?.image),
     /* Store's own classification, shown as a small label on each result so a
        merchandiser can see what part Store says this item plays. */
     usedAs: str(item?.usedAs) || usedAsDef.DEFAULT_USED_AS,
@@ -330,9 +342,13 @@ async function search(ctx, { q = "", category = "", section = "", cursor = "", l
       ],
     });
   }
-  /* The hard gate, ANDed into every query — it cannot be turned off from the
-     client. `category` has already narrowed `allowedUsedAs` within the section. */
-  clauses.push({ usedAs: { $in: allowedUsedAs } });
+  /* THE MATERIALS PICKER OFFERS THE WHOLE CATALOGUE (3 Oct 2026, owner): the
+     "Used as" gate hid every raw item Store had not classified — which is
+     almost all of them, since registered materials carry no such tag — so the
+     picker showed one item. Sample packaging keeps its gate; Materials & Trims
+     searches every raw item of the company and a category chip is a plain
+     narrowing, never a hard filter. */
+  if (sectionResolved === usedAsDef.SECTION.PACKAGING) clauses.push({ usedAs: { $in: allowedUsedAs } });
 
   if (str(cursor)) {
     const [name, id] = str(cursor).split("|");
@@ -359,10 +375,9 @@ async function search(ctx, { q = "", category = "", section = "", cursor = "", l
        places (the empty state asks Store to set an item's "Used as"). */
     str(cursor)
       ? Promise.resolve(null)
-      : RawItem.countDocuments({
-        companyId: ctx.companyId,
-        usedAs: { $in: usedAsDef.SECTION_USED_AS[sectionResolved] },
-      }),
+      : RawItem.countDocuments(sectionResolved === usedAsDef.SECTION.PACKAGING
+        ? { companyId: ctx.companyId, usedAs: { $in: usedAsDef.SECTION_USED_AS[sectionResolved] } }
+        : { companyId: ctx.companyId }),
   ]);
 
   const page = found.slice(0, size);
@@ -485,9 +500,14 @@ const MAX_NAME = 120;
 async function registrationOptions(ctx, session = null) {
   if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Merchandising.");
 
+  /* Units (and the categories in use) are the Store's, and the Store keeps no
+     company gate (29 Sep 2026): not one unit in this register carries a
+     companyId, so a strict match offered "no units of measure" and the whole
+     form was disabled. The company's own first, then the unowned ones. */
+  const unowned = { $or: [{ companyId: ctx.companyId }, { companyId: null }, { companyId: { $exists: false } }] };
   const [inUse, units] = await Promise.all([
-    RawItem.distinct("customCategory", { companyId: ctx.companyId }, { session }),
-    Unit.find({ companyId: ctx.companyId, status: "Active" })
+    RawItem.distinct("customCategory", unowned, { session }),
+    Unit.find({ ...unowned, status: { $ne: "Inactive" } })
       .select("name").sort({ name: 1 }).session(session)
       .lean(),
   ]);
@@ -597,7 +617,27 @@ async function register(ctx, body = {}, actorId = null, session = null) {
      material, so they are removed rather than refused. Everything else the
      caller sent travels on, where the shared service refuses whatever this
      door may not supply. */
-  const { fileId, idempotencyKey, expectedRevision, ...material } = body || {};
+  const { fileId, idempotencyKey, expectedRevision, attributes: rawAttributes, variants: _ignored, ...material } = body || {};
+
+  /* ── VARIANTS AT REGISTRATION (3 Oct 2026, owner) ─────────────────────
+     The merchandiser may name the attributes a material comes in (Colour:
+     Red, Blue; Width: 44", 58") and every combination becomes a variant, as
+     Store's own form does. Named none, and the material is registered with
+     ONE "Default" variant, so every registered material has a variant to
+     put on a BOM row and to receive stock against. */
+  const attributes = (Array.isArray(rawAttributes) ? rawAttributes : [])
+    .map((a) => ({
+      name: str(a?.name).slice(0, 60),
+      values: [...new Set((Array.isArray(a?.values) ? a.values : str(a?.values).split(","))
+        .map((v) => str(v).slice(0, 80)).filter(Boolean))],
+    }))
+    .filter((a) => a.name && a.values.length)
+    .slice(0, 4);
+  const combos = attributes.length
+    ? attributes.reduce((acc, a) => acc.flatMap((c) => a.values.map((v) => [...c, v])), [[]])
+    : [["Default"]];
+  const attrsToStore = attributes.length ? attributes : [{ name: "Variant", values: ["Default"] }];
+  const variants = combos.slice(0, 200).map((combination) => ({ combination }));
 
   const { rawItem } = await rawItemCreation.createRawItem({
     /* Company from the resolved Merchandising context, actor from the session.
@@ -614,10 +654,12 @@ async function register(ctx, body = {}, actorId = null, session = null) {
          than a guess this door is not entitled to make. */
       ...(usedAs ? { usedAs } : {}),
       description: body.description,
+      attributes: attrsToStore,
+      variants,
     },
-    /* Identity and classification. Not stock levels, not variants, not
-       attributes, not conversions, not discounts, not suppliers. */
-    sections: rawItemCreation.MERCHANDISING_SECTIONS,
+    /* Identity, classification, and the variants the material comes in. Not
+       stock levels, not conversions, not discounts, not suppliers. */
+    sections: [...rawItemCreation.MERCHANDISING_SECTIONS, rawItemCreation.SECTION.ATTRIBUTES, rawItemCreation.SECTION.VARIANTS],
     onDuplicate: "refuse",
     /* Part of the caller's unit of work, not a write of its own. The item and
        the audit row that says why it exists commit together or not at all. */

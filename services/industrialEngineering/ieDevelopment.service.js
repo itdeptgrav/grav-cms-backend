@@ -267,6 +267,8 @@ const STYLE_PROJECTION = [
      module is written out by hand and neither reference is among them. */
   "journeyId", "enquiryId", "isActive",
   "materials.status", "sample.status",
+  /* the development order IE handles — status only, for the row (4 Oct 2026) */
+  "production.developmentOrder.status",
   "techSheet.technical.status", "techSheet.technical.revision",
   "techSheet.technicalRevisions.revision", "techSheet.technicalRevisions.outcome",
   "techSheet.technicalRevisions.submittedAt", "techSheet.technicalRevisions.decidedAt",
@@ -882,6 +884,8 @@ function developmentRow(style, { sales, technical, merchandising, engineering, v
     rnd: technical,
     merchandising: { ...merchandising, duplicate: Boolean(duplicateDevelopment) },
     engineering,
+    /* where R&D's development order stands with IE (4 Oct 2026) */
+    order: { status: str(style.production?.developmentOrder?.status) || "none" },
 
     classification: verdict.classification,
     trackingOnly: verdict.trackingOnly,

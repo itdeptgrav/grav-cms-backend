@@ -4,6 +4,8 @@ const mongoose = require("mongoose");
 
 const issuanceItemSchema = new mongoose.Schema({
   rawItem:            { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+  /* the request LINE this item answers (4 Oct 2026) */
+  materialRequestLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
   rawItemName:        { type: String, default: "" },
   rawItemSku:         { type: String, default: "" },
   variantId:          { type: mongoose.Schema.Types.ObjectId, default: null },
@@ -91,6 +93,9 @@ const stockIssuanceSchema = new mongoose.Schema(
     // Optional MO reference
     manufacturingOrder: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null },
     moNumber:           { type: String, default: "" },
+    /* the PPC material request this issue answers, when it answers one
+       (CustomerRequest.materialRequests[]._id) — 4 Oct 2026 */
+    materialRequestId:  { type: mongoose.Schema.Types.ObjectId, default: null },
     customerName:       { type: String, default: "" },
 
     items:  [issuanceItemSchema],

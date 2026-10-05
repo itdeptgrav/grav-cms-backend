@@ -208,10 +208,27 @@ async function snapshot(companyId, opts = {}) {
 
 async function snapshotUncached(companyId, { asOfDay = todayKey(), moIds = null, start = null, end = null } = {}) {
   const index = await ledger.woIndex(companyId, moIds ? { moIds } : {});
-  const ids = [...index.byMo.keys()];
-  const [headers, events, targets] = ids.length ? await Promise.all([
-    headersFor(ids), ledger.readEvents(index, { start, end }), PpcOrderTarget.find({ companyId, manufacturingOrderId: { $in: ids.map(oid) } }).lean(),
-  ]) : [new Map(), new Map(), []];
+  let ids = [...index.byMo.keys()];
+  let headers = ids.length ? await headersFor(ids) : new Map();
+  /* ── A SAMPLING RUN IS NOT A PPC ORDER (4 Oct 2026, owner) ─────────────
+     "This sampling order doesn't need to showcase in the PPC." A development
+     order R&D sent through IE is read on IE's own development page, so a
+     board-wide snapshot leaves it out — orders, work-order register, calendar,
+     targets, reports and overview all read this one function. A snapshot
+     asked for NAMED orders (`moIds`) keeps them, which is how IE's progress
+     read and a direct order detail still work. */
+  if (!moIds) {
+    const sampling = new Set([...headers.entries()].filter(([, h]) => h.orderOrigin === "sampling").map(([k]) => k));
+    if (sampling.size) {
+      for (const k of sampling) { headers.delete(k); index.byMo.delete(k); }
+      index.list = index.list.filter((w) => !sampling.has(w.moId));
+      for (const [k, w] of [...index.byId]) if (sampling.has(w.moId)) { index.byId.delete(k); index.byShort.delete(w.shortId); }
+      ids = [...index.byMo.keys()];
+    }
+  }
+  const [events, targets] = ids.length ? await Promise.all([
+    ledger.readEvents(index, { start, end }), PpcOrderTarget.find({ companyId, manufacturingOrderId: { $in: ids.map(oid) } }).lean(),
+  ]) : [new Map(), []];
   const eventsByMo = new Map();
   for (const [d, list] of events) for (const e of list) { const k = e.moId; if (!k) continue; if (!eventsByMo.has(k)) eventsByMo.set(k, new Map()); const m = eventsByMo.get(k); if (!m.has(d)) m.set(d, []); m.get(d).push(e); }
   return { companyId: String(companyId), asOfDay, index, headers, events, eventsByMo, targets, targetsByMo: groupBy(targets, (t) => String(t.manufacturingOrderId)) };

@@ -416,7 +416,7 @@ router.get("/", canRead, async (req, res) => {
        the figures — 1–4 s a request on 307 items. Filtering, counting and
        paging now use a light projection; only the page's rows are read in
        full. Budget is no longer part of setup (see materialSetup). */
-    const LIGHT = "name sku category customCategory usedAs unit customUnit quantity minStock maxStock status productType createdAt variants.quantity variants.minStock";
+    const LIGHT = "name sku category customCategory usedAs unit customUnit quantity minStock maxStock status productType createdAt variants.quantity variants.minStock variants.combination";
     /* the unit map does not depend on the rows — read it beside them */
     const [lightRows, unitConversionsMap] = await Promise.all([
       RawItem.find(filter).select(LIGHT).sort({ createdAt: -1 }).lean(),

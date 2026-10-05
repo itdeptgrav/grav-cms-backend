@@ -106,6 +106,7 @@ const Account = require("../../../models/CMS_Models/Sales/Account");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
 const { nextFollowUpAt } = require("../../../services/leadNextAction");
 const SalesDepartment = require("../../../models/SalesDepartment");
+const { resolveActorNames } = require("../../../services/actorNames");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { createWithRef } = require("../../../services/leadRef");
@@ -725,8 +726,10 @@ function pickEditable(body = {}) {
 async function resolveEmployeeName(employeeId, req) {
   if (!employeeId) return undefined;
   if (String(employeeId) === String(req.user?.id || "")) return req.user?.name;
-  const employee = await SalesDepartment.findById(employeeId).select("name").lean();
-  return employee?.name;
+  /* the owner may be a dept_users, employees, department_roles or legacy
+     salesdepartments id — one resolver for all of them (3 Oct 2026) */
+  const names = await resolveActorNames([employeeId]);
+  return names.get(String(employeeId)) || undefined;
 }
 
 // Permissions correction: only a Sales manager may set assignedTo/sourcedBy
@@ -1499,12 +1502,18 @@ router.post("/", salesAuth, async (req, res) => {
 router.get("/:id", salesAuth, async (req, res) => {
   try {
     const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
-      .populate("assignedTo", "name email")
+      /* assignedTo is resolved by name below, not populated: its ref is the
+         legacy SalesDepartment, which is empty, and a populate NULLS the id */
       // Populated only here, not on the list — a Converted Lead's own page
       // needs the human Journey reference + name to link to it; the list
       // never shows this.
       .populate("conversion.journeyId", "journeyId name")
       .lean();
+    if (lead && lead.assignedTo) {
+      const n = await resolveActorNames([lead.assignedTo]);
+      const id = String(lead.assignedTo);
+      lead.assignedTo = { _id: id, name: n.get(id) || lead.assignedToName || "", email: "" };
+    }
     if (!lead)
       return res
         .status(404)

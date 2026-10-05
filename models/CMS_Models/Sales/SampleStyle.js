@@ -1184,6 +1184,48 @@ const sampleStyleSchema = new mongoose.Schema(
       ],
       orderVariantsSetAt: { type: Date, default: null },
       orderVariantsSetBy: actorRef(),
+      /* ── THE DEVELOPMENT ORDER, HANDLED BY INDUSTRIAL ENGINEERING (4 Oct 2026, owner) ──
+         "Once the techpack gets approved by the sales team, the job of R&D is to
+         send the requested product-variant and the defined qty to production …
+         now the IE will do the rest." R&D no longer defines an operation route.
+         It sends the order to IE; IE assigns the operations with an ASSUMED SAM
+         each, presses Start (which is when the sampling request and its work
+         orders are created, so the floor sees them), tracks the departments'
+         progress, and completes the run with the ACTUAL SAM per operation,
+         which goes back to R&D. Embedded here rather than in a collection of
+         its own — the cluster sits at its collection cap. */
+      developmentOrder: {
+        status: {
+          type: String,
+          enum: ["none", "sent_to_ie", "operations_assigned", "processing", "completed"],
+          default: "none",
+        },
+        priority: { type: String, enum: ["low", "medium", "high", "urgent"], default: "medium" },
+        deliveryDeadline: { type: Date, default: null },
+        sentToIeAt: { type: Date, default: null },
+        sentToIeBy: actorRef(),
+        operations: [
+          new mongoose.Schema(
+            {
+              operationId: { type: mongoose.Schema.Types.ObjectId, ref: "Operation" },
+              operationCode: { type: String, trim: true, default: "" },
+              name: { type: String, trim: true, default: "" },
+              machineType: { type: String, trim: true, default: "" },
+              /* IE's figure before the run, and the measured one after it. */
+              assumedSamMinutes: { type: Number, min: 0, default: null },
+              actualSamMinutes: { type: Number, min: 0, default: null },
+            },
+            { _id: false },
+          ),
+        ],
+        operationsAssignedAt: { type: Date, default: null },
+        operationsAssignedBy: actorRef(),
+        startedAt: { type: Date, default: null },
+        startedBy: actorRef(),
+        completedAt: { type: Date, default: null },
+        completedBy: actorRef(),
+        completionNote: { type: String, trim: true, default: "" },
+      },
       // The audit trail R&D reads back — "customer created", "product
       // registered", "order request raised", "approved, N work orders
       // created" — exactly what the pipeline actually did, in order.

@@ -1364,6 +1364,49 @@ customerRequestSchema.index(
    what makes that run reversible: the batch identity, who authorised it, and
    exactly which references it assigned. Absent on every record created since,
    because those lines were minted by the hook below as they were written. */
+/* ── MATERIAL REQUESTS FROM PPC TO THE STORE (4 Oct 2026, owner) ──────────
+   "The store person can issue as much qty he wants against that order — a
+   request-based approach is needed on the PPC side." PPC raises a request
+   (raw item, variant, quantity, unit, reason); the Store issues against it and
+   every such issue names the request and the line (StockIssuance). Embedded
+   on the order rather than in a collection of its own — the cluster is at its
+   collection cap. Status is derived from the issues at read time
+   (services/ppc/materialRequests.service.js); only "cancelled" is stored. */
+const materialRequestPerson = { userId: { type: String, trim: true, default: "" }, name: { type: String, trim: true, default: "" }, email: { type: String, trim: true, default: "" } };
+customerRequestSchema.add({
+  materialRequests: [
+    new mongoose.Schema(
+      {
+        requestNumber: { type: String, trim: true, default: "" },
+        status: { type: String, enum: ["open", "partially_issued", "issued", "cancelled"], default: "open" },
+        reason: { type: String, trim: true, default: "" },
+        neededBy: { type: Date, default: null },
+        lines: [
+          new mongoose.Schema(
+            {
+              rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+              rawItemName: { type: String, trim: true, default: "" },
+              rawItemSku: { type: String, trim: true, default: "" },
+              variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
+              variantCombination: [{ type: String, trim: true }],
+              quantity: { type: Number, required: true, min: 0 },
+              unit: { type: String, trim: true, default: "" },
+              note: { type: String, trim: true, default: "" },
+            },
+            { _id: true },
+          ),
+        ],
+        createdBy: materialRequestPerson,
+        createdAt: { type: Date, default: Date.now },
+        cancelledAt: { type: Date, default: null },
+        cancelledBy: materialRequestPerson,
+        cancelReason: { type: String, trim: true, default: "" },
+      },
+      { _id: true },
+    ),
+  ],
+});
+
 customerRequestSchema.add({
   lineRefBackfill: {
     batchId: { type: String, trim: true },

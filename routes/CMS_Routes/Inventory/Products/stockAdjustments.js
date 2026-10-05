@@ -416,11 +416,30 @@ router.post(
   withIdempotency("STOCK_ISSUE"),
   async (req, res) => {
   try {
-    const { direction, manufacturingOrderId, moNumber, customerName, items: incomingItems = [], reason = "", notes = "" } = req.body;
+    const { direction, manufacturingOrderId, moNumber, customerName, items: incomingItems = [], reason = "", notes = "", materialRequestId = null } = req.body;
     if (!["debit", "credit"].includes(direction))
       return res.status(400).json({ success: false, message: "direction must be debit or credit" });
     if (!Array.isArray(incomingItems) || !incomingItems.length)
       return res.status(400).json({ success: false, message: "No items provided" });
+    /* ── ISSUED AGAINST A PPC MATERIAL REQUEST (4 Oct 2026, owner) ────────
+       Optional. When named, the request must be one of THIS order's and
+       still open; every line may name the request line it answers. The free
+       issue — no request — stays exactly as it was. */
+    let materialRequest = null;
+    if (materialRequestId) {
+      if (!objectId(materialRequestId) || !objectId(manufacturingOrderId))
+        return res.status(400).json({ success: false, message: "The material request does not belong to this order." });
+      const owner = await CustomerRequest.findOne({ _id: objectId(manufacturingOrderId), "materialRequests._id": objectId(materialRequestId) })
+        .select("requestId customerInfo.name materialRequests.$").lean();
+      materialRequest = owner?.materialRequests?.[0] || null;
+      if (!materialRequest) return res.status(400).json({ success: false, message: "The material request does not belong to this order." });
+      if (materialRequest.status === "cancelled") return res.status(400).json({ success: false, message: `${materialRequest.requestNumber} was cancelled by PPC — issue freely or ask PPC for a new request.` });
+      const lineIds = new Set((materialRequest.lines || []).map((l) => String(l._id)));
+      for (const it of incomingItems) {
+        if (it?.materialRequestLineId && !lineIds.has(String(it.materialRequestLineId)))
+          return res.status(400).json({ success: false, message: "A line names a request line that is not on this request." });
+      }
+    }
 
     /* ── A REASON IS AUDIT EVIDENCE, NOT A PLACEHOLDER ────────────────────
        The old handler substituted "Stock Debit"/"Stock Credit" when none was
@@ -509,7 +528,7 @@ router.post(
        tenant ownership, the conversion, and the resulting balance. */
     const plan = [];
     for (const incoming of incomingItems) {
-      const { rawItemId, variantId, issuedQty, issuedUnit, notes: itemNotes = "" } = incoming;
+      const { rawItemId, variantId, issuedQty, issuedUnit, notes: itemNotes = "", materialRequestLineId = null } = incoming;
       const oid = objectId(rawItemId);
       if (!oid) return res.status(400).json({ success: false, message: `Invalid rawItemId: ${rawItemId}` });
 
@@ -622,6 +641,7 @@ router.post(
         rawItem, variant, oid, qty, issuedUnit: issuedUnit || nativeUnit, nativeUnit,
         nativeQty, conversion, itemNotes, currentTotal, currentVariant,
         warehouse, location, barcode,
+        materialRequestLineId: materialRequest && objectId(materialRequestLineId) ? objectId(materialRequestLineId) : null,
       });
     }
 
@@ -793,6 +813,7 @@ router.post(
 
           issuanceItems.push({
             rawItem: updated._id, rawItemName: updated.name, rawItemSku: updated.sku,
+            materialRequestLineId: p.materialRequestLineId || null,
             variantId: p.variant?._id || null, variantCombination: p.variant?.combination || [],
             issuedQty: p.qty, issuedUnit: p.issuedUnit, nativeQty: p.nativeQty, nativeUnit: p.nativeUnit,
             notes: [p.itemNotes, labelQty?.unchanged ? `label ${p.barcode._id} kept at ${labelQty.before} ${labelQty.unit} (unit not relatable)` : ""].filter(Boolean).join(" | "),
@@ -821,6 +842,7 @@ router.post(
           manufacturingOrder: objectId(manufacturingOrderId),
           moNumber: moNumber || "",
           customerName: customerName || "",
+          materialRequestId: materialRequest ? materialRequest._id : null,
           items: issuanceItems, reason: reasonText, notes,
           performedBy: req.user?.id || null,
           performedByName: req.user?.name || req.user?.email || "",
@@ -847,6 +869,19 @@ router.post(
       },
     });
 
+    /* PPC is told that the Store issued against its request (4 Oct 2026) — best effort, after the commit */
+    if (materialRequest) {
+      (async () => {
+        const svc = require("../../../../services/ppc/materialRequests.service");
+        const view = await svc.listForOrder(String(manufacturingOrderId));
+        const reqView = view.requests.find((r) => r.id === String(materialRequest._id));
+        const { notifyMaterialRequestIssued } = require("../../../../services/ppc/materialRequestsNotify.service");
+        await notifyMaterialRequestIssued(view.order, reqView, {
+          who: req.user?.name || req.user?.email || "Store",
+          issuedLines: (result.issuance?.items || []).map((it) => ({ rawItemName: it.rawItemName, variantLabel: (it.variantCombination || []).join(" · "), qty: it.issuedQty, unit: it.issuedUnit })),
+        });
+      })().catch((e) => console.error("[stockAdjustments] material request mail:", e?.message || e));
+    }
     const body = { success: true, issuance: result.issuance, stockUpdates: result.stockUpdates };
     return req.idempotent
       ? await req.idempotent.succeed(200, body, { entityType: ENTITY, entityId: result.issuance._id })

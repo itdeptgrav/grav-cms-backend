@@ -166,11 +166,17 @@ router.get("/", async (req, res) => {
     const lens = LENS_FILTERS.has(req.query.lens) ? req.query.lens : "all";
 
     // ── The item set (bounded scan, tenant-scoped, optional search) ──────────
-    const clause = { companyId };
-    if (search) {
-      const rx = new RegExp(escapeRegex(search), "i");
-      clause.$and = [{ $or: [{ name: rx }, { sku: rx }] }];  // $and keeps the boundary intact
-    }
+    /* THE SAME FILTER AS THE MATERIALS LIST (5 Oct 2026, owner: "as it is
+       showing in the raw items page, it should also show in the stock page").
+       This read used `{ companyId }` alone while `GET /raw-items` reads through
+       `tenantContext.tenantFilter`, which — while the TEMPORARY legacy
+       read-through is on — also admits records with no company. Most
+       materials carry none, so the register listed 16 of 317. One filter,
+       one population. `$and` keeps the tenant clause intact beside a search. */
+    const tenant = tenantContext.tenantFilter(req.tenant);
+    const clause = search
+      ? { $and: [tenant, { $or: [{ name: new RegExp(escapeRegex(search), "i") }, { sku: new RegExp(escapeRegex(search), "i") }] }] }
+      : { ...tenant };
     const matchingSearch = await RawItem.countDocuments(clause);
     const items = await RawItem.find(clause)
       .select("name sku unit customUnit quantity minStock variants")
@@ -182,11 +188,11 @@ router.get("/", async (req, res) => {
 
     // ── Bulk enrichment — ONE query per dimension over the scanned ids ───────
     const [lots, reservations, balances] = await Promise.all([
-      safe(() => CustomerMaterialLot.find({ companyId, rawItemId: { $in: ids }, status: "HELD" })
+      safe(() => CustomerMaterialLot.find({ ...tenant, rawItemId: { $in: ids }, status: "HELD" })
         .select("rawItemId variantId availableQuantity").lean()),
-      safe(() => LocationReservation.find({ companyId, itemId: { $in: ids } })
+      safe(() => LocationReservation.find({ ...tenant, itemId: { $in: ids } })
         .select("itemId variantId warehouseId locationId reserved").lean()),
-      safe(() => LocationBalance.find({ companyId, itemId: { $in: ids } })
+      safe(() => LocationBalance.find({ ...tenant, itemId: { $in: ids } })
         .select("itemId variantId warehouseId locationId onHand").lean()),
     ]);
 

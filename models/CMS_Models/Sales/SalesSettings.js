@@ -252,6 +252,12 @@ const salesSettingsSchema = new mongoose.Schema(
     // descriptions) the settings page reads.
     departmentNotifications: {
       disabledEvents: { type: [String], default: [] },
+      /* ── CC PER EVENT (4 Oct 2026, owner) ─────────────────────────────
+         "The cc input need to keep so that the employee who wants to be
+         notified for this approval, the sales person can also give access
+         to them." Event key → e-mail addresses copied on every send of
+         that event, beside the department's own recipients. */
+      ccByEvent: { type: Map, of: [String], default: {} },
     },
 
     // ── Sampling messages — the three Style & Sample hand-offs (28 Aug 2026) ──
