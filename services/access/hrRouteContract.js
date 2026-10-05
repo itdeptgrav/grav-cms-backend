@@ -67,6 +67,15 @@ const D = (method, path, capabilities, opts = {}) => ({
 /* Shorthands for the two commonest option sets. */
 const P = { protectedData: true };                                   // carries protected data
 const SELF = (params) => ({ scope: "self", selfParams: params || [] });
+/* SELF, where the path id names the RECORD and not the person — a leave
+   application, a document request, a regularization. Without this marker the
+   authorizer's implicit default reads `:id` as an employee id and compares a
+   leave's _id with the caller's own, which is false for everybody: the owner
+   of the record is refused their own record. The route still refuses an
+   `employeeId` naming somebody else; what proves the RECORD is the handler's
+   owner-scoped query, which every route below carries and which
+   test/hr-access/self-record-scope.test.js holds them to. */
+const SELF_RECORD = { scope: "self", selfParams: [], selfRecord: true };
 /* A manager route's authority is a RELATIONSHIP, and the descriptor says how to
    prove it: `queue` (no target — the handler's query names the caller),
    `record` + `param` (load the leave/regularization/overtime row named in the
@@ -246,6 +255,14 @@ const DECLARATIONS = [
     note: "Re-derives a whole period from the biometric source. Exempt from the approval queue as a machine operation (server.js), which is exactly why it needs the higher capability here.",
   }),
   D("GET", "/hr/attendance/sync-period/:jobId", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
+  D("POST", "/hr/attendance/restore-to-month", [C.HR_ACCESS, C.ATTENDANCE_CLOSE], {
+    persona: "attendance approver",
+    note: "The undo of remove-from-month, and declared to match it: same month-shaped effect on the roster, so the same CLOSE capability. It shipped undeclared, which meant the contract refused it for everybody — the door out of an accidental removal was the one door that did not open.",
+  }),
+  D("GET", "/hr/attendance/roster-exclusions", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "time office",
+    note: "Who is held off which month. A read of the same roster the two routes above write, so it takes the READ capability. Also shipped undeclared.",
+  }),
   D("POST", "/hr/attendance/backfill-hr-leaves", [C.HR_ACCESS, C.ATTENDANCE_CLOSE, C.LEAVE_CONFIGURE], { persona: "attendance approver" }),
 
   D("GET", "/hr/attendance/regularizations/:id", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
@@ -272,6 +289,10 @@ const DECLARATIONS = [
   D("POST", "/hr/face-registration/photo/:employeeId", [C.HR_ACCESS, C.PEOPLE_WRITE], { persona: "HR editor", ...P }),
   D("POST", "/hr/face-registration/archive/:employeeId", [C.HR_ACCESS, C.PEOPLE_WRITE], { persona: "HR editor", ...P }),
   D("POST", "/hr/face-registration/recheck", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], { persona: "HR operations" }),
+  D("POST", "/hr/face-registration/verify-token", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], {
+    persona: "HR operations",
+    note: "Mints a two-minute, one-operation token so a browser can stream frames at the face engine directly. Shipped undeclared and so refused for everybody. Classified like `recheck` — its nearest sibling, non-mutating, face-registration-scoped — rather than from an observed caller: NOTHING in the CMS or the employee app calls it, so whichever surface drives face sign-in lives outside both repos. If that surface turns out to authenticate as something without an HR grant, this is the line to revisit; the handler’s own comment asks only for a session.",
+  }),
 
   /* ══════════════════════════════════════════════════════════════════════════
    *  LEAVE — configuration, balances and HR decisions
@@ -532,7 +553,7 @@ const DECLARATIONS = [
   D("GET", "/api/ceo/hr/attendance/export", [C.HR_ACCESS, C.ATTENDANCE_READ, C.ANALYTICS_WORKFORCE], { persona: "management" }),
   D("POST", "/api/ceo/hr/attendance/sync", [C.HR_ACCESS, C.ATTENDANCE_CLOSE], {
     persona: "attendance approver — NOT management",
-    note: "The only non-GET under /api/ceo/hr. It is declared with the attendance CLOSE capability, which the CEO projection template does not hold, so the projection stays read-only. Nothing breaks: the handler proxies to `/hr/attendance/sync`, a path that does not exist (the real one is /sync-period), so it has been answering the proxy's 404 since it shipped.",
+    note: "The only non-GET under /api/ceo/hr. Declared with the attendance CLOSE capability, which the CEO projection template does not hold, so the projection stays read-only — a CEO-only session is refused here and is now TOLD so. The handler used to proxy to `/hr/attendance/sync`, a path that does not exist, and so answered a 404 for everybody; it reaches /sync-period now, which means the roles ceoAuth also admits (admin, hr_manager) really do run the sync, and the refusal a plain CEO gets is this contract's, not a typo's.",
   }),
 
   /* ══════════════════════════════════════════════════════════════════════════
@@ -568,11 +589,11 @@ const DECLARATIONS = [
 
   D("GET", "/api/employee/documents/types", [], { ...SELF([]), persona: "employee" }),
   D("GET", "/api/employee/documents/:id/download", [], { ...PUB, persona: "employee, via a short-lived signed link", note: "COMPATIBILITY: the download carries its own signed token instead of a session, so the browser can follow the link. The router verifies it and never projects an unreleased row." }),
-  D("GET", "/api/employee/documents/:id/file", [], { ...SELF([]), persona: "employee", ...P }),
-  D("GET", "/api/employee/documents/:id", [], { ...SELF([]), persona: "employee", ...P }),
+  D("GET", "/api/employee/documents/:id/file", [], { ...SELF_RECORD, persona: "employee", ...P }),
+  D("GET", "/api/employee/documents/:id", [], { ...SELF_RECORD, persona: "employee", ...P }),
   D("GET", "/api/employee/documents", [], { ...SELF([]), persona: "employee" }),
   D("POST", "/api/employee/documents/requests", [], { ...SELF([]), persona: "employee" }),
-  D("PATCH", "/api/employee/documents/:id/cancel", [], { ...SELF([]), persona: "employee" }),
+  D("PATCH", "/api/employee/documents/:id/cancel", [], { ...SELF_RECORD, persona: "employee" }),
 
   D("GET", "/api/employee/leave-applications/config", [], { ...SELF([]), persona: "employee" }),
   D("GET", "/api/employee/leave-applications/holidays", [], { ...SELF([]), persona: "employee" }),
@@ -594,14 +615,14 @@ const DECLARATIONS = [
   }),
   D("POST", "/api/employee/leave-applications/quick-apply", [], { ...SELF([]), persona: "employee" }),
   D("PATCH", "/api/employee/leave-applications/quick-apply/:id/resolve", [], { ...MGR({ record: "leave", param: "id" }), persona: "manager" }),
-  D("GET", "/api/employee/leave-applications/:id", [], { ...SELF([]), persona: "employee", ...P }),
+  D("GET", "/api/employee/leave-applications/:id", [], { ...SELF_RECORD, persona: "employee", ...P }),
   D("GET", "/api/employee/leave-applications", [], { ...SELF([]), persona: "employee" }),
   D("POST", "/api/employee/leave-applications", [], { ...SELF([]), persona: "employee" }),
-  D("PUT", "/api/employee/leave-applications/:id", [], { ...SELF([]), persona: "employee" }),
-  D("DELETE", "/api/employee/leave-applications/:id", [], { ...SELF([]), persona: "employee" }),
-  D("PATCH", "/api/employee/leave-applications/:id/cancel", [], { ...SELF([]), persona: "employee" }),
-  D("PATCH", "/api/employee/leave-applications/:id/cancel-withdraw", [], { ...SELF([]), persona: "employee" }),
-  D("POST", "/api/employee/leave-applications/:id/upload-document", [], { ...SELF([]), persona: "employee", ...P }),
+  D("PUT", "/api/employee/leave-applications/:id", [], { ...SELF_RECORD, persona: "employee" }),
+  D("DELETE", "/api/employee/leave-applications/:id", [], { ...SELF_RECORD, persona: "employee" }),
+  D("PATCH", "/api/employee/leave-applications/:id/cancel", [], { ...SELF_RECORD, persona: "employee" }),
+  D("PATCH", "/api/employee/leave-applications/:id/cancel-withdraw", [], { ...SELF_RECORD, persona: "employee" }),
+  D("POST", "/api/employee/leave-applications/:id/upload-document", [], { ...SELF_RECORD, persona: "employee", ...P }),
 
   D("GET", "/api/employee/regularizations/manager/pending", [], { ...MGR_QUEUE, persona: "manager" }),
   D("GET", "/api/employee/regularizations/manager/history", [], { ...MGR_HISTORY, persona: "manager" }),
@@ -609,7 +630,7 @@ const DECLARATIONS = [
   D("PATCH", "/api/employee/regularizations/manager/:id/reject", [], { ...MGR({ record: "regularization", param: "id" }), persona: "manager" }),
   D("GET", "/api/employee/regularizations", [], { ...SELF([]), persona: "employee" }),
   D("POST", "/api/employee/regularizations", [], { ...SELF([]), persona: "employee" }),
-  D("PATCH", "/api/employee/regularizations/:id/cancel", [], { ...SELF([]), persona: "employee" }),
+  D("PATCH", "/api/employee/regularizations/:id/cancel", [], { ...SELF_RECORD, persona: "employee" }),
 
   D("GET", "/api/employee/overtime/manager/pending", [], { ...MGR_QUEUE, persona: "manager" }),
   D("PATCH", "/api/employee/overtime/manager/:id/approve", [], { ...MGR({ record: "overtime", param: "id" }), persona: "manager" }),

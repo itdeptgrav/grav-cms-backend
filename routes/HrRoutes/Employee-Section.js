@@ -64,6 +64,10 @@ const {
   decryptEmployeeDocs,
 } = require("../../utils/salaryEncryption");
 const { computeSalary } = require("../../services/salaryFormula");
+/* The department NAME to display. `department` is a copy of what
+   `departmentId` references and the two had drifted; this prefers the
+   reference. See services/employeeDepartment.js. */
+const { departmentNameOf } = require("../../services/employeeDepartment");
 
 require("dotenv").config();
 
@@ -313,6 +317,17 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       !employeeData.secondaryManager.managerId
     ) {
       delete employeeData.secondaryManager;
+    }
+
+    /* ── ONE DEPARTMENT, NOT TWO ─────────────────────────────────────────
+       `department` is a display COPY of the department `departmentId` points
+       at, and nothing used to keep the two in step. Derived here so the copy
+       cannot be created already disagreeing with the reference. See
+       services/employeeDepartment.js for why the copy exists at all. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(employeeData, Department);
     }
 
     // ── Inherit the department's managers ─────────────────────────────────
@@ -681,6 +696,15 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // Sanitize empty-string ObjectId fields to prevent BSONError cast failures
     if (updateData.departmentId === "" || updateData.departmentId === null) {
       delete updateData.departmentId;
+    }
+
+    /* The display copy follows the reference on every update too — this is
+       the half that was missing, and it is how a record ended up reading
+       department "SAMPLING" while departmentId pointed at R&D. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(updateData, Department);
     }
     if (updateData.primaryManager && !updateData.primaryManager.managerId) {
       delete updateData.primaryManager;
@@ -1150,6 +1174,14 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
     }
     if (clean.departmentId === "" || clean.departmentId === null)
       delete clean.departmentId;
+
+    /* A bulk move between departments is the most likely way for many records
+       to drift at once, so it derives the name as the single update does. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(clean, Department);
+    }
     if (clean.primaryManager && !clean.primaryManager.managerId)
       delete clean.primaryManager;
     if (clean.secondaryManager && !clean.secondaryManager.managerId)
@@ -1436,7 +1468,13 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         customFields: employee.personalCustomFields || [],
       },
       workInfo: {
-        department: employee.department,
+        /* The POPULATED department's name, falling back to the stored string
+           only when there is no reference to read. Records that drifted
+           before the write-side fix therefore display the truth without
+           waiting for a migration — and this screen stops disagreeing with
+           the edit form beside it, which has always driven its dropdown from
+           the reference. */
+        department: departmentNameOf(employee),
         departmentId: employee.departmentId,
         designation: employee.designation || employee.jobPosition,
         jobTitle: employee.jobTitle,

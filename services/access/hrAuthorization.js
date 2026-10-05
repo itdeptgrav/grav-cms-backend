@@ -788,8 +788,33 @@ function requestedUnprovableScope(req) {
  * Returns true when the request names nobody, which is the common case: those
  * handlers derive the employee from the token themselves.
  */
-function namesSelf(req, actor, paramNames) {
-  const names = paramNames && paramNames.length ? paramNames : ["employeeId", "id"];
+function namesSelf(req, actor, paramNames, opts = {}) {
+  /* ── WHOSE id IS `:id`? ────────────────────────────────────────────────────
+     The implicit default below reads a path `:id` as an EMPLOYEE id. That is
+     right for /api/employees/:id and wrong for every self-service route whose
+     `:id` names a RECORD the caller owns — a leave application, a document
+     request, a regularization. On those the comparison was
+
+         leaveApplication._id  ===  my own employee _id
+
+     which is false for everybody, always, so the route refused its own owner
+     with HR_OUT_OF_SCOPE: "You do not have permission to perform this
+     action." Ten endpoints were dead that way, the leave withdrawal among
+     them. Only `:id` routes were hit — `:taskId` and `:deviceId` miss the
+     default by the accident of their names.
+
+     `selfRecord` on the declaration says the path id is a record, not a
+     person. `employeeId` is STILL checked, so naming somebody else in the
+     body or the query is still a refusal; what is dropped is only the
+     pretence that the record id is a person. The record's own ownership is
+     proved by the handler's owner-scoped query (`employeeId: req.user.id`),
+     which every route carrying this marker has and which the contract test
+     holds them to — the same arrangement `managerScope.queue` already uses. */
+  const names = opts.selfRecord
+    ? ["employeeId"]
+    : paramNames && paramNames.length
+      ? paramNames
+      : ["employeeId", "id"];
   const mine = new Set([actor.employeeRef, actor.biometricId].filter(Boolean).map(String));
   if (!mine.size) return false;
 
@@ -817,6 +842,8 @@ function namesSelf(req, actor, paramNames) {
  * @param {string}  [input.scope]        "public" | "hr" | "self" | "manager"
  * @param {object}  [input.req]          the request, for scope proofs only
  * @param {string[]} [input.selfParams]  which params name an employee
+ * @param {boolean} [input.selfRecord]  the path id names a RECORD the caller
+ *   owns, not a person; the handler's owner-scoped query is the proof
  * @param {object}  [input.managerScope]  how to PROVE the reporting relationship
  * @param {object}  [input.actor]        a pre-resolved actor, to avoid a re-read
  *
@@ -830,6 +857,7 @@ async function authorizeHr({
   scope = "hr",
   req = null,
   selfParams = [],
+  selfRecord = false,
   managerScope = null,
   actor = null,
 }) {
@@ -880,7 +908,7 @@ async function authorizeHr({
     if (unprovable) return deny(DECISIONS.SCOPE_NOT_PROVABLE, { scopeKey: unprovable });
   }
 
-  if (scope === "self" && req && !namesSelf(req, resolved, selfParams)) {
+  if (scope === "self" && req && !namesSelf(req, resolved, selfParams, { selfRecord })) {
     /* An HR actor holding the matching read capability may still act on
        somebody else's record through the HR routes; this scope is the
        SELF-SERVICE surface, where naming another person is always a refusal. */

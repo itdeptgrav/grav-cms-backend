@@ -419,25 +419,55 @@ router.post("/attendance/sync", ceoAuth, async (req, res) => {
         }
 
         const port = process.env.PORT || 5000;
-        const body = JSON.stringify({ fromDate: date, toDate: date });
+        /* `from`/`to`, which is what /sync-period reads. It was `fromDate`/
+           `toDate`, so even once the path was right the handler would have
+           answered "from and to required". */
+        const body = JSON.stringify({ from: date, to: date });
 
         const syncResult = await new Promise((resolve, reject) => {
             const proxyReq = http.request({
                 hostname: "localhost",
                 port,
-                path: "/hr/attendance/sync",
+                /* THE REAL ROUTE. This proxied to /hr/attendance/sync, which
+                   has never existed — the route is /sync-period — so the
+                   Re-sync button on the CEO attendance page had been
+                   answering the proxy's own 404 since it shipped. */
+                path: "/hr/attendance/sync-period",
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     "Content-Length": Buffer.byteLength(body),
+                    /* BOTH, and for the reason stated at the top of this file:
+                       in production the frontend is a different host, the
+                       auth_token cookie is third-party and Safari drops it, so
+                       the session arrives as `Authorization: Bearer`. Forwarding
+                       only the cookie meant the proxied request carried no
+                       identity at all in production while working locally —
+                       which is exactly how a sync fails only once deployed. */
                     Cookie: req.headers.cookie || "",
+                    ...(req.headers.authorization
+                        ? { Authorization: req.headers.authorization }
+                        : {}),
                 },
             }, (proxyRes) => {
                 let data = "";
                 proxyRes.on("data", chunk => { data += chunk; });
                 proxyRes.on("end", () => {
-                    try { resolve(JSON.parse(data)); }
-                    catch { resolve({ success: false, message: "Parse error" }); }
+                    /* The upstream STATUS travels with the body. /sync-period
+                       answers 202 with a job for a long range and 403 when the
+                       caller lacks the attendance CLOSE capability — a CEO-only
+                       session does not hold it, by design, and must be told
+                       that rather than shown a generic failure. */
+                    try { resolve({ status: proxyRes.statusCode || 200, payload: JSON.parse(data) }); }
+                    catch {
+                        resolve({
+                            status: proxyRes.statusCode || 502,
+                            payload: {
+                                success: false,
+                                message: "The attendance service did not answer in a form this page could read.",
+                            },
+                        });
+                    }
                 });
             });
             proxyReq.on("error", reject);
@@ -445,7 +475,7 @@ router.post("/attendance/sync", ceoAuth, async (req, res) => {
             proxyReq.end();
         });
 
-        res.json(syncResult);
+        res.status(syncResult.status).json(syncResult.payload);
     } catch (err) {
         console.error("[CEO] POST /attendance/sync:", err.message);
         res.status(500).json({ success: false, message: "Sync failed: " + err.message });

@@ -1137,3 +1137,89 @@ Verified 1 Oct 2026: WH-MAIN exported (95 locations, all tokened, floor plan,
 renamed copy → created as WH-TEST-IMP with 95 locations, parents inside,
 tokens re-minted and disjoint; a second file with a rename and a new bin →
 update, 1 added / 95 updated, new bin tokened; the test warehouse deleted.
+
+### A self-service route's `:id` is a RECORD, not a person (5 Oct 2026)
+
+`services/access/hrAuthorization.js:namesSelf` defaults to reading a path
+`:id` as an EMPLOYEE id. That is right for `/api/employees/:id` and wrong for
+every `/api/employee/**` route whose `:id` names a record the caller owns, so
+the guard was comparing
+
+```
+leaveApplication._id  ===  the caller's own employee _id
+```
+
+— false for everybody, always. Ten self-service endpoints answered 403
+`HR_OUT_OF_SCOPE`, "You do not have permission to perform this action", **to
+their own owner**: the leave detail / edit / delete / cancel (the employee
+app's **Withdraw Application**) / cancel-withdraw / upload-document, the
+document detail / file / cancel, and the regularization cancel. Only `:id`
+routes were hit — `:taskId` and `:deviceId` miss the default by the accident
+of their names.
+
+`SELF_RECORD` (hrRouteContract.js) marks those ten: `selfParams: []` plus
+`selfRecord: true`, which `namesSelf` reads as "check `employeeId`, do not
+pretend the record id is a person". Naming somebody else in the body or query
+is still refused; what proves the RECORD is the handler's own owner-scoped
+query (`employeeId: req.user.id`), which all ten carry and which
+`test/hr-access/self-record-scope.test.js` sweeps their source for — along
+with a real HTTP request through the real guard, because the symptom was a
+status code. **The employee app needed no change and no rebuild**: the route
+it already calls simply started answering.
+
+Three more HR routes shipped with no declaration at all, which fails closed
+with the same sentence: `POST /hr/attendance/restore-to-month` and `GET
+/hr/attendance/roster-exclusions` (so the roster-exclusion panel on the HR
+attendance page and the undo of an accidental removal were both dead) and
+`POST /hr/face-registration/verify-token`. Declared now; `route-coverage`'s
+"NO mounted HR route is missing a declaration" passes again. Its sibling test
+still fails on `verifyHrWriteCoverage.js`, a harness file that does not exist
+anywhere in the repo — unrelated and untouched.
+
+### The CEO attendance Re-sync proxied to a path that never existed (5 Oct 2026)
+
+`POST /api/ceo/hr/attendance/sync` (routes/CEO_Routes/hr.js) makes a loopback
+call to the HR attendance router. It asked for `/hr/attendance/sync` — the
+route is `/sync-period` — and sent `fromDate`/`toDate` where the handler reads
+`from`/`to`, so fixing either half alone would still have failed. It also
+forwarded only `Cookie`, and this file's own header says why that is wrong: in
+production the frontend is a different host, `auth_token` is third-party and
+Safari drops it, so the session arrives as `Authorization: Bearer`. The proxy
+therefore carried **no identity at all in production while working locally** —
+which is how a sync fails only once deployed. Path, body keys and both
+credentials fixed, and the upstream status now travels with the body (202 for
+a long range; 403 when the caller lacks `attendance.close`, which a CEO-only
+session does not hold **by design** and is now told). `test/hr-access/ceo-sync-proxy.test.js`
+pins the target against the real `router.post`, because a proxied path is
+invisible to every import graph. It is a source test on purpose: exercising the
+proxy runs a real biometric sync and writes attendance rows.
+
+### One department, not two (5 Oct 2026)
+
+Employee carries the same fact twice — `departmentId` (a reference) and
+`department` (the NAME, free text, read directly by exports, the ID card,
+payroll sheets, the attendance roster and the employee app). Nothing kept the
+copy in step, so the two screens that read them disagreed in front of the
+user: `EmployeeForm`'s Work Details printed `form.department` in view mode and
+drove its dropdown from `form.departmentId` in edit mode. One record read
+`department: "SAMPLING"` (a department that no longer exists) with
+`departmentId` → R&D, so the profile said SAMPLING, Edit said R&D, and neither
+half was wrong about what it had been handed.
+
+`services/employeeDepartment.js` makes the copy DERIVED. `syncDepartmentName`
+runs on create, update and bulk-update: a departmentId that resolves
+overwrites whatever the client sent as the name (the client gets no vote — a
+payload naming one department and referencing another is the drift itself);
+one that resolves to nothing is left alone rather than blanking a name; a name
+with no id fills the id in only when **exactly one** department matches,
+case- and whitespace-insensitively, because this database really does contain
+both `R&D` and `R & D`. `departmentNameOf` is the read side — a populated
+`departmentId.name` beats the stored string — used by `/:id/details`'
+`workInfo.department`; `EmployeeForm` resolves the same way through its own
+`depts` list, so its two modes cannot disagree whatever is stored.
+
+Six live records had drifted (`STORE`→`STORE & PURCHASE` ×4, `SAMPLING`→`R&D`,
+`PRODUCT DEVELOPMENT`→`R&D`) and were repaired from their references on
+5 Oct 2026, with the before values printed and the result read back. The
+duplicate `R&D` / `R & D` departments were left alone — nobody is assigned to
+the second one.

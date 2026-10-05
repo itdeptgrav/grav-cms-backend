@@ -203,6 +203,7 @@ function hrContract(opts = {}) {
         capabilities: declaration.capabilities,
         scope: declaration.scope,
         selfParams: declaration.selfParams,
+        selfRecord: declaration.selfRecord,
         managerScope: declaration.managerScope,
         req,
       });
