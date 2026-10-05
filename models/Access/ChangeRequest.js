@@ -150,6 +150,12 @@ const changeRequestSchema = new mongoose.Schema(
     // Set only when an APPROVED request could not be replayed — the record the
     // approver needs in order to understand why their approval did nothing.
     applyError: { type: String, default: "" },
+    /* The lowest role that may decide this request. "approver" is the
+       ordinary queue. "owner" is a change that carries something only the
+       owner may set (pay, on an employee created by an approver or editor) —
+       held for the owner rather than refused outright (5 Oct 2026). */
+    requiredRole: { type: String, enum: ["approver", "owner"], default: "approver" },
+    requiredRoleReason: { type: String, default: "" },
     appliedAt: { type: Date },
   },
   { timestamps: true, collection: "change_requests" },

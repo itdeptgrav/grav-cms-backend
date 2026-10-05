@@ -361,7 +361,7 @@ router.get("/:id/manager-candidates", EmployeeAuthMiddleware, async (req, res) =
     const holders = pairs.length
       ? await Employee.find({
           $and: [
-            { $or: [{ isActive: { $ne: false } }, { status: "active" }] },
+            { isActive: { $ne: false }, status: { $ne: "inactive" } }, // BOTH: either flag alone means they have left (5 Oct 2026)
             {
               $or: pairs.map((pr) => ({
                 department: new RegExp(`^${esc(pr.departmentName)}$`, "i"),
