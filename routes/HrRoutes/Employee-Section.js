@@ -314,6 +314,19 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
 // ─── CREATE new employee ──────────────────────────────────────────────────────
 router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    /* BACKSTOP. A create carrying pay from somebody who may not set pay is
+       marked `holdForOwner` by the HR contract and must be HELD for the owner
+       by the department guard (services/changeRequests.js). It reaches this
+       handler only as the owner-approved replay. If it ever arrives any other
+       way — a mount reordered, a path exempted — refuse, rather than create
+       somebody with pay nobody allowed to be set. */
+    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      return res.status(403).json({
+        success: false,
+        code: "OWNER_APPROVAL_REQUIRED",
+        message: "Pay on a new employee is set by the HR owner — this should have been sent to them for approval. Nothing was saved.",
+      });
+    }
     const { user } = req;
     const employeeData = req.body;
 

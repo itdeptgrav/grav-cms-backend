@@ -129,6 +129,11 @@ const DECLARATIONS = [
   D("POST", "/api/employees", [C.HR_ACCESS, C.PEOPLE_WRITE], {
     persona: "HR editor",
     writePolicy: "employee",
+    /* A new employee's pay may be entered by an approver or editor and sent
+       to the OWNER to accept, instead of the whole create being refused
+       (5 Oct 2026, owner's rule). Only pay: anything else missing still
+       refuses. See Middlewear/hrContract.js and services/changeRequests.js. */
+    holdForOwnerOn: [C.COMPENSATION_WRITE],
     ...P,
   }),
   D("PUT", "/api/employees/:id", [C.HR_ACCESS, C.PEOPLE_WRITE], {
