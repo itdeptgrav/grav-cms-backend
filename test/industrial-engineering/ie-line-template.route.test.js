@@ -256,6 +256,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },
@@ -328,6 +329,7 @@ const patchLayout = (a, w, layoutId, body) => call(`/line-layouts/${layoutId}`, 
 /* ── CHUNK 6C HELPERS ─────────────────────────────────────────────────────── */
 
 const IeLineTemplate = require("../../models/CMS_Models/IndustrialEngineering/IeLineTemplate");
+const { assessFeasible } = require("./support/feasibility");
 
 const openLayout = (a, w) => call(`/engineering-files/${w.fileId}/line-layouts`, {
   method: "POST", token: a.token, company: w.co._id, body: {},

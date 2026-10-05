@@ -748,6 +748,9 @@ router.get("/dashboard", requireCapability(CAPABILITIES.READ), async (req, res) 
 /* ── reports (JSON; the CMS lays them out and exports) ──────────────────── */
 const REPORTS = Object.freeze({
   stockByLocation: "Stock by location", locationByProduct: "Location by product", unallocated: "Unallocated stock", movements: "Movement report", transfers: "Transfer report", occupancy: "Location occupancy", reconciliation: "Inventory vs location", age: "Stock age by location",
+  /* every raw item and variant with what is on the racks, added across every
+     position — no rack or location named on it (3 Oct 2026, owner) */
+  stockByProduct: "Stock on racks by raw item and variant",
 });
 router.get("/reports/:type", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
@@ -772,6 +775,12 @@ router.get("/reports/:type", requireCapability(CAPABILITIES.READ), async (req, r
       const detail = [];
       for (const r of rows.filter((x) => x.located > 0).slice(0, 2000)) { const bal = await LocationBalance.find({ companyId: objectId(companyId), itemId: objectId(r.rawItemId), variantId: r.variantId ? objectId(r.variantId) : null, locationId: { $type: "objectId" }, onHand: { $gt: loc.QTY_TOL } }).lean(); for (const b of bal) { const w = await Warehouse.findById(b.warehouseId).lean(); const l = w ? S.locationIn(w, b.locationId) : null; detail.push({ item: r.name, sku: r.sku, variant: r.variant, category: r.category, baseUnit: r.baseUnit, onHand: r.onHand, located: r.located, unallocated: r.unallocated, warehouse: w?.name || "", ...(l && w ? S.addressOf(w, l) : { code: "", display: "" }), locationCode: l?.code || "", locationOnHand: loc.round4(b.onHand) }); } }
       return res.json({ success: true, type, title: REPORTS[type], generatedAt, filters: req.query, rows: detail });
+    }
+    if (type === "stockByProduct") {
+      const rows = (await reconciliationRows(req)).filter((r) => r.located > loc.QTY_TOL)
+        .map((r) => ({ item: r.name, sku: r.sku, variant: r.variant, category: r.category, baseUnit: r.baseUnit, onRacks: r.located }))
+        .sort((a, b) => a.item.localeCompare(b.item) || a.variant.localeCompare(b.variant));
+      return res.json({ success: true, type, title: REPORTS[type], generatedAt, filters: {}, rows });
     }
     if (type === "unallocated" || type === "reconciliation") {
       const rows = await reconciliationRows(req);

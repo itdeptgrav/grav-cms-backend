@@ -130,6 +130,48 @@ const FixtureSchema = new mongoose.Schema({
   label: { type: String, default: "" },
 });
 
+/* ── A sewing line with machine slots (2 Oct 2026) ─────────────────────────
+ * One long table (and a QC table across its end, drawn by the frontend), a
+ * row of `slotsPerSide` slots down the LEFT and
+ * another down the RIGHT (13 a side on this floor). (x, y) is where the line
+ * starts — the middle of its first end — and `rotation` turns it clockwise,
+ * the same convention as a machine. Left and right are as seen walking from
+ * slot 1 to the last slot.
+ *
+ * A slot is stored only while it holds a machine; an absent slot is an empty
+ * one. Which machine may stand where is checked by
+ * services/production/lineSlots.js on every save: one machine per slot, one
+ * slot per machine, and only machines from the register. The machine's own
+ * position in `machinePositions` is written by the designer to match its slot,
+ * so every reader that only knows positions still draws it in the right place.
+ */
+const LineSlotSchema = new mongoose.Schema(
+  {
+    side: { type: String, enum: ["L", "R"], required: true },
+    index: { type: Number, required: true }, // 1-based, slot 1 at the line's start
+    // "machine" (a register machine, machineId) or "table" (a plain work
+    // table — not a register item, so no id and no limit).
+    item: { type: String, enum: ["machine", "table"], default: "machine" },
+    machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine", default: null },
+  },
+  { _id: false }
+);
+
+const LineSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    name: { type: String, default: "" },
+    x: { type: Number, default: 0 },
+    y: { type: Number, default: 0 },
+    rotation: { type: Number, default: 0 },
+    slotsPerSide: { type: Number, default: 13 },
+    pitch: { type: Number, default: 175 }, // cm along the line per slot
+    tableWidth: { type: Number, default: 120 }, // cm across the table
+    slots: [LineSlotSchema],
+  },
+  { _id: false }
+);
+
 const CanvasLayoutSchema = new mongoose.Schema(
   {
     organizationId: {
@@ -152,6 +194,9 @@ const CanvasLayoutSchema = new mongoose.Schema(
     walls: [WallSchema],
     aisles: [AisleSchema],
     fixtures: [FixtureSchema],
+    // Absent on every document before 2 Oct 2026; the designer then offers
+    // the floor's two lines empty.
+    lines: [LineSchema],
 
     floor: {
       // Snap grid. 50cm is half a sewing table — fine enough to line a row up,

@@ -225,6 +225,7 @@ describe("canonical HR semantic metrics", () => {
     expect(metricGlossary()).toContain("CTC/cost to company");
     expect(metricFromText("what is Arpita's email?")).toMatchObject({ id: "employee.work_email" });
     expect(metricFromText("Arpita personal email")).toMatchObject({ id: "employee.personal_email" });
+    expect(metricFromText("what is Umung's full name?")).toMatchObject({ id: "employee.full_name" });
     for (const [metricId, aliases] of Object.entries(ALIASES)) {
       for (const alias of aliases) {
         expect(metricFromText(`Arpita ${alias}`)).toMatchObject({ id: metricId });
@@ -242,6 +243,19 @@ describe("canonical HR semantic metrics", () => {
       employeeName: "of Arpita",
       metric: "compensation.configured_employer_cost_monthly",
     });
+    await expect(tool.claim({ message: "what is Umung's full name?", history: [] })).resolves.toEqual({
+      employeeName: "what is Umung's ?",
+      metric: "employee.full_name",
+    });
+  });
+
+  test("renders a split employee name as one deterministic value", () => {
+    const { metric, renderMetricAnswer } = require("../../services/hrSemanticMetrics");
+    expect(renderMetricAnswer({
+      definition: metric("employee.full_name"),
+      employee: "UMANG ARORA",
+      source: { firstName: "UMANG", middleName: "KUMAR", lastName: "ARORA" },
+    })).toBe("UMANG ARORA's full name is UMANG KUMAR ARORA.");
   });
 
   test("catalogue comparisons preserve the employee, metric and expected value", async () => {

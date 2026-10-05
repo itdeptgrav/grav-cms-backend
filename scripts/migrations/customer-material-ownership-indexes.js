@@ -32,6 +32,7 @@
 //
 //   node -r dotenv/config scripts/migrations/customer-material-ownership-indexes.js
 //   …--apply   build the ones that are missing
+//   …--retire  drop the named indexes this feature built and got wrong (see RETIRED)
 "use strict";
 
 const mongoose = require("mongoose");
@@ -104,6 +105,38 @@ const INDEXES = Object.freeze([
     why: "print-run idempotency: one label per (batch key, position), per company",
   },
   {
+    collection: "merchandising_customer_material_expectations",
+    name: "one_expectation_per_request_line",
+    key: { companyId: 1, sourceMrfLineId: 1 },
+    /* ── THE IDEMPOTENCY THAT MAKES ROUTING SAFE TO RETRY ─────────────────
+       An approved customer-supplied request line produces exactly one
+       expectation. Approvals are delivered more than once and callers repeat
+       timed-out requests; without this, two attempts that overlap both pass
+       their own read-then-write and the delivery arrives against two claims.
+
+       The service reads first, which handles the ordinary repeat. This handles
+       the two that land in the same millisecond — and it is the only thing that
+       can. Partial, because every expectation Merchandising composed directly
+       carries no source line and `null` would collide across all of them. */
+    options: {
+      unique: true,
+      partialFilterExpression: { sourceMrfLineId: { $type: "objectId" } },
+    },
+    why: "one customer-material expectation per approved request line, per company",
+  },
+  {
+    collection: "merchandising_customer_material_expectations",
+    name: "one_revision_per_document",
+    key: { companyId: 1, documentRef: 1, revisionNo: 1 },
+    /* A revision number belongs to a DOCUMENT, not to the work it is for. An
+       execution file has one expectation revised 1..n; a development may have
+       several, because each approved customer-supplied request line produces its
+       own, each opening at revision 1. Keyed on the development — as this first
+       was — the second sample for one development collided with the first. */
+    options: { unique: true },
+    why: "one revision number per customer-material document, per company",
+  },
+  {
     collection: "customer_material_lots",
     name: "companyId_1_documentRef_1_status_1",
     key: { companyId: 1, documentRef: 1, status: 1 },
@@ -127,6 +160,39 @@ const INDEXES = Object.freeze([
   },
 ]);
 
+/* ── INDEXES THIS FEATURE CREATED AND GOT WRONG ──────────────────────────────
+   Not "indexes somebody else might not need". An entry belongs here only when it
+   was built by this feature, is now known to be incorrect, and leaving it in
+   place breaks the feature — which is a narrower thing than a tidy-up and the
+   only case where this script will drop anything at all.
+
+   It still does not drop on `--apply`. It reports, and drops only under the
+   explicit `--retire`, because every other mode of this script promises in
+   writing that it touches nothing it did not build. */
+const RETIRED = Object.freeze([
+  {
+    collection: "merchandising_customer_material_expectations",
+    name: "one_revision_per_development",
+    why: "keyed revisions on the development, so a second expectation for one "
+       + "development collided with the first — a legitimate case. Replaced by "
+       + "one_revision_per_document.",
+  },
+]);
+
+/** Which retired indexes are actually present. Reads index metadata only. */
+async function surveyRetired(db) {
+  const out = [];
+  for (const spec of RETIRED) {
+    let present = false;
+    try {
+      const existing = await db.collection(spec.collection).indexes();
+      present = existing.some((i) => i.name === spec.name);
+    } catch { present = false; /* no collection yet: nothing to retire */ }
+    out.push({ ...spec, present });
+  }
+  return out;
+}
+
 async function survey() {
   /* ── STRUCTURE, NOT NAME ──────────────────────────────────────────────────
      This used to ask `existing.some(i => i.name === spec.name)`. An index under
@@ -136,7 +202,7 @@ async function survey() {
   return preflight.surveyIndexes(mongoose.connection.db, INDEXES);
 }
 
-function render(rows, applied, outcome = null) {
+function render(rows, applied, outcome = null, retired = null) {
   const L = [""];
   L.push("CUSTOMER-MATERIAL OWNERSHIP INDEXES");
   L.push(`  Mode           ${applied ? "APPLIED" : "DRY RUN — nothing written"}`);
@@ -156,20 +222,42 @@ function render(rows, applied, outcome = null) {
     L.push(`  ${conflicts} CONFLICT(S) left alone — a name is taken by a different index. `
       + "Decide what happens to those by hand.");
   }
+  const stale = (retired || []).filter((r) => r.present);
+  if (stale.length) {
+    L.push("");
+    L.push(retired.dropped
+      ? "  RETIRED (dropped):"
+      : "  STALE — built by this feature, now incorrect. Re-run with --retire to drop:");
+    for (const r of stale) {
+      L.push(`    ${r.collection}.${r.name}`);
+      L.push(`            ${r.why}`);
+    }
+  }
   L.push("");
   return L.join("\n");
 }
 
-async function run({ apply = false } = {}) {
+async function run({ apply = false, retire = false } = {}) {
   const rows = await survey();
-  if (!apply) return { ok: true, rows, applied: false, text: render(rows, false) };
+  const retired = await surveyRetired(mongoose.connection.db);
+  if (retire) {
+    /* Named one at a time, and only the names above — never a pattern, never
+       "everything that is not in INDEXES". */
+    for (const r of retired.filter((x) => x.present)) {
+      await mongoose.connection.db.collection(r.collection).dropIndex(r.name);
+    }
+    retired.dropped = true;
+  }
+  if (!apply) {
+    return { ok: true, rows, retired, applied: false, text: render(rows, false, null, retired) };
+  }
   /* Builds what is missing and REFUSES a conflict rather than dropping and
      recreating it — replacing a live index is a decision for somebody who can
      see the collection's size and load. */
   const outcome = await preflight.buildMissing(mongoose.connection.db, rows);
   return {
     ok: outcome.refused.length === 0,
-    rows, applied: true, ...outcome, text: render(rows, true, outcome),
+    rows, retired, applied: true, ...outcome, text: render(rows, true, outcome, retired),
   };
 }
 
@@ -183,7 +271,10 @@ async function main() {
   await mongoose.connect(uri, { autoIndex: false });
   console.log(`  Database       ${mongoose.connection.name}`);
   try {
-    const out = await run({ apply: process.argv.includes("--apply") });
+    const out = await run({
+      apply: process.argv.includes("--apply"),
+      retire: process.argv.includes("--retire"),
+    });
     console.log(out.text);
   } finally {
     await mongoose.disconnect();
@@ -194,4 +285,4 @@ if (require.main === module) {
   main().catch((e) => { console.error(e); process.exitCode = 1; });
 }
 
-module.exports = { run, survey, render, INDEXES };
+module.exports = { run, survey, surveyRetired, render, INDEXES, RETIRED };

@@ -43,6 +43,7 @@ const IeCapacityStandard = require("../../models/CMS_Models/IndustrialEngineerin
 const IeRampProfile = require("../../models/CMS_Models/IndustrialEngineering/IeRampProfile");
 
 const { calculateCapacity, garmentSamFor } = require("../../services/industrialEngineering/capacityCalculation");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, seq = 0;
 
@@ -267,6 +268,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },

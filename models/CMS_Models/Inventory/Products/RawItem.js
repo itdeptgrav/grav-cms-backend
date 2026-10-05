@@ -108,6 +108,9 @@ const stockTransactionSchema = new mongoose.Schema(
     notes:           { type: String, default: "" },
 
     performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
+    /* the signed-in person's name at the time (3 Oct 2026): the id above may be
+       a dept_users row, which `ref: "Employee"` cannot resolve */
+    performedByName: { type: String, default: "" },
 
     /* ── WHICH OPERATION MOVED THIS STOCK ────────────────────────────────────
        The `_id` of the Store & Purchase idempotency record whose action wrote

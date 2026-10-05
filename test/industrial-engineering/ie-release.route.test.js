@@ -294,6 +294,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },
@@ -485,6 +486,7 @@ async function approvedStandard(name, overrides = {}) {
 
 const { aggregateFingerprintOf } = require("../../services/industrialEngineering/releaseFingerprint");
 const { transactionsAvailable, __setTransactionSupport } = require("../../services/storePurchase/unitOfWork.service");
+const { assessFeasible } = require("./support/feasibility");
 
 let keySeq = 0;
 const nextKey = () => `key-${++keySeq}-${Date.now()}`;
@@ -662,6 +664,7 @@ describe("the aggregate must be approved and still bound together", () => {
        review, the layout is a draft, and the standard is a draft on it. */
     const w = await world("Unapproved");
     const file = await IeStyleFile.findById(w.fileId).lean();
+    await assessFeasible(call, { fileId: w.fileId, token: w.maker.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${w.fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: file.revision },

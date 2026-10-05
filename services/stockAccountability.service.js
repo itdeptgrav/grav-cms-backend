@@ -12,6 +12,7 @@
 // Classification is done HERE and nowhere else, so the table, the totals and
 // the charts can never disagree about what counts as a debit.
 
+const { attachActorNames } = require("./actorNames");
 const RawItem = require("../models/CMS_Models/Inventory/Products/RawItem");
 
 // ── Categories ────────────────────────────────────────────────────────────
@@ -80,9 +81,11 @@ async function listMovements(from, to, opts = {}) {
 
   const docs = await RawItem.find(match)
     .select("name sku unit customUnit category variants stockTransactions")
-    .populate("stockTransactions.performedBy", "firstName lastName name email")
     .populate("stockTransactions.supplierId", "companyName")
     .lean();
+  /* the performer by name from EITHER register (3 Oct 2026): an Employee
+     populate nulled every dept_users id, so the report named nobody */
+  await attachActorNames(docs.flatMap((d) => d.stockTransactions || []));
 
   const variantLabel = (doc, tx) => {
     if (Array.isArray(tx.variantCombination) && tx.variantCombination.length) {

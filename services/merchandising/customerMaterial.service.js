@@ -211,7 +211,18 @@ function expectationView(doc) {
     /* Why this document is allowed to exist, on the document. */
     fulfilmentModel: str(doc.fulfilmentModel),
 
-    executionFileId: str(doc.executionFileId),
+    /* ── WHICH KIND OF WORK THIS IS FOR ──────────────────────────────────
+       A confirmed order or a development sample. Carried so Store's Expected
+       receipts can say which without re-deriving it from whichever id happens
+       to be populated — and so a reader is never left to infer the origin from
+       an absence. */
+    origin: str(doc.origin) || "CONFIRMED_ORDER",
+    executionFileId: doc.executionFileId ? str(doc.executionFileId) : null,
+    developmentFileId: doc.developmentFileId ? str(doc.developmentFileId) : null,
+    /* The approved request this came from, where one did. Lineage for a person
+       asking "why is this coming?" - never the authority for whose it is. */
+    sourceMrfId: doc.sourceMrfId ? str(doc.sourceMrfId) : null,
+    sourceMrfNumber: str(doc.sourceMrfNumber),
     fileNumber: str(doc.fileNumber),
     orderRef: str(doc.orderRef),
     salesOrderLineRef: str(doc.salesOrderLineRef),
@@ -1145,6 +1156,13 @@ async function storeDetail(ctx, { docId } = {}) {
 }
 
 module.exports = {
+  /* Exported so the customer-supplied routing service numbers its documents and
+     names its lines through Merchandising's OWN minters rather than inventing a
+     second series. A development-sample document and an order document are the
+     same kind of document and must be numbered from one sequence — a person
+     reading "CSM-2026-0041" should not have to know which path produced it. */
+  nextDocumentRef,
+  newLineRef,
   STATE,
   RECEIPT_AVAILABLE,
   DEFAULT_LIMIT,

@@ -285,7 +285,20 @@ async function confirmWithIe(companyId, styleId, { maker = null, checker = null 
     }
   }
 
-  /* 4 — submit, and have somebody ELSE approve. Maker-checker is the point. */
+  /* 4 — assess, then submit, and have somebody ELSE approve.
+     Submitting now requires somebody to have said whether the factory can make
+     the style: "not assessed" is not a pass and the gate refuses it. The chain
+     records the smallest honest assessment through the real route, exactly as
+     an engineer would, rather than writing the field into the document. */
+  const assessed = await call(`/engineering-files/${file.fileId}/feasibility`, {
+    method: "PATCH", token: m.token, company: companyId,
+    body: { expectedRevision: 0, outcome: "FEASIBLE", findings: [], conditions: [] },
+  });
+  if (assessed.status !== 200) {
+    throw new Error(`authorityChain: the feasibility assessment was not recorded (${assessed.status}) `
+      + `${JSON.stringify(assessed.body?.error || assessed.body)}`);
+  }
+
   const fresh = await call(`/styles/${styleId}/engineering-file`, { token: m.token, company: companyId });
   const submitted = await call(`/engineering-files/${file.fileId}/bulletin-versions`, {
     method: "POST", token: m.token, company: companyId,

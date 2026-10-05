@@ -7,6 +7,9 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const Barcode  = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const RawItem  = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Unit     = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+/* was used by start-cutting-session but never required — every cutting
+   session start on a label crashed "identityRefusal is not defined" (3 Oct 2026) */
+const { identityRefusal } = require("../../../../services/storePurchase/labelIdentity");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -75,15 +78,26 @@ router.get("/:barcodeId", async (req, res) => {
     const barcode = await Barcode.findById(barcodeId).populate("purchaseOrder", "poNumber vendorName status").lean();
     if (!barcode) return res.status(404).json({ success: false, message: "Barcode not found" });
 
+    /* The item's and the variant's CURRENT balance ride along (2 Oct 2026):
+       the Issues & returns drawer checks a line against the recorded balance
+       and refused every scanned line as "balance not recorded" — the lookup
+       never carried one. The item's conversions are the fallback when the
+       variant has none. */
     let unitConversions = [];
-    if (barcode.rawItem && barcode.variantId) {
-      const riDoc   = await RawItem.findById(barcode.rawItem).select("variants").lean();
-      const variant = riDoc?.variants?.find(v => v._id?.toString() === barcode.variantId?.toString());
-      if (variant?.unitConversions?.length) unitConversions = variant.unitConversions.filter(uc => uc.toUnit);
+    let itemQuantity = null, variantQuantity = null, image = "";
+    if (barcode.rawItem) {
+      const riDoc   = await RawItem.findById(barcode.rawItem).select("quantity unitConversions image variants._id variants.quantity variants.unitConversions variants.image").lean();
+      itemQuantity = Number.isFinite(Number(riDoc?.quantity)) ? Number(riDoc.quantity) : null;
+      const variant = barcode.variantId ? riDoc?.variants?.find(v => v._id?.toString() === barcode.variantId?.toString()) : null;
+      if (variant) variantQuantity = Number.isFinite(Number(variant.quantity)) ? Number(variant.quantity) : null;
+      const list = variant?.unitConversions?.length ? variant.unitConversions : (riDoc?.unitConversions || []);
+      unitConversions = list.filter(uc => uc && uc.toUnit);
+      /* the photo of what was scanned: the variant's, else the item's (3 Oct 2026) */
+      image = variant?.image || riDoc?.image || "";
     }
 
     const openSession = (barcode.cuttingSessions || []).find(s => !s.closedAt) || null;
-    return res.json({ success: true, barcode: { ...formatBarcode(barcode), unitConversions }, openSession: formatSession(openSession) });
+    return res.json({ success: true, barcode: { ...formatBarcode(barcode), unitConversions, itemQuantity, variantQuantity, image }, openSession: formatSession(openSession) });
   } catch (err) {
     console.error("raw-item-barcode lookup error:", err);
     return res.status(500).json({ success: false, message: "Server error", error: err.message });

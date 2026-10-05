@@ -38,6 +38,7 @@
 
 const mongoose = require("mongoose");
 const { processRouteSchema } = require("./processRoute.schema");
+const { feasibilitySchema } = require("./feasibility.schema");
 
 /* Only one status exists in this chunk, and it is written out rather than
    implied: a file that cannot yet be anything but DRAFT should still SAY
@@ -61,6 +62,10 @@ const EVENT_TYPES = [
      applies. Its own event so the trail never records a route decision as a
      bulletin row edit. */
   "PROCESS_ROUTE_EDITED",
+  /* The feasibility assessment moved: a finding added, resolved, or the
+     overall result set. Its own event so the trail never records a judgement
+     about making the garment as a bulletin edit. */
+  "FEASIBILITY_ASSESSED",
   /* ── THE FILE RE-BASED ONTO A NEWER R&D REVISION ──────────────────────
      R&D approving a newer technical revision used to be the end of the road:
      the file stayed frozen against the revision it was opened from, every
@@ -303,6 +308,13 @@ const ieStyleFileSchema = new mongoose.Schema(
         acknowledgedByName: { type: String, trim: true },
       },
     },
+
+    /* ── CAN THIS BE MADE? ────────────────────────────────────────────────
+       IE's own assessment of the construction, materials, processes, machines,
+       skills, quality risk and sample evidence. Absent until somebody opens
+       one; `NOT_ASSESSED` once they do and before they decide. Frozen into the
+       bulletin version at submission — see feasibility.schema.js. */
+    feasibility: { type: feasibilitySchema, default: undefined },
 
     status: { type: String, enum: FILE_STATUS, default: "DRAFT", required: true },
 

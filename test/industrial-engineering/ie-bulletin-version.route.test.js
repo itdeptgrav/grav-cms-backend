@@ -56,6 +56,7 @@ const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering
 
 const { transactionsAvailable, __setTransactionSupport } = require("../../services/storePurchase/unitOfWork.service");
 const layouts = require("../../services/industrialEngineering/ieLineLayout.service");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, seq = 0;
 
@@ -389,9 +390,16 @@ async function standing(name, overrides = {}) {
 
 /* ── THE FIVE 7C1 ROUTES, AND THE DRAFT'S ONE WRITER ─────────────────────── */
 
-const submit = (a, w, fileId, body) => call(`/engineering-files/${fileId}/bulletin-versions`, {
-  method: "POST", token: a.token, company: w.co._id, body,
-});
+/* Submitting now requires an assessment, so the suite's own submit helper
+   records the smallest honest one first — the same two steps an engineer
+   takes. The tests that prove the GATE refuses an unassessed submission call
+   the route directly instead. */
+const submit = async (a, w, fileId, body) => {
+  await assessFeasible(call, { fileId, token: a.token, company: w.co._id });
+  return call(`/engineering-files/${fileId}/bulletin-versions`, {
+    method: "POST", token: a.token, company: w.co._id, body,
+  });
+};
 const listVersions = (a, w, fileId, qs = "") => call(
   `/engineering-files/${fileId}/bulletin-versions${qs}`, { token: a.token, company: w.co._id },
 );

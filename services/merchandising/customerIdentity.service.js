@@ -60,6 +60,11 @@ const ExecutionFile = require("../../models/CMS_Models/Merchandising/ExecutionFi
 const SalesHandoverVersion = require("../../models/CMS_Models/Sales/SalesHandoverVersion");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../models/Customer_Models/Customer");
+/* The development chain: a sample has no execution file, so its customer is
+   established through the Sales journey it was opened under. */
+const { DevelopmentFile } = require("../../models/CMS_Models/Merchandising/Development");
+const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
+const Account = require("../../models/CMS_Models/Sales/Account");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -67,6 +72,19 @@ const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
 /** Why a chain could not be walked. Stable, so a screen can explain each one. */
 const UNPROVEN = Object.freeze({
   NO_HANDOVER_VERSION: "NO_HANDOVER_VERSION",
+  /* ── THE DEVELOPMENT CHAIN ──────────────────────────────────────────────
+     A development sample has no execution file and no handover version: there
+     is no confirmed order behind it yet. Its customer is established through
+     the Sales journey the development belongs to, which is a different walk
+     with its own ways of being broken — so it has its own reasons rather than
+     borrowing the order chain's and reporting a handover that was never
+     expected to exist. */
+  DEVELOPMENT_NOT_FOUND: "DEVELOPMENT_NOT_FOUND",
+  NO_JOURNEY: "NO_JOURNEY",
+  JOURNEY_NOT_FOUND: "JOURNEY_NOT_FOUND",
+  ACCOUNT_NOT_NAMED: "ACCOUNT_NOT_NAMED",
+  ACCOUNT_NOT_FOUND: "ACCOUNT_NOT_FOUND",
+  ACCOUNT_NOT_LINKED_TO_CUSTOMER: "ACCOUNT_NOT_LINKED_TO_CUSTOMER",
   HANDOVER_VERSION_NOT_FOUND: "HANDOVER_VERSION_NOT_FOUND",
   SOURCE_RECORD_MISSING: "SOURCE_RECORD_MISSING",
   CUSTOMER_REQUEST_NOT_FOUND: "CUSTOMER_REQUEST_NOT_FOUND",
@@ -89,6 +107,19 @@ const UNPROVEN_MESSAGE = Object.freeze({
     + "customer-supplied material is received against it.",
   [UNPROVEN.CUSTOMER_NOT_FOUND]:
     "The customer named on the request behind this order was not found.",
+  [UNPROVEN.DEVELOPMENT_NOT_FOUND]:
+    "That development was not found in this company.",
+  [UNPROVEN.NO_JOURNEY]:
+    "This development names no Sales journey, so the customer it belongs to cannot be established.",
+  [UNPROVEN.JOURNEY_NOT_FOUND]:
+    "The Sales journey this development belongs to is not in this company.",
+  [UNPROVEN.ACCOUNT_NOT_NAMED]:
+    "The Sales journey behind this development names no account, so the customer cannot be established.",
+  [UNPROVEN.ACCOUNT_NOT_FOUND]:
+    "The account on the Sales journey behind this development was not found.",
+  [UNPROVEN.ACCOUNT_NOT_LINKED_TO_CUSTOMER]:
+    "The account behind this development is not linked to a customer record yet. Ask Sales to link it "
+    + "before customer-supplied material is expected against it.",
 });
 
 /* ── THE DISPLAY SNAPSHOT ────────────────────────────────────────────────────
@@ -184,4 +215,89 @@ async function resolveFromFileId(ctx, fileId, session = null) {
   return resolveFromFile(ctx, file, session);
 }
 
-module.exports = { UNPROVEN, UNPROVEN_MESSAGE, resolveFromFile, resolveFromFileId, snapshotOf };
+/**
+ * WHOSE GOODS THESE ARE, FOR A DEVELOPMENT SAMPLE.
+ *
+ * ── A DIFFERENT WALK, FOR A DIFFERENT REASON ───────────────────────────────
+ * The order chain starts at an execution file and walks its handover version to
+ * the customer request that was confirmed. A development has none of that: it
+ * exists BEFORE anybody confirms an order, which is the entire point of it. What
+ * it does have is the Sales journey it was opened under, and that journey names
+ * the account the conversation is with.
+ *
+ *   Development → journeyId → SalesJourney.accountId → Account.linkedCustomer
+ *
+ * The last hop is the one that matters and the one that is allowed to fail. An
+ * account is a CRM record of a conversation; a Customer is the commercial master
+ * that can own stock. They are deliberately separate, and an account nobody has
+ * linked yet is an ordinary state early in a development — so this refuses
+ * rather than inventing a customer, and the refusal names the fix.
+ *
+ * ── AND IT IS NEVER TAKEN FROM A PAYLOAD ───────────────────────────────────
+ * Same rule as the order chain, for the same reason: a client that could name
+ * the customer could attribute one customer's fabric to another by editing a
+ * form. The MRF is the demand and the audit root; it is not the authority for
+ * ownership.
+ */
+async function resolveFromDevelopmentId(ctx, developmentId, session = null) {
+  const refuse = (reason) => ({ ok: false, reason, message: UNPROVEN_MESSAGE[reason] });
+  if (!isId(developmentId)) return refuse(UNPROVEN.DEVELOPMENT_NOT_FOUND);
+
+  /* Company-scoped: this is the boundary, and a lookup by id alone would reach
+     another company's development. */
+  const development = await DevelopmentFile
+    .findOne({ _id: developmentId, companyId: ctx.companyId })
+    .select("journeyId developmentNumber productName styleRef buyerDisplayLabel currentRequestId")
+    .session(session).lean();
+  if (!development) return refuse(UNPROVEN.DEVELOPMENT_NOT_FOUND);
+
+  if (!isId(development.journeyId)) return refuse(UNPROVEN.NO_JOURNEY);
+  const journey = await SalesJourney
+    .findOne({ _id: development.journeyId, companyId: ctx.companyId })
+    .select("accountId journeyRef")
+    .session(session).lean();
+  if (!journey) return refuse(UNPROVEN.JOURNEY_NOT_FOUND);
+  if (!isId(journey.accountId)) return refuse(UNPROVEN.ACCOUNT_NOT_NAMED);
+
+  /* ── COMPANY-SCOPED, EVEN THOUGH THE JOURNEY ALREADY WAS ────────────────
+     The journey is scoped, so in a sound database this hop cannot cross. But
+     "the previous link was checked" is exactly the reasoning that leaves one
+     unchecked link in a chain, and this is the hop that decides whose fabric
+     arrives. An account in another company is refused as not found rather than
+     followed on the strength of an id. */
+  const account = await Account
+    .findOne({ _id: journey.accountId, companyId: ctx.companyId })
+    .select("linkedCustomer companyName")
+    .session(session).lean();
+  if (!account) return refuse(UNPROVEN.ACCOUNT_NOT_FOUND);
+  /* `Account.linkedCustomer` is the link every reader uses — see
+     `CustomerAccountClaim`, which records the decision rather than replacing
+     it. An unlinked account is an ordinary early state, not a fault. */
+  if (!isId(account.linkedCustomer)) return refuse(UNPROVEN.ACCOUNT_NOT_LINKED_TO_CUSTOMER);
+
+  const customer = await Customer
+    .findById(account.linkedCustomer).select("name customerId profile.companyName")
+    .session(session).lean();
+  if (!customer) return refuse(UNPROVEN.CUSTOMER_NOT_FOUND);
+
+  return {
+    ok: true,
+    customerId: customer._id,
+    /* A development has no confirmed customer request; the journey is what it
+       has, and saying so is better than leaving a field that implies one. */
+    customerRequestId: null,
+    development: {
+      id: development._id,
+      number: str(development.developmentNumber),
+      productName: str(development.productName),
+      styleRef: str(development.styleRef),
+      buyerDisplayLabel: str(development.buyerDisplayLabel),
+    },
+    snapshot: snapshotOf(customer, null),
+  };
+}
+
+module.exports = {
+  UNPROVEN, UNPROVEN_MESSAGE,
+  resolveFromFile, resolveFromFileId, resolveFromDevelopmentId, snapshotOf,
+};

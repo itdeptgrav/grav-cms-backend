@@ -78,6 +78,7 @@ const ieOrders = require("../../../services/industrialEngineering/ieOrders.servi
 const ieLibrary = require("../../../services/industrialEngineering/ieOperationLibrary.service");
 const ieStyleFile = require("../../../services/industrialEngineering/ieStyleFile.service");
 const ieProcessRoute = require("../../../services/industrialEngineering/ieProcessRoute.service");
+const ieFeasibility = require("../../../services/industrialEngineering/ieFeasibility.service");
 const ieMethodStudy = require("../../../services/industrialEngineering/ieMethodStudy.service");
 const ieAllowancePolicy = require("../../../services/industrialEngineering/ieAllowancePolicy.service");
 const ieLineLayout = require("../../../services/industrialEngineering/ieLineLayout.service");
@@ -572,6 +573,37 @@ router.post("/engineering-files/:fileId/rebase-review", requireCompany, canWrite
  * Frozen with the bulletin on submission and approved with it; the same
  * revision rule and the same review freeze as the rows.
  */
+/* ══ ENGINEERING FEASIBILITY ═══════════════════════════════════════════════
+ *
+ * Can this factory make this style correctly and repeatedly? IE's own
+ * assessment, read by anyone who may read the file and written by an editor
+ * while the file is a draft.
+ *
+ * There is no approve verb here on purpose: the assessment is frozen into the
+ * bulletin version at submission and decided with it, under the maker-checker
+ * that already exists. A second decision here would be a second place to say
+ * yes about one style.
+ */
+router.get("/engineering-files/:fileId/feasibility", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieFeasibility.readFeasibility(req.ie, { fileId: req.params.fileId });
+  return res.json({ success: true, ...out });
+}));
+
+/* The same rung as every other IE write, in this surface's own words: the
+   shared refusal talks about the operation library, which is not what a person
+   assessing a style was trying to change. */
+const canAssess = requireIe("editor", {
+  code: "IE_WRITE_FORBIDDEN",
+  message: "Recording whether a style can be made needs an Industrial Engineering editor role.",
+});
+
+router.patch("/engineering-files/:fileId/feasibility", requireCompany, canAssess, handle(async (req, res) => {
+  const out = await ieFeasibility.saveFeasibility(req.ie, {
+    fileId: req.params.fileId, body: req.body, actor: actorOf(req),
+  });
+  return res.json({ success: true, ...out });
+}));
+
 router.patch("/engineering-files/:fileId/process-route", requireCompany, canWrite, handle(async (req, res) => {
   const out = await ieProcessRoute.updateProcessRoute(req.ie, {
     fileId: req.params.fileId,

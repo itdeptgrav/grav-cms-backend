@@ -1925,6 +1925,10 @@ app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/customerMaterialRoute")
    nothing here, and Sales has no handle on the Development File. */
 app.use("/api/cms/sales/development-requests", require("./routes/CMS_Routes/Sales/developmentRequests"));
 
+/* R&D's interactive 3D garment workspace. Models and annotations stay behind
+   the live R&D grant and private, signed asset delivery. */
+app.use("/api/cms/rnd", require("./routes/CMS_Routes/RnD/garmentModelRoute"));
+
 /* ── SALES ISSUES THE MERCHANDISING HANDOVER ─────────────────────────────
    The producer's door: issuance, supersession and cancellation of the
    versioned confirmed requirement, on the proven order line, behind Sales'

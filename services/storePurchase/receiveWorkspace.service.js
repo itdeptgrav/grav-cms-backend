@@ -484,7 +484,20 @@ async function readExpectedCustomer(ctx, { search }) {
          a customer-owned row. */
       partyLabel: row.buyerDisplayLabel || row.buyerName || "",
       partyKind: "customer",
-      orderReference: row.orderRef || "",
+      /* The work this material is for. A confirmed order quotes its order
+         reference; a development sample has none, and quotes the request that
+         asked for it instead — so the column is never blank for a row that
+         genuinely has a context. */
+      orderReference: row.orderRef || row.sourceMrfNumber || "",
+      /* Said in words, not by the absence of an order reference. */
+      purposeLabel: row.origin === "DEVELOPMENT_SAMPLE" ? "Development/sample" : "Production order",
+      sourceMrfNumber: row.sourceMrfNumber || "",
+      sourceMrfId: row.sourceMrfId || "",
+      /* What is still coming, so a receiver can see the remainder without
+         opening the document. Summed over the outstanding lines only. */
+      expectedQuantity: outstanding.reduce((t, l) => t + num(l.requiredQuantity), 0),
+      receivedQuantity: outstanding.reduce((t, l) => t + num(l.receivedQuantity), 0),
+      remainingQuantity: outstanding.reduce((t, l) => t + num(l.pendingQuantity), 0),
       expectedDate: row.requiredBy || row.expectedAt || null,
       recordedDate: null,
       lineCount: outstanding.length,

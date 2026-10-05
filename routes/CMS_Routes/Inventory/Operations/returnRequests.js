@@ -824,6 +824,7 @@ router.post(
             purchaseOrder: po.poNumber,
             purchaseOrderId: po._id,
             performedBy: req.user?.id || null,
+            performedByName: req.user?.name || req.user?.email || "",
           },
           });
 

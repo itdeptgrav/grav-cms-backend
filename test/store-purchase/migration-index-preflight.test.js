@@ -227,6 +227,52 @@ test("the ownership migration declares the unique first-print and one-return-per
   expect(oneReturn.options.unique).toBe(true);
 });
 
+/* ══ RETIRING AN INDEX THE FEATURE ITSELF GOT WRONG ══════════════════════ */
+
+// `--retire` is the one mode of that script that DROPS something, so the two
+// things worth holding are that it drops nothing unless asked, and that when
+// asked it drops only what is named.
+
+test("a stale index is reported but not dropped unless --retire is given", async () => {
+  const migration = require("../../scripts/migrations/customer-material-ownership-indexes");
+  const spec = migration.RETIRED[0];
+  const col = db().collection(spec.collection);
+
+  /* Rebuild the wrong index exactly as the deployed database carries it. */
+  await col.createIndex(
+    { companyId: 1, developmentFileId: 1, revisionNo: 1 },
+    { unique: true, name: spec.name, partialFilterExpression: { developmentFileId: { $type: "objectId" } } },
+  );
+
+  const dry = await migration.run({});
+  expect(dry.retired.find((r) => r.name === spec.name).present).toBe(true);
+  expect(dry.text).toMatch(/STALE/);
+  expect(dry.text).toMatch(/--retire/);
+  /* Reported, and still there. */
+  expect((await col.indexes()).map((i) => i.name)).toContain(spec.name);
+
+  const done = await migration.run({ retire: true });
+  expect(done.text).toMatch(/RETIRED \(dropped\)/);
+  expect((await col.indexes()).map((i) => i.name)).not.toContain(spec.name);
+});
+
+test("--retire drops only the named indexes, never a neighbour", async () => {
+  const migration = require("../../scripts/migrations/customer-material-ownership-indexes");
+  const spec = migration.RETIRED[0];
+  const col = db().collection(spec.collection);
+
+  await col.createIndex({ companyId: 1, developmentFileId: 1, revisionNo: 1 }, { name: spec.name });
+  /* A bystander on the same collection, of the same shape family. */
+  await col.createIndex({ companyId: 1, developmentFileId: 1 }, { name: "someone_elses_read" });
+
+  await migration.run({ retire: true });
+
+  const left = (await col.indexes()).map((i) => i.name);
+  expect(left).not.toContain(spec.name);
+  expect(left).toContain("someone_elses_read");
+  await col.dropIndex("someone_elses_read");
+});
+
 /* ══ THE DRY RUN THAT CREATED INDEXES IN PRODUCTION ══════════════════════ */
 
 // This guard is not about a function's return value; it is about a line of
