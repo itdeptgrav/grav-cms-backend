@@ -51,10 +51,28 @@ test("a 3rd late covered by PL with punches kept still counts", () => {
   );
 });
 
-test("a late HR corrected to ON TIME is not a late — a fixed device error", () => {
-  /* HR typed the right time: inTime present, isLate recomputed false. */
-  const corrected = late({ hrFinalStatus: "P", isLate: false });
-  assert.deepEqual(run([late(), late(), corrected, late(), late()]), [null, null, null, "LHD", null]);
+test("THE OWNER'S CASE: 3rd late regularized — the 4th is just late, the 5th is absent", () => {
+  /* What an approved regularization leaves: the check-in moved, the day
+     re-judged from scratch (status P, not late), and the marker the
+     correction now stamps. Before 5 Oct 2026 the day left the streak and the
+     4th late was docked as a late half day. */
+  const regularized = late({ systemPrediction: "P", isLate: false, lateRegularized: true });
+  assert.deepEqual(run([late(), late(), regularized, late(), late()]), [null, null, null, null, "LAB"]);
+});
+
+test("a regularized day is never itself docked, even when it lands on the 3rd or 5th", () => {
+  const regularized = late({ systemPrediction: "P", isLate: false, lateRegularized: true });
+  assert.deepEqual(run([late(), late(), late(), late(), regularized]), [null, null, "LHD", null, null]);
+});
+
+test("an HR punch edit that took the late away counts the same way (it stamps the marker too)", () => {
+  const corrected = late({ hrFinalStatus: "P", isLate: false, lateRegularized: true });
+  assert.deepEqual(run([late(), late(), corrected, late(), late()]), [null, null, null, null, "LAB"]);
+});
+
+test("a day that was never late is not counted", () => {
+  const onTime = late({ systemPrediction: "P", isLate: false });
+  assert.deepEqual(run([late(), late(), onTime, late()]), [null, null, null, "LHD"]);
 });
 
 test("a projection that never selected inTime keeps the old rule", () => {
