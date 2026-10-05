@@ -44,6 +44,47 @@ function dropHrAuthorizationCache(reason) {
     console.warn("[employees] HR authorisation cache invalidation skipped:", err.message);
   }
 }
+
+/* ── WHEN SOMEBODY LEAVES, NOTHING CURRENT POINTS AT THEM (5 Oct 2026) ──────
+   Deactivation ended their sessions and nothing else: they stayed somebody's
+   manager, open requests stayed waiting on them, and their app grants stayed
+   active. services/employeeDeparture.js detaches all three and deletes
+   nothing. Called from every route that can turn a record inactive, only on
+   the transition, and it must never fail the deactivation itself — a
+   failure is logged and HR can re-run it. */
+async function detachIfDeparted(req, before, after) {
+  const { detachDepartedEmployee, hasLeft } = require("../../services/employeeDeparture");
+  if (!after || hasLeft(before) || !hasLeft(after)) return null;
+  try {
+    const db = require("mongoose").connection.db;
+    const by = req.user?.name || req.user?.email || "";
+    const done = await detachDepartedEmployee(db, after, { by });
+    if (done.grants.length) dropHrAuthorizationCache("departed employee's grants deactivated");
+    const parts = [
+      done.reports.length && `${done.reports.length} report(s) no longer have them as manager`,
+      done.departments.length && `removed as manager of ${done.departments.length} department(s)`,
+      done.requests.length && `taken off ${done.requests.length} waiting request(s), which HR now decides`,
+      done.grants.length && `${done.grants.length} app access grant(s) switched off`,
+    ].filter(Boolean);
+    if (parts.length) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:employees",
+        entity: "employee",
+        entityId: after._id,
+        entityLabel: `${after.firstName || ""} ${after.lastName || ""}`.trim(),
+        action: "update",
+        summary: `Left the company: ${parts.join("; ")}.`,
+        before: { reports: done.reports, departments: done.departments, waitingRequests: done.requests, grants: done.grants },
+        after: { reports: [], departments: [], waitingRequests: [], grants: [] },
+      });
+    }
+    return done;
+  } catch (err) {
+    console.error(`[departure] ${after?._id}: could not detach — ${err.message}`);
+    return null;
+  }
+}
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
@@ -743,6 +784,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+    await detachIfDeparted(req, beforeDoc, updated.toObject());
 
     /* An email is the key every access record is filed under, and it is
        editable right here. Changing it without moving those records orphans
@@ -1244,6 +1286,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
         doc.set("updatedByName", user.name || "");
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
+        await detachIfDeparted(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
         // Same reason as the single-employee update: a change of employment
         // type changes whether the app will let them in, and the answer is
         // cached for five minutes.
@@ -1732,6 +1775,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // have. Both caches, because they answer different questions.
     invalidateAppAccess(req.params.id);
     dropHrAuthorizationCache("employee deactivated");
+    const departure = await detachIfDeparted(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
 
     // Audit: who deactivated this employee.
     recordChange(req, {
@@ -1748,7 +1792,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     res
       .status(200)
-      .json({ success: true, message: "Employee deactivated successfully" });
+      .json({ success: true, message: "Employee deactivated successfully", departure });
   } catch (error) {
     console.error("Delete employee error:", error);
     if (error.name === "CastError")
