@@ -2422,67 +2422,9 @@ async function applyApprovedLeavesForDate(dateStr) {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// COUNT-BASED LATE/EARLY PROMOTION HELPER (per HR policy doc)
-//   1st, 2nd late → P* (no deduction)
-//   Nth late (lateHDOnCount=3)       → HD, counter resets
-//   Nth late (lateFullDayOnCount=5)  → AB, counter resets
-//   Same rule for early-out (P~) with earlyOut* settings
-//   HR overrides and today are never promoted.
-//
-// state = { lateCount, earlyCount }  — mutated in-place
-// Returns { promotedStatus: "HD"|"AB"|null, promoted: bool }
-// ─────────────────────────────────────────────────────────────────────────────
-function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
-  const none = { promotedStatus: null, promoted: false };
-  if (!policy?.enabled) return none;
-  const lateHDOn = policy.lateHDOnCount ?? 3;
-  const lateFullDayOn = policy.lateFullDayOnCount ?? 5;
-  const earlyHDOn = policy.earlyOutHDOnCount ?? 3;
-  const earlyFullDayOn = policy.earlyOutFullDayOnCount ?? 5;
-
-  /* WHAT COUNTS IS THE RAW LATENESS, NOT WHAT HR DECIDED ABOUT THE DAY.
-     This used to return before incrementing whenever HR had overridden the
-     day. So when HR pardoned somebody's 3rd late by marking it Present, that
-     day vanished from the streak and the NEXT late inherited its position —
-     the 4th late became "the 3rd" and was docked a half day. The pardon
-     moved the penalty instead of removing it.
-
-     A pardon forgives the deduction on that day. It does not un-late the day.
-     So the count always advances on a raw late; only the PROMOTION is
-     withheld when HR has already ruled on the day, or the day is still today
-     and not yet over. */
-  const rawLate =
-    !!entry.isLate && ["P*", "LHD", "LAB"].includes(entry.systemPrediction);
-  const rawEarly =
-    !rawLate &&
-    !!entry.isEarlyDeparture &&
-    ["P~", "EAB"].includes(entry.systemPrediction);
-  const mayPromote = !entry.hrFinalStatus && dateStr !== todayStr;
-
-  if (rawLate) {
-    state.lateCount++;
-    if (state.lateCount >= lateFullDayOn) {
-      state.lateCount = 0;
-      return mayPromote ? { promotedStatus: "LAB", promoted: true } : none;
-    }
-    if (state.lateCount === lateHDOn) {
-      return mayPromote ? { promotedStatus: "LHD", promoted: true } : none;
-    }
-    return none; // 4th (and any other in-between) late: counted, not docked
-  }
-  if (rawEarly) {
-    state.earlyCount++;
-    if (state.earlyCount >= earlyFullDayOn) {
-      state.earlyCount = 0;
-      return mayPromote ? { promotedStatus: "EAB", promoted: true } : none;
-    }
-    if (state.earlyCount === earlyHDOn) {
-      return mayPromote ? { promotedStatus: "HD", promoted: true } : none;
-    }
-  }
-  return none;
-}
+/* The late / early-out streak rule. Moved to services/lateStreak.js (5 Oct
+   2026) — see there for why a pardoned or leave-covered late still counts. */
+const { applyLateCountPromotion } = require("../../services/lateStreak");
 
 async function applyMonthlyLatePromotion(dayDoc, settings) {
   const policy = settings.lateHalfDayPolicy;
@@ -2503,7 +2445,7 @@ async function applyMonthlyLatePromotion(dayDoc, settings) {
     dateStr: { $lte: dayDoc.dateStr },
   })
     .select(
-      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus",
+      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus employees.inTime",
     )
     .sort({ dateStr: 1 })
     .lean();
@@ -4220,10 +4162,21 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     emp.hrReviewedBy = req.user?.name || req.user?.email || "HR";
 
     const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
+    /* ── A STATUS WITH NO TIMES DOES NOT ERASE THE DAY'S PUNCHES (5 Oct 2026) ──
+       Both HR dialogs send inTime/finalOut as null when the chosen status has
+       no times (leave, LWP, Absent, a holiday, comp off). Applied, that wiped
+       what the device recorded and recomputed the day as not late — so a
+       late day turned into PL fell out of the late streak and the NEXT late
+       was docked a half day in its place. Changing what a day COUNTS AS is not
+       a punch edit; removing a punch is punch-correction's job. So for these
+       statuses the time fields are ignored, whoever sent them. */
+    const NO_TIME_STATUSES = new Set(["AB", "WO", "PH", "FH", "NH", "OH", "RH", "L-CL", "L-SL", "L-EL", "LWP", "CO"]);
+    const keepPunches = hrFinalStatus !== undefined && NO_TIME_STATUSES.has(hrFinalStatus);
     const punchChanges = [];
     let anyTimeUpdated = false;
     for (const [field, value] of Object.entries(punchFields)) {
       if (value === undefined) continue;
+      if (keepPunches) continue;
       anyTimeUpdated = true;
       const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
       const newDate = value ? parseTimeOnDateIST(value, dateStr) : null;
