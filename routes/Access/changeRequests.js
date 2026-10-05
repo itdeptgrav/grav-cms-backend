@@ -226,6 +226,9 @@ router.get("/:slug", async (req, res) => {
         decidedAt: r.decidedAt,
         decisionNote: r.decisionNote,
         applyError: r.applyError,
+        requiredRole: r.requiredRole || "approver",
+        requiredRoleReason: r.requiredRoleReason || "",
+        canDecideThis: r.requiredRole === "owner" ? roleAtLeast(role, "owner") : roleAtLeast(role, "approver"),
         createdAt: r.createdAt,
         // The path is shown to an approver so they can tell two similar
         // requests apart. The BODY is not sent: it can hold anything the form
@@ -268,7 +271,13 @@ router.post("/:slug/approve-all", async (req, res) => {
       return res.status(403).json({ success: false, message: "Only an approver can approve the queue." });
     }
 
-    const pending = await ChangeRequest.find({ departmentSlug: slug, status: "pending" })
+    /* An approver's "approve all" must not sweep up requests only the owner
+       may decide; they stay waiting for the owner. */
+    const pending = await ChangeRequest.find({
+      departmentSlug: slug,
+      status: "pending",
+      ...(roleAtLeast(role, "owner") ? {} : { requiredRole: { $ne: "owner" } }),
+    })
       .sort({ createdAt: 1 })
       .limit(200)
       .select("_id")
@@ -324,6 +333,17 @@ router.post("/:id/decide", async (req, res) => {
         success: false,
         code: "INSUFFICIENT_DEPARTMENT_ROLE",
         message: "Only an approver or the owner can decide this.",
+      });
+    }
+
+    /* A request held for the OWNER (it sets pay, which only the owner may
+       set) is decided by the owner — approve or reject. Another approver
+       deciding it would be the very bypass the hold exists to stop. */
+    if (cr.requiredRole === "owner" && !roleAtLeast(role, "owner") && !req.user.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        code: "OWNER_DECISION",
+        message: "Only the HR owner can decide this — it sets pay.",
       });
     }
 
