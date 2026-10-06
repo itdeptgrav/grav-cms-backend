@@ -17,7 +17,8 @@
     "face:link-folders": "node services/face-biometric/link-folders.js",
     "face:link-folders:apply": "node services/face-biometric/link-folders.js --apply",
     "face:link": "node services/face-biometric/run.js link",
-    "dev:all": "bash scripts/dev-with-face.sh"
+    "dev:all": "bash scripts/dev-with-face.sh",
+    "verify:access": "node scripts/accessProbe.js"
   },
   "keywords": [],
   "author": "",

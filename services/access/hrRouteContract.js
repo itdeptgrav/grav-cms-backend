@@ -299,6 +299,20 @@ const DECLARATIONS = [
     note: "Mints a two-minute, one-operation token so a browser can stream frames at the face engine directly. Shipped undeclared and so refused for everybody. Classified like `recheck` — its nearest sibling, non-mutating, face-registration-scoped — rather than from an observed caller: NOTHING in the CMS or the employee app calls it, so whichever surface drives face sign-in lives outside both repos. If that surface turns out to authenticate as something without an HR grant, this is the line to revisit; the handler’s own comment asks only for a session.",
   }),
 
+  /* Face enrolment by link (routes/HrRoutes/FaceEnrollInvite_section.js).
+     Shipped undeclared, so the contract refused BOTH halves for everybody —
+     HR could not mint a link and an employee opening one got 403 (found by
+     scripts/accessProbe.js, 6 Oct 2026). The HR half is a people write on one
+     employee's gallery; the session half is public BY DESIGN: the employee
+     has no session, the 32-byte hashed, expiring, revocable token is the
+     authorisation, and the router caps and rate-limits it itself. */
+  D("POST", "/hr/face-enroll/invite/:employeeId", [C.HR_ACCESS, C.PEOPLE_WRITE], { persona: "HR editor", ...P }),
+  D("GET", "/hr/face-enroll/invite/:employeeId", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], { persona: "HR operations" }),
+  D("POST", "/hr/face-enroll/invite/:employeeId/revoke", [C.HR_ACCESS, C.PEOPLE_WRITE], { persona: "HR editor" }),
+  D("GET", "/hr/face-enroll/session/:token", [], { ...PUB, persona: "employee with an enrolment link", note: "The token is the authorisation; answers the first name only." }),
+  D("POST", "/hr/face-enroll/session/:token/upload", [], { ...PUB, persona: "employee with an enrolment link", note: "Adds photos to the ONE gallery the token names; capped per invite and rate-limited per IP inside the router." }),
+  D("POST", "/hr/face-enroll/session/:token/complete", [], { ...PUB, persona: "employee with an enrolment link", note: "Closes the invite; the token stops working." }),
+
   /* ══════════════════════════════════════════════════════════════════════════
    *  LEAVE — configuration, balances and HR decisions
    * ══════════════════════════════════════════════════════════════════════════ */

@@ -1,3 +1,7 @@
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 /* Server-owned field policy. `selectFor` narrows the QUERY to what this caller
    may read; `projectFor` narrows the RESPONSE to the declared allowlist. Both
@@ -653,7 +657,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       }
     }
 
-    const canUpdate = user.role === "hr_manager" || user.id === id;
+    const canUpdate = isHrOperator(req) || user.id === id;
     if (!canUpdate) {
       return res
         .status(403)
@@ -882,7 +886,7 @@ router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
     const { documents } = req.body;
 
-    if (user.role !== "hr_manager" && user.id !== id) {
+    if (!isHrOperator(req) && user.id !== id) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -954,7 +958,7 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
     const { profilePhoto } = req.body;
 
-    if (user.role !== "hr_manager" && user.id !== id) {
+    if (!isHrOperator(req) && user.id !== id) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1175,7 +1179,7 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1353,7 +1357,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
 // shadowed by the param route.
 router.get("/history", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    if (req.user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1748,7 +1752,7 @@ router.get(
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res.status(403).json({
         success: false,
         message: "Only HR managers can delete employees",

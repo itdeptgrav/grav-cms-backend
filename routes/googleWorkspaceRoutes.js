@@ -85,10 +85,21 @@ router.get("/auth/callback", async (req, res) => {
 // ── DASHBOARD ─────────────────────────────────────────────────────────────────
 router.get("/dashboard", async (req, res) => {
   try {
-    const promises = [getAllTasksFlat(), getUnreadCount(), getTodayEvents()];
-    if (chatService) promises.push(chatService.getSpaces());
-
-    const results = await Promise.allSettled(promises);
+    /* Every call goes through Promise.allSettled from the moment it starts.
+       This used to read `if (chatService) promises.push(chatService.getSpaces())`
+       — but `chatService` is the AUTH module, which has no getSpaces, so that
+       line threw AFTER the three calls above had started. The catch answered
+       500, nothing was left waiting on those three promises, and when Google
+       refused one (no refresh token) the rejection was unhandled and took the
+       whole backend down for every department (found 6 Oct 2026). Each call
+       is now a thunk, so a missing function is one rejected result. */
+    const calls = [
+      () => getAllTasksFlat(),
+      () => getUnreadCount(),
+      () => getTodayEvents(),
+      () => (typeof chatService?.getSpaces === "function" ? chatService.getSpaces() : []),
+    ];
+    const results = await Promise.allSettled(calls.map((call) => Promise.resolve().then(call)));
     const tasksResult = results[0];
     const gmailResult = results[1];
     const calResult = results[2];
