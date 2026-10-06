@@ -1130,6 +1130,10 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       shippingCharges: parseFloat(shippingCharges.toFixed(2)),
       grandTotal: parseFloat(grandTotal.toFixed(2)),
       quotationNumber, preparedBy: req.user.id,
+      /* who prepared it, in words, and when — a re-save keeps the first
+         preparer and moment (6 Oct 2026) */
+      preparedByName: existingQuotation?.preparedByName || req.user.name || req.user.email || "",
+      preparedAt: existingQuotation?.preparedAt || new Date(),
       status: resolvedStatus, updatedAt: new Date()
     };
 

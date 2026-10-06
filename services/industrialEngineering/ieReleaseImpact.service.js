@@ -531,7 +531,7 @@ async function ownershipFor(styleIds) {
   if (!wanted.length) return new Map();
   const styles = await SampleStyle
     .find({ _id: { $in: wanted.map((id) => new mongoose.Types.ObjectId(id)) } })
-    .select("_id journeyId enquiryId isActive status sourceStockItemId").lean();
+    .select("_id companyId journeyId enquiryId isActive status sourceStockItemId").lean();
   const journeyIds = [...new Set(styles.map((s) => str(s.journeyId)).filter(isId))];
   const enquiryIds = [...new Set(styles.map((s) => str(s.enquiryId)).filter(isId))];
   const [journeys, enquiries] = await Promise.all([

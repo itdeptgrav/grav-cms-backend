@@ -287,6 +287,18 @@ function refQuery(value, refField) {
 async function ownershipProofFor(style, companyId) {
   const want = String(companyId);
 
+  /* ── A STYLE THAT NAMES ITS OWN COMPANY IS DECIDED BY IT (6 Oct 2026) ─────
+     An in-house sample has no journey and no enquiry — it is raised with no
+     customer at all — so a proof that only ever asked a PARENT found nothing
+     and every write on it answered "Style not found". `POST /house` now
+     stamps the creator's company on the style itself (and the 5 Oct 2026
+     backfill stamped every journey style the same way). A stamped style of
+     another company is refused here; an unstamped one goes on to its parents
+     exactly as before. */
+  if (style.companyId) {
+    return String(style.companyId) === want ? { proof: "STYLE", journeyRef: "" } : null;
+  }
+
   /* ── BOTH FORMS OF THE REFERENCE ARE ACCEPTED ───────────────────────────
      `journeyId` and `enquiryId` are declared as ObjectIds and normally hold
      one, but the same fields are also written from imports and older records

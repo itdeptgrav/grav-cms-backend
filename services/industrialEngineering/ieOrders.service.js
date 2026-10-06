@@ -210,7 +210,7 @@ async function styleOwnersFor(styleIds) {
   if (!wanted.length) return new Map();
 
   const styles = await SampleStyle().find({ _id: { $in: wanted.map(oid) } })
-    .select("_id journeyId enquiryId isActive status")
+    .select("_id companyId journeyId enquiryId isActive status")
     .lean();
 
   const journeyIds = [...new Set(styles.map((s) => str(s.journeyId)).filter(isId))];

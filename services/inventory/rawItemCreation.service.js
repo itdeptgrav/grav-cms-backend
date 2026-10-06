@@ -373,6 +373,10 @@ async function createRawItem({
       minStock: num(variant.minStock) || num(minStock) || 0,
       maxStock: num(variant.maxStock) || num(maxStock) || 0,
       sku: variant.sku || "",
+      /* optional per-unit weight in grams (5 Oct 2026); absent or blank = not stated */
+      weightGrams: (variant.weightGrams === undefined || variant.weightGrams === null || variant.weightGrams === "")
+        ? null
+        : (num(variant.weightGrams) !== null && num(variant.weightGrams) >= 0 ? num(variant.weightGrams) : null),
       image: variant.image || "",
       unitConversions: (Array.isArray(variant.unitConversions) ? variant.unitConversions : [])
         .map((uc) => normaliseUnitConversion(uc)).filter(Boolean),

@@ -1227,6 +1227,11 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
             minStock: parseFloat(incoming.minStock ?? existing?.minStock ?? rawItem.minStock) || 0,
             maxStock: parseFloat(incoming.maxStock ?? existing?.maxStock ?? rawItem.maxStock) || 0,
             sku: incoming.sku ?? existing?.sku ?? "",
+            /* optional per-variant weight (5 Oct 2026): sent → kept as a
+               number or cleared with "", absent → whatever is stored */
+            weightGrams: incoming.weightGrams !== undefined
+              ? (incoming.weightGrams === "" || incoming.weightGrams === null ? null : (Number.isFinite(Number(incoming.weightGrams)) && Number(incoming.weightGrams) >= 0 ? Number(incoming.weightGrams) : null))
+              : (existing?.weightGrams ?? null),
             image,
             vendorNicknames: nicknames,
             unitConversions: ucs,

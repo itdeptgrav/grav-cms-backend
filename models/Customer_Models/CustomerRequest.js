@@ -686,6 +686,12 @@ const quotationSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesDepartment",
     },
+    /* The preparer's NAME and the moment, kept on the document itself
+       (6 Oct 2026, owner: "showcase who created this PI"). `preparedBy` is
+       an id into a collection the reader may not be able to open; a record
+       says who did it in words. */
+    preparedByName: { type: String, trim: true, default: "" },
+    preparedAt: { type: Date },
 
     // ── NEGOTIATION ────────────────────────────────────────────────────────
     // A price that goes to a customer is rarely the price they accept. Each

@@ -281,6 +281,10 @@ function shelfClause(category) {
  * the set shifts under it. `total` is counted only on the first page, so
  * typing a query costs one count, not one per page.
  */
+/** This company's materials, plus those registered before a company was
+    stamped (companyId null or absent) — the Store read-through's rule. */
+const ownedOrUnowned = (ctx) => ({ $or: [{ companyId: ctx.companyId }, { companyId: null }, { companyId: { $exists: false } }] });
+
 async function search(ctx, { q = "", category = "", section = "", cursor = "", limit } = {}) {
   if (!ctx?.companyId) throw fail("UNAUTHENTICATED", "Sign in to use Merchandising.");
   const size = Math.min(Number(limit) > 0 ? Number(limit) : DEFAULT_LIMIT, MAX_LIMIT);
@@ -363,7 +367,13 @@ async function search(ctx, { q = "", category = "", section = "", cursor = "", l
     });
   }
 
-  const filter = { companyId: ctx.companyId };
+  /* THE COMPANY CLAUSE ADMITS UNOWNED MATERIALS (5 Oct 2026, owner: "while
+     searching for a raw item it is not showing even though it is registered").
+     Store registered most materials before Sales/Store stamped a company, so a
+     strict `{ companyId }` matched 16 of 317. The same allowance Store's own
+     reads apply — this company, or no company recorded — is the one the
+     registration-options read below already used for units and warehouses. */
+  const filter = { ...ownedOrUnowned(ctx) };
   if (clauses.length) filter.$and = clauses;
 
   const [found, total, catalogueSize] = await Promise.all([
@@ -376,8 +386,8 @@ async function search(ctx, { q = "", category = "", section = "", cursor = "", l
     str(cursor)
       ? Promise.resolve(null)
       : RawItem.countDocuments(sectionResolved === usedAsDef.SECTION.PACKAGING
-        ? { companyId: ctx.companyId, usedAs: { $in: usedAsDef.SECTION_USED_AS[sectionResolved] } }
-        : { companyId: ctx.companyId }),
+        ? { ...ownedOrUnowned(ctx), usedAs: { $in: usedAsDef.SECTION_USED_AS[sectionResolved] } }
+        : ownedOrUnowned(ctx)),
   ]);
 
   const page = found.slice(0, size);
@@ -417,7 +427,7 @@ async function resolve(ctx, { rawItemId, variantId } = {}, session = null) {
     throw fail("VALIDATION", "That is not a catalogue reference.", { field: "rawItemId" });
   }
 
-  const item = await RawItem.findOne({ _id: rawItemId, companyId: ctx.companyId })
+  const item = await RawItem.findOne({ _id: rawItemId, ...ownedOrUnowned(ctx) })
     .select(SAFE_SELECT).session(session).lean();
   if (!item) {
     throw fail("DEVELOPMENT_CATALOGUE_ITEM_NOT_FOUND",

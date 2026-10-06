@@ -171,6 +171,17 @@ const sampleStyleSchema = new mongoose.Schema(
     // "has no journey" and "is deliberately an in-house sample" are different
     // claims, and every screen that badges these needs the second one.
     sampleType: { type: String, enum: ["journey", "house"], default: "journey", index: true },
+    /* THE COMPANY, ON THE STYLE (6 Oct 2026). Journey styles were always
+       proved through their journey; a house sample has no parent at all, so it
+       carries the company itself. Written by `POST /house` and by the 5 Oct
+       2026 backfill; `ownershipProofFor` reads it first. Unset on older rows,
+       which keep proving themselves through their parents. */
+    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Company", index: true },
+    companyOwnership: {
+      source: { type: String, trim: true, default: "" },
+      resolvedAt: { type: Date },
+      proven: { type: Boolean, default: false },
+    },
 
     // Linkage — the journey is the spine; the enquiry is where the product row
     // (this style's origin) lives.

@@ -509,8 +509,15 @@ router.post("/house", salesAuth, async (req, res) => {
     });
 
     const who = actor(req);
+    /* THE CREATOR'S COMPANY, ON THE STYLE ITSELF (6 Oct 2026): a house sample
+       has no journey or enquiry to prove its company through, so every write
+       on one answered "Style not found" until the proof could read the style's
+       own stamp. Resolved once, the way every other Sales write resolves it. */
+    const houseScope = await salesScopeFor(req);
     const style = await createWithRef(SampleStyle, {
       sampleType: "house",
+      companyId: houseScope.companyId,
+      companyOwnership: { source: houseScope.membershipSource, resolvedAt: new Date(), proven: houseScope.membershipSource === "MEMBERSHIP_RECORD" },
       // No journeyId, no enquiryId, no accountId — that is the whole point.
       // The partial unique index (see the model) is what makes this safe.
       productName,
@@ -2244,10 +2251,30 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
             totalSeconds: o.totalSeconds != null ? Number(o.totalSeconds) || 0 : minutes * 60 + seconds,
           };
         });
+      /* ── IE'S RECORD IS THE OPERATIONS (5 Oct 2026, owner: "don't ask R&D
+         for the operations: IE already saved the actual times"). When R&D
+         sends none, the development order's operations with the ACTUAL SAM IE
+         recorded at completion stand in, in the shape the costing expects.
+         A style with no completed IE run and no operations sent is still
+         refused: there is no record of what was done. */
+      if (!cleanedOperations.length) {
+        const dev = style.production?.developmentOrder || {};
+        const ieOps = dev.status === "completed" ? (dev.operations || []) : [];
+        for (const o of ieOps) {
+          const sam = Number(o.actualSamMinutes ?? o.assumedSamMinutes) || 0;
+          const totalSeconds = Math.max(0, Math.round(sam * 60));
+          cleanedOperations.push({
+            type: String(o.name || "").trim(), operationCode: String(o.operationCode || "").trim(),
+            machine: String(o.machineType || "").trim(), machineType: String(o.machineType || "").trim(),
+            salaryDept: "", salaryDesig: "",
+            minutes: Math.floor(totalSeconds / 60), seconds: totalSeconds % 60, totalSeconds,
+          });
+        }
+      }
       if (!cleanedOperations.length) {
         return res.status(400).json({
           success: false,
-          message: "Record at least one operation you ran making this sample before submitting.",
+          message: "No operations are recorded for this sample. IE records them with the actual SAM when it completes the development order.",
         });
       }
       // Costed here, at submit, rather than at approval — so the Sales
@@ -3443,10 +3470,15 @@ router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
     const scope = await salesScopeFor(req);
     const re = new RegExp(escapeRegex(q), "i");
     const rows = await RawItem.find({
-      companyId: scope.companyId,
-      $or: [{ name: re }, { sku: re }],
+      /* this company's, or registered before a company was stamped: the
+         Store read-through's rule (5 Oct 2026); strict matching found 16 of 317.
+         `$and` keeps the company clause beside the search's own `$or`. */
+      $and: [
+        { $or: [{ companyId: scope.companyId }, { companyId: null }, { companyId: { $exists: false } }] },
+        { $or: [{ name: re }, { sku: re }] },
+      ],
     })
-      .select("name sku unit customUnit category quantity variants").limit(10).lean();
+      .select("name sku unit customUnit category quantity variants unitConversions").limit(10).lean();
     const rawItems = rows.map((r) => {
       const unit = r.customUnit || r.unit || "Unit";
       const variants = (r.variants || []).map((v) => {
@@ -3454,7 +3486,7 @@ router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
         const price = prices.length ? prices.reduce((s, p) => s + p, 0) / prices.length : null;
         return { id: v._id, sku: v.sku, combination: v.combination || [], quantity: v.quantity || 0, price, unitConversions: v.unitConversions || [] };
       });
-      return { id: r._id, name: r.name, sku: r.sku, category: r.category, unit, quantity: r.quantity || 0, variants };
+      return { id: r._id, name: r.name, sku: r.sku, category: r.category, unit, quantity: r.quantity || 0, unitConversions: r.unitConversions || [], variants };
     });
     return res.json({ success: true, rawItems });
   } catch (err) {
@@ -3818,6 +3850,19 @@ router.post("/:id/production/stock-item", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* An in-house sample has no customer to link (the R&D page skips that
+       step for it), so it borrows the standing house account here too —
+       send-to-ie and the release already did, but a house sample could not
+       get THIS far: the register was refused with "Link a customer" (6 Oct 2026). */
+    if (style.sampleType === "house" && !style.production?.customerId) {
+      const { resolveHouseSamplingCustomer } = require("../../../services/houseSamplingCustomer.service");
+      const house = await resolveHouseSamplingCustomer();
+      style.production = style.production || {};
+      style.production.customerId = house._id;
+      if (!style.production.status || style.production.status === "not_started") style.production.status = "customer_linked";
+      style.production.log = style.production.log || [];
+      style.production.log.push({ kind: "customer_linked", at: new Date(), by: actor(req), note: `In-house sample — billed to the house account "${house.name}".` });
+    }
     if (!style.production?.customerId) return res.status(400).json({ success: false, message: "Link a customer before registering the product." });
 
     let stockItem;
@@ -4513,6 +4558,46 @@ router.post("/:id/choose", salesAuth, async (req, res) => {
    line that already carries an open request gets a new version, exactly as a
    second ask from the Sales panel would. Nothing here touches the style. */
 async function issueDevelopmentRequestForStyle(style, req) {
+  /* ── AN IN-HOUSE SAMPLE GOES TO THE MERCHANDISER TOO (6 Oct 2026, owner).
+     It has no journey and no enquiry line, so the request is issued on the
+     sample's own grain (see developmentRequest.service `house`). The brief
+     is the sample's own. */
+  if (style?.sampleType === "house") {
+    const companyId = style.companyId || (await salesScopeFor(req)).companyId;
+    if (!companyId) return;
+    const b = style.brief || {};
+    const say = (label, v) => (v != null && String(v).trim() !== "" ? `${label}: ${String(v).trim()}` : null);
+    const summary = [
+      `${style.productName || "In-house sample"}${style.styleCode ? ` (${style.styleCode})` : ""} — in-house sample, no customer`,
+      say("Quantity", b.quantity != null ? `${b.quantity} pcs` : null),
+      say("Gender", b.gender), say("Colour", b.colour), say("Fabric", b.fabricPreference), say("Composition", b.fabricComposition),
+      say("GSM", b.gsm), say("Fit", b.fit), say("Size range", b.sizeRange),
+      say("Branding", [b.branding, b.brandingPlacement].filter(Boolean).join(" at ")),
+      say("Trims", b.trims), say("Special construction", b.specialConstruction), say("Note", b.note),
+    ].filter(Boolean).join(" · ");
+    const categories = ["FABRIC", "TRIMS"];
+    if (b.logo || b.printing || b.embroidery || String(b.branding || "").trim()) categories.push("LABELS");
+    const images = (Array.isArray(b.images) ? b.images : [])
+      .map((im) => ({ url: String(im?.url || im?.secure_url || "").trim(), caption: String(im?.caption || im?.name || "Reference").slice(0, 120) }))
+      .filter((im) => /^https?:\/\//i.test(im.url)).slice(0, 10);
+    const deadline = style.materials?.deadline ? new Date(style.materials.deadline) : null;
+    const out = await developmentRequests.issue({ companyId }, {
+      house: { style: style.toObject ? style.toObject() : style },
+      body: {
+        requirementSummary: summary.length >= 15 ? summary : `${summary} — select the fabric and trims for this in-house sample.`,
+        requestedCategories: categories,
+        requiredByDate: deadline && !Number.isNaN(deadline.getTime()) ? deadline.toISOString().slice(0, 10) : undefined,
+        referenceImages: images,
+        styleRef: style.styleCode || style.sampleStyleId || undefined,
+        sampleStyleId: String(style._id),
+        stockItemId: style.sourceStockItemId ? String(style.sourceStockItemId) : undefined,
+        idempotencyKey: `style-send:${style._id}:${(style.history || []).length}`,
+      },
+      actor: req.user?.id ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" } : null,
+    });
+    await developmentDelivery.deliverPending({ companyId, correlationId: out.correlationId });
+    return;
+  }
   if (!style?.journeyId || !style?.enquiryId) return;
   const journey = await SalesJourney.findById(style.journeyId).select("companyId").lean();
   const enquiry = await Enquiry.findById(style.enquiryId).select("products").lean();
