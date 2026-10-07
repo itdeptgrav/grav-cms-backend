@@ -30,6 +30,8 @@ const stageTargets = require("../../../../services/production/embroideryStageTar
 /* PPC's published embroidery targets, answered by Embroidery. Declared before
    the ":moId" route below so "stage-targets" is never read as an order id. */
 router.use("/stage-targets", require("./stageTargetRoutes"));
+/* The Designs tab's catalogue — see designRoutes.js. */
+router.use("/designs", require("./designRoutes"));
 
 /**
  * The operator who did the embroidery, resolved from employee records.

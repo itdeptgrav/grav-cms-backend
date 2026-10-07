@@ -762,6 +762,18 @@ function resolveCompanyScope(req, { required = true } = {}) {
 
   if (found.length === 0) {
     if (!required) return { ok: true, companyId: null, sources: [] };
+    /* An organisation that owns exactly ONE company has exactly one answer to
+       "which company". Refusing there protected nothing — the id can only be
+       that one, and it is the organisation's own — and it failed every page
+       that did not thread the selector's id through: a posted journal voucher
+       answered its Email / Print / actions with "companyId is required for
+       this request." (6 Oct 2026). With two or more companies the question is
+       real and the refusal stands. Ownership comes from the database-confirmed
+       `req.organization`, never from the caller. */
+    const owned = (req.organization?.tallyCompanyIds || []).map(String);
+    if (!req.user?.isDev && owned.length === 1 && OBJECT_ID_RE.test(owned[0])) {
+      return { ok: true, companyId: owned[0], sources: ["organization"] };
+    }
     return {
       ok: false,
       status: 400,
@@ -842,7 +854,25 @@ function requireCompanyScope(req, res, next) {
   const result = resolveCompanyScope(req, { required: true });
   if (!result.ok) return sendScopeRefusal(res, result);
   req.companyId = result.companyId;
+  if (result.sources[0] === "organization") supplyCompanyId(req, result.companyId);
   next();
+}
+
+/**
+ * The scope resolved the organisation's only company because the request
+ * named none. Most handlers still read `req.query.companyId` /
+ * `req.body.companyId` themselves (and answer "companyId required" when it is
+ * absent), so write the resolved id where they look. Express 5's `req.query`
+ * is a getter, hence the property redefinition.
+ */
+function supplyCompanyId(req, companyId) {
+  try {
+    const q = { ...(req.query || {}), companyId };
+    Object.defineProperty(req, "query", { value: q, writable: true, configurable: true, enumerable: true });
+  } catch { /* a handler reading req.companyId still has it */ }
+  if (req.body && typeof req.body === "object" && !Array.isArray(req.body) && req.body.companyId == null) {
+    req.body.companyId = companyId;
+  }
 }
 
 /**

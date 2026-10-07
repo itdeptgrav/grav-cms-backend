@@ -42,7 +42,8 @@ const generateDefaultPassword = (firstName, dateOfBirth) => {
 
 // ─── Utility: only HR managers can access these routes ───────────────────────
 function hrOnly(req, res, next) {
-  if (req.user?.role !== "hr_manager") {
+  /* The HR contract's verdict, not the role string — see services/access/hrOperator.js. */
+  if (!require("../../services/access/hrOperator").isHrOperator(req)) {
     return res.status(403).json({
       success: false,
       message: "Access denied. HR privileges required.",

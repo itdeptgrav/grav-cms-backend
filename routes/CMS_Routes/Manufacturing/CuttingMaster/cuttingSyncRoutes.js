@@ -72,6 +72,7 @@ router.post("/work-orders/:woId/send-to-cutting", async (req, res) => {
     wo.sentToCuttingAt = new Date();
     await wo.save();
     res.json({ success: true, sentToCuttingAt: wo.sentToCuttingAt });
+    warmLater(String(wo._id), req);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -90,6 +91,144 @@ router.post("/work-orders/:woId/recall-from-cutting", async (req, res) => {
 });
 
 // ── outbox: bundles for the desktop ──────────────────────────────────────────
+/*
+ * A BUNDLE IS EXPENSIVE, AND THE DESK WILL NOT WAIT FOR EVER.
+ *
+ * Capturing a work order means calling this server's own endpoints once per employee and once per size, and the
+ * size files come from Google Drive. Done one after another that is minutes for a work order of forty people, and
+ * the desk gives every request twenty seconds — so a big order could never arrive: each pull timed out, the work done
+ * for it was thrown away, and the next pull started again from nothing.
+ *
+ * So the captures run several at a time, a size file is fetched once and reused (a Drive file id never changes its
+ * content), and every finished bundle is kept until something it was built from changes — the work order, the
+ * product, its pattern config or the employees' measurements. A pull that times out still finishes its work here,
+ * and the desk's next pull a minute later is answered from that.
+ */
+const BUNDLES = new Map();     /* woId -> { key, bundle } */
+const BUILDING = new Map();    /* woId -> Promise<bundle>, so two pulls never build the same order twice */
+const FILES = new Map();       /* svg-content path -> capture; immutable per Drive file id */
+const Measurement = require("../../../../models/Customer_Models/Measurement");
+const fsLog = require("fs");
+const pathLog = require("path");
+/* how long each bundle took and what failed in it, for whoever has to find out why a desk is not receiving one */
+function outboxLog(line) {
+  try { fsLog.appendFileSync(pathLog.join(__dirname, "../../../../cutting-sync-outbox.log"), `${new Date().toISOString()} ${line}
+`); } catch { /* logging must never break a sync */ }
+}
+const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+
+/** Run `fn` over `items`, at most `n` at a time, keeping order. */
+async function inPool(items, n, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); } };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(n, items.length)) }, worker));
+  return out;
+}
+
+/** What a bundle was built from. Any of these changing makes the kept bundle stale. */
+async function bundleKey(wo) {
+  const stockItemId = wo.stockItemId || null;
+  const [cfg, item, meas] = await Promise.all([
+    stockItemId ? PatternGradingConfig.findOne({ stockItemId, isActive: true }).select("updatedAt").lean() : null,
+    stockItemId ? StockItem.findById(stockItemId).select("updatedAt").lean() : null,
+    wo.customerRequestId ? Measurement.findOne({ poRequestId: wo.customerRequestId }).select("updatedAt").lean() : null,
+  ]);
+  const t = (d) => (d ? new Date(d).toISOString() : "-");
+  return [t(wo.updatedAt), t(wo.sentToCuttingAt), t(cfg?.updatedAt), t(item?.updatedAt), t(meas?.updatedAt)].join("|");
+}
+
+async function buildBundle(wo, origin, headers) {
+  const woId = String(wo._id);
+  const stockItemId = String(wo.stockItemId || "");
+  const responses = {};
+  let failed = 0;
+  const failedPaths = [];
+  const grab = async (path) => {
+    const r = await capture(origin, path, headers);
+    if (!r.status || r.status >= 500) { failed += 1; failedPaths.push(`${path.replace(BASE, "")} -> ${r.status}`); }
+    responses[path] = r;
+    return r;
+  };
+
+  /* What the cutting-master CAD page reads. */
+  const em = await grab(`${BASE}/work-orders/${woId}/employee-measurements`);
+  await grab(`${BASE}/pattern-grading/work-order/${woId}/employee-sizes`);
+  const employees = (em?.body?.employeeMeasurements || []);
+  await inPool(employees, 6, (emp) => grab(`${BASE}/pattern-grading/employee/${emp.employeeId}/cad-data?woId=${woId}`));
+
+  /* What the designer page reads for this product. */
+  if (stockItemId) {
+    await inPool([
+      `${BASE}/pattern-grading/stock-items?limit=30`,
+      `${BASE}/pattern-grading/stock-items/${stockItemId}`,
+      `${BASE}/pattern-grading/stock-item/${stockItemId}/setup-status`,
+      `${BASE}/pattern-grading/stock-item/${stockItemId}/size-patterns`,
+      `${BASE}/pattern-grading/stock-item/${stockItemId}/size-patterns-with-groups`,
+      `${BASE}/pattern-grading/stock-item/${stockItemId}/settings`,
+    ], 6, grab);
+  }
+
+  /* The pattern SVGs, in case a size has no stored geometry yet; and each size's full record for the designer. */
+  const config = stockItemId
+    ? await PatternGradingConfig.findOne({ stockItemId, isActive: true }).select("sizePatterns.sizeName sizePatterns.svgPublicId sizePatterns.svgFileUrl").lean()
+    : null;
+  const sizeJobs = [];
+  for (const sp of config?.sizePatterns || []) {
+    if (sp.sizeName) sizeJobs.push({ path: `${BASE}/pattern-grading/stock-item/${stockItemId}/size-pattern/${encodeURIComponent(sp.sizeName)}` });
+    const fileId = sp.svgPublicId || (sp.svgFileUrl || "").match(/[-\w]{25,}/)?.[0];
+    if (fileId) sizeJobs.push({ path: `${BASE}/pattern-grading/svg-content/${fileId}`, file: true });
+  }
+  await inPool(sizeJobs, 4, async (job) => {
+    if (!job.file) return grab(job.path);
+    const kept = FILES.get(job.path);
+    if (kept && kept.status === 200) { responses[job.path] = kept; return kept; }
+    const r = await grab(job.path);
+    if (r.status === 200) FILES.set(job.path, r);
+    return r;
+  });
+
+  /* Which employees are already done, so a fresh desktop does not show them as pending. */
+  const done = await EmployeeProductionProgress.find({ workOrderId: wo._id, cutDone: true })
+    .select("employeeId cutDoneAt").lean();
+
+  return {
+    bundle: {
+      workOrder: { ...wo, _id: woId, stockItemId, moId: String(wo.customerRequestId || "") },
+      employees: employees.map((e) => ({ employeeId: e.employeeId, employeeName: e.employeeName, employeeUIN: e.employeeUIN, gender: e.gender, quantity: e.quantity })),
+      cutDone: done.map((d) => ({ employeeId: String(d.employeeId), cutDoneAt: d.cutDoneAt })),
+      responses,
+      capturedAt: new Date().toISOString(),
+    },
+    complete: failed === 0,
+    failedPaths,
+  };
+}
+
+/** The bundle for one work order: kept if nothing it was built from has changed, otherwise built (once). */
+async function bundleFor(wo, origin, headers) {
+  const woId = String(wo._id);
+  const key = await bundleKey(wo);
+  const kept = BUNDLES.get(woId);
+  /* a bundle with a failed capture in it is kept for ten minutes only, then built again in case it was transient */
+  if (kept && kept.key === key && (kept.complete || Date.now() - kept.at < 10 * 60 * 1000)) return kept.bundle;
+  if (BUILDING.has(woId)) return BUILDING.get(woId);
+  const work = (async () => {
+    try {
+      const t0 = Date.now();
+      const { bundle, complete, failedPaths } = await buildBundle(wo, origin, headers);
+      BUNDLES.set(woId, { key, bundle, complete, at: Date.now() });
+      while (BUNDLES.size > 60) BUNDLES.delete(BUNDLES.keys().next().value);
+      outboxLog(`built ${wo.workOrderNumber || woId} (${bundle.employees.length} employees, ${Object.keys(bundle.responses).length} responses) in ${((Date.now() - t0) / 1000).toFixed(1)}s${complete ? "" : `; failed: ${failedPaths.slice(0, 8).join(", ")}`}`);
+      return bundle;
+    } finally {
+      BUILDING.delete(woId);
+    }
+  })();
+  BUILDING.set(woId, work);
+  return work;
+}
+
 router.get("/cutting-sync/outbox", async (req, res) => {
   try {
     const since = req.query.since ? new Date(req.query.since) : null;
@@ -104,62 +243,32 @@ router.get("/cutting-sync/outbox", async (req, res) => {
 
     const origin = selfOrigin(req);
     const headers = forwardedAuth(req);
-    const bundles = [];
+    /* the time is taken BEFORE the bundles are built, so nothing that changes while they build can fall between pulls */
+    const serverTime = new Date().toISOString();
+    const t0 = Date.now();
+    const bundles = await inPool(wos, 2, (wo) => bundleFor(wo, origin, headers));
+    outboxLog(`outbox since=${req.query.since || "-"}: ${bundles.length} bundle(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
-    for (const wo of wos) {
-      const woId = String(wo._id);
-      const stockItemId = String(wo.stockItemId || "");
-      const responses = {};
-      const grab = async (path) => { responses[path] = await capture(origin, path, headers); return responses[path]; };
-
-      /* What the cutting-master CAD page reads. */
-      const em = await grab(`${BASE}/work-orders/${woId}/employee-measurements`);
-      await grab(`${BASE}/pattern-grading/work-order/${woId}/employee-sizes`);
-      const employees = (em?.body?.employeeMeasurements || []);
-      for (const emp of employees) {
-        await grab(`${BASE}/pattern-grading/employee/${emp.employeeId}/cad-data?woId=${woId}`);
-      }
-
-      /* What the designer page reads for this product. */
-      if (stockItemId) {
-        await grab(`${BASE}/pattern-grading/stock-items?limit=30`);
-        await grab(`${BASE}/pattern-grading/stock-items/${stockItemId}`);
-        await grab(`${BASE}/pattern-grading/stock-item/${stockItemId}/setup-status`);
-        await grab(`${BASE}/pattern-grading/stock-item/${stockItemId}/size-patterns`);
-        await grab(`${BASE}/pattern-grading/stock-item/${stockItemId}/size-patterns-with-groups`);
-        await grab(`${BASE}/pattern-grading/stock-item/${stockItemId}/settings`);
-      }
-
-      /* The pattern SVGs, in case a size has no stored geometry yet. */
-      const config = stockItemId
-        ? await PatternGradingConfig.findOne({ stockItemId, isActive: true }).select("sizePatterns.sizeName sizePatterns.svgPublicId sizePatterns.svgFileUrl").lean()
-        : null;
-      for (const sp of config?.sizePatterns || []) {
-        /* the designer opens a size with its full record (paths, groups, connectors) */
-        if (sp.sizeName) await grab(`${BASE}/pattern-grading/stock-item/${stockItemId}/size-pattern/${encodeURIComponent(sp.sizeName)}`);
-        const fileId = sp.svgPublicId || (sp.svgFileUrl || "").match(/[-\w]{25,}/)?.[0];
-        if (fileId) await grab(`${BASE}/pattern-grading/svg-content/${fileId}`);
-      }
-
-      /* Which employees are already done, so a fresh desktop does not show them as pending. */
-      const done = await EmployeeProductionProgress.find({ workOrderId: wo._id, cutDone: true })
-        .select("employeeId cutDoneAt").lean();
-
-      bundles.push({
-        workOrder: { ...wo, _id: woId, stockItemId, moId: String(wo.customerRequestId || "") },
-        employees: employees.map((e) => ({ employeeId: e.employeeId, employeeName: e.employeeName, employeeUIN: e.employeeUIN, gender: e.gender, quantity: e.quantity })),
-        cutDone: done.map((d) => ({ employeeId: String(d.employeeId), cutDoneAt: d.cutDoneAt })),
-        responses,
-        capturedAt: new Date().toISOString(),
-      });
-    }
-
-    res.json({ success: true, serverTime: new Date().toISOString(), bundles });
+    res.json({ success: true, serverTime, bundles });
   } catch (error) {
     console.error("cutting-sync outbox:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
+
+/* Warm the bundles of a work order the moment it is sent, so the desk's first pull finds them ready. */
+function warmLater(woId, req) {
+  const origin = selfOrigin(req);
+  const headers = forwardedAuth(req);
+  setTimeout(async () => {
+    try {
+      const wo = await WorkOrder.findById(woId)
+        .select("workOrderNumber stockItemName stockItemReference stockItemId quantity customerRequestId variantAttributes cuttingStatus cuttingProgress sentToCuttingAt updatedAt")
+        .lean();
+      if (wo?.sentToCutting !== false) await bundleFor(wo, origin, headers);
+    } catch (e) { console.warn("cutting-sync warm:", e.message); }
+  }, 50);
+}
 
 // ── inbox: "cutting done" per employee ───────────────────────────────────────
 router.post("/cutting-sync/inbox", async (req, res) => {

@@ -1,0 +1,1480 @@
+{
+ "productRef": "PROD-BOT-EXETOMANTRO-1815",
+ "createdAt": "2026-10-06T18:03:30.905Z",
+ "testOrg": {
+  "id": "6ac537e794f81ff48445cf35",
+  "email": "cadtest.prodbotexetomantro1815@internal.gravtest.com"
+ },
+ "measurementId": "6ac537e894f81ff48445cf9b",
+ "requestId": "REQ-2026-0038",
+ "requestObjectId": "6ac537e894f81ff48445cfa3",
+ "workOrders": [
+  {
+   "id": "6ac537e994f81ff48445cfaa",
+   "number": "WO-8445cfaa",
+   "quantity": 45,
+   "variant": [
+    {
+     "name": "Size",
+     "value": "37",
+     "_id": "6ac537e994f81ff48445cfac"
+    }
+   ]
+  },
+  {
+   "id": "6ac537ed94f81ff48445d010",
+   "number": "WO-8445d010",
+   "quantity": 45,
+   "variant": [
+    {
+     "name": "Size",
+     "value": "37",
+     "_id": "6ac537ed94f81ff48445d012"
+    }
+   ]
+  }
+ ],
+ "employees": [
+  {
+   "id": "6ac537e794f81ff48445cedb",
+   "uin": "CADTEST-M-muwzlrbx-0001",
+   "name": "Suresh Chauhan",
+   "gender": "Male",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39,
+    "Waist": 29,
+    "Sheet": 34.25,
+    "Thigh": 22.75,
+    "Knee": 17.25,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 25.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cedc",
+   "uin": "CADTEST-F-muwzlrbx-0002",
+   "name": "Sushmita Yadav",
+   "gender": "Female",
+   "size": "3XS",
+   "measurements": {
+    "Length": 38.5,
+    "Waist": 28.25,
+    "Sheet": 32.75,
+    "Thigh": 22,
+    "Knee": 16.5,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 25.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cedd",
+   "uin": "CADTEST-M-muwzlrbx-0003",
+   "name": "Kishore Singh",
+   "gender": "Male",
+   "size": "3XS",
+   "measurements": {
+    "Length": 38.5,
+    "Waist": 28.25,
+    "Sheet": 34,
+    "Thigh": 21.75,
+    "Knee": 17,
+    "Buttom": 13,
+    "Crouch Kista Cut": 25.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cede",
+   "uin": "CADTEST-F-muwzlrbx-0004",
+   "name": "Pallavi Thapa",
+   "gender": "Female",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39,
+    "Waist": 28.5,
+    "Sheet": 34.75,
+    "Thigh": 23,
+    "Knee": 17.25,
+    "Buttom": 13.5,
+    "Crouch Kista Cut": 25.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cedf",
+   "uin": "CADTEST-M-muwzlrbx-0005",
+   "name": "Manoj Gupta",
+   "gender": "Male",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39,
+    "Waist": 28.5,
+    "Sheet": 35,
+    "Thigh": 21.75,
+    "Knee": 16.75,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 25.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee0",
+   "uin": "CADTEST-F-muwzlrbx-0006",
+   "name": "Sunita Sethi",
+   "gender": "Female",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39.25,
+    "Waist": 29.5,
+    "Sheet": 35.25,
+    "Thigh": 22.75,
+    "Knee": 17,
+    "Buttom": 13.5,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee1",
+   "uin": "CADTEST-M-muwzlrbx-0007",
+   "name": "Manoj Kumar",
+   "gender": "Male",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39.25,
+    "Waist": 29.75,
+    "Sheet": 35.75,
+    "Thigh": 23.25,
+    "Knee": 17,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 26.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee2",
+   "uin": "CADTEST-F-muwzlrbx-0008",
+   "name": "Nisha Mohanty",
+   "gender": "Female",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39,
+    "Waist": 28.5,
+    "Sheet": 34,
+    "Thigh": 21.75,
+    "Knee": 17.5,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 25.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee3",
+   "uin": "CADTEST-M-muwzlrbx-0009",
+   "name": "Kishore Tamang",
+   "gender": "Male",
+   "size": "3XS",
+   "measurements": {
+    "Length": 39,
+    "Waist": 29.25,
+    "Sheet": 35.75,
+    "Thigh": 22.75,
+    "Knee": 17,
+    "Buttom": 13.5,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee4",
+   "uin": "CADTEST-F-muwzlrbx-0010",
+   "name": "Shweta Mishra",
+   "gender": "Female",
+   "size": "3XS",
+   "measurements": {
+    "Length": 38.75,
+    "Waist": 28.75,
+    "Sheet": 34,
+    "Thigh": 22,
+    "Knee": 16.75,
+    "Buttom": 13,
+    "Crouch Kista Cut": 25.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee5",
+   "uin": "CADTEST-M-muwzlrbx-0011",
+   "name": "Sunil Pradhan",
+   "gender": "Male",
+   "size": "2XS",
+   "measurements": {
+    "Length": 40.25,
+    "Waist": 31.5,
+    "Sheet": 34.75,
+    "Thigh": 24.25,
+    "Knee": 17.5,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 26.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee6",
+   "uin": "CADTEST-F-muwzlrbx-0012",
+   "name": "Manisha Sethi",
+   "gender": "Female",
+   "size": "2XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 30.75,
+    "Sheet": 34.25,
+    "Thigh": 24,
+    "Knee": 18.25,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee7",
+   "uin": "CADTEST-M-muwzlrbx-0013",
+   "name": "Naveen Mishra",
+   "gender": "Male",
+   "size": "2XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 30.25,
+    "Sheet": 36.5,
+    "Thigh": 23.75,
+    "Knee": 17.25,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee8",
+   "uin": "CADTEST-F-muwzlrbx-0014",
+   "name": "Sarita Sahoo",
+   "gender": "Female",
+   "size": "2XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 31.5,
+    "Sheet": 34.75,
+    "Thigh": 24.5,
+    "Knee": 17.5,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cee9",
+   "uin": "CADTEST-M-muwzlrbx-0015",
+   "name": "Debashish Reddy",
+   "gender": "Male",
+   "size": "2XS",
+   "measurements": {
+    "Length": 39.5,
+    "Waist": 31.5,
+    "Sheet": 37.25,
+    "Thigh": 23.5,
+    "Knee": 18.25,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceea",
+   "uin": "CADTEST-F-muwzlrbx-0016",
+   "name": "Namrata Gupta",
+   "gender": "Female",
+   "size": "2XS",
+   "measurements": {
+    "Length": 39.25,
+    "Waist": 30.25,
+    "Sheet": 35,
+    "Thigh": 23.5,
+    "Knee": 17.25,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceeb",
+   "uin": "CADTEST-M-muwzlrbx-0017",
+   "name": "Naveen Menon",
+   "gender": "Male",
+   "size": "2XS",
+   "measurements": {
+    "Length": 39.25,
+    "Waist": 30.5,
+    "Sheet": 36.75,
+    "Thigh": 22.75,
+    "Knee": 17.75,
+    "Buttom": 14,
+    "Crouch Kista Cut": 25.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceec",
+   "uin": "CADTEST-F-muwzlrbx-0018",
+   "name": "Lata Pradhan",
+   "gender": "Female",
+   "size": "2XS",
+   "measurements": {
+    "Length": 40.25,
+    "Waist": 30.5,
+    "Sheet": 34,
+    "Thigh": 23,
+    "Knee": 17.75,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceed",
+   "uin": "CADTEST-M-muwzlrbx-0019",
+   "name": "Pramod Naidu",
+   "gender": "Male",
+   "size": "2XS",
+   "measurements": {
+    "Length": 39.25,
+    "Waist": 31.25,
+    "Sheet": 35.5,
+    "Thigh": 23.25,
+    "Knee": 17.75,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceee",
+   "uin": "CADTEST-F-muwzlrbx-0020",
+   "name": "Vandana Das",
+   "gender": "Female",
+   "size": "2XS",
+   "measurements": {
+    "Length": 39.5,
+    "Waist": 30.5,
+    "Sheet": 35.25,
+    "Thigh": 22.5,
+    "Knee": 17.25,
+    "Buttom": 13.25,
+    "Crouch Kista Cut": 26
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceef",
+   "uin": "CADTEST-M-muwzlrbx-0021",
+   "name": "Manoj Choudhury",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 32.25,
+    "Sheet": 35.75,
+    "Thigh": 24.25,
+    "Knee": 17.75,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 26.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef0",
+   "uin": "CADTEST-F-muwzlrbx-0022",
+   "name": "Rekha Choudhury",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 40.25,
+    "Waist": 32.5,
+    "Sheet": 37.75,
+    "Thigh": 24,
+    "Knee": 18,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef1",
+   "uin": "CADTEST-M-muwzlrbx-0023",
+   "name": "Bikash Pradhan",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 41,
+    "Waist": 33,
+    "Sheet": 37.75,
+    "Thigh": 24,
+    "Knee": 18,
+    "Buttom": 13.75,
+    "Crouch Kista Cut": 26.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef2",
+   "uin": "CADTEST-F-muwzlrbx-0024",
+   "name": "Kiran Verma",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 33.75,
+    "Sheet": 37.25,
+    "Thigh": 25,
+    "Knee": 18.25,
+    "Buttom": 14.25,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef3",
+   "uin": "CADTEST-M-muwzlrbx-0025",
+   "name": "Rakesh Reddy",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 40.75,
+    "Waist": 32.75,
+    "Sheet": 37.5,
+    "Thigh": 25,
+    "Knee": 18,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef4",
+   "uin": "CADTEST-F-muwzlrbx-0026",
+   "name": "Meena Mishra",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 33,
+    "Sheet": 37.5,
+    "Thigh": 24,
+    "Knee": 18,
+    "Buttom": 14.5,
+    "Crouch Kista Cut": 26.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef5",
+   "uin": "CADTEST-M-muwzlrbx-0027",
+   "name": "Anil Mishra",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 32.5,
+    "Sheet": 36.5,
+    "Thigh": 24.75,
+    "Knee": 17.75,
+    "Buttom": 14.25,
+    "Crouch Kista Cut": 26.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef6",
+   "uin": "CADTEST-F-muwzlrbx-0028",
+   "name": "Kavita Nayak",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 39.75,
+    "Waist": 32.25,
+    "Sheet": 37.75,
+    "Thigh": 24.5,
+    "Knee": 18,
+    "Buttom": 14,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef7",
+   "uin": "CADTEST-M-muwzlrbx-0029",
+   "name": "Vikram Behera",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 33,
+    "Sheet": 37.75,
+    "Thigh": 25,
+    "Knee": 18,
+    "Buttom": 14,
+    "Crouch Kista Cut": 26.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef8",
+   "uin": "CADTEST-F-muwzlrbx-0030",
+   "name": "Priya Thapa",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 40,
+    "Waist": 32.25,
+    "Sheet": 36.5,
+    "Thigh": 23.5,
+    "Knee": 18.25,
+    "Buttom": 14.25,
+    "Crouch Kista Cut": 26.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cef9",
+   "uin": "CADTEST-M-muwzlrbx-0031",
+   "name": "Bikash Mohanty",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 40,
+    "Waist": 35,
+    "Sheet": 38.5,
+    "Thigh": 25.25,
+    "Knee": 18.75,
+    "Buttom": 15,
+    "Crouch Kista Cut": 27.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cefa",
+   "uin": "CADTEST-F-muwzlrbx-0032",
+   "name": "Sunita Nayak",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 41,
+    "Waist": 35,
+    "Sheet": 39.75,
+    "Thigh": 25,
+    "Knee": 19.25,
+    "Buttom": 15.25,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cefb",
+   "uin": "CADTEST-M-muwzlrbx-0033",
+   "name": "Vinod Behera",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 34.75,
+    "Sheet": 40.5,
+    "Thigh": 25,
+    "Knee": 19.25,
+    "Buttom": 14.25,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cefc",
+   "uin": "CADTEST-F-muwzlrbx-0034",
+   "name": "Priya Pradhan",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 34.5,
+    "Sheet": 40.75,
+    "Thigh": 24.5,
+    "Knee": 18.75,
+    "Buttom": 14.75,
+    "Crouch Kista Cut": 27.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cefd",
+   "uin": "CADTEST-M-muwzlrbx-0035",
+   "name": "Bikash Verma",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 40.75,
+    "Waist": 35,
+    "Sheet": 40.25,
+    "Thigh": 25.25,
+    "Knee": 18.75,
+    "Buttom": 14.5,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cefe",
+   "uin": "CADTEST-F-muwzlrbx-0036",
+   "name": "Manisha Tripathy",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 40.25,
+    "Waist": 35.5,
+    "Sheet": 40,
+    "Thigh": 25.25,
+    "Knee": 19.5,
+    "Buttom": 14.75,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445ceff",
+   "uin": "CADTEST-M-muwzlrbx-0037",
+   "name": "Subrat Verma",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 39.75,
+    "Waist": 34.5,
+    "Sheet": 38.75,
+    "Thigh": 25.5,
+    "Knee": 19,
+    "Buttom": 14.75,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf00",
+   "uin": "CADTEST-F-muwzlrbx-0038",
+   "name": "Vandana Sethi",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 35.5,
+    "Sheet": 39.75,
+    "Thigh": 25.75,
+    "Knee": 18.75,
+    "Buttom": 15,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf01",
+   "uin": "CADTEST-M-muwzlrbx-0039",
+   "name": "Ashok Menon",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 35.25,
+    "Sheet": 40.25,
+    "Thigh": 26,
+    "Knee": 18.75,
+    "Buttom": 14.25,
+    "Crouch Kista Cut": 27.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf02",
+   "uin": "CADTEST-F-muwzlrbx-0040",
+   "name": "Vandana Kumar",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 35.5,
+    "Sheet": 40.25,
+    "Thigh": 26.25,
+    "Knee": 19,
+    "Buttom": 14.5,
+    "Crouch Kista Cut": 27
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf03",
+   "uin": "CADTEST-M-muwzlrbx-0041",
+   "name": "Sunil Iyer",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 36.75,
+    "Sheet": 40.75,
+    "Thigh": 26.75,
+    "Knee": 19,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf04",
+   "uin": "CADTEST-F-muwzlrbx-0042",
+   "name": "Alka Sahoo",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 36.75,
+    "Sheet": 41.5,
+    "Thigh": 27,
+    "Knee": 19.75,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf05",
+   "uin": "CADTEST-M-muwzlrbx-0043",
+   "name": "Prakash Nayak",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 41,
+    "Waist": 37.25,
+    "Sheet": 41.25,
+    "Thigh": 26.75,
+    "Knee": 20,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf06",
+   "uin": "CADTEST-F-muwzlrbx-0044",
+   "name": "Ritu Mishra",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 41,
+    "Waist": 37.5,
+    "Sheet": 43.25,
+    "Thigh": 27.25,
+    "Knee": 19.75,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf07",
+   "uin": "CADTEST-M-muwzlrbx-0045",
+   "name": "Sanjay Rana",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 37.25,
+    "Sheet": 43.5,
+    "Thigh": 26.25,
+    "Knee": 20,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf08",
+   "uin": "CADTEST-F-muwzlrbx-0046",
+   "name": "Pooja Rana",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 36.75,
+    "Sheet": 41.75,
+    "Thigh": 26.25,
+    "Knee": 19.75,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf09",
+   "uin": "CADTEST-M-muwzlrbx-0047",
+   "name": "Vijay Sethi",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 41,
+    "Waist": 36.25,
+    "Sheet": 40.5,
+    "Thigh": 26.75,
+    "Knee": 19.5,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0a",
+   "uin": "CADTEST-F-muwzlrbx-0048",
+   "name": "Deepika Rout",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 36,
+    "Sheet": 40.25,
+    "Thigh": 25.75,
+    "Knee": 19.5,
+    "Buttom": 14.75,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0b",
+   "uin": "CADTEST-M-muwzlrbx-0049",
+   "name": "Sunil Pradhan",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 41,
+    "Waist": 37,
+    "Sheet": 40.75,
+    "Thigh": 26.25,
+    "Knee": 19.5,
+    "Buttom": 15.25,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0c",
+   "uin": "CADTEST-F-muwzlrbx-0050",
+   "name": "Rekha Verma",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 37.25,
+    "Sheet": 41.25,
+    "Thigh": 26.5,
+    "Knee": 20,
+    "Buttom": 15,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0d",
+   "uin": "CADTEST-M-muwzlrbx-0051",
+   "name": "Bijay Mishra",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 39.5,
+    "Sheet": 45,
+    "Thigh": 27.25,
+    "Knee": 20.5,
+    "Buttom": 16,
+    "Crouch Kista Cut": 28
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0e",
+   "uin": "CADTEST-F-muwzlrbx-0052",
+   "name": "Priya Pradhan",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 41,
+    "Waist": 38.25,
+    "Sheet": 44.75,
+    "Thigh": 26.75,
+    "Knee": 20.25,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf0f",
+   "uin": "CADTEST-M-muwzlrbx-0053",
+   "name": "Sunil Choudhury",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 40.5,
+    "Waist": 38,
+    "Sheet": 44,
+    "Thigh": 27.75,
+    "Knee": 20.25,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 27.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf10",
+   "uin": "CADTEST-F-muwzlrbx-0054",
+   "name": "Jyotsna Thapa",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 41,
+    "Waist": 39,
+    "Sheet": 42.75,
+    "Thigh": 27.75,
+    "Knee": 20.25,
+    "Buttom": 15.25,
+    "Crouch Kista Cut": 28
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf11",
+   "uin": "CADTEST-M-muwzlrbx-0055",
+   "name": "Rakesh Tamang",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 42,
+    "Waist": 39.5,
+    "Sheet": 44.75,
+    "Thigh": 28,
+    "Knee": 20.5,
+    "Buttom": 15.5,
+    "Crouch Kista Cut": 28.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf12",
+   "uin": "CADTEST-F-muwzlrbx-0056",
+   "name": "Sarita Patel",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 40.75,
+    "Waist": 39.5,
+    "Sheet": 43,
+    "Thigh": 28.5,
+    "Knee": 20.75,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf13",
+   "uin": "CADTEST-M-muwzlrbx-0057",
+   "name": "Ravi Patel",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 39,
+    "Sheet": 44.25,
+    "Thigh": 27.5,
+    "Knee": 20.25,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf14",
+   "uin": "CADTEST-F-muwzlrbx-0058",
+   "name": "Geeta Menon",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 39.5,
+    "Sheet": 45,
+    "Thigh": 28,
+    "Knee": 20.25,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf15",
+   "uin": "CADTEST-M-muwzlrbx-0059",
+   "name": "Ajay Mohanty",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 41.75,
+    "Waist": 39,
+    "Sheet": 43,
+    "Thigh": 27.75,
+    "Knee": 20.75,
+    "Buttom": 16,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf16",
+   "uin": "CADTEST-F-muwzlrbx-0060",
+   "name": "Namrata Sethi",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 41.75,
+    "Waist": 39,
+    "Sheet": 44.25,
+    "Thigh": 28.25,
+    "Knee": 20,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 28
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf17",
+   "uin": "CADTEST-M-muwzlrbx-0061",
+   "name": "Naveen Thapa",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 40.5,
+    "Sheet": 45.5,
+    "Thigh": 27,
+    "Knee": 21,
+    "Buttom": 16,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf18",
+   "uin": "CADTEST-F-muwzlrbx-0062",
+   "name": "Namrata Naidu",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 41.75,
+    "Waist": 40.5,
+    "Sheet": 44.25,
+    "Thigh": 27,
+    "Knee": 21,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf19",
+   "uin": "CADTEST-M-muwzlrbx-0063",
+   "name": "Sandeep Mohanty",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 40.75,
+    "Sheet": 45.5,
+    "Thigh": 27.25,
+    "Knee": 21,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1a",
+   "uin": "CADTEST-F-muwzlrbx-0064",
+   "name": "Ritu Verma",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 41,
+    "Waist": 40.5,
+    "Sheet": 44.25,
+    "Thigh": 27,
+    "Knee": 21,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 28.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1b",
+   "uin": "CADTEST-M-muwzlrbx-0065",
+   "name": "Alok Singh",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 40.5,
+    "Sheet": 45,
+    "Thigh": 27.25,
+    "Knee": 20.5,
+    "Buttom": 16,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1c",
+   "uin": "CADTEST-F-muwzlrbx-0066",
+   "name": "Rekha Reddy",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 40,
+    "Sheet": 43.75,
+    "Thigh": 28.75,
+    "Knee": 20.75,
+    "Buttom": 15.75,
+    "Crouch Kista Cut": 28.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1d",
+   "uin": "CADTEST-M-muwzlrbx-0067",
+   "name": "Deepak Yadav",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 42.25,
+    "Waist": 40.75,
+    "Sheet": 45.25,
+    "Thigh": 27,
+    "Knee": 20.5,
+    "Buttom": 16,
+    "Crouch Kista Cut": 28.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1e",
+   "uin": "CADTEST-F-muwzlrbx-0068",
+   "name": "Kiran Iyer",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 41.25,
+    "Waist": 40.5,
+    "Sheet": 44.25,
+    "Thigh": 28,
+    "Knee": 21,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf1f",
+   "uin": "CADTEST-M-muwzlrbx-0069",
+   "name": "Vikram Sethi",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 42.25,
+    "Waist": 41,
+    "Sheet": 45.5,
+    "Thigh": 27,
+    "Knee": 20.75,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf20",
+   "uin": "CADTEST-F-muwzlrbx-0070",
+   "name": "Nisha Kumar",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 40.75,
+    "Sheet": 45.5,
+    "Thigh": 27.5,
+    "Knee": 20.5,
+    "Buttom": 16.25,
+    "Crouch Kista Cut": 28.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf21",
+   "uin": "CADTEST-M-muwzlrbx-0071",
+   "name": "Nirmal Patel",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 42,
+    "Sheet": 45.75,
+    "Thigh": 26.25,
+    "Knee": 21.75,
+    "Buttom": 16,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf22",
+   "uin": "CADTEST-F-muwzlrbx-0072",
+   "name": "Meena Mishra",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 43,
+    "Waist": 43.75,
+    "Sheet": 47.75,
+    "Thigh": 30,
+    "Knee": 22,
+    "Buttom": 17.25,
+    "Crouch Kista Cut": 29.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf23",
+   "uin": "CADTEST-M-muwzlrbx-0073",
+   "name": "Santosh Tamang",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 41.75,
+    "Waist": 42.5,
+    "Sheet": 46.75,
+    "Thigh": 26.5,
+    "Knee": 21.25,
+    "Buttom": 17,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf24",
+   "uin": "CADTEST-F-muwzlrbx-0074",
+   "name": "Alka Singh",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 42.5,
+    "Sheet": 47.25,
+    "Thigh": 26.5,
+    "Knee": 22,
+    "Buttom": 16.75,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf25",
+   "uin": "CADTEST-M-muwzlrbx-0075",
+   "name": "Ravi Gupta",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42.25,
+    "Waist": 42.25,
+    "Sheet": 46.75,
+    "Thigh": 26.75,
+    "Knee": 21.25,
+    "Buttom": 17,
+    "Crouch Kista Cut": 28.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf26",
+   "uin": "CADTEST-F-muwzlrbx-0076",
+   "name": "Sunita Pillai",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 41.5,
+    "Waist": 43,
+    "Sheet": 46.75,
+    "Thigh": 27.75,
+    "Knee": 21.25,
+    "Buttom": 16.5,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf27",
+   "uin": "CADTEST-M-muwzlrbx-0077",
+   "name": "Amit Rout",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42.25,
+    "Waist": 42.5,
+    "Sheet": 47.75,
+    "Thigh": 26.5,
+    "Knee": 21.5,
+    "Buttom": 17,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf28",
+   "uin": "CADTEST-F-muwzlrbx-0078",
+   "name": "Kavita Kumar",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 43.25,
+    "Sheet": 48.5,
+    "Thigh": 28.75,
+    "Knee": 22.25,
+    "Buttom": 17,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf29",
+   "uin": "CADTEST-M-muwzlrbx-0079",
+   "name": "Sandeep Gupta",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42.5,
+    "Waist": 43.75,
+    "Sheet": 47.25,
+    "Thigh": 28.75,
+    "Knee": 22,
+    "Buttom": 16.75,
+    "Crouch Kista Cut": 30
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2a",
+   "uin": "CADTEST-F-muwzlrbx-0080",
+   "name": "Divya Das",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 42.5,
+    "Sheet": 45.75,
+    "Thigh": 27.25,
+    "Knee": 21.75,
+    "Buttom": 16.5,
+    "Crouch Kista Cut": 29
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2b",
+   "uin": "CADTEST-M-muwzlrbx-0081",
+   "name": "Bijay Rout",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.5,
+    "Waist": 45.5,
+    "Sheet": 50,
+    "Thigh": 33.75,
+    "Knee": 22.5,
+    "Buttom": 17.25,
+    "Crouch Kista Cut": 29.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2c",
+   "uin": "CADTEST-F-muwzlrbx-0082",
+   "name": "Alka Choudhury",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42,
+    "Waist": 44.75,
+    "Sheet": 48.75,
+    "Thigh": 32,
+    "Knee": 22.25,
+    "Buttom": 17,
+    "Crouch Kista Cut": 30.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2d",
+   "uin": "CADTEST-M-muwzlrbx-0083",
+   "name": "Arun Mishra",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.75,
+    "Waist": 45,
+    "Sheet": 50,
+    "Thigh": 32.25,
+    "Knee": 22.25,
+    "Buttom": 17,
+    "Crouch Kista Cut": 30
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2e",
+   "uin": "CADTEST-F-muwzlrbx-0084",
+   "name": "Meena Pradhan",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.5,
+    "Waist": 45.25,
+    "Sheet": 48.75,
+    "Thigh": 32.25,
+    "Knee": 22.25,
+    "Buttom": 17.5,
+    "Crouch Kista Cut": 29.75
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf2f",
+   "uin": "CADTEST-M-muwzlrbx-0085",
+   "name": "Vinod Pradhan",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.5,
+    "Waist": 44.5,
+    "Sheet": 48,
+    "Thigh": 31.25,
+    "Knee": 22.5,
+    "Buttom": 17,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf30",
+   "uin": "CADTEST-F-muwzlrbx-0086",
+   "name": "Pooja Pillai",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 43,
+    "Waist": 45,
+    "Sheet": 49.5,
+    "Thigh": 31.75,
+    "Knee": 22.5,
+    "Buttom": 17.25,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf31",
+   "uin": "CADTEST-M-muwzlrbx-0087",
+   "name": "Ravi Mohanty",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 43.25,
+    "Waist": 45.5,
+    "Sheet": 49.75,
+    "Thigh": 33.5,
+    "Knee": 22,
+    "Buttom": 17,
+    "Crouch Kista Cut": 30.25
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf32",
+   "uin": "CADTEST-F-muwzlrbx-0088",
+   "name": "Anita Pradhan",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 43.25,
+    "Waist": 45,
+    "Sheet": 50,
+    "Thigh": 32.5,
+    "Knee": 22.75,
+    "Buttom": 16.75,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf33",
+   "uin": "CADTEST-M-muwzlrbx-0089",
+   "name": "Subrat Rana",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.75,
+    "Waist": 45,
+    "Sheet": 47.5,
+    "Thigh": 32.25,
+    "Knee": 22,
+    "Buttom": 17,
+    "Crouch Kista Cut": 29.5
+   }
+  },
+  {
+   "id": "6ac537e794f81ff48445cf34",
+   "uin": "CADTEST-F-muwzlrbx-0090",
+   "name": "Ritu Patel",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 42.25,
+    "Waist": 45,
+    "Sheet": 48,
+    "Thigh": 32.75,
+    "Knee": 22,
+    "Buttom": 17.25,
+    "Crouch Kista Cut": 29.75
+   }
+  }
+ ],
+ "cleanup": "node scripts/onboard/seedEmployees.js ..\\grav-cad-desktop\\tools\\onboard\\out\\PROD-BOT-EXETOMANTRO-1815.json --cleanup"
+}

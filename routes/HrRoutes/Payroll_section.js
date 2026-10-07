@@ -1,4 +1,8 @@
 "use strict";
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -1058,7 +1062,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
 router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Only HR managers can run payroll" });
@@ -1512,7 +1516,7 @@ router.get("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
 router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Only HR managers can edit" });
@@ -1553,7 +1557,7 @@ router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
 router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Only HR managers can edit" });
@@ -1796,7 +1800,7 @@ router.patch(
   async (req, res) => {
     try {
       const { user } = req;
-      if (user.role !== "hr_manager") {
+      if (!isHrOperator(req)) {
         return res
           .status(403)
           .json({ success: false, message: "Only HR managers can edit" });
@@ -2107,7 +2111,7 @@ router.patch(
 router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Only HR managers can mark as paid" });
@@ -2935,7 +2939,7 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
 router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res.status(403).json({
         success: false,
         message: "Only HR managers can delete a payroll run",
@@ -2992,7 +2996,7 @@ router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
 router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Only HR managers can save payroll" });
@@ -3238,7 +3242,7 @@ router.patch(
   async (req, res) => {
     try {
       const { user } = req;
-      if (user.role !== "hr_manager") {
+      if (!isHrOperator(req)) {
         return res.status(403).json({
           success: false,
           message: "Only HR managers can edit payroll",
@@ -3374,7 +3378,7 @@ router.patch(
   async (req, res) => {
     try {
       const { user } = req;
-      if (user.role !== "hr_manager") {
+      if (!isHrOperator(req)) {
         return res.status(403).json({
           success: false,
           message: "Only HR managers can revert payroll",
@@ -3449,7 +3453,7 @@ router.patch(
 router.delete("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res.status(403).json({
         success: false,
         message: "Only HR managers can remove payroll items",
