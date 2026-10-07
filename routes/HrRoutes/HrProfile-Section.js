@@ -26,6 +26,14 @@ async function resolveAccount(userId) {
   if (hr) return { doc: hr, kind: "hr" };
   const emp = await Employee.findById(userId);
   if (emp) return { doc: emp, kind: "employee" };
+  /* A department login — the CEO and platform administrators open HR with
+     one. Without this every HR page asked "who am I" and was told "No account
+     found for this session" (found by scripts/pageSweep.js, 6 Oct 2026). Read
+     here only: the PUT/password handlers below still act on HR and employee
+     accounts alone, and a department login is managed in Access Control. */
+  const DeptUser = require("../../models/Access/DeptUser");
+  const dept = await DeptUser.findById(userId).select("name email role isAdmin createdAt");
+  if (dept) return { doc: dept, kind: "dept_user" };
   return null;
 }
 
@@ -115,6 +123,13 @@ router.put("/profile", EmployeeAuthMiddleware, async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "No account found for this session. Sign in again.",
+      });
+    }
+    if (acct.kind === "dept_user") {
+      return res.status(409).json({
+        success: false,
+        code: "MANAGED_IN_ACCESS_CONTROL",
+        message: "This sign-in is a department login. Change its details or password in Access Control.",
       });
     }
 
@@ -212,6 +227,13 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "No account found for this session. Sign in again.",
+      });
+    }
+    if (acct.kind === "dept_user") {
+      return res.status(409).json({
+        success: false,
+        code: "MANAGED_IN_ACCESS_CONTROL",
+        message: "This sign-in is a department login. Change its details or password in Access Control.",
       });
     }
     const hr = acct.doc;

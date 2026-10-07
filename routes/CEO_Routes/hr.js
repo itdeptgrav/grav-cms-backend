@@ -393,7 +393,7 @@ router.get("/attendance/export", ceoAuth, async (req, res) => {
             port,
             path: `/hr/attendance/export-muster-roll?${qs}`,
             method: "GET",
-            headers: { Cookie: req.headers.cookie || "" },
+            headers: { Cookie: req.headers.cookie || "", ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}), },
         }, (proxyRes) => {
             res.status(proxyRes.statusCode);
             Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));

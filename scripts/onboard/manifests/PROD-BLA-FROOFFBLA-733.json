@@ -1,0 +1,1160 @@
+{
+ "productRef": "PROD-BLA-FROOFFBLA-733",
+ "createdAt": "2026-10-06T18:03:16.980Z",
+ "testOrg": {
+  "id": "6ac537dcea54697ba3ad823c",
+  "email": "cadtest.prodblafrooffbla733@internal.gravtest.com"
+ },
+ "measurementId": "6ac537ddea54697ba3ad828d",
+ "requestId": "REQ-2026-0037",
+ "requestObjectId": "6ac537ddea54697ba3ad8293",
+ "workOrders": [
+  {
+   "id": "6ac537deea54697ba3ad8298",
+   "number": "WO-a3ad8298",
+   "quantity": 35,
+   "variant": [
+    {
+     "name": "Size",
+     "value": "L",
+     "_id": "6ac537deea54697ba3ad829a"
+    }
+   ]
+  },
+  {
+   "id": "6ac537e1ea54697ba3ad82ce",
+   "number": "WO-a3ad82ce",
+   "quantity": 35,
+   "variant": [
+    {
+     "name": "Size",
+     "value": "L",
+     "_id": "6ac537e1ea54697ba3ad82d0"
+    }
+   ]
+  }
+ ],
+ "employees": [
+  {
+   "id": "6ac537dcea54697ba3ad81f6",
+   "uin": "CADTEST-M-muwzlixp-0001",
+   "name": "Anil Gupta",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 29.25,
+    "Chest": 38.5,
+    "Stomach": 33.75,
+    "Bottom hem": 31.5,
+    "Shoulder": 16.75,
+    "Sleeve Length": 24.5,
+    "Cuff": 10.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81f7",
+   "uin": "CADTEST-F-muwzlixp-0002",
+   "name": "Namrata Patel",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.75,
+    "Chest": 38.5,
+    "Stomach": 32.5,
+    "Bottom hem": 32.25,
+    "Shoulder": 16.25,
+    "Sleeve Length": 24.5,
+    "Cuff": 10.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81f8",
+   "uin": "CADTEST-M-muwzlixp-0003",
+   "name": "Sanjay Behera",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 29,
+    "Chest": 39.5,
+    "Stomach": 32.5,
+    "Bottom hem": 33.75,
+    "Shoulder": 16.75,
+    "Sleeve Length": 24.25,
+    "Cuff": 10.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81f9",
+   "uin": "CADTEST-F-muwzlixp-0004",
+   "name": "Divya Singh",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.5,
+    "Chest": 38.75,
+    "Stomach": 31.5,
+    "Bottom hem": 32.75,
+    "Shoulder": 16.25,
+    "Sleeve Length": 24.5,
+    "Cuff": 11
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81fa",
+   "uin": "CADTEST-M-muwzlixp-0005",
+   "name": "Ashok Behera",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.5,
+    "Chest": 39.25,
+    "Stomach": 33,
+    "Bottom hem": 34,
+    "Shoulder": 17.25,
+    "Sleeve Length": 24.5,
+    "Cuff": 10.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81fb",
+   "uin": "CADTEST-F-muwzlixp-0006",
+   "name": "Priya Pradhan",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 29.25,
+    "Chest": 40.25,
+    "Stomach": 33.5,
+    "Bottom hem": 33.25,
+    "Shoulder": 16.5,
+    "Sleeve Length": 23.5,
+    "Cuff": 10.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81fc",
+   "uin": "CADTEST-M-muwzlixp-0007",
+   "name": "Vikram Iyer",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.75,
+    "Chest": 38,
+    "Stomach": 32.5,
+    "Bottom hem": 33,
+    "Shoulder": 16.5,
+    "Sleeve Length": 23.25,
+    "Cuff": 10.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81fd",
+   "uin": "CADTEST-F-muwzlixp-0008",
+   "name": "Manisha Thapa",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.5,
+    "Chest": 39.5,
+    "Stomach": 33,
+    "Bottom hem": 34.5,
+    "Shoulder": 17,
+    "Sleeve Length": 23.75,
+    "Cuff": 11
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81fe",
+   "uin": "CADTEST-M-muwzlixp-0009",
+   "name": "Nirmal Behera",
+   "gender": "Male",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.5,
+    "Chest": 38.25,
+    "Stomach": 33.5,
+    "Bottom hem": 32.25,
+    "Shoulder": 16.25,
+    "Sleeve Length": 23.5,
+    "Cuff": 10.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad81ff",
+   "uin": "CADTEST-F-muwzlixp-0010",
+   "name": "Shweta Pradhan",
+   "gender": "Female",
+   "size": "XS",
+   "measurements": {
+    "Length": 28.5,
+    "Chest": 38,
+    "Stomach": 33,
+    "Bottom hem": 33,
+    "Shoulder": 16.25,
+    "Sleeve Length": 23.5,
+    "Cuff": 10
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8200",
+   "uin": "CADTEST-M-muwzlixp-0011",
+   "name": "Sandeep Gupta",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 30,
+    "Chest": 43,
+    "Stomach": 35.75,
+    "Bottom hem": 38.75,
+    "Shoulder": 17.25,
+    "Sleeve Length": 24.25,
+    "Cuff": 11.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8201",
+   "uin": "CADTEST-F-muwzlixp-0012",
+   "name": "Vandana Mishra",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 30,
+    "Chest": 42.75,
+    "Stomach": 38.25,
+    "Bottom hem": 36.5,
+    "Shoulder": 17.5,
+    "Sleeve Length": 24.25,
+    "Cuff": 10.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8202",
+   "uin": "CADTEST-M-muwzlixp-0013",
+   "name": "Bikash Rana",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 29.75,
+    "Chest": 42.5,
+    "Stomach": 37.75,
+    "Bottom hem": 36.75,
+    "Shoulder": 17.25,
+    "Sleeve Length": 25,
+    "Cuff": 11.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8203",
+   "uin": "CADTEST-F-muwzlixp-0014",
+   "name": "Jyotsna Naidu",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 29.25,
+    "Chest": 45.5,
+    "Stomach": 40.75,
+    "Bottom hem": 41,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.25,
+    "Cuff": 11.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8204",
+   "uin": "CADTEST-M-muwzlixp-0015",
+   "name": "Subrat Menon",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 29.25,
+    "Chest": 42.5,
+    "Stomach": 36.75,
+    "Bottom hem": 37.75,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.25,
+    "Cuff": 11
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8205",
+   "uin": "CADTEST-F-muwzlixp-0016",
+   "name": "Vandana Rout",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 45.25,
+    "Stomach": 40.25,
+    "Bottom hem": 38.25,
+    "Shoulder": 18.25,
+    "Sleeve Length": 24.5,
+    "Cuff": 11.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8206",
+   "uin": "CADTEST-M-muwzlixp-0017",
+   "name": "Arun Iyer",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 29.25,
+    "Chest": 43.25,
+    "Stomach": 37.25,
+    "Bottom hem": 38.75,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.75,
+    "Cuff": 11.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8207",
+   "uin": "CADTEST-F-muwzlixp-0018",
+   "name": "Geeta Iyer",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 29.75,
+    "Chest": 43.5,
+    "Stomach": 36.25,
+    "Bottom hem": 38.75,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.5,
+    "Cuff": 11
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8208",
+   "uin": "CADTEST-M-muwzlixp-0019",
+   "name": "Vijay Choudhury",
+   "gender": "Male",
+   "size": "S",
+   "measurements": {
+    "Length": 29.5,
+    "Chest": 45,
+    "Stomach": 38.75,
+    "Bottom hem": 39.5,
+    "Shoulder": 18,
+    "Sleeve Length": 24,
+    "Cuff": 11.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8209",
+   "uin": "CADTEST-F-muwzlixp-0020",
+   "name": "Rekha Thapa",
+   "gender": "Female",
+   "size": "S",
+   "measurements": {
+    "Length": 29,
+    "Chest": 44,
+    "Stomach": 38.25,
+    "Bottom hem": 38,
+    "Shoulder": 18,
+    "Sleeve Length": 24,
+    "Cuff": 11
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820a",
+   "uin": "CADTEST-M-muwzlixp-0021",
+   "name": "Kishore Kumar",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 29.75,
+    "Chest": 46,
+    "Stomach": 39.75,
+    "Bottom hem": 40.5,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.75,
+    "Cuff": 11.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820b",
+   "uin": "CADTEST-F-muwzlixp-0022",
+   "name": "Alka Nayak",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 48.5,
+    "Stomach": 44,
+    "Bottom hem": 41.5,
+    "Shoulder": 18.25,
+    "Sleeve Length": 25.5,
+    "Cuff": 11.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820c",
+   "uin": "CADTEST-M-muwzlixp-0023",
+   "name": "Vikram Patel",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 48,
+    "Stomach": 42.75,
+    "Bottom hem": 41,
+    "Shoulder": 18.5,
+    "Sleeve Length": 25.75,
+    "Cuff": 11.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820d",
+   "uin": "CADTEST-F-muwzlixp-0024",
+   "name": "Sarita Verma",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 29.5,
+    "Chest": 47.5,
+    "Stomach": 40,
+    "Bottom hem": 40.5,
+    "Shoulder": 18.75,
+    "Sleeve Length": 25.25,
+    "Cuff": 12
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820e",
+   "uin": "CADTEST-M-muwzlixp-0025",
+   "name": "Deepak Pradhan",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 30,
+    "Chest": 47.5,
+    "Stomach": 42.75,
+    "Bottom hem": 41.75,
+    "Shoulder": 18,
+    "Sleeve Length": 25.25,
+    "Cuff": 11.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad820f",
+   "uin": "CADTEST-F-muwzlixp-0026",
+   "name": "Alka Choudhury",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 30,
+    "Chest": 48.5,
+    "Stomach": 43.5,
+    "Bottom hem": 41.75,
+    "Shoulder": 18.75,
+    "Sleeve Length": 25.75,
+    "Cuff": 11.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8210",
+   "uin": "CADTEST-M-muwzlixp-0027",
+   "name": "Deepak Das",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 29.5,
+    "Chest": 48,
+    "Stomach": 40.75,
+    "Bottom hem": 41.5,
+    "Shoulder": 18.75,
+    "Sleeve Length": 25.5,
+    "Cuff": 11.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8211",
+   "uin": "CADTEST-F-muwzlixp-0028",
+   "name": "Alka Sethi",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 30,
+    "Chest": 49.75,
+    "Stomach": 44.25,
+    "Bottom hem": 42.5,
+    "Shoulder": 18.25,
+    "Sleeve Length": 24.75,
+    "Cuff": 12
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8212",
+   "uin": "CADTEST-M-muwzlixp-0029",
+   "name": "Santosh Behera",
+   "gender": "Male",
+   "size": "M",
+   "measurements": {
+    "Length": 30,
+    "Chest": 47.25,
+    "Stomach": 42.5,
+    "Bottom hem": 42,
+    "Shoulder": 17.75,
+    "Sleeve Length": 24.25,
+    "Cuff": 12
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8213",
+   "uin": "CADTEST-F-muwzlixp-0030",
+   "name": "Geeta Naidu",
+   "gender": "Female",
+   "size": "M",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 47,
+    "Stomach": 40,
+    "Bottom hem": 42.75,
+    "Shoulder": 18.5,
+    "Sleeve Length": 25,
+    "Cuff": 11.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8214",
+   "uin": "CADTEST-M-muwzlixp-0031",
+   "name": "Sunil Pradhan",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 30.5,
+    "Chest": 51.5,
+    "Stomach": 45.5,
+    "Bottom hem": 44.75,
+    "Shoulder": 19.25,
+    "Sleeve Length": 26,
+    "Cuff": 12.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8215",
+   "uin": "CADTEST-F-muwzlixp-0032",
+   "name": "Divya Menon",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 31,
+    "Chest": 51.5,
+    "Stomach": 46.5,
+    "Bottom hem": 46.25,
+    "Shoulder": 18.5,
+    "Sleeve Length": 25,
+    "Cuff": 12
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8216",
+   "uin": "CADTEST-M-muwzlixp-0033",
+   "name": "Rajesh Das",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 29.75,
+    "Chest": 51.25,
+    "Stomach": 44,
+    "Bottom hem": 46.25,
+    "Shoulder": 18.75,
+    "Sleeve Length": 25.75,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8217",
+   "uin": "CADTEST-F-muwzlixp-0034",
+   "name": "Kavita Rai",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 52.25,
+    "Stomach": 45.75,
+    "Bottom hem": 46.5,
+    "Shoulder": 19,
+    "Sleeve Length": 25.25,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8218",
+   "uin": "CADTEST-M-muwzlixp-0035",
+   "name": "Sanjay Sharma",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 53.5,
+    "Stomach": 48.75,
+    "Bottom hem": 47.75,
+    "Shoulder": 19.25,
+    "Sleeve Length": 25.5,
+    "Cuff": 12.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8219",
+   "uin": "CADTEST-F-muwzlixp-0036",
+   "name": "Namrata Naidu",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 30.5,
+    "Chest": 51.25,
+    "Stomach": 46.5,
+    "Bottom hem": 45,
+    "Shoulder": 19.25,
+    "Sleeve Length": 25,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821a",
+   "uin": "CADTEST-M-muwzlixp-0037",
+   "name": "Rakesh Pradhan",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 30.75,
+    "Chest": 53.5,
+    "Stomach": 48.75,
+    "Bottom hem": 47,
+    "Shoulder": 19.25,
+    "Sleeve Length": 25,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821b",
+   "uin": "CADTEST-F-muwzlixp-0038",
+   "name": "Nisha Rana",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 52.5,
+    "Stomach": 45.5,
+    "Bottom hem": 47.75,
+    "Shoulder": 19,
+    "Sleeve Length": 25.5,
+    "Cuff": 12
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821c",
+   "uin": "CADTEST-M-muwzlixp-0039",
+   "name": "Deepak Yadav",
+   "gender": "Male",
+   "size": "L",
+   "measurements": {
+    "Length": 31,
+    "Chest": 51,
+    "Stomach": 44,
+    "Bottom hem": 44,
+    "Shoulder": 19,
+    "Sleeve Length": 26,
+    "Cuff": 12.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821d",
+   "uin": "CADTEST-F-muwzlixp-0040",
+   "name": "Suman Verma",
+   "gender": "Female",
+   "size": "L",
+   "measurements": {
+    "Length": 29.75,
+    "Chest": 51.75,
+    "Stomach": 46.75,
+    "Bottom hem": 45,
+    "Shoulder": 19,
+    "Sleeve Length": 25.75,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821e",
+   "uin": "CADTEST-M-muwzlixp-0041",
+   "name": "Rohit Mohanty",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 30.75,
+    "Chest": 56.75,
+    "Stomach": 49.5,
+    "Bottom hem": 51.25,
+    "Shoulder": 20.25,
+    "Sleeve Length": 26.75,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad821f",
+   "uin": "CADTEST-F-muwzlixp-0042",
+   "name": "Neha Gupta",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 31.25,
+    "Chest": 56,
+    "Stomach": 49.25,
+    "Bottom hem": 49.75,
+    "Shoulder": 20,
+    "Sleeve Length": 25.25,
+    "Cuff": 12.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8220",
+   "uin": "CADTEST-M-muwzlixp-0043",
+   "name": "Ashok Sethi",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 57.25,
+    "Stomach": 51.25,
+    "Bottom hem": 51.75,
+    "Shoulder": 19.75,
+    "Sleeve Length": 25.5,
+    "Cuff": 13
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8221",
+   "uin": "CADTEST-F-muwzlixp-0044",
+   "name": "Pooja Sharma",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 31.25,
+    "Chest": 56.25,
+    "Stomach": 50,
+    "Bottom hem": 49.25,
+    "Shoulder": 19.75,
+    "Sleeve Length": 25.5,
+    "Cuff": 12.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8222",
+   "uin": "CADTEST-M-muwzlixp-0045",
+   "name": "Naveen Gupta",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 31.5,
+    "Chest": 56.5,
+    "Stomach": 51.75,
+    "Bottom hem": 50.75,
+    "Shoulder": 19.75,
+    "Sleeve Length": 26,
+    "Cuff": 13.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8223",
+   "uin": "CADTEST-F-muwzlixp-0046",
+   "name": "Pooja Behera",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 30.75,
+    "Chest": 55.75,
+    "Stomach": 51,
+    "Bottom hem": 51.25,
+    "Shoulder": 19.25,
+    "Sleeve Length": 25.5,
+    "Cuff": 13
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8224",
+   "uin": "CADTEST-M-muwzlixp-0047",
+   "name": "Subrat Pradhan",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 55.75,
+    "Stomach": 50.5,
+    "Bottom hem": 50.25,
+    "Shoulder": 19.5,
+    "Sleeve Length": 25.5,
+    "Cuff": 13
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8225",
+   "uin": "CADTEST-F-muwzlixp-0048",
+   "name": "Shweta Sharma",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 30.25,
+    "Chest": 55.5,
+    "Stomach": 49,
+    "Bottom hem": 51,
+    "Shoulder": 19.75,
+    "Sleeve Length": 26,
+    "Cuff": 12.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8226",
+   "uin": "CADTEST-M-muwzlixp-0049",
+   "name": "Ravi Sahoo",
+   "gender": "Male",
+   "size": "XL",
+   "measurements": {
+    "Length": 31.5,
+    "Chest": 55.25,
+    "Stomach": 50.25,
+    "Bottom hem": 50.5,
+    "Shoulder": 19.25,
+    "Sleeve Length": 26.5,
+    "Cuff": 12.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8227",
+   "uin": "CADTEST-F-muwzlixp-0050",
+   "name": "Pooja Nayak",
+   "gender": "Female",
+   "size": "XL",
+   "measurements": {
+    "Length": 31.5,
+    "Chest": 55,
+    "Stomach": 49.25,
+    "Bottom hem": 50.25,
+    "Shoulder": 20,
+    "Sleeve Length": 25.5,
+    "Cuff": 12.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8228",
+   "uin": "CADTEST-M-muwzlixp-0051",
+   "name": "Pramod Yadav",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31.75,
+    "Chest": 58.5,
+    "Stomach": 51.25,
+    "Bottom hem": 51.75,
+    "Shoulder": 20.25,
+    "Sleeve Length": 26.25,
+    "Cuff": 12.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8229",
+   "uin": "CADTEST-F-muwzlixp-0052",
+   "name": "Divya Das",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31,
+    "Chest": 58.5,
+    "Stomach": 53.5,
+    "Bottom hem": 51.5,
+    "Shoulder": 20.25,
+    "Sleeve Length": 26.25,
+    "Cuff": 13.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822a",
+   "uin": "CADTEST-M-muwzlixp-0053",
+   "name": "Prakash Das",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 32.25,
+    "Chest": 60.5,
+    "Stomach": 55.5,
+    "Bottom hem": 55.5,
+    "Shoulder": 20.75,
+    "Sleeve Length": 27.25,
+    "Cuff": 13.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822b",
+   "uin": "CADTEST-F-muwzlixp-0054",
+   "name": "Divya Singh",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 30.5,
+    "Chest": 58.25,
+    "Stomach": 51.75,
+    "Bottom hem": 52.75,
+    "Shoulder": 20.5,
+    "Sleeve Length": 25.5,
+    "Cuff": 13.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822c",
+   "uin": "CADTEST-M-muwzlixp-0055",
+   "name": "Ajay Panda",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31.5,
+    "Chest": 61.5,
+    "Stomach": 54.5,
+    "Bottom hem": 55,
+    "Shoulder": 21,
+    "Sleeve Length": 26.25,
+    "Cuff": 13.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822d",
+   "uin": "CADTEST-F-muwzlixp-0056",
+   "name": "Divya Kumar",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 30.75,
+    "Chest": 58.5,
+    "Stomach": 51.5,
+    "Bottom hem": 54,
+    "Shoulder": 20.25,
+    "Sleeve Length": 25.75,
+    "Cuff": 13
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822e",
+   "uin": "CADTEST-M-muwzlixp-0057",
+   "name": "Rakesh Mishra",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31.25,
+    "Chest": 58.25,
+    "Stomach": 51.25,
+    "Bottom hem": 52,
+    "Shoulder": 20,
+    "Sleeve Length": 26,
+    "Cuff": 13.25
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad822f",
+   "uin": "CADTEST-F-muwzlixp-0058",
+   "name": "Namrata Chauhan",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 32.25,
+    "Chest": 60.25,
+    "Stomach": 54.5,
+    "Bottom hem": 54.5,
+    "Shoulder": 20.75,
+    "Sleeve Length": 26.5,
+    "Cuff": 13.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8230",
+   "uin": "CADTEST-M-muwzlixp-0059",
+   "name": "Subrat Rai",
+   "gender": "Male",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31.75,
+    "Chest": 60.75,
+    "Stomach": 54.75,
+    "Bottom hem": 55,
+    "Shoulder": 20.25,
+    "Sleeve Length": 26.75,
+    "Cuff": 13.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8231",
+   "uin": "CADTEST-F-muwzlixp-0060",
+   "name": "Anjali Iyer",
+   "gender": "Female",
+   "size": "2XL",
+   "measurements": {
+    "Length": 31.25,
+    "Chest": 60.25,
+    "Stomach": 54.75,
+    "Bottom hem": 53.25,
+    "Shoulder": 20.5,
+    "Sleeve Length": 26,
+    "Cuff": 13.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8232",
+   "uin": "CADTEST-M-muwzlixp-0061",
+   "name": "Nirmal Singh",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32.75,
+    "Chest": 63.5,
+    "Stomach": 57.25,
+    "Bottom hem": 56.5,
+    "Shoulder": 21,
+    "Sleeve Length": 26.75,
+    "Cuff": 13.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8233",
+   "uin": "CADTEST-F-muwzlixp-0062",
+   "name": "Geeta Sahoo",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 31.25,
+    "Chest": 64.25,
+    "Stomach": 57,
+    "Bottom hem": 59.75,
+    "Shoulder": 21.5,
+    "Sleeve Length": 27.75,
+    "Cuff": 14
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8234",
+   "uin": "CADTEST-M-muwzlixp-0063",
+   "name": "Rohit Sethi",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32.5,
+    "Chest": 64,
+    "Stomach": 57.75,
+    "Bottom hem": 57.25,
+    "Shoulder": 21,
+    "Sleeve Length": 27.25,
+    "Cuff": 14
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8235",
+   "uin": "CADTEST-F-muwzlixp-0064",
+   "name": "Swati Rana",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 64.5,
+    "Stomach": 60,
+    "Bottom hem": 59.5,
+    "Shoulder": 21.5,
+    "Sleeve Length": 26.75,
+    "Cuff": 14
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8236",
+   "uin": "CADTEST-M-muwzlixp-0065",
+   "name": "Amit Verma",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 31.5,
+    "Chest": 64.75,
+    "Stomach": 57.75,
+    "Bottom hem": 58.75,
+    "Shoulder": 21.5,
+    "Sleeve Length": 26.5,
+    "Cuff": 13.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8237",
+   "uin": "CADTEST-F-muwzlixp-0066",
+   "name": "Pooja Rout",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32.5,
+    "Chest": 63,
+    "Stomach": 55.5,
+    "Bottom hem": 55.75,
+    "Shoulder": 20.75,
+    "Sleeve Length": 27,
+    "Cuff": 13.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8238",
+   "uin": "CADTEST-M-muwzlixp-0067",
+   "name": "Vijay Tamang",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 63.5,
+    "Stomach": 56.25,
+    "Bottom hem": 56.75,
+    "Shoulder": 21.25,
+    "Sleeve Length": 27.25,
+    "Cuff": 13.5
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad8239",
+   "uin": "CADTEST-F-muwzlixp-0068",
+   "name": "Deepika Kumar",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 63.75,
+    "Stomach": 58.25,
+    "Bottom hem": 57.75,
+    "Shoulder": 21.25,
+    "Sleeve Length": 26.5,
+    "Cuff": 14
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad823a",
+   "uin": "CADTEST-M-muwzlixp-0069",
+   "name": "Manoj Patel",
+   "gender": "Male",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 63,
+    "Stomach": 56,
+    "Bottom hem": 58.25,
+    "Shoulder": 21.5,
+    "Sleeve Length": 26.75,
+    "Cuff": 13.75
+   }
+  },
+  {
+   "id": "6ac537dcea54697ba3ad823b",
+   "uin": "CADTEST-F-muwzlixp-0070",
+   "name": "Anita Verma",
+   "gender": "Female",
+   "size": "3XL",
+   "measurements": {
+    "Length": 32,
+    "Chest": 62.75,
+    "Stomach": 55.75,
+    "Bottom hem": 56.75,
+    "Shoulder": 21,
+    "Sleeve Length": 27.5,
+    "Cuff": 14
+   }
+  }
+ ],
+ "cleanup": "node scripts/onboard/seedEmployees.js ..\\grav-cad-desktop\\tools\\onboard\\out\\PROD-BLA-FROOFFBLA-733.json --cleanup"
+}

@@ -95,8 +95,8 @@ function header(headers, name) {
  * the call and WhatsApp matchers use — so "who is this customer" has ONE answer
  * across all three channels rather than three subtly different ones.
  */
-async function emailsForCustomer({ leadId, accountId, customerId }) {
-  const identity = await identityFor({ leadId, accountId, customerId });
+async function emailsForCustomer({ leadId, accountId, customerId }, ctx) {
+  const identity = await identityFor({ leadId, accountId, customerId }, ctx);
   if (!identity) return null;
   return { identity, emails: identity.emails || [] };
 }
@@ -109,8 +109,8 @@ async function emailsForCustomer({ leadId, accountId, customerId }) {
  * caller must render as "connect your account", never as "no emails", because
  * the two look identical from the outside and mean opposite things.
  */
-async function emailsForLead({ employeeId, leadId, accountId, customerId }) {
-  const found = await emailsForCustomer({ leadId, accountId, customerId });
+async function emailsForLead({ employeeId, leadId, accountId, customerId }, ctx) {
+  const found = await emailsForCustomer({ leadId, accountId, customerId }, ctx);
   if (!found) return null;
   const { identity, emails } = found;
 

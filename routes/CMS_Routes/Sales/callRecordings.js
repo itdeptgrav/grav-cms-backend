@@ -50,7 +50,7 @@ router.get("/", salesAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "accountId, customerId or leadId is required" });
     }
 
-    const identity = await identityFor({ accountId, customerId, leadId });
+    const identity = await identityFor({ accountId, customerId, leadId }, await require("../../../services/companyContext/evidenceContext").evidenceContext(req));
     if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     const filter = buildRecordingFilter(identity);

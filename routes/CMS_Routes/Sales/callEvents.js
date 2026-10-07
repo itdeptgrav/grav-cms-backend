@@ -23,6 +23,7 @@ const { SalesPerson } = require("../../../models/CMS_Models/Sales/SalesPerson");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { buildRecordingFilter, annotateMatches } = require("../../../services/callRecordingMatch.service");
 const { identityFor } = require("../../../services/customerIdentityLookup.service");
+const { evidenceContext } = require("../../../services/companyContext/evidenceContext");
 
 /** Hard ceiling on one customer's call history in a single response. */
 const MAX_ROWS = 200;
@@ -44,7 +45,7 @@ router.get("/", salesAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "accountId, customerId or leadId is required" });
     }
 
-    const identity = await identityFor({ accountId, customerId, leadId });
+    const identity = await identityFor({ accountId, customerId, leadId }, await evidenceContext(req));
     if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     const filter = buildRecordingFilter(identity);

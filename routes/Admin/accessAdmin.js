@@ -268,13 +268,24 @@ router.get("/effective-access", async (req, res) => {
     ];
 
     const { listAccessibleApps } = require("../../services/access/appAccess.service");
-    const rows = [];
-    for (const p of people) {
-      // One identity read and one catalogue read per person.
-      const out = await listAccessibleApps(p.actor);
-      if (!out.ok && out.denialCode === "ACCESS_CHECK_UNAVAILABLE") {
-        return fail(res, 503, "Access could not be checked just now. Try again in a moment.");
+    /* One identity read and one catalogue read per person. Run eight at a
+       time: strictly one-after-another this took ~76 s for 67 people against
+       Atlas (6 Oct 2026), longer than any client waits. Order is kept. */
+    const answers = new Array(people.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(8, people.length) }, async () => {
+      while (next < people.length) {
+        const k = next++;
+        answers[k] = await listAccessibleApps(people[k].actor);
       }
+    }));
+    if (answers.some((out) => !out.ok && out.denialCode === "ACCESS_CHECK_UNAVAILABLE")) {
+      return fail(res, 503, "Access could not be checked just now. Try again in a moment.");
+    }
+    const rows = [];
+    for (let k = 0; k < people.length; k++) {
+      const p = people[k];
+      const out = answers[k];
       const granted = new Map(out.apps.map((x) => [x.department.slug, x.access]));
       const cells = {};
       for (const app of apps) {

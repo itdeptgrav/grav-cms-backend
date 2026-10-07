@@ -368,14 +368,33 @@ describe("conflicting company scope", () => {
 });
 
 describe("missing and malformed company scope", () => {
-  test("a required endpoint with no companyId is a stable 400", async () => {
+  /* An organisation with ONE company: "which company" has one answer, and the
+     scope resolves to it (6 Oct 2026 — pages that did not thread the selector's
+     id were refused with "companyId is required for this request."). The
+     refusal is for an organisation with several, where the question is real. */
+  async function twoCompanyOwner() {
+    const org = await makeOrg([await makeCompany(), await makeCompany()]);
+    return makeUser(org, "owner");
+  }
+
+  test("an organisation with ONE company: no companyId means that company", async () => {
+    const { alpha } = await twoTenants();
+    const bearer = signOrgToken(alpha.owner);
+    for (const [label, url] of READS) {
+      if (OPTIONAL_SCOPE.has(label)) continue;
+      const res = await call(url, { bearer });
+      expect(`${label}: ${res.status} ${res.body?.code || ""} ${res.body?.message || res.body?.error || ""}`).not.toMatch(/: 400/);
+      expect(res.body?.code).not.toBe("COMPANY_SCOPE_REQUIRED");
+    }
+  });
+
+  test("a required endpoint with no companyId is a stable 400 when the organisation has several", async () => {
     // Two of the representative reads deliberately aggregate across the whole
     // organisation when no company is named (the ledger list and the budget
     // list), so they carry the permissive guard and are excluded here. What
     // they must still do — refuse a company that is not theirs — is asserted in
     // "an optional-scope endpoint still refuses a foreign company" below.
-    const { alpha } = await twoTenants();
-    const bearer = signOrgToken(alpha.owner);
+    const bearer = signOrgToken(await twoCompanyOwner());
     for (const [label, url] of READS) {
       if (OPTIONAL_SCOPE.has(label)) continue;
       const res = await call(url, { bearer });
@@ -390,7 +409,7 @@ describe("missing and malformed company scope", () => {
     for (const [label, url] of READS) {
       if (!OPTIONAL_SCOPE.has(label)) continue;
       const res = await call(url, { bearer });
-      expect(`${label}: ${res.status}`).not.toBe(`${label}: 400`);
+      expect(`${label}: ${res.status} ${res.body?.code || ""} ${res.body?.message || res.body?.error || ""}`).not.toMatch(/: 400/);
     }
   });
 
@@ -411,9 +430,8 @@ describe("missing and malformed company scope", () => {
   });
 
   test("a blank companyId is treated as missing, not malformed", async () => {
-    const { alpha } = await twoTenants();
     const res = await call("/api/accountant/vouchers?companyId=", {
-      bearer: signOrgToken(alpha.owner),
+      bearer: signOrgToken(await twoCompanyOwner()),
     });
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("COMPANY_SCOPE_REQUIRED");
