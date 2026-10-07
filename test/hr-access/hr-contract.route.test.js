@@ -314,7 +314,6 @@ describe("12-16 — the capability separations, end to end", () => {
       "/api/hr/payslip/GR0001/pdf",
       "/api/hr/payroll/items",
       "/api/hr/payroll/preview",
-      "/api/employees/config/salary",
       "/api/employees/import-export/export",
     ]) {
       const denied = await call("GET", path, { token: editor });

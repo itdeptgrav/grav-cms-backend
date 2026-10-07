@@ -52,7 +52,11 @@ const employeeSchema = new mongoose.Schema({
   dateOfBirth: { type: Date },
   gender: {
     type: String,
-    enum: ["Male", "Female", "Other", "male", "female"],
+    /* "" is in the list because it is the DEFAULT and the form's "—" option.
+       Without it every create that left gender unpicked, and every save of the
+       Employee-info card with gender on "—" (names and phones included), was
+       refused whole with a bare "Validation error" (7 Oct 2026). */
+    enum: ["Male", "Female", "Other", "male", "female", ""],
     default: "",
   },
   bloodGroup: { type: String },
