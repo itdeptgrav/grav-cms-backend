@@ -1231,8 +1231,13 @@ router.put(
      * This route used to accept `status` and assign it directly, which made
      * it a second, unguarded way to issue or cancel an order: no issue
      * capability, no approval policy, no reason, no history. Status changes
-     * belong to PATCH /:id/status and nowhere else. */
-    if (req.body?.status !== undefined) {
+     * belong to PATCH /:id/status and nowhere else.
+     *
+     * "DRAFT" itself is not a change: only a draft is editable (below), and
+     * the edit form sent `status: "DRAFT"` on every save, so adding a product
+     * to a draft was refused with this message (owner, 7 Oct 2026). It is
+     * ignored; any other value is still refused. */
+    if (req.body?.status !== undefined && String(req.body.status).toUpperCase() !== "DRAFT") {
       throw fail(
         "VALIDATION",
         "An order's status is changed from the order itself, not by editing it.",
